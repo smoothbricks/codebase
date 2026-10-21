@@ -770,6 +770,23 @@ export type DatabaseHolder = {
 };
 
 /**
+ * A kernel identifier (a device, an inode, a process's unique id) on the wire as its exact
+ * decimal string. A JSON number past 2^53 loses precision in JavaScript, and a reader that
+ * compares identities must compare them exactly, so none is ever a number. The scalar carries the
+ * exact upper bound: a canonical decimal string is at most `u64::MAX` when it is shorter than 20
+ * digits, or 20 digits that compare no greater than `18446744073709551615`, which compares digit
+ * strings of one length in place, with no conversion.
+ */
+export type DecimalU64 = string &
+  tags.Pattern<'^(0|[1-9][0-9]*)$'> &
+  tags.TagBase<{
+    kind: 'u64Decimal';
+    target: 'string';
+    value: '18446744073709551615';
+    validate: '$input.length < 20 || ($input.length === 20 && $input <= "18446744073709551615")';
+  }>;
+
+/**
  * What `cowshed defrag` changed: the image's extents before and after its data was rewritten
  * contiguously, and the data bytes the rewrite copied.
  */
@@ -1823,6 +1840,24 @@ export type LandingCommits =
     });
 
 /**
+ * What the kernel shows of one descriptor on the locked inode.
+ */
+export type LockCustody = 'holds' | 'open' | 'recorded' | 'unexposed';
+
+/**
+ * A process with a descriptor on the locked inode.
+ */
+export type LockDescriptor = {
+  readonly pid: number & tags.Type<'int32'>;
+  /**
+   * The kernel's unique id of the process (`p_uniqueid`); Linux has none to give.
+   */
+  readonly uniqueId: DecimalU64 | null;
+  readonly command: string;
+  readonly custody: LockCustody;
+};
+
+/**
  * The process holding a lock another one waits for.
  */
 export type LockHolder = {
@@ -1836,6 +1871,85 @@ export type LockHolder = {
    */
   readonly program?: string;
 };
+
+/**
+ * The inode a lock is on: the device and inode numbers `stat(2)` gives it.
+ */
+export type LockInode = {
+  readonly dev: DecimalU64;
+  readonly ino: DecimalU64;
+};
+
+/**
+ * Who the kernel shows holding a lock file, read in one pass (`cowshed lock-holders`). Every
+ * field serializes whatever bytes the path and the file hold, so the object is always written
+ * whole.
+ */
+export type LockObservation = {
+  readonly path: LockPath;
+  /**
+   * The inode the path names; `None` when no lock file exists.
+   */
+  readonly inode: LockInode | null;
+  /**
+   * Whether the kernel shows the inode exclusively locked.
+   */
+  readonly locked: boolean;
+  /**
+   * The holder record on the inode as written, empty when there is none.
+   */
+  readonly record: LockRecord;
+  /**
+   * The descriptor of the holder the record names, once the kernel proves it: on Linux it holds
+   * the lock; on Darwin its unique id is the record's.
+   */
+  readonly owner: LockDescriptor | null;
+  /**
+   * Every other process with a descriptor on the inode, and what the kernel shows of it. The
+   * observing process is not among them.
+   */
+  readonly descriptors: ReadonlyArray<LockDescriptor>;
+};
+
+/**
+ * A lock file's path, exactly as the caller named it: its bytes as tagged bytes, `utf8` when they
+ * are UTF-8 and canonical standard base64 otherwise, so no path is refused or mangled.
+ */
+export type LockPath = TaggedBytesRef;
+
+/**
+ * A lock file's content, the holder record as written, as its exact bytes in tagged form: a
+ * record is a claim a reader parses, so it is never shown decoded lossily or refused for not
+ * being UTF-8. Empty when there is none.
+ */
+export type LockRecord = TaggedBytesRef;
+
+/**
+ * One event a `cowshed lock` waiter writes on its `--state-fd` channel, one JSON object per line:
+ * a reason or a path carrying a newline stays one line. `failed`, `commandFailed` and `signalled`
+ * are terminal failures; `acquired` is the last line on a normal run, with the channel retained
+ * until the command ends. A failed handoff closes the channel before joining, retaining custody.
+ * `signalled` and `notSignalled` answer SIGUSR1 while `queued`.
+ */
+export type LockWaiterEvent =
+  | ({ readonly kind: 'queued' } & {
+      readonly inode: LockInode;
+    })
+  | ({ readonly kind: 'acquired' } & {
+      readonly inode: LockInode;
+    })
+  | ({ readonly kind: 'commandFailed' } & {
+      readonly reason: string;
+    })
+  | ({ readonly kind: 'failed' } & {
+      readonly reason: string;
+    })
+  | ({ readonly kind: 'signalled' } & {
+      readonly pid: number & tags.Type<'int32'>;
+    })
+  | ({ readonly kind: 'notSignalled' } & {
+      readonly reason: string;
+    });
 
 /**
  * The JSON half of a `job.logs` answer; the bytes follow as its raw-byte frame.
@@ -2951,6 +3065,33 @@ export type TraceContext = {
 };
 
 export type TraceId = string & tags.Pattern<'^(?!0{32}$)[0-9a-f]{32}$'>;
+
+/**
+ * How a process holds the tree: the first hold the census found, cheapest first.
+ */
+export type TreeHoldKind = 'working-directory' | 'root-directory' | 'executable' | 'open-file' | 'mapped-file';
+
+/**
+ * One process holding something inside a directory tree: one line of `cowshed tree-holders`, its
+ * fields in the order a reader matches them, the pid and how it holds the tree first. The pid
+ * names the process; the path is exact; the command is for a person to read.
+ */
+export type TreeHolder = {
+  readonly pid: number & tags.Type<'int32'>;
+  readonly hold: TreeHoldKind;
+  readonly path: TreePath;
+  /**
+   * Its argument vector joined by spaces, each argument decoded lossily (or its executable's
+   * path, or `command unreadable`): never an identity.
+   */
+  readonly command: string;
+};
+
+/**
+ * A path inside the tree, exactly as the kernel names it: its bytes as tagged bytes, `utf8` when
+ * they are UTF-8 and canonical standard base64 otherwise, so no path is lost or refused.
+ */
+export type TreePath = TaggedBytesRef;
 
 /**
  * One line of a repository's turn log.

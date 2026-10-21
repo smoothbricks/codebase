@@ -1294,7 +1294,7 @@ fn project_tagged_bytes<R>(bytes: &[u8], use_wire: impl FnOnce(&TaggedBytesRef<'
     }
 }
 
-fn serialize_tagged_bytes<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+pub(crate) fn serialize_tagged_bytes<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {

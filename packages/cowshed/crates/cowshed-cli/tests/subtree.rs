@@ -316,12 +316,9 @@ fn hosted_entrypoint_helper() {
     if std::env::var_os("COWSHED_TEST_HOSTED_SUBTREE").is_none() {
         return;
     }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let code = runtime.block_on(cowshed_cli::run::run(
+    // Prepared before the runtime exists, as the binary prepares its own argv: preparation owns
+    // the invocation's inherited descriptors.
+    let invocation = cowshed_cli::run::prepare(
         [
             "subtree-root",
             "--handle-fd",
@@ -333,7 +330,14 @@ fn hosted_entrypoint_helper() {
         ]
         .map(OsString::from)
         .into(),
-    ));
+    )
+    .unwrap_or_else(|code| panic!("the hosted subtree-root was refused with exit {code}"));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let code = runtime.block_on(cowshed_cli::run::run(invocation));
     panic!("hosted exec returned {code}");
 }
 

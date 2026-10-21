@@ -8,11 +8,11 @@
 //! after the train took the turn and held it for 36 minutes.
 //!
 //! So a land takes a numbered ticket and waits for its turn. Each ticket is a file in the
-//! repository's directory, exclusively locked by the process that took it for as long as it holds
-//! or waits for the turn: the kernel drops the lock when that process exits however it exits, so
-//! a ticket whose lock is free is dead and is removed by whoever finds it. Numbers are given out
-//! under the directory's `.seq` lock, each above every ticket present, so the live tickets are in
-//! the order their lands asked. The live ticket with the lowest number holds the turn; every other
+//! repository's directory, exclusively locked for as long as the land or any process handed its
+//! descriptor holds or waits for the turn. The kernel drops the lock when the last inherited
+//! description closes; a ticket whose lock is free is dead and is removed by whoever finds it.
+//! Numbers are given out under the directory's `.seq` lock, each above every ticket present, so
+//! the live tickets are in the order their lands asked. The lowest number holds the turn; every other
 //! waits on the lock of the live ticket just ahead of it and, when that ends, looks again. Nothing
 //! polls, and nobody but the next in line is woken.
 //!
@@ -24,12 +24,16 @@
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read as _, Write as _};
+use std::os::fd::{AsRawFd as _, RawFd};
+use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cowshed_os::process::Holder;
 use serde::{Deserialize, Serialize};
+
+use crate::held_lock::{HeldLock, Opened};
 
 /// The directory holding every repository's land turns: beside the install slot, in the host's
 /// support directory, which only this user writes.
@@ -99,43 +103,52 @@ pub fn outside_holders(me: i32, open: Result<Vec<Holder>, String>) -> OutsideHol
     }
 }
 
-/// A held turn. Ending it records how the land's command ended; dropping it unended records that
-/// it ended with no outcome. Either way the ticket is then removed and its lock released.
+/// A held turn. Ending it records how the land's command ended. The ticket remains discoverable
+/// until every inherited holder closes it; a later queue scan removes it once its lock is free.
+/// A turn dropped without an explicit end is then recorded as abandoned, not finished.
 #[derive(Debug)]
 pub struct Turn {
-    path: PathBuf,
     directory: PathBuf,
     ticket: Ticket,
-    ended: bool,
-    _ticket: File,
-    _outside: Option<File>,
+    held_ticket: File,
+    outside: Option<HeldLock>,
 }
 
 impl Turn {
     /// End the turn, recording `outcome` (how the command ended) in the repository's turn log.
-    pub fn end(mut self, outcome: String) {
+    pub fn end(self, outcome: String) {
+        // The original JSON has no trailing newline. Append one byte as the completion marker:
+        // every prefix is still valid ticket JSON, including a concurrent reader's snapshot.
+        // The inherited description's cursor is not ours, so never write through that cursor.
+        let marked = self
+            .held_ticket
+            .metadata()
+            .and_then(|metadata| self.held_ticket.write_all_at(b"\n", metadata.len()));
+        if let Err(error) = marked {
+            cowshed_os::eprintln!(
+                "cowshed: land turn {}: ticket {} completion marker not written: {error}",
+                self.directory.display(),
+                self.ticket.number,
+            );
+        }
+        // Mark first: a failed log append must not turn an explicitly ended ticket into an
+        // abandonment on the next scan. Neither operation releases an inherited holder.
         record(
             &self.directory,
             &self.ticket,
             TurnEventKind::Finished,
             Some(outcome),
         );
-        self.ended = true;
     }
-}
 
-impl Drop for Turn {
-    fn drop(&mut self) {
-        if !self.ended {
-            record(
-                &self.directory,
-                &self.ticket,
-                TurnEventKind::Finished,
-                Some("ended before its command did (cowshed failed or was interrupted)".to_owned()),
-            );
-        }
-        // Removed while still locked, so no scan in between reads it as a dead ticket.
-        let _ = fs::remove_file(&self.path);
+    /// The descriptors that hold this turn: its ticket's lock and the outside lock's. A command
+    /// handed them ([`crate::held_lock::keep_across_exec`]) holds the turn with this process, so
+    /// the kernel keeps the turn until the command has ended too, however this process ends: no
+    /// command runs outside its turn.
+    pub fn descriptors(&self) -> Vec<RawFd> {
+        std::iter::once(self.held_ticket.as_raw_fd())
+            .chain(self.outside.as_ref().map(HeldLock::descriptor))
+            .collect()
     }
 }
 
@@ -154,10 +167,8 @@ pub enum TurnEventKind {
     Taken,
     /// The land's command ended; `outcome` says how.
     Finished,
-    /// The land's process ended without finishing, found dead by whoever read the queue next:
-    /// killed, crashed, or its session gone. Measured 2026-10-21: a land queued for 635 s
-    /// vanished with its agent's session and nothing recorded it, so it read as running for half
-    /// an hour while it did not exist.
+    /// The land ended without recording an outcome, found unlocked by whoever read the queue
+    /// next. It may have been dropped on an error, killed, crashed, or lost with its session.
     Abandoned,
 }
 
@@ -273,16 +284,15 @@ fn open_ticket(path: &Path) -> io::Result<Option<File>> {
 fn live(file: &File, path: &Path) -> io::Result<bool> {
     match file.try_lock_shared() {
         Ok(()) => {
-            // Its process ended without removing it: abandoned, recorded before it goes.
-            if let (Some(directory), Ok(ticket)) = (path.parent(), read_ticket(file, path)) {
+            // Only explicit end appends the completion marker. A dropped turn or a process
+            // killed before ending remains unmarked until its last inherited holder closes.
+            if let (Some(directory), Ok((ticket, false))) = (path.parent(), read_ticket(file, path))
+            {
                 record(
                     directory,
                     &ticket,
                     TurnEventKind::Abandoned,
-                    Some(
-                        "its process ended without finishing: killed, crashed, or its session gone"
-                            .to_owned(),
-                    ),
+                    Some("its land ended without recording an outcome".to_owned()),
                 );
             }
             match fs::remove_file(path) {
@@ -297,15 +307,18 @@ fn live(file: &File, path: &Path) -> io::Result<bool> {
     }
 }
 
-fn read_ticket(mut file: &File, path: &Path) -> io::Result<Ticket> {
+fn read_ticket(mut file: &File, path: &Path) -> io::Result<(Ticket, bool)> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    serde_json::from_slice(&bytes).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("land turn ticket {}: {error}", path.display()),
-        )
-    })
+    let finished = bytes.last() == Some(&b'\n');
+    serde_json::from_slice(&bytes)
+        .map(|ticket| (ticket, finished))
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("land turn ticket {}: {error}", path.display()),
+            )
+        })
 }
 
 /// The live tickets of `directory` in turn order, the first holding the turn; dead ones found on
@@ -322,7 +335,7 @@ pub fn observe(directory: &Path) -> io::Result<Vec<Ticket>> {
             continue;
         };
         if live(&file, &path)? {
-            queue.push(read_ticket(&file, &path)?);
+            queue.push(read_ticket(&file, &path)?.0);
         }
     }
     Ok(queue)
@@ -370,11 +383,7 @@ pub fn observe_all(root: &Path, abandoned_since_unix_ms: u64) -> io::Result<Vec<
 
 /// Take a ticket under the `.seq` lock, numbered above every ticket present, and lock it before
 /// any other land can read it: written under a temporary name, then renamed into place.
-fn take_ticket(
-    directory: &Path,
-    workspace: &str,
-    command: &str,
-) -> io::Result<(Ticket, PathBuf, File)> {
+fn take_ticket(directory: &Path, workspace: &str, command: &str) -> io::Result<(Ticket, File)> {
     let seq = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -419,7 +428,7 @@ fn take_ticket(
     fs::rename(&staged, &path)?;
     drop(seq);
     record(directory, &ticket, TurnEventKind::Queued, None);
-    Ok((ticket, path, file))
+    Ok((ticket, file))
 }
 
 /// The live ticket just ahead of `number` and the live tickets before it, or `None` at the head.
@@ -434,7 +443,7 @@ fn ahead_of(directory: &Path, number: u64) -> io::Result<Option<(File, Vec<Ticke
             continue;
         };
         if live(&file, &path)? {
-            ahead.push(read_ticket(&file, &path)?);
+            ahead.push(read_ticket(&file, &path)?.0);
             nearest = Some(file);
         }
     }
@@ -482,7 +491,7 @@ fn outside_wait(lock: &Path, me: i32) -> Wait {
 /// take `outside` exclusively too when given: the lock file of lands that do not ask for turns,
 /// kept and never removed. `waiting` is told who holds the turn and how many are ahead, or which
 /// processes have the outside lock open, whenever that changes and every `report_every` while it
-/// does not. The turn is held until the [`Turn`] is dropped or this process exits.
+/// does not. The turn is held until the last inherited copy of its ticket descriptor closes.
 pub fn take(
     directory: &Path,
     workspace: &str,
@@ -492,7 +501,7 @@ pub fn take(
     mut waiting: impl FnMut(&Wait),
 ) -> io::Result<Turn> {
     fs::create_dir_all(directory)?;
-    let (ticket, path, file) = take_ticket(directory, workspace, command)?;
+    let (ticket, file) = take_ticket(directory, workspace, command)?;
     while let Some((nearest, ahead)) = ahead_of(directory, ticket.number)? {
         let holder = ahead
             .first()
@@ -526,39 +535,30 @@ pub fn take(
             },
         )?;
     }
+    // The outside lock is the held lock every other holder of it takes, recorded on its inode.
     let outside = match outside {
         None => None,
-        Some(lock) => {
-            let held = OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(lock)?;
-            match held.try_lock() {
-                Ok(()) => Some(held),
-                Err(TryLockError::WouldBlock) => {
-                    let me = i32::try_from(std::process::id()).map_err(io::Error::other)?;
-                    Some(wait_telling(
-                        move || held.lock().map(|()| held),
-                        report_every,
-                        || {
-                            waiting(&outside_wait(lock, me));
-                            Ok(())
-                        },
-                    )?)
-                }
-                Err(TryLockError::Error(error)) => return Err(error),
+        Some(lock) => Some(match Opened::open(lock)?.try_hold()? {
+            Ok(held) => held,
+            Err(opened) => {
+                let me = i32::try_from(std::process::id()).map_err(io::Error::other)?;
+                wait_telling(
+                    move || opened.hold(),
+                    report_every,
+                    || {
+                        waiting(&outside_wait(lock, me));
+                        Ok(())
+                    },
+                )?
             }
-        }
+        }),
     };
     record(directory, &ticket, TurnEventKind::Taken, None);
     Ok(Turn {
-        path,
         directory: directory.to_path_buf(),
         ticket,
-        ended: false,
-        _ticket: file,
-        _outside: outside,
+        held_ticket: file,
+        outside,
     })
 }
 
@@ -569,6 +569,207 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    fn events(directory: &Path) -> Vec<TurnEvent> {
+        fs::read_to_string(directory.join(LOG_NAME))
+            .expect("read turn history")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a turn event"))
+            .collect()
+    }
+
+    /// The direct child exits, but its descendant retains the ticket until the parent releases a
+    /// pipe. The next turn must wait on that ticket, without an outside lock to hide early unlink.
+    fn descendant_keeps_turn(finish: bool, exit_code: i32) {
+        use cowshed_os::fork_lock::Spawn as _;
+        use std::process::{Command, Stdio};
+
+        let root = crate::temp_root::TempRoot::new("land-descendant");
+        let turn = take(
+            &root,
+            "first",
+            "foreground",
+            None,
+            Duration::from_secs(5),
+            |_| {
+                panic!("the first turn has no predecessor");
+            },
+        )
+        .expect("take first turn");
+        let first = turn.ticket.clone();
+        let path = root.join(ticket_name(first.number));
+        let descendant_done = root.join("descendant-done");
+        let (release_read, mut release_write) = io::pipe().expect("descendant release pipe");
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                r#"sh -c 'IFS= read -r release; : > "$1"' descendant "$1" <&0 & exit "$2""#,
+                "land-direct",
+            ])
+            .arg(&descendant_done)
+            .arg(exit_code.to_string())
+            .stdin(Stdio::from(release_read))
+            .stdout(Stdio::null());
+        crate::held_lock::hand_to(&mut command, turn.descriptors());
+        let status = command
+            .spawn_locked()
+            .expect("start direct child")
+            .wait()
+            .expect("reap direct child, not its descendant");
+        assert_eq!(status.code(), Some(exit_code));
+
+        if finish {
+            turn.end(format!("exit {exit_code}"));
+        } else {
+            drop(turn);
+        }
+        assert!(
+            path.exists(),
+            "the descendant's locked inode must stay discoverable"
+        );
+        assert_eq!(
+            observe(&root)
+                .expect("observe the descendant's turn")
+                .as_slice(),
+            std::slice::from_ref(&first)
+        );
+        assert!(
+            abandoned_since(&root, 0)
+                .expect("read abandonments")
+                .is_empty()
+        );
+
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (taken_tx, taken_rx) = mpsc::channel();
+        let directory = root.to_path_buf();
+        let waiter = std::thread::spawn(move || {
+            let mut first_wait = Some(waiting_tx);
+            let next = take(
+                &directory,
+                "next",
+                "next foreground",
+                None,
+                Duration::from_millis(20),
+                |wait| {
+                    if let Some(sender) = first_wait.take() {
+                        sender.send(wait.clone()).expect("report the queued turn");
+                    }
+                },
+            );
+            taken_tx.send(next).expect("return the next turn");
+        });
+        assert_eq!(
+            waiting_rx.recv().expect("next turn queues"),
+            Wait::Queued {
+                holder: first.clone(),
+                ahead: 1
+            },
+        );
+        assert!(
+            matches!(
+                File::open(&path)
+                    .expect("open the descendant's ticket")
+                    .try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ),
+            "a direct child's exit must not release its descendant's turn",
+        );
+        assert!(path.exists(), "scanning a locked ticket must not unlink it");
+        assert!(
+            !descendant_done.exists(),
+            "the descendant still waits for release"
+        );
+
+        release_write
+            .write_all(b"release\n")
+            .expect("release descendant");
+        drop(release_write);
+        let next = taken_rx
+            .recv()
+            .expect("next turn starts after the descendant closes")
+            .expect("take next turn");
+        waiter.join().expect("join next turn waiter");
+        assert!(descendant_done.exists(), "the descendant reached its end");
+        assert!(
+            !path.exists(),
+            "the unlocked predecessor is cleaned by the queue"
+        );
+        next.end("exit 0".to_owned());
+        assert!(
+            observe(&root)
+                .expect("clean the ended next turn")
+                .is_empty()
+        );
+        let first_events: Vec<_> = events(&root)
+            .into_iter()
+            .filter(|event| event.ticket == first)
+            .map(|event| (event.event, event.outcome))
+            .collect();
+        let terminal = if finish {
+            (TurnEventKind::Finished, Some(format!("exit {exit_code}")))
+        } else {
+            (
+                TurnEventKind::Abandoned,
+                Some("its land ended without recording an outcome".to_owned()),
+            )
+        };
+        assert_eq!(
+            first_events,
+            [
+                (TurnEventKind::Queued, None),
+                (TurnEventKind::Taken, None),
+                terminal,
+            ],
+        );
+        assert!(ticket_files(&root).expect("ticket cleanup").is_empty());
+    }
+
+    #[test]
+    fn every_terminal_outcome_waits_for_descendants_after_the_direct_child_exits() {
+        for finish in [true, false] {
+            for exit_code in [0, 7] {
+                descendant_keeps_turn(finish, exit_code);
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_take_leaves_an_unmarked_ticket_for_the_queue_to_clean() {
+        let root = crate::temp_root::TempRoot::new("land-take-error");
+        let directory = root.join("queue");
+        // A directory cannot be opened as a writable outside lock.
+        assert!(
+            take(
+                &directory,
+                "failed",
+                "never started",
+                Some(&root),
+                Duration::from_secs(5),
+                |_| panic!("the invalid outside lock must fail, not wait"),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            ticket_files(&directory).expect("error leaves ticket").len(),
+            1
+        );
+        assert!(
+            observe(&directory)
+                .expect("clean abandoned ticket")
+                .is_empty()
+        );
+        assert!(
+            ticket_files(&directory)
+                .expect("cleaned tickets")
+                .is_empty()
+        );
+        let kinds: Vec<_> = events(&directory)
+            .into_iter()
+            .map(|event| event.event)
+            .collect();
+        assert_eq!(kinds, [TurnEventKind::Queued, TurnEventKind::Abandoned]);
+    }
 
     proptest! {
         /// Whatever the census lists, the outside wait names each process with the lock open but

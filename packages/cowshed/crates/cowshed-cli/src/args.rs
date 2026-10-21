@@ -50,6 +50,9 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &LAND_TURN,
     &SUBTREE_ROOT,
     &RETIRE_DESCENDANTS,
+    &LOCK,
+    &LOCK_HOLDERS,
+    &TREE_HOLDERS,
     &GATEWAY,
     &CONTROLLER,
     &CREDENTIAL,
@@ -116,6 +119,13 @@ pub enum Command {
     SubtreeRoot(SubtreeRootArgs),
     /// Retire only the retained subtree identified by one handle on standard input.
     RetireDescendants(RetireDescendantsArgs),
+    /// `lock <path> -- <cmd...>`: one command run holding a lock file's exclusive `flock(2)`,
+    /// which it inherits: no project, no daemon, no runtime.
+    Lock(LockArgs),
+    /// `lock-holders <path>`: who the kernel shows holding a lock file, as one JSON object.
+    LockHolders(LockHoldersArgs),
+    /// `tree-holders <dir>`: every process holding something inside a directory tree, as JSON lines.
+    TreeHolders(TreeHoldersArgs),
     Gateway(GatewayCommand),
     /// One coordinator controller connection, served on standard input for an embedding process.
     Controller,
@@ -176,6 +186,9 @@ impl Command {
             | Self::LandTurn(_)
             | Self::SubtreeRoot(_)
             | Self::RetireDescendants(_)
+            | Self::Lock(_)
+            | Self::LockHolders(_)
+            | Self::TreeHolders(_)
             | Self::Sccache(_)
             | Self::Skill(_)
             | Self::Version
@@ -213,6 +226,29 @@ pub struct LandTurnArgs {
     pub workspace: String,
     pub outside_lock: Option<PathBuf>,
     pub argv: Vec<OsString>,
+}
+
+/// `lock <path> [--state-fd <n>] [--owned-pid <pid>]... -- <cmd...>`: the lock file, the descriptor
+/// its state lines go to, the lives a cancellation may reach, and the command run holding it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LockArgs {
+    pub path: PathBuf,
+    pub state_fd: Option<i32>,
+    /// The pids whose lives the caller owns: captured at the start, the only lives a signal may reach.
+    pub owned_pids: Vec<i32>,
+    pub argv: Vec<OsString>,
+}
+
+/// `lock-holders <path>`: the lock file whose holders the kernel names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LockHoldersArgs {
+    pub path: PathBuf,
+}
+
+/// `tree-holders <dir>`: the tree whose holders the census names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreeHoldersArgs {
+    pub path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1011,6 +1047,21 @@ fn cli_command() -> ClapCommand {
         )
         .subcommand(leaf("retire-descendants").arg(value_once("grace-ms")))
         .subcommand(
+            leaf("lock")
+                .arg(positional("path", 0..=1))
+                .arg(value("state-fd"))
+                .arg(append_value("owned-pid"))
+                .arg(
+                    Arg::new("argv")
+                        .value_parser(value_parser!(OsString))
+                        .num_args(0..)
+                        .last(true)
+                        .allow_hyphen_values(true),
+                ),
+        )
+        .subcommand(leaf("lock-holders").arg(positional("path", 0..=1)))
+        .subcommand(leaf("tree-holders").arg(positional("path", 0..=1)))
+        .subcommand(
             leaf("gateway")
                 .subcommand_required(true)
                 .subcommand(leaf("start"))
@@ -1161,6 +1212,9 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "land-turn" => parse_land_turn(leaf, &global)?,
         "subtree-root" => parse_subtree_root(leaf, &global)?,
         "retire-descendants" => parse_retire_descendants(leaf, &global)?,
+        "lock" => parse_lock(leaf, &global)?,
+        "lock-holders" => parse_lock_holders(leaf, &global)?,
+        "tree-holders" => parse_tree_holders(leaf, &global)?,
         "controller" => Command::Controller,
         "gateway" => parse_gateway(leaf, &global)?,
         "credential" => parse_credential(leaf)?,
@@ -1252,6 +1306,9 @@ fn translate_clap(error: clap::Error, args: &[OsString]) -> UsageError {
                 }
                 Some(spec) if spec.name == "land-turn" && !token.starts_with('-') => {
                     UsageError::new("land-turn requires `--` before the command", spec)
+                }
+                Some(spec) if spec.name == "lock" && !token.starts_with('-') => {
+                    UsageError::new("lock requires `--` before the command", spec)
                 }
                 Some(spec) if token.starts_with('-') => unknown_flag(&token, spec),
                 Some(spec) => UsageError::new(
@@ -1572,7 +1629,7 @@ const LAND_TURN: CommandSpec = CommandSpec {
     summary: "run a command as a land turn",
     about: &[
         "Takes this repository's land turn and runs `<cmd...>` under it. The command is argv, never a shell string, and it inherits cowshed's standard streams and environment. Turns are granted first come, first served per repository: a land that asks while another holds the turn waits behind it and says on stderr who holds it, how many are ahead, and when the holder asked. The report repeats every 90 s, the land watchdog's cadence, and `taken after N s` says how long the wait was.",
-        "The turn is released only after the command ends, so an interrupted land still waits for the command's real end. SIGINT, SIGHUP and SIGTERM that cowshed receives are forwarded to the command; a signal that arrives while the turn is still queued ends cowshed and gives up its place. The command's exit status is cowshed's, and a signal ends it with 128 + the signal.",
+        "The turn is released only after the command ends, so an interrupted land still waits for the command's real end. The command inherits the descriptors of its ticket and of the outside lock, so the kernel keeps the turn until the command ends even if cowshed is killed first. SIGINT, SIGHUP and SIGTERM that cowshed receives are forwarded to the command; a signal that arrives while the turn is still queued ends cowshed and gives up its place. The command's exit status is cowshed's, and a signal ends it with 128 + the signal.",
         "It needs no project and asks no daemon: a land script calls it from any directory. `--json` is refused, since its output is the command's own bytes and cowshed's stderr lines.",
     ],
     options: &[
@@ -1647,6 +1704,162 @@ fn parse_land_turn(matches: &ArgMatches, global: &GlobalOptions) -> Result<Comma
         outside_lock: os(matches, "outside-lock").map(PathBuf::from),
         argv,
     }))
+}
+
+const LOCK: CommandSpec = CommandSpec {
+    name: "lock",
+    missing: "lock requires the lock file's path before `--`",
+    args: "<path>",
+    trailing: "-- <cmd...>",
+    summary: "run a command holding a lock file",
+    about: &[
+        "Takes an exclusive flock(2) on the lock file at <path>, creating it if no holder has yet and never removing it, records this process on it once the kernel grants the lock, and runs `<cmd...>` holding it. The command is argv, never a shell string, and it inherits cowshed's standard streams and environment.",
+        "The command inherits the lock's descriptor, so the kernel releases the lock only once cowshed, the command and every process the command handed the descriptor to have closed it: killing cowshed alone never lets another holder in while its command runs. The command runs with NX_DAEMON_START=never, honored by cowshed's managed Nx, and with git's automatic gc, maintenance and fsmonitor off (appended to any GIT_CONFIG_COUNT entries it was given). Other descendants, including detached processes, keep the lock until they close its descriptor. An empty GIT_CONFIG_COUNT means zero; an invalid count is refused before taking or queueing for the lock. A waiter killed before the grant takes its pending request with it.",
+        "SIGINT, SIGHUP and SIGTERM that cowshed receives once it holds the lock are forwarded to the command; one that arrives while it still waits ends cowshed and gives up its place. The command's exit status is cowshed's, and a signal ends it with 128 + the signal. It needs no project and asks no daemon; `--json` is refused, since its output is the command's own bytes.",
+    ],
+    options: &[
+        Opt {
+            spelling: "--state-fd <n>",
+            meaning: "a caller-opened descriptor (3 or above), adopted before runtime allocation, for one JSON LockWaiterEvent per line: `{\"kind\":\"queued\",\"inode\":…}` while another holds the lock, `{\"kind\":\"acquired\",\"inode\":…}` only after the command successfully spawns holding it, or `{\"kind\":\"failed\",\"reason\":…}` if setup, locking or spawn fails without running the command. Before `acquired`, the controller relinquishes its copies of command stdin/stdout/stderr. After a successful handoff, the state channel remains open until the command ends. A handoff fault emits `commandFailed` and closes the channel before waiting, with child and lock custody retained; a later wrapper fault also emits `commandFailed`, never a claim that no command ran. The command never inherits this channel. If its reader closes, a nonzero wrapper exit still reports the failure; command stderr is not retained as a fallback. A descriptor that cannot be adopted is reported on stderr. While queued, each SIGUSR1 adds one event: `notSignalled` with its reason, and the wait goes on, or `signalled` with the pid, the last event: lock then refuses its command and exits with the conflict code",
+        },
+        Opt {
+            spelling: "--owned-pid <pid>",
+            meaning: "repeatable: a process the caller owns. Its life is captured when lock starts (a pidfd on Linux, its pid version on Darwin) and held for the whole run. While queued, SIGUSR1 sends SIGTERM to the owner of the inode lock is queued on only if the kernel proves it one of these captured lives, still running: a later process given the same pid, whatever its uid and argv, or the holder of a file renamed over the path, is never signalled",
+        },
+    ],
+};
+
+fn parse_lock(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &LOCK;
+    reject_project(
+        global,
+        USAGE,
+        "--project is not valid for lock: it names no project",
+    )?;
+    if global.json {
+        return Err(UsageError::new(
+            "lock writes no JSON envelope: its output is the command's own bytes; drop --json",
+            USAGE,
+        ));
+    }
+    let path = os(matches, "path")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
+    let state_fd = match os(matches, "state-fd") {
+        None => None,
+        Some(value) => Some(
+            value
+                .to_str()
+                .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+                .and_then(|text| text.parse::<i32>().ok())
+                .filter(|descriptor| *descriptor >= 3)
+                .ok_or_else(|| {
+                    UsageError::new(
+                        "--state-fd must be an open descriptor number of 3 or above, never a standard stream",
+                        USAGE,
+                    )
+                })?,
+        ),
+    };
+    let argv: Vec<OsString> = matches
+        .get_many::<OsString>("argv")
+        .map(|values| values.cloned().collect())
+        .unwrap_or_default();
+    if argv.is_empty() {
+        return Err(UsageError::new(
+            if matches.contains_id("argv") {
+                "lock requires a command after `--`"
+            } else {
+                "lock requires `--` before the command"
+            },
+            USAGE,
+        ));
+    }
+    let owned_pids = appended_values(matches, "owned-pid", USAGE)?
+        .into_iter()
+        .map(|value| {
+            value
+                .parse::<i32>()
+                .ok()
+                .filter(|pid| *pid >= 1 && value.bytes().all(|byte| byte.is_ascii_digit()))
+                .ok_or_else(|| {
+                    UsageError::new("--owned-pid must be a process id of 1 or above", USAGE)
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Command::Lock(LockArgs {
+        path,
+        state_fd,
+        owned_pids,
+        argv,
+    }))
+}
+
+const LOCK_HOLDERS: CommandSpec = CommandSpec {
+    name: "lock-holders",
+    missing: "lock-holders requires the lock file's path",
+    args: "<path>",
+    trailing: "",
+    summary: "show who holds a lock file",
+    about: &[
+        "Prints one JSON object: the lock file's inode, whether the kernel shows it exclusively locked, the holder record on it, the owner that record names once the kernel proves it, and every other process with a descriptor on that inode with its custody. On Linux a descriptor's custody is the kernel's own: `holds` (its fdinfo shows the flock) or `open` (a waiter blocked in flock(2), or an open that never asked). Darwin exposes no lock state per descriptor: the life the record names, proven by its kernel unique id and a descriptor on the inode, is `recorded`, and every other descriptor is `unexposed`, never counted a holder.",
+        "It needs no project and asks no daemon; `--json` is refused, since the object is its whole output.",
+    ],
+    options: &[],
+};
+
+fn parse_lock_holders(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &LOCK_HOLDERS;
+    reject_project(
+        global,
+        USAGE,
+        "--project is not valid for lock-holders: it names no project",
+    )?;
+    if global.json {
+        return Err(UsageError::new(
+            "lock-holders always writes one JSON object, never an envelope; drop --json",
+            USAGE,
+        ));
+    }
+    let path = os(matches, "path")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
+    Ok(Command::LockHolders(LockHoldersArgs { path }))
+}
+
+const TREE_HOLDERS: CommandSpec = CommandSpec {
+    name: "tree-holders",
+    missing: "tree-holders requires the directory whose holders it names",
+    args: "<dir>",
+    trailing: "",
+    summary: "show who holds a directory tree",
+    about: &[
+        "Prints one JSON object per line for every process of this user holding something inside the directory tree at <dir>, as the census `rm` and `detach` refuse with reads it (02_workspaces.md \"Holders cowshed does not run\"): `{\"pid\":…,\"hold\":…,\"path\":…,\"command\":…}`, where `hold` is the first hold the census found, cheapest first: `working-directory`, `root-directory`, `executable`, `open-file` or `mapped-file`. A missing directory has no holder.",
+        "It needs no project and asks no daemon; `--json` is refused, since its lines are its whole output.",
+    ],
+    options: &[],
+};
+
+fn parse_tree_holders(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &TREE_HOLDERS;
+    reject_project(
+        global,
+        USAGE,
+        "--project is not valid for tree-holders: it names no project",
+    )?;
+    if global.json {
+        return Err(UsageError::new(
+            "tree-holders always writes JSON lines, never an envelope; drop --json",
+            USAGE,
+        ));
+    }
+    let path = os(matches, "path")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
+    Ok(Command::TreeHolders(TreeHoldersArgs { path }))
 }
 
 /// A land queue is keyed by one directory name: 1 to 64 of `[A-Za-z0-9._-]`, not starting with a
@@ -5572,6 +5785,9 @@ mod tests {
             (&["sccache", "status"], NotUsed),
             (&["skill", "install"], NotUsed),
             (&["land-turn", "repo", "--", "true"], NotUsed),
+            (&["lock", "/tmp/x.lock", "--", "true"], NotUsed),
+            (&["lock-holders", "/tmp/x.lock"], NotUsed),
+            (&["tree-holders", "/tmp/tree"], NotUsed),
             (&["help"], NotUsed),
         ];
 

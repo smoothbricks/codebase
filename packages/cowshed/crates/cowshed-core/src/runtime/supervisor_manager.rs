@@ -109,11 +109,21 @@ impl SupervisorSpawner for ProgramSpawner {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .kill_on_drop(false);
+        let spawn_failure = |failure: crate::exec::SpawnFailure| {
+            io::Error::new(
+                failure.source.kind(),
+                format!(
+                    "supervisor spawn failed during {:?}: {}",
+                    failure.stage, failure.source
+                ),
+            )
+        };
+        crate::exec::prepare_child_descriptors(command.as_std_mut()).map_err(spawn_failure)?;
         // SAFETY: `setsid` and `fcntl` between fork and exec are async-signal-safe and touch only
         // this child. A session of its own takes the supervisor out of the daemon's process
-        // group, which a service manager ends with the daemon. The report pipe is close-on-exec
-        // in the daemon; clearing the flag on the child's copy of that same descriptor number is
-        // what lets the supervisor alone inherit it.
+        // group, which a service manager ends with the daemon. Descriptor preparation registered
+        // above seals every non-stdio descriptor first; this hook allows only the report pipe
+        // through exec, never a foreground lock inherited by the manager.
         unsafe {
             command.pre_exec(move || {
                 if libc::setsid() == -1 {
@@ -125,7 +135,10 @@ impl SupervisorSpawner for ProgramSpawner {
                 Ok(())
             });
         }
-        let child = command.spawn_locked();
+        let child = command
+            .spawn_locked()
+            .map_err(crate::exec::classify_spawn_error)
+            .map_err(spawn_failure);
         // The child holds its own copy now; the manager's would keep the report from ending.
         drop(report);
         child
@@ -1143,6 +1156,160 @@ mod tests {
         StartReport::named(None)
             .send(&error)
             .expect("a supervisor started by hand has nobody to tell");
+    }
+
+    /// Exercise ProgramSpawner from a process that really inherited a foreground lock across
+    /// exec. Its supervisor stays alive while that process closes both the inherited lock and an
+    /// unrelated inheritable descriptor; both locks must be free and the report must still work.
+    #[tokio::test]
+    async fn a_spawned_supervisor_seals_inherited_descriptors_and_preserves_its_report() {
+        use crate::held_lock::{Opened, hand_to, keep_across_exec};
+        use std::fs::{File, OpenOptions, TryLockError};
+        use std::process::Stdio;
+        use tokio::io::AsyncWriteExt as _;
+
+        const ROOT: &str = "COWSHED_TEST_SUPERVISOR_SEAL_ROOT";
+        const HELD_FD: &str = "COWSHED_TEST_SUPERVISOR_SEAL_HELD_FD";
+        const TEST: &str = concat!(
+            "runtime::supervisor_manager::tests::",
+            "a_spawned_supervisor_seals_inherited_descriptors_and_preserves_its_report"
+        );
+        let reported = CowshedError::conflict("supervisor descriptor boundary", "test complete");
+
+        if let Some(root) = std::env::var_os(ROOT) {
+            let root = PathBuf::from(root);
+            let socket = root.join("control.sock");
+            if std::env::var_os(START_REPORT_FD_ENV).is_some() {
+                // The actual ProgramSpawner child: its session, stdio and report are real.
+                // SAFETY: getsid/getpid only query the calling process.
+                assert_eq!(unsafe { libc::getsid(0) }, unsafe { libc::getpid() });
+                for descriptor in 0..=2 {
+                    // SAFETY: F_GETFD accepts any descriptor number.
+                    assert_ne!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
+                }
+                assert_eq!(std::io::stdin().read(&mut [0]).expect("null stdin"), 0);
+                std::io::stdout()
+                    .write_all(b"discarded supervisor stdout\n")
+                    .expect("null stdout");
+                let report = StartReport::inherited();
+                assert!(
+                    report.0.is_some(),
+                    "the allowlisted report descriptor survives exec"
+                );
+                report.send(&reported).expect("send real startup report");
+                let mut control = UnixStream::connect(&socket)
+                    .await
+                    .expect("connect to starter");
+                control
+                    .write_all(b"ready")
+                    .await
+                    .expect("announce live supervisor");
+                let mut release = [0];
+                control
+                    .read_exact(&mut release)
+                    .await
+                    .expect("release byte");
+                return;
+            }
+
+            // The foreground starter inherited this descriptor from the outer test process.
+            let descriptor: RawFd = std::env::var(HELD_FD)
+                .expect("inherited descriptor number")
+                .parse()
+                .expect("descriptor");
+            // SAFETY: hand_to passed this owned descriptor across exec; no Rust value in this
+            // process owns it yet. This value closes only the starter's inherited copy.
+            let inherited = unsafe { File::from_raw_fd(descriptor) };
+            let mut parent_released = [0];
+            std::io::stdin()
+                .read_exact(&mut parent_released)
+                .expect("parent closed its lock copy");
+            let lock_path = root.join("held.lock");
+            assert!(matches!(
+                File::open(&lock_path)
+                    .expect("probe inherited lock")
+                    .try_lock(),
+                Err(TryLockError::WouldBlock)
+            ));
+            let unrelated_path = root.join("unrelated.lock");
+            let unrelated = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&unrelated_path)
+                .expect("open unrelated descriptor");
+            unrelated.lock().expect("hold unrelated descriptor");
+            keep_across_exec(unrelated.as_raw_fd()).expect("make unrelated descriptor inheritable");
+            let listener = UnixListener::bind(&socket).expect("starter control listener");
+            let (report_read, report_write) = io::pipe().expect("startup report pipe");
+            let spawner = ProgramSpawner::new(
+                std::env::current_exe().expect("test binary"),
+                vec!["--exact".into(), TEST.into(), "--nocapture".into()],
+            );
+            let mut supervisor = spawner
+                .spawn(
+                    &root,
+                    &WorkspaceName::new("descriptor-seal").expect("workspace"),
+                    report_write,
+                )
+                .expect("spawn actual supervisor");
+            let (mut control, _) = listener.accept().await.expect("accept supervisor");
+            let mut ready = [0; 5];
+            control.read_exact(&mut ready).await.expect("ready bytes");
+            assert_eq!(&ready, b"ready");
+            assert_eq!(read_start_report(report_read).await, Some(reported));
+            drop(inherited);
+            drop(unrelated);
+            assert!(supervisor.try_wait().expect("supervisor state").is_none());
+            assert!(
+                File::open(&lock_path)
+                    .expect("open foreground lock")
+                    .try_lock()
+                    .is_ok(),
+                "the live supervisor retained the foreground's inherited lock"
+            );
+            assert!(
+                File::open(&unrelated_path)
+                    .expect("open unrelated lock")
+                    .try_lock()
+                    .is_ok(),
+                "the live supervisor retained an arbitrary inheritable descriptor"
+            );
+            control.write_all(b"x").await.expect("release supervisor");
+            assert!(supervisor.wait().await.expect("reap supervisor").success());
+            return;
+        }
+
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::scratch_parent(),
+            "supervisor-seal",
+        );
+        let held = Opened::open(&root.join("held.lock"))
+            .expect("open foreground lock")
+            .try_hold()
+            .expect("take foreground lock")
+            .expect("free foreground lock");
+        let mut command =
+            tokio::process::Command::new(std::env::current_exe().expect("test binary"));
+        command
+            .args(["--exact", TEST, "--nocapture"])
+            .env(ROOT, &*root)
+            .env(HELD_FD, held.descriptor().to_string())
+            .env_remove(START_REPORT_FD_ENV)
+            .stdin(Stdio::piped())
+            .kill_on_drop(true);
+        hand_to(command.as_std_mut(), vec![held.descriptor()]);
+        let mut starter = command
+            .spawn_locked()
+            .expect("start foreground lock inheritor");
+        drop(held);
+        starter
+            .stdin
+            .take()
+            .expect("starter stdin")
+            .write_all(b"x")
+            .await
+            .expect("confirm parent released its copy");
+        assert!(starter.wait().await.expect("reap starter").success());
     }
 
     /// A daemon whose startup pass has finished.

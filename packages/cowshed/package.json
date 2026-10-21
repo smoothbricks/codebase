@@ -22,6 +22,11 @@
       "types": "./dist/ts/declaration-ir.generated.d.ts",
       "import": "./dist/ts/declaration-ir.generated.js",
       "default": "./dist/ts/declaration-ir.generated.js"
+    },
+    "./validators": {
+      "types": "./dist/ts/validators.generated.d.ts",
+      "import": "./dist/ts/validators.generated.js",
+      "default": "./dist/ts/validators.generated.js"
     }
   },
   "files": [

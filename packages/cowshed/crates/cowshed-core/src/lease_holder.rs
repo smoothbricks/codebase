@@ -35,42 +35,62 @@ use serde::{Deserialize, Serialize};
 pub struct Process {
     pub pid: u32,
     /// The kernel's unique id of the process (`p_uniqueid`), which no later process given the same
-    /// pid has. Absent where the platform has none, and in records earlier builds wrote.
+    /// pid has, as its exact decimal string. Absent where the platform has none. A record an
+    /// earlier build wrote with a number does not parse: it names nothing and proves nothing, and
+    /// no reader takes a pid from it (02_workspaces.md, "Holders cowshed does not run").
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unique_id: Option<u64>,
+    pub unique_id: Option<crate::api::held_lock::DecimalU64>,
     /// When it took the lease, as the deletion log writes times.
     pub since: String,
+    /// Its argument vector joined by spaces, each argument decoded lossily: what a person reads,
+    /// never an identity. The pid and unique id name the process.
     pub command: String,
 }
 
 impl Process {
-    /// This process, holding a lease from now.
+    /// This process, holding a lease from now. Its arguments are read as the kernel holds them, so
+    /// no argument that is not UTF-8 stops the record ([`display_command`]).
     pub fn this() -> io::Result<Self> {
         let pid = std::process::id();
         Ok(Self {
             pid,
             unique_id: unique_id(pid)?,
             since: crate::storage::deletion_log::rfc3339_utc(SystemTime::now()),
-            command: std::env::args().collect::<Vec<_>>().join(" "),
+            command: display_command(std::env::args_os()),
         })
     }
 }
 
+/// `arguments` joined by spaces, each decoded lossily: the record's `command`, for a person to
+/// read. Only this copy is lossy; nothing the process runs is read from it.
+fn display_command(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> String {
+    let mut command = String::new();
+    for (index, argument) in arguments.into_iter().enumerate() {
+        if index > 0 {
+            command.push(' ');
+        }
+        command.push_str(&argument.to_string_lossy());
+    }
+    command
+}
+
 /// The kernel's unique id of the running process `pid`; `None` once it has exited.
 #[cfg(target_os = "macos")]
-fn unique_id(pid: u32) -> io::Result<Option<u64>> {
+fn unique_id(pid: u32) -> io::Result<Option<crate::api::held_lock::DecimalU64>> {
     let pid = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
-    Ok(crate::runtime::job_groups::process_record(pid)?.map(|record| record.unique_id))
+    Ok(crate::runtime::job_groups::process_record(pid)?
+        .map(|record| crate::api::held_lock::DecimalU64::new(record.unique_id)))
 }
 
 /// Linux records no unique id: its census asks every process (`procfs_census`).
 #[cfg(not(target_os = "macos"))]
-fn unique_id(_pid: u32) -> io::Result<Option<u64>> {
+fn unique_id(_pid: u32) -> io::Result<Option<crate::api::held_lock::DecimalU64>> {
     Ok(None)
 }
 
 /// Write `holder` into the lease `file` this process has just locked, replacing whatever an
-/// earlier holder left.
+/// earlier holder left: the record's bytes are truncated and rewritten on the locked inode itself,
+/// which is never unlinked or replaced, so the lock and every waiter queued on it stay with it.
 pub fn record(file: &File, holder: &impl Serialize) -> io::Result<()> {
     let bytes = serde_json::to_vec(holder).map_err(io::Error::other)?;
     file.set_len(0)?;
@@ -195,12 +215,48 @@ pub(crate) fn with_stores<T>(stores: Vec<PathBuf>, work: impl FnOnce() -> T) -> 
     done
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    /// An argument that is not UTF-8 is recorded in the display command, decoded lossily, beside
+    /// the arguments that are, rather than stopping the record.
+    #[test]
+    fn an_argument_that_is_not_utf8_is_shown_lossily_and_never_stops_the_record() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+        let command = display_command([
+            OsString::from("cowshed"),
+            OsString::from_vec(vec![b'a', 0xff, b'b']),
+            OsString::from("lock"),
+        ]);
+        assert_eq!(command, "cowshed a\u{fffd}b lock");
+        assert_eq!(display_command(std::iter::empty()), "");
+    }
+
+    /// A record an earlier build wrote, its unique id a JSON number, does not parse: it names no
+    /// process and proves nothing. One with the exact decimal string does.
+    #[test]
+    fn a_record_with_a_numeric_unique_id_names_nothing() {
+        assert!(
+            serde_json::from_str::<Process>(
+                r#"{"pid":7,"uniqueId":42,"since":"2026-10-21T00:00:00Z","command":"cowshed fork"}"#
+            )
+            .is_err()
+        );
+        let current: Process = serde_json::from_str(
+            r#"{"pid":7,"uniqueId":"42","since":"2026-10-21T00:00:00Z","command":"cowshed fork"}"#,
+        )
+        .expect("the decimal-string record");
+        assert_eq!(
+            current.unique_id,
+            Some(crate::api::held_lock::DecimalU64::new(42))
+        );
+    }
+
     /// A lease names this process with its unique id from the moment it is recorded, and records
     /// nothing once cleared.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_recorded_holder_names_this_life_and_a_cleared_lease_names_nothing() {
         let root = crate::temp_root::TempRoot::new("lease-holder");

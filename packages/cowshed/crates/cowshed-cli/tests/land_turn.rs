@@ -6,20 +6,22 @@
 #![cfg(unix)]
 
 use std::ffi::CString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead as _, BufReader, ErrorKind, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use cowshed_core::api::dto::ExitStatus;
 use cowshed_core::host_dirs::support_directory;
 use cowshed_core::land_turn::{TurnEventKind, land_turn_root, observe, observe_all};
+use cowshed_core::runtime::job_groups::{await_exit_unreaped, signal_unreaped_group};
 
 const REPO: &str = "testrepo";
 const POLL: Duration = Duration::from_millis(20);
@@ -84,24 +86,8 @@ fn send(pid: u32, signal: i32) {
     );
 }
 
-/// `killpg(2)` to a land's process group: its cowshed and the `sh` it spawned. A group with no
-/// members left is the normal end of a land, so ESRCH is not a failure.
-fn send_group(pgid: u32, signal: i32) -> io::Result<()> {
-    let pgid = i32::try_from(pgid).expect("a pid fits in pid_t");
-    // SAFETY: killpg(2) takes no pointers.
-    if unsafe { libc::killpg(pgid, signal) } == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(error)
-    }
-}
-
-/// One `cowshed land-turn` process as a test drives it. It leads its own process group, so the
-/// `sh` it spawns can be killed with it.
+/// One `cowshed land-turn` process as a test drives it. It leads its own process group and keeps
+/// its leader unreaped until Drop, so cleanup cannot signal a reused process-group id.
 struct Land {
     workspace: String,
     child: Child,
@@ -151,6 +137,13 @@ impl Land {
         outside: Option<&Path>,
         script: &str,
     ) -> Self {
+        Self::start(
+            workspace,
+            Self::command(home, repo, workspace, outside).args(["--", "sh", "-c", script]),
+        )
+    }
+
+    fn command(home: &Home, repo: &str, workspace: &str, outside: Option<&Path>) -> Command {
         let mut command = Command::new(cowshed());
         command
             .env("HOME", &home.path)
@@ -158,8 +151,11 @@ impl Land {
         if let Some(lock) = outside {
             command.arg("--outside-lock").arg(lock);
         }
+        command
+    }
+
+    fn start(workspace: &str, command: &mut Command) -> Self {
         let mut child = command
-            .args(["--", "sh", "-c", script])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -221,26 +217,29 @@ impl Land {
         send(self.pid(), libc::SIGCONT);
     }
 
-    /// `kill -9` of the cowshed process, then of its group, so the `sh` it spawned (blocked on
-    /// the fifo) goes too. Reaped before returning.
+    /// Kill the owned group without reaping its leader; Drop alone relinquishes the group id.
     fn kill_hard(&mut self) {
-        send(self.pid(), libc::SIGKILL);
-        send_group(self.pid(), libc::SIGKILL).expect("kill the land's process group");
-        self.child.wait().expect("reap the killed cowshed");
+        signal_unreaped_group(
+            i32::try_from(self.pid()).expect("a pid fits in pid_t"),
+            libc::SIGKILL,
+        )
+        .expect("kill the land's process group");
+        self.wait_exit();
     }
 
-    /// Waits for the land to end and returns its status.
-    fn wait_exit(&mut self) -> ExitStatus {
-        self.child.wait().expect("wait for cowshed")
+    /// Observe the exit while retaining the leader and therefore ownership of its group id.
+    fn wait_exit(&self) -> ExitStatus {
+        await_exit_unreaped(i32::try_from(self.pid()).expect("a pid fits in pid_t"))
+            .expect("observe cowshed exit without reaping")
     }
 
     fn wait_success(&mut self) {
         let status = self.wait_exit();
         self.finish_stderr();
         assert_eq!(
-            status.code(),
-            Some(0),
-            "{} ended with {status}; stderr: {:?}",
+            status,
+            ExitStatus::Exited { code: 0 },
+            "{} ended with {status:?}; stderr: {:?}",
             self.workspace,
             self.seen
         );
@@ -274,12 +273,15 @@ impl Land {
 
 impl Drop for Land {
     fn drop(&mut self) {
-        // Tears down a land the test left running, a stopped one included: SIGKILL reaches a
-        // stopped process. Failures are raised unless the test is already panicking.
-        let torn_down = send_group(self.pid(), libc::SIGKILL);
-        if !thread::panicking() {
-            torn_down.expect("kill the land's process group");
-            self.child.wait().expect("reap the land");
+        let pid = i32::try_from(self.pid()).expect("a pid fits in pid_t");
+        let result =
+            signal_unreaped_group(pid, libc::SIGKILL).and_then(|()| self.child.wait().map(|_| ()));
+        if let Err(error) = result {
+            if thread::panicking() {
+                cowshed_os::eprintln!("land fixture process group {pid} cleanup failed: {error}");
+            } else {
+                panic!("land fixture process group {pid} cleanup failed: {error}");
+            }
         }
     }
 }
@@ -407,6 +409,10 @@ fn a_waiter_killed_in_line_blocks_no_later_land() {
     wait_for_order(&home, &["H", "W2", "W3"]);
     last.release();
     last.wait_success();
+    assert!(
+        queue(&home).is_empty(),
+        "all ticket descriptors have closed"
+    );
     assert_eq!(
         ticket_files(&home),
         Vec::<String>::new(),
@@ -523,5 +529,159 @@ fn a_land_exits_with_its_commands_status() {
     let mut land = Land::spawn(&home, "W", "exit 7");
     let status = land.wait_exit();
     land.finish_stderr();
-    assert_eq!(status.code(), Some(7), "stderr: {:?}", land.seen);
+    assert_eq!(
+        status,
+        ExitStatus::Exited { code: 7 },
+        "stderr: {:?}",
+        land.seen
+    );
+}
+
+/// A land whose cowshed alone is killed keeps its turn and its outside lock while its command
+/// runs: the command inherited both descriptors, so the kernel releases neither before the command
+/// ends, and no later land runs beside it.
+#[test]
+fn a_land_killed_without_its_command_keeps_its_turn_and_outside_lock_until_the_command_ends() {
+    let home = Home::new();
+    let outside = home.path.join("outside.lock");
+    let holder = Land::gated_in(&home, REPO, "H", Some(&outside));
+    wait_for_order(&home, &["H"]);
+    let mut waiter = Land::gated(&home, "W1");
+    wait_for_queue(&home, &["H", "W1"]);
+    send(holder.pid(), libc::SIGKILL);
+    holder.wait_exit();
+    let outside_held = File::open(&outside)
+        .expect("open the outside lock")
+        .try_lock();
+    assert!(
+        matches!(outside_held, Err(TryLockError::WouldBlock)),
+        "the outside lock went with the killed cowshed while its command ran"
+    );
+    assert_eq!(
+        queue(&home),
+        ["H", "W1"],
+        "the turn went with the killed cowshed while its command ran"
+    );
+    assert_eq!(order(&home), ["H"], "a land ran beside the held turn");
+    holder.release();
+    wait_for_order(&home, &["H", "W1"]);
+    waiter.release();
+    waiter.wait_success();
+}
+
+/// A land receives the same automatic Git background-work settings and managed Nx no-start
+/// policy as every other held command.
+#[test]
+fn a_land_holding_its_turn_receives_the_git_and_managed_nx_policies() {
+    let home = Home::new();
+    let seen = home.path.join("seen");
+    let script = format!(
+        "{{ git config --get gc.auto; git config --get maintenance.auto; git config --get core.fsmonitor; \
+         echo \"$NX_DAEMON_START\"; }} > {}",
+        seen.display()
+    );
+    let mut land = Land::spawn(&home, "W", &script);
+    let status = land.wait_exit();
+    land.finish_stderr();
+    assert_eq!(
+        status,
+        ExitStatus::Exited { code: 0 },
+        "stderr: {:?}",
+        land.seen
+    );
+    assert_eq!(
+        fs::read_to_string(&seen).expect("read what the land saw"),
+        "0\nfalse\nfalse\nnever\n"
+    );
+}
+
+#[test]
+fn land_turn_with_an_outside_lock_preserves_non_utf8_child_arguments() {
+    let home = Home::new();
+    let outside = home.path.join("outside.lock");
+    let seen = home.path.join("raw-argv");
+    let bytes = b"raw-\xff-\xfe";
+    let mut land = Land::start(
+        "raw",
+        Land::command(&home, REPO, "raw", Some(&outside))
+            .args(["--", "sh", "-c", r#"printf '%s' "$1" > "$2""#, "step"])
+            .arg(std::ffi::OsStr::from_bytes(bytes))
+            .arg(&seen),
+    );
+    land.wait_success();
+    assert_eq!(fs::read(&seen).expect("read child argument"), bytes);
+    assert!(
+        File::open(&outside)
+            .expect("open the outside lock")
+            .try_lock()
+            .is_ok(),
+        "the ended command retained the outside lock"
+    );
+}
+
+#[test]
+fn a_land_refuses_invalid_git_config_before_asking_for_a_turn() {
+    let home = Home::new();
+    let outside = home.path.join("outside.lock");
+    let mut holder = Land::gated_in(&home, REPO, "H", Some(&outside));
+    wait_for_order(&home, &["H"]);
+    let ran = home.path.join("invalid-ran");
+    let mut refused = Land::start(
+        "invalid",
+        Land::command(&home, REPO, "invalid", Some(&outside))
+            .env("GIT_CONFIG_COUNT", "not-a-count")
+            .args(["--", "sh", "-c", r#": > "$1""#, "step"])
+            .arg(&ran),
+    );
+    assert_eq!(refused.wait_exit(), ExitStatus::Exited { code: 104 });
+    refused.finish_stderr();
+    assert!(
+        refused
+            .seen
+            .iter()
+            .any(|line| line.contains("GIT_CONFIG_COUNT")),
+        "{:?}",
+        refused.seen
+    );
+    assert_eq!(queue(&home), ["H"], "invalid command took a queue place");
+    assert!(!ran.exists(), "invalid configuration started the command");
+    let log = fs::read_to_string(home.repo_dir().join("turns.log")).expect("turn log");
+    assert!(
+        log.lines().all(|line| {
+            let event: serde_json::Value = serde_json::from_str(line).expect("turn event");
+            event["ticket"]["workspace"] != "invalid"
+        }),
+        "invalid configuration entered the turn history: {log}"
+    );
+    holder.release();
+    holder.wait_success();
+}
+
+#[test]
+fn a_land_spawn_failure_records_that_no_command_started() {
+    let home = Home::new();
+    let missing = home.path.join("no-such-executable");
+    let mut land = Land::start(
+        "missing",
+        Land::command(&home, REPO, "missing", None)
+            .arg("--")
+            .arg(&missing),
+    );
+    assert_eq!(land.wait_exit(), ExitStatus::Exited { code: 104 });
+    land.finish_stderr();
+    assert!(queue(&home).is_empty(), "failed spawn retained its ticket");
+    let log = fs::read_to_string(home.repo_dir().join("turns.log")).expect("turn log");
+    let events: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("turn event"))
+        .collect();
+    let finished = events.last().expect("recorded turn outcome");
+    assert_eq!(finished["event"], "finished", "{log}");
+    assert!(
+        finished["outcome"]
+            .as_str()
+            .expect("recorded outcome")
+            .starts_with("did not start: cannot run "),
+        "{log}"
+    );
 }

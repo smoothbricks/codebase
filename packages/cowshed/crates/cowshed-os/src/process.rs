@@ -4,6 +4,54 @@ use std::fmt;
 use std::io;
 use std::process::{ExitStatus, Output};
 
+/// A prepared replacement for a controller's standard streams after its command inherits them.
+/// Preparation happens before spawn. Release happens before acknowledging the handoff on a
+/// separate diagnostic channel: from that point the controller must never write to stdio.
+/// Keeping inert descriptors in 0..=2 prevents later opens from reusing those reserved numbers.
+#[cfg(unix)]
+pub struct StdioRelease(std::fs::File);
+
+#[cfg(unix)]
+impl StdioRelease {
+    pub fn prepare() -> io::Result<Self> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")?;
+        // A caller may already have closed a standard stream. Keep the backing descriptor
+        // outside the reserved range, so dropping it cannot undo the replacement below.
+        let file = if file.as_raw_fd() < 3 {
+            // SAFETY: duplicate the open descriptor into an unused number at least 3.
+            let descriptor = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            if descriptor == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: fcntl returned a new descriptor owned exclusively by this value.
+            unsafe { std::fs::File::from_raw_fd(descriptor) }
+        } else {
+            file
+        };
+        Ok(Self(file))
+    }
+
+    /// Relinquish this process's copies, not the copies its spawned command inherited.
+    /// The caller must retain and report an error through its separate diagnostic channel.
+    pub fn release(self) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        for descriptor in 0..=2 {
+            // SAFETY: the backing descriptor is open and outside the standard-stream range.
+            if unsafe { libc::dup2(self.0.as_raw_fd(), descriptor) } == -1 {
+                return Err(io::Error::other(format!(
+                    "cannot relinquish standard descriptor {descriptor}: {}",
+                    io::Error::last_os_error()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Whether the process `pid` names has not exited. A zombie -- exited, not yet reaped by its
 /// parent -- has: the null signal is never asked, because `kill(pid, 0)` succeeds on a zombie
 /// (POSIX requires it), and a daemon reparented to launchd stays one until launchd gets round to

@@ -773,6 +773,11 @@ mod parity_tests {
             // A host-only land queue over repository files; the addon has no endpoint for it, and
             // scripts run cowshed's own verb.
             | Command::LandTurn(_)
+            // A host-only held lock over a caller's lock file; scripts run cowshed's own verbs.
+            | Command::Lock(_)
+            | Command::LockHolders(_)
+            // The holder census `rm` and `detach` read, for scripts; no controller call.
+            | Command::TreeHolders(_)
             | Command::Skill(_)
             | Command::Setup(_)
             | Command::Mount(_)
@@ -858,6 +863,9 @@ mod parity_tests {
         (&["sccache", "status"], None),
         (&["disk-command", "hdiutil", "--", "info"], None),
         (&["land-turn", "parity", "--", "true"], None),
+        (&["lock", "/tmp/parity.lock", "--", "true"], None),
+        (&["lock-holders", "/tmp/parity.lock"], None),
+        (&["tree-holders", "/tmp/parity"], None),
         (&["skill", "install"], None),
         (&["mount", "main", "--repo-id", "acme/widget"], None),
         (&["forget", "acme/widget", "--abandon"], None),

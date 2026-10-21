@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::time::Duration;
 
-use cowshed_cli::run::{Ending, run_interruptible};
+use cowshed_cli::run::{Ending, prepare, run_interruptible};
 
 /// How long an interrupted invocation waits for blocking work already underway before it exits.
 const INTERRUPTED_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -16,25 +16,23 @@ fn main() {
     }
     cowshed_os::timing::start_clock();
     let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let invocation = match prepare(arguments) {
+        Ok(invocation) => invocation,
+        Err(code) => std::process::exit(code),
+    };
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            cowshed_os::eprintln!("cowshed: cannot start the async runtime: {error}");
-            std::process::exit(1);
+            let code = invocation.fail(cowshed_core::CowshedError::internal(format!(
+                "cannot start the async runtime: {error}"
+            )));
+            std::process::exit(code);
         }
     };
-    if arguments
-        .first()
-        .is_some_and(|verb| verb == cowshed_cli::workspace_supervisor::VERB)
-    {
-        let code = runtime.block_on(cowshed_cli::workspace_supervisor::run(&arguments[1..]));
-        cowshed_os::stderr::flush();
-        std::process::exit(code);
-    }
-    let ending = runtime.block_on(run_interruptible(arguments));
+    let ending = runtime.block_on(run_interruptible(invocation));
     if let Ending::Interrupted { signal } = ending {
         // Shutting the runtime down drops every task it still holds. A workspace supervisor is
         // one, and dropping it ends the process group of each job it still runs: once this

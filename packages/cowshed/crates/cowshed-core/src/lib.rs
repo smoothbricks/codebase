@@ -15,6 +15,7 @@ pub mod gateway_sessions;
 pub mod git;
 mod git_preservation;
 mod held_change;
+pub mod held_lock;
 pub mod host_dirs;
 pub mod host_load;
 mod inherited_daemons;

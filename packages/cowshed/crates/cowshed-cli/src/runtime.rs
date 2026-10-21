@@ -252,6 +252,9 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         | Command::LandTurn(_)
         | Command::SubtreeRoot(_)
         | Command::RetireDescendants(_)
+        | Command::Lock(_)
+        | Command::LockHolders(_)
+        | Command::TreeHolders(_)
         | Command::Controller
         | Command::Credential(_)
         | Command::Identity(_)
@@ -319,6 +322,9 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::LandTurn(_)
         | Command::SubtreeRoot(_)
         | Command::RetireDescendants(_)
+        | Command::Lock(_)
+        | Command::LockHolders(_)
+        | Command::TreeHolders(_)
         | Command::Controller
         | Command::Credential(_)
         | Command::Identity(_)
@@ -427,6 +433,9 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         | Command::LandTurn(_)
         | Command::SubtreeRoot(_)
         | Command::RetireDescendants(_)
+        | Command::Lock(_)
+        | Command::LockHolders(_)
+        | Command::TreeHolders(_)
         | Command::Controller
         | Command::Sccache(_)
         | Command::Skill(_)
@@ -498,6 +507,8 @@ fn attach_demand(command: &Command) -> (u64, Vec<&str>) {
         Command::Push(args) => (2, named([args.workspace.as_deref()])),
         Command::Rebase(args) => (2, named([args.workspace.as_deref(), args.into.as_deref()])),
         Command::Cache(CacheCommand::Clear { workspace }) => (2, named([workspace.as_deref()])),
+        // Lock owns its descriptors; holder queries read the kernel before the runtime bridge.
+        Command::Lock(_) | Command::LockHolders(_) | Command::TreeHolders(_) => (0, Vec::new()),
         Command::Remove(_)
         | Command::Forget(_)
         | Command::Detach(_)
@@ -2300,6 +2311,11 @@ where
         Command::SubtreeRoot(_) | Command::RetireDescendants(_) => Err(CowshedError::internal(
             "subtree commands use the native supervisor socket before the runtime bridge",
         )),
+        Command::Lock(_) | Command::LockHolders(_) | Command::TreeHolders(_) => {
+            Err(CowshedError::internal(
+                "lock, lock-holders and tree-holders name no project and are dispatched before the runtime bridge",
+            ))
+        }
         Command::Controller => Err(CowshedError::internal(
             "the controller verb serves its own connection and is dispatched before the runtime bridge",
         )),
@@ -6781,6 +6797,9 @@ mod tests {
             &["ls"],
             &["gc"],
             &["doctor"],
+            &["lock", "/tmp/x.lock", "--", "true"],
+            &["lock-holders", "/tmp/x.lock"],
+            &["tree-holders", "/tmp/tree"],
         ] {
             assert_eq!(demand(nothing).0, 0, "{nothing:?}");
         }

@@ -1280,8 +1280,14 @@ impl Process {
         self.pid
     }
 
+    /// Whether this very life still runs: its pid's running process carries its pid version, which
+    /// no later process given the pid has.
+    pub(crate) fn running(&self) -> io::Result<bool> {
+        Ok(self.record()?.is_some())
+    }
+
     /// Signal the process; `false` when it no longer runs.
-    pub(super) fn signal(&self, signal: libc::c_int) -> io::Result<bool> {
+    pub(crate) fn signal(&self, signal: libc::c_int) -> io::Result<bool> {
         let mut token = AuditToken { val: [0; 8] };
         token.val[5] = self.pid.cast_unsigned();
         token.val[7] = self.version;
@@ -1744,6 +1750,36 @@ fn stat_while_running(
 
 #[cfg(target_os = "linux")]
 impl Process {
+    /// The process `pid` names now, held by a pidfd, which names that one process whatever later
+    /// takes its pid; `None` once it has exited. A pid below one names no process, so it is
+    /// refused, not read.
+    pub fn observe(pid: i32) -> io::Result<Option<Self>> {
+        use std::os::fd::FromRawFd as _;
+
+        if pid < 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("pid {pid} names no process"),
+            ));
+        }
+        // SAFETY: pidfd_open takes plain integers; the descriptor is owned from here on.
+        let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if opened < 0 {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ESRCH) => Ok(None),
+                _ => Err(error),
+            };
+        }
+        let opened = libc::c_int::try_from(opened).map_err(io::Error::other)?;
+        // SAFETY: a fresh descriptor this function alone owns.
+        let handle = unsafe { std::os::fd::OwnedFd::from_raw_fd(opened) };
+        if pidfd_exited(&handle)? {
+            return Ok(None);
+        }
+        Ok(Some(Self { pid, handle }))
+    }
+
     /// The process at the other end of a connected Unix socket, as the kernel recorded it when
     /// the connection was made: whatever happens to its pid later, the handle names only it.
     pub(super) fn of_socket_peer(socket: &impl std::os::fd::AsRawFd) -> io::Result<Self> {
@@ -1797,8 +1833,13 @@ impl Process {
         self.pid
     }
 
+    /// Whether this very life still runs: its pidfd names it alone, whatever later takes its pid.
+    pub(crate) fn running(&self) -> io::Result<bool> {
+        Ok(!pidfd_exited(&self.handle)?)
+    }
+
     /// Signal the process; `false` when it no longer runs.
-    pub(super) fn signal(&self, signal: libc::c_int) -> io::Result<bool> {
+    pub(crate) fn signal(&self, signal: libc::c_int) -> io::Result<bool> {
         use std::os::fd::AsRawFd as _;
 
         // SAFETY: pidfd_send_signal takes a live descriptor and plain integers.

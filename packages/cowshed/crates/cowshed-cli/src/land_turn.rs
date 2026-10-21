@@ -6,19 +6,22 @@
 //! [`cowshed_core::land_turn`]; this module adds the wait reports a caller reads on stderr, the
 //! child's run under the turn, and the termination signals that reach the child.
 
+use std::ffi::OsString;
 use std::io::{self, Write};
+use std::os::fd::RawFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 use cowshed_core::gateway_sessions::canonical_home;
+use cowshed_core::held_lock;
 use cowshed_core::host_dirs::support_directory;
 use cowshed_core::land_turn::{self as queue, OutsideHolders, Wait};
 use cowshed_core::{CowshedError, ErrorCode};
 
 use crate::args::LandTurnArgs;
 use crate::output::Output;
-use crate::run::InterruptPolicy;
+use crate::run::{InterruptPolicy, Interrupts};
 
 /// How often a waiting land repeats what it waits for: the land watchdog's cadence.
 pub const LAND_TURN_REPORT_EVERY: Duration = Duration::from_secs(90);
@@ -63,9 +66,10 @@ where
             "land-turn reached its run without a command to run",
         ));
     };
+    let command = PreparedCommand::prepare(program, rest)?;
     let home = canonical_home()?;
     let directory = queue::land_turn_root(&support_directory(&home)).join(&args.repo);
-    let command = args
+    let description = args
         .argv
         .iter()
         .map(|part| part.to_string_lossy())
@@ -80,7 +84,7 @@ where
         queue::take(
             &directory,
             &workspace,
-            &command,
+            &description,
             outside.as_deref(),
             LAND_TURN_REPORT_EVERY,
             |wait| {
@@ -121,41 +125,37 @@ where
                 args.repo
             ))
         })?;
-    written?;
-    if waited {
-        output
-            .guidance(&format!(
-                "land turn {}: taken after {} s",
-                args.repo,
-                started.elapsed().as_secs()
-            ))
-            .map_err(write_failed)?;
+    let reported = written.and_then(|()| {
+        if waited {
+            output
+                .guidance(&format!(
+                    "land turn {}: taken after {} s",
+                    args.repo,
+                    started.elapsed().as_secs()
+                ))
+                .map_err(write_failed)?;
+        }
+        Ok(())
+    });
+    if let Err(error) = reported {
+        turn.end(format!("did not start: {}", error.message));
+        return Err(error);
     }
     // Armed once the turn is held and before the child starts, so a signal that arrives from here
     // on reaches the child, and the turn is held until the child ends.
     let mut interrupts = policy.arm_forwarding();
 
-    let program_name = program.to_string_lossy().into_owned();
-    let mut child = tokio::process::Command::new(program)
-        .args(rest)
-        .spawn()
-        .map_err(|error| spawn_error(&program_name, &error))?;
-    let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) else {
-        return Err(CowshedError::internal(format!(
-            "{program_name} started, but its process id is not available to forward signals to"
-        )));
-    };
-    // A signal that cannot be relayed is kept until the child has ended, so the turn still ends
-    // with the child and never before it.
-    let mut relay: Result<(), CowshedError> = Ok(());
-    let status = loop {
-        tokio::select! {
-            status = child.wait() => break status,
-            signal = interrupts.received() => {
-                relay = relay.and(forward(output, pid, signal, &program_name));
-            }
+    // The child inherits the turn's descriptors: the kernel keeps the turn until the child has
+    // ended too, even if this process is killed first.
+    let held = match command.spawn(turn.descriptors()) {
+        Ok(held) => held,
+        Err(error) => {
+            turn.end(format!("did not start: {}", error.message));
+            return Err(error);
         }
     };
+    let program_name = held.name.clone();
+    let (status, relay) = held.wait(&mut interrupts).await;
     // The turn ends with the child, never before it, recording how the child ended.
     let status = match status {
         Ok(status) => {
@@ -168,7 +168,6 @@ where
             status
         }
         Err(error) => {
-            turn.end(format!("could not be waited for: {error}"));
             return Err(CowshedError::internal(format!(
                 "cannot wait for {program_name}: {error}"
             )));
@@ -176,6 +175,76 @@ where
     };
     relay?;
     exit_code(status)
+}
+
+/// A held command whose environment is already valid, prepared before asking for any lock.
+pub(crate) struct PreparedCommand {
+    command: tokio::process::Command,
+    name: String,
+}
+
+impl PreparedCommand {
+    pub(crate) fn prepare(program: &OsString, rest: &[OsString]) -> Result<Self, CowshedError> {
+        let name = program.to_string_lossy().into_owned();
+        let mut command = tokio::process::Command::new(program);
+        command.args(rest);
+        held_lock::prepare_command_environment(command.as_std_mut()).map_err(|reason| {
+            CowshedError::new(
+                ErrorCode::EnvironmentMissing,
+                reason,
+                "unset GIT_CONFIG_COUNT or give it a count, then run it again",
+            )
+        })?;
+        Ok(Self { command, name })
+    }
+
+    pub(crate) fn spawn(mut self, descriptors: Vec<RawFd>) -> Result<HeldCommand, CowshedError> {
+        held_lock::hand_to(self.command.as_std_mut(), descriptors);
+        let child = self
+            .command
+            .spawn()
+            .map_err(|error| spawn_error(&self.name, &error))?;
+        // A newly spawned, unpolled child always has its kernel pid, which fits pid_t.
+        let pid = child
+            .id()
+            .and_then(|pid| libc::pid_t::try_from(pid).ok())
+            .expect("a newly spawned child has a pid_t process id");
+        Ok(HeldCommand {
+            child,
+            pid,
+            name: self.name,
+        })
+    }
+}
+
+/// A command run holding descriptors this process holds a lock through: each is kept open across
+/// its exec ([`held_lock::keep_across_exec`]), so the kernel keeps the lock until the command, and
+/// every process it hands the descriptor to, has closed it too.
+pub(crate) struct HeldCommand {
+    child: tokio::process::Child,
+    pid: libc::pid_t,
+    pub(crate) name: String,
+}
+
+impl HeldCommand {
+    /// Wait for the command to end, forwarding each termination signal `interrupts` receives. A
+    /// signal that cannot be relayed is kept, second, until the command has ended, so whatever
+    /// holds the lock with it ends with it and never before it.
+    pub(crate) async fn wait(
+        mut self,
+        interrupts: &mut Interrupts,
+    ) -> (io::Result<ExitStatus>, Result<(), CowshedError>) {
+        let mut relay: Result<(), CowshedError> = Ok(());
+        let status = loop {
+            tokio::select! {
+                status = self.child.wait() => break status,
+                signal = interrupts.received() => {
+                    relay = relay.and(forward(self.pid, signal, &self.name));
+                }
+            }
+        };
+        (status, relay)
+    }
 }
 
 /// One wait report, in the words a caller reads on stderr.
@@ -218,21 +287,14 @@ fn report<W: Write, E: Write>(
 
 /// Send one termination signal to the child. The child may have ended as the signal arrived;
 /// then there is nothing left to signal, and its exit status is the answer.
-fn forward<W: Write, E: Write>(
-    output: &mut Output<W, E>,
-    pid: libc::pid_t,
-    signal: i32,
-    program: &str,
-) -> Result<(), CowshedError> {
+fn forward(pid: libc::pid_t, signal: i32, program: &str) -> Result<(), CowshedError> {
     // SAFETY: `kill` sends `signal` to `pid` and reads or writes no memory of this process.
     if unsafe { libc::kill(pid, signal) } == -1 {
         let error = io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::ESRCH) {
-            output
-                .error(&format!(
-                    "cannot forward signal {signal} to {program}: {error}"
-                ))
-                .map_err(write_failed)?;
+            return Err(CowshedError::internal(format!(
+                "cannot forward signal {signal} to {program}: {error}"
+            )));
         }
     }
     Ok(())
@@ -240,14 +302,14 @@ fn forward<W: Write, E: Write>(
 
 /// The exit code a shell reports for the child's end: its own code, or 128 plus the signal that
 /// ended it.
-fn exit_code(status: ExitStatus) -> Result<i32, CowshedError> {
+pub(crate) fn exit_code(status: ExitStatus) -> Result<i32, CowshedError> {
     if let Some(code) = status.code() {
         return Ok(code);
     }
     match status.signal() {
         Some(signal) => Ok(128 + signal),
         None => Err(CowshedError::internal(
-            "the land turn's command ended, but the kernel reported neither its exit code nor its signal",
+            "the command ended, but the kernel reported neither its exit code nor its signal",
         )),
     }
 }

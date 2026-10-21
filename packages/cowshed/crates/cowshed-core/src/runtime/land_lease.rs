@@ -58,9 +58,9 @@ impl Holding {
 pub struct Holder {
     pub holding: Holding,
     pub pid: u32,
-    /// The holder's kernel unique id; absent in records earlier builds wrote.
+    /// The holder's kernel unique id as its exact decimal string, as every lease record carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unique_id: Option<u64>,
+    pub unique_id: Option<crate::api::held_lock::DecimalU64>,
     /// When it took the lease, as the deletion log writes times.
     pub since: String,
     pub command: String,

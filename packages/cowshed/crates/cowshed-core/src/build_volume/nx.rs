@@ -497,6 +497,26 @@ fn descriptor_holders(files: &[PathBuf]) -> io::Result<Vec<Vec<Holder>>> {
     files.iter().map(|file| holders(file)).collect()
 }
 
+/// Every process with a descriptor on the inode `(device, inode)`, with those descriptors, from
+/// procfs: each `/proc/<pid>/fd` entry whose file (followed, so its device and inode, not its path)
+/// is that inode. A process of another user, or one that exited since the listing, shows none.
+#[cfg(target_os = "linux")]
+pub(crate) fn inode_holders(identity: (u64, u64)) -> io::Result<Vec<(Holder, Vec<i32>)>> {
+    use std::os::unix::fs::MetadataExt;
+    procfs_census(|process| {
+        let descriptors: Vec<i32> = fs::read_dir(process.join("fd"))
+            .ok()?
+            .flatten()
+            .filter(|descriptor| {
+                fs::metadata(descriptor.path())
+                    .is_ok_and(|file| (file.dev(), file.ino()) == identity)
+            })
+            .filter_map(|descriptor| descriptor.file_name().to_str()?.parse().ok())
+            .collect();
+        (!descriptors.is_empty()).then_some(descriptors)
+    })
+}
+
 /// Every process holding anything on the volume mounted at `mount` -- an open file, a mapped
 /// file, its working directory, its root, its executable -- which is what keeps `umount`
 /// answering `EBUSY`. From procfs, so a process of another user, or one that exited since the
@@ -666,6 +686,32 @@ fn descriptor_holders(files: &[PathBuf]) -> io::Result<Vec<Vec<Holder>>> {
         }
     }
     Ok(held)
+}
+
+/// Every process with a vnode descriptor on the inode `(device, inode)`, with those descriptors:
+/// each live pid the kernel lists ([`all_pids`], not a census that skips lifecycle processes, since
+/// a lock's custody misses no holder), each vnode descriptor's device and inode
+/// (`PROC_PIDFDVNODEINFO`). Event-only opens hold nothing.
+#[cfg(target_os = "macos")]
+pub(crate) fn inode_holders(identity: (u64, u64)) -> io::Result<Vec<(Holder, Vec<i32>)>> {
+    let vinfo_size = c_size::<VnodeFdinfo>()?;
+    let mut holders = Vec::new();
+    for pid in all_pids()? {
+        let descriptors: Vec<i32> = vnode_descriptors(pid)?
+            .into_iter()
+            .filter(|&fd| vnode_fd_identity(pid, fd, vinfo_size) == Some(identity))
+            .collect();
+        if !descriptors.is_empty() {
+            holders.push((
+                Holder {
+                    pid,
+                    command: command_line(pid),
+                },
+                descriptors,
+            ));
+        }
+    }
+    Ok(holders)
 }
 
 /// Every process holding anything on the volume mounted at `mount` -- its working or root
@@ -1174,6 +1220,41 @@ fn command_line(pid: libc::pid_t) -> String {
         || "command unreadable".to_owned(),
         |path| path.display().to_string(),
     )
+}
+
+/// Take the opened file's lock once the kernel grants it, with no deadline of its own: a wait
+/// that never returns is ended by the test runner's no-progress bound (08_testing.md, "Every
+/// test target ... is bounded by progress alone"). First it says on stderr what the wait is for
+/// and every process with a descriptor on the inode, by pid, command and descriptors, so the
+/// run that bound ends names the process that kept the lock. A census that cannot be read is
+/// said as such, and the wait is still taken.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn hold_announced(
+    opened: crate::held_lock::Opened,
+    awaited: &str,
+) -> io::Result<crate::held_lock::HeldLock> {
+    let inode = opened.inode();
+    let own = std::process::id();
+    let holders = match inode_holders((inode.dev.get(), inode.ino.get())) {
+        Ok(holders) => holders
+            .iter()
+            .map(|(holder, descriptors)| {
+                let waiter = if u32::try_from(holder.pid).is_ok_and(|pid| pid == own) {
+                    " (this waiter)"
+                } else {
+                    ""
+                };
+                format!("{holder} on descriptors {descriptors:?}{waiter}")
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+        Err(error) => format!("unread: {error}"),
+    };
+    cowshed_os::eprintln!(
+        "waiting for {awaited} to let go of {} (inode {inode}); its holders now: [{holders}]",
+        opened.path().display()
+    );
+    opened.hold()
 }
 
 /// The last Nx run recorded in a cache directory.
@@ -1998,18 +2079,19 @@ mod tests {
         fs::remove_dir_all(&sibling).unwrap();
     }
 
-    /// A checkout of the repository's own stock Nx, its daemon enabled, under a scratch root:
-    /// whatever ends the test, the root's teardown ends every process working in it, the daemon
-    /// with the rest.
-    #[cfg(target_os = "macos")]
+    /// A checkout of the repository's own stock Nx, its daemon enabled, under a test root: on
+    /// macOS a scratch root, whose teardown ends every process working in it, the daemon with the
+    /// rest, whatever ends the test; elsewhere the test stops the daemon it may start itself
+    /// ([`RecordedDaemon`]).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     struct StockNx {
         nx: PathBuf,
         checkout: PathBuf,
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     impl StockNx {
-        fn new(root: &crate::scratch_directory::ScratchRoot) -> Self {
+        fn new(root: &Path) -> Self {
             // Read at run time: `env!` would compile this checkout's path into the test binary,
             // and a test binary built in one checkout must not reach another's files.
             let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
@@ -2018,7 +2100,7 @@ mod tests {
                 .join("../../../../node_modules/nx")
                 .canonicalize()
                 .expect("the repository's own Nx is installed");
-            let checkout = root.path().to_path_buf();
+            let checkout = root.to_path_buf();
             fs::write(
                 checkout.join("package.json"),
                 r#"{"name":"fixture","private":true}"#,
@@ -2033,14 +2115,9 @@ mod tests {
             }
         }
 
-        /// Run `nx daemon <verb>` in the checkout as a host shell does, without the caller's
-        /// `NX_*` or `CI`; it must exit 0. Answers what it printed.
-        fn daemon(&self, verb: &str) -> String {
-            self.run(&["daemon", verb])
-        }
-
-        /// Run `nx <args>` in the checkout as [`Self::daemon`] does.
-        fn run(&self, args: &[&str]) -> String {
+        /// `nx <args>` in the checkout as a host shell runs it: without the caller's `NX_*` or
+        /// `CI`, so no setting of the shell running the test decides what Nx does.
+        fn command(&self, args: &[&str]) -> std::process::Command {
             let mut command = std::process::Command::new("node");
             command.arg(&self.nx).args(args).current_dir(&self.checkout);
             for (key, _) in std::env::vars_os() {
@@ -2048,7 +2125,20 @@ mod tests {
                     command.env_remove(key);
                 }
             }
-            let output = command
+            command
+        }
+
+        /// Run `nx daemon <verb>` in the checkout as [`Self::run`] does.
+        #[cfg(target_os = "macos")]
+        fn daemon(&self, verb: &str) -> String {
+            self.run(&["daemon", verb])
+        }
+
+        /// Run [`Self::command`]; it must exit 0. Answers what it printed.
+        #[cfg(target_os = "macos")]
+        fn run(&self, args: &[&str]) -> String {
+            let output = self
+                .command(args)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn_locked()
@@ -2063,9 +2153,39 @@ mod tests {
             text
         }
 
+        fn workspace_data(&self) -> PathBuf {
+            self.checkout.join(".nx/workspace-data")
+        }
+
         fn record(&self) -> PathBuf {
-            self.checkout
-                .join(".nx/workspace-data/d/server-process.json")
+            self.workspace_data().join("d/server-process.json")
+        }
+    }
+
+    /// The daemon a test's own Nx client may start in a checkout's `workspace-data`, stopped as
+    /// stock `nx daemon --stop` stops it ([`stop_recorded_daemon`]) however the test ends. The
+    /// client detaches the daemon, so where no scratch root's teardown ends it nothing else does.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    struct RecordedDaemon(PathBuf);
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    impl Drop for RecordedDaemon {
+        fn drop(&mut self) {
+            let failure = match stop_recorded_daemon(&self.0) {
+                Ok(Ok(_)) => return,
+                Ok(Err(busy)) => format!("{busy:?}"),
+                Err(error) => error.to_string(),
+            };
+            let said = format!(
+                "stop the test's Nx daemon in {}: {failure}",
+                self.0.display()
+            );
+            // A second panic while unwinding would abort the run; the failing test already fails.
+            if std::thread::panicking() {
+                cowshed_os::eprintln!("{said}");
+            } else {
+                panic!("{said}");
+            }
         }
     }
 
@@ -2254,7 +2374,7 @@ mod tests {
     #[test]
     fn an_nx_opener_waits_out_held_opens_and_opens_the_database_the_moved_link_names() {
         let root = crate::scratch_directory::ScratchRoot::new("nx-opens").expect("scratch root");
-        let stock = StockNx::new(&root);
+        let stock = StockNx::new(root.path());
         let linked = Linked::new(&root, &stock);
         // Each volume holds the task database a first Nx process made there.
         for volume in [&linked.into, &linked.from] {
@@ -2379,7 +2499,7 @@ mod tests {
     fn a_host_daemon_whose_record_is_handed_over_serves_on_across_the_move() {
         let root =
             crate::scratch_directory::ScratchRoot::new("nx-hand-over").expect("scratch root");
-        let stock = StockNx::new(&root);
+        let stock = StockNx::new(root.path());
         let linked = Linked::new(&root, &stock);
         stock.daemon("--start");
         let daemon = crate::runtime::nx_daemon::live_pid(&stock.record()).expect("a live daemon");
@@ -2442,7 +2562,7 @@ mod tests {
     #[test]
     fn a_stock_nx_daemon_stopped_natively_restarts_cleanly() {
         let root = crate::scratch_directory::ScratchRoot::new("nx-daemon").expect("scratch root");
-        let stock = StockNx::new(&root);
+        let stock = StockNx::new(root.path());
         let state = BuildVolumeState {
             paths: vec![BuildStatePath::new(".nx/workspace-data", ".nx/workspace-data").unwrap()],
             fingerprint: None,
@@ -2491,7 +2611,7 @@ mod tests {
 
         let root =
             crate::scratch_directory::ScratchRoot::new("nx-task-hashes").expect("scratch root");
-        let stock = StockNx::new(&root);
+        let stock = StockNx::new(root.path());
         fs::create_dir_all(stock.checkout.join("p")).unwrap();
         fs::write(
             stock.checkout.join("p/project.json"),
@@ -2545,6 +2665,154 @@ mod tests {
         );
     }
 
+    /// A real Nx client handed a held lock through the one held-command boundary
+    /// ([`crate::held_lock::prepare_command_environment`], then [`crate::held_lock::hand_to`], as
+    /// `lock` and `land-turn` spawn their commands) starts no daemon, and once it has ended only
+    /// its own descendants hold the lock (02_workspaces.md "Held locks"). The client is `nx show
+    /// projects`, which computes the project graph through the daemon and starts one when none
+    /// runs. `NX_DAEMON=true` keeps a CI host or a container from switching the daemon off, so the
+    /// boundary's policy is all that differs between the two runs. The control is the same client
+    /// handed the descriptor alone: it starts the daemon. On Linux that daemon inherits the
+    /// descriptor and keeps the lock after the client has ended, until it is stopped. Darwin's
+    /// Node spawns with `POSIX_SPAWN_CLOEXEC_DEFAULT`, so there neither the daemon nor a plugin
+    /// worker inherits it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn an_nx_client_holding_a_lock_starts_no_daemon_that_would_keep_it() {
+        #[cfg(target_os = "macos")]
+        let scratch =
+            crate::scratch_directory::ScratchRoot::new("nx-held-lock").expect("scratch root");
+        #[cfg(target_os = "macos")]
+        let root = scratch.path();
+        #[cfg(target_os = "linux")]
+        let scratch = crate::temp_root::TempRoot::new("cowshed-nx-held-lock");
+        #[cfg(target_os = "linux")]
+        let root: &Path = &scratch;
+        let stock = StockNx::new(root);
+        fs::create_dir_all(stock.checkout.join("p")).unwrap();
+        fs::write(
+            stock.checkout.join("p/project.json"),
+            r#"{"name":"p","targets":{"build":{"executor":"nx:noop","cache":true}}}"#,
+        )
+        .unwrap();
+        // Declared after the root and before any client, so whichever run starts a daemon, it is
+        // stopped before the root goes.
+        let _daemon = RecordedDaemon(stock.workspace_data());
+        let lock = root.join("held.lock");
+        let take = || {
+            crate::held_lock::Opened::open(&lock)
+                .expect("open the lock")
+                .try_hold()
+                .expect("take the lock")
+                .expect("a free lock")
+        };
+        let client = || {
+            let mut command = stock.command(&["show", "projects", "--json"]);
+            command.env("NX_DAEMON", "true");
+            command
+        };
+        let show = |mut command: std::process::Command| {
+            let output = command
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn_locked()
+                .and_then(std::process::Child::wait_with_output)
+                .expect("node runs");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "nx show projects: {stderr}");
+            let projects: Vec<String> =
+                serde_json::from_slice(&output.stdout).expect("nx prints the projects as JSON");
+            assert!(
+                projects.iter().any(|project| project == "p"),
+                "{projects:?}: {stderr}"
+            );
+        };
+        let holders = |held: &crate::held_lock::HeldLock| {
+            let inode = held.inode();
+            inode_holders((inode.dev.get(), inode.ino.get())).expect("the lock's holders")
+        };
+
+        // Under the policy, in a checkout no daemon ever served.
+        let held = take();
+        let mut command = client();
+        crate::held_lock::prepare_command_environment(&mut command).expect("the held policy");
+        crate::held_lock::hand_to(&mut command, vec![held.descriptor()]);
+        show(command);
+        assert_eq!(
+            crate::runtime::nx_daemon::live_pid(&stock.record()),
+            None,
+            "the held client started a daemon"
+        );
+        let after = holders(&held);
+        drop(held);
+        let own = i32::try_from(std::process::id()).unwrap();
+        let others: Vec<_> = after
+            .iter()
+            .filter(|(holder, _)| holder.pid != own)
+            .collect();
+        #[cfg(target_os = "macos")]
+        assert!(
+            others.is_empty(),
+            "the held client's processes kept the lock: {others:?}"
+        );
+        // Linux hands the client's detached plugin workers the descriptor; each ends once it sees
+        // its host gone, and holds the lock as the command's descendant until then.
+        #[cfg(target_os = "linux")]
+        assert!(
+            others
+                .iter()
+                .all(|(holder, _)| holder.command.contains("plugin-worker")),
+            "a process other than the client's plugin workers kept the lock: {others:?}"
+        );
+        drop(
+            hold_announced(
+                crate::held_lock::Opened::open(&lock).expect("open the lock"),
+                "the held client's descendants",
+            )
+            .expect("the lock is granted once the client's descendants have ended"),
+        );
+
+        // The control: the descriptor alone, without the policy.
+        let held = take();
+        let mut command = client();
+        crate::held_lock::hand_to(&mut command, vec![held.descriptor()]);
+        show(command);
+        let daemon = crate::runtime::nx_daemon::live_pid(&stock.record())
+            .expect("the client without the policy started its daemon");
+        let daemon_holds = holders(&held)
+            .iter()
+            .any(|(holder, _)| holder.pid == daemon);
+        drop(held);
+        let kept = crate::held_lock::Opened::open(&lock)
+            .expect("open the lock")
+            .try_hold()
+            .expect("ask for the lock")
+            .is_err();
+        #[cfg(target_os = "linux")]
+        assert!(
+            daemon_holds && kept,
+            "the daemon {daemon} inherited the lock and keeps it after the client ended \
+             (holds: {daemon_holds}, kept: {kept})"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            !daemon_holds && !kept,
+            "Darwin's posix_spawn hands the daemon {daemon} no descriptor it was not named \
+             (holds: {daemon_holds}, kept: {kept})"
+        );
+        assert_eq!(
+            stop_recorded_daemon(&stock.workspace_data()).expect("stop the daemon"),
+            Ok(Some(daemon))
+        );
+        drop(
+            hold_announced(
+                crate::held_lock::Opened::open(&lock).expect("open the lock"),
+                "the stopped daemon and its workers",
+            )
+            .expect("the lock is granted once the daemon and its workers have ended"),
+        );
+    }
+
     /// A test that fails while its stock Nx daemon runs leaves no daemon behind. The daemon
     /// detaches from the `nx daemon --start` that started it, so nothing but the fixture's own
     /// teardown ever ends it: a failed assertion between `--start` and [`close`] left it running
@@ -2558,7 +2826,7 @@ mod tests {
         let daemon = std::cell::Cell::new(None);
         let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let root = root;
-            let stock = StockNx::new(&root);
+            let stock = StockNx::new(root.path());
             stock.daemon("--start");
             daemon.set(crate::runtime::nx_daemon::live_pid(&stock.record()));
             panic!("the test fails while its Nx daemon runs");
@@ -2678,7 +2946,7 @@ mod tests {
         };
         let fork = |unique_id| crate::lease_holder::Process {
             pid: lifecycle.id(),
-            unique_id: Some(unique_id),
+            unique_id: Some(crate::api::held_lock::DecimalU64::new(unique_id)),
             since: "2026-10-21T00:00:00Z".to_owned(),
             command: "cowshed fork main topic".to_owned(),
         };

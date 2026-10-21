@@ -1097,18 +1097,25 @@ ordinary remedy `git rebase --onto <new-main> e9e596563`; it never replays that 
 
    **The repository lock is the target's ref lock, and it fences the head alone.** Writers that move the target branch
    outside cowshed — an operator's Markdown commit straight into main, say — order themselves by a lock file of their
-   own, and the land joins them when its caller names that file with `--ref-lock <file>`: it takes the file's exclusive
-   `flock(2)`, the lock lockf(1) takes, re-reads the target head, revalidates the expected target head against it,
-   fetches and fast-forwards, and lets go. Nothing else runs under it: the check (step 2) and the Nx cache
+   own, and the land joins them when its caller names that file with `--ref-lock <file>`: it takes the file as a held
+   lock ("Held locks" below), the exclusive `flock(2)` lockf(1) also takes, re-reads the target head, revalidates the
+   expected target head against it, fetches and fast-forwards, and lets go. The fetch and the fast-forward's git are
+   handed the lock's descriptor, so the kernel keeps the lock until that git ends: a land killed mid-fast-forward never
+   leaves git moving the ref outside it. Git's automatic gc and maintenance are off for them (`gc.auto=0`,
+   `maintenance.auto=false`; hooks and the fsmonitor are off for every controller git), so neither detaches holding the
+   lock, and no other process the land starts inherits it. A program the target repository's own configuration selects
+   (a filter or merge driver) that outlives git holds the lock like any held command's descendant ("Held locks" below):
+   until it closes it or exits, never unlocked around. Nothing else runs under it: the check (step 2) and the Nx cache
    initialization before it, and the build-volume adoption and retirement after it (steps 4 and 5), run unlocked, so a
    writer queued on the lock waits for this fence, never for a land's minutes of other work. A land that finds the lock
    held waits for it without bound — its holder is a writer of the same branch, which the land follows rather than
-   overtakes — and says on stderr every 10 s how long it has waited and which processes held the file when the wait
-   began: one look at the holders per wait, never one per report. Its `delivery` span is the hold. Measured 2026-10-20
-   with the whole land under such a lock: an operator's land held its ref lock for 82 to 85 s per land, about 56 to 63 s
-   of it build-volume adoption, and one land held it 45 minutes while its Nx cache initialization waited, so every
-   Markdown commit queued behind work the lock does not protect. Without `--ref-lock`, git's own ref and index locks are
-   the only fence against such writers, and the head is still re-read and revalidated just before the fast-forward.
+   overtakes — and says on stderr every 10 s how long it has waited and who held the file when the wait began, as the
+   kernel shows it (`lock-holders`): one look at the holders per wait, never one per report. Its `delivery` span is the
+   hold. Measured 2026-10-20 with the whole land under such a lock: an operator's land held its ref lock for 82 to 85 s
+   per land, about 56 to 63 s of it build-volume adoption, and one land held it 45 minutes while its Nx cache
+   initialization waited, so every Markdown commit queued behind work the lock does not protect. Without `--ref-lock`,
+   git's own ref and index locks are the only fence against such writers, and the head is still re-read and revalidated
+   just before the fast-forward.
 
    **Land has no branch-name contract.** It fetches whatever branch the workspace has checked out — `cowshed/<ws>` is
    what `fork` creates, but an agent may have made `wt/<ws>` or anything else, and land neither assumes nor requires the
@@ -1427,6 +1434,16 @@ read are the host store's (`/private/cowshed/store/<owner>/<repo>/sessions`) onl
 fixture's store elsewhere records its lease there, which no census reads, so it is asked like any other process and can
 still stall a concurrent census. Linux records no unique id and its census asks every process.
 
+A record's unique id is its exact decimal string (`DecimalU64` in `api::held_lock`, the form every kernel identifier on
+the wire takes), the one form any reader parses; the switch from a JSON number was a clean cutover, with no reader of
+the old form. A record an earlier build wrote, with a numeric unique id, does not parse and names nothing: none takes a
+pid, an exemption, an owner or a signal from it. What such a record costs is observation and time only. A census asks
+the process it names like any other, so that one query may wait as long as the process's kernel call (above), and the
+process may be named a holder and refuse the operation; a land lease held under it refuses its contender without naming
+the holder; `lock-holders` proves no owner from it, so nothing is signalled. Every such record is ephemeral: it lasts
+only while its writer holds the lease, or, left by a writer that ended without unwinding, until the next holder rewrites
+the file, which is why the cutover keeps no converter.
+
 A holder check belongs in front of a destructive operation and, but for the one exception below, nowhere else: once per
 operation, in that operation's own context, never on an interval and never inside a supervisor's actor. `detach`, `rm`,
 the retirement a `land` ends with (which is `rm`'s), `mv` and gc's retirement of an abandoned unpublished clone consult
@@ -1451,6 +1468,105 @@ When a detach's unmount is still refused by the kernel, the refusal names what h
 then the volume census, which also walks mapped files. When neither names a process of this user, the refusal says so
 and names any file system mounted inside the volume. With none, the holder is another user's process (Spotlight's `mds`
 runs as root) or the kernel, and `sudo lsof +f -- <mount>` is the next look.
+
+`cowshed tree-holders <dir>` reads the tree census out for a caller that is not cowshed: one JSON line per process of
+this user holding something inside the tree, each a `TreeHolder` (`api::tree_holder`, read with its generated validator)
+with its fields in this order: `pid`; `hold`, the first hold the census found (`working-directory`, `root-directory`,
+`executable`, `open-file` or `mapped-file`); `path`; `command`. A shell reader may match the
+`{"pid":<n>,"hold":"<kind>",` prefix. `path` is the held path's exact bytes in the tagged-bytes form `CommandArg` uses:
+`{"encoding":"utf8","data":<text>}` when they are UTF-8, `{"encoding":"base64","data":<canonical standard base64>}` when
+they are not, so no path is refused, mangled, or the cause of a cut listing. `command` is the holder's argument vector
+joined by spaces, each argument decoded lossily: it is for a person to read and is never an identity, which the pid is.
+A census that cannot be taken writes no line and exits non-zero; a line stdout refuses ends the listing with a non-zero
+exit naming the failure. A repository's land tooling asks it whether its own callers would hold a workspace the land
+retires, the same census the retire refuses with.
+
+## Held locks: `cowshed lock` and `cowshed lock-holders`
+
+A held lock is an exclusive `flock(2)` on a caller's lock file, the one primitive behind `land --ref-lock`,
+`land-turn --outside-lock` and `cowshed lock <path> [--state-fd <n>] -- <cmd…>`, through which a repository's own
+scripts take their ref and gate locks. The lock is on the inode the path names, and no holder ever unlinks, renames over
+or otherwise replaces the file: a holder that unlinked it would hand a waiter already blocked on the old inode a lock on
+a file no path names while the next caller created and locked a new one. The holder's record is the file's content, so
+recording and clearing it truncate and rewrite bytes in place on the locked inode; the inode, and the lock and queue on
+it, stay. A holder that finds the path naming another inode once granted refuses rather than holds it.
+
+- **The holder records itself.** Once the kernel grants the lock, the holder writes the lifecycle leases' record onto
+  the inode (`{pid, uniqueId, since, command}`, "Holders cowshed does not run"), and empties it before it lets go, so a
+  record outlives its hold only when its process ended without unwinding. `command` is the holder's own argument bytes,
+  each argument decoded lossily and joined by spaces, so an argument that is not UTF-8 never stops the record; it is for
+  a person to read, never an identity, and nothing a held command runs is taken from it: the command's argv is passed
+  byte-exact. The record is a claim, never proof: a reader believes it only as far as the kernel confirms it.
+- **The command holds the lock with cowshed.** `lock` and `land-turn` hand their command the lock's descriptor (and
+  `land-turn` its ticket's): the lock belongs to the open file description, so the kernel releases it only once cowshed,
+  the command and every process the command handed the descriptor to have closed it. Killing cowshed alone never lets
+  another holder in while its command runs. A waiter killed before the grant takes its pending request with it.
+- **No daemon cowshed launches holds it; the command's descendants do.** Every daemon cowshed launches (a workspace
+  supervisor, through the supervisor manager's program spawner; a job; the kept Nx daemon inside one) is spawned through
+  the descriptor seal, which marks every inherited descriptor close-on-exec but standard input, output and error (and a
+  supervisor's report descriptor), and no held command is their parent. A launch whose inherited descriptors cannot all
+  be sealed (on macOS, a census of them past the seal's fixed 4096-descriptor ceiling) is refused at that stage
+  (`PrepareChildDescriptors`), never started unsealed. Every held command (`lock`'s, `land-turn`'s, and the git under
+  `land --ref-lock`) is spawned through one boundary that hands it the descriptor with two policies.
+  `NX_DAEMON_START=never`, the policy every job runs under, is what keeps the patched Nx (04_sandbox.md) from starting a
+  host daemon that would hold the lock (the only Nx daemon cowshed runs is the kept one); a stock Nx ignores the
+  variable and is not stopped by it. Whether an Nx child inherits the descriptor at all depends on the platform,
+  measured on Darwin 2026-10-22: Node spawns through `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`, so neither an Nx
+  daemon nor a plugin worker inherits it. [INFERENCE] On Linux, libuv's fork and exec hands it to both; the client's
+  detached plugin workers end once their host disconnects, and until then hold it as the command's descendants. The
+  Linux control requires a CI run; no local Linux result is claimed. `gc.auto=0`, `maintenance.auto=false` and
+  `core.fsmonitor=false`, as `GIT_CONFIG_COUNT` entries appended after the caller's, turn off exactly git's automatic
+  gc, automatic maintenance and fsmonitor daemon in every git the command or its hooks run. Nothing wider is promised.
+  Any other process the command starts that outlives it, an unmanaged daemon for one (a git credential helper's cache
+  daemon is a possible case, not a measured one), inherits the open file description and holds the lock, by design,
+  until it closes it or exits; cowshed never unlocks around it, and `lock-holders` names it. The policies apply to the
+  held command alone: the git and Nx a workspace runs anywhere else keep their configuration, so deferred gc and
+  maintenance run at the next git outside the lock. Each path has a real-boundary test: the seal; git's own config
+  resolution under `lock` and `land-turn`; a real Nx client (`nx show projects`) handed a held lock, beside a control
+  run without the policy; a fast-forward whose target's automatic maintenance detaches (a worktree-prune task held on a
+  FIFO gitdir), with a held and an unheld arm; and the fence's owner killed while its real git is blocked writing, with
+  a contender refused until that git ends.
+- **The waiter's own word.** `--state-fd <n>` gives the caller the waiter's own word: one `LockWaiterEvent` per line, as
+  JSON (`{"kind":…}`), so no reason or path breaks a line, and the caller reads it with the generated validator of the
+  same type. A valid state descriptor is adopted before any runtime or setup work, so every failure after that and
+  before the command starts is a `failed` line (with its reason); a descriptor that cannot be adopted has no channel yet
+  and is said on stderr alone. An invalid `GIT_CONFIG_COUNT` is refused with `failed` before `queued`; an empty one
+  counts as zero, as in git. `queued` (with its inode) while another holds it; `acquired` (with its inode) once granted,
+  the command's spawn has succeeded, and the controller has relinquished its copies of command stdin/stdout/stderr.
+  Those streams belong to the command alone: their EOF does not wait for the controller, including when the command is a
+  hold that the caller releases only after output ends. After a successful handoff the state channel stays open until
+  the command ends and is never inherited by it. A failed handoff emits `commandFailed` and closes the channel before
+  joining, so a caller can release a command-side hold; the controller retains child and lock custody while it waits. A
+  later wrapper fault is also `commandFailed` with its reason; unlike a pre-spawn `failed`, it does not claim no command
+  ran. A normal child exit, including nonzero, leaves `acquired` as the last line. If the state reader closes, a nonzero
+  wrapper exit remains observable; command stderr is not retained as a fallback. Without a state channel, ordinary
+  stderr diagnostics remain owned until the controller exits. Signals cowshed receives once it holds the lock are
+  forwarded to the command, as `land-turn` forwards them.
+- **Who holds it is the kernel's answer.** `lock-holders <path>` prints one JSON object, a `LockObservation`: the path,
+  the inode, whether the kernel shows it exclusively locked, the record as written, the owner that record names once the
+  kernel proves it, and every process with a descriptor on the inode with its custody. The path and the record are their
+  exact bytes in the tagged-bytes form `CommandArg` uses (`utf8` with their text when they are UTF-8, canonical standard
+  base64 under `base64` when not), so neither is refused, decoded lossily, or the cause of a cut object; the owner is
+  judged from the record's bytes, and a record that does not parse as a holder record proves no owner. Linux exposes
+  custody per descriptor: a readable `/proc/<pid>/fdinfo` carrying a granted `flock` for the exact device and inode
+  proves `holds`. A readable descriptor without that grant proves only `open`; an unreadable candidate makes the process
+  `unexposed` unless another descriptor proves the grant, never `open` by default. Disappeared descriptors are omitted.
+  The owner is the record's pid holding a proven grant. Darwin exposes no lock state per descriptor (`proc_pidfdinfo`
+  carries none, and `F_GETLK` answers a `flock` conflict with no pid): the life the record names, proven by its kernel
+  unique id and a descriptor on the inode, is the owner (`recorded`), and every other descriptor on the inode is named
+  `unexposed`, never counted a holder. A process of another user whose descriptors this user cannot read shows none;
+  `locked` still says the inode is held.
+- **Only an owned, proven owner is ever signalled.** `lock <path> --owned-pid <pid>` (repeatable) names the lives the
+  caller owns; the waiter holds each by the kernel's identity of its life (a pidfd on Linux, its pid version on Darwin)
+  before it queues. On `SIGUSR1` while queued it proves the owner of the inode it is queued on from `lock-holders`'
+  judgment (a file renamed over the path since is another lock, and proves nothing), and signals it with SIGTERM only
+  through a captured life that has not ended: the signal reaches that life or nothing, never a later process given its
+  pid, and an `unexposed` or unproven descriptor is never signalled. It answers on its state channel. `signalled` (with
+  the pid) is its refusal of its step and its last word: it never says `acquired` nor runs its command, and exits with
+  the conflict code, so a lock the owner gives up is not spent on a step being cancelled. `notSignalled` (with its
+  reason) keeps its place in the queue. A grant ready together with a request is taken first, and a request after the
+  grant is never answered, so a waiter never says both `acquired` and `signalled`. `lock-holders` only observes. A
+  `lock` command forwards the signal to its command, so the lock goes only when that command ends.
 
 ## Workspace environment: `.cowshed/env`, optionally sourced by direnv
 

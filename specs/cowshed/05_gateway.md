@@ -334,44 +334,60 @@ and when it released, a land that had asked after the train took the turn and he
 output meanwhile was watchdog `QUEUED` records. So `cowshed land-turn <repo> --workspace <ws> -- <cmd…>` waits for the
 repository's turn, runs the command holding it, and exits with the command's status (128 plus the signal for a signalled
 one; SIGINT, SIGTERM and SIGHUP are passed on to the command, and the turn is held until the command really ends). Each
-land takes a numbered ticket in `dev.cowshed/land-turn/<repo>/`: a file locked exclusively by the waiting process for as
-long as it waits or holds, so the kernel drops it with that process however it ends. Numbers are given under the
-directory's `.seq` lock, each above every ticket present, and a ticket is locked under a temporary name before it is
-renamed into place, so no reader ever sees an unlocked live ticket. A ticket whose lock is free is dead and is removed
-by whoever finds it. The lowest live ticket holds the turn; each other land waits on the lock of the live ticket just
-ahead of its own and, when that ends, looks again, so a killed holder or a killed waiter blocks nobody and only the next
-in line is woken. A waiting land says on stderr how many lands are ahead and who holds the turn — its workspace, pid and
-when it asked — when it starts waiting, whenever the land ahead changes, and every 90 s between (the land watchdog's
-cadence), and how long it waited once the turn is its own. `--outside-lock <file>` names the lock file lands took before
-every caller asked for turns: the head takes it too, exclusively and keeping the file, so it excludes a land started
-that way. A process outside the queue holding that file records nothing, so while the head waits for it the head names
-it: when it starts waiting and every 90 s after, one census of the processes with the file open
-(`build_volume::nx::holders`; Darwin names no `flock(2)` owner, so an open descriptor is the evidence) gives each one's
-pid and command, the head's own descriptor left out. A census that finds no other process says so (the holder let go as
-it looked, or is not this user's to see), and one that cannot be taken says why. Measured 2026-10-21: a land waited 1002
-s for the outside lock having said once that "a land that did not ask for a turn" held it, naming no process. The census
-decides nothing: the head waits for the kernel's lock alone, and it is the one holder census 02_workspaces.md admits
-outside a destructive operation ("Holders cowshed does not run"). The wait starts before the first census, on a thread
-of its own, so no census delays taking the lock. Measured 2026-10-21 on one fixture (a `lockf -k` holder for 1.5 s,
-debug builds, a 709-process host, 20 interleaved runs each): without the census the first report came 18 ms after the
-wait began and the turn 20 ms after the holder let go (medians); with it, 213 ms and 17 ms, at about 0.11 s of CPU per
-census. A land's turn covers rebase, gate, fast-forward and adoption; the push to a remote runs after the turn ends,
-since a remote is never needed to land (tg#6988). A turn is only as durable as the process that holds it: a land that
-shares its caller's session ends with that session. Measured 2026-10-21: one lander's lands died with its tool session
-three times, twice while queued and once mid-gate. So a caller that may go away first starts the land in a session of
-its own (`setsid`, output to a file, not its child) and waits on the land's pid; `land-turn` itself never detaches,
-since the caller that stays reads its output and its exit status.
+land takes a numbered ticket in `dev.cowshed/land-turn/<repo>/`: a file locked exclusively through one open file
+description for as long as the land waits or holds. The command inherits that description, so the kernel releases the
+ticket only once the land and every process holding the description have closed it, however each ends. Numbers are given
+under the directory's `.seq` lock, each above every ticket present, and a ticket is locked under a temporary name before
+it is renamed into place, so no reader ever sees an unlocked live ticket. No ticket is removed while its lock is held:
+neither the land's own end nor its drop unlinks it, since a descendant may still hold the description and a ticket no
+path names would let the next land run beside it. A queue scan (a waiting land's, or status's) removes a ticket only
+once it has proven it dead by taking its lock without waiting; a ticket still locked is live, whatever its pid says. The
+lowest live ticket holds the turn; each other land waits on the lock of the live ticket just ahead of its own and, when
+that ends, looks again, so a killed holder or a killed waiter blocks nobody and only the next in line is woken. A
+waiting land says on stderr how many lands are ahead and who holds the turn — its workspace, pid and when it asked —
+when it starts waiting, whenever the land ahead changes, and every 90 s between (the land watchdog's cadence), and how
+long it waited once the turn is its own. `--outside-lock <file>` names the lock file lands took before every caller
+asked for turns: the head takes it too, as a held lock (02_workspaces.md "Held locks"), keeping the file, so it excludes
+a land started that way. A legacy process outside the queue holding that file may record nothing, so while the head
+waits it names the processes with the file open: when it starts waiting and every 90 s after, one census
+(`build_volume::nx::holders`) gives each one's pid and command, the head's own descriptor left out. These are open
+process descriptors, not a proof of lock custody or authority to signal. A census that finds no other process says so
+(the holder let go as it looked, or is not this user's to see), and one that cannot be taken says why. Measured
+2026-10-21: a land waited 1002 s for the outside lock having said once that "a land that did not ask for a turn" held
+it, naming no process. The census decides nothing: the head waits for the kernel's lock alone. The wait starts before
+the first census, on a thread of its own, so no census delays taking the lock. Measured 2026-10-21 on one fixture (a
+`lockf -k` holder for 1.5 s, debug builds, a 709-process host, 20 interleaved runs each): without the census the first
+report came 18 ms after the wait began and the turn 20 ms after the holder let go (medians); with it, 213 ms and 17 ms,
+at about 0.11 s of CPU per census.
+
+The command inherits the descriptors of its ticket and of the outside lock, so the kernel keeps the turn and that lock
+until the command, and every process it hands them to, has closed them: `land-turn` killed alone never lets the next
+land run beside its command, and the next land takes the turn when the last of them ends. A descendant that detaches
+holds the turn by design until it closes the descriptor or exits; it is never unlocked around. The launch boundaries and
+the git and Nx policies that keep cowshed's own daemons and git's automatic maintenance out of a held command are
+specified in 02_workspaces.md "Held locks". A land's turn covers rebase, gate, fast-forward and adoption; the push to a
+remote runs after the turn ends, since a remote is never needed to land (tg#6988). A turn is only as durable as the
+processes that hold it: a land that shares its caller's session ends with that session. Measured 2026-10-21: one
+lander's lands died with its tool session three times, twice while queued and once mid-gate. So a caller that may go
+away first starts the land in a session of its own (`setsid`, output to a file, not its child) and waits on the land's
+pid; `land-turn` itself never detaches, since the caller that stays reads its output and its exit status.
 
 **A ticket's life is recorded.** Measured 2026-10-21: a land queued for 635 s vanished with its agent's session, its log
 stopping mid-wait, and nothing recorded it, so it read as running for half an hour while it did not exist. Each
 repository's `turns.log`, beside its tickets, gets one JSON line per event, appended and never rewritten:
 `{ atUnixMs, event, ticket, outcome? }` with `event` one of `queued` (the land took its place), `taken` (it holds the
-turn), `finished` (its command ended; `outcome` says how — `exited <code>`, `killed by signal <n>`, or that the turn
-ended before its command did because cowshed failed) and `abandoned` (its process ended without finishing — killed,
-crashed, its session gone — found by whoever read the queue next, waiter or status, before removing its dead ticket).
-How long a land waited and held is the gap between its lines. A line that cannot be written is said on stderr and never
-stops a land. `cowshed gateway status` lists each repository's live tickets, the holder first, and the tickets found
-abandoned in the last day, as
+turn), `finished` and `abandoned`. `finished` is written only by a land that ends its turn explicitly once its command
+has ended (`exited <code>` or `killed by signal <n>`) or could not start (`did not start: <reason>`). It first marks its
+ticket finished by appending a final newline to the ticket's record in place (the inode is never replaced), then writes
+the line. A turn dropped without that end (cowshed failed, was killed or crashed, its session gone) writes nothing; the
+ticket stays, locked while any descendant holds its description, and whoever next scans the queue and proves it
+unlocked, waiter or status, writes `abandoned` for it before removing it. A scan that finds a proven-unlocked ticket
+marked finished removes it and writes nothing, so a land that ended normally has exactly one `finished` and no
+`abandoned`. A marker that cannot be appended is said on stderr with the ticket number, its directory and the error, and
+the known `finished` is still written; that ticket, left unmarked, may then also be logged `abandoned` by the scan that
+removes it. How long a land waited and held is the gap between its lines. A line that cannot be written is said on
+stderr and never stops a land. `cowshed gateway status` lists each repository's live tickets, the holder first, and the
+tickets found abandoned in the last day, as
 `landTurns: [{ repo, tickets: [{ number, pid, workspace, askedUnixMs, command }], abandoned?: [<turn log line>] }]`,
 read without taking a turn, the way it reads the install slot.
 

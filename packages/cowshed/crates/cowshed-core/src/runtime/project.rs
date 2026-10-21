@@ -10177,11 +10177,14 @@ mod rebase_recovery_tests {
         deliver_into(
             &Lane::name("lane"),
             &crate::git::GitRepository::from_root(store_root, &lane.lane),
-            &unit,
-            &Lane::name("unit"),
-            "cowshed/unit",
-            &unit_head,
+            NativeLandingSource {
+                mount: &unit,
+                workspace: &Lane::name("unit"),
+                branch: "cowshed/unit",
+                head: &unit_head,
+            },
             "cowshed/lane",
+            None,
         )
         .await
         .expect("land into the lane base");
@@ -10215,6 +10218,408 @@ mod rebase_recovery_tests {
                 LandingCommits::Measured { unlanded: 1, .. }
             ),
             "{refused:?}"
+        );
+    }
+
+    /// A lane base whose automatic maintenance detaches and then waits on the test. Its config
+    /// enables the `worktree-prune` maintenance task, and one linked worktree's `gitdir` is a FIFO.
+    /// `git maintenance run --auto --detach` daemonizes first and then evaluates each task's auto
+    /// condition (git 2.50 `maintenance_run_tasks`); `worktree-prune`'s opens that `gitdir`, and
+    /// the open blocks until the FIFO has a writer. So once detached, the maintenance outlives the
+    /// git that started it for as long as the gate stays shut, and it cannot finish without the
+    /// gate: the task, once let through, prunes the worktree. No git before it opens the file:
+    /// neither a fast-forward `merge` nor the maintenance's own start lists other worktrees. A
+    /// fetch does (its connectivity check walks every worktree's HEAD), so a lane fetches before
+    /// its gate is shut. Dropped, the gate opens and waits until nothing holds `lock`, so no git
+    /// it held back outlives the test.
+    struct MaintenanceGate {
+        worktree: PathBuf,
+        fifo: PathBuf,
+        lock: PathBuf,
+        opened: Option<std::fs::File>,
+    }
+
+    impl MaintenanceGate {
+        fn shut(lane: &Path, lock: &Path) -> Self {
+            // Probe the actual task before a FIFO can block it, rather than infer support from
+            // a version string. The control also requires auto-detach before the task's condition
+            // (builtin/gc.c maintenance_run_tasks); its actual holder assertion proves that.
+            let git = format!("{}/usr/bin/git", crate::sandbox::GIT_DEVELOPER_DIR);
+            let probe = std::process::Command::new(&git)
+                .current_dir(lane)
+                .args(["maintenance", "run", "--task=worktree-prune"])
+                .output_locked()
+                .unwrap_or_else(|error| panic!("run the fence's git {git}: {error}"));
+            assert!(
+                probe.status.success(),
+                "the fence's git {git} cannot run the required worktree-prune maintenance task ({}): {}",
+                probe.status,
+                String::from_utf8_lossy(&probe.stderr)
+            );
+            for (key, value) in [
+                ("maintenance.auto", "true"),
+                ("maintenance.autoDetach", "true"),
+                ("maintenance.worktree-prune.enabled", "true"),
+            ] {
+                run_git(lane, &["config", key, value]);
+            }
+            let worktree = lane.join(".git/worktrees/gate");
+            std::fs::create_dir_all(&worktree).expect("create the gate's worktree directory");
+            let fifo = worktree.join("gitdir");
+            let c_fifo =
+                std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("no NUL");
+            // SAFETY: mkfifo(3) on a path inside this test's own directory.
+            let made = unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) };
+            assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+            Self {
+                worktree,
+                fifo,
+                lock: lock.to_owned(),
+                opened: None,
+            }
+        }
+
+        /// Whether no maintenance has got through the gate: the worktree it prunes is still there.
+        fn untouched(&self) -> bool {
+            self.worktree.exists()
+        }
+
+        /// Let a maintenance waiting at the gate, or yet to reach it, go on. Opened for reading
+        /// and writing, the FIFO opens without waiting for a reader, and every later open of it
+        /// for reading finds this writer. Pruning removes it, so a gate already passed is gone.
+        fn open(&mut self) -> std::io::Result<()> {
+            if self.opened.is_none() {
+                match std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&self.fifo)
+                {
+                    Ok(fifo) => self.opened = Some(fifo),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for MaintenanceGate {
+        fn drop(&mut self) {
+            // Every lock the test took is dropped before its gate, so only a git the gate held
+            // back can still hold this one. A gate that cannot be opened leaves that git blocked
+            // holding the lock, so it fails the test like any other cleanup failure.
+            let released = self.open().and_then(|()| {
+                crate::build_volume::nx::hold_announced(
+                    crate::held_lock::Opened::open(&self.lock)?,
+                    "the maintenance this gate held back",
+                )
+            });
+            if let Err(error) = released {
+                let said = format!(
+                    "open the maintenance gate {} and wait for its maintenance to let go of {}: \
+                     {error}",
+                    self.fifo.display(),
+                    self.lock.display()
+                );
+                // A second panic while unwinding would abort the run; the failing test already
+                // fails.
+                if std::thread::panicking() {
+                    cowshed_os::eprintln!("{said}");
+                } else {
+                    panic!("{said}");
+                }
+            }
+        }
+    }
+
+    /// The fence's git holds the ref lock and runs no maintenance that would keep it: a
+    /// fast-forward into a target configured to detach (02_workspaces.md "Held locks"). The lane
+    /// base's automatic maintenance detaches and then waits at a [`MaintenanceGate`]. The land's
+    /// fast-forward, its git built by [`fence_git_command`] with the ref lock, starts none: the
+    /// lock is free the moment git has ended, and the gate is untouched. The control is the same
+    /// fast-forward handed the descriptor alone ([`crate::held_lock::hand_to`] without
+    /// [`crate::held_lock::prepare_command_environment`]). Its git detaches a `git maintenance`
+    /// that keeps the ref lock after git has ended, until the gate opens, the maintenance prunes
+    /// the gate's worktree, and it exits.
+    #[tokio::test]
+    async fn the_fence_git_holds_the_ref_lock_and_starts_no_maintenance_that_keeps_it() {
+        use cowshed_os::fork_lock::RunAsync as _;
+
+        let lane = Lane::new("fence");
+        let store_root = lane.store.shared();
+        let unit = lane.unit("unit");
+        unit_commit(&unit, "held.txt", "under the held policy");
+        let held_head = git_oid(store_root, &unit)
+            .await
+            .expect("the held run's head");
+        unit_commit(&unit, "control.txt", "without it");
+        let control_head = git_oid(store_root, &unit)
+            .await
+            .expect("the control's head");
+        // With no maintenance of its own, so none is running when the gate shuts.
+        run_git(
+            &lane.lane,
+            &[
+                "-c",
+                "maintenance.auto=false",
+                "fetch",
+                "--quiet",
+                unit.to_str().expect("UTF-8 unit path"),
+                "cowshed/unit",
+            ],
+        );
+        let path = lane.base.join("ref.lock");
+        let mut gate = MaintenanceGate::shut(&lane.lane, &path);
+        let take = || {
+            crate::held_lock::Opened::open(&path)
+                .expect("open the ref lock")
+                .try_hold()
+                .expect("take the ref lock")
+                .expect("a free ref lock")
+        };
+        let fast_forward = |to: &GitOid, fence| {
+            fence_git_command(
+                store_root,
+                &lane.lane,
+                None,
+                &["merge", "--ff-only", to.as_str()],
+                fence,
+            )
+            .expect("build the fence git")
+        };
+        let succeeded = |output: std::process::Output| {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        let held = take();
+        succeeded(
+            fast_forward(&held_head, Some(held.descriptor()))
+                .output_locked()
+                .await
+                .expect("run the fence git"),
+        );
+        assert_eq!(
+            git_oid(store_root, &lane.lane).await.expect("lane head"),
+            held_head
+        );
+        drop(held);
+        drop(
+            crate::held_lock::Opened::open(&path)
+                .expect("open the ref lock")
+                .try_hold()
+                .expect("ask for the ref lock")
+                .expect("no process the fence's git started kept the ref lock"),
+        );
+        assert!(
+            gate.untouched(),
+            "the fence's git ran the lane base's maintenance"
+        );
+
+        let held = take();
+        let inode = held.inode();
+        let mut control = fast_forward(&control_head, None);
+        crate::held_lock::hand_to(control.as_std_mut(), vec![held.descriptor()]);
+        succeeded(control.output_locked().await.expect("run the control git"));
+        assert_eq!(
+            git_oid(store_root, &lane.lane).await.expect("lane head"),
+            control_head
+        );
+        drop(held);
+        let Err(contender) = crate::held_lock::Opened::open(&path)
+            .expect("open the ref lock")
+            .try_hold()
+            .expect("ask for the ref lock")
+        else {
+            panic!("without the held policy, nothing the fast-forward started kept the ref lock");
+        };
+        let holders = crate::build_volume::nx::inode_holders((inode.dev.get(), inode.ino.get()))
+            .expect("the ref lock's holders");
+        assert!(
+            holders
+                .iter()
+                .any(|(holder, _)| holder.command.contains("maintenance")),
+            "the ref lock is kept by {holders:?}, none of them the detached maintenance"
+        );
+        assert!(gate.untouched(), "the maintenance got through a shut gate");
+        gate.open().expect("open the maintenance gate");
+        drop(
+            crate::build_volume::nx::hold_announced(contender, "the detached git maintenance")
+                .expect("the ref lock is granted once the maintenance ends"),
+        );
+        assert!(
+            !gate.untouched(),
+            "the detached maintenance ended without running its worktree-prune task"
+        );
+    }
+
+    /// Set in the environment of this test binary re-run as the fence's owner: the lock path, then
+    /// the store, repository, blob and output fifo it hands its git.
+    const FENCE_OWNER_ROLE: &str = "COWSHED_FENCE_OWNER_FIXTURE";
+
+    /// The fence owner's process group, which the owner leads and its git joins: killed whole and
+    /// its leader reaped however the test ends. The test kills the owner alone mid-git and waits
+    /// for its exit without reaping it ([`Self::kill_owner`]), so until this drops the unreaped
+    /// leader keeps its pid, the group's id, from any other process, and the signal reaches only
+    /// the owner and the git it started.
+    struct OwnerGroup(std::process::Child);
+
+    impl OwnerGroup {
+        /// SIGKILL the owner alone and wait for its exit, leaving it unreaped: an exited process
+        /// has closed every descriptor it had, so what holds the lock then is the kernel's answer.
+        fn kill_owner(&mut self) {
+            self.0.kill().expect("kill the owner");
+            // SAFETY: an all-zero siginfo is a valid value of the plain C struct.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: waiting for this test's own child without reaping it.
+            let waited = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.0.id(),
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            assert_eq!(waited, 0, "waitid: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    impl Drop for OwnerGroup {
+        fn drop(&mut self) {
+            let pgid = self.0.id();
+            let mut failures = Vec::new();
+            match i32::try_from(pgid) {
+                Ok(group) => {
+                    if let Err(error) =
+                        crate::runtime::job_groups::signal_unreaped_group(group, libc::SIGKILL)
+                    {
+                        failures.push(format!("end the fence owner's group {pgid}: {error}"));
+                    }
+                }
+                Err(error) => failures.push(format!("the fence owner's pid {pgid}: {error}")),
+            }
+            if let Err(error) = self.0.wait() {
+                failures.push(format!("reap the fence owner {pgid}: {error}"));
+            }
+            if failures.is_empty() {
+                return;
+            }
+            let said = failures.join("; ");
+            // A second panic while unwinding would abort the run; the failing test already fails.
+            if std::thread::panicking() {
+                cowshed_os::eprintln!("{said}");
+            } else {
+                panic!("{said}");
+            }
+        }
+    }
+
+    /// The fence's owner dies; its git keeps the ref lock until git ends. The owner, this test
+    /// binary re-run in a role of its own, holds the ref lock and runs a real fence git through
+    /// the land's own command construction ([`fence_git_command`]): `cat-file` of a blob larger
+    /// than a pipe holds, writing into a fifo this test reads. The first byte proves git has
+    /// exec'd and holds the lock it inherited; the full pipe then blocks it. The owner is killed
+    /// with SIGKILL and has exited, so every descriptor it had is closed (a dropped `RefLock`
+    /// closes its descriptor and unlocks nothing explicitly, so its death and its drop are the same
+    /// to the kernel). A contender is still refused while git runs, and takes the lock once git
+    /// ends. The owner leads its own process group ([`OwnerGroup`]), so a failure anywhere ends
+    /// the owner and its git rather than leaving the owner parked.
+    #[tokio::test]
+    async fn a_fence_owner_killed_mid_git_leaves_the_ref_lock_with_git_until_it_ends() {
+        use cowshed_os::fork_lock::Spawn as _;
+        use std::io::Read as _;
+        use std::os::unix::process::CommandExt as _;
+        if let Ok(lock) = std::env::var(FENCE_OWNER_ROLE) {
+            let var = |name: &str| std::env::var(name).expect("the owner's fixture environment");
+            // Opened first, so an owner that fails after it ends the test's read with an end of
+            // file instead of leaving the test waiting for a writer.
+            let output = std::fs::OpenOptions::new()
+                .write(true)
+                .open(var("COWSHED_FENCE_OUT"))
+                .expect("open the output fifo");
+            let held = crate::held_lock::Opened::open(Path::new(&lock))
+                .expect("open the ref lock")
+                .try_hold()
+                .expect("take the ref lock")
+                .expect("a free ref lock");
+            let blob = var("COWSHED_FENCE_BLOB");
+            let mut git = fence_git_command(
+                Path::new(&var("COWSHED_FENCE_STORE")),
+                Path::new(&var("COWSHED_FENCE_REPO")),
+                None,
+                &["cat-file", "blob", &blob],
+                Some(held.descriptor()),
+            )
+            .expect("build the fence git");
+            git.stdout(output);
+            let _git = git.spawn_locked().expect("start the fence git");
+            // Held until the test kills this process.
+            loop {
+                std::thread::park();
+            }
+        }
+
+        let lane = Lane::new("fence-owner");
+        let blob_path = lane.lane.join("big.bin");
+        std::fs::write(&blob_path, vec![b'x'; 4 << 20]).expect("write the blob");
+        let hashed = git(&lane.lane, &["hash-object", "-w", "big.bin"]);
+        assert!(
+            hashed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&hashed.stderr)
+        );
+        let blob = String::from_utf8(hashed.stdout)
+            .expect("an oid")
+            .trim()
+            .to_owned();
+        let lock = lane.base.join("ref.lock");
+        let fifo = lane.base.join("git-out");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("no NUL");
+        // SAFETY: mkfifo(3) on a path inside this test's own directory.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+        let owner = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "--exact",
+                "runtime::project::rebase_recovery_tests::a_fence_owner_killed_mid_git_leaves_the_ref_lock_with_git_until_it_ends",
+                "--nocapture",
+            ])
+            .env(FENCE_OWNER_ROLE, &lock)
+            .env("COWSHED_FENCE_STORE", lane.store.shared().as_ref())
+            .env("COWSHED_FENCE_REPO", &lane.lane)
+            .env("COWSHED_FENCE_BLOB", &blob)
+            .env("COWSHED_FENCE_OUT", &fifo)
+            .stdout(std::process::Stdio::null())
+            .process_group(0)
+            .spawn_locked()
+            .expect("start the owner");
+        let mut owner = OwnerGroup(owner);
+        let mut output = std::fs::File::open(&fifo).expect("open the fifo's read end");
+        let mut first = [0u8; 1];
+        output.read_exact(&mut first).expect("git's first byte");
+        assert_eq!(&first, b"x");
+
+        owner.kill_owner();
+        let contender = crate::held_lock::Opened::open(&lock)
+            .expect("open the ref lock")
+            .try_hold()
+            .expect("ask for the ref lock");
+        let contender = match contender {
+            Ok(_) => panic!("the ref lock went with its killed owner while its git still ran"),
+            Err(waiting) => waiting,
+        };
+
+        let mut rest = Vec::new();
+        output
+            .read_to_end(&mut rest)
+            .expect("the rest of git's output");
+        assert_eq!(rest.len() + 1, 4 << 20, "git wrote the whole blob");
+        // Git has closed its output; the contender is granted once git has exited.
+        drop(
+            crate::build_volume::nx::hold_announced(contender, "the killed owner's fence git")
+                .expect("the contender takes the lock once git ends"),
         );
     }
 
@@ -10422,11 +10827,14 @@ mod rebase_recovery_tests {
         let error = deliver_into(
             &Lane::name("lane"),
             &crate::git::GitRepository::from_root(store_root, &lane.lane),
-            &unit,
-            &Lane::name("unit"),
-            "cowshed/unit",
-            &validated,
+            NativeLandingSource {
+                mount: &unit,
+                workspace: &Lane::name("unit"),
+                branch: "cowshed/unit",
+                head: &validated,
+            },
             "cowshed/lane",
+            None,
         )
         .await
         .expect_err("what arrived is not what was validated");
@@ -10454,11 +10862,14 @@ mod rebase_recovery_tests {
         deliver_into(
             &Lane::name("lane"),
             &crate::git::GitRepository::from_root(store_root, &lane.lane),
-            &first,
-            &Lane::name("first"),
-            "cowshed/first",
-            &first_head,
+            NativeLandingSource {
+                mount: &first,
+                workspace: &Lane::name("first"),
+                branch: "cowshed/first",
+                head: &first_head,
+            },
             "cowshed/lane",
+            None,
         )
         .await
         .expect("first unit lands");
@@ -10471,11 +10882,14 @@ mod rebase_recovery_tests {
         let behind = deliver_into(
             &Lane::name("lane"),
             &crate::git::GitRepository::from_root(store_root, &lane.lane),
-            &second,
-            &Lane::name("second"),
-            "cowshed/second",
-            &second_head,
+            NativeLandingSource {
+                mount: &second,
+                workspace: &Lane::name("second"),
+                branch: "cowshed/second",
+                head: &second_head,
+            },
             "cowshed/lane",
+            None,
         )
         .await
         .expect_err("the second unit is not based on the lane base's tip");
@@ -10513,11 +10927,14 @@ mod rebase_recovery_tests {
         deliver_into(
             &Lane::name("lane"),
             &crate::git::GitRepository::from_root(store_root, &lane.lane),
-            &second,
-            &Lane::name("second"),
-            "cowshed/second",
-            &rebased,
+            NativeLandingSource {
+                mount: &second,
+                workspace: &Lane::name("second"),
+                branch: "cowshed/second",
+                head: &rebased,
+            },
             "cowshed/lane",
+            None,
         )
         .await
         .expect("second unit lands");
@@ -10563,11 +10980,14 @@ mod rebase_recovery_tests {
         let error = deliver_into(
             &Lane::name("lane"),
             &crate::git::GitRepository::from_root(store_root, &lane.lane),
-            &unit,
-            &Lane::name("unit"),
-            "cowshed/unit",
-            &unit_head,
+            NativeLandingSource {
+                mount: &unit,
+                workspace: &Lane::name("unit"),
+                branch: "cowshed/unit",
+                head: &unit_head,
+            },
             "cowshed/lane",
+            None,
         )
         .await
         .expect_err("the fast-forward would overwrite the lane base's uncommitted edit");
@@ -13519,11 +13939,14 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             deliver_into(
                 &into.name,
                 &crate::git::GitRepository::from_root(store_root, &into.root),
-                &source_mount,
-                &workspace,
-                &source_branch,
-                &source_head,
+                NativeLandingSource {
+                    mount: &source_mount,
+                    workspace: &workspace,
+                    branch: &source_branch,
+                    head: &source_head,
+                },
                 &target_branch,
+                ref_lock.as_ref().map(super::ref_lock::RefLock::descriptor),
             )
             .await
         })
@@ -16995,6 +17418,15 @@ async fn target_checked_out_branch(
         })
 }
 
+/// The source checkout and the exact branch head validated for delivery.
+#[cfg(target_os = "macos")]
+struct NativeLandingSource<'a> {
+    mount: &'a Path,
+    workspace: &'a WorkspaceName,
+    branch: &'a str,
+    head: &'a GitOid,
+}
+
 /// Hand a unit's validated head to the target and fast-forward the target's checked-out branch to
 /// it.
 ///
@@ -17007,20 +17439,24 @@ async fn target_checked_out_branch(
 async fn deliver_into(
     target: &WorkspaceName,
     repository: &crate::git::GitRepository,
-    source_mount: &Path,
-    unit: &WorkspaceName,
-    source_branch: &str,
-    source_head: &GitOid,
+    source: NativeLandingSource<'_>,
     target_branch: &str,
+    fence: Option<std::os::fd::RawFd>,
 ) -> Result<()> {
+    let NativeLandingSource {
+        mount: source_mount,
+        workspace: unit,
+        branch: source_branch,
+        head: source_head,
+    } = source;
     let store_root = repository.store_root();
     let target_root = repository.root();
     let preservation_ref = format!("refs/cowshed/{unit}/heads/{source_branch}");
-    run_git_fetch(
+    fence_git(
         store_root,
         target_root,
-        source_mount,
-        [
+        Some(source_mount),
+        &[
             "fetch",
             "--no-tags",
             source_mount
@@ -17028,8 +17464,10 @@ async fn deliver_into(
                 .ok_or_else(|| CowshedError::internal("workspace mount path is not valid UTF-8"))?,
             &format!("+refs/heads/{source_branch}:{preservation_ref}"),
         ],
+        fence,
     )
-    .await?;
+    .await
+    .and_then(|output| require_git_success("git operation", &output))?;
     let fetched = git_revision_oid(store_root, target_root, &preservation_ref).await?;
     if &fetched != source_head {
         return Err(CowshedError::fence_refusal(
@@ -17067,10 +17505,12 @@ async fn deliver_into(
             format!("cowshed rebase {unit}{into}, re-run the check, then retry land"),
         ));
     }
-    let merge = invoke_git(
+    let merge = fence_git(
         store_root,
         target_root,
+        None,
         &["merge", "--ff-only", source_head.as_str()],
+        fence,
     )
     .await?;
     let Err(refused) = require_git_success("git operation", &merge) else {
@@ -17086,6 +17526,53 @@ async fn deliver_into(
         ));
     }
     Err(refused)
+}
+
+/// A git child of the ref fence, which moves refs: handed the land's ref lock (`fence`) through the
+/// one held-command boundary ([`crate::held_lock::hand_to`]), so the kernel keeps the lock until
+/// git ends, a cowshed killed mid-fast-forward never leaves git moving the ref outside it, and no
+/// git background work detaches with it (02_workspaces.md "Held locks"). Hooks and the fsmonitor
+/// are already off for every controller git. `fetch_source` names the checkout a fetch reads.
+#[cfg(target_os = "macos")]
+fn fence_git_command(
+    store_root: &Path,
+    root: &Path,
+    fetch_source: Option<&Path>,
+    args: &[&str],
+    fence: Option<std::os::fd::RawFd>,
+) -> Result<tokio::process::Command> {
+    let mut command = match fetch_source {
+        Some(source) => crate::git::sandboxed_git_fetch_command(store_root, root, source)?,
+        None => crate::git::sandboxed_git_command_at(store_root, root)?,
+    };
+    if let Some(descriptor) = fence {
+        crate::held_lock::prepare_command_environment(&mut command).map_err(|reason| {
+            CowshedError::internal(format!("cannot hand git the ref lock: {reason}"))
+        })?;
+        crate::held_lock::hand_to(&mut command, vec![descriptor]);
+    }
+    command.args(args);
+    Ok(tokio::process::Command::from(command))
+}
+
+/// Run a [`fence_git_command`] to its end.
+#[cfg(target_os = "macos")]
+async fn fence_git(
+    store_root: &std::sync::Arc<Path>,
+    root: &Path,
+    fetch_source: Option<&Path>,
+    args: &[&str],
+    fence: Option<std::os::fd::RawFd>,
+) -> Result<std::process::Output> {
+    fence_git_command(store_root, root, fetch_source, args, fence)?
+        .output_locked()
+        .await
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                error.to_string(),
+                "restore /usr/bin/git and sandbox-exec",
+            )
+        })
 }
 
 /// Preserve the workspace branch `source_branch` in main's repository at `main_root`, as

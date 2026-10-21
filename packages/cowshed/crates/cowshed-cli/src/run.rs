@@ -76,67 +76,126 @@ impl InterruptPolicy {
     }
 }
 
-/// Run one CLI invocation inside a host process. `arguments` excludes argv[0].
-///
-/// Returns the process exit code and never touches signal dispositions, because an in-process
-/// host must keep its own and be allowed to flush and unwind normally. Exception: `subtree-root`
-/// explicitly takes ownership of its named inherited descriptor and execs, replacing the entire
-/// host process after publishing admission. It does not return on successful exec.
-pub async fn run(arguments: Vec<OsString>) -> i32 {
-    run_with(arguments, InterruptPolicy::LeaveToHost)
-        .await
-        .exit_code()
+/// One parsed invocation, including ownership of any descriptor the caller handed to it.
+/// Construct with [`prepare`] before allocating an async runtime, then consume exactly once.
+pub struct Invocation(Prepared);
+
+enum Prepared {
+    Command(args::Cli),
+    Lock {
+        args: args::LockArgs,
+        state: crate::lock::State,
+        quiet: bool,
+    },
+    GatewayGitFetch,
+    WorkspaceSupervisor(Vec<OsString>),
 }
 
-/// Run one CLI invocation as the `cowshed` process. `arguments` excludes argv[0].
-///
-/// A project or host command watches SIGINT, SIGHUP and SIGTERM — each one the process did not
-/// inherit as ignored — and answers [`Ending::Interrupted`] when one arrives. The caller owns
-/// the async runtime, and shutting it down is what ends the interrupted command's jobs.
-pub async fn run_interruptible(arguments: Vec<OsString>) -> Ending {
-    run_with(arguments, InterruptPolicy::EndJobs).await
+impl Invocation {
+    /// Report a failure to start the runtime on the invocation's owned state channel too.
+    pub fn fail(mut self, error: CowshedError) -> i32 {
+        let quiet = match &mut self.0 {
+            Prepared::Lock { state, quiet, .. } => {
+                state.failed(&error);
+                *quiet
+            }
+            Prepared::Command(parsed) => parsed.global.quiet,
+            Prepared::GatewayGitFetch | Prepared::WorkspaceSupervisor(_) => false,
+        };
+        let mut output = output::Output::new(io::stdout(), io::stderr(), quiet);
+        crate::lock::report(&mut output, &error)
+    }
 }
 
-async fn run_with(arguments: Vec<OsString>, interrupts: InterruptPolicy) -> Ending {
+/// Parse argv (excluding argv[0]) and adopt caller-owned descriptors synchronously. A refused
+/// invocation has already reported its error and returns its exit code. No runtime may be
+/// allocated between receiving argv and this call: its descriptors are not caller resources.
+pub fn prepare(arguments: Vec<OsString>) -> Result<Invocation, i32> {
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == crate::workspace_supervisor::VERB)
+    {
+        return Ok(Invocation(Prepared::WorkspaceSupervisor(arguments)));
+    }
     if arguments
         .first()
         .is_some_and(|argument| argument == OsStr::new(GATEWAY_GIT_FETCH_HELPER_ARG))
     {
         if arguments.len() != 1 {
             cowshed_os::eprintln!("cowshed: the internal gateway git helper accepts no arguments");
-            return Ending::Finished(2);
+            return Err(2);
         }
-        return Ending::Finished(match run_gateway_git_fetch_helper() {
+        return Ok(Invocation(Prepared::GatewayGitFetch));
+    }
+    match parse_then_prepare(&arguments, |parsed| {
+        if let args::Command::Lock(mut lock) = parsed.command {
+            let state = crate::lock::State::adopt(lock.state_fd.take()).map_err(|error| {
+                let mut output =
+                    output::Output::new(io::stdout(), io::stderr(), parsed.global.quiet);
+                crate::lock::report(&mut output, &error)
+            })?;
+            Ok(Invocation(Prepared::Lock {
+                args: lock,
+                state,
+                quiet: parsed.global.quiet,
+            }))
+        } else {
+            Ok(Invocation(Prepared::Command(parsed)))
+        }
+    }) {
+        Ok(invocation) => invocation,
+        Err(error) => {
+            let command_map = error.command_map();
+            // Only a refused line needs argv walked; accepted commands use parsed globals.
+            let globals = args::globals_before_child_argv(&arguments);
+            let error = CowshedError::usage(error.message, error.hint);
+            Err(emit_error(error, command_map, globals.json, globals.quiet))
+        }
+    }
+}
+
+fn parse_then_prepare<F, T>(arguments: &[OsString], prepare: F) -> Result<T, args::UsageError>
+where
+    F: FnOnce(args::Cli) -> T,
+{
+    let parsed = args::parse_args(arguments)?;
+    Ok(prepare(parsed))
+}
+
+/// Run a prepared invocation inside a host process, leaving signal dispositions to the host,
+/// which must keep its own and be allowed to flush and unwind normally. Exception: `subtree-root`
+/// explicitly takes ownership of its named inherited descriptor and execs, replacing the entire
+/// host process after publishing admission. It does not return on successful exec.
+pub async fn run(invocation: Invocation) -> i32 {
+    run_with(invocation, InterruptPolicy::LeaveToHost)
+        .await
+        .exit_code()
+}
+
+/// Run a prepared invocation as the `cowshed` process. Project and host commands watch SIGINT,
+/// SIGHUP and SIGTERM unless inherited ignored. The caller owns runtime shutdown on interruption.
+pub async fn run_interruptible(invocation: Invocation) -> Ending {
+    run_with(invocation, InterruptPolicy::EndJobs).await
+}
+
+async fn run_with(invocation: Invocation, interrupts: InterruptPolicy) -> Ending {
+    match invocation.0 {
+        Prepared::Command(parsed) => run_parsed(parsed, interrupts).await,
+        Prepared::Lock { args, state, quiet } => {
+            let mut output = output::Output::new(io::stdout(), io::stderr(), quiet);
+            Ending::Finished(crate::lock::dispatch(&args, state, &mut output, interrupts).await)
+        }
+        Prepared::WorkspaceSupervisor(arguments) => {
+            Ending::Finished(crate::workspace_supervisor::run(&arguments[1..]).await)
+        }
+        Prepared::GatewayGitFetch => Ending::Finished(match run_gateway_git_fetch_helper() {
             Ok(()) => 0,
             Err(error) => {
                 cowshed_os::eprintln!("cowshed: gateway git helper failed: {error}");
                 1
             }
-        });
+        }),
     }
-    match parse_then_invoke_service(&arguments, |parsed| run_parsed(parsed, interrupts)).await {
-        Ok(ending) => ending,
-        Err(error) => {
-            let command_map = error.command_map();
-            // Only a refused line needs the argv walked: an accepted one answers from
-            // `parsed.global`, so scanning it up front was three passes nothing read.
-            let globals = args::globals_before_child_argv(&arguments);
-            let error = CowshedError::usage(error.message, error.hint);
-            Ending::Finished(emit_error(error, command_map, globals.json, globals.quiet))
-        }
-    }
-}
-
-async fn parse_then_invoke_service<F, Fut, T>(
-    arguments: &[OsString],
-    invoke: F,
-) -> Result<T, args::UsageError>
-where
-    F: FnOnce(args::Cli) -> Fut,
-    Fut: Future<Output = T>,
-{
-    let parsed = args::parse_args(arguments)?;
-    Ok(invoke(parsed).await)
 }
 
 async fn run_parsed(parsed: args::Cli, interrupts: InterruptPolicy) -> Ending {
@@ -199,6 +258,14 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     if let args::Command::RetireDescendants(retire) = &parsed.command {
         let outcome = crate::subtree::retire(retire, &mut output).await;
         return Ok(finish(outcome, &mut output, json));
+    }
+    // Lock invocations were separated during synchronous preparation to own their state channel.
+    // Observations read only the kernel, before anything asks the daemon.
+    if let args::Command::LockHolders(holders) = &parsed.command {
+        return Ok(crate::lock::dispatch_holders(holders, &mut output));
+    }
+    if let args::Command::TreeHolders(tree) = &parsed.command {
+        return Ok(crate::tree_holders::dispatch(tree, &mut output));
     }
     if let args::Command::Skill(skill_args) = &parsed.command {
         let outcome = skill::dispatch(skill_args, &parsed.global, &mut output);
@@ -562,11 +629,10 @@ mod tests {
         for invocation in invocations {
             let service_invoked = Cell::new(false);
             let argv: Vec<OsString> = invocation.into_iter().map(OsString::from).collect();
-            let result = parse_then_invoke_service(&argv, |_| {
+            let result = parse_then_prepare(&argv, |_| {
                 service_invoked.set(true);
-                async { 0 }
-            })
-            .await;
+                0
+            });
 
             assert!(result.is_err());
             assert!(!service_invoked.get());

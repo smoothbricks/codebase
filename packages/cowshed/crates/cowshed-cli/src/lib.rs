@@ -13,6 +13,7 @@ pub mod identity_service;
 pub mod install_basis;
 pub mod land_turn;
 pub mod launchd;
+pub mod lock;
 pub mod mount_main;
 pub mod output;
 pub mod path_entry;
@@ -24,6 +25,7 @@ pub mod runtime;
 pub mod setup_service;
 pub mod skill;
 mod subtree;
+pub mod tree_holders;
 pub mod workspace_supervisor;
 
 #[cfg(test)]

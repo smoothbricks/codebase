@@ -364,6 +364,11 @@ export const assertDatabaseHolderList = typia.createAssertEquals<readonly Api.Da
 export const parseDatabaseHolderList = (json: string): readonly Api.DatabaseHolder[] =>
   assertDatabaseHolderList(JSON.parse(json));
 
+export const assertDecimalU64 = typia.createAssertEquals<Api.DecimalU64>();
+export const parseDecimalU64 = (json: string): Api.DecimalU64 => assertDecimalU64(JSON.parse(json));
+export const assertDecimalU64List = typia.createAssertEquals<readonly Api.DecimalU64[]>();
+export const parseDecimalU64List = (json: string): readonly Api.DecimalU64[] => assertDecimalU64List(JSON.parse(json));
+
 export const assertDefragmentResult = typia.createAssertEquals<Api.DefragmentResult>();
 export const parseDefragmentResult = (json: string): Api.DefragmentResult => assertDefragmentResult(JSON.parse(json));
 export const assertDefragmentResultList = typia.createAssertEquals<readonly Api.DefragmentResult[]>();
@@ -825,10 +830,49 @@ export const assertLandingCommitsList = typia.createAssertEquals<readonly Api.La
 export const parseLandingCommitsList = (json: string): readonly Api.LandingCommits[] =>
   assertLandingCommitsList(JSON.parse(json));
 
+export const assertLockCustody = typia.createAssertEquals<Api.LockCustody>();
+export const parseLockCustody = (json: string): Api.LockCustody => assertLockCustody(JSON.parse(json));
+export const assertLockCustodyList = typia.createAssertEquals<readonly Api.LockCustody[]>();
+export const parseLockCustodyList = (json: string): readonly Api.LockCustody[] =>
+  assertLockCustodyList(JSON.parse(json));
+
+export const assertLockDescriptor = typia.createAssertEquals<Api.LockDescriptor>();
+export const parseLockDescriptor = (json: string): Api.LockDescriptor => assertLockDescriptor(JSON.parse(json));
+export const assertLockDescriptorList = typia.createAssertEquals<readonly Api.LockDescriptor[]>();
+export const parseLockDescriptorList = (json: string): readonly Api.LockDescriptor[] =>
+  assertLockDescriptorList(JSON.parse(json));
+
 export const assertLockHolder = typia.createAssertEquals<Api.LockHolder>();
 export const parseLockHolder = (json: string): Api.LockHolder => assertLockHolder(JSON.parse(json));
 export const assertLockHolderList = typia.createAssertEquals<readonly Api.LockHolder[]>();
 export const parseLockHolderList = (json: string): readonly Api.LockHolder[] => assertLockHolderList(JSON.parse(json));
+
+export const assertLockInode = typia.createAssertEquals<Api.LockInode>();
+export const parseLockInode = (json: string): Api.LockInode => assertLockInode(JSON.parse(json));
+export const assertLockInodeList = typia.createAssertEquals<readonly Api.LockInode[]>();
+export const parseLockInodeList = (json: string): readonly Api.LockInode[] => assertLockInodeList(JSON.parse(json));
+
+export const assertLockObservation = typia.createAssertEquals<Api.LockObservation>();
+export const parseLockObservation = (json: string): Api.LockObservation => assertLockObservation(JSON.parse(json));
+export const assertLockObservationList = typia.createAssertEquals<readonly Api.LockObservation[]>();
+export const parseLockObservationList = (json: string): readonly Api.LockObservation[] =>
+  assertLockObservationList(JSON.parse(json));
+
+export const assertLockPath = typia.createAssertEquals<Api.LockPath>();
+export const parseLockPath = (json: string): Api.LockPath => assertLockPath(JSON.parse(json));
+export const assertLockPathList = typia.createAssertEquals<readonly Api.LockPath[]>();
+export const parseLockPathList = (json: string): readonly Api.LockPath[] => assertLockPathList(JSON.parse(json));
+
+export const assertLockRecord = typia.createAssertEquals<Api.LockRecord>();
+export const parseLockRecord = (json: string): Api.LockRecord => assertLockRecord(JSON.parse(json));
+export const assertLockRecordList = typia.createAssertEquals<readonly Api.LockRecord[]>();
+export const parseLockRecordList = (json: string): readonly Api.LockRecord[] => assertLockRecordList(JSON.parse(json));
+
+export const assertLockWaiterEvent = typia.createAssertEquals<Api.LockWaiterEvent>();
+export const parseLockWaiterEvent = (json: string): Api.LockWaiterEvent => assertLockWaiterEvent(JSON.parse(json));
+export const assertLockWaiterEventList = typia.createAssertEquals<readonly Api.LockWaiterEvent[]>();
+export const parseLockWaiterEventList = (json: string): readonly Api.LockWaiterEvent[] =>
+  assertLockWaiterEventList(JSON.parse(json));
 
 export const assertLogsChunk = typia.createAssertEquals<Api.LogsChunk>();
 export const parseLogsChunk = (json: string): Api.LogsChunk => assertLogsChunk(JSON.parse(json));
@@ -1510,6 +1554,22 @@ export const assertTraceId = typia.createAssertEquals<Api.TraceId>();
 export const parseTraceId = (json: string): Api.TraceId => assertTraceId(JSON.parse(json));
 export const assertTraceIdList = typia.createAssertEquals<readonly Api.TraceId[]>();
 export const parseTraceIdList = (json: string): readonly Api.TraceId[] => assertTraceIdList(JSON.parse(json));
+
+export const assertTreeHoldKind = typia.createAssertEquals<Api.TreeHoldKind>();
+export const parseTreeHoldKind = (json: string): Api.TreeHoldKind => assertTreeHoldKind(JSON.parse(json));
+export const assertTreeHoldKindList = typia.createAssertEquals<readonly Api.TreeHoldKind[]>();
+export const parseTreeHoldKindList = (json: string): readonly Api.TreeHoldKind[] =>
+  assertTreeHoldKindList(JSON.parse(json));
+
+export const assertTreeHolder = typia.createAssertEquals<Api.TreeHolder>();
+export const parseTreeHolder = (json: string): Api.TreeHolder => assertTreeHolder(JSON.parse(json));
+export const assertTreeHolderList = typia.createAssertEquals<readonly Api.TreeHolder[]>();
+export const parseTreeHolderList = (json: string): readonly Api.TreeHolder[] => assertTreeHolderList(JSON.parse(json));
+
+export const assertTreePath = typia.createAssertEquals<Api.TreePath>();
+export const parseTreePath = (json: string): Api.TreePath => assertTreePath(JSON.parse(json));
+export const assertTreePathList = typia.createAssertEquals<readonly Api.TreePath[]>();
+export const parseTreePathList = (json: string): readonly Api.TreePath[] => assertTreePathList(JSON.parse(json));
 
 export const assertTurnEvent = typia.createAssertEquals<Api.TurnEvent>();
 export const parseTurnEvent = (json: string): Api.TurnEvent => assertTurnEvent(JSON.parse(json));
