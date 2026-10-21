@@ -869,4 +869,74 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).expect("remove the test store");
     }
+
+    /// The request frame an admission of `class` sends, read off a fake gateway that never
+    /// answers: the admission is still waiting for its grant when the frame is read.
+    async fn request_frame(class: ExecClass) -> serde_json::Value {
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "cowshed-job-cpu-frame",
+        );
+        let socket = root.join("gateway.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind the fake gateway");
+        let admission = GatewayJobCpu::new(socket).admit(JobCpuAsk {
+            class,
+            want: NonZeroUsize::new(8).expect("eight"),
+            checkout: root.join("checkout"),
+            command: "nx run-many -t gate".to_owned(),
+            job: (
+                RepoId::parse("acme/widget").expect("repo"),
+                WorkspaceIncarnation::new(format!("{:032x}", 7)).expect("incarnation"),
+                JobId::new(7).expect("job"),
+            ),
+            parent: Some("/requester/pool.sock".to_owned()),
+        });
+        let gateway = async {
+            let (stream, _) = listener.accept().await.expect("the admission connects");
+            let mut line = String::new();
+            BufReader::new(stream)
+                .read_line(&mut line)
+                .await
+                .expect("the request frame");
+            line
+        };
+        tokio::select! {
+            _ = admission => panic!("an admission the gateway never answered ended"),
+            line = gateway => serde_json::from_str(&line).expect("a JSON frame"),
+        }
+    }
+
+    /// A gate asks its repository's gate queue: the gate class, the job it serves, and never its
+    /// requester's pool, which would start it outside that queue. Background work asks as
+    /// background and may draw on its requester's pool. The exec's scope is not on the wire, so
+    /// a host gate queues exactly as a gate in the sandbox does, and host background work does
+    /// not queue as a gate.
+    #[tokio::test]
+    async fn a_gate_asks_its_repositorys_gate_queue_and_background_work_does_not() {
+        let gate = request_frame(ExecClass::Gate).await;
+        assert_eq!(
+            (
+                &gate["op"],
+                &gate["class"],
+                &gate["job"]["repoId"],
+                &gate["job"]["jobId"]
+            ),
+            (
+                &json!("jobserver"),
+                &json!("gate"),
+                &json!("acme/widget"),
+                &json!(7)
+            ),
+            "{gate}"
+        );
+        assert!(gate.get("parentPool").is_none(), "{gate}");
+        assert!(gate.get("scope").is_none(), "{gate}");
+
+        let background = request_frame(ExecClass::Background).await;
+        assert_eq!(
+            (&background["class"], &background["parentPool"]),
+            (&json!("background"), &json!("/requester/pool.sock")),
+            "{background}"
+        );
+    }
 }
