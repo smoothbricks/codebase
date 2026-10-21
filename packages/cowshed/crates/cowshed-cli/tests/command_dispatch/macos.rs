@@ -3568,6 +3568,10 @@ async fn directory_a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed_sub
     // retires the supervisors it serves, and a supervisor retires only once its keeper's daemon
     // stopped (04_sandbox.md): shutdown returns after that stop saw the daemon exit, and the
     // daemon's plugin workers follow it out.
+    // As for w1, w2's keeper starts its daemon at the run's admission, and the start's one-token
+    // stake (05_gateway.md, "A resident's start holds one token") waits behind the run's tokens,
+    // so the record may follow the run's end.
+    eventually(|| recorded_daemon(&w2).is_some()).await;
     let kept = recorded_daemon(&w2).expect("w2's run left its kept daemon recorded");
     assert!(
         cowshed_os::process::running(kept).expect("read the daemon's state"),
