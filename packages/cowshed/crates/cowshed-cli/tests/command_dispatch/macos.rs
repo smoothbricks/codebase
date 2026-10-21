@@ -1247,6 +1247,10 @@ impl Drop for HostProcesses {
 /// process working in the workspace and one with a file of it open, both started outside
 /// cowshed. `detach`, `rm` and `rm --force` refuse before anything stops, naming each with what
 /// it holds and where, and offer no override. Once they are gone the workspace detaches.
+///
+/// The held workspace is recorded as created long ago, so `rm`'s ten-minute age floor (02_workspaces.md,
+/// `rm` step 1) passes and the holder refusal is what answers: the holder check must not depend
+/// on wall-clock age. A second workspace forked seconds ago keeps the floor's own refusal in view.
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_detach_and_rm_refuse_a_host_process_holding_the_mount() {
     let mut fixture = Fixture::directory();
@@ -1261,6 +1265,40 @@ async fn directory_detach_and_rm_refuse_a_host_process_holding_the_mount() {
         .await
         .canonicalize()
         .expect("the mount resolves");
+    let young = new_workspace(&mut service, "young-topic").await;
+    let layout = cowshed_core::storage::StorageLayout::new(
+        fixture.storage.store(),
+        &RepoId::parse("fixture/dispatch").expect("repository identity"),
+    )
+    .expect("project layout");
+    let image = layout
+        .session_image(&WorkspaceName::session("held-topic").expect("held-topic"))
+        .expect("held-topic image")
+        .image()
+        .to_owned();
+    let mut metadata = cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
+        .expect("held-topic metadata");
+    metadata.info_snapshot.created_at = "2026-01-01T00:00:00Z".to_owned();
+    metadata
+        .write_for_image(&image)
+        .expect("record held-topic as created long ago");
+    let (refused, _, stderr) = run(&mut service, ["rm", "young-topic"]).await;
+    let refusal = refused.expect_err(&format!(
+        "a workspace forked seconds ago is not removed unforced; {}",
+        String::from_utf8_lossy(&stderr)
+    ));
+    assert_eq!(refusal.code, ErrorCode::Conflict, "{refusal}");
+    assert!(
+        refusal
+            .message
+            .contains("a workspace younger than 10 minutes is not removed"),
+        "{}",
+        refusal.message
+    );
+    assert!(
+        young.join(".git/HEAD").is_file(),
+        "young-topic stays mounted"
+    );
     let head = topic.join(".git/HEAD");
     let mut host = HostProcesses(Vec::new());
     let working = host.start(&topic, None);
@@ -6156,6 +6194,18 @@ async fn real_apfs_default_land_never_signals_a_foreign_nominee_during_retiremen
 }
 
 /// An unreadable or malformed landing daemon record cannot authorize retirement or adoption.
+///
+/// The run started a host Nx daemon on the checkout, then its record was made unverifiable. Stock
+/// Nx's daemon exits once its record no longer names it (16_build_volumes.md, "The Nx daemon
+/// stays on"), but its plugin workers can outlive it: under gate load three of them still held
+/// the mount when land retired. Nothing proves such processes cowshed's. The census exempts only
+/// the supervisor's tree, its ledgered job groups and the daemon the checkout's record names
+/// *verifiably* (02_workspaces.md, "Holders cowshed does not run"), and cannot-verify is not
+/// absent. So while they hold the mount, land lands, skips adoption, and keeps the workspace,
+/// naming them. Do not "fix" this by exempting an unverifiable record: a record anyone can
+/// write would then exempt any process. The worker's lifetime is the kernel's to decide, so a
+/// stand-in host process holds the mount here, after the daemon is seen gone. Once nothing
+/// holds it the landed workspace retires.
 #[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
     let (nx, node) = repository_nx();
@@ -6177,30 +6227,84 @@ async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
         git(&topic, &["commit", "-q", "-am", "change output input"]);
         sh(&mut service, "outputs", &nx_run_many(&node, "build")).await;
         let record = topic.join(".nx/workspace-data/d/server-process.json");
-        fs::create_dir_all(record.parent().unwrap()).unwrap();
-        if record.exists() {
-            fs::remove_file(&record).unwrap();
-        }
+        let recorded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&record).expect("the run's daemon record"))
+                .expect("a daemon record");
+        let daemon = i32::try_from(
+            recorded["processId"]
+                .as_i64()
+                .expect("the record names its daemon"),
+        )
+        .expect("a pid");
+        fs::remove_file(&record).unwrap();
         if unreadable {
             fs::create_dir(&record).unwrap();
         } else {
             fs::write(&record, b"{not a daemon record").unwrap();
         }
-        let report = land(&mut service, "outputs", true, &[]).await;
-        match &report.build_volume.adoption {
-            Adoption::Skipped {
-                reason:
-                    AdoptionSkip::LandingDaemonUnverifiable {
+        // SAFETY: the null signal only asks whether the pid is still held.
+        let daemon_gone = || unsafe { libc::kill(daemon, 0) } != 0;
+        for _ in 0..200 {
+            if daemon_gone() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            daemon_gone(),
+            "the daemon exits once its record does not name it"
+        );
+        let mut workers = HostProcesses(Vec::new());
+        let worker = workers.start(&topic, None);
+        let (kept, _, stderr) = run(&mut service, ["--json", "land", "outputs"]).await;
+        let kept = kept.expect_err(&format!(
+            "a process cowshed does not run holds the mount; {}",
+            String::from_utf8_lossy(&stderr)
+        ));
+        assert_eq!(kept.code, ErrorCode::Conflict, "{kept}");
+        assert!(
+            kept.message.contains("but workspace outputs was kept")
+                && kept.message.contains("cowshed does not run")
+                && kept.message.contains(&format!("pid {worker} (")),
+            "{}",
+            kept.message
+        );
+        let skips = controller_commitments(fixture.storage.telemetry())
+            .into_iter()
+            .filter_map(|value| match value {
+                cowshed_core::api::dto::ControllerCommitment::LandOutcome(value) => {
+                    Some((value.skip, value.seeded))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        match skips.as_slice() {
+            [
+                (
+                    Some(AdoptionSkip::LandingDaemonUnverifiable {
                         record: skipped_record,
                         reason,
-                    },
-            } => {
+                    }),
+                    seeded,
+                ),
+            ] => {
                 assert_eq!(skipped_record, &record);
                 assert!(!reason.is_empty());
+                assert!(!seeded, "an unverifiable record freezes no seed");
             }
             other => panic!("an unverifiable daemon record skips adoption: {other:?}"),
         }
-        assert_ne!(report.build_volume.seed, LandSeed::Frozen, "{report:?}");
+        drop(workers);
+        let mut retired = run(&mut service, ["rm", "--force", "outputs"]).await.0;
+        for _ in 0..200 {
+            if retired.is_ok() {
+                break;
+            }
+            // SIGKILL is asynchronous, and the daemon's own workers leave on their own time.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            retired = run(&mut service, ["rm", "--force", "outputs"]).await.0;
+        }
+        retired.unwrap_or_else(|error| panic!("retire once nothing holds it: {error}"));
         drop(service);
         fixture.stop_gateway().await;
     }
