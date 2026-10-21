@@ -231,6 +231,17 @@ export function captureHangDiagnostics(
   });
 }
 
+/**
+ * Ends a probe at its limit without waiting for it. An ordinary probe runs as this user, so SIGKILL to its process group
+ * ends it and anything it started. `sudo` keeps this user's real uid but runs its command as root, which no signal from
+ * this user reaches: a group SIGKILL would end sudo alone and orphan the command. Signalled itself, sudo relays SIGTERM
+ * to its command and exits only after it. While sudo starts it holds root's real uid, and this throws EPERM.
+ */
+export function stopProbe(file: string, pid: number): void {
+  if (file === 'sudo') process.kill(pid, 'SIGTERM');
+  else process.kill(-pid, 'SIGKILL');
+}
+
 /** A probe owns its group and output pipes; its deadline never waits for an unresponsive child to reap. */
 function runProbe(
   file: string,
@@ -264,9 +275,9 @@ function runProbe(
       let killFailure = '';
       if (child.pid !== undefined) {
         try {
-          process.kill(-child.pid, 'SIGKILL');
+          stopProbe(file, child.pid);
         } catch (error) {
-          killFailure = `; probe group cleanup: ${error instanceof Error ? error.message : String(error)}`;
+          killFailure = `; probe ${file === 'sudo' ? 'stop through sudo' : 'group cleanup'}: ${error instanceof Error ? error.message : String(error)}`;
         }
       }
       finish({ status, detail: detail + killFailure, stdout, stderr });
