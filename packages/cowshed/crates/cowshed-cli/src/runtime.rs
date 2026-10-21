@@ -1013,19 +1013,19 @@ impl CliService for ActorBridge {
         )
         .await?;
         let submit = cowshed_os::timing::span("exec", "submit");
-        let gate = command.request.class == cowshed_core::api::ExecClass::Gate;
-        // The gate class is the operator's: it travels the coordinator route, which a worker
-        // capability cannot take. The parser refused a gate with a session.
-        let job = if gate {
-            self.coordinator()?.exec(&worker, command.request).await?
-        } else if let Some(session_name) = command.session.as_deref() {
-            worker
-                .shell(Some(session_name))
-                .await?
-                .run(command.request)
-                .await?
-        } else {
-            worker.exec(command.request).await?
+        // The CLI is the coordinator route (07_api.md, "CLI and API exec parity"): it holds the
+        // operator's coordinator authority, so the route is who asks, never the class asked for.
+        // A named session runs in its worker shell; the parser refused a session with a gate or
+        // --host, the two things only this route admits.
+        let job = match command.session.as_deref() {
+            Some(session_name) => {
+                worker
+                    .shell(Some(session_name))
+                    .await?
+                    .run(command.request)
+                    .await?
+            }
+            None => self.coordinator()?.exec(&worker, command.request).await?,
         };
         drop(submit);
 
@@ -5842,6 +5842,8 @@ mod tests {
             ends_on_status: bool,
             exit_code: i32,
             detached: AtomicBool,
+            /// Each exec admission: the route's method and the params it carried.
+            admissions: Mutex<Vec<(String, Value)>>,
         }
 
         impl ScriptedJob {
@@ -5851,6 +5853,7 @@ mod tests {
                     ends_on_status,
                     exit_code,
                     detached: AtomicBool::new(false),
+                    admissions: Mutex::new(Vec::new()),
                 })
             }
 
@@ -5960,7 +5963,13 @@ mod tests {
                         },
                         "grants": GrantSet::default(),
                     }))),
-                    "worker.exec" => Ok(RouterResponse::json(json!(1))),
+                    "worker.exec" | "coordinator.exec" => {
+                        self.admissions
+                            .lock()
+                            .expect("admissions")
+                            .push((method.clone(), params));
+                        Ok(RouterResponse::json(json!(1)))
+                    }
                     "job.status" => {
                         if self.ends_on_status {
                             self.end();
@@ -5987,7 +5996,8 @@ mod tests {
             }
         }
 
-        async fn connect(job: &Arc<ScriptedJob>) -> JobHandle {
+        /// The operator's coordinator over a real controller connection to `job`'s router.
+        async fn coordinator(job: &Arc<ScriptedJob>) -> Coordinator {
             let repo_id = RepoId::parse("acme/widget").expect("repo");
             let (router, mut commands) =
                 RouterHandle::channel(NonZeroUsize::new(16).expect("capacity"));
@@ -6014,8 +6024,11 @@ mod tests {
                 .await
                 .expect("handshake");
             let project = cowshed.open("/w/widget").await.expect("open");
-            let coordinator = cowshed.coordinator(&project, token).expect("coordinator");
-            let worker = coordinator.worker("main").await.expect("worker");
+            cowshed.coordinator(&project, token).expect("coordinator")
+        }
+
+        async fn connect(job: &Arc<ScriptedJob>) -> JobHandle {
+            let worker = coordinator(job).await.worker("main").await.expect("worker");
             worker
                 .exec(ExecRequest {
                     command: JobCommand::Argv(vec![CommandArg::from("build")]),
@@ -6052,6 +6065,78 @@ mod tests {
 
             fn flush(&mut self) -> io::Result<()> {
                 Ok(())
+            }
+        }
+
+        /// The CLI is the coordinator route (07_api.md, "CLI and API exec parity"): every exec
+        /// it admits travels as coordinator.exec, whatever its class, so an operator's `--host`
+        /// at the default class reaches admission as background work at the host scope. Who asks
+        /// picks the route; the class it asks for never does.
+        #[tokio::test]
+        async fn the_cli_admits_every_exec_through_the_coordinator_route() {
+            for (argv, class, scope) in [
+                (
+                    &["exec", "main", "--background", "--host", "--", "build"][..],
+                    None,
+                    Some("hostGate"),
+                ),
+                (
+                    &["exec", "main", "--background", "--", "build"][..],
+                    None,
+                    None,
+                ),
+                (
+                    &[
+                        "exec",
+                        "main",
+                        "--background",
+                        "--class",
+                        "gate",
+                        "--host",
+                        "--",
+                        "gate",
+                    ][..],
+                    Some("gate"),
+                    Some("hostGate"),
+                ),
+            ] {
+                let job = ScriptedJob::new(false, 0);
+                let mut bridge = ActorBridge {
+                    coordinator: Some(coordinator(&job).await),
+                    connection: None,
+                    runtime: None,
+                    backend: GatewayStoreBackend::Native,
+                };
+                let Command::Exec(args) = crate::args::parse_args(argv.iter().copied())
+                    .expect("arguments")
+                    .command
+                else {
+                    unreachable!("an exec invocation parses as exec");
+                };
+                let command = exec_command(args, tokio::io::empty()).expect("exec command");
+                let result = bridge
+                    .exec(
+                        command,
+                        ExecPresentation::Raw,
+                        &mut Terminal::default(),
+                        &mut Terminal::default(),
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("{argv:?} is admitted: {}", error.message));
+                assert_eq!(result.end, ExecEnd::Backgrounded, "{argv:?}");
+                let admissions = job.admissions.lock().expect("admissions").clone();
+                let [(method, params)] = admissions.as_slice() else {
+                    panic!("{argv:?} admitted one job: {admissions:?}");
+                };
+                assert_eq!(
+                    (
+                        method.as_str(),
+                        params.get("class").and_then(Value::as_str),
+                        params.get("scope").and_then(Value::as_str)
+                    ),
+                    ("coordinator.exec", class, scope),
+                    "{argv:?}"
+                );
             }
         }
 

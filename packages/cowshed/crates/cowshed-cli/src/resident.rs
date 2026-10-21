@@ -187,13 +187,9 @@ async fn run(
     let build_volume = resident.build_volume.clone();
     let incarnation = resident.authority().workspace_incarnation.clone();
     let link = JobLink::new(resident);
-    // The operator's gate is the coordinator's route, as it is through the controller.
-    let gate = request.class == cowshed_core::api::ExecClass::Gate;
-    let source = if gate {
-        cowshed_core::runtime::supervisor_socket::AdmissionSource::Coordinator
-    } else {
-        cowshed_core::runtime::supervisor_socket::AdmissionSource::Worker
-    };
+    // The CLI is the coordinator route (07_api.md, "CLI and API exec parity"), on this path as
+    // through the controller: the route is who asks, never the class asked for.
+    let source = cowshed_core::runtime::supervisor_socket::AdmissionSource::Coordinator;
 
     // Admission is where a refusal can still mean nothing ran; after it, every failure is this
     // job's and is reported, never retried through the controller.

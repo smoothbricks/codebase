@@ -1913,6 +1913,8 @@ async fn router_admits_a_gate_only_through_the_coordinator_route() {
     let host_gate = json!({"class": "gate", "want": 8, "scope": "hostGate"});
     let host_only = json!({"scope": "hostGate"});
     let interactive_host = json!({"class": "interactive", "scope": "hostGate"});
+    let resident_host = json!({"class": "resident", "scope": "hostGate"});
+    let interactive_resident_host = json!({"class": "interactive-resident", "scope": "hostGate"});
 
     for authority in [worker.clone(), coordinator(repo.clone())] {
         for (ask, class, scope) in [
@@ -1922,6 +1924,12 @@ async fn router_admits_a_gate_only_through_the_coordinator_route() {
             (
                 &interactive_host,
                 ExecClass::Interactive,
+                ExecScope::HostGate,
+            ),
+            (&resident_host, ExecClass::Resident, ExecScope::HostGate),
+            (
+                &interactive_resident_host,
+                ExecClass::InteractiveResident,
                 ExecScope::HostGate,
             ),
         ] {
