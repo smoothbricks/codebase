@@ -431,6 +431,10 @@ describe('managed raw files', () => {
     expect(watches).toBeDefined();
     expect(watches).toContain('tooling/direnv/nixpkgs-overlay/flake.nix');
     expect(watches).toContain('tooling/direnv/nixpkgs-overlay/_sources/generated.nix');
+    // A directory a devenv module reads is no file devenv hands direnv: the repository names it
+    // and the managed shell watches it, without exporting the list.
+    expect(managedEnvrc).toContain('watch_dir "$smoo_input_dir"');
+    expect(managedEnvrc).toContain('unset smoo_input_dir SMOO_SHELL_INPUT_DIRS');
     expect(module).toContain('((import ./nixpkgs-overlay/flake.nix).outputs {}).overlays.default');
     expect(module).not.toContain('inputs.nixpkgs-overlay');
     expect(yaml).not.toContain('nixpkgs-overlay:');

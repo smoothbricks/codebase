@@ -16,6 +16,16 @@ eval "$(devenv direnvrc)"
 use devenv
 popd >/dev/null
 
+# devenv hands direnv only the files its evaluation read; a directory a devenv
+# module reads whole (a source filter rooted there) is on no watch list unless
+# named. tooling/direnv/devenv.nix names such directories, relative to this
+# checkout, in SMOO_SHELL_INPUT_DIRS; each is watched here, and the variable
+# goes no further than this file.
+for smoo_input_dir in ${SMOO_SHELL_INPUT_DIRS-}; do
+  watch_dir "$smoo_input_dir"
+done
+unset smoo_input_dir SMOO_SHELL_INPUT_DIRS
+
 # Re-enter after a pull or a dependency edit; devenv's smoo:install and
 # smoo:cargo-fetch tasks then decide whether anything installs. The scripts
 # shell entry runs are not inputs devenv evaluates, so a change to one
