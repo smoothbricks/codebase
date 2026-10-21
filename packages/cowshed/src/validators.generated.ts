@@ -1091,6 +1091,12 @@ export const assertRekeyResultList = typia.createAssertEquals<readonly Api.Rekey
 export const parseRekeyResultList = (json: string): readonly Api.RekeyResult[] =>
   assertRekeyResultList(JSON.parse(json));
 
+export const assertRemovalRefusal = typia.createAssertEquals<Api.RemovalRefusal>();
+export const parseRemovalRefusal = (json: string): Api.RemovalRefusal => assertRemovalRefusal(JSON.parse(json));
+export const assertRemovalRefusalList = typia.createAssertEquals<readonly Api.RemovalRefusal[]>();
+export const parseRemovalRefusalList = (json: string): readonly Api.RemovalRefusal[] =>
+  assertRemovalRefusalList(JSON.parse(json));
+
 export const assertRemoveOptions = typia.createAssertEquals<Api.RemoveOptions>();
 export const parseRemoveOptions = (json: string): Api.RemoveOptions => assertRemoveOptions(JSON.parse(json));
 export const assertRemoveOptionsList = typia.createAssertEquals<readonly Api.RemoveOptions[]>();

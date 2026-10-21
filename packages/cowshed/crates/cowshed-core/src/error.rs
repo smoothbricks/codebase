@@ -114,6 +114,14 @@ pub struct CowshedError {
         deserialize_with = "known_to_this_build"
     )]
     stdin: Option<Box<StdinRefusal>>,
+    /// Present only on an explicit removal refused after every gate that guards work passed,
+    /// naming why. Absent from the wire otherwise, like `fence`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "known_to_this_build"
+    )]
+    removal: Option<Box<RemovalRefusal>>,
 
     /// One cold execution refusal, never two pointer slots in every Result.
     #[serde(flatten, default, deserialize_with = "known_to_this_build")]
@@ -326,6 +334,28 @@ pub enum StdinRefusal {
     DeliveryUnknown { cursor: u64 },
 }
 
+/// Why an explicit removal refused a workspace that every gate guarding its work let go
+/// (02_workspaces.md, `rm` step 1). Every variant is a `Conflict` that removed nothing.
+///
+/// Fields are additive like [`FenceRefusal`]'s; a reason a later build added decodes as no
+/// refusal (`CowshedError::removal_source` answers `None`) rather than losing the whole error.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "reason",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum RemovalRefusal {
+    /// The workspace is younger than the age floor. `created_at` is the creation time its record
+    /// carries, verbatim. `removable_at` is the first second at which the floor no longer refuses
+    /// it. It is absent when that creation time cannot be read, and then the floor keeps refusing.
+    Young {
+        created_at: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        removable_at: Option<crate::api::dto::UtcTimestamp>,
+    },
+}
+
 /// The most paths a [`FenceRefusal`] names; `total` still counts every one.
 pub const MAX_FENCE_PATHS: usize = 64;
 
@@ -496,6 +526,7 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
+            removal: None,
             execution: None,
             lifecycle_conflict: None,
         }
@@ -526,6 +557,7 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
+            removal: None,
             execution: None,
             lifecycle_conflict: Some(Box::new(conflict)),
         }
@@ -553,6 +585,7 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
+            removal: None,
             execution: None,
             lifecycle_conflict: None,
         }
@@ -582,6 +615,7 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
+            removal: None,
             execution: None,
             lifecycle_conflict: None,
         }
@@ -606,6 +640,7 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
+            removal: None,
             execution: None,
             lifecycle_conflict: None,
         }
@@ -702,6 +737,19 @@ impl CowshedError {
     ) -> Self {
         Self {
             stdin: Some(Box::new(refusal)),
+            ..Self::conflict(message, hint)
+        }
+    }
+
+    /// An explicit removal refused after every gate guarding its work passed: always a
+    /// `Conflict`, carrying the reason as [`RemovalRefusal`].
+    pub fn removal_refusal(
+        refusal: RemovalRefusal,
+        message: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
+        Self {
+            removal: Some(Box::new(refusal)),
             ..Self::conflict(message, hint)
         }
     }
@@ -848,6 +896,12 @@ impl CowshedError {
     /// Why the job's stdin refused, when this is a stdin write's or close's refusal.
     pub fn stdin_source(&self) -> Option<StdinRefusal> {
         self.stdin.as_deref().copied()
+    }
+
+    /// Why an explicit removal refused a workspace its work gates let go, when this is that
+    /// refusal.
+    pub fn removal_source(&self) -> Option<&RemovalRefusal> {
+        self.removal.as_deref()
     }
 
     pub const fn exit_code(&self) -> u8 {

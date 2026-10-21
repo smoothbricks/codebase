@@ -646,8 +646,10 @@ every clone and is not the workspace's work.
 
 A clean workspace at main reads exactly like a landed one, so `rm` also refuses a workspace younger than ten minutes —
 one whose owner may not have written in it yet — naming how long ago it was created. Remove it once it is ten minutes
-old, or keep its work with `cowshed land <ws>`; `--force` removes it now. `cowshed land` retiring the workspace it just
-landed is never refused for its age.
+old, or keep its work with `cowshed land <ws>`; `--force` removes it now. Under `--json` that refusal alone carries
+`removal: {reason: "young", createdAt, removableAt}`, where `removableAt` is the first second the age no longer refuses
+it (absent when the recorded creation cannot be read). `cowshed land` retiring the workspace it just landed is never
+refused for its age.
 
 `--abandon` has no short spelling, and it is the only way to delete unlanded commits. Before deleting, it writes a Git
 bundle of `main..HEAD` beside the retired image in `sessions/.trash/<ws>-<tip>.bundle`, keeps the bundle's tips in

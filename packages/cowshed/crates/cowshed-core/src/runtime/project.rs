@@ -16016,6 +16016,93 @@ mod removal_refusal_tests {
         );
     }
 
+    proptest::proptest! {
+        /// Whenever a creation is young, its refusal names the second the floor lets it go: the
+        /// creation plus the floor, never an instant read off the clock that asked. So a caller
+        /// that waits for the typed `removableAt` instead of the floor's value waits exactly long
+        /// enough, however young the workspace was or however far the asking clock ran ahead.
+        #[test]
+        fn a_young_refusal_names_the_second_the_floor_lets_it_go(
+            created in 0_u64..4_000_000_000,
+            age in 0_u64..YOUNG_WORKSPACE.as_secs(),
+        ) {
+            let created_at = crate::runtime::supervisor::utc_at_second(created).expect("a creation");
+            let young = YoungWorkspace::of(
+                created_at.as_str(),
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(created + age),
+            )
+            .expect("younger than the floor");
+            let refusal = removal_young_refusal(&workspace(), &young);
+            proptest::prop_assert_eq!(
+                refusal.removal_source(),
+                Some(&crate::error::RemovalRefusal::Young {
+                    created_at: created_at.as_str().to_owned(),
+                    removable_at: Some(
+                        crate::runtime::supervisor::utc_at_second(created + YOUNG_WORKSPACE.as_secs())
+                            .expect("a removable second")
+                    ),
+                })
+            );
+        }
+    }
+
+    /// Only the age floor's refusal carries the typed removal reason: every other removal refusal
+    /// guards work, so a caller that waits on `removableAt` never waits on one of those. A
+    /// creation the record does not say readably still refuses, naming no second to wait for, and
+    /// the reason survives the wire while a reason from a later build decodes as none.
+    #[test]
+    fn only_the_age_floor_refusal_names_when_the_workspace_becomes_removable() {
+        for refusal in every_removal_refusal() {
+            let young = refusal
+                .message
+                .contains("is not removed: whoever forked it");
+            assert_eq!(
+                refusal.removal_source().is_some(),
+                young,
+                "{}",
+                refusal.message
+            );
+        }
+        let unreadable = removal_young_refusal(
+            &workspace(),
+            &YoungWorkspace {
+                created_at: "not a time".to_owned(),
+                age: None,
+            },
+        );
+        assert_eq!(unreadable.code, ErrorCode::Conflict);
+        assert_eq!(
+            unreadable.removal_source(),
+            Some(&crate::error::RemovalRefusal::Young {
+                created_at: "not a time".to_owned(),
+                removable_at: None,
+            })
+        );
+        let young = removal_young_refusal(
+            &workspace(),
+            &YoungWorkspace {
+                created_at: "2026-07-14T00:00:00Z".to_owned(),
+                age: Some(std::time::Duration::from_secs(180)),
+            },
+        );
+        let wire = serde_json::to_value(&young).expect("encode");
+        assert_eq!(
+            wire["removal"],
+            serde_json::json!({
+                "reason": "young",
+                "createdAt": "2026-07-14T00:00:00Z",
+                "removableAt": "2026-07-14T00:10:00Z",
+            })
+        );
+        let decoded: CowshedError = serde_json::from_value(wire.clone()).expect("decode");
+        assert_eq!(decoded.removal_source(), young.removal_source());
+        let mut later = wire;
+        later["removal"] = serde_json::json!({ "reason": "aLaterBuildsReason" });
+        let decoded: CowshedError = serde_json::from_value(later).expect("decode a later build");
+        assert_eq!(decoded.removal_source(), None);
+        assert_eq!(decoded.message, young.message);
+    }
+
     /// The regression that produced this gate: a refusal that prescribed `--force` taught
     /// coordinator scripts to retry with it, and the retry destroyed unlanded work. A refusal may
     /// never name the flag that overrides it — the flags are documented in `cowshed rm`'s usage
@@ -19682,6 +19769,17 @@ impl YoungWorkspace {
             }),
         }
     }
+
+    /// The first second the floor no longer refuses this workspace: its readable creation plus
+    /// [`YOUNG_WORKSPACE`]. `None` when the creation cannot be read, which the floor never lets
+    /// go, or when that second has no timestamp this API can spell.
+    fn removable_at(&self) -> Option<crate::api::dto::UtcTimestamp> {
+        let created = crate::api::dto::UtcTimestamp::new(self.created_at.as_str()).ok()?;
+        let second = u64::try_from(created.epoch_seconds())
+            .ok()?
+            .checked_add(YOUNG_WORKSPACE.as_secs())?;
+        super::supervisor::utc_at_second(second).ok()
+    }
 }
 
 /// What a removal's gates authorized: the commits an abandonment bundles, and, when forced, every
@@ -19727,7 +19825,11 @@ fn removal_young_refusal(workspace: &WorkspaceName, young: &YoungWorkspace) -> C
         Some(age) => format!("{} minutes ago", age.as_secs() / 60),
         None => String::from("at a time its record does not say readably"),
     };
-    CowshedError::conflict(
+    CowshedError::removal_refusal(
+        crate::error::RemovalRefusal::Young {
+            created_at: young.created_at.clone(),
+            removable_at: young.removable_at(),
+        },
         format!(
             "workspace {workspace} was created {age} ({}), and a workspace younger than {floor} \
              minutes is not removed: whoever forked it may not have written its first edit yet, \

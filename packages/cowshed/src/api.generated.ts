@@ -517,6 +517,11 @@ export type CowshedError = {
    * where that input stands. Absent from the wire otherwise, like `fence`.
    */
   readonly stdin?: StdinRefusal;
+  /**
+   * Present only on an explicit removal refused after every gate that guards work passed,
+   * naming why. Absent from the wire otherwise, like `fence`.
+   */
+  readonly removal?: RemovalRefusal;
 } & {
   readonly cpuAdmission?: CpuAdmissionRefusal;
 } & {
@@ -2315,6 +2320,18 @@ export type RekeyResult = {
    * The consumed quarantine entry, when the quarantine path ran.
    */
   readonly tombstoneRemoved?: string;
+};
+
+/**
+ * Why an explicit removal refused a workspace that every gate guarding its work let go
+ * (02_workspaces.md, `rm` step 1). Every variant is a `Conflict` that removed nothing.
+ *
+ * Fields are additive like [`FenceRefusal`]'s; a reason a later build added decodes as no
+ * refusal (`CowshedError::removal_source` answers `None`) rather than losing the whole error.
+ */
+export type RemovalRefusal = { readonly reason: 'young' } & {
+  readonly createdAt: string;
+  readonly removableAt?: UtcTimestamp;
 };
 
 /**
