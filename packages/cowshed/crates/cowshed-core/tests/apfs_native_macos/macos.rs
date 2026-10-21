@@ -1298,6 +1298,7 @@ fn gc_reclaims_abandon_bundles_only_under_the_abandoned_sweep() {
 fn sparse_images_and_their_sidecars_are_invisible_to_recovery_listing_and_gc() {
     let fixture = Fixture::new("sparse-leftovers");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    adopt_owner(&layout);
     let main = layout.main_image().expect("main");
     create_image(main.image());
     let sparse_sidecar = |workspace: WorkspaceName| {
@@ -4254,6 +4255,7 @@ fn interrupted_restore_image_publication(
     DetachedWorkspaceMetadata,
 ) {
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    adopt_owner(&layout);
     let canonical = layout.main_image().expect("canonical").image().to_owned();
     let staged = layout
         .project()
@@ -4404,6 +4406,7 @@ fn an_imageless_sibling_publication_is_reconciled_instead_of_failing_every_other
 fn a_keyless_staged_session_image_is_left_to_gc_instead_of_failing_every_verb() {
     let fixture = Fixture::new("staging-keyless-session");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    adopt_owner(&layout);
 
     let live = WorkspaceName::new("session-live").expect("live session");
     let live_canonical = layout.session_image(&live).expect("live canonical");
@@ -4833,6 +4836,7 @@ fn checkpoint_pin_facts_survive_restart_and_gc_prunes_only_old_automatic_excess(
 fn recovery_ignores_unscoped_and_non_internal_restore_lookalikes() {
     let fixture = Fixture::new("restore-lookalikes");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    adopt_owner(&layout);
     let canonical = layout.main_image().expect("canonical");
     create_image(canonical.image());
     std::fs::write(canonical.image(), b"live generation").expect("canonical");
@@ -4924,6 +4928,7 @@ fn recovery_rejects_a_non_directory_store_root_and_ignores_file_children() {
 fn recovery_never_publishes_metadata_without_its_staged_image() {
     let fixture = Fixture::new("sidecar-without-image");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    adopt_owner(&layout);
     let canonical = layout.main_image().expect("canonical");
     let staged = layout
         .project()
@@ -5008,6 +5013,7 @@ fn host_controller_restore_recovery_rejects_published_new_image_with_old_ca_key(
 fn host_controller_recovery_rolls_back_when_published_metadata_is_missing() {
     let fixture = Fixture::new("published-metadata-missing");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    adopt_owner(&layout);
     let canonical = layout.main_image().expect("canonical");
     let staged = layout
         .project()
@@ -5198,6 +5204,7 @@ fn host_controller_stateless_restore_recovery_converges_each_publication_boundar
     ] {
         let fixture = Fixture::new(&format!("stateless-restore-{failpoint:?}"));
         let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+        adopt_owner(&layout);
         let canonical = layout.main_image().expect("canonical");
         let staged = layout
             .project()
@@ -5358,6 +5365,7 @@ fn host_controller_stateless_restore_recovery_converges_each_publication_boundar
 fn host_controller_restore_recovery_selects_current_undo_generation_among_older_history() {
     let fixture = Fixture::new("restore-current-undo-generation");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    adopt_owner(&layout);
     let canonical = layout.main_image().expect("canonical");
     let first_destination =
         WorkspaceIncarnation::new("00000000000000000000000000000002").expect("first destination");
@@ -5613,6 +5621,7 @@ fn host_controller_restore_recovery_selects_current_undo_generation_among_older_
 fn retired_workspace_restart_ignores_multiple_retained_restore_generations() {
     let fixture = Fixture::new("retired-repeated-restore-history");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    adopt_owner(&layout);
     let workspace_name = WorkspaceName::session("raven").expect("workspace");
     let canonical = layout.session_image(&workspace_name).expect("canonical");
     let original = WorkspaceIncarnation::new("00000000000000000000000000000001").expect("original");
