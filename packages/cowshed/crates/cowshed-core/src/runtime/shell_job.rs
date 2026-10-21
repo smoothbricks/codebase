@@ -1515,15 +1515,17 @@ impl HostActivator {
         let mount = self.workspace_mount.display();
         match written {
             Ok(Certification::NotAttempted(NotAttempted::NothingInherited)) => {}
-            Ok(Certification::NotAttempted(NotAttempted::KeyMoved)) => eprintln!(
+            Ok(Certification::NotAttempted(NotAttempted::KeyMoved)) => cowshed_os::eprintln!(
                 "cowshed: the workspace shell of {mount} could not check its origin's export: its \
                  evaluation read other input bytes than the record keyed"
             ),
-            Ok(Certification::NotAttempted(NotAttempted::BaselineMoved { name })) => eprintln!(
-                "cowshed: the workspace shell of {mount} could not check its origin's export: it \
+            Ok(Certification::NotAttempted(NotAttempted::BaselineMoved { name })) => {
+                cowshed_os::eprintln!(
+                    "cowshed: the workspace shell of {mount} could not check its origin's export: it \
                  ran over another baseline environment than the record keyed ({name} differs)"
-            ),
-            Ok(Certification::Certified { origin }) => eprintln!(
+                )
+            }
+            Ok(Certification::Certified { origin }) => cowshed_os::eprintln!(
                 "cowshed: the workspace shell of {mount} certified its origin's export at another root{}",
                 match origin {
                     Origin::Updated => "; clones of either adopt it".to_owned(),
@@ -1536,12 +1538,12 @@ impl HostActivator {
                     }
                 }
             ),
-            Ok(Certification::Differs { name }) => eprintln!(
+            Ok(Certification::Differs { name }) => cowshed_os::eprintln!(
                 "cowshed: the workspace shell of {mount} exports {name} differently from its origin's \
                  after the move (a value derived from the checkout path, not a path in it); its \
                  producer is not certified and clones evaluate their own"
             ),
-            Err(reason) => eprintln!(
+            Err(reason) => cowshed_os::eprintln!(
                 "cowshed: the workspace shell's export is not left for clones of {mount} ({reason}); \
                  each clone evaluates its own"
             ),
@@ -1743,7 +1745,7 @@ pub(super) fn stage_host_executable(mount: &Path, program: &ShellHostProgram) ->
                 && is_staged_name(&file_name.to_string_lossy())
                 && let Err(error) = std::fs::remove_file(entry.path())
             {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: cannot remove the superseded exec host {}: {error}",
                     entry.path().display()
                 );

@@ -3926,7 +3926,7 @@ mod tests {
                     // The unwinding test already reports its own failure; a second panic would
                     // abort it.
                     Err(error) if std::thread::panicking() => {
-                        eprintln!("remove probe entry {}: {error}", path.display());
+                        cowshed_os::eprintln!("remove probe entry {}: {error}", path.display());
                     }
                     Err(error) => panic!("remove probe entry {}: {error}", path.display()),
                 }
