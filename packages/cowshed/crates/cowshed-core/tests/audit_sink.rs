@@ -556,12 +556,13 @@ fn a_group_is_one_segment_of_consecutive_orders_synced_at_its_strongest_durabili
 
 #[test]
 fn a_group_holds_at_most_group_records() {
+    let limit = u64::try_from(GROUP_RECORDS).expect("a group's record limit fits in u64");
     let mut group = CommitmentGroup::one(admission(1));
-    for job in 2..=GROUP_RECORDS {
-        group.try_push(Box::new(admission(job as u64))).unwrap();
+    for job in 2..=limit {
+        group.try_push(Box::new(admission(job))).unwrap();
     }
     assert_eq!(group.len(), GROUP_RECORDS);
-    let over = Box::new(admission(GROUP_RECORDS as u64 + 1));
+    let over = Box::new(admission(limit + 1));
     assert_eq!(group.try_push(over.clone()), Err(over));
 }
 
