@@ -120,8 +120,14 @@ impl<'a> JobserverRequest<'a> {
     /// One background token held while a shell activates, before a command exists to use it
     /// (05_gateway.md "A resident holds no token"; 11_shell.md, spare): a resident's start, or a
     /// shell pool's spare. It names no job and asks for no pool; the gateway answers `tokens: 1`
-    /// and a fifo nobody reads, and the token returns when the connection closes.
-    pub const fn activation(checkout: &'a str, command: &'a str) -> Self {
+    /// and a fifo nobody reads, and the token returns when the connection closes. A start under a
+    /// holder names the holder's live pool as `parent_pool`, and whichever of that pool and the host
+    /// ledger grants first serves it (05_gateway.md "Work a holder starts draws on its grant").
+    pub const fn activation(
+        checkout: &'a str,
+        command: &'a str,
+        parent_pool: Option<&'a str>,
+    ) -> Self {
         Self {
             op: JOBSERVER_OP,
             want: NonZeroUsize::MIN,
@@ -130,7 +136,7 @@ impl<'a> JobserverRequest<'a> {
             class: JobserverClass::Background,
             pool: false,
             job: None,
-            parent_pool: None,
+            parent_pool,
         }
     }
 }

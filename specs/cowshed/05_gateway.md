@@ -1080,6 +1080,19 @@ core count.
     ends before its command starts returns the stake with its grant. The same stake bounds a shell pool's spare
     (11_shell.md, "One spare and a SIEVE cache"). The ledger knows no partial return, so the stake is its own one-token
     grant rather than a count the resident's pool would later give back.
+  - **A kept daemon a land waits on starts as the land's gate task** (2026-10-21). A start under a holder names the
+    holder's pool as the stake's `parentPool`, and the stake waits on that pool and the host ledger at once ("Work a
+    holder starts draws on its grant"). The keeper's start (04_sandbox.md) has such a holder while its shed's supervisor
+    runs a gate job, the oldest one if several: a land's gate, or its rebase's task-hash job. A land resets the shed's
+    daemon and waits for its successor before its first gate, so that start is work the land waits on, and a land's own
+    work never contests the background room ("A land is a gate job"). The stake drawn on the gate's pool is asked of the
+    host at the gate's rank, as the gate's tasks are. A shed running no gate job asks the host alone, as background.
+    Measured 2026-10-21: a land's rebase ran its task-hash job in an idle shed, and the keeper asked its start at once.
+    Its background stake waited 324 s behind another repository's land and background tests, while the land waited 60 s
+    for the daemon and gave up. Over the same gateway log, 361 of 510 kept daemons' stakes waited 0 s, the median was 0
+    s, p90 34 s, p99 208 s, the longest 852 s, and 31 (6.1%) waited more than 60 s: a background stake waits as long as
+    background's room stays full, so no fixed wait bounds it. A land that runs its daemon reset and that wait as one
+    gate job waits for the daemon with no deadline.
   - **CPU pool retirement.** Pool retirement unlinks its endpoint before closing its listener. It drains the kernel
     accept queue, not merely the runtime's readiness cache, and answers queued and already accepted connections with
     `{"ok":false,"code":"pool-retired","error":"the CPU pool owner's lease ended"}` followed by EOF. A new connection

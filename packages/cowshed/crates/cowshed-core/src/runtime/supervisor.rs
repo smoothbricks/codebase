@@ -374,6 +374,7 @@ impl JobCpuAdmission for ImmediateCpu {
         &self,
         _checkout: PathBuf,
         _command: String,
+        _parent: Option<String>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<super::job_cpu::ActivationStake>> + Send>>
     {
         Box::pin(async { Ok(super::job_cpu::ActivationStake::new(Box::new(()))) })
@@ -5463,16 +5464,19 @@ impl SupervisorActor {
         // Off the actor's path: the actor keeps serving every command while the gateway queues
         // the request. Dropping the request -- an abort, or this supervisor ending -- closes its
         // connection, which leaves the queue. A resident holds no token for its life, but its
-        // shell's activation is work: it first waits for one background token, which it holds
-        // until its command starts (05_gateway.md "A resident holds no token").
+        // shell's activation is work: it first waits for one token, which it holds until its
+        // command starts, drawing on the requester's pool when it names one (05_gateway.md "A
+        // resident's start holds one token").
         let asking = {
             let class = scheduling.class();
             let checkout = self.workspace_root.clone();
             let command = command_label(&info.command);
             let start = match class {
-                ExecClass::Resident | ExecClass::InteractiveResident => {
-                    Some(self.cpu.activation(checkout.clone(), command.clone()))
-                }
+                ExecClass::Resident | ExecClass::InteractiveResident => Some(self.cpu.activation(
+                    checkout.clone(),
+                    command.clone(),
+                    cpu_parent.clone(),
+                )),
                 ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => None,
             };
             let ask = self.cpu.admit(JobCpuAsk {
@@ -5774,6 +5778,21 @@ impl SupervisorActor {
         }
     }
 
+    /// The CPU pool of the oldest gate job this supervisor runs: a land's gate or its rebase's
+    /// task-hash job, whose tasks ask the host through that pool at the gate's rank. A kept daemon's
+    /// start draws its stake on it (05_gateway.md "A resident's start holds one token"), since the
+    /// land waits on that daemon; with no gate running, the start asks the host as background.
+    fn gate_pool(&self) -> Option<String> {
+        self.jobs
+            .values()
+            .find_map(|job| match (job.info.class, &job.cpu) {
+                (ExecClass::Gate, CpuStanding::Granted { grant }) => {
+                    Some(grant.pool().to_string_lossy().into_owned())
+                }
+                _ => None,
+            })
+    }
+
     fn current_build_volume_grant(&self) -> Result<Option<PathBuf>> {
         match &self.build_volume_layout {
             Some(layout) => layout.grant(&self.authority.workspace, &self.workspace_root),
@@ -5869,17 +5888,19 @@ impl SupervisorActor {
             return;
         };
         let authority = self.authority.clone();
+        let gate_pool = self.gate_pool();
         let started = match self.current_build_volume_grant() {
             // The keeper is the supervisor's own coordinator-side work.
             Ok(grant) => {
-                // The keeper is a resident: it holds no token and has no requester's pool.
+                // The keeper is a resident: it holds no token. A land waits on its daemon, so while
+                // the shed runs a gate job its start's stake draws on that gate's pool.
                 self.admit_exec(
                     authority,
                     None,
                     grant,
                     request,
                     AdmissionSource::Coordinator,
-                    None,
+                    gate_pool,
                 )
                 .await
             }

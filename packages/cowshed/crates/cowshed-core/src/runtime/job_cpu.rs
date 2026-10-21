@@ -50,11 +50,15 @@ pub trait JobCpuAdmission: Send + Sync + fmt::Debug + 'static {
     /// One background token for a shell activation that has no command yet to use it -- a
     /// resident's start, or a shell pool's spare (05_gateway.md "A resident holds no token";
     /// 11_shell.md, spare) -- for `checkout`, `command` naming what activates. It waits as any
-    /// background ask does, and the token returns when the stake drops.
+    /// background ask does, and the token returns when the stake drops. `parent`, a holder's live
+    /// CPU pool, is asked alongside the host ledger, and the first grant serves the stake
+    /// (05_gateway.md "Work a holder starts draws on its grant", "A resident's start holds one
+    /// token").
     fn activation(
         &self,
         checkout: PathBuf,
         command: String,
+        parent: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<ActivationStake>> + Send>>;
 }
 
@@ -442,12 +446,14 @@ impl JobCpuAdmission for GatewayJobCpu {
         &self,
         checkout: PathBuf,
         command: String,
+        parent: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<ActivationStake>> + Send>> {
         let socket = Arc::clone(&self.socket);
         Box::pin(async move {
             let frame = serde_json::to_vec(&JobserverRequest::activation(
                 &checkout.to_string_lossy(),
                 wire_command(&command),
+                parent.as_deref(),
             ));
             let line = request_line(frame)?;
             let (granted, connection) = exchange_across_install(&socket, &line).await?;
@@ -857,7 +863,11 @@ mod tests {
             ],
         );
         let stake = GatewayJobCpu::new(socket)
-            .activation(PathBuf::from("/abs/checkout"), "cargo test".to_owned())
+            .activation(
+                PathBuf::from("/abs/checkout"),
+                "cargo test".to_owned(),
+                None,
+            )
             .await
             .expect("the retry is granted");
         drop(stake);

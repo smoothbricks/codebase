@@ -2605,6 +2605,7 @@ impl cowshed_core::runtime::job_cpu::JobCpuAdmission for GrantingCpu {
         &self,
         _checkout: PathBuf,
         _command: String,
+        _parent: Option<String>,
     ) -> std::pin::Pin<
         Box<dyn Future<Output = Result<cowshed_core::runtime::job_cpu::ActivationStake>> + Send>,
     > {

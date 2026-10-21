@@ -503,6 +503,7 @@ impl JobCpuAdmission for ImmediateCpu {
         &self,
         _checkout: PathBuf,
         _command: String,
+        _parent: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<ActivationStake>> + Send>> {
         Box::pin(async { Ok(ActivationStake::new(Box::new(()))) })
     }
@@ -524,10 +525,11 @@ struct CpuRequest {
     released: tokio::sync::oneshot::Receiver<()>,
 }
 
-/// One activation stake asked of a [`ScriptedCpu`]: what activates, the test's answer, and the
-/// stake's return to the budget.
+/// One activation stake asked of a [`ScriptedCpu`]: what activates, the holder's pool it draws
+/// on, the test's answer, and the stake's return to the budget.
 struct StakeRequest {
     command: String,
+    parent: Option<String>,
     answer: tokio::sync::oneshot::Sender<Result<()>>,
     released: tokio::sync::oneshot::Receiver<()>,
 }
@@ -586,6 +588,7 @@ impl JobCpuAdmission for ScriptedCpu {
         &self,
         _checkout: PathBuf,
         command: String,
+        parent: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<ActivationStake>> + Send>> {
         let stakes = self.stakes.clone();
         Box::pin(async move {
@@ -597,6 +600,7 @@ impl JobCpuAdmission for ScriptedCpu {
             stakes
                 .send(StakeRequest {
                     command,
+                    parent,
                     answer,
                     released,
                 })
@@ -6859,6 +6863,71 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
     h.handle.wait(second.request.job_id).await.unwrap();
 }
 
+/// A land resets its shed's Nx daemon and waits for the kept successor before its first gate, so while
+/// the shed runs a gate job the keeper's start is that gate's work: its start stake draws on the
+/// gate job's pool, where it is ranked as one of the gate's tasks, and only an idle shed's start
+/// asks the host alone as background (05_gateway.md "A resident's start holds one token").
+/// Measured 2026-10-21: a land's rebase ran its gate-class task-hash job in
+/// an idle shed, the keeper asked its start at once, and the start's background stake waited 324 s
+/// behind other work while the land waited on the daemon and gave up.
+#[tokio::test(start_paused = true)]
+async fn a_kept_daemons_start_draws_on_the_gate_job_its_shed_runs() {
+    let (config, _root) = nx_project("land");
+    let (requests, mut asked) = mpsc::unbounded_channel();
+    let (stakes, mut staked) = mpsc::unbounded_channel();
+    let config = WorkspaceSupervisorConfig {
+        cpu: Arc::new(ScriptedCpu {
+            requests,
+            stakes: Some(stakes),
+        }),
+        ..config
+    };
+    let mut h = harness_with_config(config, 1, 1024, false, false);
+    let idle = staked
+        .recv()
+        .await
+        .expect("the keeper's first start asks its stake");
+    assert_eq!(
+        idle.parent, None,
+        "an idle shed's start asks the host alone"
+    );
+
+    let gate_job = h
+        .handle
+        .exec(
+            None,
+            None,
+            gate(request(StdinSource::Empty)),
+            AdmissionSource::Coordinator,
+        )
+        .await
+        .expect("the land's gate is admitted");
+    let gate_cpu = asked.recv().await.expect("the gate asks its tokens");
+    assert_eq!(gate_cpu.ask.class, ExecClass::Gate);
+    gate_cpu.answer.send(Ok(NonZeroUsize::MIN)).unwrap();
+    let gate_spawned = h.spawned.recv().await.expect("the gate runs");
+
+    // The idle start is refused, so the keeper's next probe starts again, now under the gate.
+    idle.answer
+        .send(Err(CowshedError::conflict("the host is full", "wait")))
+        .unwrap();
+    let under_gate = staked
+        .recv()
+        .await
+        .expect("the keeper starts again while the gate runs");
+    assert_eq!(
+        under_gate.parent.as_deref(),
+        Some(TEST_POOL),
+        "the start a land waits on draws on the land's gate pool"
+    );
+    under_gate
+        .answer
+        .send(Err(CowshedError::conflict("the test ends", "none")))
+        .unwrap();
+    complete(&gate_spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(gate_job).await.unwrap();
+}
+
 /// A foreground keeper is an ordinary owned job for draining, not developer activity. Even before
 /// its socket is ready, quiescing an otherwise idle workspace stops that exact job and waits for it.
 #[tokio::test(start_paused = true)]
@@ -8422,6 +8491,7 @@ async fn admit_resident(
         .expect("answered at admission");
     let StakeRequest {
         command,
+        parent,
         answer,
         released: stake_released,
     } = staked
@@ -8429,6 +8499,10 @@ async fn admit_resident(
         .await
         .expect("the resident asks its start stake");
     assert!(!command.is_empty(), "the stake names what activates");
+    assert_eq!(
+        parent, None,
+        "a coordinator's resident draws on no holder's pool"
+    );
     assert!(
         asked.try_recv().is_err(),
         "no pool is asked before the stake is held"

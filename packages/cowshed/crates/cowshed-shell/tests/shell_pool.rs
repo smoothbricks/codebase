@@ -95,6 +95,7 @@ impl JobCpuAdmission for GrantingCpu {
         &self,
         _checkout: PathBuf,
         command: String,
+        _parent: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<ActivationStake>> + Send>> {
         let stakes = self.stakes.clone();
         Box::pin(async move {

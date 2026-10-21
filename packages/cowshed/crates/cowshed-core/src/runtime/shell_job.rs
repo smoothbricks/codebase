@@ -1377,6 +1377,7 @@ impl Activator for HostActivator {
                     .activation(
                         self.workspace_mount.clone(),
                         format!("shell spare activation in {}", self.home().display()),
+                        None,
                     )
                     .await
                 {

@@ -1098,6 +1098,7 @@ async fn an_activation_stake_holds_one_background_token_until_it_drops() {
         .activation(
             PathBuf::from("/w/keeper"),
             "shell spare activation in /w/keeper".to_owned(),
+            None,
         )
         .await
         .expect("the stake is granted");
@@ -1115,6 +1116,68 @@ async fn an_activation_stake_holds_one_background_token_until_it_drops() {
     drop(stake);
     // The ledger sends no change notification: read it until the return shows. A return that
     // never comes is a hang, which the leg's no-progress backstop decides, never a count here.
+    while ledger(&socket).await.held != 0 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    gateway.drain().await.expect("drain");
+}
+
+/// A kept Nx daemon's start that a land waits on is one of the land's gate tasks (05_gateway.md
+/// "A resident's start holds one token"). Measured 2026-10-21: the keeper asked
+/// its start's stake of the host as background while another repository's gate and background
+/// tests filled background's room. The stake waited 324 s, and the land, waiting on the daemon,
+/// gave up. Here background holds its whole room: the stake asked of the host alone queues behind
+/// it, and the same stake drawn on the land's gate pool is granted at once from the gate's half.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kept_daemons_start_drawn_on_a_lands_gate_pool_is_granted_while_background_is_full() {
+    use cowshed_core::runtime::job_cpu::{GatewayJobCpu, JobCpuAdmission as _};
+
+    let (gateway, _root, socket) = gateway(4).await;
+    let (gate, pool) = Asker::gate_job(&socket, "/w/land").await;
+    let mut background = Asker::ask(&socket, 2, "/w/tests").await;
+    assert_eq!(background.granted().await, 2);
+    let admission = GatewayJobCpu::new(socket.clone());
+    let start = "node /w/land/node_modules/nx/dist/src/daemon/server/start.js --kept";
+    // Asked of the host alone, as the keeper asked it before: it queues behind background's room.
+    let mut alone =
+        Box::pin(admission.activation(PathBuf::from("/w/land"), start.to_owned(), None));
+    loop {
+        tokio::select! {
+            granted = &mut alone => panic!("background had no room left: {granted:?}"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        if ledger(&socket)
+            .await
+            .background
+            .iter()
+            .any(|stake| stake.checkout == "/w/land" && !stake.waiters.is_empty())
+        {
+            break;
+        }
+    }
+    // Drawn on the land's gate pool, it is one of the gate's tasks: granted the host's free token
+    // while background's room stays full.
+    let stake = admission
+        .activation(
+            PathBuf::from("/w/land"),
+            start.to_owned(),
+            Some(pool.to_string_lossy().into_owned()),
+        )
+        .await
+        .expect("the land's gate pool grants the start");
+    assert_eq!(
+        ledger(&socket).await.held,
+        4,
+        "the gate's, background's two and the start's"
+    );
+    // Its host ask was withdrawn when the pool won: only the host-alone stake still waits.
+    waiters_reach(&socket, "/w/land", 1).await;
+    drop(stake);
+    drop(background);
+    let alone = alone
+        .await
+        .expect("the host-alone stake is granted once background returns its room");
+    drop((alone, gate));
     while ledger(&socket).await.held != 0 {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
