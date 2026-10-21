@@ -7175,8 +7175,12 @@ impl SupervisorActor {
             end_job_stdin(job);
             return Ok(());
         }
+        // A command not yet born -- its warm host still activating outside the job's cgroup, or
+        // its placement pending -- has not entered the cgroup, so an empty membership proves
+        // nothing about it. Its JobControl signals the activation host, or replays the signal
+        // once the command is placed; retirement waits for the birth, as on macOS.
         #[cfg(target_os = "linux")]
-        if job.cgroup.is_some() {
+        if job.cgroup.is_some() && job.birth.is_some() {
             self.retire_membership(job_id);
             return Ok(());
         }

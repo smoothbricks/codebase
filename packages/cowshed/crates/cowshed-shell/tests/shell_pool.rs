@@ -1238,6 +1238,41 @@ fn micros(earlier: std::time::Instant, later: std::time::Instant) -> u64 {
     u64::try_from(later.duration_since(earlier).as_micros()).expect("micros")
 }
 
+/// A job cancelled while its cold host activates for it ends Killed and its command never runs.
+/// Nothing of the command is born yet, so no membership can prove it ended: the kill reaches the
+/// activation through the job's control instead of an empty membership read.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_job_cancelled_while_its_host_activates_never_runs_its_command() {
+    let workspace = Workspace::new("shell-pool-activation-cancel", 41_488);
+    let tmp = workspace.sandbox.exec_temp_dir.clone();
+    for name in ["activation-pid", "activation-hold"] {
+        fifo(&tmp.join(name));
+    }
+    workspace.envrc(
+        "printf '%s\\n' $$ > \"$TMPDIR/activation-pid\"\nread _ < \"$TMPDIR/activation-hold\"\n",
+    );
+    let handle = workspace.supervisor(false);
+    let job = handle
+        .exec(
+            None,
+            None,
+            sh("printf ran > command-ran"),
+            AdmissionSource::Worker,
+        )
+        .await
+        .expect("admit");
+    // The activation runs, held on its FIFO; no command of the job exists yet.
+    read_pid(&tmp.join("activation-pid")).await;
+    handle.kill(job).await.expect("kill the activating job");
+    let info = handle.wait(job).await.expect("the cancelled job ends");
+    assert_eq!(info.state, JobState::Killed, "{info:?}");
+    assert!(
+        !workspace.mount().join("command-ran").exists(),
+        "a job cancelled while activating ran its command"
+    );
+}
+
 /// A cold host's activation is its job's first process: the job is sampled while the activation
 /// runs, led by the activation's group, and the command's group takes the lead when it starts.
 /// The activation's spawn stays the wall baseline, and the terminal sample is the sealed one.
