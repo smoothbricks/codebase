@@ -2361,7 +2361,7 @@ mod tests {
 
     /// Consumes the real existing pinned Nx product through the same adapter as production.
     #[test]
-    #[ignore = "unsandboxed host-controller RAW/Nx compatibility proof; run with `nx run cowshed:host-controller-test`; requires the existing patched-nx product"]
+    #[ignore = "unsandboxed host-controller RAW/Nx compatibility proof; run with `nx run cowshed:host-controller-test`; requires the checkout's Bun-installed patched Nx"]
     fn host_controller_raw_carry_opens_restores_stores_and_evicts_with_native_nx() {
         use cowshed_os::fork_lock::Run as _;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -2399,9 +2399,9 @@ mod tests {
             "copy source and destination must be separate mounted RAW volumes"
         );
         let product = checkout
-            .join(".cache/patched-nx/node_modules/nx")
+            .join("node_modules/nx")
             .canonicalize()
-            .expect("the existing patched-nx producer must supply the product");
+            .expect("install the pinned Bun-patched Nx before the RAW carry proof");
         for root in [&from, &into] {
             fs::write(
                 root.join("package.json"),
@@ -2477,10 +2477,16 @@ main().catch(error => { console.error(error); process.exitCode = 1; });
         let script = super::super::cache_adapter::script(BODY);
         let script = std::str::from_utf8(&script).unwrap();
         let run = |root: &Path, phase: &str| {
-            let output = Command::new("node")
-                .args(["-e", script])
-                .arg(root)
-                .arg(phase)
+            let mut command = Command::new("node");
+            command.args(["-e", script]).arg(root).arg(phase);
+            // The host shell's Nx environment is not this proof's: its NX_MAX_CACHE_SIZE outranks
+            // the nx.json maxCacheSize the verify phase evicts with (Nx resolveMaxCacheSize).
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("NX_") || key == "CI" {
+                    command.env_remove(key);
+                }
+            }
+            let output = command
                 .env("NX_SKIP_NATIVE_FILE_CACHE", "true")
                 .output_locked()
                 .expect("spawn real Node with the accepted Nx product");

@@ -582,18 +582,6 @@
           },
           {
             "projects": [
-              "@smoothbricks/codebase"
-            ],
-            "target": "patched-nx"
-          },
-          {
-            "projects": [
-              "@smoothbricks/codebase"
-            ],
-            "target": "patched-nx-bindings"
-          },
-          {
-            "projects": [
               "nx-cache-server"
             ],
             "target": "bundle"
