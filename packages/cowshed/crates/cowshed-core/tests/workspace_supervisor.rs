@@ -3056,15 +3056,42 @@ fn a_dropped_supervisor_ends_the_jobs_it_still_runs() {
     drop(spawned);
 }
 
+/// A Unix socket path in a private directory of its own, short because a socket path is bounded
+/// at 104 bytes on macOS. The directory goes with its owner on every exit path, panics included,
+/// so no test leaves an entry in `/tmp`.
+struct SocketPath {
+    path: PathBuf,
+    _directory: TempRoot,
+}
+
+impl SocketPath {
+    fn new() -> Self {
+        let directory = TempRoot::new_in(Path::new("/tmp"), "cowshed-sock");
+        Self {
+            path: directory.join("s"),
+            _directory: directory,
+        }
+    }
+}
+
+impl std::ops::Deref for SocketPath {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for SocketPath {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
 /// `handle`'s supervisor served on a fresh socket, and a handle that reaches it only through
 /// that socket.
-async fn served(handle: &WorkspaceSupervisorHandle) -> (WorkspaceSupervisorHandle, PathBuf) {
+async fn served(handle: &WorkspaceSupervisorHandle) -> (WorkspaceSupervisorHandle, SocketPath) {
     use cowshed_core::runtime::supervisor_socket;
-    // Short: a Unix socket path is bounded at 104 bytes on macOS.
-    let path = PathBuf::from("/tmp").join(format!(
-        "cowshed-sock-{}/s",
-        &uuid::Uuid::new_v4().simple().to_string()[..12]
-    ));
+    let path = SocketPath::new();
     let listener = supervisor_socket::bind(&path).await.expect("bind");
     tokio::spawn(supervisor_socket::serve(
         listener,
@@ -4335,7 +4362,7 @@ async fn a_served_supervisor_refuses_a_caller_that_holds_another_authority() {
     let (mut h, _root) = harness(1, 1024, false, false);
     let (_remote, path) = served(&h.handle).await;
     let stale = cowshed_core::runtime::supervisor_socket::connect(
-        path,
+        path.to_path_buf(),
         WorkspaceAuthoritySnapshot {
             grant_revision: authority().grant_revision + 1,
             ..authority()
@@ -4406,10 +4433,7 @@ async fn a_supervisor_of_another_build_is_refused_by_name() {
             "is cowshed build (unnamed)",
         ),
     ] {
-        let path = PathBuf::from("/tmp").join(format!(
-            "cowshed-sock-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
+        let path = SocketPath::new();
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -4426,7 +4450,6 @@ async fn a_supervisor_of_another_build_is_refused_by_name() {
         let refused = cowshed_core::runtime::supervisor_socket::hello(&path)
             .await
             .unwrap_err();
-        std::fs::remove_file(&path).ok();
         assert_eq!(refused.code, ErrorCode::Conflict);
         assert!(refused.message.contains(named), "{}", refused.message);
     }
@@ -4471,11 +4494,10 @@ impl cowshed_core::runtime::supervisor_manager::SupervisorSpawner for InProcessS
     }
 }
 
-fn manager_store() -> PathBuf {
-    PathBuf::from("/tmp").join(format!(
-        "cowshed-mgr-{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..12]
-    ))
+/// The manager's own store, short enough for the supervisor sockets under its `run` directory and
+/// removed with its owner on every exit path.
+fn manager_store() -> TempRoot {
+    TempRoot::new_in(Path::new("/tmp"), "cowshed-mgr")
 }
 
 /// A daemon whose startup pass has finished, so the manager serves ensures.
@@ -4490,9 +4512,9 @@ async fn the_manager_starts_one_supervisor_for_concurrent_ensures() {
     let store = manager_store();
     let spawned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let manager = SupervisorManager::new(
-        &store,
+        &*store,
         Box::new(InProcessSpawner {
-            store_root: store.clone(),
+            store_root: store.to_path_buf(),
             supervisor: Some(h.handle.clone()),
             child: &["sleep", "30"],
             spawned: std::sync::Arc::clone(&spawned),
@@ -4523,9 +4545,9 @@ async fn the_manager_reports_a_supervisor_that_exits_before_serving() {
     use cowshed_core::runtime::supervisor_manager::SupervisorManager;
     let store = manager_store();
     let manager = SupervisorManager::new(
-        &store,
+        &*store,
         Box::new(InProcessSpawner {
-            store_root: store.clone(),
+            store_root: store.to_path_buf(),
             supervisor: None,
             child: &["sh", "-c", "exit 3"],
             spawned: std::sync::Arc::default(),
@@ -4561,7 +4583,7 @@ async fn a_supervisor_that_cannot_start_fails_the_ensure_with_its_own_reason() {
     let script = format!("printf '%s' '{json}' >&\"${START_REPORT_FD_ENV}\"; exit 4");
     let store = manager_store();
     let manager = SupervisorManager::new(
-        &store,
+        &*store,
         Box::new(ProgramSpawner::new(
             "/bin/sh",
             vec!["-c".into(), script.into(), "sh".into()],
@@ -4628,9 +4650,9 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
     });
     let spawned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let manager = SupervisorManager::new(
-        &store,
+        &*store,
         Box::new(InProcessSpawner {
-            store_root: store.clone(),
+            store_root: store.to_path_buf(),
             supervisor: None,
             child: &["sleep", "30"],
             spawned: std::sync::Arc::clone(&spawned),
@@ -4704,7 +4726,7 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
 
 /// The served supervisor for a running ordinary background job, as every foreground `cowshed
 /// exec` reaches it whatever its class: the job, its spawn, and the socket a hold names.
-async fn held_job_fixture(h: &mut Harness) -> (JobId, Spawned, PathBuf) {
+async fn held_job_fixture(h: &mut Harness) -> (JobId, Spawned, SocketPath) {
     use cowshed_core::runtime::supervisor_socket;
     let job = h
         .handle
@@ -4721,11 +4743,11 @@ async fn held_job_fixture(h: &mut Harness) -> (JobId, Spawned, PathBuf) {
         h.process.recv().await.unwrap(),
         ProcessObservation::StdinClosed(job)
     );
-    let path = supervisor_socket::socket_path(
-        &manager_store(),
-        &authority().repo_id,
-        &authority().workspace,
-    );
+    let store = manager_store();
+    let path = SocketPath {
+        path: supervisor_socket::socket_path(&store, &authority().repo_id, &authority().workspace),
+        _directory: store,
+    };
     let listener = supervisor_socket::bind(&path).await.unwrap();
     tokio::spawn(supervisor_socket::serve(
         listener,
@@ -4842,9 +4864,9 @@ async fn an_ensure_from_a_stale_grant_read_is_answered_by_the_newer_supervisor()
     ));
     let spawned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let manager = SupervisorManager::new(
-        &store,
+        &*store,
         Box::new(InProcessSpawner {
-            store_root: store.clone(),
+            store_root: store.to_path_buf(),
             supervisor: None,
             child: &["sleep", "30"],
             spawned: std::sync::Arc::clone(&spawned),
@@ -4898,9 +4920,9 @@ async fn an_ensure_is_refused_by_a_supervisor_of_another_incarnation() {
         None,
     ));
     let manager = SupervisorManager::new(
-        &store,
+        &*store,
         Box::new(InProcessSpawner {
-            store_root: store.clone(),
+            store_root: store.to_path_buf(),
             supervisor: None,
             child: &["sleep", "30"],
             spawned: std::sync::Arc::default(),
@@ -4925,10 +4947,7 @@ async fn an_ensure_is_refused_by_a_supervisor_of_another_incarnation() {
 async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() {
     use cowshed_core::runtime::supervisor_socket;
     let (mut h, _root) = harness(1, 1024, false, false);
-    let path = PathBuf::from("/tmp").join(format!(
-        "cowshed-sock-{}/s",
-        &uuid::Uuid::new_v4().simple().to_string()[..12]
-    ));
+    let path = SocketPath::new();
     let listener = supervisor_socket::bind(&path).await.unwrap();
     let server = tokio::spawn(supervisor_socket::serve(
         listener,
@@ -5000,10 +5019,7 @@ async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() 
 async fn a_drained_supervisor_serves_a_job_s_end_to_a_client_that_comes_back_for_it() {
     use cowshed_core::runtime::supervisor_socket;
     let (mut h, _root) = harness(1, 1024, false, false);
-    let path = PathBuf::from("/tmp").join(format!(
-        "cowshed-sock-{}/s",
-        &uuid::Uuid::new_v4().simple().to_string()[..12]
-    ));
+    let path = SocketPath::new();
     let listener = supervisor_socket::bind(&path).await.unwrap();
     let server = tokio::spawn(supervisor_socket::serve(
         listener,
@@ -5056,10 +5072,7 @@ async fn a_drained_supervisor_serves_a_job_s_end_to_a_client_that_comes_back_for
 async fn a_caller_that_goes_away_while_waiting_never_leaves_the_supervisor_refusing_work() {
     use cowshed_core::runtime::supervisor_socket;
     let (mut h, _root) = harness(1, 1024, false, false);
-    let path = PathBuf::from("/tmp").join(format!(
-        "cowshed-sock-{}/s",
-        &uuid::Uuid::new_v4().simple().to_string()[..12]
-    ));
+    let path = SocketPath::new();
     let listener = supervisor_socket::bind(&path).await.unwrap();
     let server = tokio::spawn(supervisor_socket::serve(
         listener,
@@ -5153,10 +5166,7 @@ async fn a_controller_reads_a_served_supervisor_s_commitments_by_cursor_until_it
         }),
     )
     .unwrap();
-    let path = PathBuf::from("/tmp").join(format!(
-        "cowshed-sock-{}/s",
-        &uuid::Uuid::new_v4().simple().to_string()[..12]
-    ));
+    let path = SocketPath::new();
     let listener = supervisor_socket::bind(&path).await.unwrap();
     tokio::spawn(supervisor_socket::serve(
         listener,
@@ -6810,11 +6820,7 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
 
     // The start leaves a live daemon: its record names a running process whose socket accepts.
     // Short, under /tmp: a Unix socket path is bounded at 104 bytes on macOS.
-    let sockets = PathBuf::from("/tmp").join(format!(
-        "cs-nxk-{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..12]
-    ));
-    std::fs::create_dir_all(&sockets).unwrap();
+    let sockets = TempRoot::new_in(Path::new("/tmp"), "cs-nxk");
     let socket = sockets.join("d.sock");
     let _daemon = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let record = project.join(".nx/workspace-data/d/server-process.json");
@@ -6851,7 +6857,6 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
     std::fs::write(&record, &live).unwrap();
     complete(&second, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(second.request.job_id).await.unwrap();
-    std::fs::remove_dir_all(sockets).unwrap();
 }
 
 /// A foreground keeper is an ordinary owned job for draining, not developer activity. Even before
