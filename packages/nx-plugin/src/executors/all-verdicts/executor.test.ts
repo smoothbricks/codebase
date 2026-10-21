@@ -106,9 +106,11 @@ describe('all-verdicts executor', () => {
       const ready = join(root, 'ready.fifo');
       const lifetime = join(root, 'lifetime.fifo');
       expect(spawnSync('mkfifo', [ready, lifetime]).status).toBe(0);
-      // Only the shell's background sleep holds the lifetime FIFO open, so its EOF observes that the signal reached
-      // the command's whole process group, not only the shell that leads it.
-      const holding = 'sleep 3600 3>lifetime.fifo & echo up > ready.fifo; wait';
+      // The background process opens the lifetime FIFO before it says it is up, and only it (then the sleep it execs)
+      // holds it, so its EOF observes that the signal reached the command's whole process group, not only the shell
+      // that leads it. Were the shell to say it is up instead, the signal could end the background process before it
+      // opened the FIFO, and nothing would ever open it for the test's read.
+      const holding = '(echo up > ready.fifo; exec sleep 3600) 3>lifetime.fifo & wait';
       const closed = readFile(lifetime, 'utf8');
       const run = startExecutor(root, ['exit 3', holding]);
       expect(await readFile(ready, 'utf8')).toBe('up\n');
