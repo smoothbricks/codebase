@@ -312,3 +312,73 @@ fn image_fixture_scratch_stays_with_its_detach_aware_owner() {
     assert!(path.exists());
     assert!(report.findings.iter().any(|finding| matches!(&finding.disposition, Disposition::Kept(reason) if reason.contains("detach-aware"))));
 }
+
+#[test]
+fn named_fixture_ownership_leaves_payload_empty_and_reaps_only_dead_creators() {
+    let fixture = Fixture::new();
+    let live = create_named(&fixture.0, "cowshed-sock").unwrap();
+    assert_eq!(
+        fs::read_dir(&live).unwrap().count(),
+        0,
+        "no ownership file in a Git or telemetry root"
+    );
+    assert_eq!(
+        owners(&live).unwrap(),
+        [i32::try_from(std::process::id()).unwrap()]
+    );
+    File::open(&live)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(UNIX_EPOCH))
+        .unwrap();
+    let dead = named_path(&fixture.0, "cowshed-mgr", dead_pid());
+    fs::DirBuilder::new().mode(0o700).create(&dead).unwrap();
+    fs::write(dead.join("s.sock.lock"), b"").unwrap();
+    fixture.reaper().sweep(&fixture.store(), false);
+    assert!(live.exists());
+    assert!(!dead.exists());
+}
+
+#[test]
+fn archiving_named_fixture_output_carries_ownership_past_the_rename() {
+    let fixture = Fixture::new();
+    let pid = dead_pid();
+    let path = named_path(&fixture.0, "trace", pid);
+    fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+    fs::write(path.join("trace.arrow"), b"only evidence").unwrap();
+    fixture.reaper().sweep(&fixture.store(), true);
+    assert!(!path.join(OWNER_FILE).exists(), "dry-run adds no record");
+    let report = fixture.reaper().sweep(&fixture.store(), false);
+    let archive = report
+        .findings
+        .iter()
+        .find_map(|finding| match &finding.disposition {
+            Disposition::Archived(path) => Some(path),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        fs::read(archive.join("trace.arrow")).unwrap(),
+        b"only evidence"
+    );
+    assert_eq!(owners(archive).unwrap(), [i32::try_from(pid).unwrap()]);
+    assert!(
+        TrashReaper::default()
+            .sweep(
+                &fixture.store(),
+                SystemTime::now() + EVIDENCE_RETENTION + Duration::from_secs(1)
+            )
+            .unwrap()
+            > 0
+    );
+    assert!(!archive.exists());
+}
+
+#[test]
+fn a_named_creator_does_not_override_a_malformed_multiwriter_record() {
+    let fixture = Fixture::new();
+    let path = named_path(&fixture.0, "cowshed-sock", dead_pid());
+    fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+    fs::write(path.join(OWNER_FILE), b"partial").unwrap();
+    fixture.reaper().sweep(&fixture.store(), false);
+    assert!(path.exists());
+}

@@ -330,24 +330,30 @@ a complete scan restarts on the next pass. Sixty seconds amortizes idle polling;
 probes even when the shared temp root contains thousands of other tools' entries. Background archive deletion has its
 own 256-entry budget and never synchronously walks an entire output tree.
 
-Ownership is the private `.cowshed-owner` record in the scratch directory, containing `cowshed-scratch-v1`, one positive
-pid per line, and a final `end` line. The terminator makes an interrupted multi-writer publication unknown, not a
-shorter complete lease. Every recorded process must be dead according to the existing OS process probe. EPERM,
-unreadable or malformed records, missing records, foreign ownership, and symlinks are kept with a reason. PID reuse
-keeps the directory conservatively. Neither creation time nor mtime proves death; an old live directory survives. Legacy
-`cowshed-sock-*` and `cowshed-mgr-*` roots without a record remain unknown, even when all they hold is `s.sock.lock`. A
-held socket kernel lease keeps a directory even after its recorded creator has died.
+Multiwriter runtime ownership is the private `.cowshed-owner` record in the scratch directory, containing
+`cowshed-scratch-v1`, one positive pid per line, and a final `end` line. The terminator makes an interrupted publication
+unknown, not a shorter complete lease. Single-owner fixtures instead publish the creator atomically in the private
+directory's name: `<cowshed-/cs-prefix>-pid<PID>-<32-hex-uuid>`. This keeps payload roots pristine: the fixture may
+itself be a Git worktree or a directory containing only telemetry date partitions. Before an evidence rename changes
+that name, the reaper carries the creator into the record used by archive cleanup. An existing malformed record never
+falls back to the name.
 
-The shared test `TempRoot` publishes the creator for socket and manager roots and its other private fixtures. The
-runtime write-site audit also covers Git's `cowshed-ignore-rules-*`, detached disk-command `cowshed-disk-image-*`
-stdout/stderr (both caller and detached child are owners), and the cache advisor's `cowshed-advisor-*` (parent and probe
-child). Existing unmarked test scratch is reported but not guessed dead. Workspace runtime `cs-*` **symlinks** retain
-their existing `point_runtime_link` lifecycle; this directory reaper never follows or removes them. Workspace exec temp
-and sandbox profiles belong to the store's existing workspace and profile reclamation, not the shared-temp sweep.
-Real-image `cowshed-itest-*` roots and their sweep lock/record remain with `cowshed-apfs/tests/support/scratch_apfs.rs`:
-that owner stops workers and releases attached images under its own lock before reclaiming a root. The generic reaper
-explicitly excludes and reports that domain, even if a fixture acquires a marker; moving an attached backing image here
-would race its existing recovery protocol.
+Every recorded process must be dead according to the existing OS process probe. EPERM, unreadable or malformed records,
+missing ownership evidence, foreign ownership, and symlinks are kept with a reason. PID reuse keeps the directory
+conservatively. Neither creation time nor mtime proves death; an old live directory survives. Legacy `cowshed-sock-*`
+and `cowshed-mgr-*` roots without a record or the explicit pid grammar remain unknown, even when all they hold is
+`s.sock.lock`. A held socket kernel lease keeps a directory after its recorded creator has died.
+
+The shared test `TempRoot` uses the named single-owner protocol for socket and manager roots and its other private
+fixtures. The runtime write-site audit also covers Git's `cowshed-ignore-rules-*`, detached disk-command
+`cowshed-disk-image-*` stdout/stderr (both caller and detached child are owners), and the cache advisor's
+`cowshed-advisor-*` (parent and probe child). Existing unmarked test scratch is reported but not guessed dead. Workspace
+runtime `cs-*` **symlinks** retain their existing `point_runtime_link` lifecycle; this directory reaper never follows or
+removes them. Workspace exec temp and sandbox profiles belong to the store's existing workspace and profile reclamation,
+not the shared-temp sweep. Real-image `cowshed-itest-*` roots and their sweep lock/record remain with
+`cowshed-apfs/tests/support/scratch_apfs.rs`: that owner stops workers and releases attached images under its own lock
+before reclaiming a root. The generic reaper explicitly excludes and reports that domain, even if a fixture acquires a
+marker; moving an attached backing image here would race its existing recovery protocol.
 
 Only a bounded set of the marker, `s`/`s.sock` Unix sockets and an empty `s.sock.lock` can be deleted directly.
 Unexpected files, subdirectories, nonempty locks, stdout, and Arrow traces are evidence: one rename moves the whole

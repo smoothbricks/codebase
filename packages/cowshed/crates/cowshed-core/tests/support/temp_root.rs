@@ -31,12 +31,9 @@ impl TempRoot {
             "test parent {} must be a directory",
             parent.display()
         );
-        // 16 hex digits: unique enough for one parent, and short enough that a fixture under the
-        // runtime link keeps its sockets inside `sun_path`.
-        let unique = uuid::Uuid::new_v4().simple().to_string();
-        let path = parent.join(format!("{prefix}-{}", &unique[..16]));
-        cowshed_os::scratch::create(&path)
-            .unwrap_or_else(|error| panic!("create owned test root {}: {error}", path.display()));
+        let path = cowshed_os::scratch::create_named(parent, prefix).unwrap_or_else(|error| {
+            panic!("create owned test root under {}: {error}", parent.display())
+        });
         Self(path)
     }
 }

@@ -22,6 +22,45 @@ pub fn create(path: &Path) -> io::Result<()> {
     record_owners(path, &[std::process::id()])
 }
 
+/// Single-owner fixtures keep their payload pristine (it may itself be a Git or telemetry root).
+/// Ownership is published atomically by mkdir in a reserved, explicitly pid-bearing name.
+pub fn create_named(parent: &Path, prefix: &str) -> io::Result<PathBuf> {
+    if Path::new(prefix).file_name() != Some(std::ffi::OsStr::new(prefix)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "scratch prefix must be one file name",
+        ));
+    }
+    let path = named_path(parent, prefix, std::process::id());
+    fs::DirBuilder::new().mode(0o700).create(&path)?;
+    Ok(path)
+}
+
+fn named_path(parent: &Path, prefix: &str, pid: u32) -> PathBuf {
+    let namespace = if prefix.starts_with("cowshed-") || prefix.starts_with("cs-") {
+        ""
+    } else {
+        "cs-"
+    };
+    parent.join(format!(
+        "{namespace}{prefix}-pid{pid}-{}",
+        uuid::Uuid::new_v4().simple()
+    ))
+}
+
+fn named_owner(path: &Path) -> Option<i32> {
+    let name = path.file_name()?.to_str()?;
+    let (prefix, owner) = name.rsplit_once("-pid")?;
+    if !prefix.starts_with("cowshed-") && !prefix.starts_with("cs-") {
+        return None;
+    }
+    let (pid, nonce) = owner.split_once('-')?;
+    if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    pid.parse::<i32>().ok().filter(|pid| *pid > 0)
+}
+
 /// Publish every process that can keep writing. An absent/partial record is unknown, never dead.
 /// Detached children publish only after spawn, so death in that window leaves an unknown owner.
 pub fn record_owners(path: &Path, pids: &[u32]) -> io::Result<()> {
@@ -218,10 +257,17 @@ fn foreign(name: &str) -> bool {
 }
 
 fn owners(path: &Path) -> io::Result<Vec<i32>> {
-    let file = OpenOptions::new()
+    let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path.join(OWNER_FILE))?;
+        .open(path.join(OWNER_FILE))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return named_owner(path).map(|pid| vec![pid]).ok_or(error);
+        }
+        Err(error) => return Err(error),
+    };
     let metadata = file.metadata()?;
     // SAFETY: geteuid has no preconditions.
     if !metadata.is_file()
@@ -375,7 +421,12 @@ fn reclaim(
         {
             fs::remove_file(file)?;
         }
-        fs::remove_file(path.join(OWNER_FILE))?;
+        if files
+            .iter()
+            .any(|file| file.file_name().is_some_and(|name| name == OWNER_FILE))
+        {
+            fs::remove_file(path.join(OWNER_FILE))?;
+        }
         fs::remove_dir(path)?;
         Ok(Disposition::Deleted)
     } else {
@@ -389,6 +440,15 @@ fn reclaim(
             .map_err(io::Error::other)?
             .as_secs();
         let destination = trash.join(format!("{seconds}-{}", uuid::Uuid::new_v4().simple()));
+        if let Some(pid) = named_owner(path) {
+            match fs::symlink_metadata(path.join(OWNER_FILE)) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    record_owners(path, &[u32::try_from(pid).map_err(io::Error::other)?])?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         // A cross-volume rename is kept and reported, never converted into a copy/delete.
         fs::rename(path, &destination)?;
         Ok(Disposition::Archived(destination))
