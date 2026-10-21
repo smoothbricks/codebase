@@ -393,15 +393,15 @@ moved. A fork names the tree it checks out: the target's `HEAD^{tree}`, or under
 between the two trees in the target's repository; else _unknown_ (no recorded tree, or one the repository cannot
 compare, said on stderr), farther than any count. Fork step 2 decides, under the target's image lock:
 
-1. **An external land.** When neither the seed nor the target's live volume is equal, the fork's tree is the target's
-   `HEAD^{tree}`, and that tree differs from the live volume's `checkedOut`, the target's branch moved past every volume
-   cowshed knows, and a live workspace whose `HEAD^{tree}` is that tree ran its gates there. The seed becomes a capture
-   of that workspace's build volume, recorded at the tree. Candidates are tried warmest first (latest written). Each
-   one's image lock is taken without waiting (a held one is a skip naming it: its own fork or land is running), its
-   `HEAD^{tree}` is read again under that lock, and a candidate whose tree moved is refused: a seed is never recorded at
-   a tree its volume was not built at. It is then captured under the same writer exclusion as every seed, above, with
-   its own Nx daemon stopped as at a land. When no candidate is captured, each skip is said on stderr and the decision
-   falls to the reseed.
+1. **An external land**, into main only. When neither the seed nor the target's live volume is equal, the fork's tree is
+   the target's `HEAD^{tree}`, and that tree differs from the live volume's `checkedOut`, the target's branch moved past
+   every volume cowshed knows, and a live workspace whose `HEAD^{tree}` is that tree ran its gates there. The seed
+   becomes a capture of that workspace's build volume, recorded at the tree. Candidates are tried warmest first (latest
+   written). Each one's image lock is taken without waiting (a held one is a skip naming it: its own fork or land is
+   running), its `HEAD^{tree}` is read again under that lock, and a candidate whose tree moved is refused: a seed is
+   never recorded at a tree its volume was not built at. It is then captured under the same writer exclusion as every
+   seed, above, with its own Nx daemon stopped as at a land. When no candidate is captured, each skip is said on stderr
+   and the decision falls to the reseed.
 2. **A reseed** refreezes the seed from the target's live volume when the live volume is nearer the fork's tree, or as
    near and written after the seed (behind, above). A seed nearer than the live volume is kept however much later the
    live volume was written, and the live volume is not sealed at all: a landed seed beats a live volume built at an
@@ -412,10 +412,13 @@ A skip names each holder and leaves the seed as it was: the fork is colder, neve
 
 A fork of a workspace whose checkout has not moved since cowshed placed its volume is therefore no external land, even
 when its live volume records an older seed tree (forked while its target's seed was behind) and another workspace has
-its tree checked out: the reseed takes the workspace's own live volume, and the fork inherits what it built.
-**Limitation:** forking a working shed is cold. A workspace that commits and builds its own work moves its checkout from
-`checkedOut`, so step 1 treats its new tree as an external land, and its own volume is not a candidate. This is a known
-gap, not closed here.
+its tree checked out: the reseed takes the workspace's own live volume, and the fork inherits what it built. Step 1 is
+main's alone. Plain Git outside cowshed fast-forwards main to a tree some workspace built, and only that workspace's
+volume holds it. A session's checkout moves only by work in the session itself (a commit, a rebase, a merge an operator
+runs there), so the session's own live volume is what built its tree, and another workspace at that tree, a fork of it
+say, holds less. A fork of a session, a lane base included, therefore skips step 1 and takes the reseed: every fork of a
+shed inherits that shed's build state, whether it moved since its own fork or not. `target-moved-outside-land` is
+likewise reported for main only.
 
 A foreground keeper is an admitted holder. While it holds the source volume, fork takes this busy-skip cold-seed path;
 it does not stop the keeper, bypass its hold, or wait synchronously for its release. The warm path becomes reachable

@@ -1301,7 +1301,12 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 });
             };
             let mut passed = Vec::new();
-            if age.moved_from().is_some()
+            // Step 1 is for main alone. Plain git outside cowshed fast-forwards main to a tree a
+            // workspace built; a session's checkout moves only by its own work, so its own volume
+            // is what built its tree, and another workspace at that tree (a fork of it, say) holds
+            // less. That is the reseed's case, whatever the session's tree.
+            if target.name.is_main()
+                && age.moved_from().is_some()
                 && let Some(landed) =
                     seed_from_landed(&*this.host, &this.layout, &target, &aim, &mut passed)?
             {
@@ -5823,7 +5828,7 @@ fn main() {
                 tree,
                 landed: vec![Peer {
                     name: main.name.clone(),
-                    checkout: main_checkout,
+                    checkout: main_checkout.clone(),
                     lock: scratch.image_lock(&main.name),
                 }],
             },
@@ -5833,6 +5838,71 @@ fn main() {
             copy.as_deref(),
             Some("topic"),
             "a fork of an unmoved workspace inherits that workspace's build volume"
+        );
+
+        // `topic` commits and builds its own work, so its checkout moves from where cowshed
+        // placed its volume, and `sibling`, forked from it, checks out the same tree. Nothing
+        // outside cowshed lands into a session: the next fork of `topic` still takes `topic`'s
+        // own volume, never `sibling`'s, which lacks what `topic` built after that fork.
+        let moved = commit(&topic_checkout, &[("work.rs", "1")]);
+        fs::write(scratch.layout.mount(&topic_live).join("marker"), "first").unwrap();
+        let sibling = owner("sibling", '3');
+        let sibling_checkout = scratch.root.path().join("sibling");
+        let cloned = crate::git::git_command_at(scratch.root.path())
+            .args(["clone", "--quiet"])
+            .arg(&topic_checkout)
+            .arg(&sibling_checkout)
+            .output_locked()
+            .unwrap();
+        assert!(cloned.status.success(), "{cloned:?}");
+        fs::create_dir_all(sibling_checkout.join(".cowshed")).unwrap();
+        let main_peer = Peer {
+            name: main.name.clone(),
+            checkout: main_checkout.clone(),
+            lock: scratch.image_lock(&main.name),
+        };
+        let prepared = scratch
+            .volumes
+            .prepare_fork(
+                topic.clone(),
+                topic_checkout.clone(),
+                sibling.name.clone(),
+                Aim {
+                    tree: moved.clone(),
+                    landed: vec![main_peer.clone()],
+                },
+            )
+            .await
+            .expect("prepare sibling's fork from topic");
+        scratch
+            .volumes
+            .finish_fork(prepared, sibling.clone(), sibling_checkout.clone())
+            .await
+            .expect("fork sibling from topic")
+            .expect("topic has a seed");
+        fs::write(scratch.layout.mount(&topic_live).join("marker"), "built").unwrap();
+        let built = fork_marker(
+            &scratch,
+            &topic,
+            &topic_checkout,
+            "built-copy",
+            Aim {
+                tree: moved,
+                landed: vec![
+                    main_peer,
+                    Peer {
+                        name: sibling.name.clone(),
+                        checkout: sibling_checkout,
+                        lock: scratch.image_lock(&sibling.name),
+                    },
+                ],
+            },
+        )
+        .await;
+        assert_eq!(
+            built.as_deref(),
+            Some("built"),
+            "a fork of a committed-and-built workspace inherits that workspace's build volume"
         );
         scratch.release_all();
     }

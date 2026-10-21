@@ -5112,7 +5112,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             }
             None => head.clone(),
         };
-        let landed = if tree == head {
+        // Only main is landed into outside cowshed, so only a fork of main looks for the
+        // workspace that landed it; a fork of a session reseeds from the session's own volume.
+        let landed = if tree == head && target.is_main() {
             self.landed_peers(target).await?
         } else {
             Vec::new()
@@ -20515,7 +20517,10 @@ async fn seed_tree_findings(
             path: Some(checkout.to_owned()),
         });
     }
-    if let Some(placed) = age.moved_from() {
+    // Only main is landed into outside cowshed; a session's checkout moves by its own work.
+    if workspace.is_main()
+        && let Some(placed) = age.moved_from()
+    {
         findings.push(Finding {
             code: "target-moved-outside-land".into(),
             severity: FindingSeverity::Warning,
