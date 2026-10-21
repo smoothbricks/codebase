@@ -2028,7 +2028,14 @@ async function runBoundedSetupCommand(
   }
   if (outcome.kind === 'expired') {
     const { deadlineMs, lockPath } = options;
-    const message = describeDeadline({ command, deadlineMs, elapsedMs: Math.round(outcome.elapsedMs), lockPath });
+    const message = describeDeadline({
+      command,
+      deadlineMs,
+      elapsedMs: Math.round(outcome.elapsedMs),
+      lockPath,
+      group: outcome.group,
+      membersLeft: outcome.membersLeft,
+    });
     throw new CommandDeadlineError(command, message, outcome.stdout, outcome.stderr);
   }
   if (outcome.exitCode !== 0) {

@@ -1,7 +1,7 @@
 /**
  * The imperative shell around cargo-fetch-bound.ts: it spawns the command in a process group of its own, reads its
- * output, keeps the clock, and kills the group when cargo-fetch-bound.ts says the deadline has passed. Every decision
- * is that file's; this one only measures and acts.
+ * output, keeps the clock, and kills the group when cargo-fetch-bound.ts says the deadline has passed, and again while
+ * the group still has members. Every decision is that file's; this one only measures and acts.
  *
  * The command runs detached (`setsid`), so a signal that ends this process no longer reaches it the way a terminal's
  * would. The shell therefore ends the group itself when this process is ending (a SIGINT, SIGTERM or SIGHUP, or exit),
@@ -9,7 +9,7 @@
  * shell entry loads before anything is installed, so it imports only the runtime and its sibling.
  */
 import { constants } from 'node:os';
-import { judgeBound } from './cargo-fetch-bound.ts';
+import { DEADLINE_PATIENCE, judgeBound, judgeReap, type Patience, TEARDOWN_PATIENCE } from './cargo-fetch-bound.ts';
 
 /** The shell's two uses of time, so a caller can move it by hand. */
 export interface Clock {
@@ -41,26 +41,35 @@ export type BoundedOutcome =
   | { readonly kind: 'exited'; readonly exitCode: number; readonly stdout: Uint8Array; readonly stderr: Uint8Array }
   /**
    * The deadline passed with the command still running: it and everything it started were killed. The output is what
-   * was read before the kill; a member that left the process group is beyond the kill's reach.
+   * was read before the kill. `membersLeft` is whether the kernel still listed members of process group `group` when
+   * the kill stopped signalling it: a member that left the group is beyond the kill's reach.
    */
-  | { readonly kind: 'expired'; readonly elapsedMs: number; readonly stdout: Uint8Array; readonly stderr: Uint8Array };
+  | {
+      readonly kind: 'expired';
+      readonly elapsedMs: number;
+      readonly group: number;
+      readonly membersLeft: boolean;
+      readonly stdout: Uint8Array;
+      readonly stderr: Uint8Array;
+    };
 
 /** The signals that end this process and so must end the command with it. */
 const TEARDOWN_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
 
 /**
  * Runs `command` and returns how it ended. Failure to start it rejects; so does a failure to read its output, after
- * the group is killed. Whatever way this returns or throws, the group is never left running: it is killed on every
- * path but the command ending itself.
+ * the group is killed. Whatever way this returns or throws, the group is not left running: it is killed on every
+ * path but the command ending itself, and killed again while it still has members (`reapGroup`).
  */
 export async function runBounded(command: BoundedCommand, clock: Clock = systemClock): Promise<BoundedOutcome> {
   let group: number | undefined;
-  const killGroup = (): void => {
-    if (group !== undefined) signalGroup(group);
+  // The paths on which nobody waits for the answer: this process is ending, or the call is failing.
+  const endGroup = (): void => {
+    if (group !== undefined) reapGroup(group, TEARDOWN_PATIENCE);
   };
   // The hooks come before the spawn: a signal that arrives from the spawn on runs its handler after this synchronous
   // body, by which time the group is known.
-  const release = endWithThisProcess(killGroup);
+  const release = endWithThisProcess(endGroup);
   try {
     const child = Bun.spawn({
       cmd: [...command.argv],
@@ -96,16 +105,27 @@ export async function runBounded(command: BoundedCommand, clock: Clock = systemC
             stdout: Buffer.concat(stdout),
             stderr: Buffer.concat(stderr),
           };
-        case 'kill':
-          killGroup();
+        case 'kill': {
+          signalGroup(child.pid);
+          // Until it is reaped the leader is a member of its own group, and reapGroup looks for members the kill
+          // missed: the leader's exit is awaited first.
           await child.exited;
-          return { kind: 'expired', elapsedMs, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) };
+          const membersLeft = reapGroup(child.pid, DEADLINE_PATIENCE);
+          return {
+            kind: 'expired',
+            elapsedMs,
+            group: child.pid,
+            membersLeft,
+            stdout: Buffer.concat(stdout),
+            stderr: Buffer.concat(stderr),
+          };
+        }
         case 'wait':
           await untilFinishedOrAfter(done, clock, verdict.forMs);
       }
     }
   } catch (error) {
-    killGroup();
+    endGroup();
     throw error;
   } finally {
     release();
@@ -154,16 +174,55 @@ function statusOf(child: {
 }
 
 /**
- * SIGKILL to every process of the group led by `pgid`. A group that is already gone is not an error. Nothing is asked
- * to stop first: a fetch past its deadline is stalled, a member that ignores SIGTERM would go on holding the
- * package-cache lock, and a kill costs a fetch nothing it relies on (the kernel drops the lock, and Cargo's caches
- * tolerate being killed).
+ * SIGKILL to every process of the group led by `pgid`. A group that is already gone is not an error, nor is one with no
+ * member left that can be signalled. Nothing is asked to stop first: a fetch past its deadline is stalled, a member
+ * that ignores SIGTERM would go on holding the package-cache lock, and a kill costs a fetch nothing it relies on (the
+ * kernel drops the lock, and Cargo's caches tolerate being killed).
  */
 function signalGroup(pgid: number): void {
   try {
     process.kill(-pgid, 'SIGKILL');
   } catch (error) {
-    if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) throw error;
+    // ESRCH: the group is gone. EPERM: no member of it can be signalled, which is what a member that exited and has
+    // not been reaped yet answers on macOS; groupHasMembers says whether any is left.
+    if (!(error instanceof Error && 'code' in error && (error.code === 'ESRCH' || error.code === 'EPERM'))) throw error;
+  }
+}
+
+/**
+ * Whether the kernel lists a member of the group led by `pgid`. It is the probe the bounded-exec executor makes
+ * (`processGroupHasMembers`), which this script cannot import because it runs before anything is installed. A member
+ * the caller may not signal counts, and so does one that exited and has not been reaped, which macOS reports as EPERM.
+ * A group outlives its reaped leader for as long as one member does, and no process can take its id meanwhile.
+ */
+function groupHasMembers(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    return error instanceof Error && 'code' in error && error.code === 'EPERM';
+  }
+}
+
+/**
+ * Kills the group led by `pgid` and keeps killing it while it has members, as `judgeReap` in cargo-fetch-bound.ts says:
+ * a group signal reaches the members that exist when it goes out, and macOS does not hold a fork back while it does, so
+ * a member forked in that moment survives it. Each round signals once and then waits `patience.pauseMs`, blocking this
+ * process, because the paths that end it cannot do anything else. Returns whether members were left when the patience
+ * ran out.
+ */
+function reapGroup(pgid: number, patience: Patience): boolean {
+  for (let round = 0; ; round += 1) {
+    const verdict = judgeReap({ round, patience, members: groupHasMembers(pgid) });
+    switch (verdict.kind) {
+      case 'empty':
+        return false;
+      case 'members-left':
+        return true;
+      case 'signal':
+        signalGroup(pgid);
+        if (patience.pauseMs > 0) Bun.sleepSync(patience.pauseMs);
+    }
   }
 }
 

@@ -11,8 +11,8 @@
  * - git drops a transfer that has all but stopped for GIT_HTTP_LOW_SPEED_TIME_S seconds (`boundedFetchEnv`). Cargo runs
  *   the `git` executable for git dependencies unless `net.git-fetch-with-cli = false`, so this reaches the HTTP(S)
  *   transfers of its fetches and not an ssh or git-protocol one, nor Cargo's own git library; and
- * - the whole fetch, with every process it started, is killed when its deadline passes (`judgeBound`), which bounds
- *   whatever the first does not reach.
+ * - the whole fetch, with every process it started, is killed when its deadline passes (`judgeBound`), and killed
+ *   again while its group still has members (`judgeReap`), which bounds whatever the first does not reach.
  *
  * This file is a managed raw script like secret-references.ts: shell entry loads it before anything is installed, so
  * it imports nothing.
@@ -115,6 +115,58 @@ export function judgeBound({ deadlineMs, elapsedMs, finished }: BoundFacts): Bou
   return { kind: 'kill' };
 }
 
+/**
+ * How long the shell goes on killing a process group: it signals the group at most `rounds` times and waits
+ * `pauseMs` milliseconds after each.
+ */
+export interface Patience {
+  readonly rounds: number;
+  readonly pauseMs: number;
+}
+
+/**
+ * For a kill on the way out of this process, which should hold the exit up for as little as it can: signals a
+ * millisecond apart, thirty at most. Rounds with no pause do not do it: a fork already under way when the first
+ * signal goes out joins the group after they have all run.
+ */
+export const TEARDOWN_PATIENCE: Patience = { rounds: 30, pauseMs: 1 };
+
+/**
+ * For the kill at the deadline, whose outcome is told: signals 5 ms apart for up to two seconds, the time the
+ * bounded-exec executor allows a force-killed command to be reaped. A host under load can take that long to finish
+ * exiting what it was sent, and the group lists a member until it has.
+ */
+export const DEADLINE_PATIENCE: Patience = { rounds: 400, pauseMs: 5 };
+
+/** What the shell knows of the group when it asks whether to signal it again. */
+export interface ReapFacts {
+  /** Signals sent to the group so far. */
+  readonly round: number;
+  readonly patience: Patience;
+  /** The kernel still lists a member of the group. */
+  readonly members: boolean;
+}
+
+export type ReapVerdict =
+  /** Nothing is left in the group. */
+  | { readonly kind: 'empty' }
+  /** Signal the group again. */
+  | { readonly kind: 'signal' }
+  /** The patience is spent and the group still lists members. */
+  | { readonly kind: 'members-left' };
+
+/**
+ * Whether to signal a group again. A group signal reaches the members that exist when it goes out, and macOS does not
+ * hold a fork back while it does: a member forked in that moment is missed, and so is one that member forks next. A
+ * group with members is therefore signalled again, until it has none or the patience is spent. Patience that is not a
+ * positive finite number of rounds ahead is spent, so no input makes the signalling unbounded.
+ */
+export function judgeReap({ round, patience, members }: ReapFacts): ReapVerdict {
+  if (!members) return { kind: 'empty' };
+  const roundsLeft = patience.rounds - round;
+  return roundsLeft > 0 && Number.isFinite(roundsLeft) ? { kind: 'signal' } : { kind: 'members-left' };
+}
+
 /** What the failure of a command that outlived its deadline is told. */
 export interface DeadlineFacts {
   /** The command as a person would type it. */
@@ -123,13 +175,33 @@ export interface DeadlineFacts {
   readonly elapsedMs: number;
   /** Cargo's package-cache lock file, which the command held while it ran. */
   readonly lockPath: string;
+  /** The process group the command ran in. */
+  readonly group: number;
+  /** The kill stopped signalling with the group still listing members (`judgeReap`'s `members-left`). */
+  readonly membersLeft: boolean;
 }
 
-/** The failure of a command that outlived its deadline, naming the command and the lock it held. */
-export function describeDeadline({ command, deadlineMs, elapsedMs, lockPath }: DeadlineFacts): string {
+/**
+ * The failure of a command that outlived its deadline, naming the command and the lock it held. It says the kill
+ * reached every process only when it did.
+ */
+export function describeDeadline({
+  command,
+  deadlineMs,
+  elapsedMs,
+  lockPath,
+  group,
+  membersLeft,
+}: DeadlineFacts): string {
+  const killed = membersLeft
+    ? [
+        `killed, but process group ${group} still had members when the kill gave up: one that left the group is`,
+        'beyond a group kill, and one that exited and has not been reaped yet looks the same.',
+      ].join(' ')
+    : 'killed with every process it started.';
   return [
     `${command} was still running ${elapsedMs} ms after it started, past its ${deadlineMs} ms deadline, and was`,
-    `killed with every process it started. While it runs it holds Cargo's package-cache lock (${lockPath}), which makes`,
+    `${killed} While it runs it holds Cargo's package-cache lock (${lockPath}), which makes`,
     'every other cargo that shares this CARGO_HOME wait behind it, so a stalled fetch is ended rather than waited out.',
     "Cargo's output up to the kill follows.",
   ].join('\n');

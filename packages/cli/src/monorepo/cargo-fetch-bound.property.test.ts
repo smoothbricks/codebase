@@ -4,11 +4,14 @@ import {
   boundedFetchEnv,
   CARGO_FETCH_DEADLINE_ENV,
   CARGO_FETCH_DEADLINE_MS,
+  DEADLINE_PATIENCE,
   describeDeadline,
   fetchDeadline,
   GIT_HTTP_LOW_SPEED_LIMIT,
   GIT_HTTP_LOW_SPEED_TIME_S,
   judgeBound,
+  judgeReap,
+  TEARDOWN_PATIENCE,
 } from '../../../nx-plugin/managed/raw/tooling/direnv/cargo-fetch-bound.ts';
 
 /**
@@ -124,13 +127,83 @@ describe('the bound on a cargo fetch', () => {
         fc.string({ minLength: 1 }),
         deadlines,
         fc.nat(),
-        (command, lockPath, deadlineMs, elapsedMs) => {
-          const message = describeDeadline({ command, lockPath, deadlineMs, elapsedMs });
+        fc.integer({ min: 1 }),
+        fc.boolean(),
+        (command, lockPath, deadlineMs, elapsedMs, group, membersLeft) => {
+          const message = describeDeadline({ command, lockPath, deadlineMs, elapsedMs, group, membersLeft });
           for (const fact of [command, lockPath, String(deadlineMs), String(elapsedMs)]) {
             expect(message).toContain(fact);
           }
         },
       ),
     );
+  });
+
+  it('says the kill reached every process only when no member was left, and names the group when one was', () => {
+    const facts = {
+      command: 'cargo fetch --locked',
+      lockPath: '/cargo/.package-cache',
+      deadlineMs: 1000,
+      elapsedMs: 1001,
+    };
+    fc.assert(
+      fc.property(fc.integer({ min: 1, max: 4_194_304 }), (group) => {
+        const left = describeDeadline({ ...facts, group, membersLeft: true });
+        const none = describeDeadline({ ...facts, group, membersLeft: false });
+        expect(left).toContain(`process group ${group} still had members`);
+        expect(left).not.toContain('every process it started');
+        expect(none).toContain('every process it started');
+        expect(none).not.toContain('process group');
+      }),
+    );
+  });
+});
+
+describe('the kill of a process group', () => {
+  it('leaves an empty group alone at any round, whatever the patience', () => {
+    fc.assert(
+      fc.property(anyReading, anyReading, (round, rounds) => {
+        expect(judgeReap({ round, patience: { rounds, pauseMs: 0 }, members: false })).toEqual({ kind: 'empty' });
+      }),
+    );
+  });
+
+  it('signals a group that keeps its members once per round of its patience, then gives up and keeps giving up', () => {
+    fc.assert(
+      fc.property(fc.integer({ min: 0, max: 500 }), (rounds) => {
+        const verdicts = Array.from(
+          { length: rounds + 3 },
+          (_, round) => judgeReap({ round, patience: { rounds, pauseMs: 0 }, members: true }).kind,
+        );
+        expect(verdicts.slice(0, rounds).every((kind) => kind === 'signal')).toBe(true);
+        expect(verdicts.slice(rounds)).toEqual(['members-left', 'members-left', 'members-left']);
+      }),
+    );
+  });
+
+  it('signals only while its patience is a positive finite number of rounds ahead, whatever the facts', () => {
+    fc.assert(
+      fc.property(anyReading, anyReading, (round, rounds) => {
+        const verdict = judgeReap({ round, patience: { rounds, pauseMs: 0 }, members: true });
+        if (verdict.kind === 'signal') {
+          expect(Number.isFinite(rounds - round)).toBe(true);
+          expect(rounds - round).toBeGreaterThan(0);
+        }
+      }),
+    );
+  });
+
+  it('has patiences that signal again after a pause, the one on the way out holding the exit up for little', () => {
+    // A kill that is not repeated misses the member forked as it went out, and so does one repeated with no pause
+    // between the signals: a fork already under way joins the group after they have all been sent. A process that is
+    // ending should hold its exit up for no more than a moment, and the deadline's kill may wait for the group to
+    // empty.
+    for (const patience of [TEARDOWN_PATIENCE, DEADLINE_PATIENCE]) {
+      expect(Number.isInteger(patience.rounds)).toBe(true);
+      expect(patience.rounds).toBeGreaterThanOrEqual(2);
+      expect(patience.pauseMs).toBeGreaterThanOrEqual(1);
+    }
+    expect(TEARDOWN_PATIENCE.rounds * TEARDOWN_PATIENCE.pauseMs).toBeLessThanOrEqual(100);
+    expect(DEADLINE_PATIENCE.rounds * DEADLINE_PATIENCE.pauseMs).toBeGreaterThanOrEqual(1000);
   });
 });

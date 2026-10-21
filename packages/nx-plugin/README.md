@@ -513,7 +513,12 @@ of its own under a 300 s deadline (`CARGO_FETCH_DEADLINE_MS` in `tooling/direnv/
 project graph puts on each of its own Cargo children). At the deadline the whole group is killed and the task fails,
 naming the command and the lock it held and printing Cargo's output up to the kill; `SMOO_CARGO_FETCH_DEADLINE_MS` gives
 a shorter deadline in whole milliseconds and never a longer one. A signal that ends the step (SIGINT, SIGTERM, SIGHUP)
-or the step's exit ends the group with it, since the group no longer shares the terminal's signals.
+or the step's exit ends the group with it, since the group no longer shares the terminal's signals. A group signal
+reaches only the members that exist when it goes out, and macOS does not hold a fork back while it does, so the kill is
+repeated while the kernel still lists members of the group (`judgeReap` in `tooling/direnv/cargo-fetch-bound.ts`): every
+5 ms for up to two seconds at the deadline, and every millisecond for up to thirty when the step itself is ending. If
+members are left when the repeats stop, the failure names the group and says so, and does not claim the kill reached
+every process.
 
 The step also gives the fetch `GIT_HTTP_LOW_SPEED_LIMIT=1` and `GIT_HTTP_LOW_SPEED_TIME=60`, over any value the shell
 already holds. Git has no low-speed limit unless one is set, and Cargo runs the `git` executable for git dependencies
