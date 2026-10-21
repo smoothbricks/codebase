@@ -782,15 +782,21 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
 
    **No disk-image command is killed.** For a disk-image command the caller's deadline is a warning point, not a kill:
    it is waited for, synchronously and still holding its leases, and reports its verb, target, elapsed time and observed
-   progress or lack of progress at the caller's configured cadence, until it ends on its own. A late child that succeeds
-   is a success; one that fails is the caller's failure as always, and an attach's own failure path detaches whatever
-   device it produced. Other disk children (`diskutil info`, `diskutil apfs …`, `mount_apfs`, …) use the caller's
-   execution budget, never a second fixed disk-child timeout. A hung DiskImages2 verb keeps its own operation and image
-   lease pending instead of leaking a device until reboot; the gateway's disk-phase eviction lets unrelated host work
-   continue without killing it (05_gateway.md, "Disk-lifecycle lease"). Its caller stays cancellable: a caller that
-   stops waiting leaves the detached command to finish. Callers outside cowshed get the same runner through
-   `cowshed disk-command` (06_cli.md). The orphaned-helper `kill -9` does not contradict this: an orphan serves no
-   device, so killing it strands nothing.
+   progress or lack of progress at the caller's configured cadence, until it ends on its own. Each report also reads the
+   host: the oldest disk-image command running on it (pid, command line, how long it has run) and every `diskimagesiod`
+   serving no device. Attaches stall behind one another: measured 2026-10-21, one attach whose device never got its BSD
+   node held every later attach on the host for up to 41 minutes, and each waiter said only that it was still waiting.
+   The helpers are named as facts, never as a remedy: one whose attach is under way serves no device yet. Once that
+   attach's client was killed, its helper stayed, still serving none, and launchd keys a helper by its image, so the
+   next attach of that image reconnected to the wedged helper and hung again. A late child that succeeds is a success;
+   one that fails is the caller's failure as always, and an attach's own failure path detaches whatever device it
+   produced. Other disk children (`diskutil info`, `diskutil apfs …`, `mount_apfs`, …) use the caller's execution
+   budget, never a second fixed disk-child timeout. A hung DiskImages2 verb keeps its own operation and image lease
+   pending instead of leaking a device until reboot; the gateway's disk-phase eviction lets unrelated host work continue
+   without killing it (05_gateway.md, "Disk-lifecycle lease"). Its caller stays cancellable: a caller that stops waiting
+   leaves the detached command to finish. Callers outside cowshed get the same runner through `cowshed disk-command`
+   (06_cli.md). The orphaned-helper `kill -9` does not contradict this: an orphan serves no device, so killing it
+   strands nothing.
 
 3. **Detach waits on the kernel and holders.** A non-forced unmount of a volume something holds is refused with `EBUSY`
    and retried; a land's target unmount took 12.2 s on its first try and then about 45 retries, and the image detach

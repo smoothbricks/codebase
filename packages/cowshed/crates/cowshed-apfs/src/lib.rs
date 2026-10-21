@@ -704,27 +704,34 @@ impl SystemCommandRunner {
     }
 }
 
-/// Say that a disk-image command outlived its deadline and is still waited for.
+/// Say that a disk-image command outlived its deadline and is still waited for, and what the host
+/// shows about why ([`disk_image_helpers::DiskImageHost`]): the oldest disk-image command running,
+/// which an attach waiting behind a stuck one names, and the helpers serving no device.
 ///
 /// Written without `eprintln!`, which panics when stderr is gone: a caller that gave up and
 /// closed this process's stderr (an adapter past its own deadline) must not turn the warning
 /// into an unwind that abandons the wait, the lease, and the attach-pool bookkeeping. That
-/// caller cannot hear the warning any more; the wait goes on regardless.
+/// caller cannot hear the warning any more; the wait goes on regardless. The line is formatted
+/// whole and written once, so it never splices with another process's on the shared stderr.
 fn warn_outlived(request: &CommandRequest, deadline: Duration, elapsed: Duration) {
     use std::io::Write;
     let target = request
         .args
         .last()
         .map_or_else(String::new, |target| target.to_string_lossy().into_owned());
-    let _ = writeln!(
-        io::stderr(),
+    let host = match disk_image_helpers::DiskImageHost::read() {
+        Ok(host) => host.to_string(),
+        Err(error) => format!("the host's disk-image commands are unreadable: {error}"),
+    };
+    let line = format!(
         "cowshed: warning: {} on {target} is still running after {}s, past its {}s deadline; \
          a disk-image command killed mid-operation can leak its device until reboot, so cowshed \
-         never kills one: it is waited for, holding its leases, until it ends on its own",
+         never kills one: it is waited for, holding its leases, until it ends on its own. {host}\n",
         DiskImageVerb(request),
         elapsed.as_secs(),
         deadline.as_secs(),
     );
+    let _ = io::stderr().lock().write_all(line.as_bytes());
 }
 
 /// The program and verb a disk-image command names: `diskutil image attach`, `diskutil eject`,

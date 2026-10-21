@@ -20,10 +20,156 @@
 //! orphaned and no `diskutil` or `hdiutil` was running during either. cowshed never signals a
 //! helper itself: only root can, and a helper serving an image cowshed did not attach is not
 //! cowshed's to end.
+//!
+//! A disk-image command still running past its deadline reads the host the other way round
+//! ([`DiskImageHost`]): every disk-image tool running, oldest first, and every helper serving no
+//! device, named as a fact rather than as an orphan to kill. Measured 2026-10-21: one attach whose
+//! kernel device never got its BSD node held every later attach on the host for up to 41 minutes,
+//! and once its clients were killed its helper stayed, serving no device; launchd keys a helper by
+//! its image, so the next attach of that image reconnected to the wedged helper and hung again,
+//! holding main's image lock and with it every verb on main. No waiter said which attach was the
+//! first.
 
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
+use std::time::Duration;
+#[cfg(target_os = "macos")]
+use std::time::SystemTime;
+
+/// A disk-image tool running on the host: its pid, its command line, and how long it has run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunningDiskCommand {
+    pub pid: libc::pid_t,
+    pub command: String,
+    pub running: Duration,
+}
+
+/// What a disk-image command still running past its deadline sees on the host: every disk-image
+/// tool running, oldest first, and every helper serving no device, by ascending pid.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiskImageHost {
+    pub commands: Vec<RunningDiskCommand>,
+    pub idle_helpers: Vec<libc::pid_t>,
+}
+
+impl DiskImageHost {
+    /// One read of the process table and the I/O Registry. Unsupported where the kernel has no
+    /// disk image helpers (Linux).
+    #[cfg(target_os = "macos")]
+    pub fn read() -> io::Result<Self> {
+        let scan = scan_processes()?;
+        let creators = creator_pids(None)?;
+        let now = SystemTime::now();
+        let mut commands = Vec::with_capacity(scan.disk_tools.len());
+        for pid in scan.disk_tools {
+            // A tool that exited since the listing is no longer running: it is not named.
+            if let Some(command) = running_command(pid, now)? {
+                commands.push(command);
+            }
+        }
+        Ok(Self::of(
+            commands,
+            OrphanedHelpers::among(&scan.helpers, &creators).pids,
+        ))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn read() -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this kernel has no disk image helpers",
+        ))
+    }
+
+    /// The reading of `commands` in any order and `idle_helpers` in ascending pid order.
+    pub fn of(mut commands: Vec<RunningDiskCommand>, idle_helpers: Vec<libc::pid_t>) -> Self {
+        commands.sort_by(|left, right| {
+            right
+                .running
+                .cmp(&left.running)
+                .then(left.pid.cmp(&right.pid))
+        });
+        Self {
+            commands,
+            idle_helpers,
+        }
+    }
+}
+
+impl fmt::Display for DiskImageHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.commands.first() {
+            Some(oldest) => write!(
+                f,
+                "the oldest of {} disk-image command(s) running on this host is pid {}, running \
+                 {}s: {}",
+                self.commands.len(),
+                oldest.pid,
+                oldest.running.as_secs(),
+                oldest.command
+            )?,
+            None => write!(f, "no disk-image command is running on this host")?,
+        }
+        if !self.idle_helpers.is_empty() {
+            write!(
+                f,
+                "; diskimagesiod helper(s) serving no device: pid {}. A helper whose attach is \
+                 under way serves none yet; one that still serves none at the next warning is \
+                 wedged, and an attach of its image reconnects to it and waits with it. Only \
+                 root's `kill -9` ends it, and killing one whose attach is under way can leak \
+                 that device until reboot (01a_apfs.md, \"How the APFS host degrades\" §2)",
+                self.idle_helpers
+                    .iter()
+                    .map(libc::pid_t::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// `pid`'s command line and how long it has run at `now`; `None` once it has exited.
+#[cfg(target_os = "macos")]
+fn running_command(pid: libc::pid_t, now: SystemTime) -> io::Result<Option<RunningDiskCommand>> {
+    // SAFETY: `info` is a plain C struct the kernel fills; zeroed is a valid value of it.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+        .map_err(io::Error::other)?;
+    // SAFETY: `info` is writable for `size` bytes, the size passed.
+    let written =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    if written != size {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(None),
+            _ => Err(io::Error::new(
+                error.kind(),
+                format!("proc_pidinfo({pid}, PROC_PIDTBSDINFO): {error}"),
+            )),
+        };
+    }
+    let started = SystemTime::UNIX_EPOCH
+        + Duration::from_secs(info.pbi_start_tvsec)
+        + Duration::from_micros(info.pbi_start_tvusec);
+    let command = match cowshed_os::process::process_arguments(pid) {
+        Ok(arguments) => arguments
+            .argv
+            .iter()
+            .map(|argument| String::from_utf8_lossy(argument).into_owned())
+            .collect::<Vec<_>>()
+            .join(" "),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
+        // Its arguments unreadable, it is still named, by what was in the way.
+        Err(error) => format!("(command line unreadable: {error})"),
+    };
+    Ok(Some(RunningDiskCommand {
+        pid,
+        command,
+        running: now.duration_since(started).unwrap_or_default(),
+    }))
+}
 
 /// The helper's executable.
 pub const HELPER_EXECUTABLE: &str = "/usr/libexec/diskimagesiod";
@@ -213,7 +359,7 @@ fn read_orphans() -> io::Result<(OrphanedHelpers, bool)> {
     // the later registry read, so a helper that exits with its image is not caught midway.
     let scan = scan_processes()?;
     let creators = creator_pids(None)?;
-    let busy = scan.disk_tools || scan_processes()?.disk_tools;
+    let busy = !scan.disk_tools.is_empty() || !scan_processes()?.disk_tools.is_empty();
     Ok((OrphanedHelpers::among(&scan.helpers, &creators), busy))
 }
 
@@ -225,22 +371,22 @@ fn read_orphans() -> io::Result<(OrphanedHelpers, bool)> {
     ))
 }
 
-/// The running helpers, and whether any disk-image tool is running.
+/// The running helpers, and the disk-image tools running, by ascending pid.
 #[cfg(target_os = "macos")]
 struct ProcessScan {
     helpers: BTreeSet<libc::pid_t>,
-    disk_tools: bool,
+    disk_tools: Vec<libc::pid_t>,
 }
 
-/// Every running process whose executable is [`HELPER_EXECUTABLE`], and whether one of
-/// [`DISK_IMAGE_TOOLS`] is running. A pid that exits between the listing and its path read
-/// (`ESRCH`), or has no executable vnode (`ENOENT`), is neither; any other refusal would hide
-/// helpers, so it fails the read.
+/// Every running process whose executable is [`HELPER_EXECUTABLE`], and every one whose
+/// executable is one of [`DISK_IMAGE_TOOLS`]. A pid that exits between the listing and its path
+/// read (`ESRCH`), or has no executable vnode (`ENOENT`), is neither; any other refusal would
+/// hide helpers, so it fails the read.
 #[cfg(target_os = "macos")]
 fn scan_processes() -> io::Result<ProcessScan> {
     let mut scan = ProcessScan {
         helpers: BTreeSet::new(),
-        disk_tools: false,
+        disk_tools: Vec::new(),
     };
     let mut path = [0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     for pid in all_pids()? {
@@ -255,7 +401,7 @@ fn scan_processes() -> io::Result<ProcessScan> {
                 .iter()
                 .any(|tool| executable == tool.as_bytes())
             {
-                scan.disk_tools = true;
+                scan.disk_tools.push(pid);
             }
             continue;
         }
@@ -325,6 +471,69 @@ mod tests {
         assert_eq!(orphans.pids(), [4353, 75251, 90001]);
         assert_eq!(orphans.mapped_mib(), 216);
         assert_eq!(orphans.remedy(), "sudo kill -9 4353 75251 90001");
+    }
+
+    /// The measured wedge, as an overdue attach reads it: the oldest disk-image command names the
+    /// attach every later one waited behind, however the listing ordered them, and the helpers
+    /// serving no device are named as facts with the risk of ending them, never as a remedy.
+    #[test]
+    fn an_overdue_attach_names_the_oldest_disk_image_command_and_the_idle_helpers() {
+        let command = |pid, seconds| RunningDiskCommand {
+            pid,
+            command: format!("/usr/sbin/diskutil image attach --noMount /store/{pid}.dmg"),
+            running: Duration::from_secs(seconds),
+        };
+        let host = DiskImageHost::of(
+            vec![
+                command(38338, 2148),
+                command(90338, 2400),
+                command(29678, 951),
+            ],
+            vec![29680, 90396],
+        );
+        assert_eq!(
+            host.commands
+                .iter()
+                .map(|command| command.pid)
+                .collect::<Vec<_>>(),
+            [90338, 38338, 29678]
+        );
+        let said = host.to_string();
+        assert!(
+            said.starts_with(
+                "the oldest of 3 disk-image command(s) running on this host is pid 90338, \
+                 running 2400s: /usr/sbin/diskutil image attach --noMount /store/90338.dmg; \
+                 diskimagesiod helper(s) serving no device: pid 29680, 90396."
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("sudo kill"), "{said}");
+        assert_eq!(
+            DiskImageHost::of(Vec::new(), Vec::new()).to_string(),
+            "no disk-image command is running on this host"
+        );
+    }
+
+    /// A real running process is read with its exact command line and an age measured from the
+    /// kernel's start time; one that has exited is not named at all.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_running_process_is_read_with_its_command_line_and_age() {
+        use cowshed_os::fork_lock::Spawn as _;
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn_locked()
+            .expect("spawn a stand-in");
+        let pid = libc::pid_t::try_from(child.id()).expect("a pid fits pid_t");
+        let read = running_command(pid, SystemTime::now() + Duration::from_secs(5))
+            .expect("read the stand-in")
+            .expect("the stand-in runs");
+        child.kill().expect("end the stand-in");
+        child.wait().expect("reap the stand-in");
+        assert_eq!(read.pid, pid);
+        assert_eq!(read.command, "/bin/sleep 30");
+        assert!(read.running >= Duration::from_secs(5), "{read:?}");
+        assert_eq!(running_command(pid, SystemTime::now()).expect("read"), None);
     }
 
     #[test]
