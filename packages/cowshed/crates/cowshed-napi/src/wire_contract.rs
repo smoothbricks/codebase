@@ -1519,16 +1519,10 @@ fn the_committed_wire_corpus_is_what_core_serializes() {
         serde_json::to_string_pretty(&actual).expect("the corpus renders as pretty JSON");
     rendered.push('\n');
 
-    if std::env::var(WRITE_ENV).as_deref() == Ok("write") {
-        // Read at runtime, not through `env!`. The macro bakes the manifest path into the crate's
-        // output, which the patched sccache then keeps for that checkout alone, so this crate and
-        // everything downstream would miss the compile cache at every new workspace mount path.
-        // Cargo exports CARGO_MANIFEST_DIR to the test process, which is the only place
-        // this regeneration branch runs.
-        let manifest_directory = std::env::var("CARGO_MANIFEST_DIR")
-            .expect("cargo exports CARGO_MANIFEST_DIR to the test process");
-        let path = PathBuf::from(manifest_directory).join("../../src/wire-fixtures.json");
-        std::fs::write(&path, &rendered).expect("the corpus path is writable");
+    if let Some(destination) = std::env::var_os(WRITE_ENV) {
+        // `scripts/wire-fixtures.sh` names the destination: a staging file it formats and renames
+        // over the committed corpus, so no reader sees this unformatted render.
+        std::fs::write(&destination, &rendered).expect("the render destination is writable");
         // The `nx run cowshed:wire-fixtures` leg: GOLDEN is the PREVIOUS file, compiled in, and
         // comparing against it here would fail the very run that brings it current. The next
         // compile includes the written file and the assertion below proves it then.

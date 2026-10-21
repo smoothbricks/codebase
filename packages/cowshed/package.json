@@ -66,6 +66,31 @@
           "killAfterMs": 10000
         }
       },
+      "wire-fixtures-test": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "{projectRoot}/scripts/wire-fixtures.sh",
+          "{projectRoot}/scripts/wire-fixtures.test.cjs",
+          "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
+          {
+            "externalDependencies": [
+              "@biomejs/biome"
+            ]
+          },
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh node --version"
+          }
+        ],
+        "outputs": [],
+        "options": {
+          "comment": "Witness that cowshed:wire-fixtures publishes the corpus whole: cowshed:lint reads src/wire-fixtures.json while it regenerates, so a reader must see the old or the new formatted file, never the raw render.",
+          "command": "node --test packages/cowshed/scripts/wire-fixtures.test.cjs",
+          "cwd": ".",
+          "idleTimeoutMs": 180000,
+          "killAfterMs": 10000
+        }
+      },
       "api-generator": {
         "executor": "nx:run-commands",
         "cache": true,
@@ -396,6 +421,7 @@
           "{projectRoot}/crates/cowshed-napi/**/*.rs",
           "{projectRoot}/crates/cowshed-napi/Cargo.toml",
           "{workspaceRoot}/biome.json",
+          "{projectRoot}/scripts/wire-fixtures.sh",
           "!{projectRoot}/**/target/**",
           "cargoToolchain"
         ],
@@ -403,7 +429,7 @@
           "{projectRoot}/src/wire-fixtures.json"
         ],
         "options": {
-          "command": "COWSHED_WIRE_FIXTURES=write cargo --frozen test -p cowshed-napi --quiet the_committed_wire_corpus_is_what_core_serializes && biome format --write src/wire-fixtures.json",
+          "command": "sh scripts/wire-fixtures.sh",
           "cwd": "packages/cowshed"
         }
       },
@@ -537,6 +563,7 @@
           "napi-test",
           "launcher-test",
           "cache-advisor-test",
+          "wire-fixtures-test",
           "wire-test",
           "declaration-model-test",
           "verify-packaging"
