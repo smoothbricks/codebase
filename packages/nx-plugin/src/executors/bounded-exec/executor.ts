@@ -30,6 +30,7 @@ import {
 import type { InstallRestart } from './gateway-lease.js';
 import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
+import type { LockWait } from './lock-wait.js';
 import { createNoSpaceWatch } from './no-space.js';
 import { createRunProgress, withProgressReport } from './progress.js';
 import {
@@ -112,6 +113,8 @@ interface RunState {
   poolCloseError: string | null;
   /** The first output line that said ENOSPC, with the task's volume read when it arrived. */
   noSpace: Promise<NoSpaceSighting> | null;
+  /** The lock waits the expiry's snapshot named: empty unless that capture completed. Judged with the expiry. */
+  lockWaits: readonly LockWait[];
 }
 
 type GrantedTokens = Extract<TokenGrant, { granted: true }>;
@@ -309,6 +312,7 @@ export async function runBoundedExec(
     forceKillNeeded: false,
     poolCloseError: null,
     noSpace: null,
+    lockWaits: [],
   };
   const appendStdout = (chunk: Buffer | string): void => {
     const text = chunk.toString();
@@ -486,6 +490,7 @@ export async function runBoundedExec(
     elapsedMs: number,
     operational: boolean,
     noSpace: NoSpaceSighting | null,
+    lockWaits: readonly LockWait[],
   ): Promise<void> => {
     if (context.record === undefined) {
       return;
@@ -494,7 +499,7 @@ export async function runBoundedExec(
     const report = await readJunitReport(recordDirectory);
     const verdict = operational
       ? judgeOperationalFailure(exitCode, report)
-      : judgeRun({ exitCode, elapsedMs, expiry, report, noSpace });
+      : judgeRun({ exitCode, elapsedMs, expiry, report, noSpace, lockWaits });
     if (verdict.outcome === 'bound' && verdict.bound === 'test') {
       appendStderr(`Every failing test failed only on its per-test timeout: ${verdict.tests.join(', ')}\n`);
     }
@@ -506,7 +511,7 @@ export async function runBoundedExec(
     await releaseCpu();
     // The command never started, so its lease holds nothing of its own to keep.
     await releaseLease(false);
-    await recordRun(1, null, Date.now() - asked, false, null);
+    await recordRun(1, null, Date.now() - asked, false, null, []);
     return { success: false, terminalOutput: outputChunks.join('') };
   };
   if (parentRefusal !== null) {
@@ -825,6 +830,7 @@ export async function runBoundedExec(
     );
     if (bound.kind === 'idle') {
       const observed = idleCapture?.result;
+      state.lockWaits = observed?.kind === 'captured' ? observed.snapshot.lockWaits : [];
       appendStderr(
         `Hang diagnostics: runner pid=${child.pid ?? 'unavailable'} pgid=${
           process.platform === 'win32' ? 'unavailable' : (child.pid ?? 'unavailable')
@@ -940,7 +946,7 @@ export async function runBoundedExec(
   // Broken resource ownership or a lost native lifecycle fails even if a shell branch later exited 0:
   // its verdict is an ordinary operational failure, never a successful or silently unbounded run.
   const operationalFailure = state.poolCloseError !== null || lifecycleFailure !== null;
-  await recordRun(code, state.expiry, Date.now() - startedAt, operationalFailure, seen);
+  await recordRun(code, state.expiry, Date.now() - startedAt, operationalFailure, seen, state.lockWaits);
 
   return {
     success: !operationalFailure && state.expiry === null && code === 0,

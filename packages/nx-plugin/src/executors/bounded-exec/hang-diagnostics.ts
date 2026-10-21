@@ -1,5 +1,13 @@
 import { spawn } from 'node:child_process';
 import { type ProcessEntry, withDescendants } from '../../testing.js';
+import {
+  describeHolders,
+  type LockWait,
+  lockCandidates,
+  lockWaits,
+  parseLsofFields,
+  parseLsofTable,
+} from './lock-wait.js';
 
 export const HANG_CAPTURE_MS = 5_000;
 const MAX_PROBE_BYTES = 4 * 1024 * 1024;
@@ -23,6 +31,8 @@ export interface HangDiagnostics {
   /** Positive when the observation completed before the idle expiry. */
   offsetFromExpiryMs: number;
   outcome: 'holders' | 'none' | 'incomplete';
+  /** Lock waits the snapshot names: empty unless the capture is complete, and always empty without the open-file census. */
+  lockWaits: readonly LockWait[];
   text: string;
 }
 
@@ -67,6 +77,7 @@ export function captureHangDiagnostics(
   ];
   let active = 'process census';
   let finished = false;
+  let waits: readonly LockWait[] = [];
   // This package targets lib es2022, which does not declare Promise.withResolvers.
   return new Promise((resolve) => {
     const finish = (outcome: HangDiagnostics['outcome']): void => {
@@ -82,6 +93,7 @@ export function captureHangDiagnostics(
         capturedAtMs,
         offsetFromExpiryMs,
         outcome,
+        lockWaits: outcome === 'incomplete' ? [] : waits,
         text: `${lines.join('\n')}\nHang snapshot outcome=${outcome} capturedAtMs=${capturedAtMs} offsetFromExpiryMs=${offsetFromExpiryMs}\n`,
       });
     };
@@ -197,6 +209,28 @@ export function captureHangDiagnostics(
         observed = resources.stdout.trim() !== '';
         if (!observed && answered(resources))
           lines.push('lsof reported no open-file matches within its stated visibility.');
+        // A lock wait needs a complete census of the run's files: a regular file the run holds on a numbered descriptor
+        // that another process also holds open. One privileged lsof names those holders; a probe that did not answer
+        // makes the capture incomplete, never an empty holder set.
+        const rows = incomplete ? [] : parseLsofTable(resources.stdout);
+        const candidates = lockCandidates(rows);
+        if (candidates.length > 0) {
+          const holders = await probe(
+            'lsof lock holders',
+            'sudo',
+            ['-n', 'lsof', '-nP', '-F', 'pcn', '--', ...candidates],
+            1_500,
+          );
+          if (finished) return;
+          const openers =
+            answered(holders) && lsofFaults(holders.stderr) === '' ? parseLsofFields(holders.stdout) : null;
+          if (openers === null) {
+            incomplete = true;
+            lines.push('Lock holder census incomplete; no lock wait is named.');
+          } else {
+            waits = lockWaits(rows, new Set(before.map((entry) => entry.pid)), openers);
+          }
+        }
       } else {
         lines.push(`Open-file census not provided on ${source.platform}; observations below name processes only.`);
       }
@@ -220,6 +254,13 @@ export function captureHangDiagnostics(
       ) {
         incomplete = true;
         lines.push('Process identities or membership changed during capture; open-file census raced.');
+      }
+      if (!incomplete) {
+        for (const wait of waits) {
+          lines.push(
+            `Lock wait (open-handle evidence, not a kernel lock owner): ${wait.path} open in the run by pid ${wait.waiters.join(', ')} and outside it by ${describeHolders(wait.holders)}`,
+          );
+        }
       }
       finish(incomplete ? 'incomplete' : observed ? 'holders' : 'none');
     };

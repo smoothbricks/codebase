@@ -318,6 +318,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
                 capturedAtMs,
                 offsetFromExpiryMs: request.expiresAtMs - capturedAtMs,
                 outcome: 'holders',
+                lockWaits: [],
                 text: 'owned pre-signal process observation\n',
               };
             },
@@ -418,6 +419,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
                 capturedAtMs,
                 offsetFromExpiryMs: request.expiresAtMs - capturedAtMs,
                 outcome: 'holders',
+                lockWaits: [],
                 text: `capture-interval-${ordinal}\n`,
               };
             },

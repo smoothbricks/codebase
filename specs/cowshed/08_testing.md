@@ -570,12 +570,18 @@ probe stderr or changing process identity is incomplete evidence, never an empty
 that verdict: it names a mount lsof could not stat(), such as one detaching under a concurrent shed, and omits no
 descriptor of the selected processes. Successful observations with resources, successful observations without matches
 and incomplete/raced captures remain distinct. An open file is not proof of a contested lock, and an admission token
-count or one CPU/state sample does not establish CPU starvation or its absence. The process census resolves `ps` through
-the runtime `PATH`, as fixture process tables do; NixOS has no `/bin/ps`. A probe past its limit is ended without being
-awaited: an ordinary probe by SIGKILL to its process group, the privileged one by SIGTERM to `sudo` itself, which relays
-it to its root command and exits only after that command. A group signal from the caller reaches `sudo` but not the
-command it runs as root, so it would orphan `lsof`. While `sudo` starts it holds root's real uid and refuses every
-signal from the caller; the probe result names that refusal rather than claiming the probe ended.
+count or one CPU/state sample does not establish CPU starvation or its absence. The snapshot also names, for each
+regular file the run holds on a numbered descriptor, the processes outside the run that hold that file open. Such a file
+is classified as a lock wait, naming those processes as holder evidence (open handles, not a kernel lock owner), and the
+verdict records it; the lock call itself is not observed. The bound and the kill are unchanged. The case this answers:
+on 2026-10-21 a `cargo --frozen test` that printed `Blocking waiting for file lock on package cache` held
+`~/.cargo/.package-cache` open and was killed at the bound with only its own files in the snapshot, so its holder went
+unnamed. The process census resolves `ps` through the runtime `PATH`, as fixture process tables do; NixOS has no
+`/bin/ps`. A probe past its limit is ended without being awaited: an ordinary probe by SIGKILL to its process group, the
+privileged one by SIGTERM to `sudo` itself, which relays it to its root command and exits only after that command. A
+group signal from the caller reaches `sudo` but not the command it runs as root, so it would orphan `lsof`. While `sudo`
+starts it holds root's real uid and refuses every signal from the caller; the probe result names that refusal rather
+than claiming the probe ended.
 
 **Script-host fixture wedge (2026-10-16, resolved 2026-10-17).** The isolation case
 `nothing_one_script_does_to_its_process_reaches_the_next` once and `scripts_forked_at_once_each_run_whole` four times

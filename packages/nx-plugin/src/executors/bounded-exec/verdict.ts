@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { describeHolders, type LockWait, type Opener } from './lock-wait.js';
 
 /**
  * Why one bounded run ended, recorded per Nx task so a caller can tell a load-sensitive bound
@@ -12,6 +13,8 @@ import { join } from 'node:path';
  *   the suite's completion bound was exceeded, not that every process stopped: an expensive active fixture can
  *   exceed it too. The verdict names tests reported running but never finished and tests the report says were
  *   aborted; diagnostics distinguish a stalled wait from a progressing but oversized lifecycle.
+ *   When the snapshot named a lock wait, `lockWaits` names the file the run holds on a numbered descriptor and the
+ *   processes outside the run that also hold it open: open-handle evidence, not a kernel lock owner.
  * - `no-space`: the run failed and its output said a write found no space (ENOSPC). Whatever its tests then reported,
  *   they failed on the disk, not on their own: the verdict names the line that said so and, when the task held one,
  *   its RAM temp volume as it stood when that line arrived.
@@ -27,6 +30,8 @@ export type BoundedExecVerdict =
       readonly idleMs: number;
       readonly elapsedMs: number;
       readonly tests: readonly string[];
+      /** Lock waits the snapshot named: holder evidence (open handles), not a kernel lock owner. */
+      readonly lockWaits: readonly LockWait[];
     }
   | ({ readonly outcome: 'no-space'; readonly exitCode: number; readonly tests: readonly string[] } & NoSpaceSighting)
   | { readonly outcome: 'failed'; readonly exitCode: number; readonly tests: readonly string[] };
@@ -204,6 +209,8 @@ export interface RunEnd {
   readonly report: JunitFailures | null;
   /** The first output line that said ENOSPC, or `null` when none did. */
   readonly noSpace: NoSpaceSighting | null;
+  /** The lock waits the expiry's snapshot named; empty when none, or when that capture did not complete. */
+  readonly lockWaits: readonly LockWait[];
 }
 
 /**
@@ -221,7 +228,7 @@ export function judgeRun(run: RunEnd): BoundedExecVerdict {
   }
   if (run.expiry?.kind === 'idle') {
     const tests = [...new Set([...run.expiry.tests, ...(run.report?.cancelled ?? [])])];
-    return { outcome: 'wedged', idleMs: run.expiry.limitMs, elapsedMs: run.elapsedMs, tests };
+    return { outcome: 'wedged', idleMs: run.expiry.limitMs, elapsedMs: run.elapsedMs, tests, lockWaits: run.lockWaits };
   }
   if (run.report !== null && run.report.failed.length > 0) {
     return { outcome: 'failed', exitCode: run.exitCode, tests: run.report.failed };
@@ -375,11 +382,19 @@ function parseVerdict(value: unknown): BoundedExecVerdict {
           return { outcome: 'bound', bound: 'test', tests: value.tests };
         }
         break;
-      case 'wedged':
-        if (typeof value.idleMs === 'number' && typeof value.elapsedMs === 'number' && isStrings(value.tests)) {
-          return { outcome: 'wedged', idleMs: value.idleMs, elapsedMs: value.elapsedMs, tests: value.tests };
+      case 'wedged': {
+        // A record written before lock waits were named carries none.
+        const lockWaits = value.lockWaits === undefined ? [] : parseLockWaits(value.lockWaits);
+        if (
+          typeof value.idleMs === 'number' &&
+          typeof value.elapsedMs === 'number' &&
+          isStrings(value.tests) &&
+          lockWaits !== null
+        ) {
+          return { outcome: 'wedged', idleMs: value.idleMs, elapsedMs: value.elapsedMs, tests: value.tests, lockWaits };
         }
         break;
+      }
       case 'no-space': {
         const volume = parseTempVolumeSpace(value.volume);
         if (typeof value.exitCode === 'number' && isStrings(value.tests) && typeof value.line === 'string' && volume) {
@@ -401,6 +416,33 @@ function parseVerdict(value: unknown): BoundedExecVerdict {
     }
   }
   throw new Error(`not a bounded-exec verdict: ${JSON.stringify(value)}`);
+}
+
+/** A process id as the census writes it: a positive safe integer. */
+function isPid(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
+function isPids(value: unknown): value is number[] {
+  return Array.isArray(value) && value.every(isPid);
+}
+
+/** Lock waits as recorded, or `null` when any part of them is malformed. */
+function parseLockWaits(value: unknown): LockWait[] | null {
+  if (!Array.isArray(value)) return null;
+  const waits: LockWait[] = [];
+  for (const wait of value) {
+    if (!isObject(wait) || typeof wait.path !== 'string' || !isPids(wait.waiters) || !Array.isArray(wait.holders)) {
+      return null;
+    }
+    const holders: Opener[] = [];
+    for (const holder of wait.holders) {
+      if (!isObject(holder) || !isPid(holder.pid) || typeof holder.command !== 'string') return null;
+      holders.push({ pid: holder.pid, command: holder.command });
+    }
+    waits.push({ path: wait.path, waiters: wait.waiters, holders });
+  }
+  return waits;
 }
 
 /** A recorded volume, wrapped so a well-formed `null` (no RAM volume) differs from a malformed one (`undefined`). */
@@ -483,7 +525,9 @@ export function describeVerdict(verdict: BoundedExecVerdict): string {
         verdict.tests.length > 0
           ? `still running: ${verdict.tests.join(', ')}`
           : 'the runner named no test still running'
-      }`;
+      }${verdict.lockWaits
+        .map((wait) => `; waiting on a lock: ${wait.path} held open by ${describeHolders(wait.holders)}`)
+        .join('')}`;
     case 'no-space':
       return `${describeNoSpace(verdict)}${verdict.tests.length > 0 ? `; the tests that then failed: ${verdict.tests.join(', ')}` : ''}`;
     case 'failed':

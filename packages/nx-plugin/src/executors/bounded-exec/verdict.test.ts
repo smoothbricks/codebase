@@ -24,6 +24,7 @@ import {
   junitFailures,
   readRecord,
   taskDirectory,
+  VERDICT_FILE,
   withJunitReport,
   writeRecord,
 } from './verdict.js';
@@ -185,8 +186,56 @@ describe('bounded-exec verdicts', () => {
         expiry: { kind: 'idle', limitMs: 400, tests: ['nt tests::hangs'] },
         report,
         noSpace: null,
+        lockWaits: [],
       }),
-    ).toEqual({ outcome: 'wedged', idleMs: 400, elapsedMs: 900, tests: ['nt tests::hangs', 'nt tests::young'] });
+    ).toEqual({
+      outcome: 'wedged',
+      idleMs: 400,
+      elapsedMs: 900,
+      tests: ['nt tests::hangs', 'nt tests::young'],
+      lockWaits: [],
+    });
+  });
+
+  it('copies the lock waits the snapshot named into the wedged verdict', () => {
+    const cache = '/Users/dev/.cargo/.package-cache';
+    const lockWaits = [{ path: cache, waiters: [94769], holders: [{ pid: 51234, command: 'cargo' }] }];
+    expect(
+      judgeRun({
+        exitCode: 143,
+        elapsedMs: 180_900,
+        expiry: { kind: 'idle', limitMs: 180_000, tests: [] },
+        report: null,
+        noSpace: null,
+        lockWaits,
+      }),
+    ).toEqual({ outcome: 'wedged', idleMs: 180_000, elapsedMs: 180_900, tests: [], lockWaits });
+  });
+
+  it('names the process outside the run that holds the file a wedged run waits on', () => {
+    const lockWaits = [
+      { path: '/Users/dev/.cargo/.package-cache', waiters: [94769], holders: [{ pid: 51234, command: 'cargo' }] },
+    ];
+    expect(describeVerdict({ outcome: 'wedged', idleMs: 180_000, elapsedMs: 200_000, tests: [], lockWaits })).toBe(
+      'wedged: no test finished for 180000ms after 200000ms; the runner named no test still running; ' +
+        'waiting on a lock: /Users/dev/.cargo/.package-cache held open by pid 51234 (cargo)',
+    );
+  });
+
+  it('reads a wedged record written before lock waits were named as naming none, and refuses a malformed one', async () => {
+    const { root } = await workspace();
+    const directory = join(root, 'record');
+    await mkdir(directory, { recursive: true });
+    const verdict = { outcome: 'wedged', idleMs: 400, elapsedMs: 900, tests: ['t'] } as const;
+    const write = (value: unknown) =>
+      writeFile(join(directory, VERDICT_FILE), JSON.stringify({ task: 'app:test', hash: '42', verdict: value }));
+    await write(verdict);
+    expect((await readRecord(directory))?.verdict).toEqual({ ...verdict, lockWaits: [] });
+    const named = [{ path: '/fixture/cache', waiters: [7], holders: [{ pid: 9, command: 'cargo' }] }];
+    await write({ ...verdict, lockWaits: named });
+    expect((await readRecord(directory))?.verdict).toEqual({ ...verdict, lockWaits: named });
+    await write({ ...verdict, lockWaits: 'cargo' });
+    await expect(readRecord(directory)).rejects.toThrow('not a bounded-exec verdict');
   });
 
   it('records a failed run whose output said ENOSPC as out of space, ahead of the tests and the bound that followed', () => {
@@ -201,7 +250,7 @@ describe('bounded-exec verdicts', () => {
       },
     };
     const report = { timedOut: [], cancelled: [], failed: ['lsp-differential hover'] };
-    const ran = { exitCode: 1, elapsedMs: 11_580, expiry: null, report, noSpace };
+    const ran = { exitCode: 1, elapsedMs: 11_580, expiry: null, report, noSpace, lockWaits: [] };
     expect(judgeRun(ran)).toEqual({ outcome: 'no-space', exitCode: 1, tests: ['lsp-differential hover'], ...noSpace });
     // A full disk that then hung the run is still the disk.
     const idle = { kind: 'idle', limitMs: 400, tests: ['nt tests::writes'] } as const;
@@ -275,7 +324,9 @@ ${abort('t::crash', '11 (SIGSEGV)')}
   it('records a run its ceiling stopped as a bound when the only failures are the tests the stop aborted', () => {
     const total = { kind: 'total', limitMs: 120_000 } as const;
     const cut = { timedOut: [], cancelled: ['nt t::cut'], failed: [] };
-    expect(judgeRun({ exitCode: 143, elapsedMs: 120_850, expiry: total, report: cut, noSpace: null })).toEqual({
+    expect(
+      judgeRun({ exitCode: 143, elapsedMs: 120_850, expiry: total, report: cut, noSpace: null, lockWaits: [] }),
+    ).toEqual({
       outcome: 'bound',
       bound: 'total',
       limitMs: 120_000,
@@ -289,9 +340,12 @@ ${abort('t::crash', '11 (SIGSEGV)')}
         expiry: total,
         report: { ...cut, failed: ['nt t::assert'] },
         noSpace: null,
+        lockWaits: [],
       }),
     ).toEqual({ outcome: 'failed', exitCode: 143, tests: ['nt t::assert'] });
-    expect(judgeRun({ exitCode: 143, elapsedMs: 850, expiry: null, report: cut, noSpace: null })).toEqual({
+    expect(
+      judgeRun({ exitCode: 143, elapsedMs: 850, expiry: null, report: cut, noSpace: null, lockWaits: [] }),
+    ).toEqual({
       outcome: 'failed',
       exitCode: 143,
       tests: ['nt t::cut'],
@@ -308,6 +362,7 @@ ${abort('t::crash', '11 (SIGSEGV)')}
         expiry: null,
         report: { timedOut: [], cancelled, failed: [] },
         noSpace: null,
+        lockWaits: [],
       }),
     ).toEqual({
       outcome: 'failed',
@@ -322,6 +377,7 @@ ${abort('t::crash', '11 (SIGSEGV)')}
         expiry: null,
         report: { timedOut: ['nt t::slow'], cancelled, failed: [] },
         noSpace: null,
+        lockWaits: [],
       }),
     ).toEqual({ outcome: 'failed', exitCode: 100, tests: cancelled });
     // With the total bound fired, the same report is the bound's own casualties.
@@ -332,6 +388,7 @@ ${abort('t::crash', '11 (SIGSEGV)')}
         expiry: { kind: 'total', limitMs: 120_000 },
         report: { timedOut: ['nt t::slow'], cancelled, failed: [] },
         noSpace: null,
+        lockWaits: [],
       }),
     ).toMatchObject({ outcome: 'bound', bound: 'total' });
   });

@@ -1,7 +1,7 @@
 import { describe, expect, it, jest } from 'bun:test';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
@@ -47,9 +47,27 @@ function scriptedHost(results: readonly HangProbeResult[]) {
   return { host, calls };
 }
 
+/** The first complete line a process prints. A stream that ends first fails, naming what it did print. */
+async function firstLine(stdout: ReadableStream<Uint8Array>, who: string): Promise<string> {
+  const reader = stdout.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) throw new Error(`${who} ended before a complete line; observed ${JSON.stringify(text)}`);
+      text += decoder.decode(chunk.value, { stream: true });
+      const end = text.indexOf('\n');
+      if (end !== -1) return text.slice(0, end);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 describe('pre-expiry hang diagnostics', () => {
   it('keeps grandchildren and reparented group members, but not unrelated host rows', async () => {
-    const { host, calls } = scriptedHost([exited(census), exited(fileObservation), exited(census)]);
+    const { host, calls } = scriptedHost([exited(census), exited(fileObservation), exited('', 1), exited(census)]);
     const capture = await captureHangDiagnostics(request(), host);
     expect(capture.outcome).toBe('holders');
     for (const row of [rootRow, childRow, grandchildRow, reparentedRow]) expect(capture.text).toContain(row);
@@ -57,8 +75,10 @@ describe('pre-expiry hang diagnostics', () => {
     expect(capture.text).toContain('/fixture/held-file');
     expect(capture.text).toContain('not proof of a contested lock');
     expect(capture.text).toContain('pid=101 pgid=101');
-    expect(calls.map((call) => call.file)).toEqual(['ps', 'sudo', 'ps']);
+    expect(calls.map((call) => call.file)).toEqual(['ps', 'sudo', 'sudo', 'ps']);
     expect(calls[1]?.args).toEqual(['-n', 'lsof', '-nP', '-p', '101,202,303,404']);
+    expect(calls[2]?.args).toEqual(['-n', 'lsof', '-nP', '-F', 'pcn', '--', '/fixture/held-file']);
+    expect(capture.lockWaits).toEqual([]);
     expect(capture.offsetFromExpiryMs).toBeGreaterThan(0);
     expect(capture.capturedAtMs).toBeGreaterThanOrEqual(capture.startedAtMs);
   });
@@ -107,12 +127,17 @@ describe('pre-expiry hang diagnostics', () => {
       "lsof: WARNING: can't stat() apfs file system /private/tmp/hang-capture-repro/dmg.Gqndhm\n" +
       '      Output information may be incomplete.\n' +
       '      assuming "dev=100037e" from mount table\n';
-    const warned = scriptedHost([exited(rootRow), exited(fileObservation, 0, fallback), exited(rootRow)]);
+    const warned = scriptedHost([
+      exited(rootRow),
+      exited(fileObservation, 0, fallback),
+      exited('', 1),
+      exited(rootRow),
+    ]);
     const capture = await captureHangDiagnostics(request(), warned.host);
     expect(capture.outcome, capture.text).toBe('holders');
     expect(capture.text).toContain("can't stat() apfs file system /private/tmp/hang-capture-repro/dmg.Gqndhm");
     expect(capture.text).toContain('omits no descriptor of the selected processes');
-    expect(warned.calls.map((call) => call.file)).toEqual(['ps', 'sudo', 'ps']);
+    expect(warned.calls.map((call) => call.file)).toEqual(['ps', 'sudo', 'sudo', 'ps']);
     const empty = scriptedHost([exited(rootRow), exited('', 1, fallback), exited(rootRow)]);
     expect((await captureHangDiagnostics(request(), empty.host)).outcome).toBe('none');
     for (const stderr of [`${fallback}lsof: WARNING: other\n`, 'lsof: WARNING: other\n']) {
@@ -120,6 +145,47 @@ describe('pre-expiry hang diagnostics', () => {
       const other = await captureHangDiagnostics(request(), host);
       expect(other.outcome, other.text).toBe('incomplete');
       expect(other.text).toContain('lsof: WARNING: other');
+    }
+  });
+
+  it('names a lock wait for a file the run holds and a process outside the run also holds', async () => {
+    // Pid 303 is the run's own grandchild, so its row in the holder census is not an outside holder.
+    const outside = 'p303\ncchild\nf7\nn/fixture/held-file\np505\ncperl\nf3\nn/fixture/held-file\n';
+    const { host, calls } = scriptedHost([exited(census), exited(fileObservation), exited(outside), exited(census)]);
+    const capture = await captureHangDiagnostics(request(), host);
+    expect(capture.outcome, capture.text).toBe('holders');
+    expect(capture.lockWaits).toEqual([
+      { path: '/fixture/held-file', waiters: [303], holders: [{ pid: 505, command: 'perl' }] },
+    ]);
+    expect(capture.text).toContain(
+      'Lock wait (open-handle evidence, not a kernel lock owner): /fixture/held-file open in the run by pid 303 and outside it by pid 505 (perl)',
+    );
+    expect(calls[2]?.args).toEqual(['-n', 'lsof', '-nP', '-F', 'pcn', '--', '/fixture/held-file']);
+  });
+
+  it('names no lock wait for a file the run holds only through an unnumbered descriptor', async () => {
+    const library =
+      'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nchild 303 tester txt REG 1,2 4 123 /fixture/library\n';
+    const { host, calls } = scriptedHost([exited(census), exited(library), exited(census)]);
+    const capture = await captureHangDiagnostics(request(), host);
+    expect(capture.outcome).toBe('holders');
+    expect(capture.lockWaits).toEqual([]);
+    expect(calls.map((call) => call.file)).toEqual(['ps', 'sudo', 'ps']);
+  });
+
+  it('marks the capture incomplete, with no lock wait, when the holder census does not answer', async () => {
+    const holders: HangProbeResult[] = [
+      { status: 'timed-out', detail: 'probe exceeded 1500ms', stdout: '', stderr: '' },
+      exited('p505\ncperl\nf3\nn/fixture/held-file\n', 0, 'lsof: WARNING: other\n'),
+      exited('n/fixture/held-file\n'),
+      exited('p505\ncperl\nq3\n'),
+    ];
+    for (const holder of holders) {
+      const { host } = scriptedHost([exited(census), exited(fileObservation), holder, exited(census)]);
+      const capture = await captureHangDiagnostics(request(), host);
+      expect(capture.outcome, capture.text).toBe('incomplete');
+      expect(capture.lockWaits).toEqual([]);
+      expect(capture.text).not.toContain('Lock wait (open-handle');
     }
   });
 
@@ -338,6 +404,56 @@ describe('pre-expiry hang diagnostics', () => {
     }
     if (failures.length > 0) {
       throw new AggregateError(failures, `hang snapshot fixture ${directory} failed`);
+    }
+  });
+
+  it('names the process outside the run that holds the file a run is blocked on in flock', async () => {
+    if (process.platform !== 'darwin') return;
+    const directory = await mkdtemp(join(tmpdir(), 'hang-lock-wait-'));
+    const file = join(directory, 'package-cache');
+    await writeFile(file, '');
+    // The holder takes the exclusive lock and lives until the test kills it. The run opens the same file, prints
+    // `waiting`, and blocks in flock(2): the snapshot observes its open descriptor, not the blocked call itself.
+    const holderScript = 'open(F, ">>", $ARGV[0]) or die; flock(F, 2) or die; $| = 1; print "held\\n"; sleep';
+    const runScript = 'open(F, ">>", $ARGV[0]) or die; $| = 1; print "waiting\\n"; flock(F, 2) or die; sleep';
+    const holder = Bun.spawn(['perl', '-e', holderScript, file], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+    let run: typeof holder | undefined;
+    const failures: unknown[] = [];
+    try {
+      expect(await firstLine(holder.stdout, 'lock holder')).toBe('held');
+      run = Bun.spawn(['perl', '-e', runScript, file], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+      expect(await firstLine(run.stdout, 'lock waiter')).toBe('waiting');
+      jest.useFakeTimers();
+      const capture = await captureHangDiagnostics({ ...request(), pid: run.pid, pgid: null }).finally(() =>
+        jest.useRealTimers(),
+      );
+      const path = await realpath(file);
+      expect(capture.outcome, capture.text).toBe('holders');
+      expect(capture.lockWaits, capture.text).toEqual([
+        { path, waiters: [run.pid], holders: [{ pid: holder.pid, command: 'perl' }] },
+      ]);
+      expect(capture.text).toContain(
+        `Lock wait (open-handle evidence, not a kernel lock owner): ${path} open in the run by pid ${run.pid} and outside it by pid ${holder.pid} (perl)`,
+      );
+    } catch (error) {
+      failures.push(error);
+    }
+    for (const child of [run, holder]) {
+      if (child === undefined) continue;
+      try {
+        child.kill('SIGKILL');
+        await child.exited;
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    try {
+      await rm(directory, { recursive: true, force: true });
+    } catch (error) {
+      failures.push(error);
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, `lock wait fixture ${directory} failed`);
     }
   });
 });
