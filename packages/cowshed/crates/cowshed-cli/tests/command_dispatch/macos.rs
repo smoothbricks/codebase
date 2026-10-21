@@ -6466,9 +6466,10 @@ async fn real_apfs_default_land_never_signals_a_foreign_nominee_during_retiremen
 /// *verifiably* (02_workspaces.md, "Holders cowshed does not run"), and cannot-verify is not
 /// absent. So while they hold the mount, land lands, skips adoption, and keeps the workspace,
 /// naming them. Do not "fix" this by exempting an unverifiable record: a record anyone can
-/// write would then exempt any process. The worker's lifetime is the kernel's to decide, so a
-/// stand-in host process holds the mount here, after the daemon is seen gone. Once nothing
-/// holds it the landed workspace retires.
+/// write would then exempt any process. Each plugin worker leaves only once it reads the end of
+/// its socket to the exited daemon, which under load is not at once, so the test waits for the
+/// daemon and every worker it had to exit, and a stand-in host process holds the mount in their
+/// place. Once nothing holds it the landed workspace retires.
 #[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
     let (nx, node) = repository_nx();
@@ -6499,14 +6500,19 @@ async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
                 .expect("the record names its daemon"),
         )
         .expect("a pid");
+        // Listed while they are still the daemon's children: once it exits launchd adopts them.
+        let plugin_workers = children_of(daemon);
         fs::remove_file(&record).unwrap();
         if unreadable {
             fs::create_dir(&record).unwrap();
         } else {
             fs::write(&record, b"{not a daemon record").unwrap();
         }
-        // The daemon exits once its record does not name it: its exit is the event.
+        // The daemon exits once its record does not name it, and each plugin worker once it reads
+        // the end of its socket to it: their exits are the events, so no worker of this run still
+        // holds the mount when land or rm takes its census.
         await_exit(daemon);
+        await_exits(&plugin_workers);
         let mut workers = HostProcesses(Vec::new());
         let worker = workers.start(&topic, None);
         let (kept, _, stderr) = run(&mut service, ["--json", "land", "outputs"]).await;
