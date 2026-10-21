@@ -44,11 +44,12 @@ use cowshed_core::developer_links;
 use cowshed_core::runtime::job_cgroup::Placement;
 use cowshed_core::runtime::job_groups::{self, Birth};
 use cowshed_core::runtime::shell_host::{
-    BINDING_ARRAY, BINDING_SCALAR, CONTROL_DESCRIPTOR, FrameReader, FrameWriter, REPLY_ACTIVATED,
-    REPLY_ACTIVATION_EXITED, REPLY_ACTIVATION_UNUSABLE, REPLY_APPROVED, REPLY_EXITED,
-    REPLY_HOST_FAILED, REPLY_NICE_REFUSED, REPLY_RELEASED, REPLY_SIGNAL_FAILED, REPLY_STARTED,
-    REQUEST_ACTIVATE, REQUEST_APPROVE, REQUEST_RELEASE, REQUEST_RUN, REQUEST_SCRIPT,
-    REQUEST_SIGNAL, RawWaitStatus, SHELL_HOST_ARGUMENT, ShellHostProgram, read_frame,
+    BINDING_ARRAY, BINDING_SCALAR, CONTROL_DESCRIPTOR, FrameReader, FrameWriter, Inherited,
+    REPLY_ACTIVATED, REPLY_ACTIVATION_EXITED, REPLY_ACTIVATION_UNUSABLE, REPLY_ADOPTION_REFUSED,
+    REPLY_APPROVED, REPLY_EXITED, REPLY_HOST_FAILED, REPLY_NICE_REFUSED, REPLY_RELEASED,
+    REPLY_SIGNAL_FAILED, REPLY_STARTED, REQUEST_ACTIVATE, REQUEST_ADOPT, REQUEST_APPROVE,
+    REQUEST_RELEASE, REQUEST_RUN, REQUEST_SCRIPT, REQUEST_SIGNAL, RawWaitStatus,
+    SHELL_HOST_ARGUMENT, ShellHostProgram, read_frame,
 };
 use cowshed_core::script::Binding;
 
@@ -196,6 +197,35 @@ fn one_descriptor(descriptors: &mut Vec<OwnedFd>, what: &str) -> io::Result<Owne
     Ok(descriptors.remove(0))
 }
 
+/// Lay a direnv export over an environment: a value sets its variable, `None` removes it.
+fn apply_to(
+    environment: &mut BTreeMap<OsString, OsString>,
+    diff: &BTreeMap<String, Option<String>>,
+) {
+    for (name, value) in diff {
+        match value {
+            Some(value) => {
+                environment.insert(name.into(), value.into());
+            }
+            None => {
+                environment.remove(OsStr::new(name));
+            }
+        }
+    }
+}
+
+/// The first executable `name` on `path`, as the kernel's `execvp` would find it.
+fn resolve_program(name: &str, path: Option<&OsString>) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::env::split_paths(path?)
+        .map(|directory| directory.join(name))
+        .find(|candidate| {
+            std::fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+}
+
 /// The command's nice and platform placement, passed with its streams. Linux requires the
 /// controller-opened cgroup descriptor; macOS requires the observation fence. A script child
 /// closes these explicitly because it does not exec.
@@ -294,6 +324,14 @@ impl Host {
                 fields.finish()?;
                 let stderr = one_descriptor(&mut descriptors, "stderr")?;
                 self.activate(socket, &directory, stderr)
+            }
+            REQUEST_ADOPT => {
+                let directory = PathBuf::from(OsStr::from_bytes(fields.bytes()?));
+                let inherited: Inherited = serde_json::from_slice(fields.bytes()?)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                fields.finish()?;
+                let stderr = one_descriptor(&mut descriptors, "stderr")?;
+                self.adopt(socket, &directory, inherited, stderr)
             }
             REQUEST_SCRIPT => {
                 let text = fields.bytes()?;
@@ -478,19 +516,16 @@ impl Host {
                 );
             }
         };
-        for (name, value) in diff {
-            match value {
-                Some(value) => {
-                    self.environment.insert(name.into(), value.into());
-                }
-                None => {
-                    self.environment.remove(OsStr::new(&name));
-                }
-            }
-        }
-        // One version probe per activation answers every command of this warm shell; the wrapper
-        // asks again only for another program file, and itself reports any failure dropped here
-        // (15_capabilities.md, "Bootstrap executables").
+        self.apply(&diff);
+        self.reply_activated(socket, &exported)
+    }
+
+    /// Lay an export over this host's environment, then probe the developer-link wrappers once
+    /// for the shell: one version probe per activation answers every command of this warm
+    /// shell; the wrapper asks again only for another program file, and itself reports any
+    /// failure dropped here (15_capabilities.md, "Bootstrap executables").
+    fn apply(&mut self, diff: &BTreeMap<String, Option<String>>) {
+        apply_to(&mut self.environment, diff);
         let report = developer_links::report(
             self.environment
                 .get(OsStr::new("PATH"))
@@ -508,6 +543,12 @@ impl Host {
                     .remove(OsStr::new(developer_links::REPORTED_ENV));
             }
         }
+    }
+
+    /// Report the activated shell: its watch list, and the export it applied (empty for an
+    /// adopted one, whose export the supervisor already holds), so the supervisor can leave it
+    /// for the checkouts cloned from this one.
+    fn reply_activated(&self, socket: &UnixStream, export: &[u8]) -> io::Result<()> {
         let watches = self
             .environment
             .get(OsStr::new("DIRENV_WATCHES"))
@@ -517,7 +558,112 @@ impl Host {
             Some(watches) => frame.bytes(watches)?,
             None => frame,
         };
-        reply(socket, frame)
+        reply(socket, frame.bytes(export)?)
+    }
+
+    /// Take an inherited export the supervisor verified for this checkout instead of evaluating
+    /// (11_shell.md, "Shell activation and process reuse"). The values the record withholds —
+    /// credentials and what cowshed publishes per workspace — are read from this checkout's own
+    /// tail files through direnv's stdlib and `direnv dump`, exactly as an activation reads
+    /// them. A tail that does not supply one of them refuses the adoption with the host's
+    /// environment untouched, and the supervisor evaluates instead.
+    fn adopt(
+        &mut self,
+        socket: &UnixStream,
+        directory: &Path,
+        inherited: Inherited,
+        stderr: OwnedFd,
+    ) -> io::Result<()> {
+        let _orphan_guard = OrphanGuard::watch(socket)?;
+        let refuse = |reason: String| {
+            reply(
+                socket,
+                FrameWriter::new(REPLY_ADOPTION_REFUSED).bytes(reason.as_bytes())?,
+            )
+        };
+        let (environment, from_tail, tail) = inherited.into_parts();
+        let baseline = self.environment.clone();
+        let mut staged = baseline.clone();
+        apply_to(&mut staged, &environment);
+        let dump = match self.source_tail(directory, &staged, &tail, stderr) {
+            Ok(Ok(dump)) => dump,
+            Ok(Err(reason)) => return refuse(reason),
+            Err(error) => return refuse(error.to_string()),
+        };
+        let mut diff = environment;
+        for name in from_tail {
+            match dump.get(&name) {
+                Some(value) => {
+                    diff.insert(name, Some(value.clone()));
+                }
+                None => {
+                    return refuse(format!(
+                        "the inherited shell had {name}, and this checkout's own files do not set it"
+                    ));
+                }
+            }
+        }
+        apply_to(&mut staged, &diff);
+        diff.insert(
+            "DIRENV_DIFF".to_owned(),
+            Some(cowshed_core::runtime::shell_watch::encode_direnv_diff(
+                &baseline, &staged,
+            )),
+        );
+        self.apply(&diff);
+        self.reply_activated(socket, b"")
+    }
+
+    /// Source `tail` over `environment` the way direnv sources a file from an `.envrc`: its own
+    /// bash, its stdlib, `source_env_if_exists`, and `direnv dump json` for the result.
+    fn source_tail(
+        &self,
+        directory: &Path,
+        environment: &BTreeMap<OsString, OsString>,
+        tail: &[PathBuf],
+        stderr: OwnedFd,
+    ) -> io::Result<Result<BTreeMap<String, String>, String>> {
+        let direnv = match resolve_program("direnv", self.environment.get(OsStr::new("PATH"))) {
+            Some(direnv) => direnv,
+            None => {
+                return Ok(Err(self
+                    .tool_error(io::ErrorKind::NotFound.into())
+                    .to_string()));
+            }
+        };
+        let status = self
+            .tool(directory)
+            .arg("status")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|error| self.tool_error(error))?;
+        let Some(bash) = String::from_utf8_lossy(&status.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("bash_path ").map(PathBuf::from))
+        else {
+            return Ok(Err("direnv status names no bash_path".into()));
+        };
+        let output = Command::new(bash)
+            .env_clear()
+            .envs(environment)
+            .env("PWD", directory)
+            .current_dir(directory)
+            .arg("-c")
+            .arg(r#"eval "$("$0" stdlib)" || exit; for rc; do source_env_if_exists "$rc" || exit; done; "$0" dump json"#)
+            .arg(&direnv)
+            .args(tail)
+            .stdin(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .output()?;
+        if !output.status.success() {
+            return Ok(Err(format!(
+                "sourcing this checkout's own shell files failed: {}",
+                output.status
+            )));
+        }
+        Ok(serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("direnv dump json is not an environment: {error}")))
     }
 
     /// The activated environment with one command's overlay and cwd laid over it.

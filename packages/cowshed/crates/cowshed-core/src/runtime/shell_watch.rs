@@ -97,6 +97,76 @@ pub fn decode_direnv_watches(encoded: &str) -> Result<Vec<WatchEntry>, WatchList
     Ok(entries)
 }
 
+/// Encode a watch list as direnv does for `DIRENV_WATCHES`, recording each input's current
+/// whole-second modification time (0 for an absent one), as a fresh `direnv export` would.
+/// The inverse of [`decode_direnv_watches`]; an inherited shell sets it for its own checkout.
+pub fn encode_direnv_watches(entries: &[WatchEntry]) -> String {
+    #[derive(serde::Serialize)]
+    struct Recorded<'a> {
+        path: &'a Path,
+        modtime: i64,
+        exists: bool,
+    }
+    let recorded: Vec<Recorded<'_>> = entries
+        .iter()
+        .map(|entry| match std::fs::metadata(&entry.path) {
+            Ok(metadata) => Recorded {
+                path: &entry.path,
+                modtime: metadata.mtime(),
+                exists: true,
+            },
+            Err(_) => Recorded {
+                path: &entry.path,
+                modtime: 0,
+                exists: false,
+            },
+        })
+        .collect();
+    let json = serde_json::to_vec(&recorded).expect("a watch list serializes");
+    base64::engine::general_purpose::URL_SAFE
+        .encode(miniz_oxide::deflate::compress_to_vec_zlib(&json, 6))
+}
+
+/// direnv's `DIRENV_DIFF` for an environment moving from `before` to `after`: its `EnvDiff`
+/// (`p`, the previous values of every changed variable; `n`, the new ones) as base64url(zlib
+/// (JSON)), skipping the variables direnv lets change freely. An adopted shell sets it so a
+/// direnv run inside one of its commands unloads it exactly as it would an evaluated one.
+pub fn encode_direnv_diff(
+    before: &BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    after: &BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+) -> String {
+    fn ignored(name: &str) -> bool {
+        name.starts_with("__fish")
+            || name.starts_with("BASH_FUNC_")
+            || matches!(
+                name,
+                "COMP_WORDBREAKS"
+                    | "PS1"
+                    | "OLDPWD"
+                    | "PWD"
+                    | "SHELL"
+                    | "SHELLOPTS"
+                    | "SHLVL"
+                    | "_"
+                    | "DIRENV_DIFF"
+            )
+    }
+    type Environment = BTreeMap<std::ffi::OsString, std::ffi::OsString>;
+    fn changed<'a>(from: &'a Environment, to: &Environment) -> BTreeMap<&'a str, &'a str> {
+        from.iter()
+            .filter_map(|(name, value)| Some((name.to_str()?, value.to_str()?)))
+            .filter(|(name, value)| {
+                !ignored(name)
+                    && to.get(std::ffi::OsStr::new(name)).and_then(|v| v.to_str()) != Some(*value)
+            })
+            .collect()
+    }
+    let diff = serde_json::json!({ "p": changed(before, after), "n": changed(after, before) });
+    let json = serde_json::to_vec(&diff).expect("an environment diff serializes");
+    base64::engine::general_purpose::URL_SAFE
+        .encode(miniz_oxide::deflate::compress_to_vec_zlib(&json, 6))
+}
+
 /// The exact identity of one watched path, following symlinks as direnv does.
 ///
 /// `(ino, size, mtime, ctime)` at the filesystem's timestamp resolution: an atomic replace
@@ -424,13 +494,114 @@ impl Snapshot {
                 })
     }
 
-    pub fn paths(&self) -> impl Iterator<Item = &Path> {
+    pub fn paths(&self) -> impl Iterator<Item = &Path> + Clone {
         self.0.keys().map(PathBuf::as_path)
     }
 
     fn get(&self, path: &Path) -> Option<FileState> {
         self.0.get(path).copied()
     }
+}
+
+/// What one input holds, for deciding whether a shell's inputs really changed: an identity
+/// moves on a rewrite of the same bytes (a checkout, a stash, an editor's save), and a byte that
+/// did not change cannot change the shell.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Content {
+    Missing,
+    /// A directory direnv watches (`watch_dir` records each directory under the one named, and
+    /// every file): SHA-256 of its sorted entry names. An entry added or removed is a change;
+    /// the files' own bytes are inputs of their own.
+    Directory([u8; 32]),
+    File([u8; 32]),
+}
+
+impl Content {
+    pub fn of(path: &Path) -> io::Result<Self> {
+        use sha2::Digest as _;
+        use std::io::Read as _;
+        let mut file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(Self::Missing);
+            }
+            Err(error) => return Err(error),
+        };
+        if file.metadata()?.is_dir() {
+            let mut names = std::fs::read_dir(path)?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<io::Result<Vec<_>>>()?;
+            names.sort();
+            let mut hasher = sha2::Sha256::new();
+            for name in names {
+                hasher.update(name.as_encoded_bytes());
+                hasher.update([0]);
+            }
+            return Ok(Self::Directory(hasher.finalize().into()));
+        }
+        let mut hasher = sha2::Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(Self::File(hasher.finalize().into()))
+    }
+}
+
+/// The contents of a set of inputs, certified by the identities taken on either side of reading
+/// them ([`certify`]).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Contents(BTreeMap<PathBuf, Content>);
+
+impl Contents {
+    pub fn iter(&self) -> impl Iterator<Item = (&Path, Content)> {
+        self.0
+            .iter()
+            .map(|(path, content)| (path.as_path(), *content))
+    }
+}
+
+/// Why inputs could not be certified.
+#[derive(Debug, thiserror::Error)]
+pub enum CertifyError {
+    #[error("cannot read shell input {path:?}: {source}")]
+    Unreadable { path: PathBuf, source: io::Error },
+    #[error("a shell input changed while it was being read")]
+    Moved,
+}
+
+/// Identities, then bytes, then identities again: the bytes belong to those identities only if
+/// nothing moved between the two readings, so a later identity check that finds them unchanged
+/// also proves the bytes unchanged.
+pub fn certify<'a>(
+    paths: impl IntoIterator<Item = &'a Path> + Clone,
+) -> Result<(Snapshot, Contents), CertifyError> {
+    let before = Snapshot::take(paths.clone());
+    let contents = paths
+        .into_iter()
+        .map(|path| {
+            Content::of(path)
+                .map(|content| (path.to_path_buf(), content))
+                .map_err(|source| CertifyError::Unreadable {
+                    path: path.to_path_buf(),
+                    source,
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let after = Snapshot::take(before.paths());
+    if !before.same_as(&after) {
+        return Err(CertifyError::Moved);
+    }
+    Ok((after, Contents(contents)))
 }
 
 /// What one activation observed about its own inputs.
@@ -445,10 +616,24 @@ pub struct ActivationEvidence {
     pub clock: Option<EvaluationClock>,
     /// Identities of `entries` taken as soon as evaluation finished.
     pub after: Snapshot,
+    /// The bytes of `entries`, certified by `after` ([`certify`]); `None` when an input moved
+    /// while they were read, which leaves the activation unstable.
+    pub contents: Option<Contents>,
 }
 
 impl ActivationEvidence {
-    /// Whether every input the activation read stayed put while it ran.
+    /// Identities and bytes of `entries` as they are now, for an activation that just finished.
+    pub fn observe(entries: &[WatchEntry]) -> (Snapshot, Option<Contents>) {
+        match certify(entries.iter().map(|entry| entry.path.as_path())) {
+            Ok((after, contents)) => (after, Some(contents)),
+            Err(_) => (
+                Snapshot::take(entries.iter().map(|entry| entry.path.as_path())),
+                None,
+            ),
+        }
+    }
+
+    /// Whether every input the activation read stayed put while it ran, and its bytes are known.
     ///
     /// An input the previous generation also watched must be identical before and after. An
     /// input first seen by this activation has no earlier identity, so it must have last
@@ -457,21 +642,22 @@ impl ActivationEvidence {
     /// also have run forward across the evaluation ([`EvaluationClock`]). direnv's existence
     /// bit, which is exact, must agree with what is there now.
     pub fn stable(&self) -> bool {
-        self.entries.iter().all(|entry| {
-            let Some(now) = self.after.get(&entry.path) else {
-                return false;
-            };
-            let unchanged = match self.before.get(&entry.path) {
-                Some(before) => before.same_as(now),
-                None => match now {
-                    FileState::Present { dev, ctime_ns, .. } => self
-                        .clock
-                        .is_some_and(|clock| clock.precedes_start(dev, ctime_ns)),
-                    FileState::Missing | FileState::Unreadable(_) => true,
-                },
-            };
-            unchanged && entry.exists == now.exists()
-        })
+        self.contents.is_some()
+            && self.entries.iter().all(|entry| {
+                let Some(now) = self.after.get(&entry.path) else {
+                    return false;
+                };
+                let unchanged = match self.before.get(&entry.path) {
+                    Some(before) => before.same_as(now),
+                    None => match now {
+                        FileState::Present { dev, ctime_ns, .. } => self
+                            .clock
+                            .is_some_and(|clock| clock.precedes_start(dev, ctime_ns)),
+                        FileState::Missing | FileState::Unreadable(_) => true,
+                    },
+                };
+                unchanged && entry.exists == now.exists()
+            })
     }
 }
 
@@ -1004,6 +1190,7 @@ mod tests {
             before: before.clone(),
             clock,
             after,
+            contents: Some(Contents::default()),
         };
         assert!(evidence.stable(), "nothing moved during evaluation");
 
@@ -1020,6 +1207,7 @@ mod tests {
             before: before.clone(),
             clock,
             after,
+            contents: Some(Contents::default()),
         };
         assert!(!evidence.stable(), "a new input written mid-evaluation");
 
@@ -1031,6 +1219,7 @@ mod tests {
             before,
             clock,
             after,
+            contents: Some(Contents::default()),
         };
         assert!(!evidence.stable(), "a known input rewritten mid-evaluation");
 
@@ -1049,6 +1238,7 @@ mod tests {
                 finished: FsInstant::read(&root).unwrap(),
             }),
             after,
+            contents: Some(Contents::default()),
         };
         assert!(
             !evidence.stable(),
@@ -1091,6 +1281,7 @@ mod tests {
                     ctime_ns: input_ctime_ns,
                 },
             )])),
+            contents: Some(Contents::default()),
         };
         // Started at 10.5s, stepped back a second: the mid-evaluation write stamps 9.7s and the
         // clock reads 9.8s at the end.
@@ -1187,10 +1378,39 @@ mod tests {
                 path,
                 state(16_777_401, 1_398_438, 8_784, 5, 6),
             )])),
+            contents: Some(Contents::default()),
         };
         assert!(
             evidence.stable(),
             "an input remounted under another device stayed put"
         );
+    }
+
+    /// Bytes decide: a file's content is its bytes, a directory's its entry names, and a
+    /// rewrite of the same bytes under a new identity is the same content.
+    #[test]
+    fn content_is_bytes_for_files_and_entry_names_for_directories() {
+        let root =
+            std::env::temp_dir().join(format!("cowshed-content-{}", uuid::Uuid::new_v4().simple()));
+        let directory = root.join("recipe");
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("a.nix");
+        std::fs::write(&file, b"a").unwrap();
+        let (before, contents) = certify([file.as_path(), directory.as_path()]).unwrap();
+
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(&file, b"a").unwrap();
+        let (after, same) = certify([file.as_path(), directory.as_path()]).unwrap();
+        assert!(!before.same_as(&after), "a new file is a new identity");
+        assert_eq!(contents, same, "and the same content");
+
+        std::fs::write(directory.join("b.patch"), b"b").unwrap();
+        let (_, added) = certify([file.as_path(), directory.as_path()]).unwrap();
+        assert_ne!(
+            contents, added,
+            "an entry added to a watched directory is a change"
+        );
+        assert_eq!(Content::of(&root.join("absent")).unwrap(), Content::Missing);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

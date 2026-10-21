@@ -265,6 +265,16 @@ An exit-watch fixture waits for an executed-body readiness byte before its paren
 registers the watch. The parent holds the child's input gate until registration; returning from spawn alone is not
 readiness. Its actual parent retains the child unreaped through the exit observation.
 
+The inherited-shell equivalence fixture (`cowshed-shell` `shell_pool.rs`,
+`host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_evaluation`) is the two-root test 11_shell.md
+"Inherited shells" rests on. Three workspaces of one tree at different roots, port blocks and runtime links: the origin
+evaluates; the adopter receives the origin's record and must serve its first command without evaluating; the evaluator
+has no record and evaluates. Their job environments, with each fixture's own root and runtime link replaced by fixed
+names and the per-job and per-port-block variables left out, must be equal, a credential from `.envrc-local` included,
+and the record must hold no credential value. A fourth workspace with one changed input byte must evaluate and say why.
+The fixture's shell is cowshed's own `.envrc`, not a repository's; the sandboxed lane covers the record, key, move and
+host protocol (`shell_inherit.rs`, `script_host.rs`) without it.
+
 The build-state CLI probe launches the installed `cowshed` binary through private `tools/bin` beneath the executed-child
 profile in both read-write and read-only modes. Its program link and resolved executable have literal read access with
 metadata-only ancestors, matching the installed-binary contract in the package guide. The probe requires the checkout's

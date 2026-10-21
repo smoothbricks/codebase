@@ -7,11 +7,12 @@ over a Unix socket, job control, and the single exec-record capture that all cli
 
 ## Shell activation and process reuse
 
-A fresh workspace is a CoW clone of main, including its `.direnv`/`.devenv` caches. These are inputs to canonical
-activation, not proof that an exported environment is current. Activation dominates command latency: **a warm
-`direnv exec` on a devenv repo costs seconds per invocation**, dwarfing `sandbox-exec` startup and process creation.
-Cowshed therefore activates a workspace shell once, reuses the activated process for every command until one of the
-inputs direnv recorded for that activation changes, and never replays exported variables in place of activation.
+A fresh workspace is a CoW clone of its origin (main, or the workspace it was forked from): the same inputs, already
+installed. What a fresh host lacks is the activated environment, and activation dominates command latency: **a warm
+`direnv exec` on a devenv repo costs seconds per invocation, and a cold devenv evaluation at a new path costs a minute
+or more** (74.6 s measured on a devenv monorepo), dwarfing `sandbox-exec` startup and process creation. Cowshed
+therefore activates once per lineage: a host evaluates only when no verified export exists for its checkout, and reuses
+the activated process for every command until the bytes of an input direnv recorded for that activation change.
 
 **Exec hosts.** A command whose cwd lies under a workspace-contained `.envrc` runs in a warm exec host: a small cowshed
 process started under the executed-child profile, in its own process group, with the sandbox environment
@@ -37,6 +38,51 @@ keeps blocking in its control read; a host that runs only code already resident 
 by SIGBUS at its first page-in after the mount went. No job waits on a dropped host, so its supervisor writes how it
 ended to its log unless it exited 0, naming a SIGBUS as a page the host's program could not be given, and says so too
 when it cannot collect the host at all.
+
+**Inherited shells.** Every activation whose inputs stayed put while it ran (below) leaves its export in
+`.cowshed/shell-host/activation.json`, written by the supervisor, so the APFS clone carries it to every workspace forked
+from this one, and a fork of a fork carries it again. A host that starts with no live generation adopts that export
+instead of evaluating when three checks pass, and evaluates otherwise:
+
+- **The inputs are the same bytes.** The record keeps the activation's watch list, each input relative to the checkout
+  root, and its key: SHA-256 over every input, ordered by relative path, as (path, whether it exists, its bytes). The
+  adopting supervisor certifies the inputs at its own checkout — identities, bytes, identities again, refused if
+  anything moved between the readings — and recomputes the key. The cowshed-owned inputs whose bytes differ per
+  workspace by construction, `.cowshed/env` and direnv's trust files under `.cowshed/data/direnv/`, are not in the key;
+  their effect is read at each checkout (below).
+- **The baseline is the same.** direnv's export lists, for each variable the activation changed, its complete new value
+  (or a removal) relative to the host's pre-activation environment, so it is valid only over an equivalent one. The
+  record keeps the baseline's key: SHA-256 over that environment with the checkout's places (below) replaced by
+  placeholders, every withheld name (below) and cowshed's per-workspace git identity (`GIT_CONFIG_GLOBAL`) left out.
+- **Nothing names the origin after the move.** Every value has each of the origin's per-workspace places — its root, its
+  runtime link (`XDG_RUNTIME_DIR`), its `TMPDIR` and its `HOME`, root first — replaced by the adopting checkout's at a
+  path-component boundary (`/x/repo` moves `/x/repo/tooling`, never `/x/repo-worktrees`); devenv's `DEVENV_RUNTIME`, a
+  hash of the dotfile path, is recomputed as devenv computes it. A value that still names a place of the origin this
+  checkout has no counterpart for, or holds a number inside the origin's port block, refuses adoption. A value derived
+  from a hash of the root or from a fact cowshed does not publish is invisible to that check. The two-root equivalence
+  fixture (08_testing.md) proves the mechanism for cowshed's own fixture shell, and that monorepo's export was measured
+  against a fresh evaluation of a fork (of its 71 variables, 51 equal as recorded, 16 equal after the move,
+  `DEVENV_RUNTIME` recomputed, `DIRENV_WATCHES` rebuilt, `COWSHED_RUNTIME_LINK` read from the tail, and
+  `DEVENV_TASK_FILE` dropped); no gate runs a repository's own shell at two roots, so a repository edit that adds such a
+  value is outside what adoption can verify.
+
+The record never carries direnv's own `DIRENV_WATCHES` and `DIRENV_DIFF` (the host rebuilds both for its checkout),
+`DEVENV_TASK_FILE` (the parent's task file runs scripts built with the parent's root; tasks and processes are not tools)
+or a `shellHook`, nor any variable the secret convention names — cowshed's workspace and cache tokens, proxy URLs,
+`*_TOKEN`, `*_SECRET`, `*_KEY`, values of the 02_workspaces.md token shapes, URLs with userinfo — nor anything
+`.cowshed/env` publishes per workspace. Without that filter every fork would re-copy every ancestor's secrets,
+multiplied by the number of workspaces and the depth of their lineage. Those values are not lost: the record names which
+ones the export set, and the adopting host reads them from its own checkout's tail files — `.cowshed/env` and
+`.envrc-local`, those of the two the activation's watch list names, in its order — through direnv's own bash, stdlib,
+`source_env_if_exists` and `direnv dump json`, exactly as the activation read them. A tail that does not supply one of
+them refuses the adoption, the host's environment untouched, and the host evaluates. So adopted and evaluated shells
+obtain those values one way. This is non-propagation, not isolation: the files they come from are in the image either
+way, and moving them out is the gateway vault's.
+
+Adoption runs no direnv evaluation, no devenv, no entry task and no approval; only the tail files run, and their output
+reaches the job that waited on the adoption as an activation's would. A miss says why on that job's stderr
+(`cowshed: evaluating the workspace shell: …`) and evaluates as before. A lost or unreadable record is a miss, never an
+error, and a record that cannot be written is reported on the supervisor's stderr and only means clones evaluate.
 
 **Script jobs.** Besides a byte-exact argv, a job can be a script: bash-compatible shell text as a template of literal
 `parts` and `values` (`ExecCommand::Script`, 07_api.md). At admission the supervisor binds each value to a shell
@@ -177,32 +223,42 @@ filesystem's timestamp resolution — each had when the activation finished. The
 it numbers the mount, not the file, and a clone of a volume keeps every file's inode, size, mtime and ctime under
 another device, so comparing it reads an unchanged clone as changed. direnv's whole-second `modtime` is never compared.
 Where timestamps are coarse (a scheduler tick on Linux without multigrain timestamps, a second on HFS+) two same-size
-writes inside one tick share an identity, and the kernel subscription is what reports them. A kernel event only sets the
-pool's dirty flag, however many inputs changed. The next command acts on it, never the event: if the flag is set, or an
-in-process stat of the listed paths finds an identity changed (the backstop for coalesced events), every idle host and
-the spare are retired and a fresh host activates for that command; a host still executing finishes its command and is
-dropped instead of returned. An activation whose own inputs moved while it ran — an input the previous generation listed
-changed identity across the evaluation, or a newly listed input's ctime is later than the evaluation's start — serves
-the command that paid for it and is never reused. The start is read off the workspace filesystem's own clocks, never the
-process clock, which runs up to a tick ahead of the stamps a coarse clock gives. One filesystem need not stamp every
-change from one clock: ZFS on Linux stamps writes from the kernel's coarse tick clock, and attribute changes (creations
-too, under POSIX ACLs) from the VFS clock, which on a kernel with multigrain timestamps (6.13 and later) a fine-grained
-stamp on any other filesystem of the host moves up to a tick ahead of it. So the supervisor probes the protected host
-directory — it creates a file, writes to it and changes its mode, reading the ctime after each — and probes again until
-a probe's earliest stamp is later than the first probe's latest. That latest stamp is the start: every change before it,
-the approval's included, stamps no later, and every change after the probing stamps no earlier than the crossing probe's
-earliest — as long as the clocks run forward. A ctime between the two readings is not proven older than the start; a
-change made while the supervisor probes has no causal order against it. A wall clock stepped back while the evaluation
-runs (a VM's time sync, an NTP step) stamps a change made during it earlier than the start, so the supervisor reads the
-slowest clock again once the evaluation's inputs are snapshotted: an end reading earlier than the crossing proves the
-clock ran backwards, no newly listed input counts as older than the evaluation, and the activation is never reused. An
-end reading at or after the crossing does not rule a step back out: a clock stepped back and forward again past the
-crossing reads exactly like one that ran forward, was slewed or stamps coarsely, and the filesystem's stamps are the
-only clock there is to read (a monotonic clock beside them drifts from the wall clock by slewing alone). A newly listed
-input written while the clock was stepped back can still count as older, and the shell serves until that input changes
-again. An input on another filesystem, which may stamp in whole seconds, must predate the start's second. A change to a
-path not on the list costs nothing. The repository decides what else counts as shell input with `watch_file`: lockfiles
-and devenv inputs whose change must rerun shell entry.
+writes inside one tick share an identity, and the kernel subscription is what reports them. When an activation finishes
+the supervisor also certifies the inputs' bytes: identities, SHA-256 of each input (of its sorted entry names for a
+directory, which `watch_dir` records beside every file under it), identities again; an input that moved between the
+readings leaves the activation unstable. **Bytes decide; identities and events only ask.** A kernel event, or an
+in-process stat of the listed paths that finds an identity changed (the backstop for coalesced events), makes the pool
+certify the inputs again at the next decision point, never at the event: bytes equal to the generation's mean the
+rewrite changed nothing the shell read (a checkout, a stash, an editor's save of the same text), and the generation
+takes the new identities, resubscribes (a replaced file is a new vnode) and stays warm; any other bytes, or bytes that
+cannot be certified, set the pool's dirty flag. The next command acts on the flag: every idle host and the spare are
+retired and a fresh host activates for that command (adopting first, which misses because the key moved, then
+evaluating); a host still executing finishes its command and is dropped instead of returned. An activation whose own
+inputs moved while it ran — an input the previous generation listed changed identity across the evaluation, or a newly
+listed input's ctime is later than the evaluation's start — serves the command that paid for it and is never reused. The
+start is read off the workspace filesystem's own clocks, never the process clock, which runs up to a tick ahead of the
+stamps a coarse clock gives. One filesystem need not stamp every change from one clock: ZFS on Linux stamps writes from
+the kernel's coarse tick clock, and attribute changes (creations too, under POSIX ACLs) from the VFS clock, which on a
+kernel with multigrain timestamps (6.13 and later) a fine-grained stamp on any other filesystem of the host moves up to
+a tick ahead of it. So the supervisor probes the protected host directory — it creates a file, writes to it and changes
+its mode, reading the ctime after each — and probes again until a probe's earliest stamp is later than the first probe's
+latest. That latest stamp is the start: every change before it, the approval's included, stamps no later, and every
+change after the probing stamps no earlier than the crossing probe's earliest — as long as the clocks run forward. A
+ctime between the two readings is not proven older than the start; a change made while the supervisor probes has no
+causal order against it. A wall clock stepped back while the evaluation runs (a VM's time sync, an NTP step) stamps a
+change made during it earlier than the start, so the supervisor reads the slowest clock again once the evaluation's
+inputs are snapshotted: an end reading earlier than the crossing proves the clock ran backwards, no newly listed input
+counts as older than the evaluation, and the activation is never reused. An end reading at or after the crossing does
+not rule a step back out: a clock stepped back and forward again past the crossing reads exactly like one that ran
+forward, was slewed or stamps coarsely, and the filesystem's stamps are the only clock there is to read (a monotonic
+clock beside them drifts from the wall clock by slewing alone). A newly listed input written while the clock was stepped
+back can still count as older, and the shell serves until that input changes again. An input on another filesystem,
+which may stamp in whole seconds, must predate the start's second. A change to a path not on the list costs nothing. The
+repository decides what else counts as shell input with `watch_file`: lockfiles and devenv inputs whose change must
+rerun shell entry. devenv leaves directory inputs off the list it hands direnv (only files can be `watch_file`d), so a
+directory a devenv module reads, such as a package's build recipe a source filter is rooted at, is named by the
+repository with direnv's `watch_dir`, which records every file beneath it. An input missing from the list is the one way
+a warm or inherited shell can serve stale: neither the identity check nor the content key can see it.
 
 **One spare and a SIEVE cache.** Hosts are pooled per shell identity: effective sandbox mode, `.envrc` directory, grant
 revision, the exact sandbox environment, and the host program. A read-only command never runs in a read-write host, and
@@ -1062,10 +1118,22 @@ project, a Nix evaluation and every entry hook — on every command, which is wh
 Whether that evaluation is still valid is a question direnv already answers from its own recorded watch list; asking it
 once per activation and watching the answer's inputs costs a few dozen `stat`s per command instead.
 
-**Replaying an exported environment rejected.** Capturing `direnv export`/`print-dev-env` output and applying it to
-later processes looks equivalent but is not: it skips entry hooks that do work (installs, generated files), and it has
-no truthful invalidation — only direnv knows which inputs its evaluation read. A live activated process whose freshness
-is direnv's own watch set keeps both.
+**Replaying an unverified export rejected; inheriting a verified one adopted.** Capturing `direnv export` or
+`print-dev-env` output and applying it to later processes, keyed by nothing, has no truthful invalidation and skips the
+entry hooks. A clone's inherited export is different on each count. Its invalidation is the content key over the
+activation's own watch list plus the baseline key, recomputed at the adopting checkout (above): the inputs direnv says
+the evaluation read, as bytes, so a changed input misses and a rewrite of the same bytes does not. Its entry hooks
+already ran on these same bytes at the origin — installs and generated files are in the image the clone copied, and a
+task that would run again finds nothing to do (on that monorepo every entry task reported cached on a fresh fork's
+evaluation, and `devenv:files:cleanup` spent 10.1 s doing nothing). What does differ per checkout is read at the
+checkout: the tail files, sourced through direnv. A record whose checks fail is never applied.
+
+**Making devenv's own evaluation cache answer a clone rejected.** devenv keys its cache on the absolute root, dotfile,
+`TMPDIR`, runtime directory and git root, and records `HOME` among its inputs, so a clone's copy of its origin's cache
+never hits; and the shell's root-dependent derivations (there, the files-cleanup and service scripts embed the root, and
+seven derivations rebuild at a new path) would hand the clone the origin's paths even on a hit. Root-free derivations
+plus a root-free key would need a devenv fork carried across releases, for a result the inherited export already gives
+without evaluating at all.
 
 **A live bash as the warm shell rejected.** A job owns anonymous pipes whose other ends only the supervisor holds, a
 process group the supervisor signals, and an exact wait status. A long-lived bash can accept none of these per command:

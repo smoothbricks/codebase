@@ -31,16 +31,18 @@ use super::job_cgroup::JobCgroup;
 use super::job_cpu::JobCpuAdmission;
 use super::job_groups::Birth;
 use super::shell_host::{
-    BINDING_ARRAY, BINDING_SCALAR, FrameReader, FrameWriter, MAX_FRAME_BYTES, REPLY_ACTIVATED,
-    REPLY_ACTIVATION_EXITED, REPLY_ACTIVATION_UNUSABLE, REPLY_APPROVED, REPLY_EXITED,
-    REPLY_HOST_FAILED, REPLY_NICE_REFUSED, REPLY_RELEASED, REPLY_SCRIPT_SYNTAX,
-    REPLY_SIGNAL_FAILED, REPLY_STARTED, REQUEST_ACTIVATE, REQUEST_APPROVE, REQUEST_RELEASE,
-    REQUEST_RUN, REQUEST_SCRIPT, REQUEST_SIGNAL, RawWaitStatus, SHELL_HOST_DIRECTORY,
-    ShellHostProgram, dropped_host_end, send_with_descriptors,
+    BINDING_ARRAY, BINDING_SCALAR, FrameReader, FrameWriter, Inherited, MAX_FRAME_BYTES,
+    REPLY_ACTIVATED, REPLY_ACTIVATION_EXITED, REPLY_ACTIVATION_UNUSABLE, REPLY_ADOPTION_REFUSED,
+    REPLY_APPROVED, REPLY_EXITED, REPLY_HOST_FAILED, REPLY_NICE_REFUSED, REPLY_RELEASED,
+    REPLY_SCRIPT_SYNTAX, REPLY_SIGNAL_FAILED, REPLY_STARTED, REQUEST_ACTIVATE, REQUEST_ADOPT,
+    REQUEST_APPROVE, REQUEST_RELEASE, REQUEST_RUN, REQUEST_SCRIPT, REQUEST_SIGNAL, RawWaitStatus,
+    SHELL_HOST_DIRECTORY, ShellHostProgram, dropped_host_end, send_with_descriptors,
 };
+use super::shell_inherit::{self, Placement, VerifiedActivation};
 use super::shell_pool::{Acquired, Activation, Activator, ShellPool, ShellPoolConfig};
 use super::shell_watch::{
-    ActivationEvidence, EvaluationClock, FsInstant, FsSeparation, Snapshot, decode_direnv_watches,
+    ActivationEvidence, Contents, EvaluationClock, FsInstant, FsSeparation, Snapshot, WatchEntry,
+    decode_direnv_watches,
 };
 use super::supervisor::{
     OwnedProcess, ProcessEvent, ProcessSignal, RunningProcess, SandboxEnvironment, StdinLane,
@@ -1299,8 +1301,34 @@ impl HostActivator {
                 before: Snapshot::default(),
                 clock: None,
                 after: Snapshot::default(),
+                contents: Some(Default::default()),
             }));
         };
+        // A clone carries its origin's verified export (11_shell.md, "Shell activation and
+        // process reuse"). Proving it for this checkout reads every recorded input once; a miss
+        // says why on the job's stderr and evaluates.
+        let mount = self.workspace_mount.clone();
+        let baseline = self.environment.clone();
+        let verified = tokio::task::spawn_blocking(move || {
+            shell_inherit::verify(&Placement::of(&mount, &baseline), &baseline)
+        })
+        .await;
+        let miss = match verified {
+            Ok(Ok(verified)) => match self
+                .adopt_host(host, envrc_directory, &verified, &stderr)
+                .await
+            {
+                Ok(Ok(())) => return HostActivation::Ready(Ok(verified.into_evidence())),
+                Ok(Err(refused)) => refused,
+                Err(error) => return HostActivation::Broken(error),
+            },
+            Ok(Err(miss)) => miss.to_string(),
+            Err(error) => format!("the inheritance check failed: {error}"),
+        };
+        report_on(
+            &stderr,
+            &format!("cowshed: evaluating the workspace shell: {miss}"),
+        );
         let envrc = envrc_directory.join(".envrc");
         let request = FrameWriter::new(REQUEST_APPROVE)
             .bytes(envrc.as_os_str().as_bytes())
@@ -1365,7 +1393,8 @@ impl HostActivator {
                         0 => None,
                         _ => Some(String::from_utf8_lossy(fields.bytes()?).into_owned()),
                     };
-                    ActivateReply::Activated(watches)
+                    let export = fields.bytes()?.to_vec();
+                    ActivateReply::Activated(watches, export)
                 }
                 other => {
                     return Err(io::Error::new(
@@ -1386,15 +1415,14 @@ impl HostActivator {
                     "repair the workspace .envrc and retry",
                 ))
             }
-            Ok(ActivateReply::Activated(None)) => {
+            Ok(ActivateReply::Activated(None, _)) => {
                 HostActivation::Ready(Err("the activation recorded no DIRENV_WATCHES".into()))
             }
-            Ok(ActivateReply::Activated(Some(watches))) => HostActivation::Ready(
-                decode_direnv_watches(&watches)
+            Ok(ActivateReply::Activated(Some(watches), export)) => {
+                let evidence = decode_direnv_watches(&watches)
                     .map_err(|error| error.to_string())
                     .and_then(|entries| {
-                        let after =
-                            Snapshot::take(entries.iter().map(|entry| entry.path.as_path()));
+                        let (after, contents) = ActivationEvidence::observe(&entries);
                         // Read again once the inputs are snapshotted: a clock that ran backwards
                         // across the evaluation orders no input against its start.
                         let finished = FsInstant::read(&clock).map_err(|error| {
@@ -1408,17 +1436,118 @@ impl HostActivator {
                                 finished,
                             }),
                             after,
+                            contents,
                         })
-                    }),
-            ),
+                    });
+                // Only an export whose inputs stayed put while it ran answers for them, so only
+                // that one is left for the checkouts cloned from this one.
+                if let Ok(evidence) = &evidence
+                    && evidence.stable()
+                    && let Some(contents) = &evidence.contents
+                {
+                    self.record(evidence.entries.clone(), contents.clone(), export)
+                        .await;
+                }
+                HostActivation::Ready(evidence)
+            }
         }
+    }
+
+    /// Leave a stable evaluation's export in this checkout's host directory. A record that
+    /// cannot be written only means a clone evaluates for itself; the reason is reported.
+    async fn record(&self, entries: Vec<WatchEntry>, contents: Contents, export: Vec<u8>) {
+        let mount = self.workspace_mount.clone();
+        let baseline = self.environment.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            let export: BTreeMap<String, Option<String>> = serde_json::from_slice(&export)
+                .map_err(|error| {
+                    format!("the activation's export is not an environment diff: {error}")
+                })?;
+            shell_inherit::write_record(
+                &Placement::of(&mount, &baseline),
+                &baseline,
+                &entries,
+                &contents,
+                &export,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|written| written);
+        if let Err(reason) = written {
+            eprintln!(
+                "cowshed: the workspace shell's export is not left for clones of {} ({reason}); \
+                 each clone evaluates its own",
+                self.workspace_mount.display()
+            );
+        }
+    }
+
+    /// Hand `host` the verified inherited export. `Ok(Err(reason))` is a refusal the host made
+    /// with its environment untouched: the caller evaluates on the same host.
+    async fn adopt_host(
+        &self,
+        host: &mut ExecHost,
+        envrc_directory: &Path,
+        verified: &VerifiedActivation,
+        stderr: &OwnedFd,
+    ) -> Result<std::result::Result<(), String>> {
+        let inherited = serde_json::to_vec(&Inherited::of(verified))
+            .map_err(|error| protocol_error("request", error))?;
+        let request = FrameWriter::new(REQUEST_ADOPT)
+            .bytes(envrc_directory.as_os_str().as_bytes())
+            .and_then(|frame| frame.bytes(&inherited))
+            .and_then(FrameWriter::finish)
+            .map_err(|error| protocol_error("request", error))?;
+        host.send(request, &[stderr.as_raw_fd()]).await?;
+        let payload = host.receive().await?;
+        let (tag, mut fields) =
+            FrameReader::new(&payload).map_err(|error| protocol_error("reply", error))?;
+        let outcome = match tag {
+            REPLY_ACTIVATED => {
+                if fields
+                    .u32()
+                    .map_err(|error| protocol_error("reply", error))?
+                    != 0
+                {
+                    fields
+                        .bytes()
+                        .map_err(|error| protocol_error("reply", error))?;
+                }
+                fields
+                    .bytes()
+                    .map_err(|error| protocol_error("reply", error))?;
+                Ok(())
+            }
+            REPLY_ADOPTION_REFUSED => Err(String::from_utf8_lossy(
+                fields
+                    .bytes()
+                    .map_err(|error| protocol_error("reply", error))?,
+            )
+            .into_owned()),
+            other => return Err(protocol_error("reply", format!("unexpected tag {other}"))),
+        };
+        fields
+            .finish()
+            .map_err(|error| protocol_error("reply", error))?;
+        Ok(outcome)
+    }
+}
+
+/// Write one diagnostic line to a job's stderr. A stream the job already closed loses it.
+fn report_on(stderr: &OwnedFd, line: &str) {
+    use std::io::Write as _;
+    if let Ok(clone) = stderr.try_clone() {
+        let mut stream = std::fs::File::from(clone);
+        let _ = writeln!(stream, "{line}");
     }
 }
 
 enum ActivateReply {
     Exited(RawWaitStatus),
     Unusable(String),
-    Activated(Option<String>),
+    Activated(Option<String>, Vec<u8>),
 }
 
 async fn expect_status(host: &mut ExecHost, expected: u8) -> Result<RawWaitStatus> {
@@ -1504,14 +1633,7 @@ pub(super) fn stage_host_executable(mount: &Path, program: &ShellHostProgram) ->
     };
     let source = program.executable();
     let metadata = std::fs::metadata(source).map_err(|error| staging_error("inspect", error))?;
-    let name = format!(
-        "{:x}-{:x}-{:x}-{:x}.{:x}",
-        metadata.dev(),
-        metadata.ino(),
-        metadata.size(),
-        metadata.mtime(),
-        metadata.mtime_nsec()
-    );
+    let name = staged_name(&metadata);
     let directory = mount.join(SHELL_HOST_DIRECTORY);
     crate::storage::verify_no_symlinks(mount, &mount.join(".cowshed")).map_err(|error| {
         CowshedError::integrity(
@@ -1531,16 +1653,48 @@ pub(super) fn stage_host_executable(mount: &Path, program: &ShellHostProgram) ->
     std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o555))
         .map_err(|error| staging_error("mode", error))?;
     std::fs::rename(&temporary, &target).map_err(|error| staging_error("publish", error))?;
+    // Only earlier staged programs are swept: the directory also holds the activation record
+    // clones inherit (`shell_inherit::RECORD_FILE`).
     if let Ok(entries) = std::fs::read_dir(&directory) {
         for entry in entries.flatten() {
-            if entry.file_name() != target.file_name().unwrap_or_default()
-                && !entry.file_name().as_bytes().starts_with(b".")
+            let file_name = entry.file_name();
+            if file_name != target.file_name().unwrap_or_default()
+                && is_staged_name(&file_name.to_string_lossy())
+                && let Err(error) = std::fs::remove_file(entry.path())
             {
-                let _ = std::fs::remove_file(entry.path());
+                eprintln!(
+                    "cowshed: cannot remove the superseded exec host {}: {error}",
+                    entry.path().display()
+                );
             }
         }
     }
     Ok(target)
+}
+
+/// A staged host program's file name: the source file's identity, so a rebuilt binary stages
+/// beside the old one and a host already running keeps its own.
+fn staged_name(metadata: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt as _;
+    format!(
+        "{:x}-{:x}-{:x}-{:x}.{:x}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.size(),
+        metadata.mtime(),
+        metadata.mtime_nsec()
+    )
+}
+
+/// Whether `name` is one [`staged_name`] writes: four `-`-separated hex fields, a `.`, one more.
+fn is_staged_name(name: &str) -> bool {
+    let hex = |field: &str| !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_hexdigit());
+    name.split_once('.').is_some_and(|(identity, nanoseconds)| {
+        hex(nanoseconds) && {
+            let fields: Vec<&str> = identity.split('-').collect();
+            fields.len() == 4 && fields.iter().all(|field| hex(field))
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1724,6 +1878,43 @@ mod tests {
             ended,
             "the job's stream ends once the supervisor closes its writer"
         );
+    }
+
+    /// Staging a new host program sweeps the superseded one and nothing else: the directory
+    /// also holds the activation record clones inherit.
+    #[test]
+    fn staging_sweeps_only_superseded_programs() {
+        use super::super::shell_host::{SHELL_HOST_DIRECTORY, ShellHostProgram};
+        use super::super::shell_inherit::RECORD_FILE;
+        use super::{is_staged_name, stage_host_executable};
+
+        assert!(is_staged_name("1000010-5133953f-2bce010-6ad85d6c.19a6f68b"));
+        assert!(!is_staged_name(RECORD_FILE));
+        assert!(!is_staged_name(
+            ".1000010-5133953f-2bce010-6ad85d6c.19a6f68b.tmp"
+        ));
+
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-stage-sweep-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mount = root.join("mount");
+        std::fs::create_dir_all(mount.join(".cowshed")).unwrap();
+        let program = root.join("host");
+        std::fs::write(&program, b"first").unwrap();
+        let first = stage_host_executable(&mount, &ShellHostProgram::dedicated(&program)).unwrap();
+        std::fs::write(mount.join(SHELL_HOST_DIRECTORY).join(RECORD_FILE), b"{}").unwrap();
+        std::fs::remove_file(&program).unwrap();
+        std::fs::write(&program, b"second build").unwrap();
+        let second = stage_host_executable(&mount, &ShellHostProgram::dedicated(&program)).unwrap();
+        assert_ne!(first, second);
+        assert!(!first.exists(), "the superseded program is swept");
+        assert!(second.exists());
+        assert!(
+            mount.join(SHELL_HOST_DIRECTORY).join(RECORD_FILE).exists(),
+            "the activation record survives staging"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

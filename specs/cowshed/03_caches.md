@@ -302,11 +302,17 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   nix-darwin hosts a module that still declares a link into the volume is a conflict naming that module option; setup
   never rewrites module-owned paths.
 
-  **Sandboxed shells evaluate devenv in place.** devenv evaluates a project at its path, and the result really differs
-  per path. The absolute root, its `.devenv`, `TMPDIR` and runtime directory are inputs to its evaluation-cache key, and
-  its exported hook may embed each path. A clone's copy of its origin's `.devenv` therefore never answers for the clone:
-  each checkout evaluates its own shell, and no shared writable cache, however content-addressed, serves executable
-  shell exports.
+  **Sandboxed shells evaluate devenv in place, once per lineage.** devenv evaluates a project at its path, and the
+  result really differs per path. The absolute root, its `.devenv`, `TMPDIR` and runtime directory are inputs to its
+  evaluation-cache key, and its exported hook may embed each path. A clone's copy of its origin's `.devenv` therefore
+  never answers for the clone, and no shared writable cache, however content-addressed, serves executable shell exports.
+  What a clone does take is its origin's export carried in its own image (`.cowshed/shell-host/activation.json`,
+  11_shell.md "Inherited shells"), and only within this boundary: keyed by the bytes of the activation's recorded inputs
+  and by its baseline environment, both recomputed at the clone; moved to the clone's root, runtime link and dotfile,
+  with any value still naming the origin refused; never carrying `DEVENV_TASK_FILE`, a shell hook, a variable the secret
+  convention names, or what `.cowshed/env` publishes per workspace, whose values the clone reads from its own
+  `.cowshed/env` and `.envrc-local`; recomputable by evaluation and deletable at any time, a lost record costing one
+  evaluation. It is a byproduct of an activation that already ran, in the workspace it ran in, not a second store.
 
   **Every checkout reaches a shared tool home through the host's literal path.** Cargo fingerprints a registry or git
   dependency by the absolute path of its source under `$CARGO_HOME` (measured: the same registry reached through a

@@ -29,7 +29,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 
-use super::shell_watch::{ActivationEvidence, Snapshot, Watcher};
+use super::shell_watch::{ActivationEvidence, Contents, Snapshot, WatchEntry, Watcher, certify};
 use crate::error::{CowshedError, Result};
 
 /// Retained hosts per pool, executing and idle together.
@@ -167,6 +167,10 @@ impl<H> Sieve<H> {
 struct Generation {
     id: u64,
     baseline: Snapshot,
+    /// The inputs' bytes certified with `baseline`; `None` when they are not known, and then
+    /// any signal makes the generation stale.
+    contents: Option<Contents>,
+    entries: Vec<WatchEntry>,
     watcher: Watcher,
 }
 
@@ -463,25 +467,40 @@ impl<A: Activator> PoolActor<A> {
         }
     }
 
-    /// Fold kernel events, and at acquire the stat backstop, into the dirty flag.
+    /// Fold kernel events, and at acquire the stat backstop, into the dirty flag. Either only
+    /// says an input may have changed; its bytes decide (11_shell.md, "Freshness is direnv's
+    /// own"). Bytes equal to the ones the generation certified mean the rewrite changed nothing
+    /// the shell read: the generation takes the new identities, resubscribes (a replaced file
+    /// is a new vnode) and stays warm.
     fn refresh(&mut self, backstop: bool) {
-        let Some(generation) = &self.generation else {
+        let Some(generation) = &mut self.generation else {
             return;
         };
-        let changed = match generation.watcher.drain() {
+        let signalled = match generation.watcher.drain() {
             Ok(changed) => changed,
             Err(error) => {
                 cowshed_os::eprintln!(
                     "cowshed: workspace shell input subscription failed ({error}); treating the \
                  warm shells as stale"
                 );
+                generation.contents = None;
                 true
             }
         };
-        if changed || (backstop && generation.baseline.changed_since()) {
-            self.epoch += 1;
-            self.dirty = true;
+        if !signalled && !(backstop && generation.baseline.changed_since()) {
+            return;
         }
+        if let Some(contents) = &generation.contents
+            && let Ok((after, now)) = certify(generation.baseline.paths())
+            && now == *contents
+            && let Ok(watcher) = Watcher::subscribe(&generation.entries)
+        {
+            generation.baseline = after;
+            generation.watcher = watcher;
+            return;
+        }
+        self.epoch += 1;
+        self.dirty = true;
     }
 
     fn current(&self) -> Option<u64> {
@@ -566,6 +585,8 @@ impl<A: Activator> PoolActor<A> {
         self.generation = Some(Generation {
             id,
             baseline: evidence.after,
+            contents: evidence.contents,
+            entries: evidence.entries,
             watcher,
         });
         // An unstable activation still names the inputs to predict next time; its flag makes
@@ -692,7 +713,7 @@ mod tests {
                     exists: path.exists(),
                 })
                 .collect();
-            let after = Snapshot::take(self.inputs.iter().map(PathBuf::as_path));
+            let (after, contents) = ActivationEvidence::observe(&entries);
             let finished = FsInstant::read(&self.root).unwrap();
             Activation::Ready {
                 host,
@@ -701,6 +722,7 @@ mod tests {
                     before,
                     clock: Some(EvaluationClock { started, finished }),
                     after,
+                    contents,
                 }),
             }
         }
@@ -805,6 +827,22 @@ mod tests {
         command(&pool).await;
         std::fs::write(root.join("README.md"), b"unrelated").unwrap();
         assert_eq!(command(&pool).await, (1, false));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_rewrite_of_the_same_bytes_keeps_the_shell_warm() {
+        let (fixture, root) = fixture("same-bytes");
+        let pool = ShellPool::start(Arc::clone(&fixture), unwarmed());
+        command(&pool).await;
+        // A new file under the same name (a checkout, an editor's save): a new identity, the
+        // same bytes. It moves nothing the shell read.
+        std::fs::remove_file(&fixture.inputs[0]).unwrap();
+        std::fs::write(&fixture.inputs[0], b"initial").unwrap();
+        assert_eq!(command(&pool).await, (1, false));
+        // The generation took the new identity and resubscribed: a real edit still lands.
+        std::fs::write(&fixture.inputs[0], b"edited").unwrap();
+        assert_eq!(command(&pool).await, (2, true));
         std::fs::remove_dir_all(root).unwrap();
     }
 

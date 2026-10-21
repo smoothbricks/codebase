@@ -35,6 +35,7 @@ pub mod process_usage;
 pub mod project;
 pub mod ref_lock;
 pub mod shell_host;
+pub mod shell_inherit;
 mod shell_job;
 pub mod shell_pool;
 pub mod shell_watch;

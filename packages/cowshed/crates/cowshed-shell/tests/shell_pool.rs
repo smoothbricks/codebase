@@ -498,6 +498,112 @@ async fn host_controller_commands_reuse_one_activation_until_a_watched_file_chan
     assert_eq!(workspace.activations(), 2);
 }
 
+/// A job's environment with the per-workspace places of its own fixture replaced by fixed
+/// names, and what differs per job or per port block left out, so two workspaces' shells can
+/// be compared.
+fn normalized_environment(workspace: &Workspace, env: &str) -> Vec<String> {
+    let link = cowshed_core::sandbox::workspace_runtime_link(workspace.mount());
+    let root = workspace.root.display().to_string();
+    let mut lines: Vec<String> = env
+        .lines()
+        .filter(|line| {
+            let name = line.split('=').next().unwrap_or_default();
+            !matches!(
+                name,
+                "DIRENV_DIFF" | "DIRENV_WATCHES" | "SHLVL" | "_" | "PWD" | "OLDPWD"
+            ) && ![
+                "PORT",
+                "PROXY",
+                "NX_SELF_HOSTED",
+                "MAKEFLAGS",
+                "BOUNDED_EXEC",
+                "INSTALL_OBSERVED",
+            ]
+            .iter()
+            .any(|part| name.contains(part))
+        })
+        .map(|line| {
+            line.replace(&root, "<root>")
+                .replace(&*link.to_string_lossy(), "<link>")
+        })
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// The two-root equivalence the inherited shell rests on (11_shell.md, "Inherited shells"): a
+/// clone that adopts its origin's export ends with exactly the environment its own evaluation
+/// would have given it, credentials included, and never evaluates.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_evaluation() {
+    let origin = Workspace::new("inherit-origin", 41_488);
+    let adopter = Workspace::new("inherit-adopter", 41_504);
+    let evaluator = Workspace::new("inherit-evaluator", 41_520);
+    for workspace in [&origin, &adopter, &evaluator] {
+        std::fs::write(workspace.mount().join("bun.lock"), "v1").expect("lockfile");
+        std::fs::write(
+            workspace.mount().join(".envrc-local"),
+            "export LOCAL_TOKEN=from-local\n",
+        )
+        .expect(".envrc-local");
+        workspace.envrc(
+            "export AT_ROOT=\"$PWD/tool\"\nwatch_file bun.lock\nsource_env_if_exists .envrc-local\n",
+        );
+    }
+    let record = |workspace: &Workspace| {
+        workspace
+            .mount()
+            .join(".cowshed/shell-host/activation.json")
+    };
+    run(&origin.supervisor(false), sh("true")).await.ok();
+    assert_eq!(origin.activations(), 1);
+    let written = std::fs::read_to_string(record(&origin)).expect("the activation left its export");
+    assert!(
+        !written.contains("from-local"),
+        "no credential value is recorded"
+    );
+    std::fs::create_dir_all(record(&adopter).parent().unwrap()).expect("host directory");
+    std::fs::copy(record(&origin), record(&adopter)).expect("the clone carries the record");
+
+    let probe = "env";
+    let adopted = run(&adopter.supervisor(false), sh(probe)).await.ok();
+    assert_eq!(
+        adopter.activations(),
+        0,
+        "the clone adopted instead of evaluating: {}",
+        adopted.stderr
+    );
+    let evaluated = run(&evaluator.supervisor(false), sh(probe)).await.ok();
+    assert_eq!(evaluator.activations(), 1);
+    assert_eq!(
+        normalized_environment(&adopter, &adopted.stdout),
+        normalized_environment(&evaluator, &evaluated.stdout)
+    );
+
+    // One changed input byte, and the clone evaluates for itself.
+    let changed = Workspace::new("inherit-changed", 41_536);
+    std::fs::write(changed.mount().join("bun.lock"), "v2").expect("lockfile");
+    std::fs::write(
+        changed.mount().join(".envrc-local"),
+        "export LOCAL_TOKEN=from-local\n",
+    )
+    .expect(".envrc-local");
+    changed.envrc(
+        "export AT_ROOT=\"$PWD/tool\"\nwatch_file bun.lock\nsource_env_if_exists .envrc-local\n",
+    );
+    std::fs::create_dir_all(record(&changed).parent().unwrap()).expect("host directory");
+    std::fs::copy(record(&origin), record(&changed)).expect("the clone carries the record");
+    let ran = run(&changed.supervisor(false), sh("true")).await.ok();
+    assert_eq!(changed.activations(), 1);
+    assert!(
+        ran.stderr
+            .contains("evaluating the workspace shell: the inherited shell's inputs differ"),
+        "{}",
+        ran.stderr
+    );
+}
+
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_watched_inputs_reactivate_exactly_once_and_others_never() {

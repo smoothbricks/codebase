@@ -27,9 +27,10 @@ use cowshed_core::api::{ExitStatus, ScriptCommand, ScriptValue};
 use cowshed_core::runtime::job_cgroup::{CgroupAuthority, IncarnationCgroups, JobCgroup};
 use cowshed_core::runtime::job_groups::Birth;
 use cowshed_core::runtime::shell_host::{
-    BINDING_ARRAY, BINDING_SCALAR, CONTROL_DESCRIPTOR, FrameReader, FrameWriter, REPLY_EXITED,
-    REPLY_HOST_FAILED, REPLY_RELEASED, REPLY_SCRIPT_SYNTAX, REPLY_STARTED, REQUEST_APPROVE,
-    REQUEST_RELEASE, REQUEST_SCRIPT, REQUEST_SIGNAL, read_frame, send_with_descriptors,
+    BINDING_ARRAY, BINDING_SCALAR, CONTROL_DESCRIPTOR, FrameReader, FrameWriter, REPLY_ACTIVATED,
+    REPLY_ADOPTION_REFUSED, REPLY_EXITED, REPLY_HOST_FAILED, REPLY_RELEASED, REPLY_SCRIPT_SYNTAX,
+    REPLY_STARTED, REQUEST_ADOPT, REQUEST_APPROVE, REQUEST_RELEASE, REQUEST_SCRIPT, REQUEST_SIGNAL,
+    read_frame, send_with_descriptors,
 };
 use cowshed_core::script::{Binding, RenderedScript, render};
 #[cfg(target_os = "linux")]
@@ -1457,4 +1458,118 @@ fn linux_refused_cgroup_placement_never_runs_the_command() {
             "placement failure did not enter the host"
         );
     }
+}
+
+/// A checkout tree the adoption tests record at `origin` and adopt at `clone`, inside the host's
+/// own directory so the host's baseline (its PATH and HOME) is the same for both. The recorded
+/// export carries `LOCAL_TOKEN`; `tail_supplies_token` decides whether the checkouts' own
+/// `.envrc-local` sets it. Returns the clone and the host's reply to the adoption.
+fn adopt_in_fixture(host: &Host, tail_supplies_token: bool) -> (PathBuf, Vec<u8>) {
+    use cowshed_core::runtime::shell_host::{Inherited, SHELL_HOST_DIRECTORY};
+    use cowshed_core::runtime::shell_inherit::{Placement, record_path, verify, write_record};
+    use cowshed_core::runtime::shell_watch::{WatchEntry, certify};
+
+    let origin = host.directory.join("origin");
+    let clone = host.directory.join("clone");
+    let local = if tail_supplies_token {
+        "export LOCAL_TOKEN=from-local\n"
+    } else {
+        "export LOCAL_OTHER=1\n"
+    };
+    for root in [&origin, &clone] {
+        std::fs::create_dir_all(root.join(SHELL_HOST_DIRECTORY)).unwrap();
+        std::fs::write(root.join(".envrc"), "use devenv\n").unwrap();
+        let name = root.file_name().unwrap().to_string_lossy().into_owned();
+        std::fs::write(
+            root.join(".cowshed/env"),
+            format!("export COWSHED_RUNTIME_LINK=/tmp/cs-{name}\n"),
+        )
+        .unwrap();
+        std::fs::write(root.join(".envrc-local"), local).unwrap();
+    }
+    let baseline: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> = [
+        ("PATH", std::env::var_os("PATH").expect("PATH")),
+        ("HOME", host.directory.clone().into_os_string()),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.into(), value))
+    .collect();
+    let entries: Vec<WatchEntry> = [".envrc", ".cowshed/env", ".envrc-local"]
+        .iter()
+        .map(|input| WatchEntry {
+            path: origin.join(input),
+            exists: true,
+        })
+        .collect();
+    let (_, contents) = certify(entries.iter().map(|entry| entry.path.as_path())).unwrap();
+    let export = [
+        ("AT_ROOT", Some(format!("{}/tool", origin.display()))),
+        ("LOCAL_TOKEN", Some("from-local".to_owned())),
+        ("COWSHED_RUNTIME_LINK", Some("/tmp/cs-origin".to_owned())),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_owned(), value))
+    .collect();
+    write_record(
+        &Placement::of(&origin, &baseline),
+        &baseline,
+        &entries,
+        &contents,
+        &export,
+    )
+    .unwrap();
+    let written = std::fs::read_to_string(record_path(&origin)).unwrap();
+    assert!(
+        !written.contains("from-local"),
+        "the record holds no credential value"
+    );
+    std::fs::copy(record_path(&origin), record_path(&clone)).unwrap();
+    let verified =
+        verify(&Placement::of(&clone, &baseline), &baseline).expect("the record verifies");
+    let inherited = serde_json::to_vec(&Inherited::of(&verified)).unwrap();
+    let frame = FrameWriter::new(REQUEST_ADOPT)
+        .bytes(clone.as_os_str().as_encoded_bytes())
+        .unwrap()
+        .bytes(&inherited)
+        .unwrap()
+        .finish()
+        .unwrap();
+    let (_read, write) = pipe();
+    send_with_descriptors(host.control().as_raw_fd(), &frame, &[write.as_raw_fd()]).unwrap();
+    drop(write);
+    let (reply, _) = read_frame(host.control())
+        .unwrap()
+        .expect("an adoption reply");
+    (clone, reply)
+}
+
+/// An adopted shell lays the moved export over the host's environment and takes the values the
+/// record withholds from the checkout's own tail files, read through direnv's stdlib.
+#[test]
+fn an_adopted_shell_takes_its_credentials_from_its_own_tail_files() {
+    let mut host = Host::start("adopt");
+    let (clone, reply) = adopt_in_fixture(&host, true);
+    let (tag, _) = FrameReader::new(&reply).unwrap();
+    assert_eq!(tag, REPLY_ACTIVATED, "{}", String::from_utf8_lossy(&reply));
+    let ran = host.run(&text(
+        "printf '%s|%s|%s' \"$AT_ROOT\" \"$LOCAL_TOKEN\" \"$COWSHED_RUNTIME_LINK\"",
+    ));
+    assert_eq!(
+        ran.stdout,
+        format!("{}/tool|from-local|/tmp/cs-clone", clone.display())
+    );
+}
+
+/// A tail that does not supply a withheld value refuses the adoption and leaves the host as it
+/// was, so the supervisor evaluates on the same host.
+#[test]
+fn a_tail_that_lacks_a_withheld_value_refuses_and_changes_nothing() {
+    let mut host = Host::start("adopt-refused");
+    let (_, reply) = adopt_in_fixture(&host, false);
+    let (tag, mut fields) = FrameReader::new(&reply).unwrap();
+    assert_eq!(tag, REPLY_ADOPTION_REFUSED);
+    let reason = String::from_utf8_lossy(fields.bytes().unwrap()).into_owned();
+    assert!(reason.contains("LOCAL_TOKEN"), "{reason}");
+    let ran = host.run(&text("printf '%s' \"${AT_ROOT-unset}\""));
+    assert_eq!(ran.stdout, "unset");
 }

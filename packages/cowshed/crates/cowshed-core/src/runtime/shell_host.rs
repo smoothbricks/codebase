@@ -77,10 +77,20 @@ pub const REQUEST_SIGNAL: u8 = 5;
 /// The job concluded: reap its command `[]`. Sent once, after `REPLY_EXITED`; answered by
 /// `REPLY_RELEASED`, after which the host serves its next command.
 pub const REQUEST_RELEASE: u8 = 6;
+/// Take an inherited export instead of evaluating: `[directory, inherited]`, descriptors
+/// `[stderr]`, where `inherited` is an [`Inherited`] as JSON. Sent in place of
+/// `REQUEST_APPROVE`/`REQUEST_ACTIVATE` for a record the supervisor verified (11_shell.md,
+/// "Shell activation and process reuse"). Answered by `REPLY_ACTIVATED` (with an empty
+/// export) or `REPLY_ADOPTION_REFUSED`; a refused host's environment is untouched.
+pub const REQUEST_ADOPT: u8 = 7;
 
 pub const REPLY_APPROVED: u8 = 1;
 pub const REPLY_ACTIVATION_EXITED: u8 = 2;
+/// The shell is activated: `[has watches, watches?, export]`. `export` is what the host
+/// applied as direnv printed it, empty for an adopted shell, whose export the supervisor holds.
 pub const REPLY_ACTIVATED: u8 = 3;
+/// An inherited export could not be completed from this checkout's own files: `[reason]`.
+pub const REPLY_ADOPTION_REFUSED: u8 = 12;
 pub const REPLY_ACTIVATION_UNUSABLE: u8 = 4;
 /// The command started: `[birth]`, its group leader as the host observed it before it could
 /// reap the command ([`FrameWriter::birth`]).
@@ -121,6 +131,39 @@ const CHILD_NICE_SELF: u32 = 1;
 
 /// A raw `waitpid` status, decoded only where it is reported.
 pub type RawWaitStatus = i32;
+
+/// An inherited export on the wire (`REQUEST_ADOPT`). The supervisor builds one only from a
+/// [`super::shell_inherit::VerifiedActivation`]; the host decodes it and trusts its supervisor,
+/// as for every request.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct Inherited {
+    environment: std::collections::BTreeMap<String, Option<String>>,
+    from_tail: Vec<String>,
+    tail: Vec<PathBuf>,
+}
+
+impl Inherited {
+    pub fn of(verified: &super::shell_inherit::VerifiedActivation) -> Self {
+        Self {
+            environment: verified.environment().clone(),
+            from_tail: verified.from_tail().iter().cloned().collect(),
+            tail: verified.tail().to_vec(),
+        }
+    }
+
+    /// The moved export to lay over the host's environment, the names whose values come from
+    /// the checkout's own tail files, and those files, absolute, in the order the activation
+    /// sourced them.
+    pub fn into_parts(
+        self,
+    ) -> (
+        std::collections::BTreeMap<String, Option<String>>,
+        Vec<String>,
+        Vec<PathBuf>,
+    ) {
+        (self.environment, self.from_tail, self.tail)
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Frame codec

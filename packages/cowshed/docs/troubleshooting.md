@@ -28,9 +28,16 @@ proactively, but explicit `cowshed attach` remains the recovery command.
 **direnv says `.envrc is blocked` in a workspace.** This is expected until that clone path is authorized. Run
 `direnv allow`; `cowshed attach` repairs mounts but deliberately does not change trust.
 
-**A command does not see an edited shell file.** A warm workspace shell re-activates when a file direnv recorded as an
-input changes. A file your `.envrc` reads without telling direnv (a sourced script, a lockfile an install step uses) is
-not on that list: add `watch_file <path>` to the `.envrc`, and edits to it re-activate the next command.
+**A command does not see an edited shell file.** A warm workspace shell re-activates when the bytes of a file direnv
+recorded as an input change. A file your `.envrc` reads without telling direnv (a sourced script, a lockfile an install
+step uses) is not on that list: add `watch_file <path>` to the `.envrc`, and edits to it re-activate the next command. A
+directory a devenv module reads whole is never on it (devenv hands direnv only files): name it with `watch_dir <dir>`.
+
+**A fork's first command evaluated its shell.** The line `cowshed: evaluating the workspace shell: …` on its stderr says
+why it did not inherit its origin's: no record (the origin never finished a stable activation), the inputs' bytes
+differ, the baseline environment differs, a value still names the origin after the move, or the fork's own
+`.envrc-local` does not supply a credential the origin's shell had. The evaluation is correct either way; the next fork
+of this one inherits from it.
 
 **`cowshed adopt` or `cowshed push` refused with exit 4 naming files.** The secrets gate found credential-shaped content
 (`.env*`, key files, known token prefixes, `.envrc` secret exports). For adopt: move each value into the gateway
