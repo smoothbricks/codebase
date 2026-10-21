@@ -17,8 +17,10 @@
 //! three hours without a request or a file event, a bound it neither lets a caller set nor
 //! applies to a tree that keeps changing, so the supervisor ends the daemon itself. A shed is
 //! used while its supervisor runs a job or holds a session, while a process other than the daemon
-//! holds one of its Nx task databases open (a host shell's run), and for [`IDLE`] after a daemon
-//! comes up. Once none of that has happened for [`IDLE`] the keeper stops the daemon, as
+//! holds one of its Nx task databases open (a host shell's run), while a process the supervisor
+//! does not run holds the checkout (a host shell's run between its tasks, asked only when the
+//! keeper is about to stop the daemon: [`super::mount_activity`]), and for [`IDLE`] after a
+//! daemon comes up. Once none of that has happened for [`IDLE`] the keeper stops the daemon, as
 //! `nx daemon --stop` does, and starts none until the shed is used again. Its foreground daemon
 //! is one admitted maintenance job, excluded from developer activity. Quiescence and retirement
 //! stop and wait for that job; the supervisor also releases any daemon its keeper watched.
@@ -790,7 +792,11 @@ impl NxDaemonKeeper {
         );
         match stop(project_root, &why).await {
             Stop::Stopped => Verdict::Release,
-            Stop::InUse => {
+            Stop::InUse(why) => {
+                eprintln!(
+                    "cowshed: kept the Nx daemon of {}: {why}",
+                    project_root.display()
+                );
                 self.last_use = Instant::now();
                 Verdict::Keep
             }
@@ -860,17 +866,23 @@ async fn clients_at_work(project_root: &Path) -> bool {
 enum Stop {
     /// The daemon exited, or was already gone.
     Stopped,
-    /// A process holds a task database open: the shed is in use after all, and nothing was
+    /// Something still uses the daemon, said as `why`: a process other than the daemon holds a
+    /// task database open, or one the supervisor does not run holds the checkout. Nothing was
     /// stopped.
-    InUse,
+    InUse(String),
     Failed(String),
 }
 
 /// Stop the daemon of the Nx project at `project_root` as `nx daemon --stop` does, unless a
-/// process other than the daemon holds a task database open
+/// process the supervisor does not run holds the checkout ([`host_holders`]) or a process other
+/// than the daemon holds a task database open
 /// ([`crate::build_volume::nx::close_workspace_data`]), and say on the supervisor's stderr that
 /// it stopped and `why`.
 async fn stop(project_root: &Path, why: &str) -> Stop {
+    #[cfg(target_os = "macos")]
+    if let Some(held) = host_holders(project_root).await {
+        return Stop::InUse(held);
+    }
     let pid = live_pid(&nx::daemon_record(project_root));
     let data = nx::workspace_data(project_root);
     let closed =
@@ -886,10 +898,39 @@ async fn stop(project_root: &Path, why: &str) -> Stop {
             }
             Stop::Stopped
         }
-        Ok(Ok(Err(crate::build_volume::nx::Busy::Held { .. }))) => Stop::InUse,
+        Ok(Ok(Err(busy @ crate::build_volume::nx::Busy::Held { .. }))) => Stop::InUse(format!(
+            "a host client holds one of its task databases open: {busy}"
+        )),
         Ok(Ok(Err(busy))) => Stop::Failed(busy.to_string()),
         Ok(Err(error)) => Stop::Failed(error.to_string()),
         Err(error) => Stop::Failed(format!("the stop did not finish: {error}")),
+    }
+}
+
+/// What holds the Nx project's checkout at `project_root` beyond what this supervisor runs: the
+/// mount census every detach and retirement asks ([`super::mount_activity`]), with this process's
+/// tree and the recorded daemon exempt. A host shell's run between its tasks holds no task
+/// database, yet the daemon is what it talks to. A census that fails proves the checkout idle no
+/// more than a holder does, so it counts as a hold, and says why.
+#[cfg(target_os = "macos")]
+async fn host_holders(project_root: &Path) -> Option<String> {
+    let root = project_root.to_owned();
+    let census = tokio::task::spawn_blocking(move || {
+        super::mount_activity::unaccounted(
+            &root,
+            &super::mount_activity::Accounted {
+                supervisor: i32::try_from(std::process::id()).ok(),
+                ledger: None,
+            },
+        )
+    })
+    .await;
+    match census {
+        Ok(Ok(held)) => held.map(|held| held.to_string()),
+        Ok(Err(error)) => Some(format!("what holds its checkout cannot be listed: {error}")),
+        Err(error) => Some(format!(
+            "the look at what holds its checkout failed: {error}"
+        )),
     }
 }
 
@@ -899,9 +940,8 @@ async fn stop(project_root: &Path, why: &str) -> Stop {
 pub(crate) async fn release(project_root: &Path) {
     match stop(project_root, "its supervisor retired").await {
         Stop::Stopped => {}
-        Stop::InUse => eprintln!(
-            "cowshed: the Nx daemon of {} outlives its retired supervisor: a host client holds \
-             one of its task databases open",
+        Stop::InUse(why) => eprintln!(
+            "cowshed: the Nx daemon of {} outlives its retired supervisor: {why}",
             project_root.display()
         ),
         Stop::Failed(why) => eprintln!(
@@ -1143,6 +1183,54 @@ mod tests {
             Verdict::Release
         );
         assert!(keeper.settled, "the next probe finds it gone");
+    }
+
+    /// A host shell's run between its tasks holds no task database, so the idle look cannot see
+    /// it, yet the daemon is what it talks to. A process the supervisor does not run, working in
+    /// the checkout, keeps the daemon past the idle interval; once it is gone the unused daemon is
+    /// stopped.
+    #[cfg(target_os = "macos")]
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_looking_shed_with_a_host_run_in_it_keeps_its_daemon() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-keeper-host-run-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).expect("scratch");
+        // Backgrounded by an `sh` that exits at once, so launchd adopts it rather than this test
+        // process, as it adopts a host shell's run.
+        let mut shell = std::process::Command::new("/bin/sh");
+        shell
+            .args(["-c", "/bin/sleep 600 </dev/null >/dev/null 2>&1 & echo $!"])
+            .current_dir(&root)
+            .stdout(std::process::Stdio::piped());
+        let started = cowshed_os::fork_lock::Spawn::spawn_locked(&mut shell)
+            .expect("start a host run")
+            .wait_with_output()
+            .expect("the shell exits");
+        let run: i32 = String::from_utf8(started.stdout)
+            .expect("a pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        let mut keeper = keeper();
+        assert_eq!(keeper.judge(&root, false, Probe::Live).await, Verdict::Keep);
+        tokio::time::advance(IDLE * 2).await;
+        let kept = keeper.judge(&root, false, Probe::Live).await;
+        // SAFETY: kill takes plain integers and touches no memory of ours.
+        unsafe { libc::kill(run, libc::SIGKILL) };
+        // SAFETY: the null signal only asks whether the pid is still held.
+        while unsafe { libc::kill(run, 0) } == 0 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(kept, Verdict::Keep, "a host run in the checkout is use");
+        tokio::time::advance(IDLE).await;
+        assert_eq!(
+            keeper.judge(&root, false, Probe::Live).await,
+            Verdict::Release,
+            "once the run is gone the unused daemon is stopped"
+        );
+        std::fs::remove_dir_all(&root).expect("remove scratch");
     }
 
     /// A scratch tree with two PATH directories, `a` and `b`, and the PATH that lists them.

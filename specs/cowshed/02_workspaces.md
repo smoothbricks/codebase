@@ -1314,14 +1314,16 @@ stats nothing on the mount but its root. A holder whose parent the kernel will n
 be cowshed's, so it stays a holder.
 
 `detach`, `rm`, the retirement a `land` ends with (which is `rm`'s), `mv`, gc's retirement of an abandoned unpublished
-clone, and a supervisor's idle retirement all consult it. Each asks before the supervisor stops, with the serving
-supervisor exempt. Stopping the supervisor first would end the keeper's Nx daemon that a host run may be using, so the
-census itself would disrupt what it measures. A retirement asks again once the supervisor has stopped, before the image
-is retired. A held mount refuses with `conflict`, naming each holder's pid, command, and what it holds where
-(`pid 4242 (nx run-many -t test), working directory /…/raven/packages`). It names ten holders and counts the rest.
-Nothing is stopped, and no flag overrides the refusal (11_shell.md, "Teardown ordering"). A supervisor whose idle bound
-expires while such a process holds the mount keeps serving, says so on stderr, and looks again after another bound. gc's
-build-volume collection is a separate gate with its own grace (16_build_volumes.md) and does not consult it.
+clone, a supervisor's idle retirement, and the Nx keeper's daemon stop (04_sandbox.md) all consult it. Each asks before
+the supervisor stops, with the serving supervisor exempt. Stopping the supervisor first would end the keeper's Nx daemon
+that a host run may be using, so the census itself would disrupt what it measures. A retirement asks again once the
+supervisor has stopped, before the image is retired. A held mount refuses with `conflict`, naming each holder's pid,
+command, and what it holds where (`pid 4242 (nx run-many -t test), working directory /…/raven/packages`). It names ten
+holders and counts the rest. Nothing is stopped, and no flag overrides the refusal (11_shell.md, "Teardown ordering"). A
+supervisor whose idle bound expires while such a process holds the mount keeps serving, says so on stderr, and looks
+again after another bound. A keeper about to stop an idle shed's daemon keeps it instead, saying what holds the
+checkout. gc's build-volume collection is a separate gate with its own grace (16_build_volumes.md) and does not consult
+it.
 
 When a detach's unmount is still refused by the kernel, the refusal names what holds the volume: first the tree census,
 then the volume census, which also walks mapped files. When neither names a process of this user, the refusal says so

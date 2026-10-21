@@ -8625,7 +8625,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 &census,
                 &super::mount_activity::Accounted {
                     supervisor,
-                    ledger: &ledger,
+                    ledger: Some(&ledger),
                 },
             )
         })

@@ -27,8 +27,9 @@ const ANCESTRY_BOUND: usize = 1024;
 pub(crate) struct Accounted<'a> {
     /// The process serving the workspace's supervisor, when one is known to serve.
     pub supervisor: Option<i32>,
-    /// The job-group ledger beside the workspace's supervisor socket.
-    pub ledger: &'a Path,
+    /// The job-group ledger beside the workspace's supervisor socket: a job that left the
+    /// supervisor's tree. Absent for the supervisor's own keeper, which has no socket path.
+    pub ledger: Option<&'a Path>,
 }
 
 /// A workspace mount that processes cowshed does not account for hold, each named with what it
@@ -93,8 +94,11 @@ pub(crate) fn unaccounted(
     let roots: Vec<i32> = accounted.supervisor.into_iter().chain(daemon).collect();
     let mut holders = Vec::new();
     for held in nx::tree_holds(mount)? {
-        if descends_from(held.holder.pid, &roots)
-            || job_groups::owned_process(accounted.ledger, held.holder.pid)?.is_some()
+        if descends_from(held.holder.pid, &roots) {
+            continue;
+        }
+        if let Some(ledger) = accounted.ledger
+            && job_groups::owned_process(ledger, held.holder.pid)?.is_some()
         {
             continue;
         }
@@ -185,7 +189,7 @@ mod tests {
         let ledger = beside.join("supervisor.groups");
         let accounted = Accounted {
             supervisor: None,
-            ledger: &ledger,
+            ledger: Some(&ledger),
         };
         let mut working = holder(&packages, None);
         let mut reading = holder(&beside, Some(&lock));
@@ -244,7 +248,7 @@ mod tests {
             &mount,
             &Accounted {
                 supervisor: None,
-                ledger: &ledger,
+                ledger: Some(&ledger),
             },
             &[pid],
         );
@@ -252,10 +256,11 @@ mod tests {
             &mount,
             &Accounted {
                 supervisor: Some(i32::try_from(std::process::id()).unwrap()),
-                ledger: &ledger,
+                ledger: Some(&ledger),
             },
         )
         .unwrap();
+        let record = job_groups::process_record(pid);
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(
@@ -263,7 +268,8 @@ mod tests {
                 .iter()
                 .flat_map(|held| &held.holders)
                 .any(|holder| holder.holder.pid == pid),
-            "the supervisor's child is named: {supervised:?}"
+            "the supervisor's child is named: {supervised:?}; its record {record:?}, this process {}",
+            std::process::id()
         );
         fs::remove_dir_all(&mount).unwrap();
         fs::remove_dir_all(&beside).unwrap();
