@@ -15,6 +15,12 @@
 //! the order their lands asked. The live ticket with the lowest number holds the turn; every other
 //! waits on the lock of the live ticket just ahead of it and, when that ends, looks again. Nothing
 //! polls, and nobody but the next in line is woken.
+//!
+//! The head then takes the outside lock, the file lands took before every caller asked for turns.
+//! A process outside the queue holding it records nothing, so while the head waits it names the
+//! processes with that file open from one descriptor census per report. Measured 2026-10-21: a
+//! land waited 1002 s behind an outside holder having said once that "a land that did not ask
+//! for a turn" held it, and nothing named the process.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read as _, Write as _};
@@ -22,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use cowshed_os::process::Holder;
 use serde::{Deserialize, Serialize};
 
 /// The directory holding every repository's land turns: beside the install slot, in the host's
@@ -51,9 +58,45 @@ pub struct Ticket {
 pub enum Wait {
     /// Behind `ahead` live tickets, the first of which, `holder`, holds the turn.
     Queued { holder: Ticket, ahead: usize },
-    /// At the head, waiting for the lock a land outside the queue holds (a land started before
-    /// every caller asked for turns).
-    Outside { lock: PathBuf },
+    /// At the head, waiting for `lock`, which a process outside the queue holds: a land started
+    /// before every caller asked for turns, or anything else that took the file.
+    Outside {
+        lock: PathBuf,
+        holders: OutsideHolders,
+    },
+}
+
+/// Who holds the outside lock, as one census of the processes with that file open shows it.
+/// Darwin names no `flock(2)` owner, so an open descriptor is the evidence, as for `lsof`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OutsideHolders {
+    /// The processes other than the waiting land with the file open, by pid, each once: the
+    /// holder is one of them.
+    Open(Vec<Holder>),
+    /// No other process has it open: the holder let go as the census ran, or is not this user's
+    /// to see.
+    NoneOpen,
+    /// The census could not be taken, and why.
+    Unknown(String),
+}
+
+/// What the land `me`, waiting for the outside lock with its own descriptor open on it, says holds
+/// that lock, given one census `open` of the processes with the file open. Pure: the census is
+/// the caller's.
+pub fn outside_holders(me: i32, open: Result<Vec<Holder>, String>) -> OutsideHolders {
+    match open {
+        Err(error) => OutsideHolders::Unknown(error),
+        Ok(mut open) => {
+            open.retain(|holder| holder.pid != me);
+            open.sort_by_key(|holder| holder.pid);
+            open.dedup_by_key(|holder| holder.pid);
+            if open.is_empty() {
+                OutsideHolders::NoneOpen
+            } else {
+                OutsideHolders::Open(open)
+            }
+        }
+    }
 }
 
 /// A held turn. Ending it records how the land's command ended; dropping it unended records that
@@ -398,11 +441,48 @@ fn ahead_of(directory: &Path, number: u64) -> io::Result<Option<(File, Vec<Ticke
     Ok(nearest.map(|file| (file, ahead)))
 }
 
+/// Run `blocking` on a thread of its own and answer what it answers, calling `tell` once it has
+/// started and every `every` until then: a lock wait that keeps saying what it waits for. The wait
+/// starts first, so however long a `tell` takes, it never delays taking the lock.
+fn wait_telling<T: Send + 'static>(
+    blocking: impl FnOnce() -> io::Result<T> + Send + 'static,
+    every: Duration,
+    mut tell: impl FnMut() -> io::Result<()>,
+) -> io::Result<T> {
+    let (ended, end) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = ended.send(blocking());
+    });
+    tell()?;
+    loop {
+        match end.recv_timeout(every) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) => tell()?,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::other(
+                    "the land turn wait thread ended unanswered",
+                ));
+            }
+        }
+    }
+}
+
+/// The outside wait of the land `me`, from one census of the processes with `lock` open
+/// (05_gateway.md "Land turns"; the one holder census 02_workspaces.md admits outside a
+/// destructive operation, "Holders cowshed does not run"). It reports and decides nothing.
+fn outside_wait(lock: &Path, me: i32) -> Wait {
+    let open = crate::build_volume::nx::holders(lock).map_err(|error| error.to_string());
+    Wait::Outside {
+        lock: lock.to_path_buf(),
+        holders: outside_holders(me, open),
+    }
+}
+
 /// Wait in `directory`'s queue for this process's turn to land `workspace` with `command`, then
 /// take `outside` exclusively too when given: the lock file of lands that do not ask for turns,
-/// kept and never removed. `waiting` is told who holds the turn and how many are ahead whenever
-/// that changes and every `report_every` while it does not. The turn is held until the [`Turn`]
-/// is dropped or this process exits.
+/// kept and never removed. `waiting` is told who holds the turn and how many are ahead, or which
+/// processes have the outside lock open, whenever that changes and every `report_every` while it
+/// does not. The turn is held until the [`Turn`] is dropped or this process exits.
 pub fn take(
     directory: &Path,
     workspace: &str,
@@ -422,20 +502,15 @@ pub fn take(
             holder,
             ahead: ahead.len(),
         };
-        waiting(&told);
         // The wait on the ticket just ahead runs on its own thread, so this one can repeat what
         // it was told at its cadence; the lock is released at once, since only its end matters.
-        let (ended, end) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = ended.send(nearest.lock_shared());
-        });
-        loop {
-            match end.recv_timeout(report_every) {
-                Ok(result) => {
-                    result?;
-                    break;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
+        // The first telling is what `ahead_of` just read; each later one looks again.
+        let mut first = true;
+        wait_telling(
+            move || nearest.lock_shared(),
+            report_every,
+            || {
+                if !first {
                     let now = observe(directory)?;
                     let mine = now.iter().position(|live| live.number == ticket.number);
                     if let (Some(holder), Some(ahead)) = (now.first(), mine) {
@@ -444,15 +519,12 @@ pub fn take(
                             ahead,
                         };
                     }
-                    waiting(&told);
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(io::Error::other(
-                        "the land turn wait thread ended unanswered",
-                    ));
-                }
-            }
-        }
+                first = false;
+                waiting(&told);
+                Ok(())
+            },
+        )?;
     }
     let outside = match outside {
         None => None,
@@ -463,16 +535,20 @@ pub fn take(
                 .write(true)
                 .open(lock)?;
             match held.try_lock() {
-                Ok(()) => {}
+                Ok(()) => Some(held),
                 Err(TryLockError::WouldBlock) => {
-                    waiting(&Wait::Outside {
-                        lock: lock.to_path_buf(),
-                    });
-                    held.lock()?;
+                    let me = i32::try_from(std::process::id()).map_err(io::Error::other)?;
+                    Some(wait_telling(
+                        move || held.lock().map(|()| held),
+                        report_every,
+                        || {
+                            waiting(&outside_wait(lock, me));
+                            Ok(())
+                        },
+                    )?)
                 }
                 Err(TryLockError::Error(error)) => return Err(error),
             }
-            Some(held)
         }
     };
     record(directory, &ticket, TurnEventKind::Taken, None);
@@ -484,4 +560,44 @@ pub fn take(
         _ticket: file,
         _outside: outside,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        /// Whatever the census lists, the outside wait names each process with the lock open but
+        /// the waiting land itself, once, by pid ascending, as the first census row of that pid
+        /// lists it; no such process is `NoneOpen`, never an empty list; a census that could not
+        /// be taken is said with its reason. The reference is the same answer kept in a map.
+        #[test]
+        fn the_outside_wait_names_every_other_process_with_the_lock_open_once(
+            me in 1_i32..16,
+            rows in prop::collection::vec((1_i32..16, "[a-z]{1,6}"), 0..12),
+            failure in prop::option::of("[a-z ]{1,12}"),
+        ) {
+            let open: Vec<Holder> = rows
+                .into_iter()
+                .map(|(pid, command)| Holder { pid, command })
+                .collect();
+            let census = failure.clone().map_or_else(|| Ok(open.clone()), Err);
+            let mut reference = BTreeMap::new();
+            for holder in &open {
+                if holder.pid != me {
+                    reference.entry(holder.pid).or_insert_with(|| holder.clone());
+                }
+            }
+            let expected = match failure {
+                Some(reason) => OutsideHolders::Unknown(reason),
+                None if reference.is_empty() => OutsideHolders::NoneOpen,
+                None => OutsideHolders::Open(reference.into_values().collect()),
+            };
+            prop_assert_eq!(outside_holders(me, census), expected);
+        }
+    }
 }

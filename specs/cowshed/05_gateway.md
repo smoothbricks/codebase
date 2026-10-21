@@ -321,12 +321,23 @@ in line is woken. A waiting land says on stderr how many lands are ahead and who
 when it asked — when it starts waiting, whenever the land ahead changes, and every 90 s between (the land watchdog's
 cadence), and how long it waited once the turn is its own. `--outside-lock <file>` names the lock file lands took before
 every caller asked for turns: the head takes it too, exclusively and keeping the file, so it excludes a land started
-that way, and says so while it waits for one. A land's turn covers rebase, gate, fast-forward and adoption; the push to
-a remote runs after the turn ends, since a remote is never needed to land (tg#6988). A turn is only as durable as the
-process that holds it: a land that shares its caller's session ends with that session. Measured 2026-10-21: one lander's
-lands died with its tool session three times, twice while queued and once mid-gate. So a caller that may go away first
-starts the land in a session of its own (`setsid`, output to a file, not its child) and waits on the land's pid;
-`land-turn` itself never detaches, since the caller that stays reads its output and its exit status.
+that way. A process outside the queue holding that file records nothing, so while the head waits for it the head names
+it: when it starts waiting and every 90 s after, one census of the processes with the file open
+(`build_volume::nx::holders`; Darwin names no `flock(2)` owner, so an open descriptor is the evidence) gives each one's
+pid and command, the head's own descriptor left out. A census that finds no other process says so (the holder let go as
+it looked, or is not this user's to see), and one that cannot be taken says why. Measured 2026-10-21: a land waited 1002
+s for the outside lock having said once that "a land that did not ask for a turn" held it, naming no process. The census
+decides nothing: the head waits for the kernel's lock alone, and it is the one holder census 02_workspaces.md admits
+outside a destructive operation ("Holders cowshed does not run"). The wait starts before the first census, on a thread
+of its own, so no census delays taking the lock. Measured 2026-10-21 on one fixture (a `lockf -k` holder for 1.5 s,
+debug builds, a 709-process host, 20 interleaved runs each): without the census the first report came 18 ms after the
+wait began and the turn 20 ms after the holder let go (medians); with it, 213 ms and 17 ms, at about 0.11 s of CPU per
+census. A land's turn covers rebase, gate, fast-forward and adoption; the push to a remote runs after the turn ends,
+since a remote is never needed to land (tg#6988). A turn is only as durable as the process that holds it: a land that
+shares its caller's session ends with that session. Measured 2026-10-21: one lander's lands died with its tool session
+three times, twice while queued and once mid-gate. So a caller that may go away first starts the land in a session of
+its own (`setsid`, output to a file, not its child) and waits on the land's pid; `land-turn` itself never detaches,
+since the caller that stays reads its output and its exit status.
 
 **A ticket's life is recorded.** Measured 2026-10-21: a land queued for 635 s vanished with its agent's session, its log
 stopping mid-wait, and nothing recorded it, so it read as running for half an hour while it did not exist. Each

@@ -1368,18 +1368,25 @@ read are the host store's (`/private/cowshed/store/<owner>/<repo>/sessions`) onl
 fixture's store elsewhere records its lease there, which no census reads, so it is asked like any other process and can
 still stall a concurrent census. Linux records no unique id and its census asks every process.
 
-A holder check belongs in front of a destructive operation and nowhere else: once per operation, in that operation's own
-context, never on an interval and never inside a supervisor's actor. `detach`, `rm`, the retirement a `land` ends with
-(which is `rm`'s), `mv` and gc's retirement of an abandoned unpublished clone consult this census. Each asks before the
-supervisor stops, with the serving supervisor exempt. Stopping the supervisor first would end the keeper's Nx daemon
-that a host run may be using, so the census itself would disrupt what it measures. A retirement asks again once the
-supervisor has stopped, before the image is retired. A held mount refuses with `conflict`, naming each holder's pid,
-command, and what it holds where (`pid 4242 (nx run-many -t test), working directory /…/raven/packages`). It names ten
-holders and counts the rest. Nothing is stopped, and no flag overrides the refusal (11_shell.md, "Teardown ordering"). A
-supervisor's idle retirement and the Nx keeper's daemon stop (04_sandbox.md) run on timers and consult the supervisor's
-ledger alone: a supervisor retires once its ledger has held nothing for its idle bound, whatever else is on the mount,
-since retiring it unmounts nothing. gc's build-volume collection is a separate gate with its own grace
-(16_build_volumes.md) and does not consult it.
+A holder check belongs in front of a destructive operation and, but for the one exception below, nowhere else: once per
+operation, in that operation's own context, never on an interval and never inside a supervisor's actor. `detach`, `rm`,
+the retirement a `land` ends with (which is `rm`'s), `mv` and gc's retirement of an abandoned unpublished clone consult
+this census. Each asks before the supervisor stops, with the serving supervisor exempt. Stopping the supervisor first
+would end the keeper's Nx daemon that a host run may be using, so the census itself would disrupt what it measures. A
+retirement asks again once the supervisor has stopped, before the image is retired. A held mount refuses with
+`conflict`, naming each holder's pid, command, and what it holds where
+(`pid 4242 (nx run-many -t test), working directory /…/raven/packages`). It names ten holders and counts the rest.
+Nothing is stopped, and no flag overrides the refusal (11_shell.md, "Teardown ordering"). A supervisor's idle retirement
+and the Nx keeper's daemon stop (04_sandbox.md) run on timers and consult the supervisor's ledger alone: a supervisor
+retires once its ledger has held nothing for its idle bound, whatever else is on the mount, since retiring it unmounts
+nothing. gc's build-volume collection is a separate gate with its own grace (16_build_volumes.md) and does not consult
+it.
+
+One census is admitted outside a destructive operation, and only this one: the head of a land-turn queue waiting for its
+`--outside-lock` names the processes with that lock file open (05_gateway.md, "Land turns"). It runs on that
+`cowshed land-turn` process's own thread, one walk when the wait starts and one per 90 s report while it lasts, never in
+a supervisor or daemon, and it decides nothing: the head waits for the kernel's lock alone, and the census only says who
+has the file open. The exception widens to nothing else.
 
 When a detach's unmount is still refused by the kernel, the refusal names what holds the volume: first the tree census,
 then the volume census, which also walks mapped files. When neither names a process of this user, the refusal says so

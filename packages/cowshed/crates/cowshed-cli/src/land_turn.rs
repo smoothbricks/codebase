@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use cowshed_core::gateway_sessions::canonical_home;
 use cowshed_core::host_dirs::support_directory;
-use cowshed_core::land_turn::{self as queue, Wait};
+use cowshed_core::land_turn::{self as queue, OutsideHolders, Wait};
 use cowshed_core::{CowshedError, ErrorCode};
 
 use crate::args::LandTurnArgs;
@@ -191,10 +191,27 @@ fn report<W: Write, E: Write>(
             holder.pid,
             local_clock(holder.asked_unix_ms),
         ),
-        Wait::Outside { lock } => format!(
-            "land turn {repo}: next, waiting for {} held by a land that did not ask for a turn",
-            lock.display(),
-        ),
+        Wait::Outside { lock, holders } => {
+            let held = match holders {
+                OutsideHolders::Open(open) => format!(
+                    "open in {}",
+                    open.iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                OutsideHolders::NoneOpen => "no other process has it open now: its holder let \
+                    go as this looked, or is not this user's to see"
+                    .to_owned(),
+                OutsideHolders::Unknown(reason) => {
+                    format!("the processes with it open could not be listed: {reason}")
+                }
+            };
+            format!(
+                "land turn {repo}: next, waiting for {}, held outside the queue; {held}",
+                lock.display(),
+            )
+        }
     };
     output.guidance(&line).map_err(write_failed)
 }

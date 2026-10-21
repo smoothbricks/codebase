@@ -551,8 +551,9 @@ pub fn tree_holds(root: &Path) -> io::Result<Vec<TreeHold>> {
 
 /// Process-table walks this process has begun: every listing of all pids a holder census starts
 /// from ([`census_pids`] on macOS, a `/proc` read on Linux). Never on an interval and never in a
-/// supervisor's actor (02_workspaces.md, "Holders cowshed does not run"), which tests read
-/// through [`process_table_walks`].
+/// supervisor's actor (02_workspaces.md, "Holders cowshed does not run"), but for the one exception
+/// that section admits: a land-turn head naming who has its outside lock open, once per 90 s report
+/// (`land_turn::take`). Tests read the count through [`process_table_walks`].
 static PROCESS_TABLE_WALKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How many process-table walks this process has begun ([`PROCESS_TABLE_WALKS`]).

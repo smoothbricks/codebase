@@ -11,7 +11,7 @@ use std::io::{self, BufRead as _, BufReader, ErrorKind, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::process::CommandExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
@@ -114,6 +114,11 @@ struct Land {
 impl Land {
     /// A land whose command appends `workspace` to the order file, then blocks until released.
     fn gated(home: &Home, workspace: &str) -> Self {
+        Self::gated_in(home, REPO, workspace, None)
+    }
+
+    /// [`Land::gated`] in `repo`'s queue, its head taking `outside` too when given.
+    fn gated_in(home: &Home, repo: &str, workspace: &str, outside: Option<&Path>) -> Self {
         let fifo = home.path.join(format!("{workspace}.fifo"));
         let c_path = CString::new(fifo.as_os_str().as_bytes()).expect("a fifo path has no NUL");
         // SAFETY: mkfifo(3) on a path inside this test's own HOME.
@@ -130,24 +135,31 @@ impl Land {
             home.order().display(),
             fifo.display()
         );
-        let mut land = Self::spawn(home, workspace, &script);
+        let mut land = Self::spawn_in(home, repo, workspace, outside, &script);
         land.fifo = Some(fifo);
         land
     }
 
     fn spawn(home: &Home, workspace: &str, script: &str) -> Self {
-        let mut child = Command::new(cowshed())
+        Self::spawn_in(home, REPO, workspace, None, script)
+    }
+
+    fn spawn_in(
+        home: &Home,
+        repo: &str,
+        workspace: &str,
+        outside: Option<&Path>,
+        script: &str,
+    ) -> Self {
+        let mut command = Command::new(cowshed());
+        command
             .env("HOME", &home.path)
-            .args([
-                "land-turn",
-                REPO,
-                "--workspace",
-                workspace,
-                "--",
-                "sh",
-                "-c",
-                script,
-            ])
+            .args(["land-turn", repo, "--workspace", workspace]);
+        if let Some(lock) = outside {
+            command.arg("--outside-lock").arg(lock);
+        }
+        let mut child = command
+            .args(["--", "sh", "-c", script])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -468,6 +480,38 @@ fn the_waiting_line_names_the_holder() {
     holder.release();
     holder.wait_success();
     wait_for_order(&home, &["H", "W1"]);
+    waiter.release();
+    waiter.wait_success();
+}
+
+/// Measured 2026-10-21: a land waited 1002 s for the outside lock having said once that "a land
+/// that did not ask for a turn" held it, naming no process. The head waiting for the outside lock
+/// names the process holding it, by pid and command. The holder is a real process outside this
+/// queue: the head of another repository's queue, which takes the same outside lock.
+#[test]
+fn a_head_waiting_for_the_outside_lock_names_the_process_holding_it() {
+    let home = Home::new();
+    let lock = home.path.join("outside.lock");
+    let mut holder = Land::gated_in(&home, "otherrepo", "H", Some(&lock));
+    wait_for_order(&home, &["H"]);
+    let mut waiter = Land::gated_in(&home, REPO, "W", Some(&lock));
+    let line = waiter.stderr_line("cowshed: land turn testrepo: next, waiting for ");
+    let named = format!(
+        "cowshed: land turn testrepo: next, waiting for {}, held outside the queue; open in pid {} (",
+        lock.display(),
+        holder.pid()
+    );
+    assert!(
+        line.starts_with(&named),
+        "the outside wait names the holder's pid: {line}"
+    );
+    assert!(
+        line.contains("land-turn otherrepo --workspace H --outside-lock"),
+        "the holder's command is named: {line}"
+    );
+    holder.release();
+    holder.wait_success();
+    wait_for_order(&home, &["H", "W"]);
     waiter.release();
     waiter.wait_success();
 }
