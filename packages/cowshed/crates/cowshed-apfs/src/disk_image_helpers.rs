@@ -342,7 +342,9 @@ impl fmt::Display for OrphanedHelpers {
              left every disk image attach fails with error code 150 (kIOReturnNoResources) until \
              root kills the orphans: `launchctl kill` is refused, `kill -9` frees the mappings \
              without a reboot. Killing them does not free leaked image devices: those take a \
-             reboot (disk-image-attach-budget)",
+             reboot (disk-image-attach-budget). The helpers run as the `_diskimagesiod` user, so \
+             `ps` as this user does not list them; `launchctl print system | grep \
+             diskimagesiod` names each running one with its pid, and `sudo ps -p <pid>` shows it",
             self.pids.len(),
             self.pid_list(", "),
             self.mapped_mib()
@@ -638,6 +640,8 @@ mod tests {
             "error code 150",
             "launchctl kill",
             "does not free leaked image devices",
+            "`ps` as this user does not list them",
+            "launchctl print system",
         ] {
             assert!(
                 message.contains(needle),
