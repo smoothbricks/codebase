@@ -850,7 +850,8 @@ describe('smoo-nx-exec with a fresh daemon', () => {
           nxEntry(workspace),
           workspace,
           ['run-many', '-t', 'build', '-p', 'app', '--outputStyle=static-failures-only'],
-          { NX_DAEMON: 'false', NX_WORKSPACE_ROOT_PATH: workspace },
+          // Its plugin workers bind sockets too: Nx's default root is not admitted in a sandbox.
+          { NX_DAEMON: 'false', NX_WORKSPACE_ROOT_PATH: workspace, NX_SOCKET_DIR: socketDirectory },
         );
         expect(built.code, built.stdout + built.stderr).toBe(0);
         const reuseEntry = join(root, 'graph-reuse.ts');
@@ -996,7 +997,7 @@ await writeFile(${JSON.stringify(resultsPath)}, JSON.stringify(results));
     try {
       await withNxFixture(
         'ensure-built-producer-',
-        async ({ root, workspace }) => {
+        async ({ root, workspace, socketDirectory }) => {
           const builds = join(root, 'lib-builds.log');
           await writeTwoProjectWorkspace(workspace, builds, true);
           providerSockets = providerSocketDirectory(workspace);
@@ -1006,7 +1007,7 @@ await writeFile(${JSON.stringify(resultsPath)}, JSON.stringify(results));
             nxEntry(workspace),
             workspace,
             ['run-many', '-t', 'build', '-p', 'app', '--outputStyle=static-failures-only'],
-            { NX_DAEMON: 'false', NX_WORKSPACE_ROOT_PATH: workspace },
+            { NX_DAEMON: 'false', NX_WORKSPACE_ROOT_PATH: workspace, NX_SOCKET_DIR: socketDirectory },
           );
           expect(built.code, built.stdout + built.stderr).toBe(0);
           expect(await readFile(builds, 'utf-8')).toBe('lib\n');
@@ -1297,7 +1298,7 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
             nxEntry(workspace),
             workspace,
             ['run-many', '-t', 'build', '-p', 'app', '--outputStyle=static-failures-only'],
-            { NX_DAEMON: 'false', NX_WORKSPACE_ROOT_PATH: workspace },
+            { NX_DAEMON: 'false', NX_WORKSPACE_ROOT_PATH: workspace, NX_SOCKET_DIR: fixture.socketDirectory },
           );
           expect(built.code, built.stdout + built.stderr).toBe(0);
           expect(await readFile(builds, 'utf-8')).toBe('lib\n');
