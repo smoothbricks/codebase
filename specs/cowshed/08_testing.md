@@ -261,6 +261,8 @@ use only disposable local data and never change installed host services or check
 proof launches only its unique one-shot agent from the generated gateway plist, holds 10000 descriptors with finite
 `OPEN_MAX`, and unloads that agent on every exit path.
 
+Workspace supervisors and children deliberately deny `file-link`; this host-controller proof cannot run inside them.
+
 An exit-watch fixture waits for an executed-body readiness byte before its parent captures the process identity and
 registers the watch. The parent holds the child's input gate until registration; returning from spawn alone is not
 readiness. Its actual parent retains the child unreaped through the exit observation.

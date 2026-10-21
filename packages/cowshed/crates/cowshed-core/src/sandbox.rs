@@ -4036,7 +4036,11 @@ mod tests {
             );
         };
         let absent = |path: &str| {
-            assert!(fs::symlink_metadata(path).is_err(), "{path} must not exist");
+            let found = fs::symlink_metadata(path);
+            assert!(
+                matches!(&found, Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+                "{path} must not exist: {found:?}"
+            );
         };
 
         // A root as a fixture builds it: through `/tmp`, a short alias beside real leaves, then
@@ -4168,7 +4172,11 @@ mod tests {
                 && String::from_utf8_lossy(&made.stderr).contains("Operation not permitted"),
             "controller Git must not make a fixture root: {made:?}"
         );
-        assert!(fs::symlink_metadata(&well_formed).is_err());
+        let found = fs::symlink_metadata(&well_formed);
+        assert!(
+            matches!(&found, Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+            "{well_formed} must not exist: {found:?}"
+        );
     }
 
     /// A child whose stdout is the null device can fstat it. Runtimes classify their stdio
