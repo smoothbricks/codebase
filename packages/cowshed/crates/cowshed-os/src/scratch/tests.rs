@@ -330,13 +330,23 @@ fn named_ownership_preserves_the_fixture_socket_path_budget() {
         named_owner(Path::new("/tmp/cowshed-sock-0123456789abcdef")),
         None
     );
-    let parent = fs::canonicalize("/tmp").unwrap();
-    let fixture = Fixture(create_named(&parent, "cowshed-recovering").unwrap());
-    let directory = fixture.0.join("run");
-    fs::create_dir(&directory).unwrap();
-    // Production publishes through a 32-hex + ".bind" socket, not just manager.sock.
-    let path = directory.join(format!("{}.bind", uuid::Uuid::new_v4().simple()));
-    let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    // The longest socket path below a named fixture: the longest scratch parent, a workspace's
+    // runtime link /tmp/cs-<12 hex> (cowshed-core sandbox.rs workspace_runtime_link; 08_testing.md
+    // "Fixtures"), the longest prefix of a store holding a supervisor socket (supervisor_manager.rs
+    // recovery_store), the largest creator pid, and the supervisor's unpublished listener
+    // run/<32 hex>.bind (supervisor_socket.rs bind). Building the production sockaddr needs no
+    // write grant to the host's shared temp root.
+    let longest = named_path(
+        Path::new("/tmp/cs-0123456789ab"),
+        "cowshed-recovering",
+        i32::MAX.unsigned_abs(),
+    );
+    let listener = |fixture: &Path| fixture.join("run").join(format!("{:032x}.bind", u128::MAX));
+    std::os::unix::net::SocketAddr::from_pathname(listener(&longest)).unwrap();
+    // The control: the branch's earlier prefix + 33 byte name does not fit there.
+    let mut wider = longest.into_os_string();
+    wider.push("0123456789abcdef");
+    assert!(std::os::unix::net::SocketAddr::from_pathname(listener(Path::new(&wider))).is_err());
 }
 
 #[test]
