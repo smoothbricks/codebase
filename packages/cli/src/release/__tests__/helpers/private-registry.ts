@@ -349,7 +349,8 @@ async function createFixtureConsumer(root: string, options: FixtureConsumerOptio
       await mkdir(cache, { recursive: true });
       const result = await Bun.$`${bunBinary()} install`
         .cwd(root)
-        .env({ PATH: process.env.PATH ?? '', HOME: home, BUN_INSTALL_CACHE_DIR: cache, ...env })
+        // Bun leaves a file in its temporary directory on every install: the consumer's own, not /tmp.
+        .env({ PATH: process.env.PATH ?? '', HOME: home, TMPDIR: home, BUN_INSTALL_CACHE_DIR: cache, ...env })
         .nothrow()
         .quiet();
       return {

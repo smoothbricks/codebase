@@ -181,11 +181,15 @@ function manifestText(value: object): string {
 }
 
 async function writeLockfile(root: string): Promise<void> {
+  const home = join(root, 'bun-home');
+  await mkdir(home, { recursive: true });
   const result = await Bun.$`${bunBinary()} install --lockfile-only --ignore-scripts`
     .cwd(root)
     .env({
       PATH: process.env.PATH ?? '',
-      HOME: join(root, 'bun-home'),
+      HOME: home,
+      // Bun leaves a file in its temporary directory on every install: the fixture's own, not /tmp.
+      TMPDIR: home,
       BUN_INSTALL_CACHE_DIR: join(root, 'bun-cache'),
     })
     .nothrow()

@@ -20,6 +20,8 @@ async function fixture() {
   const env = {
     PATH: process.env.PATH ?? '',
     HOME: home,
+    // Bun leaves a file in its temporary directory on every install: the fixture's own, not /tmp.
+    TMPDIR: home,
     BUN_INSTALL_CACHE_DIR: join(root, 'cache'),
     BUN_CONFIG_NO_CLEAR_TERMINAL: '1',
   };
