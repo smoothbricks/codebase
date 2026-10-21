@@ -1,12 +1,23 @@
 import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
 import { printCommandOutput } from '../lib/run.js';
 
 const script = join(managedAssetsRoot, 'raw/tooling/direnv/ttsc-env.sh');
+/** Where every checkout holds its managed copy, sourced relative to the checkout root. */
+const checkoutScript = 'tooling/direnv/ttsc-env.sh';
 
 interface TtscEnv {
   readonly TTSC_TSGO_BINARY: string;
@@ -15,14 +26,14 @@ interface TtscEnv {
 }
 
 /**
- * Source the script from `checkout` with exactly `inherited` as the environment
- * (plus PATH), the way a git hook or devenv's enterShell does, and read back
- * what it exported.
+ * Source the checkout's own copy from its root with exactly `inherited` as the
+ * environment (plus PATH), the way a git hook or devenv's enterShell does, and
+ * read back what it exported.
  */
 function enter(checkout: string, inherited: Record<string, string>): TtscEnv {
   const result = spawnSync(
     '/bin/sh',
-    ['-c', `. "$0" && printf '%s\\n' "$TTSC_TSGO_BINARY" "$TTSC_CACHE_DIR" "$TTSC_GO_CACHE_DIR"`, script],
+    ['-c', `. "$0" && printf '%s\\n' "$TTSC_TSGO_BINARY" "$TTSC_CACHE_DIR" "$TTSC_GO_CACHE_DIR"`, checkoutScript],
     { cwd: checkout, env: { PATH: process.env.PATH ?? '/usr/bin:/bin', ...inherited }, encoding: 'utf8' },
   );
   if (result.status !== 0) printCommandOutput(result.stdout ?? '', result.stderr ?? '');
@@ -36,7 +47,10 @@ function withCheckouts(run: (checkout: string, other: string, scratch: string) =
   try {
     const checkout = join(scratch, 'checkout');
     const other = join(scratch, 'other');
-    for (const path of [checkout, other]) mkdirSync(path);
+    for (const path of [checkout, other]) {
+      mkdirSync(join(path, 'tooling/direnv'), { recursive: true });
+      copyFileSync(script, join(path, checkoutScript));
+    }
     run(checkout, other, scratch);
   } finally {
     rmSync(scratch, { recursive: true, force: true });
@@ -71,7 +85,7 @@ it('refuses a declared producer with no executable profile output instead of sel
   withCheckouts((checkout) => {
     mkdirSync(join(checkout, 'tooling/direnv'), { recursive: true });
     writeFileSync(join(checkout, 'tooling/direnv/typescript-go.nix'), '{ pkgs }: pkgs.typescript\n');
-    const result = spawnSync('/bin/sh', ['-c', '. "$0"', script], {
+    const result = spawnSync('/bin/sh', ['-c', '. "$0"', checkoutScript], {
       cwd: checkout,
       env: { PATH: process.env.PATH ?? '/usr/bin:/bin', TTSC_TSGO_BINARY: '/old/compiler' },
       encoding: 'utf8',
@@ -81,6 +95,21 @@ it('refuses a declared producer with no executable profile output instead of sel
     expect(result.stderr).toContain(join(checkout, 'tooling/direnv/.devenv/profile/bin/tsgo'));
   });
 });
+it('refuses a directory that is not a workspace root instead of caching beside it', () => {
+  withCheckouts((checkout, _other, scratch) => {
+    const home = join(scratch, 'home');
+    mkdirSync(home);
+    const result = spawnSync('/bin/sh', ['-c', '. "$0"', join(checkout, checkoutScript)], {
+      cwd: home,
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home },
+      encoding: 'utf8',
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`not a workspace root (no ${checkoutScript}): ${home}`);
+    expect(existsSync(join(home, '.cache'))).toBe(false);
+  });
+});
+
 describe('ttsc-env.sh', () => {
   it("names this checkout's compiler and caches when nothing is inherited", () => {
     withCheckouts((checkout) => {

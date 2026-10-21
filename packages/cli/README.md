@@ -552,7 +552,7 @@ nothing when nothing changed:
   `GOFLAGS` carries `-trimpath`. A cache the caller already exported wins, so a host or a sandbox that shares these
   caches across checkouts sets them itself, unless the caller's environment was bound for another workspace (its
   `NX_WORKSPACE_ROOT_PATH` names another directory): that workspace's caches are dropped. Go's own caches keep Go's
-  defaults.
+  defaults. Sourced from a directory that is not a workspace root, it refuses rather than cache beside that directory.
 - `SMOO_TYPECHECK_TSC` names the native compiler the inferred `typecheck` and `typecheck-tests` targets run.
   `devenv.smoo.nix` builds it from one pinned TypeScript source revision with `go_1_27` from the `nixpkgs-go` input. The
   targets run it directly rather than through ttsc, whose auto-loaded transform plugins (typia) check inside their own
