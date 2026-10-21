@@ -38,6 +38,9 @@ writes — but cannot add a permission absent from the enclosing execution profi
 ;; that path. Nothing under HOME is readable because it merely exists.
 (deny file-read* file-read-data (subpath "~"))
 (allow process-exec process-fork)
+;; macOS refuses a sandboxed exec of a set-user-ID program; /bin/ps is one ("Process inspection").
+;; After the line above, which would otherwise match it last. Not in Git's executes-only-Git role.
+(allow process-exec (literal "/bin/ps") (with no-sandbox))
 (allow file-map-executable)
 (allow sysctl-read)
 (allow pseudo-tty)
@@ -422,6 +425,29 @@ Notes:
   before any join. The policy is read by the controller, never through a repository-relative path. Missing policy is the
   empty policy; a malformed or unreadable one, or one with a field cowshed does not know, fails closed before supervisor
   launch and serves no gateway session of the project.
+
+## Process inspection
+
+A job inspects processes with the host's `ps`: a test proves a daemon is its own by the environment it started with
+(`ps -E`), and a hung run's diagnostics list its process tree. macOS refuses a sandboxed exec of a set-user-ID program
+whatever the profile allows, `(allow default)` included, and `/bin/ps` is set-user-ID root, so under any profile it
+fails with `EPERM` before it runs. The one Seatbelt form that admits such an exec is `(with no-sandbox)`, which runs the
+program outside every sandbox; no rule runs it sandboxed. Every role that runs workspace commands therefore carries
+exactly one such rule, for the literal `/bin/ps`, after the broad exec allow, which would otherwise match last. Git's
+executes-only-Git role does not. Every other set-user-ID program (`top`, `login`, `su`) stays refused.
+
+Outside the sandbox `ps` sees what any local user's `ps` sees: the whole process table, every process's command line,
+and the start environment of this user's processes only (`ps -E` prints none for another user's). The kernel shows an
+Apple platform program's start environment to that program alone, so `ps -E` prints none for `/bin/sh` or `/bin/sleep`
+either; a Node or Nix-built daemon shows its own. `ps` reads the process table and prints it; it starts no program and
+writes no file. `/bin/ps` lies on the sealed system volume, so the path names Apple's program and no job can replace it.
+
+The rule does not widen what a job reads of this user's processes. Seatbelt mediates no operation for the
+`kern.procargs2` sysctl, so every job already reads the command line, and the start environment unless it is a platform
+program, of every process its user runs, sibling workspaces' Nx daemons and the operator's agents included, and no
+profile rule closes it: `(deny sysctl*)` and `(deny process-info*)` both leave it readable. A secret in one workspace's
+process environment is therefore readable by every workspace of the same user. What the rule adds is other users'
+command lines, which macOS shows every local user.
 
 ## Grants
 
@@ -1165,6 +1191,8 @@ untouched-artifact assertions:
 - under the "simulator" preset: assert filesystem and network authority are unwidened (the preset opens CoreSimulator
   IPC only);
 - write through `/tmp` symlinks into denied paths; abuse `file-map-executable` scratch dirs;
+- exec a set-user-ID program other than `/bin/ps` (must EPERM) while `/bin/ps -E` reads the start environment of a Node
+  daemon the job started;
 - verify effective filesystem grant and revoke propagation against
   [11_shell.md, Grant-change propagation](11_shell.md#grant-change-propagation), including the manager's no-restart
   boundary, revision-keyed exec hosts, running jobs and stale named sessions; verify an inner ReadOnly profile rejects

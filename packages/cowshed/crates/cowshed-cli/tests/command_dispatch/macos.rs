@@ -1130,6 +1130,50 @@ async fn directory_a_git_worktree_workspace_starts_its_supervisor_and_executes()
     fixture.stop_gateway().await;
 }
 
+/// A job inspects the processes it started with `ps`, the environment each started with included:
+/// a test proves a daemon is its own by what `ps -E` prints. macOS refuses a sandboxed exec of a
+/// set-user-ID program whatever the profile allows, and `/bin/ps` is one, so every job's `ps`
+/// failed with "Operation not permitted". It runs now; `top`, also set-user-ID, stays refused
+/// (04_sandbox.md, "Process inspection"). The daemon is Node, as a fixture's Nx daemon is: the
+/// kernel shows a platform program's environment to that program alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_job_reads_its_own_start_environment_with_ps() {
+    let (_, node) = repository_nx();
+    let mut fixture = Fixture::directory();
+    let mut service = serve_project(&mut fixture, &[]).await;
+    new_workspace(&mut service, "inspect").await;
+    let (stdout, _) = succeed(
+        &mut service,
+        [
+            OsString::from("exec"),
+            "inspect".into(),
+            "--".into(),
+            "/bin/sh".into(),
+            "-c".into(),
+            r#"COWSHED_PS_PROBE=daemon "$1" -e 'require("fs").writeFileSync("started", ""); setInterval(() => {}, 1000)' &
+daemon=$!
+while [ ! -e started ]; do kill -0 $daemon || exit 5; sleep 0.1; done
+line=$(/bin/ps -E -ww -o command= -p $daemon)
+listed=$?
+kill $daemon
+[ $listed = 0 ] || exit 1
+case " $line " in *" COWSHED_PS_PROBE=daemon "*) ;; *) printf 'ps -E: %s\n' "$line" >&2; exit 2 ;; esac
+refused=$( { /usr/bin/top -l 1 -n 0; } 2>&1 ) && exit 3
+case $refused in *'Operation not permitted'*) ;; *) printf 'top: %s\n' "$refused" >&2; exit 4 ;; esac
+printf inspected"#.into(),
+            "sh".into(),
+            node.into_os_string(),
+        ],
+    )
+    .await;
+    assert_eq!(stdout, b"inspected");
+    service
+        .shutdown()
+        .await
+        .expect("stop the inspecting runtime");
+    fixture.stop_gateway().await;
+}
+
 /// `rm` stops the checkout's Nx daemon as `detach` does. A daemon detaches from the job that
 /// started it, so stopping the supervisor leaves it running with its cwd on the checkout: the
 /// unmount was refused for its whole grace, then forced, and the daemon outlived the removal.

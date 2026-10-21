@@ -722,6 +722,13 @@ impl SeatbeltProfile {
     }
 }
 
+/// The one program a workspace command runs outside the sandbox. macOS refuses a sandboxed exec
+/// of a set-user-ID program whatever the profile allows, and `/bin/ps` is one, so without this a
+/// job cannot list its own processes or read their start environment (04_sandbox.md, "Process
+/// inspection"). `ps` only reads the process table and prints it, and shows the environment of
+/// this user's processes alone, which every job already reads through `kern.procargs2`.
+const PROCESS_STATUS_EXEC: &str = "(allow process-exec (literal \"/bin/ps\") (with no-sandbox))";
+
 /// Generate a complete, deterministic SBPL profile for one authority tier.
 ///
 /// Paths must already be canonical controller data. Child argv, environment,
@@ -812,6 +819,8 @@ pub fn seatbelt_profile(
         }
     } else {
         push_line(&mut profile, "(allow process-exec process-fork)");
+        // After the broad allow, which would otherwise match `/bin/ps` last and keep it sandboxed.
+        push_line(&mut profile, PROCESS_STATUS_EXEC);
     }
     push_line(&mut profile, "(allow file-map-executable)");
     push_line(&mut profile, "(allow sysctl-read)");
@@ -3159,6 +3168,36 @@ mod tests {
         }
     }
 
+    /// Every role that runs workspace commands executes `/bin/ps` outside the sandbox, after the
+    /// broad exec allow, and no other program leaves it. Git's executes-only-Git role keeps it
+    /// out with everything but Git (`git_only_profile_executes_only_git`).
+    #[test]
+    fn only_process_status_leaves_the_sandbox() {
+        let config = config(RunSandboxMode::ReadWrite);
+        for role in [
+            SandboxProfileRole::TrustedSupervisor,
+            SandboxProfileRole::ExecutedChild,
+            SandboxProfileRole::GitDiscovery,
+        ] {
+            let profile = seatbelt_profile(&config, role).unwrap().into_text();
+            let lines = profile.lines().collect::<Vec<_>>();
+            let escapes = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.contains("no-sandbox"))
+                .map(|(index, line)| (index, *line))
+                .collect::<Vec<_>>();
+            let broad = lines
+                .iter()
+                .position(|line| *line == "(allow process-exec process-fork)")
+                .unwrap_or_else(|| panic!("{role:?} executes workspace programs"));
+            assert!(
+                matches!(escapes.as_slice(), [(index, PROCESS_STATUS_EXEC)] if broad < *index),
+                "{role:?}: {escapes:?}"
+            );
+        }
+    }
+
     /// An admitted socket reaches the profile as an outbound rule with its directory traversable,
     /// or connecting fails on path resolution before the outbound rule is consulted.
     #[test]
@@ -3336,6 +3375,72 @@ mod tests {
                     && Path::new(String::from_utf8_lossy(&made.stdout).trim())
                         .starts_with(&config.exec_temp_dir),
                 "{role:?} mktemp: {made:?}"
+            );
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A job inspects its own processes with `ps`, their start environment included. macOS
+    /// refuses a sandboxed exec of a set-user-ID program whatever the profile allows, and
+    /// `/bin/ps` is one, so every role runs that one program outside the sandbox; `top`, also
+    /// set-user-ID, stays refused.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_seatbelt_runs_process_status_and_no_other_set_user_id_program() {
+        let sequence = NEXT_SANDBOX_DIR.fetch_add(1, Ordering::Relaxed);
+        let root_alias = std::env::temp_dir().join(format!(
+            "cowshed-process-status-test-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root_alias).unwrap();
+        let root = fs::canonicalize(&root_alias).unwrap();
+        let mut config = config(RunSandboxMode::ReadWrite);
+        config.home = root.join("home");
+        config.mount_root = root.join("mounts");
+        config.workspace_mount = root.join("workspace");
+        config.exec_temp_dir = root.join("tmp");
+        config.allowed_unix_sockets.clear();
+        for path in [&config.home, &config.workspace_mount, &config.exec_temp_dir] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let marker = format!(
+            "COWSHED_PROCESS_STATUS_PROBE={}-{sequence}",
+            std::process::id()
+        );
+        let (name, value) = marker.split_once('=').unwrap();
+        let run = |profile: &str, argv: &[&str]| {
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", profile, "--"])
+                .args(argv)
+                .env(name, value)
+                .current_dir(&config.workspace_mount)
+                .output_locked()
+                .unwrap()
+        };
+        for role in [
+            SandboxProfileRole::TrustedSupervisor,
+            SandboxProfileRole::ExecutedChild,
+            SandboxProfileRole::GitDiscovery,
+        ] {
+            let profile = seatbelt_profile(&config, role).unwrap().into_text();
+            // The shell execs `ps` on its own pid: the kernel shows a platform program's start
+            // environment to that program alone, and `/bin/sh` and `/bin/ps` are both platform
+            // programs. `ps -E` follows the command line with that environment.
+            let listed = run(
+                &profile,
+                &["/bin/sh", "-c", "exec /bin/ps -E -ww -o command= -p $$"],
+            );
+            let line = String::from_utf8_lossy(&listed.stdout);
+            assert!(
+                listed.status.success() && line.split_whitespace().any(|word| word == marker),
+                "{role:?} ps: {listed:?}"
+            );
+            let other = run(&profile, &["/usr/bin/top", "-l", "1", "-n", "0"]);
+            assert!(
+                !other.status.success()
+                    && String::from_utf8_lossy(&other.stderr).contains("Operation not permitted"),
+                "{role:?} top: {other:?}"
             );
         }
         fs::remove_dir_all(&root).unwrap();
