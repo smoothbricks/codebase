@@ -186,3 +186,26 @@ done. They are independent of each other.
 - Acceptance: an event-coordinated real host Cargo build creates a previously absent profile after capture has
   enumerated its old profiles; the producer lease must block that creation or refuse the capture before any seed
   publication. A held existing profile and a live Nx holder still refuse, while an open index reader remains exempt.
+
+## The `bun` wrapper runs the host's Bun, not the Bun the activated shell provides
+
+- Spec: `specs/cowshed/15_capabilities.md:168-178`: after shell activation `tools/manager-bin` alone leads PATH, and the
+  toolchain a repository's shell declares is the one its jobs and its Nx daemon run, which is why no `cargo` or `rustc`
+  is linked.
+- Code: `packages/cowshed/crates/cowshed-core/src/developer_links.rs:820-843` (`dispatch`) executes `tools/real-bin/bun`
+  for every `bun` invocation that is not an install verb, "never searched again on PATH". The Bun capability records
+  that target from `~/.bun/bin` and the host's conventional install directories (`capabilities/bun.rs:26-28`) so that a
+  `.envrc` can run `bun` before any shell puts one on PATH (`:57-59`). A Bun the activated shell provides sits behind
+  the wrapper and never runs: in a checkout whose shell pins one Bun, `cowshed exec <ws> -- bun --version` prints the
+  host's, and `Bun.spawn(['bun', …])` in the job resolves through PATH to the wrapper again, so every child runs the
+  host's Bun too. Measured 2026-10-21: the checkout's shell Bun 1.4.3, the exec route's 1.4.2. The two routes run
+  different runtimes, and a child's `console.log` on 1.4.2 drops what a full pipe refuses, so a gate fails for the
+  version difference and reads as a flaky test.
+- Work: for non-install invocations, and for the install route's own child, run the Bun the activated shell provides
+  (the first `bun` on PATH behind `manager-bin`, skipping the wrapper itself) and fall back to the recorded host Bun
+  only when none exists, which keeps the `.envrc` bootstrap. Or state in `15_capabilities.md` that the exec route runs
+  the host's Bun, so that a repository whose shell pins one cannot rely on it there.
+- Acceptance (`developer_links.rs` tests): with a PATH that holds the wrapper directory and a second `bun`, a
+  non-install invocation runs the second; with no second, it runs the recorded host Bun; an install verb still snapshots
+  and restores developer links around whichever it runs. In a checkout whose shell pins a Bun other than the host's,
+  `cowshed exec <ws> -- bun --version` agrees with `direnv exec <checkout> bun --version`.
