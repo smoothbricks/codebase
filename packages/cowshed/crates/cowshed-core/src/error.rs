@@ -175,9 +175,6 @@ pub enum CpuAdmissionRefusal {
         class: crate::api::dto::ExecClass,
         scope: crate::api::dto::ExecScope,
     },
-    InvalidRequest {
-        detail: String,
-    },
     GatewayUnavailable {
         socket: std::path::PathBuf,
         error: String,
@@ -417,9 +414,6 @@ impl CowshedError {
                 format!("class-not-permitted: worker exec cannot request {class:?} / {scope:?}"),
                 "use the trusted coordinator/operator gate path; workers admit background, interactive and resident workspace work",
             ),
-            CpuAdmissionRefusal::InvalidRequest { detail } => {
-                Self::usage(detail, "the host gate scope requires the gate class")
-            }
             CpuAdmissionRefusal::GatewayUnavailable { socket, error } => Self::environment_missing(
                 format!(
                     "jobserver admission at {} is unavailable: {error}",

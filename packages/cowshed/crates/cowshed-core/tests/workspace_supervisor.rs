@@ -8832,6 +8832,52 @@ async fn a_coordinator_gate_runs_at_gate_nice_and_may_reach_the_host_boundary() 
     assert!(h.spawned.try_recv().is_err(), "nothing spawned");
 }
 
+/// The host scope says where a coordinator's command runs, not how it is scheduled: a host job
+/// at the default class asks the CPU budget as background work -- never the repository's gate
+/// order -- runs at background nice, and reports both its class and its scope.
+#[tokio::test]
+async fn a_coordinator_host_job_at_the_default_class_asks_a_background_token() {
+    let (mut h, mut asked, _root) = scripted_harness("cpu-host-background");
+    // The exec answers at admission, before any grant (11_shell.md).
+    let job = h
+        .handle
+        .exec(
+            None,
+            None,
+            ExecRequest {
+                want: NonZeroUsize::new(4).unwrap(),
+                scope: ExecScope::HostGate,
+                ..request(StdinSource::Empty)
+            },
+            AdmissionSource::Coordinator,
+        )
+        .await
+        .expect("the coordinator admits host work at the default class");
+    let cpu = asked.recv().await.unwrap();
+    assert_eq!(
+        (cpu.ask.class, cpu.ask.want),
+        (ExecClass::Background, NonZeroUsize::new(4).unwrap())
+    );
+    cpu.answer.send(Ok(NonZeroUsize::new(4).unwrap())).unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    assert_eq!(
+        (spawned.request.scope, spawned.request.cpu.nice),
+        (ExecScope::HostGate, 10)
+    );
+    let info = h.handle.info(job).await.unwrap();
+    assert_eq!(
+        (info.class, info.scope, info.nice, info.cpu_tokens),
+        (
+            ExecClass::Background,
+            ExecScope::HostGate,
+            Some(10),
+            NonZeroUsize::new(4)
+        )
+    );
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(job).await.unwrap();
+}
+
 /// The production store keeps the job's class, scope, granted tokens and observed nice in its
 /// terminal record, so the sealed job says what it ran under after its supervisor is gone.
 #[tokio::test]

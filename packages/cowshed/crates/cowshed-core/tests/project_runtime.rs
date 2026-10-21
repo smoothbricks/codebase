@@ -1924,7 +1924,7 @@ async fn router_admits_a_gate_only_through_the_coordinator_route() {
     }
     assert!(admitted.lock().unwrap().is_empty(), "nothing was admitted");
 
-    for ask in [gate, host_gate] {
+    for ask in [gate, host_gate, host_only] {
         assert_eq!(
             route(
                 &router,
@@ -1933,7 +1933,7 @@ async fn router_admits_a_gate_only_through_the_coordinator_route() {
                 main_exec(&repo, &incarnation, ask),
             )
             .await
-            .expect("the coordinator route admits a gate"),
+            .expect("the coordinator route admits a gate and host background work"),
             json!(1)
         );
     }
@@ -1981,6 +1981,12 @@ async fn router_admits_a_gate_only_through_the_coordinator_route() {
                 source: AdmissionSource::Coordinator,
                 class: ExecClass::Gate,
                 want: eight,
+                scope: ExecScope::HostGate,
+            },
+            Admitted {
+                source: AdmissionSource::Coordinator,
+                class: ExecClass::Background,
+                want: NonZeroUsize::MIN,
                 scope: ExecScope::HostGate,
             },
             Admitted {
@@ -2090,45 +2096,6 @@ async fn a_worker_connection_cannot_call_the_coordinator_exec_route() {
         events.try_recv().is_err(),
         "a refused call reached the host"
     );
-    assert!(admitted.lock().unwrap().is_empty());
-}
-
-/// A scheduling the gateway cannot accept is an invalid request even under coordinator
-/// authority — the host gate as background — and a worker asking for the gate meets the authority
-/// refusal first, whatever else it got wrong.
-#[tokio::test]
-async fn router_refuses_an_unpaired_scheduling_before_admission() {
-    let root = test_root();
-    let (_runtime, router, repo, mut events, admitted, incarnation) =
-        start_recording_admissions(&root).await;
-    for ask in [json!({"scope": "hostGate"})] {
-        let error = route(
-            &router,
-            coordinator(repo.clone()),
-            "coordinator.exec",
-            main_exec(&repo, &incarnation, ask.clone()),
-        )
-        .await
-        .expect_err("an unpaired scheduling");
-        assert_eq!(error.code, ErrorCode::Usage, "{ask}");
-        assert!(
-            matches!(
-                error.cpu_admission_source(),
-                Some(CpuAdmissionRefusal::InvalidRequest { .. })
-            ),
-            "{ask}"
-        );
-        assert!(events.try_recv().is_err(), "{ask} reached the host");
-    }
-    let error = route(
-        &router,
-        coordinator(repo.clone()),
-        "worker.exec",
-        main_exec(&repo, &incarnation, json!({"class": "gate"})),
-    )
-    .await
-    .expect_err("a worker route admits no gate");
-    assert_eq!(error.code, ErrorCode::SandboxDenied);
     assert!(admitted.lock().unwrap().is_empty());
 }
 

@@ -2162,9 +2162,9 @@ impl SpawnSink for SystemSpawnSink {
     }
 }
 
-/// The host-boundary command of a trusted coordinator's gate: its argv exec'd directly in the
-/// workspace, outside every sandbox profile and without shell activation, so the gate keeps the
-/// host authority real APFS images need. Its environment is exactly the caller's (credential
+/// The host-boundary command of a trusted coordinator's host exec, at whatever class it was
+/// admitted: its argv exec'd directly in the workspace, outside every sandbox profile and without
+/// shell activation, so it keeps the host authority real APFS images need. Its environment is exactly the caller's (credential
 /// names already withheld), with the CPU grant's pool and count laid over it and
 /// `NX_DAEMON_START=never` last, so no job's Nx client starts a daemon (04_sandbox.md). Admission
 /// refused a host-gate script, which needs the sandboxed exec host's interpreter.
@@ -5190,30 +5190,26 @@ impl SupervisorActor {
         // not restrict execution; the public-name projection is applied only when recording.
         crate::api::dto::validate_host_gate_request(request.scope, session.is_some())?;
         let scheduling = JobScheduling::new(request.scope, request.class, request.want)
-            .ok_or_else(|| match request.scope {
-                ExecScope::HostGate => CowshedError::usage(
-                    "the host-gate scope requires the gate class",
-                    "pass --class gate with the host-gate scope",
-                ),
-                ExecScope::Workspace => CowshedError::usage(
+            .ok_or_else(|| {
+                CowshedError::usage(
                     "a resident holds no CPU token, so it wants none: its descendants ask its \
                      pool for their own",
                     "drop --want from a resident exec",
-                ),
+                )
             })?;
         // The host boundary has no sandbox to narrow and no exec host to interpret a script.
         if scheduling.scope() == ExecScope::HostGate {
             if matches!(request.command, ExecCommand::Script(_)) {
                 return Err(CowshedError::usage(
-                    "a host gate runs an argv; a script runs only in the workspace's sandboxed \
+                    "a host exec runs an argv; a script runs only in the workspace's sandboxed \
                      exec host",
-                    "pass the gate's command as an argv",
+                    "pass the command as an argv",
                 ));
             }
             if request.mode == crate::api::dto::RunSandboxMode::ReadOnly {
                 return Err(CowshedError::usage(
-                    "a host gate runs outside every sandbox, so it cannot be narrowed read-only",
-                    "run the gate read-write, or in the workspace scope",
+                    "a host exec runs outside every sandbox, so it cannot be narrowed read-only",
+                    "run it read-write, or in the workspace scope",
                 ));
             }
         }

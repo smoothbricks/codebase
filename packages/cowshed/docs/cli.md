@@ -1777,18 +1777,19 @@ at once, and its grant is between one and `n`. Background work never holds more 
 nice 0, ahead of a gate at +5 and background at +10 on a contended core, and a workspace's own capability may ask for
 it. `--class gate` admits the command as the operator's gate: it starts at once on the half background leaves free while
 no other gate work holds it, and otherwise waits for whole returned tokens ahead of queued background work with no
-deadline; it runs at nice +5. `--host` is valid only with `--class gate`, and a gate cannot name a `--session`. Only
-this trusted route may ask for a gate: a workspace's own capability (`worker.exec`) is refused with a typed
-class-not-permitted error before anything runs, and no environment variable confers the class. `--host` runs the gate
-once at the host boundary, outside the workspace sandbox, for the real-APFS host gate. `--class resident` holds no token
-and runs at +10; its descendants ask its pool for their own. `JobInfo` reports the admitted `class` and `scope`, the
-observed `nice`, and the granted `cpuTokens`. Every one of these is the same typed field of the API's exec request
-(07_api.md, "Exec and grants"), so the CLI asks for nothing an embedding process cannot.
+deadline; it runs at nice +5. Neither a gate nor `--host` can name a `--session`. Only this trusted route may ask for a
+gate: a workspace's own capability (`worker.exec`) is refused with a typed class-not-permitted error before anything
+runs, and no environment variable confers the class. `--host` runs the command once at the host boundary, outside the
+workspace sandbox, at the class it names: host unit work at the default background class takes a background token, and
+only a land's `--class gate --host` takes the gate order. Only the trusted route may name `--host`, at any class.
+`--class resident` holds no token and runs at +10; its descendants ask its pool for their own. `JobInfo` reports the
+admitted `class` and `scope`, the observed `nice`, and the granted `cpuTokens`. Every one of these is the same typed
+field of the API's exec request (07_api.md, "Exec and grants"), so the CLI asks for nothing an embedding process cannot.
 
-A host gate's child starts from an empty environment. `--host` carries the operator's environment, including custom
+A host exec's child starts from an empty environment. `--host` carries the operator's environment, including custom
 operator and project variables, in the normal request. There is no execution environment-name allowlist: the existing
 supervisor runtime rules withhold enrolled credentials and replace reserved CPU-authority variables with the actual
-grant. A host gate still cannot name a session; an ordinary exec's environment is unchanged.
+grant. A host exec still cannot name a session; an ordinary exec's environment is unchanged.
 
 For every scope, keyed admission records contain only public environment names: `PATH`, `HOME`, `USER`, `LOGNAME`,
 `SHELL`, `TMPDIR`, `LANG`, `TERM`, `TZ`, `CARGO_HOME`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`, `BUN_INSTALL`, `DEVELOPER_DIR`

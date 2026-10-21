@@ -772,6 +772,10 @@ mod parity_tests {
             Some(&["worker.exec", "coordinator.exec"]),
         ),
         (
+            &["exec", "parity", "--host", "--", "true"],
+            Some(&["worker.exec", "coordinator.exec"]),
+        ),
+        (
             &["grant", "parity"],
             Some(&["coordinator.grant", "workspace.grants"]),
         ),

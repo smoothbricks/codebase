@@ -29,7 +29,7 @@ use super::server::{
     HANDSHAKE_VERSION, MAX_HANDSHAKE_BYTES, MAX_IN_FLIGHT_REQUESTS,
     MAX_JSON_FRAME_BYTES as MAX_RPC_BYTES, codec,
 };
-use crate::error::{CowshedError, CpuAdmissionRefusal, ErrorCode, OtherBuild, Result};
+use crate::error::{CowshedError, ErrorCode, OtherBuild, Result};
 use crate::metadata::WorkspaceName;
 use crate::repository::{ProjectPaths, RepoId, RepositoryBinding};
 use crate::runtime::supervisor_socket::AdmissionSource;
@@ -336,11 +336,6 @@ impl ControllerRuntime for ActorRuntime {
         source.admit(request.class, request.scope)?;
         request.command.validate().map_err(|error| {
             CowshedError::usage(error.to_string(), "provide a valid bounded command")
-        })?;
-        crate::api::dto::validate_scheduling(request.class, request.scope).map_err(|error| {
-            CowshedError::cpu_admission(CpuAdmissionRefusal::InvalidRequest {
-                detail: error.to_string(),
-            })
         })?;
         crate::api::dto::validate_host_gate_request(request.scope, session.is_some())?;
         let ExecRequest {
@@ -2649,6 +2644,7 @@ mod tests {
     use crate::api::dto::RunSandboxMode;
     use crate::api::dto::{ExecClass, ExecScope};
     use crate::api::operations::{self, OPERATIONS, Scope};
+    use crate::error::CpuAdmissionRefusal;
     use serde_json::json;
     use std::future::{self, Future};
     use std::num::NonZeroUsize;
@@ -4175,29 +4171,29 @@ mod tests {
         assert!(outcome.is_err(), "no call reached the controller");
     }
 
-    /// A scheduling the gateway cannot accept — the host gate as background — is refused as an
-    /// invalid request before the controller hears anything, even under coordinator authority.
+    /// The host scope names where a coordinator's command runs, not its class: a host exec
+    /// travels at the class it names, background by default.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_scheduling_the_gateway_cannot_accept_is_refused_before_any_call() {
+    async fn a_host_exec_travels_at_the_class_it_names() {
         let (runtime, mut server) = actor_pair();
+        let server_task = tokio::spawn(async move {
+            let (_, exec) = read_rpc_request(&mut server).await;
+            assert_eq!(exec["method"], "coordinator.exec");
+            // Background is the wire's default class, so it travels as an absent field.
+            assert_eq!(
+                (exec["params"].get("class"), &exec["params"]["scope"]),
+                (None, &json!("hostGate"))
+            );
+            write_rpc_success(&mut server, exec["id"].as_u64().unwrap(), json!(7), None).await;
+        });
         let worker = workspace_handle(Arc::clone(&runtime));
         let coordinator = coordinator(runtime);
         let mut request = exec_request(StdinSource::Empty);
-        request.class = ExecClass::Background;
         request.scope = ExecScope::HostGate;
-        let error = coordinator
-            .exec(&worker, request)
-            .await
-            .expect_err("an invalid scheduling");
-        assert_eq!(error.code, ErrorCode::Usage);
-        assert!(matches!(
-            error.cpu_admission_source(),
-            Some(CpuAdmissionRefusal::InvalidRequest { .. })
-        ));
-        drop((worker, coordinator));
-        let outcome = read_rpc_frame(&mut server).await;
-        assert!(outcome.is_err(), "no call reached the controller");
+        let job = coordinator.exec(&worker, request).await.unwrap();
+        assert_eq!(job.id(), JobId::new(7).unwrap());
+        server_task.await.unwrap();
     }
 
     #[cfg(unix)]

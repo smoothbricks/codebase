@@ -99,8 +99,12 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
   a host entry is a second cold evaluation of the same shed beside the sandbox's own (measured 2026-10-20: 197 s on top
   of the shed's, concurrently), and the Nx it runs starts its daemon outside the sandbox.
 - The one thing this changes for you: the command runs with the shed's authority, not yours. A path outside the shed
-  (another checkout, `~`) needs `cowshed grant <ws> --read|--write <path>` first, and a host-boundary operation (a land
-  gate, an APFS image test) goes through the repository's land path, not `cowshed exec`.
+  (another checkout, `~`) needs `cowshed grant <ws> --read|--write <path>` first.
+- Unit work that cannot run sandboxed (an APFS image test, a host-controller test) runs as
+  `cowshed exec <ws> --host -- direnv exec . <cmd…>`: outside the sandbox, without shell activation (hence the
+  `direnv exec`, with the host evaluation cost above), at the default background class and its background token. Never
+  pass `--class gate` for unit work: the gate class takes the repository's gate order ahead of its lands, and only the
+  repository's land path runs a gate.
 - macOS loopback inside exec: only the shed's own port block (`$COWSHED_PORT_BASE`, 64 ports) is connectable; 127.0.0.1
   outside it is EPERM. Bind services at `$COWSHED_PORT_BASE + 1…`, and `grant --ports <N>` before starting them. Linux
   sheds get private loopback with all ports.

@@ -450,7 +450,7 @@ pub struct JobAdmission {
 }
 
 /// The host CPU admission a job asked for (05_gateway.md "Host CPU budget"): the scope it runs
-/// in, its class and the tokens it wants. Only a gate runs at the host boundary, and a resident
+/// in, its class and the tokens it wants. Either scope pairs with every class, and a resident
 /// asks for no token, so its want is the default one it cannot raise; [`Self::new`] is the only
 /// way to one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -461,25 +461,15 @@ pub struct JobScheduling {
 }
 
 impl JobScheduling {
-    /// `None` for a host gate scope with work that is not a gate, and for a resident that names
-    /// a want above the default.
+    /// `None` for a resident that names a want above the default.
     pub fn new(scope: ExecScope, class: ExecClass, want: NonZeroUsize) -> Option<Self> {
-        match (scope, class) {
-            (
-                ExecScope::Workspace,
-                ExecClass::Background | ExecClass::Interactive | ExecClass::Gate,
-            )
-            | (ExecScope::HostGate, ExecClass::Gate) => Some(Self { scope, class, want }),
-            (ExecScope::Workspace, ExecClass::Resident | ExecClass::InteractiveResident) => {
+        match class {
+            ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => {
+                Some(Self { scope, class, want })
+            }
+            ExecClass::Resident | ExecClass::InteractiveResident => {
                 (want == NonZeroUsize::MIN).then_some(Self { scope, class, want })
             }
-            (
-                ExecScope::HostGate,
-                ExecClass::Background
-                | ExecClass::Interactive
-                | ExecClass::Resident
-                | ExecClass::InteractiveResident,
-            ) => None,
         }
     }
 
@@ -4788,7 +4778,7 @@ fn decode_cpu(
         return Err(ArtifactError::Arrow("cpu_wait_ms is zero".into()));
     }
     let scheduling = JobScheduling::new(scope, class, want)
-        .ok_or_else(|| ArtifactError::Arrow("only a gate runs at the host boundary".into()))?;
+        .ok_or_else(|| ArtifactError::Arrow("a resident wants only one token".into()))?;
     let cpu_tokens = (!batch.column(first + 3).is_null(0))
         .then(|| {
             uint64(batch, first + 3).and_then(|column| decode_tokens(column.value(0), "cpu_tokens"))
@@ -8110,39 +8100,48 @@ mod tests {
     }
 
     #[test]
-    fn scheduling_admits_a_host_gate_only_for_the_gate_class() {
+    fn scheduling_pairs_either_scope_with_every_class() {
         let want = NonZeroUsize::new(3).unwrap();
-        let workspace = ExecScope::Workspace;
-        assert!(
-            JobScheduling::new(ExecScope::HostGate, ExecClass::Background, want).is_none(),
-            "only a gate runs at the host boundary"
-        );
-        let gate = JobScheduling::new(workspace, ExecClass::Gate, want).unwrap();
-        assert_eq!(
-            (gate.scope(), gate.class(), gate.want()),
-            (workspace, ExecClass::Gate, want)
-        );
-        let host = JobScheduling::new(ExecScope::HostGate, ExecClass::Gate, want).unwrap();
-        assert_eq!(host.scope(), ExecScope::HostGate);
+        for scope in [ExecScope::Workspace, ExecScope::HostGate] {
+            for class in [
+                ExecClass::Background,
+                ExecClass::Interactive,
+                ExecClass::Gate,
+            ] {
+                let scheduling = JobScheduling::new(scope, class, want).unwrap();
+                assert_eq!(
+                    (scheduling.scope(), scheduling.class(), scheduling.want()),
+                    (scope, class, want)
+                );
+            }
+            for class in [ExecClass::Resident, ExecClass::InteractiveResident] {
+                assert!(
+                    JobScheduling::new(scope, class, want).is_none(),
+                    "a resident wants no token, in {scope:?} too"
+                );
+                assert!(JobScheduling::new(scope, class, NonZeroUsize::MIN).is_some());
+            }
+        }
         let ordinary = JobScheduling::default();
         assert_eq!(
             (ordinary.scope(), ordinary.class(), ordinary.want()),
-            (workspace, ExecClass::Background, NonZeroUsize::MIN)
+            (
+                ExecScope::Workspace,
+                ExecClass::Background,
+                NonZeroUsize::MIN
+            )
         );
-        let host_record = JobArtifactRecord {
-            scheduling: host,
+        let host_gate = JobArtifactRecord {
+            scheduling: JobScheduling::new(ExecScope::HostGate, ExecClass::Gate, want).unwrap(),
             ..valid_job_record(9)
         };
-        assert_eq!(round_trip(&host_record), host_record);
-        let host_background = replace_column(
-            &admitted(&valid_job_record(9)),
-            CPU_COLUMN + 5,
-            Arc::new(StringArray::from(vec![Some("hostGate")])),
-        );
-        assert!(
-            batch_to_protected_record(&host_background).is_err(),
-            "a recorded host-gate background job is damage"
-        );
+        assert_eq!(round_trip(&host_gate), host_gate);
+        let host_background = JobArtifactRecord {
+            scheduling: JobScheduling::new(ExecScope::HostGate, ExecClass::Background, want)
+                .unwrap(),
+            ..valid_job_record(9)
+        };
+        assert_eq!(round_trip(&host_background), host_background);
     }
 
     /// A key binds the scheduling it was admitted under with the rest of its request, and the

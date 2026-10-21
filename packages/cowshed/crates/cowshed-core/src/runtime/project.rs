@@ -40,7 +40,7 @@ use crate::api::resources::{JobResourceSample, SampleInterval};
 use crate::api::server::{
     ConnectionAuthority, EventSource, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
 };
-use crate::error::{CowshedError, CpuAdmissionRefusal, ErrorCode, Result};
+use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
 #[cfg(target_os = "macos")]
 use crate::repository::OwnedRepoIds;
@@ -2217,11 +2217,6 @@ fn exec_request(
     upload: Option<Bytes>,
 ) -> Result<(WorkerScope, Option<String>, ExecRequest)> {
     let command = exec_command(params.argv, params.script)?;
-    crate::api::dto::validate_scheduling(params.class, params.scope).map_err(|error| {
-        CowshedError::cpu_admission(CpuAdmissionRefusal::InvalidRequest {
-            detail: error.to_string(),
-        })
-    })?;
     crate::api::dto::validate_host_gate_request(params.scope, params.session.is_some())?;
     let stdin = match params.stdin {
         ExecStdin::Empty => {

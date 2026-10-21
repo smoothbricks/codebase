@@ -977,13 +977,13 @@ observed and errno. No allocation occurs in the forked report path. REPLY_NICE_R
 in the warm-host exchange; absence is explicit, not a guessed nice. A script that exits before reporting its group
 answers EXITED, never STARTED. Failed placement is priority, and observed nice stays absent until placement succeeds.
 
-HostGate is an explicitly authorized argv host one-shot on this same server, without ExecutedChild or activation; it
-preserves the real-APFS host boundary and refuses scripts, read-only mode and sessions, never custom environment names.
-Its record-only public environment projection and full authored-env commitment are defined in 07_api.md, Task server
-scheduling and trusted host gates; execution and canonical activation retain all ordinary project variables. No ordinary
-workspace sandbox is widened. The single sandbox builder allows only connection and file metadata in the gateway-derived
-workspace CPU-pool scope, not directory data, file writes, socket binding, the global control socket or another
-workspace's pool.
+HostGate is an explicitly authorized argv host one-shot of any class on this same server, without ExecutedChild or
+activation; it preserves the real-APFS host boundary and refuses scripts, read-only mode and sessions, never custom
+environment names. Its record-only public environment projection and full authored-env commitment are defined in
+07_api.md, Task server scheduling and trusted host gates; execution and canonical activation retain all ordinary project
+variables. No ordinary workspace sandbox is widened. The single sandbox builder allows only connection and file metadata
+in the gateway-derived workspace CPU-pool scope, not directory data, file writes, socket binding, the global control
+socket or another workspace's pool.
 
 Job records use layout11: layout10's cpu_class, cpu_want, cpu_wait_ms, cpu_tokens, cpu_nice and cpu_scope columns remain
 an exact prefix, followed by admission_env_sha256 for the complete non-withheld authored environment. cpu_wait_ms is

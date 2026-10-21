@@ -137,7 +137,7 @@ pub struct ExecRequest {
                                           // pool asks the host per child (05_gateway.md "Bands")
     pub want: NonZeroUsize,               // default1; actual command demand, bounded to granted tokens; a
                                           // Resident names only the default
-    pub scope: ExecScope,                 // Workspace default; HostGate requires trusted Gate
+    pub scope: ExecScope,                 // Workspace default; HostGate: coordinator route only, any class
 }
 
 /// The exec's own class: one row of 05_gateway.md "Bands" (token order and nice). Not the gateway
@@ -1868,13 +1868,14 @@ Requesting Gate or HostGate there is typed class-not-permitted before snapshot, 
 class and want bind keyed admission just like command/env: changing one under the same key is keyConflict, never a new
 spawn. No class has an admission deadline (05_gateway.md, "No admission deadline, for any class").
 
-`ExecScope` is Workspace (default) or HostGate. HostGate requires Gate, argv, read-write mode and no session; it runs
-one host one-shot without ExecutedChild or shell activation, never a new wrapper. No worker gains host authority. The
-operator gate command explicitly selects its checkout environment. The host child starts from an empty environment and
-gets the ordinary request environment under the existing reserved/credential rules, its live grant's pool/count, PWD and
-`NX_DAEMON_START=never` (no job's Nx client starts a daemon, 04_sandbox.md), not the supervisor's environment or
-authority. CLI HostGate preserves custom operator/project names; ordinary worker activation and overlays remain
-unchanged.
+`ExecScope` is Workspace (default) or HostGate. HostGate requires the coordinator route, argv, read-write mode and no
+session, and pairs with every class: it names where the command runs, and the class alone decides its CPU admission
+(06_cli.md, `--host`). It runs one host one-shot without ExecutedChild or shell activation, never a new wrapper. No
+worker gains host authority. The operator gate command explicitly selects its checkout environment. The host child
+starts from an empty environment and gets the ordinary request environment under the existing reserved/credential rules,
+its live grant's pool/count, PWD and `NX_DAEMON_START=never` (no job's Nx client starts a daemon, 04_sandbox.md), not
+the supervisor's environment or authority. CLI HostGate preserves custom operator/project names; ordinary worker
+activation and overlays remain unchanged.
 
 The public environment-name policy is **record-only**, for **all scopes**: `JobAdmission.env` stores only
 `PATH HOME USER LOGNAME SHELL TMPDIR LANG TERM TZ CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN BUN_INSTALL DEVELOPER_DIR` and
@@ -1908,8 +1909,8 @@ silent compatibility.
 
 `cowshed exec` asks for nothing an embedding process cannot: every scheduling option and class the CLI offers is
 available through the Rust API and the NAPI/Bun binding, so an embedding executor never shells out for one. Every flag
-is one typed field of the same request, decoded by the same validation (`validate_scheduling`, `JobScheduling::new`,
-`AdmissionSource::admit`), so the two surfaces refuse the same pairings:
+is one typed field of the same request, decoded by the same validation (`JobScheduling::new`, `AdmissionSource::admit`,
+`validate_host_gate_request`), so the two surfaces refuse the same requests:
 
 | `cowshed exec` flag                                                       | Rust `ExecRequest` (`WorkspaceHandle::exec`, `Coordinator::exec`) | NAPI `ExecRequest` (`worker.exec`, `coordinator.exec`)    |
 | ------------------------------------------------------------------------- | ----------------------------------------------------------------- | --------------------------------------------------------- |

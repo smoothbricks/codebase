@@ -519,9 +519,6 @@ export type CpuAdmissionRefusal =
       readonly class: ExecClass;
       readonly scope: ExecScope;
     })
-  | ({ readonly reason: 'invalidRequest' } & {
-      readonly detail: string;
-    })
   | ({ readonly reason: 'gatewayUnavailable' } & {
       readonly socket: string;
       readonly error: string;

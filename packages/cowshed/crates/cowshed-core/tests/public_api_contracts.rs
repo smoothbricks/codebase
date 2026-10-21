@@ -1763,7 +1763,7 @@ fn job_info_reports_admitted_scheduling_and_observations_exactly() {
 }
 
 /// A job's class and scope are required on the wire, each refuses an unknown spelling, a zero
-/// grant is not a grant, the host gate is a gate, and a queued job has observed no nice.
+/// grant is not a grant, a host job may be of any class, and a queued job has observed no nice.
 #[test]
 fn job_info_requires_its_class_and_scope_and_refuses_impossible_scheduling() {
     let info = finished_job(None);
@@ -1792,12 +1792,10 @@ fn job_info_requires_its_class_and_scope_and_refuses_impossible_scheduling() {
 
     let mut host = info.clone();
     host.scope = ExecScope::HostGate;
-    assert!(
-        host.validate().is_err(),
-        "a background job does not run as the host gate"
-    );
+    host.validate()
+        .expect("background work runs at the host scope");
     host.class = ExecClass::Gate;
-    host.validate().expect("a gate runs as the host gate");
+    host.validate().expect("a gate runs at the host scope");
 
     let mut queued = info;
     queued.state = JobState::Queued;
@@ -1857,24 +1855,6 @@ fn sealed_job_and_cpu_failures_keep_their_exact_wire_spellings() {
         serde_json::to_value(ExecScope::default()).unwrap(),
         json!("workspace")
     );
-}
-
-/// The pairings an exec's scheduling may carry: the host gate is a gate, and every other pairing
-/// is valid.
-#[test]
-fn exec_scheduling_pairs_class_and_scope() {
-    for (class, scope, valid) in [
-        (ExecClass::Background, ExecScope::Workspace, true),
-        (ExecClass::Gate, ExecScope::Workspace, true),
-        (ExecClass::Gate, ExecScope::HostGate, true),
-        (ExecClass::Background, ExecScope::HostGate, false),
-    ] {
-        assert_eq!(
-            validate_scheduling(class, scope).is_ok(),
-            valid,
-            "{class:?} {scope:?}"
-        );
-    }
 }
 
 /// Admission records in every scope contain only public tool and identity names

@@ -1022,9 +1022,10 @@ core count.
   command execution, using the held-child fence on macOS and a private report pipe on Linux. Refusal is typed
   PriorityFailure, not an unobserved run. Class, scope, actual tokens and observed nice are recorded; nice remains
   absent when never observed. A HostGate is a coordinator-only argv one-shot on the host, outside ExecutedChild,
-  preserving the real-APFS gate's host authority; no ordinary workspace sandbox is loosened. Controller discovery uses
-  only `cargo locate-project` and `cargo metadata --no-deps --offline`, which retain their noncompiling exemption: no
-  grant, class nice or job record is claimed for that discovery.
+  preserving the host authority real-APFS work needs; it asks the ledger as its own class, so host work that is not a
+  gate never enters the gate order; no ordinary workspace sandbox is loosened. Controller discovery uses only
+  `cargo locate-project` and `cargo metadata --no-deps --offline`, which retain their noncompiling exemption: no grant,
+  class nice or job record is claimed for that discovery.
 - **A resident holds no token** (2026-10-19). A token is a runnable thread the holder is using now, so a process that
   stays up to serve requests and is idle between them — the Nx daemon a shed's supervisor keeps (04_sandbox.md), a
   worker that runs each request it is sent — must not hold one for its lifetime: starting a resident must not reduce its

@@ -133,8 +133,6 @@ pub enum DtoError {
     CommandShape,
     #[error("an admission key is 1 to {MAX_ADMISSION_KEY_BYTES} UTF-8 bytes, got {0}")]
     InvalidAdmissionKey(usize),
-    #[error("invalid exec scheduling: {0}")]
-    InvalidScheduling(&'static str),
 }
 
 #[cfg_attr(
@@ -2166,11 +2164,6 @@ impl JobInfo {
                 "failure is present only for the failed state",
             ));
         }
-        if self.scope == ExecScope::HostGate && self.class != ExecClass::Gate {
-            return Err(DtoError::InvalidJobProjection(
-                "a host gate job is admitted as a gate",
-            ));
-        }
         if self.nice.is_some() && self.state == JobState::Queued {
             return Err(DtoError::InvalidJobProjection(
                 "a queued job owns no command to observe a nice for",
@@ -2792,7 +2785,7 @@ pub struct ExecRequest {
     /// The most CPU tokens the command can use at once; its grant is between one and this count.
     /// A resident holds none and names only the default.
     pub want: NonZeroUsize,
-    /// Where the command runs: the workspace sandbox, or a coordinator's host gate, which is a gate.
+    /// Where the command runs: the workspace sandbox, or a coordinator's host boundary outside it.
     pub scope: ExecScope,
 }
 
@@ -2803,21 +2796,12 @@ pub enum ExecScope {
     /// Inside the workspace's sandbox, as every exec runs.
     #[default]
     Workspace,
-    /// A trusted coordinator's one-shot gate at the host boundary, outside the workspace sandbox:
-    /// the real-APFS host gate. Only the coordinator route admits it, and only as a gate.
+    /// A trusted coordinator's argv one-shot at the host boundary, outside the workspace sandbox,
+    /// at whatever class it names: the land's real-APFS gate, or host unit work at background.
+    /// Only the coordinator route admits it; the class alone decides its CPU admission.
     HostGate,
 }
 
-/// The pairings an exec's scheduling may carry (05_gateway.md "Host CPU budget"): the host gate
-/// scope is a gate, and every other pairing is valid.
-pub fn validate_scheduling(class: ExecClass, scope: ExecScope) -> Result<(), DtoError> {
-    if scope == ExecScope::HostGate && class != ExecClass::Gate {
-        return Err(DtoError::InvalidScheduling(
-            "the host gate scope requires the gate class",
-        ));
-    }
-    Ok(())
-}
 /// Public environment names permitted in JobAdmission.env records for every exec scope
 /// (07_api.md "Keyed admission and restart attachment"). This is a record projection, not an
 /// execution allowlist: custom operator and project variables may travel in requests and reach
@@ -2858,15 +2842,15 @@ pub fn host_gate_env_name_allowed(name: &str) -> bool {
             })
 }
 
-/// A host gate runs outside every session, whose cwd and environment a worker controls
-/// (07_api.md "Task server scheduling and trusted host gates"). Environment names do not
-/// restrict execution; the public-name policy applies only to records. Other scopes may use
-/// sessions. Scheduling is validated separately by [`validate_scheduling`].
+/// A host exec runs outside every session, whose cwd and environment a worker controls
+/// (07_api.md "Task server scheduling and trusted host gates"), whatever its class. Environment
+/// names do not restrict execution; the public-name policy applies only to records. Other scopes
+/// may use sessions.
 pub fn validate_host_gate_request(scope: ExecScope, in_session: bool) -> Result<(), CowshedError> {
     if scope == ExecScope::HostGate && in_session {
         return Err(CowshedError::usage(
-            "a host gate runs outside every session: it takes no session's cwd or environment",
-            "run the host gate without a session",
+            "a host exec runs outside every session: it takes no session's cwd or environment",
+            "run the host exec without a session",
         ));
     }
     Ok(())

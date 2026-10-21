@@ -487,6 +487,7 @@ mod tests {
         assert!(step(&["rebase", "raven", "--gate"]));
         assert!(step(&["land", "raven"]));
         assert!(!step(&["exec", "raven", "--", "build"]));
+        assert!(!step(&["exec", "raven", "--host", "--", "build"]));
         assert!(!step(&[
             "exec", "raven", "--class", "resident", "--", "serve"
         ]));
