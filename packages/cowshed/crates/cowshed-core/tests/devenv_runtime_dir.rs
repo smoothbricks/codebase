@@ -97,12 +97,16 @@ fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
     let exec_temp_dir = root.join("tmp");
     std::fs::create_dir_all(&home).expect("home");
     std::fs::create_dir_all(&exec_temp_dir).expect("exec temp dir");
+    // The store the launcher serves is the fixture's own, and exists: a grant makes every spawn
+    // read its Git fetch routes there (04_sandbox.md, "Exec pipeline" step 4).
+    let store_root = root.join("store");
+    std::fs::create_dir_all(&store_root).expect("fixture store");
     SandboxConfig {
         home,
         mount_root,
         workspace_mount: mount,
         exec_temp_dir,
-        store_root: root.join("store"),
+        store_root,
         port_block: PortBlock::new(port_base, 16).expect("port block"),
         retained_port_blocks: Vec::new(),
         cpu_pool_directory: None,

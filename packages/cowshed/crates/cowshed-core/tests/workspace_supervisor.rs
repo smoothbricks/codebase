@@ -835,6 +835,9 @@ fn isolated_config(label: &str) -> (WorkspaceSupervisorConfig, TempRoot) {
     let mut supervisor_config = config(&root);
     supervisor_config.sandbox.home = root.join("home");
     supervisor_config.sandbox.exec_temp_dir = root.join("tmp");
+    // The store the launcher serves is the fixture's own, and exists: a grant makes every spawn
+    // read its Git fetch routes there (04_sandbox.md, "Exec pipeline" step 4).
+    std::fs::create_dir_all(&supervisor_config.sandbox.store_root).expect("fixture store");
     (supervisor_config, root)
 }
 
