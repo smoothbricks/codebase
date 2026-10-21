@@ -42,6 +42,12 @@ pub const RECORD_FILE: &str = "activation.json";
 /// The fence file every writer of [`RECORD_FILE`] locks ([`lock_record`]).
 const RECORD_LOCK_FILE: &str = "activation.lock";
 
+/// The baseline entry under which an activator keys its pool's grants: what an evaluation could
+/// read or reach is part of what it was computed against. Angle brackets cannot begin an
+/// environment variable name, so no variable collides with it, and a baseline that differs on
+/// it reports the grants by this name.
+pub const GRANTS_KEY: &str = "<grants>";
+
 const RECORD_VERSION: u32 = 1;
 
 /// A record is one export plus its watch list; a larger file is not one this code wrote.
@@ -169,7 +175,7 @@ struct ActivationRecord {
     places: [Option<PathBuf>; PLACES],
     ports: Option<(u32, u32)>,
     key: String,
-    baseline: String,
+    baseline: Baseline,
     watches: Vec<RecordedWatch>,
     /// direnv's export minus every withheld name: for each variable the activation changed, its
     /// complete value, or `null` for a removal, relative to the host's baseline.
@@ -349,22 +355,39 @@ fn key(root: &Path, watches: &[RecordedWatch], contents: &Contents) -> String {
     crate::api::dto::hex_lower(&hasher.finalize())
 }
 
-/// The baseline key: SHA-256 over the host's environment before activation, sorted, with every
-/// per-workspace place replaced by a placeholder and every withheld name left out (a workspace
-/// token or proxy URL differs per workspace by construction and is not an input the export was
-/// computed from that adoption could carry).
-fn baseline(placement: &Placement<'_>, environment: &BTreeMap<OsString, OsString>) -> String {
+/// The baseline key: for each variable of the host's environment before activation, SHA-256 of
+/// its value with every per-workspace place replaced by a placeholder, every withheld name left
+/// out (a workspace token or proxy URL differs per workspace by construction and is not an
+/// input the export was computed from that adoption could carry). Kept per variable, so a
+/// baseline that differs says which variable does; no value is kept.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+struct Baseline(BTreeMap<String, String>);
+
+impl Baseline {
+    /// The first variable set in one baseline and not the other, or set differently.
+    fn differs_from(&self, other: &Self) -> Option<String> {
+        let names: BTreeSet<&String> = self.0.keys().chain(other.0.keys()).collect();
+        names
+            .into_iter()
+            .find(|name| self.0.get(*name) != other.0.get(*name))
+            .cloned()
+    }
+}
+
+fn baseline(placement: &Placement<'_>, environment: &BTreeMap<OsString, OsString>) -> Baseline {
     let places = placement
         .places()
         .map(|place| place.map(Path::to_string_lossy));
-    let mut hasher = Sha256::new();
+    let digest = |bytes: &[u8]| crate::api::dto::hex_lower(&Sha256::digest(bytes));
+    let mut keyed = BTreeMap::new();
     for (name, value) in environment {
         let (Some(name), Some(value)) = (name.to_str(), value.to_str()) else {
-            // A non-UTF-8 variable is hashed as it is: it cannot be moved, so it must match.
-            hasher.update(name.as_bytes());
-            hasher.update([0]);
-            hasher.update(value.as_bytes());
-            hasher.update([0]);
+            // A non-UTF-8 variable is keyed as it is: it cannot be moved, so it must match.
+            keyed.insert(
+                name.to_string_lossy().into_owned(),
+                digest(value.as_bytes()),
+            );
             continue;
         };
         // Cowshed's managed git identity is a workspace's own file, and `/dev/null` in a main
@@ -379,12 +402,9 @@ fn baseline(placement: &Placement<'_>, environment: &BTreeMap<OsString, OsString
                 value = rebase(&value, place, &format!("\0place{index}\0"));
             }
         }
-        hasher.update(name.as_bytes());
-        hasher.update([0]);
-        hasher.update(value.as_bytes());
-        hasher.update([0]);
+        keyed.insert(name.to_owned(), digest(value.as_bytes()));
     }
-    crate::api::dto::hex_lower(&hasher.finalize())
+    Baseline(keyed)
 }
 
 /// Why a record could not be written.
@@ -467,8 +487,9 @@ pub enum NotAttempted {
     /// The inputs this evaluation read are not the bytes the inherited record keyed (an
     /// evaluation that rewrote one of its own inputs, a lock file say).
     KeyMoved,
-    /// The baseline this evaluation ran over is not the one the inherited record keyed.
-    BaselineMoved,
+    /// The baseline this evaluation ran over is not the one the inherited record keyed: `name`
+    /// is the first variable that differs.
+    BaselineMoved { name: String },
 }
 
 /// What became of the origin's record when this evaluation certified its producer.
@@ -529,8 +550,10 @@ pub fn write_record(
         Some(inherited) if inherited.key != key => {
             Err(Certification::NotAttempted(NotAttempted::KeyMoved))
         }
-        Some(inherited) if inherited.baseline != baseline => {
-            Err(Certification::NotAttempted(NotAttempted::BaselineMoved))
+        Some(inherited) if let Some(name) = inherited.baseline.differs_from(&baseline) => {
+            Err(Certification::NotAttempted(NotAttempted::BaselineMoved {
+                name,
+            }))
         }
         Some(inherited) => match inherited.differs_from(&environment, &from_tail) {
             Some(name) => Err(Certification::Differs { name }),
@@ -579,7 +602,7 @@ pub struct Uncertified {
     /// The roots the producer was already measured at; the origin alone if none.
     proof: Vec<PathBuf>,
     key: String,
-    baseline: String,
+    baseline: Baseline,
     /// The origin's export moved to this checkout, without the rebuilt watch list.
     environment: BTreeMap<String, Option<String>>,
     from_tail: BTreeSet<String>,
@@ -699,8 +722,8 @@ pub enum AdoptionMiss {
     Inputs(#[from] CertifyError),
     #[error("the inherited shell's inputs differ from this checkout's")]
     KeyMoved,
-    #[error("the inherited shell was computed against a different environment")]
-    BaselineMoved,
+    #[error("the inherited shell was computed against a different environment: {name} differs")]
+    BaselineMoved { name: String },
     #[error("{name} still names the origin checkout after the move")]
     Residue { name: String },
     #[error("the inherited shell record carries {name}, which no record may")]
@@ -810,8 +833,8 @@ pub fn verify(
     if key != record.key {
         return Err(AdoptionMiss::KeyMoved);
     }
-    if baseline(placement, baseline_environment) != record.baseline {
-        return Err(AdoptionMiss::BaselineMoved);
+    if let Some(name) = baseline(placement, baseline_environment).differs_from(&record.baseline) {
+        return Err(AdoptionMiss::BaselineMoved { name });
     }
     // Each per-workspace place of the origin moves to this checkout's, root first, at a
     // path-component boundary.
@@ -1437,7 +1460,7 @@ mod tests {
         baseline.insert("EXTRA".into(), "1".into());
         assert!(matches!(
             verify(&Placement::of(&sites.clone.root, &baseline), &baseline),
-            Err(AdoptionMiss::BaselineMoved)
+            Err(AdoptionMiss::BaselineMoved { name }) if name == "EXTRA"
         ));
     }
 

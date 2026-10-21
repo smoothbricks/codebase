@@ -126,6 +126,8 @@ pub(super) struct PooledSpawn<'a> {
     pub environment: SandboxEnvironment,
     pub caller: &'a BTreeMap<String, String>,
     pub grant_revision: u64,
+    /// The grants of that revision, which an evaluation's result can depend on.
+    pub grants: &'a crate::sandbox::SandboxGrants,
     /// The job's CPU grant and class nice, which the command alone runs under, never its host.
     pub cpu: &'a super::supervisor::CpuPlacement,
     #[cfg(target_os = "macos")]
@@ -170,6 +172,7 @@ impl WorkspaceShells {
                         workspace_mount: spawn.workspace_mount.clone(),
                         profile: spawn.profile.clone(),
                         environment: base,
+                        grants: spawn.grants.clone(),
                         envrc_directory: spawn.envrc_directory.clone(),
                         cpu: Arc::clone(&self.cpu),
                     }),
@@ -1203,6 +1206,9 @@ pub(super) struct HostActivator {
     /// Made sure of at each host start: `cowshed gc` may have removed its file since the last.
     profile: super::supervisor::ChildProfile,
     environment: BTreeMap<OsString, OsString>,
+    /// The grants this pool's hosts run under. What an evaluation can read or reach is part of
+    /// what it was computed against, so they join the inherited record's baseline key.
+    grants: crate::sandbox::SandboxGrants,
     /// `None` for a workspace with no shell configuration: its hosts hold the sandbox
     /// environment itself, which no workspace file can make stale.
     envrc_directory: Option<PathBuf>,
@@ -1211,6 +1217,17 @@ pub(super) struct HostActivator {
 }
 
 impl HostActivator {
+    /// The baseline an inherited record is keyed against: the host's environment and, under a
+    /// name no variable can have, the grants.
+    fn keyed_baseline(&self) -> BTreeMap<OsString, OsString> {
+        let mut keyed = self.environment.clone();
+        keyed.insert(
+            shell_inherit::GRANTS_KEY.into(),
+            format!("{:?}", self.grants).into(),
+        );
+        keyed
+    }
+
     /// Where the host starts: the `.envrc`'s directory, or the workspace root.
     fn home(&self) -> &Path {
         self.envrc_directory
@@ -1308,7 +1325,7 @@ impl HostActivator {
         // process reuse"). Proving it for this checkout reads every recorded input once; a miss
         // says why on the job's stderr and evaluates.
         let mount = self.workspace_mount.clone();
-        let baseline = self.environment.clone();
+        let baseline = self.keyed_baseline();
         let verified = tokio::task::spawn_blocking(move || {
             shell_inherit::verify(&Placement::of(&mount, &baseline), &baseline)
         })
@@ -1475,7 +1492,7 @@ impl HostActivator {
         inherited: Option<shell_inherit::Uncertified>,
     ) {
         let mount = self.workspace_mount.clone();
-        let baseline = self.environment.clone();
+        let baseline = self.keyed_baseline();
         let written = tokio::task::spawn_blocking(move || {
             let export: BTreeMap<String, Option<String>> = serde_json::from_slice(&export)
                 .map_err(|error| {
@@ -1502,9 +1519,9 @@ impl HostActivator {
                 "cowshed: the workspace shell of {mount} could not check its origin's export: its \
                  evaluation read other input bytes than the record keyed"
             ),
-            Ok(Certification::NotAttempted(NotAttempted::BaselineMoved)) => eprintln!(
+            Ok(Certification::NotAttempted(NotAttempted::BaselineMoved { name })) => eprintln!(
                 "cowshed: the workspace shell of {mount} could not check its origin's export: it \
-                 ran over another baseline environment than the record keyed"
+                 ran over another baseline environment than the record keyed ({name} differs)"
             ),
             Ok(Certification::Certified { origin }) => eprintln!(
                 "cowshed: the workspace shell of {mount} certified its origin's export at another root{}",

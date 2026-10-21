@@ -2419,6 +2419,7 @@ impl SpawnSink for SystemSpawnSink {
             environment,
             caller: &request.env,
             grant_revision: request.authority.grant_revision,
+            grants: &sandbox.grants,
             cpu: &request.cpu,
             #[cfg(target_os = "linux")]
             cgroup: Arc::clone(&cgroup),

@@ -217,13 +217,16 @@ impl Workspace {
     }
 
     /// A workspace mounted beside `beside`, under the same mount root, as sibling workspaces of
-    /// one repository are on a real host; its home, temp directory and store stay its own.
+    /// one repository are on a real host: they share the host user's identity home (`sandbox.home`,
+    /// which names the installed cowshed directory on PATH), while each keeps its own private
+    /// home, temp directory and store.
     fn new_beside(label: &str, port_base: u16, beside: &Workspace) -> Self {
         let mut workspace = Self::new(label, port_base);
         let mount = beside.sandbox.mount_root.join(label);
         std::fs::rename(workspace.mount(), &mount).expect("mount beside");
         workspace.sandbox.mount_root = beside.sandbox.mount_root.clone();
         workspace.sandbox.workspace_mount = mount;
+        workspace.sandbox.home = beside.sandbox.home.clone();
         workspace
     }
 
@@ -516,6 +519,7 @@ fn normalized_environment(workspace: &Workspace, env: &str) -> Vec<String> {
     let link = cowshed_core::sandbox::workspace_runtime_link(workspace.mount());
     let mount = workspace.mount().display().to_string();
     let root = workspace.root.display().to_string();
+    let host_home = workspace.sandbox.home.display().to_string();
     let mut lines: Vec<String> = env
         .lines()
         .filter(|line| {
@@ -532,10 +536,12 @@ fn normalized_environment(workspace: &Workspace, env: &str) -> Vec<String> {
                 "INSTALL_OBSERVED",
             ]
             .iter()
-            .any(|part| name.contains(part))
+            // `http_proxy` and `https_proxy` carry the port block too.
+            .any(|part| name.to_ascii_uppercase().contains(part))
         })
         .map(|line| {
-            line.replace(&mount, "<mount>")
+            line.replace(&host_home, "<host-home>")
+                .replace(&mount, "<mount>")
                 .replace(&root, "<root>")
                 .replace(&*link.to_string_lossy(), "<link>")
         })
@@ -553,10 +559,15 @@ fn inheritor(
     from: Option<&Workspace>,
     beside: Option<&Workspace>,
 ) -> Workspace {
-    let workspace = match beside {
+    let mut workspace = match beside {
         Some(beside) => Workspace::new_beside(label, port, beside),
         None => Workspace::new(label, port),
     };
+    // One host user: a clone shares its origin's identity home, as every workspace on a host
+    // shares the user's (it names the installed cowshed directory on the sandbox PATH).
+    if let Some(from) = from {
+        workspace.sandbox.home = from.sandbox.home.clone();
+    }
     std::fs::write(workspace.mount().join("bun.lock"), "v1").expect("lockfile");
     std::fs::write(
         workspace.mount().join(".envrc-local"),
@@ -721,7 +732,8 @@ async fn host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_ev
         .await
         .ok();
     assert_eq!(
-        ran.stdout, own.stdout,
+        ran.stdout,
+        own.stdout.trim_end(),
         "the clone's hash is its own, not the origin's"
     );
 }
@@ -954,17 +966,47 @@ async fn host_controller_a_grant_revision_retires_every_older_shell() {
     run(&handle, sh("true")).await.ok();
     run(&handle, sh("true")).await.ok();
     assert_eq!(workspace.activations(), 1);
+    // A new revision never reuses a shell built under the old one: its pool starts fresh. With
+    // the same grants and inputs, the new host adopts the export its own checkout already
+    // evaluated (11_shell.md, "Inherited shells") instead of evaluating again.
     let advanced = handle
         .advance_authority(2, 1, workspace.sandbox.clone())
         .await
         .expect("advance the grant revision");
     let ran = run(&advanced, sh("true")).await.ok();
     assert_eq!(ran.info.grant_revision, 2);
+    assert!(!ran.stderr.contains("direnv: loading"), "{}", ran.stderr);
+    assert_eq!(
+        workspace.activations(),
+        1,
+        "same grants, same inputs: adopted"
+    );
+    // Other grants are another baseline: what the evaluation could read differs, so it runs.
+    let granted = workspace
+        .root
+        .parent()
+        .expect("scratch parent")
+        .join(format!("cowshed-granted-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&granted).expect("granted directory");
+    let mut widened = workspace.sandbox.clone();
+    widened.grants.read.push(granted.clone());
+    let advanced = advanced
+        .advance_authority(3, 1, widened)
+        .await
+        .expect("advance the grant revision again");
+    let ran = run(&advanced, sh("true")).await.ok();
+    assert_eq!(ran.info.grant_revision, 3);
+    assert!(
+        ran.stderr.contains("<grants> differs"),
+        "the miss names the grants: {}",
+        ran.stderr
+    );
     assert_eq!(
         workspace.activations(),
         2,
-        "no shell built under the old revision serves the new one"
+        "no shell evaluated under other grants serves these"
     );
+    std::fs::remove_dir_all(&granted).ok();
 }
 
 #[tokio::test]
@@ -1095,8 +1137,10 @@ async fn host_controller_a_concurrent_command_takes_the_prewarmed_spare() {
         "the first command paid for activation: {}",
         first.stderr
     );
+    // The spare starts once a generation exists, holding a stake of its own. Its checkout has
+    // just evaluated these inputs, so it adopts that export instead of evaluating again.
     let spare_ready = tokio::time::timeout(Duration::from_secs(30), async {
-        while workspace.activations() < 2 {
+        while workspace.stakes().is_empty() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -1125,6 +1169,11 @@ async fn host_controller_a_concurrent_command_takes_the_prewarmed_spare() {
         second.stderr
     );
     handle.wait(holding).await.expect("holding job");
+    assert_eq!(
+        workspace.activations(),
+        1,
+        "the spare adopted the export its checkout evaluated"
+    );
 }
 
 const ORPHAN_HELPER: &str = "COWSHED_SHELL_POOL_ORPHAN_HELPER";
@@ -1338,9 +1387,10 @@ async fn host_controller_a_revoke_binds_every_later_command_and_no_running_one()
         )
         .await
         .expect("admit the running job");
-    // The spare built ahead of demand under revision 1 exists before the revoke.
+    // The spare built ahead of demand under revision 1 exists before the revoke (it adopts the
+    // export the first command's evaluation left, so its stake is what shows it).
     let spare = tokio::time::timeout(Duration::from_secs(60), async {
-        while workspace.activations() < 2 {
+        while workspace.stakes().is_empty() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
