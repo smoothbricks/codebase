@@ -171,9 +171,9 @@ cowshed land "$WS"
 `land` retires the workspace once its commits are in `main`, so there is usually no separate `rm`. Removing a workspace
 destroys the image its commits live in, so `rm` refuses until `main` contains the workspace's `HEAD`.
 
-`--force` overrides _transient_ state only — a dirty tree, an in-progress merge, a busy mount. It does not authorize
-destroying commits. `--abandon` does, and only that: it bundles the unlanded commits into `sessions/.trash` first and
-prints what it destroyed.
+`--force` overrides _transient_ state only — a dirty tree, an in-progress merge, the workspace's own running jobs. It
+never waives a process cowshed does not run holding the mount, and it does not authorize destroying commits. `--abandon`
+does, and only that: it bundles the unlanded commits into `sessions/.trash` first and prints what it destroyed.
 
 ## Recommended coding-agent workflow
 

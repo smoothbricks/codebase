@@ -2298,7 +2298,7 @@ export type RekeyResult = {
  * What `cowshed rm` is allowed to override.
  *
  * The two overrides are deliberately separate, because they authorize losses of different kinds.
- * `force` covers *transient* state — a dirty tree, an in-progress merge, a busy mount — none of
+ * `force` covers *transient* state — a dirty tree, an in-progress merge, the workspace's own running jobs — none of
  * which is unrecoverable content. `abandon` is the only thing that authorizes destroying commits
  * the project's main branch does not contain, and it is spelled out in full for exactly that
  * reason: a script that reaches for `force` to get past a stuck workspace must not thereby

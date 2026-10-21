@@ -81,8 +81,9 @@ Notes for harness integration:
   merge queue) takes over. Never push to main's checked-out branch.
 - `cowshed rm` refuses (exit 4) unless `main` already contains the workspace's `HEAD` — the image about to be deleted is
   where those commits live, so the refusal is your signal that work would be lost. Land it. `--force` overrides only
-  _transient_ state (dirty tree, in-progress merge, busy mount) and deliberately cannot get past this gate; `--abandon`
-  is the sole authorization for destroying unlanded commits, and it bundles them into `sessions/.trash` first.
+  _transient_ state (dirty tree, in-progress merge, the workspace's own running jobs; never a process cowshed does not
+  run holding the mount) and deliberately cannot get past this gate; `--abandon` is the sole authorization for
+  destroying unlanded commits, and it bundles them into `sessions/.trash` first.
 - **Never turn a removal conflict into a retry with a flag.** The gate is the whole point: a coordinator script that
   answers exit 4 by adding `--force` is the failure mode this design exists to prevent.
 - If a task needs a _snapshot to retry from_, `cowshed checkpoint <ws> <label>` before the risky step and

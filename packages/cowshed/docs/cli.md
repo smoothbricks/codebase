@@ -630,10 +630,10 @@ them. A refusal is reported separately with its own `next:` hint and exit code. 
 
 The two overrides authorize different losses and neither substitutes for the other:
 
-| Flag        | Overrides                                                                                                   | Does **not** override   |
-| ----------- | ----------------------------------------------------------------------------------------------------------- | ----------------------- |
-| `--force`   | transient state: a dirty tree, an in-progress merge, a busy mount; and a workspace younger than ten minutes | the landed-content gate |
-| `--abandon` | the landed-content gate — changes `main` does not hold                                                      | transient state         |
+| Flag        | Overrides                                                                                                                       | Does **not** override                                                     |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `--force`   | transient state: a dirty tree, an in-progress merge, the workspace's own running jobs; and a workspace younger than ten minutes | the landed-content gate; a process cowshed does not run holding the mount |
+| `--abandon` | the landed-content gate — changes `main` does not hold                                                                          | transient state                                                           |
 
 `--force` stops that workspace's running jobs (TERM, then KILL after the grace period) before detaching; without it,
 removal lets the supervisor finish its active jobs. A leftover `.git/AUTO_MERGE` alone is not an in-progress operation
