@@ -1,7 +1,7 @@
 use super::*;
 use crate::fork_lock::Spawn as _;
 use std::fs::{File, FileTimes};
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::process::Command;
 
 struct Fixture(PathBuf);
@@ -417,4 +417,105 @@ fn a_named_creator_does_not_override_a_malformed_multiwriter_record() {
     fs::write(path.join(OWNER_FILE), b"partial").unwrap();
     fixture.reaper().sweep(&fixture.store(), false);
     assert!(path.exists());
+}
+
+#[test]
+fn an_archive_the_walk_cannot_finish_stays_owned_and_never_starves_the_archives_behind_it() {
+    let fixture = Fixture::new();
+    let creator = dead_pid();
+    let stuck = fixture.scratch("cowshed-sock-stuck", creator);
+    fs::create_dir(stuck.join("held")).unwrap();
+    fs::write(stuck.join("held/trace.arrow"), b"evidence").unwrap();
+    let behind = fixture.scratch("cowshed-sock-behind", dead_pid());
+    fs::write(behind.join("trace.arrow"), b"evidence").unwrap();
+    let report = fixture.reaper().sweep(&fixture.store(), false);
+    let archive_of = |source: &Path| {
+        report
+            .findings
+            .iter()
+            .find_map(|finding| match &finding.disposition {
+                Disposition::Archived(to) if finding.path == source => Some(to.clone()),
+                _ => None,
+            })
+            .expect("dead output is archived")
+    };
+    let (stuck, behind) = (archive_of(&stuck), archive_of(&behind));
+    // A real subtree this user cannot read: entering it fails.
+    fs::set_permissions(stuck.join("held"), fs::Permissions::from_mode(0o000)).unwrap();
+    let after = SystemTime::now() + EVIDENCE_RETENTION + Duration::from_secs(1);
+    let mut trash = TrashReaper::default();
+    let refusals = (0..3)
+        .filter_map(|_| trash.sweep(&fixture.store(), after).err())
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    let readable = fs::set_permissions(stuck.join("held"), fs::Permissions::from_mode(0o700));
+    assert!(
+        !behind.exists(),
+        "the archive behind it is still deleted: {refusals:?}"
+    );
+    assert_eq!(
+        owners(&stuck).unwrap(),
+        [i32::try_from(creator).unwrap()],
+        "an unfinished archive keeps its ownership record"
+    );
+    assert!(
+        refusals
+            .iter()
+            .any(|refusal| refusal.contains(&format!("kept scratch archive {}", stuck.display()))),
+        "{refusals:?}"
+    );
+    readable.unwrap();
+    for _ in 0..2 {
+        trash.sweep(&fixture.store(), after).unwrap();
+    }
+    assert!(
+        !stuck.exists(),
+        "the next listing walks it again from its root"
+    );
+}
+
+#[test]
+fn an_archive_root_that_outlives_its_record_gets_the_record_back() {
+    let fixture = Fixture::new();
+    let creator = dead_pid();
+    let source = fixture.scratch("cowshed-sock-pinned", creator);
+    fs::write(source.join("trace.arrow"), b"evidence").unwrap();
+    let report = fixture.reaper().sweep(&fixture.store(), false);
+    let archive = report
+        .findings
+        .iter()
+        .find_map(|finding| match &finding.disposition {
+            Disposition::Archived(to) => Some(to.clone()),
+            _ => None,
+        })
+        .expect("dead output is archived");
+    let record = fs::read(archive.join(OWNER_FILE)).unwrap();
+    // The archive empties, but its root cannot leave a trash directory this user cannot write.
+    let trash_dir = fixture.store().join(".trash/scratch");
+    fs::set_permissions(&trash_dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let after = SystemTime::now() + EVIDENCE_RETENTION + Duration::from_secs(1);
+    let mut trash = TrashReaper::default();
+    let refused = trash.sweep(&fixture.store(), after);
+    let writable = fs::set_permissions(&trash_dir, fs::Permissions::from_mode(0o700));
+    let refused = refused.expect_err("the root outlives its removal");
+    assert!(
+        refused
+            .to_string()
+            .contains(&format!("kept scratch archive {}", archive.display())),
+        "{refused}"
+    );
+    assert_eq!(
+        fs::read(archive.join(OWNER_FILE)).unwrap(),
+        record,
+        "the exact record is back"
+    );
+    assert_eq!(owners(&archive).unwrap(), [i32::try_from(creator).unwrap()]);
+    writable.unwrap();
+    for _ in 0..2 {
+        trash.sweep(&fixture.store(), after).unwrap();
+    }
+    assert!(
+        !archive.exists(),
+        "the restored record lets the next listing finish it"
+    );
 }

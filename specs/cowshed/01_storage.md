@@ -365,8 +365,12 @@ directory into the store's private `.trash/scratch/<archive-seconds>-<uuid>`. A 
 the source and reports the OS error; there is no copy/delete fallback. The archive's 24-hour recovery window starts at
 the rename, not at scratch creation. `gc` does not delete those archives. The daemon later removes them incrementally;
 it never follows symlinks or deletes through a mounted descendant (including same-device Linux bind mounts). Its
-original ownership record stays until the last deletion, so an interrupted cleanup can resume; a timestamp-shaped name
-alone never authorizes deletion.
+original ownership record stays until a fresh listing shows nothing else in the archive, and its exact bytes go back if
+the root then cannot be removed (an unwritable trash directory, an entry created after that listing), so an interrupted
+cleanup can resume; a timestamp-shaped name alone never authorizes deletion. A walk that fails (an unreadable subtree, a
+mounted descendant, an entry it cannot remove) keeps the archive and its record, reports both the archive and the error,
+and gives up that walk so the archives behind it still take their turn; the next full listing walks it again from its
+root.
 
 The roots are canonical `/tmp` and the daemon/CLI's non-RAM temp root, deduplicated. Foreign `node_*`, `bash_*`,
 `cargo_*`, `bun_*`, `devenv-*`, and `sccache_*` entries are excluded, even if they contain a marker. Bounded-exec

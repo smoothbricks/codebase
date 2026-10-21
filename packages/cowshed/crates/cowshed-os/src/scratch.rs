@@ -513,6 +513,84 @@ pub struct TrashReaper {
 }
 
 impl TrashReaper {
+    /// One entry of the archive being walked: a file removed, a directory entered, or a finished
+    /// directory removed. The archive root's ownership record goes last, once a fresh listing
+    /// shows nothing else in it, and comes back if the root then cannot be removed: the archive
+    /// stays owned through every failure.
+    fn step(&mut self) -> io::Result<usize> {
+        let archive_root = self.walk.len() == 1;
+        let Some((path, children)) = self.walk.last_mut() else {
+            return Ok(0);
+        };
+        match children.next() {
+            Some(entry) => {
+                let entry = entry?;
+                if archive_root && entry.file_name() == OWNER_FILE {
+                    return Ok(0);
+                }
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.is_dir() {
+                    if mount_identity(&entry.path(), &metadata)? != self.device {
+                        return Err(io::Error::other(format!(
+                            "holds mounted directory {}",
+                            entry.path().display()
+                        )));
+                    }
+                    let children = fs::read_dir(entry.path())?;
+                    self.walk.push((entry.path(), children));
+                    Ok(0)
+                } else {
+                    fs::remove_file(entry.path())?;
+                    Ok(1)
+                }
+            }
+            None => {
+                if archive_root {
+                    for entry in fs::read_dir(&*path)? {
+                        let name = entry?.file_name();
+                        if name != OWNER_FILE {
+                            return Err(io::Error::other(format!(
+                                "still holds {}",
+                                name.to_string_lossy()
+                            )));
+                        }
+                    }
+                    // The record is the archive's only proof of ownership: should the directory outlive
+                    // its removal, the same bytes go back before the failure is reported.
+                    let record = path.join(OWNER_FILE);
+                    let mut bytes = Vec::new();
+                    OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                        .open(&record)?
+                        .take(MAX_OWNER_BYTES + 1)
+                        .read_to_end(&mut bytes)?;
+                    fs::remove_file(&record)?;
+                    if let Err(error) = fs::remove_dir(&*path) {
+                        let restored = OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                            .open(&record)
+                            .and_then(|mut file| file.write_all(&bytes));
+                        return Err(match restored {
+                            Ok(()) => error,
+                            Err(lost) => io::Error::new(
+                                error.kind(),
+                                format!("{error}; its ownership record was not restored: {lost}"),
+                            ),
+                        });
+                    }
+                } else {
+                    fs::remove_dir(&*path)?;
+                }
+                self.walk.pop();
+                Ok(1)
+            }
+        }
+    }
+
     pub fn sweep(&mut self, store: &Path, now: SystemTime) -> io::Result<usize> {
         let trash = store.join(".trash/scratch");
         if self.entries.is_none() {
@@ -525,37 +603,18 @@ impl TrashReaper {
         }
         let mut removed = 0;
         for _ in 0..PASS_ENTRIES {
-            let archive_root = self.walk.len() == 1;
-            if let Some((path, children)) = self.walk.last_mut() {
-                match children.next() {
-                    Some(entry) => {
-                        let entry = entry?;
-                        if archive_root && entry.file_name() == OWNER_FILE {
-                            continue;
-                        }
-                        let metadata = fs::symlink_metadata(entry.path())?;
-                        if metadata.is_dir() {
-                            if mount_identity(&entry.path(), &metadata)? != self.device {
-                                let held = entry.path();
-                                self.walk.clear();
-                                return Err(io::Error::other(format!(
-                                    "archive holds mounted directory {}; kept",
-                                    held.display()
-                                )));
-                            }
-                            self.walk.push((entry.path(), fs::read_dir(entry.path())?));
-                        } else {
-                            fs::remove_file(entry.path())?;
-                            removed += 1;
-                        }
-                    }
-                    None => {
-                        if archive_root {
-                            fs::remove_file(path.join(OWNER_FILE))?;
-                        }
-                        fs::remove_dir(&*path)?;
-                        removed += 1;
-                        self.walk.pop();
+            if !self.walk.is_empty() {
+                match self.step() {
+                    Ok(count) => removed += count,
+                    // The archive keeps its ownership record. Giving up its walk lets the archives
+                    // behind it take their turn; the next full listing walks it again from its root.
+                    Err(error) => {
+                        let (archive, _) = self.walk.swap_remove(0);
+                        self.walk.clear();
+                        return Err(io::Error::new(
+                            error.kind(),
+                            format!("kept scratch archive {}: {error}", archive.display()),
+                        ));
                     }
                 }
             } else {
