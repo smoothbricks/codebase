@@ -1463,10 +1463,29 @@ started with lies in the lease. Most leftovers write there only through `TMPDIR`
 sources, a Bun or Node compile cache written at exit), and a working-directory census alone let them write into a lease
 while it was removed, failing the next task's lease with `ENOTEMPTY`. A target's own `env.TMPDIR` wins over the lease.
 Inside a cowshed sandbox, which cannot write the lock in `/private/tmp`, the task keeps its inherited `TMPDIR` and says
-so once. A failed task whose output said ENOSPC (`ENOSPC`, or `strerror`'s `No space left on device`) names it, the
-writer's task and lease, and the volume's free space read when that line arrived, and records the `no-space` verdict:
-the writer usually removes what it half-wrote before it exits, so the volume no longer looks full by then. A failed task
-that printed no such line but left the volume nearly full names the volume.
+so once.
+
+The lease is the default for every `bounded-exec` target, every test target included, so a test's scratch lives on the
+RAM volume unless its target names `env.TMPDIR`. Reclamation never deletes the scratch of a run that did not pass: a
+lease whose task died, or whose own run failed, timed out or was signalled, is renamed whole into
+`/Volumes/smoo-ram2-<uid>/.archive/<archived at, epoch ms>-<lease>`, on the same volume, so the move is one `rename(2)`
+and copies nothing (the build-volume trash does the same, `specs/cowshed/16_build_volumes.md`, "Garbage collection").
+The task that reclaims it says where on stderr
+(`RAM temp volume: dead lease <lease> archived at <archive>: kept until …`). A passing run's lease is deleted. The
+volume keeps the newest two archives, the failing run under triage and the one before it, which a triage compares to
+tell a flake from a regression; that bound is a stated reason, not a measurement. It keeps none when less than half the
+volume is free as an archive arrives: half of 8 GiB is 2.5 times the 1.61 GiB a full parallel gate peaked at, and live
+leases need the space more than evidence does. Every other archive is renamed into
+`.archive/.deleting/<deleter pid>-<archive>` at once and deleted by that task in the background, one at a time, with
+nothing waiting on it; a dead deleter's entries are claimed and deleted by the next retention, and a failed deletion is
+said on stderr and retried then. What is retained is therefore bounded by the volume's life: the volume detaches with
+its last live lease, and its archives go with it, which that release says. A test whose value depends on its raw traces
+after the run must name a store-backed `env.TMPDIR`.
+
+A failed task whose output said ENOSPC (`ENOSPC`, or `strerror`'s `No space left on device`) names it, the writer's task
+and lease, and the volume's free space read when that line arrived, and records the `no-space` verdict: the writer
+usually removes what it half-wrote before it exits, so the volume no longer looks full by then. A failed task that
+printed no such line but left the volume nearly full names the volume.
 
 Outside macOS, the executor never provisions an APFS RAM disk: it keeps the inherited `TMPDIR`, or uses the target's
 `env.TMPDIR` override, without reclaiming either directory. The host temp-directory proof runs the real default executor
@@ -1502,16 +1521,18 @@ when one Node process makes five concurrent requests with four workers. The obse
 cross-process waits behind long host-wide probes under the RAM lock. Real nested and sibling default-executor proofs run
 with background single-lease processes to cover that shape. No case or target timeout is raised.
 
-Once the process and holder checks permit removal, cleanup restores owner read/write/search permission on directories
-through no-follow directory handles before deleting the lease. Read-only fixture directories cannot strand a dead lease
-and block later tasks. File modes and symlink targets stay untouched; a directory on another device refuses cleanup
-instead of changing an attached volume. Held leases undergo no permission changes.
+Once the process and holder checks permit removal, a lease to delete, and an archive being deleted, has owner
+read/write/search permission restored on its directories through no-follow directory handles first. Read-only fixture
+directories cannot strand a dead lease and block later tasks. File modes and symlink targets stay untouched; a directory
+on another device refuses cleanup instead of changing an attached volume. Held leases undergo no permission changes.
 
 The real RAM-volume regression walks one volume's lifecycle in a single test: unmarked debris and a live-lease refusal,
 recovery over the debris, concurrent leases, failed-acquire lease/claim rollback, read-only cleanup, a held dead lease,
 owner detach and reclaim of that lease while a writer the dead task left still writes into it through `TMPDIR` (stopped,
-then removed) beside a dead lease nothing works in, and the final detach. External symlink targets and held directory
-modes stay unchanged, without duplicate provision and teardown; its 60 s case bound is unchanged and its target has the
+then archived whole, readonly tree and modes included) beside a dead lease nothing works in, a third dead lease whose
+archive rotates the oldest out and is deleted in the background, a failed run's own lease archived below the half-volume
+floor and so deleted with every other archive, and the final detach. External symlink targets and held directory modes
+stay unchanged, without duplicate provision and teardown; its 60 s case bound is unchanged and its target has the
 progress bound.
 
 The host target names both owned files with `./` paths: Bun otherwise interprets a bare path as a filter over recursive

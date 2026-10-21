@@ -359,13 +359,17 @@ export async function runBoundedExec(
       for (const reaped of acquired.value.reaped) {
         appendStderr(`RAM temp volume: stopped ${reaped}, which a dead task left working in its lease\n`);
       }
+      for (const retained of acquired.value.retained) {
+        appendStderr(`RAM temp volume: dead lease ${retained}\n`);
+      }
     } else {
       appendStderr(
         `RAM temp volume unavailable in this sandbox (${acquired.value.detail}); TMPDIR stays ${process.env.TMPDIR ?? '(unset)'}\n`,
       );
     }
   }
-  const releaseLease = async (): Promise<void> => {
+  // `keep`: the run did not pass, so its scratch is archived on the volume rather than deleted (ram-temp.ts, `retain`).
+  const releaseLease = async (keep: boolean): Promise<void> => {
     if (lease === null) {
       return;
     }
@@ -381,8 +385,12 @@ export async function runBoundedExec(
     } else if (reaped) {
       appendStderr(`${describeRamTempError(reaped.error)}\n`);
     }
-    const released = await tempVolume?.release(held);
-    if (released && !released.ok) {
+    const released = await tempVolume?.release(held, keep);
+    if (released?.ok) {
+      for (const retained of released.value) {
+        appendStderr(`RAM temp volume: lease ${retained}\n`);
+      }
+    } else if (released) {
       appendStderr(`${describeRamTempError(released.error)}\n`);
     }
   };
@@ -496,7 +504,8 @@ export async function runBoundedExec(
   const refuse = async (message: string): Promise<BoundedExecResult> => {
     appendStderr(message);
     await releaseCpu();
-    await releaseLease();
+    // The command never started, so its lease holds nothing of its own to keep.
+    await releaseLease(false);
     await recordRun(1, null, Date.now() - asked, false, null);
     return { success: false, terminalOutput: outputChunks.join('') };
   };
@@ -755,7 +764,7 @@ export async function runBoundedExec(
     cancelCapture();
     void killChildTree(false)
       .finally(releaseCpu)
-      .finally(releaseLease)
+      .finally(() => releaseLease(true))
       .finally(() => process.kill(process.pid, signal));
   };
   const onSigint = (): void => onTerminationSignal('SIGINT');
@@ -926,7 +935,7 @@ export async function runBoundedExec(
       appendStderr(`${describeRamTempError(full)}\n`);
     }
   }
-  await releaseLease();
+  await releaseLease(code !== 0 || state.expiry !== null || state.poolCloseError !== null || lifecycleFailure !== null);
 
   // Broken resource ownership or a lost native lifecycle fails even if a shell branch later exited 0:
   // its verdict is an ordinary operational failure, never a successful or silently unbounded run.

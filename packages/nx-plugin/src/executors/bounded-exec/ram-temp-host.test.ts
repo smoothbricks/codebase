@@ -14,8 +14,9 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { statfs } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { OpContextBinding } from '@smoothbricks/lmao';
 import { useTestSpan } from '@smoothbricks/lmao/testing/bun';
@@ -23,6 +24,8 @@ import { whenChanged } from '../../__tests__/directory-change.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { processTable, terminate } from '../../testing.js';
 import {
+  ARCHIVES_KEPT,
+  archiveDeletions,
   type CommandOutput,
   createHostCommands,
   type HostCommands,
@@ -322,7 +325,8 @@ async function nativeRamVolume(): Promise<void> {
     readonlyTree(leaseA.directory);
     symlinkSync(outside, join(leaseA.directory, 'outside-link'));
 
-    expect(await first.release(leaseA)).toEqual({ ok: true, value: undefined });
+    // A passing run's lease is deleted, not archived.
+    expect(await first.release(leaseA, false)).toEqual({ ok: true, value: [] });
     expect(existsSync(leaseA.directory)).toBe(false);
     expectUntouched(outside);
     expect(statSync(leaseB.directory).dev).not.toBe(statSync(parent).dev);
@@ -363,7 +367,7 @@ async function nativeRamVolume(): Promise<void> {
     expect(statSync(join(leaseB.directory, 'tree', 'inner')).mode & 0o777).toBe(0o500);
     expect(existsSync(join(leaseB.directory, 'tree', 'inner', 'deep'))).toBe(true);
     expectUntouched(outside);
-    expect(await third.release(c.value.lease)).toEqual({ ok: true, value: undefined });
+    expect(await third.release(c.value.lease, false)).toEqual({ ok: true, value: [] });
     expect(existsSync(c.value.lease.directory)).toBe(false);
     expect(statSync(leaseB.directory).dev).not.toBe(statSync(parent).dev);
     expect(statSync(join(leaseB.directory, 'tree')).mode & 0o777).toBe(0o555);
@@ -371,9 +375,9 @@ async function nativeRamVolume(): Promise<void> {
     // Once its owner has detached the image, the next task reclaims the lease, and its release,
     // the last, detaches the volume. The dead task left a writer behind, as a test's ttsc plugin
     // build is left: working elsewhere, writing into the lease through its TMPDIR, with a child.
-    // The pid the lease is named after is dead; the writer is stopped before the lease goes, so
-    // its removal never meets a file made after the lease was judged dead. A second dead lease,
-    // that nothing works in, is reclaimed beside it.
+    // The pid the lease is named after is dead; the writer is stopped before the lease is reclaimed,
+    // so its archive never gains a file after the lease was judged dead. A second dead lease, that
+    // nothing works in, is reclaimed beside it. Both are dead tasks' scratch, so both are archived.
     attachedBelow.image = null;
     const writer = spawn('sh', ['-c', 'sleep 600 & echo $!; i=0; while :; do i=$((i+1)); : > "$TMPDIR/w$i"; done'], {
       cwd: parent,
@@ -401,7 +405,67 @@ async function nativeRamVolume(): Promise<void> {
       expect(existsSync(leaseB.directory)).toBe(false);
       expect(existsSync(quiet)).toBe(false);
       expectUntouched(outside);
-      expect(await fourth.release(d.value.lease)).toEqual({ ok: true, value: undefined });
+
+      // Each dead lease's scratch was renamed whole into the archive on the volume: its files, and its readonly tree
+      // with its modes, are there to read.
+      const archive = join(paths.mountpoint, '.archive');
+      const archives = (): string[] =>
+        readdirSync(archive)
+          .filter((name) => name !== '.deleting')
+          .sort();
+      const archiveOf = (lease: string): string => {
+        const name = archives().find((candidate) => candidate.endsWith(`-${basename(lease)}`));
+        if (name === undefined) throw new Error(`no archive of ${lease} in ${archives().join(', ')}`);
+        return name;
+      };
+      const archivedB = archiveOf(leaseB.directory);
+      const archivedQuiet = archiveOf(quiet);
+      expect(existsSync(join(archive, archivedB, 'w1'))).toBe(true);
+      expect(statSync(join(archive, archivedB, 'tree')).mode & 0o777).toBe(0o555);
+      expect(readFileSync(join(archive, archivedQuiet, 'left'), 'utf8')).toBe('by a task nothing of which still runs');
+      expect(d.value.retained.map((line) => line.replace(/\d+ MiB/, 'N MiB')).sort()).toEqual(
+        [
+          [leaseB.directory, archivedB],
+          [quiet, archivedQuiet],
+        ]
+          .map(
+            ([lease, name]) =>
+              `${lease} archived at ${join(archive, name)}: kept until ${ARCHIVES_KEPT} newer archives replace it, less than N MiB of the volume is free when one arrives, or the volume detaches with its last lease`,
+          )
+          .sort(),
+      );
+
+      // A third dead lease's archive rotates the oldest out at once, by rename; its deletion runs in the background.
+      const oldest = [archivedB, archivedQuiet].sort()[0];
+      const later = join(paths.mountpoint, '505-later1');
+      mkdirSync(later);
+      writeFileSync(join(later, 'left'), 'by a task that died after the others');
+      const fifth = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid), processes);
+      const e = await fifth.acquire();
+      if (!e.ok || e.value.kind !== 'leased') {
+        throw new Error(`fifth lease failed: ${JSON.stringify(e)}`);
+      }
+      expect(archives()).toHaveLength(ARCHIVES_KEPT);
+      expect(archives()).not.toContain(oldest);
+      expect(readFileSync(join(archive, archiveOf(later), 'left'), 'utf8')).toBe(
+        'by a task that died after the others',
+      );
+      await archiveDeletions();
+      expect(readdirSync(join(archive, '.deleting'))).toEqual([]);
+
+      // A failed run's own scratch is archived too, unless less than half the volume is free when it arrives: then the
+      // volume keeps no archive at all, since live leases need the space more than evidence does.
+      const volumeNow = await statfs(paths.mountpoint);
+      const fill = volumeNow.bavail * volumeNow.bsize - Math.floor((volumeNow.blocks * volumeNow.bsize) / 2) + MIB;
+      writeFileSync(join(e.value.lease.directory, 'fill'), Buffer.alloc(fill));
+      const crowded = await fifth.release(e.value.lease, true);
+      expect(crowded.ok ? crowded.value.map((line) => line.replace(/\d+ MiB/g, 'N MiB')) : crowded).toEqual([
+        `${e.value.lease.directory} deleted: the volume has N MiB free, below the N MiB under which it keeps no archive`,
+      ]);
+      expect(archives()).toEqual([]);
+      await archiveDeletions();
+      expect(readdirSync(join(archive, '.deleting'))).toEqual([]);
+      expect(await fourth.release(d.value.lease, false)).toEqual({ ok: true, value: [] });
     } finally {
       terminate(writer.pid ?? 0, 'SIGKILL');
       terminate(writerChild, 'SIGKILL');

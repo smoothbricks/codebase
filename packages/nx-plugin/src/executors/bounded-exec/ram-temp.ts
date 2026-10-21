@@ -161,6 +161,30 @@ const FULL_FREE_BYTES = 64 * MIB;
 /** `<pid>-<mkdtemp suffix>`: the pid says whether the lease's task is alive. */
 const LEASE_NAME = /^(\d+)-[A-Za-z0-9]{6}$/;
 const MARKER_FILE = '.smoo-ram';
+/**
+ * The scratch of a run that did not pass, moved out of its lease when the lease is reclaimed: a directory beside the
+ * leases on the same volume, so the move is one `rename(2)` and copies nothing. An entry is
+ * `<archived at, epoch ms, 13 digits>-<lease name>`, so the names sort oldest first.
+ */
+const ARCHIVE_DIR = '.archive';
+const ARCHIVE_NAME = /^\d{13}-\d+-[A-Za-z0-9]{6}$/;
+/**
+ * Archives on their way out, below the archive directory: each is renamed here as `<deleter pid>-<archive name>` and
+ * deleted by that process in the background. A dead deleter's entries are claimed by renaming them to the next one's pid.
+ */
+const DELETING_DIR = '.deleting';
+const DELETING_NAME = /^(\d+)-(\d{13}-\d+-[A-Za-z0-9]{6})$/;
+/**
+ * How many archives the volume keeps: the failing run under triage and the one before it, the pair a triage compares to
+ * tell a flake from a regression. A stated reason, not a measurement.
+ */
+export const ARCHIVES_KEPT = 2;
+/**
+ * Below this share of the volume free, the volume keeps no archive: live leases need the space more than evidence does.
+ * Half of the 8 GiB volume is 4 GiB, 2.5 times the 1.61 GiB a full parallel gate peaked at (measured 2026-10-04, see
+ * `RAM_TEMP_CAPACITY_BYTES`).
+ */
+const ARCHIVE_FLOOR_SHARE = 0.5;
 
 export interface CommandOutput {
   status: number;
@@ -358,7 +382,14 @@ export type RamTempAcquisition =
    * `held`: dead leases that could not be reclaimed, each with what still holds it. `reaped`: the
    * processes of dead leases that were still working there and were stopped before the lease went.
    */
-  | { kind: 'leased'; lease: RamTempLease; held: string[]; reaped: string[] }
+  | {
+      kind: 'leased';
+      lease: RamTempLease;
+      held: string[];
+      reaped: string[];
+      /** What became of each dead lease's scratch this acquire reclaimed: archived and kept, or deleted and why. */
+      retained: string[];
+    }
   /** Inside a cowshed sandbox: /private/tmp is not writable and no image can attach. */
   | { kind: 'sandboxed'; detail: string };
 
@@ -462,6 +493,8 @@ interface Candidate {
   readonly identity: string;
   /** The caller's own ending lease, whose task reaped it, rather than a dead one. */
   readonly own: boolean;
+  /** Its scratch is archived, not deleted: its task died, or its own run did not pass. */
+  readonly keep: boolean;
 }
 
 /** A lease kept because something is attached below it, described for the task's output. */
@@ -481,7 +514,25 @@ interface Claimed {
 interface Settled {
   readonly held: readonly HeldLease[];
   readonly reaped: readonly string[];
+  readonly retained: readonly string[];
   readonly verdicts: readonly HeldEntry[];
+}
+
+/** A reclaimed lease whose scratch was renamed into the archive, and the name it has there. */
+interface Archived {
+  readonly directory: string;
+  readonly archive: string;
+}
+
+/**
+ * This process's background deletions of archives, one at a time in order. Nothing that takes or releases a lease waits
+ * on it; the detach of the volume does, since a deletion still walking the volume would hold it busy.
+ */
+let archiveDeletion: Promise<void> = Promise.resolve();
+
+/** Settles once every archive deletion this process has queued so far has finished; a test seam, and the detach's wait. */
+export function archiveDeletions(): Promise<void> {
+  return archiveDeletion;
 }
 
 /** How long a caller has waited on one lifecycle claim, and how many notices it has printed. */
@@ -646,7 +697,7 @@ export class RamTempVolume {
         }
         // The lease exists before the lock drops, so no release finds the volume empty under it.
         const directory = await this.make(op);
-        const claimed = await this.claim(ledger, volume, op.owner, null);
+        const claimed = await this.claim(ledger, volume, op.owner, null, false);
         return {
           ledger: claimed.ledger,
           value: { kind: 'leased', volume, directory, held: claimed.held, candidates: claimed.candidates },
@@ -688,6 +739,7 @@ export class RamTempVolume {
               },
               held: [...value.held, ...settled.value.held].map((lease) => lease.text),
               reaped: [...settled.value.reaped],
+              retained: [...settled.value.retained],
             },
           };
         }
@@ -737,6 +789,7 @@ export class RamTempVolume {
         lease: { directory: placed.value.value, mountpoint: this.paths.mountpoint, capacityBytes: this.capacityBytes },
         held: [],
         reaped: [],
+        retained: [],
       },
     };
   }
@@ -762,18 +815,21 @@ export class RamTempVolume {
     }
   }
 
-  /** End a lease; the last lease detaches the volume, returning its RAM. */
-  async release(lease: RamTempLease): Promise<Result<void, RamTempError>> {
+  /**
+   * End a lease; the last lease detaches the volume, returning its RAM. `keep` archives the lease's scratch instead of
+   * deleting it: its run did not pass. Answers what became of every scratch this release reclaimed, its own included.
+   */
+  async release(lease: RamTempLease, keep: boolean): Promise<Result<string[], RamTempError>> {
     const op: Operation = { owner: { pid: this.pid, token: randomUUID() }, claimed: false, made: null };
-    let result: Result<void, LockedError>;
+    let result: Result<string[], LockedError>;
     try {
-      result = await this.releaseLease(op, basename(lease.directory));
+      result = await this.releaseLease(op, basename(lease.directory), keep);
     } catch (error) {
       result = failed('release', errorText(error));
     }
     const ended = await this.end(op);
     if (result.ok) {
-      return ended;
+      return ended.ok ? result : ended;
     }
     const primary: RamTempError =
       result.error.kind === 'lock-denied'
@@ -782,7 +838,7 @@ export class RamTempVolume {
     return { ok: false, error: alsoFailed(primary, ended.ok ? [] : [ended.error]) };
   }
 
-  private async releaseLease(op: Operation, own: string): Promise<Result<void, LockedError>> {
+  private async releaseLease(op: Operation, own: string, keep: boolean): Promise<Result<string[], LockedError>> {
     let waited: ClaimWait | null = null;
     for (;;) {
       const taken = await this.locked(op, 'release', async (ledger, volume): Promise<Step<Releasing>> => {
@@ -792,7 +848,7 @@ export class RamTempVolume {
         if (ledger.lifecycle !== null) {
           return { ledger, value: { kind: 'wait', claim: ledger.lifecycle } };
         }
-        const claimed = await this.claim(ledger, volume, op.owner, own);
+        const claimed = await this.claim(ledger, volume, op.owner, own, keep);
         return {
           ledger: claimed.ledger,
           value: { kind: 'claimed', volume, held: claimed.held, candidates: claimed.candidates },
@@ -804,7 +860,7 @@ export class RamTempVolume {
       const value = taken.value;
       switch (value.kind) {
         case 'unmounted':
-          return { ok: true, value: undefined };
+          return { ok: true, value: [] };
         case 'wait':
           waited = await this.waitOut(value.claim, waited);
           continue;
@@ -830,7 +886,23 @@ export class RamTempVolume {
           if (kept !== undefined) {
             return failed('release', kept.text);
           }
-          return idle.value ? await this.detach(op, value.volume) : { ok: true, value: undefined };
+          if (!idle.value) {
+            return { ok: true, value: [...settled.value.retained] };
+          }
+          const detached = await this.detach(op, value.volume);
+          if (!detached.ok) {
+            return detached;
+          }
+          // The volume's pages go with it, its archives included: what the lines above kept lived until now.
+          return {
+            ok: true,
+            value: [
+              ...settled.value.retained,
+              ...(settled.value.retained.length > 0
+                ? [`${this.paths.mountpoint} detached with its last lease, and every archive on it went with it`]
+                : []),
+            ],
+          };
         }
       }
     }
@@ -1025,7 +1097,13 @@ export class RamTempVolume {
    * caller is settling. A dead lease whose cached verdict still validates is named held and left
    * unclaimed: that proof costs `lstat` calls, not a host-wide probe, so no caller waits on it.
    */
-  private async claim(ledger: Ledger, volume: MountedVolume, owner: ClaimOwner, own: string | null): Promise<Claimed> {
+  private async claim(
+    ledger: Ledger,
+    volume: MountedVolume,
+    owner: ClaimOwner,
+    own: string | null,
+    keepOwn: boolean,
+  ): Promise<Claimed> {
     const held: HeldLease[] = [];
     const candidates: Candidate[] = [];
     const claims = [...ledger.claims];
@@ -1056,7 +1134,7 @@ export class RamTempVolume {
         verdicts = verdicts.filter((entry) => entry !== cached);
       }
       claims.push({ name, identity, owner });
-      candidates.push({ name, directory, identity, own: name === own });
+      candidates.push({ name, directory, identity, own: name === own, keep: name !== own || keepOwn });
     }
     return { ledger: { ...ledger, claims, held: verdicts }, held, candidates };
   }
@@ -1069,8 +1147,8 @@ export class RamTempVolume {
    * here would race the owner that releases it under its own lease; a mount there is backed
    * elsewhere — a cowshed workspace adopted from a fixture checkout, say — and `rm -r` would
    * delete its contents through the mount. A kept lease gets a verdict to publish, when its
-   * holders have cheap lifetime keys. A lease nothing holds is removed once the lock confirms it
-   * is as claimed.
+   * holders have cheap lifetime keys. A lease nothing holds is reclaimed once the lock confirms it
+   * is as claimed: a kept one's scratch is renamed into the archive (`retain`), any other deleted.
    */
   private async settle(
     op: Operation,
@@ -1078,7 +1156,7 @@ export class RamTempVolume {
     candidates: readonly Candidate[],
   ): Promise<Result<Settled, LockedError>> {
     if (candidates.length === 0) {
-      return { ok: true, value: { held: [], reaped: [], verdicts: [] } };
+      return { ok: true, value: { held: [], reaped: [], retained: [], verdicts: [] } };
     }
     const reaped: string[] = [];
     for (const candidate of candidates) {
@@ -1110,6 +1188,7 @@ export class RamTempVolume {
         verdicts.push({ lease: candidate.name, verdict: captured.value });
       }
     }
+    const archived: Archived[] = [];
     if (removable.length > 0) {
       const confirmed = await this.locked(
         op,
@@ -1123,13 +1202,98 @@ export class RamTempVolume {
         return confirmed;
       }
       for (const candidate of confirmed.value) {
+        if (candidate.keep) {
+          // One rename on the volume: the scratch stays whole and readable, and nothing waits on a deletion.
+          const archive = `${String(Date.now()).padStart(13, '0')}-${candidate.name}`;
+          await mkdir(join(this.paths.mountpoint, ARCHIVE_DIR), { recursive: true, mode: 0o700 });
+          await rename(candidate.directory, join(this.paths.mountpoint, ARCHIVE_DIR, archive));
+          archived.push({ directory: candidate.directory, archive });
+          continue;
+        }
         // Nothing holds the lease, so its directories may be made removable first: `rm -r` cannot
         // empty a readonly one. Only this volume's device is changed (see prepareForRemoval).
         await prepareForRemoval(candidate.directory, volume.device);
         await rm(candidate.directory, { recursive: true, force: true });
       }
     }
-    return { ok: true, value: { held, reaped, verdicts } };
+    const retained = archived.length === 0 ? [] : await this.retain(volume, archived);
+    return { ok: true, value: { held, reaped, retained, verdicts } };
+  }
+
+  /**
+   * Keep the newest {@link ARCHIVES_KEPT} archives while at least {@link ARCHIVE_FLOOR_SHARE} of the volume is free, and
+   * none below that; rename every other one out of the archive and delete it in the background. Answers, for each lease
+   * just archived, where its scratch is kept or why it was not. The floor is read once, here, as an archive arrives.
+   */
+  private async retain(volume: MountedVolume, archived: readonly Archived[]): Promise<string[]> {
+    const root = join(this.paths.mountpoint, ARCHIVE_DIR);
+    const [fs, names] = await Promise.all([statfs(this.paths.mountpoint), readdir(root)]);
+    const freeBytes = fs.bavail * fs.bsize;
+    const floorBytes = Math.ceil(fs.blocks * fs.bsize * ARCHIVE_FLOOR_SHARE);
+    const archives = names.filter((name) => ARCHIVE_NAME.test(name)).sort();
+    const kept = freeBytes < floorBytes ? [] : archives.slice(-ARCHIVES_KEPT);
+    await mkdir(join(root, DELETING_DIR), { recursive: true, mode: 0o700 });
+    for (const name of archives.filter((candidate) => !kept.includes(candidate))) {
+      await rename(join(root, name), join(root, DELETING_DIR, `${this.pid}-${name}`)).catch((error: unknown) => {
+        // Another caller's retention renamed it first, and deletes it.
+        if (errorCode(error) !== 'ENOENT') throw error;
+      });
+    }
+    this.deleteArchives(volume.device);
+    return archived.map(({ directory, archive }) =>
+      kept.includes(archive)
+        ? `${directory} archived at ${join(root, archive)}: kept until ${ARCHIVES_KEPT} newer archives replace it, less than ${Math.round(floorBytes / MIB)} MiB of the volume is free when one arrives, or the volume detaches with its last lease`
+        : freeBytes < floorBytes
+          ? `${directory} deleted: the volume has ${Math.round(freeBytes / MIB)} MiB free, below the ${Math.round(floorBytes / MIB)} MiB under which it keeps no archive`
+          : `${directory} deleted: ${ARCHIVES_KEPT} newer archives are kept`,
+    );
+  }
+
+  /**
+   * Queue the deletion of the archives this process renamed out, and of any a dead deleter left, behind this process's
+   * earlier ones. Nothing waits for it. A failure is said on stderr and leaves its entry for the next deleter.
+   */
+  private deleteArchives(device: number): void {
+    archiveDeletion = archiveDeletion.then(() =>
+      this.emptyDeleting(device).catch((error: unknown) => {
+        process.stderr.write(
+          `RAM temp volume: could not delete an archive in ${join(this.paths.mountpoint, ARCHIVE_DIR, DELETING_DIR)}: ${errorText(error)}; the next archive's retention retries it\n`,
+        );
+      }),
+    );
+  }
+
+  private async emptyDeleting(device: number): Promise<void> {
+    const root = join(this.paths.mountpoint, ARCHIVE_DIR, DELETING_DIR);
+    const names = await readdir(root).catch((error: unknown) => {
+      if (errorCode(error) === 'ENOENT') return [];
+      throw error;
+    });
+    for (const name of names) {
+      const claim = DELETING_NAME.exec(name);
+      if (claim === null) {
+        process.stderr.write(`RAM temp volume: ${join(root, name)} is no archive being deleted; left as it is\n`);
+        continue;
+      }
+      let entry = join(root, name);
+      const deleter = Number(claim[1]);
+      if (deleter !== this.pid) {
+        if (this.isAlive(deleter)) continue;
+        const mine = join(root, `${this.pid}-${claim[2]}`);
+        const taken = await rename(entry, mine).then(
+          () => true,
+          (error: unknown) => {
+            if (errorCode(error) === 'ENOENT') return false;
+            throw error;
+          },
+        );
+        if (!taken) continue;
+        entry = mine;
+      }
+      // An archive keeps its lease's modes, so a readonly directory in it is made removable first (see prepareForRemoval).
+      await prepareForRemoval(entry, device);
+      await rm(entry, { recursive: true, force: true });
+    }
   }
 
   /**
@@ -1382,6 +1546,8 @@ export class RamTempVolume {
       // A lease or another attach arrived despite the claim: the volume stays for it.
       return { ok: true, value: undefined };
     }
+    // Detaching frees the archives' pages anyway, but a deletion of this process's still walking the volume holds it busy.
+    await archiveDeletions();
     let detached = await this.commands.run('/usr/bin/hdiutil', ['detach', disk.physical]);
     if (detached.status !== 0) {
       detached = await this.commands.run('/usr/bin/hdiutil', ['detach', '-force', disk.physical]);

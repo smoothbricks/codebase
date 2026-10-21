@@ -854,9 +854,11 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const directory = join(workspace.root, 'lease');
     await mkdir(directory);
     const held = '/v/9-abcdef is kept: /v/9-abcdef/x.asif (/dev/disk9) still attached from below it';
+    const retained =
+      '/v/8-ghijkl archived at /v/.archive/0001792505574623-8-ghijkl: kept until 2 newer archives replace it';
     const volume = scriptedVolume({
       ok: true,
-      value: { kind: 'leased', lease: leaseAt(directory), held: [held], reaped: [] },
+      value: { kind: 'leased', lease: leaseAt(directory), held: [held], reaped: [], retained: [retained] },
     });
 
     const result = await runBoundedExec(
@@ -870,7 +872,32 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.success).toBe(true);
     expect(result.terminalOutput).toContain(directory);
     expect(result.terminalOutput).toContain(`RAM temp volume: dead lease ${held}\n`);
+    expect(result.terminalOutput).toContain(`RAM temp volume: dead lease ${retained}\n`);
     expect(volume.released).toEqual([directory]);
+    // A passing run's scratch is not evidence anyone needs: the lease is released to be deleted.
+    expect(volume.order).toEqual([`reap ${directory}`, `release ${directory}`]);
+  });
+
+  it("releases a failed run's lease to be archived, and says where its scratch went", async () => {
+    const workspace = await createWorkspace();
+    const directory = join(workspace.root, 'lease');
+    await mkdir(directory);
+    const volume = scriptedVolume({
+      ok: true,
+      value: { kind: 'leased', lease: leaseAt(directory), held: [], reaped: [], retained: [] },
+    });
+
+    const result = await runBoundedExec(
+      { command: 'node -e "process.exit(3)"', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+      workspace.context,
+      createProcessTreeKiller(),
+      volume,
+      null,
+    );
+
+    expect(result.success).toBe(false);
+    expect(volume.order).toEqual([`reap ${directory}`, `release ${directory} (kept)`]);
+    expect(result.terminalOutput).toContain(`RAM temp volume: lease ${directory} archived by the scripted volume\n`);
   });
 
   it('stops what the command left working in its lease before the lease ends, and says so', async () => {
@@ -880,7 +907,13 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const volume = scriptedVolume(
       {
         ok: true,
-        value: { kind: 'leased', lease: leaseAt(directory), held: [], reaped: ['4242 (nx daemon of a dead task)'] },
+        value: {
+          kind: 'leased',
+          lease: leaseAt(directory),
+          held: [],
+          reaped: ['4242 (nx daemon of a dead task)'],
+          retained: [],
+        },
       },
       null,
       ['31337 (bun nx daemon --start)'],
@@ -952,7 +985,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const directory = join(workspace.root, 'lease');
     await mkdir(directory);
     const volume = scriptedVolume(
-      { ok: true, value: { kind: 'leased', lease: leaseAt(directory), held: [], reaped: [] } },
+      { ok: true, value: { kind: 'leased', lease: leaseAt(directory), held: [], reaped: [], retained: [] } },
       { kind: 'volume-full', mountpoint: workspace.root, capacityBytes: 1024 * 1024 * 1024, freeBytes: 1024 * 1024 },
     );
 
@@ -979,7 +1012,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const lease = leaseAt(directory);
     const space = { lease: directory, mountpoint: workspace.root, capacityBytes: lease.capacityBytes, freeBytes: 4096 };
     const volume = scriptedVolume(
-      { ok: true, value: { kind: 'leased', lease, held: [], reaped: [] } },
+      { ok: true, value: { kind: 'leased', lease, held: [], reaped: [], retained: [] } },
       null,
       [],
       space,
@@ -1008,7 +1041,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       verdict: { outcome: 'no-space', exitCode: 1, tests: [], line, volume: space },
     });
     // Read while the lease was still the task's, before it was reaped and released.
-    expect(volume.order).toEqual(['space', `reap ${directory}`, `release ${directory}`]);
+    expect(volume.order).toEqual(['space', `reap ${directory}`, `release ${directory} (kept)`]);
   });
 
   it('keeps inherited nextest and Cargo ceilings under oversized grants', async () => {
@@ -1540,7 +1573,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       const bun = await fakeBun(join(workspace.root, 'bin'), '1.4.2');
       const volume = scriptedVolume({
         ok: true,
-        value: { kind: 'leased', lease: leaseAt(join(workspace.root, 'lease')), held: [], reaped: [] },
+        value: { kind: 'leased', lease: leaseAt(join(workspace.root, 'lease')), held: [], reaped: [], retained: [] },
       });
       const asked: number[] = [];
       const budget: CpuBudget = {
@@ -1987,7 +2020,10 @@ function leaseAt(directory: string): RamTempLease {
   return { directory, mountpoint: dirname(directory), capacityBytes: 1024 * 1024 * 1024 };
 }
 
-/** A temp volume whose answers are fixed, recording which leases were reaped and released, and when space was read. */
+/**
+ * A temp volume whose answers are fixed, recording which leases were reaped and released, each release marked
+ * `(kept)` when its scratch was to be archived, and when space was read.
+ */
 function scriptedVolume(
   acquisition: Result<RamTempAcquisition, RamTempError>,
   full: RamTempError | null = null,
@@ -2004,10 +2040,10 @@ function scriptedVolume(
       order.push(`reap ${lease.directory}`);
       return Promise.resolve({ ok: true, value: leftovers });
     },
-    release(lease) {
+    release(lease, keep) {
       released.push(lease.directory);
-      order.push(`release ${lease.directory}`);
-      return Promise.resolve({ ok: true, value: undefined });
+      order.push(`release ${lease.directory}${keep ? ' (kept)' : ''}`);
+      return Promise.resolve({ ok: true, value: keep ? [`${lease.directory} archived by the scripted volume`] : [] });
     },
     fullness: () => Promise.resolve(full),
     space() {
