@@ -186,3 +186,22 @@ done. They are independent of each other.
 - Acceptance: an event-coordinated real host Cargo build creates a previously absent profile after capture has
   enumerated its old profiles; the producer lease must block that creation or refuse the capture before any seed
   publication. A held existing profile and a live Nx holder still refuse, while an open index reader remains exempt.
+
+## Retirement prunes the workspace's `push` refs
+
+- Spec: `specs/cowshed/02_workspaces.md:972`: "`land` prunes a workspace's refs at retire"; `:1096`: the land's fetched
+  branch lands in `refs/cowshed/<ws>/heads/<branch>`, "which retirement prunes".
+- Code: `packages/cowshed/crates/cowshed-core/src/runtime/project.rs:16791` (land) and `:16895` (`push`) write
+  `refs/cowshed/<ws>/heads/<branch>`; no retirement path (`rm`, `land --retire`) and no `gc` category deletes them, and
+  `gc --supersede` only accepts `refs/cowshed/<ws>/abandoned/<head>/`. Every push therefore leaves one ref in main's
+  repository forever.
+- Measured 2026-10-21 in one adopted project: 36 such refs whose workspaces were retired or whose tips main already held
+  (30 ancestors of main, 6 patch-id equal) had to be deleted by hand with a compare-and-swap `git update-ref --stdin`
+  transaction.
+- Work: when `rm` or `land` retires a workspace, delete `refs/cowshed/<ws>/heads/*` (and `refs/cowshed/<ws>/wip`) whose
+  tips main holds by the `rm` gate's own measurement, compare-and-swap against the tip measured, journaled in the
+  deletion log like `retire-abandoned-ref`; a tip main does not hold is kept and named, as abandonments are. `gc` sweeps
+  the same refs for workspaces already retired.
+- Acceptance: push a branch, land it, retire the workspace: no `refs/cowshed/<ws>/heads/` ref remains and the deletion
+  log names it. Push a branch carrying a commit main lacks, retire with `--abandon`: the ref stays and `gc` names it
+  with its unlanded count.
