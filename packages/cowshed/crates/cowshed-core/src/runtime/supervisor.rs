@@ -4470,7 +4470,11 @@ impl SupervisorActor {
                 name,
                 reply,
             } => {
+                let named = name.is_some();
                 let result = self.open_session(&authority, name);
+                if named && result.is_ok() {
+                    self.nx_daemon_used();
+                }
                 let _ = reply.send(result);
             }
             Command::SessionSnapshot {
@@ -4509,6 +4513,9 @@ impl SupervisorActor {
                         cpu_parent,
                     )
                     .await;
+                if admitted.is_ok() {
+                    self.nx_daemon_used();
+                }
                 let _ = reply.send(admitted);
             }
             Command::Detach {
@@ -5813,6 +5820,15 @@ impl SupervisorActor {
                     "restart this workspace's supervisor with the current cowshed",
                 )),
             },
+        }
+    }
+
+    /// A job or a named session was just admitted: the shed is in use (04_sandbox.md, the kept
+    /// daemon), so the keeper hears it now and probes at once rather than at its next tick. A
+    /// job that ends between two probes is use all the same; the ledger held it.
+    fn nx_daemon_used(&mut self) {
+        if let Some(keeper) = &mut self.nx_daemon {
+            keeper.used();
         }
     }
 

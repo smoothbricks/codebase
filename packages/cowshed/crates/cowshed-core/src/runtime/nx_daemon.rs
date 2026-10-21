@@ -711,6 +711,14 @@ impl NxDaemonKeeper {
         }
     }
 
+    /// The supervisor admitted a job or opened a named session: the shed is in use from now, and
+    /// the next probe is due at once. A job that ends before the next tick counts all the same;
+    /// otherwise a short command would never be seen as use.
+    pub(crate) fn used(&mut self) {
+        self.last_use = Some(Instant::now());
+        self.probes.reset_immediately();
+    }
+
     /// A start that left no daemon live, `what` saying how: another follows at the next probe
     /// until [`START_ATTEMPTS`] have failed in a row; then starts pause, said with the failures,
     /// the pause and its cap, and one start follows each pause.
@@ -1084,6 +1092,12 @@ mod tests {
             judge(&mut keeper, false, Probe::Dead).await,
             Verdict::Release
         );
+
+        // A job admitted and ended between two probes leaves nothing in the ledger at the next
+        // one, and is use all the same: the supervisor told the keeper at its admission.
+        keeper.used();
+        assert_eq!(judge(&mut keeper, false, Probe::Dead).await, Verdict::Keep);
+        assert!(!keeper.settled, "a daemon is wanted after a short job");
     }
 
     /// A daemon that comes up, started by the keeper or by a client that found none, gets a whole

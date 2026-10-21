@@ -6983,8 +6983,10 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
 
 /// A land resets its shed's Nx daemon and waits for the kept successor before its first gate, so while
 /// the shed runs a gate job the keeper's start is that gate's work: its start stake draws on the
-/// gate job's pool, where it is ranked as one of the gate's tasks, and only an idle shed's start
-/// asks the host alone as background (05_gateway.md "A resident's start holds one token").
+/// gate job's pool, where it is ranked as one of the gate's tasks, and only the start of a shed
+/// that runs no gate job asks the host alone as background (05_gateway.md "A resident's start
+/// holds one token"). A named session puts the shed in use without a gate job, since a
+/// supervisor's own start is no use (04_sandbox.md, the kept daemon).
 /// Measured 2026-10-21: a land's rebase ran its gate-class task-hash job in
 /// an idle shed, the keeper asked its start at once, and the start's background stake waited 324 s
 /// behind other work while the land waited on the daemon and gave up.
@@ -7001,13 +7003,14 @@ async fn a_kept_daemons_start_draws_on_the_gate_job_its_shed_runs() {
         ..config
     };
     let mut h = harness_with_config(config, 1, 1024, false, false);
+    let _in_use = open_named(&h.handle, "build").await;
     let idle = staked
         .recv()
         .await
         .expect("the keeper's first start asks its stake");
     assert_eq!(
         idle.parent, None,
-        "an idle shed's start asks the host alone"
+        "the start of a shed that runs no gate job asks the host alone"
     );
 
     let gate_job = h
@@ -7048,11 +7051,15 @@ async fn a_kept_daemons_start_draws_on_the_gate_job_its_shed_runs() {
 
 /// A foreground keeper is an ordinary owned job for draining, not developer activity. Even before
 /// its socket is ready, quiescing an otherwise idle workspace stops that exact job and waits for it.
+/// A named session puts the shed in use so the keeper starts, and is closed before the quiesce, so
+/// the keeper's own job is all the ledger holds.
 #[tokio::test(start_paused = true)]
 async fn a_foreground_nx_keeper_does_not_count_as_user_work_and_quiescence_drains_it() {
     let (config, _root) = nx_project("foreground");
     let mut h = harness_with_config(config, 1, 1024, false, false);
+    let in_use = open_named(&h.handle, "build").await;
     let keeper = h.spawned.recv().await.expect("the foreground keeper job");
+    h.handle.close_session(in_use).await.unwrap();
     assert_eq!(
         h.process.recv().await.unwrap(),
         ProcessObservation::StdinClosed(keeper.request.job_id),

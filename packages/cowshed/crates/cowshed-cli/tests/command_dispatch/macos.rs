@@ -3540,6 +3540,9 @@ async fn directory_a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed_sub
         "w1 runs a:build and a:test itself: {ran:?}"
     );
 
+    // A supervisor's own start is no use (04_sandbox.md, the kept daemon): w1's keeper starts its
+    // daemon at the run's admission, alongside it, so the record may follow the run's end.
+    eventually(|| recorded_daemon(&w1).is_some()).await;
     let source_daemon = recorded_daemon(&w1).expect("w1's keeper left its daemon recorded");
     assert!(
         cowshed_os::process::running(source_daemon).expect("observe w1's daemon"),
@@ -6516,6 +6519,10 @@ async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
         git(&topic, &["commit", "-q", "-am", "change output input"]);
         sh(&mut service, "outputs", &nx_run_many(&node, "build")).await;
         let record = topic.join(".nx/workspace-data/d/server-process.json");
+        // The run put the shed in use at its admission, and the keeper started its daemon alongside
+        // it; a supervisor's own start is no use (04_sandbox.md, the kept daemon), so the record
+        // may follow the run's end.
+        eventually(|| record.is_file()).await;
         let recorded: serde_json::Value =
             serde_json::from_slice(&fs::read(&record).expect("the run's daemon record"))
                 .expect("a daemon record");
