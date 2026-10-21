@@ -1185,28 +1185,37 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    where main deleted the file, `mode`, or `unmergeable` with git's reason), ten files per branch and a count of the
    rest; `ls --landed` applies the same measurement. This is not the install gate's question (05_gateway.md, "The
    installed cowshed"), which asks whether a build holds the installed commits themselves, by ancestry or patch
-   identity. `--force` permits loss of dirty/in-progress state, not unlanded work. Explicit `--abandon` requires a
-   verified recovery bundle, `sessions/.trash/<ws>-<head>.bundle`, holding HEAD and every branch that did not pass as
-   refs, before retiring unlanded work. It is written beside that name and renamed into place once verified; a retried
-   removal that finds a bundle verifying for the same range keeps it instead of writing another. The verified bundle's
-   tips are then fetched into main's repository, unforced, as `refs/cowshed/<ws>/abandoned/<head>/HEAD` and
-   `refs/cowshed/<ws>/abandoned/<head>/heads/<branch>`, each read back against the tip the bundle advertises, before
-   anything retires: the trash is emptied by `gc --abandoned`, and the refs by any `gc` once main holds every tip by
-   this gate's own measurement, or by their owner's `gc --supersede` (01_storage.md, "Retention"). Keying the namespace
-   by the abandoned head means a later workspace reusing the name never overwrites what an earlier one left. A tip that
-   cannot be kept refuses the abandonment. The report says what keeps the tips (`AbandonedWork.preserved`): `preserved`
-   with each kept ref; `nothingToPreserve` for main's own `--restore --abandon` (below), where main is what is being
-   restored and its bundle is the copy; or `predatesPreservation` for a record an earlier build wrote, which kept no
-   refs and recorded none — the bundle it names was the one copy it made. A measurement's files (`unlandedPaths`)
-   likewise are `named`, or `predatesPaths` for a record from a build that counted commits by patch identity and named
-   no file. A command reporting a predating record warns once on stderr, naming what it does not record
-   (00_overview.md).
+   identity. `--force` permits loss of dirty/in-progress state, not unlanded work. An explicit `rm` (and a project
+   purge, for each session it removes) also refuses a workspace younger than ten minutes, measured from the creation
+   time its record carries, after every other gate has passed: a clean workspace at main is indistinguishable from a
+   landed one, and one its owner forked minutes ago may not have its first edit yet. The refusal names the age and the
+   floor, and its hint the remedies that keep the work; a creation time that cannot be read refuses the same way.
+   `--force` overrides it. A `land` retiring the unit it landed, and the replay of a removal already authorized, are not
+   asked. Explicit `--abandon` requires a verified recovery bundle, `sessions/.trash/<ws>-<head>.bundle`, holding HEAD
+   and every branch that did not pass as refs, before retiring unlanded work. It is written beside that name and renamed
+   into place once verified; a retried removal that finds a bundle verifying for the same range keeps it instead of
+   writing another. The verified bundle's tips are then fetched into main's repository, unforced, as
+   `refs/cowshed/<ws>/abandoned/<head>/HEAD` and `refs/cowshed/<ws>/abandoned/<head>/heads/<branch>`, each read back
+   against the tip the bundle advertises, before anything retires: the trash is emptied by `gc --abandoned`, and the
+   refs by any `gc` once main holds every tip by this gate's own measurement, or by their owner's `gc --supersede`
+   (01_storage.md, "Retention"). Keying the namespace by the abandoned head means a later workspace reusing the name
+   never overwrites what an earlier one left. A tip that cannot be kept refuses the abandonment. The report says what
+   keeps the tips (`AbandonedWork.preserved`): `preserved` with each kept ref; `nothingToPreserve` for main's own
+   `--restore --abandon` (below), where main is what is being restored and its bundle is the copy; or
+   `predatesPreservation` for a record an earlier build wrote, which kept no refs and recorded none — the bundle it
+   names was the one copy it made. A measurement's files (`unlandedPaths`) likewise are `named`, or `predatesPaths` for
+   a record from a build that counted commits by patch identity and named no file. A command reporting a predating
+   record warns once on stderr, naming what it does not record (00_overview.md).
 
    Every retirement, abandoned or not, appends a `retire-workspace` line to the project's `deletion-log.jsonl`
    (01_storage.md) once the image is renamed into trash: the head and every local branch tip read before the image went,
    each with what keeps it — `{"by":"ref","repository":…,"reference":…}` for a tip the abandonment kept,
-   `{"by":"target",…}` naming the branch and head that held a tip the gate passed. A retirement whose tips could not be
-   read says so on stderr and logs no Git facts; it is never refused for that.
+   `{"by":"target",…}` naming the branch and head that held a tip the gate passed. The line also says who retired the
+   workspace (`retiredBy`): the `caller`, the process that ran the removal with its pid and argv and its parent's, which
+   is the shell, script or agent that asked; and, for a forced removal, `forced`, naming each guard the force overrode
+   (`dirty`, `inProgress` with the operation, `young` with `createdAt` and `ageSeconds`), empty when it overrode none. A
+   retirement whose tips could not be read says so on stderr and writes the line without Git facts; it is never refused
+   for that.
 
    The refusal reports whether the published branch already holds HEAD's commits; it never authorizes a removal. Only
    once the gate has refused HEAD does it measure HEAD, with the same landing module `ls` reads, against the primary

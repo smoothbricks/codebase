@@ -2859,7 +2859,7 @@ const REMOVE: CommandSpec = CommandSpec {
     options: &[
         Opt {
             spelling: "--force",
-            meaning: "waive transient state only — a dirty tree, an in-progress merge, the workspace's own running jobs. It does not waive the containment gate or a process cowshed does not run holding the mount, and it does not preserve what it waives: an uncommitted tree is destroyed with no bundle and no record, so commit it or `cowshed checkpoint` first if it is the only copy",
+            meaning: "waive transient state only — a dirty tree, an in-progress merge, the workspace's own running jobs — and the ten-minute floor on a workspace's age; the deletion log records which of them it waived and which process asked. It does not waive the containment gate or a process cowshed does not run holding the mount, and it does not preserve what it waives: an uncommitted tree is destroyed with no bundle and no record, so commit it or `cowshed checkpoint` first if it is the only copy",
         },
         Opt {
             spelling: "--restore",

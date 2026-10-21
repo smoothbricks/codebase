@@ -630,10 +630,10 @@ them. A refusal is reported separately with its own `next:` hint and exit code. 
 
 The two overrides authorize different losses and neither substitutes for the other:
 
-| Flag        | Overrides                                                         | Does **not** override   |
-| ----------- | ----------------------------------------------------------------- | ----------------------- |
-| `--force`   | transient state: a dirty tree, an in-progress merge, a busy mount | the landed-content gate |
-| `--abandon` | the landed-content gate — changes `main` does not hold            | transient state         |
+| Flag        | Overrides                                                                                                   | Does **not** override   |
+| ----------- | ----------------------------------------------------------------------------------------------------------- | ----------------------- |
+| `--force`   | transient state: a dirty tree, an in-progress merge, a busy mount; and a workspace younger than ten minutes | the landed-content gate |
+| `--abandon` | the landed-content gate — changes `main` does not hold                                                      | transient state         |
 
 `--force` stops that workspace's running jobs (TERM, then KILL after the grace period) before detaching; without it,
 removal lets the supervisor finish its active jobs. A leftover `.git/AUTO_MERGE` alone is not an in-progress operation
@@ -643,11 +643,17 @@ A dirty tree is a tracked change, or an untracked file that is not hidden, not i
 rules, and not held by main's checkout with the same content at the same path: an untracked file left in main arrives in
 every clone and is not the workspace's work.
 
+A clean workspace at main reads exactly like a landed one, so `rm` also refuses a workspace younger than ten minutes —
+one whose owner may not have written in it yet — naming how long ago it was created. Remove it once it is ten minutes
+old, or keep its work with `cowshed land <ws>`; `--force` removes it now. `cowshed land` retiring the workspace it just
+landed is never refused for its age.
+
 `--abandon` has no short spelling, and it is the only way to delete unlanded commits. Before deleting, it writes a Git
 bundle of `main..HEAD` beside the retired image in `sessions/.trash/<ws>-<tip>.bundle`, keeps the bundle's tips in
 main's repository as `refs/cowshed/<ws>/abandoned/<head>/HEAD` and `…/heads/<branch>`, and prints what it destroyed and
 where it is kept, so even a deliberate abandonment is recoverable from main itself. The project's `deletion-log.jsonl`
-records every retirement's head and branch tips with the ref or target that keeps each:
+records every retirement's head and branch tips with the ref or target that keeps each, and who retired the workspace:
+the `cowshed` process and its parent, each by pid and argv, and for a forced removal every guard the force overrode:
 
 ```
 $ cowshed rm raven

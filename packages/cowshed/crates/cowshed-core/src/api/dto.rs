@@ -297,7 +297,8 @@ impl<'de> Deserialize<'de> for AdmissionKey {
     }
 }
 
-fn is_rfc3339_utc(value: &str) -> bool {
+/// The UTC second `value` names, when it is an RFC 3339 timestamp: what [`UtcTimestamp`] accepts.
+fn rfc3339_utc_seconds(value: &str) -> Option<i64> {
     let bytes = value.as_bytes();
     if bytes.len() < 20
         || !value.is_ascii()
@@ -307,7 +308,7 @@ fn is_rfc3339_utc(value: &str) -> bool {
         || bytes.get(13) != Some(&b':')
         || bytes.get(16) != Some(&b':')
     {
-        return false;
+        return None;
     }
     let digits = |start: usize, end: usize| -> Option<u32> {
         bytes
@@ -326,7 +327,7 @@ fn is_rfc3339_utc(value: &str) -> bool {
         digits(14, 16),
         digits(17, 19),
     ) else {
-        return false;
+        return None;
     };
     let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     let max_day = match month {
@@ -334,7 +335,7 @@ fn is_rfc3339_utc(value: &str) -> bool {
         4 | 6 | 9 | 11 => 30,
         2 if leap_year => 29,
         2 => 28,
-        _ => return false,
+        _ => return None,
     };
     let (time_end, offset_seconds) = if bytes.last() == Some(&b'Z') {
         (bytes.len() - 1, 0_i64)
@@ -343,14 +344,14 @@ fn is_rfc3339_utc(value: &str) -> bool {
         let (Some(offset_hour), Some(offset_minute)) =
             (digits(sign + 1, sign + 3), digits(sign + 4, sign + 6))
         else {
-            return false;
+            return None;
         };
         if !matches!(bytes[sign], b'+' | b'-')
             || bytes[sign + 3] != b':'
             || offset_hour > 23
             || offset_minute > 59
         {
-            return false;
+            return None;
         }
         let magnitude = i64::from(offset_hour * 3600 + offset_minute * 60);
         let offset = if bytes[sign] == b'+' {
@@ -360,7 +361,7 @@ fn is_rfc3339_utc(value: &str) -> bool {
         };
         (sign, offset)
     } else {
-        return false;
+        return None;
     };
     let fraction_valid = match bytes.get(19..time_end) {
         Some([]) => true,
@@ -374,7 +375,13 @@ fn is_rfc3339_utc(value: &str) -> bool {
         || (second == 60
             && calendar_valid
             && is_published_leap_second(year, month, day, hour, minute, offset_seconds));
-    calendar_valid && second_valid && fraction_valid
+    (calendar_valid && second_valid && fraction_valid).then(|| {
+        days_from_civil(year, month, day) * 86_400
+            + i64::from(hour) * 3_600
+            + i64::from(minute) * 60
+            + i64::from(second)
+            - offset_seconds
+    })
 }
 
 fn days_from_civil(year: u32, month: u32, day: u32) -> i64 {
@@ -444,7 +451,7 @@ pub struct UtcTimestamp(String);
 impl UtcTimestamp {
     pub fn new(value: impl Into<String>) -> Result<Self, DtoError> {
         let value = value.into();
-        let valid = is_rfc3339_utc(&value);
+        let valid = rfc3339_utc_seconds(&value).is_some();
         if valid {
             Ok(Self(value))
         } else {
@@ -454,6 +461,11 @@ impl UtcTimestamp {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The UTC second this timestamp names, offset applied.
+    pub fn epoch_seconds(&self) -> i64 {
+        rfc3339_utc_seconds(&self.0).expect("a UtcTimestamp is validated when it is made")
     }
 }
 

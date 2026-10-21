@@ -70,7 +70,7 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
     waivers.json                     # reasoned secret-scan waivers (02_workspaces.md)
     lifecycle-intents.json           # bounded persist-before-mutate create/fork/remove recovery journal, mode 0600
     lifecycle-intents.json.lock      # flock held for each read-modify-write of the journal
-    deletion-log.jsonl               # one line per artifact the controller unlinked, one per build volume released, one per workspace retired and per abandon bundle kept and per abandoned ref retired, with Git tips (storage/deletion_log.rs)
+    deletion-log.jsonl               # one line per artifact the controller unlinked, one per build volume released, one per workspace retired (naming the process that retired it and what a force overrode) and per abandon bundle kept and per abandoned ref retired, with Git tips (storage/deletion_log.rs)
     main.dmg                         # adopted main image (created here behind a PendingFence sidecar)
     main.dmg.grants.json             # controller-owned grants + detached metadata
     main.dmg.ca.key                  # main's workspace CA private key, 0600

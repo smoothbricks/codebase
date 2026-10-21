@@ -1177,7 +1177,8 @@ async fn directory_rm_stops_the_checkouts_nx_daemon_before_removal() {
     )
     .expect("daemon record");
 
-    let (removed, _, stderr) = run(&mut service, ["rm", "daemon-topic"]).await;
+    // Forked seconds ago: forced past the age floor alone; nothing else here needs the force.
+    let (removed, _, stderr) = run(&mut service, ["rm", "daemon-topic", "--force"]).await;
     assert_eq!(
         removed.unwrap_or_else(|error| panic!("rm: {error}; {}", String::from_utf8_lossy(&stderr))),
         0,
@@ -4220,7 +4221,9 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
             .any(|holder| holder.pid == pid)
     })
     .await;
-    succeed(&mut service, ["rm", "sibling"]).await;
+    // Forked seconds ago: forced past the age floor alone. The holder is a host process, not a
+    // job, so the force changes nothing the release does to it.
+    succeed(&mut service, ["rm", "sibling", "--force"]).await;
     assert!(
         !layout.image(&sibling_volume).exists(),
         "rm reclaims the unlinked image before returning"
@@ -4251,7 +4254,7 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
     assert_build_label(&layout, &topic, "topic").await;
     assert_linked_build_mounts(&layout, &[&fixture.checkout, &topic]);
 
-    succeed(&mut service, ["rm", "topic"]).await;
+    succeed(&mut service, ["rm", "topic", "--force"]).await;
     assert!(
         layout.image(&landing).exists(),
         "rm preserves main's adopted volume"

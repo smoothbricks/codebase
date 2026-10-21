@@ -4233,7 +4233,17 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                             ));
                         }
                         Ok(_) => {
-                            self.remove(workspace, options).await?;
+                            // Authorized before it was journaled Mutating: the replay finishes it, and
+                            // a workspace's youth no longer decides anything.
+                            let containment = self.main_containment()?;
+                            self.remove_contained_in(
+                                workspace,
+                                options,
+                                &containment,
+                                CheckoutNxCheck::CloseRecorded,
+                                YoungPolicy::Authorized,
+                            )
+                            .await?;
                         }
                         Err(error) if error.code == ErrorCode::NotFound => {
                             if origin.is_some()
@@ -4243,7 +4253,17 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                     .iter()
                                     .any(|(_, metadata)| metadata.workspace == workspace)
                             {
-                                self.remove(workspace, options).await?;
+                                // Authorized before it was journaled Mutating: the replay finishes it, and
+                                // a workspace's youth no longer decides anything.
+                                let containment = self.main_containment()?;
+                                self.remove_contained_in(
+                                    workspace,
+                                    options,
+                                    &containment,
+                                    CheckoutNxCheck::CloseRecorded,
+                                    YoungPolicy::Authorized,
+                                )
+                                .await?;
                             } else {
                                 self.complete_lifecycle_intent(
                                     &workspace,
@@ -6018,20 +6038,36 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         options: RemoveOptions,
         fence: &NativeRemovalGitFence,
         containment: &NativeContainment,
-    ) -> Result<Option<NativeLandedState>> {
+        young: Option<&YoungWorkspace>,
+    ) -> Result<NativeRemovalAuthority> {
         if workspace.is_main() {
             // Main's removal has no landed gate: main *is* the branch a session has to reach, and
             // its own preservation proof is the retained checkout or a remote ref, which the
             // `--restore` path checks. What remains here is transient state — and unlike a session,
             // main's is not overridable, because there is no fork of it to fall back on.
             Self::require_session_state_clean(workspace, fence)?;
-            return Ok(None);
+            return Ok(NativeRemovalAuthority {
+                abandoning: None,
+                forced: options.force.then(Vec::new),
+            });
         }
-        if !options.force {
+        let forced = if options.force {
+            Some(overridden_by_force(fence, young))
+        } else {
             Self::require_session_state_clean(workspace, fence)?;
+            None
+        };
+        let abandoning = self
+            .require_session_landed(workspace, fence, options.abandon, containment)
+            .await?;
+        // Last, so a refusal for real work at risk is the one a young workspace gets: landed is
+        // not abandoned, and a workspace this young may be one whose owner has not yet written.
+        if !options.force
+            && let Some(young) = young
+        {
+            return Err(removal_young_refusal(workspace, young));
         }
-        self.require_session_landed(workspace, fence, options.abandon, containment)
-            .await
+        Ok(NativeRemovalAuthority { abandoning, forced })
     }
 
     /// Stop the supervisor, then prove the workspace is still the one that was checked.
@@ -6504,27 +6540,37 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         })
     }
 
-    /// Write the `retire-workspace` line once the retirement committed, or say why it has no Git
-    /// facts to carry.
-    fn log_retired_tips(
+    /// Journal a workspace's retirement (`retire-workspace`) once it committed: its Git tips when
+    /// they were read, and who retired it, with what a force overrode (02_workspaces.md, `rm`
+    /// step 1). A retirement whose tips could not be read still names its caller, and says on
+    /// stderr why it records no Git facts.
+    fn log_retirement(
         &self,
         workspace: &WorkspaceName,
         mount: &Path,
         tips: std::result::Result<crate::storage::deletion_log::GitTips, String>,
+        forced: Option<Vec<crate::storage::deletion_log::Overridden>>,
     ) {
-        match tips {
-            Ok(tips) => crate::storage::deletion_log::log_git_tips(
-                &self.layout.project().project_root,
-                crate::storage::deletion_log::DeletionOp::RetireWorkspace,
-                workspace.as_str(),
-                mount,
-                tips,
-            ),
-            Err(reason) => eprintln!(
-                "cowshed: the deletion log records no Git tips for {workspace}'s retirement: \
-                 {reason}"
-            ),
-        }
+        let git = match tips {
+            Ok(tips) => Some(tips),
+            Err(reason) => {
+                eprintln!(
+                    "cowshed: the deletion log records no Git tips for {workspace}'s retirement: \
+                     {reason}"
+                );
+                None
+            }
+        };
+        crate::storage::deletion_log::log_retirement(
+            &self.layout.project().project_root,
+            workspace.as_str(),
+            mount,
+            git,
+            crate::storage::deletion_log::RetiredBy {
+                caller: crate::storage::deletion_log::Caller::this_process(),
+                forced,
+            },
+        );
     }
 
     /// Keep every tip of the abandon bundle at `bundle` in the repository at `repository`, under
@@ -6840,9 +6886,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         options: RemoveOptions,
         containment: &NativeContainment,
         nx_check: CheckoutNxCheck,
+        young: YoungPolicy,
     ) -> Result<RemoveReport> {
         let report = self
-            .retire_contained_in(workspace.clone(), options, containment, nx_check)
+            .retire_contained_in(workspace.clone(), options, containment, nx_check, young)
             .await?;
         if !options.restore {
             self.collect_build_volumes().await.map_err(|failed| {
@@ -6865,6 +6912,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         options: RemoveOptions,
         containment: &NativeContainment,
         nx_check: CheckoutNxCheck,
+        young: YoungPolicy,
     ) -> Result<RemoveReport> {
         use crate::storage::lifecycle::{MountIntent, MountState, Substrate};
 
@@ -7297,8 +7345,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let removal = async {
             let current = self.current(&workspace).await?;
             let initial_fence = self.removal_git_fence(&current).await?;
-            self.require_removal_safe(&workspace, options, &initial_fence, containment)
-                .await?;
+            self.require_removal_safe(
+                &workspace,
+                options,
+                &initial_fence,
+                containment,
+                young.of(&current)?.as_ref(),
+            )
+            .await?;
             let (current, final_fence, _stopped) = self
                 .revalidated_removal_fence(
                     &workspace,
@@ -7308,8 +7362,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     RetirementPurpose::Removal,
                 )
                 .await?;
-            let abandoning = self
-                .require_removal_safe(&workspace, options, &final_fence, containment)
+            let NativeRemovalAuthority { abandoning, forced } = self
+                .require_removal_safe(
+                    &workspace,
+                    options,
+                    &final_fence,
+                    containment,
+                    young.of(&current)?.as_ref(),
+                )
                 .await?;
             if !was_pending {
                 self.begin_lifecycle_intent(intent).await?;
@@ -7335,7 +7395,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 )
                 .await;
             self.finish_retirement(current, nx_check).await?;
-            self.log_retired_tips(&workspace, &mount, tips);
+            self.log_retirement(&workspace, &mount, tips, forced);
             Ok(RemoveReport { abandoned })
         }
         .await;
@@ -8993,7 +9053,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         // An unpublished clone never landed anywhere: main is what has to hold its work.
         let containment = self.main_containment()?;
         let result = async {
-            let (retired, (abandoned, tips, mount)) = substrate
+            let (retired, (abandoned, tips, mount, forced)) = substrate
                 .execute_pending_clone_retirement(metadata, identity, |stage| {
                     let this = &mut *self;
                     let containment = &containment;
@@ -9035,9 +9095,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                 &last.head,
                             ));
                         }
-                        if !options.force {
+                        let forced = if options.force {
+                            Some(overridden_by_force(&last, None))
+                        } else {
                             Self::require_session_state_clean(workspace, &last)?;
-                        }
+                            None
+                        };
                         let abandoning = this
                             .require_session_landed(workspace, &last, options.abandon, containment)
                             .await?;
@@ -9063,12 +9126,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                             .await;
                         this.unregister_workspace_in_main(workspace, git_worktree)
                             .await?;
-                        Ok::<_, CowshedError>((abandoned, tips, stage.mount_point.clone()))
+                        Ok::<_, CowshedError>((abandoned, tips, stage.mount_point.clone(), forced))
                     }
                 })
                 .await
                 .map_err(native_staged_error)?;
-            self.log_retired_tips(workspace, &mount, tips);
+            self.log_retirement(workspace, &mount, tips, forced);
             self.commitments
                 .record(CommitmentDraft::WorkspaceRetired {
                     repo_id: self.descriptor.repo_id.clone(),
@@ -12276,6 +12339,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             options,
             &containment,
             CheckoutNxCheck::CloseRecorded,
+            YoungPolicy::Refuse,
         )
         .await
     }
@@ -13366,6 +13430,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 RemoveOptions::default(),
                 &containment,
                 CheckoutNxCheck::Held,
+                // The owner's own land retires the unit it just landed, however young.
+                YoungPolicy::Authorized,
             )
             .await
             .map_err(|kept| {
@@ -15840,6 +15906,13 @@ mod removal_refusal_tests {
             removal_unlanded_refusal(&workspace(), &oid('4'), &indeterminate(), None),
             removal_head_moved_refusal(&workspace(), &oid('1'), &oid('4')),
             main_removal_mode_refusal(),
+            removal_young_refusal(
+                &workspace(),
+                &YoungWorkspace {
+                    created_at: "2026-07-14T00:00:00Z".to_owned(),
+                    age: Some(std::time::Duration::from_secs(180)),
+                },
+            ),
             NativeProjectRuntimeHost::require_session_state_clean(&workspace(), &fence(true, None))
                 .expect_err("dirty is refused"),
             NativeProjectRuntimeHost::require_session_state_clean(
@@ -15848,6 +15921,54 @@ mod removal_refusal_tests {
             )
             .expect_err("an in-progress operation is refused"),
         ]
+    }
+    /// The age floor reads the workspace's recorded creation: younger than ten minutes is young,
+    /// a creation after now is clock skew and reads as age zero, and a creation time that cannot
+    /// be read is young with no age, so the guard fails closed.
+    #[test]
+    fn a_workspace_is_young_until_ten_minutes_and_an_unreadable_creation_stays_young() {
+        let created = "2026-07-14T00:00:00Z";
+        let at = |seconds: u64| {
+            std::time::UNIX_EPOCH
+                + std::time::Duration::from_secs(
+                    u64::try_from(
+                        crate::api::dto::UtcTimestamp::new(created)
+                            .unwrap()
+                            .epoch_seconds(),
+                    )
+                    .unwrap()
+                        + seconds,
+                )
+        };
+        assert_eq!(
+            YoungWorkspace::of(created, at(180)),
+            Some(YoungWorkspace {
+                created_at: created.to_owned(),
+                age: Some(std::time::Duration::from_secs(180)),
+            })
+        );
+        assert_eq!(YoungWorkspace::of(created, at(600)), None);
+        assert_eq!(
+            YoungWorkspace::of("2026-07-14T00:05:00Z", at(0)).and_then(|young| young.age),
+            Some(std::time::Duration::ZERO),
+            "a creation after now is age zero"
+        );
+        assert_eq!(
+            YoungWorkspace::of("not a time", at(86_400)),
+            Some(YoungWorkspace {
+                created_at: "not a time".to_owned(),
+                age: None,
+            })
+        );
+        assert_eq!(
+            crate::api::dto::UtcTimestamp::new("2026-07-14T02:00:00+02:00")
+                .unwrap()
+                .epoch_seconds(),
+            crate::api::dto::UtcTimestamp::new(created)
+                .unwrap()
+                .epoch_seconds(),
+            "an offset is applied"
+        );
     }
 
     /// The regression that produced this gate: a refusal that prescribed `--force` taught
@@ -19441,6 +19562,131 @@ fn removal_in_progress_refusal(workspace: &WorkspaceName, operation: &str) -> Co
     CowshedError::conflict(
         format!("workspace {workspace} has an in-progress {operation} Git operation"),
         "finish or abort the Git operation, then retry",
+    )
+}
+
+/// The age below which an explicit `rm` refuses a session workspace unless forced
+/// (02_workspaces.md, `rm` step 1): younger than the time it takes to write a first edit, a clean
+/// workspace at main is indistinguishable from a landed one, and it is not abandoned.
+#[cfg(target_os = "macos")]
+const YOUNG_WORKSPACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Whether a removal still asks how young its workspace is. Only an explicit removal does: a
+/// land retires the unit it just landed, and a replay finishes a removal already authorized.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum YoungPolicy {
+    Refuse,
+    Authorized,
+}
+
+#[cfg(target_os = "macos")]
+impl YoungPolicy {
+    /// `workspace`, when this removal refuses it for being younger than [`YOUNG_WORKSPACE`].
+    fn of(self, workspace: &NativeWorkspace) -> Result<Option<YoungWorkspace>> {
+        match self {
+            Self::Authorized => Ok(None),
+            Self::Refuse => Ok(YoungWorkspace::of(
+                &workspace.metadata.info_snapshot.created_at,
+                std::time::SystemTime::now(),
+            )),
+        }
+    }
+}
+
+/// A workspace younger than [`YOUNG_WORKSPACE`]: when it was created, and how long ago. A creation
+/// time that cannot be read is young with no age: the guard fails closed.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct YoungWorkspace {
+    created_at: String,
+    age: Option<std::time::Duration>,
+}
+
+#[cfg(target_os = "macos")]
+impl YoungWorkspace {
+    fn of(created_at: &str, now: std::time::SystemTime) -> Option<Self> {
+        let created = crate::api::dto::UtcTimestamp::new(created_at)
+            .ok()
+            .map(|created| created.epoch_seconds());
+        let now = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        // A creation after now is clock skew: it reads as age zero, never as old.
+        let age = created.map(|created| {
+            std::time::Duration::from_secs(
+                u64::try_from(
+                    i64::try_from(now)
+                        .unwrap_or(i64::MAX)
+                        .saturating_sub(created),
+                )
+                .unwrap_or(0),
+            )
+        });
+        match age {
+            Some(age) if age >= YOUNG_WORKSPACE => None,
+            age => Some(Self {
+                created_at: created_at.to_owned(),
+                age,
+            }),
+        }
+    }
+}
+
+/// What a removal's gates authorized: the commits an abandonment bundles, and, when forced, every
+/// guard the force overrode, for the deletion log.
+#[cfg(target_os = "macos")]
+struct NativeRemovalAuthority {
+    abandoning: Option<NativeLandedState>,
+    forced: Option<Vec<crate::storage::deletion_log::Overridden>>,
+}
+
+/// Every guard `--force` overrode on `fence` and `young`, in the order the gates ask them.
+#[cfg(target_os = "macos")]
+fn overridden_by_force(
+    fence: &NativeRemovalGitFence,
+    young: Option<&YoungWorkspace>,
+) -> Vec<crate::storage::deletion_log::Overridden> {
+    use crate::storage::deletion_log::Overridden;
+    let mut overridden = Vec::new();
+    if let Some(operation) = &fence.in_progress {
+        overridden.push(Overridden::InProgress {
+            operation: operation.clone(),
+        });
+    }
+    if fence.dirty {
+        overridden.push(Overridden::Dirty);
+    }
+    if let Some(young) = young {
+        overridden.push(Overridden::Young {
+            created_at: young.created_at.clone(),
+            age_seconds: young.age.map(|age| age.as_secs()),
+        });
+    }
+    overridden
+}
+
+/// A removal refused for youth names the guard and its floor, never the flag that overrides it:
+/// naming the override is what taught coordinator scripts to reach for it by reflex.
+#[cfg(target_os = "macos")]
+fn removal_young_refusal(workspace: &WorkspaceName, young: &YoungWorkspace) -> CowshedError {
+    let floor = YOUNG_WORKSPACE.as_secs() / 60;
+    let age = match young.age {
+        Some(age) if age.as_secs() < 60 => format!("{} seconds ago", age.as_secs()),
+        Some(age) => format!("{} minutes ago", age.as_secs() / 60),
+        None => String::from("at a time its record does not say readably"),
+    };
+    CowshedError::conflict(
+        format!(
+            "workspace {workspace} was created {age} ({}), and a workspace younger than {floor} \
+             minutes is not removed: whoever forked it may not have written its first edit yet, \
+             and until then it looks exactly like a landed one",
+            young.created_at
+        ),
+        format!(
+            "if {workspace} is yours and unneeded, remove it once it is {floor} minutes old; to \
+             keep its work: cowshed land {workspace}"
+        ),
     )
 }
 

@@ -135,6 +135,9 @@ impl Fixture {
         .await
     }
 
+    /// Remove `workspace`, forced past the age floor alone: every workspace these tests remove
+    /// is seconds old, younger than an explicit `rm` removes unforced (02_workspaces.md, `rm`
+    /// step 1), and nothing in one is dirty or running for the force to override.
     async fn remove(&self, runtime: &ProjectRuntime, workspace: &str) -> Result<Value> {
         self.call(
             runtime,
@@ -142,7 +145,7 @@ impl Fixture {
             json!({
                 "repoId": self.repo,
                 "workspace": workspace,
-                "options": RemoveOptions::default(),
+                "options": RemoveOptions { force: true, ..RemoveOptions::default() },
             }),
         )
         .await
@@ -1035,7 +1038,7 @@ async fn rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed(
             "coordinator.destroy",
             json!({
                 "repoId": fixture.repo, "workspace": "finished",
-                "options": RemoveOptions { abandon: true, ..RemoveOptions::default() },
+                "options": RemoveOptions { abandon: true, force: true, ..RemoveOptions::default() },
             }),
         )
         .await
@@ -1122,6 +1125,88 @@ fn assert_kept_by_ref(entry: &Value, head: &str, repository: &Path, reference: &
         kept_in.canonicalize().expect("kept repository"),
         repository.canonicalize().expect("main checkout"),
         "{entry}"
+    );
+}
+
+/// A clean workspace at main reads as landed, so an `rm` sweep can take one its owner forked a
+/// minute ago and has not written in yet. An explicit `rm` refuses a workspace that young, naming
+/// its age and the floor, and refuses a dirty one first; `--force` removes it, and the deletion
+/// log says which process forced it and past which guards (02_workspaces.md, `rm` step 1).
+#[tokio::test]
+async fn rm_refuses_a_young_or_dirty_workspace_unforced_and_journals_who_forced_it() {
+    let fixture = Fixture::new("rm-young");
+    let runtime = fixture.adopt().await;
+    let minted = fixture
+        .mint(&runtime, "fresh", ForkOptions::default())
+        .await
+        .expect("mint fresh");
+    let mount = PathBuf::from(minted["info"]["mount"].as_str().expect("fresh mount"));
+    let unforced = || {
+        fixture.call(
+            &runtime,
+            "coordinator.destroy",
+            json!({ "repoId": fixture.repo, "workspace": "fresh", "options": RemoveOptions::default() }),
+        )
+    };
+    let young = unforced()
+        .await
+        .expect_err("a workspace minted seconds ago is not removed unforced");
+    assert_eq!(young.code, cowshed_core::ErrorCode::Conflict, "{young:?}");
+    assert!(
+        young.message.contains("workspace fresh was created")
+            && young
+                .message
+                .contains("younger than 10 minutes is not removed"),
+        "{young:?}"
+    );
+    assert!(!young.hint.contains("--force"), "{young:?}");
+
+    fs::write(mount.join("draft"), b"first edit\n").expect("an uncommitted edit");
+    let dirty = unforced()
+        .await
+        .expect_err("uncommitted work is not removed unforced");
+    assert!(
+        dirty.message.contains("has uncommitted Git work"),
+        "{dirty:?}"
+    );
+    assert!(mount.join("draft").exists(), "a refusal keeps the edit");
+
+    fixture
+        .call(
+            &runtime,
+            "coordinator.destroy",
+            json!({
+                "repoId": fixture.repo, "workspace": "fresh",
+                "options": RemoveOptions { force: true, ..RemoveOptions::default() },
+            }),
+        )
+        .await
+        .expect("--force removes it");
+    runtime.shutdown().await.expect("stop the runtime");
+    let retired = deletion_log(&fixture, "retire-workspace", "fresh");
+    let by = &retired["retiredBy"];
+    assert_eq!(by["caller"]["pid"], json!(std::process::id()), "{retired}");
+    assert_eq!(
+        by["caller"]["argv"],
+        json!(
+            std::env::args_os()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        ),
+        "{retired}"
+    );
+    let forced = by["forced"].as_array().expect("a forced removal says so");
+    assert_eq!(forced[0], json!({ "guard": "dirty" }), "{retired}");
+    assert_eq!(forced[1]["guard"], "young", "{retired}");
+    assert_eq!(
+        forced[1]["createdAt"], minted["info"]["createdAt"],
+        "{retired}"
+    );
+    assert!(
+        forced[1]["ageSeconds"]
+            .as_u64()
+            .is_some_and(|age| age < 600),
+        "{retired}"
     );
 }
 
@@ -1213,7 +1298,7 @@ async fn gc_retires_the_abandoned_refs_main_holds_and_supersedes_the_rest_only_w
                 "coordinator.destroy",
                 json!({
                     "repoId": fixture.repo, "workspace": workspace,
-                    "options": RemoveOptions { abandon: true, ..RemoveOptions::default() },
+                    "options": RemoveOptions { abandon: true, force: true, ..RemoveOptions::default() },
                 }),
             )
             .await
