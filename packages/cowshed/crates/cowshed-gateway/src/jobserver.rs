@@ -807,19 +807,17 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_pool_binds_and_serves_with_a_real_fixture_length_store() {
-        use std::os::unix::fs::DirBuilderExt as _;
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
-        let root = std::fs::canonicalize("/tmp").unwrap().join(format!(
-            "cowshed-dtest-{}-{}-cli",
-            std::process::id(),
-            &uuid::Uuid::new_v4().simple().to_string()[..4]
-        ));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&root)
-            .unwrap();
-        let store = root.join("store");
+        let root = crate::control::test_fixture_dir::secure_fixture_dir_in(
+            &std::fs::canonicalize("/tmp").unwrap(),
+            &format!(
+                "cowshed-dtest-{}-{}-cli",
+                std::process::id(),
+                &uuid::Uuid::new_v4().simple().to_string()[..4]
+            ),
+        );
+        let store = root.path().join("store");
         let incarnation = "0123456789abcdef0123456789abcdef";
         let previous_layout = store
             .join("run/cpu-pool")
@@ -874,7 +872,6 @@ mod tests {
         assert_eq!(reader.read_line(&mut line).await.unwrap(), 0);
         assert!(!endpoint.exists());
         assert!(!fifo.exists(), "closing the pool unlinks its fifo");
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// One held `cpu-pool` connection, answered `queued`.
@@ -913,16 +910,14 @@ mod tests {
     /// the fifo and a child asking the socket draw on one count, never on two.
     #[tokio::test]
     async fn a_lent_pool_lends_its_fifo_bytes_and_its_holders_own_token_and_nothing_twice() {
-        use std::os::unix::fs::DirBuilderExt as _;
-        let root = std::fs::canonicalize("/tmp").unwrap().join(format!(
-            "cowshed-lend-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&root)
-            .unwrap();
-        let fifos = JobserverFifos::start(root.join("store/jobserver"));
+        let root = crate::control::test_fixture_dir::secure_fixture_dir_in(
+            &std::fs::canonicalize("/tmp").unwrap(),
+            &format!(
+                "cowshed-lend-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..8]
+            ),
+        );
+        let fifos = JobserverFifos::start(root.path().join("store/jobserver"));
         let pool = fifos
             .create_pool(
                 PoolSource::Lent(std::num::NonZeroUsize::new(3).unwrap()),
@@ -972,7 +967,6 @@ mod tests {
         drop(first);
         pool.close().await.unwrap();
         assert!(!fifo.exists());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -980,7 +974,11 @@ mod tests {
         use tokio::io::AsyncReadExt as _;
 
         for explicit_close in [true, false] {
-            let root = PathBuf::from(format!("/tmp/cspr-{}", uuid::Uuid::new_v4().simple()));
+            let scratch = crate::control::test_fixture_dir::secure_fixture_dir(&format!(
+                "cspr-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..8]
+            ));
+            let root = scratch.path().join("s");
             let pool = CpuPool::start(
                 std::sync::Arc::new(root.clone()),
                 PoolSource::Lent(std::num::NonZeroUsize::new(2).unwrap()),
@@ -1020,7 +1018,6 @@ mod tests {
             }
             assert!(!endpoint.exists());
             assert!(!fifo.exists(), "retirement unlinks the pool's fifo");
-            std::fs::remove_dir_all(root).unwrap();
         }
     }
 

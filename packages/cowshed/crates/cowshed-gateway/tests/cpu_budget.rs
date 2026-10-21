@@ -2,6 +2,9 @@
 //! The host CPU budget over a real control socket: grants, fairness between checkouts, the
 //! ledger, and tokens coming back when a holder is killed.
 
+#[path = "support/fixture_dir.rs"]
+mod fixture_dir;
+
 use std::io::{BufRead as _, BufReader as StdBufReader, Write as _};
 use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt as _;
@@ -64,17 +67,14 @@ impl AuditSink for DiscardAudit {
 }
 
 /// A gateway with a budget of `tokens` on a socket under `/tmp` (a bind path is capped at
-/// `sun_path`'s 104 bytes), and the root to remove once it has drained.
-async fn gateway(tokens: usize) -> (Gateway, PathBuf, PathBuf) {
+/// `sun_path`'s 104 bytes), and the guard that removes its root on every exit path.
+async fn gateway(tokens: usize) -> (Gateway, fixture_dir::FixtureDir, PathBuf) {
     let id = Uuid::new_v4().simple().to_string();
-    let root = PathBuf::from(format!("/tmp/cscpu-{}", &id[..8]));
-    std::fs::create_dir(&root).expect("create fixture root");
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
-        .expect("secure fixture root");
-    let cache = root.join("cache");
+    let root = fixture_dir::secure_fixture_dir(&format!("cscpu-{}", &id[..8]));
+    let cache = root.path().join("cache");
     std::fs::create_dir(&cache).expect("cache");
     std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).expect("secure cache");
-    let socket = root.join("gateway.sock");
+    let socket = root.path().join("gateway.sock");
     let gateway = Gateway::start(
         GatewayConfig {
             control_socket: Some(socket.clone()),
@@ -298,7 +298,7 @@ async fn grant_handoff_and_selection_timings_need_no_environment_switch() {
         return;
     }
     assert!(std::env::var_os("COWSHED_TIMING").is_none());
-    let (gateway, root, socket) = gateway(2).await;
+    let (gateway, _root, socket) = gateway(2).await;
     let mut holder = Asker::ask(&socket, 1, "/w/holder").await;
     assert_eq!(holder.granted().await, 1);
     let mut waiter = Asker::ask(&socket, 1, "/w/waiter").await;
@@ -346,12 +346,11 @@ async fn grant_handoff_and_selection_timings_need_no_environment_switch() {
     assert_eq!(ledger(&socket).await.held, 2);
     drop((head, other));
     gateway.drain().await.expect("drain");
-    std::fs::remove_dir_all(root).expect("clean timing fixture");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
-    let (gateway, root, socket) = gateway(8).await;
+    let (gateway, _root, socket) = gateway(8).await;
     // The holder takes background's whole half, so a second background checkout queues whole.
     // The holder is another process, so SIGKILL is a real death: the kernel closes its socket.
     let mut holder = Command::new("/usr/bin/nc")
@@ -403,12 +402,11 @@ async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
     drop(input);
 
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkouts_share_the_background_half_and_a_lone_grant_fills_it() {
-    let (gateway, root, socket) = gateway(16).await;
+    let (gateway, _root, socket) = gateway(16).await;
 
     // Alone, one background grant fills background's half of the host, 8 of 16.
     let mut whole = Asker::ask(&socket, 64, "/w/a").await;
@@ -446,12 +444,11 @@ async fn checkouts_share_the_background_half_and_a_lone_grant_fills_it() {
 
     drop((a_next, b));
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_jobserver_grant_names_a_fifo_and_close_returns_every_token() {
-    let (gateway, root, socket) = gateway(8).await;
+    let (gateway, _root, socket) = gateway(8).await;
     let stream = UnixStream::connect(&socket).await.expect("connect");
     let (reader, mut writer) = stream.into_split();
     writer
@@ -491,13 +488,12 @@ async fn a_jobserver_grant_names_a_fifo_and_close_returns_every_token() {
     }
 
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// The gate's own half is held by an older gate, so it waits for a returned token like anyone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_gate_takes_the_larger_part_of_returned_tokens_before_older_background_work() {
-    let (gateway, root, socket) = gateway(8).await;
+    let (gateway, _root, socket) = gateway(8).await;
     let mut holder = Asker::ask(&socket, 8, "/w/background").await;
     assert_eq!(holder.granted().await, 4);
     let mut first_gate = Asker::jobserver(&socket, 4, "/w/first-gate").await;
@@ -524,7 +520,6 @@ async fn a_gate_takes_the_larger_part_of_returned_tokens_before_older_background
     assert_eq!((status.total, status.held), (8, 8));
     drop((first_gate, gate, old_background));
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// The measured hole, over the socket (05_gateway.md "Room for a gate"): a background run that
@@ -534,7 +529,7 @@ async fn a_gate_takes_the_larger_part_of_returned_tokens_before_older_background
 /// being returned, so the gate's wait is the ledger's own transition, not any run's length.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_gate_is_granted_the_free_half_while_a_lone_background_grant_still_holds_its_own() {
-    let (gateway, root, socket) = gateway(8).await;
+    let (gateway, _root, socket) = gateway(8).await;
     let mut smoke = Asker::ask(&socket, 8, "/w/smoke").await;
     assert_eq!(smoke.granted().await, 4);
     let mut other = Asker::ask(&socket, 8, "/w/other").await;
@@ -558,12 +553,11 @@ async fn a_gate_is_granted_the_free_half_while_a_lone_background_grant_still_hol
     assert_eq!(other.granted().await, 4);
     drop((gate, task, other));
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_running_gate_holds_up_neither_background_nor_a_later_gate_while_tokens_are_free() {
-    let (gateway, root, socket) = gateway(8).await;
+    let (gateway, _root, socket) = gateway(8).await;
     let mut gate = Asker::jobserver(&socket, 4, "/w/gate").await;
     assert_eq!(gate.granted().await, 4);
     let mut background = Asker::ask(&socket, 1, "/w/background").await;
@@ -573,12 +567,11 @@ async fn a_running_gate_holds_up_neither_background_nor_a_later_gate_while_token
     assert_eq!(ledger(&socket).await.held, 7);
     drop((gate, background, next_gate));
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_gate_jobs_pool_admits_each_child_while_older_background_work_stays_queued() {
-    let (gateway, root, socket) = gateway(4).await;
+    let (gateway, _root, socket) = gateway(4).await;
     // The land's gate job holds only its orchestrator's token.
     let (gate, pool) = Asker::gate_job(&socket, "/w/land").await;
     let mut a = Asker::ask(&socket, 2, "/w/a").await;
@@ -604,7 +597,6 @@ async fn a_gate_jobs_pool_admits_each_child_while_older_background_work_stays_qu
     assert_eq!(queued.granted().await, 1);
     drop((gate, queued));
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// 05_gateway.md "A queued CPU ask outlives an install". Measured 2026-10-18: an install
@@ -616,7 +608,7 @@ async fn a_gate_jobs_pool_admits_each_child_while_older_background_work_stays_qu
 /// before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_install_restart_tells_every_queued_cpu_ask_which_install_cut_it_off() {
-    let (gateway, root, socket) = gateway(2).await;
+    let (gateway, _root, socket) = gateway(2).await;
     let (_gate, pool) = Asker::gate_job(&socket, "/w/land").await;
     let mut holder = Asker::ask(&socket, 1, "/w/a").await;
     assert_eq!(holder.granted().await, 1);
@@ -660,14 +652,13 @@ async fn an_install_restart_tells_every_queued_cpu_ask_which_install_cut_it_off(
         "a holder is told nothing: its grant ends with its connection"
     );
     drop(serving);
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// With no install serving the handoff socket a restart is what it always was: a queued ask's
 /// connection closes with no answer, so its client is never sent to ask again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restart_no_install_serves_cuts_a_queued_ask_off_unnamed() {
-    let (gateway, root, socket) = gateway(1).await;
+    let (gateway, _root, socket) = gateway(1).await;
     let mut holder = Asker::ask(&socket, 1, "/w/a").await;
     assert_eq!(holder.granted().await, 1);
     let mut queued = Asker::ask(&socket, 1, "/w/b").await;
@@ -680,13 +671,12 @@ async fn a_restart_no_install_serves_cuts_a_queued_ask_off_unnamed() {
         .expect("the queued connection ends");
     assert_eq!(rest, "", "no install named, so no install-restart answer");
     drop(holder);
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_older_land_task_is_served_before_a_younger_lands_and_a_feature_builds_that_asked_first()
 {
-    let (gateway, root, socket) = gateway(4).await;
+    let (gateway, _root, socket) = gateway(4).await;
     let (older, older_pool) = Asker::gate_job(&socket, "/w/older").await;
     let (younger, younger_pool) = Asker::gate_job(&socket, "/w/younger").await;
     // A feature shed holds the rest of the host with two runners, and its next one waits first.
@@ -811,7 +801,6 @@ async fn an_older_land_task_is_served_before_a_younger_lands_and_a_feature_build
     assert_eq!(feature_next.granted().await, 1);
     drop((older, younger, younger_task, feature_next));
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// The measured failure, over the socket: an older land's gate job holds most of the host with
@@ -821,7 +810,7 @@ async fn an_older_land_task_is_served_before_a_younger_lands_and_a_feature_build
 /// bound ever refuses it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_younger_land_is_served_its_floor_while_an_older_land_holds_most_of_the_host() {
-    let (gateway, root, socket) = gateway(8).await;
+    let (gateway, _root, socket) = gateway(8).await;
     let (older, older_pool) = Asker::gate_job(&socket, "/w/older").await;
     let mut older_task = Asker::child(&older_pool, 5).await;
     assert_eq!(older_task.granted().await, 5);
@@ -841,12 +830,11 @@ async fn a_younger_land_is_served_its_floor_while_an_older_land_holds_most_of_th
     assert_eq!(older_next.granted().await, 4);
     drop((older, older_next, own, other, younger));
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn jobserver_class_is_validated_and_a_wait_bound_is_an_unknown_field() {
-    let (gateway, root, socket) = gateway(4).await;
+    let (gateway, _root, socket) = gateway(4).await;
     for fields in [
         serde_json::json!({"class":"pretend-gate"}),
         serde_json::json!({"class":"gate","waitMs":120_000}),
@@ -869,14 +857,13 @@ async fn jobserver_class_is_validated_and_a_wait_bound_is_an_unknown_field() {
     }
     assert_eq!(ledger(&socket).await.held, 0);
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// A grant never grows (05_gateway.md "All at once"): `grow` is an unknown field on a root
 /// `jobserver` request and on a child's `cpu-pool` ask alike, refused before anything is queued.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_jobserver_or_cpu_pool_request_naming_grow_is_an_invalid_request() {
-    let (gateway, root, socket) = gateway(4).await;
+    let (gateway, _root, socket) = gateway(4).await;
     let (gate, pool) = Asker::gate_job(&socket, "/w/land").await;
     for (target, request) in [
         (
@@ -895,7 +882,6 @@ async fn a_jobserver_or_cpu_pool_request_naming_grow_is_an_invalid_request() {
     assert_eq!(ledger(&socket).await.held, 1);
     drop(gate);
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// One answer line off a lease connection, byte by byte, so nothing past it is read out of a
@@ -965,7 +951,7 @@ async fn resident(socket: &Path, checkout: &str, job_id: u64) -> (tokio::process
 /// behind them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resident_holds_no_token_and_each_request_it_runs_asks_the_host() {
-    let (gateway, root, socket) = gateway(4).await;
+    let (gateway, _root, socket) = gateway(4).await;
     // A resident in each of eight sheds, against a host of four tokens, two of them background's.
     let mut residents = Vec::new();
     for shed in 0..8_u64 {
@@ -1015,7 +1001,6 @@ async fn a_resident_holds_no_token_and_each_request_it_runs_asks_the_host() {
     }
     assert_eq!(ledger(&socket).await.held, 0);
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// The class an API caller names on its exec request reaches the real ledger through the
@@ -1029,7 +1014,7 @@ async fn each_exec_class_takes_its_own_ledger_place_through_the_supervisors_admi
     use cowshed_core::api::{ExecClass, JobId};
     use cowshed_core::runtime::job_cpu::{GatewayJobCpu, JobCpuAdmission as _, JobCpuAsk};
 
-    let (gateway, root, socket) = gateway(4).await;
+    let (gateway, _root, socket) = gateway(4).await;
     let admission = GatewayJobCpu::new(socket.clone());
     let ask = |class: ExecClass, want: usize, checkout: &str, job: u64| JobCpuAsk {
         class,
@@ -1097,7 +1082,6 @@ async fn each_exec_class_takes_its_own_ledger_place_through_the_supervisors_admi
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// A shell activation with no command yet to use a token -- a resident's start, a pool's spare --
@@ -1108,7 +1092,7 @@ async fn each_exec_class_takes_its_own_ledger_place_through_the_supervisors_admi
 async fn an_activation_stake_holds_one_background_token_until_it_drops() {
     use cowshed_core::runtime::job_cpu::{GatewayJobCpu, JobCpuAdmission as _};
 
-    let (gateway, root, socket) = gateway(4).await;
+    let (gateway, _root, socket) = gateway(4).await;
     let admission = GatewayJobCpu::new(socket.clone());
     let stake = admission
         .activation(
@@ -1135,7 +1119,6 @@ async fn an_activation_stake_holds_one_background_token_until_it_drops() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// Two checkouts of one repository cannot run gates together, even when the queued gate
@@ -1145,7 +1128,7 @@ async fn gates_serialize_per_repository_through_supervisor_admission_not_parent_
     use cowshed_core::api::ExecClass;
     use cowshed_core::runtime::job_cpu::{GatewayJobCpu, JobCpuAdmission as _};
 
-    let (gateway, root, socket) = gateway(8).await;
+    let (gateway, _root, socket) = gateway(8).await;
     let admission = GatewayJobCpu::new(socket.clone());
     let mut first_ask = exec_ask(1, "/w/first", 1, None);
     first_ask.class = ExecClass::Gate;
@@ -1211,7 +1194,6 @@ async fn gates_serialize_per_repository_through_supervisor_admission_not_parent_
         tokio::task::yield_now().await;
     }
     gateway.drain().await.expect("drain");
-    std::fs::remove_dir_all(root).expect("clean repository fixture");
 }
 
 /// A background exec of `checkout`'s job `job`, as a supervisor asks it, from a requester that
@@ -1248,7 +1230,7 @@ fn exec_ask(
 async fn a_holder_at_backgrounds_room_has_its_childs_exec_granted_from_its_own_pool() {
     use cowshed_core::runtime::job_cpu::{GatewayJobCpu, JobCpuAdmission as _};
 
-    let (gateway, root, socket) = gateway(4).await;
+    let (gateway, _root, socket) = gateway(4).await;
     let admission = GatewayJobCpu::new(socket.clone());
     // The holder takes background's whole room: 2 of 4 tokens.
     let holder = admission
@@ -1330,7 +1312,6 @@ async fn a_holder_at_backgrounds_room_has_its_childs_exec_granted_from_its_own_p
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// Wait until `checkout`'s background stake has exactly `count` waiters in the ledger. A count
@@ -1376,7 +1357,7 @@ async fn pool_child(pool: &Path, want: usize) -> (UnixStream, u64) {
 async fn a_holders_exec_whose_pool_is_busy_is_granted_by_the_host_when_it_has_room() {
     use cowshed_core::runtime::job_cpu::{GatewayJobCpu, JobCpuAdmission as _};
 
-    let (gateway, root, socket) = gateway(4).await;
+    let (gateway, _root, socket) = gateway(4).await;
     let admission = GatewayJobCpu::new(socket.clone());
     let holder = admission
         .admit(exec_ask(1, "/w/holder", 1, None))
@@ -1407,7 +1388,6 @@ async fn a_holders_exec_whose_pool_is_busy_is_granted_by_the_host_when_it_has_ro
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// With the host full and its holder's pool busy, an exec from the holder waits at the host,
@@ -1419,7 +1399,7 @@ async fn a_holders_exec_whose_pool_is_busy_is_granted_by_the_host_when_it_has_ro
 async fn a_holders_exec_on_a_full_host_with_a_busy_pool_is_granted_by_whichever_frees_first() {
     use cowshed_core::runtime::job_cpu::{GatewayJobCpu, JobCpuAdmission as _};
 
-    let (gateway, root, socket) = gateway(4).await;
+    let (gateway, _root, socket) = gateway(4).await;
     let admission = GatewayJobCpu::new(socket.clone());
     let holder = admission
         .admit(exec_ask(1, "/w/holder", 1, None))
@@ -1470,5 +1450,4 @@ async fn a_holders_exec_on_a_full_host_with_a_busy_pool_is_granted_by_whichever_
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }

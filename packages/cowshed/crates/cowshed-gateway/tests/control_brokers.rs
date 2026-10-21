@@ -1,6 +1,9 @@
 #![cfg(target_os = "macos")]
 
-use std::{os::unix::fs::PermissionsExt as _, path::PathBuf, sync::Arc};
+#[path = "support/fixture_dir.rs"]
+mod fixture_dir;
+
+use std::{os::unix::fs::PermissionsExt as _, sync::Arc};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -58,14 +61,11 @@ impl AuditSink for DiscardAudit {
 }
 
 /// Deliberately `/tmp` rather than `TMPDIR`: this root holds `gateway.sock`, and a bind path is
-/// capped at `sun_path`'s 104 bytes — a per-user TMPDIR alone spends half of that on macOS.
-fn fixture_root() -> PathBuf {
+/// capped at `sun_path`'s 104 bytes — a per-user TMPDIR alone spends half of that on macOS. The
+/// guard removes it on every exit path.
+fn fixture_root() -> fixture_dir::FixtureDir {
     let id = Uuid::new_v4().simple().to_string();
-    let root = PathBuf::from(format!("/tmp/csctl-{}", &id[..8]));
-    std::fs::create_dir(&root).expect("create fixture root");
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
-        .expect("secure fixture root");
-    root
+    fixture_dir::secure_fixture_dir(&format!("csctl-{}", &id[..8]))
 }
 
 fn write_credential(path: &std::path::Path, byte: u8, controller_domain: bool) {
@@ -99,13 +99,13 @@ async fn raw_tcp(request: serde_json::Value) -> serde_json::Value {
 #[tokio::test]
 async fn tcp_credential_is_distinct_unix_is_local_and_shutdown_closes_both() {
     let root = fixture_root();
-    let cache = root.join("cache");
+    let cache = root.path().join("cache");
     std::fs::create_dir(&cache).expect("cache");
     std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).expect("secure cache");
-    let socket = root.join("gateway.sock");
-    let credential = root.join("controller.credential");
-    let wrong_credential = root.join("wrong.credential");
-    let data_token_file = root.join("workspace.token");
+    let socket = root.path().join("gateway.sock");
+    let credential = root.path().join("controller.credential");
+    let wrong_credential = root.path().join("wrong.credential");
+    let data_token_file = root.path().join("workspace.token");
     write_credential(&credential, 7, true);
     write_credential(&wrong_credential, 8, true);
     write_credential(&data_token_file, 7, false);
@@ -181,5 +181,4 @@ async fn tcp_credential_is_distinct_unix_is_local_and_shutdown_closes_both() {
     gateway.drain().await.expect("drain");
     assert!(!socket.exists());
     assert!(TcpStream::connect(CONTROL_TCP_ADDR).await.is_err());
-    let _ = std::fs::remove_dir_all(root);
 }

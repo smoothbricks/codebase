@@ -38,3 +38,5 @@ toml.workspace = true
 # Paused time: a test lets a day pass while a foreground exec still waits for its job.
 tokio = { workspace = true, features = ["test-util"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+# The shared TempRoot fixture (cowshed-core/tests/support/temp_root.rs) names its directories.
+uuid = { version = "1", features = ["v4"] }

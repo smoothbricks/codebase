@@ -5523,11 +5523,7 @@ fn main() {
             .unwrap()
             .expect("the landing volume had no Nx client at quiesce");
         // Short, under /tmp: a Unix socket path is bounded at 104 bytes on macOS.
-        let sockets = Path::new("/tmp").join(format!(
-            "cs-seal-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
-        fs::create_dir_all(&sockets).unwrap();
+        let sockets = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cs-seal");
         let socket = sockets.join("d.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let mut daemon = std::process::Command::new("/bin/sleep")
@@ -5556,7 +5552,6 @@ fn main() {
             daemon.wait().unwrap();
         }
         drop(listener);
-        fs::remove_dir_all(&sockets).unwrap();
         drop(quiet);
         drop(locked);
         scratch.release_all();
@@ -5898,11 +5893,7 @@ fn main() {
         for id in [&source, &destination] {
             drop(scratch.layout.admit(id).unwrap());
         }
-        let sockets = Path::new("/tmp").join(format!(
-            "cs-carry-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
-        fs::create_dir_all(&sockets).unwrap();
+        let sockets = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cs-carry");
         let socket = sockets.join("d.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let admission = sockets.join("admission");
@@ -5977,7 +5968,6 @@ fn main() {
             .output_locked()
             .unwrap();
         drop(listener);
-        fs::remove_dir_all(sockets).unwrap();
         scratch.release_all();
         assert!(stopped.is_some(), "the carry stopped the recorded daemon");
         assert_eq!(
@@ -6032,11 +6022,7 @@ fn main() {
             )
             .unwrap();
         // Short, under /tmp: a Unix socket path is bounded at 104 bytes on macOS.
-        let sockets = Path::new("/tmp").join(format!(
-            "cs-keep-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
-        fs::create_dir_all(&sockets).unwrap();
+        let sockets = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cs-keep");
         let socket = sockets.join("d.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let admission = sockets.join("admission");
@@ -6111,7 +6097,6 @@ fn main() {
             unsafe { libc::kill(child, libc::SIGKILL) };
         }
         drop(listener);
-        fs::remove_dir_all(&sockets).unwrap();
         let seeds = seeds_of(&scratch.layout, &target).unwrap();
         scratch.release_all();
         assert!(stopped.is_some(), "the reseed stops the recorded daemon");

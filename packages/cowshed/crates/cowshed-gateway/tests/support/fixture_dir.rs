@@ -66,7 +66,14 @@ pub fn scratch_parent() -> PathBuf {
 /// strategy that hands back a directory this fixture did not create, from resurfacing as a bare
 /// `InvalidInput` raised deep inside `Gateway::start`, which names neither the path nor the mode.
 pub fn secure_fixture_dir(name: &str) -> FixtureDir {
-    let path = scratch_parent().join(name);
+    secure_fixture_dir_in(&scratch_parent(), name)
+}
+
+/// [`secure_fixture_dir`] under `parent`, for a fixture whose paths are spelled from one
+/// particular parent, such as the canonical `/private/tmp` a real store sits under.
+#[allow(dead_code)]
+pub fn secure_fixture_dir_in(parent: &Path, name: &str) -> FixtureDir {
+    let path = parent.join(name);
     let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir(&path)
         .unwrap_or_else(|error| panic!("create fixture directory {}: {error}", path.display()));

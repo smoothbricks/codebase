@@ -1081,11 +1081,7 @@ mod tests {
     #[test]
     fn a_daemon_is_live_only_while_its_recorded_process_runs_and_its_socket_accepts() {
         // Short, under /tmp: a Unix socket path is bounded at 104 bytes on macOS.
-        let root = Path::new("/tmp").join(format!(
-            "cs-nxd-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
-        std::fs::create_dir_all(&root).expect("scratch");
+        let root = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cs-nxd");
         let record = root.join("server-process.json");
         let socket = root.join("d.sock");
         let own = std::process::id();
@@ -1122,8 +1118,6 @@ mod tests {
 
         std::fs::write(&record, b"{\"processId\":0,\"socketPath\":\"/tmp/x\"}").expect("record");
         assert_eq!(probe(&record), Probe::Unreadable);
-
-        std::fs::remove_dir_all(&root).expect("remove scratch");
     }
 
     /// A project with no Nx state: stopping its daemon finds none to signal, so a verdict made

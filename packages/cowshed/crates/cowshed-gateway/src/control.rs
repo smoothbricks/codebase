@@ -2477,7 +2477,7 @@ pub enum ControlError {
 
 #[cfg(test)]
 #[path = "../tests/support/fixture_dir.rs"]
-mod test_fixture_dir;
+pub(crate) mod test_fixture_dir;
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
@@ -2638,9 +2638,8 @@ mod tests {
     async fn an_install_reads_the_gates_of_a_ledger_from_another_build() {
         // Under `/tmp`: a bind path is capped at `sun_path`'s 104 bytes.
         let id = Uuid::new_v4().simple().to_string();
-        let root = PathBuf::from(format!("/tmp/csgates-{}", &id[..8]));
-        std::fs::create_dir(&root).expect("root");
-        let socket = root.join("gateway.sock");
+        let root = test_fixture_dir::secure_fixture_dir(&format!("csgates-{}", &id[..8]));
+        let socket = root.path().join("gateway.sock");
         let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
         let answer = serde_json::json!({"ok": true, "cpuBudget": {"total": 4, "held": 3,
             "checkouts": [{"checkout": "/w/land", "held": 2, "running": 2, "waiting": 1},
@@ -2679,7 +2678,6 @@ mod tests {
             "the full ledger of another build is not this build's"
         );
         answering.await.expect("the answers");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A daemon that takes the request and never answers is refused once the asker's bound

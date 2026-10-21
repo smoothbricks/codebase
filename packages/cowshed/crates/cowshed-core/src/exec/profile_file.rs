@@ -216,12 +216,9 @@ mod tests {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     /// A fresh directory under `/tmp`, short enough for a socket inside it to bind (`sun_path`
-    /// holds 104 bytes).
-    fn scratch() -> PathBuf {
-        PathBuf::from(format!(
-            "/tmp/cowshed-pf-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ))
+    /// holds 104 bytes), removed with its guard on every exit path.
+    fn scratch() -> crate::temp_root::TempRoot {
+        crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cowshed-pf")
     }
 
     /// Set `path`'s modification time to `seconds` after the epoch, without following a symlink.
@@ -249,7 +246,8 @@ mod tests {
 
     #[test]
     fn a_profile_is_written_once_read_only_kept_and_its_launches_bump_it() {
-        let directory = scratch();
+        let scratch = scratch();
+        let directory = scratch.join("profiles");
         let first = ProfileFile::write(&directory, "(version 1)(allow default)").unwrap();
         assert_eq!(
             fs::read_to_string(first.path()).unwrap(),
@@ -282,7 +280,6 @@ mod tests {
             2,
             "dropping a handle removes nothing"
         );
-        fs::remove_dir_all(&directory).unwrap();
     }
 
     /// gc removes a profile file exactly when its last launch predates the start of the store's
@@ -291,7 +288,8 @@ mod tests {
     /// the file again.
     #[test]
     fn gc_removes_a_profile_only_when_every_live_supervisor_started_after_its_last_launch() {
-        let store = scratch();
+        let scratch = scratch();
+        let store = scratch.join("store");
         let run = store.join("run");
         let profile = "(version 1)(allow default)";
         let file = ProfileFile::write(&profile_directory(&store), profile).unwrap();
@@ -336,7 +334,6 @@ mod tests {
             0,
             "a launch after the youngest supervisor started keeps its file"
         );
-        fs::remove_dir_all(&store).unwrap();
     }
 
     #[test]

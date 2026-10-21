@@ -4522,18 +4522,26 @@ mod tests {
         }
 
         /// A daemon's gateway, its supervisor manager, and the supervisors it found, composed
-        /// as `run_daemon` composes them, under `/tmp/<name>-<pid>` with `sockets` under `run`.
+        /// as `run_daemon` composes them, under `root` with `sockets` under `run`. The root goes
+        /// with the daemon on every exit path.
         struct Daemon {
-            root: PathBuf,
+            root: crate::temp_root::TempRoot,
             socket: PathBuf,
             gateway: Gateway,
             recovery: Recovery,
         }
 
-        async fn daemon(name: &str, sockets: &[&str], heal: Arc<StartupHealState>) -> Daemon {
+        /// A daemon's private root, named after `name`.
+        fn gateway_root(name: &str) -> crate::temp_root::TempRoot {
             // `/tmp`, not TMPDIR: the gateway socket's path has to fit in `sun_path`.
-            let root = PathBuf::from(format!("/tmp/{name}-{}", std::process::id()));
-            private_directory(&root);
+            crate::temp_root::TempRoot::new_in(Path::new("/tmp"), name)
+        }
+
+        async fn daemon(
+            root: crate::temp_root::TempRoot,
+            sockets: &[&str],
+            heal: Arc<StartupHealState>,
+        ) -> Daemon {
             let store = root.join("store");
             fs::create_dir_all(store.join("run")).expect("run directory");
             for socket in sockets {
@@ -4585,7 +4593,7 @@ mod tests {
         #[tokio::test]
         async fn the_control_socket_counts_supervisors_still_draining() {
             let daemon = daemon(
-                "csrecover",
+                gateway_root("csrecover"),
                 &["first.sock", "second.sock"],
                 Arc::new(StartupHealState::healed()),
             )
@@ -4619,7 +4627,6 @@ mod tests {
             assert_eq!(drained.recovering, None);
 
             daemon.gateway.drain().await.expect("drain the gateway");
-            fs::remove_dir_all(&daemon.root).expect("cleanup");
         }
 
         /// The control socket answers from the first moment, while the startup pass still mounts
@@ -4629,7 +4636,7 @@ mod tests {
         #[tokio::test]
         async fn the_control_socket_answers_while_the_startup_pass_mounts() {
             let heal = Arc::new(StartupHealState::mounting(2));
-            let daemon = daemon("csheal", &[], Arc::clone(&heal)).await;
+            let daemon = daemon(gateway_root("csheal"), &[], Arc::clone(&heal)).await;
             let client =
                 GatewayControlClient::new(daemon.socket.clone()).expect("a control client");
             let mounting = StartupHeal::Mounting {
@@ -4682,7 +4689,6 @@ mod tests {
             );
 
             daemon.gateway.drain().await.expect("drain the gateway");
-            fs::remove_dir_all(&daemon.root).expect("cleanup");
         }
 
         /// A land's gate job holding its orchestrator's token on `socket`, as the supervisor's
@@ -4724,7 +4730,7 @@ mod tests {
         async fn an_install_waits_until_no_gate_job_holds_or_wants_cpu_tokens() {
             let heal = Arc::new(StartupHealState::mounting(0));
             heal.restored();
-            let daemon = daemon("csgatewait", &[], heal).await;
+            let daemon = daemon(gateway_root("csgatewait"), &[], heal).await;
             let client = GatewayControlClient::new(daemon.socket.clone()).expect("client");
             let support = daemon.root.join("dev.cowshed");
             fs::create_dir(&support).expect("support directory");
@@ -4806,7 +4812,6 @@ mod tests {
             assert_eq!(observed(), None, "the slot is free");
 
             daemon.gateway.drain().await.expect("drain the gateway");
-            fs::remove_dir_all(&daemon.root).expect("cleanup");
         }
 
         /// The measured failure: `setup` restarted the gateway and released the install slot at
@@ -4815,12 +4820,10 @@ mod tests {
         /// started serves: before its control socket answers, and through its startup pass.
         #[tokio::test]
         async fn an_install_holds_the_slot_until_the_gateway_it_started_serves() {
-            let support = PathBuf::from(format!("/tmp/csinstserve-{}", std::process::id()));
-            private_directory(&support);
+            let support = gateway_root("csinstserve");
             let slot = InstallSlot::take(&support).await.expect("the slot");
-            let name = "csinstserve-gw";
-            let socket =
-                PathBuf::from(format!("/tmp/{name}-{}", std::process::id())).join("gateway.sock");
+            let root = gateway_root("csinstserve-gw");
+            let socket = root.join("gateway.sock");
             let client = GatewayControlClient::new(socket.clone()).expect("client");
             let install = tokio::spawn({
                 let (socket, client) = (socket.clone(), client.clone());
@@ -4847,7 +4850,7 @@ mod tests {
                 }
             });
             let land = tokio::spawn({
-                let (support, client) = (support.clone(), client.clone());
+                let (support, client) = (support.to_path_buf(), client.clone());
                 async move {
                     crate::install_basis::wait_for_install(&support)
                         .await
@@ -4860,7 +4863,7 @@ mod tests {
             assert!(!land.is_finished(), "the land step waits for the install");
 
             let heal = Arc::new(StartupHealState::mounting(0));
-            let daemon = daemon(name, &[], Arc::clone(&heal)).await;
+            let daemon = daemon(root, &[], Arc::clone(&heal)).await;
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert!(
                 !install.is_finished(),
@@ -4884,8 +4887,6 @@ mod tests {
             );
 
             daemon.gateway.drain().await.expect("drain the gateway");
-            fs::remove_dir_all(&daemon.root).expect("cleanup");
-            fs::remove_dir_all(&support).expect("cleanup");
         }
     }
 

@@ -1167,10 +1167,7 @@ mod tests {
     #[tokio::test]
     async fn an_ensure_from_another_build_is_refused_naming_both_builds() {
         // Unix socket paths are short; the per-user temporary directory is not.
-        let store = PathBuf::from("/tmp").join(format!(
-            "cowshed-other-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
+        let store = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cowshed-other");
         std::fs::create_dir_all(store.join("run")).expect("run directory");
         let socket = manager_socket_path(&store);
         let listener = supervisor_socket::bind(&socket)
@@ -1178,7 +1175,7 @@ mod tests {
             .expect("bind the manager");
         let served = tokio::spawn(serve(
             listener,
-            SupervisorManager::new(&store, Box::new(NoSpawner), healed()),
+            SupervisorManager::new(&*store, Box::new(NoSpawner), healed()),
         ));
         let mut stream = UnixStream::connect(&socket)
             .await
@@ -1212,7 +1209,6 @@ mod tests {
             })
         );
         served.abort();
-        std::fs::remove_dir_all(store).expect("cleanup");
     }
 
     /// A verb asks the manager whether it runs this build before it changes anything: the
@@ -1220,10 +1216,7 @@ mod tests {
     /// hint that names the install, and no manager at all is no disagreement.
     #[tokio::test]
     async fn a_build_check_is_answered_for_this_build_and_refused_for_another() {
-        let store = PathBuf::from("/tmp").join(format!(
-            "cowshed-check-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
+        let store = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cowshed-check");
         std::fs::create_dir_all(store.join("run")).expect("run directory");
         require_same_build(&store)
             .await
@@ -1235,7 +1228,7 @@ mod tests {
             .expect("bind the manager");
         let served = tokio::spawn(serve(
             listener,
-            SupervisorManager::new(&store, Box::new(NoSpawner), healed()),
+            SupervisorManager::new(&*store, Box::new(NoSpawner), healed()),
         ));
         require_same_build(&store)
             .await
@@ -1264,16 +1257,12 @@ mod tests {
         );
         assert!(error.hint.contains("cowshed setup"), "{}", error.hint);
         served.abort();
-        std::fs::remove_dir_all(store).expect("cleanup");
     }
 
     /// A fresh store with a `run` directory holding a socket file for each of `sockets`. Unix
     /// socket paths are short; the per-user temporary directory is not.
-    fn recovery_store(prefix: &str, sockets: &[&str]) -> PathBuf {
-        let store = PathBuf::from("/tmp").join(format!(
-            "{prefix}-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
+    fn recovery_store(prefix: &str, sockets: &[&str]) -> crate::temp_root::TempRoot {
+        let store = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), prefix);
         std::fs::create_dir_all(store.join("run")).expect("run directory");
         for socket in sockets {
             std::fs::write(store.join("run").join(socket), b"").expect("a socket file");
@@ -1337,7 +1326,7 @@ mod tests {
         let raven =
             supervisor_socket::socket_path(&store, &authority.repo_id, &authority.workspace);
         std::fs::write(&raven, b"").expect("raven's socket file");
-        let manager = SupervisorManager::new(&store, Box::new(NoSpawner), healed());
+        let manager = SupervisorManager::new(&*store, Box::new(NoSpawner), healed());
         let peers = Arc::new(GatedPeers {
             gate: tokio::sync::Semaphore::new(0),
         });
@@ -1372,7 +1361,6 @@ mod tests {
             unrecovered.message
         );
         served.abort();
-        std::fs::remove_dir_all(store).expect("cleanup");
     }
 
     /// While the daemon's startup pass still mounts projects or restores sessions, the manager
@@ -1393,7 +1381,7 @@ mod tests {
             .into();
         let store = recovery_store("cowshed-healing", &[]);
         let startup = Arc::new(crate::StartupHealState::mounting(3));
-        let manager = SupervisorManager::new(&store, Box::new(NoSpawner), Arc::clone(&startup));
+        let manager = SupervisorManager::new(&*store, Box::new(NoSpawner), Arc::clone(&startup));
         let listener = supervisor_socket::bind(&manager_socket_path(&store))
             .await
             .expect("bind the manager");
@@ -1416,7 +1404,6 @@ mod tests {
             .expect_err("this manager starts no supervisor");
         assert_eq!(healed.healing_source(), None, "{}", healed.message);
         served.abort();
-        std::fs::remove_dir_all(store).expect("cleanup");
     }
 
     /// Supervisors of another build whose drains answer only once every one of them is draining.
@@ -1445,7 +1432,7 @@ mod tests {
     #[tokio::test]
     async fn supervisors_of_another_build_drain_at_once() {
         let store = recovery_store("cowshed-drains", &["first.sock", "second.sock"]);
-        let manager = SupervisorManager::new(&store, Box::new(NoSpawner), healed());
+        let manager = SupervisorManager::new(&*store, Box::new(NoSpawner), healed());
         manager
             .recovery()
             .start(Arc::new(BarrierPeers {
@@ -1454,7 +1441,6 @@ mod tests {
             .await
             .expect("both drains reach the barrier");
         assert_eq!(manager.recovering(), None);
-        std::fs::remove_dir_all(store).expect("cleanup");
     }
 
     /// Names the socket [`serves_as_a_supervisor_of_another_build`] serves.
@@ -1499,10 +1485,7 @@ mod tests {
         use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::process::ExitStatusExt as _;
         // Unix socket paths are short; the per-user temporary directory is not.
-        let store = PathBuf::from("/tmp").join(format!(
-            "cowshed-stop-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
+        let store = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cowshed-stop");
         std::fs::create_dir_all(store.join("run")).expect("run directory");
         let socket = store.join("run/other.sock");
         // Killed should the test fail before it is stopped: the helper serves until it is killed.
@@ -1579,7 +1562,6 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, ["other.sock.lock"], "no socket file is left behind");
-        std::fs::remove_dir_all(store).expect("cleanup");
     }
 
     /// A land step that meets a supervisor of another build waits on that process's exit: past
@@ -1587,10 +1569,7 @@ mod tests {
     /// supervisor exits the wait answers at once.
     #[tokio::test]
     async fn a_land_step_waits_for_a_supervisor_of_another_build_and_never_ends_it() {
-        let store = PathBuf::from("/tmp").join(format!(
-            "cowshed-wait-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
+        let store = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cowshed-wait");
         std::fs::create_dir_all(store.join("run")).expect("run directory");
         let socket = store.join("run/other.sock");
         let mut supervisor =
@@ -1652,7 +1631,6 @@ mod tests {
             .await
             .expect("the wait")
             .expect("the supervisor's exit ends the wait, not its ceiling");
-        std::fs::remove_dir_all(store).expect("cleanup");
     }
 
     /// A daemon socket that refuses while an install holds the slot is waited out and connected
@@ -1661,11 +1639,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_daemon_connection_waits_for_a_running_install_only() {
         use std::os::fd::AsRawFd as _;
-        let root = PathBuf::from("/tmp").join(format!(
-            "cowshed-across-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
-        std::fs::create_dir_all(&root).expect("root");
+        let root = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cowshed-across");
         let socket = root.join("manager.sock");
         let support = root.join("support");
         std::fs::create_dir(&support).expect("support");
@@ -1698,7 +1672,6 @@ mod tests {
             .await
             .expect("the connecting task")
             .expect("reaches the daemon the install started");
-        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     /// Measured 2026-10-21: the manager started a second supervisor beside a live one whose hello

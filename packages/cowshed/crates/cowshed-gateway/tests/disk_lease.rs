@@ -2,6 +2,9 @@
 //! The disk-lifecycle lease over a real control socket, asked by the client every disk command
 //! runs inside (`cowshed_apfs::disk_lease`).
 
+#[path = "support/fixture_dir.rs"]
+mod fixture_dir;
+
 use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -67,17 +70,14 @@ impl AuditSink for DiscardAudit {
 }
 
 /// A gateway serving leases with `limits` on a socket under `/tmp` (a bind path is capped at
-/// `sun_path`'s 104 bytes), and the root to remove once it has drained.
-async fn gateway(limits: DiskLeaseLimits) -> (Gateway, PathBuf, PathBuf) {
+/// `sun_path`'s 104 bytes), and the guard that removes its root on every exit path.
+async fn gateway(limits: DiskLeaseLimits) -> (Gateway, fixture_dir::FixtureDir, PathBuf) {
     let id = Uuid::new_v4().simple().to_string();
-    let root = PathBuf::from(format!("/tmp/csdl-{}", &id[..8]));
-    std::fs::create_dir(&root).expect("create fixture root");
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
-        .expect("secure fixture root");
-    let cache = root.join("cache");
+    let root = fixture_dir::secure_fixture_dir(&format!("csdl-{}", &id[..8]));
+    let cache = root.path().join("cache");
     std::fs::create_dir(&cache).expect("cache");
     std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).expect("secure cache");
-    let socket = root.join("gateway.sock");
+    let socket = root.path().join("gateway.sock");
     let gateway = Gateway::start(
         GatewayConfig {
             control_socket: Some(socket.clone()),
@@ -136,7 +136,7 @@ async fn fires(signal: Receiver<()>, within: Duration) -> (Receiver<()>, bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_class_shares_its_phase_and_the_other_runs_only_once_it_drains() {
-    let (gateway, root, socket) = gateway(DiskLeaseLimits {
+    let (gateway, _root, socket) = gateway(DiskLeaseLimits {
         per_class: NonZeroUsize::new(2).unwrap(),
         // Not the subject: no holder here is stuck, so the bound sits at the run's backstop.
         phase_bound: cowshed_os::test_backstop::NO_PROGRESS,
@@ -173,13 +173,12 @@ async fn one_class_shares_its_phase_and_the_other_runs_only_once_it_drains() {
     finish_third.send(()).unwrap();
 
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_holder_stuck_past_the_bound_stops_holding_the_other_class_back() {
     let bound = Duration::from_millis(300);
-    let (gateway, root, socket) = gateway(DiskLeaseLimits {
+    let (gateway, _root, socket) = gateway(DiskLeaseLimits {
         per_class: NonZeroUsize::new(8).unwrap(),
         phase_bound: bound,
     })
@@ -204,7 +203,6 @@ async fn a_holder_stuck_past_the_bound_stops_holding_the_other_class_back() {
     finish_attach.send(()).unwrap();
 
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// How the contention regression runs one arm: free for all, or every command under the lease.
@@ -462,7 +460,7 @@ async fn contention_attaches_stay_fast_beside_mount_churn_only_under_the_lease()
     const MOUNTERS: usize = 2;
     const PERIOD: Duration = Duration::from_secs(40);
     let (gateway, root, socket) = gateway(DiskLeaseLimits::default()).await;
-    let images = root.join("images");
+    let images = root.path().join("images");
     std::fs::create_dir(&images).expect("image directory");
     let backend = MacOsApfsBackend::new(SystemCommandRunner);
     let source = backend
@@ -494,7 +492,7 @@ async fn contention_attaches_stay_fast_beside_mount_churn_only_under_the_lease()
         .iter()
         .enumerate()
         .map(|(i, attachment)| {
-            let mount_point = root.join(format!("mnt{i}"));
+            let mount_point = root.path().join(format!("mnt{i}"));
             std::fs::create_dir(&mount_point).expect("mount point");
             (attachment.volume_device().to_owned(), mount_point)
         })
@@ -514,7 +512,6 @@ async fn contention_attaches_stay_fast_beside_mount_churn_only_under_the_lease()
             .expect("detach a mount-loop image");
     }
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(&root);
 
     let (unleased_p95, _) = report(Arm::Unleased, &unleased);
     let (leased_p95, leased_total_p95) = report(Arm::Leased, &leased);

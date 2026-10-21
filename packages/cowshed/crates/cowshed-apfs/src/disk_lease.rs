@@ -827,22 +827,33 @@ mod tests {
         deadline: None,
     };
 
-    /// A listening socket the client is already connected to, removed on drop. Directly under
-    /// `/tmp`, which macOS links to `/private/tmp` and every Linux host has: a bind path is capped
-    /// at `sun_path`'s 104 bytes.
+    /// A socket path in a private directory of its own under `/tmp`, which macOS links to
+    /// `/private/tmp` and every Linux host has: a bind path is capped at `sun_path`'s 104 bytes.
+    /// The directory, with every marker a test writes beside the socket, goes with the guard on
+    /// every exit path.
     struct Socket(std::path::PathBuf);
+
+    impl Socket {
+        fn new() -> Self {
+            let directory = std::path::PathBuf::from(format!(
+                "/tmp/cowshed-dl-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir(&directory).expect("socket directory");
+            Self(directory.join("s.sock"))
+        }
+    }
 
     impl Drop for Socket {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+            if let Some(directory) = self.0.parent() {
+                let _ = std::fs::remove_dir_all(directory);
+            }
         }
     }
 
     fn pair() -> (Socket, UnixListener, UnixStream) {
-        let socket = Socket(std::path::PathBuf::from(format!(
-            "/tmp/cowshed-dl-{}.sock",
-            uuid::Uuid::new_v4().simple()
-        )));
+        let socket = Socket::new();
         let listener = UnixListener::bind(&socket.0).expect("bind");
         let client = UnixStream::connect(&socket.0).expect("connect");
         (socket, listener, client)
@@ -857,10 +868,7 @@ mod tests {
 
     #[test]
     fn a_full_control_backlog_is_bounded_and_expired_safe_admission_executes_no_payload() {
-        let socket = Socket(std::path::PathBuf::from(format!(
-            "/tmp/cowshed-dl-{}.sock",
-            uuid::Uuid::new_v4().simple()
-        )));
+        let socket = Socket::new();
         let marker = socket.0.with_extension("payload");
         let listener = UnixListener::bind(&socket.0).expect("bind exact backlog fixture");
         // SAFETY: adjust only this fixture-owned listener's real kernel backlog.
@@ -1170,10 +1178,7 @@ mod tests {
 
     #[test]
     fn a_command_a_gateway_refuses_alone_is_asked_again_shared_and_runs_leased() {
-        let socket = Socket(std::path::PathBuf::from(format!(
-            "/tmp/cowshed-dl-{}.sock",
-            uuid::Uuid::new_v4().simple()
-        )));
+        let socket = Socket::new();
         let listener = UnixListener::bind(&socket.0).expect("bind");
         let gateway = std::thread::spawn(move || {
             let granted: &[u8] =
@@ -1228,10 +1233,7 @@ mod tests {
             Alone,
         }
         for admission in [Admission::Queued, Admission::Legacy, Admission::Alone] {
-            let socket = Socket(std::path::PathBuf::from(format!(
-                "/tmp/cowshed-dl-{}.sock",
-                uuid::Uuid::new_v4().simple()
-            )));
+            let socket = Socket::new();
             let marker = socket.0.with_extension("spawned");
             let listener = UnixListener::bind(&socket.0).expect("bind owned gateway");
             let (finished, finish) = std::sync::mpsc::channel::<()>();

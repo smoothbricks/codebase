@@ -23,3 +23,7 @@ pub mod runtime;
 pub mod setup_service;
 pub mod skill;
 pub mod workspace_supervisor;
+
+#[cfg(test)]
+#[path = "../../cowshed-core/tests/support/temp_root.rs"]
+mod temp_root;

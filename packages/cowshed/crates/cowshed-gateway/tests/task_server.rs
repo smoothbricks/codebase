@@ -3,6 +3,9 @@
 //! human assignment, the caps applied from the grant, and a queue view that names what waits on
 //! what and who holds each serialization class.
 
+#[path = "support/fixture_dir.rs"]
+mod fixture_dir;
+
 use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -62,17 +65,14 @@ impl AuditSink for DiscardAudit {
 }
 
 /// A gateway with a budget of `tokens` on a socket under `/tmp` (a bind path is capped at
-/// `sun_path`'s 104 bytes), and the root to remove once it has drained.
-async fn gateway(tokens: usize) -> (Gateway, PathBuf, PathBuf) {
+/// `sun_path`'s 104 bytes), and the guard that removes its root on every exit path.
+async fn gateway(tokens: usize) -> (Gateway, fixture_dir::FixtureDir, PathBuf) {
     let id = Uuid::new_v4().simple().to_string();
-    let root = PathBuf::from(format!("/tmp/cstask-{}", &id[..8]));
-    std::fs::create_dir(&root).expect("create fixture root");
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
-        .expect("secure fixture root");
-    let cache = root.join("cache");
+    let root = fixture_dir::secure_fixture_dir(&format!("cstask-{}", &id[..8]));
+    let cache = root.path().join("cache");
     std::fs::create_dir(&cache).expect("cache");
     std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).expect("secure cache");
-    let socket = root.join("gateway.sock");
+    let socket = root.path().join("gateway.sock");
     let gateway = Gateway::start(
         GatewayConfig {
             control_socket: Some(socket.clone()),
@@ -159,7 +159,7 @@ async fn one_shot(socket: &Path, line: &str) -> Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn units_run_without_an_assignment_and_the_queue_names_what_waits_on_what() {
-    let (gateway, root, socket) = gateway(16).await;
+    let (gateway, _root, socket) = gateway(16).await;
     // unit-a wants 8 tokens, background's half of 16, and runs; unit-b waits on unit-a and runs
     // after its fact alone.
     let mut runner = Asker::ask(
@@ -219,12 +219,11 @@ async fn units_run_without_an_assignment_and_the_queue_names_what_waits_on_what(
     drop(runner);
     drop(dependent);
     gateway.drain().await.expect("drain");
-    std::fs::remove_dir_all(root).expect("clean fixture root");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_unit_keeps_one_live_attempt_over_the_wire() {
-    let (gateway, root, socket) = gateway(4).await;
+    let (gateway, _root, socket) = gateway(4).await;
     let mut runner = Asker::ask(&socket, admit("unit", &[], 1, None)).await;
     runner.granted().await;
     let mut second = Asker::ask(&socket, admit("unit", &[], 1, None)).await;
@@ -240,12 +239,11 @@ async fn one_unit_keeps_one_live_attempt_over_the_wire() {
     drop(runner);
     drop(second);
     gateway.drain().await.expect("drain");
-    std::fs::remove_dir_all(root).expect("clean fixture root");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gate_band_units_share_cpu_without_exclusive_root_admission() {
-    let (gateway, root, socket) = gateway(4).await;
+    let (gateway, _root, socket) = gateway(4).await;
     // Both requests retain TaskAdmitRequest's Gate class. Their grants must coexist:
     // a task band is not an exclusive JobserverClass::Gate root.
     let mut first = Asker::ask(&socket, admit("first", &[], 1, None)).await;
@@ -259,5 +257,4 @@ async fn gate_band_units_share_cpu_without_exclusive_root_admission() {
     drop(first);
     drop(second);
     gateway.drain().await.expect("drain");
-    std::fs::remove_dir_all(root).expect("clean fixture root");
 }
