@@ -66,9 +66,9 @@ instead of evaluating when three checks pass, and evaluates otherwise:
   against a fresh evaluation of a fork (of its 71 variables, 51 equal as recorded, 16 equal after the move,
   `DEVENV_RUNTIME` recomputed, `DIRENV_WATCHES` rebuilt, `COWSHED_RUNTIME_LINK` read from the tail, and
   `DEVENV_TASK_FILE` dropped); no gate runs a repository's own shell at two roots, so a repository edit that adds such a
-  value (an `.envrc` exporting a hash of `$PWD`, say) is adopted with the origin's value. That is an accepted limitation
-  of adoption, stated here so no reader takes an adopted shell for proof against it; the fix is the gate, not a runtime
-  check.
+  value (an `.envrc` exporting a hash of `$PWD`, say) is adopted with the origin's value. That is a known limitation of
+  adoption as built, stated here so no reader takes an adopted shell for proof against it; closing it means scoping
+  adoption to a producer a two-root gate has measured, not a runtime check.
 
 The record never carries direnv's own `DIRENV_WATCHES` and `DIRENV_DIFF` (the host rebuilds both for its checkout),
 `DEVENV_TASK_FILE` (the parent's task file runs scripts built with the parent's root; tasks and processes are not tools)
