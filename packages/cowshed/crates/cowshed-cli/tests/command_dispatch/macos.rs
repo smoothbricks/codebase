@@ -6389,6 +6389,106 @@ async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
     }
 }
 
+/// The managed `bun` is the Bun the workspace declares (15_capabilities.md, "Bootstrap
+/// executables"). With a real `.envrc` putting the declared program on PATH, a sandboxed
+/// `bun --version` answers the declaration, as the host route's shell does, not the host's
+/// bootstrap Bun, and the activation exports what that program reported. Where PATH names no other
+/// `bun`, the bootstrap Bun reports another version and the wrapper refuses before running it,
+/// naming the declaration and the program with its version.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_managed_bun_runs_the_declared_bun_and_refuses_another_naming_both() {
+    use std::os::unix::fs::PermissionsExt as _;
+    cowshed_core::runtime::shell_host::register(
+        cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
+            cowshed(),
+            vec![cowshed_core::runtime::shell_host::SHELL_HOST_ARGUMENT.into()],
+        ),
+    );
+    // No released Bun has this version, so only the declared program can answer it.
+    let declared = "0.0.0-declared";
+    let mut fixture = Fixture::directory();
+    fs::write(
+        fixture.checkout.join("package.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "name": "fixture", "private": true, "packageManager": format!("bun@{declared}+sha224.0")
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(fixture.checkout.join("bun.lock"), "{}\n").unwrap();
+    fs::create_dir_all(fixture.checkout.join("declared")).unwrap();
+    let program = fixture.checkout.join("declared/bun");
+    fs::write(&program, format!("#!/bin/sh\necho {declared}\n")).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(fixture.checkout.join(".envrc"), "PATH_add declared\n").unwrap();
+    git(
+        &fixture.checkout,
+        &["add", "package.json", "bun.lock", "declared", ".envrc"],
+    );
+    git(&fixture.checkout, &["commit", "-q", "-m", "declared bun"]);
+    let mut service = serve_project(&mut fixture, &[]).await;
+    succeed(&mut service, ["fork", "managed"]).await;
+
+    let stdout = sh(
+        &mut service,
+        "managed",
+        "bun --version && printf '%s\\n' \"$COWSHED_PACKAGE_MANAGER_REPORTED\"",
+    )
+    .await;
+    let stdout = String::from_utf8(stdout).unwrap();
+    let mut lines = stdout.lines();
+    assert_eq!(lines.next(), Some(declared), "{stdout}");
+    assert!(
+        lines
+            .next()
+            .is_some_and(|report| report.starts_with(&format!("{declared} "))),
+        "the activation exported what the declared program reported: {stdout}"
+    );
+
+    let bootstrap = String::from_utf8(
+        sh(
+            &mut service,
+            "managed",
+            "\"$COWSHED_MANAGER_BIN/../real-bin/bun\" --version",
+        )
+        .await,
+    )
+    .unwrap();
+    let bootstrap = bootstrap.trim();
+    assert_ne!(bootstrap, declared);
+    let (exit, stdout, stderr) = run(
+        &mut service,
+        [
+            "exec",
+            "managed",
+            "--",
+            "/bin/sh",
+            "-c",
+            "PATH=\"$COWSHED_MANAGER_BIN:/usr/bin:/bin\" bun --version",
+        ],
+    )
+    .await;
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert_eq!(
+        exit.expect("the admitted child returned an exit code"),
+        126,
+        "{stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "nothing ran: {}",
+        String::from_utf8_lossy(&stdout)
+    );
+    for named in [
+        format!("packageManager bun@{declared},"),
+        format!("real-bin/bun reports {bootstrap:?}"),
+    ] {
+        assert!(stderr.contains(&named), "{named} in {stderr}");
+    }
+    drop(service);
+    fixture.stop_gateway().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans_absolute_bypass() {
     cowshed_core::runtime::shell_host::register(

@@ -173,16 +173,33 @@ Each detector returns data through one `CapabilityContribution`:
   activated shell (04_sandbox.md, "direnv trust is path-keyed"). The toolchain is not among what leads, nor among what
   is linked at all: the repository declares its toolchain through its own shell (Cargo build-state discovery above), so
   the cargo capability links no `cargo`, `rustc`, `rustdoc` or `rustup`, and the toolchain a repository's shell declares
-  is the one its jobs and its Nx daemon run. A first-argument install verb is covered immediately: Bun `install`, `i`,
-  `add`, `remove`, `update`; npm `install`, `i`, `ci`, `add`, `uninstall`, `remove`, `update`; pnpm `install`, `i`,
-  `add`, `remove`, `update`. Other invocations execute the recorded program directly, without guessing another CLI or
-  changing explicit relinks. The wrapper snapshots live developer package links and their executable aliases before the
-  install, and restores them before returning its actual exit or signal, so `bun install && nx ...` uses those links in
-  one job. A link the declaration made and no longer names, one whose text still matches its
-  `node_modules/.smoo-declared-links` receipt while the root manifest's `smoo.developerLinks` no longer names its
-  package, is the declaration's and not a developer link (packages/cli/README.md, "Declared Links"): no snapshot
-  captures it, so neither the wrapper nor terminal cleanup restores it, the install leaves the version it installs, and
-  the wrapper names it on stderr.
+  is the one its jobs and its Nx daemon run. The package managers follow the same rule: every invocation, install or
+  not, runs the first executable of its name on the PATH it was given that is not the wrapper itself, recognized by file
+  identity so no spelling of its route makes it run itself. After activation that is the shell's own, the program the
+  host route runs; only when PATH names none, as before activation or in a job without a shell, does it run the
+  capability-resolved program under `tools/real-bin`. **Why**: a bootstrap program is whatever the host's profile
+  pinned. Measured 2026-10-21: the wrapper ran the home-manager profile's Bun 1.4.2 in a repository whose
+  `packageManager` and devenv shell are Bun 1.4.3, and 1.4.2 truncates the stdout of a `console.log` followed by exit at
+  768 KiB where 1.4.3 delivers it whole, so a sandboxed test did not test what the gate tests.
+
+  When the root `package.json` declares `packageManager` as `<name>@<version>` for the invoked manager (an integrity
+  suffix after `+` is not part of the version), the wrapper compares the version that program prints for `--version`
+  before running anything, and refuses a different one with exit 126, naming the manifest, the declaration, and the
+  program with the version it reported. A manifest that declares another manager, or none, is not compared; one that
+  cannot be read or parsed, or a declaration that is not `<name>@<version>`, refuses. The exec host asks the program its
+  activated PATH names once per activation and exports the answer as `COWSHED_PACKAGE_MANAGER_REPORTED`,
+  `<version> <dev>:<ino>` of the file that answered; the wrapper takes that answer for the same file and asks any other
+  file itself, so the commands of a warm shell start no extra process.
+
+  A first-argument install verb is covered immediately: Bun `install`, `i`, `add`, `remove`, `update`; npm `install`,
+  `i`, `ci`, `add`, `uninstall`, `remove`, `update`; pnpm `install`, `i`, `add`, `remove`, `update`. Other invocations
+  execute that program directly, without guessing another CLI or changing explicit relinks. The wrapper snapshots live
+  developer package links and their executable aliases before the install, and restores them before returning its actual
+  exit or signal, so `bun install && nx ...` uses those links in one job. A link the declaration made and no longer
+  names, one whose text still matches its `node_modules/.smoo-declared-links` receipt while the root manifest's
+  `smoo.developerLinks` no longer names its package, is the declaration's and not a developer link
+  (packages/cli/README.md, "Declared Links"): no snapshot captures it, so neither the wrapper nor terminal cleanup
+  restores it, the install leaves the version it installs, and the wrapper names it on stderr.
 
   The supervisor uses the same snapshot/restore implementation at job admission and terminal cleanup, including failed
   or killed installs. Terminal cleanup has two distinct failures, each labelled in the sealed job's stderr: a link

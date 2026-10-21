@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use cowshed_core::api::dto::ExitStatus;
+use cowshed_core::developer_links;
 use cowshed_core::runtime::job_groups::{self, Birth};
 use cowshed_core::runtime::shell_host::{
     BINDING_ARRAY, BINDING_SCALAR, CONTROL_DESCRIPTOR, FrameReader, FrameWriter, REPLY_ACTIVATED,
@@ -458,6 +459,35 @@ impl Host {
                 None => {
                     self.environment.remove(OsStr::new(&name));
                 }
+            }
+        }
+        // One version probe per activation answers every command of this warm shell; the wrapper
+        // asks again only for another program file, and itself reports any failure dropped here
+        // (15_capabilities.md, "Bootstrap executables").
+        let report = match (
+            self.environment
+                .get(OsStr::new(developer_links::MANAGER_BIN_ENV)),
+            self.environment.get(OsStr::new(developer_links::ROOT_ENV)),
+        ) {
+            (Some(route), Some(root)) => developer_links::report(
+                self.environment
+                    .get(OsStr::new("PATH"))
+                    .map(OsString::as_os_str),
+                Path::new(route),
+                Path::new(root),
+            )
+            .ok()
+            .flatten(),
+            _ => None,
+        };
+        match report {
+            Some(report) => {
+                self.environment
+                    .insert(developer_links::REPORTED_ENV.into(), report);
+            }
+            None => {
+                self.environment
+                    .remove(OsStr::new(developer_links::REPORTED_ENV));
             }
         }
         let watches = self

@@ -9,6 +9,7 @@ use std::ffi::{CString, OsStr, OsString};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -25,6 +26,9 @@ pub const ROOT_ENV: &str = "COWSHED_PACKAGE_MANAGER_ROOT";
 /// leads PATH after shell activation (15_capabilities.md, "Bootstrap executables").
 pub const MANAGER_BIN_ENV: &str = "COWSHED_MANAGER_BIN";
 pub const INSTALL_OBSERVED_ENV: &str = "COWSHED_INSTALL_OBSERVED";
+/// What an activated shell's declared package manager reports for `--version`, as
+/// `<version> <dev>:<ino>` of the program that reported it ([`report`]).
+pub const REPORTED_ENV: &str = "COWSHED_PACKAGE_MANAGER_REPORTED";
 
 /// The managed declaration's receipts, relative to the checkout: one row per alias
 /// `smoo.developerLinks` linked, with the exact link text it wrote (`DECLARED_RECORD` in the
@@ -816,8 +820,219 @@ fn installs(manager: &OsStr, arguments: &[OsString]) -> bool {
     }
 }
 
+/// `packageManager` in the root manifest, `<manager>@<version>`; an integrity suffix after `+` is
+/// not part of the version.
+#[derive(Debug, PartialEq, Eq)]
+struct Declaration {
+    manifest: PathBuf,
+    manager: String,
+    version: String,
+}
+
+impl Declaration {
+    /// No manifest, or one without `packageManager`, declares nothing; an unreadable or
+    /// malformed one is an error, never an absent declaration.
+    fn read(root: &Path) -> io::Result<Option<Self>> {
+        #[derive(serde::Deserialize)]
+        struct Manifest {
+            #[serde(rename = "packageManager")]
+            package_manager: Option<String>,
+        }
+        let manifest = root.join("package.json");
+        let bytes = match fs::read(&manifest) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("read {}: {error}", manifest.display()),
+                ));
+            }
+        };
+        let Manifest { package_manager } = serde_json::from_slice(&bytes).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("parse {}: {error}", manifest.display()),
+            )
+        })?;
+        let Some(declared) = package_manager else {
+            return Ok(None);
+        };
+        let Some((manager, version)) = declared
+            .split_once('@')
+            .map(|(manager, version)| {
+                (
+                    manager,
+                    version
+                        .split_once('+')
+                        .map_or(version, |(version, _)| version),
+                )
+            })
+            .filter(|(manager, version)| !manager.is_empty() && !version.is_empty())
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} declares packageManager {declared:?}, not <name>@<version>",
+                    manifest.display()
+                ),
+            ));
+        };
+        Ok(Some(Self {
+            manager: manager.to_owned(),
+            version: version.to_owned(),
+            manifest,
+        }))
+    }
+}
+
+/// The executable a managed command name runs, with the file identity a version report names.
+#[derive(Debug, PartialEq, Eq)]
+struct Managed {
+    path: PathBuf,
+    identity: (u64, u64),
+}
+
+fn identity(metadata: &fs::Metadata) -> (u64, u64) {
+    (metadata.dev(), metadata.ino())
+}
+
+/// What `manager` runs: the first executable of that name on `path` that is not this wrapper,
+/// which after activation is the shell's own, the one the host route runs; else the program the
+/// capability recorded under `tools/real-bin`. The wrapper is recognized by file identity, so no
+/// spelling of its route on PATH can make it run itself.
+fn resolve(manager: &OsStr, path: Option<&OsStr>, route: &Path) -> io::Result<Managed> {
+    let wrapper = route.join(manager);
+    let wrapper = fs::metadata(&wrapper)
+        .map(|metadata| identity(&metadata))
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("package-manager wrapper {}: {error}", wrapper.display()),
+            )
+        })?;
+    let found = path
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|directory| directory.join(manager))
+        .find_map(|candidate| {
+            let metadata = fs::metadata(&candidate).ok()?;
+            (metadata.is_file() && metadata.mode() & 0o111 != 0 && identity(&metadata) != wrapper)
+                .then(|| Managed {
+                    identity: identity(&metadata),
+                    path: candidate,
+                })
+        });
+    if let Some(found) = found {
+        return Ok(found);
+    }
+    let recorded = route
+        .parent()
+        .ok_or_else(|| io::Error::other("the package-manager wrapper route has no parent"))?
+        .join("real-bin")
+        .join(manager);
+    let metadata = fs::metadata(&recorded).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("recorded package manager {}: {error}", recorded.display()),
+        )
+    })?;
+    Ok(Managed {
+        identity: identity(&metadata),
+        path: recorded,
+    })
+}
+
+/// The version `program` prints for `--version`.
+fn reported_version(program: &Path) -> io::Result<String> {
+    let output = Command::new(program)
+        .arg("--version")
+        .output_locked()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("ask {} for its version: {error}", program.display()),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "{} --version ended {}: {}",
+            program.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    String::from_utf8(output.stdout)
+        .map(|version| version.trim().to_owned())
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} --version is not UTF-8: {error}", program.display()),
+            )
+        })
+}
+
+/// Refuse `program` when the workspace declares `manager` at a version the program does not
+/// report. `witness` ([`REPORTED_ENV`]) answers for the one program file it names.
+fn verify(
+    manager: &OsStr,
+    program: &Managed,
+    root: &Path,
+    witness: Option<&OsStr>,
+) -> io::Result<()> {
+    let Some(declared) = Declaration::read(root)? else {
+        return Ok(());
+    };
+    if OsStr::new(&declared.manager) != manager {
+        return Ok(());
+    }
+    let witnessed = witness
+        .and_then(OsStr::to_str)
+        .and_then(|witness| witness.split_once(' '))
+        .filter(|(_, file)| {
+            file.split_once(':')
+                .and_then(|(dev, ino)| Some((dev.parse().ok()?, ino.parse().ok()?)))
+                == Some(program.identity)
+        })
+        .map(|(version, _)| version.to_owned());
+    let reported = match witnessed {
+        Some(version) => version,
+        None => reported_version(&program.path)?,
+    };
+    if reported == declared.version {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "{} declares packageManager {}@{}, but {} reports {reported:?}; put the declared {} first on PATH or change the declaration",
+        declared.manifest.display(),
+        declared.manager,
+        declared.version,
+        program.path.display(),
+        declared.manager,
+    )))
+}
+
+/// The [`REPORTED_ENV`] value an activated shell exports once for all its commands: what the
+/// declared manager's program on that shell's `path` reports. `None` when the workspace
+/// declares no managed package manager.
+pub fn report(path: Option<&OsStr>, route: &Path, root: &Path) -> io::Result<Option<OsString>> {
+    let Some(declared) = Declaration::read(root)? else {
+        return Ok(None);
+    };
+    let manager = OsStr::new(&declared.manager);
+    if !is_package_manager(manager) {
+        return Ok(None);
+    }
+    let program = resolve(manager, path, route)?;
+    let version = reported_version(&program.path)?;
+    Ok(Some(
+        format!("{version} {}:{}", program.identity.0, program.identity.1).into(),
+    ))
+}
+
 /// Multicall dispatch through the existing protected bootstrap-program link, before a runtime starts.
-/// The real executable is the capability's recorded target, never searched again on PATH.
+/// The program run is the one PATH names past this wrapper ([`resolve`]), checked against the
+/// workspace's declaration ([`verify`]) before anything runs.
 pub fn dispatch() -> io::Result<Option<ExitStatus>> {
     let mut args = std::env::args_os();
     let invoked = args.next().unwrap_or_default();
@@ -829,21 +1044,24 @@ pub fn dispatch() -> io::Result<Option<ExitStatus>> {
     };
     let route = std::env::var_os(MANAGER_BIN_ENV)
         .ok_or_else(|| io::Error::other("managed package manager has no wrapper route"))?;
-    let mut real = PathBuf::from(route);
-    if !real.pop() {
-        return Err(io::Error::other(
-            "the package-manager wrapper route has no parent",
-        ));
-    }
-    real.push("real-bin");
-    real.push(manager);
-    let arguments: Vec<OsString> = args.collect();
-    if !installs(manager, &arguments) {
-        return Err(Command::new(real).args(arguments).exec());
-    }
     let root = std::env::var_os(ROOT_ENV)
         .ok_or_else(|| io::Error::other("managed package manager has no workspace root"))?;
     let root = Path::new(&root);
+    let program = resolve(
+        manager,
+        std::env::var_os("PATH").as_deref(),
+        Path::new(&route),
+    )?;
+    verify(
+        manager,
+        &program,
+        root,
+        std::env::var_os(REPORTED_ENV).as_deref(),
+    )?;
+    let arguments: Vec<OsString> = args.collect();
+    if !installs(manager, &arguments) {
+        return Err(Command::new(program.path).args(arguments).exec());
+    }
     let snapshot = DeveloperLinks::capture_job(
         root,
         PackageStores::from_environment().map_err(io::Error::other)?,
@@ -852,7 +1070,7 @@ pub fn dispatch() -> io::Result<Option<ExitStatus>> {
     if let Some(path) = std::env::var_os(INSTALL_OBSERVED_ENV) {
         fs::write(path, b"observed\n")?;
     }
-    let status = Command::new(real).args(arguments).status_locked();
+    let status = Command::new(program.path).args(arguments).status_locked();
     let restored = snapshot
         .restore(root, RestoreMode::CoveredInstall)
         .map_err(io::Error::other)
@@ -892,6 +1110,172 @@ mod tests {
                 .join("home"),
         )
         .expect("an absolute fixture home")
+    }
+
+    /// An executable fixture script running `body` for any arguments.
+    fn script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::create_dir_all(path.parent().expect("a script has a parent")).unwrap();
+        fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The managed program at `path`, as [`resolve`] would name it.
+    fn managed(path: PathBuf) -> Managed {
+        Managed {
+            identity: identity(&fs::metadata(&path).unwrap()),
+            path,
+        }
+    }
+
+    /// The wrapper runs what PATH names past it, as the host route does: after activation the
+    /// shell's program, never the bootstrap one, and never itself under another spelling of its
+    /// route. Only a PATH naming none falls back to the recorded program.
+    #[test]
+    fn the_wrapper_runs_the_program_path_names_past_it_else_the_recorded_one() {
+        let scratch = crate::temp_root::TempRoot::new("managed-resolve");
+        let tools = scratch.join("tools");
+        let route = tools.join("manager-bin");
+        script(&scratch.join("wrapper"), "exit 99");
+        fs::create_dir_all(&route).unwrap();
+        symlink(scratch.join("wrapper"), route.join("bun")).unwrap();
+        script(&scratch.join("bootstrap/bun"), "echo 1.4.2");
+        fs::create_dir_all(tools.join("real-bin")).unwrap();
+        symlink(scratch.join("bootstrap/bun"), tools.join("real-bin/bun")).unwrap();
+        script(&scratch.join("shell/bun"), "echo 1.4.3");
+        symlink(&route, scratch.join("alias")).unwrap();
+        let bun = OsStr::new("bun");
+        let activated =
+            std::env::join_paths([route.clone(), scratch.join("alias"), scratch.join("shell")])
+                .unwrap();
+        assert_eq!(
+            resolve(bun, Some(&activated), &route).unwrap(),
+            managed(scratch.join("shell/bun"))
+        );
+        let bootstrap = std::env::join_paths([route.clone(), scratch.join("alias")]).unwrap();
+        assert_eq!(
+            resolve(bun, Some(&bootstrap), &route).unwrap(),
+            managed(tools.join("real-bin/bun"))
+        );
+        assert_eq!(
+            resolve(bun, None, &route).unwrap(),
+            managed(tools.join("real-bin/bun"))
+        );
+        let root = scratch.join("checkout");
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(report(Some(&activated), &route, &root).unwrap(), None);
+        fs::write(
+            root.join("package.json"),
+            r#"{"packageManager":"bun@1.4.3"}"#,
+        )
+        .unwrap();
+        let shell = managed(scratch.join("shell/bun"));
+        assert_eq!(
+            report(Some(&activated), &route, &root).unwrap(),
+            Some(OsString::from(format!(
+                "1.4.3 {}:{}",
+                shell.identity.0, shell.identity.1
+            )))
+        );
+    }
+
+    /// A program reporting another version than the workspace declares is refused, naming the
+    /// declaration and the program with what it reports; another manager's declaration, or none,
+    /// is not this wrapper's to check.
+    #[test]
+    fn a_program_reporting_another_version_than_the_declaration_is_refused_naming_both() {
+        let scratch = crate::temp_root::TempRoot::new("managed-verify");
+        let root = scratch.join("checkout");
+        fs::create_dir_all(&root).unwrap();
+        script(&scratch.join("declared/bun"), "echo 1.4.3");
+        script(&scratch.join("other/bun"), "echo 1.4.2");
+        let (declared, other) = (
+            managed(scratch.join("declared/bun")),
+            managed(scratch.join("other/bun")),
+        );
+        let bun = OsStr::new("bun");
+        verify(bun, &other, &root, None).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"packageManager":"bun@1.4.3+sha224.0123"}"#,
+        )
+        .unwrap();
+        verify(bun, &declared, &root, None).unwrap();
+        let refused = verify(bun, &other, &root, None).unwrap_err().to_string();
+        for named in [
+            root.join("package.json").display().to_string(),
+            "bun@1.4.3,".to_owned(),
+            format!("{} reports \"1.4.2\"", scratch.join("other/bun").display()),
+        ] {
+            assert!(refused.contains(&named), "{named} in {refused}");
+        }
+        verify(OsStr::new("npm"), &other, &root, None).unwrap();
+    }
+
+    /// An activation's report answers for the one program file it names, without asking that
+    /// program again; any other program is asked.
+    #[test]
+    fn an_activation_report_answers_for_its_own_program_file_only() {
+        let scratch = crate::temp_root::TempRoot::new("managed-witness");
+        let root = scratch.join("checkout");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"packageManager":"bun@1.4.3"}"#,
+        )
+        .unwrap();
+        script(&scratch.join("silent/bun"), "echo probed >&2; exit 1");
+        script(&scratch.join("elsewhere/bun"), "echo 1.4.3");
+        let (silent, elsewhere) = (
+            managed(scratch.join("silent/bun")),
+            managed(scratch.join("elsewhere/bun")),
+        );
+        let witness = |program: &Managed, version: &str| {
+            OsString::from(format!(
+                "{version} {}:{}",
+                program.identity.0, program.identity.1
+            ))
+        };
+        let bun = OsStr::new("bun");
+        verify(bun, &silent, &root, Some(&witness(&silent, "1.4.3"))).unwrap();
+        let refused = verify(bun, &silent, &root, Some(&witness(&silent, "1.4.2")))
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("reports \"1.4.2\""), "{refused}");
+        let asked = verify(bun, &silent, &root, Some(&witness(&elsewhere, "1.4.3")))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            asked.contains("--version ended") && asked.contains("probed"),
+            "{asked}"
+        );
+    }
+
+    /// A declaration that is not `<name>@<version>`, or a manifest that does not parse, is refused
+    /// rather than read as no declaration.
+    #[test]
+    fn a_malformed_package_manager_declaration_is_refused_not_ignored() {
+        let scratch = crate::temp_root::TempRoot::new("managed-declaration");
+        let root = scratch.join("checkout");
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(Declaration::read(&root).unwrap(), None);
+        fs::write(root.join("package.json"), r#"{"name":"fixture"}"#).unwrap();
+        assert_eq!(Declaration::read(&root).unwrap(), None);
+        for manifest in [
+            r#"{"packageManager":"bun"}"#,
+            r#"{"packageManager":"@1.4.3"}"#,
+            r#"{"packageManager":"bun@"}"#,
+            r#"{"packageManager":7}"#,
+            "{",
+        ] {
+            fs::write(root.join("package.json"), manifest).unwrap();
+            let refused = Declaration::read(&root).unwrap_err();
+            assert_eq!(
+                refused.kind(),
+                io::ErrorKind::InvalidData,
+                "{manifest}: {refused}"
+            );
+        }
     }
 
     #[test]
