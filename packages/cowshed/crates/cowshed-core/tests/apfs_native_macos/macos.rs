@@ -3713,6 +3713,10 @@ impl CommandRunner for EjectAtFsck {
         SystemCommandRunner.attached_disk_images()
     }
 
+    fn attachments_of(&self, image: &Path) -> std::io::Result<Vec<AttachedDiskImage>> {
+        SystemCommandRunner.attachments_of(image)
+    }
+
     fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> std::io::Result<()> {
         SystemCommandRunner.grow_image(image, capacity)
     }
@@ -4014,6 +4018,10 @@ impl CommandRunner for EjectAfterAttach {
 
     fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
         SystemCommandRunner.attached_disk_images()
+    }
+
+    fn attachments_of(&self, image: &Path) -> std::io::Result<Vec<AttachedDiskImage>> {
+        SystemCommandRunner.attachments_of(image)
     }
 
     fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> std::io::Result<()> {
@@ -6835,6 +6843,10 @@ impl CommandRunner for ImmutableDuringResize {
     fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
         SystemCommandRunner.attached_disk_images()
     }
+
+    fn attachments_of(&self, image: &Path) -> std::io::Result<Vec<AttachedDiskImage>> {
+        SystemCommandRunner.attachments_of(image)
+    }
 }
 
 /// SliceA quarantine: a published canonical image whose grants sidecar exists but whose CA
@@ -7262,6 +7274,9 @@ mod build_mount_races {
         }
         fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
             self.recorded.attached_disk_images()
+        }
+        fn attachments_of(&self, image: &Path) -> std::io::Result<Vec<AttachedDiskImage>> {
+            self.recorded.attachments_of(image)
         }
         fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> std::io::Result<()> {
             self.recorded.grow_image(image, capacity)

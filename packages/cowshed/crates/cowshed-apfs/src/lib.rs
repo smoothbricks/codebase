@@ -361,6 +361,17 @@ pub trait CommandRunner {
     /// release that never happened and lost a mounted workspace's identity on restart. The
     /// kernel's matching snapshot is taken under the registry's own consistency check.
     fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>>;
+    /// Every attachment the kernel holds for the backing file at `image`, an absolute path:
+    /// exactly the entries of [`Self::attached_disk_images`] backed by it, so its absences are as
+    /// authoritative. The system runner has the kernel match that image's devices alone, so the
+    /// answer costs that image's registry entries however many other images are attached.
+    fn attachments_of(&self, image: &Path) -> io::Result<Vec<AttachedDiskImage>> {
+        Ok(self
+            .attached_disk_images()?
+            .into_iter()
+            .filter(|attached| attached.is_backed_by(image))
+            .collect())
+    }
     /// Grow a detached RAW image's virtual disk to `capacity` by extending its file, and nothing
     /// else: the file's length is the virtual capacity, and no header is rewritten.
     ///
@@ -836,6 +847,22 @@ impl CommandRunner for SystemCommandRunner {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "attached disk images are read from the macOS I/O Registry",
+            ))
+        }
+    }
+    fn attachments_of(&self, image: &Path) -> io::Result<Vec<AttachedDiskImage>> {
+        #[cfg(target_os = "macos")]
+        {
+            io_registry::attachments_of(image)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "the attachments of {} are read from the macOS I/O Registry",
+                    image.display()
+                ),
             ))
         }
     }
@@ -2333,7 +2360,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// get past this check.
     fn require_attached_mapping(&self, attachment: &AttachedImage) -> Result<(), ApfsError> {
         let image = attachment_inventory_path(&attachment.image)?;
-        let actual = image_attachments(&image, &self.attached_disk_images()?)?;
+        let actual = image_attachments(&image, &self.attachments_of(&image)?)?;
         if actual.iter().any(|held| {
             matches!(held, RecoveredImageAttachment::Apfs(held)
                 if held.whole_device == attachment.whole_device
@@ -2353,7 +2380,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// the driver's container holds.
     fn require_released_volume(&self, attachment: &AttachedImage) -> Result<(), ApfsError> {
         let image = attachment_inventory_path(&attachment.image)?;
-        let views = release_views_of(&image, &self.attached_disk_images()?)?;
+        let views = release_views_of(&image, &self.attachments_of(&image)?)?;
         if views.iter().any(|view| {
             view.whole_device == attachment.whole_device
                 && view.volumes.contains(&attachment.volume_device)
@@ -2540,7 +2567,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
 
     fn attachment_inventory(&self, image: &Path) -> Result<AttachmentInventory, ApfsError> {
         let image = attachment_inventory_path(image)?;
-        image_inventory(&image, &self.attached_disk_images()?)
+        image_inventory(&image, &self.attachments_of(&image)?)
     }
 
     /// The kernel's disk-image inventory: Tahoe's `diskutil image info --plist` exposes no
@@ -2556,6 +2583,16 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                     .map_err(ApfsError::KernelInventory)
             },
         )
+    }
+
+    /// Every attachment the kernel holds for `image`, an attachment inventory path: the
+    /// inventory's entries backed by it, read without reading any other image.
+    fn attachments_of(&self, image: &Path) -> Result<Vec<AttachedDiskImage>, ApfsError> {
+        cowshed_os::timing::timed("apfs-inventory", format_args!("image attachments"), || {
+            self.runner
+                .attachments_of(image)
+                .map_err(ApfsError::KernelInventory)
+        })
     }
 
     fn cleanup_new_attachments(
@@ -2974,7 +3011,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     ) -> Result<Option<RecoveredImageAttachment>, ApfsError> {
         validate_image_path(image)?;
         let image = attachment_inventory_path(image)?;
-        existing_image_attachment(&image, &self.attached_disk_images()?)
+        existing_image_attachment(&image, &self.attachments_of(&image)?)
     }
 
     /// Every driver the kernel holds for `image`, however many, each as its whole device and
@@ -2982,7 +3019,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// owned attachment is format-independent, including a retained re-adoption input.
     pub(crate) fn release_views(&self, image: &Path) -> Result<Vec<ReleaseView>, ApfsError> {
         let image = attachment_inventory_path(image)?;
-        release_views_of(&image, &self.attached_disk_images()?)
+        release_views_of(&image, &self.attachments_of(&image)?)
     }
 
     /// The backing file of every attached disk image, each once, by the path its attach was
@@ -3141,7 +3178,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         input: &RetainedInput<'_>,
     ) -> Result<Option<RetainedAttachment>, ApfsError> {
         let image = attachment_inventory_path(input.path())?;
-        match existing_image_attachment(&image, &self.attached_disk_images()?)? {
+        match existing_image_attachment(&image, &self.attachments_of(&image)?)? {
             None => Ok(None),
             Some(RecoveredImageAttachment::Apfs(attachment)) => {
                 Ok(Some(RetainedAttachment(attachment)))
@@ -3703,7 +3740,7 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
 
     fn attached_capacity(&self, image: &Path) -> Result<ImageCapacity, ApfsError> {
         let image = attachment_inventory_path(image)?;
-        attachment_capacity(&image, &self.attached_disk_images()?)
+        attachment_capacity(&image, &self.attachments_of(&image)?)
     }
 }
 
@@ -4939,14 +4976,18 @@ fn project_registered_apfs(
 
 /// The kernel's I/O Registry view of attached disk images and registered APFS containers.
 ///
-/// One `IOServiceGetMatchingServices` call answers every IOMedia node the kernel has registered.
-/// The kernel collects those matches under the registry's own consistency check — it restarts
-/// its walk whenever a concurrent attach or detach invalidates it — so the set is complete for
-/// one instant, which is exactly what `hdiutil info` and `diskutil apfs list` are not. For disk
-/// images each node is walked up its provider chain to the image driver's
-/// `AppleDiskImageDevice`, whose `DiskImageURL` names the backing store; for APFS the same
-/// snapshot yields every container's `AppleAPFSMedia` and every `AppleAPFSVolume`, grouped by
-/// the media its `AppleAPFSContainer` provider hangs from. A live node's provider links do not
+/// Each read starts from one `IOServiceGetMatchingServices` snapshot, which the kernel collects
+/// under the registry's own consistency check — it restarts its walk whenever a concurrent attach
+/// or detach invalidates it — so the set is complete for one instant, which is exactly what
+/// `hdiutil info` and `diskutil apfs list` are not. Disk images are read from their image
+/// drivers: the snapshot holds every registered `AppleDiskImageDevice`, whose `DiskImageURL`
+/// names the backing store, or for one image only the devices whose `DiskImageURL` the kernel
+/// matched to that image's file URL; each device's media are read from its own subtree, again
+/// whenever a concurrent change invalidated a child list. A question about one image therefore
+/// reads that image's registry entries alone, however many other images are attached. APFS is
+/// read from a snapshot of every registered IOMedia: every container's `AppleAPFSMedia` and every
+/// `AppleAPFSVolume`, grouped by the media its `AppleAPFSContainer` provider hangs from. A live
+/// node's provider links do not
 /// change; a node already detached from the plane is departing and is not reported, and neither
 /// is one the kernel finalizes while the walk holds it: finalizing destroys the entry's port, so
 /// every reference to it becomes a dead name that answers `MACH_SEND_INVALID_DEST` to any call
@@ -4983,6 +5024,7 @@ mod io_registry {
     /// `kIOMainPortDefault`.
     const MAIN_PORT_DEFAULT: libc::mach_port_t = 0;
     const SERVICE_PLANE: &CStr = c"IOService";
+    const IMAGE_DEVICE: &CStr = c"AppleDiskImageDevice";
     const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
     const CF_NUMBER_SINT64_TYPE: CfIndex = 4;
 
@@ -4995,10 +5037,10 @@ mod io_registry {
 
     #[link(name = "IOKit", kind = "framework")]
     unsafe extern "C" {
-        fn IOServiceMatching(name: *const c_char) -> *mut c_void;
+        fn IOServiceMatching(name: *const c_char) -> CfType;
         fn IOServiceGetMatchingServices(
             main_port: libc::mach_port_t,
-            matching: *mut c_void,
+            matching: CfType,
             existing: *mut IoObject,
         ) -> KernReturn;
         fn IOIteratorNext(iterator: IoObject) -> IoObject;
@@ -5055,8 +5097,33 @@ mod io_registry {
         fn CFNumberGetValue(number: CfType, number_type: CfIndex, value: *mut c_void) -> u8;
         fn CFDictionaryGetTypeID() -> usize;
         fn CFDictionaryGetValue(dictionary: CfType, key: CfType) -> CfType;
+
+        fn CFRetain(object: CfType) -> CfType;
+        fn CFDictionaryCreateMutable(
+            allocator: CfType,
+            capacity: CfIndex,
+            key_callbacks: *const CfDictionaryCallBacks,
+            value_callbacks: *const CfDictionaryCallBacks,
+        ) -> CfType;
+        fn CFDictionarySetValue(dictionary: CfType, key: CfType, value: CfType);
+        fn CFURLCreateFromFileSystemRepresentation(
+            allocator: CfType,
+            buffer: *const u8,
+            length: CfIndex,
+            is_directory: u8,
+        ) -> CfType;
+        fn CFURLGetString(url: CfType) -> CfType;
+        #[link_name = "kCFTypeDictionaryKeyCallBacks"]
+        static CF_TYPE_DICTIONARY_KEY_CALL_BACKS: CfDictionaryCallBacks;
+        #[link_name = "kCFTypeDictionaryValueCallBacks"]
+        static CF_TYPE_DICTIONARY_VALUE_CALL_BACKS: CfDictionaryCallBacks;
     }
 
+    /// CoreFoundation's dictionary callbacks, opaque here: only their address is passed.
+    #[repr(C)]
+    struct CfDictionaryCallBacks {
+        _opaque: [u8; 0],
+    }
     /// One owned registry reference.
     struct Object(IoObject);
 
@@ -5082,14 +5149,6 @@ mod io_registry {
         content: Cf,
         size: Cf,
         url: Cf,
-    }
-
-    /// The image driver a media node hangs from, and whether the node is the image's own whole
-    /// device: no other media lies between them.
-    struct ImageDriver {
-        driver: Object,
-        id: u64,
-        is_whole: bool,
     }
 
     struct ApfsKeys {
@@ -5127,13 +5186,26 @@ mod io_registry {
 
     /// Every registered instance of `class` at one instant.
     fn registered(class: &CStr) -> io::Result<Entries> {
+        registered_matching(class, None)
+    }
+
+    /// Every registered instance of `class` at one instant that has each of `properties`, when
+    /// given. The kernel compares them (`IOPropertyMatch`) against the class's own instances, so
+    /// no instance that does not match is read.
+    fn registered_matching(class: &CStr, properties: Option<&Cf>) -> io::Result<Entries> {
         let named = class.to_string_lossy();
+        let property_match = properties.map(|_| key("IOPropertyMatch")).transpose()?;
         // SAFETY: the class name is NUL-terminated; a null answer is refused below.
         let matching = unsafe { IOServiceMatching(class.as_ptr()) };
         if matching.is_null() {
             return Err(io::Error::other(format!(
                 "IOServiceMatching({named}) returned no matching dictionary"
             )));
+        }
+        if let (Some(properties), Some(property_match)) = (properties, &property_match) {
+            // SAFETY: `matching` is the live mutable dictionary just created, which only the call
+            // below consumes; the dictionary retains the key and the properties it is given.
+            unsafe { CFDictionarySetValue(matching, property_match.0, properties.0) };
         }
         let mut iterator: IoObject = 0;
         // SAFETY: `matching` is a +1 dictionary the call consumes whatever it returns, and
@@ -5144,6 +5216,58 @@ mod io_registry {
             return Err(kernel_error(&format!("match registered {named}"), status));
         }
         Ok(Entries(Object(iterator)))
+    }
+
+    /// A new, empty CoreFoundation dictionary of CF-typed keys and values.
+    fn mutable_dictionary() -> io::Result<Cf> {
+        // SAFETY: the callbacks are CoreFoundation's own for CF-typed keys and values, and the
+        // answer is +1 or null.
+        let dictionary = unsafe {
+            CFDictionaryCreateMutable(
+                ptr::null(),
+                0,
+                &raw const CF_TYPE_DICTIONARY_KEY_CALL_BACKS,
+                &raw const CF_TYPE_DICTIONARY_VALUE_CALL_BACKS,
+            )
+        };
+        if dictionary.is_null() {
+            Err(io::Error::other(
+                "CoreFoundation could not create a matching dictionary",
+            ))
+        } else {
+            Ok(Cf(dictionary))
+        }
+    }
+
+    /// The file URL CoreFoundation spells for the local path `image`: the `DiskImageURL` the
+    /// image framework registers for a file attached by that path, which it spells the same way.
+    fn file_url(image: &std::path::Path) -> io::Result<Cf> {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = image.as_os_str().as_bytes();
+        let length = CfIndex::try_from(bytes.len())
+            .map_err(|_| invalid(format!("{} is too long for a file URL", image.display())))?;
+        // SAFETY: `bytes` is readable for `length` bytes, which the call copies; the answer is +1
+        // or null.
+        let url = unsafe {
+            CFURLCreateFromFileSystemRepresentation(ptr::null(), bytes.as_ptr(), length, 0)
+        };
+        if url.is_null() {
+            return Err(io::Error::other(format!(
+                "CoreFoundation could not spell {} as a file URL",
+                image.display()
+            )));
+        }
+        let url = Cf(url);
+        // SAFETY: `url` is a live CFURL; the string it answers is borrowed from it, or null.
+        let string = unsafe { CFURLGetString(url.0) };
+        if string.is_null() {
+            return Err(io::Error::other(format!(
+                "CoreFoundation spelled no URL string for {}",
+                image.display()
+            )));
+        }
+        // SAFETY: `string` is a live CFString borrowed from `url`, retained before `url` goes.
+        Ok(Cf(unsafe { CFRetain(string) }))
     }
 
     /// The entry's children in the service plane, unregistered ones (user clients) included.
@@ -5193,6 +5317,30 @@ mod io_registry {
     }
 
     pub(super) fn attached_disk_images() -> io::Result<Vec<AttachedDiskImage>> {
+        image_devices(registered(IMAGE_DEVICE)?)
+    }
+
+    /// Every attachment the kernel holds for the local file at `image`: the image devices whose
+    /// `DiskImageURL` the kernel matched to that file's URL among image devices alone, each with
+    /// the media in its own subtree. No other image is read, however many are attached.
+    pub(super) fn attachments_of(image: &std::path::Path) -> io::Result<Vec<AttachedDiskImage>> {
+        let properties = mutable_dictionary()?;
+        let url_key = key("DiskImageURL")?;
+        let url = file_url(image)?;
+        // SAFETY: `properties` is a live mutable dictionary, which retains the key and value.
+        unsafe { CFDictionarySetValue(properties.0, url_key.0, url.0) };
+        let attachments = image_devices(registered_matching(IMAGE_DEVICE, Some(&properties))?)?;
+        // The kernel matched the URL's spelling; the backing path it names decides.
+        Ok(attachments
+            .into_iter()
+            .filter(|attached| attached.is_backed_by(image))
+            .collect())
+    }
+
+    /// Each image device of one registry snapshot with the BSD media in its own subtree, in
+    /// registry order. A device that publishes no media yet exposes nothing and is not reported;
+    /// one that leaves the registry mid-read is departing and is not reported either.
+    fn image_devices(devices: Entries) -> io::Result<Vec<AttachedDiskImage>> {
         let keys = Keys {
             bsd_name: key("BSD Name")?,
             content: key("Content")?,
@@ -5200,67 +5348,123 @@ mod io_registry {
             url: key("DiskImageURL")?,
         };
         let mut images: BTreeMap<u64, AttachedDiskImage> = BTreeMap::new();
-        for media in registered(c"IOMedia")? {
-            settle(record_image_media(&mut images, &media, &keys))?;
+        for device in devices {
+            settle(record_image_device(&mut images, &device, &keys))?;
         }
-        Ok(images
-            .into_values()
-            .map(|mut image| {
-                image
-                    .media
-                    .sort_by(|left, right| left.device.cmp(&right.device));
-                image
-            })
-            .collect())
+        Ok(images.into_values().collect())
     }
 
-    /// Record one IOMedia node under the disk image it hangs from, if any. Every read lands
-    /// before anything is recorded, so a node that leaves the registry mid-read leaves no trace.
-    fn record_image_media(
+    /// The media one image device exposes: its whole media's size and every BSD media node.
+    #[derive(Default)]
+    struct DeviceMedia {
+        capacity: Option<ImageCapacity>,
+        media: Vec<ImageMedia>,
+    }
+
+    /// Record one image device with every BSD media node in its own subtree, reading the subtree
+    /// again whenever a concurrent attach or detach invalidated a child list. Every read lands
+    /// before anything is recorded, so a device that leaves the registry mid-read leaves no trace.
+    fn record_image_device(
         images: &mut BTreeMap<u64, AttachedDiskImage>,
-        media: &Object,
+        device: &Object,
         keys: &Keys,
+    ) -> Read<()> {
+        let id = entry_id(device, "read a disk image's registry id")?;
+        let Some(url) = string_property(device, &keys.url, "DiskImageURL")? else {
+            return Err(invalid("a disk image device registers no DiskImageURL").into());
+        };
+        let mut found = DeviceMedia::default();
+        while !read_media(device, 0, keys, &mut found)? {
+            found = DeviceMedia::default();
+        }
+        if found.media.is_empty() {
+            return Ok(());
+        }
+        found
+            .media
+            .sort_by(|left, right| left.device.cmp(&right.device));
+        images.insert(
+            id,
+            AttachedDiskImage {
+                source: DiskImageSource::from_url(&url),
+                capacity: found.capacity,
+                media: found.media,
+            },
+        );
+        Ok(())
+    }
+
+    /// Read the BSD media below `entry` into `found`, `media_above` being how many IOMedia lie
+    /// between `entry` and its image device: the device's whole media is the one with none above
+    /// it. A child the kernel finalizes mid-read is departing and is skipped with everything below
+    /// it, and another image device is never part of this one. Answers whether every child list
+    /// read was consistent.
+    fn read_media(
+        entry: &Object,
+        media_above: usize,
+        keys: &Keys,
+        found: &mut DeviceMedia,
+    ) -> Read<bool> {
+        let mut walk = children(entry)?;
+        let mut consistent = true;
+        for child in walk.by_ref() {
+            if conforms(&child, IMAGE_DEVICE) {
+                continue;
+            }
+            match read_child(&child, media_above, keys, found) {
+                Ok(read) => consistent &= read,
+                Err(Unread::Gone) => {}
+                Err(failed) => return Err(failed),
+            }
+        }
+        Ok(consistent && walk.consistent())
+    }
+
+    /// Record `child` when it is an IOMedia, then read the media below it.
+    fn read_child(
+        child: &Object,
+        media_above: usize,
+        keys: &Keys,
+        found: &mut DeviceMedia,
+    ) -> Read<bool> {
+        let below = if conforms(child, c"IOMedia") {
+            record_media(child, media_above == 0, keys, found)?;
+            media_above + 1
+        } else {
+            media_above
+        };
+        read_media(child, below, keys, found)
+    }
+
+    /// Record one IOMedia node of an image device if it has a BSD name, with its size when it is
+    /// the device's whole media. Every read lands before anything is recorded.
+    fn record_media(
+        media: &Object,
+        is_whole: bool,
+        keys: &Keys,
+        found: &mut DeviceMedia,
     ) -> Read<()> {
         let Some(name) = string_property(media, &keys.bsd_name, "BSD Name")? else {
             return Ok(());
         };
-        let Some(owner) = image_driver_of(media)? else {
-            return Ok(());
-        };
-        let capacity = if owner.is_whole {
+        let capacity = if is_whole {
             Some(u64_property(media, &keys.size, "Size")?.map(ImageCapacity::from_bytes))
         } else {
             None
         };
         let content = string_property(media, &keys.content, "Content")?.unwrap_or_default();
-        let image = match images.entry(owner.id) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let Some(url) = string_property(&owner.driver, &keys.url, "DiskImageURL")? else {
-                    return Err(invalid(format!(
-                        "the disk image exposing {name} registers no DiskImageURL"
-                    ))
-                    .into());
-                };
-                entry.insert(AttachedDiskImage {
-                    source: DiskImageSource::from_url(&url),
-                    capacity: None,
-                    media: Vec::new(),
-                })
-            }
-        };
         if let Some(capacity) = capacity {
-            image.capacity = capacity;
+            found.capacity = capacity;
         }
-        image.media.push(ImageMedia {
+        found.media.push(ImageMedia {
             device: format!("/dev/{name}"),
             content,
         });
         Ok(())
     }
 
-    /// Every APFS container and volume registered at one instant, from the same IOMedia snapshot
-    /// [`attached_disk_images`] reads: `AppleAPFSMedia` is a container's synthesized whole disk,
+    /// Every APFS container and volume registered at one instant, from one IOMedia snapshot:
+    /// `AppleAPFSMedia` is a container's synthesized whole disk,
     /// and each `AppleAPFSVolume` hangs from an `AppleAPFSContainer` that hangs from one. A
     /// container whose volumes are all gone, or not yet started, is still reported. A volume
     /// whose provider chain has already left the plane, or whose entries the kernel finalizes
@@ -5528,28 +5732,6 @@ mod io_registry {
         Ok(Some(media))
     }
 
-    /// The image driver above `media`, if any. A finalized node answers `false` to
-    /// [`conforms`], and the walk then asks it for its provider, which reports it gone.
-    fn image_driver_of(media: &Object) -> Read<Option<ImageDriver>> {
-        let mut intervening_media = 0usize;
-        let mut current = provider(media)?;
-        while let Some(entry) = current {
-            if conforms(&entry, c"AppleDiskImageDevice") {
-                let id = entry_id(&entry, "read a disk image's registry id")?;
-                return Ok(Some(ImageDriver {
-                    driver: entry,
-                    id,
-                    is_whole: intervening_media == 0,
-                }));
-            }
-            if conforms(&entry, c"IOMedia") {
-                intervening_media += 1;
-            }
-            current = provider(&entry)?;
-        }
-        Ok(None)
-    }
-
     /// The entry's provider in the service plane, or `None` once it is detached from the plane.
     fn provider(entry: &Object) -> Read<Option<Object>> {
         let mut parent: IoObject = 0;
@@ -5755,7 +5937,7 @@ mod io_registry {
         fn a_provider_chain_finalized_mid_walk_is_departing_not_an_inventory_failure() {
             let entry = finalized_entry();
             assert!(matches!(provider(&entry), Err(Unread::Gone)));
-            assert!(matches!(image_driver_of(&entry), Err(Unread::Gone)));
+            assert!(matches!(children(&entry), Err(Unread::Gone)));
             assert!(matches!(apfs_volume_media(&entry, None), Err(Unread::Gone)));
             assert!(matches!(entry_id(&entry, "read"), Err(Unread::Gone)));
         }
@@ -5782,11 +5964,11 @@ mod io_registry {
             ));
             let mut images = BTreeMap::new();
             assert!(matches!(
-                record_image_media(&mut images, &entry, &keys),
+                record_image_device(&mut images, &entry, &keys),
                 Err(Unread::Gone)
             ));
             assert!(images.is_empty());
-            assert!(settle(record_image_media(&mut images, &entry, &keys)).is_ok());
+            assert!(settle(record_image_device(&mut images, &entry, &keys)).is_ok());
         }
 
         /// The other half of the boundary: a property a still-registered entry does not have is
@@ -9347,6 +9529,81 @@ mod tests {
             backend.attached_capacity(Path::new("/tmp/cowshed-target.dmg")),
             Err(ApfsError::ImageNotAttached(path)) if path == Path::new("/tmp/cowshed-target.dmg")
         ));
+    }
+
+    /// A question about one image asks the kernel for that image alone and never reads every
+    /// attached image. Each whole read walked all of the host's media, and a verb asks several
+    /// such questions, so with hundreds of images attached every verb's cost grew with them.
+    #[test]
+    fn one_image_questions_never_read_every_attached_image() {
+        struct OneImage(AttachedDiskImage);
+        impl CommandRunner for OneImage {
+            fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+                panic!("a one-image question spawned {request:?}")
+            }
+            fn run_guarded<E>(
+                &self,
+                request: &CommandRequest,
+                _: impl FnOnce() -> Result<bool, E>,
+            ) -> Result<Option<CommandOutput>, E>
+            where
+                E: From<CommandRunError> + fmt::Display,
+            {
+                panic!("a one-image question spawned {request:?}")
+            }
+            fn image_lease(&self, _: &Path) -> io::Result<Option<Fenced<File>>> {
+                Ok(None)
+            }
+            fn pin_raw_device(&self, _: &Path) -> io::Result<Option<Fenced<File>>> {
+                Ok(None)
+            }
+            fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>> {
+                panic!("a one-image question read every attached image")
+            }
+            fn attachments_of(&self, image: &Path) -> io::Result<Vec<AttachedDiskImage>> {
+                Ok(self
+                    .0
+                    .is_backed_by(image)
+                    .then(|| self.0.clone())
+                    .into_iter()
+                    .collect())
+            }
+            fn grow_image(&self, image: &Path, _: ImageCapacity) -> io::Result<()> {
+                panic!("a one-image question grew {}", image.display())
+            }
+        }
+        let image = Path::new("/tmp/cowshed-target.dmg");
+        let backend = MacOsApfsBackend::new(OneImage(live_capture()));
+        assert_eq!(
+            backend.attached_whole_devices(image).unwrap(),
+            BTreeSet::from(["/dev/disk14".to_owned(), "/dev/disk15".to_owned()])
+        );
+        let attachment = backend
+            .existing_attachment(image)
+            .unwrap()
+            .expect("attached");
+        assert_eq!(
+            (attachment.whole_device(), attachment.volume_device()),
+            ("/dev/disk14", "/dev/disk15s1")
+        );
+        assert_eq!(
+            backend.attached_capacity(image).unwrap(),
+            ImageCapacity::from_bytes(125_000 * 512)
+        );
+        let views = backend.release_views(image).unwrap();
+        assert_eq!(
+            views
+                .iter()
+                .map(ReleaseView::whole_device)
+                .collect::<Vec<_>>(),
+            ["/dev/disk14"]
+        );
+        assert!(
+            backend
+                .recovered_image_attachment(Path::new("/tmp/cowshed-other.dmg"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Foreign, ambiguous, malformed and unreadable inventories fail closed.

@@ -413,12 +413,16 @@ general and unrecognized failures are errors, never grace or force authority. Ev
 The disk-image child policy warns at the caller's deadline and reports progress at the caller's configured cadence,
 rather than killing an in-flight `hdiutil detach`; this does not widen the release grace. The kernel's I/O Registry is
 the one host view that maps an image's path to its devices (`diskutil image info` reports none): one
-`IOServiceGetMatchingServices("IOMedia")` snapshot, each node walked up to its `AppleDiskImageDevice` and that device's
-`DiskImageURL`. `hdiutil info -plist` is not an inventory: while any other image attaches or detaches it answers a
-truncated image list with nothing marking it (a reviewer probe that kept one image attached while churning another saw
-it missing from 11–89 of every 648–1551 polls, and from none of the same polls' registry reads). Reading that omission
-as absence once skipped a post-format release, leaving the image attached for `diskutil image resize` to refuse as busy,
-and once lost a mounted workspace's attachment on restart.
+`IOServiceGetMatchingServices("AppleDiskImageDevice")` snapshot, each device's `DiskImageURL` and the IOMedia of that
+device's own subtree, reread when a concurrent attach or detach invalidates a child list. A question about one image
+names the image's file URL in the matching dictionary (`IOPropertyMatch` on `DiskImageURL`, spelled by CoreFoundation as
+the image framework spells it), so the kernel answers that image's devices alone and the read costs that image however
+many others are attached. Walking every registered IOMedia node up to its image device instead cost 7 ms per question
+with 54 images attached and 110 ms with 799, and a verb asks several. `hdiutil info -plist` is not an inventory: while
+any other image attaches or detaches it answers a truncated image list with nothing marking it (a reviewer probe that
+kept one image attached while churning another saw it missing from 11–89 of every 648–1551 polls, and from none of the
+same polls' registry reads). Reading that omission as absence once skipped a post-format release, leaving the image
+attached for `diskutil image resize` to refuse as busy, and once lost a mounted workspace's attachment on restart.
 
 The image driver registers an attach's media before `diskutil image attach` reports them, so creation requires the
 reported blank whole device to be the image's exact single-device mapping in one registry read before formatting.

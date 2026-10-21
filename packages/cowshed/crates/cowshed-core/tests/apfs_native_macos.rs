@@ -124,6 +124,10 @@ mod kernel_unmount {
             SystemCommandRunner.attached_disk_images()
         }
 
+        fn attachments_of(&self, image: &Path) -> io::Result<Vec<AttachedDiskImage>> {
+            SystemCommandRunner.attachments_of(image)
+        }
+
         fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> io::Result<()> {
             SystemCommandRunner.grow_image(image, capacity)
         }
