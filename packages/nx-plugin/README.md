@@ -1684,7 +1684,9 @@ task id and the hash it ran at:
 - `wedged`: `idleTimeoutMs` fired: no test finished during that much active test time. This proves the completion
   interval was exceeded, not that every process stopped: an oversized fixture can exceed it too. Its `tests` name those
   the runner reported running (nextest's `SLOW`, libtest's `has been running for over`) and never finished, and those
-  the JUnit report says it aborted when the bound stopped it.
+  the JUnit report says it aborted when the bound stopped it. Its `lockWaits` pairs the run's open regular files with
+  outside processes that also hold them, naming their pids and commands. This is open-handle evidence, not kernel
+  lock-owner proof; an incomplete or raced capture names no lock wait.
 - `no-space`: the command failed after its output said a write found no space (`ENOSPC` or `No space left on device`).
   Its tests failed on the disk, not on their own, whatever bound or hang followed: it records that line and, when the
   task held a RAM lease, the lease, the volume and its free bytes when the line arrived. A passing run that printed such

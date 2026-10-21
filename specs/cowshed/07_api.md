@@ -716,9 +716,9 @@ corpus tests check every generated projection and reject a deliberately changed 
 
 Error detail projection follows the canonical Serde object, including omitted and flattened sources. The native adapter
 copies its actual serialized own properties, not a second generated property list. Optional flattened named causes
-retain their optional public members in TypeScript; absence is not a null intersection. Mutually exclusive cold
-execution refusals may share one private boxed cause without changing the flat cpuAdmission/priority fields,
-unknown-source decoding, or borrowed source accessors.
+retain their optional public members in TypeScript; absence is not a null intersection. Mutually exclusive cold refusals
+may share one private boxed cause without changing the flat cpuAdmission/priority/removal fields, unknown-source
+decoding, or borrowed source accessors.
 
 The public declaration IR is serializable from its own Rust types. Its serde and projection metadata and normalized Rust
 type graph generate their TypeScript model through the same owner emitter; a consumer never restates those fields or
