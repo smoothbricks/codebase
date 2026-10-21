@@ -359,9 +359,12 @@ which every fork of the target holds while it clones the seed, so a reseed never
 4. the live volume and its backing image are flushed, then the existing mounted-source descriptor-clone captures the
    image atomically. Capture does not require unmount or detach; open files on exempt contributed paths do not refuse
    it. The Nx and Cargo guards remain held until the cloned bytes and immutable freshness mark are fixed;
-5. the clone's extent-map write and owner-record publication complete before supervised admission reopens. A job
-   admitted afterwards cannot invalidate the snapshot; its later writes make the seed behind again. Dropping the capture
-   claim only unlocks the source's hold; it never retires or deletes the source.
+5. the clone's extent-map write and owner-record publication complete before supervised admission reopens. The
+   content-neutral first-block rewrite has its own unconditional `build-volume first-write <image>` start/end span,
+   separate from `clonefile`, with elapsed time and success or failure. It pays the clone's extent-map cost before a
+   later mounted write; it does not repair or change the captured bytes. A job admitted afterwards cannot invalidate the
+   snapshot; its later writes make the seed behind again. Dropping the capture claim only unlocks the source's hold; it
+   never retires or deletes the source.
 
 Land already owns a shared GC hold on its quiet source. Its typed quiet capture retains the stopped supervisor socket
 lease that refuses replacement admission, from before the jobs stop through capture and adoption. It does not take a

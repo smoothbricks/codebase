@@ -208,7 +208,11 @@ where
         }
         let written = written_at(&to)?;
         // The clone's own extent map, paid here rather than by its first write inside a mount.
-        self.write_first(&to)?;
+        cowshed_os::timing::timed(
+            "build-volume",
+            format_args!("first-write {}", to.display()),
+            || self.write_first(&to),
+        )?;
         self.mark_seed_written(layout, destination, written)?;
         layout
             .write_record(destination, record)
@@ -777,6 +781,53 @@ mod tests {
         )
         .unwrap();
         (host, BuildVolumeLayout::new(&project).unwrap())
+    }
+
+    /// A detached file exercises the real clone and first write without attaching any image.
+    /// Both success and an unreadable first block must close the reported lifecycle step.
+    #[tokio::test]
+    async fn build_clone_reports_first_write_success_and_failure_without_mounting() {
+        use cowshed_os::timing::{Step, StepSink, reporting};
+
+        let root = std::env::temp_dir().join(format!("build-first-write-{}", uuid::Uuid::new_v4()));
+        let (host, layout) = fixture(&root);
+        fs::create_dir_all(layout.images()).unwrap();
+        for contents in [vec![0x5a; 8192], vec![0x5a; 32]] {
+            let source = BuildVolumeId::mint();
+            let destination = BuildVolumeId::mint();
+            fs::write(layout.image(&source), &contents).unwrap();
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let result = reporting(StepSink::new(sender), async {
+                host.clone_build_volume(&layout, &source, &destination, &linked("topic"))
+            })
+            .await;
+            let steps: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+            let expected = format!("first-write {}", layout.image(&destination).display());
+            let step = steps
+                .iter()
+                .find_map(|event| match event {
+                    Step::Started {
+                        step, scope, name, ..
+                    } if scope == "build-volume" && name == &expected => Some(*step),
+                    _ => None,
+                })
+                .expect("the first write starts its own step");
+            let error = steps
+                .iter()
+                .find_map(|event| match event {
+                    Step::Ended { step: ended, error } if *ended == step => Some(error),
+                    _ => None,
+                })
+                .expect("the first write ends its own step");
+            assert_eq!(error.is_none(), contents.len() >= 4096);
+            assert_eq!(
+                error.as_ref(),
+                result.as_ref().err().map(ToString::to_string).as_ref()
+            );
+            assert_eq!(fs::read(layout.image(&destination)).unwrap(), contents);
+            assert_eq!(layout.record(&destination).exists(), result.is_ok());
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// Observe admission at the mounted-source selection that leads to the live clone, while
