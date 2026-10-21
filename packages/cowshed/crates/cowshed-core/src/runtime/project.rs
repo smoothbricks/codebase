@@ -2801,12 +2801,16 @@ fn plan_terminal_storage_tree(path: &Path, plan: &mut Vec<TerminalEntry>) -> Res
         plan.push(TerminalEntry::Directory(path.to_owned()));
         Ok(())
     } else if metadata.file_type().is_file()
-        && metadata.len() == 0
         && path
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| {
-                name.ends_with(".lock") || name.ends_with(crate::build_volume::HOLD_SUFFIX)
+                // A land lease describes its last holder (a killed one cannot clear it); that
+                // description is no state, so the lease is a lock whatever its length.
+                name.ends_with(super::land_lease::LAND_LEASE_SUFFIX)
+                    || (metadata.len() == 0
+                        && (name.ends_with(".lock")
+                            || name.ends_with(crate::build_volume::HOLD_SUFFIX)))
             })
     {
         plan.push(TerminalEntry::Lock(path.to_owned()));
@@ -12328,6 +12332,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         workspace: WorkspaceName,
         options: RemoveOptions,
     ) -> Result<RemoveReport> {
+        // A land of this workspace in flight holds the lease, and this removal is refused naming
+        // it; held for the removal, so a land started meanwhile is refused the same way.
+        let _land_lease = super::land_lease::take(
+            &self.layout.project().sessions,
+            workspace.as_str(),
+            super::land_lease::Holding::Remove,
+        )?;
         let containment = self.main_containment()?;
         self.remove_contained_in(
             workspace,
@@ -13138,7 +13149,18 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         self.wait_for_other_builds_as_a_land_step();
         let store_root = &std::sync::Arc::clone(self.git.store_root());
         timed_async("land", "binding", self.validate_binding()).await?;
+        // Held to the end of the land, its own retire included: an `rm` of this workspace is
+        // refused meanwhile, naming this land (02_workspaces.md "A land and an rm of one workspace
+        // exclude each other").
+        let _land_lease = super::land_lease::take(
+            &self.layout.project().sessions,
+            workspace.as_str(),
+            super::land_lease::Holding::Land,
+        )?;
         let current = timed_async("land", "source", self.current(&workspace)).await?;
+        // Read once, here: from the fast-forward on, nothing reads the workspace back, since the
+        // steps after it may unpublish it.
+        let landing_incarnation = current.derived.workspace.incarnation().clone();
         if let Some(expected) = options.expected_workspace_incarnation.as_ref() {
             Self::require_exact_incarnation(&current, expected)?;
         }
@@ -13369,13 +13391,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             )
         })?;
         use super::supervisor::{CommitmentDraft, CommitmentSink};
-        let landing_incarnation = self
-            .current(&workspace)
-            .await?
-            .derived
-            .workspace
-            .incarnation()
-            .clone();
+        // The landing workspace is not read again after the build-volume step (its incarnation
+        // was read at the start); the target stays published.
         let target_incarnation = self
             .current(&into.name)
             .await?
@@ -13420,25 +13437,36 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             // the retry its hint names would land nothing. Containment is measured against the
             // branch the unit landed on, so a lane unit whose commits are in its lane base retires.
             let containment = into.containment(target_branch.clone());
-            self.remove_contained_in(
-                workspace.clone(),
-                RemoveOptions::default(),
-                &containment,
-                CheckoutNxCheck::Held,
-                // The owner's own land retires the unit it just landed, however young.
-                YoungPolicy::Authorized,
-            )
-            .await
-            .map_err(|kept| {
-                CowshedError::new(
-                    kept.code,
-                    format!(
-                        "landed {source_head} on {target_branch}, but workspace {workspace} was kept: {}",
-                        kept.message
-                    ),
-                    kept.hint,
+            match self
+                .remove_contained_in(
+                    workspace.clone(),
+                    RemoveOptions::default(),
+                    &containment,
+                    CheckoutNxCheck::Held,
+                    // The owner's own land retires the unit it just landed, however young.
+                    YoungPolicy::Authorized,
                 )
-            })?;
+                .await
+            {
+                Ok(_) => {}
+                // Nothing of the workspace is left to retire: a removal outside a land's lease
+                // took it (an older cowshed's `rm`, a hand). The land itself is done.
+                Err(gone) if gone.code == ErrorCode::NotFound => eprintln!(
+                    "cowshed: landed {source_head} on {target_branch}; workspace {workspace} was \
+                     already gone, so the land had nothing left to retire: {}",
+                    gone.message
+                ),
+                Err(kept) => {
+                    return Err(CowshedError::new(
+                        kept.code,
+                        format!(
+                            "landed {source_head} on {target_branch}, but workspace {workspace} was kept: {}",
+                            kept.message
+                        ),
+                        kept.hint,
+                    ));
+                }
+            }
         } else {
             // Retiring collects; a land that keeps the workspace collects here, so the target's
             // previous volume and whatever else no checkout links goes with every land.

@@ -1147,6 +1147,20 @@ adoption. The next fork (including `--ref` naming the target's current tree) aut
 exactly that tree as the target's seed, under writer exclusion; no manual seed-refresh or warm command exists. `doctor`
 reports `seed-tree-behind` and `target-moved-outside-land` when the recorded volumes do not match the tree.
 
+**A land and an rm of one workspace exclude each other.** From the fast-forward on, a landing workspace's commits are in
+the target, so `rm`'s containment gate passes while its land still adopts the build volume and retires it, and the age
+floor does not help a workspace older than ten minutes. Measured 2026-10-21: an agent's watcher saw the landed head on
+main and ran `cowshed rm` on the workspace while its land was releasing the target's previous build volume; the land,
+reading its workspace back afterwards, answered `not-found` and its wrapper skipped the push of a main the land had
+moved. So a land, from just after it validates the binding to its end (its own retire included), and an `rm`, for its
+whole run, each hold `sessions/<ws>.land.lock` exclusively: a `flock(2)` on a descriptor the process owns, so the kernel
+drops it when that process ends however it ends, and a killed land never keeps its workspace from being removed. The
+file records the holder (`land` or `remove`, its pid, since when, its command line); the operation refused names it —
+`cannot remove workspace <ws>: it is being landed by pid …` — and is never queued behind it. A land reads its
+workspace's incarnation once, at its start, and never reads the workspace back after the fast-forward. A land whose own
+retire finds the workspace already gone (removed by a cowshed that predates the lease, or by hand) reports `landed` and
+says on stderr that there was nothing left to retire. Who removed it is the deletion log's `retiredBy`.
+
 ### Lanes: `fork` and `--into`
 
 A lane is a line of work that reaches main as one change but is built by several workspaces. Its base is an ordinary

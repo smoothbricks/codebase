@@ -82,6 +82,7 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
       <workspace>.dmg.ca.key         # the workspace's CA private key, 0600
       <workspace>.dmg.lock           # flock target for lifecycle operations
       <workspace>.intent.lock        # flock the process executing <workspace>'s lifecycle intent holds
+      <workspace>.land.lock          # flock a land or an rm of <workspace> holds for its run (02 "A land and an rm of one workspace exclude each other")
       .trash/                        # removed images awaiting reclamation (`gc`)
     checkpoints/
       <workspace>/<label>.dmg        # clonefile snapshot

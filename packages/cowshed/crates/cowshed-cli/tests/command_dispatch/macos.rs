@@ -20,6 +20,7 @@ use cowshed_core::build_volume::{
 use cowshed_core::metadata::{PortBlock, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::RecoveryScope;
+use cowshed_core::runtime::land_lease::{self, Holding};
 use cowshed_core::storage::apfs::native::{
     KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
 };
@@ -31,6 +32,7 @@ use cowshed_gateway::{
     KeychainCredentialProvider, MirrorCacheConfig, SystemConnector,
 };
 use cowshed_os::test_backstop::NO_PROGRESS;
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
@@ -2982,6 +2984,160 @@ async fn directory_a_land_fences_the_target_head_under_the_caller_ref_lock_subst
         .shutdown()
         .await
         .expect("stop the real directory project");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_an_rm_during_a_land_is_refused_naming_it_substrate_lifecycle() {
+    let mut fixture = Fixture::directory();
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let main = fixture.checkout.clone();
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("topic.txt"), b"topic\n").expect("write the workspace file");
+    git(&topic, &["add", "topic.txt"]);
+    git(&topic, &["commit", "-q", "-m", "topic"]);
+    let topic_head = git_stdout(&topic, &["rev-parse", "HEAD"]);
+
+    // The land parks in its check until the rm has been refused, so the rm runs while the land
+    // holds the lease. The release is written even when the rm misbehaves, so the land ends.
+    let mid_land = topic.join(".git/mid-land");
+    let release = topic.join(".git/release-land");
+    let finished = Cell::new(false);
+    let mut removal_service = fixture.reopen().await;
+    let land = async {
+        let outcome = run(
+            &mut service,
+            [
+                "--json",
+                "land",
+                "topic",
+                "--no-retire",
+                "--check",
+                "/usr/bin/touch .git/mid-land; while [ ! -e .git/release-land ]; do /bin/sleep 0.05; done",
+            ],
+        )
+        .await;
+        finished.set(true);
+        outcome
+    };
+    let rm_during_land = async {
+        eventually(|| mid_land.exists() || finished.get()).await;
+        let outcome = run(&mut removal_service, ["rm", "topic"]).await;
+        fs::write(&release, b"").expect("release the parked land");
+        outcome
+    };
+    let ((landed, _, land_stderr), (removed, _, _)) = tokio::join!(land, rm_during_land);
+
+    let landed = landed.unwrap_or_else(|error| {
+        panic!(
+            "the land failed: {error}\n{}",
+            String::from_utf8_lossy(&land_stderr)
+        )
+    });
+    assert_eq!(landed, 0, "the land exits 0");
+    assert_eq!(
+        git_stdout(&main, &["rev-parse", "HEAD"]),
+        topic_head,
+        "the land moved main to the workspace's commit"
+    );
+    let refusal = removed.expect_err("an rm was admitted while its workspace was landing");
+    assert!(
+        refusal
+            .message
+            .contains(&format!("being landed by pid {}", std::process::id())),
+        "the rm did not name the land: {refusal}"
+    );
+    assert!(topic.exists(), "the refused rm left the workspace in place");
+    removal_service
+        .shutdown()
+        .await
+        .expect("stop the second controller bridge");
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_an_rm_while_a_land_holds_the_lease_is_refused_substrate_lifecycle() {
+    let mut fixture = Fixture::directory();
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let topic = new_workspace(&mut service, "topic").await;
+    let held = land_lease::take(&fixture_sessions(&fixture), "topic", Holding::Land)
+        .expect("a land takes the lease");
+
+    let (removed, _, stderr) = run(&mut service, ["rm", "topic"]).await;
+    let refusal = removed.expect_err("an rm was admitted while a land held the lease");
+    assert!(
+        refusal
+            .message
+            .contains(&format!("being landed by pid {}", std::process::id())),
+        "the rm did not name the land: {refusal}\n{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(topic.exists(), "the refused rm left the workspace in place");
+
+    drop(held);
+    // Seconds old, so past the age floor only by force; the lease no longer refuses it.
+    succeed(&mut service, ["rm", "topic", "--force"]).await;
+    // The rm's logical retirement returns before its mountpoint is reclaimed in the background.
+    eventually(|| !topic.exists()).await;
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_land_while_an_rm_holds_the_lease_is_refused_substrate_lifecycle() {
+    let mut fixture = Fixture::directory();
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let main = fixture.checkout.clone();
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("topic.txt"), b"topic\n").expect("write the workspace file");
+    git(&topic, &["add", "topic.txt"]);
+    git(&topic, &["commit", "-q", "-m", "topic"]);
+    let main_head = git_stdout(&main, &["rev-parse", "HEAD"]);
+    let topic_head = git_stdout(&topic, &["rev-parse", "HEAD"]);
+    let held = land_lease::take(&fixture_sessions(&fixture), "topic", Holding::Remove)
+        .expect("an rm takes the lease");
+
+    let (landed, _, stderr) = run(&mut service, ["--json", "land", "topic", "--no-retire"]).await;
+    let refusal = landed.expect_err("a land was admitted while an rm held the lease");
+    assert!(
+        refusal
+            .message
+            .contains(&format!("being removed by pid {}", std::process::id())),
+        "the land did not name the rm: {refusal}\n{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        git_stdout(&main, &["rev-parse", "HEAD"]),
+        main_head,
+        "a refused land left main where it was"
+    );
+    assert!(topic.exists(), "a refused land left the workspace in place");
+
+    drop(held);
+    succeed(&mut service, ["--json", "land", "topic", "--no-retire"]).await;
+    assert_eq!(
+        git_stdout(&main, &["rev-parse", "HEAD"]),
+        topic_head,
+        "the released lease let the land move main"
+    );
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}
+
+/// The fixture project's session directory, where its workspaces' land leases live.
+fn fixture_sessions(fixture: &Fixture) -> PathBuf {
+    let storage = cowshed_core::storage::StorageLayout::new(
+        fixture.storage.store(),
+        &RepoId::parse("fixture/dispatch").expect("repository identity"),
+    )
+    .expect("fixture storage layout");
+    storage.project().sessions.clone()
 }
 
 async fn eventually(mut ready: impl FnMut() -> bool) {
