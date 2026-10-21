@@ -506,9 +506,20 @@ workspace that was detached while main moved has no volume to write into; `attac
 configuration when the workspace is next used, so the repair rides the front door a workspace already passes through
 rather than needing a verb of its own. Both paths are the idempotent no-op the remote configuration is built to be.
 
-A fresh mint starts from a clean slate: the workspace's `.git` arrives by CoW carrying every remote main had, network
-URLs included, so mint **strips them all** before configuring its own. That is the "no remote URL ever exists inside a
-sandbox" invariant, not a judgement about user intent — nothing in a just-cloned image is the user's yet.
+A fresh mint starts from a clean slate: the workspace's `.git` arrives by CoW carrying every remote its source had,
+network URLs included, so mint **strips them all** before configuring its own. That is the "no remote URL ever exists
+inside a sandbox" invariant, not a judgement about user intent — nothing in a just-cloned image is the user's yet. The
+one remote it keeps is cowshed's own `main` already naming main's canonical mount, which configuration would recreate
+unchanged: a fork of a workspace keeps that remote's tracking refs, and a replayed mint keeps what its first pass
+recorded.
+
+**A fork carries main's ref.** A workspace resolves `main` with no fetch: `main/main`, `main` and
+`git merge-base HEAD main` name the commit the workspace forked from. A clone of main carries main's branches as they
+stood at capture, so before mint prunes them (fork mint step 6) it records them as the `main` remote's tracking refs,
+and main's checked-out branch as `main/HEAD`, through one fetch from the clone's own repository: no objects move and
+nothing outside the workspace is read. A fork of a workspace carries that workspace's `main/*` refs as it last saw them.
+Like any tracking ref they are snapshots that `git fetch main` refreshes; `rebase` fetches before it reads them, and
+`land` reads its target live.
 
 Afterwards it is, and configuration **never clobbers a remote cowshed did not create**. Remote configuration is
 idempotent and re-runs on reconciliation, against a repository an agent has been working in — where `cowshed repo`
@@ -594,17 +605,17 @@ image remains live and mounted throughout capture.
    sibling targets of the source's developer package links to its read grants (16_build_volumes.md, "Hash inputs"); it
    never adds an ancestor dependency store or the source's main root, and the source's owned-link marker is migrated
    first. Finding them reads every directory of the fresh volume, concurrently, and is the largest setup cost after the
-   clone's first write. Then, inside the mount, under the workspace's closed sandbox: configure the `main` remote (see
-   "The `main` remote") and `git switch -c cowshed/<name>` from the checked-out state, then delete every other local
-   branch. One branch per workspace, as in a git worktree: the workspace's own branch is the only one it rebases on main
-   and lands, and main's branches stay main's, reached through the `main` remote. Nothing in the clone is the
-   workspace's work yet, so every carried branch is a copy of the source's as captured, whether or not the source has
-   since moved or dropped it; a copy left in the workspace is a branch work can land on unseen and one `rm` must judge
-   against main. A fork from a session keeps none of the source's branches either, its `cowshed/<src>` included. The
-   seed contributes only build state (16_build_volumes.md); every Git byte comes from the source's own image. The `.git`
-   directory arrived complete via CoW — the workspace is a standalone repository with **no linked-worktree registration
-   and no back-references** into the host checkout, unless it was created with `--git-worktree` (see "Git-worktree
-   workspaces").
+   clone's first write. Then, inside the mount, under the workspace's closed sandbox: configure the `main` remote and,
+   in a clone of main, record the branches it carried as that remote's (see "The `main` remote"), then
+   `git switch -c cowshed/<name>` from the checked-out state, then delete every other local branch. One branch per
+   workspace, as in a git worktree: the workspace's own branch is the only one it rebases on main and lands, and main's
+   branches stay main's, reached through the `main` remote. Nothing in the clone is the workspace's work yet, so every
+   carried branch is a copy of the source's as captured, whether or not the source has since moved or dropped it; a copy
+   left in the workspace is a branch work can land on unseen and one `rm` must judge against main. A fork from a session
+   keeps none of the source's branches either, its `cowshed/<src>` included. The seed contributes only build state
+   (16_build_volumes.md); every Git byte comes from the source's own image. The `.git` directory arrived complete via
+   CoW — the workspace is a standalone repository with **no linked-worktree registration and no back-references** into
+   the host checkout, unless it was created with `--git-worktree` (see "Git-worktree workspaces").
 7. Record the audit
    `ControllerCommitment::Fork(ForkCommitment { version, order, repo_id, source_incarnation, destination_incarnation })`;
    the new marker carries `lineage` = source incarnation followed by the source's own lineage, which authorizes the job

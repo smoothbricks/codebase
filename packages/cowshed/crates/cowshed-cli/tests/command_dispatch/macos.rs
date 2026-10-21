@@ -819,7 +819,8 @@ async fn real_apfs_doctor_repair_moves_the_newer_of_two_workspaces_sharing_a_por
 /// branch or working tree (02_workspaces.md, "`cowshed push`"). A checked land refuses while
 /// the gateway is absent, then fast-forwards main once it is back (02_workspaces.md,
 /// "`cowshed land`"). Adopt, new, exec and land never create a shell hook (02_workspaces.md,
-/// "Workspace environment"; 15_capabilities.md, "Required evidence").
+/// "Workspace environment"; 15_capabilities.md, "Required evidence"). The fresh fork resolves `main`
+/// with no fetch (02_workspaces.md, "The `main` remote").
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_plain_git_repository_adopts_clones_executes_and_lands_without_shell_hooks() {
     let started = std::time::Instant::now();
@@ -860,6 +861,20 @@ async fn directory_plain_git_repository_adopts_clones_executes_and_lands_without
         .path("topic", false)
         .await
         .expect("plain clone mount");
+    // A fork carries main's ref (02_workspaces.md, "The `main` remote"): with no fetch, `main`
+    // and `main/main` name the commit the workspace forked from, and merge-base answers.
+    let forked_from = git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]);
+    for revision in ["main", "refs/remotes/main/main"] {
+        assert_eq!(
+            git_stdout(&topic.mount, &["rev-parse", revision]),
+            forked_from,
+            "{revision}"
+        );
+    }
+    assert_eq!(
+        git_stdout(&topic.mount, &["merge-base", "HEAD", "main"]),
+        forked_from
+    );
     phase("exec topic");
     let (executed, stdout, stderr) = run(
         &mut service,

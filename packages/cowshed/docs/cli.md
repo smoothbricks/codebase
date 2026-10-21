@@ -473,8 +473,9 @@ use the old path, or may be absent; cowshed does not inspect or rewrite it.
 ### `cowshed fork [<src>] <ws> [--clean] [--ref <rev>] [--browse] [--slot <n>] [--register] [--git-worktree]`
 
 Clones a live image from the selected repository and mints its own `cowshed/<ws>` branch, the only local branch the
-workspace keeps: main's branches stay main's, reached through the `main` remote. The source defaults to main and may be
-any session. By default tracked edits, untracked files, dependencies and build state all carry warm. `--clean` resets
+workspace keeps: main's branches stay main's, reached through the `main` remote, which carries them as the fork captured
+them, so `main`, `main/main` and `git merge-base HEAD main` resolve with no fetch. The source defaults to main and may
+be any session. By default tracked edits, untracked files, dependencies and build state all carry warm. `--clean` resets
 tracked edits and removes nonignored untracked paths; ignored build state stays.
 
 ```sh

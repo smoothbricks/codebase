@@ -2350,11 +2350,16 @@ impl GitRepository {
             .workspace_branch_for_initialization(name, "the cloned workspace", retry, resuming)
             .await?;
 
-        // The `.git` directory arrived by CoW carrying every remote main had, including network
-        // URLs. Replaying this loop is safe: an earlier pass leaves either no remotes or the local
-        // cowshed-owned `main`, which configure_main_remote recreates below.
+        // The `.git` directory arrived by CoW carrying every remote its source had, network URLs
+        // included. Every one goes except cowshed's own `main` already naming main's mount: from
+        // a workspace source its tracking refs are main's branches as that source last saw them,
+        // and a replay finds the refs an earlier pass recorded there. configure_main_remote
+        // re-asserts it below.
         timed_async("fork", "remotes", async {
             for remote in self.remote_names().await? {
+                if remote == MAIN_REMOTE && self.is_owned_main_remote(main_mount).await? {
+                    continue;
+                }
                 let output = self.run(["remote", "remove", remote.as_str()]).await?;
                 ensure_git_success("remove inherited remote", output)?;
             }
@@ -2367,6 +2372,16 @@ impl GitRepository {
             self.configure_main_remote(main_mount),
         )
         .await?;
+        // A clone of main carries main's branches as captured; the prune below removes them, so
+        // they are recorded first as the remote's, where main's branches belong.
+        if source == main_mount {
+            timed_async(
+                "fork",
+                "main-branches",
+                self.track_carried_main_branches(name, main_remote.remote_name()),
+            )
+            .await?;
+        }
 
         timed_async("fork", "branch", async {
             if branch_ready {
@@ -2385,6 +2400,60 @@ impl GitRepository {
         )
         .await?;
         Ok(main_remote)
+    }
+
+    /// Whether this clone's `main` remote is cowshed's own and already names `main_mount`, the
+    /// one remote a fresh mint keeps (02_workspaces.md, "The `main` remote").
+    async fn is_owned_main_remote(&self, main_mount: &Path) -> Result<bool> {
+        match self.remote_url(MAIN_REMOTE).await? {
+            Some(url) if url == main_mount => self.owns_remote(MAIN_REMOTE, &url, main_mount).await,
+            _ => Ok(false),
+        }
+    }
+
+    /// Record the branches a clone of main carried as `remote`'s tracking refs, and main's
+    /// checked-out branch as `remote`'s HEAD: they are main's branches exactly as captured, so
+    /// `main/main` and `main` name the commit the workspace forked from, and `git merge-base HEAD
+    /// main` answers, without a fetch (02_workspaces.md, "The `main` remote"). One fetch from the
+    /// clone itself moves no objects and reads nothing outside the workspace; automatic
+    /// maintenance stays off, as for every fetch cowshed runs. A replay rewrites the same captured
+    /// tips and leaves out the workspace's own branch, and HEAD names that branch once switched.
+    async fn track_carried_main_branches(&self, name: &str, remote: &str) -> Result<()> {
+        let (_, own_ref) = workspace_branch(name);
+        let tracking = format!("+refs/heads/*:refs/remotes/{remote}/*");
+        let own = format!("^{own_ref}");
+        let output = self
+            .run([
+                "-c",
+                "maintenance.auto=false",
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                ".",
+                tracking.as_str(),
+                own.as_str(),
+            ])
+            .await?;
+        ensure_git_success("record main's branches as the main remote's", output)?;
+        // The full ref, not `--short`: once `<remote>/HEAD` exists, git shortens `refs/heads/main`
+        // to `heads/main`, which names no tracking ref.
+        let head = self.run(["symbolic-ref", "--quiet", "HEAD"]).await?;
+        let head = match head.status.code() {
+            Some(0) => parse_one_string(&head.stdout, "main's checked-out branch")?,
+            Some(1) => return Ok(()),
+            _ => return Err(git_internal("read main's checked-out branch", &head)),
+        };
+        match head.strip_prefix("refs/heads/") {
+            Some(branch) if head != own_ref => {
+                let output = self.run(["remote", "set-head", remote, branch]).await?;
+                ensure_git_success(
+                    "name main's checked-out branch as the main remote's HEAD",
+                    output,
+                )
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Delete every local branch this clone carried, keeping only its own `cowshed/<name>`: a
@@ -6465,7 +6534,7 @@ mod tests {
         );
         let repo = GitRepository::from_root(store.shared(), &mount);
         assert_eq!(
-            repo.prepare_workspace("raven", &main, &main, Some("main"), false)
+            repo.prepare_workspace("raven", &main, &main, None, false)
                 .await
                 .expect("prepare workspace"),
             MainRemote::Canonical
@@ -6517,7 +6586,7 @@ mod tests {
         );
         git(&mount, &["update-ref", "refs/heads/moved", advanced.trim()]);
         let repo = GitRepository::from_root(store.shared(), &mount);
-        repo.prepare_workspace("raven", &main, &main, Some("main"), false)
+        repo.prepare_workspace("raven", &main, &main, None, false)
             .await
             .expect("prepare workspace");
         let branches =
@@ -6531,6 +6600,74 @@ mod tests {
             branches(&main),
             "refs/heads/carried\nrefs/heads/main\nrefs/heads/moved\n",
             "the source keeps every branch"
+        );
+    }
+
+    /// A clone of main carries main's branches, and mint prunes them. Before it does, it records
+    /// them as the `main` remote's tracking refs, so `main/main` and `main` name the commit the
+    /// workspace forked from and `git merge-base HEAD main` answers with no fetch. A replay keeps
+    /// what the first pass recorded, and a fork of that workspace carries them.
+    #[tokio::test]
+    async fn a_fork_resolves_main_without_a_fetch() {
+        let store = crate::temp_root::FixtureStore::new();
+        let main = repository();
+        git(&main, &["branch", "carried"]);
+        let tip = git_stdout(&main, &["rev-parse", "main"]);
+        let mount = clone_image(&main);
+        let repo = GitRepository::from_root(store.shared(), &mount);
+        repo.prepare_workspace("raven", &main, &main, None, false)
+            .await
+            .expect("prepare workspace");
+        let resolved = |root: &Path| {
+            [
+                git_stdout(root, &["rev-parse", "refs/remotes/main/main"]),
+                git_stdout(root, &["rev-parse", "main"]),
+                git_stdout(root, &["merge-base", "HEAD", "main"]),
+            ]
+        };
+        let forked_from = [tip.clone(), tip.clone(), tip.clone()];
+        assert_eq!(
+            resolved(&mount),
+            forked_from,
+            "main resolves to the commit the workspace forked from"
+        );
+        assert_eq!(
+            git_stdout(&mount, &["rev-parse", "refs/remotes/main/carried"]),
+            tip,
+            "every branch the clone carried is main's, named through the main remote"
+        );
+        assert_eq!(
+            git_stdout(
+                &mount,
+                &["for-each-ref", "--format=%(refname)", "refs/heads"]
+            ),
+            "refs/heads/cowshed/raven\n",
+            "the workspace still holds only its own branch"
+        );
+
+        repo.prepare_workspace("raven", &main, &main, None, true)
+            .await
+            .expect("replay preparation");
+        assert_eq!(
+            resolved(&mount),
+            forked_from,
+            "a replay keeps what the first pass recorded"
+        );
+
+        let session = mount.with_extension("session");
+        let status = Command::new("cp")
+            .args(["-R".as_ref(), mount.as_os_str(), session.as_os_str()])
+            .status_locked()
+            .expect("clone the workspace image");
+        assert!(status.success());
+        GitRepository::from_root(store.shared(), &session)
+            .prepare_workspace("swift", &main, &mount, None, false)
+            .await
+            .expect("prepare a fork of the workspace");
+        assert_eq!(
+            resolved(&session),
+            forked_from,
+            "a fork of a workspace carries main's branches as its source saw them"
         );
     }
 
