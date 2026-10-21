@@ -560,7 +560,7 @@ pub fn tree_holds(root: &Path) -> io::Result<Vec<TreeHold>> {
     };
     let under = |link: PathBuf| link.starts_with(&root).then_some(link);
     let holds = procfs_census(|process| {
-        let link = |name: &str| fs::read_link(process.join(name)).ok().and_then(&under);
+        let link = |name: &str| fs::read_link(process.join(name)).ok().and_then(under);
         link("cwd")
             .map(Hold::WorkingDirectory)
             .or_else(|| link("root").map(Hold::RootDirectory))
@@ -569,7 +569,7 @@ pub fn tree_holds(root: &Path) -> io::Result<Vec<TreeHold>> {
                 fs::read_dir(process.join("fd"))
                     .ok()?
                     .flatten()
-                    .find_map(|descriptor| fs::read_link(descriptor.path()).ok().and_then(&under))
+                    .find_map(|descriptor| fs::read_link(descriptor.path()).ok().and_then(under))
                     .map(Hold::OpenFile)
             })
             // A mapping's path is its line's last field and the line's first `/`: the
