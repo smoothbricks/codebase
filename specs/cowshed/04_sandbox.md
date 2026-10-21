@@ -990,6 +990,18 @@ the first host client after a shed went idle finds no daemon and starts one of i
 keeper stops that one too. A daemon is stopped, never disabled: the next host Nx command, or the keeper once a job is
 admitted, starts one (16_build_volumes.md, "The Nx daemon stays on").
 
+Every stop of a daemon cowshed makes ends its plugin workers with it: the keeper's, a retirement's (02_workspaces.md)
+and a land's (16_build_volumes.md, Land 4). Nx forks each worker detached, leading its own session, so neither the job's
+group nor the daemon's session names it, and once the daemon exits launchd adopts it and nothing the kernel keeps names
+it the daemon's. So the stop captures them before its signal, while they are still the daemon's children: each child
+whose kernel record names the daemon's unique id (`p_uniqueid`) as its parent's, held by its own unique id with its exit
+watched, and again after each fork the daemon reports until it exits (`runtime::daemon_watch`). The keeper's daemon is
+also a job of its supervisor, and that job's end, its group stopped or the daemon gone on its own, ends its workers the
+same way: the job's process observation followed each from its birth (07_api.md, "Process-tree observations"), and what
+it saw born and not yet exit is ended. Once the daemon has exited each one still running is sent SIGTERM, then SIGKILL
+after the 10 s grace, and every wait is on its exit event. A worker that outlives that, or a fork whose children were
+listed only after the daemon had gone, is said on stderr, and the mount census names any that still hold the checkout.
+
 An open request connection, registered watcher or graph listener retains the daemon even when silent; closing the last
 request connection resets the full idle interval. The non-default, uncached target
 `bun nx run tooling:nx-daemon-idle-proof` compiles `tooling/nx-daemon-idle-proof.ts` with the canonical Typia transform,

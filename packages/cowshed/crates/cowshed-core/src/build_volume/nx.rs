@@ -374,82 +374,30 @@ pub(crate) fn live_daemon(data: &Path) -> Option<i32> {
     crate::runtime::nx_daemon::live_pid(&data.join(DAEMON_DIRECTORY).join(DAEMON_RECORD))
 }
 
-/// `SIGTERM` `pid` and wait for its exit on the kernel's exit event: `true` once it has exited,
-/// `false` when it outlived [`DAEMON_EXIT_GRACE`], which guards only against a hang. The
-/// daemon's own termination handler removes its socket and record.
+/// `SIGTERM` `pid` and wait for its exit on the kernel's exit event, then end the plugin workers
+/// it forked, held from before the signal while they were still its children
+/// ([`crate::runtime::daemon_watch`]): `true` once it has exited, `false` when it outlived
+/// [`DAEMON_EXIT_GRACE`], which guards only against a hang. The daemon's own termination handler
+/// removes its socket and record. A worker that could not be ended is said on stderr, and the mount
+/// census names it while it holds the checkout.
 #[cfg(target_os = "macos")]
 fn stop_daemon(pid: i32) -> io::Result<bool> {
-    use std::os::fd::{FromRawFd, OwnedFd};
-    // SAFETY: `kqueue` takes no arguments; a negative answer is an error.
-    let queue = unsafe { libc::kqueue() };
-    if queue < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `queue` is a fresh descriptor this function alone owns.
-    let queue = unsafe { OwnedFd::from_raw_fd(queue) };
-    let exit = libc::kevent {
-        ident: pid as libc::uintptr_t,
-        filter: libc::EVFILT_PROC,
-        flags: libc::EV_ADD | libc::EV_ONESHOT,
-        fflags: libc::NOTE_EXIT,
-        data: 0,
-        udata: std::ptr::null_mut(),
+    let Some(daemon) = crate::runtime::job_groups::process_record(pid)? else {
+        return Ok(true);
     };
-    use std::os::fd::AsRawFd;
-    // Registered before the signal, so an exit between the two is never missed.
-    // SAFETY: one valid change, no events requested back.
-    if unsafe {
-        libc::kevent(
-            queue.as_raw_fd(),
-            &exit,
-            1,
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null(),
-        )
-    } < 0
-    {
-        let error = io::Error::last_os_error();
-        return match error.raw_os_error() {
-            Some(libc::ESRCH) => Ok(true),
-            _ => Err(error),
-        };
-    }
-    // SAFETY: `pid` is positive (a live daemon's), so it names one process and never a group.
-    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-        let error = io::Error::last_os_error();
-        return match error.raw_os_error() {
-            Some(libc::ESRCH) => Ok(true),
-            _ => Err(error),
-        };
-    }
-    let timeout = libc::timespec {
-        tv_sec: DAEMON_EXIT_GRACE.as_secs() as libc::time_t,
-        tv_nsec: 0,
+    let Some(watch) = crate::runtime::daemon_watch::DaemonWatch::of(daemon.life())? else {
+        return Ok(true);
     };
-    let mut event = exit;
-    loop {
-        // SAFETY: room for one event; `timeout` outlives the call.
-        let ready = unsafe {
-            libc::kevent(
-                queue.as_raw_fd(),
-                std::ptr::null(),
-                0,
-                &mut event,
-                1,
-                &timeout,
-            )
-        };
-        match ready {
-            1 => return Ok(true),
-            0 => return Ok(false),
-            _ => {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
+    // A daemon gone since the watch takes no signal, and its exit already waits on the watch.
+    watch.terminate()?;
+    match watch.await_exit(DAEMON_EXIT_GRACE)? {
+        Ok(orphans) => {
+            for said in orphans.end(DAEMON_EXIT_GRACE) {
+                eprintln!("cowshed: {said}");
             }
+            Ok(true)
         }
+        Err(_running) => Ok(false),
     }
 }
 

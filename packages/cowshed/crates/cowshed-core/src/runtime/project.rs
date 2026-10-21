@@ -4868,9 +4868,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         },
                     }));
                 }
-                crate::runtime::nx_daemon::DaemonStopPlan::Owned { process, exit } => {
+                crate::runtime::nx_daemon::DaemonStopPlan::Owned { process, watch } => {
                     let outcome =
-                        crate::runtime::nx_daemon::stop_owned_daemon(process, exit, || {
+                        crate::runtime::nx_daemon::stop_owned_daemon(process, watch, || {
                             timed_async(
                                 "land",
                                 "stop-landing-nx",

@@ -31,6 +31,9 @@ const CONTROL_EVENT: usize = usize::MAX;
 type EventReply = oneshot::Sender<Option<Result<JobProcessEvent>>>;
 
 enum Request {
+    Running {
+        reply: mpsc::SyncSender<Vec<ProcessIdentity>>,
+    },
     Watch {
         pid: u32,
         reply: mpsc::SyncSender<Result<()>>,
@@ -238,6 +241,14 @@ impl ProcessMonitor {
     /// stream ends only when the last retained registration ends.
     pub(crate) fn finish(&self) -> Result<()> {
         self.driver.acknowledged(|reply| Request::Finish { reply })
+    }
+
+    /// The lives the observation saw born and not yet exit, in birth order: once the job ended,
+    /// what of it outlived its root.
+    pub(crate) fn running(&self) -> Result<Vec<ProcessIdentity>> {
+        let (reply, answer) = mpsc::sync_channel(1);
+        self.driver.send(Request::Running { reply })?;
+        answer.recv().map_err(|_| unavailable(self.driver.job_id))
     }
 
     /// Attach the existing supervisor writer. The source replays its retained events,
@@ -467,6 +478,16 @@ impl Writer {
             }
             while let Ok(request) = receiver.try_recv() {
                 match request {
+                    Request::Running { reply } => {
+                        let _ = reply.send(
+                            self.observer
+                                .fold()
+                                .nodes()
+                                .filter(|node| node.exit.is_none())
+                                .map(|node| node.identity)
+                                .collect(),
+                        );
+                    }
                     Request::Watch { pid, reply } => {
                         let result = self.observer.watch_root(pid).map_err(observation_error);
                         self.publish(result.clone());

@@ -4042,6 +4042,9 @@ struct JobStateRecord {
     sampling: Sampling,
     #[cfg(target_os = "macos")]
     monitor: Option<ProcessMonitor>,
+    /// The keeper's foreground Nx daemon: its plugin workers end with it (04_sandbox.md).
+    #[cfg(target_os = "macos")]
+    kept_nx_daemon: bool,
     /// The job's volumes as its admission found them, immediately before its first process was
     /// dispatched: every sample's volume deltas count from here, activation and command alike.
     volumes: VolumeBaseline<HostVolume>,
@@ -5515,6 +5518,8 @@ impl SupervisorActor {
             sampling: Sampling::Unowned,
             #[cfg(target_os = "macos")]
             monitor: None,
+            #[cfg(target_os = "macos")]
+            kept_nx_daemon: false,
             volumes,
             output_limit: None,
             kill_reason: None,
@@ -5879,6 +5884,10 @@ impl SupervisorActor {
         match started {
             Ok(job_id) => {
                 keeper.starting = Some(job_id);
+                #[cfg(target_os = "macos")]
+                if let Some(job) = self.jobs.get_mut(&job_id) {
+                    job.kept_nx_daemon = true;
+                }
                 // Nobody attaches to the keeper's job: it runs detached from its admission.
                 if let Err(error) = self.detach(job_id) {
                     eprintln!(
@@ -6651,6 +6660,33 @@ impl SupervisorActor {
                     "cowshed: job {}'s terminal process observation failed: {error}",
                     job_id.get()
                 );
+            }
+        }
+        // The daemon forks each plugin worker detached, outside the job's group, so the job's end
+        // ended none of them; its observation followed each from its birth (04_sandbox.md).
+        #[cfg(target_os = "macos")]
+        if job.kept_nx_daemon
+            && let (Some(monitor), Some(birth)) = (&job.monitor, &job.birth)
+        {
+            let monitor = monitor.clone();
+            let daemon = birth.pid().cast_signed();
+            let ended = tokio::task::spawn_blocking(move || {
+                let lives = monitor.running().map_err(|error| error.to_string())?;
+                super::daemon_watch::Orphans::of(daemon, lives)
+                    .map(|orphans| orphans.end(crate::build_volume::nx::DAEMON_EXIT_GRACE))
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()));
+            match ended {
+                Ok(said) => {
+                    for said in said {
+                        eprintln!("cowshed: {said}");
+                    }
+                }
+                Err(why) => eprintln!(
+                    "cowshed: the plugin workers of the Nx daemon {daemon} could not be ended: {why}"
+                ),
             }
         }
         // The terminal sample, frozen into the job's record; none for a job that never owned a

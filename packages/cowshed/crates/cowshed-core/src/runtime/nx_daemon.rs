@@ -169,11 +169,12 @@ pub(crate) enum DaemonStopPlan {
     NotRunning,
     /// A live process the record names that the ledger does not prove the job's. Never signalled.
     Unproven { pid: i32, reason: String },
-    /// The job's own process, proven by the ledger, with its exit watch registered before any
-    /// signal is sent. Signalling it reaches that process or nothing.
+    /// The job's own process, proven by the ledger, with its exit and the children it forks watched
+    /// before any signal is sent ([`super::daemon_watch::DaemonWatch`]), so its plugin workers are
+    /// held while they are still its children. Signalling it reaches that process or nothing.
     Owned {
         process: super::job_groups::OwnedGroupProcess,
-        exit: super::job_groups::ExitWatch,
+        watch: super::daemon_watch::DaemonWatch,
     },
 }
 
@@ -296,10 +297,13 @@ fn read_daemon_stop_plan(record: &Path, ledger: &Path) -> io::Result<DaemonStopP
             reason: format!("no job group in the ledger proves process {pid} is the job's own"),
         });
     };
-    match process.watch_exit() {
-        Ok(exit) => Ok(DaemonStopPlan::Owned { process, exit }),
+    let watched = process
+        .life()
+        .and_then(|life| life.map_or(Ok(None), super::daemon_watch::DaemonWatch::of));
+    match watched {
+        Ok(Some(watch)) => Ok(DaemonStopPlan::Owned { process, watch }),
         // It exited between the proof and its watch: nothing runs to stop.
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(DaemonStopPlan::NotRunning),
+        Ok(None) => Ok(DaemonStopPlan::NotRunning),
         Err(error) => Err(io::Error::new(
             error.kind(),
             format!("cannot watch exit of ledger-proven process {pid}: {error}"),
@@ -973,13 +977,15 @@ pub(crate) struct OwnedStopOutcome {
     pub(crate) diagnostics: Vec<String>,
 }
 
-/// Stop the job's own daemon process: `SIGTERM` the exact identity the ledger proved, run the
-/// caller's socket-cleanup command, then wait on the exit watch registered before any signal for
-/// the shared grace. Only a join failure of the wait is an error.
+/// Stop the job's own daemon process: take the forks it made since the plan while it still runs,
+/// `SIGTERM` the exact identity the ledger proved, run the caller's socket-cleanup command, then
+/// wait on the exit watch registered before any signal for the shared grace and end the plugin
+/// workers it forked ([`super::daemon_watch::Orphans::end`]). Only a join failure of the wait is an
+/// error.
 #[cfg(target_os = "macos")]
 pub(crate) async fn stop_owned_daemon<F, Fut, E>(
     process: super::job_groups::OwnedGroupProcess,
-    exit: super::job_groups::ExitWatch,
+    mut watch: super::daemon_watch::DaemonWatch,
     cleanup: F,
 ) -> Result<OwnedStopOutcome>
 where
@@ -989,6 +995,10 @@ where
 {
     let pid = process.pid();
     let mut diagnostics = Vec::new();
+    // Once the daemon exits its children are launchd's, and nothing names them its own.
+    if let Err(error) = watch.follow_forks() {
+        diagnostics.push(format!("following the forks of pid {pid} failed: {error}"));
+    }
     let signalled = match process.terminate() {
         Ok(true) => true,
         Ok(false) => {
@@ -1013,19 +1023,28 @@ where
         Err(error) => diagnostics.push(format!("nx daemon --stop did not run: {error}")),
     }
     let grace = crate::build_volume::nx::DAEMON_EXIT_GRACE;
-    let exited =
-        match crate::storage::lifecycle::dispatch_blocking(move || exit.within(grace)).await {
-            Ok(Ok(exited)) => exited,
-            Ok(Err(error)) => {
-                diagnostics.push(format!("waiting for pid {pid} to exit failed: {error}"));
-                false
-            }
-            Err(error) => {
-                return Err(CowshedError::internal(format!(
-                    "waiting for the Nx daemon failed: {error}"
-                )));
-            }
-        };
+    let waited = crate::storage::lifecycle::dispatch_blocking(move || {
+        watch
+            .await_exit(grace)
+            .map(|exit| exit.map(|orphans| orphans.end(grace)))
+    })
+    .await;
+    let exited = match waited {
+        Ok(Ok(Ok(said))) => {
+            diagnostics.extend(said);
+            true
+        }
+        Ok(Ok(Err(_running))) => false,
+        Ok(Err(error)) => {
+            diagnostics.push(format!("waiting for pid {pid} to exit failed: {error}"));
+            false
+        }
+        Err(error) => {
+            return Err(CowshedError::internal(format!(
+                "waiting for the Nx daemon failed: {error}"
+            )));
+        }
+    };
     Ok(OwnedStopOutcome {
         pid,
         exited,
@@ -1550,6 +1569,118 @@ mod tests {
         child
     }
 
+    /// A sandboxed group leader that forks one plugin worker as Nx's daemon forks each of its own
+    /// (`plugins/isolation/isolated-plugin.js`): detached, leading a session of its own, and
+    /// sleeping on past its daemon's exit unless something ends it. The worker announces its pid
+    /// once its session is its own; the leader then blocks reading its stdin.
+    #[cfg(target_os = "macos")]
+    fn sandboxed_daemon_with_worker() -> (std::process::Child, super::super::job_groups::Process) {
+        use cowshed_os::fork_lock::Spawn as _;
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        let mut child = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args([
+                "-p",
+                "(version 1)(allow default)",
+                "/bin/sh",
+                "-c",
+                "/usr/bin/perl -MPOSIX -e 'POSIX::setsid() > 0 or die \"setsid: $!\"; \
+                 print \"WORKER $$\\n\"; close STDOUT; sleep 300' & read _",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn_locked()
+            .expect("a sandboxed daemon with a worker");
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("its stdout"))
+            .read_line(&mut line)
+            .expect("the worker announces itself");
+        let worker = line
+            .trim()
+            .strip_prefix("WORKER ")
+            .and_then(|pid| pid.parse().ok())
+            .unwrap_or_else(|| panic!("the worker's pid: {line:?}"));
+        let worker = super::super::job_groups::Process::observe(worker)
+            .expect("observe the worker")
+            .expect("the worker runs");
+        (child, worker)
+    }
+
+    /// Whether `worker` outlived the stop that just returned; one that did is ended here, so a
+    /// failing run leaves no sleeper behind.
+    #[cfg(target_os = "macos")]
+    fn outlived(worker: &super::super::job_groups::Process) -> bool {
+        let alive = worker.record().expect("read the worker").is_some();
+        if alive {
+            worker.signal(libc::SIGKILL).expect("end the stray worker");
+        }
+        alive
+    }
+
+    /// Stopping a ledger-proven daemon, as land does, ends the plugin workers it forked
+    /// (04_sandbox.md, "its plugin workers go with it"). Nx forks each worker detached, so it
+    /// leads its own session, and once the daemon exits launchd adopts it: from then on nothing
+    /// names it the daemon's. The worker here would sleep on past its daemon; the stop returns only
+    /// once it has exited.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn stopping_an_owned_daemon_ends_the_plugin_workers_it_forked() {
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "nx-daemon-owned-workers",
+        );
+        let (mut daemon, worker) = sandboxed_daemon_with_worker();
+        let ledger = ledger_naming(&scratch, &daemon);
+        let record = scratch.join("server-process.json");
+        write_record(&record, daemon.id(), &scratch.join("refusing.sock"));
+        let DaemonStopPlan::Owned { process, watch } =
+            prepare_daemon_stop(&record, &ledger).unwrap()
+        else {
+            panic!("a ledger-proven live daemon is owned");
+        };
+        let outcome = stop_owned_daemon(process, watch, || async {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .output_locked()
+        })
+        .await
+        .unwrap();
+        daemon.wait().unwrap();
+        let outlived = outlived(&worker);
+        assert!(outcome.exited, "the daemon exits: {outcome:?}");
+        assert!(
+            !outlived,
+            "the daemon's plugin worker {} outlived its stop: {outcome:?}",
+            worker.pid()
+        );
+    }
+
+    /// Closing a checkout's Nx state -- the keeper's stop of an idle shed's daemon, and every
+    /// retirement's -- ends the daemon's plugin workers with it, so the census that follows finds
+    /// none of them on the mount.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn closing_a_checkouts_nx_state_ends_its_daemons_plugin_workers() {
+        let scratch = crate::temp_root::TempRoot::new("nx-close-workers");
+        let data = scratch.join("workspace-data");
+        std::fs::create_dir_all(data.join("d")).unwrap();
+        let socket = scratch.join("d.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (mut daemon, worker) = sandboxed_daemon_with_worker();
+        write_record(&data.join("d/server-process.json"), daemon.id(), &socket);
+        let closed = crate::build_volume::nx::close_workspace_data(&data).unwrap();
+        daemon.wait().unwrap();
+        drop(listener);
+        let outlived = outlived(&worker);
+        assert_eq!(closed, Ok(()), "the daemon stops");
+        assert!(
+            !outlived,
+            "the daemon's plugin worker {} outlived its stop",
+            worker.pid()
+        );
+    }
+
     /// A daemon the ledger proves the job's is stopped through its exact identity: the plan carries
     /// the exit watch from before the signal, the signal ends the process, and the watch reports it.
     #[cfg(target_os = "macos")]
@@ -1564,7 +1695,7 @@ mod tests {
         let ledger = ledger_naming(&scratch, &child);
         let record = scratch.join("server-process.json");
         write_record(&record, child.id(), &scratch.join("refusing.sock"));
-        let DaemonStopPlan::Owned { process, exit } =
+        let DaemonStopPlan::Owned { process, watch } =
             prepare_daemon_stop(&record, &ledger).unwrap()
         else {
             panic!("a ledger-proven live daemon is owned");
@@ -1578,7 +1709,13 @@ mod tests {
             process.terminate().unwrap(),
             "the proven process was signalled"
         );
-        exit.wait().unwrap();
+        assert!(
+            watch
+                .await_exit(crate::build_volume::nx::DAEMON_EXIT_GRACE)
+                .unwrap()
+                .is_ok(),
+            "the watch reports the exit"
+        );
         child.wait().unwrap();
     }
 
@@ -1632,7 +1769,7 @@ mod tests {
         let ledger = ledger_naming(&scratch, &owned);
         let record = scratch.join("server-process.json");
         write_record(&record, owned.id(), &scratch.join("refusing.sock"));
-        let DaemonStopPlan::Owned { process, exit } =
+        let DaemonStopPlan::Owned { process, watch } =
             prepare_daemon_stop(&record, &ledger).unwrap()
         else {
             panic!("the ledger proves the owned leader before the race");
@@ -1642,7 +1779,7 @@ mod tests {
         let forged = scratch.join("forged.json");
         write_record(&forged, foreign.id(), &scratch.join("refusing.sock"));
         std::fs::rename(&forged, &record).unwrap();
-        let outcome = stop_owned_daemon(process, exit, || async {
+        let outcome = stop_owned_daemon(process, watch, || async {
             std::process::Command::new("/bin/sh")
                 .args(["-c", "exit 0"])
                 .output_locked()
@@ -1896,7 +2033,7 @@ mod tests {
         let ledger = ledger_naming(&scratch, &child);
         let record = scratch.join("server-process.json");
         write_record(&record, child.id(), &scratch.join("refusing.sock"));
-        let DaemonStopPlan::Owned { process, exit } =
+        let DaemonStopPlan::Owned { process, watch } =
             prepare_daemon_stop(&record, &ledger).unwrap()
         else {
             panic!("the settled pre-exec leader is ledger-owned");
@@ -1905,7 +2042,7 @@ mod tests {
         line.clear();
         stdout.read_line(&mut line).unwrap();
         assert_eq!(line.trim(), "EXECUTED");
-        let outcome = stop_owned_daemon(process, exit, || async {
+        let outcome = stop_owned_daemon(process, watch, || async {
             std::process::Command::new("/bin/true").output_locked()
         })
         .await
@@ -2009,17 +2146,16 @@ mod lifecycle_authority_tests {
             String::from_utf8_lossy(&refused.stderr)
         );
 
-        let DaemonStopPlan::Owned { process, exit } =
+        let DaemonStopPlan::Owned { process, watch } =
             prepare_daemon_stop(&record_path, &ledger).expect("the plan reads")
         else {
             panic!("a ledger-proven live process is owned");
         };
-        assert!(
-            !exit.within(Duration::ZERO).expect("the watch answers"),
-            "still running"
-        );
+        let Err(watch) = watch.await_exit(Duration::ZERO).expect("the watch answers") else {
+            panic!("still running");
+        };
 
-        let outcome = stop_owned_daemon(process, exit, || async {
+        let outcome = stop_owned_daemon(process, watch, || async {
             let mut command = tokio::process::Command::new("/bin/sh");
             command.args(["-c", "exit 17"]);
             RunAsync::output_locked(&mut command).await
@@ -2186,7 +2322,7 @@ mod lifecycle_authority_tests {
         Recorder::new(ledger.clone())
             .record([(1, leader)].into_iter(), &[])
             .expect("record the job's group");
-        let DaemonStopPlan::Owned { process, exit } =
+        let DaemonStopPlan::Owned { process, watch } =
             prepare_daemon_stop(&record_path, &ledger).expect("the plan reads")
         else {
             panic!("the ledger proves the real daemon is the job's own");
@@ -2205,12 +2341,11 @@ mod lifecycle_authority_tests {
             text.contains("Operation not permitted") || text.contains("EPERM"),
             "the kernel refused the sandboxed signal: {text}"
         );
-        assert!(
-            !exit.within(Duration::ZERO).expect("the watch answers"),
-            "the sandboxed stop signalled nothing"
-        );
+        let Err(watch) = watch.await_exit(Duration::ZERO).expect("the watch answers") else {
+            panic!("the sandboxed stop signalled nothing");
+        };
 
-        let outcome = stop_owned_daemon(process, exit, || async {
+        let outcome = stop_owned_daemon(process, watch, || async {
             let mut command = tokio::process::Command::from(sandboxed_nx_stop(&root, &node, &nx));
             RunAsync::output_locked(&mut command).await
         })

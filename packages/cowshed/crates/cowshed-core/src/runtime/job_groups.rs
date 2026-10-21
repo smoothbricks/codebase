@@ -924,6 +924,16 @@ fn record_of(info: &BsdInfoWithUniqueId) -> ProcessRecord {
 }
 
 #[cfg(target_os = "macos")]
+impl ProcessRecord {
+    /// The life this record is of ([`Life`]).
+    pub(crate) fn life(&self) -> Life {
+        Life {
+            pid: self.pid.cast_signed(),
+            unique_id: self.unique_id,
+        }
+    }
+}
+#[cfg(target_os = "macos")]
 impl Process {
     /// This process's record, read now; `None` once it has exited, or once its pid names a later
     /// process, whose record is never this one's: the pid's running process must still carry this
@@ -1033,45 +1043,15 @@ impl Process {
     /// pid's running process read after the registration carries this process's pid version,
     /// which no other process is given: it ran throughout, and the watch names it.
     pub fn watch_exit(&self) -> io::Result<ExitWatch> {
-        use std::os::fd::{AsRawFd as _, FromRawFd as _};
-
-        // SAFETY: kqueue takes nothing and returns a new descriptor.
-        let queue = unsafe { libc::kqueue() };
-        if queue < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: a fresh descriptor this function alone owns.
-        let queue = unsafe { std::os::fd::OwnedFd::from_raw_fd(queue) };
-        let change = libc::kevent {
-            ident: usize::try_from(self.pid).map_err(io::Error::other)?,
-            filter: libc::EVFILT_PROC,
-            flags: libc::EV_ADD | libc::EV_ONESHOT,
-            fflags: libc::NOTE_EXIT,
-            data: 0,
-            udata: std::ptr::null_mut(),
-        };
-        // SAFETY: one change read from live memory, no event list, on a live queue. With no room
-        // for events a failed registration is the call's own error.
-        let registered = unsafe {
-            libc::kevent(
-                queue.as_raw_fd(),
-                &change,
-                1,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null(),
-            )
-        };
-        if registered != 0 {
-            let error = io::Error::last_os_error();
-            return Err(io::Error::new(
+        let queue = exit_queue(self.pid).map_err(|error| {
+            io::Error::new(
                 error.kind(),
                 format!(
                     "process {} cannot be watched to its exit, which may have begun: {error}",
                     self.pid
                 ),
-            ));
-        }
+            )
+        })?;
         match running_info(self.pid)? {
             Some(info) if info.unique.id_version.cast_unsigned() == self.version => {
                 Ok(ExitWatch(queue))
@@ -1117,6 +1097,80 @@ impl Process {
     }
 }
 
+/// A kqueue with `pid`'s exit registered on it, reported once. A pid whose process has begun to
+/// exit is refused (`ESRCH`), as is one no process holds.
+#[cfg(target_os = "macos")]
+fn exit_queue(pid: i32) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    // SAFETY: kqueue takes nothing and returns a new descriptor.
+    let queue = unsafe { libc::kqueue() };
+    if queue < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a fresh descriptor this function alone owns.
+    let queue = unsafe { std::os::fd::OwnedFd::from_raw_fd(queue) };
+    let change = libc::kevent {
+        ident: usize::try_from(pid).map_err(io::Error::other)?,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: one change read from live memory, no event list, on a live queue. With no room
+    // for events a failed registration is the call's own error.
+    let registered = unsafe {
+        libc::kevent(
+            queue.as_raw_fd(),
+            &change,
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if registered != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(queue)
+}
+
+/// One process through every image it runs: its pid and the unique id the kernel never gives
+/// another process (`p_uniqueid`). An exec gives the pid a new version, which ends a [`Process`]
+/// held from before it, but keeps the unique id, so a life is found again after one.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Life {
+    pub(crate) pid: i32,
+    pub(crate) unique_id: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl Life {
+    /// The process this life is now, in one read of its pid; `None` once it has exited, reaped
+    /// or not, since no other process is given its unique id.
+    pub(crate) fn current(self) -> io::Result<Option<Process>> {
+        Ok(running_info(self.pid)?
+            .filter(|info| info.unique.unique_id == self.unique_id)
+            .map(|info| Process {
+                pid: self.pid,
+                version: info.unique.id_version.cast_unsigned(),
+            }))
+    }
+
+    /// Watch this life's exit from now, through any exec; `None` once it has exited. The pid's
+    /// running process read after the registration still carries this life's unique id: it ran
+    /// throughout, and the watch names it.
+    pub(crate) fn watch_exit(self) -> io::Result<Option<ExitWatch>> {
+        let queue = match exit_queue(self.pid) {
+            Ok(queue) => queue,
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(self.current()?.map(|_| ExitWatch(queue)))
+    }
+}
 /// A process the trusted ledger proves is a job's own: a member of a recorded group whose
 /// ownership held throughout ([`ownership`]). Only [`owned_process`] makes one, so a caller holding
 /// it has the proof and no other process can enter the privileged signal path through it.
@@ -1129,9 +1183,9 @@ impl OwnedGroupProcess {
         self.0.pid()
     }
 
-    /// Watch this process's exit from now. Registered before any signal is sent.
-    pub(crate) fn watch_exit(&self) -> io::Result<ExitWatch> {
-        self.0.watch_exit()
+    /// This process through any exec from now ([`Life`]); `None` once it has exited.
+    pub(crate) fn life(&self) -> io::Result<Option<Life>> {
+        Ok(self.0.record()?.map(|record| record.life()))
     }
 
     /// `SIGTERM` the exact identity the ledger proved: `Ok(false)` when it no longer runs.

@@ -562,18 +562,19 @@ same for main and for an integration workspace; "the target" is whichever one it
    same policy; ordinary lifecycle callers explicitly select `Recorded`. An old supervisor that cannot accept the
    controller handoff is refused rather than generically drained. Before that retirement the controller reads each
    landing Nx daemon's plan from the job group ledger: a record only nominates a pid, and only a process the ledger
-   proves is the job's own is signalled, with its exit watch registered first. After retirement it attempts `SIGTERM`
-   through that identity, reports whether the signal was delivered, runs a one-shot `nx daemon --stop` only to remove
-   the daemon's socket (its failure is reported and never aborts the land), and waits up to the shared 10 s grace. A
-   daemon the ledger does not prove the job's, or one that outlives the grace, skips adoption as `LandingDaemonStayed`;
-   an unproven daemon is never signalled. A daemon started detached outside the ledger is that skip. An unreadable or
-   malformed daemon record or job ledger instead skips as `LandingDaemonUnverifiable`, carrying the record path and
-   reason, before quiesce or any signal. Nothing is signalled through a record alone. The landing build volume's Nx task
-   database must then have no open file descriptors, read without signalling. If it still does, adoption is **skipped**
-   and reported, as for the target below. This settles supervised jobs and Nx; the later seed capture retains Nx open
-   locks and existing Cargo-profile guards through capture and publication. Other contributed paths remain exempt under
-   the named-list rule (Owned index links). Mounted capture replaces the former detach-and-seal barrier; the
-   new-host-profile gap remains as documented in Targets and seeds.
+   proves is the job's own is signalled, with its exit and the children it forks watched first (04_sandbox.md). After
+   retirement it attempts `SIGTERM` through that identity, reports whether the signal was delivered, runs a one-shot
+   `nx daemon --stop` only to remove the daemon's socket (its failure is reported and never aborts the land), waits up
+   to the shared 10 s grace, and then ends the plugin workers the daemon forked. A daemon the ledger does not prove the
+   job's, or one that outlives the grace, skips adoption as `LandingDaemonStayed`; an unproven daemon is never
+   signalled. A daemon started detached outside the ledger is that skip. An unreadable or malformed daemon record or job
+   ledger instead skips as `LandingDaemonUnverifiable`, carrying the record path and reason, before quiesce or any
+   signal. Nothing is signalled through a record alone. The landing build volume's Nx task database must then have no
+   open file descriptors, read without signalling. If it still does, adoption is **skipped** and reported, as for the
+   target below. This settles supervised jobs and Nx; the later seed capture retains Nx open locks and existing
+   Cargo-profile guards through capture and publication. Other contributed paths remain exempt under the named-list rule
+   (Owned index links). Mounted capture replaces the former detach-and-seal barrier; the new-host-profile gap remains as
+   documented in Targets and seeds.
 5. **Close the target, carry, and freeze the seed.** Outside the repository lock, which fenced only the head: what keeps
    these steps correct is the target's Nx open locks and image lock below (rule "The adoption needs the target's Nx
    database closed"):
