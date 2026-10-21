@@ -99,11 +99,16 @@ pub fn decode_direnv_watches(encoded: &str) -> Result<Vec<WatchEntry>, WatchList
 
 /// The exact identity of one watched path, following symlinks as direnv does.
 ///
-/// `(dev, ino, size, mtime, ctime)` at the filesystem's timestamp resolution: an atomic replace
+/// `(ino, size, mtime, ctime)` at the filesystem's timestamp resolution: an atomic replace
 /// changes the inode, and ctime cannot be set by any user tool, so a content change that
 /// restores mtime still shows. Two same-size writes inside one timestamp tick (a coarse Linux
 /// clock tick, an HFS+ second) share an identity; the kernel subscription reports those.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// `dev` is kept for ordering a ctime against a filesystem's clocks ([`FsSeparation`]), never
+/// for identity ([`FileState::same_as`]): it numbers the mount, not the file. A clone of a
+/// volume keeps every file's inode, size, mtime and ctime and mounts under another device, and
+/// a file whose four fields all match is that same file state.
+#[derive(Clone, Copy, Debug)]
 pub enum FileState {
     Missing,
     Present {
@@ -141,6 +146,35 @@ impl FileState {
 
     fn exists(self) -> bool {
         !matches!(self, Self::Missing)
+    }
+
+    /// Whether `self` and `other` are one state of one file: equal inode, size, mtime and
+    /// ctime, or both missing, or both unreadable with one errno. The device is not compared.
+    pub fn same_as(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Missing, Self::Missing) => true,
+            (
+                Self::Present {
+                    ino,
+                    size,
+                    mtime_ns,
+                    ctime_ns,
+                    dev: _,
+                },
+                Self::Present {
+                    ino: other_ino,
+                    size: other_size,
+                    mtime_ns: other_mtime_ns,
+                    ctime_ns: other_ctime_ns,
+                    dev: _,
+                },
+            ) => {
+                (ino, size, mtime_ns, ctime_ns)
+                    == (other_ino, other_size, other_mtime_ns, other_ctime_ns)
+            }
+            (Self::Unreadable(errno), Self::Unreadable(other_errno)) => errno == other_errno,
+            (Self::Missing | Self::Present { .. } | Self::Unreadable(_), _) => false,
+        }
     }
 }
 
@@ -357,7 +391,7 @@ impl EvaluationClock {
 }
 
 /// Stat identities of a set of paths at one moment.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct Snapshot(BTreeMap<PathBuf, FileState>);
 
 impl Snapshot {
@@ -374,7 +408,20 @@ impl Snapshot {
     pub fn changed_since(&self) -> bool {
         self.0
             .iter()
-            .any(|(path, state)| FileState::of(path) != *state)
+            .any(|(path, state)| !FileState::of(path).same_as(*state))
+    }
+
+    /// Whether `other` names the same paths, each in the same file state
+    /// ([`FileState::same_as`]).
+    pub fn same_as(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .zip(&other.0)
+                .all(|((path, state), (other_path, other_state))| {
+                    path == other_path && state.same_as(*other_state)
+                })
     }
 
     pub fn paths(&self) -> impl Iterator<Item = &Path> {
@@ -415,7 +462,7 @@ impl ActivationEvidence {
                 return false;
             };
             let unchanged = match self.before.get(&entry.path) {
-                Some(before) => before == now,
+                Some(before) => before.same_as(now),
                 None => match now {
                     FileState::Present { dev, ctime_ns, .. } => self
                         .clock
@@ -1099,5 +1146,51 @@ mod tests {
             "a recorded-absent input appearing"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A clone of a volume keeps each file's inode, size, mtime and ctime and mounts under
+    /// another device: the same file state, which an activation's evidence must not read as an
+    /// input that changed. Any one of the four fields differing is a change.
+    #[test]
+    fn the_device_number_is_not_part_of_an_inputs_identity() {
+        let state = |dev, ino, size, mtime_ns, ctime_ns| FileState::Present {
+            dev,
+            ino,
+            size,
+            mtime_ns,
+            ctime_ns,
+        };
+        let main = state(16_777_256, 1_398_438, 8_784, 5, 6);
+        assert!(main.same_as(state(16_777_401, 1_398_438, 8_784, 5, 6)));
+        for changed in [
+            state(16_777_256, 1_398_439, 8_784, 5, 6),
+            state(16_777_256, 1_398_438, 8_785, 5, 6),
+            state(16_777_256, 1_398_438, 8_784, 7, 6),
+            state(16_777_256, 1_398_438, 8_784, 5, 7),
+            FileState::Missing,
+            FileState::Unreadable(13),
+        ] {
+            assert!(!main.same_as(changed), "{changed:?} differs from {main:?}");
+        }
+        assert!(FileState::Unreadable(13).same_as(FileState::Unreadable(13)));
+        assert!(!FileState::Unreadable(13).same_as(FileState::Unreadable(1)));
+
+        let path = PathBuf::from("/workspace/tooling/direnv/devenv.nix");
+        let evidence = ActivationEvidence {
+            entries: vec![WatchEntry {
+                path: path.clone(),
+                exists: true,
+            }],
+            before: Snapshot(BTreeMap::from([(path.clone(), main)])),
+            clock: None,
+            after: Snapshot(BTreeMap::from([(
+                path,
+                state(16_777_401, 1_398_438, 8_784, 5, 6),
+            )])),
+        };
+        assert!(
+            evidence.stable(),
+            "an input remounted under another device stayed put"
+        );
     }
 }

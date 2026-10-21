@@ -546,7 +546,7 @@ impl<A: Activator> PoolActor<A> {
             && self
                 .generation
                 .as_ref()
-                .is_some_and(|generation| generation.baseline == evidence.after)
+                .is_some_and(|generation| generation.baseline.same_as(&evidence.after))
         {
             return Some(current);
         }
