@@ -145,7 +145,7 @@ mod macos {
             if clone_median >= attach_median {
                 return Err("clonefile must remain cheaper than attach+fsck".into());
             }
-            eprintln!(
+            cowshed_os::eprintln!(
                 "APFS: clone median={clone_median:?} max={clone_max:?}; attach+fsck median={attach_median:?}"
             );
             Ok(())
@@ -178,6 +178,6 @@ fn main() {
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
-    eprintln!("the APFS benchmark requires macOS");
+    cowshed_os::eprintln!("the APFS benchmark requires macOS");
     std::process::exit(1);
 }

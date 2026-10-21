@@ -617,13 +617,13 @@ where
                 match layout.seed_of(workspace, incarnation).map_err(host)? {
                     Some((seed, _)) => {
                         refork(&seed).map_err(lost)?;
-                        eprintln!(
+                        cowshed_os::eprintln!(
                             "cowshed: {workspace}'s build link named build volume {linked}, which no longer exists; {workspace} now links a fresh clone of its seed {seed}, and what {linked} held beyond that seed is lost"
                         );
                     }
                     None => {
                         link::unlink(checkout).map_err(host).map_err(lost)?;
-                        eprintln!(
+                        cowshed_os::eprintln!(
                             "cowshed: {workspace}'s build link named build volume {linked}, which no longer exists, and {workspace} has no seed to clone; the link is removed, and {workspace}'s next build-state refresh makes its first volume"
                         );
                     }
@@ -938,7 +938,7 @@ mod tests {
         let live = host.build_volume_written(&layout, &source).unwrap();
         let seeded = host.build_volume_written(&layout, &seed).unwrap();
         let captured_written = seeded;
-        eprintln!("live capture seed clock={seeded:?}, flushed live={live:?}");
+        cowshed_os::eprintln!("live capture seed clock={seeded:?}, flushed live={live:?}");
         assert!(
             live <= seeded,
             "capture without a later write leaves a Fresh seed without tolerance"
@@ -985,7 +985,7 @@ mod tests {
         let live = host.build_volume_written(&layout, &source).unwrap();
         let seeded = host.build_volume_written(&layout, &seed).unwrap();
         assert_eq!(seeded, captured_written, "the capture mark stays immutable");
-        eprintln!("admitted job seed clock={seeded:?}, flushed live={live:?}");
+        cowshed_os::eprintln!("admitted job seed clock={seeded:?}, flushed live={live:?}");
         assert!(
             live > seeded,
             "the admitted job's write must make the seed behind"
@@ -1100,7 +1100,7 @@ mod tests {
         let live = host.build_volume_written(&layout, &source).unwrap();
         let seeded = host.build_volume_written(&layout, &seed).unwrap();
         let captured_written = seeded;
-        eprintln!("quiet live capture seed clock={seeded:?}, flushed live={live:?}");
+        cowshed_os::eprintln!("quiet live capture seed clock={seeded:?}, flushed live={live:?}");
         assert!(
             live <= seeded,
             "Quiet's live capture leaves Fresh without a later write or tolerance"
@@ -1196,7 +1196,9 @@ mod tests {
         let live = host.build_volume_written(&layout, &source).unwrap();
         let seeded = host.build_volume_written(&layout, &seed).unwrap();
         assert_eq!(seeded, captured_written, "the capture mark stays immutable");
-        eprintln!("replacement admitted job seed clock={seeded:?}, flushed live={live:?}");
+        cowshed_os::eprintln!(
+            "replacement admitted job seed clock={seeded:?}, flushed live={live:?}"
+        );
         assert!(
             live > seeded,
             "an admitted job after Quiet releases must make the seed behind"
@@ -1445,7 +1447,7 @@ mod tests {
             .mount_build_volume(&layout, &clone)
             .expect("mount the clone");
         let mounted = started.elapsed();
-        eprintln!("build volume clone {cloned:?}, attach+mount {mounted:?}");
+        cowshed_os::eprintln!("build volume clone {cloned:?}, attach+mount {mounted:?}");
         assert_eq!(
             snapshot(&clone_mount),
             before,

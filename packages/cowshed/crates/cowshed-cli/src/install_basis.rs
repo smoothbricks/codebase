@@ -67,7 +67,7 @@ impl InstallSlot {
         let lock = match flock(&lock, libc::LOCK_EX | libc::LOCK_NB) {
             Ok(()) => lock,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: another install holds {}; waiting for it to finish",
                     path.display()
                 );
@@ -468,7 +468,7 @@ pub(crate) mod tests {
             "{}",
             refusal.hint
         );
-        eprintln!("refusal: {}\nhint: {}", refusal.message, refusal.hint);
+        cowshed_os::eprintln!("refusal: {}\nhint: {}", refusal.message, refusal.hint);
     }
 
     /// A build of main that descends from the installed commit holds everything it carries.

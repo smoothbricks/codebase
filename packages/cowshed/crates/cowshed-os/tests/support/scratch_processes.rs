@@ -22,7 +22,7 @@ pub(crate) fn end_processes_in(select: impl Fn(&Path) -> bool) -> std::io::Resul
             return Ok(());
         }
         for (pid, cwd) in &found {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "scratch root: ending pid {pid} ({}), working in {}",
                 executable(*pid),
                 cwd.display()

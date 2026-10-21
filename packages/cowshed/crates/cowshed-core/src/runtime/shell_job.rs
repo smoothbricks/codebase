@@ -990,7 +990,7 @@ impl ExecHost {
                             };
                             if let Err(error) = sent {
                                 // The reply says how the host ended.
-                                eprintln!(
+                                cowshed_os::eprintln!(
                                     "cowshed: cannot release job {}'s command to its host: \
                                      {error}",
                                     job_id.get()

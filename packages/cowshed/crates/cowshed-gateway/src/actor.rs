@@ -1542,7 +1542,7 @@ impl Actor {
                 return;
             }
         }
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: Nx cache backend for {repo_id} stopped: its project has no session left"
         );
         self.drop_nx_backend(repo_id).await;
@@ -1566,9 +1566,9 @@ impl Actor {
                 match tcp.as_fd().try_clone_to_owned() {
                     Ok(copy) => Some(Fenced::new(copy)),
                     Err(error) => {
-                        eprintln!(
+                        cowshed_os::eprintln!(
                             "cowshed: workspace {workspace_id}'s listener is not carried across a \
-                             gateway restart: duplicating it failed: {error}"
+                         gateway restart: duplicating it failed: {error}"
                         );
                         None
                     }
@@ -1634,7 +1634,7 @@ impl Actor {
             use std::os::fd::AsFd as _;
             match copy.as_fd().try_clone_to_owned() {
                 Ok(copy) => listeners.push((*address, copy)),
-                Err(error) => eprintln!(
+                Err(error) => cowshed_os::eprintln!(
                     "cowshed: the listener at {address} is not carried across this restart: {error}"
                 ),
             }
@@ -1654,20 +1654,22 @@ impl Actor {
             // A stop, or a start onto a gateway nothing replaces: no install served the handoff,
             // so the workspace listeners close with this gateway, as designed. Said, so the
             // refused connections that follow read as that, not as a failed handoff.
-            Ok(Ok(0)) => eprintln!(
+            Ok(Ok(0)) => cowshed_os::eprintln!(
                 "cowshed: {carried} workspace listener(s) not carried across this restart: no \
-                 install was serving the handoff socket {}; their clients are refused until the \
-                 next gateway binds",
+             install was serving the handoff socket {}; their clients are refused until the \
+             next gateway binds",
                 path_for_message.display()
             ),
-            Ok(Ok(given)) => eprintln!(
+            Ok(Ok(given)) => cowshed_os::eprintln!(
                 "cowshed: gave {given} workspace listener(s) to the install restarting this gateway"
             ),
-            Ok(Err(error)) => eprintln!(
+            Ok(Err(error)) => cowshed_os::eprintln!(
                 "cowshed: could not give the workspace listeners to the install restarting this \
-                 gateway; its clients are refused until the next gateway binds: {error}"
+             gateway; its clients are refused until the next gateway binds: {error}"
             ),
-            Err(error) => eprintln!("cowshed: the listener handoff task failed: {error}"),
+            Err(error) => {
+                cowshed_os::eprintln!("cowshed: the listener handoff task failed: {error}")
+            }
         }
     }
 
@@ -1762,13 +1764,13 @@ impl Actor {
             }) => match process.try_wait() {
                 Ok(None) => false,
                 Ok(Some(status)) => {
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: Nx cache backend for {repo_id} exited {status}; starting a replacement"
                     );
                     true
                 }
                 Err(error) => {
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: cannot inspect the Nx cache backend for {repo_id}: {error}; starting a replacement"
                     );
                     true
@@ -1934,12 +1936,14 @@ impl Actor {
         }
         match &result {
             Ok(entries) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: Nx cache store for {repo_id} cleared: {entries} entries deleted"
                 );
             }
             Err(refusal) => {
-                eprintln!("cowshed: Nx cache store for {repo_id} was not cleared: {refusal}");
+                cowshed_os::eprintln!(
+                    "cowshed: Nx cache store for {repo_id} was not cleared: {refusal}"
+                );
             }
         }
         let _ = reply.send(result.map_err(GatewayError::from));
@@ -1989,9 +1993,11 @@ impl Actor {
         }
         match result {
             Ok((backend, process)) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: Nx cache backend ready repo={} address={} reclaimed_staging_files={}",
-                    backend.repo_id, backend.address, backend.reclaimed_staging_files,
+                    backend.repo_id,
+                    backend.address,
+                    backend.reclaimed_staging_files,
                 );
                 self.nx_backends.insert(
                     repo_id.clone(),
@@ -2003,7 +2009,9 @@ impl Actor {
                 self.resume_nx_pending(&repo_id).await;
             }
             Err(reason) => {
-                eprintln!("cowshed: Nx cache backend for {repo_id} did not start: {reason}");
+                cowshed_os::eprintln!(
+                    "cowshed: Nx cache backend for {repo_id} did not start: {reason}"
+                );
                 let retry_after = std::time::Instant::now() + self.config.timeouts.connect;
                 self.nx_backends.insert(
                     repo_id.clone(),
@@ -2034,7 +2042,7 @@ impl Actor {
         } = refusal;
         let http_status = crate::nx_cache::unavailable_status(&intent.method);
         if let Some(detail) = &detail {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: Nx cache {} for workspace {workspace_id} refused ({classification}): {detail}",
                 intent.method
             );
@@ -3338,9 +3346,9 @@ async fn take_carried_listeners(
         let taken = match taken {
             Ok(taken) => taken,
             Err(error) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: could not take the workspace listeners the install carried; every \
-                     session binds afresh: {error}"
+                 session binds afresh: {error}"
                 );
                 return HashMap::new();
             }
@@ -3355,14 +3363,14 @@ async fn take_carried_listeners(
                 Ok(listener) => {
                     carried.insert(address, Fenced::new(listener));
                 }
-                Err(error) => eprintln!(
+                Err(error) => cowshed_os::eprintln!(
                     "cowshed: the carried listener at {address} is closed, and its session binds \
-                     afresh: {error}"
+                 afresh: {error}"
                 ),
             }
         }
         if !carried.is_empty() {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: took {} workspace listener(s) the install carried across the restart",
                 carried.len()
             );
@@ -3578,23 +3586,25 @@ impl ControlRuntime {
                 Ok(Ok(Some(install))) => {
                     let named = format!("install {} ({})", install.pid, install.binary.display());
                     match timeout(CUT_OFF_BOUND, self.cpu_budget.cut_off(install)).await {
-                        Ok(told) => eprintln!(
+                        Ok(told) => cowshed_os::eprintln!(
                             "cowshed: told {told} queued CPU ask(s) that {named} is restarting \
-                             this gateway; each asks the gateway it starts once"
+                         this gateway; each asks the gateway it starts once"
                         ),
-                        Err(_) => eprintln!(
+                        Err(_) => cowshed_os::eprintln!(
                             "cowshed: not every queued CPU ask was told within {} s that {named} \
-                             is restarting this gateway; the rest are cut off unnamed",
+                         is restarting this gateway; the rest are cut off unnamed",
                             CUT_OFF_BOUND.as_secs()
                         ),
                     }
                 }
                 Ok(Ok(None)) => {}
-                Ok(Err(error)) => eprintln!(
+                Ok(Err(error)) => cowshed_os::eprintln!(
                     "cowshed: the install serving the handoff socket did not say who it is, so \
-                     queued CPU asks are cut off unnamed: {error}"
+                 queued CPU asks are cut off unnamed: {error}"
                 ),
-                Err(error) => eprintln!("cowshed: the handoff identity task failed: {error}"),
+                Err(error) => {
+                    cowshed_os::eprintln!("cowshed: the handoff identity task failed: {error}")
+                }
             }
         }
         let _ = self.stop.send(true);
@@ -3638,19 +3648,19 @@ async fn run_unix_control(
                 let (stream, _) = match result {
                     Ok(accepted) => accepted,
                     Err(error) => {
-                        eprintln!("cowshed: gateway control socket stopped accepting: {error}");
+                        cowshed_os::eprintln!("cowshed: gateway control socket stopped accepting: {error}");
                         break;
                     }
                 };
                 let credentials = match stream.peer_cred() {
                     Ok(credentials) => credentials,
                     Err(error) => {
-                        eprintln!("cowshed: gateway control connection dropped unanswered: its peer credentials could not be read: {error}");
+                        cowshed_os::eprintln!("cowshed: gateway control connection dropped unanswered: its peer credentials could not be read: {error}");
                         continue;
                     }
                 };
                 if credentials.uid() != authorized_uid || connections.len() >= capacity {
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: gateway control connection dropped unanswered: uid {} (authorized {authorized_uid}), {} of {capacity} connections",
                         credentials.uid(),
                         connections.len()
@@ -3664,13 +3674,13 @@ async fn run_unix_control(
             }
             ended = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(error)) = ended {
-                    eprintln!("cowshed: gateway control connection task failed: {error}");
+                    cowshed_os::eprintln!("cowshed: gateway control connection task failed: {error}");
                 }
             }
             changed = stopped.changed() => {
                 if changed.is_err() || *stopped.borrow() {
                     let reason = if changed.is_err() { "shutdown sender dropped" } else { "shutdown requested" };
-                    eprintln!("cowshed: gateway control listener stopping: {reason}; closing {} connections", connections.len());
+                    cowshed_os::eprintln!("cowshed: gateway control listener stopping: {reason}; closing {} connections", connections.len());
                     break;
                 }
             }
@@ -3937,7 +3947,7 @@ mod tests {
             if let Err(error) = std::fs::remove_dir_all(&self.0)
                 && error.kind() != std::io::ErrorKind::NotFound
             {
-                eprintln!("remove actor fixture {}: {error}", self.0.display());
+                cowshed_os::eprintln!("remove actor fixture {}: {error}", self.0.display());
             }
         }
     }

@@ -962,7 +962,7 @@ impl NativeGatewayInventory {
                     | GatewayInventoryError::ForeignBinding { .. }),
                 ) => return Err(error),
                 Err(error) => {
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: skipping {repo_id}: its workspace records could not be read: {error}"
                     );
                 }
@@ -1014,7 +1014,7 @@ impl NativeGatewayInventory {
     fn adopted_projects_blocking(&self) -> Result<Vec<AdoptedProject>, GatewayInventoryError> {
         let scan = self.adopted_and_checkoutless_blocking()?;
         for (repo_id, error) in scan.issues {
-            eprintln!("cowshed: skipping project {repo_id}: {error}");
+            cowshed_os::eprintln!("cowshed: skipping project {repo_id}: {error}");
         }
         Ok(scan.projects)
     }
@@ -1604,7 +1604,7 @@ impl NativeGatewayInventory {
     ) -> Result<ReservedPortBlocks, GatewayInventoryError> {
         let PortClaims { claims, unreadable } = self.port_claims_blocking()?;
         for (path, error) in unreadable {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: {} cannot be used ({error}); a port block it names may be handed out again",
                 path.display()
             );
@@ -1781,7 +1781,7 @@ impl NativeGatewayInventory {
                 .try_exists()
                 .map_err(|source| io_error("inspect session metadata", &sidecar, source))?
         {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: skipping orphan session image {}: missing {}",
                 image.display(),
                 sidecar.display()
@@ -1835,7 +1835,7 @@ impl NativeGatewayInventory {
                     ) {
                         return Err(error);
                     }
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: skipping {repo}: its workspace records could not be read: {error}"
                     );
                 }

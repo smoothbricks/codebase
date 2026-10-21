@@ -59,7 +59,7 @@ impl Drop for TempRoot {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             // The unwinding test already reports its own failure; a second panic would abort it.
             Err(error) if std::thread::panicking() => {
-                eprintln!("remove test root {}: {error}", self.0.display());
+                cowshed_os::eprintln!("remove test root {}: {error}", self.0.display());
             }
             Err(error) => panic!("remove test root {}: {error}", self.0.display()),
         }

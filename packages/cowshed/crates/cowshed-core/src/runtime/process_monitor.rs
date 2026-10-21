@@ -149,12 +149,12 @@ impl Driver {
 impl Drop for Driver {
     fn drop(&mut self) {
         if let Err(error) = self.send(Request::Stop) {
-            eprintln!("cowshed: stopping process observation: {error}");
+            cowshed_os::eprintln!("cowshed: stopping process observation: {error}");
         }
         if let Some(thread) = self.thread.take()
             && thread.join().is_err()
         {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: job {}'s process observation writer panicked",
                 self.job_id.get()
             );
@@ -379,7 +379,7 @@ impl NativeSubscription {
 impl Drop for NativeSubscription {
     fn drop(&mut self) {
         if let Err(error) = self.driver.send(Request::Close { id: self.id }) {
-            eprintln!("cowshed: closing process subscription: {error}");
+            cowshed_os::eprintln!("cowshed: closing process subscription: {error}");
         }
     }
 }

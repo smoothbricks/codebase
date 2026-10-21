@@ -308,7 +308,7 @@ mod tests {
         impl Drop for Root {
             fn drop(&mut self) {
                 if let Err(error) = std::fs::remove_dir_all(&self.0) {
-                    eprintln!("remove {}: {error}", self.0.display());
+                    cowshed_os::eprintln!("remove {}: {error}", self.0.display());
                 }
             }
         }

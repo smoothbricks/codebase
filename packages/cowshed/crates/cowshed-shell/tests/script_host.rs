@@ -83,7 +83,7 @@ impl Host {
                 });
             }
             let child = command.spawn()?;
-            eprintln!("script-fixture host={} phase=spawned", child.id());
+            cowshed_os::eprintln!("script-fixture host={} phase=spawned", child.id());
             drop(theirs);
             Ok(Self {
                 child,
@@ -130,12 +130,12 @@ impl Host {
         }
         // The actual parent host must retire its held group before it is joined.
         self.close_control();
-        eprintln!(
+        cowshed_os::eprintln!(
             "script-fixture host={} phase=control-closed",
             self.child.id()
         );
         let joined = self.child.wait();
-        eprintln!(
+        cowshed_os::eprintln!(
             "script-fixture host={} phase=host-joined result={joined:?}",
             self.child.id()
         );
@@ -263,7 +263,7 @@ fn submit(
         send_with_descriptors(control.as_raw_fd(), &frame, &descriptors).expect("send the request");
     std::io::Write::write_all(&mut &*control, &frame[sent..]).expect("send the rest");
     drop((stdin, stdout_write, stderr_write));
-    eprintln!(
+    cowshed_os::eprintln!(
         "script-fixture control={} phase=request-sent",
         control.as_raw_fd()
     );
@@ -280,7 +280,7 @@ fn submit(
     let _observation = {
         drop((ready_write, go_read));
         let mut ready = std::fs::File::from(ready_read);
-        eprintln!(
+        cowshed_os::eprintln!(
             "script-fixture control={} phase=waiting-observation-ready",
             control.as_raw_fd()
         );
@@ -298,7 +298,7 @@ fn submit(
                 .read_exact(&mut pid[1..])
                 .expect("the complete leader report");
             let pid = u32::try_from(i32::from_ne_bytes(pid)).expect("leader pid");
-            eprintln!(
+            cowshed_os::eprintln!(
                 "script-fixture control={} phase=leader-reported pid={pid}",
                 control.as_raw_fd()
             );
@@ -310,14 +310,14 @@ fn submit(
             assert_eq!(observer.fold().live(pid).map(|life| life.pid), Some(pid));
             std::io::Write::write_all(&mut std::fs::File::from(go_write), b"x")
                 .expect("release the observed leader");
-            eprintln!(
+            cowshed_os::eprintln!(
                 "script-fixture control={} phase=observer-released pid={pid}",
                 control.as_raw_fd()
             );
             Some(observer)
         }
     };
-    eprintln!(
+    cowshed_os::eprintln!(
         "script-fixture control={} phase=waiting-start-reply",
         control.as_raw_fd()
     );
@@ -339,7 +339,7 @@ fn run_on(
         REPLY_SCRIPT_SYNTAX => (None, None),
         REPLY_STARTED => {
             let birth = fields.birth().unwrap();
-            eprintln!(
+            cowshed_os::eprintln!(
                 "script-fixture control={} phase=waiting-exit pid={}",
                 control.as_raw_fd(),
                 birth.pid()
@@ -356,19 +356,19 @@ fn run_on(
         ),
         other => panic!("unexpected reply {other}"),
     };
-    eprintln!(
+    cowshed_os::eprintln!(
         "script-fixture control={} phase=waiting-stream-eof",
         control.as_raw_fd()
     );
     let [stdout, stderr] = readers.map(|reader| reader.join().expect("stream reader"));
     if birth.is_some() {
-        eprintln!(
+        cowshed_os::eprintln!(
             "script-fixture control={} phase=waiting-release-reply",
             control.as_raw_fd()
         );
         release(control);
     }
-    eprintln!(
+    cowshed_os::eprintln!(
         "script-fixture control={} phase=run-completed",
         control.as_raw_fd()
     );
@@ -665,7 +665,7 @@ fn a_script_that_does_not_parse_never_runs() {
 #[test]
 fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
     let mut host = Host::start("group");
-    eprintln!(
+    cowshed_os::eprintln!(
         "script-group phase=host-started host_pid={} control_fd={} fixture={}",
         host.child.id(),
         host.control().as_raw_fd(),
@@ -690,40 +690,40 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
         hold.display(),
         leader.display()
     ));
-    eprintln!("script-group phase=submitting");
+    cowshed_os::eprintln!("script-group phase=submitting");
     let Submitted { reply, readers } = submit(host.control(), &host.directory, &rendered);
-    eprintln!("script-group phase=start-reply");
+    cowshed_os::eprintln!("script-group phase=start-reply");
     let (tag, mut fields) = FrameReader::new(&reply).expect("start reply");
     assert_eq!(tag, REPLY_STARTED);
     let birth = fields
         .birth()
         .expect("the real parent observed its unreaped leader");
     fields.finish().expect("start frame");
-    eprintln!("script-group phase=started birth={birth:?}");
+    cowshed_os::eprintln!("script-group phase=started birth={birth:?}");
     // Each FIFO reports only after that exact process runs. No elapsed delay supplies readiness.
     let pids = [&leader, &descendant].map(|path| {
-        eprintln!("script-group phase=reading-pid fifo={}", path.display());
+        cowshed_os::eprintln!("script-group phase=reading-pid fifo={}", path.display());
         let value = std::fs::read_to_string(path).expect("read the actual process's FIFO");
         let pid = value.trim().parse::<i32>().expect("published process PID");
-        eprintln!(
+        cowshed_os::eprintln!(
             "script-group phase=pid-read fifo={} pid={pid}",
             path.display()
         );
         pid
     });
     assert_eq!(birth.pid(), pids[0].cast_unsigned());
-    eprintln!("script-group phase=reading-members birth={birth:?} pids={pids:?}");
+    cowshed_os::eprintln!("script-group phase=reading-members birth={birth:?} pids={pids:?}");
     let members =
         cowshed_core::runtime::job_groups::job_members(&birth).expect("identity-proven live group");
     for member in &members {
-        eprintln!("script-group phase=member-read pid={}", member.pid());
+        cowshed_os::eprintln!("script-group phase=member-read pid={}", member.pid());
     }
     let exits = pids.map(|pid| {
         let member = members
             .iter()
             .find(|member| member.pid() == pid)
             .expect("published process is in the actual owned group");
-        eprintln!("script-group phase=watching-exit pid={pid}");
+        cowshed_os::eprintln!("script-group phase=watching-exit pid={pid}");
         let exit = member
             .watch_exit()
             .expect("watch this retained life before killing it");
@@ -731,41 +731,41 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
             !exit.within(Duration::ZERO).expect("current exit readiness"),
             "process {pid} already exited"
         );
-        eprintln!("script-group phase=exit-watched-running pid={pid}");
+        cowshed_os::eprintln!("script-group phase=exit-watched-running pid={pid}");
         exit
     });
     // A real group signal must end both retained lives, not just the leader or its output pipes.
-    eprintln!("script-group phase=signalling signal={}", libc::SIGTERM);
+    cowshed_os::eprintln!("script-group phase=signalling signal={}", libc::SIGTERM);
     send_signal(host.control(), libc::SIGTERM);
-    eprintln!("script-group phase=reading-exit");
+    cowshed_os::eprintln!("script-group phase=reading-exit");
     let status = read_exit(host.control());
-    eprintln!("script-group phase=exit-read status={status:?}");
+    cowshed_os::eprintln!("script-group phase=exit-read status={status:?}");
     assert_eq!(signaled(Some(&status)), Some(libc::SIGTERM));
     for (pid, exit) in pids.into_iter().zip(exits) {
-        eprintln!("script-group phase=awaiting-native-exit pid={pid}");
+        cowshed_os::eprintln!("script-group phase=awaiting-native-exit pid={pid}");
         assert!(
             exit.within(Duration::from_secs(10))
                 .expect("native exit notification"),
             "retained process {pid} of the killed script still runs"
         );
-        eprintln!("script-group phase=native-exit-observed pid={pid}");
+        cowshed_os::eprintln!("script-group phase=native-exit-observed pid={pid}");
     }
-    eprintln!("script-group phase=joining-output-readers");
+    cowshed_os::eprintln!("script-group phase=joining-output-readers");
     let [stdout, stderr] = readers.map(|reader| reader.join().expect("owned output reader"));
-    eprintln!("script-group phase=outputs-ended");
+    cowshed_os::eprintln!("script-group phase=outputs-ended");
     assert_eq!((stdout.as_str(), stderr.as_str()), ("", ""));
-    eprintln!("script-group phase=releasing-leader");
+    cowshed_os::eprintln!("script-group phase=releasing-leader");
     release(host.control()); // Only its actual parent reaps the script's leader.
-    eprintln!("script-group phase=leader-reaped");
+    cowshed_os::eprintln!("script-group phase=leader-reaped");
     assert!(
         host.child.try_wait().expect("host status").is_none(),
         "the host is not in the job's group"
     );
-    eprintln!("script-group phase=reusing-host");
+    cowshed_os::eprintln!("script-group phase=reusing-host");
     assert_eq!(host.run(&text("printf again")).stdout, "again");
-    eprintln!("script-group phase=finishing-fixture");
+    cowshed_os::eprintln!("script-group phase=finishing-fixture");
     host.finish().expect("finish the successful host fixture");
-    eprintln!("script-group phase=fixture-finished");
+    cowshed_os::eprintln!("script-group phase=fixture-finished");
 }
 
 /// The old null-signal oracle called an exited, unreaped child alive. The exit watch must not.
@@ -838,7 +838,7 @@ fn an_unreaped_zombie_is_exited_even_while_the_null_signal_reaches_it() {
             Some("Z"),
             "actual Linux zombie state: {stat}"
         );
-        eprintln!(
+        cowshed_os::eprintln!(
             "owned-zombie pid={pid} kernel_state=Z null_signal_reaches=true exit_watch_ready=true reaped_by_owner=true"
         );
     }
@@ -885,24 +885,24 @@ fn scripts_forked_at_once_each_run_whole() {
 
 #[test]
 fn nothing_one_script_does_to_its_process_reaches_the_next() {
-    eprintln!("script-isolation phase=starting-host");
+    cowshed_os::eprintln!("script-isolation phase=starting-host");
     let mut host = Host::start("isolation");
-    eprintln!("script-isolation phase=first-command");
+    cowshed_os::eprintln!("script-isolation phase=first-command");
     let first = host.run(&text(
         "umask 077; ulimit -n 64; cd /; export LEAK=1; trap 'echo trapped' EXIT",
     ));
-    eprintln!("script-isolation phase=first-completed");
+    cowshed_os::eprintln!("script-isolation phase=first-completed");
     assert_eq!(exited(first.status.as_ref()), Some(0));
     let second = host.run(&text(
         "umask; ulimit -n; printf '%s|%s\\n' \"$PWD\" \"${LEAK-}\"",
     ));
-    eprintln!("script-isolation phase=second-completed");
+    cowshed_os::eprintln!("script-isolation phase=second-completed");
     let lines: Vec<&str> = second.stdout.lines().collect();
     assert_ne!(lines[0], "0077", "umask leaked: {}", second.stdout);
     assert_ne!(lines[1], "64", "ulimit leaked: {}", second.stdout);
     assert_eq!(lines[2], format!("{}|", host.directory.display()));
     assert!(!second.stdout.contains("trapped"));
-    eprintln!("script-isolation phase=assertions-completed");
+    cowshed_os::eprintln!("script-isolation phase=assertions-completed");
 }
 
 #[test]

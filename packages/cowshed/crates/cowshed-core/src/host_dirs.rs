@@ -76,7 +76,7 @@ pub fn wait_for_running_install(support_directory: &Path) -> std::io::Result<boo
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
         Err(error) => return Err(error),
     }
-    eprintln!(
+    cowshed_os::eprintln!(
         "cowshed: an install holds {}; waiting for it to finish",
         path.display()
     );

@@ -1123,7 +1123,7 @@ pub mod test_support {
     impl Drop for Fixture {
         fn drop(&mut self) {
             if let Err(error) = fs::remove_dir_all(&self.root) {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "capability fixture {} was not removed: {error}",
                     self.root.display()
                 );

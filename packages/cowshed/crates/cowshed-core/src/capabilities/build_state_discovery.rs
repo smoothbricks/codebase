@@ -263,7 +263,7 @@ impl CargoRunner for JobCargo<'_> {
                 loop {
                     tokio::select! {
                         output = &mut job => break output,
-                        _ = report.tick() => eprintln!(
+                        _ = report.tick() => cowshed_os::eprintln!(
                             "cowshed: build-state discovery has waited {}s on `cargo {}` in {} \
                              ({} manifests, run as a job after the workspace shell's \
                              activation); {} (holders as of the first report)",

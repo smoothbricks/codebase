@@ -2443,7 +2443,7 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
                 resumed = Some((workspace, identity, attachment, staging));
             }
             None => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: replacing unpublished main image {} ({}); the checkout was never touched",
                     pending.image.display(),
                     if same_source {

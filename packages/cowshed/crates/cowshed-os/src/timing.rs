@@ -96,7 +96,7 @@ impl Drop for Span {
         let (Some(started), Some(origin)) = (self.started, *ORIGIN) else {
             return;
         };
-        eprintln!(
+        crate::eprintln!(
             "cowshed: timing +{:?} {} {} {:?}",
             started.duration_since(origin),
             self.scope,
@@ -110,7 +110,7 @@ impl Drop for Span {
 /// spans are on. `what` runs only then.
 pub fn event(scope: &'static str, what: impl FnOnce() -> String) {
     if let Some(origin) = *ORIGIN {
-        eprintln!("cowshed: timing +{:?} {scope} {}", origin.elapsed(), what());
+        crate::eprintln!("cowshed: timing +{:?} {scope} {}", origin.elapsed(), what());
     }
 }
 
@@ -171,7 +171,7 @@ pub fn timed_over<T, E: fmt::Display>(
     slow: Duration,
     work: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
-    eprintln!("cowshed: {scope} {step} start");
+    crate::eprintln!("cowshed: {scope} {step} start");
     let started = Instant::now();
     let result = match OpenStep::start(scope, || step.to_string()) {
         Some(open) => {
@@ -199,7 +199,7 @@ pub async fn timed_async_over<T, E: fmt::Display>(
     work: impl Future<Output = Result<T, E>>,
 ) -> Result<T, E> {
     let step = step.into();
-    eprintln!("cowshed: {scope} {step} start");
+    crate::eprintln!("cowshed: {scope} {step} start");
     let started = Instant::now();
     let result = match OpenStep::start(scope, || (*step).to_owned()) {
         Some(open) => {
@@ -222,7 +222,7 @@ pub async fn timed_async_over<T, E: fmt::Display>(
 fn done(label: fmt::Arguments<'_>, started: Instant, slow: Duration, ok: bool) {
     let elapsed = started.elapsed();
     if elapsed >= slow {
-        eprintln!(
+        crate::eprintln!(
             "cowshed: {label} done elapsed={elapsed:?} status={}",
             if ok { "ok" } else { "err" }
         );
@@ -238,7 +238,7 @@ pub fn attribute(
     key: &'static str,
     value: impl fmt::Display,
 ) {
-    eprintln!("cowshed: {scope} {step} {key}={value}");
+    crate::eprintln!("cowshed: {scope} {step} {key}={value}");
 }
 
 /// Where one call's lifecycle steps are reported while it runs. A caller that asked for its

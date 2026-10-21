@@ -22,7 +22,7 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         if let Err(error) = fs::remove_dir_all(&self.0) {
             if std::thread::panicking() {
-                eprintln!("remove build-state fixture {}: {error}", self.0.display());
+                cowshed_os::eprintln!("remove build-state fixture {}: {error}", self.0.display());
             } else {
                 panic!("remove build-state fixture {}: {error}", self.0.display());
             }

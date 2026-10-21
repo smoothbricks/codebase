@@ -386,7 +386,7 @@ pub(in crate::storage) fn grants_sidecar_missing(image: &Path) -> Result<bool, A
 }
 
 pub(in crate::storage) fn warn_session_image_issue(image: &Path, issue: impl std::fmt::Display) {
-    eprintln!("{}", session_image_issue(&image_file_name(image), issue));
+    cowshed_os::eprintln!("{}", session_image_issue(&image_file_name(image), issue));
 }
 
 fn session_image_issue(name: &str, issue: impl std::fmt::Display) -> String {
@@ -2250,9 +2250,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     where
         R: CommandRunner + Send + Sync + 'static,
     {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: retired image {} has no grants sidecar; its retirement record was already \
-             reclaimed, so its remaining bytes are reclaimed too",
+         reclaimed, so its remaining bytes are reclaimed too",
             trash_image.display()
         );
         self.reclaim_image(trash_image)
@@ -2640,7 +2640,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let path = held.path.with_file_name(destination_name);
         let retained = RootHeldMountpoint::Retained(path);
         let (_, cleanup) = retained.cleanup_guidance();
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: retained root-owned event-log debris from {} at {}; privileged cleanup: {}",
             held.path.display(),
             retained.mount_point().display(),
@@ -4582,7 +4582,7 @@ where
         self.verify_controller_path(destination)?;
         copy_until_quiescent_blocking(source, destination)
             .and_then(|_| crate::copy::verify_tree_blocking(source, destination))
-            .map(|report| { eprintln!("cowshed: verified copy {} -> {}; regular-file allocated bytes: source {}, copied {}; content {}", source.display(), destination.display(), report.source_allocated_bytes, report.copied_allocated_bytes, report.digest.to_hex()); })
+            .map(|report| { cowshed_os::eprintln!("cowshed: verified copy {} -> {}; regular-file allocated bytes: source {}, copied {}; content {}", source.display(), destination.display(), report.source_allocated_bytes, report.copied_allocated_bytes, report.digest.to_hex()); })
             .map_err(|error| ApfsStorageError::Host(error.to_string()))
     }
 
@@ -6776,7 +6776,7 @@ fn remove_stray_junk(
             fs::remove_file(&path)
         };
         match removed {
-            Ok(()) => eprintln!(
+            Ok(()) => cowshed_os::eprintln!(
                 "cowshed: removed stray {} from retired mountpoint",
                 path.display()
             ),

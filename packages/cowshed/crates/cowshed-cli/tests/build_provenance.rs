@@ -29,7 +29,7 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         if let Err(error) = fs::remove_dir_all(&self.0) {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "release provenance fixture cleanup {} failed: {error}",
                 self.0.display()
             );

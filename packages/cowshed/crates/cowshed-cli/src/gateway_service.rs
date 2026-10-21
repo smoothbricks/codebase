@@ -706,9 +706,9 @@ fn carry_listeners(
     ) {
         Ok(server) => Some(server),
         Err(error) => {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: the handoff socket cannot serve, so this restart carries no workspace \
-                 listener and names no install to the CPU asks it cuts off: {error}"
+             listener and names no install to the CPU asks it cuts off: {error}"
             );
             None
         }
@@ -1281,16 +1281,14 @@ fn empty_build_volume_trash_from_now_on(store: PathBuf) {
             loop {
                 let emptied = cowshed_core::build_volume::empty_store_trash(&store);
                 if emptied.images > 0 {
-                    eprintln!(
-                        "cowshed: deleted {} released build volume image(s), {} bytes, from the trash",
-                        emptied.images, emptied.bytes
-                    );
+                    cowshed_os::eprintln!("cowshed: deleted {} released build volume image(s), {} bytes, from the trash",
+                    emptied.images, emptied.bytes);
                 }
                 std::thread::sleep(BUILD_VOLUME_TRASH_INTERVAL);
             }
         });
     if let Err(error) = started {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: build-volume trash is not emptied while this daemon runs ({error}); `cowshed gc` empties it"
         );
     }
@@ -1315,7 +1313,9 @@ async fn run_daemon() -> Result<()> {
         .recorded_projects()
         .await
         .unwrap_or_else(|error| {
-            eprintln!("cowshed: could not list adopted projects at gateway startup: {error}");
+            cowshed_os::eprintln!(
+                "cowshed: could not list adopted projects at gateway startup: {error}"
+            );
             Vec::new()
         });
     let heal = Arc::new(StartupHealState::mounting(repositories.len()));
@@ -1380,10 +1380,8 @@ async fn run_daemon() -> Result<()> {
         // its clients for nobody.
         match gateway.handle().release_unclaimed_listeners().await {
             Ok(0) => {}
-            Ok(released) => eprintln!(
-                "cowshed: closed {released} carried workspace listener(s) no restored session claimed"
-            ),
-            Err(error) => eprintln!("cowshed: could not close the unclaimed carried listeners: {error}"),
+            Ok(released) => cowshed_os::eprintln!("cowshed: closed {released} carried workspace listener(s) no restored session claimed"),
+            Err(error) => cowshed_os::eprintln!("cowshed: could not close the unclaimed carried listeners: {error}"),
         }
         Ok::<(), CowshedError>(())
     }
@@ -1437,7 +1435,7 @@ async fn serve_supervisors(store_root: &Path, manager: Arc<SupervisorManager>) -
         supervisor_socket::bind(&supervisor_manager::manager_socket_path(store_root)).await?;
     tokio::spawn(async move {
         if let Err(error) = supervisor_manager::serve(listener, manager).await {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: workspace supervisors are unavailable: {}",
                 error.message
             );
@@ -1457,7 +1455,7 @@ async fn resume_project_retirements(storage: &ValidatedHostStorage) {
     let resumed =
         cowshed_core::project_retirement::native::resume_retirements(storage.clone()).await;
     for line in retirement_resume_lines(&resumed) {
-        eprintln!("{line}");
+        cowshed_os::eprintln!("{line}");
     }
 }
 
@@ -1516,17 +1514,18 @@ async fn heal_recorded_projects(
 ) {
     for outcome in inventory.heal(repositories, heal).await {
         if let Err(error) = &outcome.main {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: {}: main checkout is not mounted after gateway startup: {error}",
                 outcome.repo_id
             );
-            eprintln!("next: cowshed doctor");
+            cowshed_os::eprintln!("next: cowshed doctor");
         }
         for session in &outcome.sessions {
             if let Err(error) = &session.mount {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: could not mount {}/{} at gateway startup: {error}",
-                    outcome.repo_id, session.workspace
+                    outcome.repo_id,
+                    session.workspace
                 );
             }
         }
@@ -1545,7 +1544,7 @@ async fn heal_recorded_projects(
 /// job is to serve, and every workspace works without a compile cache.
 async fn heal_sccache_daemon() {
     if let Err(error) = crate::capabilities::sccache::service::start_service(None).await {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: could not start the sccache daemon at startup: {}",
             error.message
         );
@@ -1557,13 +1556,16 @@ async fn heal_sccache_daemon() {
 /// project's next reconcile moves it to a free block (05_gateway.md, port block).
 fn report_session_restore(report: &SessionRestoreReport) {
     for failure in &report.refused {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: {}: gateway session {} at {} was not restored at startup: {}",
-            failure.repo_id, failure.workspace_id, failure.endpoint, failure.refusal
+            failure.repo_id,
+            failure.workspace_id,
+            failure.endpoint,
+            failure.refusal
         );
     }
     if !report.refused.is_empty() {
-        eprintln!("next: cowshed doctor");
+        cowshed_os::eprintln!("next: cowshed doctor");
     }
 }
 
@@ -2271,7 +2273,7 @@ fn record_installed_source(executable: &HostStableExecutable, source: &Path) {
         env!("CARGO_PKG_VERSION")
     );
     if let Err(error) = fs::write(&record, contents) {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: could not record the installed cowshed path in {}: {error}",
             record.display()
         );
@@ -2303,9 +2305,9 @@ fn record_installed_build(executable: &HostStableExecutable, candidate: &Candida
         .map_err(io::Error::other)
         .and_then(|bytes| fs::write(&path, bytes));
     if let Err(error) = written {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: could not record the installed build in {}: {error}; a later setup cannot \
-             tell whether a build it installs is older",
+         tell whether a build it installs is older",
             path.display()
         );
     }
@@ -2514,7 +2516,7 @@ fn prune_superseded<F, C>(
             .map_err(launchd_error)
     });
     if let Err(error) = pruned {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: could not remove superseded copies of {}: {}",
             executable.path().display(),
             error.message

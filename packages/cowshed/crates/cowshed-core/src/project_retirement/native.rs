@@ -464,7 +464,7 @@ mod macos {
                 assert!(output.succeeded(), "{output:?}");
                 String::from_utf8(output.stdout).unwrap()
             };
-            eprintln!("forget-native before: {}", count().trim());
+            cowshed_os::eprintln!("forget-native before: {}", count().trim());
             crate::blank_image::blank_image(&image);
             let mount = root.path().join("mnt");
             fs::create_dir(&mount).unwrap();
@@ -507,7 +507,7 @@ mod macos {
             assert!(!SystemCommandRunner.attached_disk_images().unwrap().iter().any(
                 |entry| matches!(&entry.source, DiskImageSource::File(path) if path == &image || path.starts_with(&report.archive))
             ));
-            eprintln!("forget-native after: {}", count().trim());
+            cowshed_os::eprintln!("forget-native after: {}", count().trim());
         }
     }
 }

@@ -471,9 +471,9 @@ impl<A: Activator> PoolActor<A> {
         let changed = match generation.watcher.drain() {
             Ok(changed) => changed,
             Err(error) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: workspace shell input subscription failed ({error}); treating the \
-                     warm shells as stale"
+                 warm shells as stale"
                 );
                 true
             }
@@ -553,9 +553,9 @@ impl<A: Activator> PoolActor<A> {
         let watcher = match Watcher::subscribe(&evidence.entries) {
             Ok(watcher) => watcher,
             Err(error) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: cannot subscribe the workspace shell's inputs ({error}); its \
-                     shells serve one command each"
+                 shells serve one command each"
                 );
                 self.dirty = true;
                 return None;
@@ -585,9 +585,9 @@ impl<A: Activator> PoolActor<A> {
         let generation = match evidence {
             Ok(evidence) => self.install(epoch, evidence),
             Err(reason) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: the workspace shell's inputs are unknown ({reason}); this shell \
-                     serves one command"
+                 serves one command"
                 );
                 None
             }

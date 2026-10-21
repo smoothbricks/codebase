@@ -212,9 +212,9 @@ fn lease_then<T, E: fmt::Display>(
         Ok(stream) => stream,
         Err(error) => {
             if !ABSENT_SAID.swap(true, Ordering::Relaxed) {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: disk-lease {class} unleased: the gateway's control socket {} does not \
-                     answer ({error}); disk commands in this process run unleased while it is down",
+                 answer ({error}); disk commands in this process run unleased while it is down",
                     socket.display()
                 );
             }
@@ -569,9 +569,9 @@ impl WaitRecord {
         if let Err(error) = append_line(&self.path, line)
             && !self.failed.swap(true, Ordering::Relaxed)
         {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: disk-lease wait record {} is unwritable ({error}); this process's lease \
-                 waits count as its test's code time",
+             waits count as its test's code time",
                 self.path.display()
             );
         }
@@ -617,9 +617,9 @@ impl CommandRecord {
         if let Err(error) = append_line(&self.path, &format!("{class} {command}\n"))
             && !self.failed.swap(true, Ordering::Relaxed)
         {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: disk command record {} is unwritable ({error}); this process's disk \
-                 commands are missing from it",
+             commands are missing from it",
                 self.path.display()
             );
         }

@@ -97,7 +97,9 @@ impl Server {
                 .map(|_| frame);
             // The receiver is gone only when the test stopped waiting, so the frame has no reader.
             if sender.send(outcome).is_err() {
-                eprintln!("nx-cache-server readiness frame arrived after the test stopped waiting");
+                cowshed_os::eprintln!(
+                    "nx-cache-server readiness frame arrived after the test stopped waiting"
+                );
             }
         });
         // Owned from here: a failed readiness check below kills the server as the panic unwinds.
@@ -144,10 +146,10 @@ impl Drop for Server {
             Ok(()) => {}
             // The child already exited and was reaped, so there is nothing left to kill.
             Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {}
-            Err(error) => eprintln!("kill nx-cache-server {}: {error}", self.origin),
+            Err(error) => cowshed_os::eprintln!("kill nx-cache-server {}: {error}", self.origin),
         }
         if let Err(error) = child.wait() {
-            eprintln!("reap nx-cache-server {}: {error}", self.origin);
+            cowshed_os::eprintln!("reap nx-cache-server {}: {error}", self.origin);
         }
     }
 }

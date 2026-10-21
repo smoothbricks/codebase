@@ -264,7 +264,7 @@ where
             &build.image.source_mount,
             &build.image.retained,
         )?;
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: re-adoption build replacement allocates {new} bytes; the retained image {old}"
         );
         Ok(())
@@ -280,9 +280,9 @@ where
             fs::remove_file(staged)
                 .map_err(|error| io_error("discard a lost build's staged copy", staged, error))?;
             sync_parent_path(staged)?;
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: re-adoption discarded {}, a staged copy of a build volume whose retained \
-                 image is gone",
+             image is gone",
                 staged.display()
             );
         }

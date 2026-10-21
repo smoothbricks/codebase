@@ -4715,7 +4715,7 @@ mod tests {
             && mounted_at(APFS_CACHES_VOLUME)
                 .is_none_or(|at| at == Some(Path::new(RETIRED_CACHES_MOUNTPOINT)));
         let actions = read_only_validation_actions(&plan);
-        eprintln!(
+        cowshed_os::eprintln!(
             "existing host storage validation: elapsed={elapsed:?} canonical={canonical} commands={:?} actions={actions:?}",
             commands
                 .iter()

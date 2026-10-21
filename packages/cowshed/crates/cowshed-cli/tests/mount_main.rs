@@ -143,7 +143,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         if let Err(error) = fs::remove_dir_all(&self.root) {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "mount-main fixture {} was not removed: {error}",
                 self.root.display()
             );

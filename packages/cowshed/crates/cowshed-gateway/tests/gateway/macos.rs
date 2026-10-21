@@ -2604,7 +2604,7 @@ async fn session_current_benchmark() {
         let point_total: Duration = point.iter().sum();
         census.sort_unstable();
         point.sort_unstable();
-        eprintln!(
+        cowshed_os::eprintln!(
             "session_current sessions={count} jobs={JOBS} census_mean_us={:.6} point_mean_us={:.6} census_1000_ms={:.6} point_1000_ms={:.6} census_median_us={:.6} point_median_us={:.6}",
             census_total.as_secs_f64() * 1e6 / JOBS as f64,
             point_total.as_secs_f64() * 1e6 / JOBS as f64,

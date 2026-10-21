@@ -1673,14 +1673,17 @@ mod descriptor_inheritance {
                     .output()
                 {
                     Ok(output) if output.status.success() => {}
-                    Ok(output) => eprintln!(
+                    Ok(output) => cowshed_os::eprintln!(
                         "cannot unload descriptor probe {}: {} {}",
                         self.target,
                         output.status,
                         String::from_utf8_lossy(&output.stderr)
                     ),
                     Err(error) => {
-                        eprintln!("cannot unload descriptor probe {}: {error}", self.target)
+                        cowshed_os::eprintln!(
+                            "cannot unload descriptor probe {}: {error}",
+                            self.target
+                        )
                     }
                 }
             }

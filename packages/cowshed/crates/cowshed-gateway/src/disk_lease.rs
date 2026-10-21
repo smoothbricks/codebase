@@ -466,10 +466,10 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                     claim,
                     held,
                     waiting,
-                } => eprintln!(
+                } => cowshed_os::eprintln!(
                     "cowshed: disk-lease evicted a {class} holder after {held:?} while {waiting} \
-                     waited; its command may still be running beside the {waiting} phase: pid {} \
-                     `{}`",
+                 waited; its command may still be running beside the {waiting} phase: pid {} \
+                 `{}`",
                     claim
                         .pid
                         .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),

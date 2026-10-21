@@ -248,10 +248,10 @@ impl ImageTelemetry {
         let measuring = Instant::now();
         let before: Vec<_> = images.iter().map(|image| {
             let snapshot = Snapshot::read(image.before);
-            eprintln!("cowshed: image {operation} before image={} role={} extents={:?} allocated_bytes={:?} state={} measurement_error={:?}",
+            cowshed_os::eprintln!("cowshed: image {operation} before image={} role={} extents={:?} allocated_bytes={:?} state={} measurement_error={:?}",
                 image.before.display(), image.role, snapshot.extents, snapshot.allocated, snapshot.state, snapshot.error);
             if let Some(reason) = warning(&snapshot, None) {
-                eprintln!("cowshed: warning image {operation} before image={} reason={reason} extents_warn={EXTENTS_WARN} extents_delta_warn={EXTENTS_DELTA_WARN} allocated_bytes_warn={ALLOCATED_WARN} allocated_bytes_delta_warn={ALLOCATED_DELTA_WARN}", image.before.display());
+                cowshed_os::eprintln!("cowshed: warning image {operation} before image={} reason={reason} extents_warn={EXTENTS_WARN} extents_delta_warn={EXTENTS_DELTA_WARN} allocated_bytes_warn={ALLOCATED_WARN} allocated_bytes_delta_warn={ALLOCATED_DELTA_WARN}", image.before.display());
             }
             snapshot
         }).collect();
@@ -336,7 +336,7 @@ impl ImageTelemetry {
             columns.warning_reason = warning(&after, Some(&before));
             columns.measurement_error_after = after.error;
             columns.error = result.as_ref().err().map(ToString::to_string);
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: image {operation} after image={} role={} extents_before={:?} extents_after={:?} extents_delta={:?} allocated_bytes_before={:?} allocated_bytes_after={:?} allocated_bytes_delta={:?} elapsed_us={elapsed_us} measurement_us={measurement_us} process_io_write_bytes_before={io_before:?} process_io_write_bytes_after={io_after:?} process_io_write_bytes_delta={:?} process_io_scope=\"{IO_SCOPE}\" process_io_error={io_error:?} measurement_error={:?} status={} error={:?}",
                 image.after.display(),
                 image.role,
@@ -352,7 +352,7 @@ impl ImageTelemetry {
                 columns.error
             );
             if let Some(reason) = &columns.warning_reason {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: warning image {operation} after image={} reason={reason} extents_warn={EXTENTS_WARN} extents_delta_warn={EXTENTS_DELTA_WARN} allocated_bytes_warn={ALLOCATED_WARN} allocated_bytes_delta_warn={ALLOCATED_DELTA_WARN}",
                     image.after.display()
                 );
@@ -601,7 +601,7 @@ fn write_observations(
 
 fn failure(failed: &AtomicU64, count: u64, root: &Path, reason: fmt::Arguments<'_>) {
     let total = failed.fetch_add(count, Ordering::Relaxed) + count;
-    eprintln!(
+    cowshed_os::eprintln!(
         "cowshed: warning image telemetry failed={total} at {}: {reason}",
         root.display()
     );

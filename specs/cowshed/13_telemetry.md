@@ -453,7 +453,11 @@ Cowshed uses Arrow IPC for both, but placement and authority differ:
   events; gateway decision boundaries retain the flush policy below.
 - **The one text-file survivor** — `~/Library/Logs/cowshed/daemon-stderr.log`, the launchd `StandardErrorPath` target,
   exists only for crashes before tracer initialization. It lives off the `/private/cowshed/store` mountpoint so reboot
-  remount cannot be masked. `doctor` flags it when non-empty.
+  remount cannot be masked. `doctor` flags it when non-empty. The gateway, every workspace supervisor and their children
+  write it at once, so each cowshed process writes each line in one `write(2)` (`cowshed_os::eprintln!`; clippy refuses
+  `std::eprintln!`/`eprint!` in the cowshed crates). `std` writes a line one formatted piece at a time, and pieces of
+  concurrent processes splice: measured 2026-10-21, an install's `supervisor-recovery drain` spans and its supervisors'
+  "retires after draining" lines interleaved mid-word, so no line said which supervisor waited on what.
 
 `StreamInfo` is the shared content descriptor:
 

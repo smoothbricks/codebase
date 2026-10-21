@@ -849,7 +849,7 @@ fn lock_cargo(cargo_home: &Path) -> Result<cargo::CacheLock, RetirementError> {
                 let waited = started.elapsed();
                 if waited >= reported + std::time::Duration::from_secs(10) {
                     reported = waited;
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: waiting {}s for cargo's package-cache lock in {} so its caches can move",
                         waited.as_secs(),
                         cargo_home.display()

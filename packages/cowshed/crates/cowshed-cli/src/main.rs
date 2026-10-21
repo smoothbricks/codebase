@@ -10,7 +10,9 @@ fn main() {
     // Before the runtime starts any thread: this binary is also every workspace's warm
     // exec host, and in that role it never returns from here.
     if let Err(error) = cowshed_shell::dispatch() {
-        eprintln!("cowshed: cannot locate this executable for warm workspace shells: {error}");
+        cowshed_os::eprintln!(
+            "cowshed: cannot locate this executable for warm workspace shells: {error}"
+        );
     }
     cowshed_os::timing::start_clock();
     let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -20,7 +22,7 @@ fn main() {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("cowshed: cannot start the async runtime: {error}");
+            cowshed_os::eprintln!("cowshed: cannot start the async runtime: {error}");
             std::process::exit(1);
         }
     };
@@ -50,7 +52,7 @@ fn die_by(signal: i32) {
     // whose default action for every signal passed here terminates the process.
     let reset = unsafe { libc::signal(signal, libc::SIG_DFL) };
     if reset == libc::SIG_ERR {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: cannot restore the default action for signal {signal}: {}",
             std::io::Error::last_os_error()
         );
@@ -58,7 +60,7 @@ fn die_by(signal: i32) {
     }
     // SAFETY: see above; `raise` takes no memory operands.
     if unsafe { libc::raise(signal) } != 0 {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: cannot raise signal {signal}: {}",
             std::io::Error::last_os_error()
         );

@@ -101,13 +101,13 @@ async fn run_with(arguments: Vec<OsString>, interrupts: InterruptPolicy) -> Endi
         .is_some_and(|argument| argument == OsStr::new(GATEWAY_GIT_FETCH_HELPER_ARG))
     {
         if arguments.len() != 1 {
-            eprintln!("cowshed: the internal gateway git helper accepts no arguments");
+            cowshed_os::eprintln!("cowshed: the internal gateway git helper accepts no arguments");
             return Ending::Finished(2);
         }
         return Ending::Finished(match run_gateway_git_fetch_helper() {
             Ok(()) => 0,
             Err(error) => {
-                eprintln!("cowshed: gateway git helper failed: {error}");
+                cowshed_os::eprintln!("cowshed: gateway git helper failed: {error}");
                 1
             }
         });
@@ -160,7 +160,7 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
         return Ok(match output.bare(page.as_bytes()) {
             Ok(()) => 0,
             Err(write_error) => {
-                eprintln!("cowshed: failed to write command result: {write_error}");
+                cowshed_os::eprintln!("cowshed: failed to write command result: {write_error}");
                 1
             }
         });
@@ -171,7 +171,7 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
         return Ok(match output.bare(version.as_bytes()) {
             Ok(()) => 0,
             Err(write_error) => {
-                eprintln!("cowshed: failed to write command result: {write_error}");
+                cowshed_os::eprintln!("cowshed: failed to write command result: {write_error}");
                 1
             }
         });
@@ -344,14 +344,16 @@ fn watch(kind: SignalKind, number: libc::c_int, name: &str, fate: &str) -> Optio
         Ok(true) => return None,
         Ok(false) => {}
         Err(error) => {
-            eprintln!("cowshed: cannot read the {name} disposition ({error}); a {name} {fate}");
+            cowshed_os::eprintln!(
+                "cowshed: cannot read the {name} disposition ({error}); a {name} {fate}"
+            );
             return None;
         }
     }
     match signal(kind) {
         Ok(watched) => Some(watched),
         Err(error) => {
-            eprintln!("cowshed: cannot watch for {name} ({error}); a {name} {fate}");
+            cowshed_os::eprintln!("cowshed: cannot watch for {name} ({error}); a {name} {fate}");
             None
         }
     }
@@ -429,7 +431,7 @@ fn finish<W: io::Write, E: io::Write>(
         Err(error) => {
             let exit_code = i32::from(error.exit_code());
             if let Err(write_error) = write_error(output, error, json, None) {
-                eprintln!("cowshed: failed to write command result: {write_error}");
+                cowshed_os::eprintln!("cowshed: failed to write command result: {write_error}");
                 1
             } else {
                 exit_code
@@ -444,7 +446,7 @@ fn emit_error(error: CowshedError, command_map: Option<&str>, json: bool, quiet:
     let stderr = io::stderr();
     let mut output = output::Output::new(stdout, stderr, quiet);
     if let Err(write_error) = write_error(&mut output, error, json, command_map) {
-        eprintln!("cowshed: failed to write command result: {write_error}");
+        cowshed_os::eprintln!("cowshed: failed to write command result: {write_error}");
         1
     } else {
         exit_code

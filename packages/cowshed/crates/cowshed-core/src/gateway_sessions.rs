@@ -156,9 +156,10 @@ impl NativeSessionInventory {
             .iter()
             .filter(|collision| reporting.is_none_or(|repo| collision.claimed.repo == *repo))
         {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: not serving {}/{}: {collision}; next: cowshed doctor --repair",
-                collision.claimed.repo, collision.claimed.workspace
+                collision.claimed.repo,
+                collision.claimed.workspace
             );
         }
         Ok((served, refused))

@@ -635,7 +635,7 @@ impl<H: RuntimeStorageHost> FirstMint<H> {
     /// on stderr beside the adoption's own failure, which the caller answers.
     pub async fn abandon(self) {
         if let Self::Failed(error) = &self {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: main's first build volume could not be minted beside its image either: {error}"
             );
         }
@@ -654,7 +654,7 @@ impl<H: RuntimeStorageHost> FirstMint<H> {
             })
             .await;
         if let Err(error) = released {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: {whose} build volume minted beside main stays: {error}; `cowshed gc` retries it"
             );
         }
@@ -1064,7 +1064,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             .await;
         match released {
             Ok(release) => say_release(&live, "a fork that never staged", &release),
-            Err(error) => eprintln!(
+            Err(error) => cowshed_os::eprintln!(
                 "cowshed: build volume {live} of a fork that never staged stays: {error}; `cowshed gc` retries it"
             ),
         }
@@ -2425,7 +2425,7 @@ fn release_minted(
     match released {
         Ok(None) => {}
         Ok(Some(release)) => say_release(id, whose, &release),
-        Err(error) => eprintln!(
+        Err(error) => cowshed_os::eprintln!(
             "cowshed: {whose} build volume {id}, minted beside main, stays: {error}; `cowshed gc` retries it"
         ),
     }
@@ -2447,21 +2447,21 @@ fn say_release(id: &BuildVolumeId, whose: &str, release: &BuildVolumeRelease) {
         BuildVolumeRelease::Deleted { refused: None } => {}
         BuildVolumeRelease::Deleted {
             refused: Some(BuildVolumeRefusal { open, forced }),
-        } if open.is_empty() => eprintln!(
+        } if open.is_empty() => cowshed_os::eprintln!(
             "cowshed: {whose} build volume {id}: its unforced unmount was refused with no visible holder; {}",
             outcome(*forced)
         ),
         BuildVolumeRelease::Deleted {
             refused: Some(BuildVolumeRefusal { open, forced }),
-        } => eprintln!(
+        } => cowshed_os::eprintln!(
             "cowshed: {whose} build volume {id} was open in {} when its unforced unmount was refused; {}",
             nx::Holders(open),
             outcome(*forced)
         ),
-        BuildVolumeRelease::Held { open } if open.is_empty() => eprintln!(
+        BuildVolumeRelease::Held { open } if open.is_empty() => cowshed_os::eprintln!(
             "cowshed: {whose} build volume {id} stays while a job admitted on it runs; the next rm, land or gc after it ends reclaims it"
         ),
-        BuildVolumeRelease::Held { open } => eprintln!(
+        BuildVolumeRelease::Held { open } => cowshed_os::eprintln!(
             "cowshed: {whose} build volume {id} stays while a job admitted on it runs (open in {}); the next rm, land or gc after it ends reclaims it",
             nx::Holders(open)
         ),
@@ -2527,7 +2527,7 @@ fn nearness(checkout: &Path, recorded: Option<&GitOid>, tree: &GitOid) -> Nearne
             Nearness::Paths(u64::try_from(paths).unwrap_or(u64::MAX))
         }
         Ok(output) => {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: cannot compare build tree {recorded} with {tree} in {}: {}; it counts as farther than any comparable tree",
                 checkout.display(),
                 crate::git::git_ended(&output)
@@ -2535,7 +2535,7 @@ fn nearness(checkout: &Path, recorded: Option<&GitOid>, tree: &GitOid) -> Nearne
             Nearness::Unknown
         }
         Err(error) => {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: cannot compare build tree {recorded} with {tree} in {}: {}; it counts as farther than any comparable tree",
                 checkout.display(),
                 crate::git::git_spawn_error(&error)
@@ -2747,7 +2747,7 @@ pub(crate) fn say_refresh(
     refreshed: &Refreshed,
 ) {
     for (workspace, reason) in &refreshed.passed {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: {workspace} has the tree {target} moved to checked out, but does not seed {target}: {reason}"
         );
     }
@@ -2757,10 +2757,10 @@ pub(crate) fn say_refresh(
             workspace,
             tree,
             elapsed_ms,
-        } => eprintln!(
+        } => cowshed_os::eprintln!(
             "cowshed: {target}'s branch moved to tree {tree} outside cowshed land; its seed is now {workspace}'s build volume ({elapsed_ms} ms)"
         ),
-        Refresh::Skipped { behind_ms, reason } => eprintln!(
+        Refresh::Skipped { behind_ms, reason } => cowshed_os::eprintln!(
             "cowshed: {target}'s seed stays{} behind its build volume, so {destination} misses what {target} built since: {reason}; the next fork retries",
             behind_ms.map(|ms| format!(" {ms} ms")).unwrap_or_default(),
         ),
@@ -5176,7 +5176,7 @@ fn main() {
             );
             assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         }
-        eprintln!(
+        cowshed_os::eprintln!(
             "Cargo fixture witness: entry_pid={started_pid}, actual_cargo_pid={pid}, kernel_parent_pid={parent_pid}, kernel_process_group={group}, executable={}, makeflags={makeflags:?}, budget_tokens={tokens:?}",
             cargo.display()
         );

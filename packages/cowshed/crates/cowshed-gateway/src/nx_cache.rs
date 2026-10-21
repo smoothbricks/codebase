@@ -515,7 +515,7 @@ pub(crate) async fn stop_backend(
             .map(|_| ())
             .map_err(|error| failed("wait for", error)),
         Err(_) => {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: Nx cache backend for {repo_id} did not exit within {}s of SIGTERM; killing it",
                 BACKEND_STOP_GRACE.as_secs()
             );

@@ -150,9 +150,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     })();
     if let Err(error) = host.detach_existing_image(&image, DetachIntent::Release) {
-        eprintln!("cleanup failed; retaining {}: {error}", root.display());
+        cowshed_os::eprintln!("cleanup failed; retaining {}: {error}", root.display());
         if let Err(primary) = outcome {
-            eprintln!("measurement failed: {primary}");
+            cowshed_os::eprintln!("measurement failed: {primary}");
         }
         return Err(error.into());
     }

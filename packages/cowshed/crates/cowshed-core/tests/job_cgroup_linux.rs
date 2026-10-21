@@ -167,7 +167,7 @@ fn a_job_owns_its_cgroup_from_before_its_first_instruction() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     println!("{stdout}");
-    eprintln!("{stderr}");
+    cowshed_os::eprintln!("{stderr}");
     assert!(
         output.status.success(),
         "the delegated controller failed: {}",
@@ -251,7 +251,7 @@ fn delegate(uid: u32, gid: u32) {
         .output_locked()
         .expect("run the unprivileged controller");
     println!("{}", String::from_utf8_lossy(&output.stdout));
-    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    cowshed_os::eprintln!("{}", String::from_utf8_lossy(&output.stderr));
     scratch
         .cleanup()
         .expect("release scratch after the controller exits");

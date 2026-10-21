@@ -1327,7 +1327,7 @@ impl Drop for SandboxedChild {
         if self.exit.is_none()
             && let Err(error) = self.process.signal_process_tree(ProcessSignal::Kill)
         {
-            eprintln!("cannot kill the sandboxed child: {error}");
+            cowshed_os::eprintln!("cannot kill the sandboxed child: {error}");
         }
     }
 }
@@ -1744,7 +1744,7 @@ process.stdout.write(`${process.argv[3]}watch-ready\n`);
     std::fs::rename(&next_source, mount.join("own.txt"))
         .expect("publish allowed change atomically");
     let (exit, stdout, stderr) = watcher.wait().await;
-    eprintln!("{}", String::from_utf8_lossy(&stderr));
+    cowshed_os::eprintln!("{}", String::from_utf8_lossy(&stderr));
     assert_eq!(
         exit,
         ExitStatus::Exited { code: 0 },
@@ -2360,7 +2360,7 @@ bun -e 'if (require("install-probe-dependency") !== 7) process.exit(1)'
             ],
         )
         .await;
-        eprintln!(
+        cowshed_os::eprintln!(
             "{tool} cache operation: {:?}\nstdout: {}\nstderr: {}",
             result.0,
             String::from_utf8_lossy(&result.1),

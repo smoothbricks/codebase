@@ -29,7 +29,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("{USAGE}");
+    cowshed_os::eprintln!("{USAGE}");
     ExitCode::from(2)
 }
 
@@ -38,9 +38,9 @@ fn gate(need: u64) -> ExitCode {
         Ok(budget) => budget,
         Err(error) => {
             println!("{}", json!({ "need": need, "unread": error.to_string() }));
-            eprintln!(
+            cowshed_os::eprintln!(
                 "attach-budget: warning: the disk-image attach pool is unreadable ({error}); \
-                 nothing proves there is headroom or that there is not, so the lane runs"
+             nothing proves there is headroom or that there is not, so the lane runs"
             );
             return ExitCode::SUCCESS;
         }
@@ -49,7 +49,7 @@ fn gate(need: u64) -> ExitCode {
     match budget.admits(need) {
         Ok(()) => ExitCode::SUCCESS,
         Err(refused) => {
-            eprintln!("{refused}");
+            cowshed_os::eprintln!("{refused}");
             ExitCode::from(3)
         }
     }
@@ -59,7 +59,9 @@ fn clear() -> ExitCode {
     match attach_budget::clear() {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("attach-budget: clear the recorded exhaustion and ceiling: {error}");
+            cowshed_os::eprintln!(
+                "attach-budget: clear the recorded exhaustion and ceiling: {error}"
+            );
             ExitCode::from(1)
         }
     }

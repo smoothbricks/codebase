@@ -158,12 +158,12 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 Err(error) => {
                     // Nothing published: the original link still names the original image.
                     if let Err(restore) = host.mount_build_volume(layout, &plan.previous) {
-                        eprintln!("cowshed: restoring {}'s original build volume {} after reseed refusal failed: {restore}", plan.workspace.owner.name, plan.previous);
+                        cowshed_os::eprintln!("cowshed: restoring {}'s original build volume {} after reseed refusal failed: {restore}", plan.workspace.owner.name, plan.previous);
                     }
                     drop(creating);
                     match host.release_build_volume(layout, &replacement) {
                         Ok(release) => super::say_release(&replacement, "unpublished reseed replacement", &release),
-                        Err(cleanup) => eprintln!("cowshed: releasing unpublished reseed replacement {replacement} failed: {cleanup}"),
+                        Err(cleanup) => cowshed_os::eprintln!("cowshed: releasing unpublished reseed replacement {replacement} failed: {cleanup}"),
                     }
                     return Err(error);
                 }

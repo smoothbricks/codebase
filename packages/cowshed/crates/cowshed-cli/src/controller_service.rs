@@ -123,7 +123,7 @@ async fn relay(mut calls: mpsc::Receiver<RouterCommand>, router: RouterHandle) {
             },
             Some(ended) = open.join_next() => {
                 if let Err(error) = ended {
-                    eprintln!("cowshed: a controller call ended without an answer: {error}");
+                    cowshed_os::eprintln!("cowshed: a controller call ended without an answer: {error}");
                 }
             }
         }

@@ -15,6 +15,7 @@ bench = false
 
 [dependencies]
 cowshed-core.workspace = true
+cowshed-os = { path = "../cowshed-os" }
 libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
@@ -34,5 +35,4 @@ brush-parser = "0.4"
 async-trait = "0.1"
 bytes = "1"
 cowshed-gateway-types = { path = "../cowshed-gateway-types" }
-cowshed-os = { path = "../cowshed-os" }
 uuid = { version = "1", features = ["v4"] }

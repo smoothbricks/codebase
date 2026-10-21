@@ -406,7 +406,7 @@ fn stop_daemon(pid: i32) -> io::Result<bool> {
     match watch.await_exit(DAEMON_EXIT_GRACE)? {
         Ok(orphans) => {
             for said in orphans.end(DAEMON_EXIT_GRACE) {
-                eprintln!("cowshed: {said}");
+                cowshed_os::eprintln!("cowshed: {said}");
             }
             Ok(true)
         }

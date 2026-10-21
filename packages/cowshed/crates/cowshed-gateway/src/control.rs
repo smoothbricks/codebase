@@ -1108,7 +1108,7 @@ async fn serve<R, W>(
                 Some(path) => match connect_parent(path).await {
                     Ok(stream) => Some((path.to_path_buf(), stream)),
                     Err(error) => {
-                        eprintln!(
+                        cowshed_os::eprintln!(
                             "cowshed: the requester's CPU pool {} does not answer ({error}); `{command}` asks the host budget alone",
                             path.display()
                         );
@@ -1250,7 +1250,7 @@ async fn hold<R, W, S, G>(
         return;
     }
     if matches!(response.lease, Some(LeaseState::Granted)) {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: timing lease-grant scheduler={scheduler:?} elapsed_ns={}",
             asked.elapsed().as_nanos(),
         );
@@ -1451,7 +1451,7 @@ impl Served {
         match self {
             Self::Pool(pool) => {
                 if let Err(error) = pool.close().await {
-                    eprintln!("cowshed: jobserver CPU pool did not close: {error}");
+                    cowshed_os::eprintln!("cowshed: jobserver CPU pool did not close: {error}");
                 }
             }
             Self::Fifo(fifo) => fifo.drain_and_unlink(),
@@ -1513,7 +1513,7 @@ where
         served.close().await;
         return None;
     }
-    eprintln!(
+    cowshed_os::eprintln!(
         "cowshed: timing lease-grant scheduler=\"jobserver\" elapsed_ns={} tokens={tokens}",
         asked.elapsed().as_nanos(),
     );
@@ -1572,7 +1572,7 @@ where
 /// stderr and as a jobserver timing event (05_gateway.md "Work a holder starts draws on its
 /// grant").
 fn withdrawn(job: &str, tokens: usize, winner: &str, loser: &str, waited_ms: u128) {
-    eprintln!(
+    cowshed_os::eprintln!(
         "cowshed: `{job}` was granted {tokens} token(s) by {winner}; its ask of {loser} was withdrawn after {waited_ms} ms"
     );
     cowshed_os::timing::event("jobserver", || {
@@ -1620,7 +1620,7 @@ async fn hold_parent_grant<R, W>(
             // A pool says nothing after its grant: any byte or end is the end of that grant.
             _ = parent.read(&mut parent_byte), if parent_open => {
                 parent_open = false;
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: the requester's CPU pool {} ended its {tokens}-token grant; the job runs on over budget until it ends, and its own pool lends nothing more",
                     parent_path.display()
                 );
@@ -1701,7 +1701,7 @@ async fn hold_resident_pool<R, W>(
         {}
     }
     if let Err(error) = pool.close().await {
-        eprintln!("cowshed: resident CPU pool did not close: {error}");
+        cowshed_os::eprintln!("cowshed: resident CPU pool did not close: {error}");
     }
 }
 

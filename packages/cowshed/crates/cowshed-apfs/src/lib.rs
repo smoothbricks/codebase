@@ -764,9 +764,9 @@ fn record_pool_outcome(request: &CommandRequest, output: &CommandOutput) {
         return;
     };
     if let Err(error) = recorded {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: warning: could not record the disk-image attach pool's answer to {}: \
-             {error}",
+         {error}",
             request.program.display()
         );
     }
@@ -2711,16 +2711,16 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 self.retire_inherited_event_log(attachment, mount_point, options)
             }
             Ok(EventLog::Squatted) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: apfs {} has a {EVENT_LOG_DIRECTORY} that is not a directory, or a \
-                     {EVENT_LOG_OPT_OUT} that is not an empty regular file; left as found, not \
-                     written through",
+                 {EVENT_LOG_OPT_OUT} that is not an empty regular file; left as found, not \
+                 written through",
                     mount_point.display()
                 );
                 Ok(())
             }
             Err(error) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: apfs {} keeps fseventsd's event log: {error}",
                     mount_point.display()
                 );
@@ -2743,7 +2743,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 .map(|_| ())
         };
         if let Err(error) = unmount("unmount to retire an inherited event log") {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: apfs {} keeps fseventsd's inherited event log: {error}",
                 mount_point.display()
             );
@@ -2766,7 +2766,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                     (Ok(()), unmounted) => unmounted,
                     (Err(replaced), Ok(())) => Err(replaced),
                     (Err(replaced), Err(unmounted)) => {
-                        eprintln!(
+                        cowshed_os::eprintln!(
                             "cowshed: apfs {} keeps fseventsd's inherited event log: {replaced}",
                             mount_point.display()
                         );
@@ -2775,7 +2775,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 }
             });
         if let Err(error) = &retired {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: apfs {} keeps fseventsd's inherited event log: {error}",
                 mount_point.display()
             );
@@ -2785,7 +2785,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             mount_request(attachment, options, mount_point),
         )?;
         if retired.is_ok() {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: apfs {} retired fseventsd's inherited event log",
                 mount_point.display()
             );
@@ -3391,21 +3391,21 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         loop {
             match self.attached_whole_devices(image) {
                 Ok(held) if !held.contains(whole_device) => {
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: apfs detach-settle {whole_device} departed waited={waited:?}"
                     );
                     return;
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: apfs detach-settle {whole_device} inventory unreadable ({error}); proceeding without confirmation waited={waited:?}"
                     );
                     return;
                 }
             }
             if waited >= self.settle.total {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: apfs detach-settle {whole_device} STILL PRESENT after {:?}; proceeding without confirmation",
                     self.settle.total
                 );
@@ -6911,7 +6911,7 @@ mod tests {
         impl Drop for FifoDirectory {
             fn drop(&mut self) {
                 if let Err(error) = fs::remove_dir_all(&self.0) {
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "remove owned disk-child FIFOs {}: {error}",
                         self.0.display()
                     );
@@ -6924,7 +6924,7 @@ mod tests {
                 if let Some(mut pipe) = self.0.take()
                     && let Err(error) = pipe.write_all(b"cancel\n")
                 {
-                    eprintln!("release owned disk child during cleanup: {error}");
+                    cowshed_os::eprintln!("release owned disk child during cleanup: {error}");
                 }
             }
         }

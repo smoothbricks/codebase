@@ -135,7 +135,7 @@ mod native {
         let root = HostConfig::load(scratch.path(), scratch.path())?
             .mount_root()
             .to_path_buf();
-        eprintln!("Provisioning fixed workspace root {}", root.display());
+        cowshed_os::eprintln!("Provisioning fixed workspace root {}", root.display());
         execute_mount_root_provisioning(&root).await?;
         let directories = [
             root.parent().and_then(Path::parent).ok_or("mount prefix")?,

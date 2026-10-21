@@ -247,7 +247,7 @@ fn record_previous_program(home: &Path, previous_plist: &[u8]) {
     if let Err(error) =
         fs::create_dir_all(&directory).and_then(|()| fs::write(&record, format!("{program}\n")))
     {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: could not record the previous sccache program in {}: {error}",
             record.display()
         );

@@ -193,7 +193,7 @@ impl Drop for SharedMount {
                 None => Ok(()),
             });
         if let Err(error) = unmounted {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "unmount shared fixture volume at {}: {error}",
                 self.mount_point.display()
             );
@@ -342,7 +342,7 @@ fn detach_previous_runs(current: &Path) {
             if kernel_holds(&image)
                 && let Err(error) = release_image(&image)
             {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "release the previous run's pool image {}: {error}",
                     image.display()
                 );

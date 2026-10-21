@@ -405,9 +405,9 @@ impl SupervisorManager {
             // Only a positively absent listener authorizes lost-supervisor recovery. A wedged
             // live peer or an unknown protocol outcome retains its jobs and ledger.
             Ok(None) => end_lost_jobs(socket.clone(), super::job_groups::Writer::Any).await,
-            Err(error) => eprintln!(
+            Err(error) => cowshed_os::eprintln!(
                 "cowshed: cannot determine whether workspace supervisor {} stopped; its jobs and \
-                 ledger are retained: {}",
+             ledger are retained: {}",
                 socket.display(),
                 error.message
             ),
@@ -552,7 +552,9 @@ impl Recovery {
                 }
                 while let Some(recovered) = recoveries.join_next().await {
                     if let Err(error) = recovered {
-                        eprintln!("cowshed: recovering a workspace supervisor failed: {error}");
+                        cowshed_os::eprintln!(
+                            "cowshed: recovering a workspace supervisor failed: {error}"
+                        );
                     }
                 }
                 Ok::<(), Infallible>(())
@@ -648,14 +650,14 @@ fn watch_child(mut child: tokio::process::Child, socket: PathBuf) {
     tokio::spawn(async move {
         match child.wait().await {
             Ok(status) if status.success() => {}
-            Ok(status) => eprintln!(
+            Ok(status) => cowshed_os::eprintln!(
                 "cowshed: workspace supervisor {} ended: {status}",
                 socket.display()
             ),
             Err(error) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: cannot wait for workspace supervisor {}; its jobs and ledger are \
-                     retained: {error}",
+                 retained: {error}",
                     socket.display()
                 );
                 return;
@@ -680,11 +682,11 @@ fn recover_after_exit(
     tokio::spawn(async move {
         match tokio::task::spawn_blocking(exited).await {
             Ok(Ok(())) => end_lost_jobs(socket, super::job_groups::Writer::Process(pid)).await,
-            Ok(Err(error)) => eprintln!(
+            Ok(Err(error)) => cowshed_os::eprintln!(
                 "cowshed: cannot watch workspace supervisor {} (pid {pid}): {error}",
                 socket.display()
             ),
-            Err(error) => eprintln!(
+            Err(error) => cowshed_os::eprintln!(
                 "cowshed: watching workspace supervisor {} failed: {error}",
                 socket.display()
             ),
@@ -707,9 +709,9 @@ async fn end_lost_jobs(socket: PathBuf, writer: super::job_groups::Writer) {
     let _socket = match supervisor_socket::bind(&socket).await {
         Ok(socket) => socket,
         Err(error) => {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: cannot exclusively recover workspace supervisor {}; its ledger is \
-                 retained: {}",
+             retained: {}",
                 socket.display(),
                 error.message
             );
@@ -724,26 +726,26 @@ async fn end_lost_jobs(socket: PathBuf, writer: super::job_groups::Writer) {
     match ended {
         Ok(Ok(ended)) => {
             if !ended.signalled.is_empty() {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: ended jobs {:?}, left running by workspace supervisor {}",
                     ended.signalled,
                     socket.display()
                 );
             }
             if !ended.unresolved.is_empty() {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: jobs {:?} of workspace supervisor {} left processes whose group \
-                     leader is gone; not signalled, and kept in its ledger for the next supervisor",
+                 leader is gone; not signalled, and kept in its ledger for the next supervisor",
                     ended.unresolved,
                     socket.display()
                 );
             }
         }
-        Ok(Err(error)) => eprintln!(
+        Ok(Err(error)) => cowshed_os::eprintln!(
             "cowshed: cannot end the jobs workspace supervisor {} left running: {error}",
             socket.display()
         ),
-        Err(error) => eprintln!("cowshed: ending lost jobs failed: {error}"),
+        Err(error) => cowshed_os::eprintln!("cowshed: ending lost jobs failed: {error}"),
     }
 }
 
@@ -910,9 +912,9 @@ pub async fn stop_other_build(socket: &Path) -> Result<OtherBuildStopped> {
                 )
             })?;
     for group in &unresolved {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: job {} process group {} that pid {pid} left still has processes but its \
-             leader is gone; not signalled, and kept in {} for the workspace's next supervisor",
+         leader is gone; not signalled, and kept in {} for the workspace's next supervisor",
             group.job_id(),
             group.pgid(),
             ledger.display()

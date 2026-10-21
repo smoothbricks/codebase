@@ -1489,7 +1489,9 @@ mod tests {
         );
         assert_eq!(carried.entries, 2);
         assert!(carried.stopped.is_none(), "{carried:?}");
-        eprintln!("carry measured work: stage={stage_work:?}, both phases={all_work:?}");
+        cowshed_os::eprintln!(
+            "carry measured work: stage={stage_work:?}, both phases={all_work:?}"
+        );
     }
 
     #[test]
@@ -2105,7 +2107,7 @@ mod tests {
                     .any(|detail| detail.starts_with(&format!("SCAN {alias}"))),
                 "{plan:?}"
             );
-            eprintln!("publication indexed plan: {plan:?}");
+            cowshed_os::eprintln!("publication indexed plan: {plan:?}");
         }
         assert_eq!(fixture.carried_hashes(), BTreeSet::from(["1".into()]));
     }
@@ -2495,7 +2497,7 @@ main().catch(error => { console.error(error); process.exitCode = 1; });
                 "pinned Nx {phase}: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            eprint!("{}", String::from_utf8_lossy(&output.stdout));
+            cowshed_os::eprint!("{}", String::from_utf8_lossy(&output.stdout));
         };
         run(&from, "create");
         run(&into, "initialize");
@@ -2596,7 +2598,7 @@ main().catch(error => { console.error(error); process.exitCode = 1; });
                 b"terminal"
             );
         }
-        eprintln!(
+        cowshed_os::eprintln!(
             "real RAW carry: {stage_work:?}, rows={}, elapsed={:?}, Nx-initialized DB={} bytes",
             carried.entries,
             started.elapsed(),

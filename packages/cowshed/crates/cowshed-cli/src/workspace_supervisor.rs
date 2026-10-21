@@ -24,12 +24,14 @@ pub async fn run(arguments: &[OsString]) -> i32 {
     match serve(arguments).await {
         Ok(()) => 0,
         Err(error) => {
-            eprintln!("cowshed: {}", error.message);
-            eprintln!("hint: {}", error.hint);
+            cowshed_os::eprintln!("cowshed: {}", error.message);
+            cowshed_os::eprintln!("hint: {}", error.hint);
             match report.send(&error) {
                 // Nobody reads a report once the supervisor has served: the log has it.
                 Err(sent) if sent.kind() != std::io::ErrorKind::BrokenPipe => {
-                    eprintln!("cowshed: could not report this to the cowshed daemon: {sent}");
+                    cowshed_os::eprintln!(
+                        "cowshed: could not report this to the cowshed daemon: {sent}"
+                    );
                 }
                 _ => {}
             }

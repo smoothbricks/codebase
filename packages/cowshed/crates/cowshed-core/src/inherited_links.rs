@@ -577,7 +577,7 @@ mod tests {
     impl Drop for TempTree {
         fn drop(&mut self) {
             if let Err(error) = fs::remove_dir_all(&self.0) {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "inherited-links test tree {} was not removed: {error}",
                     self.0.display()
                 );

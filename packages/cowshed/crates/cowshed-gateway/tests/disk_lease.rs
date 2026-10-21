@@ -429,9 +429,9 @@ fn report(arm: Arm, measured: &Measured) -> (Duration, Duration) {
     // SAFETY: `getloadavg` writes at most the three samples the buffer holds.
     unsafe { libc::getloadavg(load.as_mut_ptr(), 3) };
     let p95 = percentile(&ran, 0.95);
-    eprintln!(
+    cowshed_os::eprintln!(
         "disk-lease contention {arm:?}: load {:.0}, {} attaches in {:.1?} ({:.2}/s), attach p50 \
-         {:.2?} p95 {p95:.2?}, with its lease wait p50 {:.2?} p95 {:.2?}, {} mount cycles",
+     {:.2?} p95 {p95:.2?}, with its lease wait p50 {:.2?} p95 {:.2?}, {} mount cycles",
         load[0],
         ran.len(),
         measured.wall,

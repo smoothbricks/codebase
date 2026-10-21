@@ -567,13 +567,13 @@ impl DirectoryExecutionHost {
                 match layout.seed_of(workspace, incarnation).map_err(host_error)? {
                     Some((seed, _)) => {
                         refork(&seed).map_err(lost)?;
-                        eprintln!(
+                        cowshed_os::eprintln!(
                             "cowshed: {workspace}'s build link named build volume {linked}, which no longer exists; {workspace} now links a fresh clone of its seed {seed}, and what {linked} held beyond that seed is lost"
                         );
                     }
                     None => {
                         link::unlink(checkout).map_err(host_error).map_err(lost)?;
-                        eprintln!(
+                        cowshed_os::eprintln!(
                             "cowshed: {workspace}'s build link named build volume {linked}, which no longer exists, and {workspace} has no seed to clone; the link is removed, and {workspace}'s next build-state refresh makes its first volume"
                         );
                     }

@@ -418,7 +418,7 @@ impl Drop for Fixture {
             Err(error) => Err(error),
         };
         if let Err(error) = result {
-            eprintln!("remove APFS fixture {}: {error}", self.root.display());
+            cowshed_os::eprintln!("remove APFS fixture {}: {error}", self.root.display());
         }
     }
 }
@@ -3575,18 +3575,18 @@ impl EjectAtFsck {
             "the raw-pin release hook must run before the owned volume is mounted"
         );
         let eject_request = CommandRequest::new("/usr/bin/hdiutil", ["detach", "-force", whole]);
-        eprintln!(
+        cowshed_os::eprintln!(
             "raw-pin attack start wall={:?} pid={} image={} whole={whole} \
-             volume={volume_device} kernel_mounts={mounted_before:?} command={eject_request:?}",
+         volume={volume_device} kernel_mounts={mounted_before:?} command={eject_request:?}",
             SystemTime::now(),
             std::process::id(),
             self.owned.display(),
         );
         let started = Instant::now();
         let eject = system.run(&eject_request);
-        eprintln!(
+        cowshed_os::eprintln!(
             "raw-pin attack end wall={:?} elapsed={:?} image={} whole={whole} \
-             volume={volume_device} result={eject:?}",
+         volume={volume_device} result={eject:?}",
             SystemTime::now(),
             started.elapsed(),
             self.owned.display(),
@@ -3614,7 +3614,9 @@ impl EjectAtFsck {
                 "recycled volume did not reuse {volume}: {}",
                 String::from_utf8_lossy(&attached.stdout)
             );
-            eprintln!("foreign mounted on recycled {volume} before the pinned operation");
+            cowshed_os::eprintln!(
+                "foreign mounted on recycled {volume} before the pinned operation"
+            );
         } else {
             let refusal = ApfsError::CommandFailed {
                 operation: "independent forced detach of pinned image",
@@ -3642,10 +3644,10 @@ impl EjectAtFsck {
                         .filter(|mount| mount.source_device == volume_device)
                         .collect::<Vec<_>>()
                 });
-                eprintln!(
+                cowshed_os::eprintln!(
                     "raw-pin unexpected refusal wall={:?} image={} whole={whole} \
-                     volume={volume_device} registry_after={registry_after:?} \
-                     kernel_mounts_after={mounts_after:?}; {refusal}",
+                 volume={volume_device} registry_after={registry_after:?} \
+                 kernel_mounts_after={mounts_after:?}; {refusal}",
                     SystemTime::now(),
                     self.owned.display(),
                 );
@@ -3687,7 +3689,7 @@ impl CommandRunner for EjectAtFsck {
             None
         };
         if let Some(volume) = volume {
-            eprintln!("raw-pin attack hook request={request:?}");
+            cowshed_os::eprintln!("raw-pin attack hook request={request:?}");
             self.try_recycle(volume)?;
         }
         SystemCommandRunner.run(request)
@@ -3699,7 +3701,7 @@ impl CommandRunner for EjectAtFsck {
 
     fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
         let pin = SystemCommandRunner.pin_raw_device(device)?;
-        eprintln!(
+        cowshed_os::eprintln!(
             "raw-pin opened wall={:?} image={} raw={} descriptor={pin:?} rdev={:?}",
             SystemTime::now(),
             self.owned.display(),
@@ -3784,7 +3786,7 @@ fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
             "foreign RAW mount: {attached_foreign:?}"
         );
         let volume = attachment.volume_device().trim_start_matches("/dev/");
-        eprintln!(
+        cowshed_os::eprintln!(
             "foreign volume reused {volume}: {}",
             String::from_utf8_lossy(&attached_foreign.stdout)
                 .contains(&format!("<string>{volume}</string>"))

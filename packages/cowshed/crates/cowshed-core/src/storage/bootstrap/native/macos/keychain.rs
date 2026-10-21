@@ -161,7 +161,7 @@ mod tests {
     impl Drop for FixtureRoot {
         fn drop(&mut self) {
             if let Err(error) = fs::remove_dir_all(&self.0) {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cannot clean private keychain fixture {}: {error}",
                     self.0.display()
                 );

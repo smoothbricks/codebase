@@ -287,7 +287,7 @@ impl Drop for BundleVerificationScratch {
             && let Err(error) = fs::remove_dir_all(&self.path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: could not remove interrupted bundle verification repository {}: {error}",
                 self.path.display()
             );
@@ -309,7 +309,7 @@ impl Drop for StagedBundle {
             && let Err(error) = fs::remove_file(&self.path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: could not remove interrupted partial bundle {}: {error}",
                 self.path.display()
             );
@@ -1268,7 +1268,7 @@ impl GitRepository {
                 .await
             {
                 Ok(()) => return Ok(commit_count),
-                Err(error) => eprintln!(
+                Err(error) => cowshed_os::eprintln!(
                     "cowshed: replacing {}, which does not hold this range: {}",
                     destination.display(),
                     error.message
@@ -4214,7 +4214,7 @@ impl Drop for IgnoreRuleTree {
         if let Err(error) = fs::remove_dir_all(&self.path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: could not remove ignore-rule scratch tree {}: {error}",
                 self.path.display()
             );

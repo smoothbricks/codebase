@@ -62,7 +62,7 @@ impl TempRoot {
 impl Drop for TempRoot {
     fn drop(&mut self) {
         if let Err(error) = fs::remove_dir_all(&self.0) {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "rekey fixture {} was not removed: {error}",
                 self.0.display()
             );

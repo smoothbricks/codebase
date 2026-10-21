@@ -59,7 +59,7 @@ impl RefLock {
                         .map_err(|error| failure(path, "lock", &error))?;
                     return Ok(Self { _file: file });
                 }
-                _ = report.tick() => eprintln!(
+                _ = report.tick() => cowshed_os::eprintln!(
                     "cowshed: land has waited {}s for the ref lock {}: {held} when the wait began",
                     started.elapsed().as_secs(),
                     path.as_str(),

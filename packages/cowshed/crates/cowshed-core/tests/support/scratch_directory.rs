@@ -79,7 +79,7 @@ fn sweep_dead_roots() -> std::io::Result<()> {
 impl Drop for ScratchRoot {
     fn drop(&mut self) {
         if let Err(error) = reclaim(&self.path) {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "directory fixture {}: {error}; keeping the root for the next run",
                 self.path.display()
             );

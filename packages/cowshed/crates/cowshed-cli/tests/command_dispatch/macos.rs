@@ -359,7 +359,7 @@ impl Drop for Fixture {
 
 fn git(directory: &Path, args: &[&str]) {
     let verb = args.first().copied().unwrap_or("empty");
-    eprintln!("dispatch fixture git: {verb} start");
+    cowshed_os::eprintln!("dispatch fixture git: {verb} start");
     let started = std::time::Instant::now();
     let output = Command::new("git")
         .args(args)
@@ -372,7 +372,7 @@ fn git(directory: &Path, args: &[&str]) {
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .output()
         .expect("git process");
-    eprintln!(
+    cowshed_os::eprintln!(
         "dispatch fixture git: {verb} done elapsed={:?} status={}",
         started.elapsed(),
         output.status
@@ -398,13 +398,13 @@ async fn run(
         .next()
         .unwrap_or("command")
         .to_owned();
-    eprintln!("dispatch fixture cowshed: {verb} start");
+    cowshed_os::eprintln!("dispatch fixture cowshed: {verb} start");
     let started = Instant::now();
     let mut output = Output::new(Vec::new(), Vec::new(), cli.global.quiet);
     let result = dispatch(service, cli, tokio::io::empty(), &mut output)
         .await
         .map(|exit| exit.code);
-    eprintln!(
+    cowshed_os::eprintln!(
         "dispatch fixture cowshed: {verb} done elapsed={:?} ok={}",
         started.elapsed(),
         result.is_ok()
@@ -660,7 +660,7 @@ impl Drop for PortClaims {
     fn drop(&mut self) {
         for (_, marker) in &self.0 {
             if let Err(error) = fs::remove_file(marker) {
-                eprintln!("port reservation {}: {error}", marker.display());
+                cowshed_os::eprintln!("port reservation {}: {error}", marker.display());
             }
         }
     }
@@ -825,7 +825,7 @@ async fn real_apfs_doctor_repair_moves_the_newer_of_two_workspaces_sharing_a_por
 async fn directory_plain_git_repository_adopts_clones_executes_and_lands_without_shell_hooks() {
     let started = std::time::Instant::now();
     let phase = |name| {
-        eprintln!("plain-git fixture: {name} elapsed={:?}", started.elapsed());
+        cowshed_os::eprintln!("plain-git fixture: {name} elapsed={:?}", started.elapsed());
     };
     phase("fixture");
     let mut fixture = Fixture::directory();
@@ -1510,7 +1510,7 @@ fn developer_nx(fixture: &Fixture) -> (PathBuf, PathBuf) {
     .expect("the existing Bun install configuration");
     let configuration =
         fs::read(nx.join("bunfig.toml")).expect("actual developer Bun configuration");
-    eprintln!(
+    cowshed_os::eprintln!(
         "developer Nx bunfig.toml sha256={}",
         cowshed_core::api::dto::Sha256Digest::compute(&configuration)
     );
@@ -1531,7 +1531,7 @@ fn developer_nx(fixture: &Fixture) -> (PathBuf, PathBuf) {
         nx,
         "the observed Bun root is the standalone developer package"
     );
-    eprintln!("developer Nx installer root: {}", nx.display());
+    cowshed_os::eprintln!("developer Nx installer root: {}", nx.display());
     // Production mode is frozen and never writes a missing lock. The ordinary producer must
     // generate this package's exact lock first, just as the covered-install fixture does.
     let lock_started = Instant::now();
@@ -1546,7 +1546,7 @@ fn developer_nx(fixture: &Fixture) -> (PathBuf, PathBuf) {
         .current_dir(&nx)
         .output()
         .expect("produce the actual developer package lock");
-    eprintln!(
+    cowshed_os::eprintln!(
         "developer Nx lock producer: {:?}; stdout: {}; stderr: {}",
         lock_started.elapsed(),
         String::from_utf8_lossy(&locked.stdout),
@@ -1567,7 +1567,7 @@ fn developer_nx(fixture: &Fixture) -> (PathBuf, PathBuf) {
         .current_dir(&nx)
         .output()
         .expect("install the developer package's exact production closure");
-    eprintln!(
+    cowshed_os::eprintln!(
         "developer Nx production install: {:?}; stdout: {}; stderr: {}",
         began.elapsed(),
         String::from_utf8_lossy(&install.stdout),
@@ -1606,7 +1606,7 @@ fn developer_nx(fixture: &Fixture) -> (PathBuf, PathBuf) {
             .current_dir(&checkout)
             .output()
             .expect("produce the developer checkout's ordinary workspace namespace");
-        eprintln!(
+        cowshed_os::eprintln!(
             "developer Nx workspace producer {args:?}: {:?}; stdout: {}; stderr: {}",
             began.elapsed(),
             String::from_utf8_lossy(&result.stdout),
@@ -1627,7 +1627,7 @@ fn developer_nx(fixture: &Fixture) -> (PathBuf, PathBuf) {
         "the root producer preserves the package's own production lock"
     );
     assert_eq!(checkout.join("node_modules/nx").canonicalize().unwrap(), nx);
-    eprintln!(
+    cowshed_os::eprintln!(
         "developer Nx workspace bun.lock sha256={}",
         cowshed_core::api::dto::Sha256Digest::compute(
             &fs::read(checkout.join("bun.lock")).unwrap()
@@ -1639,14 +1639,14 @@ fn developer_nx(fixture: &Fixture) -> (PathBuf, PathBuf) {
             after, bytes,
             "ordinary dependency installation must not change the maintained Nx {file}"
         );
-        eprintln!(
+        cowshed_os::eprintln!(
             "developer Nx {file} sha256={}",
             cowshed_core::api::dto::Sha256Digest::compute(&after)
         );
     }
     let lock =
         fs::read(nx.join("bun.lock")).expect("ordinary Bun wrote the developer closure lock");
-    eprintln!(
+    cowshed_os::eprintln!(
         "developer Nx bun.lock sha256={}",
         cowshed_core::api::dto::Sha256Digest::compute(&lock)
     );
@@ -1728,7 +1728,7 @@ fn host_bun() -> PathBuf {
     )
     .canonicalize()
     .expect("the observed pinned Bun executable resolves");
-    eprintln!("fixture Bun executable: {}", executable.display());
+    cowshed_os::eprintln!("fixture Bun executable: {}", executable.display());
     executable
 }
 
@@ -2088,7 +2088,7 @@ fn write_nx_project(checkout: &Path, nx: &Path, node: &Path, declared: bool) {
     .unwrap();
     let started = std::time::Instant::now();
     clone_repository_nx_install(checkout, nx);
-    eprintln!(
+    cowshed_os::eprintln!(
         "cloned the repository's Bun-installed Nx namespace in {}: {:?}",
         checkout.display(),
         started.elapsed()
@@ -2255,7 +2255,7 @@ async fn land_nx_project(
     let test = nx_run_many(&node, "test");
     // The undeclared output is untracked work in the topic, which a retire refuses.
     let report = land(&mut service, "topic", false, &[&build, &test]).await;
-    eprintln!("land report: {report:?}");
+    cowshed_os::eprintln!("land report: {report:?}");
     assert_eq!(report.build_volume.seed, LandSeed::Frozen, "{report:?}");
     let cowshed_core::api::dto::Adoption::Adopted { check: rerun, .. } =
         &report.build_volume.adoption
@@ -2507,7 +2507,7 @@ impl RustToolchain {
             rustc: cargo_tool("RUSTC", "rustc"),
             rustdoc: cargo_tool("RUSTDOC", "rustdoc"),
         };
-        eprintln!(
+        cowshed_os::eprintln!(
             "fixture Rust toolchain: cargo={}, rustc={}, rustdoc={}",
             toolchain.cargo.display(),
             toolchain.rustc.display(),
@@ -3186,10 +3186,10 @@ impl Drop for Holder {
     fn drop(&mut self) {
         // A holder that already exited cannot be killed again; reaping it is all that is left.
         if let Err(error) = self.0.kill() {
-            eprintln!("holder {}: kill: {error}", self.0.id());
+            cowshed_os::eprintln!("holder {}: kill: {error}", self.0.id());
         }
         if let Err(error) = self.0.wait() {
-            eprintln!("holder {}: wait: {error}", self.0.id());
+            cowshed_os::eprintln!("holder {}: wait: {error}", self.0.id());
         }
     }
 }
@@ -3254,15 +3254,19 @@ async fn directory_a_fork_of_a_warm_target_is_all_fresh_and_all_hits_substrate_l
     let host_warm = cargo_artifacts(&host.stdout);
     let started = Instant::now();
     let warm = cargo_artifacts(&sh(&mut service, "w2", CARGO_BUILD).await);
-    eprintln!("w2 cargo build: {:?}", started.elapsed());
+    cowshed_os::eprintln!("w2 cargo build: {:?}", started.elapsed());
     let spawned = SystemTime::now();
     sh(&mut service, "w2", &nx_check).await;
     let exited = SystemTime::now();
     let nx_run = nx::attribute(&w2.join(".nx/cache"), &nx_check, spawned, exited);
-    eprintln!("physical warm proof: stopping runtime after both real builds and Nx run");
+    cowshed_os::eprintln!(
+        "physical warm proof: stopping runtime after both real builds and Nx run"
+    );
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
-    eprintln!("physical warm proof: runtime and gateway stopped; checking captured outcomes");
+    cowshed_os::eprintln!(
+        "physical warm proof: runtime and gateway stopped; checking captured outcomes"
+    );
     assert!(
         host.status.success(),
         "host Cargo: {}",
@@ -3293,11 +3297,11 @@ async fn directory_a_fork_of_a_warm_target_is_all_fresh_and_all_hits_substrate_l
             panic!("w2's Nx run left no summary of its own: {reason:?}")
         }
     }
-    eprintln!(
+    cowshed_os::eprintln!(
         "physical warm proof: semantic assertions passed; releasing owned runtime and scratch images"
     );
     drop(fixture);
-    eprintln!("physical warm proof: owned scratch teardown complete");
+    cowshed_os::eprintln!("physical warm proof: owned scratch teardown complete");
 }
 
 /// The checkout path [`Project::Declared`] declares as build state.

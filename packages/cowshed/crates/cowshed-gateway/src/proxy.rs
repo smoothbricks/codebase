@@ -2725,9 +2725,11 @@ async fn nx_backend_unavailable(
     audit_kind: AuditKind,
 ) -> Response<ResponseBody> {
     let status = crate::nx_cache::unavailable_status(&admission.method);
-    eprintln!(
+    cowshed_os::eprintln!(
         "cowshed: nx-backend-unavailable repo={} workspace={} method={} reason={reason}",
-        admission.repo_id, admission.workspace_id, admission.method,
+        admission.repo_id,
+        admission.workspace_id,
+        admission.method,
     );
     complete_now(
         context,
@@ -2829,7 +2831,7 @@ impl Completion {
         // An Nx response head is already committed as 200, so a body that does not complete is
         // audited as a failed transfer, never as a completed or hit read.
         if self.nx && !matches!(status, AuditStatus::Completed) {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: nx-transfer-failed repo={} workspace={} method={} reason={}",
                 draft.repo_id,
                 draft.workspace_id,

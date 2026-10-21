@@ -1,0 +1,6 @@
+# Every stderr line is one write: cowshed processes share one stderr file, and std's macros write
+# a line in pieces that splice into other processes' lines (cowshed-os/src/stderr.rs).
+disallowed-macros = [
+  { path = "std::eprintln", reason = "write the line with cowshed_os::eprintln!, in one write" },
+  { path = "std::eprint", reason = "write the text with cowshed_os::eprint!, in one write" },
+]

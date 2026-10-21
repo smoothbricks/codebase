@@ -847,13 +847,13 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
         let elapsed = started.elapsed();
         if let Some((cause, ticket, released)) = transition {
             if let Some(released) = released.filter(|_| !effects.is_empty()) {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: timing cpu-tokens handoff ticket={ticket} elapsed_ns={} grants={}",
                     released.elapsed().as_nanos(),
                     effects.len(),
                 );
             }
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: timing cpu-tokens queue-step cause={cause} ticket={ticket} elapsed_ns={} grants={}",
                 elapsed.as_nanos(),
                 effects.len(),
@@ -871,7 +871,7 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
             head,
         } in effects.drain(..)
         {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: timing cpu-tokens grant ticket={ticket} tokens={tokens} want={want} waited_ns={} checkout={checkout:?} pid={:?} command={:?} gate_repo={:?} gate_job={:?} head_repo={:?} head_job={:?}",
                 waited.as_nanos(),
                 claim.pid,

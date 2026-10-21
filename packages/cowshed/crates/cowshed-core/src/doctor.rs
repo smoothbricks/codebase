@@ -90,12 +90,14 @@ impl WorkspaceChecks {
         self.close();
         let elapsed = self.started.elapsed();
         match &self.slowest {
-            Some((workspace, slowest)) => eprintln!(
+            Some((workspace, slowest)) => cowshed_os::eprintln!(
                 "cowshed: doctor workspace-checks done elapsed={elapsed:?} workspaces={} slowest={workspace} {slowest:?}",
                 self.checked
             ),
             None => {
-                eprintln!("cowshed: doctor workspace-checks done elapsed={elapsed:?} workspaces=0")
+                cowshed_os::eprintln!(
+                    "cowshed: doctor workspace-checks done elapsed={elapsed:?} workspaces=0"
+                )
             }
         }
     }

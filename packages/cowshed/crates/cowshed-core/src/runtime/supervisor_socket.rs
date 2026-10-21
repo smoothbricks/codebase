@@ -630,14 +630,14 @@ impl Drop for BoundSocket {
         match Instance::at(&self.path) {
             Ok(Some(instance)) if instance == self.instance => {
                 if let Err(error) = std::fs::remove_file(&self.path) {
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: cannot remove retired supervisor socket {}: {error}",
                         self.path.display()
                     );
                 }
             }
             Ok(_) => {}
-            Err(error) => eprintln!(
+            Err(error) => cowshed_os::eprintln!(
                 "cowshed: cannot inspect retired supervisor socket {}: {error}",
                 self.path.display()
             ),
@@ -817,7 +817,7 @@ pub async fn bind(path: &Path) -> Result<BoundSocket> {
             if let Err(error) = std::fs::remove_file(&fresh)
                 && error.kind() != io::ErrorKind::NotFound
             {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: cannot remove unpublished supervisor socket {}: {error}",
                     fresh.display()
                 );
@@ -921,7 +921,7 @@ pub async fn serve(
                     bytes,
                 }) => {
                     if release.send((stream, value, bytes)).await.is_err() {
-                        eprintln!(
+                        cowshed_os::eprintln!(
                             "cowshed: retired supervisor socket owner ended before its reply"
                         );
                     }
@@ -947,7 +947,7 @@ pub async fn serve(
                         return;
                     }
                     let settled = owed.settle(super::project::SUPERVISOR_IDLE).await;
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: workspace supervisor {} of build {} retires after draining; {settled}",
                         socket_path.display(),
                         BuildId::current().map_or("(unnamed)", BuildId::as_str),
@@ -1330,7 +1330,7 @@ async fn kill_unheld(supervisor: &WorkspaceSupervisorHandle, job_id: JobId) -> R
     if current.info(job_id).await?.state.is_terminal() {
         return Ok(());
     }
-    eprintln!(
+    cowshed_os::eprintln!(
         "cowshed: job {} lost its holder before it ended; killing it, since nothing waits for it",
         job_id.get()
     );
@@ -1881,9 +1881,9 @@ pub async fn await_other_build_retired(path: &Path, deadline: std::time::Instant
     let drained = drain(path).await?;
     let pid = drained.pid();
     let started = std::time::Instant::now();
-    eprintln!(
+    cowshed_os::eprintln!(
         "cowshed: the workspace supervisor at {} (pid {pid}) is of another cowshed build and \
-         drains its running jobs; waiting for it to retire, for at most {}s",
+     drains its running jobs; waiting for it to retire, for at most {}s",
         path.display(),
         deadline.saturating_duration_since(started).as_secs()
     );
@@ -1917,7 +1917,7 @@ pub async fn await_other_build_retired(path: &Path, deadline: std::time::Instant
             ),
         ));
     }
-    eprintln!(
+    cowshed_os::eprintln!(
         "cowshed: the workspace supervisor at {} (pid {pid}) retired after {}s",
         path.display(),
         started.elapsed().as_secs()
@@ -2045,7 +2045,7 @@ async fn open_process_events(
                 biased;
                 () = send.closed() => {
                     if let Err(error) = write_json(&mut writer, &Demand::Close).await {
-                        eprintln!("cowshed: closing process observation: {error}");
+                        cowshed_os::eprintln!("cowshed: closing process observation: {error}");
                     }
                     break;
                 }
@@ -2061,7 +2061,7 @@ async fn open_process_events(
                 Ok(Some(event)) => {
                     if send.send(Ok(event)).await.is_err() {
                         if let Err(error) = write_json(&mut writer, &Demand::Close).await {
-                            eprintln!("cowshed: closing process observation: {error}");
+                            cowshed_os::eprintln!("cowshed: closing process observation: {error}");
                         }
                         break;
                     }

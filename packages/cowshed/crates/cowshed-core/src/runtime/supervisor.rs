@@ -1984,9 +1984,9 @@ pub(super) async fn sandbox_environment(
             crate::workspace_clients::SSL_CERT_ENV,
         ] {
             if caller.contains_key(name) {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: {name} was supplied by the caller; the workspace trust bundle is not \
-                     being used for it, so an intercepted HTTPS origin may fail to verify"
+                 being used for it, so an intercepted HTTPS origin may fail to verify"
                 );
             }
             defaults.insert(OsString::from(name), bundle.clone().into_os_string());
@@ -2000,9 +2000,9 @@ pub(super) async fn sandbox_environment(
             crate::capabilities::EnvAction::Unset => withheld.push(name),
             crate::capabilities::EnvAction::Default(value) => {
                 if caller.contains_key(name) {
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: {name} was supplied by the caller; the project capability \
-                         default is not being used"
+                     default is not being used"
                     );
                 }
                 defaults.insert(name.into(), value.clone());
@@ -2436,7 +2436,7 @@ fn spawn_observed(
                 match placed {
                     Some(Err(failure)) => {
                         if kill.is_some() || waited.is_err() {
-                            eprintln!(
+                            cowshed_os::eprintln!(
                                 "cowshed: the command refused nice {} was not ended cleanly: group kill {kill:?}; reap {waited:?}",
                                 failure.requested
                             );
@@ -2795,7 +2795,7 @@ impl RunningProcess for SystemRunningProcess {
 impl Drop for SystemRunningProcess {
     fn drop(&mut self) {
         if let Err(error) = self.fence.release() {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: cannot reap the sandbox process {}: {error}",
                 self.fence.birth().pid()
             );
@@ -4314,9 +4314,9 @@ impl Drop for SupervisorActor {
 
 fn report_unsignalled(job: JobId, signalled: Result<()>) {
     if let Err(error) = signalled {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: could not signal job {} of a supervisor that is going away, so it may keep \
-             running: {}",
+         running: {}",
             job.get(),
             error.message
         );
@@ -4359,7 +4359,7 @@ impl SupervisorActor {
                 }
                 labelled = self.labelling.join_next(), if !self.labelling.is_empty() => {
                     if let Some(Err(error)) = labelled {
-                        eprintln!("cowshed: volume label task failed: {error}");
+                        cowshed_os::eprintln!("cowshed: volume label task failed: {error}");
                     }
                 }
                 () = next_sample_tick(&mut self.sample_clock), if self.sample_clock.is_some() => {
@@ -4811,9 +4811,9 @@ impl SupervisorActor {
         match path.record(groups, &self.inherited_groups) {
             Ok(recorded) => {
                 for error in &recorded.uninspected {
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: an inherited unresolved process group in {} could not be \
-                         inspected and is carried as it was: {error}",
+                     inspected and is carried as it was: {error}",
                         path.path().display()
                     );
                 }
@@ -4822,7 +4822,7 @@ impl SupervisorActor {
             Err(error) => {
                 // The jobs run either way; what is lost is only the means to end them should
                 // this supervisor die, which is worth saying where the daemon log shows it.
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: cannot record the job process groups at {}: {error}",
                     path.path().display()
                 );
@@ -5032,10 +5032,8 @@ impl SupervisorActor {
                         Ok(Some(granted)) if granted == mount => {}
                         Ok(_) => continue,
                         Err(error) => {
-                            eprintln!(
-                                "cowshed: could not authorize workspace {name}'s build volume label at {}: {error}",
-                                mount.display()
-                            );
+                            cowshed_os::eprintln!("cowshed: could not authorize workspace {name}'s build volume label at {}: {error}",
+                            mount.display());
                             continue;
                         }
                     }
@@ -5045,7 +5043,7 @@ impl SupervisorActor {
                 if let Some(line) =
                     label_report(&name, what, &image, &label, &outcome, started.elapsed())
                 {
-                    eprintln!("{line}");
+                    cowshed_os::eprintln!("{line}");
                 }
             }
         });
@@ -5676,7 +5674,7 @@ impl SupervisorActor {
             if let (Some(monitor), Some(publisher)) = (&job.monitor, &self.job_spans)
                 && let Err(error) = monitor.trace(publisher.clone(), &job.info)
             {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: attaching job {}'s process spans: {error}",
                     job_id.get()
                 );
@@ -5927,7 +5925,7 @@ impl SupervisorActor {
                 }
                 // Nobody attaches to the keeper's job: it runs detached from its admission.
                 if let Err(error) = self.detach(job_id) {
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: the Nx daemon job {} of {} runs, but its captured output is not durable: {}",
                         job_id.get(),
                         project_root.display(),
@@ -6335,7 +6333,7 @@ impl SupervisorActor {
                 if job.terminal() {
                     // The job's record is final; what failed is the release of its process,
                     // whose group is no longer provably the job's.
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: job {}'s process was not released after the job concluded: {}",
                         job_id.get(),
                         error.message
@@ -6465,7 +6463,7 @@ impl SupervisorActor {
                 };
                 // The job runs on: whoever asked for it to end is told it was not signalled, and
                 // the daemon log says so for the ends nobody waits on (retirement, output limit).
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: a signal for job {} did not reach it: {}",
                     job_id.get(),
                     error.message
@@ -6693,7 +6691,7 @@ impl SupervisorActor {
                 .await
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()))
             {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: job {}'s terminal process observation failed: {error}",
                     job_id.get()
                 );
@@ -6718,10 +6716,10 @@ impl SupervisorActor {
             match ended {
                 Ok(said) => {
                     for said in said {
-                        eprintln!("cowshed: {said}");
+                        cowshed_os::eprintln!("cowshed: {said}");
                     }
                 }
-                Err(why) => eprintln!(
+                Err(why) => cowshed_os::eprintln!(
                     "cowshed: the plugin workers of the Nx daemon {daemon} could not be ended: {why}"
                 ),
             }
@@ -7176,7 +7174,7 @@ fn admission_host(job_id: JobId) -> Option<HostLoadSample> {
     match crate::host_load::read_host_load() {
         Ok(host) => Some(host),
         Err(error) => {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: job {} start host observation failed: {error}",
                 job_id.get()
             );
@@ -7206,7 +7204,7 @@ fn own_process(job: &mut JobStateRecord, process: OwnedProcess, coverage: LeafCo
         ) {
             Ok(sample) => job.info.resources = Some(sample),
             // The latest sample stands, dated by its own `sampledAt`; a read reports the failure.
-            Err(error) => eprintln!(
+            Err(error) => cowshed_os::eprintln!(
                 "cowshed: job {} was not sampled: {}",
                 job_id.get(),
                 error.message
@@ -7225,7 +7223,7 @@ fn clock_observation(job: &JobStateRecord) {
     if let (Some(monitor), Some(origin)) = (&job.monitor, job.sampling.origin())
         && let Err(error) = monitor.clock(origin)
     {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: starting job {}'s process windows on its clock: {error}",
             job.info.job_id.get()
         );
@@ -7457,7 +7455,7 @@ fn job_progress(job: &mut JobStateRecord) -> Result<ProgressRead> {
 /// supervisor die; a supervisor that keeps a ledger says so where the daemon log shows it.
 fn adopt_birth(job: &mut JobStateRecord, ledger: bool, birth: Birth) {
     if ledger && let Birth::Unobserved { pid, reason } = &birth {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: job {} process group {pid} was not identified at its start: {reason}",
             job.info.job_id.get()
         );
@@ -8786,7 +8784,7 @@ mod workspace_toolchain_tests {
                 };
                 if let Err(error) = removed {
                     if std::thread::panicking() {
-                        eprintln!(
+                        cowshed_os::eprintln!(
                             "remove owned runtime alias {}: {error}",
                             self.path.display()
                         );
@@ -9605,18 +9603,20 @@ mod process_death_tests {
                 if unsafe { libc::killpg(pgid, libc::SIGKILL) } != 0 {
                     let error = io::Error::last_os_error();
                     if error.raw_os_error() != Some(libc::ESRCH) {
-                        eprintln!("end owned signal-test group {pgid}: {error}");
+                        cowshed_os::eprintln!("end owned signal-test group {pgid}: {error}");
                     }
                 }
                 if let Err(error) = self.0.wait()
                     && error.raw_os_error() != Some(libc::ECHILD)
                 {
-                    eprintln!("reap owned signal-test leader {pgid}: {error}");
+                    cowshed_os::eprintln!("reap owned signal-test leader {pgid}: {error}");
                 }
                 if let Some(mut output) = self.0.stdout.take()
                     && let Err(error) = io::copy(&mut output, &mut io::sink())
                 {
-                    eprintln!("observe owned signal-test group {pgid} output closure: {error}");
+                    cowshed_os::eprintln!(
+                        "observe owned signal-test group {pgid} output closure: {error}"
+                    );
                 }
                 drop(self.1.take());
             }
@@ -9631,7 +9631,9 @@ mod process_death_tests {
                 if let Some(thread) = self.thread.take()
                     && let Err(panic) = thread.join()
                 {
-                    eprintln!("join owned signal-test signaller during cleanup: {panic:?}");
+                    cowshed_os::eprintln!(
+                        "join owned signal-test signaller during cleanup: {panic:?}"
+                    );
                 }
             }
         }

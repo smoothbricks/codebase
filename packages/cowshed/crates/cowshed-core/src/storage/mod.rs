@@ -582,7 +582,7 @@ mod tests {
     impl Drop for TempStore {
         fn drop(&mut self) {
             if let Err(error) = fs::remove_dir_all(&self.0) {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "layout test store {} was not removed: {error}",
                     self.0.display()
                 );

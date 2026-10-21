@@ -792,7 +792,7 @@ async fn run(
                 Some(Message::Terminal { unit, outcome, reply }) => {
                     let settled = ledger.terminal(&unit, outcome, &mut follow);
                     if let Ok(facts) = &settled {
-                        eprintln!(
+                        cowshed_os::eprintln!(
                             "cowshed: timing task-server terminal unit={:?} owner={:?} incarnation={:?} outcome={outcome}",
                             facts.unit,
                             facts.owner,
@@ -803,7 +803,7 @@ async fn run(
                 }
                 Some(Message::Leave { ticket }) => {
                     if let Some(facts) = ledger.leave(ticket, &mut follow) {
-                        eprintln!(
+                        cowshed_os::eprintln!(
                             "cowshed: timing task-server terminal ticket={ticket} unit={:?} owner={:?} incarnation={:?} outcome=abandoned",
                             facts.unit,
                             facts.owner,
@@ -839,7 +839,7 @@ async fn run(
                         .unit_of(ticket)
                         .expect("selected ticket remains live")
                         .facts;
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: timing task-server select ticket={ticket} unit={:?} attempt={attempt} owner={:?} incarnation={:?} waited_ns={} band={band:?} want={} leases={:?}",
                         facts.unit,
                         facts.owner,

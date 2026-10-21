@@ -1385,14 +1385,12 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         crate::copy::copy_until_quiescent_blocking(source, destination)
             .and_then(|_| crate::copy::verify_tree_blocking(source, destination))
             .map(|report| {
-                eprintln!(
-                    "cowshed: verified copy {} -> {}; regular-file allocated bytes: source {}, copied {}; content {}",
-                    source.display(),
-                    destination.display(),
-                    report.source_allocated_bytes,
-                    report.copied_allocated_bytes,
-                    report.digest.to_hex()
-                );
+                cowshed_os::eprintln!("cowshed: verified copy {} -> {}; regular-file allocated bytes: source {}, copied {}; content {}",
+                source.display(),
+                destination.display(),
+                report.source_allocated_bytes,
+                report.copied_allocated_bytes,
+                report.digest.to_hex());
             })
             .map_err(host_error)
     }

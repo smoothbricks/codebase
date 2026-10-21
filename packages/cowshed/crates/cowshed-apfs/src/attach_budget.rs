@@ -548,9 +548,9 @@ fn load_or_empty(path: &Path) -> io::Result<(PoolRecord, bool)> {
     match load(path) {
         Ok(record) => Ok((record, false)),
         Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: warning: the disk-image attach pool record does not parse ({error}); \
-                 read as empty, and replaced at its next write"
+             read as empty, and replaced at its next write"
             );
             Ok((PoolRecord::default(), true))
         }
@@ -777,9 +777,9 @@ pub fn harness_gate_at(path: &Path, session: &str) -> Result<(), AttachPoolExhau
 }
 
 fn unreadable(error: &io::Error) {
-    eprintln!(
+    cowshed_os::eprintln!(
         "cowshed: warning: the disk-image attach pool record is unreadable ({error}); attaching \
-         anyway"
+     anyway"
     );
 }
 

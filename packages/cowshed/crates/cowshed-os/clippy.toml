@@ -8,3 +8,10 @@ disallowed-methods = [
   { path = "tokio::process::Command::output", reason = "run with cowshed_os::fork_lock::RunAsync::output_locked" },
   { path = "tokio::process::Command::status", reason = "run with cowshed_os::fork_lock::RunAsync::status_locked" },
 ]
+
+# Every stderr line is one write: cowshed processes share one stderr file, and std's macros write
+# a line in pieces that splice into other processes' lines (cowshed-os/src/stderr.rs).
+disallowed-macros = [
+  { path = "std::eprintln", reason = "write the line with crate::eprintln!, in one write" },
+  { path = "std::eprint", reason = "write the text with crate::eprint!, in one write" },
+]

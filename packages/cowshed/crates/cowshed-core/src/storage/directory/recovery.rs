@@ -1069,7 +1069,7 @@ impl DirectoryExecutionHost {
             (Some(authority), _) => authority,
             (None, Some(expected)) => expected.clone(),
             (None, None) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: retired payload {} has no grants sidecar; its retirement record was already reclaimed, so its remaining bytes are reclaimed too",
                     trash_image.display()
                 );

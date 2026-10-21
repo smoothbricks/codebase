@@ -603,7 +603,7 @@ impl NxDaemonKeeper {
             if Instant::now() < *until {
                 return None;
             }
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: the Nx daemon keeper of {}'s pause is over; trying one start",
                 project_root.display()
             );
@@ -612,7 +612,7 @@ impl NxDaemonKeeper {
         match start_request(workspace_root, project_root, node) {
             Ok(request) => {
                 if let Some(Hold::Refused(_)) = self.hold.take() {
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: the Nx daemon of {} can start now; starting it",
                         project_root.display()
                     );
@@ -629,9 +629,9 @@ impl NxDaemonKeeper {
     /// Start nothing while no start can run, for `why`; said once for each new reason.
     pub(crate) fn refuse(&mut self, why: String) {
         if self.hold != Some(Hold::Refused(why.clone())) {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: {why}; the shed's supervisor starts no Nx daemon until one can run, \
-                 looking again at every probe"
+             looking again at every probe"
             );
         }
         self.hold = Some(Hold::Refused(why));
@@ -665,7 +665,7 @@ impl NxDaemonKeeper {
         self.failed_starts = 0;
         self.next_pause = FIRST_PAUSE;
         if let Some(Hold::Paused { .. }) = self.hold.take() {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: the Nx daemon of {} is live; its keeper's pause is closed",
                 project_root.display()
             );
@@ -693,11 +693,11 @@ impl NxDaemonKeeper {
         };
         match (ending, daemon) {
             (None, Probe::Live) => {}
-            (Some(ending), Probe::Live) => eprintln!("cowshed: {}", what(&ending)),
+            (Some(ending), Probe::Live) => cowshed_os::eprintln!("cowshed: {}", what(&ending)),
             (ending, Probe::Unrecorded | Probe::Unreadable | Probe::Dead | Probe::Refused)
                 if served =>
             {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: {} after it served; starting its successor",
                     what(ending.as_deref().unwrap_or("exited 0"))
                 );
@@ -714,7 +714,7 @@ impl NxDaemonKeeper {
     pub(crate) fn start_failed(&mut self, what: String) {
         self.failed_starts += 1;
         if self.failed_starts < START_ATTEMPTS {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: {what}; starting another, {} of {START_ATTEMPTS}, in {}s",
                 self.failed_starts + 1,
                 PROBE_INTERVAL.as_secs()
@@ -723,9 +723,9 @@ impl NxDaemonKeeper {
         }
         let pause = self.next_pause;
         self.next_pause = (pause * 2).min(PAUSE_CAP);
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: {what}; {} starts in a row left no daemon live, so the keeper starts none \
-             for {}s, then one (pauses double to {}s); a live daemon ends the pause",
+         for {}s, then one (pauses double to {}s); a live daemon ends the pause",
             self.failed_starts,
             pause.as_secs(),
             PAUSE_CAP.as_secs()
@@ -765,7 +765,7 @@ impl NxDaemonKeeper {
             .as_ref()
             .filter(|using| self.kept_by.as_ref() != Some(using))
         {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: keeps the Nx daemon of {}: {using}",
                 project_root.display()
             );
@@ -816,7 +816,7 @@ impl NxDaemonKeeper {
              more"
                 .to_owned()
         };
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: the Nx daemon of {} has been idle for {}s and did not stop: {why}; {next}",
             project_root.display(),
             IDLE.as_secs(),
@@ -855,7 +855,7 @@ async fn stop(project_root: &Path, why: &str) -> std::result::Result<(), String>
             .map_err(|error| error.to_string())?
             .map_err(|busy| busy.to_string())?;
     if let Some(pid) = stopped {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: stopped the Nx daemon (pid {pid}) of {}: {why}",
             project_root.display(),
         );
@@ -868,7 +868,7 @@ async fn stop(project_root: &Path, why: &str) -> std::result::Result<(), String>
 /// its ledger holds nothing that uses the daemon.
 pub(crate) async fn release(project_root: &Path) {
     if let Err(why) = stop(project_root, "its supervisor retired").await {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: the Nx daemon of {} did not stop as its supervisor retired: {why}",
             project_root.display()
         );

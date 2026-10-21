@@ -1177,7 +1177,7 @@ mod tests {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) if std::thread::panicking() => {
-                    eprintln!("remove test root {}: {error}", self.0.display());
+                    crate::eprintln!("remove test root {}: {error}", self.0.display());
                 }
                 Err(error) => panic!("remove test root {}: {error}", self.0.display()),
             }

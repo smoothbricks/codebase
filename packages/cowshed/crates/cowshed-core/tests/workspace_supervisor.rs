@@ -6213,7 +6213,7 @@ impl Drop for EndedOnPanic {
         }
         // SAFETY: the group is the test's own scripted child's, which it holds unreaped.
         if unsafe { libc::killpg(self.0, libc::SIGKILL) } != 0 {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "the panicking test could not end its scripted group {}: {}",
                 self.0,
                 std::io::Error::last_os_error()
@@ -7289,7 +7289,7 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
             }
             let exit = self.child.wait().expect("reap the concluded job's leader");
             if let Err(error) = self.reaped.send(exit) {
-                eprintln!("the job's exit observer is gone: {error}");
+                cowshed_os::eprintln!("the job's exit observer is gone: {error}");
             }
         }
     }

@@ -440,7 +440,7 @@ impl DeveloperLinks {
             let at = root.join(&link.at);
             let current = current_target(&at).map_err(|error| link_error(&at, error))?;
             if current.as_deref() != Some(link.target.as_os_str().as_bytes()) {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: developer link {} -> {} is not restored: smoo.developerLinks no longer declares its package",
                     link.at.display(),
                     link.target.display()
@@ -777,7 +777,7 @@ fn restore_links(root: &Path, mut restores: Vec<&DeveloperLink>, mode: RestoreMo
                 })
                 .map_err(|error| link_error(&at, error))?;
             if restored {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: restored developer link {} -> {}",
                     link.at.display(),
                     link.target.display()
@@ -1133,7 +1133,7 @@ pub fn dispatch() -> io::Result<Option<ExitStatus>> {
         .map_err(io::Error::other)
         .map(|findings| {
             for finding in &findings {
-                eprintln!("cowshed: {finding}");
+                cowshed_os::eprintln!("cowshed: {finding}");
             }
         });
     match (status, restored) {

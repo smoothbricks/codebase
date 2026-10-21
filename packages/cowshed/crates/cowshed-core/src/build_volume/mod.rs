@@ -1062,7 +1062,7 @@ pub fn empty_trash(trash: &Path) -> io::Result<EmptiedTrash> {
             .is_some();
         let metadata = entry.metadata()?;
         if !image || !metadata.is_file() {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: {} is not a trashed build-volume image; it is left",
                 path.display()
             );
@@ -1093,7 +1093,7 @@ pub fn empty_store_trash(store: &Path) -> EmptiedTrash {
     let owners = match fs::read_dir(store) {
         Ok(owners) => owners,
         Err(error) => {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: cannot list the store {} for build-volume trash: {error}",
                 store.display()
             );
@@ -1111,7 +1111,7 @@ pub fn empty_store_trash(store: &Path) -> EmptiedTrash {
                     emptied.images += project.images;
                     emptied.bytes += project.bytes;
                 }
-                Err(error) => eprintln!(
+                Err(error) => cowshed_os::eprintln!(
                     "cowshed: cannot empty the build-volume trash {}: {error}",
                     trash.display()
                 ),
@@ -1152,7 +1152,7 @@ impl BackgroundDiskPriority {
             // SAFETY: both calls take plain integers and change only this thread's policy.
             let previous = unsafe { getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD) };
             if unsafe { setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE) } != 0 {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: build-volume trash is emptied at normal disk priority: {}",
                     io::Error::last_os_error()
                 );

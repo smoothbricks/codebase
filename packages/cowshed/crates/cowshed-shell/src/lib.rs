@@ -74,7 +74,7 @@ pub fn dispatch() -> io::Result<()> {
         }
         Ok(None) => {}
         Err(error) => {
-            eprintln!("cowshed: managed package manager failed: {error}");
+            cowshed_os::eprintln!("cowshed: managed package manager failed: {error}");
             std::process::exit(126);
         }
     }

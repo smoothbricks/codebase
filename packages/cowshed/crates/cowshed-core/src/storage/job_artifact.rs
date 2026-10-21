@@ -3977,11 +3977,11 @@ fn set_aside_records(
         .map_err(|error| io_error(lock.records, error))?;
     sync_directory(&destination)?;
     sync_directory(job_root)?;
-    eprintln!(
+    cowshed_os::eprintln!(
         "cowshed: set aside the job records in {} -- written in record layout {layout}, before \
-         layout {RECORD_SCHEMA_VERSION}, the only one this cowshed reads -- into {}, with the \
-         checkpoint manifests among them; a new empty store starts in their place, allocating \
-         job ids above {floor}",
+     layout {RECORD_SCHEMA_VERSION}, the only one this cowshed reads -- into {}, with the \
+     checkpoint manifests among them; a new empty store starts in their place, allocating \
+     job ids above {floor}",
         job_root.display(),
         destination.display()
     );

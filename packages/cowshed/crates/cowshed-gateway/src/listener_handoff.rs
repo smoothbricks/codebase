@@ -299,7 +299,7 @@ fn serve(listener: &UnixListener, stop: &AtomicBool, install: &InstallRestart) {
             Ok((stream, _)) => stream,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
-                eprintln!("cowshed: the listener handoff stopped accepting: {error}");
+                cowshed_os::eprintln!("cowshed: the listener handoff stopped accepting: {error}");
                 return;
             }
         };
@@ -310,7 +310,7 @@ fn serve(listener: &UnixListener, stop: &AtomicBool, install: &InstallRestart) {
             continue;
         }
         if let Err(error) = exchange(&stream, &mut held, install) {
-            eprintln!("cowshed: a listener handoff exchange failed: {error}");
+            cowshed_os::eprintln!("cowshed: a listener handoff exchange failed: {error}");
         }
     }
 }
@@ -340,7 +340,7 @@ fn exchange(
                 }
             }
             *held = given;
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: holding {} workspace listener(s) across the gateway restart",
                 held.len()
             );

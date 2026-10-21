@@ -721,9 +721,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                     image.capacity_bytes,
                                 )
                                 .map_err(native_storage_error)?;
-                            eprintln!(
+                            cowshed_os::eprintln!(
                                 "cowshed: re-adoption replacement allocates {new} bytes; the \
-                                 retained image {old}"
+                             retained image {old}"
                             );
                         }
                         Ok::<(), CowshedError>(())

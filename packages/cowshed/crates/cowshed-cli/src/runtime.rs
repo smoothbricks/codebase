@@ -2935,9 +2935,10 @@ async fn attach_scoped_sessions(
         {
             Ok(info) => attached.push(info),
             Err(error) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: skipping workspace {}/{} during attach: {error}",
-                    target.repo_id, target.workspace
+                    target.repo_id,
+                    target.workspace
                 );
                 first_error.get_or_insert(error);
             }
@@ -3013,7 +3014,7 @@ async fn attach_store_wide(browse: bool) -> Result<StoreWideMounts<Vec<Workspace
         let mounted = match attach_project_sessions_from_store(&storage, project, browse).await {
             Ok(mounted) => mounted,
             Err(error) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: skipping project {} during attach --all: {error}",
                     project.repo_id
                 );
@@ -3089,7 +3090,7 @@ async fn attach_project_sessions_from_store(
         match result {
             Ok(info) => attached.push(info),
             Err(error) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: skipping workspace {}/{name} during attach --all: {error}",
                     project.repo_id
                 );
@@ -3180,9 +3181,10 @@ async fn detach_scoped_sessions(service: &mut dyn CliService) -> Result<()> {
         match service.detach(target.workspace.as_str()).await {
             Ok(()) => detached = true,
             Err(error) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: skipping workspace {}/{} during detach: {error}",
-                    target.repo_id, target.workspace
+                    target.repo_id,
+                    target.workspace
                 );
                 first_error.get_or_insert(error);
             }
@@ -3207,7 +3209,7 @@ async fn detach_store_wide() -> Result<StoreWideMounts<()>> {
         let unmounted = match detach_project_sessions_from_store(&storage, project).await {
             Ok(unmounted) => unmounted,
             Err(error) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: skipping project {} during detach --all: {error}",
                     project.repo_id
                 );
@@ -3266,7 +3268,7 @@ async fn detach_project_sessions_from_store(
         {
             Ok(()) => detached += 1,
             Err(error) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: skipping workspace {}/{} during detach --all: {error}",
                     project.repo_id,
                     target.name()
@@ -7847,8 +7849,8 @@ mod host_gate_environment_tests {
             .output().expect("run the real host activation");
         let mut names: Vec<&str> = forwarded.keys().map(String::as_str).collect();
         names.sort_unstable();
-        eprintln!("HostGate activation forwarded names: {}", names.join(", "));
-        eprintln!("{}", String::from_utf8_lossy(&activated.stdout));
+        cowshed_os::eprintln!("HostGate activation forwarded names: {}", names.join(", "));
+        cowshed_os::eprintln!("{}", String::from_utf8_lossy(&activated.stdout));
         assert!(
             activated.status.success(),
             "activation failed: {}",

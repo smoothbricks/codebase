@@ -160,7 +160,7 @@ fn record(directory: &Path, ticket: &Ticket, event: TurnEventKind, outcome: Opti
                 .write_all(&bytes)
         });
     if let Err(error) = written {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: land turn {}: ticket {} {event:?} not recorded in {}: {error}",
             directory.display(),
             ticket.number,

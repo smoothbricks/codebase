@@ -83,7 +83,9 @@ impl ScratchRoot {
             {
                 Ok(sweep) => root.sweep = Some(sweep),
                 Err(error) => {
-                    eprintln!("scratch root: no sweep thread ({error}); sweeping dead runs now");
+                    cowshed_os::eprintln!(
+                        "scratch root: no sweep thread ({error}); sweeping dead runs now"
+                    );
                     sweep();
                 }
             }
@@ -114,7 +116,7 @@ pub fn reclaim_dead_root(path: &Path) -> std::io::Result<()> {
 fn tear_down_root(path: &Path) -> std::io::Result<()> {
     // End the root's workers before releasing any image they may hold.
     if let Err(error) = end_processes_in(|cwd| cwd.starts_with(path)) {
-        eprintln!("scratch root {}: {error}", path.display());
+        cowshed_os::eprintln!("scratch root {}: {error}", path.display());
     }
     let unreleased = detach_images(|image| image.starts_with(path))?;
     if !unreleased.is_empty() {
@@ -134,7 +136,7 @@ impl Drop for ScratchRoot {
     fn drop(&mut self) {
         let started = Instant::now();
         if let Err(error) = tear_down_root(&self.path) {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "scratch root {}: {error}; a later sweep reclaims it",
                 self.path.display()
             );
@@ -144,11 +146,11 @@ impl Drop for ScratchRoot {
         if let Some(sweep) = self.sweep.take()
             && sweep.join().is_err()
         {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "scratch root: its sweep of dead runs panicked before recording it; the next run sweeps"
             );
         }
-        eprintln!(
+        cowshed_os::eprintln!(
             "scratch root {}: torn down in {torn_down:?}, then waited {:?} for its own sweep",
             self.path.display(),
             swept.elapsed()
@@ -174,7 +176,9 @@ fn sweep_dead_runs() {
     let _sweeping = match lock_exclusive(Path::new(SWEEP_LOCK)) {
         Ok(lock) => lock,
         Err(error) => {
-            eprintln!("abandoned scratch roots stay until a later run: lock {SWEEP_LOCK}: {error}");
+            cowshed_os::eprintln!(
+                "abandoned scratch roots stay until a later run: lock {SWEEP_LOCK}: {error}"
+            );
             return;
         }
     };
@@ -184,12 +188,12 @@ fn sweep_dead_runs() {
     let started = Instant::now();
     let dead = |path: &Path| owner_pid(&path.to_string_lossy()).is_some_and(process_is_gone);
     if let Err(error) = end_processes_in(dead) {
-        eprintln!("abandoned scratch roots: {error}");
+        cowshed_os::eprintln!("abandoned scratch roots: {error}");
     }
     let unreleased = match detach_images(dead) {
         Ok(unreleased) => unreleased,
         Err(error) => {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "abandoned scratch roots remain intact because image release could not be inventoried: {error}"
             );
             return;
@@ -206,16 +210,16 @@ fn sweep_dead_runs() {
         &unreleased,
         |path| fs::remove_dir_all(path),
         |path, error| {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "abandoned scratch root {} was not removed: {error}",
                 path.display()
             );
         },
     );
     if let Err(error) = fs::write(SWEEP_RECORD, run.as_bytes()) {
-        eprintln!("this run sweeps again: record its sweep in {SWEEP_RECORD}: {error}");
+        cowshed_os::eprintln!("this run sweeps again: record its sweep in {SWEEP_RECORD}: {error}");
     }
-    eprintln!("scratch root: swept dead runs in {:?}", started.elapsed());
+    cowshed_os::eprintln!("scratch root: swept dead runs in {:?}", started.elapsed());
 }
 
 /// This run's identity, as [`SWEEP_RECORD`] records it: nextest gives every test process of one
@@ -303,7 +307,7 @@ fn detach_images(select: impl Fn(&Path) -> bool) -> std::io::Result<BTreeSet<Pat
             Ok(Err(error)) => error,
             Err(_) => std::io::Error::other("its release thread panicked"),
         };
-        eprintln!(
+        cowshed_os::eprintln!(
             "scratch image {} could not be released: {error}",
             image.display()
         );
@@ -318,9 +322,9 @@ fn detach_images(select: impl Fn(&Path) -> bool) -> std::io::Result<BTreeSet<Pat
             {
                 Ok(thread) => releasing.push((image, thread)),
                 Err(error) => {
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "scratch image {}: no thread to release it beside the others ({error}); \
-                         releasing it in turn",
+                     releasing it in turn",
                         image.display()
                     );
                     report(image, Ok(release(image)));

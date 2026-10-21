@@ -114,7 +114,7 @@ impl Drop for RealImageCleanup<'_> {
                 .release_attachment()
                 .and_then(|()| self.delete_released_backing_file());
             if let Err(error) = released {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: retained real APFS fixture {}: {error}",
                     self.image.display()
                 );
@@ -415,7 +415,9 @@ impl Drop for TestPaths {
         }
         let retained = retained.join("; ");
         if std::thread::panicking() {
-            eprintln!("cowshed: retained test paths after the failure above: {retained}");
+            cowshed_os::eprintln!(
+                "cowshed: retained test paths after the failure above: {retained}"
+            );
         } else {
             panic!("remove test paths: {retained}");
         }
@@ -545,7 +547,7 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
                 let report = |event: Progress| {
                     if let Progress::Step(step) = &event {
                         // On stderr too, so a harness kill still shows the open step.
-                        eprintln!("cowshed: lease test image B step `{step}` started");
+                        cowshed_os::eprintln!("cowshed: lease test image B step `{step}` started");
                     }
                     let _ = progress.send(event);
                 };
@@ -669,7 +671,7 @@ fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
         let forwarded = std::thread::spawn(move || {
             stderr.lines().fold(false, |panicked, line| {
                 let line = line.expect("run stderr");
-                eprintln!("{line}");
+                cowshed_os::eprintln!("{line}");
                 panicked || line.contains("panicked at")
             })
         });

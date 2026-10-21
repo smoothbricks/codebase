@@ -131,7 +131,7 @@ impl Drop for ChurnGuard {
 #[test]
 fn real_apfs_raw_substrate_lifecycle() {
     match run_lifecycle() {
-        Ok(evidence) => eprintln!("APFS: {evidence}"),
+        Ok(evidence) => cowshed_os::eprintln!("APFS: {evidence}"),
         Err(error) => panic!("required APFS capability failed: {error}"),
     }
 }

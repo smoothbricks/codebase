@@ -2450,7 +2450,7 @@ impl Drop for PortGrantReservation {
         self.listeners.clear();
         for marker in &self.markers {
             if let Err(error) = std::fs::remove_file(marker) {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: cannot release port reservation {}: {error}",
                     marker.display()
                 );
@@ -3570,7 +3570,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             })??;
         drop(recovery_span);
         for line in legacy.lines() {
-            eprintln!("{line}");
+            cowshed_os::eprintln!("{line}");
         }
         let retired_project_root = layout.project().project_root.clone();
         let retired_repo = repo_id.clone();
@@ -3892,7 +3892,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .discard_unmutated_clone_intent(workspace, superseded)
             .await
         {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: the failed lifecycle intent for {workspace} stays journaled ({}: {}); recovery discards it if nothing durable carries its name",
                 error.code.as_str(),
                 error.message
@@ -3929,7 +3929,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         }
         .await;
         if let Err(error) = withdrawn {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: the refused clone of {workspace} was reclaimed, but withdrawing what it left stopped ({}: {}); cowshed doctor lists what stays",
                 error.code.as_str(),
                 error.message
@@ -4018,7 +4018,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         // One line however many: doctor names each as an `unfinished-intent` finding.
         if !left.is_empty() {
             let plural = if left.len() == 1 { "" } else { "s" };
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: info: leaving {} unfinished lifecycle operation{plural} outside this command's recovery scope; these do not block this command; cowshed doctor lists each",
                 left.len()
             );
@@ -4028,7 +4028,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             if self.claim_intent_lease(&workspace)? {
                 claimed.push(workspace);
             } else {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: leaving {workspace} to the cowshed process running its lifecycle operation"
                 );
             }
@@ -4074,17 +4074,13 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         let (_, re_adoption) = self.resume_re_adopt(*source).await?;
                         // Startup recovery answers no caller, so it logs the account for whoever
                         // reopened cowshed; an adopt that finishes a replacement returns it instead.
-                        eprintln!(
-                            "cowshed: recovery re-adopted main as {}; it kept what it replaced at:",
-                            re_adoption.replacement.as_str()
-                        );
+                        cowshed_os::eprintln!("cowshed: recovery re-adopted main as {}; it kept what it replaced at:",
+                        re_adoption.replacement.as_str());
                         for path in &re_adoption.retained {
-                            eprintln!("  {}", path.display());
+                            cowshed_os::eprintln!("  {}", path.display());
                         }
-                        eprintln!(
-                            "cowshed: once you have checked the replacement, removing exactly those \
-                             paths returns their space"
-                        );
+                        cowshed_os::eprintln!("cowshed: once you have checked the replacement, removing exactly those \
+                         paths returns their space");
                     }
                     LifecycleIntent::Create { workspace, options } => {
                         match self.current(&workspace).await {
@@ -4118,13 +4114,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                             }
                             Err(error) if error.code == ErrorCode::NotFound => {
                                 if self.discard_unmutated_clone_intent(&workspace, None).await? {
-                                    eprintln!(
-                                        "cowshed: discarded the unfinished {verb} of {workspace}: it ended before changing anything, so nothing is left to finish"
-                                    );
+                                    cowshed_os::eprintln!("cowshed: discarded the unfinished {verb} of {workspace}: it ended before changing anything, so nothing is left to finish");
                                 } else if retiring {
-                                    eprintln!(
-                                        "cowshed: leaving the unfinished {verb} of {workspace} to the rm retiring it"
-                                    );
+                                    cowshed_os::eprintln!("cowshed: leaving the unfinished {verb} of {workspace} to the rm retiring it");
                                 } else {
                                     self.resume_fork(workspace, options).await?;
                                 }
@@ -4134,18 +4126,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     }
                     LifecycleIntent::Fork { source, destination, rename: true } => {
                         if retiring {
-                            eprintln!(
-                                "cowshed: leaving the unfinished {verb} of {destination} to the rm retiring it"
-                            );
+                            cowshed_os::eprintln!("cowshed: leaving the unfinished {verb} of {destination} to the rm retiring it");
                         } else {
                             match self.current(&destination).await {
                                 // A published destination is the rename's own resume.
                                 Ok(_) => { self.rename(source, destination).await?; }
                                 Err(error) if error.code == ErrorCode::NotFound => {
                                     if self.discard_unmutated_clone_intent(&destination, None).await? {
-                                        eprintln!(
-                                            "cowshed: discarded the unfinished {verb} of {destination}: it ended before changing anything, so nothing is left to finish"
-                                        );
+                                        cowshed_os::eprintln!("cowshed: discarded the unfinished {verb} of {destination}: it ended before changing anything, so nothing is left to finish");
                                     } else {
                                         self.rename(source, destination).await?;
                                     }
@@ -4182,13 +4170,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         }
                         Err(error) if error.code == ErrorCode::NotFound => {
                             if self.discard_unmutated_clone_intent(&destination, None).await? {
-                                eprintln!(
-                                    "cowshed: discarded the unfinished {verb} of {destination}: it ended before changing anything, so nothing is left to finish"
-                                );
+                                cowshed_os::eprintln!("cowshed: discarded the unfinished {verb} of {destination}: it ended before changing anything, so nothing is left to finish");
                             } else if retiring {
-                                eprintln!(
-                                    "cowshed: leaving the unfinished {verb} of {destination} to the rm retiring it"
-                                );
+                                cowshed_os::eprintln!("cowshed: leaving the unfinished {verb} of {destination} to the rm retiring it");
                             } else {
                                 self.clone_for_rename(source, destination, ClonePurpose::HistoricalFork).await?;
                             }
@@ -4307,7 +4291,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .await;
             match replayed {
                 Ok(()) => {}
-                Err(error) if replay == IntentReplay::Residue => eprintln!(
+                Err(error) if replay == IntentReplay::Residue => cowshed_os::eprintln!(
                     "cowshed: unfinished {verb} of {workspace} could not be completed ({}: {}); it stays journaled for a later pass",
                     error.code.as_str(),
                     error.message
@@ -4797,7 +4781,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 routine += 1;
                 continue;
             }
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: build volume {} stays: {}{}",
                 deferred.path.display(),
                 deferred.deferral,
@@ -4809,7 +4793,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             );
         }
         if routine > 0 {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: {routine} build volume{} of detached or still-forming workspaces stay until those attach or finish forming; `cowshed gc --dry-run` names them",
                 if routine == 1 { "" } else { "s" }
             );
@@ -4890,7 +4874,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             match plan {
                 crate::runtime::nx_daemon::DaemonStopPlan::NotRunning => {}
                 crate::runtime::nx_daemon::DaemonStopPlan::Unproven { pid, reason } => {
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: the landing workspace's Nx daemon {pid} was left running: {reason}"
                     );
                     return Ok(skipped(AdoptionSkip::LandingDaemonStayed {
@@ -4919,10 +4903,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         })
                         .await?;
                     for diagnostic in &outcome.diagnostics {
-                        eprintln!("cowshed: the landing workspace's Nx daemon: {diagnostic}");
+                        cowshed_os::eprintln!(
+                            "cowshed: the landing workspace's Nx daemon: {diagnostic}"
+                        );
                     }
                     if !outcome.stderr.is_empty() {
-                        eprint!("{}", String::from_utf8_lossy(&outcome.stderr));
+                        cowshed_os::eprint!("{}", String::from_utf8_lossy(&outcome.stderr));
                     }
                     if !outcome.exited {
                         return Ok(skipped(AdoptionSkip::LandingDaemonStayed {
@@ -4994,9 +4980,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let locked = match volumes.try_lock_target(owner, lock).await? {
             Ok(locked) => locked,
             Err(contended) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: another cowshed operation on {} holds its image lock (e.g. a new, fork or rm of it); the land freezes {}'s seed and moves its build link once that ends",
-                    into.name, into.name
+                    into.name,
+                    into.name
                 );
                 timed_async("land", "target-lock", contended.wait()).await?
             }
@@ -5076,7 +5063,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     // The land fails for what failed in the target; the volume nothing links is
                     // collection's to retry.
                     (Err(release), Err(error)) => {
-                        eprintln!(
+                        cowshed_os::eprintln!(
                             "cowshed: {}'s previous build volume stays: {release}; `cowshed gc` retries it",
                             into.name
                         );
@@ -5349,10 +5336,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 .await?;
         }
         for displaced in &refresh.displaced {
-            eprintln!("cowshed: {name}: {displaced}");
+            cowshed_os::eprintln!("cowshed: {name}: {displaced}");
         }
         for finding in &refresh.findings {
-            eprintln!("cowshed: {name}: {finding}");
+            cowshed_os::eprintln!("cowshed: {name}: {finding}");
         }
         Ok(refresh)
     }
@@ -6182,7 +6169,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         ) {
             let mount = self.workspace_mount_path(&workspace)?;
             if let Err(busy) = check_checkout_nx(&workspace, &mount, nx_check).await? {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: {workspace}'s linked Nx state is in use: {busy}; {}",
                     nx_check.busy_action()
                 );
@@ -6583,9 +6570,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let git = match tips {
             Ok(tips) => Some(tips),
             Err(reason) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: the deletion log records no Git tips for {workspace}'s retirement: \
-                     {reason}"
+                 {reason}"
                 );
                 None
             }
@@ -6614,7 +6601,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .preserve_bundle(bundle, &abandoned_namespace(&workspace, &head))
             .await?;
         for kept in &preserved {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: kept {} at {} of {} in {} as {}",
                 kept.name,
                 kept.tip,
@@ -6890,9 +6877,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 ),
             ));
         }
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: carried {} refs/cowshed ref{} from main into {}, which the restore keeps: \
-             they outlive the project there, and removing that checkout is what would lose them",
+         they outlive the project there, and removing that checkout is what would lose them",
             refs.len(),
             if refs.len() == 1 { "" } else { "s" },
             retained.display()
@@ -7050,7 +7037,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     .discard_unmutated_clone_intent(&destination, None)
                     .await?
             {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: discarded the unfinished rename of {workspace} into {destination}: it ended before changing anything, so nothing is left to finish"
                 );
             } else {
@@ -7785,14 +7772,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .remove_unbound(self.descriptor.storage.store())?
         {
             UnboundLease::Removed => {}
-            UnboundLease::Held { lease } => eprintln!(
+            UnboundLease::Held { lease } => cowshed_os::eprintln!(
                 "cowshed: project lease {} stays: another cowshed process (the gateway, or a \
-                 command still open on {}) holds it, and removing a held lease would let a later \
-                 `cowshed forget` fence past that process",
+             command still open on {}) holds it, and removing a held lease would let a later \
+             `cowshed forget` fence past that process",
                 lease.display(),
                 self.descriptor.repo_id
             ),
-            UnboundLease::Recorded { lease } => eprintln!(
+            UnboundLease::Recorded { lease } => cowshed_os::eprintln!(
                 "cowshed: project lease {} stays beside the retirement record it fences",
                 lease.display()
             ),
@@ -8212,7 +8199,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             CowshedError::internal(format!("owned-link migration panicked: {error}"))
         })??;
         if let Some(plan) = plan {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: migrated {} owned absolute link(s) to relative paths",
                 plan.rewrites.len()
             );
@@ -8530,7 +8517,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         Err(_) => return,
                     };
                     if let Some(lost) = page.lost_through {
-                        eprintln!(
+                        cowshed_os::eprintln!(
                             "cowshed: commitments through {lost} of workspace supervisor {} were dropped before they were forwarded",
                             socket.display()
                         );
@@ -8581,11 +8568,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             )
         })?;
         for group in &unresolved {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: workspace {}: job {} process group {} (recorded by lost supervisor process \
-                 {}) still has processes but its leader is gone, so they cannot be told from \
-                 another group that took the id; not signalled, kept in the ledger and reported by \
-                 `cowshed doctor`",
+             {}) still has processes but its leader is gone, so they cannot be told from \
+             another group that took the id; not signalled, kept in the ledger and reported by \
+             `cowshed doctor`",
                 config.authority.workspace,
                 group.job_id(),
                 group.pgid(),
@@ -8619,7 +8606,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         if sealed.is_empty() {
             return Ok(());
         }
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: sealed jobs {:?} of workspace {} as lost with the supervisor that ran them",
             sealed
                 .iter()
@@ -8786,7 +8773,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         return Err(error);
                     }
                     let stopped = super::supervisor_manager::stop_other_build(&socket).await?;
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: stopped workspace {name}'s supervisor (pid {}) of another cowshed build",
                         stopped.pid
                     );
@@ -8969,9 +8956,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 "clone"
             };
             if dry_run {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: would retire {workspace}, an unfinished {kind} its process \
-                     abandoned before publishing it: {}",
+                 abandoned before publishing it: {}",
                     image.display()
                 );
                 continue;
@@ -8992,13 +8979,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     .map(|_| ())
             };
             match retired {
-                Ok(()) => eprintln!(
+                Ok(()) => cowshed_os::eprintln!(
                     "cowshed: retired {workspace}, an unfinished {kind} its process abandoned \
-                     before publishing it"
+                 before publishing it"
                 ),
-                Err(error) => eprintln!(
+                Err(error) => cowshed_os::eprintln!(
                     "cowshed: kept unfinished {kind} {workspace}: {}\nnext: {}",
-                    error.message, error.hint
+                    error.message,
+                    error.hint
                 ),
             }
         }
@@ -9225,7 +9213,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         ) {
             Ok(lease) => lease,
             Err(error) => {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: retaining {} for later reclamation: {}",
                     retired.workspace().name(),
                     error.message
@@ -9239,7 +9227,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         self.reclaims.push(tokio::spawn(async move {
             let _retirement_lease = retirement_lease;
             if let Err(error) = substrate.reclaim(retired).await {
-                eprintln!("cowshed: retaining retired workspace {workspace} for later reclamation: {error}");
+                cowshed_os::eprintln!("cowshed: retaining retired workspace {workspace} for later reclamation: {error}");
             }
         }));
     }
@@ -9373,10 +9361,10 @@ async fn finish_store_residue<H: crate::storage::apfs::ApfsExecutionHost>(
         let workspace = retirement.workspace().name().clone();
         let incarnation = retirement.workspace().incarnation().clone();
         if let Err(error) = substrate.reclaim(retirement).await {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: retired workspace {workspace} (incarnation {incarnation}) stays in \
-                 sessions/.trash: reclaiming it failed ({error}); the next cowshed command or \
-                 cowshed gc retries, and cowshed doctor reports it as retired-trash"
+             sessions/.trash: reclaiming it failed ({error}); the next cowshed command or \
+             cowshed gc retries, and cowshed doctor reports it as retired-trash"
             );
         }
     }
@@ -9387,9 +9375,9 @@ async fn finish_store_residue<H: crate::storage::apfs::ApfsExecutionHost>(
             .reclaim_unrecorded_retired(repo_id, image.clone())
             .await
         {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: retired image {} stays in sessions/.trash: reclaiming it failed \
-                 ({error}); the next cowshed command or cowshed gc retries",
+             ({error}); the next cowshed command or cowshed gc retries",
                 image.display()
             );
         }
@@ -10581,15 +10569,15 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 None => continue,
             };
             if let Err(error) = retired {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: workspace {name}'s supervisor did not retire as its runtime shut \
-                     down: {error}"
+                 down: {error}"
                 );
             }
             if let Err(error) = self.forget_served(&name).await {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: workspace {name}'s supervisor socket did not close as its runtime \
-                     shut down: {error}"
+                 shut down: {error}"
                 );
             }
         }
@@ -10600,7 +10588,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // only a later gc collects.
         for reclaim in std::mem::take(&mut self.reclaims) {
             if let Err(error) = reclaim.await {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: image reclamation task failed as its runtime shut down: {error}"
                 );
             }
@@ -12409,7 +12397,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             if let Some(kept) =
                 crate::storage::recovery::KeptAbandonBundles::named_by(bundles.candidates())?
             {
-                eprintln!(
+                cowshed_os::eprintln!(
                     "cowshed: {kept}; {}",
                     crate::storage::recovery::KeptAbandonBundles::HINT
                 );
@@ -12501,7 +12489,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 "discard",
                 crate::storage::lifecycle::dispatch_blocking(move || {
                     crate::build_volume::discard::finish(&checkout, |discard| {
-                        eprintln!("cowshed: deleting old build state {}", discard.display());
+                        cowshed_os::eprintln!(
+                            "cowshed: deleting old build state {}",
+                            discard.display()
+                        );
                     })
                 }),
             )
@@ -12565,10 +12556,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let store_root = self.layout.project().store_root.clone();
         match crate::exec::collect_profiles(&store_root) {
             Ok(0) => {}
-            Ok(removed) => eprintln!(
+            Ok(removed) => cowshed_os::eprintln!(
                 "cowshed: gc removed {removed} sandbox profile file(s) no live supervisor launches from"
             ),
-            Err(error) => eprintln!(
+            Err(error) => cowshed_os::eprintln!(
                 "cowshed: gc left the sandbox profile files in {}: {error}",
                 crate::exec::profile_directory(&store_root).display()
             ),
@@ -12578,15 +12569,17 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // bytes are counted where they were released, so this only says what it deleted.
         let trash = self.build_volume_layout()?.trash();
         match tokio::task::spawn_blocking(move || crate::build_volume::empty_trash(&trash)).await {
-            Ok(Ok(emptied)) if emptied.images > 0 => eprintln!(
+            Ok(Ok(emptied)) if emptied.images > 0 => cowshed_os::eprintln!(
                 "cowshed: gc deleted {} released build volume image(s) from the trash",
                 emptied.images
             ),
             Ok(Ok(_)) => {}
-            Ok(Err(error)) => eprintln!(
+            Ok(Err(error)) => cowshed_os::eprintln!(
                 "cowshed: gc left released build volume images in the trash; the daemon retries: {error}"
             ),
-            Err(error) => eprintln!("cowshed: emptying the build volume trash failed: {error}"),
+            Err(error) => {
+                cowshed_os::eprintln!("cowshed: emptying the build volume trash failed: {error}")
+            }
         }
         Ok(GcReport {
             examined: u64::try_from(report.examined)
@@ -13480,9 +13473,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 Ok(_) => {}
                 // Nothing of the workspace is left to retire: a removal outside a land's lease
                 // took it (an older cowshed's `rm`, a hand). The land itself is done.
-                Err(gone) if gone.code == ErrorCode::NotFound => eprintln!(
+                Err(gone) if gone.code == ErrorCode::NotFound => cowshed_os::eprintln!(
                     "cowshed: landed {source_head} on {target_branch}; workspace {workspace} was \
-                     already gone, so the land had nothing left to retire: {}",
+                 already gone, so the land had nothing left to retire: {}",
                     gone.message
                 ),
                 Err(kept) => {
@@ -14390,7 +14383,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 // Every Conflict a close answers says the supervisor holds no session for this
                 // token under its authority (it restarted, or the session was closed): the
                 // session is already closed. Said, never dropped silently.
-                Err(error) if error.code == ErrorCode::Conflict => eprintln!(
+                Err(error) if error.code == ErrorCode::Conflict => cowshed_os::eprintln!(
                     "cowshed: session {superseded} of workspace {workspace}, superseded by session {reopened}, was already closed by its supervisor: {error}"
                 ),
                 closed => closed?,

@@ -265,10 +265,10 @@ impl CpuPool {
                     } => match accepted {
                         Ok(stream) => {
                             children.spawn(serve_pool_until_retired(stream, ledger.clone(), std::sync::Arc::clone(&directory), child_stopped.clone()));                        }
-                        Err(error) => { eprintln!("cowshed: CPU pool listener failed: {error}"); break; }
+                        Err(error) => { cowshed_os::eprintln!("cowshed: CPU pool listener failed: {error}"); break; }
                     },
                     ended = children.join_next(), if !children.is_empty() => {
-                        if let Some(Err(error)) = ended { eprintln!("cowshed: CPU pool child failed: {error}"); }
+                        if let Some(Err(error)) = ended { cowshed_os::eprintln!("cowshed: CPU pool child failed: {error}"); }
                     }
                 }
             }
@@ -281,16 +281,18 @@ impl CpuPool {
                     Ok(true) => ended += 1,
                     Ok(false) => {}
                     Err(error) => {
-                        eprintln!("cowshed: CPU pool child failed during retirement: {error}")
+                        cowshed_os::eprintln!(
+                            "cowshed: CPU pool child failed during retirement: {error}"
+                        )
                     }
                 }
             }
             match &retired {
-                Ok(refused) => eprintln!(
+                Ok(refused) => cowshed_os::eprintln!(
                     "cowshed: CPU pool {} listener closed: refused {refused} queued connections, ended {ended} accepted connections (pool-retired)",
                     retiring_path.display()
                 ),
-                Err(error) => eprintln!(
+                Err(error) => cowshed_os::eprintln!(
                     "cowshed: CPU pool {} retirement failed: {error}",
                     retiring_path.display()
                 ),
@@ -386,14 +388,16 @@ async fn refuse_retired_pool(mut stream: cowshed_os::fork_lock::Fenced<tokio::ne
         .write_all(b"{\"ok\":false,\"code\":\"pool-retired\",\"error\":\"the CPU pool owner's lease ended\"}\n")
         .await
     {
-        eprintln!("cowshed: CPU pool could not deliver pool-retired: {error}");
+        cowshed_os::eprintln!("cowshed: CPU pool could not deliver pool-retired: {error}");
     }
     if let Err(error) = stream.shutdown().await {
-        eprintln!("cowshed: CPU pool could not close refused connection: {error}");
+        cowshed_os::eprintln!("cowshed: CPU pool could not close refused connection: {error}");
     }
     tokio::spawn(async move {
         if let Err(error) = tokio::io::copy(&mut stream, &mut tokio::io::sink()).await {
-            eprintln!("cowshed: CPU pool could not read refused connection to its end: {error}");
+            cowshed_os::eprintln!(
+                "cowshed: CPU pool could not read refused connection to its end: {error}"
+            );
         }
     });
 }
@@ -515,7 +519,9 @@ async fn lend(
             let bytes = match read_tokens(fifo.get_ref(), want) {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    eprintln!("cowshed: CPU pool cannot read its jobserver fifo: {error}");
+                    cowshed_os::eprintln!(
+                        "cowshed: CPU pool cannot read its jobserver fifo: {error}"
+                    );
                     return;
                 }
             };
@@ -542,7 +548,7 @@ async fn lend(
                 Some(FifoMessage::Return { bytes, implicit: returned }) => {
                     implicit |= returned;
                     if let Err(error) = write_tokens(fifo.get_ref(), bytes) {
-                        eprintln!("cowshed: CPU pool cannot return {bytes} token(s) to its jobserver fifo: {error}");
+                        cowshed_os::eprintln!("cowshed: CPU pool cannot return {bytes} token(s) to its jobserver fifo: {error}");
                         return;
                     }
                 }
@@ -552,7 +558,7 @@ async fn lend(
             ready = fifo.readable(), if !queue.is_empty() => match ready {
                 Ok(mut guard) => guard.clear_ready(),
                 Err(error) => {
-                    eprintln!("cowshed: CPU pool cannot wait on its jobserver fifo: {error}");
+                    cowshed_os::eprintln!("cowshed: CPU pool cannot wait on its jobserver fifo: {error}");
                     return;
                 }
             },
@@ -683,7 +689,7 @@ async fn serve_pool(
             return;
         }
         Err(error) => {
-            eprintln!("cowshed: cannot read CPU pool request: {error}");
+            cowshed_os::eprintln!("cowshed: cannot read CPU pool request: {error}");
             return;
         }
     };
@@ -774,7 +780,7 @@ async fn serve_pool(
     if let Some(pool) = pool
         && let Err(error) = pool.close().await
     {
-        eprintln!("cowshed: child CPU pool did not close: {error}");
+        cowshed_os::eprintln!("cowshed: child CPU pool did not close: {error}");
     }
     drop(held);
 }

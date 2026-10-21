@@ -29,7 +29,7 @@ fn main() -> std::process::ExitCode {
     match runtime.block_on(probe::run()) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("npm_registry_probe: {error}");
+            cowshed_os::eprintln!("npm_registry_probe: {error}");
             std::process::ExitCode::FAILURE
         }
     }
@@ -37,7 +37,9 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(not(target_os = "macos"))]
 fn main() -> std::process::ExitCode {
-    eprintln!("npm_registry_probe: only the macOS loopback port-block endpoint is wired");
+    cowshed_os::eprintln!(
+        "npm_registry_probe: only the macOS loopback port-block endpoint is wired"
+    );
     std::process::ExitCode::FAILURE
 }
 

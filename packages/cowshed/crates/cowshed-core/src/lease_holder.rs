@@ -81,7 +81,7 @@ pub fn record(file: &File, holder: &impl Serialize) -> io::Result<()> {
 /// said: its record then names this process until it exits, and a census asks nothing of it.
 pub fn clear(file: &File, path: &Path) {
     if let Err(error) = file.set_len(0) {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: cannot clear the holder record of lease {}: {error}",
             path.display()
         );

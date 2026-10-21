@@ -79,7 +79,7 @@ pub fn reap(checkout: &Path) {
         Ok(pending) if pending.is_empty() => return,
         Ok(_) => {}
         Err(error) => {
-            eprintln!(
+            cowshed_os::eprintln!(
                 "cowshed: cannot list old build state under {}: {error}",
                 checkout.join(DISCARD_DIRECTORY).display()
             );
@@ -99,7 +99,7 @@ pub fn reap(checkout: &Path) {
                 let pending = match pending(&checkout) {
                     Ok(pending) => pending,
                     Err(error) => {
-                        eprintln!(
+                        cowshed_os::eprintln!(
                             "cowshed: cannot list old build state under {}: {error}",
                             checkout.join(DISCARD_DIRECTORY).display()
                         );
@@ -110,14 +110,14 @@ pub fn reap(checkout: &Path) {
                     return;
                 }
                 for discard in pending {
-                    eprintln!(
+                    cowshed_os::eprintln!(
                         "cowshed: deleting old build state {} in the background",
                         discard.display()
                     );
                     if let Err(error) = remove(&discard) {
-                        eprintln!(
+                        cowshed_os::eprintln!(
                             "cowshed: cannot delete old build state {}: {error}; the next \
-                             refresh or `cowshed gc` retries it",
+                         refresh or `cowshed gc` retries it",
                             discard.display()
                         );
                         return;
@@ -126,9 +126,9 @@ pub fn reap(checkout: &Path) {
             }
         });
     if let Err(error) = spawned {
-        eprintln!(
+        cowshed_os::eprintln!(
             "cowshed: cannot start deleting old build state under {}: {error}; the next refresh \
-             or `cowshed gc` retries it",
+         or `cowshed gc` retries it",
             checkout.join(DISCARD_DIRECTORY).display()
         );
     }
