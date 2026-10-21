@@ -19,10 +19,15 @@
  */
 
 import { readdirSync, type Stats, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
 const BIN_ROOT = new URL('../dist/bin', import.meta.url).pathname;
 const EXECUTABLE_OWNER_BIT = 0o100;
+/**
+ * The record of what a build read, which `smoo-nx-build-inputs` writes beside the binaries it
+ * describes (@smoothbricks/nx-plugin `BUILD_INPUTS_FILE`): data, never a binary to execute.
+ */
+const BUILD_INPUTS_FILE = '.build-inputs.json';
 
 function listFilesRecursively(directory: string): string[] {
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
@@ -44,7 +49,7 @@ if (!stat.isDirectory()) {
   process.exit(1);
 }
 
-const files = listFilesRecursively(BIN_ROOT);
+const files = listFilesRecursively(BIN_ROOT).filter((path) => basename(path) !== BUILD_INPUTS_FILE);
 if (files.length === 0) {
   console.error(`${BIN_ROOT} holds no files, so no packaged binary was checked`);
   process.exit(1);
