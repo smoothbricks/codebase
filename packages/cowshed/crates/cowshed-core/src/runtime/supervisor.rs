@@ -1866,10 +1866,6 @@ pub(super) async fn sandbox_environment(
     };
     own("PATH", &path);
     own(
-        crate::developer_links::ROOT_ENV,
-        sandbox.workspace_mount.as_os_str(),
-    );
-    own(
         crate::developer_links::MANAGER_BIN_ENV,
         environment_root.join("tools/manager-bin").as_os_str(),
     );

@@ -464,22 +464,13 @@ impl Host {
         // One version probe per activation answers every command of this warm shell; the wrapper
         // asks again only for another program file, and itself reports any failure dropped here
         // (15_capabilities.md, "Bootstrap executables").
-        let report = match (
+        let report = developer_links::report(
             self.environment
-                .get(OsStr::new(developer_links::MANAGER_BIN_ENV)),
-            self.environment.get(OsStr::new(developer_links::ROOT_ENV)),
-        ) {
-            (Some(route), Some(root)) => developer_links::report(
-                self.environment
-                    .get(OsStr::new("PATH"))
-                    .map(OsString::as_os_str),
-                Path::new(route),
-                Path::new(root),
-            )
-            .ok()
-            .flatten(),
-            _ => None,
-        };
+                .get(OsStr::new("PATH"))
+                .map(OsString::as_os_str),
+        )
+        .ok()
+        .flatten();
         match report {
             Some(report) => {
                 self.environment

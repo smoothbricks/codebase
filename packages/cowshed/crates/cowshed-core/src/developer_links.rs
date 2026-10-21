@@ -17,11 +17,11 @@ use std::process::{Command, ExitStatus};
 use crate::capabilities::bun::BUN_HOME;
 use crate::capabilities::cache::SharedToolHome;
 use crate::capabilities::pnpm::PNPM_HOME;
+use crate::runtime::shell_host::SHELL_HOST_DIRECTORY;
 use crate::{CowshedError, Result};
 use cowshed_os::fork_lock::Run as _;
 use cowshed_os::fsio::AnchoredDirectory;
 
-pub const ROOT_ENV: &str = "COWSHED_PACKAGE_MANAGER_ROOT";
 /// The mode's private `tools/manager-bin`: the package-manager wrapper links, the only route that
 /// leads PATH after shell activation (15_capabilities.md, "Bootstrap executables").
 pub const MANAGER_BIN_ENV: &str = "COWSHED_MANAGER_BIN";
@@ -897,38 +897,91 @@ fn identity(metadata: &fs::Metadata) -> (u64, u64) {
     (metadata.dev(), metadata.ino())
 }
 
-/// What `manager` runs: the first executable of that name on `path` that is not this wrapper,
-/// which after activation is the shell's own, the one the host route runs; else the program the
-/// capability recorded under `tools/real-bin`. The wrapper is recognized by file identity, so no
-/// spelling of its route on PATH can make it run itself.
-fn resolve(manager: &OsStr, path: Option<&OsStr>, route: &Path) -> io::Result<Managed> {
-    let wrapper = route.join(manager);
-    let wrapper = fs::metadata(&wrapper)
-        .map(|metadata| identity(&metadata))
-        .map_err(|error| {
+/// The running wrapper or exec host: the staged executable every `tools/manager-bin` link
+/// names, `<workspace>/.cowshed/shell-host/<file>`, which the supervisor writes and no job may.
+/// Its identity and its workspace are read from the executable itself, never from the
+/// environment, which any child may replace (a test spawning `bun` with only PATH and HOME).
+#[derive(Debug, PartialEq, Eq)]
+struct Staged {
+    identity: (u64, u64),
+    workspace: PathBuf,
+}
+
+impl Staged {
+    fn running() -> io::Result<Self> {
+        Self::at(&std::env::current_exe()?)
+    }
+
+    fn at(executable: &Path) -> io::Result<Self> {
+        let staged = fs::canonicalize(executable).map_err(|error| {
             io::Error::new(
                 error.kind(),
-                format!("package-manager wrapper {}: {error}", wrapper.display()),
+                format!(
+                    "resolve the running executable {}: {error}",
+                    executable.display()
+                ),
             )
         })?;
-    let found = path
-        .into_iter()
-        .flat_map(std::env::split_paths)
-        .map(|directory| directory.join(manager))
-        .find_map(|candidate| {
-            let metadata = fs::metadata(&candidate).ok()?;
-            (metadata.is_file() && metadata.mode() & 0o111 != 0 && identity(&metadata) != wrapper)
-                .then(|| Managed {
-                    identity: identity(&metadata),
-                    path: candidate,
-                })
-        });
-    if let Some(found) = found {
-        return Ok(found);
+        let metadata = fs::metadata(&staged).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("inspect {}: {error}", staged.display()),
+            )
+        })?;
+        let workspace = staged
+            .parent()
+            .filter(|directory| directory.ends_with(SHELL_HOST_DIRECTORY))
+            .and_then(|directory| directory.parent()?.parent())
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "{} is not an exec host staged in a workspace's {SHELL_HOST_DIRECTORY}",
+                    staged.display()
+                ))
+            })?;
+        Ok(Self {
+            identity: identity(&metadata),
+            workspace: workspace.to_owned(),
+        })
     }
+}
+
+/// What `manager` runs: the first executable of that name on `path` that is not the `wrapper`
+/// file, which after activation is the shell's own, the one the host route runs; else the program
+/// the capability recorded in `real-bin` beside the first PATH directory holding the wrapper. The
+/// wrapper is recognized by file identity, so no spelling of its route on PATH can make it run
+/// itself, and its route is the one PATH reached it through.
+fn resolve(manager: &OsStr, path: Option<&OsStr>, wrapper: (u64, u64)) -> io::Result<Managed> {
+    let mut route = None;
+    for directory in path.into_iter().flat_map(std::env::split_paths) {
+        let candidate = directory.join(manager);
+        let Ok(metadata) = fs::metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+            continue;
+        }
+        if identity(&metadata) != wrapper {
+            return Ok(Managed {
+                identity: identity(&metadata),
+                path: candidate,
+            });
+        }
+        route.get_or_insert(directory);
+    }
+    let route = route.ok_or_else(|| {
+        io::Error::other(format!(
+            "PATH names no {} past the package-manager wrapper, nor the wrapper's own directory beside its recorded program",
+            manager.display()
+        ))
+    })?;
     let recorded = route
         .parent()
-        .ok_or_else(|| io::Error::other("the package-manager wrapper route has no parent"))?
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "the package-manager wrapper directory {} has no parent",
+                route.display()
+            ))
+        })?
         .join("real-bin")
         .join(manager);
     let metadata = fs::metadata(&recorded).map_err(|error| {
@@ -1012,27 +1065,34 @@ fn verify(
     )))
 }
 
-/// The [`REPORTED_ENV`] value an activated shell exports once for all its commands: what the
-/// declared manager's program on that shell's `path` reports. `None` when the workspace
-/// declares no managed package manager.
-pub fn report(path: Option<&OsStr>, route: &Path, root: &Path) -> io::Result<Option<OsString>> {
-    let Some(declared) = Declaration::read(root)? else {
+/// [`report`] for the exec host `host`.
+fn witness(path: Option<&OsStr>, host: &Staged) -> io::Result<Option<OsString>> {
+    let Some(declared) = Declaration::read(&host.workspace)? else {
         return Ok(None);
     };
     let manager = OsStr::new(&declared.manager);
     if !is_package_manager(manager) {
         return Ok(None);
     }
-    let program = resolve(manager, path, route)?;
+    let program = resolve(manager, path, host.identity)?;
     let version = reported_version(&program.path)?;
     Ok(Some(
         format!("{version} {}:{}", program.identity.0, program.identity.1).into(),
     ))
 }
 
+/// The [`REPORTED_ENV`] value an activated exec host exports once for all its commands: what the
+/// declared manager's program on that shell's `path` reports. `None` when the workspace
+/// declares no managed package manager.
+pub fn report(path: Option<&OsStr>) -> io::Result<Option<OsString>> {
+    let host = Staged::running()?;
+    witness(path, &host)
+}
+
 /// Multicall dispatch through the existing protected bootstrap-program link, before a runtime starts.
 /// The program run is the one PATH names past this wrapper ([`resolve`]), checked against the
-/// workspace's declaration ([`verify`]) before anything runs.
+/// workspace's declaration ([`verify`]) before anything runs. The wrapper and its workspace are
+/// the staged executable's ([`Staged`]), so a child that replaced its environment still runs it.
 pub fn dispatch() -> io::Result<Option<ExitStatus>> {
     let mut args = std::env::args_os();
     let invoked = args.next().unwrap_or_default();
@@ -1042,15 +1102,12 @@ pub fn dispatch() -> io::Result<Option<ExitStatus>> {
     else {
         return Ok(None);
     };
-    let route = std::env::var_os(MANAGER_BIN_ENV)
-        .ok_or_else(|| io::Error::other("managed package manager has no wrapper route"))?;
-    let root = std::env::var_os(ROOT_ENV)
-        .ok_or_else(|| io::Error::other("managed package manager has no workspace root"))?;
-    let root = Path::new(&root);
+    let wrapper = Staged::running()?;
+    let root = wrapper.workspace.as_path();
     let program = resolve(
         manager,
         std::env::var_os("PATH").as_deref(),
-        Path::new(&route),
+        wrapper.identity,
     )?;
     verify(
         manager,
@@ -1130,40 +1187,49 @@ mod tests {
 
     /// The wrapper runs what PATH names past it, as the host route does: after activation the
     /// shell's program, never the bootstrap one, and never itself under another spelling of its
-    /// route. Only a PATH naming none falls back to the recorded program.
+    /// route. Only a PATH naming none falls back to the program recorded beside the directory PATH
+    /// reached the wrapper through; a PATH naming neither is refused, naming the manager.
     #[test]
     fn the_wrapper_runs_the_program_path_names_past_it_else_the_recorded_one() {
         let scratch = crate::temp_root::TempRoot::new("managed-resolve");
-        let tools = scratch.join("tools");
+        let root = scratch.join("checkout");
+        let tools = root.join(".cowshed/tools");
         let route = tools.join("manager-bin");
-        script(&scratch.join("wrapper"), "exit 99");
+        let staged = root.join(SHELL_HOST_DIRECTORY).join("host");
+        script(&staged, "exit 99");
         fs::create_dir_all(&route).unwrap();
-        symlink(scratch.join("wrapper"), route.join("bun")).unwrap();
+        symlink(&staged, route.join("bun")).unwrap();
         script(&scratch.join("bootstrap/bun"), "echo 1.4.2");
         fs::create_dir_all(tools.join("real-bin")).unwrap();
         symlink(scratch.join("bootstrap/bun"), tools.join("real-bin/bun")).unwrap();
         script(&scratch.join("shell/bun"), "echo 1.4.3");
         symlink(&route, scratch.join("alias")).unwrap();
+        let wrapper = Staged::at(&route.join("bun")).unwrap();
+        assert_eq!(
+            wrapper,
+            Staged {
+                identity: identity(&fs::metadata(&staged).unwrap()),
+                workspace: root.clone(),
+            }
+        );
         let bun = OsStr::new("bun");
         let activated =
             std::env::join_paths([route.clone(), scratch.join("alias"), scratch.join("shell")])
                 .unwrap();
         assert_eq!(
-            resolve(bun, Some(&activated), &route).unwrap(),
+            resolve(bun, Some(&activated), wrapper.identity).unwrap(),
             managed(scratch.join("shell/bun"))
         );
         let bootstrap = std::env::join_paths([route.clone(), scratch.join("alias")]).unwrap();
         assert_eq!(
-            resolve(bun, Some(&bootstrap), &route).unwrap(),
+            resolve(bun, Some(&bootstrap), wrapper.identity).unwrap(),
             managed(tools.join("real-bin/bun"))
         );
-        assert_eq!(
-            resolve(bun, None, &route).unwrap(),
-            managed(tools.join("real-bin/bun"))
-        );
-        let root = scratch.join("checkout");
-        fs::create_dir_all(&root).unwrap();
-        assert_eq!(report(Some(&activated), &route, &root).unwrap(), None);
+        let refused = resolve(bun, None, wrapper.identity)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("PATH names no bun"), "{refused}");
+        assert_eq!(witness(Some(&activated), &wrapper).unwrap(), None);
         fs::write(
             root.join("package.json"),
             r#"{"packageManager":"bun@1.4.3"}"#,
@@ -1171,11 +1237,18 @@ mod tests {
         .unwrap();
         let shell = managed(scratch.join("shell/bun"));
         assert_eq!(
-            report(Some(&activated), &route, &root).unwrap(),
+            witness(Some(&activated), &wrapper).unwrap(),
             Some(OsString::from(format!(
                 "1.4.3 {}:{}",
                 shell.identity.0, shell.identity.1
             )))
+        );
+        let unstaged = Staged::at(&scratch.join("shell/bun"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unstaged.contains("is not an exec host staged in a workspace's .cowshed/shell-host"),
+            "{unstaged}"
         );
     }
 

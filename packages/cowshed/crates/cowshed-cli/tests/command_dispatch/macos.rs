@@ -6563,6 +6563,16 @@ async fn directory_managed_bun_runs_the_declared_bun_and_refuses_another_naming_
             .is_some_and(|report| report.starts_with(&format!("{declared} "))),
         "the activation exported what the declared program reported: {stdout}"
     );
+    // A child that keeps only PATH and HOME and leaves the workspace, as a test fixture's spawn
+    // does, still reaches the declared program through the wrapper: it locates itself and its
+    // workspace from its own executable, never from variables a child may drop.
+    let scrubbed = sh(
+        &mut service,
+        "managed",
+        "cd \"$TMPDIR\" && /usr/bin/env -i PATH=\"$PATH\" HOME=\"$HOME\" bun --version",
+    )
+    .await;
+    assert_eq!(String::from_utf8(scrubbed).unwrap().trim(), declared);
 
     let bootstrap = String::from_utf8(
         sh(
@@ -6575,34 +6585,32 @@ async fn directory_managed_bun_runs_the_declared_bun_and_refuses_another_naming_
     .unwrap();
     let bootstrap = bootstrap.trim();
     assert_ne!(bootstrap, declared);
-    let (exit, stdout, stderr) = run(
-        &mut service,
-        [
-            "exec",
-            "managed",
-            "--",
-            "/bin/sh",
-            "-c",
-            "PATH=\"$COWSHED_MANAGER_BIN:/usr/bin:/bin\" bun --version",
-        ],
-    )
-    .await;
-    let stderr = String::from_utf8_lossy(&stderr);
-    assert_eq!(
-        exit.expect("the admitted child returned an exit code"),
-        126,
-        "{stderr}"
-    );
-    assert!(
-        stdout.is_empty(),
-        "nothing ran: {}",
-        String::from_utf8_lossy(&stdout)
-    );
-    for named in [
-        format!("packageManager bun@{declared},"),
-        format!("real-bin/bun reports {bootstrap:?}"),
+    for refused in [
+        "PATH=\"$COWSHED_MANAGER_BIN:/usr/bin:/bin\" bun --version",
+        "route=$COWSHED_MANAGER_BIN; cd \"$TMPDIR\" && /usr/bin/env -i PATH=\"$route:/usr/bin:/bin\" bun --version",
     ] {
-        assert!(stderr.contains(&named), "{named} in {stderr}");
+        let (exit, stdout, stderr) = run(
+            &mut service,
+            ["exec", "managed", "--", "/bin/sh", "-c", refused],
+        )
+        .await;
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert_eq!(
+            exit.expect("the admitted child returned an exit code"),
+            126,
+            "{refused}: {stderr}"
+        );
+        assert!(
+            stdout.is_empty(),
+            "nothing ran: {}",
+            String::from_utf8_lossy(&stdout)
+        );
+        for named in [
+            format!("packageManager bun@{declared},"),
+            format!("real-bin/bun reports {bootstrap:?}"),
+        ] {
+            assert!(stderr.contains(&named), "{refused}: {named} in {stderr}");
+        }
     }
     drop(service);
     fixture.stop_gateway().await;

@@ -177,10 +177,19 @@ Each detector returns data through one `CapabilityContribution`:
   not, runs the first executable of its name on the PATH it was given that is not the wrapper itself, recognized by file
   identity so no spelling of its route makes it run itself. After activation that is the shell's own, the program the
   host route runs; only when PATH names none, as before activation or in a job without a shell, does it run the
-  capability-resolved program under `tools/real-bin`. **Why**: a bootstrap program is whatever the host's profile
-  pinned. Measured 2026-10-21: the wrapper ran the home-manager profile's Bun 1.4.2 in a repository whose
-  `packageManager` and devenv shell are Bun 1.4.3, and 1.4.2 truncates the stdout of a `console.log` followed by exit at
-  768 KiB where 1.4.3 delivers it whole, so a sandboxed test did not test what the gate tests.
+  capability-resolved program under `tools/real-bin` beside the PATH directory that reached the wrapper. **Why**: a
+  bootstrap program is whatever the host's profile pinned. Measured 2026-10-21: the wrapper ran the home-manager
+  profile's Bun 1.4.2 in a repository whose `packageManager` and devenv shell are Bun 1.4.3, and 1.4.2 truncates the
+  stdout of a `console.log` followed by exit at 768 KiB where 1.4.3 delivers it whole, so a sandboxed test did not test
+  what the gate tests.
+
+  The wrapper knows itself and its workspace from its own executable, never from the environment: every
+  `tools/manager-bin` link names the exec host the supervisor staged at `<workspace>/.cowshed/shell-host/<file>`, which
+  no job can write, so the staged file's identity is the wrapper's and its location names the workspace. A job's
+  environment is the job's to replace. **Why**: a test that spawns `bun` with only `PATH` and `HOME` still finds the
+  wrapper first on that PATH; measured 2026-10-21, when the wrapper read its route and workspace from variables, every
+  such child exited 126 ("managed package manager has no wrapper route"), 91 in one nx-plugin suite, where the host
+  route runs the same command.
 
   When the root `package.json` declares `packageManager` as `<name>@<version>` for the invoked manager (an integrity
   suffix after `+` is not part of the version), the wrapper compares the version that program prints for `--version`
@@ -189,7 +198,8 @@ Each detector returns data through one `CapabilityContribution`:
   cannot be read or parsed, or a declaration that is not `<name>@<version>`, refuses. The exec host asks the program its
   activated PATH names once per activation and exports the answer as `COWSHED_PACKAGE_MANAGER_REPORTED`,
   `<version> <dev>:<ino>` of the file that answered; the wrapper takes that answer for the same file and asks any other
-  file itself, so the commands of a warm shell start no extra process.
+  file itself, so the commands of a warm shell start no extra process, and a child that dropped the answer is asked
+  again.
 
   A first-argument install verb is covered immediately: Bun `install`, `i`, `add`, `remove`, `update`; npm `install`,
   `i`, `ci`, `add`, `uninstall`, `remove`, `update`; pnpm `install`, `i`, `add`, `remove`, `update`. Other invocations
