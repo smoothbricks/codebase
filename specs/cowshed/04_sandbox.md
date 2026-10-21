@@ -215,6 +215,18 @@ writes — but cannot add a permission absent from the enclosing execution profi
 ;; re-denies it and every `mktemp` fails on a path the child never chose.
 (allow file-read* file-read-data file-write* (subpath "<exec temp dir>"))
 
+;; Fixture roots, the one world-shared /tmp area a job may write ("Fixture roots under /tmp"): a fixture's
+;; short root with everything beneath it, the lock that serializes sweeps of dead runs' roots, and the Unix
+;; sockets a daemon binds inside a root. Canonical spelling only. The regex engine does not honor a {n}
+;; interval, so the two random characters are two classes. The roles that run workspace commands, in both
+;; modes; never controller Git.
+(allow file-read* file-read-data file-write*
+  (regex #"^/private/tmp/cx[0-9]+-[A-Za-z0-9][A-Za-z0-9](/|$)")
+  (literal "/private/tmp/cxsweep.lock"))
+(allow network-bind network-inbound network-outbound
+  (local unix-socket (path-regex #"^/private/tmp/cx[0-9]+-[A-Za-z0-9][A-Za-z0-9]/"))
+  (remote unix-socket (path-regex #"^/private/tmp/cx[0-9]+-[A-Za-z0-9][A-Za-z0-9]/")))
+
 ;; Secrets: denied after the scoped allows. The explicit file-read-data deny
 ;; is essential: a wildcard file-read* deny does not defeat the broad,
 ;; operation-specific file-read-data allow above, even when emitted later.
@@ -522,6 +534,54 @@ program, of every process its user runs, sibling workspaces' Nx daemons and the 
 profile rule closes it: `(deny sysctl*)` and `(deny process-info*)` both leave it readable. A secret in one workspace's
 process environment is therefore readable by every workspace of the same user. What the rule adds is other users'
 command lines, which macOS shows every local user.
+
+## Fixture roots under /tmp
+
+A test fixture that runs a real Nx daemon keeps the daemon's Unix sockets inside the fixture's own root, and a socket
+path is bounded by `sun_path`, 104 bytes on macOS. A root under the job's `TMPDIR`,
+`<store>/<owner>/<repo>/tmp/<workspace>` (01_storage.md), can leave no room for the socket names beneath it, and the
+workspace's short runtime link, `/tmp/cs-<digest>`, reaches only the workspace's own runtime directory. A fixture that
+keeps its root under `TMPDIR` and reaches its sockets through a short alias in that admitted runtime namespace needs
+nothing here (08_testing.md). A fixture whose root itself must be short takes the root directly under `/tmp`, in this
+namespace and nowhere else.
+
+The baseline denies every other write to the world-shared `/private/tmp`. Exactly these names are carved back for the
+two roles that run workspace commands, the trusted supervisor and the executed child, in both modes: a read-only job
+keeps its source tree read-only, and a root is scratch outside every checkout, like the exec temp dir it also writes.
+
+- **A root.** `/private/tmp/cx<pid>-<two alphanumerics>`: `cx`, a decimal pid, a dash and two characters of
+  `[A-Za-z0-9]`. The root and everything beneath it are readable and writable: create, rename, unlink and `rmdir`, the
+  root itself included. The pid names the process that made the root and removes it, so a later run can tell the root a
+  dead run left from a live run's.
+- **Its sockets.** Unix-socket bind, listen, accept and connect at any depth beneath a root, spelled through `/tmp` or
+  through a symlink inside the root that resolves there.
+- **The sweep lock.** The one file `/private/tmp/cxsweep.lock`, readable and writable. A run that reclaims dead roots
+  holds an exclusive `flock` on it, so each root is reclaimed once.
+
+The grant adds nothing else. `/tmp` gains no write, no metadata for any other entry and no listing authority beyond what
+the broad `file-read-data` allow already gives, which is all a sweep needs to find roots by name. A name that differs
+from the pattern is another name and stays denied: three characters after the dash, one, or a character outside the
+alphabet, no pid, no dash, a longer prefix, a suffix such as `.old`, `cxsweep.lock.bak`, or the same root name under
+`/private/var/tmp`. A dead run's root with a longer suffix is therefore outside the namespace: a sandboxed sweep cannot
+reclaim it, and an unsandboxed one must. A root cannot be renamed out of the namespace. A `..` or a symlink inside a
+root that names a path outside it gives nothing, because the resolved target decides, and hard links stay denied
+(`file-link`). Controller Git's roles carry none of it.
+
+The paths are canonical because Seatbelt matches the resolved path, so a `/tmp` spelling reaches the same rule. The
+names are regular expressions because no other SBPL filter names a pattern, and the engine does not honor a `{n}`
+interval (measured: `[A-Za-z0-9]{2}` compiles and does not match `ab`), so the two random characters are two classes. A
+profile is rendered for a workspace, not for a job, so it cannot name the pid of a job that does not exist yet. The pid
+is therefore a convention the fixture's sweep keeps and not a boundary: any job of any workspace of this user can read
+and write any root so named, as any process of that user outside a sandbox already can. A root is scratch its test owns
+and removes on every way out, and nothing secret belongs in one.
+
+`cowshed-core`'s host-controller probe
+`host_controller_seatbelt_admits_only_pid_named_fixture_roots_and_the_sweep_lock_in_tmp` runs both roles under the
+kernel. It makes a root through `/tmp`, builds the short alias beside real leaves, writes, renames and lists through it,
+binds and connects a Unix socket through the alias, appends to the lock and removes the root. It then asserts that every
+lookalike above, a write inside a lookalike directory that already exists, an escape by `..`, by symlink and by rename,
+and a hard link are each refused with `EPERM` and leave nothing behind, and that controller Git's profile refuses even a
+well-formed root. A text test pins the rules to the two roles and to their place before the secret denies.
 
 ## Grants
 
@@ -951,10 +1011,11 @@ checkout, because a tool may need scratch space outside the project it builds (a
 not sit under the project root), and outside the image, so a clone starts with an empty one and never copies another
 workspace's scratch. It is keyed by the workspace's name like its checkpoints, survives a restore, and goes when the
 retired image is reclaimed (`rm`, or `gc` for a retirement a crash stranded). The child may write these scoped
-directories, but the baseline still denies writes to the world-shared `/private/tmp` and to the host user's own
-temporary directory under `/private/var/folders`; shell activation does not require a blanket temporary-directory grant.
-A process that reaches a temporary directory by any other route than `TMPDIR` finds none it can write: `xcrun`, for one,
-then fails to create its cache, prints its `mkstemp` path, and resolves every lookup the slow way.
+directories, but the baseline still denies writes to the world-shared `/private/tmp`, apart from the fixture roots of
+[Fixture roots under /tmp](#fixture-roots-under-tmp), and to the host user's own temporary directory under
+`/private/var/folders`; shell activation does not require a blanket temporary-directory grant. A process that reaches a
+temporary directory by any other route than `TMPDIR` finds none it can write: `xcrun`, for one, then fails to create its
+cache, prints its `mkstemp` path, and resolves every lookup the slow way.
 
 Nx receives a real `nx` child directory below the short runtime alias through `NX_SOCKET_DIR`. Its `O_NOFOLLOW`
 admission rejects a symlink at the leaf, so the alias itself is not its socket directory. Nx does not use
@@ -1283,6 +1344,9 @@ untouched-artifact assertions:
   CoreSimulator — the safe default, 14_nix.md);
 - under the "simulator" preset: assert filesystem and network authority are unwidened (the preset opens CoreSimulator
   IPC only);
+- write beside a fixture root in `/tmp`: a lookalike name, a directory a lookalike already names, `..`, a symlink pivot
+  and a rename out of the namespace, each refused and leaving nothing behind, while the exact root, a Unix socket
+  beneath it and the sweep lock are admitted;
 - write through `/tmp` symlinks into denied paths; abuse `file-map-executable` scratch dirs;
 - exec a set-user-ID program other than `/bin/ps` (must EPERM) while `/bin/ps -E` reads the start environment of a Node
   daemon the job started;

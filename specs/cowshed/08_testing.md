@@ -309,6 +309,16 @@ not a symlink. Workspace ownership is established by physical containment, so th
 unchanged. The fixture stops its daemon before unlinking its verified alias and removing its root. Bind and connect are
 proved under the real sandbox's long store `TMPDIR`, not only a host runner's short temporary directory.
 
+A sandboxed Rust fixture whose root itself must be short, because a real Nx daemon binds its sockets inside the root,
+takes it under the fixture namespace of 04_sandbox.md, "Fixture roots under /tmp": `/tmp/cx<pid>-<two alphanumerics>`,
+named for the pid of the process that owns it and reclaimed by pid once that process is gone, under the
+`/tmp/cxsweep.lock` that serializes the reclaiming. The grant is proved at the kernel in the host-controller lane,
+because a nested profile cannot add what an enclosing sandbox lacks.
+`host_controller_seatbelt_admits_only_pid_named_fixture_roots_and_the_sweep_lock_in_tmp` makes, writes, renames, lists,
+binds a socket in and removes such a root under the supervisor and child profiles, and refuses its lookalikes, a write
+beside it and an escape from it. The probe removes every entry it made in `/tmp` on every exit path, a failed assertion
+included, and leaves the shared lock, which belongs to every sweep.
+
 Nx backend host-controller fixtures run the package's server bundle, `dist/server/nx-cache-server.js` from
 `nx run nx-cache-server:bundle`, under the `bun` on the test's `PATH`, bound on an ephemeral loopback listener owned by
 the fixture. The core ignored protocol fixture,

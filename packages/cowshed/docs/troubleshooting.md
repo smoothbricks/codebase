@@ -145,6 +145,12 @@ and the gateway audit events for egress (Arrow segments under `/private/cowshed/
   instead of ENOENT (Determinate Nix probes an optional `sentry-endpoint`). Workspace profiles grant read-only metadata
   on `/etc/nix` — both spellings, since `/etc` resolves to `/private/etc` — and on nothing else in `/etc`, so a cowshed
   that still shows this predates that rule. Never grant `/etc` to work around it.
+- **A test fixture gets "Operation not permitted" writing `/tmp`**: the baseline denies every write to the world-shared
+  `/tmp` except a fixture's short root, `/tmp/cx<pid>-<two letters or digits>` with everything beneath it (Unix sockets
+  included), and the lock `/tmp/cxsweep.lock`. A name one character off is another name and stays denied: three
+  characters after the dash, a missing dash, a suffix such as `.old`, or the same name under `/var/tmp`. Keep other
+  scratch in `$TMPDIR` and never grant `/tmp`; the spec states the
+  [namespace](../../../specs/cowshed/04_sandbox.md#fixture-roots-under-tmp).
 - **Denial persists after a grant**: filesystem grants apply from the _next_ exec; a long-running process (watcher, dev
   server) keeps its launch-time profile. Restart that process.
 

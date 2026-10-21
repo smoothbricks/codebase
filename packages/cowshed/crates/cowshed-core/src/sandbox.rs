@@ -744,6 +744,38 @@ impl SeatbeltProfile {
 /// this user's processes alone, which every job already reads through `kern.procargs2`.
 const PROCESS_STATUS_EXEC: &str = "(allow process-exec (literal \"/bin/ps\") (with no-sandbox))";
 
+/// Where a fixture's short root lies: directly under the world-shared `/tmp`, spelled canonically
+/// because Seatbelt matches the resolved path and `/tmp` is a symlink to `/private/tmp`.
+const FIXTURE_PARENT: &str = "/private/tmp";
+
+/// What starts a fixture's names beneath [`FIXTURE_PARENT`]: the root `cx<pid>-<2 alphanumerics>`
+/// its process creates and removes with everything beneath it, and the `cxsweep.lock` that
+/// serializes reclaiming a dead run's roots (04_sandbox.md, "Fixture roots under /tmp"). It holds
+/// no regex metacharacter.
+const FIXTURE_PREFIX: &str = "cx";
+
+/// The one place a job writes in `/tmp`: a fixture root and what lies beneath it, the sweep lock,
+/// and the Unix sockets a daemon binds inside a root. Only these spellings match, so a lookalike
+/// name and every other entry of `/tmp` stay denied. A regex is the one SBPL filter that names a
+/// pattern, and its engine does not honor a `{n}` interval (measured: `[A-Za-z0-9]{2}` compiles
+/// and does not match `ab`), so the two random characters are two classes. The sweep reads
+/// `/tmp`'s names with the `file-read-data` the broad allow already grants; no other entry gains
+/// metadata.
+fn push_fixture_root_rules(profile: &mut String) {
+    let root = format!("^{FIXTURE_PARENT}/{FIXTURE_PREFIX}[0-9]+-[A-Za-z0-9][A-Za-z0-9]");
+    let lock = format!("{FIXTURE_PARENT}/{FIXTURE_PREFIX}sweep.lock");
+    push_line(
+        profile,
+        &format!("(allow file-read* file-write* (regex #\"{root}(/|$)\") (literal \"{lock}\"))"),
+    );
+    push_line(
+        profile,
+        &format!(
+            "(allow network-bind network-inbound network-outbound (local unix-socket (path-regex #\"{root}/\")) (remote unix-socket (path-regex #\"{root}/\")))"
+        ),
+    );
+}
+
 /// Generate a complete, deterministic SBPL profile for one authority tier.
 ///
 /// Paths must already be canonical controller data. Child argv, environment,
@@ -1227,7 +1259,7 @@ pub fn seatbelt_profile(
         }
     }
     // Generic short runtime links resolve to the mode's own runtime directory. Only metadata
-    // on their exact names is allowed, never a /tmp listing.
+    // on their exact names is allowed, never metadata for the rest of /tmp.
     let runtime_name = runtime_link
         .file_name()
         .expect("runtime link has a file name");
@@ -1238,6 +1270,16 @@ pub fn seatbelt_profile(
             "allow file-read-metadata",
             &Path::new(tmp).join(runtime_name),
         )?;
+    }
+
+    // The one world-shared `/tmp` area a job writes: a fixture's short root and its sweep lock
+    // (04_sandbox.md, "Fixture roots under /tmp"). Controller Git keeps its narrower write
+    // boundary.
+    if !matches!(
+        role,
+        SandboxProfileRole::GitDiscovery | SandboxProfileRole::GitDiscoveryGitOnly
+    ) {
+        push_fixture_root_rules(&mut profile);
     }
 
     for deny in secrets {
@@ -3806,6 +3848,327 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&header.stdout)
         );
+    }
+
+    /// A job writes `/tmp` nowhere but a fixture's short root, the sweep lock beside the roots and
+    /// the Unix sockets beneath a root: both roles that run workspace commands carry exactly those
+    /// two rules in either mode, controller Git's roles carry neither, and no write rule names
+    /// `/tmp` itself. The rules follow the store deny and precede the secret denies, so
+    /// last-match-wins leaves them as emitted.
+    #[test]
+    fn the_fixture_namespace_is_the_only_tmp_write_and_only_workspace_commands_carry_it() {
+        let files = "(allow file-read* file-write* (regex #\"^/private/tmp/cx[0-9]+-[A-Za-z0-9][A-Za-z0-9](/|$)\") (literal \"/private/tmp/cxsweep.lock\"))";
+        let sockets = "(allow network-bind network-inbound network-outbound (local unix-socket (path-regex #\"^/private/tmp/cx[0-9]+-[A-Za-z0-9][A-Za-z0-9]/\")) (remote unix-socket (path-regex #\"^/private/tmp/cx[0-9]+-[A-Za-z0-9][A-Za-z0-9]/\")))";
+        let store_deny = "(deny file-read* file-write* (subpath \"/private/cowshed\"))";
+        for mode in [RunSandboxMode::ReadOnly, RunSandboxMode::ReadWrite] {
+            for role in [
+                SandboxProfileRole::TrustedSupervisor,
+                SandboxProfileRole::ExecutedChild,
+                SandboxProfileRole::GitDiscovery,
+                #[cfg(target_os = "macos")]
+                SandboxProfileRole::GitDiscoveryGitOnly,
+            ] {
+                let profile = seatbelt_profile(&config(mode), role).unwrap().into_text();
+                let carries = matches!(
+                    role,
+                    SandboxProfileRole::TrustedSupervisor | SandboxProfileRole::ExecutedChild
+                );
+                for rule in [files, sockets] {
+                    assert_eq!(
+                        profile.lines().filter(|line| *line == rule).count(),
+                        usize::from(carries),
+                        "{mode:?} {role:?}: {rule}"
+                    );
+                }
+                for line in profile.lines().filter(|line| line.contains("file-write")) {
+                    for blanket in [
+                        "(literal \"/tmp\")",
+                        "(subpath \"/tmp\")",
+                        "(literal \"/private/tmp\")",
+                        "(subpath \"/private/tmp\")",
+                    ] {
+                        assert!(
+                            !line.contains(blanket),
+                            "{mode:?} {role:?} writes all of /tmp: {line}"
+                        );
+                    }
+                }
+                if carries {
+                    let rule = profile.find(files).unwrap();
+                    let after_store = profile.find(store_deny).unwrap();
+                    let before_secrets = profile.rfind("/Users/tester/.ssh").unwrap();
+                    assert!(
+                        after_store < rule && rule < before_secrets,
+                        "{mode:?} {role:?} must follow the store deny and precede the secret denies"
+                    );
+                }
+            }
+        }
+    }
+
+    /// What a probe made in the world-shared `/tmp`, removed however the test ends, a failed
+    /// assertion included: a leaked root is one more entry every fixture sweep has to read.
+    #[cfg(target_os = "macos")]
+    struct ProbeEntries(Vec<PathBuf>);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for ProbeEntries {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let removed = match fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
+                    Ok(_) => fs::remove_file(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => Err(error),
+                };
+                match removed {
+                    Ok(()) => {}
+                    // The unwinding test already reports its own failure; a second panic would
+                    // abort it.
+                    Err(error) if std::thread::panicking() => {
+                        eprintln!("remove probe entry {}: {error}", path.display());
+                    }
+                    Err(error) => panic!("remove probe entry {}: {error}", path.display()),
+                }
+            }
+        }
+    }
+
+    /// `argv` under `profile`, started in `workspace`.
+    #[cfg(target_os = "macos")]
+    fn under_profile(profile: &str, workspace: &Path, argv: &[&str]) -> std::process::Output {
+        std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", profile, "--"])
+            .args(argv)
+            .current_dir(workspace)
+            .output_locked()
+            .unwrap()
+    }
+
+    /// What a daemon and its client do with a Unix socket: bind one at the path given, connect to
+    /// it and say so. Perl's `IO::Socket::UNIX` is a system tool with no shim in front of it.
+    #[cfg(target_os = "macos")]
+    const SOCKET_SCRIPT: &str = "use IO::Socket::UNIX; use Socket; my $path = shift; unlink $path; \
+        my $server = IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => $path, Listen => 1) \
+        or die \"bind $path: $!\\n\"; \
+        my $client = IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $path) \
+        or die \"connect $path: $!\\n\"; print \"ok\\n\";";
+
+    /// The listing a fixture sweep reads to find roots: whether `/tmp` names the entry given.
+    #[cfg(target_os = "macos")]
+    const LISTING_SCRIPT: &str = "opendir(my $tmp, '/tmp') or die \"opendir /tmp: $!\\n\"; \
+        my $name = shift; \
+        print((grep { $_ eq $name } readdir($tmp)) ? \"found\\n\" : \"missing\\n\");";
+
+    /// What `profile` admits in `/tmp` and what it refuses there, each proved by a command the
+    /// kernel runs under it in `workspace`. Every refusal is the profile's own (`EPERM`) and leaves
+    /// nothing behind.
+    #[cfg(target_os = "macos")]
+    fn assert_fixture_namespace(profile: &str, workspace: &Path, entries: &mut ProbeEntries) {
+        let pid = std::process::id();
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let tag = &tag[..2];
+        let at = |name: String| format!("/tmp/{name}");
+        let name = format!("{FIXTURE_PREFIX}{pid}-{tag}");
+        let root = at(name.clone());
+        let lock = at(format!("{FIXTURE_PREFIX}sweep.lock"));
+        let stale_lock = format!("{lock}2");
+        // Each of these differs from a root's spelling by one character, or sits beside it.
+        let lookalikes = [
+            format!("{FIXTURE_PREFIX}{pid}-{tag}x"),
+            format!("{FIXTURE_PREFIX}{pid}-{}", &tag[..1]),
+            format!("{FIXTURE_PREFIX}-{tag}"),
+            format!("{FIXTURE_PREFIX}{pid}{tag}"),
+            format!("x{FIXTURE_PREFIX}{pid}-{tag}"),
+            format!("{FIXTURE_PREFIX}{pid}-{tag}.old"),
+            format!("{FIXTURE_PREFIX}{pid}-{}_", &tag[..1]),
+            format!("{FIXTURE_PREFIX}sweep"),
+            format!("{FIXTURE_PREFIX}sweep.lock.bak"),
+            format!("outside-{pid}-{tag}"),
+        ]
+        .map(at);
+        // Lookalike directories that already exist, so a write inside one is refused for its name
+        // and not for want of a directory.
+        let premade = [
+            format!("{FIXTURE_PREFIX}{pid}-{tag}y"),
+            format!("{FIXTURE_PREFIX}{pid}-{tag}-evil"),
+        ]
+        .map(at);
+        let other_parent = format!("/private/var/tmp/{name}");
+        let canonical_outside = format!("/private/tmp/outside-canonical-{pid}-{tag}");
+        let dotdot_target = at(format!("outside-dotdot-{pid}-{tag}"));
+        let pivot_target = at(format!("pivot-{pid}-{tag}"));
+        let moved = at(format!("moved-{pid}-{tag}"));
+        for path in [
+            &root,
+            &stale_lock,
+            &other_parent,
+            &canonical_outside,
+            &dotdot_target,
+            &pivot_target,
+            &moved,
+        ]
+        .into_iter()
+        .chain(&lookalikes)
+        .chain(&premade)
+        {
+            entries.0.push(PathBuf::from(path));
+        }
+        for directory in &premade {
+            fs::create_dir(directory).unwrap();
+        }
+
+        let allowed = |argv: &[&str]| {
+            let output = under_profile(profile, workspace, argv);
+            assert!(
+                output.status.success(),
+                "{argv:?} must be admitted: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let refused = |argv: &[&str]| {
+            let output = under_profile(profile, workspace, argv);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success() && stderr.contains("Operation not permitted"),
+                "{argv:?} must be refused by the profile: {stderr}"
+            );
+        };
+        let absent = |path: &str| {
+            assert!(fs::symlink_metadata(path).is_err(), "{path} must not exist");
+        };
+
+        // A root as a fixture builds it: through `/tmp`, a short alias beside real leaves, then
+        // written, renamed, listed and bound through the alias.
+        allowed(&["/bin/mkdir", &root]);
+        allowed(&["/bin/mkdir", "-p", &format!("{root}/.cowshed/run/nx")]);
+        allowed(&[
+            "/bin/ln",
+            "-s",
+            &format!("{root}/.cowshed/run"),
+            &format!("{root}/r"),
+        ]);
+        assert_eq!(
+            fs::read_link(format!("{root}/r")).unwrap(),
+            PathBuf::from(format!("{root}/.cowshed/run"))
+        );
+        let state = format!("{root}/r/nx/state");
+        allowed(&["/bin/sh", "-c", "printf hello > \"$1\"", "sh", &state]);
+        assert_eq!(
+            fs::read(format!("{root}/.cowshed/run/nx/state")).unwrap(),
+            b"hello"
+        );
+        assert_eq!(allowed(&["/bin/cat", &state]), "hello");
+        allowed(&["/bin/mv", &state, &format!("{root}/moved")]);
+        assert_eq!(fs::read(format!("{root}/moved")).unwrap(), b"hello");
+        absent(&format!("{root}/.cowshed/run/nx/state"));
+        assert_eq!(
+            allowed(&[
+                "/usr/bin/perl",
+                "-e",
+                SOCKET_SCRIPT,
+                &format!("{root}/r/nx/d.sock")
+            ]),
+            "ok\n"
+        );
+        assert_eq!(
+            allowed(&["/usr/bin/perl", "-e", LISTING_SCRIPT, &name]),
+            "found\n"
+        );
+        allowed(&["/bin/sh", "-c", ": >> \"$1\"", "sh", &lock]);
+        allowed(&["/bin/mkdir", &format!("/private{root}/canonical")]);
+
+        // Nothing else in `/tmp` is writable, and no other spelling is a root or the lock.
+        for lookalike in &lookalikes {
+            refused(&["/bin/mkdir", lookalike]);
+            absent(lookalike);
+        }
+        refused(&["/bin/sh", "-c", ": >> \"$1\"", "sh", &stale_lock]);
+        absent(&stale_lock);
+        refused(&["/usr/bin/touch", &canonical_outside]);
+        absent(&canonical_outside);
+        refused(&["/usr/bin/touch", &other_parent]);
+        absent(&other_parent);
+        for directory in &premade {
+            let inside = format!("{directory}/file");
+            refused(&["/usr/bin/touch", &inside]);
+            absent(&inside);
+            let socket = format!("{directory}/s.sock");
+            refused(&["/usr/bin/perl", "-e", SOCKET_SCRIPT, &socket]);
+            absent(&socket);
+        }
+
+        // Nothing inside a root reaches outside it: `..` and a symlink resolve to the path they
+        // name, which decides; a root cannot be renamed out; hard links stay denied.
+        refused(&[
+            "/bin/mkdir",
+            &format!("{root}/../outside-dotdot-{pid}-{tag}"),
+        ]);
+        absent(&dotdot_target);
+        allowed(&["/bin/ln", "-s", "/tmp", &format!("{root}/up")]);
+        refused(&["/usr/bin/touch", &format!("{root}/up/pivot-{pid}-{tag}")]);
+        absent(&pivot_target);
+        refused(&["/bin/mv", &root, &moved]);
+        absent(&moved);
+        assert!(
+            fs::symlink_metadata(&root).is_ok(),
+            "{root} stays where it is"
+        );
+        allowed(&[
+            "/bin/sh",
+            "-c",
+            "printf x > \"$1\"",
+            "sh",
+            &format!("{root}/linked"),
+        ]);
+        refused(&[
+            "/bin/ln",
+            &format!("{root}/linked"),
+            &format!("{root}/hard"),
+        ]);
+        absent(&format!("{root}/hard"));
+
+        // What a sweep does to a dead run's root, by the one operation that does it.
+        allowed(&["/bin/rm", "-rf", &root]);
+        absent(&root);
+    }
+
+    /// The kernel enforces the fixture namespace the profile states (04_sandbox.md, "Fixture roots
+    /// under /tmp"): the supervisor's and the child's profiles admit a pid-named root with its
+    /// alias, files and sockets, and the sweep lock; they refuse every lookalike, a write beside a
+    /// root and an escape from one; and controller Git's profile refuses even a well-formed root.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_seatbelt_admits_only_pid_named_fixture_roots_and_the_sweep_lock_in_tmp() {
+        let (root, mut config, _) = host_child_profile("fixture-root");
+        let mut entries = ProbeEntries(vec![root]);
+        for (mode, role) in [
+            (RunSandboxMode::ReadWrite, SandboxProfileRole::ExecutedChild),
+            (
+                RunSandboxMode::ReadWrite,
+                SandboxProfileRole::TrustedSupervisor,
+            ),
+            (RunSandboxMode::ReadOnly, SandboxProfileRole::ExecutedChild),
+        ] {
+            config.mode = mode;
+            let profile = seatbelt_profile(&config, role).unwrap().into_text();
+            assert_fixture_namespace(&profile, &config.workspace_mount, &mut entries);
+        }
+
+        let git = seatbelt_profile(&config, SandboxProfileRole::GitDiscovery)
+            .unwrap()
+            .into_text();
+        let well_formed = format!("/tmp/{FIXTURE_PREFIX}{}-gt", std::process::id());
+        entries.0.push(PathBuf::from(&well_formed));
+        let made = under_profile(&git, &config.workspace_mount, &["/bin/mkdir", &well_formed]);
+        assert!(
+            !made.status.success()
+                && String::from_utf8_lossy(&made.stderr).contains("Operation not permitted"),
+            "controller Git must not make a fixture root: {made:?}"
+        );
+        assert!(fs::symlink_metadata(&well_formed).is_err());
     }
 
     /// A child whose stdout is the null device can fstat it. Runtimes classify their stdio
