@@ -537,8 +537,8 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use crate::workspace_environment::{
-        DEV_CI_POLICY, PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, RUNTIME_LINK_ENV, TEMP_DIR_ENV,
-        WORKSPACE_TOKEN_ENV,
+        DEV_CI_POLICY, NX_REMOTE_SERVER_ENV, NX_REMOTE_TOKEN_ENV, PORT_BASE_ENV,
+        PORT_BLOCK_SIZE_ENV, RUNTIME_LINK_ENV, TEMP_DIR_ENV, WORKSPACE_TOKEN_ENV,
     };
 
     use super::*;
@@ -585,11 +585,14 @@ mod tests {
         root
     }
 
+    /// The token reaches `.cowshed/env` only as the Nx cache route's bearer, so an Nx checkout's
+    /// environment is the one a rotation rewrites; the bare `COWSHED_WORKSPACE_TOKEN` is never in it.
     #[test]
     fn token_rotation_rewrites_the_in_image_environment() {
         let root = test_root("environment-rotation");
         let image_mount = root.join("image");
         fs::create_dir(&image_mount).expect("image mount");
+        fs::write(image_mount.join("nx.json"), "{}").expect("Nx checkout");
         let key_path = root.join("raven.ca.key");
         let workspace = workspace("00112233445566778899aabbccddeeff");
         let port_block = crate::metadata::PortBlock::new(40_960, 16).expect("port block");
@@ -609,7 +612,7 @@ mod tests {
         assert_eq!(
             first_environment,
             format!(
-                "{DEV_CI_POLICY}export {WORKSPACE_TOKEN_ENV}={first_token}\nexport {PORT_BASE_ENV}=40960\nexport {PORT_BLOCK_SIZE_ENV}=16\nunset {RUNTIME_LINK_ENV}\n"
+                "{DEV_CI_POLICY}export {PORT_BASE_ENV}=40960\nexport {PORT_BLOCK_SIZE_ENV}=16\nexport {NX_REMOTE_SERVER_ENV}=http://127.0.0.1:40960/nx\nexport {NX_REMOTE_TOKEN_ENV}={first_token}\nunset {RUNTIME_LINK_ENV}\n"
             )
         );
 
@@ -628,10 +631,10 @@ mod tests {
         assert_ne!(second_token, first_token);
         assert_ne!(second_environment, first_environment);
         assert!(
-            second_environment
-                .contains(&format!("export COWSHED_WORKSPACE_TOKEN={second_token}\n"))
+            second_environment.contains(&format!("export {NX_REMOTE_TOKEN_ENV}={second_token}\n"))
         );
         assert!(!second_environment.contains(&first_token));
+        assert!(!second_environment.contains(WORKSPACE_TOKEN_ENV));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -677,7 +680,7 @@ mod tests {
         assert_eq!(
             fs::read_to_string(image_mount.join(".cowshed/env")).expect("environment"),
             format!(
-                "{DEV_CI_POLICY}export {WORKSPACE_TOKEN_ENV}={token}\nexport {PORT_BASE_ENV}=40976\nexport {PORT_BLOCK_SIZE_ENV}=16\nexport {TEMP_DIR_ENV}='{}'\nexport {RUNTIME_LINK_ENV}={}\nexport PATH='{}'\"${{PATH:+:}}${{PATH-}}\"\n",
+                "{DEV_CI_POLICY}export {PORT_BASE_ENV}=40976\nexport {PORT_BLOCK_SIZE_ENV}=16\nexport {TEMP_DIR_ENV}='{}'\nexport {RUNTIME_LINK_ENV}={}\nexport PATH='{}'\"${{PATH:+:}}${{PATH-}}\"\n",
                 temp_dir.display(),
                 crate::sandbox::workspace_runtime_link(&image_mount).display(),
                 crate::host_dirs::installed_binary_directory(&root).display()
@@ -710,10 +713,9 @@ mod tests {
         let token = fs::read_to_string(image_mount.join(WORKSPACE_TOKEN_PATH)).expect("token");
         assert_eq!(
             environment,
-            format!(
-                "{DEV_CI_POLICY}export {WORKSPACE_TOKEN_ENV}={token}\nunset {RUNTIME_LINK_ENV}\n"
-            )
+            format!("{DEV_CI_POLICY}unset {RUNTIME_LINK_ENV}\n")
         );
+        assert!(!environment.contains(&token));
         assert!(!environment.contains("COWSHED_PORT_BASE"));
         assert!(!environment.contains("COWSHED_PORT_BLOCK_SIZE"));
 

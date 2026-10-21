@@ -240,10 +240,11 @@ package-specific proxy agent is required.
 
 No wiring file carries the token. The proxy variables carry it as userinfo, which the client turns into
 `Proxy-Authorization: Basic` itself: a generic proxy client has no cowshed configuration file and no way to add a
-header. That exports no authority into the sandbox that `COWSHED_WORKSPACE_TOKEN` does not already give it, and the
-token still authenticates against nothing but that workspace's own endpoint. The compatibility listener provides
-reachability, not identity or authority: endpoint/socket selection plus the token still authenticate, and gateway policy
-still authorizes.
+header. No job environment and no `.cowshed/env` carries it bare as `COWSHED_WORKSPACE_TOKEN`; `.cowshed/workspace.json`
+marks a workspace. The token is readable by a sandboxed sibling through `kern.procargs2`, and is still worth nothing
+there: the sibling cannot connect to this workspace's endpoint, and its own endpoint answers this token with 407. The
+compatibility listener provides reachability, not identity or authority: endpoint/socket selection plus the token still
+authenticate, and gateway policy still authorizes.
 
 The workspace's public CA certificate is installed as a server trust anchor for supported tool families. Its private key
 never enters a mount. macOS-native TLS clients that ignore configured anchors must fail or use an explicitly granted

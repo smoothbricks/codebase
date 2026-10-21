@@ -1224,6 +1224,109 @@ async fn endpoint_identity_precedes_token_authentication() {
     gateway.drain().await.expect("drain gateway");
 }
 
+/// A token dies with its workspace's authority. Restore installs the next revision with a fresh
+/// token on the same endpoint, and removal frees the block for a later workspace that brings its
+/// own; either way the old token authenticates nowhere. The Nx cache route takes the same
+/// per-workspace token, so it refuses the old one as well.
+#[tokio::test]
+async fn a_restored_or_removed_workspace_token_authenticates_nowhere() {
+    use cowshed_gateway::NxCacheBackend;
+    let (upstream_port, _captured, _upstream) = http_fixture(4, None).await;
+    let (config, _cache) = test_config();
+    let gateway = gateway(
+        config,
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let handle = gateway.handle();
+    handle
+        .configure_nx_cache(NxCacheBackend {
+            repo_id: "owner/repo-revoked".to_owned(),
+            address: SocketAddr::from(([127, 0, 0, 1], upstream_port)),
+            read_token: WorkspaceToken::from_bytes([41; 32]),
+            write_token: WorkspaceToken::from_bytes([42; 32]),
+            reclaimed_staging_files: 0,
+        })
+        .await
+        .expect("configure project backend");
+    let policy = WorkspacePolicy {
+        grants: vec![grant("isolated.test", upstream_port)],
+        mirrors: Vec::new(),
+    };
+    let proxied = |endpoint: SocketAddr, token: &str| {
+        proxy_request(
+            endpoint,
+            absolute_request("isolated.test", upstream_port, token, "/allowed"),
+        )
+    };
+    let cached = |endpoint: SocketAddr, token: &str| {
+        proxy_request(endpoint, nx_request(endpoint, "GET", token, "42"))
+    };
+
+    let (original, original_token, _) = session(
+        "revoked",
+        "owner/repo-revoked",
+        block_endpoint(free_endpoint()),
+        1,
+        1,
+        policy.clone(),
+    );
+    let endpoint = install_in_free_block(&handle, original).await;
+    let response = proxied(endpoint, &original_token).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    // Restore: the next revision on the same endpoint, with a fresh token.
+    let (restored, restored_token, _) = session(
+        "revoked",
+        "owner/repo-revoked",
+        block_endpoint(endpoint),
+        2,
+        2,
+        policy.clone(),
+    );
+    handle.install(restored).await.expect("restore in place");
+    let response = proxied(endpoint, &original_token).await;
+    assert!(response.starts_with("HTTP/1.1 407"), "{response}");
+    let response = cached(endpoint, &original_token).await;
+    assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    let response = proxied(endpoint, &restored_token).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    // Removal: the freed block's next workspace mints its own token.
+    handle
+        .remove("revoked", 2)
+        .await
+        .expect("remove the workspace");
+    let (successor, successor_token, _) = session(
+        "successor",
+        "owner/repo-revoked",
+        block_endpoint(endpoint),
+        3,
+        1,
+        policy,
+    );
+    handle
+        .install(successor)
+        .await
+        .expect("a later workspace takes the freed block");
+    for stale in [&original_token, &restored_token] {
+        let response = proxied(endpoint, stale).await;
+        assert!(response.starts_with("HTTP/1.1 407"), "{response}");
+        let response = cached(endpoint, stale).await;
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    }
+    let response = proxied(endpoint, &successor_token).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let response = cached(endpoint, &successor_token).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    gateway.drain().await.expect("drain gateway");
+}
+
 #[tokio::test]
 async fn eight_intercept_tunnels_do_not_starve_their_own_registry_requests() {
     let (upstream_port, mut captured, _upstream) = http_fixture(8, None).await;

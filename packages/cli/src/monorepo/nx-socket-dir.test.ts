@@ -57,7 +57,7 @@ function cowshedCheckout(scratch: Scratch): void {
   mkdirSync(join(scratch.checkout, '.cowshed', 'run'), { recursive: true });
   writeFileSync(
     join(scratch.checkout, '.cowshed', 'env'),
-    `export COWSHED_WORKSPACE_TOKEN=token\nexport COWSHED_PORT_BASE=37376\nexport COWSHED_PORT_BLOCK_SIZE=64\nexport TMPDIR='${scratch.hostRuntime}'\nexport COWSHED_RUNTIME_LINK=${scratch.link}\n`,
+    `export COWSHED_PORT_BASE=37376\nexport COWSHED_PORT_BLOCK_SIZE=64\nexport TMPDIR='${scratch.hostRuntime}'\nexport COWSHED_RUNTIME_LINK=${scratch.link}\n`,
   );
 }
 

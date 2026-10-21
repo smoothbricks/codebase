@@ -1394,8 +1394,9 @@ fn developer_directory() -> Option<PathBuf> {
 /// Without it every CONNECT is rejected, and cargo reads the rejection as a spurious network error
 /// and retries its whole ladder before failing.
 ///
-/// This exports no authority the sandbox lacks: it also receives `COWSHED_WORKSPACE_TOKEN`, and
-/// the token authenticates against nothing but this workspace's own loopback port. The username is
+/// The token authenticates against nothing but this workspace's own loopback listener: a sibling
+/// that reads it from this workspace's process environment (`kern.procargs2`, 04_sandbox.md) can
+/// neither connect to that listener nor present it at its own, which answers 407. The username is
 /// a fixed label the gateway does not compare. The token's alphabet is unpadded base64url, which
 /// is userinfo-safe, so the value never needs percent-encoding.
 fn gateway_proxy_url(port_base: &str, workspace_token: &WorkspaceToken) -> String {
@@ -1895,7 +1896,10 @@ pub(super) async fn sandbox_environment(
         PORT_BLOCK_SIZE_ENV,
         OsStr::new(&sandbox.port_block.size().to_string()),
     );
-    own(WORKSPACE_TOKEN_ENV, OsStr::new(&encoded_token));
+    // The bare token is no job's to read: the proxy userinfo and the Nx route carry it where a
+    // client presents it, and `.cowshed/workspace.json` marks a workspace. A caller's stale value
+    // (a host shell that sourced an older `.cowshed/env`) is withheld, not forwarded.
+    withheld.push(WORKSPACE_TOKEN_ENV);
     if sandbox
         .capabilities
         .contribution
@@ -7898,6 +7902,11 @@ mod workspace_toolchain_tests {
         env.insert("CALLER_ONLY".to_owned(), "kept".to_owned());
         env.insert("NODE_USE_ENV_PROXY".to_owned(), "0".to_owned());
         env.insert("HOME".to_owned(), "/caller/home".to_owned());
+        // A host shell that sourced an older `.cowshed/env` still carries the bare token.
+        env.insert(
+            "COWSHED_WORKSPACE_TOKEN".to_owned(),
+            "caller-stale-token".to_owned(),
+        );
 
         let environment = sandbox_environment(&sandbox, &env)
             .await
@@ -7998,6 +8007,18 @@ mod workspace_toolchain_tests {
                 "{name}"
             );
         }
+        // No other name carries it: the bare `COWSHED_WORKSPACE_TOKEN` is neither exported nor
+        // forwarded from the caller, so a fork's inherited environment never holds it.
+        assert!(!vars.contains_key("COWSHED_WORKSPACE_TOKEN"));
+        let carriers: Vec<&str> = vars
+            .iter()
+            .filter(|(_, value)| value.contains(token.as_str()))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(
+            carriers,
+            ["HTTPS_PROXY", "HTTP_PROXY", "http_proxy", "https_proxy"]
+        );
         assert_eq!(
             vars.get("NODE_USE_ENV_PROXY").map(String::as_str),
             Some("1")

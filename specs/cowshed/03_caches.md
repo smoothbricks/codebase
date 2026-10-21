@@ -338,12 +338,14 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
 
 - **Environment variables.** Two sets, and neither is wiring a file could carry instead:
   - The in-image `.cowshed/env`, sourced by the workspace's `.envrc`, exports what processes cowshed never spawned need
-    and no file can give them: `COWSHED_WORKSPACE_TOKEN`, and on macOS the dev-server port conventions
-    `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE` (04_sandbox.md, cooperative-sandboxing caveat). A served mount
-    also publishes the sccache capability's client environment below, and Nx's `NX_MAX_CACHE_SIZE` default; explicit
-    caller cache-size overrides are preserved. Linux exports no port values: services use private loopback and
-    package/proxy wiring uses `http://127.0.0.1:7644`. No workspace-identity variable is exported; anything that needs
-    identity derives it from cwd via `.cowshed/workspace.json` or asks the CLI.
+    and no file can give them: on macOS the dev-server port conventions `COWSHED_PORT_BASE` and
+    `COWSHED_PORT_BLOCK_SIZE` (04_sandbox.md, cooperative-sandboxing caveat), and in an Nx checkout the local Nx cache
+    route's server and bearer, the bearer being the workspace token, because stock Nx takes it from nowhere else. It
+    never exports the bare token as `COWSHED_WORKSPACE_TOKEN`. A served mount also publishes the sccache capability's
+    client environment below, and Nx's `NX_MAX_CACHE_SIZE` default; explicit caller cache-size overrides are preserved.
+    Linux exports no port values: services use private loopback and package/proxy wiring uses `http://127.0.0.1:7644`.
+    No workspace-identity variable is exported; anything that needs identity derives it from cwd via
+    `.cowshed/workspace.json` or asks the CLI.
   - The supervisor sets, for every job it spawns (`runtime/supervisor.rs` `sandbox_environment`):
     - the private environment: `HOME`, `XDG_{CONFIG,CACHE,DATA,STATE}_HOME`, `DIRENV_CONFIG`, `TMPDIR` (the workspace's
       temp dir in the project store, 04_sandbox.md) and `XDG_RUNTIME_DIR`;
@@ -361,8 +363,9 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
       path; and for a Gradle project a private `GRADLE_USER_HOME` under the private cache whose `caches` links to the
       host's `~/.gradle/caches`, so the daemon, wrapper distributions, native libraries and JDKs stay private and no
       other part of the host `~/.gradle` is granted;
-    - the `.cowshed/env` set again (the token, the port pair), `SCCACHE_SERVER_UDS` and `SCCACHE_DIR` (the host sccache
-      daemon, below), and `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in both cases, carrying the token as proxy userinfo;
+    - the `.cowshed/env` set again (the port pair, and for an Nx project the cache route pair), `SCCACHE_SERVER_UDS` and
+      `SCCACHE_DIR` (the host sccache daemon, below), and `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in both cases, carrying
+      the token as proxy userinfo. A caller's `COWSHED_WORKSPACE_TOKEN` is withheld, not forwarded;
     - the build wiring, also emitted into `.cowshed/env` from the same sccache capability: `SCCACHE_BASEDIR_CWD=1`,
       `SCCACHE_BASEDIR=<workspace root>`, and `RUSTC_WRAPPER` naming `bin/sccache` inside the store path the host's
       sccache GC root pins, the program the daemon itself runs (below). It is read through the root before every spawn
@@ -379,9 +382,12 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     supervisor: no locale, terminal, Xcode selection, login `PATH`, `NX_*`, `VIRTUAL_ENV` or `CARGO_HOME` from another
     shell reaches a job, and a tool a build needs from the host user's home is declared in the workspace devenv instead.
 
-    No registry client receives the workspace token from a file: it travels only as proxy userinfo and as
-    `COWSHED_WORKSPACE_TOKEN`, and no file under the private `home`, `config` or `cache` carries it. The cargo `[env]`
-    guidance above mirrors `SCCACHE_SERVER_UDS` for cargo builds cowshed never spawned.
+    No registry client receives the workspace token from a file: it travels only as proxy userinfo, and to Nx as the
+    cache route's bearer. No job environment and no `.cowshed/env` carries it bare, and no file under the private
+    `home`, `config` or `cache` carries it. Within one workspace a child inherits its parent's proxy variables, token
+    included, by design; a fork's inherited shell export leaves the proxy variables and every token-bearing name out,
+    and the fork's own supervisor sets its own. The cargo `[env]` guidance above mirrors `SCCACHE_SERVER_UDS` for cargo
+    builds cowshed never spawned.
 
     **Paths under the checkout but outside the cwd.** sccache hashes every `CARGO_*` value and every env-dep value into
     a Rust key, and `SCCACHE_BASEDIR_CWD=1` normalizes only the request's cwd prefix. cargo runs a registry crate's

@@ -82,16 +82,30 @@ wrong-length values, and compares all 32 bytes in constant time. Missing or mism
 authentication refusal is 401 with exactly `Content-Type: text/plain`, and a proxy refusal uses the proxy's 407
 challenge.
 
+**What the token proves, and to whom.** The token is per workspace and authenticates only at that workspace's own
+endpoint: the selected listener compares the presented value with its own session's token alone, so a token is worth
+nothing at any other endpoint. It is not secret from the workspace's siblings. Seatbelt does not mediate
+`kern.procargs2` (04_sandbox.md), so a sandboxed sibling can read another workspace's proxy variables, token included.
+What holds is that the read token is unusable: the sibling's profile refuses a connection to another workspace's block
+(`EPERM`), and the sibling's own endpoint answers another workspace's token with 407. Another local uid sees no start
+environment of this user's processes (04_sandbox.md), and reaches a loopback listener only to get 407 without this
+workspace's token. An unsandboxed process of the owning uid can read `.cowshed/token` and reach the listener: that is
+the owner's own authority, not an attack, and is out of scope. If that ever stops being acceptable, the remedy is a
+separate uid for the gateway and its workspaces. The token is never exported bare: no job environment and no
+`.cowshed/env` carries `COWSHED_WORKSPACE_TOKEN` (03_caches.md), and `.cowshed/workspace.json` is what marks a
+workspace.
+
 Create and fork mint a token. Restore stops admissions, drains the Linux connector and gateway connections, kills the
 connector cgroup, rotates the token, unlinks/recreates the Linux socket and namespace-local connector when applicable,
 and atomically rewrites the in-image token before new execution is admitted. Detach performs the same drain, cgroup
 kill, and socket unlink without rotating persistent authority; attach creates the socket and connector before admitting
 execs. The old token and every pre-restore keep-alive or tunnel are therefore invalid immediately; a preserved macOS
-port does not preserve authority. A policy miss after successful endpoint and token authentication is 403 with a
-machine-parsable grant hint naming both remedies, the standing one first: `cowshed grant --project-wide --egress <host>`
-(every workspace of the project) or `cowshed grant <ws> --egress <host>` (that workspace). The hint names the bare
-canonical DNS name or IP address, never a CONNECT authority: the grant host grammar is shared with grant admission and
-exec (04_sandbox.md).
+port does not preserve authority. Remove uninstalls the session with its listener, so the removed workspace's token
+authenticates nowhere, including at a later workspace given the freed block, which mints its own. A policy miss after
+successful endpoint and token authentication is 403 with a machine-parsable grant hint naming both remedies, the
+standing one first: `cowshed grant --project-wide --egress <host>` (every workspace of the project) or
+`cowshed grant <ws> --egress <host>` (that workspace). The hint names the bare canonical DNS name or IP address, never a
+CONNECT authority: the grant host grammar is shared with grant admission and exec (04_sandbox.md).
 
 Main is a first-class data-plane client with identical platform wiring and policy. Gateway startup and absence are
 covered under "Availability and offline behavior".

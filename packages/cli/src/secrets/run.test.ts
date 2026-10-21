@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import typia from 'typia';
@@ -65,11 +65,9 @@ async function withRepo(
   const ambient = {
     CI: process.env.CI,
     GITHUB_ACTIONS: process.env.GITHUB_ACTIONS,
-    COWSHED_WORKSPACE_TOKEN: process.env.COWSHED_WORKSPACE_TOKEN,
   };
   delete process.env.CI;
   delete process.env.GITHUB_ACTIONS;
-  delete process.env.COWSHED_WORKSPACE_TOKEN;
   try {
     await writeFile(join(vault, 'REGISTRY_TOKEN'), 'registry-value');
     await writeFile(join(vault, 'NX_CACHE_TOKEN'), 'cache-value');
@@ -323,7 +321,8 @@ describe('smoo secrets run', () => {
 
   it('in a cowshed workspace, refuses a registry credential with gateway-enrollment guidance', async () => {
     await withRepo(async ({ root, invocations }) => {
-      process.env.COWSHED_WORKSPACE_TOKEN = 'gateway-session';
+      await mkdir(join(root, '.cowshed'), { recursive: true });
+      await writeFile(join(root, '.cowshed', 'workspace.json'), '{}');
 
       const { code, output } = await capture(async () => secretsRun(root, 'registry', recorder(root)));
 

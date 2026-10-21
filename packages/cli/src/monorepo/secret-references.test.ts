@@ -1,7 +1,7 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Secret reference fixtures are literal shell and workflow text. */
 import { describe, expect, it } from 'bun:test';
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
@@ -154,7 +154,7 @@ async function withProviderLedger(
 }
 /**
  * Runs one script against the raw module in a plain Bun child. The child env
- * carries only PATH/HOME so parent suite state (CI, workspace tokens) cannot
+ * carries only PATH/HOME so parent suite state (CI, GITHUB_ACTIONS) cannot
  * leak into the routing flags; every decision input travels through the
  * explicit request instead.
  */
@@ -229,6 +229,16 @@ async function withFixture(
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+}
+
+/**
+ * Marks `root` as a cowshed workspace: the in-workspace marker
+ * `.cowshed/workspace.json` (specs/cowshed/00_overview.md). The resolver reads
+ * only whether that file exists.
+ */
+async function markCowshedWorkspace(root: string): Promise<void> {
+  await mkdir(join(root, '.cowshed'), { recursive: true });
+  await writeFile(join(root, '.cowshed', 'workspace.json'), '{}');
 }
 
 describe('smoo.secrets shape validation', () => {
@@ -484,7 +494,8 @@ describe('resolveSecretEnvironment', () => {
 
           // And a cowshed workspace does not refuse it either: the gateway
           // rule is about registry credentials, and this is not one.
-          expect(await resolveInBootstrap({ root, env: { COWSHED_WORKSPACE_TOKEN: 'gateway-session' } })).toEqual({
+          await markCowshedWorkspace(root);
+          expect(await resolveInBootstrap({ root, env: {} })).toEqual({
             resolved: {},
             deferred: [
               {
@@ -548,7 +559,8 @@ describe('resolveSecretEnvironment', () => {
         secrets: { SMOO_NPM_TOKEN: { command: emit('LOCAL-RESOLVED-VALUE') } },
       },
       async (root) => {
-        const outcome = await resolveInBootstrap({ root, env: { COWSHED_WORKSPACE_TOKEN: 'gateway-session' } });
+        await markCowshedWorkspace(root);
+        const outcome = await resolveInBootstrap({ root, env: {} });
         expect(outcome.error).toContain('SMOO_NPM_TOKEN');
         expect(outcome.error).toContain('cowshed gateway');
         expect(outcome.error).not.toContain('LOCAL-RESOLVED-VALUE');
@@ -563,7 +575,8 @@ describe('resolveSecretEnvironment', () => {
         secrets: { SMOO_GENERIC: { command: emit('generic-tok') } },
       },
       async (root) => {
-        expect(await resolveInBootstrap({ root, env: { COWSHED_WORKSPACE_TOKEN: 'gateway-session' } })).toEqual({
+        await markCowshedWorkspace(root);
+        expect(await resolveInBootstrap({ root, env: {} })).toEqual({
           resolved: { SMOO_GENERIC: 'generic-tok' },
           deferred: [],
         });
@@ -713,11 +726,8 @@ describe('resolveSecretEnvironment', () => {
         async (root) => {
           // The gateway is the enrollment path there, so the wrapper does not
           // become a way around it.
-          const outcome = await resolveInBootstrap({
-            root,
-            env: { COWSHED_WORKSPACE_TOKEN: 'gateway-session' },
-            group: 'registry',
-          });
+          await markCowshedWorkspace(root);
+          const outcome = await resolveInBootstrap({ root, env: {}, group: 'registry' });
 
           expect(outcome.error).toContain('SMOO_NPM_TOKEN');
           expect(outcome.error).toContain('cowshed gateway');

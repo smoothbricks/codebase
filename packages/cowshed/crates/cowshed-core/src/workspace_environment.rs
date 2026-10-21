@@ -162,18 +162,16 @@ pub(crate) fn write_workspace_environment(
         EnvironmentMount::Minted(_) => 0,
     };
     let mut contents = Zeroizing::new(String::with_capacity(
-        384 + 2 * token.len()
+        384 + token.len()
             + DEV_CI_POLICY.len()
             + capability_bytes
             + installed_directory_text.map_or(0, |path| path.len() * 4 + 96)
             + served.as_ref().map_or(0, |(temp_dir, _)| temp_dir.len()),
     ));
     contents.push_str(DEV_CI_POLICY);
-    contents.push_str("export ");
-    contents.push_str(WORKSPACE_TOKEN_ENV);
-    contents.push('=');
-    contents.push_str(token);
-    contents.push('\n');
+    // No bare `COWSHED_WORKSPACE_TOKEN`: every shell that sources this file would hand it to every
+    // child. The token appears only where a client presents it, the Nx cache route below;
+    // `.cowshed/workspace.json` is what marks a workspace.
     if let Some(block) = port_block {
         writeln!(
             &mut *contents,
