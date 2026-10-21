@@ -2657,13 +2657,15 @@ describe('what shell entry fetches for a Cargo workspace', () => {
 
   it("loads the shell when the fetch fails, naming Cargo's cause, and fetches again on the next entry", async () => {
     await withManagedRepository(
-      { files: { ...CARGO_PROJECT, 'cargo-fails': '' } },
+      { workspaces: ['packages/*'], files: { ...CARGO_PROJECT, 'cargo-fails': '' } },
       async ({ root, xdgCache, enterShell: enter, cargoRuns }) => {
         const failed = await enter(CARGO);
         expect(failed.exitCode).toBe(0);
         expect(failed.stderr).toContain('cargo fetch --locked --manifest-path Cargo.toml');
         expect(failed.stderr).toContain('failed to download from `https://index.crates.io/config.json`');
         expect((await enter(CARGO)).exitCode).toBe(0);
+        // Two workspaces, and each fetch fails at once, so the ledger is written in event order: the step stopped at the
+        // first failed fetch and never began the second.
         expect(cargoRuns()).toEqual([fetch('Cargo.toml'), fetch('Cargo.toml')]);
         // A fetch that failed promised nothing: no stamp, not even the directory for one.
         expect(existsSync(join(xdgCache, 'smoo'))).toBe(false);
@@ -2671,15 +2673,16 @@ describe('what shell entry fetches for a Cargo workspace', () => {
         await rm(join(root, 'cargo-fails'));
         expect(await enter(CARGO)).toEqual(HEALTHY);
         expect(await enter(CARGO)).toEqual(HEALTHY);
-        expect(cargoRuns()).toHaveLength(3);
-        expect(stamps(xdgCache)).toHaveLength(1);
+        // Both workspaces fetch and stamp once nothing fails.
+        expect(cargoRuns()).toHaveLength(4);
+        expect(stamps(xdgCache)).toHaveLength(2);
       },
     );
   });
 
   it('fails a CI fetch that fails', async () => {
     await withManagedRepository(
-      { files: { ...CARGO_PROJECT, 'cargo-fails': '' } },
+      { workspaces: ['packages/*'], files: { ...CARGO_PROJECT, 'cargo-fails': '' } },
       async ({ xdgCache, enterShell: enter, cargoRuns }) => {
         const entry = await enter({
           cargo: true,
@@ -2687,6 +2690,7 @@ describe('what shell entry fetches for a Cargo workspace', () => {
         });
         expect(entry.exitCode).toBe(1);
         expect(entry.stderr).toContain('failed to download from `https://index.crates.io/config.json`');
+        // The step stopped at the failed fetch: the second workspace was never begun.
         expect(cargoRuns()).toEqual([fetch('Cargo.toml')]);
         expect(existsSync(join(xdgCache, 'smoo'))).toBe(false);
       },
