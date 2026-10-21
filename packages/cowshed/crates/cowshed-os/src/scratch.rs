@@ -446,10 +446,7 @@ impl TrashReaper {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
                 Err(error) => return Err(error),
             }
-            self.entries = match fs::read_dir(&trash) {
-                Ok(entries) => Some(entries),
-                Err(error) => return Err(error),
-            };
+            self.entries = Some(fs::read_dir(&trash)?);
         }
         let mut removed = 0;
         for _ in 0..PASS_ENTRIES {
