@@ -1,4 +1,5 @@
-//! The build-state CLI is checkout-local even when its executable is host-installed.
+//! What the host-installed CLI can and cannot do from inside a workspace job's sandbox: build-state
+//! is checkout-local, and no exec of the coordinator route is reachable.
 #![cfg(target_os = "macos")]
 
 use std::fs;
@@ -47,20 +48,21 @@ fn job(config: &SandboxConfig, tools: &Path, argv: &[&str]) -> Output {
         .expect("run executed-child profile")
 }
 
-#[test]
-#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-fn host_controller_build_state_answers_with_only_the_installed_executable_grant() {
-    // Host HOME must be outside the protected cowshed store, independently of the runner's TMPDIR.
+/// A checkout with a build volume, the integration-test binary installed as the host's cowshed,
+/// and the executed-child sandbox of a read-write job in it, with the support directory the
+/// install lives in. The root is outside the protected cowshed store, independently of the
+/// runner's TMPDIR.
+fn installed_cli_fixture(label: &str) -> (Scratch, SandboxConfig, PathBuf) {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = Scratch(PathBuf::from(format!(
-        "/private/tmp/cowshed-state-cli-{}-{nonce}",
+    let scratch = PathBuf::from(format!(
+        "/private/tmp/cowshed-{label}-cli-{}-{nonce}",
         std::process::id()
-    )));
-    fs::create_dir(&root.0).unwrap();
-    let scratch = &root.0;
+    ));
+    fs::create_dir(&scratch).unwrap();
+    let root = Scratch(scratch.clone());
     let checkout = scratch.join("mounts/workspace");
     let home = scratch.join("home");
     let temporary = scratch.join("tmp");
@@ -96,8 +98,6 @@ fn host_controller_build_state_answers_with_only_the_installed_executable_grant(
         .expect("cargo and nextest provide the integration-test binary at runtime");
     fs::copy(binary, &installed).unwrap();
     std::os::unix::fs::symlink("cowshed-test-build", support.join("bin/cowshed")).unwrap();
-    let secret = support.join("controller-state");
-    fs::write(&secret, "controller sentinel").unwrap();
 
     let mut config = SandboxConfig {
         home,
@@ -123,16 +123,31 @@ fn host_controller_build_state_answers_with_only_the_installed_executable_grant(
         config.allowed_unix_sockets.is_empty(),
         "no controller socket is admitted"
     );
+    (root, config, support)
+}
+
+/// The job's bootstrap tool directory for its mode, holding the capability's programs.
+fn job_tools(config: &SandboxConfig) -> PathBuf {
+    let tools = match config.mode {
+        RunSandboxMode::ReadWrite => config.workspace_mount.join(".cowshed/tools/bin"),
+        RunSandboxMode::ReadOnly => config.exec_temp_dir.join("tools/bin"),
+    };
+    fs::create_dir_all(&tools).unwrap();
+    for program in &config.capabilities.contribution.bootstrap_programs {
+        std::os::unix::fs::symlink(&program.target, tools.join(program.name)).unwrap();
+    }
+    tools
+}
+
+#[test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+fn host_controller_build_state_answers_with_only_the_installed_executable_grant() {
+    let (_root, mut config, support) = installed_cli_fixture("state");
+    let secret = support.join("controller-state");
+    fs::write(&secret, "controller sentinel").unwrap();
     for mode in [RunSandboxMode::ReadWrite, RunSandboxMode::ReadOnly] {
         config.mode = mode;
-        let tools = match mode {
-            RunSandboxMode::ReadWrite => config.workspace_mount.join(".cowshed/tools/bin"),
-            RunSandboxMode::ReadOnly => config.exec_temp_dir.join("tools/bin"),
-        };
-        fs::create_dir_all(&tools).unwrap();
-        for program in &config.capabilities.contribution.bootstrap_programs {
-            std::os::unix::fs::symlink(&program.target, tools.join(program.name)).unwrap();
-        }
+        let tools = job_tools(&config);
         let answer = job(
             &config,
             &tools,
@@ -165,5 +180,58 @@ fn host_controller_build_state_answers_with_only_the_installed_executable_grant(
             "executable grant must not list its directory"
         );
         assert!(String::from_utf8_lossy(&denied.stderr).contains("Operation not permitted"));
+    }
+}
+
+/// The CLI is the coordinator route (07_api.md, "CLI and API exec parity"), so a workspace's own
+/// process must not reach it: the boundary is who can ask, never the class asked for. A job runs
+/// the installed CLI (build-state above) but its sandbox denies cowshed's store, where every
+/// project's records, the daemon's socket and every workspace supervisor's socket live, and
+/// admits no controller socket (04_sandbox.md). So `exec --host` from inside a job is refused at
+/// every class at the CLI's first write into that store, before any route is asked: the host
+/// command never starts.
+#[test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+fn host_controller_a_jobs_cli_is_refused_the_host_scope_at_every_class() {
+    let (root, config, _support) = installed_cli_fixture("host-route");
+    let tools = job_tools(&config);
+    let marker = root.0.join("ran-on-the-host");
+    let checkout = config.workspace_mount.to_str().unwrap().to_owned();
+    for class in [
+        "background",
+        "interactive",
+        "gate",
+        "resident",
+        "interactive-resident",
+    ] {
+        let refused = job(
+            &config,
+            &tools,
+            &[
+                "/usr/bin/env",
+                "cowshed",
+                "--project",
+                &checkout,
+                "exec",
+                "workspace",
+                "--host",
+                "--class",
+                class,
+                "--",
+                "/usr/bin/touch",
+                marker.to_str().unwrap(),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            !refused.status.success(),
+            "{class}: a job's CLI admitted host work; stdout={}, stderr={stderr}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        assert!(
+            stderr.contains(cowshed_gateway_types::STORE_ROOT),
+            "{class}: refused at the store, as the sandbox denies it: {stderr}"
+        );
+        assert!(!marker.exists(), "{class}: the host command ran");
     }
 }
