@@ -130,6 +130,11 @@ pub struct DetectionContext<'a> {
     pub environment_root: &'a Path,
     pub runtime_dir: &'a Path,
     pub trust_bundle: Option<&'a Path>,
+    /// The host's conventional installation directories, in search order: where core and every
+    /// detector resolve an individual tool, never a directory that joins PATH whole. A production
+    /// caller passes [`host_program_directories`]; a detector adds only its own tool's
+    /// installation convention (15_capabilities.md, "Bootstrap executables").
+    pub program_directories: &'a [PathBuf],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -385,7 +390,7 @@ fn detect_with(
         &mut result.contribution,
         context,
         "bash",
-        &host_program_directories(context),
+        context.program_directories,
     )?;
     let mut owners = result
         .contribution
@@ -1003,11 +1008,13 @@ pub fn add_bootstrap(
     Ok(())
 }
 
-/// Conventional installation directories are searched for individual tools, never inherited whole.
-pub fn host_program_directories(context: &DetectionContext<'_>) -> Vec<PathBuf> {
+/// The real host's conventional installation directories for `home` and the effective user:
+/// the value a production shell passes as [`DetectionContext::program_directories`]. Only this
+/// function asks the host who it is; detection itself inspects only the directories it is given.
+pub fn host_program_directories(home: &Path) -> Vec<PathBuf> {
     let mut directories = vec![
-        context.home.join(".nix-profile/bin"),
-        context.home.join(".local/state/nix/profile/bin"),
+        home.join(".nix-profile/bin"),
+        home.join(".local/state/nix/profile/bin"),
     ];
     if let Some(user) = effective_user_name() {
         directories.push(Path::new("/etc/profiles/per-user").join(&user).join("bin"));
@@ -1062,6 +1069,9 @@ pub mod test_support {
         pub home: PathBuf,
         pub environment: PathBuf,
         pub runtime: PathBuf,
+        /// The real host's program directories, named explicitly: these detector tests resolve
+        /// the host's own tools, as production detection does (08_testing.md, "Fixtures").
+        pub program_directories: Vec<PathBuf>,
     }
     impl Fixture {
         pub fn new() -> Self {
@@ -1072,11 +1082,13 @@ pub mod test_support {
             let environment = root.join(".cowshed");
             let runtime = environment.join("run");
             fs::create_dir_all(&home).unwrap();
+            let program_directories = host_program_directories(&home);
             Self {
                 root,
                 home,
                 environment,
                 runtime,
+                program_directories,
             }
         }
         pub fn context(&self) -> DetectionContext<'_> {
@@ -1089,6 +1101,7 @@ pub mod test_support {
                 environment_root: &self.environment,
                 runtime_dir: &self.runtime,
                 trust_bundle: None,
+                program_directories: &self.program_directories,
             }
         }
         pub fn files(&self, files: &[&str]) {
@@ -1098,10 +1111,10 @@ pub mod test_support {
                 fs::write(path, "").unwrap();
             }
         }
-        /// What core detection contributes for `bash` on this host: the one bash
-        /// [`host_program_directories`] resolves first, with the grants that resolution takes. It
-        /// depends on the host, so a test expecting the core contribution derives it here rather
-        /// than naming a path.
+        /// What core detection contributes for `bash` on this host: the one bash the fixture's
+        /// program directories resolve first, with the grants that resolution takes. It depends
+        /// on the host, so a test expecting the core contribution derives it here rather than
+        /// naming a path.
         pub fn core_bash(&self) -> CapabilityContribution {
             let mut contribution = CapabilityContribution::default();
             let context = self.context();
@@ -1109,7 +1122,7 @@ pub mod test_support {
                 &mut contribution,
                 &context,
                 "bash",
-                &host_program_directories(&context),
+                context.program_directories,
             )
             .unwrap();
             contribution
@@ -1142,7 +1155,13 @@ pub mod test_support {
     }
 }
 
-pub fn mint_daemon_states(workspace: &Path, home: &Path) -> Result<Vec<PathBuf>> {
+/// What a fresh mint discards: the daemon state the workspace's detected capabilities name.
+/// `program_directories` is the host's ([`DetectionContext::program_directories`]).
+pub fn mint_daemon_states(
+    workspace: &Path,
+    home: &Path,
+    program_directories: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
     let private = workspace.join(".cowshed");
     let runtime = private.join("run");
     let context = DetectionContext {
@@ -1154,6 +1173,7 @@ pub fn mint_daemon_states(workspace: &Path, home: &Path) -> Result<Vec<PathBuf>>
         environment_root: &private,
         runtime_dir: &runtime,
         trust_bundle: None,
+        program_directories,
     };
     Ok(detect_for_workspace(&context)?
         .contribution

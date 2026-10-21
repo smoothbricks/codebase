@@ -52,8 +52,9 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
     let mut contribution = CapabilityContribution::default();
     add_shared_tool_home(&mut contribution, context.home, &MODULE_HOME);
     add_shared_tool_home(&mut contribution, context.home, &BUILD_HOME);
-    let mut directories = vec![PathBuf::from(OFFICIAL_INSTALL)];
-    directories.extend(super::host_program_directories(context));
+    let directories: Vec<_> = std::iter::once(PathBuf::from(OFFICIAL_INSTALL))
+        .chain(context.program_directories.iter().cloned())
+        .collect();
     super::add_bootstrap(&mut contribution, context, "go", &directories)?;
     Ok(contribution)
 }

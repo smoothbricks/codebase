@@ -1,7 +1,7 @@
 use super::cache::{SharedLayout, SharedToolHome};
 use super::{
     CapabilityContribution, CapabilityGrant, CapabilityId, DetectionContext, Detector, EnvAction,
-    GrantAccess, GrantScope, SharedCache, add_bootstrap, host_program_directories,
+    GrantAccess, GrantScope, SharedCache, add_bootstrap,
 };
 use crate::{CowshedError, Result};
 use std::os::unix::fs::FileTypeExt as _;
@@ -184,7 +184,7 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
     // socket and trust settings above, never through these links. They stay in `tools/bin`,
     // behind the activated shell; leading it from `tools/manager-bin` would override a nix the
     // shell declares (15_capabilities.md, "Bootstrap executables").
-    let directories = host_program_directories(context);
+    let directories = context.program_directories;
     for name in [
         "nix",
         "nix-store",
@@ -193,7 +193,7 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
         "nix-env",
         "devenv",
     ] {
-        add_bootstrap(&mut contribution, context, name, &directories)?;
+        add_bootstrap(&mut contribution, context, name, directories)?;
     }
     Ok(contribution)
 }
@@ -400,6 +400,7 @@ mod tests {
             git_worktree_repository: None,
             build_volume_mount: None,
             repository_caches: Vec::new(),
+            program_directories: fixture.program_directories.clone(),
             capabilities: super::super::DetectedCapabilities {
                 active: vec![CapabilityId::Nix],
                 contribution,

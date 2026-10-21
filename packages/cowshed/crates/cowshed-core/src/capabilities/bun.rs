@@ -1,8 +1,5 @@
 use super::cache::{SharedLayout, SharedToolHome};
-use super::{
-    CapabilityContribution, CapabilityId, DetectionContext, Detector, add_bootstrap,
-    host_program_directories,
-};
+use super::{CapabilityContribution, CapabilityId, DetectionContext, Detector, add_bootstrap};
 use crate::Result;
 
 pub static BUN_HOME: SharedToolHome = SharedToolHome {
@@ -23,8 +20,9 @@ pub const DETECTOR: Detector = Detector {
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {
     let mut contribution = super::javascript::contribute(context, &BUN_HOME)?;
-    let mut directories = host_program_directories(context);
-    directories.insert(0, context.home.join(".bun/bin"));
+    let directories: Vec<_> = std::iter::once(context.home.join(".bun/bin"))
+        .chain(context.program_directories.iter().cloned())
+        .collect();
     add_bootstrap(&mut contribution, context, "bun", &directories)?;
     Ok(contribution)
 }

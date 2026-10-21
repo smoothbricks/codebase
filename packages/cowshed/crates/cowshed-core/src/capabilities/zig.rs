@@ -1,7 +1,7 @@
 use super::cache::{SharedLayout, SharedToolHome};
 use super::{
     CapabilityContribution, CapabilityId, DetectionContext, Detector, add_bootstrap,
-    add_shared_tool_home, host_program_directories,
+    add_shared_tool_home,
 };
 use crate::Result;
 
@@ -28,7 +28,7 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
         &mut contribution,
         context,
         "zig",
-        &host_program_directories(context),
+        context.program_directories,
     )?;
     Ok(contribution)
 }

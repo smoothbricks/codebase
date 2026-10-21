@@ -61,8 +61,11 @@ impl Fixture {
         .expect("workspace hooks ignore");
         git(&checkout, &["add", "tracked", ".gitignore"]);
         git(&checkout, &["commit", "-q", "-m", "initial"]);
-        let storage =
-            ValidatedHostStorage::new(scratch.path().to_path_buf(), CanonicalRoots::at(store));
+        let storage = ValidatedHostStorage::new(
+            scratch.path().to_path_buf(),
+            Vec::new(),
+            CanonicalRoots::at(store),
+        );
         Self {
             _scratch: scratch,
             checkout,

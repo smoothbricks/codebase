@@ -1,8 +1,5 @@
 use super::cache::{SharedLayout, SharedToolHome};
-use super::{
-    CapabilityContribution, CapabilityId, DetectionContext, Detector, add_bootstrap,
-    host_program_directories,
-};
+use super::{CapabilityContribution, CapabilityId, DetectionContext, Detector, add_bootstrap};
 use crate::Result;
 
 #[cfg(target_os = "macos")]
@@ -27,8 +24,12 @@ pub const DETECTOR: Detector = Detector {
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {
     let mut contribution = super::javascript::contribute(context, &PNPM_HOME)?;
-    let directories = host_program_directories(context);
-    add_bootstrap(&mut contribution, context, "pnpm", &directories)?;
+    add_bootstrap(
+        &mut contribution,
+        context,
+        "pnpm",
+        context.program_directories,
+    )?;
     Ok(contribution)
 }
 

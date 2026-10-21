@@ -314,6 +314,7 @@ impl FakeHost {
                 git_root: std::sync::Arc::from(root.join("checkout")),
                 storage: cowshed_core::storage::bootstrap::ValidatedHostStorage::new(
                     root.join("home"),
+                    Vec::new(),
                     cowshed_core::storage::bootstrap::CanonicalRoots::at(root.join("store")),
                 ),
             },
@@ -2677,6 +2678,7 @@ fn supervisor_config_of(
             git_worktree_repository: None,
             build_volume_mount: None,
             repository_caches: Vec::new(),
+            program_directories: Vec::new(),
             capabilities: Default::default(),
         },
         build_volume_layout: None,

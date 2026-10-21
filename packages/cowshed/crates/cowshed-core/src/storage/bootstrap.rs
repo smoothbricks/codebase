@@ -1031,20 +1031,28 @@ impl CanonicalRoots {
 }
 
 /// Host-storage roots a project runtime, gateway, or service opens on, with the home they were
-/// resolved for.
+/// resolved for and the host program directories capability detection searches.
 ///
 /// In production this is constructed only by the native boundaries that validated (or
 /// bootstrapped) the machine-global volumes in place, and every component downstream takes the
-/// value rather than resolving `$HOME` again: one open, one storage.
+/// value rather than resolving `$HOME` or the host's program directories again: one open, one
+/// storage. A fixture passes its own.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedHostStorage {
     home: PathBuf,
+    program_directories: Vec<PathBuf>,
     roots: CanonicalRoots,
 }
 
 impl ValidatedHostStorage {
-    pub fn new(home: PathBuf, roots: CanonicalRoots) -> Self {
-        Self { home, roots }
+    /// `program_directories` is [`crate::capabilities::host_program_directories`] of `home` on
+    /// the real host ([`crate::capabilities::DetectionContext::program_directories`]).
+    pub fn new(home: PathBuf, program_directories: Vec<PathBuf>, roots: CanonicalRoots) -> Self {
+        Self {
+            home,
+            program_directories,
+            roots,
+        }
     }
 
     pub fn roots(&self) -> &CanonicalRoots {
@@ -1053,6 +1061,10 @@ impl ValidatedHostStorage {
 
     pub fn home(&self) -> &Path {
         &self.home
+    }
+
+    pub fn program_directories(&self) -> &[PathBuf] {
+        &self.program_directories
     }
 
     pub fn store(&self) -> &Path {

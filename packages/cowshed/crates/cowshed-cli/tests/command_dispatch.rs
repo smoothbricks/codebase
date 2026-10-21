@@ -12,6 +12,7 @@ async fn native_dispatch_refuses_unsupported_host_before_opening_storage() {
 
     let storage = ValidatedHostStorage::new(
         PathBuf::from("/tmp"),
+        Vec::new(),
         CanonicalRoots::at(PathBuf::from("/tmp/store")),
     );
     match ProjectRuntime::open_for_adopt_at(

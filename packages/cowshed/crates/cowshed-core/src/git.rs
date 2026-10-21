@@ -3965,6 +3965,8 @@ fn sandboxed_git_command_with_paths(
         git_worktree_repository: None,
         build_volume_mount: None,
         repository_caches: Vec::new(),
+        // Controller Git detects no capability, so it resolves no program.
+        program_directories: Vec::new(),
         capabilities: Default::default(),
     };
     let profile = seatbelt_profile(&config, role).map_err(|error| {

@@ -1,8 +1,5 @@
 use super::cache::{SharedLayout, SharedToolHome};
-use super::{
-    CapabilityContribution, CapabilityId, DetectionContext, Detector, add_bootstrap,
-    host_program_directories,
-};
+use super::{CapabilityContribution, CapabilityId, DetectionContext, Detector, add_bootstrap};
 use crate::Result;
 
 pub static NPM_HOME: SharedToolHome = SharedToolHome {
@@ -23,8 +20,12 @@ pub const DETECTOR: Detector = Detector {
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {
     let mut contribution = super::javascript::contribute(context, &NPM_HOME)?;
-    let directories = host_program_directories(context);
-    add_bootstrap(&mut contribution, context, "npm", &directories)?;
+    add_bootstrap(
+        &mut contribution,
+        context,
+        "npm",
+        context.program_directories,
+    )?;
     Ok(contribution)
 }
 

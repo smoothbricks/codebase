@@ -1821,9 +1821,11 @@ mod tests {
     fn host_and_fixture_allocations_never_share_ports() {
         use crate::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
 
-        let host = ValidatedHostStorage::new(PathBuf::from("/home"), CanonicalRoots::global());
+        let host =
+            ValidatedHostStorage::new(PathBuf::from("/home"), Vec::new(), CanonicalRoots::global());
         let fixture = ValidatedHostStorage::new(
             PathBuf::from("/fixture"),
+            Vec::new(),
             CanonicalRoots::at(PathBuf::from("/fixture/store")),
         );
         assert_eq!(host.port_allocation(), PortAllocation::Host);

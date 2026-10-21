@@ -116,6 +116,7 @@ fn installed_cli_fixture(label: &str) -> (Scratch, SandboxConfig, PathBuf) {
         git_worktree_repository: None,
         build_volume_mount: Some(volume),
         repository_caches: Vec::new(),
+        program_directories: Vec::new(),
         capabilities: Default::default(),
     };
     config.configure_capabilities().unwrap();

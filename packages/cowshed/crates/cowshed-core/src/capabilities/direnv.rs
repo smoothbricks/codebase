@@ -1,6 +1,6 @@
 use super::{
     CapabilityContribution, CapabilityId, DetectionContext, Detector, EnvAction, GrantAccess,
-    SharedCache, ShellActivation, add_bootstrap, host_program_directories,
+    SharedCache, ShellActivation, add_bootstrap,
 };
 use crate::Result;
 
@@ -45,7 +45,7 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
         &mut contribution,
         context,
         "direnv",
-        &host_program_directories(context),
+        context.program_directories,
     )?;
     Ok(contribution)
 }

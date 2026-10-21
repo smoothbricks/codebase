@@ -134,8 +134,13 @@ impl Fixture {
             blank_image::blank_image(&blank_template_path(&store, blank_image::CAPACITY));
         }
         clone_tree(&checkout_template(project), &checkout);
+        // The fixture's workspaces run the host's own tools (bash, Bun, Nx's node), resolved
+        // where production resolves them: the real host's program directories, named
+        // explicitly (08_testing.md, "Fixtures").
+        let home = scratch.path().to_path_buf();
+        let program_directories = cowshed_core::capabilities::host_program_directories(&home);
         let storage =
-            ValidatedHostStorage::new(scratch.path().to_path_buf(), CanonicalRoots::at(store));
+            ValidatedHostStorage::new(home, program_directories, CanonicalRoots::at(store));
         Self {
             _scratch: scratch,
             checkout,

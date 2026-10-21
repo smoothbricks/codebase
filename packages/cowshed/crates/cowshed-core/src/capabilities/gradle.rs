@@ -1,7 +1,7 @@
 use super::cache::{SharedLayout, SharedToolHome};
 use super::{
     CapabilityContribution, CapabilityId, DetectionContext, Detector, EnvAction, add_bootstrap,
-    add_shared_tool_home, host_program_directories,
+    add_shared_tool_home,
 };
 use crate::Result;
 
@@ -44,9 +44,9 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
     for cache in &mut contribution.shared_caches {
         cache.private_link = cache.path.file_name().map(|name| private.join(name));
     }
-    let directories = host_program_directories(context);
-    add_bootstrap(&mut contribution, context, "gradle", &directories)?;
-    add_bootstrap(&mut contribution, context, "java", &directories)?;
+    let directories = context.program_directories;
+    add_bootstrap(&mut contribution, context, "gradle", directories)?;
+    add_bootstrap(&mut contribution, context, "java", directories)?;
     Ok(contribution)
 }
 

@@ -101,6 +101,9 @@ fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
     // read its Git fetch routes there (04_sandbox.md, "Exec pipeline" step 4).
     let store_root = root.join("store");
     std::fs::create_dir_all(&store_root).expect("fixture store");
+    // The `.envrc` fixtures activate through the host's own direnv, resolved where production
+    // resolves it: the real host's program directories, named explicitly.
+    let program_directories = cowshed_core::capabilities::host_program_directories(&home);
     SandboxConfig {
         home,
         mount_root,
@@ -118,6 +121,7 @@ fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
         git_worktree_repository: None,
         build_volume_mount: None,
         repository_caches: Vec::new(),
+        program_directories,
         capabilities: Default::default(),
     }
 }
@@ -1800,6 +1804,7 @@ fn production_workspace(
         },
         repository_deny,
         repository_caches: &[],
+        program_directories: &cowshed_core::capabilities::host_program_directories(home),
         git_worktree_repository: None,
         build_volume_mount: None,
         workspace_mount: mount,

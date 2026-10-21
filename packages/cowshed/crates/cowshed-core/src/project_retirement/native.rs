@@ -344,7 +344,7 @@ mod macos {
             fs::write(project.join("repository.json"), b"retained corrupt binding").unwrap();
             fs::write(project.join("evidence"), b"do not lose these bytes").unwrap();
             (
-                ValidatedHostStorage::new(root.join("home"), CanonicalRoots::at(store)),
+                ValidatedHostStorage::new(root.join("home"), Vec::new(), CanonicalRoots::at(store)),
                 project,
             )
         }

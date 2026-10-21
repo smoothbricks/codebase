@@ -2819,7 +2819,7 @@ mod tests {
             fs::create_dir_all(roots.telemetry()).expect("fixture telemetry");
             Self {
                 root,
-                storage: ValidatedHostStorage::new(home, roots),
+                storage: ValidatedHostStorage::new(home, Vec::new(), roots),
                 port_blocks: Cell::new(FixturePortBlocks::Grid(MACOS_PORT_MIN)),
             }
         }

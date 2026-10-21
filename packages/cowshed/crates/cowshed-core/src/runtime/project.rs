@@ -2351,6 +2351,8 @@ struct StorageProjectRuntimeHost<H: RuntimeStorageHost> {
         super::supervisor::SessionToken,
     >,
     home: PathBuf,
+    /// The host program directories capability detection searches: the validated storage's.
+    program_directories: Vec<PathBuf>,
     telemetry_root: PathBuf,
     lifecycle_intents_path: PathBuf,
     lifecycle_intents: crate::storage::recovery::LifecycleIntentJournal,
@@ -3275,7 +3277,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     ));
                 }
                 crate::storage::bootstrap::ValidatedHostStorage::new(
-                    home,
+                    home.clone(),
+                    crate::capabilities::host_program_directories(&home),
                     bootstrap.roots().clone(),
                 )
             }
@@ -3290,6 +3293,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             },
         );
         let home = storage.home().to_path_buf();
+        let program_directories = storage.program_directories().to_vec();
         let existing_only = matches!(
             &bootstrap_mode,
             crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly
@@ -3689,6 +3693,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             },
             sessions: std::collections::BTreeMap::new(),
             home,
+            program_directories,
             telemetry_root,
             lifecycle_intents_path,
             lifecycle_intents,
@@ -4836,6 +4841,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let main_mount = self.workspace_mount_path(&main_name())?;
         let sandbox = supervisor_sandbox(
             &self.home,
+            &self.program_directories,
             &self.layout,
             &self.telemetry_root,
             &current,
@@ -5275,6 +5281,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             let grants = effective_workspace_grants(&self.layout, &current.metadata.grants)?;
             let sandbox = supervisor_sandbox(
                 &self.home,
+                &self.program_directories,
                 &self.layout,
                 &self.telemetry_root,
                 current,
@@ -8337,6 +8344,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let build_volume_layout = self.build_volume_layout()?;
         let sandbox = supervisor_sandbox(
             &self.home,
+            &self.program_directories,
             &self.layout,
             &self.telemetry_root,
             &current,
@@ -8888,6 +8896,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let grants = effective_workspace_grants(&self.layout, &current.metadata.grants)?;
         let sandbox = supervisor_sandbox(
             &self.home,
+            &self.program_directories,
             &self.layout,
             &self.telemetry_root,
             &current,
@@ -10779,6 +10788,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let binding = self.descriptor.binding.clone();
         let binding_path = self.layout.project().repository_binding.clone();
         let home = &self.home;
+        let program_directories = &self.program_directories;
         // Main's first build volume is minted beside main's image, so the two attaches wait on
         // `storagekitd` once (16_build_volumes.md, "Targets and seeds"), at the capacity the
         // checkout's `.cowshed.toml` asks, which main's image is copied from; none for a checkout
@@ -10813,7 +10823,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         "daemons",
                         crate::inherited_daemons::macos::discard_in(
                             &stage.mount_point,
-                            crate::capabilities::mint_daemon_states(&stage.mount_point, home)?,
+                            crate::capabilities::mint_daemon_states(
+                                &stage.mount_point,
+                                home,
+                                program_directories,
+                            )?,
                         ),
                     )
                     .await?;
@@ -10998,6 +11012,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 self.mark_lifecycle_intent_mutating(&workspace).await?;
             }
             let home = &self.home;
+            let program_directories = &self.program_directories;
             let build_volumes = self.build_volumes()?;
             // Under the source's image lock, which every fork of the source holds while its
             // clone is staged: the seed the fork clones is first refreshed for the tree it checks
@@ -11046,7 +11061,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                             "daemons",
                             crate::inherited_daemons::macos::discard_in(
                                 &stage.mount_point,
-                                crate::capabilities::mint_daemon_states(&stage.mount_point, home)?,
+                                crate::capabilities::mint_daemon_states(
+                                    &stage.mount_point,
+                                    home,
+                                    program_directories,
+                                )?,
                             ),
                         )
                         .await?;
@@ -11393,6 +11412,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     .map_err(native_integrity_error)?;
                 self.mark_lifecycle_intent_mutating(&destination).await?;
                 let home = &self.home;
+                let program_directories = &self.program_directories;
                 let build_volumes = self.build_volumes()?;
                 let source_name_for_callback = source.clone();
                 // Under the source's image lock, as for `resume_fork`: the source's seed is first
@@ -11428,7 +11448,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                             crate::inherited_git_locks::discard_in(&stage.mount_point).await?;
                             crate::inherited_daemons::macos::discard_in(
                                 &stage.mount_point,
-                                crate::capabilities::mint_daemon_states(&stage.mount_point, home)?,
+                                crate::capabilities::mint_daemon_states(
+                                    &stage.mount_point,
+                                    home,
+                                    program_directories,
+                                )?,
                             )
                             .await?;
                             build_volumes
@@ -12756,6 +12780,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let mount = self.workspace_mount_path(&workspace)?;
         let main_mount = self.workspace_mount_path(&main_name())?;
         let home = self.home.clone();
+        let program_directories = self.program_directories.clone();
         let layout = self.layout.clone();
         let telemetry_root = self.telemetry_root.clone();
 
@@ -12796,6 +12821,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     let effective = effective_workspace_grants(&layout, &current.metadata.grants)?;
                     let config = supervisor_sandbox(
                         &home,
+                        &program_directories,
                         &layout,
                         &telemetry_root,
                         &current,
@@ -12902,6 +12928,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let main_mount = self.workspace_mount_path(&main_name())?;
         let path = self.layout.project().policy.clone();
         let home = self.home.clone();
+        let program_directories = self.program_directories.clone();
         let layout = self.layout.clone();
         let telemetry_root = self.telemetry_root.clone();
         crate::storage::lifecycle::dispatch_blocking(move || -> Result<_> {
@@ -12939,6 +12966,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     .map_err(|error| CowshedError::internal(error.to_string()))?;
             let config = supervisor_sandbox(
                 &home,
+                &program_directories,
                 &layout,
                 &telemetry_root,
                 &main,
@@ -18222,6 +18250,7 @@ mod grant_unit_tests {
             git_worktree_repository: None,
             build_volume_mount: None,
             repository_caches: Vec::new(),
+            program_directories: Vec::new(),
             capabilities: Default::default(),
         }
     }
@@ -18649,6 +18678,7 @@ fn validate_grant_sandbox(config: &crate::sandbox::SandboxConfig) -> Result<()> 
 #[allow(clippy::too_many_arguments)]
 fn supervisor_sandbox(
     home: &Path,
+    program_directories: &[PathBuf],
     layout: &crate::storage::StorageLayout,
     telemetry_root: &Path,
     current: &NativeWorkspace,
@@ -18667,6 +18697,7 @@ fn supervisor_sandbox(
         grants,
         repository_deny: repository.sandbox_deny(),
         repository_caches: repository.caches_home(),
+        program_directories,
         git_worktree_repository: git_worktree_repository(&current.metadata, main_mount.clone()),
         build_volume_mount,
         workspace_mount: mount,
@@ -23295,7 +23326,7 @@ mod port_reservation_tests {
         .expect("binding");
         crate::metadata::write_json(&layout.project().repository_binding, &binding)
             .expect("publish binding");
-        let storage = ValidatedHostStorage::new(root.join("home"), roots);
+        let storage = ValidatedHostStorage::new(root.join("home"), Vec::new(), roots);
         (NativeGatewayInventory::new(storage), layout)
     }
 
@@ -23696,6 +23727,7 @@ mod port_reservation_tests {
         std::fs::create_dir_all(&home).expect("home");
         let inventory = NativeGatewayInventory::new(ValidatedHostStorage::new(
             home,
+            Vec::new(),
             CanonicalRoots::at(fixture.store().to_owned()),
         ));
         let staging = fixture.store().join(".staging");

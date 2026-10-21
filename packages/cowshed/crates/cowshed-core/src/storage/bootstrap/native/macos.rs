@@ -436,6 +436,7 @@ where
     }
     Ok(ValidatedHostStorage::new(
         plan.home().to_owned(),
+        crate::capabilities::host_program_directories(plan.home()),
         plan.roots().clone(),
     ))
 }

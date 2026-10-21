@@ -1,7 +1,7 @@
 use super::cache::{SharedLayout, SharedToolHome};
 use super::{
     CapabilityContribution, CapabilityId, DetectionContext, Detector, EnvAction, add_bootstrap,
-    add_shared_tool_home, host_program_directories,
+    add_shared_tool_home,
 };
 use crate::Result;
 
@@ -29,8 +29,9 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
             .env
             .insert("UV_SYSTEM_CERTS", EnvAction::Default("true".into()));
     }
-    let mut directories = host_program_directories(context);
-    directories.insert(0, context.home.join(".local/bin"));
+    let directories: Vec<_> = std::iter::once(context.home.join(".local/bin"))
+        .chain(context.program_directories.iter().cloned())
+        .collect();
     add_bootstrap(&mut contribution, context, "uv", &directories)?;
     Ok(contribution)
 }

@@ -100,8 +100,11 @@ async fn a_probe_that_waits_for_an_answer_is_the_doctor_step_its_call_is_in() {
     .expect("workspace hooks ignore");
     git(&checkout, &["add", "tracked", ".gitignore"]);
     git(&checkout, &["commit", "-q", "-m", "initial"]);
-    let storage =
-        ValidatedHostStorage::new(scratch.path().to_path_buf(), CanonicalRoots::at(store));
+    let storage = ValidatedHostStorage::new(
+        scratch.path().to_path_buf(),
+        Vec::new(),
+        CanonicalRoots::at(store),
+    );
     let repo = RepoId::parse("fixture/doctor").expect("repository identity");
 
     let adopting = ProjectRuntime::open_directory_for_adopt_at(

@@ -1,7 +1,6 @@
 use super::cache::SharedToolHome;
 use super::{
     CapabilityContribution, DetectionContext, EnvAction, add_bootstrap, add_shared_tool_home,
-    host_program_directories,
 };
 use crate::Result;
 
@@ -24,7 +23,7 @@ pub(super) fn contribute(
         &mut contribution,
         context,
         "node",
-        &host_program_directories(context),
+        context.program_directories,
     )?;
     Ok(contribution)
 }

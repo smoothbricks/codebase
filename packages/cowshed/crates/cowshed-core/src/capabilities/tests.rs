@@ -31,7 +31,7 @@ fn a_plain_repository_has_only_the_core_executable_probes() {
 fn bash_is_a_core_bootstrap_resolved_from_the_host_program_directories() {
     let fixture = Fixture::new();
     let detected = detect(&fixture.context(), &BTreeMap::new()).unwrap();
-    let bash = bootstrap_program("bash", &host_program_directories(&fixture.context()))
+    let bash = bootstrap_program("bash", &fixture.program_directories)
         .unwrap()
         .expect("every supported host installs a bash in a conventional directory");
     assert!(

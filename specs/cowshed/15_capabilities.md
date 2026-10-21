@@ -7,9 +7,18 @@ hooks.
 ## Detection inputs
 
 Detection reads convention markers inside the workspace, never an enclosing checkout or the operator's shell
-environment. Its input is the workspace mount, command cwd, host home, main's `[caches] home` entries (below), private
-environment root, short runtime directory, and optional public gateway trust bundle. Paths derive from those inputs;
-secrets and ambient PATH are not detection inputs.
+environment. Its input is the workspace mount, command cwd, host home, main's `[caches] home` entries (below), the
+host's program directories, private environment root, short runtime directory, and optional public gateway trust bundle.
+Paths derive from those inputs; secrets and ambient PATH are not detection inputs.
+
+The program directories are the host's conventional installation directories, in search order, where core and every
+detector resolve an individual tool ("Bootstrap executables"): the user's and the system's Nix profiles, Homebrew's,
+`/usr/local/bin`, `/usr/bin` and `/bin`. The controller resolves them once, from HOME and its effective user, when it
+validates host storage, and every workspace sandbox it builds carries that value. Detection searches only the
+directories it is given, plus a detector's own tool convention (`~/.bun/bin`, Go's installer directory), and never asks
+the host who it is; a test passes its own directories. **Why**: detection that resolved the effective user itself
+inspected `/etc/profiles/per-user/<user>/bin` from inside any test that built a workspace sandbox, and a test running in
+a workspace sandbox, whose profile denies that path, failed with `EPERM` before its subject ran.
 
 Project-scoped detectors inspect the workspace root, or the contained relative directory selected by that capability's
 override. A tool invoked through a task runner gets the same cache and daemon authority as one invoked directly. There

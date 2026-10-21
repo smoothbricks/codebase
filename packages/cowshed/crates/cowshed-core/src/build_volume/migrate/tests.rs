@@ -102,6 +102,7 @@ fn sandbox(checkout: &Path) -> SandboxConfig {
         git_worktree_repository: None,
         build_volume_mount: None,
         repository_caches: Vec::new(),
+        program_directories: Vec::new(),
         capabilities: Default::default(),
     }
 }

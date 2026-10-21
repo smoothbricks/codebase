@@ -188,6 +188,11 @@ pub struct SandboxConfig {
     /// own tooling caches into, shared read-write into every sandbox of the project. Never a
     /// workspace's copy of the file.
     pub repository_caches: Vec<PathBuf>,
+    /// The host program directories capability detection searches for each bootstrap tool
+    /// ([`DetectionContext::program_directories`]): the real host's
+    /// ([`crate::capabilities::host_program_directories`]) in production, a fixture's own in a
+    /// test.
+    pub program_directories: Vec<PathBuf>,
     /// The project capabilities detected in this workspace for this mode
     /// ([`SandboxConfig::configure_capabilities`]): every tool-specific grant, shared cache,
     /// socket and environment entry a child receives comes from here, never from a tool table.
@@ -236,6 +241,7 @@ impl SandboxConfig {
             git_worktree_repository: self.git_worktree_repository.clone(),
             build_volume_mount: self.build_volume_mount.clone(),
             repository_caches: self.repository_caches.clone(),
+            program_directories: self.program_directories.clone(),
             capabilities,
         }
     }
@@ -303,6 +309,7 @@ impl SandboxConfig {
             environment_root: &environment_root,
             runtime_dir: &runtime_dir,
             trust_bundle: has_workspace_ca.then_some(trust_bundle.as_path()),
+            program_directories: &self.program_directories,
         };
         discover(&context)
     }
@@ -327,6 +334,9 @@ pub struct WorkspaceSandbox<'a> {
     pub repository_deny: &'a [PathBuf],
     /// `[caches] home` from main's `.cowshed.toml`, trusted exactly like `repository_deny`.
     pub repository_caches: &'a [PathBuf],
+    /// The host's program directories, where detection resolves each bootstrap tool: a production
+    /// caller passes [`crate::capabilities::host_program_directories`] of the real host.
+    pub program_directories: &'a [PathBuf],
     /// The `.git` of main's mount, for a git-worktree workspace only.
     pub git_worktree_repository: Option<PathBuf>,
     /// The checkout's current owned build-volume mount, resolved by the controller.
@@ -353,6 +363,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         grants,
         repository_deny,
         repository_caches,
+        program_directories,
         git_worktree_repository,
         build_volume_mount,
         workspace_mount: mount,
@@ -413,6 +424,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         git_worktree_repository,
         build_volume_mount,
         repository_caches: repository_caches.to_vec(),
+        program_directories: program_directories.to_vec(),
         capabilities: DetectedCapabilities::default(),
     };
     // The supervisor is the trusted tier of the same workspace; it gets the same capability
@@ -1560,6 +1572,7 @@ mod tests {
             git_worktree_repository: None,
             build_volume_mount: None,
             repository_caches: Vec::new(),
+            program_directories: Vec::new(),
             capabilities: DetectedCapabilities::default(),
         }
     }
@@ -2192,6 +2205,7 @@ mod tests {
                 grants: &grants,
                 repository_deny: &[],
                 repository_caches: &[],
+                program_directories: &[],
                 git_worktree_repository: None,
                 build_volume_mount: None,
                 workspace_mount: mount.to_path_buf(),
@@ -2305,6 +2319,7 @@ mod tests {
             grants: &grants,
             repository_deny: &[PathBuf::from("c"), PathBuf::from("a")],
             repository_caches: &[],
+            program_directories: &[],
             git_worktree_repository: None,
             build_volume_mount: None,
             workspace_mount: PathBuf::from("/Users/tester/.cowshed/mnt/acme/widget/raven"),
@@ -2320,6 +2335,83 @@ mod tests {
             config.grants.deny,
             [PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")]
         );
+    }
+
+    /// The builder resolves a bootstrap tool only in the program directories it is given
+    /// (15_capabilities.md, "Detection inputs"): a bash planted in the one given directory is the
+    /// bash the workspace links, and with none given no bash is linked at all, though a macOS host
+    /// keeps its own in `/bin`. Every grant detection takes lies inside the fixture, so the build
+    /// resolved nothing in the host's own program directories.
+    #[test]
+    fn the_workspace_builder_resolves_programs_only_in_the_given_directories() {
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "cowshed-program-directories",
+        );
+        let home = root.join("home");
+        let mount_root = root.join("mnt");
+        let mount = mount_root.join("acme/widget/raven");
+        let bin = root.join("bin");
+        for directory in [&home, &mount, &bin] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let bash = bin.join("bash");
+        std::fs::write(&bash, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bash, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let grants = crate::metadata::GrantSet {
+            port_block: Some(PortBlock::new(40_960, 16).unwrap()),
+            ..crate::metadata::GrantSet::default()
+        };
+        let incarnation =
+            crate::metadata::WorkspaceIncarnation::new("0123456789abcdef0123456789abcdef").unwrap();
+        let build = |program_directories: &[PathBuf]| {
+            workspace_sandbox(WorkspaceSandbox {
+                home: &home,
+                mount_root: &mount_root,
+                project_root: &root.join("project"),
+                main_mount: &root.join("main"),
+                telemetry_root: &root.join("telemetry"),
+                grants: &grants,
+                repository_deny: &[],
+                repository_caches: &[],
+                program_directories,
+                git_worktree_repository: None,
+                build_volume_mount: None,
+                workspace_mount: mount.clone(),
+                exec_temp_dir: root.join("tmp"),
+                store_root: &root.join("store"),
+                workspace_incarnation: &incarnation,
+            })
+            .unwrap()
+        };
+        let assert_inside = |config: &SandboxConfig| {
+            for grant in &config.capabilities.contribution.grants {
+                assert!(
+                    grant.path.starts_with(&*root),
+                    "{} lies outside the fixture",
+                    grant.path.display()
+                );
+            }
+        };
+
+        let given = build(std::slice::from_ref(&bin));
+        assert_eq!(
+            given.capabilities.contribution.bootstrap_programs,
+            [crate::capabilities::BootstrapProgram {
+                name: "bash",
+                target: bash,
+            }]
+        );
+        assert_inside(&given);
+
+        let none = build(&[]);
+        assert!(
+            none.capabilities.contribution.bootstrap_programs.is_empty(),
+            "{:?}",
+            none.capabilities.contribution.bootstrap_programs
+        );
+        assert_inside(&none);
     }
 
     #[test]

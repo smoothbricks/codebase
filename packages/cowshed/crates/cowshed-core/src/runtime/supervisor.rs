@@ -315,6 +315,7 @@ impl Default for WorkspaceSupervisorConfig {
                 git_worktree_repository: None,
                 build_volume_mount: None,
                 repository_caches: Vec::new(),
+                program_directories: Vec::new(),
                 capabilities: Default::default(),
             },
             build_volume_layout: None,
@@ -7868,11 +7869,15 @@ mod workspace_toolchain_tests {
 
     // Only macOS tests build a sandbox; on the Linux cross lint the helper would be dead code.
     // The mount root is a sibling of the fixture's home and stores, as it is on a host: its deny
-    // covers other workspaces, never the host home a capability grants into.
+    // covers other workspaces, never the host home a capability grants into. These jobs run the
+    // host's own tools (a linked bash, a detector's program), so the sandbox names the real
+    // host's program directories, as production does (08_testing.md, "Fixtures").
     #[cfg(target_os = "macos")]
     fn sandbox_at(mount: &Path) -> SandboxConfig {
+        let home = mount.parent().expect("root").join("home");
         SandboxConfig {
-            home: mount.parent().expect("root").join("home"),
+            program_directories: crate::capabilities::host_program_directories(&home),
+            home,
             mount_root: mount.parent().expect("root").join("mounts"),
             workspace_mount: mount.to_path_buf(),
             exec_temp_dir: mount.parent().expect("root").join("tmp"),
