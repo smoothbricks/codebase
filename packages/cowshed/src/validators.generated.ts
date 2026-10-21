@@ -92,6 +92,11 @@ export const assertAdoptRequestList = typia.createAssertEquals<readonly Api.Adop
 export const parseAdoptRequestList = (json: string): readonly Api.AdoptRequest[] =>
   assertAdoptRequestList(JSON.parse(json));
 
+export const assertAdoptView = typia.createAssertEquals<Api.AdoptView>();
+export const parseAdoptView = (json: string): Api.AdoptView => assertAdoptView(JSON.parse(json));
+export const assertAdoptViewList = typia.createAssertEquals<readonly Api.AdoptView[]>();
+export const parseAdoptViewList = (json: string): readonly Api.AdoptView[] => assertAdoptViewList(JSON.parse(json));
+
 export const assertAdoption = typia.createAssertEquals<Api.Adoption>();
 export const parseAdoption = (json: string): Api.Adoption => assertAdoption(JSON.parse(json));
 export const assertAdoptionList = typia.createAssertEquals<readonly Api.Adoption[]>();
@@ -1037,6 +1042,11 @@ export const parseQuotaRequest = (json: string): Api.QuotaRequest => assertQuota
 export const assertQuotaRequestList = typia.createAssertEquals<readonly Api.QuotaRequest[]>();
 export const parseQuotaRequestList = (json: string): readonly Api.QuotaRequest[] =>
   assertQuotaRequestList(JSON.parse(json));
+
+export const assertReAdoption = typia.createAssertEquals<Api.ReAdoption>();
+export const parseReAdoption = (json: string): Api.ReAdoption => assertReAdoption(JSON.parse(json));
+export const assertReAdoptionList = typia.createAssertEquals<readonly Api.ReAdoption[]>();
+export const parseReAdoptionList = (json: string): readonly Api.ReAdoption[] => assertReAdoptionList(JSON.parse(json));
 
 export const assertRebaseBuildVolume = typia.createAssertEquals<Api.RebaseBuildVolume>();
 export const parseRebaseBuildVolume = (json: string): Api.RebaseBuildVolume =>

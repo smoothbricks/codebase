@@ -86,6 +86,6 @@ pub use storage::bootstrap::native::validate_existing_host_storage;
 pub use workspace_credentials::GatewayWorkspaceCredentials;
 
 pub use api::{
-    Coordinator, CoordinatorToken, Cowshed, EventStream, JobAttachment, JobHandle, JobStdin,
-    JobStream, Project, RawByteStream, Session, WorkspaceHandle, WorkspaceRef,
+    Adopted, Coordinator, CoordinatorToken, Cowshed, EventStream, JobAttachment, JobHandle,
+    JobStdin, JobStream, Project, RawByteStream, Session, WorkspaceHandle, WorkspaceRef,
 };

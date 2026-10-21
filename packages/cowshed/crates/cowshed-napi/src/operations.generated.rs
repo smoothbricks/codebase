@@ -86,11 +86,7 @@ impl Coordinator {
     /// Adopts the project's checkout as main.
     #[napi(js_name = "adopt")]
     pub fn adopt(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
-        super::workspace_call::<operations::CoordinatorAdopt, _>(
-            env,
-            Arc::clone(&self.inner),
-            arguments,
-        )
+        super::adopted_call::<operations::CoordinatorAdopt>(env, Arc::clone(&self.inner), arguments)
     }
 
     /// Mints a warm workspace from main or an explicit source.

@@ -266,7 +266,7 @@ operations! {
     /// Renames a session workspace.
     coordinator json "coordinator.rename" CoordinatorRename(SourceDestinationRequest) -> WorkspaceView;
     /// Adopts the project's checkout as main.
-    coordinator json "coordinator.adopt" CoordinatorAdopt(AdoptRequest) -> WorkspaceView;
+    coordinator json "coordinator.adopt" CoordinatorAdopt(AdoptRequest) -> AdoptView;
     /// Mints a warm workspace from main or an explicit source.
     coordinator json "coordinator.fork" CoordinatorFork(ForkRequest) -> WorkspaceView;
     /// Moves the project's checkout.
@@ -438,6 +438,25 @@ pub struct WorkspaceView {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct WorkerView(pub WorkspaceView);
+
+/// What `coordinator.adopt` made: main, and, when the call replaced main, what the replacement
+/// kept (02_workspaces.md, "Re-adoption: format transition and space reclamation", step 5).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdoptView {
+    pub workspace: WorkspaceView,
+    /// Null unless this call re-adopted main.
+    pub re_adoption: Option<ReAdoption>,
+}
+
+/// A completed re-adoption: the incarnation that replaced main, and every path it kept of what it
+/// replaced. Once the replacement is checked, removing exactly those paths returns their space.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReAdoption {
+    pub replacement: WorkspaceIncarnation,
+    pub retained: Vec<PathBuf>,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

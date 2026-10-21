@@ -120,6 +120,8 @@ enum Answer {
     OptionalJob,
     /// The call's events, each demanded by the caller, until its end.
     Stream,
+    /// Main's reference, and what a re-adoption kept as JSON or null.
+    Adopted,
 }
 
 impl Answer {
@@ -132,6 +134,10 @@ impl Answer {
                 (Lane::Stream, _, _, _) => Self::Stream,
                 (_, "WorkspaceView", ResultShape::Record, _) => Self::Workspace,
                 (_, "WorkerView", ResultShape::Record, "Coordinator") => Self::Worker,
+                (_, "AdoptView", ResultShape::Record, "Coordinator") => Self::Adopted,
+                (_, "AdoptView", ResultShape::Record, _) => {
+                    return Err(format!("{}: only the coordinator adopts", operation.method));
+                }
                 (_, "WorkerView", ResultShape::Record, _) => {
                     return Err(format!(
                         "{}: only the coordinator mints a worker capability",
@@ -157,6 +163,7 @@ impl Answer {
             Self::Job => "NativeJobHandle",
             Self::OptionalJob => "NativeJobHandle | null",
             Self::Stream => "NativeEvents",
+            Self::Adopted => "NativeAdopted",
         }
     }
 }
@@ -690,12 +697,14 @@ fn rust(classes: &[(&Class, Vec<Method<'_>>)]) -> Result<String, String> {
                 (Answer::Job, true) => "job_upload_call",
                 (Answer::OptionalJob, false) => "optional_job_call",
                 (Answer::Stream, false) => "stream_call",
+                (Answer::Adopted, false) => "adopted_call",
                 (
                     Answer::Download
                     | Answer::Workspace
                     | Answer::Worker
                     | Answer::OptionalJob
-                    | Answer::Stream,
+                    | Answer::Stream
+                    | Answer::Adopted,
                     true,
                 ) => {
                     return Err(format!(
@@ -712,7 +721,9 @@ fn rust(classes: &[(&Class, Vec<Method<'_>>)]) -> Result<String, String> {
                 | Answer::OptionalJob => {
                     format!("operations::{}, _", operation.marker)
                 }
-                Answer::Worker | Answer::Job => format!("operations::{}", operation.marker),
+                Answer::Worker | Answer::Job | Answer::Adopted => {
+                    format!("operations::{}", operation.marker)
+                }
             };
             let bytes = if upload { ", bytes" } else { "" };
             writeln!(
@@ -762,6 +773,8 @@ fn typescript(
          import * as V from './validators.generated.js';\n\n\
          /** A download's answer: its chunk's metadata as JSON, and the bytes it describes. */\n\
          export interface NativeDownload {{\n  readonly json: string;\n  readonly bytes: Buffer;\n}}\n\n\
+         /** An adoption's answer: main's reference, and what a re-adoption kept as JSON, or null. */\n\
+         export interface NativeAdopted {{\n  readonly workspace: NativeWorkspaceRefHandle;\n  readonly reAdoption: string | null;\n}}\n\n\
          /**\n * A stream-lane call's events: `next` sends one demand and resolves to the event that answers it,\n\
          \x20* as JSON, or to `null` once the call has ended; `close` ends the call, never what it observes, even\n\
          \x20* while a `next` waits, which then resolves to `null`.\n */\n\
@@ -868,6 +881,18 @@ fn typescript(
                 format!("Promise<{}>", method.answer.native()),
                 format!("return {call};"),
             ),
+            Answer::Adopted => {
+                let re_adoption = record_name("ReAdoption")?;
+                (
+                    "async function",
+                    format!(
+                        "Promise<{{ readonly workspace: NativeWorkspaceRefHandle; readonly reAdoption: Api.{re_adoption} | null }}>"
+                    ),
+                    format!(
+                        "const answer = await {call};\n  return {{\n    workspace: answer.workspace,\n    reAdoption: answer.reAdoption === null ? null : V.parse{re_adoption}(answer.reAdoption),\n  }};"
+                    ),
+                )
+            }
             // Each step of the loop is one demand, and leaving it early closes the call.
             Answer::Stream => {
                 let (ty, validator) = operation_result_type(&operation.result, &record_name)?;

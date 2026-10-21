@@ -183,17 +183,19 @@ ASIF-to-RAW transition and the RAW guest-space reclaim operation, not an image c
    contents remain covered by byte comparison and fsck, not by physical allocation equality.
 5. Reuse adopt's atomic `PendingFence` activation and mount the verified replacement at the exact original checkout
    path. Recovery resumes the recorded replacement; it never starts an unrelated adopt or deletes a retained source.
-   Verify the remounted content, Git state and build identity against the recorded before-state. Return the retained
-   image path and its explicit later-removal instruction. Keep the old backing image and original `.pre-cowshed` until
-   the user removes them after verification; repeated invocation resumes the transaction rather than replacing its
-   evidence. Both `adopt <checkout> --re-adopt` and `mount main --repo-id <owner/repo>` reach this recovery without a
-   live Git checkout, but only from the strict unfinished journal's exact repository/checkout match. After startup
-   finishes that intent, retrying adopt retrieves its recorded replacement rather than beginning another reclaim or
-   retained generation. A recorded retained source temporarily remounted read-only at its canonical checkout remains a
-   recovery input, not an active workspace. Repairing startup recognizes it only when the strict unfinished journal's
-   old repository, checkout, workspace and incarnation match its marker, and the kernel joins that exact retained image
-   to a read-only mount at that checkout. Recorded main/build inputs restored read-only at their canonical paths move
-   back to their recorded copy stages without force. Foreign paths and read-write retained mounts refuse.
+   Verify the remounted content, Git state and build identity against the recorded before-state. Return every retained
+   path as data (`ReAdoption.retained`, 07_api.md); the CLI renders the explicit later-removal instruction from them,
+   and startup recovery, which answers no caller, logs them on stderr. Keep the old backing image and original
+   `.pre-cowshed` until the user removes them after verification; repeated invocation resumes the transaction rather
+   than replacing its evidence. Both `adopt <checkout> --re-adopt` and `mount main --repo-id <owner/repo>` reach this
+   recovery without a live Git checkout, but only from the strict unfinished journal's exact repository/checkout match.
+   After startup finishes that intent, retrying adopt retrieves its recorded replacement rather than beginning another
+   reclaim or retained generation. A recorded retained source temporarily remounted read-only at its canonical checkout
+   remains a recovery input, not an active workspace. Repairing startup recognizes it only when the strict unfinished
+   journal's old repository, checkout, workspace and incarnation match its marker, and the kernel joins that exact
+   retained image to a read-only mount at that checkout. Recorded main/build inputs restored read-only at their
+   canonical paths move back to their recorded copy stages without force. Foreign paths and read-write retained mounts
+   refuse.
 
 #### Missing main image
 

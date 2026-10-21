@@ -23,7 +23,9 @@ use cowshed_core::api::dto::{
     RemoveProjectOptions, RemoveProjectReport, RemoveReport, ResizeResult, ResizeVolume,
     RunSandboxMode, StdinSource, StepReport, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
-use cowshed_core::api::operations::{JobLogs, LogsRequest, Operation, OperationRequest};
+use cowshed_core::api::operations::{
+    JobLogs, LogsRequest, Operation, OperationRequest, ReAdoption,
+};
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle, serve_controller_connection};
 use cowshed_core::error::CpuAdmissionRefusal;
 use cowshed_core::metadata::{
@@ -612,6 +614,16 @@ impl ProjectRuntimeHost for FakeHost {
                 "repair overlapping mounts",
             )),
         }
+    }
+
+    async fn re_adopt(
+        &mut self,
+        _options: AdoptOptions,
+    ) -> Result<(WorkspaceSnapshot, ReAdoption)> {
+        Err(CowshedError::usage(
+            "this test host keeps no adopted image to replace",
+            "adopt instead",
+        ))
     }
 
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceSnapshot> {
@@ -1715,15 +1727,22 @@ async fn start_with_removal(
     (runtime, router, repo, receiver)
 }
 
+/// Adopts main and answers main's workspace view; a plain adopt replaced nothing.
 async fn adopt(router: &RouterHandle, repo: &RepoId) -> Value {
-    route(
+    let adopted = route(
         router,
         coordinator(repo.clone()),
         "coordinator.adopt",
         json!({ "repoId": repo, "options": AdoptOptions::default() }),
     )
     .await
-    .expect("adopt")
+    .expect("adopt");
+    assert_eq!(
+        adopted["reAdoption"],
+        Value::Null,
+        "a plain adopt replaced nothing: {adopted}"
+    );
+    adopted["workspace"].clone()
 }
 
 async fn checkpoint_as_worker(
@@ -5193,7 +5212,8 @@ async fn secret_refusal_precedes_image_initialization_and_quarantine_preserves_p
     )
     .await
     .expect("quarantined adopt");
-    assert_eq!(adopted["info"]["workspace"], "main");
+    assert_eq!(adopted["workspace"]["info"]["workspace"], "main");
+    assert_eq!(adopted["reAdoption"], Value::Null);
     assert!(!secret.exists());
     let quarantined = root.join("store/quarantine/.env");
     assert_eq!(

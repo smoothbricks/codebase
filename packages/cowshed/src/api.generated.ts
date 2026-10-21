@@ -184,6 +184,18 @@ export type AdoptRequest = {
   readonly options: AdoptOptions;
 };
 
+/**
+ * What `coordinator.adopt` made: main, and, when the call replaced main, what the replacement
+ * kept (02_workspaces.md, "Re-adoption: format transition and space reclamation", step 5).
+ */
+export type AdoptView = {
+  readonly workspace: WorkspaceView;
+  /**
+   * Null unless this call re-adopted main.
+   */
+  readonly reAdoption: ReAdoption | null;
+};
+
 export type Adoption =
   | ({ readonly kind: 'adopted' } & {
       readonly elapsedMs: number & tags.Type<'uint64'>;
@@ -2187,6 +2199,15 @@ export type QuotaRequest = {
   readonly repoId: RepoId;
   readonly workspace: WorkspaceName;
   readonly quota: CheckpointQuota;
+};
+
+/**
+ * A completed re-adoption: the incarnation that replaced main, and every path it kept of what it
+ * replaced. Once the replacement is checked, removing exactly those paths returns their space.
+ */
+export type ReAdoption = {
+  readonly replacement: WorkspaceIncarnation;
+  readonly retained: ReadonlyArray<string>;
 };
 
 /**

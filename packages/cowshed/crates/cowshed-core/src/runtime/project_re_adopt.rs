@@ -16,6 +16,7 @@ use super::{
 };
 use super::{WorkspaceSnapshot, native_staged_error, native_storage_error};
 use crate::api::dto::AdoptOptions;
+use crate::api::operations::ReAdoption;
 use crate::build_volume::BuildVolumeId;
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
@@ -31,7 +32,10 @@ use cowshed_apfs::image::IMAGE_EXTENSION;
 
 impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// Re-adopt main: gate, record, then run the replacement (step 1 of the spec, then 2-5).
-    pub(super) async fn re_adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceSnapshot> {
+    pub(super) async fn re_adopt_main(
+        &mut self,
+        options: AdoptOptions,
+    ) -> Result<(WorkspaceSnapshot, ReAdoption)> {
         let main = main_name();
         // A re-adoption already under way resumes from its record, whatever this call asked. A
         // completed one is not resumed: a further `--re-adopt` is a new explicit reclaim, and its
@@ -116,7 +120,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         options: AdoptOptions,
         source: ReAdoptSource,
         supervisor: Option<super::super::supervisor_socket::BoundSocket>,
-    ) -> Result<WorkspaceSnapshot> {
+    ) -> Result<(WorkspaceSnapshot, ReAdoption)> {
         let main = main_name();
         let checkout = source.checkout.clone();
         let intent = LifecycleIntent::ReAdopt {
@@ -459,11 +463,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         })
     }
 
-    /// Steps 2-5 from the record, converging from whatever a crash left.
+    /// Steps 2-5 from the record, converging from whatever a crash left: the replacement, and what
+    /// it kept of what it replaced.
     pub(super) async fn resume_re_adopt(
         &mut self,
         source: ReAdoptSource,
-    ) -> Result<WorkspaceSnapshot> {
+    ) -> Result<(WorkspaceSnapshot, ReAdoption)> {
         let source = std::sync::Arc::new(source);
         let main = main_name();
         let lock = self
@@ -602,23 +607,13 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let snapshot = self
             .conclude_adoption(&workspace, super::super::build_volumes::FirstMint::Nothing)
             .await?;
-        eprintln!(
-            "cowshed: re-adopted main as {}; this re-adoption kept what it replaced at:",
-            source.replacement.as_str()
-        );
-        for path in &retained {
-            eprintln!("  {}", path.display());
-        }
-        eprintln!(
-            "cowshed: once you have checked the replacement, removing exactly those paths returns \
-             their space: rm -R -- {}",
-            retained
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        Ok(snapshot)
+        Ok((
+            snapshot,
+            ReAdoption {
+                replacement: source.replacement.clone(),
+                retained,
+            },
+        ))
     }
 
     /// The recorded missing-main re-adoption `source`, its plain checkout first proved unheld and

@@ -93,7 +93,7 @@ export interface Project {
 }
 
 export interface Coordinator {
-  adopt(options?: Api.AdoptOptions): Promise<WorkspaceRef>;
+  adopt(options?: Api.AdoptOptions): Promise<Adopted>;
   fork(workspace: string, options?: Partial<Api.ForkOptions> & { source?: string }): Promise<WorkspaceRef>;
   rename(source: string, destination: string): Promise<WorkspaceRef>;
   moveCheckout(destination: string): Promise<WorkspaceRef>;
@@ -198,6 +198,15 @@ export interface JobHandle {
   detach(): Promise<void>;
   wait(): Promise<Api.JobInfo>;
   kill(): Promise<void>;
+}
+
+/**
+ * What an adopt made: main's reference, and, when the call re-adopted main, what the replacement
+ * kept of what it replaced (02_workspaces.md, "Re-adoption", step 5).
+ */
+export interface Adopted {
+  readonly workspace: WorkspaceRef;
+  readonly reAdoption: Api.ReAdoption | null;
 }
 
 export interface WorkspaceRef {

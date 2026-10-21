@@ -18,6 +18,12 @@ export interface NativeDownload {
   readonly bytes: Buffer;
 }
 
+/** An adoption's answer: main's reference, and what a re-adoption kept as JSON, or null. */
+export interface NativeAdopted {
+  readonly workspace: NativeWorkspaceRefHandle;
+  readonly reAdoption: string | null;
+}
+
 /**
  * A stream-lane call's events: `next` sends one demand and resolves to the event that answers it,
  * as JSON, or to `null` once the call has ended; `close` ends the call, never what it observes, even
@@ -101,7 +107,7 @@ export interface NativeJobHandleOperations
 
 /** A handle that serves `coordinator.adopt`. */
 export interface NativeCoordinatorAdopt {
-  adopt(argumentsJson: string): Promise<NativeWorkspaceRefHandle>;
+  adopt(argumentsJson: string): Promise<NativeAdopted>;
 }
 
 /** The request fields a `coordinator.adopt` caller names; its handle binds the rest. */
@@ -113,8 +119,12 @@ export type CoordinatorAdoptArguments = Pick<Api.AdoptRequest, 'options'>;
 export async function coordinatorAdopt(
   handle: NativeCoordinatorAdopt,
   args: CoordinatorAdoptArguments,
-): Promise<NativeWorkspaceRefHandle> {
-  return handle.adopt(JSON.stringify(args));
+): Promise<{ readonly workspace: NativeWorkspaceRefHandle; readonly reAdoption: Api.ReAdoption | null }> {
+  const answer = await handle.adopt(JSON.stringify(args));
+  return {
+    workspace: answer.workspace,
+    reAdoption: answer.reAdoption === null ? null : V.parseReAdoption(answer.reAdoption),
+  };
 }
 
 /** A handle that serves `coordinator.assignSlot`. */

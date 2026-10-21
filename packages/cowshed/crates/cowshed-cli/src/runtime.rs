@@ -13,6 +13,7 @@ use bytes::Bytes;
 use cowshed_apfs::SystemCommandRunner;
 use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
 pub use cowshed_core::api::ProjectWorkspaces;
+use cowshed_core::api::operations::ReAdoption;
 use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection};
 use cowshed_core::api::{
     AbandonedPreservation, AbandonedWork, AdoptOptions, AttachOptions, BranchLandings, BranchName,
@@ -51,8 +52,8 @@ use cowshed_core::storage::lifecycle::{DerivedWorkspace, MountIntent, MountState
 use cowshed_core::storage::recovery::KeptAbandonBundles;
 use cowshed_core::storage::{StorageLayout, discover_session_images};
 use cowshed_core::{
-    AdoptedProject, CowshedError, ErrorCode, GatewayInventoryError, GatewayStoreBackend, JobHandle,
-    NativeGatewayInventory, Result, UnreachableMain, validate_existing_host_storage,
+    Adopted, AdoptedProject, CowshedError, ErrorCode, GatewayInventoryError, GatewayStoreBackend,
+    JobHandle, NativeGatewayInventory, Result, UnreachableMain, validate_existing_host_storage,
 };
 use cowshed_gateway_types::STORE_ROOT;
 use std::collections::HashMap;
@@ -100,7 +101,9 @@ pub enum ExecEnd {
 
 #[async_trait]
 pub trait CliService: Send {
-    async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceInfo>;
+    /// Main, and what the replacement kept when `options` re-adopted it.
+    async fn adopt(&mut self, options: AdoptOptions)
+    -> Result<(WorkspaceInfo, Option<ReAdoption>)>;
     async fn fork(
         &mut self,
         workspace: &str,
@@ -700,8 +703,15 @@ async fn kept_abandon_bundles() -> Result<Vec<(RepoId, KeptAbandonBundles)>> {
 
 #[async_trait]
 impl CliService for ActorBridge {
-    async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceInfo> {
-        Ok(self.coordinator()?.adopt(options).await?.into_info())
+    async fn adopt(
+        &mut self,
+        options: AdoptOptions,
+    ) -> Result<(WorkspaceInfo, Option<ReAdoption>)> {
+        let Adopted {
+            workspace,
+            re_adoption,
+        } = self.coordinator()?.adopt(options).await?;
+        Ok((workspace.into_info(), re_adoption))
     }
 
     async fn fork(
@@ -1378,6 +1388,7 @@ pub struct DispatchExit {
 enum AdoptionOutcome<'a> {
     Created { capacity: &'a str },
     Recovered,
+    Replaced(&'a ReAdoption),
 }
 
 async fn report_adoption<S, W, E>(
@@ -1396,18 +1407,19 @@ where
     // recoverable condition, not a reason to issue another adoption.
     let gateway = service.reconcile_gateway().await;
     emit_mount(output, json, info)?;
-    let guidance = match outcome {
-        AdoptionOutcome::Created { capacity } => format!(
+    match outcome {
+        AdoptionOutcome::Created { capacity } => output.guidance(&format!(
             "created {}.{IMAGE_EXTENSION} for {} (capacity {capacity})",
             info.workspace, info.repo_id,
-        ),
-        AdoptionOutcome::Recovered => format!(
+        )),
+        AdoptionOutcome::Recovered => output.guidance(&format!(
             "resumed recorded replacement for {} at {}",
             info.workspace,
             info.mount.display(),
-        ),
-    };
-    output.guidance(&guidance).map_err(output_error)?;
+        )),
+        AdoptionOutcome::Replaced(re_adoption) => report_re_adoption(output, re_adoption),
+    }
+    .map_err(output_error)?;
     match gateway {
         Ok(()) => output.hint("cowshed fork <ws>").map_err(output_error)?,
         Err(error) => {
@@ -1421,6 +1433,35 @@ where
         }
     }
     Ok(success())
+}
+
+/// What a re-adoption kept (02_workspaces.md, "Re-adoption", step 5): every retained path, and,
+/// as the next command quiet mode never suppresses, the removal that returns their space once the
+/// replacement is checked.
+fn report_re_adoption<W, E>(output: &mut Output<W, E>, re_adoption: &ReAdoption) -> io::Result<()>
+where
+    W: Write + Send,
+    E: Write + Send,
+{
+    output.guidance(&format!(
+        "re-adopted main as {}; this re-adoption kept what it replaced at:",
+        re_adoption.replacement.as_str()
+    ))?;
+    for path in &re_adoption.retained {
+        output.note(&format!("  {}", path.display()))?;
+    }
+    output.guidance(
+        "once you have checked the replacement, removing exactly those paths returns their space",
+    )?;
+    output.hint(&format!(
+        "rm -R -- {}",
+        re_adoption
+            .retained
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    ))
 }
 
 async fn report_recovered_adoption<S, W, E>(
@@ -1460,17 +1501,14 @@ where
                 .capacity
                 .clone()
                 .unwrap_or_else(|| DEFAULT_IMAGE_CAPACITY.to_string());
-            let info = service.adopt(options).await?;
-            report_adoption(
-                service,
-                &info,
-                AdoptionOutcome::Created {
+            let (info, re_adoption) = service.adopt(options).await?;
+            let outcome = match &re_adoption {
+                Some(re_adoption) => AdoptionOutcome::Replaced(re_adoption),
+                None => AdoptionOutcome::Created {
                     capacity: &capacity,
                 },
-                json,
-                output,
-            )
-            .await
+            };
+            report_adoption(service, &info, outcome, json, output).await
         }
         Command::Move(args) => {
             let info = match &args.destination {

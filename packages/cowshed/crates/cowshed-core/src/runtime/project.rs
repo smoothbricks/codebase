@@ -30,10 +30,11 @@ use crate::api::dto::{BranchLandings, LandingCommits, UnlandedPaths};
 #[cfg(target_os = "macos")]
 use crate::api::dto::{LandedReport, RunSandboxMode};
 use crate::api::operations::{
-    self, AdoptRequest, BuildVolume, ExecParams, ExecStdin, GrantRequest, JobRequest, JobStream,
-    LogsChunk, LogsRequest, Operation, OperationRequest, ProgressRequest, ProjectOpenRequest,
-    ProjectOpened, RepoRequest, Scope, StdinWriteRequest, TailRequest, WorkerScope,
-    WorkspaceAtRequest, WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, encode_result,
+    self, AdoptRequest, AdoptView, BuildVolume, ExecParams, ExecStdin, GrantRequest, JobRequest,
+    JobStream, LogsChunk, LogsRequest, Operation, OperationRequest, ProgressRequest,
+    ProjectOpenRequest, ProjectOpened, ReAdoption, RepoRequest, Scope, StdinWriteRequest,
+    TailRequest, WorkerScope, WorkspaceAtRequest, WorkspaceGrantsRequest, WorkspaceRequest,
+    WorkspaceView, encode_result,
 };
 use crate::api::process::JobProcessTree;
 use crate::api::resources::{JobResourceSample, SampleInterval};
@@ -144,7 +145,11 @@ pub trait ProjectRuntimeHost: Send + 'static {
     async fn workspace_snapshot(&mut self, workspace: WorkspaceName) -> Result<WorkspaceSnapshot>;
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceSnapshot>;
 
+    /// Adopts the checkout as main. A re-adoption is [`Self::re_adopt`], never this.
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceSnapshot>;
+    /// Replaces an adopted main (02_workspaces.md, "Re-adoption"), answering the replacement and
+    /// what it kept of what it replaced.
+    async fn re_adopt(&mut self, options: AdoptOptions) -> Result<(WorkspaceSnapshot, ReAdoption)>;
     async fn resume_fork(
         &mut self,
         workspace: WorkspaceName,
@@ -1711,7 +1716,7 @@ impl ProjectActor {
         ))
     }
 
-    async fn coordinator_adopt(&mut self, params: AdoptRequest) -> Result<WorkspaceView> {
+    async fn coordinator_adopt(&mut self, params: AdoptRequest) -> Result<AdoptView> {
         self.require_repo(&params.repo_id)?;
         if params
             .options
@@ -1724,7 +1729,18 @@ impl ProjectActor {
                 "retry with the repository identity selected while opening the project",
             ));
         }
-        self.host.adopt(params.options).await.map(workspace_view)
+        if params.options.re_adopt {
+            let (snapshot, re_adoption) = self.host.re_adopt(params.options).await?;
+            return Ok(AdoptView {
+                workspace: workspace_view(snapshot),
+                re_adoption: Some(re_adoption),
+            });
+        }
+        let snapshot = self.host.adopt(params.options).await?;
+        Ok(AdoptView {
+            workspace: workspace_view(snapshot),
+            re_adoption: None,
+        })
     }
 
     async fn coordinator_grant(&mut self, params: GrantRequest, revoke: bool) -> Result<GrantSet> {
@@ -4056,7 +4072,20 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                 "repair the lifecycle intent journal, then reopen cowshed",
                             ));
                         }
-                        self.resume_re_adopt(*source).await?;
+                        let (_, re_adoption) = self.resume_re_adopt(*source).await?;
+                        // Startup recovery answers no caller, so it logs the account for whoever
+                        // reopened cowshed; an adopt that finishes a replacement returns it instead.
+                        eprintln!(
+                            "cowshed: recovery re-adopted main as {}; it kept what it replaced at:",
+                            re_adoption.replacement.as_str()
+                        );
+                        for path in &re_adoption.retained {
+                            eprintln!("  {}", path.display());
+                        }
+                        eprintln!(
+                            "cowshed: once you have checked the replacement, removing exactly those \
+                             paths returns their space"
+                        );
                     }
                     LifecycleIntent::Create { workspace, options } => {
                         match self.current(&workspace).await {
@@ -10627,11 +10656,17 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         self.snapshot(&current)
     }
 
+    async fn re_adopt(&mut self, options: AdoptOptions) -> Result<(WorkspaceSnapshot, ReAdoption)> {
+        self.re_adopt_main(options).await
+    }
+
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceSnapshot> {
         use crate::storage::lifecycle::LifecyclePlanner;
         let store_root = &std::sync::Arc::clone(self.git.store_root());
         if options.re_adopt {
-            return self.re_adopt(options).await;
+            return Err(CowshedError::internal(
+                "a re-adoption reached plain adoption; the coordinator sends it to re_adopt",
+            ));
         }
         // A main adopted before RAW is invisible to this runtime's inventory, which therefore
         // reads empty: a fresh adopt would journal over it and mint a second main. Only its

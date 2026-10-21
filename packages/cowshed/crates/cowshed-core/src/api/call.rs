@@ -15,12 +15,12 @@
 //! a second field list, decides what the call accepts.
 
 use super::capability::{
-    ControllerRuntime, Coordinator, EventStream, JobHandle, Project, WorkspaceHandle, WorkspaceRef,
-    invoke, invoke_download, invoke_stream, invoke_upload,
+    Adopted, ControllerRuntime, Coordinator, EventStream, JobHandle, Project, WorkspaceHandle,
+    WorkspaceRef, invoke, invoke_download, invoke_stream, invoke_upload,
 };
 use super::dto::{JobId, JobInfo, WorkspaceIncarnation};
 use super::operations::{
-    Lane, LogsChunk, Operation, Scope, StreamOperation, WorkerView, WorkspaceView,
+    AdoptView, Lane, LogsChunk, Operation, Scope, StreamOperation, WorkerView, WorkspaceView,
 };
 use crate::error::{CowshedError, Result};
 use crate::metadata::WorkspaceName;
@@ -209,6 +209,25 @@ impl Coordinator {
     {
         let WorkerView(view) = call::<O, Self>(self, arguments).await?;
         Ok(self.worker_handle(view))
+    }
+
+    /// Calls the operation that adopts main, as main's reference and what a re-adoption kept.
+    pub async fn call_adopt<O: Operation<Result = AdoptView>>(
+        &self,
+        arguments: Arguments,
+    ) -> Result<Adopted>
+    where
+        Self: Serves<O>,
+    {
+        let runtime = Arc::clone(self.binding().runtime);
+        let AdoptView {
+            workspace,
+            re_adoption,
+        } = call::<O, Self>(self, arguments).await?;
+        Ok(Adopted {
+            workspace: WorkspaceRef::from_view(workspace, runtime),
+            re_adoption,
+        })
     }
 }
 

@@ -4597,40 +4597,6 @@ enum ReAdoptionProof {
 }
 
 async fn prove_re_adoption(proof: ReAdoptionProof) {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    struct RestoreStderr {
-        saved: Option<OwnedFd>,
-        report_path: PathBuf,
-    }
-    impl RestoreStderr {
-        fn restore(&mut self) -> std::io::Result<()> {
-            if let Some(saved) = self.saved.take() {
-                // SAFETY: saved owns the descriptor until duplication completes.
-                if unsafe { libc::dup2(saved.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
-                    self.saved = Some(saved);
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        }
-    }
-    impl Drop for RestoreStderr {
-        fn drop(&mut self) {
-            if self.saved.is_some() {
-                if let Err(error) = self.restore() {
-                    eprintln!("replacement proof could not restore stderr: {error}");
-                    return;
-                }
-                match fs::read_to_string(&self.report_path) {
-                    Ok(report) => eprint!("{report}"),
-                    Err(error) => eprintln!(
-                        "replacement proof could not read captured stderr {}: {error}",
-                        self.report_path.display()
-                    ),
-                }
-            }
-        }
-    }
     let mut fixture = Fixture::with(Project::Declared);
     let mut service = fixture.open().await;
     let storage = cowshed_core::storage::StorageLayout::new(
@@ -4712,28 +4678,8 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             .expect("main's sidecar")
             .workspace_incarnation;
 
-        // Core retention guidance writes to the real stderr descriptor, not the CLI Output buffer.
-        // Observe that actual channel; the isolated nextest process has only this lifecycle walk.
-        let report_path = fixture._scratch.path().join("re-adopt-report.stderr");
-        let report_file = fs::File::create(&report_path).expect("capture core replacement report");
-        // SAFETY: fcntl duplicates the live standard-error descriptor and owns the result.
-        let saved = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
-        assert!(
-            saved >= 0,
-            "save stderr: {}",
-            std::io::Error::last_os_error()
-        );
-        // SAFETY: the successful duplication returned an owned, non-stdio descriptor.
-        let mut restore = RestoreStderr {
-            saved: Some(unsafe { OwnedFd::from_raw_fd(saved) }),
-            report_path,
-        };
-        // SAFETY: report_file stays open until stderr is restored.
-        assert!(
-            unsafe { libc::dup2(report_file.as_raw_fd(), libc::STDERR_FILENO) } >= 0,
-            "capture stderr: {}",
-            std::io::Error::last_os_error()
-        );
+        // The replacement's account is a returned value the CLI renders into its own output:
+        // each kept path on its line, and the one removal command naming them all.
         let (replacement, stdout, stderr) = run(
             &mut service,
             [
@@ -4743,13 +4689,6 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             ],
         )
         .await;
-        restore.restore().expect("restore stderr after replacement");
-        drop(report_file);
-        let core_report =
-            fs::read_to_string(&restore.report_path).expect("read actual replacement guidance");
-        // Restore the real channel before asserting: neither an operational refusal nor
-        // a panic may disappear into a private capture deleted by fixture teardown.
-        eprint!("{core_report}");
         let stderr = String::from_utf8_lossy(&stderr);
         assert!(
             matches!(replacement, Ok(0)),
@@ -4815,10 +4754,13 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             retained.join(format!("build-{}.dmg.json", main_volume.as_str())),
         ] {
             assert!(kept.exists(), "{} is retained: {stderr}", kept.display());
+            let kept = kept.display().to_string();
             assert!(
-                core_report.contains(&kept.display().to_string()),
-                "the actual stderr report names {}: {core_report}",
-                kept.display()
+                stderr.lines().any(|line| line == format!("  {kept}"))
+                    && stderr
+                        .lines()
+                        .any(|line| line.starts_with("next: rm -R -- ") && line.contains(&kept)),
+                "the returned report names {kept} and its removal: {stderr}"
             );
         }
 

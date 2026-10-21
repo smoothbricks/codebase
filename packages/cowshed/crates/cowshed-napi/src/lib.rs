@@ -26,7 +26,7 @@ use cowshed_core::{
     WorkspaceRef as CoreWorkspaceRef,
     api::{
         call::{self, Arguments, NamesJob, Serves},
-        operations::{LogsChunk, Operation, StreamOperation, WorkerView, WorkspaceView},
+        operations::{AdoptView, LogsChunk, Operation, StreamOperation, WorkerView, WorkspaceView},
     },
 };
 use napi::{
@@ -203,6 +203,30 @@ where
             call::call_workspace::<O, H>(&*handle, arguments(O::METHOD, &json)?).await?;
         Ok(WorkspaceRef {
             inner: Arc::new(workspace),
+        })
+    })
+}
+
+/// The operation that adopts main, as main's reference and what a re-adoption kept.
+fn adopted_call<O>(
+    env: Env,
+    coordinator: Arc<CoreCoordinator>,
+    json: String,
+) -> napi::Result<JsObject>
+where
+    O: Operation<Result = AdoptView>,
+    CoreCoordinator: Serves<O>,
+{
+    spawn_promise(env, async move {
+        let adopted = coordinator
+            .call_adopt::<O>(arguments(O::METHOD, &json)?)
+            .await?;
+        Ok(Adopted {
+            workspace: Arc::new(adopted.workspace),
+            re_adoption: adopted
+                .re_adoption
+                .map(|re_adoption| canonical_json("re-adoption", &re_adoption))
+                .transpose()?,
         })
     })
 }
@@ -568,6 +592,29 @@ impl WorkspaceRef {
     pub fn target_json(&self, env: Env) -> napi::Result<String> {
         canonical_json("workspace target", &self.inner.target())
             .map_err(|failure| to_napi_error(env, failure))
+    }
+}
+
+/// What an adopt made: main's reference, and what a re-adoption kept.
+#[napi]
+pub struct Adopted {
+    workspace: Arc<CoreWorkspaceRef>,
+    re_adoption: Option<String>,
+}
+
+#[napi]
+impl Adopted {
+    #[napi(getter)]
+    pub fn workspace(&self) -> WorkspaceRef {
+        WorkspaceRef {
+            inner: Arc::clone(&self.workspace),
+        }
+    }
+
+    /// What the re-adoption kept, as canonical JSON, or null when this adopt replaced nothing.
+    #[napi(getter, js_name = "reAdoption")]
+    pub fn re_adoption(&self) -> Option<String> {
+        self.re_adoption.clone()
     }
 }
 

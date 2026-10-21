@@ -11,14 +11,15 @@ use super::dto::{
 };
 use super::frame;
 use super::operations::{
-    self, AdmissionKeyRequest, AdoptRequest, ChangeRepoIdRequest, CheckpointRequest,
+    self, AdmissionKeyRequest, AdoptRequest, AdoptView, ChangeRepoIdRequest, CheckpointRequest,
     DestroyRequest, ExecParams, ExecStdin, ForkRequest, GcRequest, GrantRequest, JobRequest,
     JobStream, LandRequest, LogsChunk, LogsRequest, MirrorRequest, MoveCheckoutRequest, Operation,
     ProgressRequest, ProjectGrantRequest, ProjectOpenRequest, PushRequest, QuotaRequest,
-    RebaseRequest, RemoveProjectRequest, RepoRequest, ReseedRequest, ResizeRequest, RestoreRequest,
-    SessionRequest, SlotRequest, SourceDestinationRequest, StdinWriteRequest, StreamOperation,
-    TailRequest, WorkerScope, WorkerView, WorkspaceAtRequest, WorkspaceAttachRequest,
-    WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, decode_result, encode_request,
+    ReAdoption, RebaseRequest, RemoveProjectRequest, RepoRequest, ReseedRequest, ResizeRequest,
+    RestoreRequest, SessionRequest, SlotRequest, SourceDestinationRequest, StdinWriteRequest,
+    StreamOperation, TailRequest, WorkerScope, WorkerView, WorkspaceAtRequest,
+    WorkspaceAttachRequest, WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, decode_result,
+    encode_request,
 };
 use super::peer_credentials::PeerCredentialsError;
 use super::process::JobProcessTree;
@@ -1031,6 +1032,14 @@ impl fmt::Debug for Project {
     }
 }
 
+/// What [`Coordinator::adopt`] made: main's reference, and what the replacement kept when the call
+/// re-adopted main (02_workspaces.md, "Re-adoption", step 5).
+#[derive(Clone)]
+pub struct Adopted {
+    pub workspace: WorkspaceRef,
+    pub re_adoption: Option<ReAdoption>,
+}
+
 /// Read-only identity and detached snapshot for exactly one workspace.
 #[derive(Clone)]
 pub struct WorkspaceRef {
@@ -1864,14 +1873,22 @@ impl Coordinator {
         WorkspaceRef::from_view(view, Arc::clone(&self.runtime))
     }
 
-    pub async fn adopt(&self, options: AdoptOptions) -> Result<WorkspaceRef> {
+    pub async fn adopt(&self, options: AdoptOptions) -> Result<Adopted> {
         let request = AdoptRequest {
             repo_id: self.repo_id(),
             options,
         };
         invoke::<operations::CoordinatorAdopt>(&*self.runtime, &request)
             .await
-            .map(|view| self.workspace_ref(view))
+            .map(
+                |AdoptView {
+                     workspace,
+                     re_adoption,
+                 }| Adopted {
+                    workspace: self.workspace_ref(workspace),
+                    re_adoption,
+                },
+            )
     }
 
     pub async fn fork(

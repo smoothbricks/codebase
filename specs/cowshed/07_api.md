@@ -528,7 +528,11 @@ impl Coordinator {
     // The daemon's refusal of this controller's build (`OtherBuild`), once any call on this
     // connection met it; the remedy is a controller of the daemon's build (11_shell.md "hello").
     pub fn other_build(&self) -> watch::Receiver<Option<OtherBuild>>;
-    pub async fn adopt(&self, opts: AdoptOptions) -> Result<WorkspaceRef, CowshedError>;
+    // Main, and, when `opts.re_adopt` replaced it, what the replacement kept (02: "Re-adoption", step 5):
+    // `Adopted { workspace: WorkspaceRef, re_adoption: Option<ReAdoption> }`, where
+    // `ReAdoption { replacement: WorkspaceIncarnation, retained: Vec<PathBuf> }` holds paths, never
+    // instruction text; the CLI renders the removal command from them.
+    pub async fn adopt(&self, opts: AdoptOptions) -> Result<Adopted, CowshedError>;
     pub async fn fork(&self, workspace: &str, source: Option<&str>, opts: ForkOptions) -> Result<WorkspaceRef, CowshedError>;
     pub async fn grant(&self, ws: &str, delta: GrantDelta) -> Result<GrantSet, CowshedError>;
     pub async fn revoke(&self, ws: &str, delta: GrantDelta) -> Result<GrantSet, CowshedError>;
@@ -1417,7 +1421,12 @@ supervisor that ran the job retires.
   are validated lowercase 40- or 64-hex strings.
 - `AdoptOptions = { path?, repoId?, capacity?, quarantine, reAdopt }`; `reAdopt: false` keeps default adoption
   idempotent, while `true` selects the verified retained-source replacement in 02_workspaces.md §Re-adoption, or, when
-  main's image is missing, the plain-checkout recovery in §Missing main image.
+  main's image is missing, the plain-checkout recovery in §Missing main image. `coordinator.adopt` answers
+  `AdoptView = { workspace: WorkspaceView, reAdoption: ReAdoption | null }`, with
+  `ReAdoption = { replacement, retained }` and `reAdoption` non-null exactly when the call re-adopted main; the
+  TypeScript `Coordinator.adopt` resolves `Adopted = { workspace: WorkspaceRef, reAdoption: ReAdoption | null }`. The
+  value is for callers. A re-adoption that startup recovery finishes answers no caller, so it logs the same paths on
+  stderr for the human who reopened cowshed; the two coexist deliberately.
   `ForkOptions = { ref?, clean, browse, slot?, register, gitWorktree }`; `AttachOptions = { browse }`;
   `RemoveOptions = { force }`; `GcOptions = { dryRun, abandoned }`; `RebaseOptions`, `LandOptions`, and `PushOptions`
   use the expectation fields shown above. All booleans are explicit in JSON; absence never silently means authority was

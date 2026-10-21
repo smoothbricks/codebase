@@ -14,6 +14,7 @@ import {
   type NativeWorkspaceRefHandle,
 } from './native.js';
 import {
+  type Adopted,
   type Coordinator,
   type CoordinatorEndpoint,
   CowshedError,
@@ -182,10 +183,9 @@ class CoordinatorImpl implements Coordinator {
     this.#native = nativeCoordinator;
   }
 
-  async adopt(options?: Api.AdoptOptions): Promise<WorkspaceRef> {
-    return new WorkspaceRefImpl(
-      await callNativeAsync(() => N.coordinatorAdopt(this.#native, { options: options ?? {} })),
-    );
+  async adopt(options?: Api.AdoptOptions): Promise<Adopted> {
+    const adopted = await callNativeAsync(() => N.coordinatorAdopt(this.#native, { options: options ?? {} }));
+    return { workspace: new WorkspaceRefImpl(adopted.workspace), reAdoption: adopted.reAdoption };
   }
 
   async fork(workspace: string, options?: Partial<Api.ForkOptions> & { source?: string }): Promise<WorkspaceRef> {

@@ -130,7 +130,11 @@ async fn a_probe_that_waits_for_an_answer_is_the_doctor_step_its_call_is_in() {
     )
     .await
     .expect("directory-backed adoption");
-    let main_mount = PathBuf::from(adopted["info"]["mount"].as_str().expect("main mount"));
+    let main_mount = PathBuf::from(
+        adopted["workspace"]["info"]["mount"]
+            .as_str()
+            .expect("main mount"),
+    );
     adopting
         .shutdown()
         .await
