@@ -124,14 +124,23 @@ write took 10.6 seconds). Allocation separately warns at **128 GiB absolute** or
 3.1% of that 281 GB image. A high baseline warns before work begins even when the delta is zero. Shrinking does not
 trigger a growth warning. Each warning names the signal and the thresholds.
 
-One lazily started writer belongs to each native host. Its bounded queue holds 64 operations; `try_send` refuses and
-increments a failure count rather than waiting for the writer. It gathers for the same ten-second
-`PROCESS_SEAL_INTERVAL` as process telemetry, or 64 operations, then seals one segment. This is **per writer**, not per
-partition: a fork's several observations share a seal, not one `F_FULLFSYNC` per observation. Host drop closes the queue
-and joins the final flush, preserving the last accepted operation. Queue refusal, spawn failure and seal failure report
-a cumulative failed-observation count on stderr. A crash may lose the unsealed window, as with process telemetry.
-Before/after rows are published together after the operation; live waits remain visible in the existing lifecycle start
-diagnostics.
+One lazily started writer belongs to each native host. Its queue admits at most **4,096 operations or 16 MiB of retained
+Rust payload capacity, whichever binds first**, including observations the writer has received but not yet sealed. The
+operation limit can absorb 4,096 arrivals in one ten-second window, rather than discarding a busy interval after 64
+arrivals. The independent byte limit accounts for variable-length image paths and errors: each observation counts its
+row/vector storage and every string's reserved capacity, without serializing a second copy. Allocator, channel
+bookkeeping and temporary Arrow encoding storage are outside this payload bound. Admission refuses and increments a
+failure count rather than waiting for capacity; the diagnostic names the operation or byte limit that refused it.
+Draining the channel does not make the interval buffer unbounded. Sealing runs on the ten-second `PROCESS_SEAL_INTERVAL`
+alone, regardless of operation count, with a final flush on host drop. A full queue drops detail with a counted refusal;
+it never triggers an early seal. A count-triggered seal would make full-drive flush rate grow with activity, recreating
+the defect telemetry coalescing fixes.
+
+This is **per writer**, not per partition: a fork's observations share a seal, not one `F_FULLFSYNC` per observation.
+Host drop closes the queue and joins the final flush, preserving the last accepted operation. Queue refusal, spawn
+failure and seal failure report a cumulative failed-observation count on stderr. A crash may lose the unsealed window,
+as with process telemetry. Before/after rows are published together after the operation; live waits remain visible in
+the existing lifecycle start diagnostics.
 
 Use the ordinary reader to inspect a trace (the date is the batch's first operation's UTC date):
 

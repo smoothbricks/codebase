@@ -3,7 +3,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,8 +28,9 @@ const ALLOCATED_WARN: u64 = 128 << 30;
 const ALLOCATED_DELTA_WARN: i64 = 8 << 30;
 const IO_SCOPE: &str =
     "process-window, includes concurrent threads, excludes children and later async writes";
-const QUEUE_CAPACITY: usize = 64;
-const BATCH_OPERATIONS: usize = 64;
+const QUEUE_CAPACITY: usize = 4096;
+/// Retained Rust payload capacity; allocator and channel bookkeeping are additional.
+const QUEUE_BYTES: usize = 16 << 20;
 
 /// The same image across a rename, or one endpoint of a clone. A clone observes both
 /// source->source and destination->destination; creation is absent (zero) -> present.
@@ -163,6 +164,40 @@ struct Observation {
     rows: Vec<Row>,
 }
 
+impl Observation {
+    /// Count owned row/vector storage and every string's reserved capacity, without
+    /// serializing or copying the observation merely to price its admission.
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.rows.capacity() * std::mem::size_of::<Row>()
+            + self
+                .rows
+                .iter()
+                .map(|row| {
+                    let columns = &row.columns;
+                    [
+                        Some(&columns.operation),
+                        Some(&columns.image_role),
+                        Some(&columns.image_path_before),
+                        Some(&columns.image_path_after),
+                        Some(&columns.image_state_before),
+                        Some(&columns.process_io_scope),
+                        columns.image_state_after.as_ref(),
+                        columns.process_io_error.as_ref(),
+                        columns.measurement_error_before.as_ref(),
+                        columns.measurement_error_after.as_ref(),
+                        columns.error.as_ref(),
+                        columns.warning_reason.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(String::capacity)
+                    .sum::<usize>()
+                })
+                .sum::<usize>()
+    }
+}
+
 fn micros(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).expect("an operation fits in u64 microseconds")
 }
@@ -189,6 +224,10 @@ pub(super) struct ImageTelemetry {
 struct Writer {
     sender: mpsc::SyncSender<Observation>,
     thread: thread::JoinHandle<()>,
+    /// Reservations include rows already received by the writer. Draining the channel
+    /// must not turn a bounded queue into an unbounded interval buffer.
+    pending: Arc<AtomicUsize>,
+    pending_bytes: Arc<AtomicUsize>,
 }
 
 impl ImageTelemetry {
@@ -351,11 +390,23 @@ impl ImageTelemetry {
             let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
             let root = self.root.clone();
             let failed = Arc::clone(&self.failed);
+            let pending = Arc::new(AtomicUsize::new(0));
+            let writing = Arc::clone(&pending);
+            let pending_bytes = Arc::new(AtomicUsize::new(0));
+            let writing_bytes = Arc::clone(&pending_bytes);
             match thread::Builder::new()
                 .name("cowshed-image-telemetry".into())
-                .spawn(move || write_observations(&root, receiver, &failed))
-            {
-                Ok(thread) => *writer = Some(Writer { sender, thread }),
+                .spawn(move || {
+                    write_observations(&root, receiver, &failed, &writing, &writing_bytes)
+                }) {
+                Ok(thread) => {
+                    *writer = Some(Writer {
+                        sender,
+                        thread,
+                        pending,
+                        pending_bytes,
+                    })
+                }
                 Err(error) => {
                     failure(
                         &self.failed,
@@ -367,12 +418,48 @@ impl ImageTelemetry {
                 }
             }
         }
-        if let Err(error) = writer
-            .as_ref()
-            .expect("writer started")
-            .sender
-            .try_send(observation)
+        let writer = writer.as_ref().expect("writer started");
+        if writer
+            .pending
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                (pending < QUEUE_CAPACITY).then_some(pending + 1)
+            })
+            .is_err()
         {
+            failure(
+                &self.failed,
+                1,
+                &self.root,
+                format_args!(
+                    "observation refused: interval operation queue is full (limit={QUEUE_CAPACITY})"
+                ),
+            );
+            return;
+        }
+        let bytes = observation.retained_bytes();
+        if let Err(pending_bytes) =
+            writer
+                .pending_bytes
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                    pending
+                        .checked_add(bytes)
+                        .filter(|total| *total <= QUEUE_BYTES)
+                })
+        {
+            writer.pending.fetch_sub(1, Ordering::Relaxed);
+            failure(
+                &self.failed,
+                1,
+                &self.root,
+                format_args!(
+                    "observation refused: interval payload byte budget is full (pending={pending_bytes}, incoming={bytes}, limit={QUEUE_BYTES})"
+                ),
+            );
+            return;
+        }
+        if let Err(error) = writer.sender.try_send(observation) {
+            writer.pending.fetch_sub(1, Ordering::Relaxed);
+            writer.pending_bytes.fetch_sub(bytes, Ordering::Relaxed);
             failure(
                 &self.failed,
                 1,
@@ -385,7 +472,7 @@ impl ImageTelemetry {
 
 impl Drop for ImageTelemetry {
     fn drop(&mut self) {
-        if let Some(Writer { sender, thread }) = self
+        if let Some(Writer { sender, thread, .. }) = self
             .writer
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -469,26 +556,46 @@ fn seal(root: &Path, observations: &mut Vec<Observation>, failed: &AtomicU64) {
     observations.clear();
 }
 
-fn write_observations(root: &Path, receiver: mpsc::Receiver<Observation>, failed: &AtomicU64) {
-    while let Ok(first) = receiver.recv() {
-        let deadline = Instant::now() + PROCESS_SEAL_INTERVAL;
-        let mut observations = vec![first];
-        loop {
-            match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(observation) => {
-                    observations.push(observation);
-                    if observations.len() >= BATCH_OPERATIONS {
-                        break;
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    seal(root, &mut observations, failed);
-                    return;
-                }
-            }
+/// Gather until the clock expires or the host closes, never until a row count.
+/// Admission reserves at most QUEUE_CAPACITY observations across the channel and
+/// this buffer; bursts refuse rather than raising the full-drive flush rate.
+fn gather(
+    first: Observation,
+    mut receive: impl FnMut(Duration) -> Result<Observation, mpsc::RecvTimeoutError>,
+) -> (Vec<Observation>, bool) {
+    let deadline = Instant::now() + PROCESS_SEAL_INTERVAL;
+    let mut observations = Vec::with_capacity(QUEUE_CAPACITY);
+    observations.push(first);
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return (observations, false);
+        };
+        match receive(remaining) {
+            Ok(observation) => observations.push(observation),
+            Err(mpsc::RecvTimeoutError::Timeout) => return (observations, false),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return (observations, true),
         }
+    }
+}
+
+fn write_observations(
+    root: &Path,
+    receiver: mpsc::Receiver<Observation>,
+    failed: &AtomicU64,
+    pending: &AtomicUsize,
+    pending_bytes: &AtomicUsize,
+) {
+    while let Ok(first) = receiver.recv() {
+        let (mut observations, closed) =
+            gather(first, |remaining| receiver.recv_timeout(remaining));
+        let count = observations.len();
+        let bytes: usize = observations.iter().map(Observation::retained_bytes).sum();
         seal(root, &mut observations, failed);
+        pending.fetch_sub(count, Ordering::Relaxed);
+        pending_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        if closed {
+            return;
+        }
     }
 }
 
@@ -775,6 +882,8 @@ mod tests {
             writer: Mutex::new(Some(Writer {
                 sender,
                 thread: thread::spawn(|| {}),
+                pending: Arc::new(AtomicUsize::new(0)),
+                pending_bytes: Arc::new(AtomicUsize::new(0)),
             })),
             failed: Arc::new(AtomicU64::new(0)),
         };
@@ -787,6 +896,117 @@ mod tests {
             rows: Vec::new(),
         });
         assert_eq!(telemetry.failed.load(Ordering::Relaxed), 1);
+        assert_eq!(receiver.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn image_telemetry_full_interval_waits_for_time_not_operation_count() {
+        let observation = || Observation {
+            id: Uuid::new_v4(),
+            rows: Vec::new(),
+        };
+        let mut incoming = (1..QUEUE_CAPACITY).map(|_| observation());
+        let mut interval_elapsed = false;
+        let (observations, closed) = gather(observation(), |_| match incoming.next() {
+            Some(observation) => Ok(observation),
+            None => {
+                interval_elapsed = true;
+                Err(mpsc::RecvTimeoutError::Timeout)
+            }
+        });
+        assert!(
+            interval_elapsed,
+            "a full queue cannot seal before the interval"
+        );
+        assert!(!closed);
+        assert_eq!(observations.len(), QUEUE_CAPACITY);
+
+        let final_id = Uuid::new_v4();
+        let (observations, closed) = gather(
+            Observation {
+                id: final_id,
+                rows: Vec::new(),
+            },
+            |_| Err(mpsc::RecvTimeoutError::Disconnected),
+        );
+        assert!(
+            closed,
+            "host drop flushes without waiting for another interval"
+        );
+        assert_eq!(observations[0].id, final_id);
+    }
+
+    #[test]
+    fn image_telemetry_receiving_does_not_free_interval_queue_capacity() {
+        let fixture = Fixture::new();
+        let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let telemetry = ImageTelemetry {
+            root: fixture.0.join("telemetry"),
+            writer: Mutex::new(Some(Writer {
+                sender,
+                thread: thread::spawn(|| {}),
+                pending: Arc::clone(&pending),
+                pending_bytes: Arc::new(AtomicUsize::new(0)),
+            })),
+            failed: Arc::new(AtomicU64::new(0)),
+        };
+        for _ in 0..QUEUE_CAPACITY {
+            telemetry.publish(Observation {
+                id: Uuid::new_v4(),
+                rows: Vec::new(),
+            });
+        }
+        let gathered: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(gathered.len(), QUEUE_CAPACITY);
+        telemetry.publish(Observation {
+            id: Uuid::new_v4(),
+            rows: Vec::new(),
+        });
+        assert_eq!(telemetry.failed.load(Ordering::Relaxed), 1);
+        assert_eq!(pending.load(Ordering::Relaxed), QUEUE_CAPACITY);
+        assert!(
+            receiver.try_recv().is_err(),
+            "a drained channel cannot admit an unbounded batch"
+        );
+    }
+
+    #[test]
+    fn image_telemetry_byte_budget_refuses_before_operation_capacity() {
+        let fixture = Fixture::new();
+        let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let pending_bytes = Arc::new(AtomicUsize::new(0));
+        let telemetry = ImageTelemetry {
+            root: fixture.0.join("telemetry"),
+            writer: Mutex::new(Some(Writer {
+                sender,
+                thread: thread::spawn(|| {}),
+                pending: Arc::clone(&pending),
+                pending_bytes: Arc::clone(&pending_bytes),
+            })),
+            failed: Arc::new(AtomicU64::new(0)),
+        };
+        let observation = || Observation {
+            id: Uuid::new_v4(),
+            rows: vec![Row {
+                at: SystemTime::now(),
+                span: 1,
+                kind: EntryType::SpanErr,
+                columns: ImageColumns {
+                    error: Some("x".repeat(QUEUE_BYTES / 2)),
+                    ..ImageColumns::default()
+                },
+            }],
+        };
+        let first = observation();
+        let bytes = first.retained_bytes();
+        assert!(bytes > QUEUE_BYTES / 2 && bytes < QUEUE_BYTES);
+        telemetry.publish(first);
+        telemetry.publish(observation());
+        assert_eq!(telemetry.failed.load(Ordering::Relaxed), 1);
+        assert_eq!(pending.load(Ordering::Relaxed), 1);
+        assert_eq!(pending_bytes.load(Ordering::Relaxed), bytes);
         assert_eq!(receiver.try_iter().count(), 1);
     }
 
