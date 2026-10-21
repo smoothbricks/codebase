@@ -9,5 +9,5 @@ disallowed-methods = [
   { path = "tokio::process::Command::status", reason = "run with cowshed_os::fork_lock::RunAsync::status_locked" },
   # copyfile(3) given paths holds its source and destination open without O_CLOEXEC for the whole
   # call, so a concurrent spawn keeps them for its life (copy/native/macos.rs).
-  { path = "libc::copyfile", reason = "copy through close-on-exec descriptors with libc::fcopyfile" },
+  { path = "libc::copyfile", reason = "copy through close-on-exec descriptors with libc::fcopyfile", allow-invalid = true },
 ]

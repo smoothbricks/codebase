@@ -14,11 +14,16 @@
 //! foreign holder: the operation's own leases and image locks already refuse the operations a
 //! census guards.
 
+#[cfg(target_os = "macos")]
 use std::collections::BTreeSet;
-use std::fs::{self, File};
+#[cfg(target_os = "macos")]
+use std::fs;
+use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
