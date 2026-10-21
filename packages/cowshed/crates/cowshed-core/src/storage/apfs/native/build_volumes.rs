@@ -469,9 +469,13 @@ where
     }
 
     /// [`Self::release_build_volume`] of the volume `claim` claimed. Answers the unforced
-    /// unmount's refusal, when there was one. The claim is dropped once the image and its hold
-    /// file are gone, so a hold taken after that finds no image. The image's deletion is
-    /// journaled in the project's deletion log, with whose its sidecar said the volume was.
+    /// unmount's refusal, when there was one. The detached image is moved into the project's
+    /// build-volume trash, one rename, and deleted from there later in the background
+    /// ([`crate::build_volume::empty_trash`]): deleting it here walked its whole extent tree and
+    /// held a land in one `unlink` for minutes (measured 2026-10-21). The claim is dropped once
+    /// the canonical image and its hold file are gone, so a hold taken after that finds no image.
+    /// The release is journaled in the project's deletion log, with whose its sidecar said the
+    /// volume was.
     pub fn release_claimed(
         &self,
         layout: &BuildVolumeLayout,
@@ -510,7 +514,13 @@ where
             }
             self.backend.detach(&attachment, DetachIntent::Release)?;
         }
-        self.backend.delete_image(&image)?;
+        layout.trash_image(id).map_err(|error| {
+            io_error(
+                "move a released build volume image into its trash",
+                &image,
+                error,
+            )
+        })?;
         if present {
             layout.journal_release(id, recorded.as_ref(), true);
         }
@@ -1292,13 +1302,25 @@ mod tests {
         );
         host.detach_claimed_build_volume(&layout, &claim).unwrap();
         assert_eq!(host.release_claimed(&layout, claim).unwrap(), None);
-        for path in [image, layout.record(&id), layout.hold_path(&id), mount] {
+        for path in [&image, &layout.record(&id), &layout.hold_path(&id), &mount] {
             assert!(
                 !path.exists(),
                 "ordinary release removes {}",
                 path.display()
             );
         }
+        // The image itself waits in the trash, the same inode moved in one rename, until the
+        // trash is emptied in the background.
+        let trashed = layout.trashed_image(&id);
+        assert_eq!(fs::metadata(&trashed).unwrap().ino(), image_inode);
+        let emptied = crate::build_volume::empty_trash(trashed.parent().unwrap()).unwrap();
+        assert_eq!(emptied.images, 1);
+        assert!(!trashed.exists(), "emptying the trash deletes the image");
+        assert_eq!(
+            crate::build_volume::empty_trash(trashed.parent().unwrap()).unwrap(),
+            crate::build_volume::EmptiedTrash::default(),
+            "an empty trash deletes nothing"
+        );
     }
 
     #[test]

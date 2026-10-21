@@ -1219,6 +1219,37 @@ fn gate_jobs_named<'a>(gates: impl IntoIterator<Item = &'a GateJobRef>) -> Strin
         .join(", ")
 }
 
+/// How often the daemon empties the store's build-volume trash, so an image a release moved
+/// there waits at most this long, plus the deletions queued before it.
+const BUILD_VOLUME_TRASH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Empty every project's build-volume trash now and then every [`BUILD_VOLUME_TRASH_INTERVAL`]
+/// for as long as the daemon runs, on a thread of its own at background disk priority
+/// (16_build_volumes.md, "Garbage collection"): a release only renames an image into the trash,
+/// and this is what deletes it. With no daemon running, the next daemon start empties it, and
+/// so does `cowshed gc`.
+fn empty_build_volume_trash_from_now_on(store: PathBuf) {
+    let started = std::thread::Builder::new()
+        .name("build-volume-trash".to_owned())
+        .spawn(move || {
+            loop {
+                let emptied = cowshed_core::build_volume::empty_store_trash(&store);
+                if emptied.images > 0 {
+                    eprintln!(
+                        "cowshed: deleted {} released build volume image(s), {} bytes, from the trash",
+                        emptied.images, emptied.bytes
+                    );
+                }
+                std::thread::sleep(BUILD_VOLUME_TRASH_INTERVAL);
+            }
+        });
+    if let Err(error) = started {
+        eprintln!(
+            "cowshed: build-volume trash is not emptied while this daemon runs ({error}); `cowshed gc` empties it"
+        );
+    }
+}
+
 async fn run_daemon() -> Result<()> {
     let home = canonical_home()?;
     let storage = validate_existing_host_storage(&home).await?;
@@ -1286,6 +1317,7 @@ async fn run_daemon() -> Result<()> {
     // Detached and concurrent: each recovery reports its own span, status counts what is left,
     // and nothing below waits for it.
     drop(recovery.start(Arc::new(SocketPeers)));
+    empty_build_volume_trash_from_now_on(store_root.clone());
     let handle = OwnedGateway::new(gateway.handle());
     let started = async {
         serve_supervisors(&store_root, manager).await?;

@@ -50,6 +50,11 @@ pub(crate) const RECORD_SUFFIX: &str = ".json";
 /// The lock beside each image that every job admitted on the volume holds shared for its whole
 /// run, and that a release takes exclusively: `<id>.dmg.hold` ([`BuildVolumeHold`]).
 pub(crate) const HOLD_SUFFIX: &str = ".hold";
+/// Where a released volume's image waits to be deleted: `build/.trash/<id>.dmg`, inside the
+/// images directory and so on its volume, so moving an image there is one `rename(2)`
+/// (16_build_volumes.md, "Garbage collection"). Deleting a written image frees its whole extent
+/// tree, which took minutes inside a land (measured 2026-10-21); the move takes none of that.
+pub(crate) const TRASH_DIRECTORY: &str = ".trash";
 /// The volume's own statement of the build-state paths it holds, at its root. It travels with
 /// every clone, so a fork knows what its source linked without rediscovering it.
 pub const STATE_FILE: &str = "cowshed-build-state.json";
@@ -592,6 +597,36 @@ impl BuildVolumeLayout {
         self.images.join(format!("{id}.{IMAGE_EXTENSION}"))
     }
 
+    /// The project's build-volume trash: released images waiting to be deleted
+    /// ([`empty_trash`]).
+    pub fn trash(&self) -> PathBuf {
+        self.images.join(TRASH_DIRECTORY)
+    }
+
+    /// Where `id`'s image goes when it is released ([`Self::trash_image`]).
+    pub fn trashed_image(&self, id: &BuildVolumeId) -> PathBuf {
+        self.trash().join(format!("{id}.{IMAGE_EXTENSION}"))
+    }
+
+    /// Move `id`'s image into the trash, if it is there: `true` when it was. One `rename(2)` on
+    /// the images directory's own volume, which never copies: a rename the kernel refuses across
+    /// volumes (`EXDEV`) is returned as the error it is, never redone as a copy. The canonical
+    /// image is gone once this returns, which is what a release promises a later hold.
+    pub fn trash_image(&self, id: &BuildVolumeId) -> io::Result<bool> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let trash = self.trash();
+        match fs::DirBuilder::new().mode(0o700).create(&trash) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        match fs::rename(self.image(id), self.trashed_image(id)) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn record(&self, id: &BuildVolumeId) -> PathBuf {
         self.images
             .join(format!("{id}.{IMAGE_EXTENSION}{RECORD_SUFFIX}"))
@@ -957,6 +992,152 @@ impl ReleaseClaim {
     /// The volume this claim keeps every new hold off.
     pub fn id(&self) -> &BuildVolumeId {
         &self.id
+    }
+}
+
+/// What emptying a build-volume trash deleted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmptiedTrash {
+    pub images: usize,
+    /// The bytes those images held on disk, read before each was deleted.
+    pub bytes: u64,
+}
+
+/// Delete every image in the build-volume trash at `trash` (`<project>/build/.trash`), one at
+/// a time, at background disk priority on the calling thread, so the extent walk each deletion
+/// costs yields to every other reader on the volume. A trash that does not exist is empty.
+/// Only image files of the trash's own naming are deleted; anything else there is left and said.
+pub fn empty_trash(trash: &Path) -> io::Result<EmptiedTrash> {
+    let entries = match fs::read_dir(trash) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(EmptiedTrash::default());
+        }
+        Err(error) => return Err(error),
+    };
+    let _background = BackgroundDiskPriority::set();
+    let mut emptied = EmptiedTrash::default();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let image = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_suffix(&format!(".{IMAGE_EXTENSION}")))
+            .and_then(BuildVolumeId::parse)
+            .is_some();
+        let metadata = entry.metadata()?;
+        if !image || !metadata.is_file() {
+            eprintln!(
+                "cowshed: {} is not a trashed build-volume image; it is left",
+                path.display()
+            );
+            continue;
+        }
+        let bytes = {
+            use std::os::unix::fs::MetadataExt as _;
+            metadata.blocks() * 512
+        };
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                emptied.images += 1;
+                emptied.bytes += bytes;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(emptied)
+}
+
+/// [`empty_trash`] for every project in the store at `store`: `<store>/<owner>/<repo>/build/.trash`.
+/// The daemon runs this at its start and then on an interval, so a released image waits for at
+/// most one interval, and for the next daemon start when no daemon runs; `cowshed gc` empties its
+/// own project's trash too. A project whose trash cannot be emptied is said and skipped.
+pub fn empty_store_trash(store: &Path) -> EmptiedTrash {
+    let mut emptied = EmptiedTrash::default();
+    let owners = match fs::read_dir(store) {
+        Ok(owners) => owners,
+        Err(error) => {
+            eprintln!(
+                "cowshed: cannot list the store {} for build-volume trash: {error}",
+                store.display()
+            );
+            return emptied;
+        }
+    };
+    for owner in owners.flatten() {
+        let Ok(repos) = fs::read_dir(owner.path()) else {
+            continue;
+        };
+        for repo in repos.flatten() {
+            let trash = repo.path().join(IMAGES_DIRECTORY).join(TRASH_DIRECTORY);
+            match empty_trash(&trash) {
+                Ok(project) => {
+                    emptied.images += project.images;
+                    emptied.bytes += project.bytes;
+                }
+                Err(error) => eprintln!(
+                    "cowshed: cannot empty the build-volume trash {}: {error}",
+                    trash.display()
+                ),
+            }
+        }
+    }
+    emptied
+}
+
+/// This thread's disk I/O at background priority (`IOPOL_THROTTLE`) until dropped. Elsewhere
+/// than macOS the scheduler has no such policy, and this changes nothing.
+struct BackgroundDiskPriority {
+    #[cfg(target_os = "macos")]
+    previous: libc::c_int,
+}
+
+#[cfg(target_os = "macos")]
+mod iopolicy {
+    // <sys/resource.h>: not in the `libc` crate.
+    pub const IOPOL_TYPE_DISK: libc::c_int = 0;
+    pub const IOPOL_SCOPE_THREAD: libc::c_int = 1;
+    pub const IOPOL_THROTTLE: libc::c_int = 3;
+    unsafe extern "C" {
+        pub fn getiopolicy_np(iotype: libc::c_int, scope: libc::c_int) -> libc::c_int;
+        pub fn setiopolicy_np(
+            iotype: libc::c_int,
+            scope: libc::c_int,
+            policy: libc::c_int,
+        ) -> libc::c_int;
+    }
+}
+
+impl BackgroundDiskPriority {
+    fn set() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            use iopolicy::*;
+            // SAFETY: both calls take plain integers and change only this thread's policy.
+            let previous = unsafe { getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD) };
+            if unsafe { setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE) } != 0 {
+                eprintln!(
+                    "cowshed: build-volume trash is emptied at normal disk priority: {}",
+                    io::Error::last_os_error()
+                );
+            }
+            Self { previous }
+        }
+        #[cfg(not(target_os = "macos"))]
+        Self {}
+    }
+}
+
+impl Drop for BackgroundDiskPriority {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if self.previous >= 0 {
+            use iopolicy::*;
+            // SAFETY: as in `set`.
+            unsafe { setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, self.previous) };
+        }
     }
 }
 
@@ -1411,6 +1592,58 @@ mod tests {
             !held,
             "a released hold keeps nothing held, whatever spawn copied it"
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A release moves the image into the trash in one rename (the same inode, no copy), the
+    /// canonical image is gone at once, and emptying the store's trash deletes exactly the trashed
+    /// images: a file of any other name there is left.
+    #[test]
+    fn a_released_image_waits_in_the_trash_and_only_trashed_images_are_deleted() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let root =
+            std::env::temp_dir().join(format!("cowshed-build-trash-{}", uuid::Uuid::new_v4()));
+        let store = root.join("store");
+        let project = ProjectPaths::with_mount_root(
+            &store,
+            root.join("mounts"),
+            &RepoId::parse("acme/widget").unwrap(),
+        )
+        .unwrap();
+        let layout = BuildVolumeLayout::new(&project).unwrap();
+        fs::create_dir_all(layout.images()).unwrap();
+        let id = BuildVolumeId::mint();
+        fs::write(layout.image(&id), vec![7_u8; 64 * 1024]).unwrap();
+        let inode = fs::metadata(layout.image(&id)).unwrap().ino();
+
+        assert!(
+            layout.trash_image(&id).unwrap(),
+            "the image was there to move"
+        );
+        assert!(!layout.image(&id).exists(), "the canonical image is gone");
+        assert_eq!(
+            fs::metadata(layout.trashed_image(&id)).unwrap().ino(),
+            inode
+        );
+        assert!(
+            !layout.trash_image(&id).unwrap(),
+            "a second release finds nothing"
+        );
+        assert_eq!(
+            layout.list_entries(true).unwrap(),
+            Vec::<BuildVolumeId>::new(),
+            "a trashed image is no volume"
+        );
+        let stray = layout.trash().join("notes.txt");
+        fs::write(&stray, b"not an image").unwrap();
+
+        let emptied = empty_store_trash(&store);
+        assert_eq!(emptied.images, 1);
+        assert!(emptied.bytes > 0);
+        assert!(!layout.trashed_image(&id).exists());
+        assert!(stray.exists(), "only trashed images are deleted");
+        assert_eq!(empty_store_trash(&store), EmptiedTrash::default());
         fs::remove_dir_all(&root).unwrap();
     }
 }

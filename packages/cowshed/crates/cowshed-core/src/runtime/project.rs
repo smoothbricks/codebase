@@ -12372,6 +12372,21 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 crate::exec::profile_directory(&store_root).display()
             ),
         }
+        // The images every release moved into the build-volume trash, this sweep's included:
+        // the daemon empties it on an interval, and gc is the verb that waits for it. Their
+        // bytes are counted where they were released, so this only says what it deleted.
+        let trash = self.build_volume_layout()?.trash();
+        match tokio::task::spawn_blocking(move || crate::build_volume::empty_trash(&trash)).await {
+            Ok(Ok(emptied)) if emptied.images > 0 => eprintln!(
+                "cowshed: gc deleted {} released build volume image(s) from the trash",
+                emptied.images
+            ),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => eprintln!(
+                "cowshed: gc left released build volume images in the trash; the daemon retries: {error}"
+            ),
+            Err(error) => eprintln!("cowshed: emptying the build volume trash failed: {error}"),
+        }
         Ok(GcReport {
             examined: u64::try_from(report.examined)
                 .map_err(|_| CowshedError::internal("GC count overflow"))?

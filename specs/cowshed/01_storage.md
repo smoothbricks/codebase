@@ -89,6 +89,7 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
       <id>.dmg                       # one build volume: Cargo target dirs + Nx cache and task DB (16_build_volumes.md)
       <id>.dmg.json                  # its sidecar: built-at tree, linking checkout, seed flag, created
       <id>.dmg.hold                  # flock each job on the volume holds shared; a release claims it exclusive, then deletes it
+      .trash/<id>.dmg                # released images; the daemon deletes them within a minute (16_build_volumes.md)
     tmp/
       <workspace>/                   # its TMPDIR, 0700: writable by its own sandbox only; reclaimed with its retired image,
                                      #   read-only directories its tools sealed made owner-writable first (`go clean -modcache`)
@@ -253,6 +254,7 @@ burden with retention _conventions_, enforced by `cowshed gc`, never by a backgr
 | CI failure checkpoints                       | same checkpoint rule as above                                                         | labeled `ci-fail`, therefore explicitly pinned until unpinned; `10_ci.md`                  |
 | Idle workspaces                              | _flagged_ by `cowshed doctor` after 14 days no exec, **never auto-destroyed**         | landing/removal is always explicit                                                         |
 | Trash images (`sessions/.trash/…`)           | drained on next `gc`                                                                  | —                                                                                          |
+| Released build images (`build/.trash/…`)     | deleted by the daemon within a minute of release, at background disk priority         | `cowshed gc` empties its project's at once                                                 |
 | Abandon bundles (`sessions/.trash/*.bundle`) | never reclaimed by default; their tips are also kept as refs in main's repository     | explicit `cowshed gc --abandoned`                                                          |
 | Abandoned refs (in main's repository)        | retired by every `gc` once main holds each tip, by ancestry or content                | `cowshed gc --supersede <ws>/<head> --reason <one line>`                                   |
 

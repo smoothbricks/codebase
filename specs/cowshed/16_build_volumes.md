@@ -872,11 +872,21 @@ again at any level above it.
   volume) from before its image exists until its sidecar is written.
 - Once no owner remains, release first requests a non-forced unmount and allows a bounded wall-clock grace for holders
   to release it: time spent waiting on command execution or a disk lease counts, not only the requested poll sleeps. If
-  the kernel still refuses, cowshed forces the unmount, detaches the image and deletes its image, sidecar, hold file and
-  mountpoint. At the initial unforced refusal, it records the holders and names each pid and command on stderr,
-  distinguishing release within the grace from a forced unmount. Editors or indexers holding files or a working
-  directory without a cowshed job hold cannot keep an unlinked volume attached indefinitely. Force revokes their access
-  to the volume; it does not kill them.
+  the kernel still refuses, cowshed forces the unmount, detaches the image, moves the image into the project's
+  build-volume trash and deletes its sidecar, hold file and mountpoint. At the initial unforced refusal, it records the
+  holders and names each pid and command on stderr, distinguishing release within the grace from a forced unmount.
+  Editors or indexers holding files or a working directory without a cowshed job hold cannot keep an unlinked volume
+  attached indefinitely. Force revokes their access to the volume; it does not kill them.
+- A release renames the image; the daemon deletes it. The trash is `build/.trash/<id>.dmg`, inside the images directory
+  and so on the store volume, and the move is one `rename(2)`, which never copies: a rename the kernel refuses across
+  volumes is the release's error, never a copy. Deleting a written image frees its whole extent tree: measured
+  2026-10-21, a land's slowest step was deleting its own workspace's image, one `unlink` for minutes with 84,594
+  metadata reads under it, inside the land and against every other reader of the store volume. So nothing that waits for
+  a release deletes an image. The daemon empties every project's trash at its start and then every minute, one image at
+  a time at background disk priority (`IOPOL_THROTTLE`), so a released image waits at most a minute plus the deletions
+  queued before it; with no daemon running the next daemon start empties it, and `cowshed gc` empties its project's
+  trash before it answers. Only `<id>.dmg` files are deleted there; anything else is named and left. The canonical image
+  is gone once the rename returns, so a hold taken after it finds none, as before.
 - Every release that deletes an image, a seed's or another volume's, whatever asked for it (collection, a land's release
   of the target's previous volume or superseded seed, a reseed, a fork that never staged), appends one line for the
   image to the project's `deletion-log.jsonl` (01_storage.md): op `release-build-volume`, kind `build-seed` when its
