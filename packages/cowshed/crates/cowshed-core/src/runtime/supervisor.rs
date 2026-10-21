@@ -5753,7 +5753,7 @@ impl SupervisorActor {
                 "cowshed doctor --json",
             )
         })?;
-        match layout.hold(&id) {
+        match layout.admit(&id) {
             Ok(hold) => Ok(Some(hold)),
             Err(error) if error.kind() == std::io::ErrorKind::ResourceBusy => {
                 Err(CowshedError::conflict(

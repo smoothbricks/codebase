@@ -917,7 +917,7 @@ mod tests {
                 "seed the detached build before its first attach, not after a mount/detach cycle"
             );
             assert_eq!(
-                self.layout.hold(&self.id).unwrap_err().kind(),
+                self.layout.admit(&self.id).unwrap_err().kind(),
                 io::ErrorKind::ResourceBusy,
                 "job admission stays closed through capture and mount"
             );
@@ -1027,7 +1027,7 @@ mod tests {
         assert_eq!(fs::read(layout.image(&build.id)).unwrap(), bytes);
         assert_eq!(fs::read(layout.record(&build.id)).unwrap(), owner);
         drop(claim);
-        layout.hold(&build.id).expect("refusal releases admission");
+        layout.admit(&build.id).expect("refusal releases admission");
     }
 
     #[test]

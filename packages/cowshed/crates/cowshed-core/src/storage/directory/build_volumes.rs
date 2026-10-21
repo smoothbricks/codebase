@@ -730,7 +730,7 @@ mod detach_tests {
         assert!(error.to_string().contains(&format!("pid {me} (")));
         assert_eq!(observed_mount(&image).unwrap(), Some(mount.clone()));
         assert_eq!(fs::read(mount.join("warm")).unwrap(), b"old build state\n");
-        assert!(layout.hold(&id).is_err());
+        assert!(layout.admit(&id).is_err());
         // Exercise the unbind's own census too: a holder arriving after the first census
         // must have the same typed refusal, without parsing a host-error string.
         let late = unbind(&image, &mount, cowshed_apfs::DetachIntent::WhenIdle).unwrap_err();
@@ -766,7 +766,7 @@ mod detach_tests {
                 MountPointState::Vacant
             ));
             assert!(
-                layout.hold(&id).is_err(),
+                layout.admit(&id).is_err(),
                 "the borrowed claim still fences admission"
             );
         }

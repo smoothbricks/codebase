@@ -642,34 +642,63 @@ impl BuildVolumeLayout {
             .join(format!("{id}.{IMAGE_EXTENSION}{HOLD_SUFFIX}"))
     }
 
-    /// Hold `id` for one job admitted on it, for as long as the answer lives: while any hold
-    /// lives, no release unmounts the volume (16_build_volumes.md, "Garbage collection"). Refused
-    /// with [`io::ErrorKind::ResourceBusy`] while a release has claimed the volume, and once one
-    /// has deleted it: a release deletes the image before it lets go of its claim, so a hold
-    /// taken after that finds no image, and the hold file it made is removed again.
+    /// Hold `id` for a land or a carry, for as long as the answer lives: while any hold lives, no
+    /// release unmounts the volume (16_build_volumes.md, "Garbage collection"). An exclusive claim
+    /// on the volume (a release, a seed capture, a reseed, a cache clear, a dry-run probe) is waited
+    /// out, because only what it leaves says whether the volume is still there. Refused with
+    /// [`io::ErrorKind::ResourceBusy`] only once a release has deleted the volume: a release deletes
+    /// the image before it lets go of its claim, so a hold that waited for it finds no image, and
+    /// the hold file it made is removed again. Every claimant takes its claim without waiting, so
+    /// this waits for the claimant's own work, never for another hold.
     pub fn hold(&self, id: &BuildVolumeId) -> io::Result<BuildVolumeHold> {
         let path = self.hold_path(id);
         let file = open_hold(&path)?;
-        match file.try_lock_shared() {
-            Ok(()) if self.image(id).exists() => Ok(BuildVolumeHold { _file: file }),
-            Ok(()) => {
-                drop(file);
-                match fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-                Err(io::Error::new(
-                    io::ErrorKind::ResourceBusy,
-                    format!("build volume {id} was released"),
-                ))
+        loop {
+            match file.lock_shared() {
+                Ok(()) => break,
+                // A signal woke the wait; the claim it waits for is unchanged.
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
             }
-            Err(fs::TryLockError::WouldBlock) => Err(io::Error::new(
-                io::ErrorKind::ResourceBusy,
-                format!("build volume {id} is being released"),
-            )),
+        }
+        self.present(id, &path, file)
+    }
+
+    /// Hold `id` for one job admitted on it, without waiting (16_build_volumes.md, "Targets and
+    /// seeds"): refused with [`io::ErrorKind::ResourceBusy`] while any exclusive claim has the
+    /// volume, so no job starts during a release or a seed capture, and once a release has deleted
+    /// it.
+    pub fn admit(&self, id: &BuildVolumeId) -> io::Result<BuildVolumeHold> {
+        let path = self.hold_path(id);
+        let file = open_hold(&path)?;
+        match file.try_lock_shared() {
+            Ok(()) => self.present(id, &path, file),
+            Err(fs::TryLockError::WouldBlock) => Err(claimed(id)),
             Err(fs::TryLockError::Error(error)) => Err(error),
         }
+    }
+
+    /// `file`, locked shared, as a hold of `id` while its image is there. Otherwise a release
+    /// deleted the volume, and the hold file this made is removed again.
+    fn present(
+        &self,
+        id: &BuildVolumeId,
+        path: &Path,
+        file: Fenced<fs::File>,
+    ) -> io::Result<BuildVolumeHold> {
+        if self.image(id).exists() {
+            return Ok(BuildVolumeHold { _file: file });
+        }
+        drop(file);
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        Err(io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            format!("build volume {id} was released"),
+        ))
     }
 
     /// Hold `id` for the operation creating it, before its image exists: a clone holds the
@@ -681,10 +710,7 @@ impl BuildVolumeLayout {
         let file = open_hold(&self.hold_path(id))?;
         match file.try_lock_shared() {
             Ok(()) => Ok(BuildVolumeHold { _file: file }),
-            Err(fs::TryLockError::WouldBlock) => Err(io::Error::new(
-                io::ErrorKind::ResourceBusy,
-                format!("build volume {id} is being released"),
-            )),
+            Err(fs::TryLockError::WouldBlock) => Err(claimed(id)),
             Err(fs::TryLockError::Error(error)) => Err(error),
         }
     }
@@ -970,7 +996,8 @@ impl BuildVolumeLayout {
     }
 }
 
-/// One job's claim on the build volume it was admitted with ([`BuildVolumeLayout::hold`]): a
+/// One job's claim on the build volume it was admitted with ([`BuildVolumeLayout::admit`]), or a
+/// land's or carry's ([`BuildVolumeLayout::hold`]): a
 /// shared lock that keeps every release from unmounting the volume until it is dropped, when the
 /// job ends. The kernel drops it with the process that held it, so a crashed supervisor leaves
 /// no stale claim. It is fenced (`fork_lock`): a child spawned while the claim was open copied
@@ -1151,6 +1178,17 @@ fn open_hold(path: &Path) -> io::Result<Fenced<fs::File>> {
         .truncate(false)
         .open(path)
         .map(Fenced::new)
+}
+
+/// The refusal of a hold taken without waiting while an exclusive claim has `id`. The lock does
+/// not say which claimant has it.
+fn claimed(id: &BuildVolumeId) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ResourceBusy,
+        format!(
+            "build volume {id} is claimed exclusively by a release, a seed capture, a reseed, a cache clear or a hold probe"
+        ),
+    )
 }
 
 fn hold_is_held(path: &Path) -> io::Result<bool> {
@@ -1564,7 +1602,7 @@ mod tests {
         fs::create_dir_all(layout.images()).unwrap();
         let id = BuildVolumeId::mint();
         fs::write(layout.image(&id), b"").unwrap();
-        let hold = layout.hold(&id).unwrap();
+        let hold = layout.admit(&id).unwrap();
         assert!(layout.held(&id).unwrap());
 
         let in_flight = cowshed_os::fork_lock::in_flight::InFlight::start();
@@ -1593,6 +1631,114 @@ mod tests {
             "a released hold keeps nothing held, whatever spawn copied it"
         );
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A hold refuses only once a release has deleted the volume. Every other exclusive claim on
+    /// the hold file keeps the volume: a seed capture, a reseed or cache clear, a dry-run probe,
+    /// a release that reads the volume again under its claim and declines it. A land's or a
+    /// carry's hold behind one of those waits for it and then holds the volume; it never refuses
+    /// it as being released. A hold that waited behind a release that did delete the volume
+    /// refuses as released.
+    ///
+    /// No timer orders the race: the claim is let go only once the holding thread has either
+    /// answered while it was still held (the false refusal) or sleeps in the kernel on the lock.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_hold_waits_out_an_exclusive_claim_and_refuses_only_a_released_volume() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-build-claimed-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let project = ProjectPaths::with_mount_root(
+            &root,
+            root.join("mnt"),
+            &RepoId::parse("acme/widget").unwrap(),
+        )
+        .unwrap();
+        let layout = BuildVolumeLayout::new(&project).unwrap();
+        fs::create_dir_all(layout.images()).unwrap();
+        let id = BuildVolumeId::mint();
+        fs::write(layout.image(&id), b"").unwrap();
+
+        let kept = hold_behind_claim(&layout, &id, || {});
+        assert!(
+            kept.is_ok(),
+            "a hold behind a claim that keeps the volume holds it: {kept:?}"
+        );
+        drop(kept);
+
+        let released = hold_behind_claim(&layout, &id, || {
+            assert!(layout.trash_image(&id).unwrap());
+            fs::remove_file(layout.hold_path(&id)).unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(released.kind(), io::ErrorKind::ResourceBusy);
+        assert_eq!(
+            released.to_string(),
+            format!("build volume {id} was released")
+        );
+        assert!(
+            !layout.hold_path(&id).exists(),
+            "a refused hold leaves no hold file"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Claim `id` exclusively, start a hold of it on another thread, and let the claim go, after
+    /// `settle`, once that hold has answered or sleeps in the kernel on the hold file's lock.
+    #[cfg(target_os = "macos")]
+    fn hold_behind_claim(
+        layout: &BuildVolumeLayout,
+        id: &BuildVolumeId,
+        settle: impl FnOnce(),
+    ) -> io::Result<BuildVolumeHold> {
+        let claim = layout
+            .claim_release(id)
+            .unwrap()
+            .expect("nothing holds the volume");
+        let (port, ported) = std::sync::mpsc::channel();
+        let (answer, answered) = std::sync::mpsc::channel();
+        let holder = {
+            let (layout, id) = (layout.clone(), id.clone());
+            std::thread::spawn(move || {
+                // SAFETY: names this thread's own Mach port and transfers no right.
+                port.send(unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) })
+                    .unwrap();
+                answer.send(layout.hold(&id)).unwrap();
+            })
+        };
+        let port = ported.recv().unwrap();
+        let early = loop {
+            if let Ok(held) = answered.try_recv() {
+                break Some(held);
+            }
+            if waits_in_kernel(port) {
+                break None;
+            }
+            std::thread::yield_now();
+        };
+        let held = early.unwrap_or_else(|| {
+            settle();
+            drop(claim);
+            answered.recv().unwrap()
+        });
+        holder.join().unwrap();
+        held
+    }
+
+    /// Whether `thread` sleeps interruptibly in the kernel, as a flock waiter does. A thread
+    /// that already ended answers no: it answered before it ended.
+    #[cfg(target_os = "macos")]
+    fn waits_in_kernel(thread: libc::mach_port_t) -> bool {
+        let mut info = std::mem::MaybeUninit::<libc::thread_basic_info>::zeroed();
+        let mut count = libc::THREAD_BASIC_INFO_COUNT;
+        let flavor = libc::thread_flavor_t::try_from(libc::THREAD_BASIC_INFO).unwrap();
+        // SAFETY: `info` has room for the `count` integers the basic flavor writes.
+        let status =
+            unsafe { libc::thread_info(thread, flavor, info.as_mut_ptr().cast(), &mut count) };
+        // SAFETY: a successful call wrote the whole basic info.
+        status == libc::KERN_SUCCESS
+            && unsafe { info.assume_init() }.run_state == libc::TH_STATE_WAITING
     }
 
     /// A release moves the image into the trash in one rename (the same inode, no copy), the

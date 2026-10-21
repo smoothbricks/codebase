@@ -4100,7 +4100,7 @@ mod tests {
 
         // A job admitted on the volume, an Nx client with the task database open, and another
         // lifecycle operation each refuse by name, and nothing is deleted.
-        let job = scratch.layout.hold(&live).unwrap();
+        let job = scratch.layout.admit(&live).unwrap();
         refused(clear().await.unwrap_err(), &std::process::id().to_string());
         drop(job);
         let open = fs::File::open(&database).unwrap();
@@ -4136,7 +4136,7 @@ mod tests {
             scratch.layout.linked(&checkout).unwrap(),
             Some(live.clone())
         );
-        drop(scratch.layout.hold(&live).expect("the claim is let go"));
+        drop(scratch.layout.admit(&live).expect("the claim is let go"));
         scratch.release_all();
     }
 
@@ -4242,7 +4242,7 @@ mod tests {
         assert_eq!(scratch.layout.linked(&checkout).unwrap(), Some(old.clone()));
 
         // Both an admitted job's shared hold and a land/capture's exclusive claim refuse.
-        let job = scratch.layout.hold(&old).unwrap();
+        let job = scratch.layout.admit(&old).unwrap();
         let refusal = scratch
             .volumes
             .execute_reseed(preview.clone())
@@ -5896,7 +5896,7 @@ fn main() {
         fs::create_dir_all(from.join("nx/cache/1")).unwrap();
         fs::write(from.join("nx/cache/1/output"), b"warm").unwrap();
         for id in [&source, &destination] {
-            drop(scratch.layout.hold(id).unwrap());
+            drop(scratch.layout.admit(id).unwrap());
         }
         let sockets = Path::new("/tmp").join(format!(
             "cs-carry-{}",
@@ -6153,7 +6153,7 @@ fn main() {
                 ),
             )
             .unwrap();
-        let job = scratch.layout.hold(&live).expect("a job's hold");
+        let job = scratch.layout.admit(&live).expect("a job's hold");
         let reseeded = reseed(
             &*scratch.host,
             &scratch.layout,
@@ -7119,7 +7119,7 @@ fn main() {
             incarnation: main.incarnation.clone(),
         });
         let unlinked = clone(BuildVolumeRole::Unlinked);
-        let job = scratch.layout.hold(&live).expect("a job's hold");
+        let job = scratch.layout.admit(&live).expect("a job's hold");
         assert!(matches!(
             scratch.host.release_build_volume(&scratch.layout, &live),
             Ok(BuildVolumeRelease::Held { .. })

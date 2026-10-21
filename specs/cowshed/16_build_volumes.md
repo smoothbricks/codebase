@@ -860,7 +860,10 @@ again at any level above it.
 - Ownership is a job hold, a land's hold on its landing volume, or an unfinished create/fork/adopt in the lifecycle
   intent journal, not the kernel's refusal to unmount. Every admitted cowshed job holds a shared flock on the build
   volume's `<id>.dmg.hold` for its lifetime; release must claim it exclusively. A running job therefore keeps main's
-  previous volume across a swap.
+  previous volume across a swap. Job admission takes its hold without waiting and refuses while any exclusive claim has
+  the volume (a release, a capture, a reseed, a cache clear, a dry-run probe), naming it claimed, not released. A land's
+  or a carry's hold waits out an exclusive claim instead, and then refuses only when the image is gone: only a release
+  deletes it, so a capture, a probe or a release that declines under its claim delays such a hold and never refuses it.
 - A held lifecycle or image lock likewise defers release. A superseded seed is retired only under its target's image
   lock, which the land and reseed paths hold while they replace it, and seed retirement takes that lock as a typed
   witness, so collection never releases a seed that a land or reseed is replacing.

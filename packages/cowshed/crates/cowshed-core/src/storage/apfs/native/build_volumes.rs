@@ -798,7 +798,7 @@ mod tests {
                         .expect_err("replacement admission must stay closed during capture");
                     assert_eq!(refused.code, crate::error::ErrorCode::Conflict);
                     self.denied.store(true, Ordering::SeqCst);
-                } else if let Err(refused) = self.layout.hold(&self.source) {
+                } else if let Err(refused) = self.layout.admit(&self.source) {
                     // clone_build_volume first checks for a mount before taking its claim.
                     // Its second census, in clone_claimed_build_volume, must refuse a job.
                     assert_eq!(refused.kind(), io::ErrorKind::ResourceBusy);
@@ -867,7 +867,7 @@ mod tests {
         assert_eq!(fs::read(layout.record(&source)).unwrap(), owner);
 
         let admitted = layout
-            .hold(&source)
+            .admit(&source)
             .expect("job admission after capture hold release");
         let refused_seed = BuildVolumeId::mint();
         let me = i32::try_from(std::process::id()).expect("pid");
@@ -1276,7 +1276,7 @@ mod tests {
         assert_eq!(snapshot(&mount), before);
         assert_eq!(fs::read(layout.record(&id)).unwrap(), record);
         assert!(
-            layout.hold(&id).is_err(),
+            layout.admit(&id).is_err(),
             "the borrowed claim still fences admission"
         );
         drop(open);
@@ -1292,7 +1292,7 @@ mod tests {
                 hold_inode
             );
             assert_eq!(fs::read(layout.record(&id)).unwrap(), record);
-            assert!(layout.hold(&id).is_err());
+            assert!(layout.admit(&id).is_err());
         }
         host.mount_build_volume(&layout, &id).unwrap();
         assert_eq!(
@@ -1376,7 +1376,7 @@ mod tests {
             linked("topic").role
         );
 
-        let hold = layout.hold(&clone).expect("a job's hold");
+        let hold = layout.admit(&clone).expect("a job's hold");
         let open = fs::File::open(clone_mount.join("target/debug/deps/a.rlib")).unwrap();
         let me = i32::try_from(std::process::id()).unwrap();
         match host.release_build_volume(&layout, &clone).unwrap() {
