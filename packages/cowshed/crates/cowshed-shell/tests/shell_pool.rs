@@ -320,7 +320,7 @@ fn request(argv: &[&str]) -> ExecRequest {
         stderr_copy: None,
         admission_key: None,
         class: ExecClass::Background,
-        want: NonZeroUsize::MIN,
+        want: None,
         scope: ExecScope::Workspace,
     }
 }
@@ -1576,7 +1576,7 @@ async fn host_controller_owned_commands_run_under_their_grant_at_their_class_nic
         let handle = workspace.supervisor(false);
         let mut forged =
             sh("printf '%s|%s' \"$BOUNDED_EXEC_CPU_TOKENS\" \"$BOUNDED_EXEC_CPU_POOL\"");
-        forged.want = NonZeroUsize::new(3).unwrap();
+        forged.want = NonZeroUsize::new(3);
         forged
             .env
             .insert("BOUNDED_EXEC_CPU_TOKENS".to_owned(), "99".to_owned());
@@ -1702,7 +1702,7 @@ async fn host_controller_a_coordinator_host_gate_runs_outside_the_sandbox() {
             outside.display()
         )));
         host.scope = ExecScope::HostGate;
-        host.want = NonZeroUsize::new(2).unwrap();
+        host.want = NonZeroUsize::new(2);
         host
     };
 

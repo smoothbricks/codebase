@@ -377,6 +377,19 @@ pub fn background_limit(total: usize) -> usize {
     (total / 2).max(1)
 }
 
+/// The tokens of this host's ledger: one per core the host reports (05_gateway.md "Host CPU
+/// budget", "The budget").
+pub fn host_tokens() -> NonZeroUsize {
+    std::thread::available_parallelism().expect("every supported host reports how many CPUs it has")
+}
+
+/// The background share of this host: [`background_limit`] of [`host_tokens`], all that its
+/// background-class work holds at once, and what an exec that names no want asks for at
+/// background or interactive class (05_gateway.md "The task server owns the live grant and nice").
+pub fn background_share() -> NonZeroUsize {
+    NonZeroUsize::new(background_limit(host_tokens().get())).unwrap_or(NonZeroUsize::MIN)
+}
+
 impl CpuBudgetStatus {
     /// The most tokens this ledger's background-class work holds at once.
     pub fn background_limit(&self) -> usize {

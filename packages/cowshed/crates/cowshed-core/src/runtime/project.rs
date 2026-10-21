@@ -5194,7 +5194,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 stderr_copy: None,
                 admission_key: None,
                 class: crate::api::dto::ExecClass::Background,
-                want: std::num::NonZeroUsize::MIN,
+                want: Some(std::num::NonZeroUsize::MIN),
                 scope: crate::api::dto::ExecScope::Workspace,
             };
             let job = handle
@@ -16647,7 +16647,7 @@ mod removal_supervisor_tests {
                     stderr_copy: None,
                     admission_key: None,
                     class: crate::api::dto::ExecClass::Background,
-                    want: std::num::NonZeroUsize::MIN,
+                    want: Some(std::num::NonZeroUsize::MIN),
                     scope: crate::api::dto::ExecScope::Workspace,
                 },
                 super::super::supervisor_socket::AdmissionSource::Worker,
@@ -17445,7 +17445,7 @@ fn land_check_request(check: &str) -> ExecRequest {
         stderr_copy: None,
         admission_key: None,
         class: crate::api::dto::ExecClass::Gate,
-        want: NonZeroUsize::MIN,
+        want: Some(NonZeroUsize::MIN),
         scope: crate::api::dto::ExecScope::Workspace,
     }
 }
@@ -17707,7 +17707,7 @@ fn nx_probe_request(
         stderr_copy: None,
         admission_key: None,
         class,
-        want: NonZeroUsize::MIN,
+        want: Some(NonZeroUsize::MIN),
         scope: crate::api::dto::ExecScope::Workspace,
     })
 }

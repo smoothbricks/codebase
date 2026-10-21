@@ -1843,7 +1843,7 @@ async fn router_decodes_tagged_non_utf8_argv_without_a_string_boundary() {
 struct Admitted {
     source: AdmissionSource,
     class: ExecClass,
-    want: NonZeroUsize,
+    want: Option<NonZeroUsize>,
     scope: ExecScope,
 }
 
@@ -2001,43 +2001,43 @@ async fn router_admits_a_gate_only_through_the_coordinator_route() {
             Admitted {
                 source: AdmissionSource::Coordinator,
                 class: ExecClass::Gate,
-                want: eight,
+                want: Some(eight),
                 scope: ExecScope::Workspace,
             },
             Admitted {
                 source: AdmissionSource::Coordinator,
                 class: ExecClass::Gate,
-                want: eight,
+                want: Some(eight),
                 scope: ExecScope::HostGate,
             },
             Admitted {
                 source: AdmissionSource::Coordinator,
                 class: ExecClass::Background,
-                want: NonZeroUsize::MIN,
+                want: None,
                 scope: ExecScope::HostGate,
             },
             Admitted {
                 source: AdmissionSource::Worker,
                 class: ExecClass::Background,
-                want: NonZeroUsize::new(4).unwrap(),
+                want: NonZeroUsize::new(4),
                 scope: ExecScope::Workspace,
             },
             Admitted {
                 source: AdmissionSource::Worker,
                 class: ExecClass::Interactive,
-                want: NonZeroUsize::MIN,
+                want: None,
                 scope: ExecScope::Workspace,
             },
             Admitted {
                 source: AdmissionSource::Worker,
                 class: ExecClass::Resident,
-                want: NonZeroUsize::MIN,
+                want: None,
                 scope: ExecScope::Workspace,
             },
             Admitted {
                 source: AdmissionSource::Worker,
                 class: ExecClass::InteractiveResident,
-                want: NonZeroUsize::MIN,
+                want: None,
                 scope: ExecScope::Workspace,
             },
         ]
@@ -2461,7 +2461,7 @@ async fn one_connection_answers_output_and_status_while_a_wait_is_pending() {
         .exec(ExecRequest {
             command: ExecCommand::Argv(vec![CommandArg::from("build")]),
             class: ExecClass::Background,
-            want: NonZeroUsize::MIN,
+            want: None,
             scope: ExecScope::Workspace,
             cwd: None,
             mode: RunSandboxMode::ReadWrite,
@@ -2812,7 +2812,7 @@ async fn exec_in(
         .exec(ExecRequest {
             command,
             class: ExecClass::Background,
-            want: NonZeroUsize::MIN,
+            want: None,
             scope: ExecScope::Workspace,
             cwd: None,
             mode: RunSandboxMode::ReadWrite,
@@ -2894,7 +2894,7 @@ async fn a_keyed_lookup_reaches_one_job_or_proven_absence_over_the_controller() 
     let request = || ExecRequest {
         command: ExecCommand::Argv(vec![CommandArg::from("build")]),
         class: ExecClass::Background,
-        want: NonZeroUsize::MIN,
+        want: None,
         scope: ExecScope::Workspace,
         cwd: None,
         mode: RunSandboxMode::ReadWrite,
@@ -4225,7 +4225,7 @@ async fn host_controller_a_keyed_job_distinguishes_unnamed_sessions() {
                 .collect(),
         ),
         class: ExecClass::Background,
-        want: NonZeroUsize::MIN,
+        want: None,
         scope: ExecScope::Workspace,
         cwd: None,
         mode: RunSandboxMode::ReadWrite,
@@ -4626,7 +4626,7 @@ async fn host_controller_open_stdin_delivers_binary_and_counts_only_written_pipe
                 .collect(),
             ),
             class: ExecClass::Background,
-            want: NonZeroUsize::MIN,
+            want: None,
             scope: ExecScope::Workspace,
             cwd: None,
             mode: RunSandboxMode::ReadWrite,
@@ -4786,7 +4786,7 @@ async fn host_controller_close_waits_for_an_in_progress_pipe_write() {
                 .collect(),
             ),
             class: ExecClass::Background,
-            want: NonZeroUsize::MIN,
+            want: None,
             scope: ExecScope::Workspace,
             cwd: None,
             mode: RunSandboxMode::ReadWrite,
@@ -5039,7 +5039,7 @@ async fn an_attachment_writes_and_ends_open_stdin_and_detaching_keeps_the_job() 
         .exec(ExecRequest {
             command: ExecCommand::Argv(vec![CommandArg::from("cat")]),
             class: ExecClass::Background,
-            want: NonZeroUsize::MIN,
+            want: None,
             scope: ExecScope::Workspace,
             cwd: None,
             mode: RunSandboxMode::ReadWrite,

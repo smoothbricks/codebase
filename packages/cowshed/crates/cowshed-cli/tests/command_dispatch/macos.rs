@@ -6998,7 +6998,7 @@ async fn real_apfs_killed_covered_install_restores_links_its_postinstall_removed
             stderr_copy: None,
             admission_key: None,
             class: cowshed_core::api::ExecClass::Background,
-            want: std::num::NonZeroUsize::MIN,
+            want: None,
             scope: cowshed_core::api::ExecScope::Workspace,
         })
         .await
@@ -7234,7 +7234,10 @@ async fn directory_an_exec_on_a_loaded_host_answers_at_admission_and_cancels_whi
         "the backgrounded exec answered while its job waits for the host: {answer}\n{stderr}"
     );
     let waiting = queued_request(&socket).await;
-    assert_eq!(waiting.want, 1, "{waiting:?}");
+    // An exec that names no want asks for the background share of the gateway's host, ⌊N/2⌋
+    // of its N tokens (05_gateway.md "Room for a gate"), not one token.
+    let share = cpu_budget(&socket).await.background_limit();
+    assert_eq!(waiting.want, share, "{waiting:?}");
     assert!(!ran.exists(), "nothing ran while the host is loaded");
     drop(load);
     eventually(|| fs::read(&ran).is_ok_and(|bytes| bytes == b"ran")).await;
@@ -7289,7 +7292,7 @@ async fn directory_an_exec_on_a_loaded_host_answers_at_admission_and_cancels_whi
                 cowshed_core::api::dto::AdmissionKey::new("loaded-host-op").expect("a key"),
             ),
             class: cowshed_core::api::ExecClass::Background,
-            want: std::num::NonZeroUsize::MIN,
+            want: None,
             scope: cowshed_core::api::ExecScope::Workspace,
         })
         .await

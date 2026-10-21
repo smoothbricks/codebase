@@ -2783,8 +2783,10 @@ pub struct ExecRequest {
     /// asks for one, or a resident that holds no token.
     pub class: ExecClass,
     /// The most CPU tokens the command can use at once; its grant is between one and this count.
-    /// A resident holds none and names only the default.
-    pub want: NonZeroUsize,
+    /// `None` asks for its class's own (`JobScheduling::requested`): the background share of the
+    /// host for background and interactive work, one token for a gate. A resident holds none
+    /// and names none.
+    pub want: Option<NonZeroUsize>,
     /// Where the command runs: the workspace sandbox, or a coordinator's host boundary outside it.
     pub scope: ExecScope,
 }

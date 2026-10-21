@@ -814,7 +814,7 @@ fn request(stdin: StdinSource) -> ExecRequest {
         stderr_copy: None,
         admission_key: None,
         class: ExecClass::Background,
-        want: NonZeroUsize::MIN,
+        want: None,
         scope: ExecScope::Workspace,
     }
 }
@@ -3255,9 +3255,12 @@ async fn a_streamed_stdin_reaches_a_served_job_whole_and_in_order() {
     assert_eq!(remote.wait(job).await.unwrap().state, JobState::Exited);
 }
 
+/// A keyed request that names its one token, so a repeat that changes its class changes nothing
+/// else it asked for.
 fn keyed(key: &str, stdin: StdinSource) -> ExecRequest {
     ExecRequest {
         admission_key: Some(AdmissionKey::new(key).unwrap()),
+        want: Some(NonZeroUsize::MIN),
         ..request(stdin)
     }
 }
@@ -3552,7 +3555,7 @@ async fn a_keyed_repeat_compares_each_authored_field_and_ignores_withheld_env() 
                     policy: PublicationPolicy::CreateNew,
                 });
             }
-            AdmissionField::Want => changed.want = NonZeroUsize::new(4).unwrap(),
+            AdmissionField::Want => changed.want = NonZeroUsize::new(4),
             AdmissionField::Class | AdmissionField::Scope => {
                 unreachable!("a class and its scope change together, below")
             }
@@ -8375,6 +8378,37 @@ async fn per_job_fixed_cost_measurement() {
     }
 }
 
+/// An exec that names no want asks the CPU budget for the background share of the host, ⌊N/2⌋
+/// of its N cores and at least one (05_gateway.md "The task server owns the live grant and
+/// nice"), not one token. Measured 2026-10-21 with one: an `nx run-many` under a default
+/// `cowshed exec` handed that token to its runners one after another, which waited up to 887 s
+/// for it, 21m19s against 5m54s on the host route.
+#[tokio::test]
+async fn an_exec_that_names_no_want_asks_for_the_background_share() {
+    let (h, mut asked, _root) = scripted_harness("cpu-share");
+    let handle = h.handle.clone();
+    let exec = tokio::spawn(async move {
+        handle
+            .exec(
+                None,
+                None,
+                request(StdinSource::Empty),
+                AdmissionSource::Worker,
+            )
+            .await
+    });
+    let cpu = asked.recv().await.expect("the job asks the CPU budget");
+    let cores = std::thread::available_parallelism().unwrap().get();
+    assert_eq!(
+        (cpu.ask.class, cpu.ask.want.get()),
+        (ExecClass::Background, (cores / 2).max(1)),
+        "an unnamed want is the background share of {cores} cores"
+    );
+    exec.await
+        .unwrap()
+        .expect("the exec answers at its admission");
+}
+
 /// A job is durable and queued before the gateway grants it anything; the actor answers status
 /// meanwhile and spawns nothing. The command spawns under the actual grant -- its count, its live
 /// pool, its class's nice -- and the grant is held until the job concludes, then returned.
@@ -8388,7 +8422,7 @@ async fn a_job_spawns_under_its_actual_grant_and_returns_it_when_it_concludes() 
                 None,
                 None,
                 ExecRequest {
-                    want: NonZeroUsize::new(6).unwrap(),
+                    want: NonZeroUsize::new(6),
                     ..request(StdinSource::Empty)
                 },
                 AdmissionSource::Worker,
@@ -8837,7 +8871,7 @@ async fn a_worker_interactive_job_asks_its_class_and_runs_above_the_gate() {
                 None,
                 ExecRequest {
                     class: ExecClass::Interactive,
-                    want: NonZeroUsize::new(2).unwrap(),
+                    want: NonZeroUsize::new(2),
                     ..request(StdinSource::Empty)
                 },
                 AdmissionSource::Worker,
@@ -8879,7 +8913,7 @@ async fn a_coordinator_gate_runs_at_gate_nice_and_may_reach_the_host_boundary() 
                     None,
                     None,
                     ExecRequest {
-                        want: NonZeroUsize::new(8).unwrap(),
+                        want: NonZeroUsize::new(8),
                         scope,
                         ..gate(request(StdinSource::Empty))
                     },
@@ -8956,7 +8990,7 @@ async fn a_coordinator_host_job_at_the_default_class_asks_a_background_token() {
             None,
             None,
             ExecRequest {
-                want: NonZeroUsize::new(4).unwrap(),
+                want: NonZeroUsize::new(4),
                 scope: ExecScope::HostGate,
                 ..request(StdinSource::Empty)
             },
@@ -9001,7 +9035,7 @@ async fn the_sealed_record_keeps_the_class_scope_grant_and_observed_nice() {
             None,
             None,
             ExecRequest {
-                want: NonZeroUsize::new(2).unwrap(),
+                want: NonZeroUsize::new(2),
                 ..gate(request(StdinSource::Empty))
             },
             AdmissionSource::Coordinator,

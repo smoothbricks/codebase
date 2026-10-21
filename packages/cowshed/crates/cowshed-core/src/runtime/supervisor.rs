@@ -5096,11 +5096,14 @@ impl SupervisorActor {
     }
 
     /// Compare the authored request by borrowing it; only a new admission needs owned metadata.
+    /// Its scheduling is compared as `requested` resolved it, so a want it leaves unnamed is its
+    /// class's own, as the first admission's was.
     fn admission_differences(
         &self,
         admitted: &JobAdmission,
         command: &ExecCommand,
-        scheduling: JobScheduling,
+        bound: JobScheduling,
+        requested: JobScheduling,
         request: &ExecRequest,
         session: Option<&SessionToken>,
     ) -> Vec<AdmissionField> {
@@ -5148,9 +5151,9 @@ impl SupervisorActor {
                 AdmissionField::StderrCopy,
                 admitted.stderr_copy != request.stderr_copy,
             ),
-            (AdmissionField::Scope, scheduling.scope() != request.scope),
-            (AdmissionField::Class, scheduling.class() != request.class),
-            (AdmissionField::Want, scheduling.want() != request.want),
+            (AdmissionField::Scope, bound.scope() != requested.scope()),
+            (AdmissionField::Class, bound.class() != requested.class()),
+            (AdmissionField::Want, bound.want() != requested.want()),
         ]
         .into_iter()
         .filter_map(|(field, differs)| differs.then_some(field))
@@ -5189,7 +5192,7 @@ impl SupervisorActor {
         // The host boundary takes no session overlay a worker controls. Environment names do
         // not restrict execution; the public-name projection is applied only when recording.
         crate::api::dto::validate_host_gate_request(request.scope, session.is_some())?;
-        let scheduling = JobScheduling::new(request.scope, request.class, request.want)
+        let scheduling = JobScheduling::requested(request.scope, request.class, request.want)
             .ok_or_else(|| {
                 CowshedError::usage(
                     "a resident holds no CPU token, so it wants none: its descendants ask its \
@@ -5231,6 +5234,7 @@ impl SupervisorActor {
                         admitted,
                         command,
                         bound,
+                        scheduling,
                         &request,
                         session.as_ref(),
                     );

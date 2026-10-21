@@ -852,7 +852,8 @@ export type ExecParams = {
    */
   readonly class?: ExecClass;
   /**
-   * The most CPU tokens the command can use at once; omitted for one.
+   * The most CPU tokens the command can use at once; omitted for its class's own, the
+   * background share of the host for background and interactive work.
    */
   readonly want?: number & tags.Type<'uint64'> & tags.Minimum<1>;
   /**

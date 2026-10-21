@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use cowshed_gateway_types::{
     CpuBackgroundStake, CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, CpuHolder,
-    CpuWaiter, InstallRestart, background_limit,
+    CpuWaiter, InstallRestart, background_limit, host_tokens,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -55,8 +55,7 @@ impl Default for CpuBudgetLimits {
     /// One token per core the host reports.
     fn default() -> Self {
         Self {
-            tokens: std::thread::available_parallelism()
-                .expect("every supported host reports how many CPUs it has"),
+            tokens: host_tokens(),
         }
     }
 }

@@ -507,18 +507,21 @@ first, however it ends — a caller's timeout killing it included — leaves a j
 kills it (05_gateway.md, "A job lives with its requester"). `--timeout` releases the hold before it leaves the job
 running; `--background` takes none. A `--class resident` command — a daemon or worker that stays up and is idle between
 requests — holds no CPU token and starts at once; its descendants ask its pool for their own (05_gateway.md, "A resident
-holds no token"). It takes no `--want`. A `--class interactive` command is one its caller waits on: it takes its tokens
-as background work does and runs at nice 0, above a gate at +5 and background at +10 (05_gateway.md, "Bands"); a
-workspace may ask for it. Every `exec` flag that asks the scheduler for something is a typed field of the API's exec
-request (07_api.md, "CLI and API exec parity"), so an embedding process can ask for everything this command can.
+holds no token"). It takes no `--want`. Any other exec that names no `--want` asks for its class's own count: background
+and interactive work the background share of the host, half its tokens, so the runners it starts run side by side, and a
+gate one token (05_gateway.md, "The task server owns the live grant and nice"); `--want <n>` asks for n. A
+`--class interactive` command is one its caller waits on: it takes its tokens as background work does and runs at nice
+0, above a gate at +5 and background at +10 (05_gateway.md, "Bands"); a workspace may ask for it. Every `exec` flag that
+asks the scheduler for something is a typed field of the API's exec request (07_api.md, "CLI and API exec parity"), so
+an embedding process can ask for everything this command can.
 
 `--host` names where the command runs, not how it is scheduled. The argv runs once at the host boundary, outside the
 workspace sandbox and without shell activation, from an empty environment filled with the operator's own (07_api.md,
 "Task server scheduling and trusted host gates"). It composes with every `--class` and defaults to background like any
-exec: host unit work — a test that needs real APFS images or the host controller — takes a background token, runs at
-nice +10, holds no install slot (05_gateway.md, "The install slot") and leaves the repository's gate order to its
-lander. Only `--class gate` takes that order, and a land's gate is the one command that asks for it, as
-`--class gate --host` (05_gateway.md, "A land is a gate job"). Unit work never passes `--class gate`.
+exec: host unit work — a test that needs real APFS images or the host controller — takes background tokens, runs at nice
++10, holds no install slot (05_gateway.md, "The install slot") and leaves the repository's gate order to its lander.
+Only `--class gate` takes that order, and a land's gate is the one command that asks for it, as `--class gate --host`
+(05_gateway.md, "A land is a gate job"). Unit work never passes `--class gate`.
 
 `--host` once required `--class gate`, because the host route was built for the land's real-APFS gate, and the tie made
 two things one. What keeps an unsandboxed command safe is its route, not its class: only the trusted coordinator route

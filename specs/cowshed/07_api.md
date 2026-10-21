@@ -135,8 +135,10 @@ pub struct ExecRequest {
     pub class: ExecClass,                 // Background by default; Interactive for work its requester awaits;
                                           // Gate requires trusted coordinator; Resident holds no token, its
                                           // pool asks the host per child (05_gateway.md "Bands")
-    pub want: NonZeroUsize,               // default1; actual command demand, bounded to granted tokens; a
-                                          // Resident names only the default
+    pub want: Option<NonZeroUsize>,       // None: the class's own, the background share ⌊N/2⌋ for Background
+                                          // and Interactive, 1 for Gate (05_gateway.md "The task server owns
+                                          // the live grant and nice"); actual command demand, bounded to
+                                          // granted tokens; a Resident names none
     pub scope: ExecScope,                 // Workspace default; HostGate: coordinator route only, any class
 }
 
@@ -1932,7 +1934,7 @@ is one typed field of the same request, decoded by the same validation (`JobSche
 | `--session <name>`                                                        | `WorkspaceHandle::shell(Some(name))`, then `Session::run`         | `shell(name)`, then `session.exec`                        |
 | `--stdout-copy`, `--stderr-copy`                                          | `stdout_copy`, `stderr_copy`                                      | `stdoutCopy`, `stderrCopy`                                |
 | `--replace-output`                                                        | `PublicationPolicy::Replace`                                      | `policy: 'replace'`                                       |
-| `--want <n>`                                                              | `want: NonZeroUsize`                                              | `want`                                                    |
+| `--want <n>`                                                              | `want: Option<NonZeroUsize>`                                      | `want`                                                    |
 | `--class <background\|interactive\|gate\|resident\|interactive-resident>` | `class: ExecClass`                                                | `class`                                                   |
 | `--host`                                                                  | `scope: ExecScope::HostGate`                                      | `scope: 'hostGate'`                                       |
 | `--background`                                                            | every exec answers its `JobHandle` at admission                   | the same                                                  |

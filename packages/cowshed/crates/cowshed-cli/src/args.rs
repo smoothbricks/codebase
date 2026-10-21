@@ -391,8 +391,10 @@ pub struct ExecArgs {
     /// The class the command is admitted under (`--class`): background unless the caller names
     /// interactive work it waits on, the operator's gate, or a resident.
     pub class: ExecClass,
-    /// The most CPU tokens the command can use at once (`--want`); its grant is between one and this.
-    pub want: NonZeroUsize,
+    /// The most CPU tokens the command can use at once (`--want`); its grant is between one and
+    /// this. `None` asks for the class's own: the background share of the host for background
+    /// and interactive work, one token for a gate.
+    pub want: Option<NonZeroUsize>,
     /// Where the command runs: the workspace sandbox, or `--host`, the host boundary outside it.
     pub scope: ExecScope,
 }
@@ -2384,7 +2386,7 @@ const EXEC: CommandSpec = CommandSpec {
     about: &[
         "Runs one argv — never a shell string — inside the workspace's sandbox, with the cwd at the workspace root. Child stdout and stderr pass through as opaque bytes and the child's exit code passes through untouched; only a denial cowshed has authoritative evidence for is reported as one.",
         "Waits for the command however long it runs and exits with its status. With `--timeout`, a command still running then keeps running under the workspace supervisor and exec exits 103 naming its job; `--background` prints the job id and returns at once. No CLI verb reattaches to a job: the cowshed API does. `--session` keeps a named session's cwd and variables across calls.",
-        "Every job but a resident takes host CPU tokens from the gateway before its command starts. An ordinary command is `background` and wants one token; `--want <n>` names the tokens a heavy runner can use at once, and its grant is between one and `n`. Background work never holds more than half the host. `--class interactive` names a command someone is waiting on: it takes its tokens as background work does and runs at nice 0, ahead of a gate at +5 and background at +10 whenever cores are contended, and a workspace may ask for it. `--class gate` admits the command as the operator's gate: it starts at once on the half background leaves free while no other gate work holds it, and otherwise waits for whole returned tokens ahead of queued background work, however long that takes; it runs at nice +5. Only this trusted route may ask for a gate; a workspace's own capability is refused. A foreground job lives as long as this exec does: if exec ends first, however it ends, the job is killed and its tokens return, so a gate whose lander is gone never keeps its place ahead of the next and a caller's timeout leaves no orphan; `--timeout` lets it run on, and `--background` never holds it. `--host` runs the command once at the host boundary, outside the workspace sandbox, at the class it names: host work at the default class takes a background token like any other, and only `--class gate` takes the repository's gate order.",
+        "Every job but a resident takes host CPU tokens from the gateway before its command starts. An ordinary command is `background` and asks for the background share of the host, the half of its tokens background work may hold, so the runners it starts run side by side; `--want <n>` names the tokens a command can use at once instead, and its grant is between one and `n`. Background work never holds more than half the host. `--class interactive` names a command someone is waiting on: it takes its tokens as background work does and runs at nice 0, ahead of a gate at +5 and background at +10 whenever cores are contended, and a workspace may ask for it. `--class gate` admits the command as the operator's gate: it starts at once on the half background leaves free while no other gate work holds it, and otherwise waits for whole returned tokens ahead of queued background work, however long that takes; it runs at nice +5. Only this trusted route may ask for a gate; a workspace's own capability is refused. A foreground job lives as long as this exec does: if exec ends first, however it ends, the job is killed and its tokens return, so a gate whose lander is gone never keeps its place ahead of the next and a caller's timeout leaves no orphan; `--timeout` lets it run on, and `--background` never holds it. `--host` runs the command once at the host boundary, outside the workspace sandbox, at the class it names: host work at the default class takes a background token like any other, and only `--class gate` takes the repository's gate order.",
         "`--class resident` admits a process that stays up to serve requests and is idle between them — a daemon, a worker. It holds no token and starts at once: its descendants ask its pool for their own tokens, each as background work for the workspace, so it costs the host tokens only while a request of its runs. A resident wants none, so it takes no `--want`. It runs at nice +10; `--class interactive-resident` is the same resident at nice 0, for a worker whose requests someone waits on, and differs in nothing else.",
     ],
     options: &[
@@ -2434,7 +2436,7 @@ const EXEC: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--want <n>",
-            meaning: "the CPU tokens the command can use at once (default 1); its grant is between one and n",
+            meaning: "the CPU tokens the command can use at once (default: the background share, half the host's tokens; one for a gate); its grant is between one and n",
         },
         Opt {
             spelling: "--class <background|interactive|gate|resident|interactive-resident>",
@@ -2508,13 +2510,14 @@ fn parse_exec(matches: &ArgMatches) -> Result<Command, UsageError> {
             }
         },
     };
-    let want = match positive_count(matches, "want", USAGE)? {
-        None => NonZeroUsize::MIN,
-        Some(count) => usize::try_from(count)
-            .ok()
-            .and_then(NonZeroUsize::new)
-            .ok_or_else(|| UsageError::new("--want is too large for this platform", USAGE))?,
-    };
+    let want = positive_count(matches, "want", USAGE)?
+        .map(|count| {
+            usize::try_from(count)
+                .ok()
+                .and_then(NonZeroUsize::new)
+                .ok_or_else(|| UsageError::new("--want is too large for this platform", USAGE))
+        })
+        .transpose()?;
     let host = flagged(matches, "host");
     if host && session.is_some() {
         return Err(UsageError::new(
@@ -2522,7 +2525,7 @@ fn parse_exec(matches: &ArgMatches) -> Result<Command, UsageError> {
             USAGE,
         ));
     }
-    if class.is_resident() && want != NonZeroUsize::MIN {
+    if class.is_resident() && want.is_some() {
         return Err(UsageError::new(
             "--class resident takes no --want: a resident holds no token, and its descendants ask its pool for their own",
             USAGE,
@@ -4412,11 +4415,20 @@ mod tests {
         };
         let ordinary = exec(&["exec", "raven", "--", "build"]);
         assert_eq!(ordinary.class, ExecClass::Background);
-        assert_eq!(ordinary.want, NonZeroUsize::MIN);
+        assert_eq!(ordinary.want, None, "an unnamed want is the class's own");
         assert_eq!(ordinary.scope, ExecScope::Workspace);
 
         let heavy = exec(&["exec", "raven", "--want", "12", "--", "nextest"]);
-        assert_eq!((heavy.class, heavy.want.get()), (ExecClass::Background, 12));
+        assert_eq!(
+            (heavy.class, heavy.want.map(NonZeroUsize::get)),
+            (ExecClass::Background, Some(12))
+        );
+        let one = exec(&["exec", "raven", "--want", "1", "--", "build"]);
+        assert_eq!(
+            one.want,
+            Some(NonZeroUsize::MIN),
+            "a named want is taken as named"
+        );
 
         let gate = exec(&["exec", "raven", "--class", "gate", "--", "gate"]);
         assert_eq!(gate.class, ExecClass::Gate);
@@ -4426,16 +4438,16 @@ mod tests {
             "exec", "raven", "--class", "gate", "--host", "--want", "18", "--", "gate",
         ]);
         assert_eq!(host.scope, ExecScope::HostGate);
-        assert_eq!(host.want.get(), 18);
+        assert_eq!(host.want.map(NonZeroUsize::get), Some(18));
 
         let host_background = exec(&["exec", "raven", "--host", "--want", "4", "--", "test"]);
         assert_eq!(
             (
                 host_background.class,
-                host_background.want.get(),
+                host_background.want.map(NonZeroUsize::get),
                 host_background.scope
             ),
-            (ExecClass::Background, 4, ExecScope::HostGate)
+            (ExecClass::Background, Some(4), ExecScope::HostGate)
         );
         for (class, spelled) in [
             (ExecClass::Interactive, "interactive"),
@@ -4449,7 +4461,7 @@ mod tests {
         let resident = exec(&["exec", "raven", "--class", "resident", "--", "sleep", "600"]);
         assert_eq!(
             (resident.class, resident.want, resident.scope),
-            (ExecClass::Resident, NonZeroUsize::MIN, ExecScope::Workspace)
+            (ExecClass::Resident, None, ExecScope::Workspace)
         );
 
         let interactive_resident = exec(&[
@@ -4467,21 +4479,13 @@ mod tests {
                 interactive_resident.want,
                 interactive_resident.scope
             ),
-            (
-                ExecClass::InteractiveResident,
-                NonZeroUsize::MIN,
-                ExecScope::Workspace
-            )
+            (ExecClass::InteractiveResident, None, ExecScope::Workspace)
         );
 
         let interactive = exec(&["exec", "raven", "--class", "interactive", "--", "nextest"]);
         assert_eq!(
             (interactive.class, interactive.want, interactive.scope),
-            (
-                ExecClass::Interactive,
-                NonZeroUsize::MIN,
-                ExecScope::Workspace
-            )
+            (ExecClass::Interactive, None, ExecScope::Workspace)
         );
     }
 
@@ -4495,6 +4499,12 @@ mod tests {
             (
                 vec![
                     "exec", "raven", "--class", "resident", "--want", "4", "--", "x",
+                ],
+                "--class resident takes no --want",
+            ),
+            (
+                vec![
+                    "exec", "raven", "--class", "resident", "--want", "1", "--", "x",
                 ],
                 "--class resident takes no --want",
             ),

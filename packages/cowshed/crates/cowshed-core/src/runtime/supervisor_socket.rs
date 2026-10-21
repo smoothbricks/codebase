@@ -422,7 +422,7 @@ struct ExecWire {
     stderr_copy: Option<OutputPublication>,
     admission_key: Option<AdmissionKey>,
     class: ExecClass,
-    want: NonZeroUsize,
+    want: Option<NonZeroUsize>,
     scope: ExecScope,
     /// The requester's live CPU pool ([`crate::runtime::job_cpu::JobCpuAsk::parent`]); absent
     /// when the requester holds none.
@@ -3057,7 +3057,7 @@ mod admission_source_tests {
         };
         assert_eq!(source, AdmissionSource::Coordinator);
         assert_eq!(request.class, ExecClass::Gate);
-        assert_eq!(request.want.get(), 8);
+        assert_eq!(request.want.map(NonZeroUsize::get), Some(8));
         assert_eq!(request.scope, ExecScope::HostGate);
 
         let mut unrouted = call;

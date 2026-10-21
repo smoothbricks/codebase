@@ -451,8 +451,8 @@ pub struct JobAdmission {
 
 /// The host CPU admission a job asked for (05_gateway.md "Host CPU budget"): the scope it runs
 /// in, its class and the tokens it wants. Either scope pairs with every class, and a resident
-/// asks for no token, so its want is the default one it cannot raise; [`Self::new`] is the only
-/// way to one.
+/// asks for no token, so its want is the default one it cannot raise; [`Self::requested`] and
+/// [`Self::new`] are the only ways to one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobScheduling {
     scope: ExecScope,
@@ -461,7 +461,32 @@ pub struct JobScheduling {
 }
 
 impl JobScheduling {
-    /// `None` for a resident that names a want above the default.
+    /// The scheduling a request asks for. A want it names is taken as named; one it leaves
+    /// unnamed is its class's own (05_gateway.md "The task server owns the live grant and
+    /// nice"): background and interactive work ask for the background share of the host, the
+    /// ⌊N/2⌋ of its N tokens their class may hold at once ("Room for a gate"); a gate asks for
+    /// the one token its orchestrator uses, since its pool asks the host for each of its tasks;
+    /// a resident asks for none. `None` for a resident that names a want.
+    pub fn requested(
+        scope: ExecScope,
+        class: ExecClass,
+        want: Option<NonZeroUsize>,
+    ) -> Option<Self> {
+        let want = match (class, want) {
+            (ExecClass::Resident | ExecClass::InteractiveResident, Some(_)) => return None,
+            (ExecClass::Background | ExecClass::Interactive | ExecClass::Gate, Some(want)) => want,
+            (ExecClass::Background | ExecClass::Interactive, None) => {
+                cowshed_gateway_types::background_share()
+            }
+            (ExecClass::Gate | ExecClass::Resident | ExecClass::InteractiveResident, None) => {
+                NonZeroUsize::MIN
+            }
+        };
+        Self::new(scope, class, want)
+    }
+
+    /// A job record's scheduling: `None` for a resident whose want is not the one token it
+    /// holds by default.
     pub fn new(scope: ExecScope, class: ExecClass, want: NonZeroUsize) -> Option<Self> {
         match class {
             ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => {
@@ -486,7 +511,7 @@ impl JobScheduling {
     }
 }
 
-/// What a request that names no scheduling asks for: background in its workspace, one token.
+/// A background job in its workspace that wanted one token.
 impl Default for JobScheduling {
     fn default() -> Self {
         Self {
@@ -8097,6 +8122,55 @@ mod tests {
             Arc::new(UInt64Array::from(vec![Some(0)])),
         );
         assert!(batch_to_protected_record(&zero_tokens).is_err());
+    }
+
+    /// A request that names no want takes its class's own (05_gateway.md "The task server owns
+    /// the live grant and nice"): background and interactive work the background share of the
+    /// host, ⌊N/2⌋ of its N cores and at least one; a gate its orchestrator's one token; a
+    /// resident none. A named want is taken as named, and a resident names none. Measured
+    /// 2026-10-21 before: a default `cowshed exec` asked for one token, and the `nx run-many` it
+    /// ran had that one token for every runner it started, which waited for it one after another
+    /// for up to 887 s: 21m19s against 5m54s on the host route.
+    #[test]
+    fn an_unnamed_want_is_its_class_share_and_a_named_want_is_exact() {
+        let cores = std::thread::available_parallelism().unwrap().get();
+        let share = NonZeroUsize::new((cores / 2).max(1)).unwrap();
+        let two = NonZeroUsize::new(2).unwrap();
+        for scope in [ExecScope::Workspace, ExecScope::HostGate] {
+            for (class, unnamed) in [
+                (ExecClass::Background, share),
+                (ExecClass::Interactive, share),
+                (ExecClass::Gate, NonZeroUsize::MIN),
+                (ExecClass::Resident, NonZeroUsize::MIN),
+                (ExecClass::InteractiveResident, NonZeroUsize::MIN),
+            ] {
+                assert_eq!(
+                    JobScheduling::requested(scope, class, None).map(JobScheduling::want),
+                    Some(unnamed),
+                    "{class:?} in {scope:?}"
+                );
+            }
+            for class in [
+                ExecClass::Background,
+                ExecClass::Interactive,
+                ExecClass::Gate,
+            ] {
+                for named in [NonZeroUsize::MIN, two] {
+                    assert_eq!(
+                        JobScheduling::requested(scope, class, Some(named))
+                            .map(JobScheduling::want),
+                        Some(named),
+                        "{class:?} in {scope:?}"
+                    );
+                }
+            }
+            for class in [ExecClass::Resident, ExecClass::InteractiveResident] {
+                assert!(
+                    JobScheduling::requested(scope, class, Some(NonZeroUsize::MIN)).is_none(),
+                    "a resident names no want, in {scope:?} too"
+                );
+            }
+        }
     }
 
     #[test]

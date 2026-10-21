@@ -3080,7 +3080,7 @@ mod tests {
             stderr_copy: None,
             admission_key: None,
             class: ExecClass::Background,
-            want: NonZeroUsize::MIN,
+            want: None,
             scope: ExecScope::Workspace,
         }
     }
@@ -4062,7 +4062,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn an_ordinary_exec_names_only_a_demand_above_one() {
+    async fn an_exec_names_a_demand_only_when_its_caller_does() {
         let (runtime, mut server) = actor_pair();
         let server_task = tokio::spawn(async move {
             for wants in [None, Some(8)] {
@@ -4079,7 +4079,7 @@ mod tests {
         let handle = workspace_handle(runtime);
         handle.exec(exec_request(StdinSource::Empty)).await.unwrap();
         let mut heavy = exec_request(StdinSource::Empty);
-        heavy.want = NonZeroUsize::new(8).unwrap();
+        heavy.want = NonZeroUsize::new(8);
         handle.exec(heavy).await.unwrap();
         server_task.await.unwrap();
     }
@@ -4149,7 +4149,7 @@ mod tests {
         let coordinator = coordinator(runtime);
         let mut request = exec_request(StdinSource::Empty);
         request.class = ExecClass::Gate;
-        request.want = NonZeroUsize::new(8).unwrap();
+        request.want = NonZeroUsize::new(8);
         request.scope = ExecScope::HostGate;
         request.env = [
             ("PROJECT_SETTING".to_owned(), "custom-value".to_owned()),

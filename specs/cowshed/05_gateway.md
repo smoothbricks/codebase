@@ -1009,31 +1009,37 @@ core count.
 - **The task server owns the live grant and nice.** Work enters the existing `cowshed exec` / workspace supervisor, not
   a gate-host or taskpolicy wrapper. Its typed request carries class, want and scope. Only a trusted
   coordinator/operator may request Gate or HostGate; a worker request is refused with typed class-not-permitted before
-  job or spawn effects. Ordinary commands default Background, want1 and Workspace scope; producers that need parallel
-  work supply their actual demand; a requester that awaits the result asks Interactive ("Bands"), which a worker may ask
-  for, since it buys a band and no token; a resident (below) is Resident or InteractiveResident, which a worker may ask
-  for, and names no want. The supervisor records Queued, asks the gateway off its actor path and spawns only after a
-  real grant. **The exec answers at that admission, never at the grant** (11_shell.md, "Server-owned CPU admission and
-  nice placement"): a job waiting in the queue has its id, reads `queued` with its class and no `cpuTokens`, and is
-  cancellable, since a request that waits for no deadline must stay reachable for as long as it waits. Measured
-  2026-10-19 with the answer at the grant: a `cowshed exec --background` on a loaded host returned 25 s later, so the
-  executor's sequential admission of 100 held jobs stopped at the first waiting one, which had no id to report or
-  cancel. CPU admission uses the control socket of the controller's validated host storage, the same store/gateway.sock
-  authority its gateway reconciliation uses, never an unrelated ambient store. A queued kill withdraws the request
-  without spawning. Missing/refused admission never causes an unbudgeted server spawn. The supervisor retains the
-  allocation until the owned job concludes. The gateway's existing CpuBudget ledger serves that exact allocation on a
-  private workspace-scoped CPU-pool endpoint; Nx bounded-exec and Cargo descendants borrow only from it, with sibling
-  sums bounded by its actual count, or, for a gate job, through it as gate-class host requests. The root FIFO is not
-  offered alongside the pool: that would spend the same tokens twice. Its canonical endpoint is
-  `<store>/run/cpu/<base64url-incarnation>/<opaque-endpoint>`: the unpadded 22-byte incarnation component losslessly
-  encodes all 128 bits of the validated 32-lowercase-hex workspace incarnation, never a digest or truncated prefix. The
-  opaque endpoint is an independent 22-byte unpadded base64url UUID. The gateway, sandbox builder and grant validator
-  derive this one layout through the same helper; there is no runtime alias or fallback. This adds 54 bytes to the store
-  prefix, giving a 98-byte socket path for the existing 44-byte fixture store, within Darwin's 103-byte usable limit.
-  Arbitrarily long store paths do not acquire a new short-link lifecycle. A bare count/class is no gate role. The owned
-  command is placed at its class's nice ("Bands"), never the shared warm host or supervisor. No class is raised above
-  default, which requires root; the order lowers the other classes' nice instead. Nice is applied and read back before
-  command execution, using the held-child fence on macOS and a private report pipe on Linux. Refusal is typed
+  job or spawn effects. Ordinary commands default Background and Workspace scope. A request that names no want asks for
+  its class's own: background and interactive work the background share `⌊N/2⌋` ("Room for a gate"), all that their
+  class holds at once, a gate the one token its orchestrator uses ("A land is a gate job"), a resident none; a named
+  want is taken as named. An ordinary command's caller cannot know how many runners it starts, and what it starts draws
+  on its grant ("Work a holder starts draws on its grant"). Measured 2026-10-21 with a default of one token: an
+  `nx run-many` under `cowshed exec` handed that one token to its bounded-exec runners in turn, which waited 261, 473,
+  664 and 887 s for it, and the run took 21m19s against 5m54s on the host route. `JobScheduling::requested` resolves the
+  want, the validation both surfaces share (07_api.md, "CLI and API exec parity"); a requester that awaits the result
+  asks Interactive ("Bands"), which a worker may ask for, since it buys a band and no token; a resident (below) is
+  Resident or InteractiveResident, which a worker may ask for, and names no want. The supervisor records Queued, asks
+  the gateway off its actor path and spawns only after a real grant. **The exec answers at that admission, never at the
+  grant** (11_shell.md, "Server-owned CPU admission and nice placement"): a job waiting in the queue has its id, reads
+  `queued` with its class and no `cpuTokens`, and is cancellable, since a request that waits for no deadline must stay
+  reachable for as long as it waits. Measured 2026-10-19 with the answer at the grant: a `cowshed exec --background` on
+  a loaded host returned 25 s later, so the executor's sequential admission of 100 held jobs stopped at the first
+  waiting one, which had no id to report or cancel. CPU admission uses the control socket of the controller's validated
+  host storage, the same store/gateway.sock authority its gateway reconciliation uses, never an unrelated ambient store.
+  A queued kill withdraws the request without spawning. Missing/refused admission never causes an unbudgeted server
+  spawn. The supervisor retains the allocation until the owned job concludes. The gateway's existing CpuBudget ledger
+  serves that exact allocation on a private workspace-scoped CPU-pool endpoint; Nx bounded-exec and Cargo descendants
+  borrow only from it, with sibling sums bounded by its actual count, or, for a gate job, through it as gate-class host
+  requests. The root FIFO is not offered alongside the pool: that would spend the same tokens twice. Its canonical
+  endpoint is `<store>/run/cpu/<base64url-incarnation>/<opaque-endpoint>`: the unpadded 22-byte incarnation component
+  losslessly encodes all 128 bits of the validated 32-lowercase-hex workspace incarnation, never a digest or truncated
+  prefix. The opaque endpoint is an independent 22-byte unpadded base64url UUID. The gateway, sandbox builder and grant
+  validator derive this one layout through the same helper; there is no runtime alias or fallback. This adds 54 bytes to
+  the store prefix, giving a 98-byte socket path for the existing 44-byte fixture store, within Darwin's 103-byte usable
+  limit. Arbitrarily long store paths do not acquire a new short-link lifecycle. A bare count/class is no gate role. The
+  owned command is placed at its class's nice ("Bands"), never the shared warm host or supervisor. No class is raised
+  above default, which requires root; the order lowers the other classes' nice instead. Nice is applied and read back
+  before command execution, using the held-child fence on macOS and a private report pipe on Linux. Refusal is typed
   PriorityFailure, not an unobserved run. Class, scope, actual tokens and observed nice are recorded; nice remains
   absent when never observed. A HostGate is a coordinator-only argv one-shot on the host, outside ExecutedChild,
   preserving the host authority real-APFS work needs; it asks the ledger as its own class, so host work that is not a

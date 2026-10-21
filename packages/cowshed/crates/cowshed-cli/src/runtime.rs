@@ -6041,7 +6041,7 @@ mod tests {
                     stderr_copy: None,
                     admission_key: None,
                     class: cowshed_core::api::ExecClass::Background,
-                    want: std::num::NonZeroUsize::MIN,
+                    want: None,
                     scope: cowshed_core::api::ExecScope::Workspace,
                 })
                 .await

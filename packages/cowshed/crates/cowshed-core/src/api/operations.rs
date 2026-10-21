@@ -652,14 +652,6 @@ fn is_background(class: &ExecClass) -> bool {
     *class == ExecClass::Background
 }
 
-fn minimum_want() -> NonZeroUsize {
-    NonZeroUsize::MIN
-}
-
-fn is_minimum_want(want: &NonZeroUsize) -> bool {
-    *want == NonZeroUsize::MIN
-}
-
 fn is_workspace(scope: &ExecScope) -> bool {
     *scope == ExecScope::Workspace
 }
@@ -692,9 +684,10 @@ pub struct ExecParams {
     /// only the coordinator.exec route admits the gate class.
     #[serde(default, skip_serializing_if = "is_background")]
     pub class: ExecClass,
-    /// The most CPU tokens the command can use at once; omitted for one.
-    #[serde(default = "minimum_want", skip_serializing_if = "is_minimum_want")]
-    pub want: NonZeroUsize,
+    /// The most CPU tokens the command can use at once; omitted for its class's own, the
+    /// background share of the host for background and interactive work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub want: Option<NonZeroUsize>,
     /// Where the command runs; omitted for the workspace sandbox.
     #[serde(default, skip_serializing_if = "is_workspace")]
     pub scope: ExecScope,
@@ -933,8 +926,8 @@ mod tests {
         assert_eq!(request.params().expect("encode"), params);
     }
 
-    /// A request that names no scheduling is ordinary work: background, one token, in the
-    /// workspace sandbox. Its defaults are omitted again when it is encoded.
+    /// A request that names no scheduling is ordinary work: background, in the workspace sandbox,
+    /// wanting its class's own count. Its defaults are omitted again when it is encoded.
     #[test]
     fn an_exec_that_names_no_scheduling_is_ordinary_background_work() {
         let params = corpus()
@@ -951,7 +944,7 @@ mod tests {
             panic!("decoded {request:?}");
         };
         assert_eq!(exec.class, ExecClass::Background);
-        assert_eq!(exec.want, NonZeroUsize::MIN);
+        assert_eq!(exec.want, None);
         assert_eq!(exec.scope, ExecScope::Workspace);
         assert_eq!(request.params().expect("encode"), params);
     }
@@ -968,7 +961,7 @@ mod tests {
             panic!("decoded {request:?}");
         };
         assert_eq!(exec.class, ExecClass::Gate);
-        assert_eq!(exec.want.get(), 8);
+        assert_eq!(exec.want.map(NonZeroUsize::get), Some(8));
         assert_eq!(exec.scope, ExecScope::HostGate);
         assert_eq!(request.params().expect("encode"), params);
     }

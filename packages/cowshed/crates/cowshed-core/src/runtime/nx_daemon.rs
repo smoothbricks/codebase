@@ -409,7 +409,7 @@ fn start_request(
         stderr_copy: None,
         admission_key: None,
         class: crate::api::dto::ExecClass::Resident,
-        want: std::num::NonZeroUsize::MIN,
+        want: None,
         scope: crate::api::dto::ExecScope::Workspace,
     })
 }

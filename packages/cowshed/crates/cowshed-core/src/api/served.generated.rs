@@ -747,8 +747,8 @@ impl Serves<CoordinatorExec> for Coordinator {
             admission_key: Option<AdmissionKey>,
             #[serde(default)]
             class: ExecClass,
-            #[serde(default = "minimum_want")]
-            want: NonZeroUsize,
+            #[serde(default)]
+            want: Option<NonZeroUsize>,
             #[serde(default)]
             scope: ExecScope,
         }
@@ -837,8 +837,8 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             admission_key: Option<AdmissionKey>,
             #[serde(default)]
             class: ExecClass,
-            #[serde(default = "minimum_want")]
-            want: NonZeroUsize,
+            #[serde(default)]
+            want: Option<NonZeroUsize>,
             #[serde(default)]
             scope: ExecScope,
         }

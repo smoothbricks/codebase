@@ -28,7 +28,8 @@ pub use cpu_budget::{
     CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, CpuHolder, CpuTokensRequest, CpuWaiter,
     HOLD_LIMIT, INSTALL_RESTART_CODE, INSTALL_SERVES_WITHIN, InstallRestart, JOBSERVER_OP,
     JobserverAnswer, JobserverClass, JobserverJob, JobserverRequest, RESIDENT_POOL_OP,
-    ResidentPoolRequest, background_limit, cpu_pool_directory, inherited_cpu_pool,
+    ResidentPoolRequest, background_limit, background_share, cpu_pool_directory, host_tokens,
+    inherited_cpu_pool,
 };
 pub use disk_lease::{
     DISK_LEASE_OP, DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState, PhaseShare,
