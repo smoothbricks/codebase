@@ -261,20 +261,31 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     // A land step that starts while an install holds the slot waits for that install, and then
     // holds nothing (`install_basis::wait_for_install`): no install ever waits on a land step.
     // Waited for before the build check, so the step judges the daemon the install left.
+    let mut waited_in = None;
     if is_land_step(&parsed.command) {
         let waited = async {
             let home = cowshed_core::gateway_sessions::canonical_home()?;
-            install_basis::wait_for_install(&cowshed_core::host_dirs::support_directory(&home))
-                .await
+            let support = cowshed_core::host_dirs::support_directory(&home);
+            let waited = install_basis::wait_for_install(&support).await?;
+            Ok::<_, CowshedError>(waited.then_some(support))
         }
         .await;
-        if let Err(error) = waited {
-            return Ok(finish(Err(error), &mut output, json));
+        match waited {
+            Ok(support) => waited_in = support,
+            Err(error) => return Ok(finish(Err(error), &mut output, json)),
         }
     }
     // The daemon refuses another build's cowshed at the first supervisor a verb asks for, which
     // is after the verb's first step. Ask it now, before anything is changed.
     if let Err(error) = runtime::require_daemon_of_this_build(&parsed.command).await {
+        // A step the install it waited for replaced goes on as the installed build, in place.
+        if let (Some(support), Some(_)) = (&waited_in, error.other_build_source()) {
+            return Ok(finish(
+                Err(continue_as_installed(support)),
+                &mut output,
+                json,
+            ));
+        }
         return Ok(finish(Err(error), &mut output, json));
     }
     // Project and host commands run the controller in this process, and its workspace supervisors
@@ -297,6 +308,30 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
         }
     };
     Ok(finish(outcome, &mut output, json))
+}
+
+/// Replace this process with the installed cowshed, run with this process's own arguments
+/// ([`install_basis::continue_as_installed`]). Returns only when that fails.
+fn continue_as_installed(support: &std::path::Path) -> CowshedError {
+    use std::os::unix::process::CommandExt as _;
+    let mut command = match install_basis::continue_as_installed(support) {
+        Ok(command) => command,
+        Err(error) => return error,
+    };
+    cowshed_os::eprintln!(
+        "cowshed: the install this land step waited for replaced its build; it goes on as the \
+         installed cowshed {}",
+        command.get_program().to_string_lossy()
+    );
+    let error = command.exec();
+    CowshedError::environment_missing(
+        format!(
+            "an install replaced this cowshed while the land step waited, and the installed \
+             cowshed {} could not be run in its place: {error}",
+            command.get_program().to_string_lossy()
+        ),
+        "rerun the land step with the installed cowshed",
+    )
 }
 
 /// The signals that end an interactive command early: Ctrl-C, a closed terminal, a polite kill.

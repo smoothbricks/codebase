@@ -177,8 +177,9 @@ impl InstallSlot {
 /// a land step: holding the slot for the whole step made every install wait on the longest gate
 /// (measured 2026-10-21, when two gates were killed to let an install run). A daemon connection
 /// refused later in the step, mid-restart, waits for that install too
-/// (`supervisor_manager::connect_across_install`).
-pub async fn wait_for_install(support_directory: &Path) -> Result<()> {
+/// (`supervisor_manager::connect_across_install`). Answers whether it waited: a step that did
+/// may now be another build than the daemon the install left ([`continue_as_installed`]).
+pub async fn wait_for_install(support_directory: &Path) -> Result<bool> {
     let support = support_directory.to_path_buf();
     let path = support_directory.join(INSTALL_LOCK_NAME);
     tokio::task::spawn_blocking(move || cowshed_core::host_dirs::wait_for_running_install(&support))
@@ -186,8 +187,38 @@ pub async fn wait_for_install(support_directory: &Path) -> Result<()> {
         .map_err(|error| {
             CowshedError::internal(format!("waiting for {} failed: {error}", path.display()))
         })?
-        .map(|_| ())
         .map_err(|error| slot_error(&path, "lock", &error))
+}
+
+/// The command that carries a land step on as the installed cowshed, with this process's own
+/// arguments (05_gateway.md, "A land step waits for an install in progress"). A step that waited
+/// for an install is still the build it started as, and the daemon the install left refuses that
+/// build: measured 2026-10-21, a land's gate passed in 1,503 s, its next step waited for an
+/// install, and the daemon refused it as another build (exit 4), throwing the green gate away.
+/// So the step execs the stored copy the stable name says now, in place: the same pid, cwd,
+/// environment and descriptors, so the land's watchdog and log go on with it. The stable name is
+/// read once, here: the copy it names is the one this exec runs, whatever renames it afterwards.
+pub fn continue_as_installed(support_directory: &Path) -> Result<std::process::Command> {
+    let bin = support_directory.join("bin");
+    let stable = bin.join(crate::launchd::COWSHED_BINARY_NAME);
+    let named = std::fs::read_link(&stable).map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "an install replaced this cowshed while the land step waited, and the installed \
+                 cowshed {} cannot be read: {error}",
+                stable.display()
+            ),
+            "rerun the land step with the installed cowshed",
+        )
+    })?;
+    let copy = bin.join(named);
+    let mut command = std::process::Command::new(&copy);
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.arg0(crate::launchd::COWSHED_BINARY_NAME);
+    }
+    command.args(std::env::args_os().skip(1));
+    Ok(command)
 }
 
 fn flock(file: &File, operation: libc::c_int) -> io::Result<()> {
@@ -620,9 +651,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_install_never_waits_on_a_land_step_and_a_land_step_waits_on_an_install() {
         let main = Main::new("land-wait");
-        wait_for_install(&main.root)
-            .await
-            .expect("no install runs, so the step goes on at once");
+        assert!(
+            !wait_for_install(&main.root)
+                .await
+                .expect("no install runs, so the step goes on at once"),
+            "a step that found no install did not wait"
+        );
         let slot = InstallSlot::take(&main.root)
             .await
             .expect("an install takes the slot although a land step ran");
@@ -633,12 +667,58 @@ pub(crate) mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(!step.is_finished(), "the land step waits for the install");
         drop(slot);
-        step.await
-            .expect("land step")
-            .expect("the land step goes on once the install ends");
+        assert!(
+            step.await
+                .expect("land step")
+                .expect("the land step goes on once the install ends"),
+            "a step that waited says so, so it can go on as the build the install left"
+        );
         let probe = File::open(main.root.join(INSTALL_LOCK_NAME)).expect("lock file");
         flock(&probe, libc::LOCK_EX | libc::LOCK_NB)
             .expect("the land step holds nothing once it goes on: the next install takes the slot");
+    }
+
+    /// A land step the install it waited for replaced goes on as the copy the stable name says
+    /// once the install is done, with this process's own arguments: an install that wrote a new
+    /// copy and pointed `cowshed` at it is run in place of the old build, and the stored copy is
+    /// run by its own path, so a later rename of the stable name does not change what runs.
+    #[test]
+    fn a_replaced_land_step_goes_on_as_the_copy_the_install_left() {
+        let main = Main::new("continue");
+        let bin = main.root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let copy = format!("cowshed-{}", "e".repeat(64));
+        let script = bin.join(&copy);
+        // A script's `$0` is its path whatever argv[0] says, so it reports its arguments alone.
+        std::fs::write(&script, b"#!/bin/sh\nprintf '%s|' \"$@\"\n").unwrap();
+        std::fs::set_permissions(
+            &script,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&copy, bin.join(crate::launchd::COWSHED_BINARY_NAME)).unwrap();
+
+        let mut command = continue_as_installed(&main.root).expect("the installed cowshed");
+        assert_eq!(command.get_program(), script.as_os_str());
+        let ours: Vec<_> = std::env::args_os().skip(1).collect();
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ours);
+        // The install's next one renames the stable name; the copy this step resolved still runs.
+        std::fs::remove_file(bin.join(crate::launchd::COWSHED_BINARY_NAME)).unwrap();
+        let ran = command.output().expect("run the installed copy");
+        let mut expected = String::new();
+        for argument in &ours {
+            expected.push_str(&argument.to_string_lossy());
+            expected.push('|');
+        }
+        assert_eq!(String::from_utf8_lossy(&ran.stdout), expected);
+
+        let missing = Main::new("continue-missing");
+        let refused = continue_as_installed(&missing.root).expect_err("no installed cowshed");
+        assert!(
+            refused.message.contains("cannot be read"),
+            "{}",
+            refused.message
+        );
     }
 
     /// A holder that died while it waited for gates leaves its record and frees the slot: status
