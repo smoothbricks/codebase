@@ -12394,6 +12394,16 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         use crate::storage::lifecycle::{StorageGcOptions, StorageGcReason, Substrate};
 
         self.validate_binding().await?;
+        let scratch_store = self.layout.project().store_root.clone();
+        let dry_run = options.dry_run;
+        tokio::task::spawn_blocking(move || match cowshed_os::scratch::Reaper::host() {
+            Ok(mut reaper) => reaper.sweep(&scratch_store, dry_run).print(),
+            Err(error) => {
+                cowshed_os::eprintln!("cowshed: kept scratch: cannot start reaper: {error}")
+            }
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("scratch reaper task failed: {error}")))?;
         self.retire_abandoned_pending_workspaces(options.dry_run)
             .await?;
         let plan = self

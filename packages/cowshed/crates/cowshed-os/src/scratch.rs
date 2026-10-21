@@ -1,0 +1,558 @@
+//! Shared-temp scratch ownership and bounded reclamation. No name or age proves death.
+
+use std::fs::{self, OpenOptions, ReadDir};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub const OWNER_FILE: &str = ".cowshed-owner";
+const MAGIC: &str = "cowshed-scratch-v1";
+/// Bound directory enumeration too, not just successful removals: a busy /tmp is the problem.
+pub const PASS_ENTRIES: usize = 256;
+pub const INTERVAL: Duration = Duration::from_secs(60);
+/// Evidence gets a recovery window after the rename, not an expiry measured from creation.
+pub const EVIDENCE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_OWNER_BYTES: u64 = 1024;
+const MAX_SOCKET_ENTRIES: usize = 8;
+
+/// Create a private scratch root and publish its creating pid before it holds any output.
+pub fn create(path: &Path) -> io::Result<()> {
+    fs::DirBuilder::new().mode(0o700).create(path)?;
+    record_owners(path, &[std::process::id()])
+}
+
+/// Publish every process that can keep writing. An absent/partial record is unknown, never dead.
+/// Detached children publish only after spawn, so death in that window leaves an unknown owner.
+pub fn record_owners(path: &Path, pids: &[u32]) -> io::Result<()> {
+    if pids.is_empty()
+        || pids.len() > 32
+        || pids
+            .iter()
+            .any(|pid| *pid == 0 || *pid > i32::MAX.unsigned_abs())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid scratch owner pid",
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path.join(OWNER_FILE))?;
+    writeln!(file, "{MAGIC}")?;
+    for pid in pids {
+        writeln!(file, "{pid}")?;
+    }
+    // A complete first pid is not a complete multi-writer lease if publication is interrupted.
+    writeln!(file, "end")
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum Disposition {
+    Kept(String),
+    Deleted,
+    Archived(PathBuf),
+    WouldDelete,
+    WouldArchive,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct Finding {
+    pub path: PathBuf,
+    pub disposition: Disposition,
+}
+
+impl std::fmt::Display for Finding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.disposition {
+            Disposition::Kept(reason) => {
+                write!(f, "kept scratch {}: {reason}", self.path.display())
+            }
+            Disposition::Deleted => write!(
+                f,
+                "deleted socket scratch {}: recorded owners are dead",
+                self.path.display()
+            ),
+            Disposition::Archived(to) => write!(
+                f,
+                "archived scratch {} to {}: recorded owners are dead; evidence retained for 24 hours",
+                self.path.display(),
+                to.display()
+            ),
+            Disposition::WouldDelete => write!(
+                f,
+                "would delete socket scratch {}: recorded owners are dead",
+                self.path.display()
+            ),
+            Disposition::WouldArchive => write!(
+                f,
+                "would archive scratch {}: recorded owners are dead; may hold run evidence",
+                self.path.display()
+            ),
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+pub struct Report {
+    pub examined: usize,
+    pub findings: Vec<Finding>,
+}
+
+impl Report {
+    pub fn print(&self) {
+        for finding in &self.findings {
+            crate::eprintln!("cowshed: {finding}");
+        }
+        crate::eprintln!(
+            "cowshed: scratch examined {} temp entries (bound {PASS_ENTRIES}); RAM leases and their archives belong to bounded-exec acquire/release, not this sweep",
+            self.examined
+        );
+    }
+}
+
+struct Root {
+    path: PathBuf,
+    entries: Option<ReadDir>,
+}
+
+/// A directory cursor survives passes, so retained/live entries cannot starve later dead ones.
+/// Only direct children are considered: RAM leases, their ledger, staging and archives are not ours.
+pub struct Reaper {
+    roots: Vec<Root>,
+    next: usize,
+}
+
+impl Reaper {
+    pub fn new(roots: impl IntoIterator<Item = PathBuf>) -> io::Result<Self> {
+        let mut unique = Vec::<Root>::new();
+        for path in roots {
+            let path = fs::canonicalize(path)?;
+            if !unique.iter().any(|root| root.path == path) {
+                unique.push(Root {
+                    path,
+                    entries: None,
+                });
+            }
+        }
+        Ok(Self {
+            roots: unique,
+            next: 0,
+        })
+    }
+
+    pub fn host() -> io::Result<Self> {
+        // A RAM TMPDIR is another owner's lease. Never descend into it, even for our children.
+        let temp = fs::canonicalize(std::env::temp_dir())?;
+        let mut roots = vec![PathBuf::from("/tmp")];
+        if !temp
+            .components()
+            .any(|part| part.as_os_str().to_string_lossy().starts_with("smoo-ram"))
+        {
+            roots.push(temp);
+        }
+        Self::new(roots)
+    }
+
+    pub fn sweep(&mut self, store: &Path, dry_run: bool) -> Report {
+        let mut report = Report::default();
+        let mut exhausted = vec![false; self.roots.len()];
+        while report.examined < PASS_ENTRIES && exhausted.iter().any(|done| !done) {
+            let index = self.next;
+            self.next = (index + 1) % self.roots.len();
+            if exhausted[index] {
+                continue;
+            }
+            let root = &mut self.roots[index];
+            if root.entries.is_none() {
+                match fs::read_dir(&root.path) {
+                    Ok(entries) => root.entries = Some(entries),
+                    Err(error) => {
+                        report
+                            .findings
+                            .push(kept(&root.path, format!("cannot enumerate: {error}")));
+                        exhausted[index] = true;
+                        continue;
+                    }
+                }
+            }
+            match root.entries.as_mut().and_then(Iterator::next) {
+                None => {
+                    root.entries = None;
+                    exhausted[index] = true;
+                }
+                Some(Err(error)) => {
+                    report.examined += 1;
+                    report
+                        .findings
+                        .push(kept(&root.path, format!("cannot read entry: {error}")));
+                }
+                Some(Ok(entry)) => {
+                    report.examined += 1;
+                    if let Some(finding) = inspect(&entry.path(), store, dry_run) {
+                        report.findings.push(finding);
+                    }
+                }
+            }
+        }
+        report
+    }
+}
+
+fn kept(path: &Path, reason: impl Into<String>) -> Finding {
+    Finding {
+        path: path.to_owned(),
+        disposition: Disposition::Kept(reason.into()),
+    }
+}
+
+fn foreign(name: &str) -> bool {
+    [
+        "node_", "bash_", "cargo_", "bun_", "devenv-", "sccache_", "smoo-ram",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+}
+
+fn owners(path: &Path) -> io::Result<Vec<i32>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path.join(OWNER_FILE))?;
+    let metadata = file.metadata()?;
+    // SAFETY: geteuid has no preconditions.
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "owner record is not a private regular file",
+        ));
+    }
+    let mut text = String::new();
+    file.take(MAX_OWNER_BYTES + 1).read_to_string(&mut text)?;
+    let mut lines = text.lines();
+    if text.len() > usize::try_from(MAX_OWNER_BYTES).expect("small constant")
+        || !text.ends_with('\n')
+        || lines.next() != Some(MAGIC)
+        || lines.next_back() != Some("end")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unknown owner record format",
+        ));
+    }
+    let pids = lines
+        .map(|line| line.parse::<i32>().ok().filter(|pid| *pid > 0))
+        .collect::<Option<Vec<_>>>()
+        .filter(|pids| !pids.is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown owner pid"))?;
+    Ok(pids)
+}
+
+fn inspect(path: &Path, store: &Path, dry_run: bool) -> Option<Finding> {
+    let name = path.file_name()?.to_string_lossy();
+    if foreign(&name) {
+        return None;
+    }
+    if name.starts_with("cowshed-itest-") {
+        return Some(kept(
+            path,
+            "APFS fixture scratch belongs to the detach-aware test sweep",
+        ));
+    }
+    let known_name = name.starts_with("cowshed-") || name.starts_with("cs-");
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => return known_name.then(|| kept(path, format!("cannot inspect: {error}"))),
+    };
+    // Never follow a link, cross an ownership boundary, or inspect a mutable public directory.
+    // SAFETY: geteuid has no preconditions.
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return known_name.then(|| kept(path, "not a private directory of this user"));
+    }
+    let pids = match owners(path) {
+        Ok(pids) => pids,
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !known_name => return None,
+        Err(error) => return Some(kept(path, format!("unknown owner: {error}"))),
+    };
+    for pid in pids {
+        match crate::process::running(pid) {
+            Ok(false) => {}
+            Ok(true) => {
+                return Some(kept(
+                    path,
+                    format!("owner pid {pid} is live (or cannot be inspected)"),
+                ));
+            }
+            Err(error) => {
+                return Some(kept(
+                    path,
+                    format!("owner pid {pid} cannot be inspected: {error}"),
+                ));
+            }
+        }
+    }
+    let result = reclaim(path, store, dry_run, &metadata);
+    Some(match result {
+        Ok(disposition) => Finding {
+            path: path.to_owned(),
+            disposition,
+        },
+        Err(error) => kept(path, format!("reclamation failed: {error}")),
+    })
+}
+
+/// Only this tiny, closed grammar is disposable. Anything else may be the only run evidence.
+fn socket_files(path: &Path) -> io::Result<Option<Vec<PathBuf>>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(path)?.take(MAX_SOCKET_ENTRIES + 1) {
+        let entry = entry?;
+        if files.len() == MAX_SOCKET_ENTRIES {
+            return Ok(None);
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        let name = entry.file_name();
+        let disposable = if name == OWNER_FILE {
+            metadata.is_file() && metadata.len() <= MAX_OWNER_BYTES
+        } else if name == "s" || name == "s.sock" {
+            metadata.file_type().is_socket()
+        } else if name == "s.sock.lock" {
+            metadata.is_file() && metadata.len() == 0
+        } else {
+            false
+        };
+        if !disposable {
+            return Ok(None);
+        }
+        files.push(entry.path());
+    }
+    Ok(Some(files))
+}
+
+fn reclaim(
+    path: &Path,
+    store: &Path,
+    dry_run: bool,
+    original: &fs::Metadata,
+) -> io::Result<Disposition> {
+    let sockets = socket_files(path)?;
+    let _socket_lease = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path.join("s.sock.lock"))
+    {
+        Ok(file) => {
+            let lease = crate::fork_lock::Fenced::new(file);
+            lease.try_lock().map_err(|error| {
+                io::Error::other(format!("socket lease is held or unreadable: {error}"))
+            })?;
+            Some(lease)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let now = fs::symlink_metadata(path)?;
+    if !now.is_dir() || (now.dev(), now.ino()) != (original.dev(), original.ino()) {
+        return Err(io::Error::other("scratch directory identity changed"));
+    }
+    if let Some(files) = sockets {
+        if dry_run {
+            return Ok(Disposition::WouldDelete);
+        }
+        // No recursive removal: a concurrent unexpected writer leaves its output in place.
+        for file in files
+            .iter()
+            .filter(|file| file.file_name().is_some_and(|name| name != OWNER_FILE))
+        {
+            fs::remove_file(file)?;
+        }
+        fs::remove_file(path.join(OWNER_FILE))?;
+        fs::remove_dir(path)?;
+        Ok(Disposition::Deleted)
+    } else {
+        if dry_run {
+            return Ok(Disposition::WouldArchive);
+        }
+        let trash = store.join(".trash/scratch");
+        crate::fsio::AnchoredDirectory::create(&trash)?;
+        let seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_secs();
+        let destination = trash.join(format!("{seconds}-{}", uuid::Uuid::new_v4().simple()));
+        // A cross-volume rename is kept and reported, never converted into a copy/delete.
+        fs::rename(path, &destination)?;
+        Ok(Disposition::Archived(destination))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mount_identity(_path: &Path, metadata: &fs::Metadata) -> io::Result<u64> {
+    Ok(metadata.dev())
+}
+
+#[cfg(target_os = "linux")]
+fn mount_identity(path: &Path, _metadata: &fs::Metadata) -> io::Result<u64> {
+    use std::os::fd::AsRawFd as _;
+    let directory = crate::fsio::open_directory_nofollow(path)?;
+    let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    // SAFETY: the held directory fd and empty path name that fd; stat is writable storage.
+    if unsafe {
+        libc::statx(
+            directory.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH,
+            libc::STATX_MNT_ID,
+            stat.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: statx initialized the structure. Older kernels may omit the requested field.
+    let stat = unsafe { stat.assume_init() };
+    if stat.stx_mask & libc::STATX_MNT_ID == 0 {
+        return Err(io::Error::other(
+            "cannot prove archive mount boundary: STATX_MNT_ID unavailable",
+        ));
+    }
+    Ok(stat.stx_mnt_id)
+}
+
+/// One archived tree's background removal, at most 256 directory entries per step. A mounted
+/// descendant is retained, including a Linux bind mount on the same device.
+#[derive(Default)]
+pub struct TrashReaper {
+    entries: Option<ReadDir>,
+    walk: Vec<(PathBuf, ReadDir)>,
+    device: u64,
+}
+
+impl TrashReaper {
+    pub fn sweep(&mut self, store: &Path, now: SystemTime) -> io::Result<usize> {
+        let trash = store.join(".trash/scratch");
+        if self.entries.is_none() {
+            match crate::fsio::AnchoredDirectory::open(&trash) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+                Err(error) => return Err(error),
+            }
+            self.entries = match fs::read_dir(&trash) {
+                Ok(entries) => Some(entries),
+                Err(error) => return Err(error),
+            };
+        }
+        let mut removed = 0;
+        for _ in 0..PASS_ENTRIES {
+            let archive_root = self.walk.len() == 1;
+            if let Some((path, children)) = self.walk.last_mut() {
+                match children.next() {
+                    Some(entry) => {
+                        let entry = entry?;
+                        if archive_root && entry.file_name() == OWNER_FILE {
+                            continue;
+                        }
+                        let metadata = fs::symlink_metadata(entry.path())?;
+                        if metadata.is_dir() {
+                            if mount_identity(&entry.path(), &metadata)? != self.device {
+                                let held = entry.path();
+                                self.walk.clear();
+                                return Err(io::Error::other(format!(
+                                    "archive holds mounted directory {}; kept",
+                                    held.display()
+                                )));
+                            }
+                            self.walk.push((entry.path(), fs::read_dir(entry.path())?));
+                        } else {
+                            fs::remove_file(entry.path())?;
+                            removed += 1;
+                        }
+                    }
+                    None => {
+                        if archive_root {
+                            fs::remove_file(path.join(OWNER_FILE))?;
+                        }
+                        fs::remove_dir(&*path)?;
+                        removed += 1;
+                        self.walk.pop();
+                    }
+                }
+            } else {
+                let Some(entry) = self.entries.as_mut().and_then(Iterator::next) else {
+                    self.entries = None;
+                    break;
+                };
+                let entry = entry?;
+                let path = entry.path();
+                let name = entry.file_name();
+                let Some((seconds, suffix)) = name.to_str().and_then(|name| name.split_once('-'))
+                else {
+                    continue;
+                };
+                let Some(created) = seconds
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
+                else {
+                    continue;
+                };
+                if suffix.len() != 32 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    crate::eprintln!(
+                        "cowshed: kept unknown scratch trash entry {}",
+                        path.display()
+                    );
+                    continue;
+                }
+                if now.duration_since(created).unwrap_or_default() < EVIDENCE_RETENTION {
+                    crate::eprintln!(
+                        "cowshed: kept scratch archive {}: 24-hour evidence retention",
+                        path.display()
+                    );
+                    continue;
+                }
+                let metadata = fs::symlink_metadata(&path)?;
+                // The rename into the private trash is the completed lease. Unknown entries stay.
+                // SAFETY: geteuid has no preconditions.
+                if !metadata.is_dir()
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.mode() & 0o022 != 0
+                {
+                    crate::eprintln!(
+                        "cowshed: kept scratch trash entry {}: not an owned directory",
+                        path.display()
+                    );
+                    continue;
+                }
+                if let Err(error) = owners(&path) {
+                    crate::eprintln!(
+                        "cowshed: kept scratch archive {}: unknown ownership: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+                self.device = mount_identity(&path, &metadata)?;
+                if self.device != mount_identity(&trash, &fs::symlink_metadata(&trash)?)? {
+                    crate::eprintln!(
+                        "cowshed: kept scratch archive {}: archive root is mounted",
+                        path.display()
+                    );
+                    continue;
+                }
+                self.walk.push((path.clone(), fs::read_dir(path)?));
+            }
+        }
+        Ok(removed)
+    }
+}
+
+#[cfg(test)]
+mod tests;

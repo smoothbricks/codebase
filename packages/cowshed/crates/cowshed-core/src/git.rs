@@ -4161,7 +4161,7 @@ impl IgnoreRuleTree {
             "cowshed-ignore-rules-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        fs::create_dir(&path).map_err(|error| at_path(&path, error))?;
+        cowshed_os::scratch::create(&path).map_err(|error| at_path(&path, error))?;
         let tree = Self { path };
         let mut directories = std::collections::BTreeSet::new();
         for judged in relative {

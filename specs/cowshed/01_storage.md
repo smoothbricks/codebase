@@ -246,8 +246,8 @@ The APFS adapter's interrupted image/metadata publication protocol is specified 
 ## Retention
 
 Copy-on-write divergence only ever accumulates — checkpoints, idle workspaces, abandon bundles, ZFS origin pins
-(09_substrates.md), and APFS image-size ratchet all grow silently. cowshed keeps "storage efficient" from becoming a
-burden with retention _conventions_, enforced by `cowshed gc`, never by a background daemon deleting work unasked:
+(09_substrates.md), and APFS image-size ratchet all grow silently. `cowshed gc` enforces retention conventions.
+Background reclamation handles only explicitly released build images and provably dead scratch, never idle workspaces:
 
 | Object                                       | Default retention                                                                     | Exempt / override                                                                          |
 | -------------------------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
@@ -258,6 +258,7 @@ burden with retention _conventions_, enforced by `cowshed gc`, never by a backgr
 | Released build images (`build/.trash/…`)     | deleted by the daemon within a minute of release, at background disk priority         | `cowshed gc` empties its project's at once                                                 |
 | Abandon bundles (`sessions/.trash/*.bundle`) | never reclaimed by default; their tips are also kept as refs in main's repository     | explicit `cowshed gc --abandoned`                                                          |
 | Abandoned refs (in main's repository)        | retired by every `gc` once main holds each tip, by ancestry or content                | `cowshed gc --supersede <ws>/<head> --reason <one line>`                                   |
+| Dead shared-temp scratch                     | sockets/empty locks deleted; all other contents renamed to `<store>/.trash/scratch/`  | unknown/live owners kept; archived evidence kept for 24 hours before background deletion   |
 
 - `cowshed gc` evaluates both checkpoint floors independently: it deletes only an unpinned checkpoint that is at least
   14 days old **and** is not among the newest five for that workspace. A user-supplied label creates an explicit pin;
@@ -318,6 +319,51 @@ burden with retention _conventions_, enforced by `cowshed gc`, never by a backgr
   substrates — referenced is shared with the base, written is the true cost). `--json` for fleet dashboards. This is how
   a coordinator decides which long-lived workspaces to `cowshed rebase --fresh` (02_workspaces.md) to shed accumulated
   divergence.
+
+### Shared temporary scratch
+
+The daemon sweeps at startup and every **60 seconds**, independently of build-image deletion. `gc` runs the same sweep
+before answering, including a read-only preview for `--dry-run`. Each pass examines at most **256 directory entries**,
+not 256 successful deletions; a retained directory cannot make the pass unbounded. The daemon keeps its directory
+cursors between passes, so live entries at the front do not starve dead entries behind them. Each root gets a turn, and
+a complete scan restarts on the next pass. Sixty seconds amortizes idle polling; 256 bounds filesystem and process
+probes even when the shared temp root contains thousands of other tools' entries. Background archive deletion has its
+own 256-entry budget and never synchronously walks an entire output tree.
+
+Ownership is the private `.cowshed-owner` record in the scratch directory, containing `cowshed-scratch-v1`, one positive
+pid per line, and a final `end` line. The terminator makes an interrupted multi-writer publication unknown, not a
+shorter complete lease. Every recorded process must be dead according to the existing OS process probe. EPERM,
+unreadable or malformed records, missing records, foreign ownership, and symlinks are kept with a reason. PID reuse
+keeps the directory conservatively. Neither creation time nor mtime proves death; an old live directory survives. Legacy
+`cowshed-sock-*` and `cowshed-mgr-*` roots without a record remain unknown, even when all they hold is `s.sock.lock`. A
+held socket kernel lease keeps a directory even after its recorded creator has died.
+
+The shared test `TempRoot` publishes the creator for socket and manager roots and its other private fixtures. The
+runtime write-site audit also covers Git's `cowshed-ignore-rules-*`, detached disk-command `cowshed-disk-image-*`
+stdout/stderr (both caller and detached child are owners), and the cache advisor's `cowshed-advisor-*` (parent and probe
+child). Existing unmarked test scratch is reported but not guessed dead. Workspace runtime `cs-*` **symlinks** retain
+their existing `point_runtime_link` lifecycle; this directory reaper never follows or removes them. Workspace exec temp
+and sandbox profiles belong to the store's existing workspace and profile reclamation, not the shared-temp sweep.
+Real-image `cowshed-itest-*` roots and their sweep lock/record remain with `cowshed-apfs/tests/support/scratch_apfs.rs`:
+that owner stops workers and releases attached images under its own lock before reclaiming a root. The generic reaper
+explicitly excludes and reports that domain, even if a fixture acquires a marker; moving an attached backing image here
+would race its existing recovery protocol.
+
+Only a bounded set of the marker, `s`/`s.sock` Unix sockets and an empty `s.sock.lock` can be deleted directly.
+Unexpected files, subdirectories, nonempty locks, stdout, and Arrow traces are evidence: one rename moves the whole
+directory into the store's private `.trash/scratch/<archive-seconds>-<uuid>`. A cross-filesystem rename failure keeps
+the source and reports the OS error; there is no copy/delete fallback. The archive's 24-hour recovery window starts at
+the rename, not at scratch creation. `gc` does not delete those archives. The daemon later removes them incrementally;
+it never follows symlinks or deletes through a mounted descendant (including same-device Linux bind mounts). Its
+original ownership record stays until the last deletion, so an interrupted cleanup can resume; a timestamp-shaped name
+alone never authorizes deletion.
+
+The roots are canonical `/tmp` and the daemon/CLI's non-RAM temp root, deduplicated. Foreign `node_*`, `bash_*`,
+`cargo_*`, `bun_*`, `devenv-*`, and `sccache_*` entries are excluded, even if they contain a marker. Bounded-exec
+remains the sole owner of RAM lease reclamation: `ram-temp.ts::settle` runs under its kernel lock, claim ledger and
+identity recheck during acquire/release. This sweep never enters `smoo-ram*` volumes, leases, staging, `.archive`,
+`.archive/.deleting`, locks or ledgers, and reports that delegation. Reclamation and retention decisions are printed by
+path and reason; the summary states the examined count and bound.
 
 ## Tradeoffs
 

@@ -21,7 +21,6 @@ impl TempRoot {
 
     /// Creates one private child within the caller's granted parent, preserving any runtime alias.
     pub(crate) fn new_in(parent: &Path, prefix: &str) -> Self {
-        use std::os::unix::fs::DirBuilderExt as _;
         assert!(
             parent.is_absolute(),
             "test parent {} must be absolute",
@@ -36,10 +35,8 @@ impl TempRoot {
         // runtime link keeps its sockets inside `sun_path`.
         let unique = uuid::Uuid::new_v4().simple().to_string();
         let path = parent.join(format!("{prefix}-{}", &unique[..16]));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .unwrap_or_else(|error| panic!("create test root {}: {error}", path.display()));
+        cowshed_os::scratch::create(&path)
+            .unwrap_or_else(|error| panic!("create owned test root {}: {error}", path.display()));
         Self(path)
     }
 }

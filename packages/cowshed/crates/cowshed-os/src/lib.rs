@@ -6,6 +6,7 @@ pub mod fork_lock;
 pub mod fsio;
 pub mod host_load;
 pub mod process;
+pub mod scratch;
 pub mod stderr;
 pub mod test_backstop;
 pub mod timing;

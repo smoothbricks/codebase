@@ -1441,6 +1441,41 @@ pub(crate) fn detach_stderr(daemon: &str) {
     }
 }
 
+fn reap_scratch_from_now_on(store: PathBuf) {
+    let started = std::thread::Builder::new()
+        .name("scratch-reaper".to_owned())
+        .spawn(move || {
+            let mut reaper = match cowshed_os::scratch::Reaper::host() {
+                Ok(reaper) => reaper,
+                Err(error) => {
+                    cowshed_os::eprintln!("cowshed: cannot start scratch reaper: {error}");
+                    return;
+                }
+            };
+            let mut trash = cowshed_os::scratch::TrashReaper::default();
+            loop {
+                reaper.sweep(&store, false).print();
+                match trash.sweep(&store, std::time::SystemTime::now()) {
+                    Ok(0) => {}
+                    Ok(removed) => {
+                        cowshed_os::eprintln!(
+                            "cowshed: deleted {removed} expired scratch archive entries"
+                        )
+                    }
+                    Err(error) => {
+                        cowshed_os::eprintln!("cowshed: kept scratch archive entries: {error}")
+                    }
+                }
+                std::thread::sleep(cowshed_os::scratch::INTERVAL);
+            }
+        });
+    if let Err(error) = started {
+        cowshed_os::eprintln!(
+            "cowshed: scratch reaper could not start: {error}; cowshed gc still reaps scratch"
+        );
+    }
+}
+
 async fn run_daemon() -> Result<()> {
     // This thread runs the whole runtime: a log write the container stalls must not stall it.
     detach_stderr("gateway");
@@ -1513,6 +1548,7 @@ async fn run_daemon() -> Result<()> {
     // and nothing below waits for it.
     drop(recovery.start(Arc::new(SocketPeers)));
     empty_build_volume_trash_from_now_on(store_root.clone());
+    reap_scratch_from_now_on(store_root.clone());
     let handle = OwnedGateway::new(gateway.handle());
     let started = async {
         serve_supervisors(&store_root, manager).await?;

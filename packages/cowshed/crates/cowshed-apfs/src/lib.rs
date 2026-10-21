@@ -1165,7 +1165,8 @@ fn spawn_disk_child_as(
             "cowshed-disk-image-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        fs::create_dir_all(&directory)?;
+        use std::os::unix::fs::DirBuilderExt as _;
+        fs::DirBuilder::new().mode(0o700).create(&directory)?;
         let stdout = File::create(directory.join("stdout"))?;
         let stderr = File::create(directory.join("stderr"))?;
         command.stdout(stdout).stderr(stderr);
@@ -1212,7 +1213,19 @@ fn spawn_disk_child_as(
             });
         }
     }
-    command.spawn_locked().map(|child| (child, output_files))
+    let child = command.spawn_locked()?;
+    if let Some(directory) = &output_files
+        && let Err(error) =
+            cowshed_os::scratch::record_owners(directory, &[std::process::id(), child.id()])
+    {
+        // The disk command is already running and must not be interrupted for bookkeeping.
+        // Missing ownership is fail-closed: a reaper keeps this output, naming the failure.
+        cowshed_os::eprintln!(
+            "cowshed: cannot record disk command scratch owner at {}: {error}",
+            directory.display()
+        );
+    }
+    Ok((child, output_files))
 }
 
 /// Kill exactly the owned child's process group; retain any failure for the caller.

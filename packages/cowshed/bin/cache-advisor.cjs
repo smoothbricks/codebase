@@ -462,6 +462,12 @@ function summarize(selection, own, main) {
 }
 
 async function probe(options, scratch) {
+  // Same on-disk ownership contract as cowshed-os::scratch. Publish after the child starts:
+  // a parent killed during spawn leaves an unknown owner, never false evidence of death.
+  fs.writeFileSync(path.join(scratch, '.cowshed-owner'), `cowshed-scratch-v1\n${process.ppid}\n${process.pid}\nend\n`, {
+    flag: 'wx',
+    mode: 0o600,
+  });
   const start = performance.now();
   const root = options.workspace;
   process.chdir(root);
