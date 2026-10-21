@@ -19,7 +19,7 @@ use std::thread;
 use std::time::Duration;
 
 use cowshed_core::host_dirs::support_directory;
-use cowshed_core::land_turn::{land_turn_root, observe};
+use cowshed_core::land_turn::{TurnEventKind, land_turn_root, observe, observe_all};
 
 const REPO: &str = "testrepo";
 const POLL: Duration = Duration::from_millis(20);
@@ -397,6 +397,54 @@ fn a_waiter_killed_in_line_blocks_no_later_land() {
         Vec::<String>::new(),
         "tickets left behind"
     );
+}
+
+/// Measured 2026-10-21: a land queued for 635 s vanished with its agent's session and nothing
+/// recorded it, so it read as running while it did not exist. A waiter killed in line is
+/// recorded as abandoned by the next reader of the queue, and `gateway status` lists it; the
+/// holder's turn is recorded from its place in line to how its command ended.
+#[test]
+fn a_waiter_killed_in_line_is_recorded_as_abandoned() {
+    let home = Home::new();
+    let mut holder = Land::gated(&home, "H");
+    wait_for_order(&home, &["H"]);
+    let mut killed = Land::gated(&home, "W1");
+    wait_for_queue(&home, &["H", "W1"]);
+    let killed_pid = killed.pid();
+    killed.kill_hard();
+    holder.release();
+    holder.wait_success();
+
+    // No land asked after W1, so the status read is the first to find its dead ticket.
+    let root = home.repo_dir();
+    let root = root.parent().expect("the land-turn root");
+    let turns = observe_all(root, 0).expect("observe the queues");
+    let repo = turns
+        .iter()
+        .find(|turns| turns.repo == REPO)
+        .expect("the repository is listed for its abandoned ticket");
+    assert!(repo.tickets.is_empty(), "no live ticket: {repo:?}");
+    let [abandoned] = repo.abandoned.as_slice() else {
+        panic!("one abandoned ticket: {repo:?}");
+    };
+    assert_eq!(
+        (abandoned.ticket.workspace.as_str(), abandoned.ticket.pid),
+        ("W1", killed_pid)
+    );
+    assert_eq!(abandoned.event, TurnEventKind::Abandoned);
+
+    let log = fs::read_to_string(home.repo_dir().join("turns.log")).expect("the turn log");
+    let holder_events: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .filter(|event: &serde_json::Value| event["ticket"]["workspace"] == "H")
+        .collect();
+    let kinds: Vec<&str> = holder_events
+        .iter()
+        .map(|event| event["event"].as_str().expect("an event kind"))
+        .collect();
+    assert_eq!(kinds, ["queued", "taken", "finished"], "{log}");
+    assert_eq!(holder_events[2]["outcome"], "exited 0", "{log}");
 }
 
 /// The line a waiting land prints names the holder, its pid, and how many lands are ahead.

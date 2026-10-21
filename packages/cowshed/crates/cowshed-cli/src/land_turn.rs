@@ -156,11 +156,24 @@ where
             }
         }
     };
-    // The turn ends with the child, never before it.
-    drop(turn);
-    let status = status.map_err(|error| {
-        CowshedError::internal(format!("cannot wait for {program_name}: {error}"))
-    })?;
+    // The turn ends with the child, never before it, recording how the child ended.
+    let status = match status {
+        Ok(status) => {
+            let outcome = match (status.code(), status.signal()) {
+                (Some(code), _) => format!("exited {code}"),
+                (None, Some(signal)) => format!("killed by signal {signal}"),
+                (None, None) => "ended with neither an exit code nor a signal".to_owned(),
+            };
+            turn.end(outcome);
+            status
+        }
+        Err(error) => {
+            turn.end(format!("could not be waited for: {error}"));
+            return Err(CowshedError::internal(format!(
+                "cannot wait for {program_name}: {error}"
+            )));
+        }
+    };
     relay?;
     exit_code(status)
 }

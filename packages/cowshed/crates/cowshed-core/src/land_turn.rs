@@ -56,16 +56,41 @@ pub enum Wait {
     Outside { lock: PathBuf },
 }
 
-/// A held turn. Dropping it removes the ticket, then releases its lock.
+/// A held turn. Ending it records how the land's command ended; dropping it unended records that
+/// it ended with no outcome. Either way the ticket is then removed and its lock released.
 #[derive(Debug)]
 pub struct Turn {
     path: PathBuf,
+    directory: PathBuf,
+    ticket: Ticket,
+    ended: bool,
     _ticket: File,
     _outside: Option<File>,
 }
 
+impl Turn {
+    /// End the turn, recording `outcome` (how the command ended) in the repository's turn log.
+    pub fn end(mut self, outcome: String) {
+        record(
+            &self.directory,
+            &self.ticket,
+            TurnEventKind::Finished,
+            Some(outcome),
+        );
+        self.ended = true;
+    }
+}
+
 impl Drop for Turn {
     fn drop(&mut self) {
+        if !self.ended {
+            record(
+                &self.directory,
+                &self.ticket,
+                TurnEventKind::Finished,
+                Some("ended before its command did (cowshed failed or was interrupted)".to_owned()),
+            );
+        }
         // Removed while still locked, so no scan in between reads it as a dead ticket.
         let _ = fs::remove_file(&self.path);
     }
@@ -73,6 +98,102 @@ impl Drop for Turn {
 
 const TICKET_SUFFIX: &str = ".ticket";
 const SEQ_NAME: &str = ".seq";
+/// The repository's turn log: one JSON line per ticket event, appended, never rewritten.
+const LOG_NAME: &str = "turns.log";
+
+/// What happened to a ticket, as the turn log records it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TurnEventKind {
+    /// The land asked and took its place in line.
+    Queued,
+    /// The land holds the turn.
+    Taken,
+    /// The land's command ended; `outcome` says how.
+    Finished,
+    /// The land's process ended without finishing, found dead by whoever read the queue next:
+    /// killed, crashed, or its session gone. Measured 2026-10-21: a land queued for 635 s
+    /// vanished with its agent's session and nothing recorded it, so it read as running for half
+    /// an hour while it did not exist.
+    Abandoned,
+}
+
+/// One line of a repository's turn log.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnEvent {
+    /// When it was recorded, in milliseconds since the Unix epoch.
+    pub at_unix_ms: u64,
+    pub event: TurnEventKind,
+    pub ticket: Ticket,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+}
+
+fn now_unix_ms() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// Append one event to `directory`'s turn log. A log that cannot be written is said on stderr
+/// and never stops a land: the turn is the kernel's, the log its account.
+fn record(directory: &Path, ticket: &Ticket, event: TurnEventKind, outcome: Option<String>) {
+    let line = TurnEvent {
+        at_unix_ms: now_unix_ms(),
+        event,
+        ticket: ticket.clone(),
+        outcome,
+    };
+    let written = serde_json::to_vec(&line)
+        .map_err(io::Error::other)
+        .and_then(|mut bytes| {
+            bytes.push(b'\n');
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(directory.join(LOG_NAME))?
+                .write_all(&bytes)
+        });
+    if let Err(error) = written {
+        eprintln!(
+            "cowshed: land turn {}: ticket {} {event:?} not recorded in {}: {error}",
+            directory.display(),
+            ticket.number,
+            directory.join(LOG_NAME).display()
+        );
+    }
+}
+
+/// The `abandoned` events of `directory`'s turn log recorded at or after `since_unix_ms`, oldest
+/// first.
+pub fn abandoned_since(directory: &Path, since_unix_ms: u64) -> io::Result<Vec<TurnEvent>> {
+    let text = match fs::read_to_string(directory.join(LOG_NAME)) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut abandoned = Vec::new();
+    for line in text.lines() {
+        let event: TurnEvent = serde_json::from_str(line).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "land turn log {}: {error}",
+                    directory.join(LOG_NAME).display()
+                ),
+            )
+        })?;
+        if event.event == TurnEventKind::Abandoned && event.at_unix_ms >= since_unix_ms {
+            abandoned.push(event);
+        }
+    }
+    Ok(abandoned)
+}
 
 fn ticket_name(number: u64) -> String {
     format!("{number:020}{TICKET_SUFFIX}")
@@ -109,6 +230,18 @@ fn open_ticket(path: &Path) -> io::Result<Option<File>> {
 fn live(file: &File, path: &Path) -> io::Result<bool> {
     match file.try_lock_shared() {
         Ok(()) => {
+            // Its process ended without removing it: abandoned, recorded before it goes.
+            if let (Some(directory), Ok(ticket)) = (path.parent(), read_ticket(file, path)) {
+                record(
+                    directory,
+                    &ticket,
+                    TurnEventKind::Abandoned,
+                    Some(
+                        "its process ended without finishing: killed, crashed, or its session gone"
+                            .to_owned(),
+                    ),
+                );
+            }
             match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -152,8 +285,17 @@ pub fn observe(directory: &Path) -> io::Result<Vec<Ticket>> {
     Ok(queue)
 }
 
-/// Every repository with a live ticket, and its queue, as `observe` reads each.
-pub fn observe_all(root: &Path) -> io::Result<Vec<(String, Vec<Ticket>)>> {
+/// A repository's live tickets, the holder first, and the tickets recently found abandoned.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepoTurns {
+    pub repo: String,
+    pub tickets: Vec<Ticket>,
+    pub abandoned: Vec<TurnEvent>,
+}
+
+/// Every repository with a live ticket or a ticket abandoned at or after `abandoned_since_unix_ms`,
+/// as `observe` and `abandoned_since` read each.
+pub fn observe_all(root: &Path, abandoned_since_unix_ms: u64) -> io::Result<Vec<RepoTurns>> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -168,12 +310,18 @@ pub fn observe_all(root: &Path) -> io::Result<Vec<(String, Vec<Ticket>)>> {
         let Some(repo) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let queue = observe(&entry.path())?;
-        if !queue.is_empty() {
-            repositories.push((repo, queue));
+        // Read the queue first: a dead ticket it finds is recorded as abandoned, and then shown.
+        let tickets = observe(&entry.path())?;
+        let abandoned = abandoned_since(&entry.path(), abandoned_since_unix_ms)?;
+        if !tickets.is_empty() || !abandoned.is_empty() {
+            repositories.push(RepoTurns {
+                repo,
+                tickets,
+                abandoned,
+            });
         }
     }
-    repositories.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    repositories.sort_unstable_by(|left, right| left.repo.cmp(&right.repo));
     Ok(repositories)
 }
 
@@ -227,6 +375,7 @@ fn take_ticket(
     let path = directory.join(ticket_name(number));
     fs::rename(&staged, &path)?;
     drop(seq);
+    record(directory, &ticket, TurnEventKind::Queued, None);
     Ok((ticket, path, file))
 }
 
@@ -326,8 +475,12 @@ pub fn take(
             Some(held)
         }
     };
+    record(directory, &ticket, TurnEventKind::Taken, None);
     Ok(Turn {
         path,
+        directory: directory.to_path_buf(),
+        ticket,
+        ended: false,
         _ticket: file,
         _outside: outside,
     })

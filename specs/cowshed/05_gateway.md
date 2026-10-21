@@ -302,10 +302,20 @@ when it asked — when it starts waiting, whenever the land ahead changes, and e
 cadence), and how long it waited once the turn is its own. `--outside-lock <file>` names the lock file lands took before
 every caller asked for turns: the head takes it too, exclusively and keeping the file, so it excludes a land started
 that way, and says so while it waits for one. A land's turn covers rebase, gate, fast-forward and adoption; the push to
-a remote runs after the turn ends, since a remote is never needed to land (tg#6988). `cowshed gateway status` lists each
-repository's live tickets, the holder first, as
-`landTurns: [{ repo, tickets: [{ number, pid, workspace, askedUnixMs, command }] }]`, read without taking a turn, the
-way it reads the install slot.
+a remote runs after the turn ends, since a remote is never needed to land (tg#6988).
+
+**A ticket's life is recorded.** Measured 2026-10-21: a land queued for 635 s vanished with its agent's session, its log
+stopping mid-wait, and nothing recorded it, so it read as running for half an hour while it did not exist. Each
+repository's `turns.log`, beside its tickets, gets one JSON line per event, appended and never rewritten:
+`{ atUnixMs, event, ticket, outcome? }` with `event` one of `queued` (the land took its place), `taken` (it holds the
+turn), `finished` (its command ended; `outcome` says how — `exited <code>`, `killed by signal <n>`, or that the turn
+ended before its command did because cowshed failed) and `abandoned` (its process ended without finishing — killed,
+crashed, its session gone — found by whoever read the queue next, waiter or status, before removing its dead ticket).
+How long a land waited and held is the gap between its lines. A line that cannot be written is said on stderr and never
+stops a land. `cowshed gateway status` lists each repository's live tickets, the holder first, and the tickets found
+abandoned in the last day, as
+`landTurns: [{ repo, tickets: [{ number, pid, workspace, askedUnixMs, command }], abandoned?: [<turn log line>] }]`,
+read without taking a turn, the way it reads the install slot.
 
 **Build records and the basis.** A release build records the commit `HEAD` names and that commit's committer time
 (`build.rs`: `COWSHED_BUILD_COMMIT`, `COWSHED_BUILD_COMMIT_TIME`); the time is read from that one commit, so a shallow

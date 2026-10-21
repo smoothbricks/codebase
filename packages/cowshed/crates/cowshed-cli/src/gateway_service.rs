@@ -1150,14 +1150,28 @@ where
     }))
 }
 
-/// The land queues on this host, read without taking a turn. A queue that cannot be read is the
-/// status's error string, not a failed status: the rest of the status still answers.
+/// How far back `gateway status` lists tickets found abandoned: a day of lands.
+const LAND_TURN_ABANDONED_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The land queues on this host and the tickets found abandoned in the last day, read without
+/// taking a turn. A queue that cannot be read is the status's error string, not a failed status:
+/// the rest of the status still answers.
 fn observe_land_turns(home: &Path) -> (Vec<LandTurnQueue>, Option<String>) {
-    match turns::observe_all(&turns::land_turn_root(&support_directory(home))) {
+    let since = std::time::SystemTime::now()
+        .checked_sub(LAND_TURN_ABANDONED_WINDOW)
+        .and_then(|since| since.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        });
+    match turns::observe_all(&turns::land_turn_root(&support_directory(home)), since) {
         Ok(queues) => (
             queues
                 .into_iter()
-                .map(|(repo, tickets)| LandTurnQueue { repo, tickets })
+                .map(|turns| LandTurnQueue {
+                    repo: turns.repo,
+                    tickets: turns.tickets,
+                    abandoned: turns.abandoned,
+                })
                 .collect(),
             None,
         ),
@@ -1689,9 +1703,27 @@ pub fn emit_gateway_status<W: Write, E: Write>(
             .map_err(output_error)?;
     }
     for queue in &status.land_turns {
-        output
-            .guidance(&land_turn_line(queue))
-            .map_err(output_error)?;
+        if !queue.tickets.is_empty() {
+            output
+                .guidance(&land_turn_line(queue))
+                .map_err(output_error)?;
+        }
+        for abandoned in &queue.abandoned {
+            output
+                .guidance(&format!(
+                    "land turn {}: {} (pid {}) was abandoned, found {} after asking at {}: {}",
+                    queue.repo,
+                    abandoned.ticket.workspace,
+                    abandoned.ticket.pid,
+                    local_clock(abandoned.at_unix_ms),
+                    local_clock(abandoned.ticket.asked_unix_ms),
+                    abandoned
+                        .outcome
+                        .as_deref()
+                        .unwrap_or("no outcome recorded")
+                ))
+                .map_err(output_error)?;
+        }
     }
     if let Some(error) = &status.land_turns_error {
         output

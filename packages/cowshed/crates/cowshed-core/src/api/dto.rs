@@ -4230,12 +4230,14 @@ pub struct PendingInstall {
 }
 
 /// One repository's land queue as `gateway status` observes it: its live tickets in turn order,
-/// the first of which holds the turn.
+/// the first of which holds the turn, and the tickets found abandoned in the last day.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LandTurnQueue {
     pub repo: String,
     pub tickets: Vec<Ticket>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub abandoned: Vec<crate::land_turn::TurnEvent>,
 }
 
 /// One gate job, as an installer that waits for it names it.

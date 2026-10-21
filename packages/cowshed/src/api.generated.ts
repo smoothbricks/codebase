@@ -1681,11 +1681,12 @@ export type LandSeed =
 
 /**
  * One repository's land queue as `gateway status` observes it: its live tickets in turn order,
- * the first of which holds the turn.
+ * the first of which holds the turn, and the tickets found abandoned in the last day.
  */
 export type LandTurnQueue = {
   readonly repo: string;
   readonly tickets: ReadonlyArray<Ticket>;
+  readonly abandoned?: ReadonlyArray<TurnEvent>;
 };
 
 export type LandedReport = {
@@ -2847,6 +2848,24 @@ export type TraceContext = {
 };
 
 export type TraceId = string & tags.Pattern<'^(?!0{32}$)[0-9a-f]{32}$'>;
+
+/**
+ * One line of a repository's turn log.
+ */
+export type TurnEvent = {
+  /**
+   * When it was recorded, in milliseconds since the Unix epoch.
+   */
+  readonly atUnixMs: number & tags.Type<'uint64'>;
+  readonly event: TurnEventKind;
+  readonly ticket: Ticket;
+  readonly outcome?: string;
+};
+
+/**
+ * What happened to a ticket, as the turn log records it.
+ */
+export type TurnEventKind = 'queued' | 'taken' | 'finished' | 'abandoned';
 
 /**
  * A landed check without an attributable run summary in the landing workspace's cache.

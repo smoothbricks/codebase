@@ -1449,6 +1449,17 @@ export const parseTraceId = (json: string): Api.TraceId => assertTraceId(JSON.pa
 export const assertTraceIdList = typia.createAssertEquals<readonly Api.TraceId[]>();
 export const parseTraceIdList = (json: string): readonly Api.TraceId[] => assertTraceIdList(JSON.parse(json));
 
+export const assertTurnEvent = typia.createAssertEquals<Api.TurnEvent>();
+export const parseTurnEvent = (json: string): Api.TurnEvent => assertTurnEvent(JSON.parse(json));
+export const assertTurnEventList = typia.createAssertEquals<readonly Api.TurnEvent[]>();
+export const parseTurnEventList = (json: string): readonly Api.TurnEvent[] => assertTurnEventList(JSON.parse(json));
+
+export const assertTurnEventKind = typia.createAssertEquals<Api.TurnEventKind>();
+export const parseTurnEventKind = (json: string): Api.TurnEventKind => assertTurnEventKind(JSON.parse(json));
+export const assertTurnEventKindList = typia.createAssertEquals<readonly Api.TurnEventKind[]>();
+export const parseTurnEventKindList = (json: string): readonly Api.TurnEventKind[] =>
+  assertTurnEventKindList(JSON.parse(json));
+
 export const assertUnattributedCheck = typia.createAssertEquals<Api.UnattributedCheck>();
 export const parseUnattributedCheck = (json: string): Api.UnattributedCheck =>
   assertUnattributedCheck(JSON.parse(json));
