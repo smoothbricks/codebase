@@ -530,6 +530,14 @@ export type CpuAdmissionRefusal =
       readonly code: string;
       readonly error: string;
     })
+  | ({ readonly reason: 'cutOffByInstall' } & {
+      readonly install: InstallRestart;
+      readonly error: string;
+    })
+  | ({ readonly reason: 'installDidNotServe' } & {
+      readonly install: InstallRestart;
+      readonly waitedMs: number & tags.Type<'uint64'>;
+    })
   | ({ readonly reason: 'protocol' } & {
       readonly detail: string;
     });
@@ -1203,6 +1211,19 @@ export type IdentityReport = {
   readonly added: boolean;
   readonly identity: BoundIdentity;
   readonly identities: ReadonlyArray<BoundIdentity>;
+};
+
+/**
+ * The install restarting a gateway, as it names itself on the listener handoff socket and as the
+ * gateway passes it on to every CPU ask it cuts off: the evidence a log line names.
+ */
+export type InstallRestart = {
+  readonly pid: number & tags.Type<'uint32'>;
+  readonly binary: string;
+  /**
+   * How long the install waits for the gateway it starts to serve ([`INSTALL_SERVES_WITHIN`]).
+   */
+  readonly servesWithinMs: number & tags.Type<'uint64'>;
 };
 
 /**

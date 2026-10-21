@@ -235,7 +235,29 @@ closes its copies before the new gateway binds. A gateway that drains with works
 serving the handoff — `gateway stop`, then a fresh start — says on stderr how many it did not carry and why, so the
 refused connections that follow read as designed, not as a failed handoff. Linux binds no TCP workspace listener, so it
 carries none. An exec client of the replaced build reads its job's end from its own drained supervisor (11_shell.md
-"Draining a supervisor of another build"); a queued CPU request is a client a restart still cuts off.
+"Draining a supervisor of another build"); a queued CPU request is cut off, and told by which install ("A queued CPU ask
+outlives an install").
+
+**A queued CPU ask outlives an install.** A restart closes every lease connection ("Crash safety by connection"). A
+holder's grant ends with it and its command runs on over budget, but a queued ask failed: measured 2026-10-18, a land's
+gate tasks failed with `cpu-tokens parent pool refused: the gateway closed the lease connection`. So the install that
+restarts a gateway names itself on `listener-handoff.sock` — its pid, its binary, and how long it gives the gateway it
+starts to serve (`INSTALL_SERVES_WITHIN`, 180 s, the bound `gateway start` waits). Linux serves no handoff socket, so
+there a restart cuts the queue off unnamed, as before. A gateway whose control socket stops while an install serves that
+socket first cuts its CPU queue off: every queued ask — a background `cpu-tokens` ask, a gate job's admission, a gate
+pool's child — and every ask after is answered
+`{"ok":false,"code":"install-restart","error":…,"install":{"pid":…,"binary":…,"servesWithinMs":…}}` before its
+connection closes, and the stop waits up to 2 s for every queued ask to be told. A client so answered asks once more, of
+the gateway that install starts: every 100 ms it asks again while the control socket refuses or the answer is the same
+install's cut-off, and the first other answer is its one retry, a grant or a refusal returned as it is. The bound covers
+reaching that gateway, not the admission: once it answers `queued`, the wait has no deadline ("No admission deadline").
+Past the bound the ask fails, naming the install's pid and binary and how long it waited, and is never asked again; a
+refusal of any other code, or a connection closed with no answer, is never retried. Nothing of the old ledger is carried
+across: the retry is a fresh ask. A gate pool's child asks the host, since its pool ended with the old gateway, and says
+that it asks as background work; so does an ask that finds its pool absent after a restart. With no install serving the
+socket, or one of an older build, a restart cuts the queue off unnamed, as before. An install still waits for the gates
+in flight ("An install waits for the gates in flight"): a gate job's own grant ends with the restart, and its tasks'
+later asks lose its class.
 
 **Pruning.** After an install succeeds (for the gateway, after its activation), every stored copy and build record but
 the new build's and the one it replaced is removed. The replaced build stays one install longer: a workspace supervisor

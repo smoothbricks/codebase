@@ -12,7 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cowshed_gateway_types::{
-    JobserverAnswer, JobserverJob, JobserverRequest, LeaseState, ResidentPoolRequest,
+    INSTALL_RESTART_CODE, InstallRestart, JobserverAnswer, JobserverJob, JobserverRequest,
+    LeaseState, ResidentPoolRequest,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
@@ -195,21 +196,24 @@ async fn answer(reader: &mut BufReader<Fenced<UnixStream>>) -> Result<JobserverA
     })
 }
 
+/// The refusal a gateway's answer names: a cut-off by an install keeps that install, every other
+/// refusal is kept as the gateway said it.
 fn refused(answer: JobserverAnswer) -> CowshedError {
-    CowshedError::cpu_admission(CpuAdmissionRefusal::GatewayRefused {
-        code: answer.code.unwrap_or_else(|| "refused".to_owned()),
-        error: answer
-            .error
-            .unwrap_or_else(|| "the gateway gave no diagnostic".to_owned()),
+    let code = answer.code.unwrap_or_else(|| "refused".to_owned());
+    let error = answer
+        .error
+        .unwrap_or_else(|| "the gateway gave no diagnostic".to_owned());
+    CowshedError::cpu_admission(match answer.install {
+        Some(install) if code == INSTALL_RESTART_CODE => {
+            CpuAdmissionRefusal::CutOffByInstall { install, error }
+        }
+        _ => CpuAdmissionRefusal::GatewayRefused { code, error },
     })
 }
 
-/// Connect to the gateway at `socket`, write `frame`, and read its `queued` then `granted`
+/// Connect to the gateway at `socket`, write `line`, and read its `queued` then `granted`
 /// answers: the grant and the connection that holds it.
-async fn exchange(
-    socket: &Path,
-    frame: serde_json::Result<Vec<u8>>,
-) -> Result<(JobserverAnswer, Fenced<UnixStream>)> {
+async fn exchange(socket: &Path, line: &[u8]) -> Result<(JobserverAnswer, Fenced<UnixStream>)> {
     let mut connect = std::pin::pin!(UnixStream::connect(socket));
     // Darwin creates a socket then sets CLOEXEC. Fence each poll, never an async wait,
     // so no concurrently spawned child can keep this lease descriptor beyond exec.
@@ -225,13 +229,7 @@ async fn exchange(
         })
     })?;
     let mut connection = Fenced::new(stream);
-    let mut frame = frame.map_err(|error| {
-        CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
-            detail: error.to_string(),
-        })
-    })?;
-    frame.push(b'\n');
-    connection.write_all(&frame).await.map_err(|error| {
+    connection.write_all(line).await.map_err(|error| {
         CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
             detail: error.to_string(),
         })
@@ -263,6 +261,74 @@ async fn exchange(
         }));
     }
     Ok((granted, reader.into_inner()))
+}
+
+/// One request line for the gateway: the request serialised once and newline-terminated, so
+/// every attempt at the same ask sends the same bytes.
+fn request_line(request: serde_json::Result<Vec<u8>>) -> Result<Vec<u8>> {
+    let mut line = request.map_err(|error| {
+        CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
+            detail: error.to_string(),
+        })
+    })?;
+    line.push(b'\n');
+    Ok(line)
+}
+
+/// How long a cut-off ask waits before it asks again while the install's gateway comes up.
+const INSTALL_RETRY_EVERY: Duration = Duration::from_millis(100);
+
+/// The install that cut this ask off, when the gateway's refusal named one.
+fn cut_off_install(error: &CowshedError) -> Option<InstallRestart> {
+    match error.cpu_admission_source()? {
+        CpuAdmissionRefusal::CutOffByInstall { install, .. } => Some(install.clone()),
+        _ => None,
+    }
+}
+
+/// The gateway's socket is absent or refuses: the old gateway is gone and the one an install
+/// starts has not bound yet.
+fn gateway_unreachable(error: &CowshedError) -> bool {
+    matches!(
+        error.cpu_admission_source(),
+        Some(CpuAdmissionRefusal::GatewayUnavailable { .. })
+    )
+}
+
+/// `exchange`, with the one retry an install's restart earns (05_gateway.md "A queued CPU ask
+/// outlives an install"): a cut-off ask is sent again, with the same bytes, to the gateway the
+/// install starts, for no longer than the install's `servesWithinMs`. Every other outcome is
+/// returned as it arrived.
+async fn exchange_across_install(
+    socket: &Path,
+    line: &[u8],
+) -> Result<(JobserverAnswer, Fenced<UnixStream>)> {
+    let install = match exchange(socket, line).await {
+        Ok(granted) => return Ok(granted),
+        Err(error) => match cut_off_install(&error) {
+            Some(install) => install,
+            None => return Err(error),
+        },
+    };
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_millis(install.serves_within_ms);
+    loop {
+        tokio::time::sleep(INSTALL_RETRY_EVERY).await;
+        if tokio::time::Instant::now() >= deadline {
+            let waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            return Err(CowshedError::cpu_admission(
+                CpuAdmissionRefusal::InstallDidNotServe { install, waited_ms },
+            ));
+        }
+        match exchange(socket, line).await {
+            Ok(granted) => return Ok(granted),
+            Err(error) if gateway_unreachable(&error) => {}
+            Err(error) => match cut_off_install(&error) {
+                Some(again) if again.pid == install.pid => {}
+                _ => return Err(error),
+            },
+        }
+    }
 }
 
 /// `command` cut to the gateway's 512-byte bound at a character boundary.
@@ -306,7 +372,8 @@ impl JobCpuAdmission for GatewayJobCpu {
                     serde_json::to_vec(&ResidentPoolRequest::new(&checkout, command, job))
                 }
             };
-            let (granted, connection) = exchange(&socket, frame).await?;
+            let line = request_line(frame)?;
+            let (granted, connection) = exchange_across_install(&socket, &line).await?;
             // A token-holding grant names its tokens, its fifo and its pool; a resident's names
             // only its pool, since it holds no token and its children ask the host through it.
             let (held, pool) = match (ask.class, granted.tokens, granted.cpu_pool, granted.fifo) {
@@ -382,7 +449,8 @@ impl JobCpuAdmission for GatewayJobCpu {
                 &checkout.to_string_lossy(),
                 wire_command(&command),
             ));
-            let (granted, connection) = exchange(&socket, frame).await?;
+            let line = request_line(frame)?;
+            let (granted, connection) = exchange_across_install(&socket, &line).await?;
             // One token and the fifo that holds it, and no pool: nothing draws on a stake.
             match (granted.tokens, granted.cpu_pool) {
                 (Some(tokens), None) if tokens == NonZeroUsize::MIN => {}
@@ -407,5 +475,398 @@ impl JobCpuAdmission for GatewayJobCpu {
                 },
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use cowshed_gateway_types::cpu_pool_directory;
+    use serde_json::json;
+    use tokio::net::UnixListener;
+    use tokio::task::JoinHandle;
+
+    use super::*;
+
+    // These tests run on the real clock. A paused clock can auto-advance past the 2 s ACK bound
+    // while a real socket's readiness is still pending, so a live gateway looks dead. The real
+    // clock keeps every bound unreached on success; assertions check request order, not elapsed
+    // time.
+
+    /// The workspace incarnation the test gateway's pools are scoped by.
+    const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
+
+    /// One gateway lifetime: after `after` it binds the socket and answers each of its `asks` in
+    /// turn, each ask being the lines written after its request line is read.
+    struct Generation {
+        after: Duration,
+        asks: Vec<Vec<String>>,
+    }
+
+    /// A fresh directory under `/tmp`, short enough that its gateway socket path fits `sun_path`.
+    fn new_store() -> PathBuf {
+        let dir = PathBuf::from("/tmp").join(format!(
+            "cs-jc-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        std::fs::create_dir_all(&dir).expect("create the test store");
+        dir
+    }
+
+    fn background() -> JobCpuAsk {
+        JobCpuAsk {
+            class: ExecClass::Background,
+            want: NonZeroUsize::MIN,
+            checkout: PathBuf::from("/abs/checkout"),
+            command: "cargo test".to_owned(),
+            job: (
+                RepoId::parse("acme/widget").expect("a repository"),
+                WorkspaceIncarnation::new(INCARNATION).expect("a workspace incarnation"),
+                JobId::new(1).expect("a job"),
+            ),
+            parent: None,
+        }
+    }
+
+    fn queued_line() -> String {
+        json!({"ok": true, "lease": "queued"}).to_string()
+    }
+
+    /// A grant of one token whose fifo and pool lie in the store's pool scope.
+    fn grant_line(store: &Path) -> String {
+        let scope = cpu_pool_directory(store, INCARNATION).expect("the pool scope");
+        json!({
+            "ok": true,
+            "lease": "granted",
+            "tokens": 1,
+            "fifo": scope.join("fifo"),
+            "cpuPool": scope.join("pool"),
+        })
+        .to_string()
+    }
+
+    fn cut_off_line(pid: u32, serves_within_ms: u64) -> String {
+        json!({
+            "ok": false,
+            "code": INSTALL_RESTART_CODE,
+            "error": "the install restarts the gateway",
+            "install": {
+                "pid": pid,
+                "binary": "/abs/path/cowshed",
+                "servesWithinMs": serves_within_ms,
+            },
+        })
+        .to_string()
+    }
+
+    fn refusal_line(code: &str, error: &str) -> String {
+        json!({"ok": false, "code": code, "error": error}).to_string()
+    }
+
+    /// Serves one ask on `listener`: records its request line in `received`, then writes `replies`.
+    async fn serve_ask(listener: &UnixListener, replies: &[String], received: &mut Vec<Vec<u8>>) {
+        let (stream, _) = listener.accept().await.expect("accept an ask");
+        let (read, mut write) = stream.into_split();
+        let mut request = Vec::new();
+        BufReader::new(read)
+            .read_until(b'\n', &mut request)
+            .await
+            .expect("read an ask");
+        received.push(request);
+        for reply in replies {
+            write
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .expect("write a reply");
+        }
+    }
+
+    /// Plays the gateway at `socket` with real sockets. The first generation binds before this
+    /// returns, so the first ask finds it; each later one binds once its delay has passed and the
+    /// one before has gone. The task yields every request line the gateway received, in order.
+    fn play_gateway(socket: PathBuf, generations: Vec<Generation>) -> JoinHandle<Vec<Vec<u8>>> {
+        let mut generations = generations.into_iter();
+        let first = generations
+            .next()
+            .expect("a gateway has a first generation");
+        assert_eq!(
+            first.after,
+            Duration::ZERO,
+            "the first generation binds at once"
+        );
+        let listener = UnixListener::bind(&socket).expect("bind the first gateway generation");
+        tokio::spawn(async move {
+            let mut received = Vec::new();
+            for ask in first.asks {
+                serve_ask(&listener, &ask, &mut received).await;
+            }
+            drop(listener);
+            for generation in generations {
+                tokio::time::sleep(generation.after).await;
+                if socket.exists() {
+                    std::fs::remove_file(&socket).expect("remove the stale gateway socket");
+                }
+                let listener =
+                    UnixListener::bind(&socket).expect("bind the next gateway generation");
+                for ask in generation.asks {
+                    serve_ask(&listener, &ask, &mut received).await;
+                }
+            }
+            received
+        })
+    }
+
+    /// Plays a gateway that answers every ask with `replies` and counts the asks it has served.
+    fn spawn_counting_gateway(
+        socket: PathBuf,
+        replies: Vec<String>,
+    ) -> (JoinHandle<()>, Arc<AtomicUsize>) {
+        let listener = UnixListener::bind(&socket).expect("bind the counting gateway");
+        let served = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&served);
+        let task = tokio::spawn(async move {
+            let mut received = Vec::new();
+            loop {
+                serve_ask(&listener, &replies, &mut received).await;
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (task, served)
+    }
+
+    /// Asks a gateway that answers `replies` once and returns the refusal, together with how many
+    /// asks that gateway served two seconds later: a retry would show there.
+    async fn refusal_and_served(replies: Vec<String>) -> (CowshedError, usize) {
+        let dir = new_store();
+        let socket = dir.join("gateway.sock");
+        let (gateway, served) = spawn_counting_gateway(socket.clone(), replies);
+        let error = GatewayJobCpu::new(socket)
+            .admit(background())
+            .await
+            .expect_err("the gateway refuses the ask");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        gateway.abort();
+        std::fs::remove_dir_all(&dir).expect("remove the test store");
+        (error, served.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_ask_is_asked_again_once_the_install_gateway_serves() {
+        let dir = new_store();
+        let socket = dir.join("gateway.sock");
+        let gateway = play_gateway(
+            socket.clone(),
+            vec![
+                Generation {
+                    after: Duration::ZERO,
+                    asks: vec![vec![queued_line(), cut_off_line(4242, 10_000)]],
+                },
+                Generation {
+                    after: Duration::from_millis(250),
+                    asks: vec![vec![queued_line(), grant_line(&dir)]],
+                },
+            ],
+        );
+        let grant = GatewayJobCpu::new(socket)
+            .admit(background())
+            .await
+            .expect("the retry is granted");
+        drop(grant);
+        let received = gateway.await.expect("the gateway task");
+        assert_eq!(received.len(), 2, "the ask, then its one retry");
+        assert_eq!(
+            received[0], received[1],
+            "the retry sends the same request line"
+        );
+        std::fs::remove_dir_all(&dir).expect("remove the test store");
+    }
+
+    #[tokio::test]
+    async fn the_same_install_still_draining_is_asked_again() {
+        let dir = new_store();
+        let socket = dir.join("gateway.sock");
+        let gateway = play_gateway(
+            socket.clone(),
+            vec![
+                Generation {
+                    after: Duration::ZERO,
+                    asks: vec![
+                        vec![queued_line(), cut_off_line(4242, 10_000)],
+                        vec![queued_line(), cut_off_line(4242, 10_000)],
+                    ],
+                },
+                Generation {
+                    after: Duration::from_millis(250),
+                    asks: vec![vec![queued_line(), grant_line(&dir)]],
+                },
+            ],
+        );
+        let grant = GatewayJobCpu::new(socket)
+            .admit(background())
+            .await
+            .expect("the retry is granted");
+        drop(grant);
+        let received = gateway.await.expect("the gateway task");
+        assert_eq!(
+            received.len(),
+            3,
+            "the ask, the draining gateway's cut-off, and the grant"
+        );
+        assert!(
+            received.iter().all(|line| *line == received[0]),
+            "every retry sends the same request line"
+        );
+        std::fs::remove_dir_all(&dir).expect("remove the test store");
+    }
+
+    #[tokio::test]
+    async fn an_install_other_than_the_first_is_returned_as_it_arrived() {
+        let dir = new_store();
+        let socket = dir.join("gateway.sock");
+        let gateway = play_gateway(
+            socket.clone(),
+            vec![
+                Generation {
+                    after: Duration::ZERO,
+                    asks: vec![vec![queued_line(), cut_off_line(4242, 10_000)]],
+                },
+                Generation {
+                    after: Duration::from_millis(250),
+                    asks: vec![vec![queued_line(), cut_off_line(5555, 10_000)]],
+                },
+            ],
+        );
+        let error = GatewayJobCpu::new(socket)
+            .admit(background())
+            .await
+            .expect_err("the other install's refusal is returned");
+        assert_eq!(
+            error.cpu_admission_source(),
+            Some(&CpuAdmissionRefusal::CutOffByInstall {
+                install: InstallRestart {
+                    pid: 5555,
+                    binary: PathBuf::from("/abs/path/cowshed"),
+                    serves_within_ms: 10_000,
+                },
+                error: "the install restarts the gateway".to_owned(),
+            })
+        );
+        let received = gateway.await.expect("the gateway task");
+        assert_eq!(
+            received.len(),
+            2,
+            "no retry follows another install's refusal"
+        );
+        std::fs::remove_dir_all(&dir).expect("remove the test store");
+    }
+
+    #[tokio::test]
+    async fn an_install_that_never_serves_is_given_up_on_at_its_bound() {
+        let dir = new_store();
+        let socket = dir.join("gateway.sock");
+        let gateway = play_gateway(
+            socket.clone(),
+            vec![Generation {
+                after: Duration::ZERO,
+                asks: vec![vec![queued_line(), cut_off_line(4242, 1_000)]],
+            }],
+        );
+        let error = GatewayJobCpu::new(socket)
+            .admit(background())
+            .await
+            .expect_err("the install never serves");
+        match error.cpu_admission_source() {
+            Some(CpuAdmissionRefusal::InstallDidNotServe { install, .. }) => {
+                assert_eq!(install.pid, 4242);
+            }
+            other => panic!("expected the install's bound to be named, got {other:?}"),
+        }
+        assert!(
+            error.message.contains(
+                "the install 4242 (/abs/path/cowshed) restarting the gateway did not bring up one \
+                 that serves within 1000 ms; waited "
+            ),
+            "{}",
+            error.message
+        );
+        let received = gateway.await.expect("the gateway task");
+        assert_eq!(
+            received.len(),
+            1,
+            "nothing serves after the bound, so no ask follows"
+        );
+        std::fs::remove_dir_all(&dir).expect("remove the test store");
+    }
+
+    #[tokio::test]
+    async fn any_other_refusal_is_returned_unchanged_and_never_asked_again() {
+        let (error, served) = refusal_and_served(vec![
+            queued_line(),
+            refusal_line("rejected", "the gate is closed"),
+        ])
+        .await;
+        assert_eq!(
+            error.cpu_admission_source(),
+            Some(&CpuAdmissionRefusal::GatewayRefused {
+                code: "rejected".to_owned(),
+                error: "the gate is closed".to_owned(),
+            })
+        );
+        assert_eq!(served, 1, "a refusal of another code is never asked again");
+    }
+
+    #[tokio::test]
+    async fn an_install_restart_naming_no_install_is_a_plain_refusal() {
+        let (error, served) = refusal_and_served(vec![
+            queued_line(),
+            refusal_line(INSTALL_RESTART_CODE, "no install named"),
+        ])
+        .await;
+        assert_eq!(
+            error.cpu_admission_source(),
+            Some(&CpuAdmissionRefusal::GatewayRefused {
+                code: INSTALL_RESTART_CODE.to_owned(),
+                error: "no install named".to_owned(),
+            })
+        );
+        assert_eq!(
+            served, 1,
+            "a cut-off that names no install is never asked again"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_activation_is_asked_again_across_an_install() {
+        let dir = new_store();
+        let socket = dir.join("gateway.sock");
+        let gateway = play_gateway(
+            socket.clone(),
+            vec![
+                Generation {
+                    after: Duration::ZERO,
+                    asks: vec![vec![queued_line(), cut_off_line(4242, 10_000)]],
+                },
+                Generation {
+                    after: Duration::from_millis(250),
+                    asks: vec![vec![
+                        queued_line(),
+                        json!({"ok": true, "lease": "granted", "tokens": 1}).to_string(),
+                    ]],
+                },
+            ],
+        );
+        let stake = GatewayJobCpu::new(socket)
+            .activation(PathBuf::from("/abs/checkout"), "cargo test".to_owned())
+            .await
+            .expect("the retry is granted");
+        drop(stake);
+        let received = gateway.await.expect("the gateway task");
+        assert_eq!(
+            received.len(),
+            2,
+            "the activation's ask, then its one retry"
+        );
+        std::fs::remove_dir_all(&dir).expect("remove the test store");
     }
 }

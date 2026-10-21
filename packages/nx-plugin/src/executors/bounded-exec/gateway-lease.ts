@@ -25,11 +25,38 @@ export interface LeaseBounds {
 }
 
 /**
- * Why a command runs without a lease: no gateway listens, the gateway predates this kind of lease,
- * the gateway knows the lease but predates a field the request names (it refuses the field at
- * once), or any other refusal, silence or breakage.
+ * Why a lease is not held: no gateway listens, the gateway predates this kind of lease, the gateway
+ * knows the lease but predates a field the request names (it refuses the field at once), an install
+ * restarted the gateway while the ask was queued (`install-restart`), or any other refusal, silence
+ * or breakage.
  */
-export type UnleasedCause = 'absent' | 'predates' | 'predates-field' | 'other';
+export type UnleasedCause = 'absent' | 'predates' | 'predates-field' | 'other' | 'install-restart';
+
+type PlainCause = Exclude<UnleasedCause, 'install-restart'>;
+
+/** The code of the one answer a gateway sends a cut-off ask before it closes the connection. */
+export const INSTALL_RESTART_CODE = 'install-restart';
+
+/**
+ * The install that restarted the gateway and cut a queued ask off: its pid, the binary it runs, and
+ * how long, in ms, the gateway it starts is bound to serve within (05_gateway.md, "A queued CPU ask outlives an install").
+ */
+export interface InstallRestart {
+  pid: number;
+  binary: string;
+  servesWithinMs: number;
+}
+
+/** A refusal: the lease is not held, and why. `install-restart` names the install that cut the ask off. */
+export type Unleased =
+  | { granted: false; cause: PlainCause; reason: string; code?: string }
+  | {
+      granted: false;
+      cause: 'install-restart';
+      reason: string;
+      code: typeof INSTALL_RESTART_CODE;
+      install: InstallRestart;
+    };
 
 /**
  * A granted lease with its `granted` answer, held until released, or why there is none. `closed`
@@ -38,7 +65,23 @@ export type UnleasedCause = 'absent' | 'predates' | 'predates-field' | 'other';
  */
 export type HeldLease =
   | { granted: true; answer: Readonly<Record<string, unknown>>; release: () => void; closed: Promise<void> }
-  | { granted: false; cause: UnleasedCause; reason: string; code?: string };
+  | Unleased;
+
+const isCount = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+
+/** The `install` an `install-restart` answer names, or `null` when it does not name a whole install. */
+function parseInstallRestart(value: unknown): InstallRestart | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const fields: Readonly<Record<string, unknown>> = Object.fromEntries(Object.entries(value));
+  const { pid, binary, servesWithinMs } = fields;
+  if (!isCount(pid) || typeof binary !== 'string' || !isCount(servesWithinMs)) {
+    return null;
+  }
+  return { pid, binary, servesWithinMs };
+}
 
 /**
  * Ask the gateway at `socket` for the lease `request` names, `what` in its messages ("disk
@@ -80,7 +123,7 @@ export function holdLease(
     }
     resolve(outcome);
   };
-  const unleased = (reason: string, cause: UnleasedCause = 'other', code?: string) =>
+  const unleased = (reason: string, cause: PlainCause = 'other', code?: string) =>
     settle({ granted: false, cause, reason, ...(code === undefined ? {} : { code }) });
   const wait = (ms: number, onExpiry: () => void) => {
     clearTimeout(timer);
@@ -103,7 +146,24 @@ export function holdLease(
     if (fields.ok !== true) {
       const error = String(fields.error ?? '');
       const why = `${String(fields.code ?? 'refused')}: ${error}`;
-      if (state === 'half-closed' || error.endsWith('unknown gateway control operation')) {
+      if (fields.code === INSTALL_RESTART_CODE) {
+        const install = parseInstallRestart(fields.install);
+        if (install === null) {
+          unleased(
+            `the gateway refused the lease (${why}; the install it names is malformed: ${fields.install === undefined ? 'missing' : JSON.stringify(fields.install)})`,
+            'other',
+            INSTALL_RESTART_CODE,
+          );
+        } else {
+          settle({
+            granted: false,
+            cause: 'install-restart',
+            reason: `the gateway refused the lease (${why})`,
+            code: INSTALL_RESTART_CODE,
+            install,
+          });
+        }
+      } else if (state === 'half-closed' || error.endsWith('unknown gateway control operation')) {
         unleased(`the gateway predates ${what} (${why}); restart it with \`cowshed setup\``, 'predates');
       } else if (error.endsWith('contains an unknown field')) {
         unleased(

@@ -1,16 +1,26 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import { rmSync } from 'node:fs';
-import { createServer, type Server, type Socket } from 'node:net';
+import type { Server, Socket } from 'node:net';
 import { join } from 'node:path';
+import { closeServer, fakeClock, GRANT_TWO, listen, restartedBy, scripted } from '../../__tests__/gateway-stand-in.js';
 import { ownedSocketDirectory } from '../../testing.js';
-import { CPU_TOKENS_ENV, gatewayCpuBudget, parseInheritedTokens, runnerDemand, sizeRunner } from './cpu-tokens.js';
+import {
+  askAcrossInstall,
+  CPU_TOKENS_ENV,
+  type CpuBudget,
+  gatewayCpuBudget,
+  parseInheritedTokens,
+  runnerDemand,
+  sizeRunner,
+} from './cpu-tokens.js';
+import type { InstallRestart } from './gateway-lease.js';
 
 const servers: Server[] = [];
 const directories: string[] = [];
 
-afterEach(() => {
+afterEach(async () => {
   for (const server of servers.splice(0)) {
-    server.close();
+    await closeServer(server);
   }
   for (const directory of directories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
@@ -31,13 +41,7 @@ async function socketPath(name: string): Promise<string> {
 /** A gateway stand-in on a socket in a directory of its own that runs `serve` per client. */
 async function gateway(serve: (client: Socket) => void): Promise<string> {
   const socket = await socketPath('gw.sock');
-  const server = createServer({ allowHalfOpen: true }, serve);
-  const { promise, resolve, reject } = Promise.withResolvers<void>();
-  server.once('error', reject);
-  server.listen(socket, resolve);
-  await promise;
-  server.off('error', reject);
-  servers.push(server);
+  servers.push(await listen(socket, serve));
   return socket;
 }
 
@@ -515,5 +519,116 @@ describe('cowshed CPU budget client', () => {
     await holder.exited;
     // The gateway sees the connection close, which is how it takes the tokens back.
     await closed;
+  });
+});
+
+describe('cowshed CPU budget retry across an install', () => {
+  /** The install that cut `budget`'s ask off; the test fails if the ask is answered any other way. */
+  async function cutOffInstall(budget: CpuBudget): Promise<InstallRestart> {
+    const answer = await budget.take(2, '/w', 'x');
+    if (answer.granted || answer.cause !== 'install-restart') {
+      throw new Error(`expected an ask cut off by an install restart, got ${JSON.stringify(answer)}`);
+    }
+    return answer.install;
+  }
+
+  it('retries a cut-off ask once against the gateway the install starts, and takes its grant', async () => {
+    const socket = await socketPath('gw.sock');
+    const restarting = await listen(socket, scripted([restartedBy(1234)]));
+    servers.push(restarting);
+    const budget = gatewayCpuBudget(socket);
+    const install = await cutOffInstall(budget);
+    let started = false;
+    const clock = fakeClock(async () => {
+      if (started) return;
+      started = true;
+      await closeServer(restarting);
+      servers.push(await listen(socket, scripted([GRANT_TWO])));
+    });
+    const retried = await askAcrossInstall(() => budget.take(2, '/w', 'x'), install, clock);
+    if (!retried.granted) throw new Error(JSON.stringify(retried));
+    expect(retried.tokens).toBe(2);
+    retried.release();
+  });
+
+  it('keeps asking while no gateway listens between the restart and the one it starts', async () => {
+    const socket = await socketPath('gw.sock');
+    const restarting = await listen(socket, scripted([restartedBy(1234)]));
+    servers.push(restarting);
+    const budget = gatewayCpuBudget(socket);
+    const install = await cutOffInstall(budget);
+    let sleeps = 0;
+    const clock = fakeClock(async () => {
+      sleeps += 1;
+      if (sleeps === 1) {
+        await closeServer(restarting);
+      } else if (sleeps === 2) {
+        servers.push(await listen(socket, scripted([GRANT_TWO])));
+      }
+    });
+    const retried = await askAcrossInstall(() => budget.take(2, '/w', 'x'), install, clock);
+    if (!retried.granted) throw new Error(JSON.stringify(retried));
+    expect(sleeps).toBe(2);
+    retried.release();
+  });
+
+  it('keeps asking while the install that cut the ask off still answers for its old gateway', async () => {
+    const socket = await gateway(scripted([restartedBy(1234), restartedBy(1234), GRANT_TWO]));
+    const budget = gatewayCpuBudget(socket);
+    const install = await cutOffInstall(budget);
+    const retried = await askAcrossInstall(() => budget.take(2, '/w', 'x'), install, fakeClock());
+    if (!retried.granted) throw new Error(JSON.stringify(retried));
+    expect(retried.tokens).toBe(2);
+    retried.release();
+  });
+
+  it("refuses once the install's bound has passed, naming the install, its binary and the wait", async () => {
+    let asks = 0;
+    const socket = await gateway((client) => {
+      asks += 1;
+      client.once('data', () => client.end(restartedBy(1234, 250)));
+    });
+    const budget = gatewayCpuBudget(socket);
+    const install = await cutOffInstall(budget);
+    const refused = await askAcrossInstall(() => budget.take(2, '/w', 'x'), install, fakeClock());
+    expect(refused).toEqual({
+      granted: false,
+      cause: 'install-deadline',
+      reason:
+        'the install 1234 (/abs/cowshed) restarting the gateway did not bring up one that serves within 250 ms; waited 300 ms',
+      install,
+      waitedMs: 300,
+    });
+    // The cut-off ask, then the retries at 100 ms and 200 ms; none at the 300 ms deadline.
+    expect(asks).toBe(3);
+  });
+
+  it('never retries a refusal other than an install restart', async () => {
+    let asks = 0;
+    const socket = await gateway((client) => {
+      asks += 1;
+      client.once('data', () => client.end('{"ok":false,"code":"rejected","error":"the gateway is shutting down"}\n'));
+    });
+    const budget = gatewayCpuBudget(socket);
+    const install = { pid: 1234, binary: '/abs/cowshed', servesWithinMs: 180_000 };
+    const answer = await askAcrossInstall(() => budget.take(2, '/w', 'x'), install, fakeClock());
+    expect(answer).toMatchObject({ granted: false, cause: 'other', code: 'rejected' });
+    expect(asks).toBe(1);
+  });
+
+  it('returns an install restart that names another install as it is', async () => {
+    const socket = await gateway(scripted([restartedBy(1234), restartedBy(99)]));
+    const budget = gatewayCpuBudget(socket);
+    const install = await cutOffInstall(budget);
+    const answer = await askAcrossInstall(() => budget.take(2, '/w', 'x'), install, fakeClock());
+    expect(answer).toMatchObject({ granted: false, cause: 'install-restart', install: { pid: 99 } });
+  });
+
+  it('refuses an install restart that names no install as an ordinary refusal', async () => {
+    const socket = await gateway(scripted(['{"ok":false,"code":"install-restart","error":"the gateway restarted"}\n']));
+    const grant = await gatewayCpuBudget(socket).take(2, '/w', 'x');
+    if (grant.granted) throw new Error(`expected a refusal, got ${JSON.stringify(grant)}`);
+    expect(grant).toMatchObject({ granted: false, cause: 'other', code: 'install-restart' });
+    expect(grant.reason).toContain('the install it names is malformed: missing');
   });
 });

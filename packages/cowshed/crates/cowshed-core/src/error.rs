@@ -186,6 +186,17 @@ pub enum CpuAdmissionRefusal {
         code: String,
         error: String,
     },
+    /// A gateway restarted by an install cut this ask off and named that install; asked again
+    /// once (05_gateway.md "A queued CPU ask outlives an install"), else returned as it is.
+    CutOffByInstall {
+        install: cowshed_gateway_types::InstallRestart,
+        error: String,
+    },
+    /// The install that cut this ask off did not bring up a gateway that serves within its bound.
+    InstallDidNotServe {
+        install: cowshed_gateway_types::InstallRestart,
+        waited_ms: u64,
+    },
     Protocol {
         detail: String,
     },
@@ -420,6 +431,25 @@ impl CowshedError {
                 format!("jobserver admission refused ({code}): {error}"),
                 "inspect cowshed gateway status and use the matching installed build",
             ),
+            CpuAdmissionRefusal::CutOffByInstall { install, error } => Self::environment_missing(
+                format!(
+                    "jobserver admission refused (install-restart) by install {} ({}): {error}",
+                    install.pid,
+                    install.binary.display()
+                ),
+                "inspect cowshed gateway status; no unbudgeted spawn is permitted",
+            ),
+            CpuAdmissionRefusal::InstallDidNotServe { install, waited_ms } => {
+                Self::environment_missing(
+                    format!(
+                        "the install {} ({}) restarting the gateway did not bring up one that serves within {} ms; waited {waited_ms} ms",
+                        install.pid,
+                        install.binary.display(),
+                        install.serves_within_ms
+                    ),
+                    "inspect cowshed gateway status; no unbudgeted spawn is permitted",
+                )
+            }
             CpuAdmissionRefusal::Protocol { detail } => Self::environment_missing(
                 format!("jobserver admission protocol failed: {detail}"),
                 "inspect the owning gateway; no unbudgeted spawn is permitted",

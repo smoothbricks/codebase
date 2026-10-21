@@ -633,18 +633,19 @@ enum Held {
 }
 
 impl Admission {
-    /// The grant and its count; `Err` when the ledger that would grant it is gone.
-    async fn granted(self) -> Result<(Held, usize), ()> {
+    /// The grant and its count; `Err` when the ledger that would grant it is gone, carrying a
+    /// host stake so its place leaves the queue only once the child has been told.
+    async fn granted(self) -> Result<(Held, usize), Option<crate::cpu_budget::Stake>> {
         match self {
             Self::Fifo(granted) => {
-                let grant = granted.await.map_err(|_| ())?;
+                let grant = granted.await.map_err(|_| None)?;
                 let tokens = grant.tokens();
                 Ok((Held::Fifo { _grant: grant }, tokens))
             }
-            Self::Host { stake, granted } => {
-                let tokens = granted.await.map_err(|_| ())?;
-                Ok((Held::Host { _stake: stake }, tokens))
-            }
+            Self::Host { stake, granted } => match granted.await {
+                Ok(tokens) => Ok((Held::Host { _stake: stake }, tokens)),
+                Err(_) => Err(Some(stake)),
+            },
         }
     }
 }
@@ -686,6 +687,11 @@ async fn serve_pool(
             return;
         }
     };
+    // A host ledger cut off for an install names it to the child it refuses.
+    let budget = match &ledger {
+        PoolLedger::Host { budget, .. } => Some(budget.clone()),
+        PoolLedger::Fifo(_) => None,
+    };
     let admission = match ledger {
         PoolLedger::Fifo(fifo) => Admission::Fifo(fifo.ask(want)),
         PoolLedger::Host {
@@ -708,8 +714,18 @@ async fn serve_pool(
     let (held, tokens) = tokio::select! {
         granted = admission.granted() => match granted {
             Ok(granted) => granted,
-            Err(()) => {
-                let _ = pool_reply(reader.get_mut(), &serde_json::json!({"ok":false,"code":"rejected","error":"the parent CPU pool stopped"})).await;
+            Err(stake) => {
+                let refusal = match budget.as_ref().and_then(crate::cpu_budget::CpuBudget::installing) {
+                    Some(install) => serde_json::json!({
+                        "ok": false,
+                        "code": cowshed_gateway_types::INSTALL_RESTART_CODE,
+                        "error": crate::cpu_budget::cut_off_by(install),
+                        "install": install,
+                    }),
+                    None => serde_json::json!({"ok":false,"code":"rejected","error":"the parent CPU pool stopped"}),
+                };
+                let _ = pool_reply(reader.get_mut(), &refusal).await;
+                drop(stake);
                 return;
             }
         },

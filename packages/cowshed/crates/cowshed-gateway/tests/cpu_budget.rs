@@ -78,6 +78,8 @@ async fn gateway(tokens: usize) -> (Gateway, PathBuf, PathBuf) {
     let gateway = Gateway::start(
         GatewayConfig {
             control_socket: Some(socket.clone()),
+            // Beside the socket, as the CLI configures it; nothing serves it unless a test does.
+            listener_handoff: Some(cowshed_gateway::handoff_path(&socket)),
             mirror_cache: MirrorCacheConfig::new(cache),
             cpu_budget: CpuBudgetLimits {
                 tokens: NonZeroUsize::new(tokens).unwrap(),
@@ -602,6 +604,82 @@ async fn a_gate_jobs_pool_admits_each_child_while_older_background_work_stays_qu
     assert_eq!(queued.granted().await, 1);
     drop((gate, queued));
     gateway.drain().await.expect("drain");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// 05_gateway.md "A queued CPU ask outlives an install". Measured 2026-10-18: an install
+/// restarted the gateway while a land's gate ran, and the gate's next tasks failed with
+/// `cpu-tokens parent pool refused: the gateway closed the lease connection`. A restart by an
+/// install now tells every queued ask — a background `cpu-tokens` ask, a gate job's admission and
+/// a gate pool's child alike — which install cut it off before the connection closes, so its
+/// client can ask the gateway that install starts; a holder's grant ends with its connection, as
+/// before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_install_restart_tells_every_queued_cpu_ask_which_install_cut_it_off() {
+    let (gateway, root, socket) = gateway(2).await;
+    let (_gate, pool) = Asker::gate_job(&socket, "/w/land").await;
+    let mut holder = Asker::ask(&socket, 1, "/w/a").await;
+    assert_eq!(holder.granted().await, 1);
+    // The host is full: each of these queues.
+    let mut background = Asker::ask(&socket, 1, "/w/c").await;
+    let mut task = Asker::child(&pool, 1).await;
+    let mut other_gate = Asker::jobserver(&socket, 1, "/w/other").await;
+    let install = cowshed_gateway_types::InstallRestart {
+        pid: 4242,
+        binary: PathBuf::from("/opt/cowshed/bin/cowshed"),
+        serves_within_ms: 180_000,
+    };
+    let serving = cowshed_gateway::HandoffServer::start(
+        &cowshed_gateway::handoff_path(&socket),
+        install.clone(),
+    )
+    .expect("the install's handoff");
+
+    gateway.drain().await.expect("drain");
+
+    for (asker, which) in [
+        (&mut background, "a background cpu-tokens ask"),
+        (&mut task, "a gate pool's child"),
+        (&mut other_gate, "a gate job's admission"),
+    ] {
+        let answer = asker.answer().await;
+        assert_eq!(answer["ok"], false, "{which}: {answer}");
+        assert_eq!(answer["code"], "install-restart", "{which}: {answer}");
+        let named: cowshed_gateway_types::InstallRestart =
+            serde_json::from_value(answer["install"].clone()).expect("the install, typed");
+        assert_eq!(named, install, "{which} is told which install cut it off");
+    }
+    let mut rest = String::new();
+    holder
+        .lines
+        .read_line(&mut rest)
+        .await
+        .expect("the holder's connection ends");
+    assert_eq!(
+        rest, "",
+        "a holder is told nothing: its grant ends with its connection"
+    );
+    drop(serving);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// With no install serving the handoff socket a restart is what it always was: a queued ask's
+/// connection closes with no answer, so its client is never sent to ask again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_no_install_serves_cuts_a_queued_ask_off_unnamed() {
+    let (gateway, root, socket) = gateway(1).await;
+    let mut holder = Asker::ask(&socket, 1, "/w/a").await;
+    assert_eq!(holder.granted().await, 1);
+    let mut queued = Asker::ask(&socket, 1, "/w/b").await;
+    gateway.drain().await.expect("drain");
+    let mut rest = String::new();
+    queued
+        .lines
+        .read_line(&mut rest)
+        .await
+        .expect("the queued connection ends");
+    assert_eq!(rest, "", "no install named, so no install-restart answer");
+    drop(holder);
     let _ = std::fs::remove_dir_all(root);
 }
 

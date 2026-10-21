@@ -583,6 +583,12 @@ export const assertIdentityReportList = typia.createAssertEquals<readonly Api.Id
 export const parseIdentityReportList = (json: string): readonly Api.IdentityReport[] =>
   assertIdentityReportList(JSON.parse(json));
 
+export const assertInstallRestart = typia.createAssertEquals<Api.InstallRestart>();
+export const parseInstallRestart = (json: string): Api.InstallRestart => assertInstallRestart(JSON.parse(json));
+export const assertInstallRestartList = typia.createAssertEquals<readonly Api.InstallRestart[]>();
+export const parseInstallRestartList = (json: string): readonly Api.InstallRestart[] =>
+  assertInstallRestartList(JSON.parse(json));
+
 export const assertJobAccounting = typia.createAssertEquals<Api.JobAccounting>();
 export const parseJobAccounting = (json: string): Api.JobAccounting => assertJobAccounting(JSON.parse(json));
 export const assertJobAccountingList = typia.createAssertEquals<readonly Api.JobAccounting[]>();

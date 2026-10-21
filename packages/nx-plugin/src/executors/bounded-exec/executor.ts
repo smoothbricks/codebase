@@ -16,13 +16,18 @@ import {
   takeParentCpuTokens,
 } from './cpu-pool.js';
 import {
+  askAcrossInstall,
   CPU_TOKENS_ENV,
   type CpuBudget,
   gatewayCpuBudget,
+  type InstallRetry,
+  type RetryClock,
   runnerDemand,
   sizeRunner,
   type TokenGrant,
+  wallClock,
 } from './cpu-tokens.js';
+import type { InstallRestart } from './gateway-lease.js';
 import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
 import { createNoSpaceWatch } from './no-space.js';
@@ -227,6 +232,44 @@ export function recordContext(context: NxTaskContext): BoundedExecContext {
 }
 
 /**
+ * The host budget's grant, asked across an install that restarts the gateway (05_gateway.md, "A queued CPU ask
+ * outlives an install").
+ * `parentCut` is the install that cut off a parent pool's queued ask, so the run asks the host at once, with no ask
+ * of its own first. Otherwise the run's own ask is the one cut off. Either way the ask is retried once against the
+ * gateway the install starts, and `say` names the install that cut it off.
+ */
+async function takeHostAcrossInstall(
+  budget: CpuBudget,
+  want: number,
+  checkout: string,
+  command: string,
+  parentCut: InstallRestart | null,
+  clock: RetryClock,
+  say: (message: string) => void,
+): Promise<InstallRetry> {
+  const ask = () => budget.take(want, checkout, command);
+  let source: string;
+  let install: InstallRestart;
+  if (parentCut !== null) {
+    source = 'parent pool';
+    install = parentCut;
+  } else {
+    const first = await ask();
+    if (first.granted || first.cause !== 'install-restart') {
+      return first;
+    }
+    source = 'gateway';
+    install = first.install;
+  }
+  // A pool child's pool ended with the old gateway: it asks the host as background work, and says so.
+  const asked = source === 'parent pool' ? " as background work, not at its pool's class" : '';
+  say(
+    `cowshed: cpu-tokens ${source} cut off by install ${install.pid} (${install.binary}) restarting the gateway; asking the gateway it starts once${asked}, within ${install.servesWithinMs} ms\n`,
+  );
+  return askAcrossInstall(ask, install, clock);
+}
+
+/**
  * Run the command once its runner holds CPU tokens from `budget` (`cpu-tokens.ts`), sized to the
  * grant; `null`, or a budget nobody serves, runs it as asked. Both bounds start once it is
  * granted: a wait for the host is not the command's time.
@@ -235,7 +278,8 @@ export function recordContext(context: NxTaskContext): BoundedExecContext {
  * and the host budget only when the pool refuses. Whatever it is granted, the run serves its own sub-pool to its
  * descendants, closed before the grant returns. A grant whose connection closes while the command runs (a gateway
  * restart, or the lending parent's exit) ends its accounting, never the command: the command runs on over budget to
- * its own exit, and the run says so.
+ * its own exit, and the run says so. An install that restarts the gateway while the ask waits is asked once more
+ * against the gateway it starts; if none serves within the install's bound, the run is refused.
  */
 export async function runBoundedExec(
   options: BoundedExecOptions,
@@ -245,6 +289,7 @@ export async function runBoundedExec(
   budget: CpuBudget | null,
   inherited: InheritedCpuPool | null = null,
   captureDiagnostics: typeof captureHangDiagnostics = captureHangDiagnostics,
+  retryClock: RetryClock = wallClock,
 ): Promise<BoundedExecResult> {
   const cwd = resolveCwd(options.cwd, context.root);
   const directory = context.record?.directory ?? null;
@@ -329,29 +374,49 @@ export async function runBoundedExec(
   const cores = availableParallelism();
   const demand = runnerDemand(requested, options.parallelism, cores, process.env, options.env);
   const asked = Date.now();
-  // A run a parent's CPU pool serves takes its tokens there. Only an absent pool leaves the host budget to ask.
-  // A pool that answered and refused is a live budget of its own -- a lent grant, or a gate's or a resident's
-  // relay to the host -- so asking the host beside it would count the run twice; the run fails instead.
+  // A run a parent's CPU pool serves takes its tokens there. Only an absent pool, or one an install's restart cut off,
+  // leaves the host budget to ask. A pool that answered and refused is a live budget of its own -- a lent grant, or a
+  // gate's or a resident's relay to the host -- so asking the host beside it would count the run twice; the run fails
+  // instead.
   let grant: GrantedTokens | null = null;
   let parentRefusal: string | null = null;
+  // The parent's gateway is gone with the install's restart, so its run asks the host across the restart at once.
+  let parentCut: { install: InstallRestart; reason: string } | null = null;
   if (inherited !== null) {
     const fromParent = await takeParentCpuTokens(inherited, demand.want);
     if (fromParent.granted) {
       grant = fromParent;
+    } else if (fromParent.cause === 'install-restart') {
+      parentCut = { install: fromParent.install, reason: fromParent.reason };
     } else if (fromParent.cause === 'absent') {
-      appendStderr(`cowshed: cpu-tokens parent pool refused: ${fromParent.reason}; asking the host budget\n`);
+      appendStderr(
+        `cowshed: cpu-tokens parent pool absent: ${fromParent.reason}; asking the host budget as background work, not at the pool's class\n`,
+      );
     } else {
       parentRefusal = fromParent.reason;
     }
   }
   let unbudgeted: string | null = null;
+  let restartRefusal: string | null = null;
   if (grant === null && parentRefusal === null && budget !== null) {
-    const fromHost = await budget.take(demand.want, context.root, requested);
+    const fromHost = await takeHostAcrossInstall(
+      budget,
+      demand.want,
+      context.root,
+      requested,
+      parentCut?.install ?? null,
+      retryClock,
+      appendStderr,
+    );
     if (fromHost.granted) {
       grant = fromHost;
+    } else if (fromHost.cause === 'install-deadline') {
+      restartRefusal = fromHost.reason;
     } else if (fromHost.cause !== 'absent') {
       unbudgeted = fromHost.reason;
     }
+  } else if (parentCut !== null) {
+    parentRefusal = parentCut.reason;
   }
   const waitedMs = Date.now() - asked;
   let cpu: BoundedExecRecord['cpu'];
@@ -420,6 +485,10 @@ export async function runBoundedExec(
     return refuse(
       `cowshed: cpu-tokens parent pool refused: ${parentRefusal}; refusing to run the command without asking the host budget\n`,
     );
+  }
+
+  if (restartRefusal !== null) {
+    return refuse(`cowshed: cpu-tokens ${restartRefusal}; refusing to run the command\n`);
   }
 
   // Descendant work queued for host CPU tokens, as its pool hears it (`host-wait`): while any is held the idle clock

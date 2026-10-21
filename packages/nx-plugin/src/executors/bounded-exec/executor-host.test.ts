@@ -318,7 +318,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
       );
       const run = startChild(script, childEnv(outer.environment));
       expect(await run.exited, run.stderr()).toBe(0);
-      expect(run.stderr()).toContain('cowshed: cpu-tokens parent pool refused: ');
+      expect(run.stderr()).toContain('cowshed: cpu-tokens parent pool absent: ');
       expect(run.stderr()).toContain('status=ok inherited=true tokens=1/1');
       expect(run.stdout()).toContain('actual-tokens=1');
       expect(run.stdout()).toContain('actual-allocation-returned');

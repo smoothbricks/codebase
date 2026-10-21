@@ -673,6 +673,9 @@ struct ControlResponse {
     /// What an `nx-cache-clear` deleted.
     #[serde(skip_serializing_if = "Option::is_none")]
     nx_cache_cleared: Option<cowshed_core::api::NxStoreClearResult>,
+    /// The install that cut a queued CPU ask off, beside [`ControlFailureCode::InstallRestart`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    install: Option<cowshed_gateway_types::InstallRestart>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -694,6 +697,9 @@ pub enum ControlFailureCode {
     Rejected,
     /// Work the operation would cut off is running; the message names it. Retry once it ends.
     Busy,
+    /// A queued CPU ask an install cut off as it restarts the gateway; `install` names it. Ask
+    /// the gateway it starts, once ([`cowshed_gateway_types::INSTALL_RESTART_CODE`]).
+    InstallRestart,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1058,6 +1064,7 @@ async fn serve<R, W>(
                 granted,
                 |()| lease(LeaseState::Granted),
                 "disk-lease scheduler",
+                scheduler_stopped,
             )
             .await;
         }
@@ -1072,6 +1079,7 @@ async fn serve<R, W>(
                 Claim::new(&command, pid),
                 crate::cpu_budget::Rank::Background,
             );
+            let budget = services.cpu_budget.clone();
             hold(
                 reader,
                 writer,
@@ -1082,6 +1090,7 @@ async fn serve<R, W>(
                     ..lease(LeaseState::Granted)
                 },
                 "CPU budget",
+                |_| cpu_ask_cut_off(&budget),
             )
             .await;
         }
@@ -1188,6 +1197,7 @@ async fn serve<R, W>(
                     Err(refusal) => failure(ControlFailureCode::Rejected, refusal.to_string()),
                 },
                 "task scheduler",
+                scheduler_stopped,
             )
             .await;
         }
@@ -1202,7 +1212,7 @@ async fn serve<R, W>(
 /// Hold one lease for this connection — a disk lease or CPU tokens — whose stake is `stake`:
 /// answer `queued` at once, the `granted` answer once the scheduler admits it, then hold until the
 /// client closes. A client that closes while queued leaves the queue; either way, dropping the
-/// stake gives back whatever it held.
+/// stake gives back whatever it held. A scheduler that drops the grant is answered `stopped`.
 async fn hold<R, W, S, G>(
     mut reader: R,
     mut writer: W,
@@ -1210,6 +1220,7 @@ async fn hold<R, W, S, G>(
     granted: tokio::sync::oneshot::Receiver<G>,
     answer: impl FnOnce(G) -> ControlResponse,
     scheduler: &str,
+    stopped: impl FnOnce(&str) -> ControlResponse,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -1226,14 +1237,7 @@ async fn hold<R, W, S, G>(
         answer = granted => match answer {
             Ok(grant) => grant,
             Err(_) => {
-                let _ = write_response(
-                    &mut writer,
-                    &failure(
-                        ControlFailureCode::Rejected,
-                        format!("the gateway's {scheduler} has stopped"),
-                    ),
-                )
-                .await;
+                let _ = write_response(&mut writer, &stopped(scheduler)).await;
                 return;
             }
         },
@@ -1337,14 +1341,7 @@ async fn hold_jobserver<R, W>(
         answer = granted => match answer {
             Ok(tokens) => Winner::Host(tokens),
             Err(_) => {
-                let _ = write_response(
-                    &mut writer,
-                    &failure(
-                        ControlFailureCode::Rejected,
-                        "the gateway's CPU budget has stopped".to_owned(),
-                    ),
-                )
-                .await;
+                let _ = write_response(&mut writer, &cpu_ask_cut_off(&budget)).await;
                 return;
             }
         },
@@ -2327,6 +2324,7 @@ fn success() -> ControlResponse {
         task_grant: None,
         task_queue: None,
         nx_cache_cleared: None,
+        install: None,
     }
 }
 
@@ -2343,6 +2341,30 @@ fn failure(code: ControlFailureCode, error: String) -> ControlResponse {
         code: Some(code),
         error: Some(error),
         ..success()
+    }
+}
+
+/// A scheduler that dropped a waiter's grant has stopped.
+fn scheduler_stopped(scheduler: &str) -> ControlResponse {
+    failure(
+        ControlFailureCode::Rejected,
+        format!("the gateway's {scheduler} has stopped"),
+    )
+}
+
+/// The refusal of a queued CPU ask whose grant the budget dropped: cut off for the install
+/// restarting the gateway, which it names, so its client asks the gateway that install starts
+/// once (05_gateway.md "A queued CPU ask outlives an install"); otherwise the budget stopped.
+fn cpu_ask_cut_off(budget: &CpuBudget) -> ControlResponse {
+    match budget.installing() {
+        Some(install) => ControlResponse {
+            install: Some(install.clone()),
+            ..failure(
+                ControlFailureCode::InstallRestart,
+                crate::cpu_budget::cut_off_by(install),
+            )
+        },
+        None => scheduler_stopped("CPU budget"),
     }
 }
 

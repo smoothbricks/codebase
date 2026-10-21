@@ -169,6 +169,28 @@ pub struct JobserverAnswer {
     pub cpu_pool: Option<std::path::PathBuf>,
     pub code: Option<String>,
     pub error: Option<String>,
+    /// The install that cut this ask off, beside [`INSTALL_RESTART_CODE`].
+    pub install: Option<InstallRestart>,
+}
+
+/// The refusal code of a CPU ask a gateway cut off because an install is restarting it
+/// (05_gateway.md "A queued CPU ask outlives an install"). It is the one refusal a client asks
+/// again after: once, of the gateway the install starts, within [`InstallRestart::serves_within_ms`].
+pub const INSTALL_RESTART_CODE: &str = "install-restart";
+
+/// How long an install gives the gateway it activated to serve before it gives up on it; the bound
+/// of a cut-off ask's one retry too, since the install says it in [`InstallRestart`].
+pub const INSTALL_SERVES_WITHIN: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The install restarting a gateway, as it names itself on the listener handoff socket and as the
+/// gateway passes it on to every CPU ask it cuts off: the evidence a log line names.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstallRestart {
+    pub pid: u32,
+    pub binary: std::path::PathBuf,
+    /// How long the install waits for the gateway it starts to serve ([`INSTALL_SERVES_WITHIN`]).
+    pub serves_within_ms: u64,
 }
 
 /// The gateway and the single sandbox builder derive exactly the same workspace IPC scope.

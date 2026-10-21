@@ -3781,7 +3781,15 @@ async fn a_request_during_a_gateway_restart_is_answered_never_refused() {
         "no Nx backend is configured, so a lookup is a miss"
     );
 
-    let install = cowshed_gateway::HandoffServer::start(&handoff).expect("the install's handoff");
+    let install = cowshed_gateway::HandoffServer::start(
+        &handoff,
+        cowshed_gateway_types::InstallRestart {
+            pid: std::process::id(),
+            binary: std::path::PathBuf::from("/opt/cowshed/bin/cowshed"),
+            serves_within_ms: 180_000,
+        },
+    )
+    .expect("the install's handoff");
     old.drain().await.expect("the old gateway drains and exits");
     // No gateway runs now: the restart's window.
     let mut during = ask(endpoint, &token)

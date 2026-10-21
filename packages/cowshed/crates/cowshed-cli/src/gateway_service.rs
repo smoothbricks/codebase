@@ -365,8 +365,9 @@ async fn reconcile_project_for_backend(
 /// it attaches, checks, and mounts every recorded project's images and restores their sessions
 /// before it serves a workspace (05_gateway.md), and a host carrying several multi-gigabyte mains
 /// needs minutes for that pass. Ten seconds timed out mid-heal and told the user to kickstart a
-/// gateway that was working exactly as intended.
-const START_DEADLINE: Duration = Duration::from_secs(180);
+/// gateway that was working exactly as intended. The install names it on the handoff socket, and
+/// it bounds the one retry of every CPU ask the restart cuts off.
+const START_DEADLINE: Duration = cowshed_gateway_types::INSTALL_SERVES_WITHIN;
 const START_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How often the wait says that it is still waiting, and on what.
 const START_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
@@ -678,9 +679,11 @@ where
 
 /// The install's side of the listener handoff (05_gateway.md "An install never refuses a client
 /// connection"): serving it from before the restart until the restarted gateway serves carries
-/// every workspace listener across the restart. A downgrade carries none: an older gateway may
-/// not take them, and its own bind would then meet this install's copies. A handoff that cannot
-/// serve is said, and the restart refuses connections as it did before.
+/// every workspace listener across the restart, and names this install to the gateway it
+/// restarts, which passes that on to every CPU ask it cuts off ("A queued CPU ask outlives an
+/// install"). A downgrade serves nothing: an older gateway may not take the listeners, and its own
+/// bind would then meet this install's copies. A handoff that cannot serve is said, and the
+/// restart refuses connections and cuts CPU asks off unnamed, as it did before.
 #[cfg(target_os = "macos")]
 fn carry_listeners(
     control_socket: &Path,
@@ -689,19 +692,27 @@ fn carry_listeners(
     if downgrade == Downgrade::Allow {
         return None;
     }
-    match cowshed_gateway::HandoffServer::start(&cowshed_gateway::handoff_path(control_socket)) {
+    let install = cowshed_gateway_types::InstallRestart {
+        pid: std::process::id(),
+        binary: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cowshed")),
+        serves_within_ms: u64::try_from(START_DEADLINE.as_millis()).unwrap_or(u64::MAX),
+    };
+    match cowshed_gateway::HandoffServer::start(
+        &cowshed_gateway::handoff_path(control_socket),
+        install,
+    ) {
         Ok(server) => Some(server),
         Err(error) => {
             eprintln!(
-                "cowshed: the workspace listeners are not carried across this restart, so their \
-                 clients are refused until the gateway serves again: {error}"
+                "cowshed: the handoff socket cannot serve, so this restart carries no workspace \
+                 listener and names no install to the CPU asks it cuts off: {error}"
             );
             None
         }
     }
 }
 
-/// Linux binds no TCP workspace listener, so a restart has none to carry.
+/// Linux binds no TCP workspace listener, so a restart has none to carry and serves no handoff.
 #[cfg(not(target_os = "macos"))]
 const fn carry_listeners(_control_socket: &Path, _downgrade: Downgrade) -> Option<()> {
     None

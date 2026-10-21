@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use cowshed_gateway_types::{
     CpuBackgroundStake, CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, CpuHolder,
-    CpuWaiter, background_limit,
+    CpuWaiter, InstallRestart, background_limit,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -620,6 +620,11 @@ enum Message {
     Status {
         reply: oneshot::Sender<CpuBudgetStatus>,
     },
+    /// An install is restarting the gateway: every queued ask is refused, and so is every ask
+    /// after; `told` resolves to how many were queued once each has left.
+    CutOff {
+        told: oneshot::Sender<usize>,
+    },
 }
 
 /// The gateway's CPU budget: a handle to the actor that owns the [`Ledger`].
@@ -627,6 +632,8 @@ enum Message {
 pub(crate) struct CpuBudget {
     messages: mpsc::UnboundedSender<Message>,
     tickets: Arc<AtomicU64>,
+    /// The install restarting the gateway, once [`CpuBudget::cut_off`] named it.
+    installing: Arc<std::sync::OnceLock<InstallRestart>>,
 }
 
 /// One request's stake in the budget, waiting or holding. Dropping it returns what it holds.
@@ -665,6 +672,7 @@ impl CpuBudget {
         Self {
             messages,
             tickets: Arc::new(AtomicU64::new(0)),
+            installing: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -712,17 +720,65 @@ impl CpuBudget {
         self.messages.send(Message::Status { reply }).ok()?;
         receiver.await.ok()
     }
+
+    /// Cut off every queued ask, and every later one, because `install` is restarting the
+    /// gateway (05_gateway.md "A queued CPU ask outlives an install"). Each waiter's grant
+    /// receiver errors, and [`CpuBudget::installing`] names `install` to it, so it refuses its
+    /// client with that install before the restart closes the connection. Resolves to how many
+    /// asks were queued, once every one of them has left the queue; holders are untouched.
+    pub(crate) async fn cut_off(&self, install: InstallRestart) -> usize {
+        let _ = self.installing.set(install);
+        let (told, receiver) = oneshot::channel();
+        if self.messages.send(Message::CutOff { told }).is_err() {
+            return 0;
+        }
+        receiver.await.unwrap_or(0)
+    }
+
+    /// The install restarting the gateway, once the queue was cut off for it.
+    pub(crate) fn installing(&self) -> Option<&InstallRestart> {
+        self.installing.get()
+    }
+}
+
+/// What a cut-off ask is told, beside `install` itself: one sentence for every socket.
+pub(crate) fn cut_off_by(install: &InstallRestart) -> String {
+    format!(
+        "install {} ({}) is restarting the gateway; ask the gateway it starts once, within {} ms",
+        install.pid,
+        install.binary.display(),
+        install.serves_within_ms
+    )
+}
+
+/// The asks a cut-off refused and that have not left the queue yet, and who waits for them all.
+struct CutOff {
+    waiting: std::collections::HashSet<Ticket>,
+    queued: usize,
+    told: Option<oneshot::Sender<usize>>,
+}
+
+impl CutOff {
+    fn left(&mut self, ticket: Ticket) {
+        self.waiting.remove(&ticket);
+        if self.waiting.is_empty()
+            && let Some(told) = self.told.take()
+        {
+            let _ = told.send(self.queued);
+        }
+    }
 }
 
 async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>) {
     let mut grants: HashMap<Ticket, oneshot::Sender<usize>> = HashMap::new();
+    let mut cut: Option<CutOff> = None;
     let mut effects = Vec::new();
     while let Some(message) = messages.recv().await {
         let started = Instant::now();
         let transition = match &message {
             Message::Ask { ticket, .. } => Some(("ask", *ticket, None)),
             Message::Leave { ticket, released } => Some(("release", *ticket, Some(*released))),
-            Message::Status { .. } => None,
+            Message::Status { .. } | Message::CutOff { .. } => None,
         };
         match message {
             Message::Ask {
@@ -734,6 +790,14 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                 job,
                 granted,
             } => {
+                // After a cut-off no ask is queued: dropping its sender refuses it at once.
+                if let Some(cut) = &mut cut {
+                    if cut.told.is_some() {
+                        cut.waiting.insert(ticket);
+                    }
+                    drop(granted);
+                    continue;
+                }
                 grants.insert(ticket, granted);
                 ledger.ask(
                     checkout,
@@ -751,9 +815,27 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
             Message::Leave { ticket, .. } => {
                 grants.remove(&ticket);
                 ledger.leave(Instant::now(), ticket, &mut effects);
+                if let Some(cut) = &mut cut {
+                    cut.left(ticket);
+                }
             }
             Message::Status { reply } => {
                 let _ = reply.send(ledger.status(Instant::now()));
+            }
+            Message::CutOff { told } => {
+                // Every sender still here is a queued ask: dropped, its waiter refuses.
+                let waiting: std::collections::HashSet<Ticket> =
+                    grants.drain().map(|(ticket, _)| ticket).collect();
+                let mut cutting = CutOff {
+                    queued: waiting.len(),
+                    waiting,
+                    told: Some(told),
+                };
+                if cutting.waiting.is_empty() {
+                    let told = cutting.told.take().expect("set just above");
+                    let _ = told.send(0);
+                }
+                cut = Some(cutting);
             }
         }
         // Deliver all grants before diagnostics: stderr backpressure must not sit between the

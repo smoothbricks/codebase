@@ -4,11 +4,20 @@ import { access, mkdir, mkdtemp, open, readFile, rm, writeFile } from 'node:fs/p
 import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import {
+  closeServer,
+  fakeClock,
+  GRANT_THREE,
+  GRANT_TWO,
+  listen,
+  restartedBy,
+  scripted,
+} from '../../__tests__/gateway-stand-in.js';
 import { onProgressClock } from '../../__tests__/progress-clock.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { ownedSocketDirectory } from '../../testing.js';
 import { CPU_POOL_ENV, type CpuPool, createCpuPool, type InheritedCpuPool, readInheritedCpuPool } from './cpu-pool.js';
-import { CPU_TOKENS_ENV, type CpuBudget, type TokenGrant } from './cpu-tokens.js';
+import { CPU_TOKENS_ENV, type CpuBudget, gatewayCpuBudget, type TokenGrant } from './cpu-tokens.js';
 import {
   type BoundedExecContext,
   type BoundedExecResult,
@@ -1421,7 +1430,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.success).toBe(true);
     expect(asked).toEqual([nextestWant]);
     expect(released).toEqual([3]);
-    expect(result.terminalOutput).toContain('cowshed: cpu-tokens parent pool refused: ');
+    expect(result.terminalOutput).toContain("; asking the host budget as background work, not at the pool's class");
+    expect(result.terminalOutput).toContain('cowshed: cpu-tokens parent pool absent: ');
     expect(result.terminalOutput).toContain(`status=ok tokens=3/${nextestWant} runner=nextest`);
     expect(result.terminalOutput).not.toContain('inherited=true');
   });
@@ -1516,6 +1526,153 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       expect(await readFile(join(workspace.root, 'refused', VERDICT_FILE), 'utf8')).toMatch(/"outcome":\s*"failed"/);
     } finally {
       await new Promise<void>((resolve) => refusing.close(() => resolve()));
+    }
+  });
+
+  it('asks the gateway once more across an install that restarts it, and runs on the grant it takes', async () => {
+    const socketDirectory = await ownedSocketDirectory('cpu-restart-', 'gw.sock');
+    workspaces.push(socketDirectory);
+    const socket = join(socketDirectory, 'gw.sock');
+    // The install cuts the first ask off and closes this gateway; the one it starts grants while the run waits.
+    let current = await listen(socket, scripted([restartedBy(1234)]));
+    const workspace = await createWorkspace();
+    const clock = fakeClock(async () => {
+      await closeServer(current);
+      current = await listen(socket, scripted([GRANT_TWO]));
+    });
+    try {
+      const result = await runBoundedExec(
+        {
+          command: 'touch ran.marker # nextest run',
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+          parallelism: nextestWant,
+        },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+        gatewayCpuBudget(socket),
+        null,
+        undefined,
+        clock,
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.terminalOutput).toContain(
+        'cowshed: cpu-tokens gateway cut off by install 1234 (/abs/cowshed) restarting the gateway; asking the gateway it starts once, within 180000 ms',
+      );
+      expect(result.terminalOutput).toContain(`status=ok tokens=2/${nextestWant} runner=nextest`);
+      expect(await exists(join(workspace.root, 'ran.marker'))).toBe(true);
+    } finally {
+      await closeServer(current);
+    }
+  });
+
+  it('refuses the run once the install that restarts the gateway has not brought one up within its bound', async () => {
+    const socketDirectory = await ownedSocketDirectory('cpu-restart-', 'gw.sock');
+    workspaces.push(socketDirectory);
+    const socket = join(socketDirectory, 'gw.sock');
+    // Every ask is cut off by install 1234, which keeps answering for the gateway it restarted until the bound runs out.
+    const gateway = await listen(socket, (client) => {
+      client.once('data', () => client.end(restartedBy(1234, 300)));
+    });
+    const workspace = await createWorkspace();
+    try {
+      const result = await runBoundedExec(
+        {
+          command: 'touch ran.marker # nextest run',
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+          parallelism: nextestWant,
+        },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+        gatewayCpuBudget(socket),
+        null,
+        undefined,
+        fakeClock(),
+      );
+
+      expect(result.success).toBe(false);
+      expect(await exists(join(workspace.root, 'ran.marker'))).toBe(false);
+      expect(result.terminalOutput).toContain(
+        'cowshed: cpu-tokens the install 1234 (/abs/cowshed) restarting the gateway did not bring up one that serves within 300 ms; waited 300 ms; refusing to run the command',
+      );
+    } finally {
+      await closeServer(gateway);
+    }
+  });
+
+  it('never retries a refusal other than an install restart, and runs unbudgeted on it as before', async () => {
+    const socketDirectory = await ownedSocketDirectory('cpu-restart-', 'gw.sock');
+    workspaces.push(socketDirectory);
+    const socket = join(socketDirectory, 'gw.sock');
+    let asks = 0;
+    const gateway = await listen(socket, (client) => {
+      asks += 1;
+      client.once('data', () => client.end('{"ok":false,"code":"rejected","error":"the gateway is shutting down"}\n'));
+    });
+    const workspace = await createWorkspace();
+    try {
+      const result = await runBoundedExec(
+        {
+          command: 'touch ran.marker # nextest run',
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+          parallelism: nextestWant,
+        },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+        gatewayCpuBudget(socket),
+        null,
+        undefined,
+        fakeClock(),
+      );
+
+      expect(asks).toBe(1);
+      expect(result.success).toBe(true);
+      expect(await exists(join(workspace.root, 'ran.marker'))).toBe(true);
+      expect(result.terminalOutput).toContain('runs unbudgeted: ');
+    } finally {
+      await closeServer(gateway);
+    }
+  });
+
+  it('asks the host budget at once when an install cuts off the parent pool, and runs on its grant', async () => {
+    const parentDirectory = await ownedSocketDirectory('cpu-restart-', 'parent.sock');
+    workspaces.push(parentDirectory);
+    const hostDirectory = await ownedSocketDirectory('cpu-restart-', 'gw.sock');
+    workspaces.push(hostDirectory);
+    const parentSocket = join(parentDirectory, 'parent.sock');
+    const hostSocket = join(hostDirectory, 'gw.sock');
+    const parent = await listen(parentSocket, scripted([restartedBy(1234)]));
+    const host = await listen(hostSocket, scripted([GRANT_THREE]));
+    const workspace = await createWorkspace();
+    try {
+      const result = await runBoundedExec(
+        {
+          command: 'touch ran.marker # nextest run',
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+          parallelism: nextestWant,
+        },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+        gatewayCpuBudget(hostSocket),
+        { socket: parentSocket, tokens: 3 },
+        undefined,
+        fakeClock(),
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.terminalOutput).toContain(
+        "cowshed: cpu-tokens parent pool cut off by install 1234 (/abs/cowshed) restarting the gateway; asking the gateway it starts once as background work, not at its pool's class, within 180000 ms",
+      );
+      expect(result.terminalOutput).toContain(`status=ok tokens=3/${nextestWant} runner=nextest`);
+      expect(result.terminalOutput).not.toContain('parent pool absent');
+      expect(await exists(join(workspace.root, 'ran.marker'))).toBe(true);
+    } finally {
+      await closeServer(parent);
+      await closeServer(host);
     }
   });
 

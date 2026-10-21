@@ -1,4 +1,5 @@
-import { GATEWAY_SOCKET, holdLease, type UnleasedCause } from './gateway-lease.js';
+import { setTimeout as delay } from 'node:timers/promises';
+import { GATEWAY_SOCKET, holdLease, type InstallRestart, type Unleased } from './gateway-lease.js';
 import { BUN_TEST, GO_TEST, NEXTEST_RUN } from './verdict.js';
 
 /**
@@ -375,7 +376,7 @@ export function parseInheritedTokens(value: string | undefined): number | null {
  */
 export type TokenGrant =
   | { granted: true; tokens: number; release: () => void; closed: Promise<void>; inherited?: true }
-  | { granted: false; cause: UnleasedCause; reason: string };
+  | Unleased;
 
 /** Where bounded-exec takes its tokens; the gateway in production, a fake in tests. */
 export interface CpuBudget {
@@ -410,4 +411,60 @@ export function gatewayCpuBudget(socket: string = GATEWAY_SOCKET): CpuBudget {
       return { granted: true, tokens, release: lease.release, closed: lease.closed };
     },
   };
+}
+
+/** The clock a retry waits on: the wall clock in production, a fake one in tests. */
+export interface RetryClock {
+  now(): number;
+  sleep(ms: number): Promise<void>;
+}
+
+export const wallClock: RetryClock = {
+  now: Date.now,
+  sleep: delay,
+};
+
+/** How long a retry waits between asks of the gateway it starts, in ms. */
+const RETRY_EVERY_MS = 100;
+
+/** A retry's outcome: the ask's own answer, or the install's deadline passing with no gateway serving. */
+export type InstallRetry =
+  | TokenGrant
+  | { granted: false; cause: 'install-deadline'; reason: string; install: InstallRestart; waitedMs: number };
+
+/**
+ * Retry a cut-off ask against the gateway the install starts (05_gateway.md, "A queued CPU ask outlives an install"), every
+ * 100 ms until the install's `servesWithinMs` has passed. A gateway not yet bound (`absent`) keeps the wait
+ * going, and so does the same install's restart, since its old gateway still drains. Any other answer is
+ * returned as-is, so a refusal is never retried.
+ */
+export async function askAcrossInstall(
+  ask: () => Promise<TokenGrant>,
+  install: InstallRestart,
+  clock: RetryClock = wallClock,
+): Promise<InstallRetry> {
+  const started = clock.now();
+  const deadline = started + install.servesWithinMs;
+  for (;;) {
+    await clock.sleep(RETRY_EVERY_MS);
+    const now = clock.now();
+    if (now >= deadline) {
+      const waitedMs = now - started;
+      return {
+        granted: false,
+        cause: 'install-deadline',
+        reason: `the install ${install.pid} (${install.binary}) restarting the gateway did not bring up one that serves within ${install.servesWithinMs} ms; waited ${waitedMs} ms`,
+        install,
+        waitedMs,
+      };
+    }
+    const answer = await ask();
+    if (answer.granted) {
+      return answer;
+    }
+    if (answer.cause === 'absent' || (answer.cause === 'install-restart' && answer.install.pid === install.pid)) {
+      continue;
+    }
+    return answer;
+  }
 }
