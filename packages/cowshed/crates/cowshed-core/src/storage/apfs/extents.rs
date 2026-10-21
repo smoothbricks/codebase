@@ -99,6 +99,17 @@ pub fn prove_forkable(image: &Path) -> Result<ExtentProof, ApfsStorageError> {
 fn measure(path: &Path, stop_at: Option<u64>) -> Result<ExtentProof, ApfsStorageError> {
     let file =
         File::open(path).map_err(|error| io_error("open image to count extents", path, error))?;
+    // Bytes written to the file but not yet placed have no device offset (delayed allocation),
+    // which F_LOG2PHYS_EXT reports as -1. fsync(2) places them without F_FULLFSYNC's drive-cache
+    // flush. It runs before the generation is read, since placing data changes the block count.
+    // SAFETY: fsync takes an open descriptor, which `file` owns for the duration of the call.
+    if unsafe { libc::fsync(std::os::fd::AsRawFd::as_raw_fd(&file)) } == -1 {
+        return Err(io_error(
+            "place written image data before counting extents",
+            path,
+            io::Error::last_os_error(),
+        ));
+    }
     let generation = ImageGeneration::of(
         &file
             .metadata()
