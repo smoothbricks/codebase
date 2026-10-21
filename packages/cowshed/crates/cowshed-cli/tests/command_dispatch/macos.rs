@@ -1234,6 +1234,66 @@ impl HostProcesses {
     }
 }
 
+impl HostProcesses {
+    /// Kill every process and wait for each to exit ([`await_exit`]).
+    fn end(mut self) {
+        for pid in std::mem::take(&mut self.0) {
+            // SAFETY: kill takes plain integers; a pid that already exited answers ESRCH.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            await_exit(pid);
+        }
+    }
+}
+
+/// Block until `pid` has exited: the kernel's `NOTE_EXIT` for it, which it posts only once the
+/// process has released what it held. A pid already gone answers `ESRCH` when registered, which
+/// is its exit. No duration: the test runner's no-progress bound names a process that never
+/// exits.
+fn await_exit(pid: i32) {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: kqueue takes no arguments; a negative answer is an error.
+    let queue = unsafe { libc::kqueue() };
+    assert!(queue >= 0, "kqueue: {}", std::io::Error::last_os_error());
+    // SAFETY: `queue` is a new descriptor this function alone owns.
+    let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+    let watch = libc::kevent {
+        ident: usize::try_from(pid).expect("a positive pid"),
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: an all-zero `kevent` is a valid value of the plain C struct.
+    let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: one change in, room for one event out, no timeout: block until it fires.
+        let fired = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                &watch,
+                1,
+                &mut event,
+                1,
+                std::ptr::null(),
+            )
+        };
+        if fired >= 0 {
+            if event.flags & libc::EV_ERROR != 0 {
+                let data = event.data;
+                assert_eq!(data, libc::ESRCH as isize, "watch pid {pid}");
+            }
+            return;
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => return,
+            Some(libc::EINTR) => {}
+            _ => panic!("watch pid {pid}: {error}"),
+        }
+    }
+}
+
 impl Drop for HostProcesses {
     fn drop(&mut self) {
         for pid in self.0.drain(..) {
@@ -1333,20 +1393,8 @@ async fn directory_detach_and_rm_refuse_a_host_process_holding_the_mount() {
         );
         assert!(head.is_file(), "{args:?} left the workspace mounted");
     }
-    drop(host);
+    host.end();
     let (detached, _, stderr) = run(&mut service, ["detach", "held-topic"]).await;
-    let mut detached = detached.map(|_| ());
-    for _ in 0..100 {
-        if detached.is_ok() {
-            break;
-        }
-        // SIGKILL is asynchronous: the killed processes leave the process table shortly.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        detached = run(&mut service, ["detach", "held-topic"])
-            .await
-            .0
-            .map(|_| ());
-    }
     detached.unwrap_or_else(|error| {
         panic!(
             "detach once nothing holds it: {error}; {}",
@@ -6242,18 +6290,8 @@ async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
         } else {
             fs::write(&record, b"{not a daemon record").unwrap();
         }
-        // SAFETY: the null signal only asks whether the pid is still held.
-        let daemon_gone = || unsafe { libc::kill(daemon, 0) } != 0;
-        for _ in 0..200 {
-            if daemon_gone() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            daemon_gone(),
-            "the daemon exits once its record does not name it"
-        );
+        // The daemon exits once its record does not name it: its exit is the event.
+        await_exit(daemon);
         let mut workers = HostProcesses(Vec::new());
         let worker = workers.start(&topic, None);
         let (kept, _, stderr) = run(&mut service, ["--json", "land", "outputs"]).await;
@@ -6294,17 +6332,14 @@ async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
             }
             other => panic!("an unverifiable daemon record skips adoption: {other:?}"),
         }
-        drop(workers);
-        let mut retired = run(&mut service, ["rm", "--force", "outputs"]).await.0;
-        for _ in 0..200 {
-            if retired.is_ok() {
-                break;
-            }
-            // SIGKILL is asynchronous, and the daemon's own workers leave on their own time.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            retired = run(&mut service, ["rm", "--force", "outputs"]).await.0;
-        }
-        retired.unwrap_or_else(|error| panic!("retire once nothing holds it: {error}"));
+        workers.end();
+        let (retired, _, stderr) = run(&mut service, ["rm", "--force", "outputs"]).await;
+        retired.unwrap_or_else(|error| {
+            panic!(
+                "retire once nothing holds it: {error}; {}",
+                String::from_utf8_lossy(&stderr)
+            )
+        });
         drop(service);
         fixture.stop_gateway().await;
     }
