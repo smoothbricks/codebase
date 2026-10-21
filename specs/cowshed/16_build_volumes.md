@@ -766,10 +766,12 @@ where the target's volume already holds those tasks' entries, so the workspace's
 target ran at that tree. So once a rebase has not conflicted, stock Nx computes task hashes in the rebased checkout.
 Only target entries with one of those current-tree hashes that the workspace lacks are eligible to carry; historical
 hashes are not copied merely because main still indexes them. Each Nx root is selected independently. An unavailable or
-failed hash computation skips the carry with the root and reason; it never falls back to copying all rows. The target's
-volume is the source and the workspace's is the destination. The hash computation runs as one job of the workspace per
-root, at background class, or at gate class when the rebase names `--gate`: a land's rebase, which its lander runs under
-the land lock, so that it is not queued behind the background work the land is served ahead of.
+failed hash computation skips the carry with the root and reason; it never falls back to copying all rows. A probe job
+that cannot be admitted, its workspace supervisor not answering included, is unavailable: the rebase has already moved
+the tree, so a carry the rebase cannot compute is skipped, never the rebase failed after it. The target's volume is the
+source and the workspace's is the destination. The hash computation runs as one job of the workspace per root, at
+background class, or at gate class when the rebase names `--gate`: a land's rebase, which its lander runs under the land
+lock, so that it is not queued behind the background work the land is served ahead of.
 
 Both volumes' shared build holds are acquired before staging and retained through commit, including while their Nx
 daemons stop. A reseed or release must not withdraw either filesystem in that interval: Nx open locks fence database

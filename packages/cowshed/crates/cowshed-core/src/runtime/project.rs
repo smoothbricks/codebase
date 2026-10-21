@@ -13135,8 +13135,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let build_volume = timed_async("rebase", "carry", async {
             // Only what the rebased tree will look up is carried, so the hashes come from it, as
             // it is checked out now, through jobs admitted on its own build volume, at the class
-            // the caller names: a land's rebase runs them as gate-class work.
-            let (handle, grant) = self.admit_build_state(&workspace).await?;
+            // the caller names: a land's rebase runs them as gate-class work. Admission is the
+            // probes' to fail: a supervisor that does not answer leaves the hashes unavailable,
+            // which skips the carry rather than failing a rebase that has already happened.
+            let admitted = self.admit_build_state(&workspace).await;
             let mount = self.workspace_mount_path(&workspace)?;
             let class = if options.gate {
                 crate::api::dto::ExecClass::Gate
@@ -13146,7 +13148,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             let selections = timed_async(
                 "rebase",
                 "task-hashes",
-                rebased_task_hashes(&handle, grant, &mount, class),
+                rebased_task_hashes(admitted, &mount, class),
             )
             .await?;
             self.build_volumes()?
@@ -17745,11 +17747,14 @@ async fn nx_probe_stdout(
 /// and the tasks it defers ([`crate::build_volume::nx::task_hashes_script`], run there as a job
 /// of the workspace at `class`). A root whose selection cannot be computed is the carry's skip,
 /// naming it: no root is ever given a selection it did not compute, so the carry never copies an
-/// entry the tree will not look up.
+/// entry the tree will not look up. A failed admission (`admitted`), its supervisor unreachable
+/// included, is a probe that cannot start: the first root is skipped with it.
 #[cfg(target_os = "macos")]
 async fn rebased_task_hashes(
-    handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
-    build_volume: Option<PathBuf>,
+    admitted: Result<(
+        crate::runtime::supervisor::WorkspaceSupervisorHandle,
+        Option<PathBuf>,
+    )>,
     mount: &Path,
     class: crate::api::dto::ExecClass,
 ) -> Result<
@@ -17769,9 +17774,12 @@ async fn rebased_task_hashes(
             crate::build_volume::nx::task_hashes_script(),
             class,
         )?;
-        let selection = nx_probe_stdout(handle, build_volume.clone(), request)
-            .await
-            .and_then(|stdout| crate::build_volume::nx::task_selection(&stdout));
+        let selection = match &admitted {
+            Ok((handle, build_volume)) => nx_probe_stdout(handle, build_volume.clone(), request)
+                .await
+                .and_then(|stdout| crate::build_volume::nx::task_selection(&stdout)),
+            Err(unavailable) => Err(format!("cannot start the probe: {unavailable}")),
+        };
         match selection {
             Ok(selection) => {
                 selections.insert(parent.to_owned(), selection);

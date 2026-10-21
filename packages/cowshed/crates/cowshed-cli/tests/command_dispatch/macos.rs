@@ -3861,6 +3861,85 @@ async fn directory_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_
     }
 }
 
+/// A rebase whose workspace supervisor does not answer skips the carry and still rebases
+/// (16_build_volumes.md, "Rebase carry": an unavailable hash computation skips the carry with
+/// the root and reason). `b`'s supervisor is stopped with `SIGSTOP`, so it holds its socket and
+/// answers nothing, as a supervisor stalled in a blocking call does; the rebase names the root
+/// and the unanswered hello instead of failing after the tree has moved.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_rebase_whose_supervisor_does_not_answer_skips_the_carry_substrate_lifecycle() {
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::with_directory(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
+    let nx_check = nx_run_many(&node, "build test");
+
+    let b = new_workspace(&mut service, "b").await;
+    // b's own run leaves its Nx state on its volume and its supervisor serving.
+    sh(&mut service, "b", &nx_check).await;
+    let stopped = StoppedSupervisor::of(&fixture, "b").await;
+    let rebased = rebase(&mut service, "b").await;
+    drop(stopped);
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+
+    assert_eq!(rebased.oid.as_str(), git_stdout(&b, &["rev-parse", "HEAD"]));
+    match rebased.build_volume {
+        RebaseBuildVolume::Skipped {
+            reason: RebaseCarrySkip::TaskHashes { state, reason },
+        } => {
+            assert_eq!(
+                state.file_name(),
+                Some(std::ffi::OsStr::new(".nx")),
+                "{state:?}"
+            );
+            assert!(
+                reason.contains("cannot start the probe") && reason.contains("did not answer"),
+                "the skip names the unanswered supervisor: {reason}"
+            );
+        }
+        build_volume => panic!("an unanswering supervisor skips the carry: {build_volume:?}"),
+    }
+}
+
+/// A workspace supervisor stopped with `SIGSTOP`, continued when dropped.
+struct StoppedSupervisor(libc::pid_t);
+
+impl StoppedSupervisor {
+    /// Stop the supervisor serving `workspace`, found by asking each socket of the store's `run`
+    /// directory who it serves.
+    async fn of(fixture: &Fixture, workspace: &str) -> Self {
+        let run = fixture.storage.store().join("run");
+        for entry in fs::read_dir(&run).expect("the store's run directory") {
+            let path = entry.expect("run directory entry").path();
+            if path.extension().is_none_or(|extension| extension != "sock") {
+                continue;
+            }
+            let Ok(hello) = cowshed_core::runtime::supervisor_socket::hello(&path).await else {
+                continue;
+            };
+            if hello.authority.workspace.as_str() == workspace {
+                let pid = libc::pid_t::try_from(hello.pid).expect("a pid fits pid_t");
+                // SAFETY: kill(2) with a live pid and a valid signal number has no memory effects.
+                let stopped = unsafe { libc::kill(pid, libc::SIGSTOP) };
+                assert_eq!(stopped, 0, "stop supervisor {pid}");
+                return Self(pid);
+            }
+        }
+        panic!("no supervisor in {} serves {workspace}", run.display());
+    }
+}
+
+impl Drop for StoppedSupervisor {
+    fn drop(&mut self) {
+        // SAFETY: kill(2) with a valid signal number has no memory effects.
+        unsafe { libc::kill(self.0, libc::SIGCONT) };
+    }
+}
+
 /// A task that hashes its dependency's outputs is carried by task (16_build_volumes.md, "Rebase
 /// carry"): stock Nx hashes `a:test`, whose inputs name `dependentTasksOutputFiles`, only once
 /// `a:build` has written or restored `a/generated.txt`, and `b`'s copy of that file is stale. `b`
