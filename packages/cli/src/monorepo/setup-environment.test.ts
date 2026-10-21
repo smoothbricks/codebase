@@ -314,6 +314,8 @@ async function git(cwd: string, args: readonly string[]): Promise<string> {
  * verbatim what the managed devenv `enterShell` runs. The environment carries
  * only what a developer machine has, so neither the CI branch nor the cowshed
  * branch can decide this run, except the CI branch when `ciSecrets` is set.
+ * Its temporary directory is the fixture's own root: `bun install` leaves a
+ * file there on every run, and it goes with the fixture.
  */
 function startShell(root: string, state: string, bin: string, options: EntryOptions): ShellProcess {
   return Bun.spawn({
@@ -328,6 +330,7 @@ function startShell(root: string, state: string, bin: string, options: EntryOpti
     cwd: root,
     env: {
       PATH: `${bin}:${process.env.PATH ?? ''}`,
+      TMPDIR: dirname(bin),
       ...(options.home === undefined
         ? {
             HOME: process.env.HOME,
@@ -1596,7 +1599,7 @@ describe('what shell entry keeps linked', () => {
             Bun.spawnSync({
               cmd: ['bun', 'install'],
               cwd: root,
-              env: { PATH: process.env.PATH, HOME: process.env.HOME, SMOO_NPM_TOKEN: 'npm' },
+              env: { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: dirname(root), SMOO_NPM_TOKEN: 'npm' },
               stdout: 'pipe',
               stderr: 'pipe',
             }).exitCode;
@@ -2814,6 +2817,7 @@ describe('a shell direnv keeps loaded', () => {
     const base: Record<string, string> = {
       PATH: `${devenvBin}:${process.env.PATH ?? ''}`,
       HOME: home,
+      TMPDIR: dirname(root),
       XDG_CONFIG_HOME: join(home, '.config'),
       XDG_DATA_HOME: join(home, '.local', 'share'),
       XDG_CACHE_HOME: join(home, '.cache'),
@@ -2942,10 +2946,10 @@ async function publishedRegistry(): Promise<PublishedRegistry> {
   const tgz = join(scratch, 'payload-1.0.0.tgz');
   const packed = Bun.spawnSync(['tar', '-czf', tgz, '-C', join(scratch, 'stage'), 'package']);
   if (packed.exitCode !== 0) {
-    throw new Error('tar failed: ' + new TextDecoder().decode(packed.stderr));
+    throw new Error(`tar failed: ${new TextDecoder().decode(packed.stderr)}`);
   }
   const real = new Uint8Array(readFileSync(tgz));
-  const integrity = 'sha512-' + new Bun.CryptoHasher('sha512').update(real).digest('base64');
+  const integrity = `sha512-${new Bun.CryptoHasher('sha512').update(real).digest('base64')}`;
   const tampered = Uint8Array.from(real);
   const last = tampered.length - 1;
   tampered[last] = (tampered[last] ?? 0) ^ 0xff;
@@ -2964,7 +2968,7 @@ async function publishedRegistry(): Promise<PublishedRegistry> {
               name: '@acme/payload',
               version: '1.0.0',
               dist: {
-                tarball: url.origin + '/tarball/payload-1.0.0.tgz',
+                tarball: `${url.origin}/tarball/payload-1.0.0.tgz`,
                 integrity,
               },
             },
@@ -2978,7 +2982,7 @@ async function publishedRegistry(): Promise<PublishedRegistry> {
     },
   });
   return {
-    origin: 'http://127.0.0.1:' + server.port,
+    origin: `http://127.0.0.1:${server.port}`,
     tamper: (on: boolean) => {
       served = on ? tampered : real;
     },
@@ -2997,7 +3001,7 @@ function packageState(dir: string): Record<string, string> {
       const path = join(current, entry);
       const key = relative(dir, path);
       const stat = lstatSync(path);
-      if (stat.isSymbolicLink()) state[key] = 'link -> ' + readlinkSync(path);
+      if (stat.isSymbolicLink()) state[key] = `link -> ${readlinkSync(path)}`;
       else if (stat.isDirectory()) walk(path);
       else state[key] = readFileSync(path, 'utf8');
     }
@@ -3038,8 +3042,9 @@ function setupRun(root: string, cargoHome: string, args: readonly string[]): She
     cmd: ['bun', join(root, 'tooling', 'direnv', 'setup-environment.ts'), ...args],
     cwd: root,
     env: {
-      PATH: join(scratch, 'bin') + ':' + (process.env['PATH'] ?? ''),
+      PATH: `${join(scratch, 'bin')}:${process.env['PATH'] ?? ''}`,
       HOME: process.env['HOME'],
+      TMPDIR: scratch,
       CARGO_HOME: cargoHome,
       XDG_CACHE_HOME: join(scratch, 'xdg-cache'),
       // The private cache lives inside this checkout: the repair contract
@@ -3069,7 +3074,7 @@ describe('explicit missing-payload repair', () => {
         ...options,
         dependencies: { '@acme/payload': '1.0.0', ...options.dependencies },
         files: {
-          '.npmrc': '@acme:registry=' + registry.origin + '\n',
+          '.npmrc': `@acme:registry=${registry.origin}\n`,
           // The repo's own proven install declaration, verbatim: isolated linker
           // plus the global store, whose root is this fixture's private
           // BUN_INSTALL_CACHE_DIR. That is what produces the measured topology —
@@ -3090,7 +3095,7 @@ describe('explicit missing-payload repair', () => {
           links.length === 0
             ? ''
             : 'linked to local checkouts: ' +
-              links.map(([name, to]) => name + ' -> ' + resolve(repository.root, to)).join(', ') +
+              links.map(([name, to]) => `${name} -> ${resolve(repository.root, to)}`).join(', ') +
               '\n';
         expect(await finished(setupRun(repository.root, repository.cargoHome, []))).toEqual({
           exitCode: 0,
@@ -3288,7 +3293,7 @@ describe('explicit missing-payload repair', () => {
         // The install inputs drift after the witness was recorded. The repair is
         // not an install: the stale inputs and the witness's recorded digests
         // stay exactly as they are, while the missing file is restored.
-        await edit(join(root, 'package.json'), readFileSync(join(root, 'package.json'), 'utf8') + '\n');
+        await edit(join(root, 'package.json'), `${readFileSync(join(root, 'package.json'), 'utf8')}\n`);
         const witness = readFileSync(receipt, 'utf8');
         const stale = readFileSync(join(root, 'package.json'), 'utf8');
         await rm(installed);
@@ -3328,9 +3333,9 @@ describe('explicit missing-payload repair', () => {
           join(dirname(cargoHome), 'bin', 'cp'),
           [
             '#!/usr/bin/env bash',
-            JSON.stringify(realCp) + ' "$@"',
+            `${JSON.stringify(realCp)} "$@"`,
             'status=$?',
-            JSON.stringify(realChmod) + ' 555 ' + JSON.stringify(parent),
+            `${JSON.stringify(realChmod)} 555 ${JSON.stringify(parent)}`,
             'exit $status',
             '',
           ].join('\n'),
@@ -3361,7 +3366,7 @@ describe("what shell entry relinks in Bun's store", () => {
         {
           dependencies: { '@acme/payload': '1.0.0' },
           files: {
-            '.npmrc': '@acme:registry=' + registry.origin + '\n',
+            '.npmrc': `@acme:registry=${registry.origin}\n`,
             // The repository's own install declaration: node_modules/.bun/<entry> links into the private install
             // cache setupRun names.
             'bunfig.toml': '[install]\nlinker = "isolated"\nglobalStore = true\n',
@@ -3373,7 +3378,7 @@ describe("what shell entry relinks in Bun's store", () => {
           const store = join(root, 'node_modules', '.bun');
           const entry = join(store, '@acme+payload@1.0.0');
           const cached = readlinkSync(entry);
-          expect(cached.startsWith(join(root, '.bun-install-cache') + '/')).toBe(true);
+          expect(cached.startsWith(`${join(root, '.bun-install-cache')}/`)).toBe(true);
           expect(await check()).toBe(0);
 
           // A superseded variant of the same package and version, its cache entry gone: nothing installed reaches
@@ -3430,6 +3435,7 @@ describe('the project root a shell entry owns', () => {
       env: {
         PATH: process.env.PATH ?? '',
         HOME: process.env.HOME,
+        TMPDIR: dirname(checkout),
         ...(devenvRoot === undefined ? {} : { DEVENV_ROOT: devenvRoot }),
       },
       stdout: 'pipe',
