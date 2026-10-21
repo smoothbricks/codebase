@@ -23,6 +23,7 @@ mod inherited_git_locks;
 pub mod inherited_links;
 pub mod land_turn;
 pub mod landing;
+pub mod lease_holder;
 pub mod metadata;
 pub mod project_policy;
 pub mod project_retirement;

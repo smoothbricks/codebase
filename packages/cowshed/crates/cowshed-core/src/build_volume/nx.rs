@@ -550,7 +550,7 @@ pub fn tree_holds(root: &Path) -> io::Result<Vec<TreeHold>> {
 }
 
 /// Process-table walks this process has begun: every listing of all pids a holder census starts
-/// from (`all_pids`, `proc_listpidspath`, a `/proc` read). Never on an interval and never in a
+/// from ([`census_pids`] on macOS, a `/proc` read on Linux). Never on an interval and never in a
 /// supervisor's actor (02_workspaces.md, "Holders cowshed does not run"), which tests read
 /// through [`process_table_walks`].
 static PROCESS_TABLE_WALKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -624,11 +624,10 @@ pub fn holders(path: &Path) -> io::Result<Vec<Holder>> {
 }
 
 /// The processes with a descriptor open on each of `files`, in order, from one pass over the
-/// process table: each vnode descriptor's device and inode (`PROC_PIDFDVNODEINFO`) against each
-/// file's. Event-only opens hold nothing. A missing file has no holder. Not `proc_listpidspath`:
-/// it also walks every mapped region of every process, one call per region, so one query of one
-/// path cost 0.4-0.65 s on a loaded host, and its calls wait on each process's VM map while
-/// compilers and linkers remap it. A database or lock is only ever held through a descriptor.
+/// processes a census asks about ([`census_pids`]): each vnode descriptor's device and inode
+/// (`PROC_PIDFDVNODEINFO`) against each file's. Event-only opens hold nothing. A missing file has
+/// no holder. No mapped region is walked: a database or lock is only ever held through a
+/// descriptor.
 #[cfg(target_os = "macos")]
 fn descriptor_holders(files: &[PathBuf]) -> io::Result<Vec<Vec<Holder>>> {
     use std::os::unix::fs::MetadataExt;
@@ -645,7 +644,7 @@ fn descriptor_holders(files: &[PathBuf]) -> io::Result<Vec<Vec<Holder>>> {
         return Ok(held);
     }
     let vinfo_size = c_size::<VnodeFdinfo>()?;
-    for pid in all_pids()? {
+    for pid in census_pids()? {
         let mut holds = vec![false; files.len()];
         for fd in vnode_descriptors(pid)? {
             let Some(identity) = vnode_fd_identity(pid, fd, vinfo_size) else {
@@ -668,17 +667,184 @@ fn descriptor_holders(files: &[PathBuf]) -> io::Result<Vec<Vec<Holder>>> {
     Ok(held)
 }
 
-/// Every process holding anything on the volume mounted at `mount` -- an open file, its working
-/// directory, its executable -- which is what keeps `umount` answering `Resource busy`.
-/// Event-only opens (FSEvents, Spotlight) never block an unmount and are left out.
+/// Every process holding anything on the volume mounted at `mount` -- its working or root
+/// Every process holding anything on the volume mounted at `mount` -- its working or root
+/// directory, a thread's working directory, an open file, its executable or another mapped file --
+/// which is what keeps `umount` answering `Resource busy`. Event-only opens (FSEvents, Spotlight)
+/// never block an unmount and are left out. It is the walk libproc's `proc_listpidspath` makes
+/// with `PROC_LISTPIDSPATH_PATH_IS_VOLUME | PROC_LISTPIDSPATH_EXCLUDE_EVTONLY`, by device, over the
+/// processes a census asks about ([`census_pids`]) rather than libproc's own listing, which asks
+/// every process, a lifecycle operation's included ([`on_volume`]). A missing mount has none.
 #[cfg(target_os = "macos")]
 pub fn volume_holders(mount: &Path) -> io::Result<Vec<Holder>> {
-    const PROC_LISTPIDSPATH_PATH_IS_VOLUME: u32 = 1;
-    const PROC_LISTPIDSPATH_EXCLUDE_EVTONLY: u32 = 2;
-    listpidspath(
-        mount,
-        PROC_LISTPIDSPATH_PATH_IS_VOLUME | PROC_LISTPIDSPATH_EXCLUDE_EVTONLY,
-    )
+    use std::os::unix::fs::MetadataExt;
+    let device = match fs::metadata(mount) {
+        Ok(metadata) => metadata.dev(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut holders = Vec::new();
+    for pid in census_pids()? {
+        if on_volume(pid, device)? {
+            holders.push(Holder {
+                pid,
+                command: command_line(pid),
+            });
+        }
+    }
+    Ok(holders)
+}
+
+/// Whether `pid` holds anything on the volume of `device`, asked as `proc_listpidspath` asks it
+/// (xnu `libsyscall/wrappers/libproc/proc_listpidspath.c`): its working and root directory
+/// (`PROC_PIDVNODEPATHINFO`), its vnode descriptors ([`vnode_fd_identity`]), the working directory
+/// of each thread that has its own (only for a process the kernel flags `PROC_FLAG_THCWD`), then
+/// the first mapped region on the device, its executable's text included (one call,
+/// `PROC_PIDREGIONPATHINFO3`). A process that exited or is withheld from this user holds none.
+#[cfg(target_os = "macos")]
+fn on_volume(pid: libc::pid_t, device: u64) -> io::Result<bool> {
+    let on = |stat: &libc::vinfo_stat| u64::from(stat.vst_dev) == device;
+    let size = c_size::<libc::proc_vnodepathinfo>()?;
+    // SAFETY: `proc_vnodepathinfo` is plain C data, for which all zeros is a valid value; it is
+    // read only when the kernel fills all of it.
+    let mut directories: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    // SAFETY: `directories` is writable for exactly `size` bytes, its whole size.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            std::ptr::from_mut(&mut directories).cast(),
+            size,
+        )
+    };
+    if filled == size
+        && (on(&directories.pvi_cdir.vip_vi.vi_stat) || on(&directories.pvi_rdir.vip_vi.vi_stat))
+    {
+        return Ok(true);
+    }
+    let vinfo_size = c_size::<VnodeFdinfo>()?;
+    if vnode_descriptors(pid)?
+        .into_iter()
+        .any(|fd| vnode_fd_identity(pid, fd, vinfo_size).is_some_and(|(dev, _)| dev == device))
+    {
+        return Ok(true);
+    }
+    if thread_directories(pid)?.iter().any(on) {
+        return Ok(true);
+    }
+    // The private flavor `proc_listpidspath` asks for the first region whose file is on the device
+    // its argument names (xnu `bsd/sys/proc_info_private.h`).
+    const PROC_PIDREGIONPATHINFO3: libc::c_int = 23;
+    let size = c_size::<RegionWithPath>()?;
+    // SAFETY: `RegionWithPath` is plain C data, for which all zeros is a valid value; it is read
+    // only when the kernel fills all of it.
+    let mut region: RegionWithPath = unsafe { std::mem::zeroed() };
+    // SAFETY: `region` is writable for exactly `size` bytes, its whole size.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PIDREGIONPATHINFO3,
+            device,
+            std::ptr::from_mut(&mut region).cast(),
+            size,
+        )
+    };
+    Ok(filled == size && on(&region.prp_vip.vip_vi.vi_stat))
+}
+
+/// `sys/proc_info.h`'s `struct proc_regionwithpathinfo`, which libc 0.2 does not bind: the 96-byte
+/// `proc_regioninfo` (four `uint32_t`, a `uint64_t`, fourteen `uint32_t`, two `uint64_t`), then the
+/// region's file.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct RegionWithPath {
+    _prp_prinfo: [u64; 12],
+    prp_vip: libc::vnode_info_path,
+}
+
+/// The attributes of each thread working directory `pid`'s threads set of their own
+/// (`pthread_chdir_np`): none unless the kernel flags the process `PROC_FLAG_THCWD`, then one
+/// listing (`PROC_PIDLISTTHREADS`) and one call per thread (`PROC_PIDTHREADPATHINFO`).
+#[cfg(target_os = "macos")]
+fn thread_directories(pid: libc::pid_t) -> io::Result<Vec<libc::vinfo_stat>> {
+    // `sys/proc_info.h`; libc 0.2 binds none of the three.
+    const PROC_FLAG_THCWD: u32 = 0x100;
+    const PROC_PIDLISTTHREADS: libc::c_int = 6;
+    const PROC_PIDTHREADPATHINFO: libc::c_int = 10;
+    let size = c_size::<libc::proc_bsdinfo>()?;
+    // SAFETY: `proc_bsdinfo` is plain C data, for which all zeros is a valid value; it is read only
+    // when the kernel fills all of it.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is writable for exactly `size` bytes, its whole size.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::from_mut(&mut info).cast(),
+            size,
+        )
+    };
+    if filled != size || info.pbi_flags & PROC_FLAG_THCWD == 0 {
+        return Ok(Vec::new());
+    }
+    let mut capacity = 64usize;
+    let threads = loop {
+        let mut threads = vec![0u64; capacity];
+        let bytes = libc::c_int::try_from(capacity * size_of::<u64>()).map_err(io::Error::other)?;
+        // SAFETY: `threads` is writable for `bytes` bytes, its whole length.
+        let filled = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDLISTTHREADS,
+                0,
+                threads.as_mut_ptr().cast(),
+                bytes,
+            )
+        };
+        let Ok(filled) = usize::try_from(filled) else {
+            return Ok(Vec::new());
+        };
+        let count = filled / size_of::<u64>();
+        // A listing that filled the buffer may have been cut short: grow it and list again.
+        if count >= capacity {
+            capacity *= 4;
+            continue;
+        }
+        threads.truncate(count);
+        break threads;
+    };
+    let size = c_size::<ThreadWithPath>()?;
+    let mut directories = Vec::new();
+    for thread in threads {
+        // SAFETY: `ThreadWithPath` is plain C data, for which all zeros is a valid value; it is
+        // read only when the kernel fills all of it.
+        let mut info: ThreadWithPath = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is writable for exactly `size` bytes, its whole size.
+        let filled = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDTHREADPATHINFO,
+                thread,
+                std::ptr::from_mut(&mut info).cast(),
+                size,
+            )
+        };
+        if filled == size {
+            directories.push(info.pvip.vip_vi.vi_stat);
+        }
+    }
+    Ok(directories)
+}
+
+/// `sys/proc_info.h`'s `struct proc_threadwithpathinfo`, which libc 0.2 does not bind: a thread's
+/// `proc_threadinfo`, then its own working directory.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ThreadWithPath {
+    _pt: libc::proc_threadinfo,
+    pvip: libc::vnode_info_path,
 }
 
 /// Every process holding anything inside the directory tree at `root` -- its working directory
@@ -694,7 +860,7 @@ pub fn tree_holds(root: &Path) -> io::Result<Vec<TreeHold>> {
         Err(error) => return Err(error),
     };
     let mut holds = Vec::new();
-    for pid in all_pids()? {
+    for pid in census_pids()? {
         if let Some(hold) = hold_in_tree(pid, &root)? {
             holds.push(TreeHold {
                 holder: Holder {
@@ -915,8 +1081,23 @@ struct VnodeFdinfoWithPath {
 #[cfg(target_os = "macos")]
 const O_EVTONLY: u32 = 0x0000_8000;
 
+/// The processes a census asks about: every live pid but those a cowshed lifecycle operation runs
+/// in, as its lease records them ([`crate::lease_holder::running_lifecycle`]). Such a process can
+/// hold one of its descriptors' vnodes in one kernel call for a minute -- a fork rewriting its new
+/// build image's first block -- and every per-descriptor query of it waits that long; the
+/// operation's own leases and image locks already refuse what a census guards. The one walker
+/// every macOS census starts from, counted once per census ([`walk_begins`]).
+#[cfg(target_os = "macos")]
+fn census_pids() -> io::Result<Vec<libc::pid_t>> {
+    let running = crate::lease_holder::running_lifecycle();
+    Ok(all_pids()?
+        .into_iter()
+        .filter(|pid| !running.contains(pid))
+        .collect())
+}
+
 /// Every live pid the kernel lists (`proc_listallpids`, which answers a count of pids, not bytes),
-/// except pid 0. The listing grows until it fits, as `listpidspath`'s does.
+/// except pid 0. The listing grows until it fits.
 #[cfg(target_os = "macos")]
 fn all_pids() -> io::Result<Vec<libc::pid_t>> {
     walk_begins();
@@ -972,59 +1153,6 @@ fn executable(pid: libc::pid_t) -> Option<PathBuf> {
     // A negative length is the kernel naming nothing: the conversion fails and `None` follows.
     path.truncate(usize::try_from(length).ok()?);
     c_path(&path)
-}
-
-#[cfg(target_os = "macos")]
-fn listpidspath(path: &Path, pathflags: u32) -> io::Result<Vec<Holder>> {
-    walk_begins();
-    use std::os::unix::ffi::OsStrExt;
-    const PROC_ALL_PIDS: u32 = 1;
-    unsafe extern "C" {
-        fn proc_listpidspath(
-            kind: u32,
-            typeinfo: u32,
-            path: *const libc::c_char,
-            pathflags: u32,
-            buffer: *mut libc::c_void,
-            buffersize: libc::c_int,
-        ) -> libc::c_int;
-    }
-    let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-    let mut capacity = 256usize;
-    loop {
-        let mut pids = vec![0 as libc::pid_t; capacity];
-        let bytes = libc::c_int::try_from(capacity * size_of::<libc::pid_t>())
-            .map_err(|_| io::Error::other("process table too large"))?;
-        // SAFETY: `path_c` is NUL-terminated and `pids` is writable for `bytes` bytes.
-        let filled = unsafe {
-            proc_listpidspath(
-                PROC_ALL_PIDS,
-                0,
-                path_c.as_ptr(),
-                pathflags,
-                pids.as_mut_ptr().cast(),
-                bytes,
-            )
-        };
-        if filled < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let count = usize::try_from(filled).unwrap_or(0) / size_of::<libc::pid_t>();
-        if count == capacity {
-            capacity *= 4;
-            continue;
-        }
-        return Ok(pids[..count]
-            .iter()
-            .copied()
-            .filter(|&pid| pid > 0)
-            .map(|pid| Holder {
-                pid,
-                command: command_line(pid),
-            })
-            .collect());
-    }
 }
 
 /// `pid`'s argument vector joined by spaces (`KERN_PROCARGS2`), or its executable path, or a
@@ -2495,5 +2623,93 @@ mod tests {
         drop(listener);
         foreign.kill().unwrap();
         foreign.wait().unwrap();
+    }
+
+    /// A census asks nothing of a process a held lifecycle lease names with the unique id it has
+    /// now: [`census_pids`], the one walker, passes over it, so the descriptor, tree and volume
+    /// censuses never query a descriptor of it (a fork in its build image's first write held one
+    /// for 54-90 s). A foreign holder of the same file is still found by each census, this process
+    /// is asked whatever its lease says, and a record whose unique id another life has names
+    /// nothing, so a reused pid is asked again.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_census_asks_nothing_of_a_process_a_held_lifecycle_lease_names() {
+        let root = scratch("lifecycle-lease");
+        let sessions = root.join("store/acme/widget/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let database = root.join("T-v3.db");
+        fs::write(&database, b"").unwrap();
+        let hold = || {
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("exec 3<\"$0\"; read _")
+                .arg(&database)
+                .current_dir(&root)
+                .stdin(std::process::Stdio::piped())
+                .spawn_locked()
+                .unwrap()
+        };
+        let (mut lifecycle, mut foreign) = (hold(), hold());
+        let (lifecycle_pid, foreign_pid) = (lifecycle.id() as i32, foreign.id() as i32);
+        let own_pid = std::process::id() as i32;
+        let _own = fs::File::open(&database).unwrap();
+        let pids = |holders: &[Holder]| holders.iter().map(|holder| holder.pid).collect::<Vec<_>>();
+        while !{
+            let held = pids(&holders(&database).unwrap());
+            held.contains(&lifecycle_pid) && held.contains(&foreign_pid)
+        } {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let life = crate::runtime::job_groups::process_record(lifecycle_pid)
+            .unwrap()
+            .expect("the lifecycle stand-in runs")
+            .unique_id;
+        let record = |path: PathBuf, process: crate::lease_holder::Process| {
+            fs::write(path, serde_json::to_vec(&process).unwrap()).unwrap();
+        };
+        let fork = |unique_id| crate::lease_holder::Process {
+            pid: lifecycle.id(),
+            unique_id: Some(unique_id),
+            since: "2026-10-21T00:00:00Z".to_owned(),
+            command: "cowshed fork main topic".to_owned(),
+        };
+        record(sessions.join("topic.intent.lock"), fork(life));
+        record(
+            sessions.join("main.land.lock"),
+            crate::lease_holder::Process::this().unwrap(),
+        );
+        let censuses = || {
+            crate::lease_holder::with_stores(vec![root.join("store")], || {
+                (
+                    census_pids().unwrap(),
+                    pids(&holders(&database).unwrap()),
+                    pids(&tree_holders(&root).unwrap()),
+                    pids(&volume_holders(&root).unwrap()),
+                )
+            })
+        };
+        let (asked, held, tree, volume) = censuses();
+        assert!(
+            !asked.contains(&lifecycle_pid),
+            "the lifecycle process was asked"
+        );
+        assert!(asked.contains(&foreign_pid) && asked.contains(&own_pid));
+        for (census, found) in [("descriptor", &held), ("tree", &tree), ("volume", &volume)] {
+            assert!(
+                found.contains(&foreign_pid) && !found.contains(&lifecycle_pid),
+                "{census} census: {found:?}"
+            );
+        }
+        assert!(held.contains(&own_pid), "this process is asked: {held:?}");
+
+        record(sessions.join("topic.intent.lock"), fork(life + 1));
+        let (asked, held, _, _) = censuses();
+        assert!(asked.contains(&lifecycle_pid) && held.contains(&lifecycle_pid));
+
+        for child in [&mut lifecycle, &mut foreign] {
+            drop(child.stdin.take());
+            child.wait().unwrap();
+        }
+        fs::remove_dir_all(&root).unwrap();
     }
 }

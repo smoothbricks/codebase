@@ -573,7 +573,10 @@ image remains live and mounted throughout capture.
    stale-family selection, fallback or retry is allowed. RAW makes no fixed attach-latency guarantee. Before attach, the
    `first-write` step rewrites the clone's first block with the bytes it holds, which copies the source image's extent
    map (01a_apfs.md, "Clone cost follows extents, not size"). On a long-used main that costs tens of seconds, and under
-   host load a container-wide metadata stall follows it, until `cowshed defrag main` rewrites main contiguously.
+   host load a container-wide metadata stall follows it, until `cowshed defrag main` rewrites main contiguously. The
+   fork's process holds the clone's descriptor in that write the whole time, so a process-table census that asks about
+   it waits as long: measured 2026-10-21, 54-90 s for each of four forks, which stalled every guard and gate census on
+   the host. A census therefore asks nothing of a process a lifecycle lease names ("Holders cowshed does not run").
 4. On attach, fsck, mount or identity failure, refuse publication with the actual error and release the destination
    attachment or report its cleanup refusal; never detach the live source as a fallback.
 5. Rewrite `.cowshed/workspace.json` (`role: "workspace"`, `baseCommit` = source HEAD), mint a fresh `.cowshed/token`,
@@ -1349,6 +1352,21 @@ process it checks the working and root directory, then the executable, then each
 hold it finds. For each holder it then walks up the parents and reads the ledger once. It reads kernel process state and
 stats nothing on the mount but its root. A holder whose parent the kernel will not describe to this user is not shown to
 be cowshed's, so it stays a holder.
+
+A census asks nothing of a process a cowshed lifecycle operation runs in. The workspace's intent lease
+(`sessions/<ws>.intent.lock`, held for a create, fork, rename, adoption or retirement) and its land lease
+(`sessions/<ws>.land.lock`, held by a land or an `rm`) each record their holder's pid and kernel unique id
+(`p_uniqueid`) in the lease file, written after the holder takes the lease's `flock(2)` and emptied before it lets go
+(`lease_holder`). A pid is passed over only while a lease file of the host store names it with the unique id its process
+has now: a record that names no process, or whose pid another process has since taken, names nothing. This is positive
+evidence the holder wrote under its own lock, not a guess from the process tree. Such a process can sit in one kernel
+call for a minute holding one of its descriptors' vnodes (a fork's `first-write`, "`cowshed fork`" step 3), and it is no
+foreign holder: the operation's own leases and image locks already refuse the operations a census guards. The census's
+own process is always asked, whatever its leases say. Every census on macOS starts from this one list of pids, the
+volume census included, which walks the processes itself rather than through libproc's `proc_listpidspath`. The leases
+read are the host store's (`/private/cowshed/store/<owner>/<repo>/sessions`) only: a lifecycle operation in a test
+fixture's store elsewhere records its lease there, which no census reads, so it is asked like any other process and can
+still stall a concurrent census. Linux records no unique id and its census asks every process.
 
 A holder check belongs in front of a destructive operation and nowhere else: once per operation, in that operation's own
 context, never on an interval and never inside a supervisor's actor. `detach`, `rm`, the retirement a `land` ends with

@@ -1227,10 +1227,19 @@ impl LifecycleIntentJournal {
 /// on the same trash path. The journal cannot tell the two apart; an exclusive lock can. The
 /// executing process holds one per workspace for as long as it works on it, and the kernel
 /// releases it when that process ends, however it ends. Dropping it releases it at once: it is
-/// fenced, so no child still being spawned holds it (`fork_lock`).
+/// fenced, so no child still being spawned holds it (`fork_lock`). The holder records itself in the
+/// lease file ([`crate::lease_holder::Process`]) and empties it before it lets go, so a
+/// process-table census asks nothing of it while it works.
 #[derive(Debug)]
 pub struct IntentLease {
-    _file: Fenced<File>,
+    file: Fenced<File>,
+    path: PathBuf,
+}
+
+impl Drop for IntentLease {
+    fn drop(&mut self) {
+        crate::lease_holder::clear(&self.file, &self.path);
+    }
 }
 
 impl IntentLease {
@@ -1249,7 +1258,20 @@ impl IntentLease {
         let path = directory.join(format!("{workspace}{INTENT_LEASE_SUFFIX}"));
         let file = open_lock_file(&path)?;
         match file.try_lock() {
-            Ok(()) => Ok(Some(Self { _file: file })),
+            Ok(()) => {
+                let holder = crate::lease_holder::Process::this()
+                    .and_then(|holder| crate::lease_holder::record(&file, &holder))
+                    .map_err(|error| {
+                        CowshedError::environment_missing(
+                            format!(
+                                "cannot record the holder of lifecycle lease {}: {error}",
+                                path.display()
+                            ),
+                            "check controller storage permissions and retry",
+                        )
+                    });
+                holder.map(|()| Some(Self { file, path }))
+            }
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(error)) => Err(CowshedError::environment_missing(
                 format!("cannot lock lifecycle lease {}: {error}", path.display()),

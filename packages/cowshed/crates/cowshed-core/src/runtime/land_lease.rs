@@ -11,12 +11,13 @@
 //! So a land and an `rm` each hold `sessions/<workspace>.land.lock` exclusively for as long as
 //! they run, a `flock(2)` on a descriptor the process owns, so the kernel drops it when that
 //! process exits however it ends: a killed land never keeps a workspace from being removed. The
-//! file records which operation holds it, so the one refused names the one that holds it.
+//! file records which operation holds it, so the one refused names the one that holds it, and the
+//! holder's kernel unique id, so a process-table census asks nothing of it while it holds the lease
+//! (`crate::lease_holder`). The holder empties the record before it lets go.
 
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -47,21 +48,33 @@ impl Holding {
     }
 }
 
-/// What the lease file says about its holder.
+/// What the lease file says about its holder: the operation, and the process
+/// ([`crate::lease_holder::Process`]).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Holder {
     pub holding: Holding,
     pub pid: u32,
+    /// The holder's kernel unique id; absent in records earlier builds wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unique_id: Option<u64>,
     /// When it took the lease, as the deletion log writes times.
     pub since: String,
     pub command: String,
 }
 
-/// A held lease: dropping it, or the process ending, releases it. The file stays.
+/// A held lease: dropping it, or the process ending, releases it. The file stays, emptied of its
+/// record.
 #[derive(Debug)]
 pub struct LandLease {
-    _file: File,
+    file: File,
+    path: PathBuf,
+}
+
+impl Drop for LandLease {
+    fn drop(&mut self) {
+        crate::lease_holder::clear(&self.file, &self.path);
+    }
 }
 
 /// Take `workspace`'s lease for `holding`, or refuse naming whoever holds it.
@@ -86,20 +99,18 @@ pub fn take(sessions: &Path, workspace: &str, holding: Holding) -> Result<LandLe
         }
         Err(TryLockError::Error(error)) => return Err(lease_unavailable(&path, &error)),
     }
+    let process =
+        crate::lease_holder::Process::this().map_err(|error| lease_unavailable(&path, &error))?;
     let holder = Holder {
         holding,
-        pid: std::process::id(),
-        since: crate::storage::deletion_log::rfc3339_utc(SystemTime::now()),
-        command: std::env::args().collect::<Vec<_>>().join(" "),
+        pid: process.pid,
+        unique_id: process.unique_id,
+        since: process.since,
+        command: process.command,
     };
-    let bytes = serde_json::to_vec(&holder).map_err(|error| {
-        CowshedError::internal(format!("cannot encode the land lease holder: {error}"))
-    })?;
-    file.set_len(0)
-        .and_then(|()| file.seek(SeekFrom::Start(0)))
-        .and_then(|_| file.write_all(&bytes))
+    crate::lease_holder::record(&file, &holder)
         .map_err(|error| lease_unavailable(&path, &error))?;
-    Ok(LandLease { _file: file })
+    Ok(LandLease { file, path })
 }
 
 fn lease_unavailable(path: &Path, error: &std::io::Error) -> CowshedError {
