@@ -234,10 +234,11 @@ async function withManagedRepository(
     );
     await chmod(join(bin, 'uv'), 0o755);
     // cargo reduced to what setup-environment.ts can observe: it records its argv and the git low-speed limits it was
-    // given and, while the checkout holds `cargo-fails`, refuses the way a fetch without a registry does, and while it
-    // holds `cargo-stalls`, never answers, as a fetch whose git child stalls on an established connection does. A fetch
-    // that succeeds leaves what Cargo itself writes in its home — the package-cache lock and the registry — and
-    // nothing else, creating the home if it was not there.
+    // given and, while the checkout holds `cargo-fails`, refuses the way a fetch without a registry does. It never
+    // answers, as a fetch whose git child stalls on an established connection does, in one of two shapes: while the
+    // checkout holds `cargo-stalls` it is a tree that reports through pipes a case makes, and while it holds
+    // `cargo-hangs` it is one process that reports nothing. A fetch that succeeds leaves what Cargo itself writes in its
+    // home — the package-cache lock and the registry — and nothing else, creating the home if it was not there.
     await writeFile(
       join(bin, 'cargo'),
       [
@@ -248,6 +249,11 @@ async function withManagedRepository(
         'if [ -f cargo-fails ]; then',
         "  echo 'error: failed to download from `https://index.crates.io/config.json`' >&2",
         '  exit 101',
+        'fi',
+        'if [ -f cargo-hangs ]; then',
+        // One process, so a kill landing at any instant leaves nothing behind: a member forked while a group signal goes
+        // out can outlive it, and a case that asserts nothing about the stand-in must not leave one.
+        '  exec tail -f /dev/null',
         'fi',
         'if [ -f cargo-stalls ]; then',
         // Every process of this tree holds the write end of the lifetime pipe, so its end of file is the death of
@@ -2688,24 +2694,25 @@ describe('what shell entry fetches for a Cargo workspace', () => {
   });
 
   // A fetch whose git child stalls holds Cargo's package-cache lock until something ends it, so the step bounds it. The
-  // bound is the case's subject: the fixture's cargo never answers, so only the deadline ends it. The step must have run
-  // that one fetch and stopped at its failure, say which fetch it ended, past which deadline and holding which lock,
-  // and record nothing. A bound that starts at spawn races the child's first instruction, so the deadline is a margin
-  // beyond the fixture's start, not a tight value. That everything the fetch started dies with it is proved against a
-  // real process tree, with the clock held by hand, in cargo-fetch-run.test.ts.
-  const STALL_DEADLINE_MS = 2_000;
+  // bound is the case's subject: the fixture's cargo never answers, so only the deadline ends it. A bound that starts at
+  // spawn races the stand-in's first instruction and no event orders that ahead of a clock, so under load the stand-in
+  // can start after whatever deadline a case gives it. Nothing asserted here therefore depends on how far the stand-in
+  // got before the kill, the deadline is the least there is, and the stand-in is one process that can leave nothing
+  // behind wherever the kill lands. The case asserts what holds then: the entry returned (the bounded exit), said which
+  // fetch it ended, past which deadline and holding which lock, and stamped nothing. That a live process tree dies with
+  // its fetch is proved where events order it: with the clock held by hand and readiness through a pipe
+  // (cargo-fetch-run.test.ts), and through this script by the signal cases below.
+  const STALL_DEADLINE_MS = 1;
   for (const [mode, entry, exitCode] of [
     ['local', CARGO, 0],
     ['CI', { cargo: true, ciSecrets: { SMOO_NPM_TOKEN: 'registry-value', SMOO_TOKEN: 'shell-value' } }, 1],
   ] as const) {
     it(`ends a fetch that outlives its deadline and stamps nothing, in a ${mode} entry`, async () => {
       await withManagedRepository(
-        { workspaces: ['packages/*'], files: { ...CARGO_PROJECT, 'cargo-stalls': '' } },
-        async ({ cargoHome, xdgCache, enterShell: enter, cargoRuns }) => {
+        { files: { ...CARGO_PROJECT, 'cargo-hangs': '' } },
+        async ({ cargoHome, xdgCache, enterShell: enter }) => {
           const entered = await enter({ ...entry, deadlineMs: STALL_DEADLINE_MS });
           expect(entered.exitCode).toBe(exitCode);
-          // One fetch ran, and the step stopped at its failure: the second workspace was never fetched.
-          expect(cargoRuns()).toEqual([fetch('Cargo.toml')]);
           for (const fact of [
             'cargo fetch --locked --manifest-path Cargo.toml',
             `past its ${STALL_DEADLINE_MS} ms deadline`,
