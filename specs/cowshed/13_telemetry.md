@@ -82,6 +82,83 @@ it. This is what upgrades a first-party tool's traffic from tier-2 to tier-1 att
   04_sandbox.md) → worker→coordinator report → `grant` span (revision bump) → retry exec — is a single trace instead of
   four disconnected log lines across three files.
 
+## Native image observations
+
+The APFS host records `cowshed.image.write_first`, `cowshed.image.seed_capture`, `cowshed.image.clone` and
+`cowshed.image.retire` spans, plus `warn` rows when an image exceeds a budget. They are unconditional stderr diagnostics
+**and** Arrow rows in `<store>/telemetry/<yyyy-mm-dd>/image-<uuid>.arrow`, encoded by the existing `trace_columns` and
+`trace_segment` owners. These are host-local traces with unique trace/thread identities, not attributes relayed through
+`StepReport` into a caller's trace.
+
+Each capture observes both the source and the destination. An absent destination starts at zero; its delta describes the
+newly named clone's allocation, **not** newly allocated unique blocks. Retirement compares the canonical file with the
+renamed file in trash: a rename frees no extents or allocated bytes. This is the release/rename boundary, not the later
+background trash unlink. Missing files are explicitly `absent`; failed measurements are null with their cause, never
+zero. The extent count comes from `storage/apfs/extents.rs::count_extents`, the existing native `F_LOG2PHYS_EXT` walker.
+Allocation reuses that module's `allocated_bytes` (`st_blocks * 512`). Neither measures the mounted filesystem's
+contents, shared-block exclusivity, or bytes written.
+
+The custom columns are:
+
+- Identity: `operation`, `image_role` (`source`, `destination`, `image`), `image_path_before`, `image_path_after`,
+  `image_state_before`, `image_state_after`, `process_id`.
+- Layout: `extents_before`, `extents_after`, `extents_delta`, `allocated_bytes_before`, `allocated_bytes_after`,
+  `allocated_bytes_delta`. Deltas are signed after-minus-before values.
+- Time: `elapsed_us` covers only the operation; `measurement_us` reports the separate cost of reading both boundaries.
+  The span's start/end timestamps cover the operation, not counting or sealing.
+- I/O: `process_io_write_bytes_before`, `process_io_write_bytes_after`, `process_io_write_bytes_delta`,
+  `process_io_scope`, `process_io_error`. The existing macOS process sampler reads
+  `proc_pid_rusage(RUSAGE_INFO_V4).ri_diskio_byteswritten` immediately around the operation. Both log and trace carry
+  the literal scope: **"process-window, includes concurrent threads, excludes children and later async writes"**. It is
+  neither image-exclusive nor an upper bound. The source and destination rows of one capture repeat the same process
+  window; do not sum them. `RUSAGE_CHILDREN` cannot see an in-process write.
+- Failures: `measurement_error_before`, `measurement_error_after`, `error` (operation failure). A measurement or
+  publication failure never changes the operation's result.
+- Warning policy: `warning_reason`, `extents_warn`, `extents_delta_warn`, `allocated_bytes_warn`,
+  `allocated_bytes_delta_warn`.
+
+Absolute extent counts **at least 100,000** warn independently of growth **at least 10,000**. The measured
+435,459-extent, 281 GB image spent 60.8 seconds in first write; these budgets warn at 23% of that extent count or a
+single-operation increase of 2.3%. They are early-warning budgets, not a linear time prediction (another observed first
+write took 10.6 seconds). Allocation separately warns at **128 GiB absolute** or **8 GiB growth**, approximately 49% and
+3.1% of that 281 GB image. A high baseline warns before work begins even when the delta is zero. Shrinking does not
+trigger a growth warning. Each warning names the signal and the thresholds.
+
+One lazily started writer belongs to each native host. Its bounded queue holds 64 operations; `try_send` refuses and
+increments a failure count rather than waiting for the writer. It gathers for the same ten-second
+`PROCESS_SEAL_INTERVAL` as process telemetry, or 64 operations, then seals one segment. This is **per writer**, not per
+partition: a fork's several observations share a seal, not one `F_FULLFSYNC` per observation. Host drop closes the queue
+and joins the final flush, preserving the last accepted operation. Queue refusal, spawn failure and seal failure report
+a cumulative failed-observation count on stderr. A crash may lose the unsealed window, as with process telemetry.
+Before/after rows are published together after the operation; live waits remain visible in the existing lifecycle start
+diagnostics.
+
+Use the ordinary reader to inspect a trace (the date is the batch's first operation's UTC date):
+
+```sh
+python /path/to/lmao-q.py --dir "$STORE/telemetry/$DAY" traces
+python /path/to/lmao-q.py --dir "$STORE/telemetry/$DAY" trace <trace-id>
+```
+
+For an image's changes over a night, use that reader's existing loader, not a second Arrow decoder:
+
+```sh
+python - /path/to/lmao-q.py "$STORE/telemetry/$DAY" "$IMAGE" <<'PY'
+import runpy, sys
+from pathlib import Path
+q = runpy.run_path(sys.argv[1])
+rows = q["load_rows"](Path(sys.argv[2]))
+rows = rows[rows["message"].str.startswith("cowshed.image.", na=False)]
+rows = rows[rows["entry_type"].isin(["span-ok", "span-err"])]
+rows = rows[(rows["image_path_before"] == sys.argv[3]) | (rows["image_path_after"] == sys.argv[3])]
+print(rows.sort_values("timestamp")[[
+    "timestamp", "operation", "image_role", "extents_before", "extents_after", "extents_delta",
+    "allocated_bytes_before", "allocated_bytes_after", "allocated_bytes_delta", "elapsed_us",
+    "measurement_us", "process_io_write_bytes_delta", "process_io_scope", "warning_reason"
+]].to_string(index=False))
+PY
+```
+
 ## Process-tree spans
 
 The workspace supervisor records one `process.run` LMAO span for every process owned by a job, even a short-lived

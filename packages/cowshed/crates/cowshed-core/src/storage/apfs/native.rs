@@ -56,9 +56,11 @@ use super::{
     recovery_staging_mount, retired_image_below, split_retired_stem, volume_key,
 };
 use cowshed_os::timing::timed;
+use image_telemetry::{Image, ImageTelemetry};
 
 mod blank_template;
 mod build_volumes;
+mod image_telemetry;
 #[cfg(target_os = "macos")]
 mod re_adopt;
 pub use build_volumes::{
@@ -1335,6 +1337,7 @@ impl MountedRegistry {
 pub struct MacOsApfsExecutionHost<R> {
     backend: MacOsApfsBackend<R>,
     config: ApfsSubstrateConfig,
+    image_telemetry: ImageTelemetry,
     mounted: MountedRegistry,
     restore_failpoint: AtomicU8,
     mount_source: Arc<dyn KernelMountSource>,
@@ -1366,6 +1369,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     ) -> Result<Self, ApfsStorageError> {
         Ok(Self {
             backend: MacOsApfsBackend::new(runner),
+            image_telemetry: ImageTelemetry::new(&config.store_root),
             config,
             mounted: MountedRegistry::start()?,
             mount_source: Arc::new(mount_source),
@@ -1382,6 +1386,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     ) -> Result<Self, ApfsStorageError> {
         Ok(Self {
             backend: MacOsApfsBackend::new(runner),
+            image_telemetry: ImageTelemetry::new(&config.store_root),
             config,
             mounted: MountedRegistry::start()?,
             mount_source: Arc::new(mount_source),
@@ -4378,20 +4383,30 @@ where
         self.verify_controller_path(image)?;
         crate::metadata::validate_image_path(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        let io = |error| ApfsStorageError::Io {
-            operation: "rewrite the first block of a cloned image",
-            path: image.to_owned(),
-            source: error,
-        };
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(image)
-            .map_err(io)?;
-        // One APFS block: the unit a copy-on-write write replaces.
-        let mut block = [0_u8; 4096];
-        file.read_exact_at(&mut block, 0).map_err(io)?;
-        file.write_all_at(&block, 0).map_err(io)
+        self.image_telemetry.measure(
+            "write_first",
+            &[Image {
+                role: "image",
+                before: image,
+                after: image,
+            }],
+            || {
+                let io = |error| ApfsStorageError::Io {
+                    operation: "rewrite the first block of a cloned image",
+                    path: image.to_owned(),
+                    source: error,
+                };
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(image)
+                    .map_err(io)?;
+                // One APFS block: the unit a copy-on-write write replaces.
+                let mut block = [0_u8; 4096];
+                file.read_exact_at(&mut block, 0).map_err(io)?;
+                file.write_all_at(&block, 0).map_err(io)
+            },
+        )
     }
 
     fn validate_pending_clone(
@@ -5636,7 +5651,15 @@ where
         self.verify_controller_path(trash)?;
         Self::ensure_parent(trash)?;
         self.validate_staged_companion(&companion_path(canonical))?;
-        retire_payload(canonical, trash)
+        self.image_telemetry.measure(
+            "retire",
+            &[Image {
+                role: "image",
+                before: canonical,
+                after: trash,
+            }],
+            || retire_payload(canonical, trash),
+        )
     }
 
     fn reclaim_image(&self, image: &Path) -> Result<(), ApfsStorageError> {

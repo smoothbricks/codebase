@@ -263,7 +263,7 @@ fn remove_if_present(path: &Path) -> Result<(), ApfsStorageError> {
     }
 }
 
-fn allocated_bytes(image: &Path) -> Result<u64, ApfsStorageError> {
+pub(super) fn allocated_bytes(image: &Path) -> Result<u64, ApfsStorageError> {
     fs::metadata(image)
         .map(|metadata| metadata.blocks().saturating_mul(SECTOR_BYTES))
         .map_err(|error| io_error("inspect image allocation", image, error))

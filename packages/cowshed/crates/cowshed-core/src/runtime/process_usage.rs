@@ -519,6 +519,21 @@ fn own_counters(pid: libc::pid_t) -> io::Result<Option<OwnCounters>> {
     }))
 }
 
+/// The current process's observed disk-write counter, not an image or job total.
+/// Shares the native sampler with process spans; no children or later async writes.
+#[cfg(target_os = "macos")]
+pub(crate) fn own_process_write_bytes() -> io::Result<u64> {
+    // SAFETY: getpid has no pointer arguments or preconditions.
+    let counters = own_counters(unsafe { libc::getpid() })?
+        .ok_or_else(|| io::Error::other("current process has no rusage record"))?;
+    match counters.io {
+        ProcessStorageIo::Read { write_bytes, .. } => Ok(write_bytes.get()),
+        ProcessStorageIo::Unavailable { reason } => Err(io::Error::other(format!(
+            "process I/O unavailable: {reason:?}"
+        ))),
+    }
+}
+
 /// `struct mach_timebase_info` (`<mach/mach_time.h>`): one tick is `numer / denom` ns. The
 /// `libc` crate's declaration is deprecated in favor of another crate; this is all of it.
 #[cfg(target_os = "macos")]

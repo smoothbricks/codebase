@@ -9,7 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use super::{MacOsApfsExecutionHost, io_error};
+use super::{Image, MacOsApfsExecutionHost, io_error};
 use crate::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, LinkResolution,
     ReleaseClaim, link,
@@ -199,7 +199,26 @@ where
         let _creating = layout
             .hold_new(destination)
             .map_err(|error| io_error("hold a build volume while it is cloned", &hold, error))?;
-        if let Err(error) = self.capture_build_seed(&from, mount, &to) {
+        let operation = match record.role {
+            BuildVolumeRole::Seed { .. } => "seed_capture",
+            BuildVolumeRole::Linked { .. } | BuildVolumeRole::Unlinked => "clone",
+        };
+        if let Err(error) = self.image_telemetry.measure(
+            operation,
+            &[
+                Image {
+                    role: "source",
+                    before: &from,
+                    after: &from,
+                },
+                Image {
+                    role: "destination",
+                    before: &to,
+                    after: &to,
+                },
+            ],
+            || self.capture_build_seed(&from, mount, &to),
+        ) {
             // No image, so nothing will ever release this hold file.
             if !to.exists() {
                 remove_if_present(&hold)?;
@@ -518,13 +537,23 @@ where
             }
             self.backend.detach(&attachment, DetachIntent::Release)?;
         }
-        layout.trash_image(id).map_err(|error| {
-            io_error(
-                "move a released build volume image into its trash",
-                &image,
-                error,
-            )
-        })?;
+        self.image_telemetry.measure(
+            "retire",
+            &[Image {
+                role: "image",
+                before: &image,
+                after: &layout.trashed_image(id),
+            }],
+            || {
+                layout.trash_image(id).map_err(|error| {
+                    io_error(
+                        "move a released build volume image into its trash",
+                        &image,
+                        error,
+                    )
+                })
+            },
+        )?;
         if present {
             layout.journal_release(id, recorded.as_ref(), true);
         }

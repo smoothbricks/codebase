@@ -366,6 +366,12 @@ which every fork of the target holds while it clones the seed, so a reseed never
    snapshot; its later writes make the seed behind again. Dropping the capture claim only unlocks the source's hold; it
    never retires or deletes the source.
 
+Native capture, clone, first-write and release-to-trash operations record each image's extent count and allocated bytes
+before and after, their signed deltas, operation and measurement time, and explicitly process-window disk-write bytes.
+Absolute extent count and growth warn separately, before a high-count image incurs another fork's first write. See
+13_telemetry.md, "Native image observations", for thresholds and their measured basis, Arrow fields, batching and
+queries.
+
 Land already owns a shared GC hold on its quiet source. Its typed quiet capture retains the stopped supervisor socket
 lease that refuses replacement admission, from before the jobs stop through capture and adoption. It does not take a
 second exclusive claim, nor upgrade the shared hold: Darwin flock upgrades release and retake the lock and would reopen
