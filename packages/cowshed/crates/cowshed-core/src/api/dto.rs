@@ -4206,10 +4206,10 @@ pub struct GatewayStatus {
     /// Absent when no daemon answered `status`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_budget: Option<GatewayCpuBudget>,
-    /// An install that holds the install slot, and the gate jobs it waits for before it restarts
-    /// the gateway (05_gateway.md "The install slot"). Absent while no install holds the slot.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_install: Option<PendingInstall>,
+    /// True while an install holds the install slot (`dev.cowshed/install.lock`), read without
+    /// taking it (05_gateway.md "A pending install is visible"). Absent on the wire while free.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending_install: bool,
     /// The land queues with live tickets, one per repository, each first ticket holding its turn.
     /// Read without taking a turn; empty when no land is queued or the queues could not be read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -4218,17 +4218,6 @@ pub struct GatewayStatus {
     /// served.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub land_turns_error: Option<String>,
-}
-
-/// An install that holds the install slot, as `gateway status` observes it without taking the
-/// slot from it. It is also what the installer records while it waits for gates, so the two
-/// cannot disagree on its shape.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PendingInstall {
-    /// The gate jobs the installer waits for before it restarts the gateway, oldest first;
-    /// empty while it is not waiting for any.
-    pub waiting_for: Vec<GateJobRef>,
 }
 
 /// One repository's land queue as `gateway status` observes it: its live tickets in turn order,
@@ -4242,7 +4231,7 @@ pub struct LandTurnQueue {
     pub abandoned: Vec<crate::land_turn::TurnEvent>,
 }
 
-/// One gate job, as an installer that waits for it names it.
+/// One gate job that holds or wants CPU tokens, as the gateway's `gates_in_flight` names it.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GateJobRef {

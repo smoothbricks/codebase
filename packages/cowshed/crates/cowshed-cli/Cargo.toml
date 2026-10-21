@@ -35,6 +35,8 @@ tokio.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+# The install and restart decisions (src/agent_cycle.rs) are property-tested.
+proptest = "1"
 # Paused time: a test lets a day pass while a foreground exec still waits for its job.
 tokio = { workspace = true, features = ["test-util"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }

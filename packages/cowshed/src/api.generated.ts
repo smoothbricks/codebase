@@ -1011,7 +1011,7 @@ export type ForkRequest = {
 };
 
 /**
- * One gate job, as an installer that waits for it names it.
+ * One gate job that holds or wants CPU tokens, as the gateway's `gates_in_flight` names it.
  */
 export type GateJobRef = {
   /**
@@ -1068,10 +1068,10 @@ export type GatewayStatus = {
    */
   readonly cpuBudget?: GatewayCpuBudget;
   /**
-   * An install that holds the install slot, and the gate jobs it waits for before it restarts
-   * the gateway (05_gateway.md "The install slot"). Absent while no install holds the slot.
+   * True while an install holds the install slot (`dev.cowshed/install.lock`), read without
+   * taking it (05_gateway.md "A pending install is visible"). Absent on the wire while free.
    */
-  readonly pendingInstall?: PendingInstall;
+  readonly pendingInstall?: boolean;
   /**
    * The land queues with live tickets, one per repository, each first ticket holding its turn.
    * Read without taking a turn; empty when no land is queued or the queues could not be read.
@@ -1911,19 +1911,6 @@ export type OutputSummary = {
   readonly version: number & tags.Type<'uint32'> & tags.Maximum<65535>;
   readonly text: string;
   readonly truncated: boolean;
-};
-
-/**
- * An install that holds the install slot, as `gateway status` observes it without taking the
- * slot from it. It is also what the installer records while it waits for gates, so the two
- * cannot disagree on its shape.
- */
-export type PendingInstall = {
-  /**
-   * The gate jobs the installer waits for before it restarts the gateway, oldest first;
-   * empty while it is not waiting for any.
-   */
-  readonly waitingFor: ReadonlyArray<GateJobRef>;
 };
 
 export type PortBlock = {

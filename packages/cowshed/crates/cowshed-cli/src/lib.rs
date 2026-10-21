@@ -1,3 +1,4 @@
+pub mod agent_cycle;
 pub mod args;
 pub mod build_record;
 pub mod build_state;

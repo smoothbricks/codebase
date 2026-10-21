@@ -1261,7 +1261,7 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         recovering: None,
         stale_daemon: None,
         cpu_budget: None,
-        pending_install: None,
+        pending_install: false,
         land_turns: Vec::new(),
         land_turns_error: None,
     };
@@ -1345,19 +1345,20 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         serde_json::to_value(unanswered).unwrap()["cpuBudget"],
         json!({"unanswered":"gateway control rejected operation (InvalidRequest): unknown op"})
     );
-    // An install that holds the slot names the gate jobs it waits for; one not waiting names none.
+    // An install that holds the slot says so; a free slot says nothing.
     let pending = GatewayStatus {
-        pending_install: Some(PendingInstall {
-            waiting_for: vec![GateJobRef {
-                job: 3,
-                checkout: "/w/land".into(),
-            }],
-        }),
+        pending_install: true,
         ..status.clone()
     };
     assert_eq!(
         serde_json::to_value(&pending).unwrap()["pendingInstall"],
-        json!({"waitingFor":[{"job":3,"checkout":"/w/land"}]})
+        json!(true)
+    );
+    assert!(
+        serde_json::to_value(&status)
+            .unwrap()
+            .get("pendingInstall")
+            .is_none()
     );
     assert_eq!(
         serde_json::from_value::<GatewayStatus>(serde_json::to_value(&pending).unwrap()).unwrap(),

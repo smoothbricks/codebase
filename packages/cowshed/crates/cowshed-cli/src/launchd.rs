@@ -389,6 +389,10 @@ pub struct LaunchAgentSpec {
     standard_error_path: PathBuf,
     /// A finite soft limit with unlimited hard authority, inherited by descendants.
     soft_number_of_files: Option<u64>,
+    /// launchd `ExitTimeOut`: how long launchd lets the program exit after the SIGTERM of a
+    /// bootout or `kickstart -k` before it SIGKILLs it. `None` leaves launchd's default, 5 s
+    /// on macOS 26 (`launchctl print`: "exit timeout = 5").
+    exit_timeout: Option<std::time::Duration>,
 }
 
 /// Everything that varies between one agent definition and another.
@@ -459,6 +463,7 @@ impl LaunchAgentSpec {
             lifecycle,
             standard_error_path,
             soft_number_of_files: None,
+            exit_timeout: None,
         })
     }
 
@@ -487,6 +492,9 @@ impl LaunchAgentSpec {
         // A finite kernel-sized soft limit keeps sysconf(_SC_OPEN_MAX) usable by fd-closing tools.
         // Hard authority remains Darwin's RLIM_INFINITY, owned by the service, not child spawns.
         spec.soft_number_of_files = Some(245_760);
+        // launchd's 5 s default SIGKILLed a draining gateway mid-drain (measured 2026-10-22), so
+        // the agent states the bound the daemon's own drain is sized within.
+        spec.exit_timeout = Some(cowshed_gateway_types::GATEWAY_EXIT_TIMEOUT);
         Ok(spec)
     }
 
@@ -651,6 +659,15 @@ impl LaunchAgentSpec {
                 )
                 .expect("writing into a String cannot fail");
             }
+        }
+        if let Some(exit_timeout) = self.exit_timeout {
+            use std::fmt::Write as _;
+            writeln!(
+                plist,
+                "  <key>ExitTimeOut</key>\n  <integer>{}</integer>",
+                exit_timeout.as_secs()
+            )
+            .expect("writing into a String cannot fail");
         }
         plist.push_str("</dict>\n</plist>\n");
         plist.into_bytes()
@@ -1437,9 +1454,20 @@ pub fn service_target(uid: u32, label: &str) -> String {
     format!("{}/{label}", gui_domain(uid))
 }
 
-/// User-facing `launchctl kickstart -k` guidance for a per-user agent.
+/// User-facing `launchctl kickstart -k` guidance for a per-user agent that is loaded.
 pub fn kickstart_hint(uid: u32, label: &str) -> String {
     format!("launchctl kickstart -k {}", service_target(uid, label))
+}
+
+/// User-facing guidance that loads a per-user agent launchd does not hold: `kickstart` answers
+/// such an agent "Could not find service" (exit 113), so only a bootstrap of its plist brings it
+/// back.
+pub fn bootstrap_hint(uid: u32, target: &LaunchAgentTarget) -> String {
+    format!(
+        "launchctl bootstrap {} '{}'",
+        gui_domain(uid),
+        target.plist_path().display()
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

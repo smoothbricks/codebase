@@ -875,6 +875,7 @@ dependencies = [
  "cowshed-os",
  "cowshed-shell",
  "libc",
+ "proptest",
  "rcgen",
  "serde",
  "serde_json",

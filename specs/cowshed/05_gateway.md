@@ -188,25 +188,47 @@ a link, the copy it names is already stored; when it is the plain binary the lay
 left, that binary is first stored under its own digest through the same copy and rename. It stores the new copy, moves
 the stable name, records the source and the build record, and activates the agent. A failed activation points the stable
 name back at the retained copy, records `cowshed-source` as restored, and loads the agent again; the error says what
-failed and whether the restore and the reload did. A first install has nothing to roll back to and keeps its copy. A
-setup on a host with no gateway agent installs the same way without the activation. Setup installs only after its
-storage repair succeeded.
+failed and whether the restore and the reload did. The reload takes the one step what launchd holds allows: an agent it
+does not hold is bootstrapped from its plist, since `kickstart` answers it "Could not find service" (exit 113); one it
+holds is kickstarted; one whose bootout went overdue (below) is left alone and named, since a kickstart of a job still
+in teardown is launchctl 37, "operation already in progress". A first install has nothing to roll back to and keeps its
+copy. A setup on a host with no gateway agent installs the same way without the activation. Setup installs only after
+its storage repair succeeded.
 
-**An install waits for the gates in flight.** Activating the agent restarts a gateway that runs, and so does the host
-move inside `setup`; a restart closes every lease connection ("Crash safety by connection"), a land's gate-job pool with
-them, and every task that gate admits afterwards is refused. Measured 2026-10-18: an install restarted the gateway at
-17:00 while a land's gate ran, its next tasks failed with
-`cpu-tokens parent pool refused: the gateway closed the lease connection`, and the land failed. So an install — holding
-the slot, after its refusals and before the activation or host move that would restart a gateway that answers `status` —
-first waits until that gateway's `cpu-budget` ledger shows no gate-class work holding or wanting tokens (`gateJobs` and
-`gateQueue` both empty, "Host CPU budget", Wire). It reads those two fields alone, each entry's `checkout` and `job`,
-and nothing else of the ledger: the gateway it is about to replace is of another build, and a ledger field one build has
-and the other lacks must not turn the wait into a restart that cuts a gate off. It reads the ledger once a second, with
-no deadline, as no admission has one ("No admission deadline"): the gates end, and the install goes on. It says on
-stderr which gate jobs it waits for (`gate job <n> at <checkout>`), once and again whenever they change, and when none
-is left. A gateway that does not answer `cpu-budget` is not waited on, and the install says so. An install that restarts
-nothing (no daemon answers, or the refresh finds the agent current) does not wait. The restart and its refusals
-themselves are unchanged.
+**A restart waits for the old gateway's exit, within launchd's own bound.** An activation that boots the agent out (a
+changed plist, a daemon running other bytes) and `gateway stop` wait until the old daemon has exited — the kernel's
+`NOTE_EXIT`, watched from before the bootout signals it, which it posts once the process has released every descriptor,
+its listeners included — and launchd no longer holds the job. launchd SIGKILLs a process its bootout's SIGTERM has not
+ended at the agent's exit timeout, so that is the only bound: the exit timeout of the definition launchd loaded, read
+from `launchctl print`, plus 1 s its unload may trail its kill by. Past it the bootout is overdue, an
+`environment-missing` error naming what is left — the pid that has not exited, or the job launchd still holds — with the
+bootstrap that loads the agent once that has gone. The gateway plist states `ExitTimeOut` 30 s (`GATEWAY_EXIT_TIMEOUT`),
+and the daemon's drain force-stops what it accepted after 20 s (`GATEWAY_DRAIN_WITHIN`), so the drain, its force stop
+and the audit flush finish before launchd's kill. Measured 2026-10-22: launchd's default exit timeout is 5 s; the plist
+stated none, so a bootout SIGKILLed a draining gateway 5.03 s after its SIGTERM, while the install's own wait, a fixed 5
+s, gave up 0.03 s earlier and reported the bootout stuck; its restore then kickstarted the job still in teardown
+(launchctl 37), and launchd dropped it a moment later, leaving the host with no gateway.
+
+**An install refuses while a land or a gate runs.** Activating the agent restarts a gateway that runs, and so does the
+host move inside `setup`; a restart closes every lease connection ("Crash safety by connection"), a land's gate-job pool
+with them, and every task that gate admits afterwards is refused. Measured 2026-10-18: an install restarted the gateway
+at 17:00 while a land's gate ran, its next tasks failed with
+`cpu-tokens parent pool refused: the gateway closed the lease connection`, and the land failed. Between a land's
+commands nothing of it shows in the ledger, and a restart there refuses its next command's connection ("A land step
+waits for an install in progress"). So an install — holding the slot, after its build refusals and before it installs
+anything that would restart a gateway that answers `status` — refuses with `Conflict`, naming each blocker, while a land
+holds its repository's turn (the first live ticket under `dev.cowshed/land-turn/<repo>/`, "Land turns": its workspace,
+ticket and pid) or that gateway's `cpu-budget` ledger shows gate-class work holding or wanting tokens (`gateJobs` and
+`gateQueue`, each entry's `checkout` and `job`: `gate job <n> at <checkout>`). It never waits for them, and the refusal
+leaves the host as it was; the hint is to rerun once they have ended, and `cowshed gateway status` lists both. A land
+queued behind the turn's holder runs nothing yet and is not a blocker: its first command waits for the slot. Land turns
+that cannot be read refuse too, naming the directory: not knowing whether a land runs is no permission. The install
+reads only those two ledger fields: the gateway it is about to replace is of another build, and a field one build has
+and the other lacks must not turn the check into a restart that cuts a gate off. A gateway that does not answer
+`cpu-budget` names no gate job, and the install says so. An install that restarts nothing (no daemon answers, or the
+refresh finds the agent current) checks nothing. This replaces a wait with no deadline for the gates in flight: measured
+2026-10-21, it held an install behind a gate of 2 h 26 min until the gate was killed, and operators took to granting
+installs a window by hand.
 
 **A land step waits for an install in progress.** The ledger shows a land only while one of its gates runs, and a land
 is several cowshed commands with none running between them: measured 2026-10-20, an install found the ledger empty as a
@@ -227,13 +249,12 @@ the installed bytes, its startup pass is over and it is not draining, the wait `
 slot at the restart is not enough: measured 2026-10-20, `setup` restarted the gateway and released the slot at once, and
 the land step that had waited on it found the daemon's socket refusing the connection, failing a land whose gate had
 passed. A land step never holds the slot for its run: it did once, and an install then waited on every land step in
-flight, between its gates as well as during them. An install still waits for a gate that holds or wants tokens ("An
-install waits for the gates in flight"), because a gate's CPU pool is gateway state a restart ends and is never carried
-across one; measured 2026-10-21, that wait is what held an install behind a gate of 2 h 26 min until the gate was
-killed. A job in flight lives in its workspace supervisor, which a gateway restart leaves running; what a restart breaks
-is a new connection to the daemon, and that is what waits. The ledger is never the guard against a restart between two
-of a land's commands: no process of that land holds anything the gateway records there. Status reads the slot without
-taking it.
+flight, between its gates as well as during them. An install refuses a gate that holds or wants tokens ("An install
+refuses while a land or a gate runs"), because a gate's CPU pool is gateway state a restart ends and is never carried
+across one. A job in flight lives in its workspace supervisor, which a gateway restart leaves running; what a restart
+breaks is a new connection to the daemon, and that is what waits. The ledger is never the guard against a restart
+between two of a land's commands, since no process of that land holds anything the gateway records there; its land turn
+is. Status reads the slot without taking it.
 
 **An install never refuses a client connection.** A restart closes every workspace listener until the next gateway's
 startup pass restores its session (5 s and more), and a stock client cannot wait for that: measured 2026-10-20, an
@@ -275,8 +296,8 @@ Past the bound the ask fails, naming the install's pid and binary and how long i
 refusal of any other code, or a connection closed with no answer, is never retried. Nothing of the old ledger is carried
 across: the retry is a fresh ask. A gate pool's child asks the host, since its pool ended with the old gateway, and says
 that it asks as background work; so does an ask that finds its pool absent after a restart. With no install serving the
-socket, or one of an older build, a restart cuts the queue off unnamed, as before. An install still waits for the gates
-in flight ("An install waits for the gates in flight"): a gate job's own grant ends with the restart, and its tasks'
+socket, or one of an older build, a restart cuts the queue off unnamed, as before. An install still refuses while a gate
+runs ("An install refuses while a land or a gate runs"): a gate job's own grant ends with the restart, and its tasks'
 later asks lose its class.
 
 **Pruning.** After an install succeeds (for the gateway, after its activation), every stored copy and build record but
@@ -297,11 +318,8 @@ who filled the slot.
 **A pending install is visible.** `cowshed gateway status` says when an install holds the slot, without taking it from
 the install: it tries a shared `flock(2)` on `install.lock` without blocking, which fails exactly while an install holds
 it, and lets go at once when it succeeds (an installer arriving in that instant waits for it as for any install, and
-says so). While it waits for gates ("An install waits for the gates in flight"), the holder records the gate jobs it
-waits for in `install.wait` beside the lock, written whole and renamed into place on every change and removed when the
-wait ends; an installer removes a record a dead holder left when it takes the slot, so while the slot is held the record
-is the holder's. Status reports `pendingInstall: { waitingFor: [{ job, checkout }] }` (empty while the holder waits for
-no gate), absent while the slot is free; `gateway start`'s own report, which holds the slot, carries none.
+says so). Status reports `pendingInstall: true` while the slot is held, absent while it is free; `gateway start`'s own
+report, which holds the slot, carries none.
 
 **Land turns.** A repository lands one land at a time, in the order the lands asked (tg#7385 keeps the per-repository
 serialization; FIFO, no priority). A bare `flock(2)` on one lock file serialized lands but never ordered them: the

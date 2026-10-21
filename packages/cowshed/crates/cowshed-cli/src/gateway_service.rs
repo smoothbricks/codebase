@@ -1,3 +1,4 @@
+use crate::agent_cycle::{self, Bootout, Held, LoadedAgent, Reload, Remains};
 use crate::args::GatewayCommand;
 use crate::build_record::{BuildRecord, unproven_refusal, unrecorded_refusal};
 use crate::install_basis::{self, InstallSlot};
@@ -16,14 +17,15 @@ use crate::path_entry::PathEntryOutcome;
 use async_trait::async_trait;
 use cowshed_core::api::Coordinator;
 use cowshed_core::api::{
-    EmptyResult, GateJobRef, GatewayCpuBudget, GatewayStatus as CliGatewayStatus, LandTurnQueue,
-    PendingInstall, StaleDaemonBinary,
+    EmptyResult, GatewayCpuBudget, GatewayStatus as CliGatewayStatus, LandTurnQueue,
+    StaleDaemonBinary,
 };
 use cowshed_core::host_dirs::support_directory;
 use cowshed_core::land_turn as turns;
 use cowshed_core::metadata::{NEW_PORT_BLOCK_SIZE, PortBlock};
 use cowshed_core::project_retirement::ProjectRetirementReport;
 use cowshed_core::repository::RepoId;
+use cowshed_core::runtime::job_groups::ExitWatch;
 use cowshed_core::runtime::supervisor_manager::{
     self, ProgramSpawner, SocketPeers, SupervisorManager,
 };
@@ -459,13 +461,9 @@ where
     }
 }
 
-/// How long to wait for `launchctl bootout` to actually finish.
-///
-/// launchd tears a service down asynchronously. Five seconds is generous for a process that has
-/// already been sent its termination signal and short enough that a genuinely wedged agent is
-/// reported rather than waited on.
-const BOOTOUT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
-const BOOTOUT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+/// How often a bootout reads launchd's hold on the job again, and how long each wait on the old
+/// process's exit lasts between those reads.
+const BOOTOUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 fn launch_agent_is_loaded<F, C>(
     executor: &mut LaunchdExecutor<F, C>,
@@ -479,6 +477,76 @@ where
         .execute_status(&crate::launchd::ControlPlan::print(uid, target))
         .map(|status| matches!(status, LaunchdServiceStatus::Loaded { .. }))
         .map_err(launchd_error)
+}
+
+/// The loaded agent's process and exit timeout, as `launchctl print` reports them; `None` when
+/// launchd does not hold the agent.
+fn loaded_agent<F, C>(
+    executor: &mut LaunchdExecutor<F, C>,
+    uid: u32,
+    target: &LaunchAgentTarget,
+) -> Result<Option<LoadedAgent>>
+where
+    C: LaunchctlCommand,
+{
+    match executor
+        .execute_status(&crate::launchd::ControlPlan::print(uid, target))
+        .map_err(launchd_error)?
+    {
+        LaunchdServiceStatus::NotLoaded { .. } => Ok(None),
+        LaunchdServiceStatus::Loaded { stdout, .. } => {
+            agent_cycle::parse_print(&String::from_utf8_lossy(&stdout))
+                .map(Some)
+                .map_err(|error| {
+                    CowshedError::environment_missing(
+                        format!("{} is loaded, but {error}", target.label()),
+                        format!(
+                            "read `launchctl print {}`",
+                            crate::launchd::service_target(uid, target.label())
+                        ),
+                    )
+                })
+        }
+    }
+}
+
+/// Why an agent was not activated: a step failed, or a bootout launchd did not finish by its own
+/// deadline. Kept apart because a restore after the second must not touch the agent launchd
+/// still tears down.
+#[derive(Debug)]
+enum ActivationError {
+    Failed(CowshedError),
+    BootoutOverdue {
+        label: String,
+        remains: Remains,
+        exit_timeout: Duration,
+        /// How the agent is loaded again once launchd has let go of it.
+        bootstrap: String,
+    },
+}
+
+// A method, not `From`: a second `From<_> for CowshedError` in this crate leaves every `?` on an
+// uninferred error type ambiguous.
+impl ActivationError {
+    fn into_error(self) -> CowshedError {
+        match self {
+            Self::Failed(error) => error,
+            Self::BootoutOverdue {
+                label,
+                remains,
+                exit_timeout,
+                bootstrap,
+            } => CowshedError::environment_missing(
+                format!(
+                    "launchd did not finish booting out {label} within its {}s exit timeout and \
+                     the {}s its unload may trail it by: {remains}",
+                    exit_timeout.as_secs(),
+                    agent_cycle::UNLOAD_GRACE.as_secs()
+                ),
+                format!("once that has gone, {bootstrap}"),
+            ),
+        }
+    }
 }
 
 /// Load the agent and leave launchd running *this* plist.
@@ -499,36 +567,84 @@ pub fn activate_launch_agent<F, C>(
 where
     C: LaunchctlCommand,
 {
-    if plist == InstallOutcome::Changed {
-        deactivate_launch_agent(executor, uid, target)?;
-    }
-    if !launch_agent_is_loaded(executor, uid, target)? {
-        if let Err(error) =
-            executor.execute_control(&crate::launchd::ControlPlan::bootstrap(uid, target))
-            && !launch_agent_is_loaded(executor, uid, target)?
-        {
-            return Err(launchd_error(error));
-        }
-        return Ok(());
-    }
-    executor
-        .execute_control(&crate::launchd::ControlPlan::kickstart(uid, target))
-        .map_err(launchd_error)?;
-    Ok(())
+    activate(executor, uid, target, plist).map_err(ActivationError::into_error)
 }
 
-/// Boot the agent out and wait until launchd agrees it is gone.
+fn activate<F, C>(
+    executor: &mut LaunchdExecutor<F, C>,
+    uid: u32,
+    target: &LaunchAgentTarget,
+    plist: InstallOutcome,
+) -> std::result::Result<(), ActivationError>
+where
+    C: LaunchctlCommand,
+{
+    if plist == InstallOutcome::Changed {
+        boot_out(executor, uid, target)?;
+    }
+    let held =
+        match launch_agent_is_loaded(executor, uid, target).map_err(ActivationError::Failed)? {
+            true => Held::Loaded,
+            false => Held::Absent,
+        };
+    load(executor, uid, target, agent_cycle::reload(held))
+}
+
+/// Take the one launchctl step that loads the agent again. A bootstrap that fails while launchd
+/// reports the agent loaded anyway loaded it: a `RunAtLoad` agent can race its own bootstrap.
+fn load<F, C>(
+    executor: &mut LaunchdExecutor<F, C>,
+    uid: u32,
+    target: &LaunchAgentTarget,
+    step: Reload,
+) -> std::result::Result<(), ActivationError>
+where
+    C: LaunchctlCommand,
+{
+    match step {
+        Reload::Bootstrap => {
+            if let Err(error) =
+                executor.execute_control(&crate::launchd::ControlPlan::bootstrap(uid, target))
+                && !launch_agent_is_loaded(executor, uid, target)
+                    .map_err(ActivationError::Failed)?
+            {
+                return Err(ActivationError::Failed(launchd_error(error)));
+            }
+            Ok(())
+        }
+        Reload::Kickstart => executor
+            .execute_control(&crate::launchd::ControlPlan::kickstart(uid, target))
+            .map(|_| ())
+            .map_err(|error| ActivationError::Failed(launchd_error(error))),
+        Reload::Blocked(remains) => {
+            Err(ActivationError::Failed(CowshedError::environment_missing(
+                format!(
+                    "{} is not loaded again: launchd still tears it down, and {remains}",
+                    target.label()
+                ),
+                format!(
+                    "once that has gone, {}",
+                    crate::launchd::bootstrap_hint(uid, target)
+                ),
+            )))
+        }
+    }
+}
+
+/// Boot the agent out and wait until its process has exited and launchd has dropped the job.
 ///
-/// The wait is the point. `launchctl bootout` returns before the service has finished tearing down,
-/// so a caller that immediately re-reads the load state can still see it loaded and take the
-/// "already loaded, kickstart it" branch — where `launchctl kickstart` answers 37, "operation
-/// already in progress", because the bootout it raced is still running. Observed twice on this
-/// host: a `setup` run failed on exactly that 37 and left the gateway agent unloaded, because the
-/// bootout had in fact succeeded.
-///
-/// Bounded and then given up on: an agent that will not leave the loaded state within the deadline
-/// is a launchd problem this function cannot fix, and returning the bootout's own error is more
-/// use than blocking. `Ok` when launchd never had it loaded, which is the common case.
+/// `launchctl bootout` returns before the service has finished tearing down: launchd sends
+/// SIGTERM and lets the process drain until the agent's exit timeout, then SIGKILLs it. So the
+/// wait is for the real condition, both halves of it: the kernel's word that the process exited,
+/// which it posts once the process has released every descriptor, its listeners included, and
+/// launchd's word that it no longer holds the job. Watched from before the bootout signals it,
+/// so no exit is missed and no later process given the pid is waited on. The only bound is
+/// launchd's own: the exit timeout of the definition it loaded, read from `launchctl print`, and
+/// the grace its unload may trail its kill by ([`agent_cycle::bootout_deadline`]). A bootout
+/// that outlives it is [`ActivationError::BootoutOverdue`], naming what is left. A fixed 5 s
+/// wait stood here; launchd's default exit timeout is also 5 s, so it gave up at the very
+/// instant launchd killed a draining gateway, and the restore that followed kickstarted a job
+/// still in teardown (launchctl 37). `Ok` when launchd never had the agent loaded.
 pub fn deactivate_launch_agent<F, C>(
     executor: &mut LaunchdExecutor<F, C>,
     uid: u32,
@@ -537,31 +653,67 @@ pub fn deactivate_launch_agent<F, C>(
 where
     C: LaunchctlCommand,
 {
-    if !launch_agent_is_loaded(executor, uid, target)? {
+    boot_out(executor, uid, target).map_err(ActivationError::into_error)
+}
+
+fn boot_out<F, C>(
+    executor: &mut LaunchdExecutor<F, C>,
+    uid: u32,
+    target: &LaunchAgentTarget,
+) -> std::result::Result<(), ActivationError>
+where
+    C: LaunchctlCommand,
+{
+    let Some(agent) = loaded_agent(executor, uid, target).map_err(ActivationError::Failed)? else {
         return Ok(());
-    }
+    };
+    let exit = match agent.pid {
+        Some(pid) => ExitWatch::of(pid)
+            .map_err(|error| {
+                ActivationError::Failed(CowshedError::internal(format!(
+                    "could not watch the exit of {}'s process {pid}: {error}",
+                    target.label()
+                )))
+            })?
+            .map(|watch| (pid, watch)),
+        None => None,
+    };
     let booted_out = executor.execute_control(&crate::launchd::ControlPlan::bootout(uid, target));
-    let deadline = std::time::Instant::now() + BOOTOUT_DEADLINE;
+    let started = std::time::Instant::now();
+    let mut running = exit.as_ref().map(|(pid, _)| *pid);
     loop {
-        if !launch_agent_is_loaded(executor, uid, target)? {
-            return Ok(());
+        if running.is_some()
+            && let Some((pid, watch)) = &exit
+            && watch.within(BOOTOUT_POLL_INTERVAL).map_err(|error| {
+                ActivationError::Failed(CowshedError::internal(format!(
+                    "could not wait for the exit of {}'s process {pid}: {error}",
+                    target.label()
+                )))
+            })?
+        {
+            running = None;
         }
-        if std::time::Instant::now() >= deadline {
-            // Still loaded after the deadline. If the bootout itself reported a failure, that is
-            // the honest explanation; otherwise say what was observed rather than inventing a cause.
-            return Err(match booted_out {
-                Err(error) => launchd_error(error),
-                Ok(_) => CowshedError::environment_missing(
-                    format!(
-                        "{} was booted out but launchd still reports it loaded after {}s",
-                        target.label(),
-                        BOOTOUT_DEADLINE.as_secs()
-                    ),
-                    kickstart_hint(uid, target.label()),
-                ),
-            });
+        // A process that still runs is launchd's job by definition; only once it exited is the
+        // job's unload asked.
+        let job_loaded = running.is_some()
+            || launch_agent_is_loaded(executor, uid, target).map_err(ActivationError::Failed)?;
+        match agent_cycle::bootout_progress(agent, running, job_loaded, started.elapsed()) {
+            Bootout::Done => return Ok(()),
+            Bootout::Overdue(remains) => {
+                // A bootout launchctl itself refused is the honest explanation of what is left.
+                return Err(match booted_out {
+                    Err(error) => ActivationError::Failed(launchd_error(error)),
+                    Ok(_) => ActivationError::BootoutOverdue {
+                        label: target.label().to_owned(),
+                        remains,
+                        exit_timeout: agent.exit_timeout,
+                        bootstrap: crate::launchd::bootstrap_hint(uid, target),
+                    },
+                });
+            }
+            Bootout::Waiting if running.is_none() => std::thread::sleep(BOOTOUT_POLL_INTERVAL),
+            Bootout::Waiting => {}
         }
-        std::thread::sleep(BOOTOUT_POLL_INTERVAL);
     }
 }
 
@@ -642,6 +794,12 @@ where
     })
     .await?;
     let bun = invoking_bun()?;
+    let client = GatewayControlClient::new(paths.control_socket.clone()).map_err(control_error)?;
+    // Activation restarts a gateway that runs; one that answers is refused the restart while a
+    // land or a gate of it runs, before the install changes anything.
+    if client.status().await.is_ok() {
+        refuse_restart_while_busy(slot, &home, &client, &mut io::stderr()).await?;
+    }
     install_nx_cache_server(&mut executor, &home, &candidate.source)?;
     let spec = LaunchAgentSpec::gateway(&executable, &bun).map_err(launchd_error)?;
     let observed = inspect_install_state(spec.target())?;
@@ -655,15 +813,10 @@ where
             }),
         },
     );
-    let client = GatewayControlClient::new(paths.control_socket.clone()).map_err(control_error)?;
-    // Activation restarts a gateway that runs; one that answers first sees its gates through.
-    if client.status().await.is_ok() {
-        wait_for_gates(slot, &client, &mut io::stderr()).await?;
-    }
     // Held until the restarted gateway serves: it took the listeners before it bound anything.
     let _carrying = carry_listeners(&paths.control_socket, downgrade);
     let written = executor.execute_install(&plan).map_err(launchd_error)?;
-    install_and_activate_gateway(&mut executor, &home, &candidate, &spec, written)?;
+    install_and_activate_gateway(&mut executor, &home, &candidate, spec.target(), written)?;
     let reported = await_healthy(
         output,
         slot,
@@ -723,13 +876,13 @@ const fn carry_listeners(_control_socket: &Path, _downgrade: Downgrade) -> Optio
 
 /// Wait until the gateway just activated serves: its control socket answers from the bytes
 /// `cli_sha256` names, its startup pass is over and it is not draining. The install holds
-/// `slot` throughout, so a land step that waited on the slot reaches a gateway that serves
+/// `_slot` throughout, so a land step that waited on the slot reaches a gateway that serves
 /// workspaces, never a socket nothing listens on yet (05_gateway.md "A land step waits for an
-/// install in progress"). launchd keeps the process it had when activation did not change the plist; that daemon
-/// is restarted once, after the gates in flight.
+/// install in progress"). launchd keeps the process it had when activation did not change the
+/// plist; that daemon is restarted once.
 async fn await_healthy<W, E, C>(
     output: &mut Output<W, E>,
-    slot: &InstallSlot,
+    _slot: &InstallSlot,
     client: &GatewayControlClient,
     control_socket: &Path,
     cli_sha256: &str,
@@ -768,8 +921,10 @@ where
                     // activation did not restart it onto the bytes just installed. Restart it
                     // once.
                     (None, Some(_), _) if !restarted => {
-                        wait_for_gates(slot, client, &mut io::stderr()).await?;
-                        // The start deadline is the daemon's to meet, not the gates'.
+                        // The land turns and gates were judged under this slot before the install
+                        // changed anything, and every land step since waits for the slot, so this
+                        // restart cuts nothing off. The start deadline is the new daemon's to
+                        // meet, not the old one's drain.
                         started = tokio::time::Instant::now();
                         activate_launch_agent(executor, uid, target, InstallOutcome::Changed)?;
                         restarted = true;
@@ -1042,12 +1197,12 @@ pub(crate) fn remove_path_entries(stable: &Path) -> Result<RemovalOutcome> {
 }
 
 /// Stop the gateway while setup moves its mirrors; the installed binary stays. A gateway that
-/// answers first sees its gates through ([`wait_for_gates`]): stopping it cuts them off as a
-/// restart does.
+/// answers is refused the stop while a land or a gate of it runs ([`refuse_restart_while_busy`]):
+/// stopping it cuts them off as a restart does.
 pub(crate) async fn stop_for_host_move(slot: &InstallSlot) -> Result<()> {
     let client = GatewayControlClient::new(control_socket_path()).map_err(control_error)?;
     if client.status().await.is_ok() {
-        wait_for_gates(slot, &client, &mut io::stderr()).await?;
+        refuse_restart_while_busy(slot, &canonical_home()?, &client, &mut io::stderr()).await?;
     }
     stop_service(false).map(|_| ())
 }
@@ -1188,81 +1343,51 @@ async fn read_cpu_budget(client: &GatewayControlClient) -> GatewayCpuBudget {
     }
 }
 
-/// How often an install that waits for gates reads the ledger again.
-const GATE_POLL: Duration = Duration::from_secs(1);
-
-/// Hold an install that is about to restart the running gateway until no gate-class work holds
-/// or wants CPU tokens (05_gateway.md "An install waits for the gates in flight").
+/// Refuse an install about to restart the running gateway while a land holds its repository's
+/// turn or a gate job holds or wants CPU tokens (05_gateway.md "An install refuses while a land
+/// or a gate runs"); the decision is [`agent_cycle::restart_blockers`]. It never waits for them,
+/// and it runs before the install changes anything, so a refusal leaves the host as it was.
 ///
-/// A restart closes every lease connection, and a gate's pool goes with it: every task that gate
-/// admits afterwards is refused ("cpu-tokens parent pool refused: the gateway closed the lease
-/// connection"), which killed a land mid-gate. The restart itself is unchanged ("Crash safety by
-/// connection"); the installer only picks a moment with no gate in flight. There is no deadline,
-/// as no admission has one (05 "No admission deadline"): the gates end, and the install goes on.
-/// The gate jobs waited for are said once, and again whenever they change, and recorded in the
-/// slot for `gateway status` until the wait ends. A gateway that does not answer `cpu-budget` is
-/// not waited on, and that is said too.
-async fn wait_for_gates(
-    slot: &InstallSlot,
+/// A restart closes every lease connection, and a gate's pool goes with it ("cpu-tokens parent
+/// pool refused: the gateway closed the lease connection" killed a land mid-gate); between a
+/// land's steps nothing of it shows in the ledger, and a restart there refused its next step's
+/// connection. Checked under the install slot, which every later land step waits for, so nothing
+/// this check did not see starts before the restart. The land turns are read from their tickets
+/// without taking a turn; a queue that cannot be read refuses too, since not knowing whether a
+/// land runs is no permission. A gateway that does not answer `cpu-budget`, a build from before
+/// it, names no gate job, and that is said.
+async fn refuse_restart_while_busy(
+    _slot: &InstallSlot,
+    home: &Path,
     client: &GatewayControlClient,
     stderr: &mut impl Write,
 ) -> Result<()> {
-    let waited = watch_gates(slot, client, stderr).await;
-    let cleared = slot.clear_wait();
-    waited.and(cleared)
-}
-
-async fn watch_gates(
-    slot: &InstallSlot,
-    client: &GatewayControlClient,
-    stderr: &mut impl Write,
-) -> Result<()> {
-    let mut named: Option<BTreeSet<GateJobRef>> = None;
-    loop {
-        let gates = match client.gates_in_flight().await {
-            Ok(gates) => gates,
-            Err(error) => {
-                return writeln!(
-                    stderr,
-                    "cowshed: restarting the gateway without waiting for gates: it does not answer cpu-budget: {error}"
-                )
-                .map_err(output_error);
-            }
-        };
-        if gates.is_empty() {
-            if named.is_some() {
-                writeln!(
-                    stderr,
-                    "cowshed: no gate job holds or wants CPU tokens any more; restarting the gateway"
-                )
-                .map_err(output_error)?;
-            }
-            return Ok(());
-        }
-        if named.as_ref() != Some(&gates) {
+    let root = turns::land_turn_root(&support_directory(home));
+    let lands = turns::observe_all(&root, u64::MAX).map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "this install cannot tell whether a land runs, so it changed nothing: the land \
+                 turns in {} cannot be read: {error}",
+                root.display()
+            ),
+            format!("make {} readable, then rerun", root.display()),
+        )
+    })?;
+    let gates = match client.gates_in_flight().await {
+        Ok(gates) => gates,
+        Err(error) => {
             writeln!(
                 stderr,
-                "cowshed: waiting to restart the gateway until no gate job holds or wants CPU tokens: {}",
-                gate_jobs_named(&gates)
+                "cowshed: the running gateway does not answer cpu-budget, so no gate job of it is known: {error}"
             )
             .map_err(output_error)?;
-            slot.record_wait(&PendingInstall {
-                waiting_for: gates.iter().cloned().collect(),
-            })?;
-            named = Some(gates);
+            BTreeSet::new()
         }
-        tokio::time::sleep(GATE_POLL).await;
+    };
+    match agent_cycle::refusal(&agent_cycle::restart_blockers(&lands, &gates)) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
     }
-}
-
-/// `gate job <n> at <checkout>, …`: how the installer and `gateway status` name the gate jobs an
-/// install waits for.
-fn gate_jobs_named<'a>(gates: impl IntoIterator<Item = &'a GateJobRef>) -> String {
-    gates
-        .into_iter()
-        .map(|gate| format!("gate job {} at {}", gate.job, gate.checkout))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// How often the daemon empties the store's build-volume trash, so an image a release moved
@@ -1619,7 +1744,7 @@ fn cli_status(
         // The ledger is a second request, asked only of a daemon that answered this one.
         cpu_budget: None,
         // The slot is observed beside the daemon, not asked of it.
-        pending_install: None,
+        pending_install: false,
         // The land queues are read beside the daemon, not asked of it.
         land_turns: Vec::new(),
         land_turns_error: None,
@@ -1699,9 +1824,11 @@ pub fn emit_gateway_status<W: Write, E: Write>(
             status.daemon_version.as_deref().unwrap_or("unavailable")
         ))
         .map_err(output_error)?;
-    if let Some(pending) = &status.pending_install {
+    if status.pending_install {
         output
-            .guidance(&pending_install_line(pending))
+            .guidance(
+                "gateway install pending: an install holds the install slot (dev.cowshed/install.lock)",
+            )
             .map_err(output_error)?;
     }
     for queue in &status.land_turns {
@@ -1736,21 +1863,6 @@ pub fn emit_gateway_status<W: Write, E: Write>(
         output.guidance(&line).map_err(output_error)?;
     }
     Ok(())
-}
-
-/// An install that holds the slot, in the operator's words: the restart it is about to make, and
-/// the gate jobs it waits for before making it.
-fn pending_install_line(pending: &PendingInstall) -> String {
-    match pending.waiting_for.as_slice() {
-        [] => {
-            "gateway install pending: an install holds the install slot (dev.cowshed/install.lock)"
-                .to_owned()
-        }
-        gates => format!(
-            "gateway install pending: an install holds the install slot (dev.cowshed/install.lock) and waits to restart the gateway until no gate job holds or wants CPU tokens: {}",
-            gate_jobs_named(gates)
-        ),
-    }
 }
 
 /// One repository's land queue in the operator's words: the ticket holding its turn, then the
@@ -2555,13 +2667,13 @@ pub fn restore_previous_executable(executable: &HostStableExecutable, retained: 
 /// The whole point is the last clause. `launchctl` failing after the copy is what left this host
 /// running a debug gateway with no agent: the binary had already been replaced, and nothing put it
 /// back. Activation is the step that can fail for reasons that have nothing to do with the bytes
-/// (exit 37, "operation already in progress", is the one that happened), so it is the step whose
-/// failure has to be recoverable.
+/// (a bootout launchd did not finish, a bootstrap it refused), so it is the step whose failure
+/// has to be recoverable.
 fn install_and_activate_gateway<F, C>(
     executor: &mut LaunchdExecutor<F, C>,
     home: &Path,
     candidate: &Candidate,
-    spec: &LaunchAgentSpec,
+    target: &LaunchAgentTarget,
     plist: InstallOutcome,
 ) -> Result<HostStableExecutable>
 where
@@ -2574,7 +2686,8 @@ where
     install_stored_executable(executor, &executable, &candidate.digest, &candidate.source)?;
     record_installed_source(&executable, &candidate.source);
     record_installed_build(&executable, candidate);
-    match activate_launch_agent(executor, effective_uid(), spec.target(), plist) {
+    let uid = effective_uid();
+    match activate(executor, uid, target, plist) {
         Ok(()) => {
             prune_superseded(
                 executor,
@@ -2584,30 +2697,15 @@ where
             );
             Ok(executable)
         }
-        Err(error) => Err(match retained {
+        Err(failure) => Err(match retained {
             Some(retained) => {
                 let rollback = restore_previous_executable(&executable, &retained);
                 record_installed_source(
                     &executable,
                     Path::new("restored after a failed activation"),
                 );
-                // Restoring the bytes is not enough: the failure that brought us here is a failed
-                // activation, so the agent is very likely unloaded, and a host with the right
-                // binary and no supervisor is still degraded. The plist is unchanged and names the
-                // restored path, so `NoChange` bootstraps it if launchd no longer holds it.
-                let reloaded = match activate_launch_agent(
-                    executor,
-                    effective_uid(),
-                    spec.target(),
-                    InstallOutcome::NoChange,
-                ) {
-                    Ok(()) => format!("{} is loaded again", spec.label()),
-                    Err(reload) => format!(
-                        "{} could NOT be reloaded ({})",
-                        spec.label(),
-                        reload.message
-                    ),
-                };
+                let reloaded = reload_restored(executor, uid, target, &failure);
+                let error = failure.into_error();
                 CowshedError::new(
                     error.code,
                     format!("{}; {rollback}; {reloaded}", error.message),
@@ -2616,8 +2714,51 @@ where
             }
             // Nothing to roll back to: this host had no installed binary before the run, so the
             // new copy is not a regression and deleting it would only hide the failed activation.
-            None => error,
+            None => failure.into_error(),
         }),
+    }
+}
+
+/// Load the agent again onto the restored build after `failure`, and say how that went.
+///
+/// Restoring the bytes is not enough: a host with the right binary and no supervisor is still
+/// degraded. The plist names the stable name, which the restore pointed back, so loading the agent
+/// runs the restored build. Which step loads it is decided by what launchd holds
+/// ([`agent_cycle::reload`]): an agent it does not hold is bootstrapped, since `kickstart` answers
+/// it "Could not find service" (exit 113); one it holds is kickstarted; one whose bootout went
+/// overdue is still in teardown and is left alone, since a kickstart of it is launchctl 37.
+fn reload_restored<F, C>(
+    executor: &mut LaunchdExecutor<F, C>,
+    uid: u32,
+    target: &LaunchAgentTarget,
+    failure: &ActivationError,
+) -> String
+where
+    C: LaunchctlCommand,
+{
+    let held = match failure {
+        ActivationError::BootoutOverdue { remains, .. } => Ok(Held::TearingDown(*remains)),
+        ActivationError::Failed(_) => {
+            launch_agent_is_loaded(executor, uid, target).map(|loaded| match loaded {
+                true => Held::Loaded,
+                false => Held::Absent,
+            })
+        }
+    };
+    match held.map(agent_cycle::reload) {
+        Ok(step) => match load(executor, uid, target, step) {
+            Ok(()) => format!("{} is loaded again", target.label()),
+            Err(reload) => format!(
+                "{} could NOT be reloaded ({})",
+                target.label(),
+                reload.into_error().message
+            ),
+        },
+        Err(error) => format!(
+            "{} could NOT be reloaded: launchd's hold on it is unknown ({})",
+            target.label(),
+            error.message
+        ),
     }
 }
 
@@ -2741,8 +2882,9 @@ struct IncomingBuild<'a> {
 
 /// [`refresh_gateway_binary`] with its inputs given. `gates` is the control client of a daemon
 /// that answered: every refresh that gets past the no-op return activates the agent, which
-/// restarts that daemon, so it first waits for the gates in flight ([`wait_for_gates`]). `bun` is
-/// asked only when a gateway agent is installed: a host without one needs no interpreter.
+/// restarts that daemon, so it is first refused while a land or a gate of that daemon runs
+/// ([`refuse_restart_while_busy`]). `bun` is asked only when a gateway agent is installed: a host
+/// without one needs no interpreter.
 async fn refresh_gateway_from<C: LaunchctlCommand>(
     home: &Path,
     incoming: IncomingBuild<'_>,
@@ -2797,20 +2939,28 @@ async fn refresh_gateway_from<C: LaunchctlCommand>(
             }));
         }
     }
+    let restarts = binary_is_stale || daemon_is_stale || !plan.is_noop();
+    // Before anything is installed: a refusal leaves the host as it was.
+    if restarts && let Some((slot, client)) = gates {
+        refuse_restart_while_busy(slot, home, client, &mut io::stderr()).await?;
+    }
     // The packaged Nx cache server is part of this build's install. A current agent is still
     // repaired, so this runs before the no-op return and before any activation: a missing
     // companion fails here rather than after the host has changed.
     install_nx_cache_server(executor, home, &candidate.source)?;
-    if !binary_is_stale && !daemon_is_stale && plan.is_noop() {
+    if !restarts {
         return Ok(None);
-    }
-    if let Some((slot, client)) = gates {
-        wait_for_gates(slot, client, &mut io::stderr()).await?;
     }
     let plist = executor.execute_install(&plan).map_err(launchd_error)?;
     if binary_is_stale {
         // Binary drift requires a restart even when the agent definition itself did not change.
-        install_and_activate_gateway(executor, home, candidate, &spec, InstallOutcome::Changed)?;
+        install_and_activate_gateway(
+            executor,
+            home,
+            candidate,
+            spec.target(),
+            InstallOutcome::Changed,
+        )?;
     } else if daemon_is_stale {
         activate_launch_agent(
             executor,
@@ -3977,7 +4127,7 @@ mod tests {
             &mut executor,
             &home,
             &second,
-            &spec,
+            spec.target(),
             InstallOutcome::Changed,
         )
         .expect_err("launchctl refuses");
@@ -4755,95 +4905,79 @@ mod tests {
             stream
         }
 
-        /// The measured failure: an install restarted the gateway mid-gate, and every task that
-        /// land admitted afterwards was refused. An install now waits until no gate job holds
-        /// or wants a token, names the gate jobs it waits for once and again when they change,
-        /// and goes on once none is left; with none in flight it goes on at once, silently.
-        /// Meanwhile `gateway status` sees the install hold the slot, and the gates it waits for.
+        /// The measured failures: an install restarted the gateway mid-gate, and every task that
+        /// land admitted afterwards was refused; an install restarted it between a land's steps,
+        /// and the next step's connection was refused. An install now refuses at once, before it
+        /// changes anything, while a gate job holds or wants a token or a land holds its turn,
+        /// naming each; with neither it goes on, silently. It never waits for them.
         #[tokio::test]
-        async fn an_install_waits_until_no_gate_job_holds_or_wants_cpu_tokens() {
+        async fn an_install_refuses_while_a_land_turn_or_a_gate_job_runs() {
             let heal = Arc::new(StartupHealState::mounting(0));
             heal.restored();
             let daemon = daemon(gateway_root("csgatewait"), &[], heal).await;
             let client = GatewayControlClient::new(daemon.socket.clone()).expect("client");
-            let support = daemon.root.join("dev.cowshed");
-            fs::create_dir(&support).expect("support directory");
-            assert_eq!(InstallSlot::observe(&support).expect("observe"), None);
-            let slot = Arc::new(InstallSlot::take(&support).await.expect("the slot"));
-            let observed = || InstallSlot::observe(&support).expect("observe");
-            let pending = |gates: &[(u64, &str)]| {
-                Some(PendingInstall {
-                    waiting_for: gates
-                        .iter()
-                        .map(|(job, checkout)| GateJobRef {
-                            job: *job,
-                            checkout: (*checkout).to_owned(),
-                        })
-                        .collect(),
-                })
-            };
-            assert_eq!(observed(), pending(&[]), "held, and waiting for nothing");
-
+            let home = daemon.root.to_path_buf();
+            let support = support_directory(&home);
+            fs::create_dir_all(&support).expect("support directory");
+            let slot = InstallSlot::take(&support).await.expect("the slot");
             let mut said = Vec::new();
-            wait_for_gates(&slot, &client, &mut said)
+            refuse_restart_while_busy(&slot, &home, &client, &mut said)
                 .await
-                .expect("no gate in flight");
+                .expect("nothing runs");
             assert!(said.is_empty(), "{}", String::from_utf8_lossy(&said));
 
-            let older = hold_gate(&daemon.socket, "/w/older-land").await;
-            let waiting = tokio::spawn({
-                let (slot, client) = (Arc::clone(&slot), client.clone());
-                async move {
-                    let mut said = Vec::new();
-                    wait_for_gates(&slot, &client, &mut said)
-                        .await
-                        .map(|()| said)
-                }
-            });
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            assert!(!waiting.is_finished(), "the install waits for the gate");
-            let older_job = observed().expect("held").waiting_for[0].job;
-            assert_eq!(observed(), pending(&[(older_job, "/w/older-land")]));
-            let younger = hold_gate(&daemon.socket, "/w/younger-land").await;
-            tokio::time::sleep(GATE_POLL * 2).await;
-            assert!(!waiting.is_finished(), "the install waits for both gates");
-            let both = observed().expect("held").waiting_for;
-            assert_eq!(both.len(), 2, "{both:?}");
-            assert_eq!(both[1].checkout, "/w/younger-land");
-            drop(older);
-            tokio::time::sleep(GATE_POLL * 2).await;
-            assert!(!waiting.is_finished(), "the younger gate still runs");
-            assert_eq!(observed(), pending(&[(both[1].job, "/w/younger-land")]));
-            drop(younger);
-            let said = waiting.await.expect("the wait task").expect("the wait");
-            let said = String::from_utf8(said).expect("utf-8");
-            let lines: Vec<&str> = said.lines().collect();
-            assert_eq!(lines.len(), 4, "{said}");
-            let waiting_for = |line: &str, checkouts: &[&str]| {
-                line.starts_with(
-                    "cowshed: waiting to restart the gateway until no gate job holds or wants CPU tokens: ",
-                ) && checkouts
-                    .iter()
-                    .all(|checkout| line.contains(&format!(" at {checkout}")))
-                    && line.matches(" at /w/").count() == checkouts.len()
-            };
-            assert!(waiting_for(lines[0], &["/w/older-land"]), "{said}");
+            let gate = hold_gate(&daemon.socket, "/w/gate-land").await;
+            let refused = refuse_restart_while_busy(&slot, &home, &client, &mut said)
+                .await
+                .expect_err("a gate job holds a token");
+            assert_eq!(refused.code, ErrorCode::Conflict);
             assert!(
-                waiting_for(lines[1], &["/w/older-land", "/w/younger-land"]),
-                "{said}"
+                refused.message.contains("gate job ")
+                    && refused.message.contains(" at /w/gate-land"),
+                "{}",
+                refused.message
             );
-            assert!(waiting_for(lines[2], &["/w/younger-land"]), "{said}");
-            assert_eq!(
-                lines[3],
-                "cowshed: no gate job holds or wants CPU tokens any more; restarting the gateway"
+            drop(gate);
+            // The gateway returns the tokens once it reads the lease connection's close.
+            while !client
+                .gates_in_flight()
+                .await
+                .expect("the gates")
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            let queue = turns::land_turn_root(&support).join("acme-widget");
+            let turn = tokio::task::spawn_blocking(move || {
+                turns::take(
+                    &queue,
+                    "widget-land",
+                    "land",
+                    None,
+                    Duration::from_secs(90),
+                    |_| {},
+                )
+            })
+            .await
+            .expect("the turn task")
+            .expect("the turn");
+            let refused = refuse_restart_while_busy(&slot, &home, &client, &mut said)
+                .await
+                .expect_err("a land holds its turn");
+            assert_eq!(refused.code, ErrorCode::Conflict);
+            assert!(
+                refused
+                    .message
+                    .contains("the land of widget-land holds the acme-widget land turn"),
+                "{}",
+                refused.message
             );
-            assert_eq!(
-                observed(),
-                pending(&[]),
-                "the wait is over; the install still holds the slot"
-            );
-            drop(slot);
-            assert_eq!(observed(), None, "the slot is free");
+            drop(turn);
+            refuse_restart_while_busy(&slot, &home, &client, &mut said)
+                .await
+                .expect("nothing runs any more");
+            assert!(said.is_empty(), "{}", String::from_utf8_lossy(&said));
 
             daemon.gateway.drain().await.expect("drain the gateway");
         }

@@ -7188,7 +7188,7 @@ mod tests {
                 cli_sha256: "b4223cd0".into(),
             }),
             cpu_budget: None,
-            pending_install: None,
+            pending_install: false,
             land_turns: Vec::new(),
             land_turns_error: None,
         };
@@ -7219,7 +7219,7 @@ mod tests {
             recovering: None,
             stale_daemon: None,
             cpu_budget: None,
-            pending_install: None,
+            pending_install: false,
             land_turns: Vec::new(),
             land_turns_error: None,
         });
@@ -7245,7 +7245,7 @@ mod tests {
             recovering: None,
             stale_daemon: None,
             cpu_budget: None,
-            pending_install: None,
+            pending_install: false,
             land_turns: Vec::new(),
             land_turns_error: None,
         });

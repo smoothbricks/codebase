@@ -408,7 +408,9 @@ impl Gateway {
             handle,
             actor: Some(actor),
             control,
-            drain_timeout: config.timeouts.request_total,
+            // Not `request_total` (15 min): launchd SIGKILLs a draining daemon at its agent's
+            // `ExitTimeOut`, so a drain past that bound is cut mid-way instead of finishing.
+            drain_timeout: cowshed_gateway_types::GATEWAY_DRAIN_WITHIN,
             repo_mirror,
             sim_broker,
             repo_mirror_task: Some(repo_mirror_task),

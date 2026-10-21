@@ -130,6 +130,8 @@ fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_bytes() {
         "    <key>NumberOfFiles</key>\n",
         "    <integer>9223372036854775807</integer>\n",
         "  </dict>\n",
+        "  <key>ExitTimeOut</key>\n",
+        "  <integer>30</integer>\n",
         "</dict>\n",
         "</plist>\n",
     );

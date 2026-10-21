@@ -20,12 +20,11 @@
 //!   shed itself removed, while main only moves forward.
 
 use crate::build_record::{BuildRecord, lost_commits_refusal, unproven_refusal};
-use cowshed_core::api::PendingInstall;
 use cowshed_core::git::GitRepository;
 use cowshed_core::runtime::project::DEFAULT_LANDING_BRANCH;
 use cowshed_core::{CowshedError, Result};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write as _};
+use std::io;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
@@ -35,17 +34,11 @@ use std::sync::Arc;
 /// what the slot holds, not the line to fill it.
 pub use cowshed_core::host_dirs::INSTALL_LOCK_NAME;
 
-/// What the slot's holder records while it waits for gates before restarting the gateway, beside
-/// the lock: a [`PendingInstall`]. Only the holder writes or removes it, and a holder removes one
-/// a crashed holder left when it takes the slot, so while the slot is held it is the holder's.
-pub const INSTALL_WAIT_NAME: &str = "install.wait";
-
 /// The install slot, held: an exclusive lock on [`INSTALL_LOCK_NAME`], which the kernel drops
 /// when this value is dropped or the process dies, so no crash leaves the slot held.
 #[derive(Debug)]
 pub struct InstallSlot {
     _lock: File,
-    support_directory: PathBuf,
 }
 
 impl InstallSlot {
@@ -84,57 +77,17 @@ impl InstallSlot {
             }
             Err(error) => return Err(slot_error(&path, "lock", &error)),
         };
-        let slot = Self {
-            _lock: lock,
-            support_directory: support_directory.to_path_buf(),
-        };
-        // A holder that died while it waited for gates left its record; the slot is ours now.
-        slot.clear_wait()?;
-        Ok(slot)
+        Ok(Self { _lock: lock })
     }
 
-    /// Record, for `gateway status`, the gate jobs this install waits for before it restarts
-    /// the gateway. Written whole and renamed into place, so a reader never sees half of one.
-    pub fn record_wait(&self, pending: &PendingInstall) -> Result<()> {
-        let path = self.support_directory.join(INSTALL_WAIT_NAME);
-        let partial = self
-            .support_directory
-            .join(format!("{INSTALL_WAIT_NAME}.partial"));
-        let bytes = serde_json::to_vec(pending).map_err(|error| {
-            CowshedError::internal(format!("could not encode {}: {error}", path.display()))
-        })?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&partial)
-            .map_err(|error| slot_error(&partial, "open", &error))?;
-        file.write_all(&bytes)
-            .map_err(|error| slot_error(&partial, "write", &error))?;
-        std::fs::rename(&partial, &path).map_err(|error| slot_error(&path, "rename", &error))
-    }
-
-    /// This install no longer waits for gates: remove its record.
-    pub fn clear_wait(&self) -> Result<()> {
-        let path = self.support_directory.join(INSTALL_WAIT_NAME);
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(slot_error(&path, "remove", &error)),
-        }
-    }
-
-    /// Whether an install holds the slot in `support_directory`, and what it waits for — read
-    /// without taking the slot from it.
+    /// Whether an install holds the slot in `support_directory` — read without taking the slot
+    /// from it.
     ///
     /// A shared `flock(2)` tried without blocking conflicts with the holder's exclusive one, so
     /// it fails exactly while an install holds the slot. When the slot is free it succeeds and
     /// is let go at once; an installer arriving in that instant waits for it as it would for any
-    /// install, and says so. While the slot is held, the holder's [`INSTALL_WAIT_NAME`] record
-    /// says which gate jobs it waits for; none means it is not waiting for any.
-    pub fn observe(support_directory: &Path) -> Result<Option<PendingInstall>> {
+    /// install, and says so.
+    pub fn observe(support_directory: &Path) -> Result<bool> {
         let path = support_directory.join(INSTALL_LOCK_NAME);
         let lock = match OpenOptions::new()
             .read(true)
@@ -143,29 +96,13 @@ impl InstallSlot {
         {
             Ok(lock) => lock,
             // No install ever took the slot on this host.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(slot_error(&path, "open", &error)),
         };
         match flock(&lock, libc::LOCK_SH | libc::LOCK_NB) {
-            Ok(()) => return Ok(None),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(slot_error(&path, "lock", &error)),
-        }
-        let record = support_directory.join(INSTALL_WAIT_NAME);
-        match std::fs::read(&record) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
-                CowshedError::integrity(
-                    format!(
-                        "the install wait record {} is unreadable: {error}",
-                        record.display()
-                    ),
-                    "it belongs to the install that holds the slot; let that install finish",
-                )
-            }),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Some(PendingInstall {
-                waiting_for: Vec::new(),
-            })),
-            Err(error) => Err(slot_error(&record, "read", &error)),
+            Ok(()) => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
+            Err(error) => Err(slot_error(&path, "lock", &error)),
         }
     }
 }
@@ -721,39 +658,28 @@ pub(crate) mod tests {
         );
     }
 
-    /// A holder that died while it waited for gates leaves its record and frees the slot: status
-    /// reads no install while the slot is free, whatever record lies beside it, and the next
-    /// holder removes the record when it takes the slot, so it never shows another's wait.
+    /// Status reads an install exactly while one holds the slot: true while a holder has it,
+    /// false once the holder lets it go, whether it finished or died.
     #[tokio::test]
-    async fn a_dead_holders_wait_record_is_never_read_as_the_live_install() {
-        let main = Main::new("slot-record");
-        let died = InstallSlot::take(&main.root).await.expect("first install");
-        died.record_wait(&PendingInstall {
-            waiting_for: vec![cowshed_core::api::GateJobRef {
-                job: 3,
-                checkout: "/w/land".into(),
-            }],
-        })
-        .expect("record the wait");
-        assert_eq!(
-            InstallSlot::observe(&main.root)
-                .expect("observe")
-                .map(|pending| pending.waiting_for.len()),
-            Some(1)
-        );
-        drop(died);
+    async fn status_reads_an_install_exactly_while_one_holds_the_slot() {
+        let main = Main::new("slot-observe");
         assert!(
-            main.root.join(INSTALL_WAIT_NAME).exists(),
-            "the record stays"
+            !InstallSlot::observe(&main.root).expect("observe"),
+            "no install ever took the slot"
         );
-        assert_eq!(InstallSlot::observe(&main.root).expect("observe"), None);
+        let held = InstallSlot::take(&main.root).await.expect("first install");
+        assert!(InstallSlot::observe(&main.root).expect("observe"), "held");
+        drop(held);
+        assert!(!InstallSlot::observe(&main.root).expect("observe"), "free");
         let next = InstallSlot::take(&main.root).await.expect("next install");
-        assert_eq!(
+        assert!(
             InstallSlot::observe(&main.root).expect("observe"),
-            Some(PendingInstall {
-                waiting_for: Vec::new()
-            })
+            "held again"
         );
         drop(next);
+        assert!(
+            !InstallSlot::observe(&main.root).expect("observe"),
+            "free again"
+        );
     }
 }

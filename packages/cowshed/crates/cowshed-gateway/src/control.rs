@@ -156,8 +156,8 @@ impl GatewayControlClient {
         response.cpu_budget.ok_or(ControlError::InvalidResponse)
     }
 
-    /// The gate jobs a gateway restart now would cut off (05_gateway.md, "An install waits for
-    /// the gates in flight"): every gate job whose runners hold tokens and every gate job a
+    /// The gate jobs a gateway restart now would cut off (05_gateway.md, "An install refuses
+    /// while a land or a gate runs"): every gate job whose runners hold tokens and every gate job a
     /// waiting request serves, oldest first. It reads `gateJobs` and `gateQueue` of the
     /// `cpu-budget` answer and nothing else of the ledger, so an install reads the gates of a
     /// running gateway of another build, whose ledger has fields this one lacks or does not know.
@@ -2630,10 +2630,10 @@ mod tests {
     }
 
     /// An install reads the gates of the gateway it is about to replace, which is of another
-    /// build (05_gateway.md "An install waits for the gates in flight"). A ledger that lacks a
-    /// field this build reports (here `holders`, with a `running` this build no longer reads)
+    /// build (05_gateway.md "An install refuses while a land or a gate runs"). A ledger that lacks
+    /// a field this build reports (here `holders`, with a `running` this build no longer reads)
     /// still names its gates, while the full ledger read refuses it: a refused read would let the
-    /// install restart the gateway without waiting, and cut a running land off.
+    /// install restart the gateway without refusing, and cut a running land off.
     #[tokio::test]
     async fn an_install_reads_the_gates_of_a_ledger_from_another_build() {
         // Under `/tmp`: a bind path is capped at `sun_path`'s 104 bytes.

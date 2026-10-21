@@ -1237,6 +1237,41 @@ impl ExitWatch {
     }
 }
 
+impl ExitWatch {
+    /// Watch the exit of the process `pid` names now, from this moment, so a later process given
+    /// the same pid is never mistaken for it; `None` when no process holds `pid`. For a process
+    /// this one does not own, such as a launchd agent's: taken before it is signalled, its exit
+    /// is never missed.
+    pub fn of(pid: u32) -> io::Result<Option<Self>> {
+        let pid = i32::try_from(pid).map_err(io::Error::other)?;
+        match Self::open(pid) {
+            Ok(watch) => Ok(Some(watch)),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn open(pid: i32) -> io::Result<Self> {
+        exit_queue(pid).map(Self)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open(pid: i32) -> io::Result<Self> {
+        use std::os::fd::FromRawFd as _;
+        // SAFETY: pidfd_open takes plain integers; a non-negative answer is a new descriptor.
+        let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if opened < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let descriptor = i32::try_from(opened).map_err(io::Error::other)?;
+        // SAFETY: a fresh descriptor this function alone owns.
+        Ok(Self(unsafe {
+            std::os::fd::OwnedFd::from_raw_fd(descriptor)
+        }))
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl ExitWatch {
     fn exited(&self, within: Option<Duration>) -> io::Result<bool> {

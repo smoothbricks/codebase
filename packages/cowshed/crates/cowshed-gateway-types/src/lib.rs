@@ -74,3 +74,18 @@ pub const STORE_ROOT: &str = "/private/cowshed/store";
 pub fn control_socket_path() -> PathBuf {
     Path::new(STORE_ROOT).join("gateway.sock")
 }
+
+/// How long a gateway told to stop (SIGTERM) lets the work it already accepted finish before it
+/// force-stops what is left: the drain deadline of every restart an install makes and of
+/// `gateway stop` (05_gateway.md "Install order and rollback").
+pub const GATEWAY_DRAIN_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The gateway agent's launchd `ExitTimeOut`: how long launchd waits after the SIGTERM of a
+/// bootout or `kickstart -k` before it SIGKILLs the daemon. The drain ([`GATEWAY_DRAIN_WITHIN`])
+/// plus the force stop, the Nx backends' exit and the audit flush after it fit inside it.
+/// launchd's own default is 5 s (measured 2026-10-22, `launchctl print`: "exit timeout = 5"),
+/// which SIGKILLed a gateway mid-drain.
+pub const GATEWAY_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+// launchd's SIGKILL must never come before the drain's own deadline.
+const _: () = assert!(GATEWAY_DRAIN_WITHIN.as_secs() < GATEWAY_EXIT_TIMEOUT.as_secs());

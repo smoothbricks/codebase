@@ -1284,16 +1284,19 @@ rename — but leaves the `cowshed` on your `PATH` alone. A build inside a works
 than refused — the copy is precisely what makes the agent independent of a path that only exists once cowshed has
 mounted it. A debug build is refused, and so is a build that does not contain the installed one (or one that records no
 commit), before anything is installed; `start` waits for the install slot like `setup` and has no `--downgrade`, which
-is `setup`'s. Activating the agent restarts a running gateway, which cuts off every land's gate in flight, so `start`
-and `setup` first wait — no deadline — until the gateway's CPU ledger shows no gate job holding or wanting tokens,
-naming the gate jobs they wait for on stderr (05 Gateway, "An install waits for the gates in flight"); a gateway that
-does not answer `cpu-budget` is not waited on. A failed activation puts the previous build back. `stop` boots out the
-agent and removes the plist, leaving the installed cowshed — host state rather than agent state, and keeping it makes
-the next `start` a plist write instead of a fresh multi-megabyte copy. `stop --purge` deletes it too — the stable name,
-every stored copy and its build record, and the `cowshed` links on your `PATH` that name the stable name — for a host
-that is done with the gateway rather than pausing it; `cowshed setup --uninstall` removes the system storage daemon,
-both user agents, the installed cowshed with its `PATH` links and sccache's nix GC root at once. All of these are
-idempotent, and a `--purge` with nothing installed says so rather than failing.
+is `setup`'s. Activating the agent restarts a running gateway, which cuts off a land's gate in flight and refuses the
+next step of a land between its steps, so `start` and `setup` refuse (exit 4) before they change anything while a land
+holds its repository's turn or the gateway's CPU ledger shows a gate job holding or wanting tokens, naming each; they
+never wait for them. Rerun once they have ended; `cowshed gateway status` lists both (05 Gateway, "An install refuses
+while a land or a gate runs"). A restart waits for the old daemon to exit and launchd to drop its job, within the
+agent's own exit timeout (the plist states 30 s; the daemon's drain ends within 20 s). A failed activation puts the
+previous build back and loads the agent again: a bootstrap when launchd no longer holds it, a kickstart when it does.
+`stop` boots out the agent and removes the plist, leaving the installed cowshed — host state rather than agent state,
+and keeping it makes the next `start` a plist write instead of a fresh multi-megabyte copy. `stop --purge` deletes it
+too — the stable name, every stored copy and its build record, and the `cowshed` links on your `PATH` that name the
+stable name — for a host that is done with the gateway rather than pausing it; `cowshed setup --uninstall` removes the
+system storage daemon, both user agents, the installed cowshed with its `PATH` links and sccache's nix GC root at once.
+All of these are idempotent, and a `--purge` with nothing installed says so rather than failing.
 
 `status` and `doctor` call the gateway healthy only when the daemon runs the same bytes as the CLI asking; a daemon
 running other bytes is reported with the remedy `cowshed setup`, run from the cowshed you mean to use.
@@ -1413,10 +1416,11 @@ has no `pid`:
 ```
 
 `gateway run` is the LaunchAgent's internal foreground entrypoint. It validates already-mounted host storage and creates
-none, restores every authoritative attached workspace session, and drains on SIGTERM or SIGINT. Ordinary `exec`,
-`attach`, and `doctor` commands reconcile the current project's attached sessions before admission; lifecycle commands
-reconcile again before reporting success. If the service is absent they fail with exit 5 and the exact
-`launchctl kickstart -k gui/<uid>/dev.cowshed.gateway` next hint.
+none, restores every authoritative attached workspace session, and drains on SIGTERM or SIGINT for at most 20 s before
+it force-stops what it accepted. Ordinary `exec`, `attach`, and `doctor` commands reconcile the current project's
+attached sessions before admission; lifecycle commands reconcile again before reporting success. If the service is
+absent they fail with exit 5 and the `cowshed gateway start` next hint: `launchctl kickstart` cannot load an agent
+launchd does not hold.
 
 ### `cowshed credential add|ls|status|rm`
 

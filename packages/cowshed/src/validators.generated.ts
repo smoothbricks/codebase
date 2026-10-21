@@ -888,12 +888,6 @@ export const assertOutputSummaryList = typia.createAssertEquals<readonly Api.Out
 export const parseOutputSummaryList = (json: string): readonly Api.OutputSummary[] =>
   assertOutputSummaryList(JSON.parse(json));
 
-export const assertPendingInstall = typia.createAssertEquals<Api.PendingInstall>();
-export const parsePendingInstall = (json: string): Api.PendingInstall => assertPendingInstall(JSON.parse(json));
-export const assertPendingInstallList = typia.createAssertEquals<readonly Api.PendingInstall[]>();
-export const parsePendingInstallList = (json: string): readonly Api.PendingInstall[] =>
-  assertPendingInstallList(JSON.parse(json));
-
 export const assertPortBlock = typia.createAssertEquals<Api.PortBlock>();
 export const parsePortBlock = (json: string): Api.PortBlock => assertPortBlock(JSON.parse(json));
 export const assertPortBlockList = typia.createAssertEquals<readonly Api.PortBlock[]>();

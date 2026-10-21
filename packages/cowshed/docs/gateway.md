@@ -128,23 +128,30 @@ name when that entry is a symbolic link, so the daemon and the `cowshed` you typ
 changes them. `start` installs without touching that entry. The previous build's copy is kept for one more install,
 because a workspace supervisor of that build still draining its jobs may start shells from its path; older copies are
 removed once the new build's agent is active. If activation fails, the stable name is pointed back at the previous copy
-and the agent is loaded again. A release build records its commit beside its copy (`cowshed-<sha256>.build`), and
-`start` and `setup` take the install slot (`dev.cowshed/install.lock`), one install at a time, and refuse to replace the
-installed cowshed with a build that does not contain it — one whose commit is not on an adopted `main`, or that lacks an
-installed commit by both ancestry and patch identity — naming the binary, both builds and each commit it lacks;
-`cowshed setup --downgrade` installs it anyway. The full rules are in the spec, `specs/cowshed/05_gateway.md` "The
-installed cowshed".
+and the agent is loaded again: bootstrapped from its plist when launchd no longer holds it (a `kickstart` answers such
+an agent "Could not find service"), kickstarted when it does, and left alone, with the bootstrap to run once it has
+gone, while launchd still tears it down. An install that would restart a running gateway refuses (exit 4), changing
+nothing, while a land holds its repository's turn or a gate job holds or wants CPU tokens, and names them; it never
+waits. A release build records its commit beside its copy (`cowshed-<sha256>.build`), and `start` and `setup` take the
+install slot (`dev.cowshed/install.lock`), one install at a time, and refuse to replace the installed cowshed with a
+build that does not contain it — one whose commit is not on an adopted `main`, or that lacks an installed commit by both
+ancestry and patch identity — naming the binary, both builds and each commit it lacks; `cowshed setup --downgrade`
+installs it anyway. The full rules are in the spec, `specs/cowshed/05_gateway.md` "The installed cowshed".
 
 `start` atomically installs `~/Library/LaunchAgents/dev.cowshed.gateway.plist` at mode 0600, with the stable name
-followed by the fixed `gateway run` argv. The agent has `RunAtLoad` and `KeepAlive`; early startup failures go only to
-`~/Library/Logs/cowshed/daemon-stderr.log`, never under the `/private/cowshed/store` mountpoint. The CLI uses fixed
-`/bin/launchctl bootstrap`, `kickstart -k`, `bootout`, and `print` argv—never shell text—and maps
+followed by the fixed `gateway run` argv. The agent has `RunAtLoad`, `KeepAlive` and `ExitTimeOut` 30 s; early startup
+failures go only to `~/Library/Logs/cowshed/daemon-stderr.log`, never under the `/private/cowshed/store` mountpoint. The
+CLI uses fixed `/bin/launchctl bootstrap`, `kickstart -k`, `bootout`, and `print` argv—never shell text—and maps
 already-loaded/not-loaded states idempotently. A plist this run rewrote is booted out and bootstrapped again rather than
-kickstarted: launchd keeps the definition it loaded, so a kickstart alone would restart the old program. It waits until
-the daemon reports itself healthy — answering, not draining, and done starting — saying every few seconds what it is
-waiting on in the daemon's own count. `cowshed gateway stop` boots out the agent and removes its plist; the installed
-cowshed stays, as host state rather than agent state. `cowshed gateway stop --purge` also deletes the stable name, every
-stored copy and its build record, and the `cowshed` links on your `PATH` that name the stable name.
+kickstarted: launchd keeps the definition it loaded, so a kickstart alone would restart the old program. A bootout waits
+until the old daemon has exited (the kernel's exit event, watched from before the bootout's SIGTERM) and launchd has
+dropped the job, bounded only by the exit timeout launchd loaded for it plus 1 s; past that it fails, naming the pid or
+job left. SIGTERM drains the daemon for at most 20 s before it force-stops what it accepted, inside the 30 s launchd
+allows before its SIGKILL. It then waits until the daemon reports itself healthy — answering, not draining, and done
+starting — saying every few seconds what it is waiting on in the daemon's own count. `cowshed gateway stop` boots out
+the agent and removes its plist; the installed cowshed stays, as host state rather than agent state.
+`cowshed gateway stop --purge` also deletes the stable name, every stored copy and its build record, and the `cowshed`
+links on your `PATH` that name the stable name.
 
 The internal `cowshed gateway run` entrypoint first remounts already-created host volumes if macOS auto-mounted them at
 `/Volumes` or if a leftover launchd stub occupies `/private/cowshed/store`. It never creates volumes or opens an
@@ -188,10 +195,11 @@ remaining candidates. The allocator binds every port in a candidate block until 
 process claiming a port between publication and installation still triggers the retry rather than stranding the
 workspace. The CLI and embedded controllers pass their already-validated host roots to the selected-workspace or project
 reconcile; they do not resolve `HOME` again. Both reuse the shared `cowshed-core` control and inventory boundaries and
-revision fences. Gateway absence is exit 5 with:
+revision fences. Gateway absence is exit 5 with the hint below; `launchctl kickstart` cannot load an agent launchd does
+not hold ("Could not find service", exit 113), and `gateway start` installs and bootstraps it:
 
 ```text
-next: launchctl kickstart -k gui/<uid>/dev.cowshed.gateway
+next: cowshed gateway start
 ```
 
 ## Credentials (credential-store-held, never in workspaces)
