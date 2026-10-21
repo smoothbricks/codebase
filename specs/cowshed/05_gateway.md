@@ -302,7 +302,11 @@ when it asked — when it starts waiting, whenever the land ahead changes, and e
 cadence), and how long it waited once the turn is its own. `--outside-lock <file>` names the lock file lands took before
 every caller asked for turns: the head takes it too, exclusively and keeping the file, so it excludes a land started
 that way, and says so while it waits for one. A land's turn covers rebase, gate, fast-forward and adoption; the push to
-a remote runs after the turn ends, since a remote is never needed to land (tg#6988).
+a remote runs after the turn ends, since a remote is never needed to land (tg#6988). A turn is only as durable as the
+process that holds it: a land that shares its caller's session ends with that session. Measured 2026-10-21: one lander's
+lands died with its tool session three times, twice while queued and once mid-gate. So a caller that may go away first
+starts the land in a session of its own (`setsid`, output to a file, not its child) and waits on the land's pid;
+`land-turn` itself never detaches, since the caller that stays reads its output and its exit status.
 
 **A ticket's life is recorded.** Measured 2026-10-21: a land queued for 635 s vanished with its agent's session, its log
 stopping mid-wait, and nothing recorded it, so it read as running for half an hour while it did not exist. Each
