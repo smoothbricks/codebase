@@ -1223,7 +1223,7 @@ impl HostActivator {
         let mut keyed = self.environment.clone();
         keyed.insert(
             shell_inherit::GRANTS_KEY.into(),
-            format!("{:?}", self.grants).into(),
+            shell_inherit::keyed_grants(&self.grants),
         );
         keyed
     }

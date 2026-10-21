@@ -35,6 +35,7 @@ use super::shell_watch::{
     ActivationEvidence, CertifyError, Content, Contents, Snapshot, WatchEntry, certify,
     encode_direnv_watches,
 };
+use crate::sandbox::{EgressGrant, SandboxGrants};
 
 /// The record's file in the workspace's host directory, which every job profile denies writes to.
 pub const RECORD_FILE: &str = "activation.json";
@@ -171,8 +172,10 @@ struct RecordedWatch {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ActivationRecord {
     v: u32,
-    /// The activating checkout's [`Placement::places`], in their order.
-    places: [Option<PathBuf>; PLACES],
+    /// The activating checkout's root: the origin every move of this record starts from.
+    root: PathBuf,
+    /// The activating checkout's [`Placement::beside`], in their order.
+    beside: [Option<PathBuf>; BESIDE],
     ports: Option<(u32, u32)>,
     key: String,
     baseline: Baseline,
@@ -187,8 +190,20 @@ struct ActivationRecord {
     /// evaluations of these input bytes, over equivalent baselines, gave exports equal after the
     /// move. Fewer than two distinct roots is no certification: the record then serves only the
     /// checkout it was written in.
-    #[serde(default)]
     proof: Vec<PathBuf>,
+}
+
+impl ActivationRecord {
+    /// The activating checkout's [`Placement::places`], root first.
+    fn places(&self) -> [Option<&Path>; BESIDE + 1] {
+        let [runtime, temp_dir, home] = &self.beside;
+        [
+            Some(self.root.as_path()),
+            runtime.as_deref(),
+            temp_dir.as_deref(),
+            home.as_deref(),
+        ]
+    }
 }
 
 /// Where a checkout's record lives.
@@ -196,7 +211,49 @@ pub fn record_path(mount: &Path) -> PathBuf {
     mount.join(SHELL_HOST_DIRECTORY).join(RECORD_FILE)
 }
 
-const PLACES: usize = 4;
+/// The grants as the baseline keys them under [`GRANTS_KEY`]: a byte encoding fixed here, so
+/// every cowshed build keys the same grants alike, which `Debug` output does not promise. Each
+/// list is its name, its length and its entries, every field NUL-terminated: no path, host or
+/// port holds a NUL. Paths stay text, so the baseline moves the checkout's places in them.
+/// The loopback grant follows the lists as its name and 0 or 1, both NUL-terminated.
+pub fn keyed_grants(grants: &SandboxGrants) -> OsString {
+    use std::fmt::Write as _;
+    const WRITE: &str = "writing to an OsString cannot fail";
+    // Destructured whole: a grant field added later does not compile until it is keyed here.
+    let SandboxGrants {
+        read,
+        write,
+        deny_write,
+        deny,
+        egress,
+        loopback_any,
+    } = grants;
+    let mut keyed = OsString::new();
+    for (name, paths) in [
+        ("read", read),
+        ("write", write),
+        ("deny-write", deny_write),
+        ("deny", deny),
+    ] {
+        write!(keyed, "{name}\0{}\0", paths.len()).expect(WRITE);
+        for path in paths {
+            keyed.push(path);
+            keyed.push("\0");
+        }
+    }
+    write!(keyed, "egress\0{}\0", egress.len()).expect(WRITE);
+    for EgressGrant { host, ports } in egress {
+        write!(keyed, "{host}\0{}\0", ports.len()).expect(WRITE);
+        for port in ports {
+            write!(keyed, "{port}\0").expect(WRITE);
+        }
+    }
+    write!(keyed, "loopback-any\0{}\0", u8::from(*loopback_any)).expect(WRITE);
+    keyed
+}
+
+/// How many per-workspace places a checkout has beside its root ([`Placement::beside`]).
+const BESIDE: usize = 3;
 
 /// Where a checkout is, and the per-workspace facts its host's baseline names.
 #[derive(Clone, Debug)]
@@ -228,8 +285,15 @@ impl<'a> Placement<'a> {
 
     /// The per-workspace paths a value can name, in the order a move replaces them: the root
     /// first, so a home or runtime directory beneath it moves with it.
-    fn places(&self) -> [Option<&'a Path>; PLACES] {
-        [Some(self.root), self.runtime, self.temp_dir, self.home]
+    fn places(&self) -> [Option<&'a Path>; BESIDE + 1] {
+        let [runtime, temp_dir, home] = self.beside();
+        [Some(self.root), runtime, temp_dir, home]
+    }
+
+    /// The per-workspace paths beside the root that a value can name, each only when the
+    /// baseline names it: the runtime link, the temporary directory and the home.
+    fn beside(&self) -> [Option<&'a Path>; BESIDE] {
+        [self.runtime, self.temp_dir, self.home]
     }
 }
 
@@ -566,7 +630,8 @@ pub fn write_record(
     };
     let record = ActivationRecord {
         v: RECORD_VERSION,
-        places: placement.places().map(|place| place.map(Path::to_path_buf)),
+        root: placement.root.to_path_buf(),
+        beside: placement.beside().map(|place| place.map(Path::to_path_buf)),
         ports: placement.ports,
         key,
         baseline,
@@ -689,14 +754,31 @@ impl Uncertified {
                     "the origin's host directory is not its own: {error}"
                 )));
             }
-            let Ok(bytes) = std::fs::read(&path) else {
-                return Ok(Origin::Changed);
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                // Removed since this checkout read it: not the record this checkout certifies.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(Origin::Changed);
+                }
+                Err(error) => {
+                    return Ok(Origin::Refused(format!(
+                        "cannot read the origin's record {}: {error}",
+                        path.display()
+                    )));
+                }
             };
             if <[u8; 32]>::from(Sha256::digest(&bytes)) != self.digest {
                 return Ok(Origin::Changed);
             }
-            let Ok(mut record) = serde_json::from_slice::<ActivationRecord>(&bytes) else {
-                return Ok(Origin::Changed);
+            // The bytes this checkout parsed, by their digest: a parse failure here is reported,
+            // never read as a change.
+            let mut record = match serde_json::from_slice::<ActivationRecord>(&bytes) {
+                Ok(record) => record,
+                Err(error) => {
+                    return Ok(Origin::Refused(format!(
+                        "the origin's record does not parse: {error}"
+                    )));
+                }
             };
             record.proof = self.proof_with(root);
             crate::metadata::write_atomic_bytes(&path, &serde_json::to_vec(&record)?)?;
@@ -794,7 +876,7 @@ fn read_record(mount: &Path) -> Result<(ActivationRecord, [u8; 32]), AdoptionMis
     file.take(MAX_RECORD_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(AdoptionMiss::Unreadable)?;
-    if bytes.len() as u64 > MAX_RECORD_BYTES {
+    if !u64::try_from(bytes.len()).is_ok_and(|length| length <= MAX_RECORD_BYTES) {
         return Err(AdoptionMiss::Malformed("larger than any record".into()));
     }
     let record: ActivationRecord = serde_json::from_slice(&bytes)
@@ -839,11 +921,11 @@ pub fn verify(
     // Each per-workspace place of the origin moves to this checkout's, root first, at a
     // path-component boundary.
     let moves: Vec<(String, Option<String>)> = record
-        .places
-        .iter()
+        .places()
+        .into_iter()
         .zip(placement.places())
         .filter_map(|(from, to)| {
-            let from = from.as_ref()?.to_string_lossy().into_owned();
+            let from = from?.to_string_lossy().into_owned();
             let to = to.map(|to| to.to_string_lossy().into_owned());
             (Some(&from) != to.as_ref()).then_some((from, to))
         })
@@ -898,7 +980,7 @@ pub fn verify(
     // its own parent is the parent of a root the producer was measured at; any other clone
     // evaluates, and agreeing adds its root to the proof. The checkout the record was written in
     // needs no proof: nothing moves.
-    let origin = record.places[0].clone().unwrap_or_default();
+    let origin = record.root;
     let distinct: BTreeSet<&PathBuf> = record.proof.iter().collect();
     let certified = distinct.len() >= 2
         && distinct.contains(&origin)
@@ -1322,6 +1404,92 @@ mod tests {
                 sites.clone.root.join(".envrc-local")
             ]
         );
+    }
+
+    /// The root every move starts from is part of the record's type: a record without one is
+    /// not one this cowshed writes, never a move from the empty path.
+    #[test]
+    fn a_record_without_its_root_is_malformed() {
+        let sites = sites("rootless");
+        lineage(&sites, NOTHING);
+        let path = record_path(&sites.clone.root);
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record["root"] = serde_json::Value::Null;
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(matches!(
+            verify_at(&sites.clone),
+            Err(AdoptionMiss::Malformed(_))
+        ));
+    }
+
+    /// An origin record the clone cannot read is refused with the error, not taken for a newer
+    /// record.
+    #[test]
+    fn an_unreadable_origin_record_is_refused_with_its_error() {
+        let sites = sites("unreadable-origin");
+        evaluate(&sites.origin, NOTHING, None);
+        std::fs::copy(
+            record_path(&sites.origin.root),
+            record_path(&sites.witness.root),
+        )
+        .unwrap();
+        let inherited = verify_at(&sites.witness)
+            .expect_err("uncertified")
+            .into_uncertified()
+            .expect("only for want of certification");
+        std::fs::remove_file(record_path(&sites.origin.root)).unwrap();
+        std::fs::create_dir(record_path(&sites.origin.root)).unwrap();
+        assert!(matches!(
+            evaluate(&sites.witness, NOTHING, Some(&inherited)),
+            Certification::Certified {
+                origin: Origin::Refused(reason)
+            } if reason.starts_with("cannot read the origin's record")
+        ));
+    }
+
+    #[test]
+    fn the_grants_key_is_a_fixed_encoding() {
+        let mut grants = SandboxGrants {
+            read: vec!["/x/repo/a".into()],
+            write: Vec::new(),
+            deny_write: vec![".git".into()],
+            deny: Vec::new(),
+            egress: vec![EgressGrant {
+                host: "example.com".into(),
+                ports: vec![443, 80],
+            }],
+            loopback_any: true,
+        };
+        let mut fields = [
+            "read",
+            "1",
+            "/x/repo/a",
+            "write",
+            "0",
+            "deny-write",
+            "1",
+            ".git",
+            "deny",
+            "0",
+            "egress",
+            "1",
+            "example.com",
+            "2",
+            "443",
+            "80",
+            "loopback-any",
+            "1",
+        ];
+        let expected: String = fields.iter().map(|field| format!("{field}\0")).collect();
+        let with_loopback = keyed_grants(&grants);
+        assert_eq!(with_loopback, OsString::from(expected));
+        grants.loopback_any = false;
+        fields[17] = "0";
+        let expected: String = fields.iter().map(|field| format!("{field}\0")).collect();
+        let without_loopback = keyed_grants(&grants);
+        assert_eq!(without_loopback, OsString::from(expected));
+        assert_ne!(with_loopback, without_loopback);
     }
 
     /// A certification never writes over a record the origin rewrote after the clone read it:
