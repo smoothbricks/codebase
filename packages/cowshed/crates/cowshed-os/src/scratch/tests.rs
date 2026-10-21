@@ -314,6 +314,32 @@ fn image_fixture_scratch_stays_with_its_detach_aware_owner() {
 }
 
 #[test]
+fn named_ownership_preserves_the_fixture_socket_path_budget() {
+    for prefix in ["cowshed-recovering", "cs-pr"] {
+        let path = named_path(Path::new("/tmp"), prefix, i32::MAX.unsigned_abs());
+        assert_eq!(named_owner(&path), Some(i32::MAX));
+        // Exactly main's TempRoot name length, the one its socket fixtures were sized for.
+        assert_eq!(path.file_name().unwrap().len(), prefix.len() + NAMED_SUFFIX);
+    }
+    // Another tool's prefix is not claimed, and an unowned 16-hex fixture name names no owner.
+    assert_eq!(
+        named_owner(&named_path(Path::new("/tmp"), "fixture", 1)),
+        None
+    );
+    assert_eq!(
+        named_owner(Path::new("/tmp/cowshed-sock-0123456789abcdef")),
+        None
+    );
+    let parent = fs::canonicalize("/tmp").unwrap();
+    let fixture = Fixture(create_named(&parent, "cowshed-recovering").unwrap());
+    let directory = fixture.0.join("run");
+    fs::create_dir(&directory).unwrap();
+    // Production publishes through a 32-hex + ".bind" socket, not just manager.sock.
+    let path = directory.join(format!("{}.bind", uuid::Uuid::new_v4().simple()));
+    let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+}
+
+#[test]
 fn named_fixture_ownership_leaves_payload_empty_and_reaps_only_dead_creators() {
     let fixture = Fixture::new();
     let live = create_named(&fixture.0, "cowshed-sock").unwrap();
@@ -342,7 +368,7 @@ fn named_fixture_ownership_leaves_payload_empty_and_reaps_only_dead_creators() {
 fn archiving_named_fixture_output_carries_ownership_past_the_rename() {
     let fixture = Fixture::new();
     let pid = dead_pid();
-    let path = named_path(&fixture.0, "trace", pid);
+    let path = named_path(&fixture.0, "cs-trace", pid);
     fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
     fs::write(path.join("trace.arrow"), b"only evidence").unwrap();
     fixture.reaper().sweep(&fixture.store(), true);

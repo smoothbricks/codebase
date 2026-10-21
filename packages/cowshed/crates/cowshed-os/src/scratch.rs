@@ -16,6 +16,11 @@ pub const EVIDENCE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_OWNER_BYTES: u64 = 1024;
 const MAX_SOCKET_ENTRIES: usize = 8;
 
+/// The bytes a named child adds to its prefix: `-` and 16 characters, the length of the unowned
+/// 16-hex name main gave every fixture (0520d27b4). A fixture under the workspace's runtime link
+/// keeps its nested sockets inside `sockaddr_un.sun_path` only at this length.
+const NAMED_SUFFIX: usize = 17;
+
 /// Create a private scratch root and publish its creating pid before it holds any output.
 pub fn create(path: &Path) -> io::Result<()> {
     fs::DirBuilder::new().mode(0o700).create(path)?;
@@ -31,34 +36,44 @@ pub fn create_named(parent: &Path, prefix: &str) -> io::Result<PathBuf> {
             "scratch prefix must be one file name",
         ));
     }
-    let path = named_path(parent, prefix, std::process::id());
-    fs::DirBuilder::new().mode(0o700).create(&path)?;
-    Ok(path)
+    let mut attempt = 0;
+    loop {
+        let path = named_path(parent, prefix, std::process::id());
+        match fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => return Ok(path),
+            // The nonce is 28 bits within one pid; mkdir never adopts a directory that exists.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempt < 8 => {
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
+/// `<prefix>-p<8 hex pid><7 hex nonce>`, [`NAMED_SUFFIX`] bytes after the prefix. `p` is not a
+/// hex digit, so no unowned `<prefix>-<16 hex>` name parses as an owner.
 fn named_path(parent: &Path, prefix: &str, pid: u32) -> PathBuf {
-    let namespace = if prefix.starts_with("cowshed-") || prefix.starts_with("cs-") {
-        ""
-    } else {
-        "cs-"
-    };
-    parent.join(format!(
-        "{namespace}{prefix}-pid{pid}-{}",
-        uuid::Uuid::new_v4().simple()
-    ))
+    let (_, nonce) = uuid::Uuid::new_v4().as_u64_pair();
+    parent.join(format!("{prefix}-p{pid:08x}{:07x}", nonce & 0x0fff_ffff))
 }
 
 fn named_owner(path: &Path) -> Option<i32> {
     let name = path.file_name()?.to_str()?;
-    let (prefix, owner) = name.rsplit_once("-pid")?;
-    if !prefix.starts_with("cowshed-") && !prefix.starts_with("cs-") {
+    if !name.starts_with("cowshed-") && !name.starts_with("cs-") {
         return None;
     }
-    let (pid, nonce) = owner.split_once('-')?;
-    if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    let (_, suffix) = name.rsplit_once('-')?;
+    let digits = suffix.strip_prefix('p')?;
+    if digits.len() != NAMED_SUFFIX - 2
+        || !digits
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
         return None;
     }
-    pid.parse::<i32>().ok().filter(|pid| *pid > 0)
+    i32::from_str_radix(&digits[..8], 16)
+        .ok()
+        .filter(|pid| *pid > 0)
 }
 
 /// Publish every process that can keep writing. An absent/partial record is unknown, never dead.

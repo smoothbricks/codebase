@@ -333,8 +333,12 @@ own 256-entry budget and never synchronously walks an entire output tree.
 Multiwriter runtime ownership is the private `.cowshed-owner` record in the scratch directory, containing
 `cowshed-scratch-v1`, one positive pid per line, and a final `end` line. The terminator makes an interrupted publication
 unknown, not a shorter complete lease. Single-owner fixtures instead publish the creator atomically in the private
-directory's name: `<cowshed-/cs-prefix>-pid<PID>-<32-hex-uuid>`. This keeps payload roots pristine: the fixture may
-itself be a Git worktree or a directory containing only telemetry date partitions. Before an evidence rename changes
+directory's name: `<cowshed-/cs-prefix>-p<8-hex-PID><7-hex-nonce>`. The suffix is exactly the 17 bytes of the unowned
+`<prefix>-<16-hex>` name it replaces, the length fixtures under the workspace's runtime link are sized for
+(08_testing.md, "Fixtures"), so nested Unix socket paths still fit `sockaddr_un`. `p` is not a hex digit, so no unowned
+name parses as an owner. Creation takes a fresh nonce when the name exists. A prefix outside `cowshed-`/`cs-` gets the
+same name but no claim: its fixture's own cleanup remains its only owner. This keeps payload roots pristine: the fixture
+may itself be a Git worktree or a directory containing only telemetry date partitions. Before an evidence rename changes
 that name, the reaper carries the creator into the record used by archive cleanup. An existing malformed record never
 falls back to the name.
 
