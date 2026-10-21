@@ -3874,9 +3874,12 @@ async fn directory_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_
 
 /// A rebase whose workspace supervisor does not answer skips the carry and still rebases
 /// (16_build_volumes.md, "Rebase carry": an unavailable hash computation skips the carry with
-/// the root and reason). `b`'s supervisor is stopped with `SIGSTOP`, so it holds its socket and
-/// answers nothing, as a supervisor stalled in a blocking call does; the rebase names the root
-/// and the unanswered hello instead of failing after the tree has moved.
+/// the root and reason). The fixture's runtime serves `b`'s supervisor in this test's own
+/// process, so stopping the process that answers its hello would stop the test with it. Once
+/// that runtime has retired `b`'s supervisor, its stand-in binds `b`'s supervisor socket under
+/// the socket lease and never accepts: it holds the socket and answers nothing, as a supervisor
+/// stalled in a blocking call does. A fresh runtime then rebases `b`, and the rebase names the
+/// root and the unanswered hello instead of failing after the tree has moved.
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_a_rebase_whose_supervisor_does_not_answer_skips_the_carry_substrate_lifecycle() {
     let (nx, node) = repository_nx();
@@ -3889,11 +3892,23 @@ async fn directory_a_rebase_whose_supervisor_does_not_answer_skips_the_carry_sub
     let nx_check = nx_run_many(&node, "build test");
 
     let b = new_workspace(&mut service, "b").await;
-    // b's own run leaves its Nx state on its volume and its supervisor serving.
+    // b's own run leaves its Nx state on its volume.
     sh(&mut service, "b", &nx_check).await;
-    let stopped = StoppedSupervisor::of(&fixture, "b").await;
+    service
+        .shutdown()
+        .await
+        .expect("the runtime retires b's supervisor");
+    let socket = cowshed_core::runtime::supervisor_socket::socket_path(
+        fixture.storage.store(),
+        &RepoId::parse("fixture/dispatch").expect("repository identity"),
+        &WorkspaceName::new("b").expect("workspace name"),
+    );
+    let stalled = cowshed_core::runtime::supervisor_socket::bind(&socket)
+        .await
+        .expect("the stand-in holds b's supervisor socket");
+    let mut service = fixture.reopen().await;
     let rebased = rebase(&mut service, "b").await;
-    drop(stopped);
+    drop(stalled);
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
 
@@ -3913,41 +3928,6 @@ async fn directory_a_rebase_whose_supervisor_does_not_answer_skips_the_carry_sub
             );
         }
         build_volume => panic!("an unanswering supervisor skips the carry: {build_volume:?}"),
-    }
-}
-
-/// A workspace supervisor stopped with `SIGSTOP`, continued when dropped.
-struct StoppedSupervisor(libc::pid_t);
-
-impl StoppedSupervisor {
-    /// Stop the supervisor serving `workspace`, found by asking each socket of the store's `run`
-    /// directory who it serves.
-    async fn of(fixture: &Fixture, workspace: &str) -> Self {
-        let run = fixture.storage.store().join("run");
-        for entry in fs::read_dir(&run).expect("the store's run directory") {
-            let path = entry.expect("run directory entry").path();
-            if path.extension().is_none_or(|extension| extension != "sock") {
-                continue;
-            }
-            let Ok(hello) = cowshed_core::runtime::supervisor_socket::hello(&path).await else {
-                continue;
-            };
-            if hello.authority.workspace.as_str() == workspace {
-                let pid = libc::pid_t::try_from(hello.pid).expect("a pid fits pid_t");
-                // SAFETY: kill(2) with a live pid and a valid signal number has no memory effects.
-                let stopped = unsafe { libc::kill(pid, libc::SIGSTOP) };
-                assert_eq!(stopped, 0, "stop supervisor {pid}");
-                return Self(pid);
-            }
-        }
-        panic!("no supervisor in {} serves {workspace}", run.display());
-    }
-}
-
-impl Drop for StoppedSupervisor {
-    fn drop(&mut self) {
-        // SAFETY: kill(2) with a valid signal number has no memory effects.
-        unsafe { libc::kill(self.0, libc::SIGCONT) };
     }
 }
 
