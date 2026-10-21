@@ -20,8 +20,8 @@ import type { NxJsonConfiguration } from 'nx/src/config/nx-json';
 import type { ProjectGraph, ProjectGraphProjectNode } from 'nx/src/config/project-graph';
 import type { Task, TaskGraph } from 'nx/src/config/task-graph';
 import type * as NxDaemonClient from 'nx/src/daemon/client/client';
+import type * as NxCreateTaskHasher from 'nx/src/hasher/create-task-hasher';
 import type * as NxHashTask from 'nx/src/hasher/hash-task';
-import type * as NxTaskHasher from 'nx/src/hasher/task-hasher';
 import type * as NxNative from 'nx/src/native';
 import type * as NxTransformObjects from 'nx/src/native/transform-objects';
 import type * as NxExecutionHooks from 'nx/src/project-graph/plugins/tasks-execution-hooks';
@@ -67,7 +67,7 @@ interface NxRuntimeModules {
   readonly 'nx/src/config/nx-json': typeof NxConfiguration;
   readonly 'nx/src/daemon/client/client': typeof NxDaemonClient;
   readonly 'nx/src/hasher/hash-task': typeof NxHashTask;
-  readonly 'nx/src/hasher/task-hasher': typeof NxTaskHasher;
+  readonly 'nx/src/hasher/create-task-hasher': typeof NxCreateTaskHasher;
   readonly 'nx/src/native': typeof NxNative;
   readonly 'nx/src/native/transform-objects': typeof NxTransformObjects;
   readonly 'nx/src/project-graph/utils/find-project-for-path': typeof NxProjectRootMappings;
@@ -834,8 +834,32 @@ async function withTaskHooks<Result>(
   return result;
 }
 
+/**
+ * `work`, or `withoutDaemon` when the daemon it was using stopped under a client
+ * that may never start one (NX_DAEMON_START=never): the patched client's error
+ * carries `daemonStartForbidden`, and has already turned the daemon off for
+ * this process. The probe then answers as it does without a daemon.
+ */
+async function orNoDaemon<Result>(work: () => Promise<Result>, withoutDaemon: () => Result): Promise<Result> {
+  try {
+    return await work();
+  } catch (error) {
+    if (error instanceof Error && 'daemonStartForbidden' in error && error.daemonStartForbidden === true) {
+      return withoutDaemon();
+    }
+    throw error;
+  }
+}
+
+function noDaemonProbe(selector: TargetSelector): Extract<PreparedWorkspaceProbe, { kind: 'no-daemon' }> {
+  return { kind: 'no-daemon', reason: { kind: 'no-daemon', taskId: selectorTaskId(selector) } };
+}
+
 async function ensureBuiltInWorkspace(workspaceRoot: string, selector: TargetSelector): Promise<EnsureBuiltResult> {
-  const prepared = await prepareWorkspaceProbe(workspaceRoot, selector, 'build');
+  const prepared = await orNoDaemon(
+    () => prepareWorkspaceProbe(workspaceRoot, selector, 'build'),
+    (): PreparedWorkspaceProbe => noDaemonProbe(selector),
+  );
   if (prepared.kind === 'no-daemon') return runViaCli(workspaceRoot, selector, prepared.reason);
   return withTaskHooks(workspaceRoot, selector, prepared, buildPreparedTarget);
 }
@@ -849,7 +873,10 @@ async function buildPreparedTarget(
   performance.mark('ensureBuilt:probe:start');
   const reason =
     missBeforeProbe(process.env, selectorTaskId(selector)) ??
-    (await probe(workspaceRoot, nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx));
+    (await orNoDaemon(
+      () => probe(workspaceRoot, nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx),
+      (): MissReason => noDaemonProbe(selector).reason,
+    ));
   performance.measure('ensureBuilt:probe', 'ensureBuilt:probe:start');
   return reason === null ? HIT : runViaCli(workspaceRoot, selector, reason);
 }
@@ -861,7 +888,10 @@ async function probeBuiltInWorkspace(workspaceRoot: string, selector: TargetSele
   // A failed publication proof asks a serving Nx daemon for the authoritative
   // generation, but never hashes against the consumer environment, starts a
   // provider runner or starts the provider's daemon.
-  const prepared = await prepareWorkspaceProbe(workspaceRoot, selector, 'read-only');
+  const prepared = await orNoDaemon(
+    () => prepareWorkspaceProbe(workspaceRoot, selector, 'read-only'),
+    (): PreparedWorkspaceProbe => noDaemonProbe(selector),
+  );
   const detail =
     prepared.kind === 'no-daemon'
       ? `${receipt.detail}; authoritative graph unavailable: ${describeMiss(prepared.reason)}`
@@ -1167,7 +1197,7 @@ async function probe(
   verifyAllArtifacts = false,
 ): Promise<MissReason | null> {
   const { daemonClient } = requireNx('nx/src/daemon/client/client');
-  const { DaemonBasedTaskHasher } = requireNx('nx/src/hasher/task-hasher');
+  const { createTaskHasher } = requireNx('nx/src/hasher/create-task-hasher');
   const { getTaskDetails, hashTasks } = requireNx('nx/src/hasher/hash-task');
   const { getTaskSpecificEnv } = requireNx('nx/src/tasks-runner/task-env');
   const { getCache } = requireNx('nx/src/tasks-runner/cache');
@@ -1180,7 +1210,9 @@ async function probe(
   // flag would add belong to the cloud runner, and the run path calls Nx's own
   // `getRunner` to obtain them.
   const runnerOptions = getRunnerOptions('default', nxJson, nxArgs, false);
-  const hasher = new DaemonBasedTaskHasher(daemonClient, runnerOptions);
+  // Nx's own composition: the daemon's hasher, which continues in this process
+  // if the daemon stops under NX_DAEMON_START=never.
+  const hasher = createTaskHasher(projectGraph, nxJson, runnerOptions);
   performance.mark('ensureBuilt:hash:start');
   // Every task, each against its own environment — per-project and per-target
   // `.env` files and custom hashers that read env participate in the hash, so

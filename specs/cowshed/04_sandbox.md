@@ -872,11 +872,12 @@ A sandboxed Nx keeps Nx's own daemon default: a caller's `NX_DAEMON` never reach
 `d/server-process.json` in Nx's workspace-data directory, never to one derived from the socket directory. A client in a
 job never starts a daemon: every job, sandboxed or host gate, gets `NX_DAEMON_START=never`, and a caller's value never
 passes. Under it the patched Nx client uses the daemon the record names while that process runs, otherwise runs the
-command without one, and waits for a successor, never starting one, when its daemon stops under it. A daemon a job
-started would belong to that job's process tree and end with the job, while clients of other jobs still used it through
-the shared record. A host shell's client, which has no such variable, that cannot reach the socket starts a daemon of
-its own, which overwrites the record and so retires the daemon it replaced (pinned Nx 23.2.1, `daemon/client/client.js`
-and `daemon/server/server.js`).
+command without one. When its daemon stops under it, the client never starts one: a request in flight resumes on a
+successor that comes up within Nx's reconnect wait, and otherwise every remaining request of the command, the rest of a
+task run included, continues in the client's own process. A daemon a job started would belong to that job's process tree
+and end with the job, while clients of other jobs still used it through the shared record. A host shell's client, which
+has no such variable, that cannot reach the socket starts a daemon of its own, which overwrites the record and so
+retires the daemon it replaced (pinned Nx 23.2.1, `daemon/client/client.js` and `daemon/server/server.js`).
 
 One escape exists, for tests only: a test whose subject is a daemon's retirement must be able to create what it retires.
 A fixture `nx` spawned with the named `FIXTURE_STARTS_ITS_OWN_DAEMON` option

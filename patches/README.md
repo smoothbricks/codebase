@@ -290,13 +290,24 @@ shares it with every client of the checkout. Cowshed ends a job's whole process 
 job's client started would end with that job while another job's `nx run` still used it. Cowshed therefore gives every
 job `NX_DAEMON_START=never` (`specs/cowshed/04_sandbox.md`). Under it, `enabled()` uses the daemon only while the
 process its record names runs. Otherwise the command runs without one, as `NX_DAEMON=false` would. The daemon can stop
-after the client chose it; its successor belongs to its starter (cowshed's keeper). In that case the client turns the
-daemon off for its own process alone (`disableDaemonForThisProcess`, never the `disabled` marker that only `nx reset`
-clears), and throws an error tagged `daemonStartForbidden` that names the variable. The project-graph builder then notes
-it and continues without the daemon; any other request in flight fails with that error. The client never calls
-`startInBackground` implicitly, and an explicit `nx daemon --start` (`command-line/daemon/daemon.js`), which would call
-it directly, is refused as policy: exit 1 with a reason naming the variable and the test fixture escape. Without the
-variable nothing changes.
+after the client chose it, or restart itself under a request and end its socket; its successor belongs to its starter
+(cowshed's keeper, or the restarting daemon). A request in flight first waits the client's reconnect window for a
+successor and resumes on it. When there is none, or when a request finds the daemon gone, the client turns the daemon
+off for its own process alone (`disableDaemonForThisProcess`, never the `disabled` marker that only `nx reset` clears),
+and fails the request with an error tagged `daemonStartForbidden` that names the variable, the connection failure as its
+cause. Every daemon request of a command continues from that error in its own process through
+`DaemonClient.orWithoutDaemon`, which notes the stop once per process and lets the connection go, so the caller's own
+in-process path answers: the project graph, task hashing (`DaemonBasedTaskHasher` builds the graph in this process once,
+for the in-process hasher's file data), output-hash record and compare (unverified outputs are copied), the pre/post
+tasks-execution hooks, sync generators and the workspace-context file queries. A run whose daemon stops under it
+therefore finishes. The client never calls `startInBackground` implicitly, and an explicit `nx daemon --start`
+(`command-line/daemon/daemon.js`), which would call it directly, is refused as policy: exit 1 with a reason naming the
+variable and the test fixture escape. Without the variable nothing changes.
+
+A daemon that restarts itself opens the log file twice for its successor's stdout and stderr. The restart closes both
+descriptors right after the spawn, which keeps duplicates for the child, as the client's own start already did: left to
+garbage collection, Node >=26 turns a collected `FileHandle` into a fatal `ERR_INVALID_STATE`, which ended the
+restarting daemon with the socket its clients were still writing to.
 
 `nx-daemon-start-never.test.ts` runs the installed Nx against a fixture with `NX_DAEMON=true`:
 
@@ -306,6 +317,11 @@ variable nothing changes.
 - a killed daemon's stale record starts nothing;
 - a record naming a live process that serves no socket: the command notes the variable and continues without a daemon,
   the record is untouched, and no `disabled` marker is written;
+- a daemon a task kills mid-run: the run finishes, notes the variable once, starts no successor and writes no `disabled`
+  marker;
+- a daemon that restarts itself mid-run (a task writes a lockfile): the run finishes on its successor;
+- the restart's successor spawn, run under Node with garbage collected right after it (`startNewDaemonInBackground`,
+  exported for this), exits cleanly with no `ERR_INVALID_STATE`;
 - `nx daemon --start` under the variable exits 1 naming it and the fixture escape, and leaves no record; without the
   variable it starts a daemon.
 

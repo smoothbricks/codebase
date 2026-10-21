@@ -125,6 +125,143 @@ it('a client that may never start a daemon continues without one that stopped un
   });
 });
 
+const taskOutput = (project: string) => `${project}/dist/${project}.txt`;
+
+/**
+ * Two cacheable tasks: `p:build` runs `first` and writes its output, and `q:build` copies it. `q:build`'s inputs are
+ * `p:build`'s outputs, so it is hashed only once `p:build` has finished, and whatever `first` did to the daemon is
+ * behind every daemon request after it: that hash, recording outputs, the post-run hooks.
+ */
+async function twoTaskWorkspace(workspace: string, first: string): Promise<void> {
+  await fixtureWorkspace(workspace);
+  const build = (command: string) => ({ command, outputs: ['{projectRoot}/dist'], cache: true });
+  await writeFile(
+    join(workspace, 'p', 'project.json'),
+    JSON.stringify({
+      name: 'p',
+      targets: { build: build(`${first}; mkdir -p p/dist && echo p > ${taskOutput('p')}`) },
+    }),
+  );
+  await mkdir(join(workspace, 'q'));
+  await writeFile(
+    join(workspace, 'q', 'project.json'),
+    JSON.stringify({
+      name: 'q',
+      implicitDependencies: ['p'],
+      targets: {
+        build: {
+          ...build(`mkdir -p q/dist && cp ${taskOutput('p')} ${taskOutput('q')}`),
+          dependsOn: ['^build'],
+          inputs: ['default', { dependentTasksOutputFiles: '**/*.txt' }],
+        },
+      },
+    }),
+  );
+}
+
+/** Start the fixture's daemon with a client allowed to, under `runtime`, and return the pid its record names. */
+async function startDaemon(workspace: string, env: Record<string, string>, runtime: string): Promise<number> {
+  const ran = spawnSync(runtime, [nxEntry, 'show', 'projects', '--json'], { cwd: workspace, env, encoding: 'utf8' });
+  expect(ran.status, `${ran.stdout}${ran.stderr}`).toBe(0);
+  const daemon = await recordedPid(workspace);
+  if (daemon === null) throw new Error('a client allowed to start a daemon left no record');
+  return daemon;
+}
+
+/** `nx run-many -t build` under the job rule; requires it to succeed with `q:build` built from `p:build`. */
+async function runBothUnderNever(workspace: string, env: Record<string, string>, runtime: string): Promise<string> {
+  const run = spawnSync(runtime, [nxEntry, 'run-many', '-t', 'build', '--outputStyle=static'], {
+    cwd: workspace,
+    env: { ...env, NX_DAEMON_START: 'never' },
+    encoding: 'utf8',
+  });
+  const printed = `${run.stdout}${run.stderr}`;
+  expect(run.status, printed).toBe(0);
+  expect(await readFile(join(workspace, taskOutput('q')), 'utf8')).toBe('p\n');
+  // Not disabled for the checkout: the marker only `nx reset` clears would follow it into every terminal.
+  await expect(readFile(join(workspace, '.nx/workspace-data/d/disabled'), 'utf8')).rejects.toMatchObject({
+    code: 'ENOENT',
+  });
+  return printed;
+}
+
+/**
+ * The daemon stops while a run uses it, after the graph came from it: `p:build` kills it, and every daemon request
+ * after that goes to a daemon that is gone. Each continues in the client, the run finishes, and nothing is disabled
+ * or started.
+ */
+it('a run whose daemon stops under it continues without one, and disables nothing', async () => {
+  await withNxFixture('nx-daemon-start-midrun', async ({ workspace, socketDirectory }) => {
+    await twoTaskWorkspace(
+      workspace,
+      'kill -9 $STOP_DAEMON; while kill -0 $STOP_DAEMON 2>/dev/null; do sleep 0.05; done',
+    );
+    const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
+    const daemon = await startDaemon(workspace, env, 'bun');
+
+    const printed = await runBothUnderNever(workspace, { ...env, STOP_DAEMON: String(daemon) }, 'bun');
+    expect(isRunning(daemon)).toBe(false);
+    expect(printed).toContain(
+      'NX_DAEMON_START=never: this client never starts a daemon. Continuing without the daemon.',
+    );
+    // No successor: the record still names the daemon the task killed.
+    expect(await recordedPid(workspace)).toBe(daemon);
+  });
+});
+
+/**
+ * The daemon restarts itself while a run uses it: `p:build` writes a lockfile, so the next request finds the daemon
+ * outdated, and it starts its successor and ends the request's socket. The client waits for that successor and
+ * resumes on it, as the job rule allows: its starter is the restarting daemon, not the client. The run finishes.
+ */
+it('a run whose daemon restarts itself under it finishes', async () => {
+  await withNxFixture('nx-daemon-start-restart', async ({ workspace, socketDirectory }) => {
+    // A lockfile Nx parses: an unparsable one fails the successor's graph, which is a different failure.
+    const lockfile = JSON.stringify({
+      name: 'daemon-start-never',
+      lockfileVersion: 3,
+      requires: true,
+      packages: { '': { name: 'daemon-start-never' } },
+    });
+    await twoTaskWorkspace(workspace, `echo '${lockfile}' > package-lock.json`);
+    const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
+    await startDaemon(workspace, env, 'node');
+
+    await runBothUnderNever(workspace, env, 'node');
+    expect(await readFile(join(workspace, '.nx/workspace-data/d/daemon.log'), 'utf8')).toContain('Restarting daemon');
+  });
+});
+
+/**
+ * A restarting daemon opens the log twice for its successor's stdout and stderr. Left to garbage collection, Node >=26
+ * turns each collected `FileHandle` into a fatal `ERR_INVALID_STATE`, which ended a restarting daemon in a job with
+ * the socket its clients were still writing to. Collected deliberately here, right after the restart's spawn, so the
+ * descriptors' lifetime decides the exit rather than when a collection happens to run.
+ */
+it('a restarting daemon closes the log descriptors it hands its successor', async () => {
+  await withNxFixture('nx-daemon-restart-descriptors', async ({ workspace, socketDirectory }) => {
+    await fixtureWorkspace(workspace);
+    const shutdownUtils = join(repositoryRoot, 'node_modules/nx/dist/src/daemon/server/shutdown-utils.js');
+    const restart = `const { setTimeout: sleep } = require('node:timers/promises');
+    require(${JSON.stringify(shutdownUtils)}).startNewDaemonInBackground().then(async () => {
+      for (let round = 0; round < 3; round++) { gc(); await sleep(50); }
+    })`;
+    const ran = spawnSync('node', ['--expose-gc', '-e', restart], {
+      cwd: workspace,
+      env: { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' },
+      encoding: 'utf8',
+    });
+    expect(ran.status, `${ran.stdout}${ran.stderr}`).toBe(0);
+    expect(ran.stderr).not.toContain('ERR_INVALID_STATE');
+    // The successor is the fixture's to stop: wait for the record it writes once it serves.
+    const deadline = Date.now() + 60_000;
+    while ((await recordedPid(workspace)) === null) {
+      if (Date.now() > deadline) throw new Error('the restarted daemon wrote no record within 60 s');
+      await Bun.sleep(100);
+    }
+  });
+});
+
 /**
  * An explicit `nx daemon --start` calls the daemon start directly, past the implicit-start check above, so under the
  * job's rule it is refused as policy: a non-zero exit naming `NX_DAEMON_START=never` and the fixture escape, and no

@@ -346,7 +346,7 @@ index 757fd200dbd83f335c9868987e4135d4b7b580cb..1bf7e571cc66d3483f8b2ebb7b73ad8b
  }
  // Must be sync for the help output use case
 diff --git a/dist/src/daemon/client/client.d.ts b/dist/src/daemon/client/client.d.ts
-index 9bd7b61bf9ad94c72a198dfe6f15fbcb68dfaac3..c552b4b252c2d0496312ddb6ff481699a6771552 100644
+index 9bd7b61bf9ad94c72a198dfe6f15fbcb68dfaac3..6b982fae848cc82a310eee9a1036be1a1cbb1985 100644
 --- a/dist/src/daemon/client/client.d.ts
 +++ b/dist/src/daemon/client/client.d.ts
 @@ -2,7 +2,7 @@ import { ChildProcess } from 'child_process';
@@ -358,7 +358,22 @@ index 9bd7b61bf9ad94c72a198dfe6f15fbcb68dfaac3..c552b4b252c2d0496312ddb6ff481699
  import { PostTasksExecutionContext, PreTasksExecutionContext } from '../../project-graph/plugins/public-api';
  import { ConfigurationSourceMaps } from '../../project-graph/utils/project-configuration/source-maps';
  import type { FlushSyncGeneratorChangesResult, SyncGeneratorRunResult } from '../../utils/sync-generators';
-@@ -89,9 +89,6 @@ export declare class DaemonClient {
+@@ -48,6 +48,14 @@ export declare class DaemonClient {
+     private projectGraphListenerFramingFailures;
+     private projectGraphListenerCallbacks;
+     enabled(): boolean;
++    private continuedWithoutDaemon;
++    /**
++     * `viaDaemon()`, or `withoutDaemon()` in this process when the daemon stopped
++     * under a client that may never start one (NX_DAEMON_START=never).
++     */
++    orWithoutDaemon<T>(viaDaemon: () => Promise<T>, withoutDaemon: () => T | Promise<T>): Promise<T>;
++    /** Lets the stopped daemon's connection go, and says so once per process. */
++    continueWithoutDaemon(error: Error): void;
+     reset(): void;
+     private getSocketPath;
+     requestShutdown(): Promise<void>;
+@@ -89,9 +97,6 @@ export declare class DaemonClient {
      getFilesInDirectory(dir: string): Promise<string[]>;
      hashGlob(globs: string[], exclude?: string[]): Promise<string>;
      hashMultiGlob(globGroups: string[][]): Promise<string[]>;
@@ -369,7 +384,7 @@ index 9bd7b61bf9ad94c72a198dfe6f15fbcb68dfaac3..c552b4b252c2d0496312ddb6ff481699
      flushSyncGeneratorChangesToDisk(generators: string[]): Promise<FlushSyncGeneratorChangesResult>;
      getRegisteredSyncGenerators(): Promise<{
 diff --git a/dist/src/daemon/client/client.js b/dist/src/daemon/client/client.js
-index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..a1aeb1ac56800af773219df4f55ee95e324f1a26 100644
+index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..64c9d05890139ad8259e3d01ee86dd0de1f5005f 100644
 --- a/dist/src/daemon/client/client.js
 +++ b/dist/src/daemon/client/client.js
 @@ -40,7 +40,6 @@ const nx_console_1 = require("../message-types/nx-console");
@@ -380,7 +395,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..a1aeb1ac56800af773219df4f55ee95e
  const update_workspace_context_1 = require("../message-types/update-workspace-context");
  const tmp_dir_1 = require("../tmp-dir");
  const sandbox_socket_hint_1 = require("../sandbox-socket-hint");
-@@ -135,6 +134,15 @@ class DaemonClient {
+@@ -135,12 +134,51 @@ class DaemonClient {
                  });
                  this._enabled = false;
              }
@@ -396,7 +411,43 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..a1aeb1ac56800af773219df4f55ee95e
              else {
                  this._enabled = true;
              }
-@@ -668,27 +676,6 @@ class DaemonClient {
+         }
+         return this._enabled;
+     }
++    /**
++     * `viaDaemon()`, or `withoutDaemon()` in this process when the daemon stopped
++     * under a client that may never start one (NX_DAEMON_START=never). That stop
++     * turned the daemon off for this process alone, so once the connection is let
++     * go `enabled()` is false, and a `withoutDaemon` that calls its own caller
++     * again takes that caller's in-process path.
++     */
++    async orWithoutDaemon(viaDaemon, withoutDaemon) {
++        try {
++            return await viaDaemon();
++        }
++        catch (e) {
++            if (!e?.daemonStartForbidden) {
++                throw e;
++            }
++            this.continueWithoutDaemon(e);
++            return withoutDaemon();
++        }
++    }
++    /**
++     * Lets the stopped daemon's connection go, and says so once per process: every
++     * request still queued for it fails the same way and continues the same way.
++     */
++    continueWithoutDaemon(error) {
++        if (!this.continuedWithoutDaemon) {
++            this.continuedWithoutDaemon = true;
++            output_1.output.note({ title: `${error.message} Continuing without the daemon.` });
++        }
++        this.reset();
++    }
+     reset() {
+         this.socketMessenger?.close();
+         this.socketMessenger = null;
+@@ -668,27 +706,6 @@ class DaemonClient {
          };
          return this.sendToDaemonViaQueue(message);
      }
@@ -424,24 +475,16 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..a1aeb1ac56800af773219df4f55ee95e
      getSyncGeneratorChanges(generators) {
          const message = {
              type: get_sync_generator_changes_1.GET_SYNC_GENERATOR_CHANGES,
-@@ -813,8 +800,23 @@ class DaemonClient {
+@@ -813,8 +830,15 @@ class DaemonClient {
                  }
              }
              if (!probe.available) {
 -                // Carried as a value so no other caller's probe can substitute for it.
 -                daemonPid = await this.startInBackground(probe.refusal);
 +                if (process.env.NX_DAEMON_START === 'never') {
-+                    // The daemon enabled() found running has stopped since. Its
-+                    // successor is its starter's (cowshed's keeper) to start, never
-+                    // this client's. The stop belongs to that owner, not to the
-+                    // workspace, so the daemon is off for this process alone: no
-+                    // marker that an ordinary terminal would inherit.
-+                    const reason = 'The Nx daemon this client was using stopped, and NX_DAEMON_START=never: this client never starts a daemon.';
-+                    (0, tmp_dir_1.disableDaemonForThisProcess)(reason);
++                    // The daemon enabled() found running has stopped since.
 +                    this._daemonStatus = DaemonStatus.DISCONNECTED;
-+                    const error = new Error(reason);
-+                    error.daemonStartForbidden = true;
-+                    throw error;
++                    throw daemonStartForbidden();
 +                }
 +                else {
 +                    // Carried as a value so no other caller's probe can substitute for it.
@@ -450,7 +493,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..a1aeb1ac56800af773219df4f55ee95e
              }
              this.setUpConnection();
              this._daemonStatus = DaemonStatus.CONNECTED;
-@@ -831,13 +833,24 @@ class DaemonClient {
+@@ -831,13 +855,24 @@ class DaemonClient {
          }
      }
      async sendToDaemonViaQueue(messageToDaemon, parser) {
@@ -482,7 +525,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..a1aeb1ac56800af773219df4f55ee95e
      }
      setUpConnection() {
          const socketPath = this.getSocketPath();
-@@ -846,7 +859,13 @@ class DaemonClient {
+@@ -846,7 +881,13 @@ class DaemonClient {
          // sendMessageToDaemon method uses a keep-alive setTimeout to
          // explicitly hold the event loop open while awaiting a response.
          socket.unref();
@@ -497,7 +540,29 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..a1aeb1ac56800af773219df4f55ee95e
              // it's ok for the daemon to terminate if the client doesn't wait on
              // any messages from the daemon
              if (this.queue.isEmpty()) {
-@@ -1132,8 +1151,11 @@ class DaemonClient {
+@@ -892,6 +933,12 @@ class DaemonClient {
+             else {
+                 error = daemonProcessException(err.toString());
+             }
++            if (process.env.NX_DAEMON_START === 'never' && !error.daemonPermissionError) {
++                // The daemon went away under this request (a restart ends the
++                // socket it was written to). A client that may never start one
++                // continues without it; what failed stays the error's cause.
++                error = daemonStartForbidden(error);
++            }
+             this.currentReject(error);
+             this.socketMessenger?.close();
+         });
+@@ -936,7 +983,7 @@ class DaemonClient {
+         else {
+             // Failed to reconnect after all attempts, reject the pending request
+             if (this.currentReject) {
+-                this.currentReject(error);
++                this.currentReject(process.env.NX_DAEMON_START === 'never' ? daemonStartForbidden() : error);
+             }
+         }
+     }
+@@ -1132,8 +1179,11 @@ class DaemonClient {
           */
          const { available, refusal: polled } = await this.waitForServerToBeAvailable({ ignoreVersionMismatch: true });
          if (available) {
@@ -511,7 +576,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..a1aeb1ac56800af773219df4f55ee95e
          }
          else {
              // A permission refusal from either source wins, then the poll's errno,
-@@ -1200,6 +1222,26 @@ function isDocker() {
+@@ -1200,6 +1250,26 @@ function isDocker() {
  function nxJsonIsNotPresent() {
      return !(0, nx_json_1.hasNxJson)(workspace_root_1.workspaceRoot);
  }
@@ -538,6 +603,28 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..a1aeb1ac56800af773219df4f55ee95e
  /**
   * The operating system refused the connection. Most often the socket belongs to
   * another user, which is the guarantee the owner-only socket directory buys —
+@@ -1226,6 +1296,21 @@ function daemonPermissionException(socketPath, cause) {
+     error.daemonPermissionError = true;
+     return error;
+ }
++/**
++ * The daemon this client was using stopped, and the client may never start one
++ * (NX_DAEMON_START=never). Its successor is its starter's (cowshed's keeper) to
++ * start, never this client's. The stop belongs to that owner, not to the
++ * workspace, so the daemon is off for this process alone: no marker that an
++ * ordinary terminal would inherit. `cause` is the connection failure that
++ * showed the stop, when one did.
++ */
++function daemonStartForbidden(cause) {
++    const reason = 'The Nx daemon this client was using stopped, and NX_DAEMON_START=never: this client never starts a daemon.';
++    (0, tmp_dir_1.disableDaemonForThisProcess)(reason);
++    const error = cause === undefined ? new Error(reason) : new Error(reason, { cause });
++    error.daemonStartForbidden = true;
++    return error;
++}
+ /**
+  * Exported for testing: the `internalDaemonError` tag decides whether a daemon
+  * failure degrades to a daemonless graph build or aborts the command.
 diff --git a/dist/src/daemon/message-types/daemon-message.d.ts b/dist/src/daemon/message-types/daemon-message.d.ts
 index 9dd6123ad6d9adb20a07f7db56fc476be78cbcca..0b1ee217729d63a29806cf6c38d0fc5d4a2161a5 100644
 --- a/dist/src/daemon/message-types/daemon-message.d.ts
@@ -1361,7 +1448,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..c68bcacb9bc46babaa86ea0ac212e79d
                          (0, shutdown_utils_1.storeOutputWatcherInstance)(await (0, watcher_1.watchOutputFiles)(server, handle_outputs_changes_1.handleOutputsChanges));
                      }
 diff --git a/dist/src/daemon/server/shutdown-utils.d.ts b/dist/src/daemon/server/shutdown-utils.d.ts
-index 698fcf9e061b8e0b37057a6318614dbe6d290b9e..422d244931ceb3a7143fc06e23d113bc0c566092 100644
+index 698fcf9e061b8e0b37057a6318614dbe6d290b9e..5470c4935d0a5f230dde3ece13bfb6ba9a58e10b 100644
 --- a/dist/src/daemon/server/shutdown-utils.d.ts
 +++ b/dist/src/daemon/server/shutdown-utils.d.ts
 @@ -1,6 +1,6 @@
@@ -1372,20 +1459,83 @@ index 698fcf9e061b8e0b37057a6318614dbe6d290b9e..422d244931ceb3a7143fc06e23d113bc
  export declare function storeWatcherInstance(instance: Watcher): void;
  export declare function getWatcherInstance(): Watcher;
  export declare function storeOutputWatcherInstance(instance: Watcher): void;
+@@ -12,6 +12,8 @@ interface HandleServerProcessTerminationParams {
+ }
+ export declare function handleServerProcessTermination({ server, reason, sockets, }: HandleServerProcessTerminationParams): Promise<void>;
+ export declare function handleServerProcessTerminationWithRestart({ server, reason, sockets, }: HandleServerProcessTerminationParams): Promise<void>;
++/** Starts a restarting daemon's successor. Exported for testing: the restart's log descriptors must not outlive it. */
++export declare function startNewDaemonInBackground(): Promise<void>;
+ export declare function resetInactivityTimeout(cb: () => void): void;
+ export declare function respondToClient(socket: Socket, response: Buffer, description: string): Promise<unknown>;
+ /**
 diff --git a/dist/src/daemon/server/shutdown-utils.js b/dist/src/daemon/server/shutdown-utils.js
-index a449f2fb3c864bc9d3d710078418c8a05879aa84..7123ce257437d940409bc683b00ed500f6b10a55 100644
+index a449f2fb3c864bc9d3d710078418c8a05879aa84..17d9f2a7569a1332105b8e1106a2b8fdfb8a3e96 100644
 --- a/dist/src/daemon/server/shutdown-utils.js
 +++ b/dist/src/daemon/server/shutdown-utils.js
-@@ -25,7 +25,7 @@ const path_1 = require("path");
+@@ -11,6 +11,7 @@ exports.resetInactivityTimeout = resetInactivityTimeout;
+ exports.respondToClient = respondToClient;
+ exports.respondWithError = respondWithError;
+ exports.respondWithErrorAndExit = respondWithErrorAndExit;
++exports.startNewDaemonInBackground = startNewDaemonInBackground;
+ const workspace_root_1 = require("../../utils/workspace-root");
+ const logger_1 = require("../logger");
+ const socket_utils_1 = require("../socket-utils");
+@@ -23,16 +24,20 @@ const analytics_1 = require("../../analytics");
+ const child_process_1 = require("child_process");
+ const path_1 = require("path");
  const node_fs_1 = require("node:fs");
- const promises_1 = require("fs/promises");
+-const promises_1 = require("fs/promises");
  const tmp_dir_1 = require("../tmp-dir");
 -exports.SERVER_INACTIVITY_TIMEOUT_MS = 10800000; // 10800000 ms = 3 hours
 +exports.SERVER_INACTIVITY_TIMEOUT_MS = 300000; // 300000 ms = 5 minutes
  async function startNewDaemonInBackground() {
      (0, node_fs_1.mkdirSync)(tmp_dir_1.DAEMON_DIR_FOR_CURRENT_WORKSPACE, { recursive: true });
      if (!(0, node_fs_1.existsSync)(tmp_dir_1.DAEMON_OUTPUT_LOG_FILE)) {
-@@ -85,15 +85,31 @@ async function handleServerProcessTerminationWithRestart({ server, reason, socke
+         (0, node_fs_1.writeFileSync)(tmp_dir_1.DAEMON_OUTPUT_LOG_FILE, '');
+     }
+-    const out = await (0, promises_1.open)(tmp_dir_1.DAEMON_OUTPUT_LOG_FILE, 'a');
+-    const err = await (0, promises_1.open)(tmp_dir_1.DAEMON_OUTPUT_LOG_FILE, 'a');
++    // Redirect the successor's stdout/stderr into the log file. The child dup's
++    // these descriptors at spawn, so they are closed right after it, as the
++    // client's start does: a `FileHandle` left to garbage collection is a fatal
++    // ERR_INVALID_STATE on Node >=26, which ended the restarting daemon with the
++    // socket its clients were still writing to.
++    const out = (0, node_fs_1.openSync)(tmp_dir_1.DAEMON_OUTPUT_LOG_FILE, 'a');
++    const err = (0, node_fs_1.openSync)(tmp_dir_1.DAEMON_OUTPUT_LOG_FILE, 'a');
+     // Use require.resolve to find the currently installed version's start.js
+     // instead of using __dirname which points to the old running daemon's path
+     // Resolve from workspace root to pick up the correct symlink target
+@@ -50,14 +55,21 @@ async function startNewDaemonInBackground() {
+     logger_1.serverLogger.log(`Restarting daemon with script: ${startScriptPath}`);
+     logger_1.serverLogger.log(`Old daemon __dirname: ${__dirname}`);
+     logger_1.serverLogger.log(`Current process.execPath: ${process.execPath}`);
+-    const backgroundProcess = (0, child_process_1.spawn)(process.execPath, [startScriptPath], {
+-        cwd: workspace_root_1.workspaceRoot,
+-        stdio: ['ignore', out.fd, err.fd],
+-        detached: true,
+-        windowsHide: true,
+-        shell: false,
+-        env: process.env,
+-    });
++    let backgroundProcess;
++    try {
++        backgroundProcess = (0, child_process_1.spawn)(process.execPath, [startScriptPath], {
++            cwd: workspace_root_1.workspaceRoot,
++            stdio: ['ignore', out, err],
++            detached: true,
++            windowsHide: true,
++            shell: false,
++            env: process.env,
++        });
++    }
++    finally {
++        (0, node_fs_1.closeSync)(out);
++        (0, node_fs_1.closeSync)(err);
++    }
+     backgroundProcess.unref();
+     logger_1.serverLogger.log('Started new daemon process in background');
+ }
+@@ -85,15 +97,31 @@ async function handleServerProcessTerminationWithRestart({ server, reason, socke
      await startNewDaemonInBackground();
      await performShutdown(server, reason, sockets);
  }
@@ -1686,6 +1836,26 @@ index d21213e8de9eba5e1edcde9e7db474ec7266272b..584785648eefa62878cc914a2d91bace
      const result = planResult[canonicalTaskId] ?? null;
      hashInputsCache.set(taskId, result);
      return result;
+diff --git a/dist/src/hasher/create-task-hasher.js b/dist/src/hasher/create-task-hasher.js
+index 91845891cea3e6ae16e241457f843647bc00859b..c481d7a73c1d3a0c6085cadb9e45e5533f246f0a 100644
+--- a/dist/src/hasher/create-task-hasher.js
++++ b/dist/src/hasher/create-task-hasher.js
+@@ -6,7 +6,14 @@ const build_project_graph_1 = require("../project-graph/build-project-graph");
+ const task_hasher_1 = require("./task-hasher");
+ function createTaskHasher(projectGraph, nxJson, runnerOptions) {
+     if (client_1.daemonClient.enabled()) {
+-        return new task_hasher_1.DaemonBasedTaskHasher(client_1.daemonClient, runnerOptions);
++        // A daemon that stops under a client that may never start one leaves the
++        // run to hash in this process, over a graph built here: the in-process
++        // hasher reads the file data of this process's build, which a graph from
++        // the daemon never brought.
++        return new task_hasher_1.DaemonBasedTaskHasher(client_1.daemonClient, runnerOptions, async () => {
++            const { createProjectGraphAsync } = require('../project-graph/project-graph');
++            return createTaskHasher(await createProjectGraphAsync({ exitOnError: false }), nxJson, runnerOptions);
++        });
+     }
+     else {
+         const { rustReferences } = (0, build_project_graph_1.getFileMap)();
 diff --git a/dist/src/hasher/hash-plan-inspector.d.ts b/dist/src/hasher/hash-plan-inspector.d.ts
 index edb5a7bf425cfd04ad243b0d30a21f1cf6061140..316ca4b91dbf788c9f41d5a2acfbb077590d5db2 100644
 --- a/dist/src/hasher/hash-plan-inspector.d.ts
@@ -1724,6 +1894,58 @@ index 332accab74919348073538f4198693328bf68193..a56864600a5e7a9f9e40adea9a7bfc9e
          const plansReference = this.planner.getPlansReference(taskIds, taskGraph);
          return this.inspector.inspectInputs(plansReference);
      }
+diff --git a/dist/src/hasher/task-hasher.d.ts b/dist/src/hasher/task-hasher.d.ts
+index cf08aa6c0fb9bcbb2fbf10e554f2e0397b1b13d7..f67c434e41a776343e11225bdd12f02cd7570d0c 100644
+--- a/dist/src/hasher/task-hasher.d.ts
++++ b/dist/src/hasher/task-hasher.d.ts
+@@ -75,7 +75,14 @@ export type Hasher = TaskHasher;
+ export declare class DaemonBasedTaskHasher implements TaskHasher {
+     private readonly daemonClient;
+     private readonly runnerOptions;
+-    constructor(daemonClient: DaemonClient, runnerOptions: any);
++    private readonly withoutDaemon;
++    private inProcess;
++    /**
++     * `withoutDaemon` makes the hasher a run continues with in this process when
++     * its daemon stops under a client that may never start one
++     * (NX_DAEMON_START=never); it is made once, for every later hash.
++     */
++    constructor(daemonClient: DaemonClient, runnerOptions: any, withoutDaemon: () => Promise<TaskHasher>);
+     hashTasks(tasks: Task[], taskGraph: TaskGraph, envOrPerTaskEnvs: NodeJS.ProcessEnv | Record<string, NodeJS.ProcessEnv>): Promise<Hash[]>;
+     hashTask(task: Task, taskGraph?: TaskGraph, env?: NodeJS.ProcessEnv): Promise<Hash>;
+ }
+diff --git a/dist/src/hasher/task-hasher.js b/dist/src/hasher/task-hasher.js
+index 482785eaf103f95831144f05f9b65a8677eca398..e1693b2163e2518b4889b0fa60227483028fc9af 100644
+--- a/dist/src/hasher/task-hasher.js
++++ b/dist/src/hasher/task-hasher.js
+@@ -44,13 +44,25 @@ function normalizePerTaskEnvs(tasks, arg) {
+     return arg;
+ }
+ class DaemonBasedTaskHasher {
+-    constructor(daemonClient, runnerOptions) {
++    /**
++     * `withoutDaemon` makes the hasher a run continues with in this process when
++     * its daemon stops under a client that may never start one
++     * (NX_DAEMON_START=never); it is made once, for every later hash.
++     */
++    constructor(daemonClient, runnerOptions, withoutDaemon) {
+         this.daemonClient = daemonClient;
+         this.runnerOptions = runnerOptions;
++        this.withoutDaemon = withoutDaemon;
+     }
+     async hashTasks(tasks, taskGraph, envOrPerTaskEnvs) {
++        if (this.inProcess) {
++            return (await this.inProcess).hashTasks(tasks, taskGraph, envOrPerTaskEnvs);
++        }
+         const collectInputs = (0, task_io_service_1.getTaskIOService)().hasTaskInputSubscribers();
+-        return this.daemonClient.hashTasks(this.runnerOptions, tasks, taskGraph, normalizePerTaskEnvs(tasks, envOrPerTaskEnvs), process.cwd(), collectInputs);
++        return this.daemonClient.orWithoutDaemon(() => this.daemonClient.hashTasks(this.runnerOptions, tasks, taskGraph, normalizePerTaskEnvs(tasks, envOrPerTaskEnvs), process.cwd(), collectInputs), () => {
++            this.inProcess ??= this.withoutDaemon();
++            return this.hashTasks(tasks, taskGraph, envOrPerTaskEnvs);
++        });
+     }
+     async hashTask(task, taskGraph, env) {
+         return (await this.hashTasks([task], taskGraph, {
 diff --git a/dist/src/plugins/js/lock-file/bun-parser.js b/dist/src/plugins/js/lock-file/bun-parser.js
 index 169563d598af64c8b74d00ab9815dd651650ec9d..0bd5e1f536b1e0e02843396e01b29dcece8293b0 100644
 --- a/dist/src/plugins/js/lock-file/bun-parser.js
@@ -2215,8 +2437,33 @@ index 3659fdd1955d56e60cc0158d19ac55d59916d78e..92e6700adfc52a380b3e9e37b655fbc9
      }
      /**
       * Returns the current session count for a phase. Useful for testing.
+diff --git a/dist/src/project-graph/plugins/tasks-execution-hooks.js b/dist/src/project-graph/plugins/tasks-execution-hooks.js
+index 83c97768834e3f56083d5e5c2ff52806f55e95a3..eb2a4b563448079be79b58540290f41c53d0025d 100644
+--- a/dist/src/project-graph/plugins/tasks-execution-hooks.js
++++ b/dist/src/project-graph/plugins/tasks-execution-hooks.js
+@@ -31,8 +31,10 @@ async function runPreTasksExecution(pluginContext) {
+         return envs;
+     }
+     else {
+-        const envs = await client_1.daemonClient.runPreTasksExecution(pluginContext);
+-        applyProcessEnvs(envs);
++        return client_1.daemonClient.orWithoutDaemon(async () => {
++            const envs = await client_1.daemonClient.runPreTasksExecution(pluginContext);
++            applyProcessEnvs(envs);
++        }, () => runPreTasksExecution(pluginContext));
+     }
+ }
+ function applyProcessEnvs(envs) {
+@@ -62,6 +64,6 @@ async function runPostTasksExecution(context) {
+         performance.measure(`postTasksExecution`, `postTasksExecution:start`, `postTasksExecution:end`);
+     }
+     else {
+-        await client_1.daemonClient.runPostTasksExecution(context);
++        await client_1.daemonClient.orWithoutDaemon(() => client_1.daemonClient.runPostTasksExecution(context), () => runPostTasksExecution(context));
+     }
+ }
 diff --git a/dist/src/project-graph/project-graph.js b/dist/src/project-graph/project-graph.js
-index a23de7d0f27d7bc222ee09f4904f5d236510d01d..0d8514be79f2ed03c7cc2410ea0d91f7c885d634 100644
+index a23de7d0f27d7bc222ee09f4904f5d236510d01d..b57c8ede62af0153311dd79bddb0b4b42507804d 100644
 --- a/dist/src/project-graph/project-graph.js
 +++ b/dist/src/project-graph/project-graph.js
 @@ -149,14 +149,7 @@ function handleProjectGraphError(opts, e) {
@@ -2235,7 +2482,7 @@ index a23de7d0f27d7bc222ee09f4904f5d236510d01d..0d8514be79f2ed03c7cc2410ea0d91f7
          }
          else if (typeof e.message === 'string') {
              const lines = e.message.split('\n');
-@@ -356,6 +349,14 @@ async function createProjectGraphAndSourceMapsAsync(opts = {
+@@ -356,6 +349,13 @@ async function createProjectGraphAndSourceMapsAsync(opts = {
                  (0, tmp_dir_1.markDaemonAsDisabled)(e.message);
                  return buildProjectGraphAndSourceMapsWithoutDaemon();
              }
@@ -2243,8 +2490,7 @@ index a23de7d0f27d7bc222ee09f4904f5d236510d01d..0d8514be79f2ed03c7cc2410ea0d91f7
 +                // The daemon stopped under a client that may not start one
 +                // (NX_DAEMON_START=never). The client already turned the daemon off
 +                // for this process alone; the command continues without it.
-+                output_1.output.note({ title: `${e.message} Continuing without the daemon.` });
-+                client_1.daemonClient.reset();
++                client_1.daemonClient.continueWithoutDaemon(e);
 +                return buildProjectGraphAndSourceMapsWithoutDaemon();
 +            }
              if (e.daemonPermissionError) {
@@ -3139,7 +3385,7 @@ index 6d3dd021b050be5c74803555b361b6502f9693c7..81e7fa2f866eb22eeabcc8d2802aec5e
      private postRunSteps;
      private scheduleNextTasksAndReleaseThreads;
 diff --git a/dist/src/tasks-runner/task-orchestrator.js b/dist/src/tasks-runner/task-orchestrator.js
-index 0b446cbce811319a741165e42a0100e0570e0a2f..1fbd5f47637dd6fb1a7e7b073d062069df31384c 100644
+index 0b446cbce811319a741165e42a0100e0570e0a2f..e1989ccab6a0ddc3cea350ee60646bf092e3732b 100644
 --- a/dist/src/tasks-runner/task-orchestrator.js
 +++ b/dist/src/tasks-runner/task-orchestrator.js
 @@ -29,6 +29,7 @@ const shared_running_task_1 = require("./running-tasks/shared-running-task");
@@ -3346,7 +3592,27 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..1fbd5f47637dd6fb1a7e7b073d062069
              });
          }));
          await this.scheduleNextTasksAndReleaseThreads();
-@@ -1376,6 +1430,7 @@ class TaskOrchestrator {
+@@ -1300,7 +1354,9 @@ class TaskOrchestrator {
+         if (tasks.length === 0)
+             return resultMap;
+         if (this.daemon?.enabled()) {
+-            const matches = await this.daemon.outputsHashesMatchBatch(tasks);
++            // A daemon gone under a client that may never start one verifies
++            // nothing: every output is copied, as below.
++            const matches = await this.daemon.orWithoutDaemon(() => this.daemon.outputsHashesMatchBatch(tasks), () => tasks.map(() => false));
+             for (let i = 0; i < tasks.length; i++) {
+                 resultMap.set(tasks[i].hash, !matches[i]);
+             }
+@@ -1315,7 +1371,7 @@ class TaskOrchestrator {
+     }
+     async recordOutputsHashBatch(entries) {
+         if (this.daemon?.enabled()) {
+-            return this.daemon.recordOutputsHashBatch(entries);
++            return this.daemon.orWithoutDaemon(() => this.daemon.recordOutputsHashBatch(entries), () => undefined);
+         }
+     }
+     // endregion utils
+@@ -1376,6 +1432,7 @@ class TaskOrchestrator {
          return this.cleanupPromise;
      }
      async performCleanup() {
@@ -3772,6 +4038,37 @@ index 7adf7fe48dbde78fa770ad37c5714985d78a7b8c..13e1858e5487a7d308a84cba1f379cde
      if (!path) {
          return null;
      }
+diff --git a/dist/src/utils/sync-generators.js b/dist/src/utils/sync-generators.js
+index d753d65ac4e40380a4dda94a34bc60e0d233f452..796630a927c81afefc9a0ec8d4edb7a274cbe217 100644
+--- a/dist/src/utils/sync-generators.js
++++ b/dist/src/utils/sync-generators.js
+@@ -40,7 +40,7 @@ async function getSyncGeneratorChanges(generators) {
+         results = await runSyncGenerators(generators);
+     }
+     else {
+-        results = await client_1.daemonClient.getSyncGeneratorChanges(generators);
++        results = await client_1.daemonClient.orWithoutDaemon(() => client_1.daemonClient.getSyncGeneratorChanges(generators), () => runSyncGenerators(generators));
+     }
+     perf_hooks_1.performance.mark('get-sync-generators-changes:end');
+     perf_hooks_1.performance.measure('get-sync-generators-changes', 'get-sync-generators-changes:start', 'get-sync-generators-changes:end');
+@@ -50,7 +50,7 @@ async function flushSyncGeneratorChanges(results) {
+     if ((0, is_on_daemon_1.isOnDaemon)() || !client_1.daemonClient.enabled()) {
+         return await flushSyncGeneratorChangesToDisk(results);
+     }
+-    return await client_1.daemonClient.flushSyncGeneratorChangesToDisk(results.map((r) => r.generatorName));
++    return await client_1.daemonClient.orWithoutDaemon(() => client_1.daemonClient.flushSyncGeneratorChangesToDisk(results.map((r) => r.generatorName)), () => flushSyncGeneratorChanges(results));
+ }
+ async function collectAllRegisteredSyncGenerators(projectGraph, nxJson) {
+     if (!client_1.daemonClient.enabled()) {
+@@ -61,7 +61,7 @@ async function collectAllRegisteredSyncGenerators(projectGraph, nxJson) {
+             ],
+         };
+     }
+-    return await client_1.daemonClient.getRegisteredSyncGenerators();
++    return await client_1.daemonClient.orWithoutDaemon(() => client_1.daemonClient.getRegisteredSyncGenerators(), () => collectAllRegisteredSyncGenerators(projectGraph, nxJson));
+ }
+ async function runSyncGenerator(tree, generatorSpecifier, projects) {
+     try {
 diff --git a/dist/src/utils/task-history.js b/dist/src/utils/task-history.js
 index 34dbaa2a5a44e6b7d1f69a516756b30939877bd7..09f95b73572a0d411f26d42aac2cfbf0098311f4 100644
 --- a/dist/src/utils/task-history.js
@@ -3819,7 +4116,7 @@ index 34dbaa2a5a44e6b7d1f69a516756b30939877bd7..09f95b73572a0d411f26d42aac2cfbf0
  }
  exports.TaskHistory = TaskHistory;
 diff --git a/dist/src/utils/workspace-context.js b/dist/src/utils/workspace-context.js
-index a887d862c9c431d8cbbc0d44e26fd394b243fb9c..ead0324cffa7dac0a019a756ab9902876c34b593 100644
+index a887d862c9c431d8cbbc0d44e26fd394b243fb9c..00460d17cea645491b99c2ffa06f1437fa6f7034 100644
 --- a/dist/src/utils/workspace-context.js
 +++ b/dist/src/utils/workspace-context.js
 @@ -13,6 +13,9 @@ exports.getAllFileDataInContext = getAllFileDataInContext;
@@ -3832,7 +4129,7 @@ index a887d862c9c431d8cbbc0d44e26fd394b243fb9c..ead0324cffa7dac0a019a756ab990287
  const perf_hooks_1 = require("perf_hooks");
  const cache_directory_1 = require("./cache-directory");
  const is_on_daemon_1 = require("../daemon/is-on-daemon");
-@@ -22,10 +25,92 @@ let workspaceContext;
+@@ -22,16 +25,98 @@ let workspaceContext;
  function setupWorkspaceContext(workspaceRoot) {
      const { WorkspaceContext } = require('../native');
      perf_hooks_1.performance.mark('workspace-context');
@@ -3926,6 +4223,73 @@ index a887d862c9c431d8cbbc0d44e26fd394b243fb9c..ead0324cffa7dac0a019a756ab990287
  async function getNxWorkspaceFilesFromContext(workspaceRoot, projectRootMap, useDaemonProcess = true) {
      if (!useDaemonProcess || (0, is_on_daemon_1.isOnDaemon)() || !client_1.daemonClient.enabled()) {
          ensureContextAvailable(workspaceRoot);
+         return workspaceContext.getWorkspaceFiles(projectRootMap);
+     }
+-    return client_1.daemonClient.getWorkspaceFiles(projectRootMap);
++    return client_1.daemonClient.orWithoutDaemon(() => client_1.daemonClient.getWorkspaceFiles(projectRootMap), () => getNxWorkspaceFilesFromContext(workspaceRoot, projectRootMap, useDaemonProcess));
+ }
+ /**
+  * Sync method to get files matching globs from workspace context.
+@@ -50,7 +135,7 @@ async function globWithWorkspaceContext(workspaceRoot, globs, exclude) {
+         return workspaceContext.glob(globs, exclude);
+     }
+     else {
+-        return client_1.daemonClient.glob(globs, exclude);
++        return client_1.daemonClient.orWithoutDaemon(() => client_1.daemonClient.glob(globs, exclude), () => globWithWorkspaceContext(workspaceRoot, globs, exclude));
+     }
+ }
+ async function multiGlobWithWorkspaceContext(workspaceRoot, globs, exclude) {
+@@ -58,21 +143,21 @@ async function multiGlobWithWorkspaceContext(workspaceRoot, globs, exclude) {
+         ensureContextAvailable(workspaceRoot);
+         return workspaceContext.multiGlob(globs, exclude);
+     }
+-    return client_1.daemonClient.multiGlob(globs, exclude);
++    return client_1.daemonClient.orWithoutDaemon(() => client_1.daemonClient.multiGlob(globs, exclude), () => multiGlobWithWorkspaceContext(workspaceRoot, globs, exclude));
+ }
+ async function hashWithWorkspaceContext(workspaceRoot, globs, exclude) {
+     if ((0, is_on_daemon_1.isOnDaemon)() || !client_1.daemonClient.enabled()) {
+         ensureContextAvailable(workspaceRoot);
+         return workspaceContext.hashFilesMatchingGlob(globs, exclude);
+     }
+-    return client_1.daemonClient.hashGlob(globs, exclude);
++    return client_1.daemonClient.orWithoutDaemon(() => client_1.daemonClient.hashGlob(globs, exclude), () => hashWithWorkspaceContext(workspaceRoot, globs, exclude));
+ }
+ async function hashMultiGlobWithWorkspaceContext(workspaceRoot, globGroups) {
+     if ((0, is_on_daemon_1.isOnDaemon)() || !client_1.daemonClient.enabled()) {
+         ensureContextAvailable(workspaceRoot);
+         return workspaceContext.hashFilesMatchingGlobs(globGroups);
+     }
+-    return client_1.daemonClient.hashMultiGlob(globGroups);
++    return client_1.daemonClient.orWithoutDaemon(() => client_1.daemonClient.hashMultiGlob(globGroups), () => hashMultiGlobWithWorkspaceContext(workspaceRoot, globGroups));
+ }
+ async function updateContextWithChangedFiles(workspaceRoot, createdFiles, updatedFiles, deletedFiles) {
+     if (!client_1.daemonClient.enabled()) {
+@@ -86,7 +171,7 @@ async function updateContextWithChangedFiles(workspaceRoot, createdFiles, update
+     }
+     else {
+         // daemon is enabled but we are not running on it, ask the daemon to update the context
+-        await client_1.daemonClient.updateWorkspaceContext(createdFiles, updatedFiles, deletedFiles);
++        await client_1.daemonClient.orWithoutDaemon(() => client_1.daemonClient.updateWorkspaceContext(createdFiles, updatedFiles, deletedFiles), () => updateContextWithChangedFiles(workspaceRoot, createdFiles, updatedFiles, deletedFiles));
+     }
+ }
+ function updateFilesInContext(workspaceRoot, updatedFiles, deletedFiles) {
+@@ -98,14 +183,14 @@ async function getAllFileDataInContext(workspaceRoot) {
+         ensureContextAvailable(workspaceRoot);
+         return workspaceContext.allFileData();
+     }
+-    return client_1.daemonClient.getWorkspaceContextFileData();
++    return client_1.daemonClient.orWithoutDaemon(() => client_1.daemonClient.getWorkspaceContextFileData(), () => getAllFileDataInContext(workspaceRoot));
+ }
+ async function getFilesInDirectoryUsingContext(workspaceRoot, dir) {
+     if ((0, is_on_daemon_1.isOnDaemon)() || !client_1.daemonClient.enabled()) {
+         ensureContextAvailable(workspaceRoot);
+         return workspaceContext.getFilesInDirectory(dir);
+     }
+-    return client_1.daemonClient.getFilesInDirectory(dir);
++    return client_1.daemonClient.orWithoutDaemon(() => client_1.daemonClient.getFilesInDirectory(dir), () => getFilesInDirectoryUsingContext(workspaceRoot, dir));
+ }
+ function updateProjectFiles(projectRootMappings, rustReferences, updatedFiles, deletedFiles) {
+     return workspaceContext?.updateProjectFiles(projectRootMappings, rustReferences.projectFiles, rustReferences.globalFiles, updatedFiles, deletedFiles);
 diff --git a/dist/src/utils/workspace-root.d.ts b/dist/src/utils/workspace-root.d.ts
 index 74bf8f91928de190fda5886163a4b7cbd5add572..8034019f30f243d86a7a74abc42fd4ad5725b5ef 100644
 --- a/dist/src/utils/workspace-root.d.ts
