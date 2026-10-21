@@ -813,8 +813,10 @@ impl Writer {
 
     fn subtree_handle(&mut self, peer: ProcessIdentity) -> Result<JobSubtreeAdmission> {
         if !self.owns_live(peer)? {
+            // Only the observation that held the peer can say its job ended. To any other the
+            // peer is no member, so the supervisor asks on until the owner answers.
             return Ok(JobSubtreeAdmission::Refused {
-                reason: if self.ended {
+                reason: if self.ended && self.observer.fold().holds(peer) {
                     JobSubtreeRefusal::JobEnded
                 } else {
                     JobSubtreeRefusal::NotMember
@@ -1801,6 +1803,43 @@ os._exit(0)
         assert_eq!(rows[2].columns.proc_pid, Some(43));
         assert_eq!(rows[1].parent_span_id, rows[0].span_id);
         assert_eq!(rows[2].parent_span_id, rows[0].span_id);
+    }
+
+    /// An ended observation says JobEnded only for a life it held. To any other peer it is no
+    /// member, so the supervisor goes on to ask the observation that owns the peer, rather than
+    /// refusing a live job's admission because an unrelated job's observation ended first.
+    #[test]
+    fn an_ended_observation_answers_job_ended_only_for_its_own_life() {
+        use cowshed_os::fork_lock::Spawn as _;
+
+        let monitor = ProcessMonitor::prepare(JobId::new(1).unwrap()).unwrap();
+        let mut child = std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .spawn_locked()
+            .expect("spawn the observed life");
+        let pid = child.id();
+        monitor.watch(pid).unwrap();
+        let own = native_life(pid);
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        monitor.finish().unwrap();
+
+        assert_eq!(
+            monitor.subtree_handle(own).unwrap(),
+            JobSubtreeAdmission::Refused {
+                reason: JobSubtreeRefusal::JobEnded,
+            },
+            "the ended job's own life"
+        );
+        assert_eq!(
+            monitor
+                .subtree_handle(native_life(std::process::id()))
+                .unwrap(),
+            JobSubtreeAdmission::Refused {
+                reason: JobSubtreeRefusal::NotMember,
+            },
+            "a life of another job"
+        );
     }
 
     #[tokio::test]
