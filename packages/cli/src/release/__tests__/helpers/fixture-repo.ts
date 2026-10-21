@@ -233,23 +233,18 @@ async function gitResult(
     stderr: 'pipe',
   });
   let timedOut = false;
+  // Rejects only when the group could not be ended; its pipes would then never close.
+  const unended = Promise.withResolvers<never>();
   const timeout = setTimeout(() => {
     timedOut = true;
-    try {
-      // `git` may exit after spawning a transport or hook which still owns its
-      // pipes. Killing the detached process group closes every inherited pipe.
-      process.kill(-proc.pid, 'SIGKILL');
-    } catch (error) {
-      if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) {
-        proc.kill('SIGKILL');
-      }
-    }
+    // `git` may exit after spawning a transport or hook which still owns its
+    // pipes. Ending the detached process group closes every inherited pipe.
+    endProcessGroup(proc.pid).catch(unended.reject);
   }, timeoutMs);
   try {
-    const [exitCode, stdout, stderr] = await Promise.all([
-      proc.exited,
-      streamBytes(proc.stdout),
-      streamBytes(proc.stderr),
+    const [exitCode, stdout, stderr] = await Promise.race([
+      Promise.all([proc.exited, streamBytes(proc.stdout), streamBytes(proc.stderr)]),
+      unended.promise,
     ]);
     return { exitCode, stdout, stderr, timedOut, timeoutMs };
   } finally {
@@ -259,6 +254,58 @@ async function gitResult(
 
 async function streamBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+/** A `ps` state in which a process starts nothing: stopped (`T`, `t` when traced) or exited (`Z`). */
+const STARTS_NOTHING = /^[TtZ]/;
+
+/**
+ * End process group `pgid`, and every member it forks while it is being ended. One SIGKILL to a
+ * group is not atomic with a fork in progress: macOS adds the child a member is forking to the group
+ * unsignalled, and that child lives on holding the group's pipes (measured: a kill landing while git
+ * forks an alias shell leaves the shell running, and so the call it serves never returns). So the
+ * group is held with SIGSTOP and listed, round after round, until a listing shows every member
+ * stopped or exited: a stopped process starts nothing, so the SIGKILL that follows ends them all.
+ */
+async function endProcessGroup(pgid: number): Promise<void> {
+  while (signalGroup(pgid, 'SIGSTOP')) {
+    if ((await groupStates(pgid)).every((stat) => STARTS_NOTHING.test(stat))) {
+      signalGroup(pgid, 'SIGKILL');
+      return;
+    }
+  }
+}
+
+/** Signal process group `pgid`; false once no member of it is left to signal. */
+function signalGroup(pgid: number, signal: NodeJS.Signals): boolean {
+  try {
+    process.kill(-pgid, signal);
+    return true;
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ESRCH') {
+      return false;
+    }
+    throw error;
+  }
+}
+
+/** The `ps` state of each member of process group `pgid`, as `ps` lists it on macOS and Linux alike. */
+async function groupStates(pgid: number): Promise<string[]> {
+  const listing = Bun.spawn(['ps', '-A', '-o', 'pgid=', '-o', 'stat='], { stdout: 'pipe', stderr: 'pipe' });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    listing.exited,
+    streamBytes(listing.stdout),
+    streamBytes(listing.stderr),
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(`ps -A failed with exit code ${exitCode} while ending process group ${pgid}: ${decode(stderr)}`);
+  }
+  return decode(stdout)
+    .split('\n')
+    .flatMap((line) => {
+      const [group, stat] = line.trim().split(/\s+/);
+      return group !== undefined && stat !== undefined && Number(group) === pgid ? [stat] : [];
+    });
 }
 
 /**

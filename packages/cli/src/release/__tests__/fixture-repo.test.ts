@@ -416,6 +416,19 @@ describe('release planning with fixture git repositories', () => {
     });
   });
 
+  it('ends the members a timed-out fixture Git process group forks while it is being ended', async () => {
+    await withFixtureRepo(async (root) => {
+      // Eight shell chains, each forking its successor and exiting, keep some member inside fork at
+      // almost any instant. One group SIGKILL misses the child a fork in progress makes, and that
+      // child keeps the chain, and git's pipes, alive: then the test never returns and the leg's
+      // no-progress bound fails the run.
+      const chains = "sh -c 'step() { (step) & exit 0; }; for i in 1 2 3 4 5 6 7 8; do (step) & done; wait'";
+      await expect(git(root, ['-c', `alias.forks=!${chains}`, 'forks'], undefined, 100)).rejects.toThrow(
+        'timed out after 100ms',
+      );
+    });
+  });
+
   it('repairs a scoped package from its project-name release tag without creating a package-name tag', async () => {
     await withFixtureRepo(async (author) => {
       await writePackage(author, '@scope/cli', 'packages/cli', '0.2.0');
