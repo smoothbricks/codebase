@@ -1565,7 +1565,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
   describe('a leg that runs bun', () => {
     const declaresBun = JSON.stringify({ name: 'workspace', packageManager: 'bun@1.4.3' });
-    const systemPath = ':/usr/bin:/bin';
+    // No test here needs a program from the host: each PATH names only the fixture's directory and each command is its
+    // `bun` or a shell builtin. A host's /usr/bin and /bin differ (a NixOS runner has no `touch` in either).
 
     it('is refused before it asks for RAM or CPU when its first bun is another version, and records why', async () => {
       const workspace = await createWorkspace();
@@ -1587,7 +1588,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       const result = await runBoundedExec(
         {
           command: 'bun run.js',
-          env: { PATH: join(workspace.root, 'bin') + systemPath },
+          env: { PATH: join(workspace.root, 'bin') },
           timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         },
         { ...workspace.context, record },
@@ -1621,7 +1622,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       const result = await runBoundedExec(
         {
           command: 'bun run.js',
-          env: { PATH: join(workspace.root, 'bin') + systemPath },
+          env: { PATH: join(workspace.root, 'bin') },
           timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         },
         workspace.context,
@@ -1641,8 +1642,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
       const result = await runBoundedExec(
         {
-          command: 'touch ran.marker',
-          env: { PATH: join(workspace.root, 'bin') + systemPath },
+          command: ': > ran.marker',
+          env: { PATH: join(workspace.root, 'bin') },
           timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         },
         workspace.context,
@@ -1661,7 +1662,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       await workspace.write('package.json', declaresBun);
       await fakeBun(join(workspace.root, 'bin'), '1.4.2');
       const inherited = process.env.PATH;
-      process.env.PATH = join(workspace.root, 'bin') + systemPath;
+      process.env.PATH = join(workspace.root, 'bin');
 
       try {
         const result = await runBoundedExec(
