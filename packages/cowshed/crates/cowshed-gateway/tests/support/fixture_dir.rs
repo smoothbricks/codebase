@@ -30,30 +30,13 @@ impl Drop for FixtureDir {
     }
 }
 
-/// Where every gateway test fixture lives. `COWSHED_RUNTIME_LINK` names the short alias a
-/// workspace's runtime grant already covers; it is used exactly as spelled, never canonicalized,
-/// because canonicalizing would expand it past `sockaddr_un.sun_path`'s 104 bytes (SUN_LEN).
-/// Otherwise `/tmp`, spelled as such, as cpu_budget.rs's roots are. Not the system temporary
-/// directory: on a macOS CI runner that is `/var/folders/<..>/T/`, and a job's pool socket several
-/// levels under a fixture there (`run/cpu/<checkout>/<pool>`) passes SUN_LEN, so the gateway
+#[path = "../../../cowshed-core/tests/support/temp_parent.rs"]
+mod temp_parent;
+
+/// Where every gateway test fixture lives: [`temp_parent::scratch_parent`]. A job's pool socket
+/// several levels under a fixture (`run/cpu/<checkout>/<pool>`) must pass SUN_LEN, or the gateway
 /// refuses the pool ("path must be shorter than SUN_LEN").
-pub fn scratch_parent() -> PathBuf {
-    let path = match std::env::var_os("COWSHED_RUNTIME_LINK") {
-        Some(value) => PathBuf::from(value),
-        None => PathBuf::from("/tmp"),
-    };
-    assert!(
-        path.is_absolute(),
-        "fixture parent {} must be absolute",
-        path.display()
-    );
-    assert!(
-        path.is_dir(),
-        "fixture parent {} must be a directory",
-        path.display()
-    );
-    path
-}
+pub(crate) use temp_parent::scratch_parent;
 
 /// A temporary directory every cowshed private-root check accepts.
 ///

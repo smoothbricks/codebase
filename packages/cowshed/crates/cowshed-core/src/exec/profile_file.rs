@@ -228,10 +228,10 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-    /// A fresh directory under `/tmp`, short enough for a socket inside it to bind (`sun_path`
+    /// A fresh directory under the scratch parent, short enough for a socket inside it to bind (`sun_path`
     /// holds 104 bytes), removed with its guard on every exit path.
     fn scratch() -> crate::temp_root::TempRoot {
-        crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cowshed-pf")
+        crate::temp_root::TempRoot::new_in(&crate::temp_parent::scratch_parent(), "cowshed-pf")
     }
 
     /// Set `path`'s modification time to `seconds` after the epoch, without following a symlink.

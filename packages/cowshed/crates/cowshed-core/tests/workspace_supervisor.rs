@@ -3070,7 +3070,7 @@ struct SocketPath {
 
 impl SocketPath {
     fn new() -> Self {
-        let directory = TempRoot::new_in(Path::new("/tmp"), "cowshed-sock");
+        let directory = TempRoot::new_in(&temp_parent::scratch_parent(), "cowshed-sock");
         Self {
             path: directory.join("s"),
             _directory: directory,
@@ -4501,7 +4501,7 @@ impl cowshed_core::runtime::supervisor_manager::SupervisorSpawner for InProcessS
 /// The manager's own store, short enough for the supervisor sockets under its `run` directory and
 /// removed with its owner on every exit path.
 fn manager_store() -> TempRoot {
-    TempRoot::new_in(Path::new("/tmp"), "cowshed-mgr")
+    TempRoot::new_in(&temp_parent::scratch_parent(), "cowshed-mgr")
 }
 
 /// A daemon whose startup pass has finished, so the manager serves ensures.
@@ -6823,8 +6823,8 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
     );
 
     // The start leaves a live daemon: its record names a running process whose socket accepts.
-    // Short, under /tmp: a Unix socket path is bounded at 104 bytes on macOS.
-    let sockets = TempRoot::new_in(Path::new("/tmp"), "cs-nxk");
+    // Short, under the scratch parent: a Unix socket path is bounded at 104 bytes on macOS.
+    let sockets = TempRoot::new_in(&temp_parent::scratch_parent(), "cs-nxk");
     let socket = sockets.join("d.sock");
     let _daemon = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let record = project.join(".nx/workspace-data/d/server-process.json");
@@ -6982,8 +6982,8 @@ struct LiveDaemon {
 impl LiveDaemon {
     fn start(project: &Path) -> Self {
         use std::sync::atomic::{AtomicBool, Ordering};
-        // Short, under /tmp: a Unix socket path is bounded at 104 bytes on macOS.
-        let sockets = PathBuf::from("/tmp").join(format!(
+        // Short, under the scratch parent: a Unix socket path is bounded at 104 bytes on macOS.
+        let sockets = temp_parent::scratch_parent().join(format!(
             "cs-nxi-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         ));
@@ -7183,7 +7183,8 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
             NxDaemonRetirement::Recorded,
         ] {
             let (mut config, root) = nx_project(name);
-            let sockets = over_socket.then(|| TempRoot::new_in(Path::new("/tmp"), "cs-retire"));
+            let sockets =
+                over_socket.then(|| TempRoot::new_in(&temp_parent::scratch_parent(), "cs-retire"));
             let mut daemon = LiveDaemon::start(&config.workspace_root);
             assert!(daemon.running(), "the foreign nominee starts alive");
             std::os::unix::net::UnixStream::connect(&daemon.socket)

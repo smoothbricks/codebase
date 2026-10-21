@@ -510,9 +510,9 @@ mod tests {
         asks: Vec<Vec<String>>,
     }
 
-    /// A fresh directory under `/tmp`, short enough that its gateway socket path fits `sun_path`.
+    /// A fresh directory under the scratch parent, short enough that its gateway socket path fits `sun_path`.
     fn new_store() -> PathBuf {
-        let dir = PathBuf::from("/tmp").join(format!(
+        let dir = crate::temp_parent::scratch_parent().join(format!(
             "cs-jc-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         ));

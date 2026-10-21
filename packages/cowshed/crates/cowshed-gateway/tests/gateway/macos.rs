@@ -3733,8 +3733,9 @@ async fn nx_cache_route_is_project_bound_readonly_except_qualified_hashes() {
 /// handoff is what makes the difference.
 #[tokio::test]
 async fn a_request_during_a_gateway_restart_is_answered_never_refused() {
-    // `/tmp`, not TMPDIR: a Unix socket path has to fit in `sun_path`.
-    let handoff = std::path::PathBuf::from(format!("/tmp/cs-restart-{}.sock", std::process::id()));
+    // The scratch parent, not TMPDIR: a Unix socket path has to fit in `sun_path`.
+    let handoff = crate::fixture_dir::scratch_parent()
+        .join(format!("cs-restart-{}.sock", std::process::id()));
     let (config, _cache) = test_config();
     let config = GatewayConfig {
         listener_handoff: Some(handoff.clone()),

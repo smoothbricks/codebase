@@ -20657,7 +20657,10 @@ mod unresolved_retirement_tests {
     async fn destructive_changes_retain_a_leaderless_writer_until_it_releases_naturally() {
         // Unix socket addresses need their own short namespace, independent of the host's
         // potentially long TMPDIR. The owned fixture still carries its ledger and real writer.
-        let root = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cowshed-unresolved");
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::scratch_parent(),
+            "cowshed-unresolved",
+        );
         let ledger = root.join("supervisor.groups");
         let workspace = WorkspaceName::new("retained").unwrap();
         let mut child = std::process::Command::new("/bin/sh")

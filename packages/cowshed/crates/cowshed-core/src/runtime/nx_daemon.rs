@@ -1000,8 +1000,9 @@ mod tests {
     /// and a socket nobody listens on are each a daemon to start.
     #[test]
     fn a_daemon_is_live_only_while_its_recorded_process_runs_and_its_socket_accepts() {
-        // Short, under /tmp: a Unix socket path is bounded at 104 bytes on macOS.
-        let root = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cs-nxd");
+        // Short, under the scratch parent: a Unix socket path is bounded at 104 bytes on macOS.
+        let root =
+            crate::temp_root::TempRoot::new_in(&crate::temp_parent::scratch_parent(), "cs-nxd");
         let record = root.join("server-process.json");
         let socket = root.join("d.sock");
         let own = std::process::id();

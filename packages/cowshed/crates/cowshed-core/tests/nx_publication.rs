@@ -17,6 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cowshed_core::build_volume::cache_adapter;
 use serde_json::{Value, json};
 
+#[path = "support/temp_parent.rs"]
+mod temp_parent;
 #[path = "support/temp_root.rs"]
 mod temp_root;
 use temp_root::TempRoot;
@@ -38,14 +40,10 @@ const WRITER_TOKEN: &str = "writer-token-for-the-host-lane-proof";
 const READER_TOKEN: &str = "reader-token-for-the-host-lane-proof";
 const UNKNOWN_HASH: &str = "18446744073709551615";
 
-/// A fixture workspace under `COWSHED_RUNTIME_LINK` when one is set, else the system temporary
-/// directory. Its child is owned by this guard from the moment it is created, so a failed check
-/// below removes it as the panic unwinds.
+/// A fixture workspace under the scratch parent. Its child is owned by this guard from the moment
+/// it is created, so a failed check below removes it as the panic unwinds.
 fn fixture() -> TempRoot {
-    let parent = std::env::var_os("COWSHED_RUNTIME_LINK")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    TempRoot::new_in(&parent, "cowshed-nx-publication")
+    TempRoot::new_in(&temp_parent::scratch_parent(), "cowshed-nx-publication")
 }
 
 /// A remote cache endpoint and the one token a process is given against it.

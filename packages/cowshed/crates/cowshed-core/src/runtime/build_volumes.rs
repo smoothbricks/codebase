@@ -5596,8 +5596,9 @@ fn main() {
             .await
             .unwrap()
             .expect("the landing volume had no Nx client at quiesce");
-        // Short, under /tmp: a Unix socket path is bounded at 104 bytes on macOS.
-        let sockets = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cs-seal");
+        // Short, under the scratch parent: a Unix socket path is bounded at 104 bytes on macOS.
+        let sockets =
+            crate::temp_root::TempRoot::new_in(&crate::temp_parent::scratch_parent(), "cs-seal");
         let socket = sockets.join("d.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let mut daemon = std::process::Command::new("/bin/sleep")
@@ -6148,7 +6149,8 @@ fn main() {
         for id in [&source, &destination] {
             drop(scratch.layout.admit(id).unwrap());
         }
-        let sockets = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cs-carry");
+        let sockets =
+            crate::temp_root::TempRoot::new_in(&crate::temp_parent::scratch_parent(), "cs-carry");
         let socket = sockets.join("d.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let admission = sockets.join("admission");
@@ -6276,8 +6278,9 @@ fn main() {
                 ),
             )
             .unwrap();
-        // Short, under /tmp: a Unix socket path is bounded at 104 bytes on macOS.
-        let sockets = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cs-keep");
+        // Short, under the scratch parent: a Unix socket path is bounded at 104 bytes on macOS.
+        let sockets =
+            crate::temp_root::TempRoot::new_in(&crate::temp_parent::scratch_parent(), "cs-keep");
         let socket = sockets.join("d.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let admission = sockets.join("admission");

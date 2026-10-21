@@ -25,5 +25,8 @@ pub mod skill;
 pub mod workspace_supervisor;
 
 #[cfg(test)]
+#[path = "../../cowshed-core/tests/support/temp_parent.rs"]
+mod temp_parent;
+#[cfg(test)]
 #[path = "../../cowshed-core/tests/support/temp_root.rs"]
 mod temp_root;

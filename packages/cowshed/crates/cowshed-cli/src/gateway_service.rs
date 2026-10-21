@@ -4565,8 +4565,8 @@ mod tests {
 
         /// A daemon's private root, named after `name`.
         fn gateway_root(name: &str) -> crate::temp_root::TempRoot {
-            // `/tmp`, not TMPDIR: the gateway socket's path has to fit in `sun_path`.
-            crate::temp_root::TempRoot::new_in(Path::new("/tmp"), name)
+            // The scratch parent, not TMPDIR: the gateway socket's path has to fit in `sun_path`.
+            crate::temp_root::TempRoot::new_in(&crate::temp_parent::scratch_parent(), name)
         }
 
         async fn daemon(

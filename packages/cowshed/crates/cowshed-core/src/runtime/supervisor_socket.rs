@@ -2620,7 +2620,7 @@ mod socket_ownership_tests {
     use cowshed_os::fork_lock::Spawn as _;
 
     fn path() -> PathBuf {
-        PathBuf::from("/tmp")
+        crate::temp_parent::scratch_parent()
             .join(format!(
                 "cowshed-fence-{}",
                 &uuid::Uuid::new_v4().simple().to_string()[..12]

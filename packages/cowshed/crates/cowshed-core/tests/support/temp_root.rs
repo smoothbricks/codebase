@@ -32,7 +32,10 @@ impl TempRoot {
             "test parent {} must be a directory",
             parent.display()
         );
-        let path = parent.join(format!("{prefix}-{}", uuid::Uuid::new_v4().simple()));
+        // 16 hex digits: unique enough for one parent, and short enough that a fixture under the
+        // runtime link keeps its sockets inside `sun_path`.
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let path = parent.join(format!("{prefix}-{}", &unique[..16]));
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&path)

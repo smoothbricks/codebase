@@ -389,11 +389,9 @@ mod tests {
     use super::*;
 
     fn socket_path(name: &str) -> PathBuf {
-        // `/tmp`, not TMPDIR: a Unix socket path has to fit in `sun_path`.
-        PathBuf::from(format!(
-            "/tmp/cs-handoff-{name}-{}.sock",
-            std::process::id()
-        ))
+        // The scratch parent, not TMPDIR: a Unix socket path has to fit in `sun_path`.
+        crate::control::test_fixture_dir::scratch_parent()
+            .join(format!("cs-handoff-{name}-{}.sock", std::process::id()))
     }
 
     fn listener() -> (SocketAddr, TcpListener) {

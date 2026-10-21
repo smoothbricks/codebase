@@ -1167,7 +1167,10 @@ mod tests {
     #[tokio::test]
     async fn an_ensure_from_another_build_is_refused_naming_both_builds() {
         // Unix socket paths are short; the per-user temporary directory is not.
-        let store = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cowshed-other");
+        let store = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::scratch_parent(),
+            "cowshed-other",
+        );
         std::fs::create_dir_all(store.join("run")).expect("run directory");
         let socket = manager_socket_path(&store);
         let listener = supervisor_socket::bind(&socket)
@@ -1216,7 +1219,10 @@ mod tests {
     /// hint that names the install, and no manager at all is no disagreement.
     #[tokio::test]
     async fn a_build_check_is_answered_for_this_build_and_refused_for_another() {
-        let store = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cowshed-check");
+        let store = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::scratch_parent(),
+            "cowshed-check",
+        );
         std::fs::create_dir_all(store.join("run")).expect("run directory");
         require_same_build(&store)
             .await
@@ -1262,7 +1268,8 @@ mod tests {
     /// A fresh store with a `run` directory holding a socket file for each of `sockets`. Unix
     /// socket paths are short; the per-user temporary directory is not.
     fn recovery_store(prefix: &str, sockets: &[&str]) -> crate::temp_root::TempRoot {
-        let store = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), prefix);
+        let store =
+            crate::temp_root::TempRoot::new_in(&crate::temp_parent::scratch_parent(), prefix);
         std::fs::create_dir_all(store.join("run")).expect("run directory");
         for socket in sockets {
             std::fs::write(store.join("run").join(socket), b"").expect("a socket file");
@@ -1485,7 +1492,10 @@ mod tests {
         use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::process::ExitStatusExt as _;
         // Unix socket paths are short; the per-user temporary directory is not.
-        let store = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cowshed-stop");
+        let store = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::scratch_parent(),
+            "cowshed-stop",
+        );
         std::fs::create_dir_all(store.join("run")).expect("run directory");
         let socket = store.join("run/other.sock");
         // Killed should the test fail before it is stopped: the helper serves until it is killed.
@@ -1569,7 +1579,10 @@ mod tests {
     /// supervisor exits the wait answers at once.
     #[tokio::test]
     async fn a_land_step_waits_for_a_supervisor_of_another_build_and_never_ends_it() {
-        let store = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cowshed-wait");
+        let store = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::scratch_parent(),
+            "cowshed-wait",
+        );
         std::fs::create_dir_all(store.join("run")).expect("run directory");
         let socket = store.join("run/other.sock");
         let mut supervisor =
@@ -1639,7 +1652,10 @@ mod tests {
     #[tokio::test]
     async fn a_refused_daemon_connection_waits_for_a_running_install_only() {
         use std::os::fd::AsRawFd as _;
-        let root = crate::temp_root::TempRoot::new_in(Path::new("/tmp"), "cowshed-across");
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::scratch_parent(),
+            "cowshed-across",
+        );
         let socket = root.join("manager.sock");
         let support = root.join("support");
         std::fs::create_dir(&support).expect("support");
@@ -1680,7 +1696,7 @@ mod tests {
     /// ensure returns that timeout as itself and starts nothing.
     #[tokio::test(start_paused = true)]
     async fn a_hello_that_times_out_is_returned_and_starts_no_second_supervisor() {
-        let store = PathBuf::from("/tmp").join(format!(
+        let store = crate::temp_parent::scratch_parent().join(format!(
             "cowshed-slow-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         ));

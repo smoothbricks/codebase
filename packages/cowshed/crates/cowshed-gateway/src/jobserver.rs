@@ -922,7 +922,7 @@ mod tests {
     #[tokio::test]
     async fn a_lent_pool_lends_its_fifo_bytes_and_its_holders_own_token_and_nothing_twice() {
         let root = crate::control::test_fixture_dir::secure_fixture_dir_in(
-            &std::fs::canonicalize("/tmp").unwrap(),
+            &crate::control::test_fixture_dir::scratch_parent(),
             &format!(
                 "cowshed-lend-{}",
                 &uuid::Uuid::new_v4().simple().to_string()[..8]

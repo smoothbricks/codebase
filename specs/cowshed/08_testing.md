@@ -166,10 +166,14 @@ supplies readiness.
 
 ## Fixtures
 
-Every test fixture stays inside the effective grants of the ordinary exec it runs in. Gateway fixtures choose
-`COWSHED_RUNTIME_LINK` as the short alias when one is available and never canonicalize it back to the long store path;
-otherwise they use `TMPDIR` or the standard temp directory outside the cowshed store. An invalid requested alias fails
-loudly; it never falls through to a global or temp directory.
+Every test fixture stays inside the effective grants of the ordinary exec it runs in. A Rust fixture whose paths are
+used as spelled, such as a Unix-socket fixture, takes the one shared scratch parent (`scratch_parent` in
+`cowshed-core/tests/support/temp_parent.rs`, which the gateway's fixture directory reuses): `COWSHED_RUNTIME_LINK`, the
+workspace's short runtime link, when it is set, else `/tmp`. The parent is never canonicalized back to the long
+`<mount>/.cowshed/run` path, and never the sandbox's `TMPDIR`, which lies under the cowshed store: either would put a
+socket below the fixture past Darwin's 104-byte `sun_path`. A fixture that holds no socket and needs a canonical path,
+such as a test `HOME`, takes the granted `TMPDIR`. An invalid requested alias fails loudly; it never falls through to a
+global or temp directory.
 
 A fixture's child directory is a real, non-symlink directory owned by the test process UID with mode 0700. Drop cleans
 every path the fixture created. No fixture adds a grant, a host cache path, a script wrapper, or a sandbox disable.
@@ -497,6 +501,14 @@ one RAM-backed volume (`packages/nx-plugin/README.md`). Scratch roots and the us
 whatever `TMPDIR` a runner has: every run's sweep must see every dead run, not only those of one task's lease; a clone
 reaches its template by `clonefile`, which cannot cross volumes; and Darwin's socket bound must not depend on the
 runner's `TMPDIR`. The lease never detaches an image attached from below it; it keeps such a lease and names it.
+
+These canonical `/private/tmp` roots, and the canonical `/tmp` parent of the independent controller-git sandbox
+fixtures, are host-only and run in the land gate; a `cowshed exec` sandbox denies `/private/tmp`. No granted parent
+replaces them there. A fixture that runs controller Git or a supervisor under a profile of its own cannot apply that
+nested profile (`sandbox_apply` fails with `EPERM`). The sandbox's `TMPDIR` lies under the cowshed store, so controller
+Git refuses to grant it, a directory store inside it is refused, and it is too long for the sockets below a fixture
+store; the canonical runtime link, `<mount>/.cowshed/run`, is too long as well. A host shell whose `TMPDIR` is the
+workspace's exported exec temp directory would meet the same refusals, so the parent stays `/tmp`, not `TMPDIR`.
 
 On macOS, disk-image coverage runs in the dedicated root `cargo-test-group-real-apfs` target, selected from the
 `cowshed-apfs-tests` crate. Its source inputs are that crate's transitive local Cargo dependency closure:

@@ -32,7 +32,8 @@ fn cowshed() -> PathBuf {
     )
 }
 
-/// A fresh HOME for one test: a short directory under /tmp, removed when the test ends.
+/// A fresh HOME for one test: a directory under the granted temporary directory, removed when the
+/// test ends. It holds no socket, so its length does not matter.
 struct Home {
     path: PathBuf,
 }
@@ -41,9 +42,11 @@ impl Home {
     fn new() -> Self {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path = PathBuf::from(format!("/tmp/cowshed-land-turn-{}-{n}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("cowshed-land-turn-{}-{n}", std::process::id()));
         fs::create_dir_all(&path).expect("create the test HOME");
-        // cowshed requires HOME to be canonical; macOS /tmp is a symlink to /private/tmp.
+        // cowshed requires HOME to be canonical; the temporary directory may be spelled through a
+        // link (macOS's /tmp is one to /private/tmp).
         let path = fs::canonicalize(&path).expect("canonicalize the test HOME");
         Self { path }
     }
