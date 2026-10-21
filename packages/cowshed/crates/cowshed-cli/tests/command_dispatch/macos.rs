@@ -6286,6 +6286,11 @@ async fn real_apfs_land_leaves_a_stock_detached_landing_daemon_running_and_skips
     fs::write(topic.join("a/src.txt"), "changed\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "change output input"]);
     sh(&mut service, "outputs", &nx_run_many(&node, "build")).await;
+    // The keeper started the shed's daemon at the run's admission, behind the run's tokens
+    // (04_sandbox.md, the kept daemon), so its record may follow the run's end. The patched Nx
+    // daemon claims the record when it starts and replaces one of another workspace root as
+    // stale, so the foreign record is copied in only once the kept daemon holds it.
+    eventually(|| recorded_daemon(&topic).is_some()).await;
 
     // A real foreign stock daemon owns a standalone root that retirement must not remove.
     // Its produced record nominates it in the landing checkout; it grants no ledger ownership.
