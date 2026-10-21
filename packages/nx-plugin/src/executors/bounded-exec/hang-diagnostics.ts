@@ -4,6 +4,18 @@ import { type ProcessEntry, withDescendants } from '../../testing.js';
 export const HANG_CAPTURE_MS = 5_000;
 const MAX_PROBE_BYTES = 4 * 1024 * 1024;
 const PS_FIELDS = 'pid=,ppid=,pgid=,stat=,%cpu=,etime=,lstart=,command=';
+/**
+ * lsof's mount-table fallback (darwin libproc dmnt.c, readmnt()): a mount it cannot stat(), such as one detaching under a
+ * concurrent shed, is kept with its mount-table device. Descriptors come per process from libproc, so this warning omits
+ * none of the selected processes' rows.
+ */
+const LSOF_MOUNT_FALLBACK =
+  /^lsof: WARNING: can't stat\(\) \S+ file system .*\n {6}Output information may be incomplete\.\n {6}assuming "dev=[0-9a-f]+" from mount table\n/gm;
+
+/** The lsof stderr that makes its census incomplete: everything except its mount-table fallback. */
+function lsofFaults(stderr: string): string {
+  return stderr.replace(LSOF_MOUNT_FALLBACK, '').trim();
+}
 
 export interface HangDiagnostics {
   startedAtMs: number;
@@ -164,7 +176,7 @@ export function captureHangDiagnostics(
         let resources = await probe('lsof privileged', 'sudo', ['-n', 'lsof', ...args], 1_500);
         if (finished) return;
         const answered = (result: HangProbeResult): boolean =>
-          result.status === 'exited' && (result.code === 0 || (result.code === 1 && result.stderr.trim() === ''));
+          result.status === 'exited' && (result.code === 0 || (result.code === 1 && lsofFaults(result.stderr) === ''));
         if (!answered(resources)) {
           incomplete = true;
           if (resources.stdout.trim() !== '')
@@ -177,7 +189,11 @@ export function captureHangDiagnostics(
         }
         if (resources.stdout.trim() !== '')
           lines.push(`lsof open files/sockets (not contested-lock proof):\n${resources.stdout.trimEnd()}`);
-        if (!answered(resources) || resources.stderr.trim() !== '') incomplete = true;
+        if (!answered(resources) || lsofFaults(resources.stderr) !== '') incomplete = true;
+        else if (resources.stderr.trim() !== '')
+          lines.push(
+            'lsof warned only that it could not stat() the named mounts and kept their mount-table devices; that omits no descriptor of the selected processes.',
+          );
         observed = resources.stdout.trim() !== '';
         if (!observed && answered(resources))
           lines.push('lsof reported no open-file matches within its stated visibility.');

@@ -97,6 +97,28 @@ describe('pre-expiry hang diagnostics', () => {
     expect(capture.text).toContain('read failed');
   });
 
+  it("keeps the verdict when lsof's only stderr is its fallback for a mount it could not stat", async () => {
+    // Observed verbatim while a concurrent image detached: lsof exited 0 and listed every selected descriptor.
+    const fallback =
+      "lsof: WARNING: can't stat() apfs file system /private/tmp/hang-capture-repro/dmg.Gqndhm\n" +
+      '      Output information may be incomplete.\n' +
+      '      assuming "dev=100037e" from mount table\n';
+    const warned = scriptedHost([exited(rootRow), exited(fileObservation, 0, fallback), exited(rootRow)]);
+    const capture = await captureHangDiagnostics(request(), warned.host);
+    expect(capture.outcome, capture.text).toBe('holders');
+    expect(capture.text).toContain("can't stat() apfs file system /private/tmp/hang-capture-repro/dmg.Gqndhm");
+    expect(capture.text).toContain('omits no descriptor of the selected processes');
+    expect(warned.calls.map((call) => call.file)).toEqual(['ps', 'sudo', 'ps']);
+    const empty = scriptedHost([exited(rootRow), exited('', 1, fallback), exited(rootRow)]);
+    expect((await captureHangDiagnostics(request(), empty.host)).outcome).toBe('none');
+    for (const stderr of [`${fallback}lsof: WARNING: other\n`, 'lsof: WARNING: other\n']) {
+      const { host } = scriptedHost([exited(rootRow), exited(fileObservation, 0, stderr), exited(rootRow)]);
+      const other = await captureHangDiagnostics(request(), host);
+      expect(other.outcome, other.text).toBe('incomplete');
+      expect(other.text).toContain('lsof: WARNING: other');
+    }
+  });
+
   it('does not turn an exited root, reused pid, or changed descendant membership into no holders', async () => {
     const absent = scriptedHost([exited(unrelatedRow)]);
     expect((await captureHangDiagnostics(request(), absent.host)).outcome).toBe('incomplete');
@@ -259,7 +281,7 @@ describe('pre-expiry hang diagnostics', () => {
       const capture = await captureHangDiagnostics({ ...request(), pid: child.pid, pgid: null }).finally(() =>
         jest.useRealTimers(),
       );
-      expect(capture.outcome).toBe('holders');
+      expect(capture.outcome, capture.text).toBe('holders');
       expect(capture.text).toContain(String(child.pid));
       expect(capture.text).toContain(String(descendant));
       if (process.platform === 'darwin') expect(capture.text).toContain(held);

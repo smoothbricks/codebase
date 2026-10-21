@@ -550,11 +550,14 @@ explicit incomplete-capture result, and starts termination immediately without a
 not extend the configured no-progress deadline. Capture timestamps, the offset from the scheduled expiry and the actual
 expiry-to-capture interval accompany the observation. Process rows retain PID, PPID, PGID, state, percent CPU, elapsed
 time, start identity and command. On macOS the open-resource probe invokes `/usr/sbin/lsof` through noninteractive sudo,
-with an explicitly limited ordinary-user fallback. A missing tool, denied privilege, timeout, truncated output or
-changing process identity is incomplete evidence, never an empty holder set. Successful observations with resources,
-successful observations without matches and incomplete/raced captures remain distinct. An open file is not proof of a
-contested lock, and an admission token count or one CPU/state sample does not establish CPU starvation or its absence.
-The process census resolves `ps` through the runtime `PATH`, as fixture process tables do; NixOS has no `/bin/ps`.
+with an explicitly limited ordinary-user fallback. A missing tool, denied privilege, timeout, truncated output, other
+probe stderr or changing process identity is incomplete evidence, never an empty holder set. lsof's mount-table fallback
+(`can't stat() <type> file system <mount>` ... `assuming "dev=<hex>" from mount table`) is the one stderr kept without
+that verdict: it names a mount lsof could not stat(), such as one detaching under a concurrent shed, and omits no
+descriptor of the selected processes. Successful observations with resources, successful observations without matches
+and incomplete/raced captures remain distinct. An open file is not proof of a contested lock, and an admission token
+count or one CPU/state sample does not establish CPU starvation or its absence. The process census resolves `ps` through
+the runtime `PATH`, as fixture process tables do; NixOS has no `/bin/ps`.
 
 **Script-host fixture wedge (2026-10-16, resolved 2026-10-17).** The isolation case
 `nothing_one_script_does_to_its_process_reaches_the_next` once and `scripts_forked_at_once_each_run_whole` four times
