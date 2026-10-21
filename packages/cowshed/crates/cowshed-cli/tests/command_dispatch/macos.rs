@@ -6427,6 +6427,12 @@ async fn real_apfs_default_land_never_signals_a_foreign_nominee_during_retiremen
     fs::write(topic.join("a/src.txt"), "changed\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "change output input"]);
     sh(&mut service, "outputs", &nx_run_many(&node, "build")).await;
+    // The run put the shed in use at its admission, and the keeper started its daemon alongside
+    // it, behind the run's tokens (04_sandbox.md, the kept daemon), so its record may follow the
+    // run's end. The patched Nx daemon claims the record when it starts and replaces one that
+    // names no Nx version or root as stale, so the nominee is forged only once the kept daemon
+    // holds the record: a forgery written first would be replaced, not left for the land.
+    eventually(|| recorded_daemon(&topic).is_some()).await;
     // A process no job started, under sandbox-exec with signals to other pids denied. The ledger
     // names no group for it, so the forged record is an unproven nominee.
     let mut foreign = Command::new("/usr/bin/sandbox-exec")
