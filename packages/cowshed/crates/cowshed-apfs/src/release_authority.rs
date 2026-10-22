@@ -22,8 +22,10 @@
 //! resolve (a volume name, a UUID, a path off any disk) is refused as
 //! [`ReleaseRefusal::Unresolved`]: nothing says it is not another user's image.
 
+use std::ffi::OsStr;
 use std::fmt;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::{CommandRequest, CommandRunError, CommandRunFailure, DISKUTIL, HDIUTIL};
@@ -139,63 +141,58 @@ pub fn refuse_unowned(
 /// when it is a release that names no single target. `hdiutil detach|eject [-flag…] <target>`;
 /// `diskutil eject|unmount|umount|unmountDisk|umountDisk [force] <target>`, its verb in any case.
 pub fn release_target(request: &CommandRequest) -> Option<Result<ReleaseTarget, ReleaseRefusal>> {
-    let args: Vec<&str> = request
-        .args
-        .iter()
-        .map(|arg| arg.to_str().unwrap_or("\u{fffd}"))
-        .collect();
-    let (verb, rest) = args.split_first()?;
-    let operands: Vec<&str> = if request.program == Path::new(HDIUTIL) {
-        if !matches!(*verb, "detach" | "eject") {
+    let (verb, rest) = request.args.split_first()?;
+    let operands = if request.program == Path::new(HDIUTIL) {
+        if verb != "detach" && verb != "eject" {
             return None;
         }
-        rest.iter()
-            .copied()
-            .filter(|arg| !arg.starts_with('-'))
-            .collect()
+        rest
     } else if request.program == Path::new(DISKUTIL) {
-        let verb = verb.to_ascii_lowercase();
-        if !matches!(
-            verb.as_str(),
-            "eject" | "unmount" | "umount" | "unmountdisk" | "umountdisk"
-        ) {
+        if !["eject", "unmount", "umount", "unmountDisk", "umountDisk"]
+            .iter()
+            .any(|release| verb.eq_ignore_ascii_case(release))
+        {
             return None;
         }
         match rest {
-            [force, operands @ ..] if force.eq_ignore_ascii_case("force") => operands.to_vec(),
-            operands => operands.to_vec(),
+            [force, operands @ ..] if force.eq_ignore_ascii_case("force") => operands,
+            operands => operands,
         }
     } else {
         return None;
     };
-    Some(match operands.as_slice() {
-        [target] => target_of(target),
-        _ => Err(ReleaseRefusal::Unresolved(args.join(" "))),
+    // hdiutil's flags (`-force`, `-verbose`, …) are not targets; no disk or path starts with `-`.
+    let mut targets = operands
+        .iter()
+        .filter(|arg| !arg.as_bytes().starts_with(b"-"));
+    Some(match (targets.next(), targets.next()) {
+        (Some(target), None) => target_of(target),
+        _ => Err(ReleaseRefusal::Unresolved(
+            request
+                .args
+                .iter()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" "),
+        )),
     })
 }
 
-/// A release operand as the disk or path it names.
-fn target_of(operand: &str) -> Result<ReleaseTarget, ReleaseRefusal> {
-    let node = operand
+/// A release operand as the disk or path it names: a device node or bare name in
+/// [`crate::device`]'s one grammar, or an absolute path.
+fn target_of(operand: &OsStr) -> Result<ReleaseTarget, ReleaseRefusal> {
+    let unresolved = || ReleaseRefusal::Unresolved(operand.to_string_lossy().into_owned());
+    let text = operand.to_str().ok_or_else(unresolved)?;
+    let node = text
         .strip_prefix("/dev/r")
-        .or_else(|| operand.strip_prefix("/dev/"))
-        .unwrap_or(operand);
-    if is_bsd_disk_name(node) {
-        Ok(ReleaseTarget::Disk(node.to_owned()))
-    } else if operand.starts_with('/') {
+        .or_else(|| text.strip_prefix("/dev/"));
+    if crate::device::identifier_depth(node.unwrap_or(text)).is_some() {
+        Ok(ReleaseTarget::Disk(node.unwrap_or(text).to_owned()))
+    } else if node.is_none() && text.starts_with('/') {
         Ok(ReleaseTarget::Path(PathBuf::from(operand)))
     } else {
-        Err(ReleaseRefusal::Unresolved(operand.to_owned()))
+        Err(unresolved())
     }
-}
-
-/// `diskN` with any `sM` slices: a BSD disk name.
-fn is_bsd_disk_name(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix("disk") else {
-        return false;
-    };
-    rest.split('s')
-        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// The BSD disk name of the volume mounted at or holding `path`.
@@ -220,7 +217,7 @@ fn disk_of_path(path: &Path) -> Result<String, ReleaseRefusal> {
         .to_string_lossy()
         .into_owned();
     match source.strip_prefix("/dev/") {
-        Some(node) if is_bsd_disk_name(node) => Ok(node.to_owned()),
+        Some(node) if crate::device::identifier_depth(node).is_some() => Ok(node.to_owned()),
         _ => Err(no_disk(io::Error::other(format!(
             "its file system is mounted from {source}"
         )))),
@@ -324,6 +321,9 @@ mod tests {
             (HDIUTIL, &["detach"]),
             (HDIUTIL, &["detach", "/dev/disk9", "/dev/disk10"]),
             (HDIUTIL, &["detach", "disk9x"]),
+            // device.rs's grammar: the kernel never zero-pads a unit or slice.
+            (HDIUTIL, &["detach", "/dev/disk09"]),
+            (DISKUTIL, &["unmount", "disk9s01"]),
         ] {
             assert!(
                 matches!(target(program, args), Some(Err(_))),
