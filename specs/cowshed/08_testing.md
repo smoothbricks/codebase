@@ -1055,15 +1055,15 @@ registration.
 | `cowshed path` / `ls`            | ≤ 50 ms                 | readdir + getmntinfo only — proves the no-state-store design                                   |
 | exec sandbox overhead            | ≤ 50 ms over bare spawn | profile generation + sandbox-exec                                                              |
 
-**Extent admission is a standalone first-write sensitivity bound, not a whole-clone SLO.** One loaded RAW observation
-was 60.845084042 s for 434,462 extents: 140.046964 µs/extent. At that observed rate, **7,140 extents** take less than 1
-s and 7,141 exceed it; 1,785 fit 250 ms and 1,786 do not. The cause is unattributed. This is measured sensitivity, not
-causal calibration: the historical **12 µs/extent ASIF-era synthetic predictor remains unchanged** and is reported
-separately. Concurrent first writes and container-wide contention can change the rate, so neither predictor is a latency
-guarantee. Further attribution found 440,074-extent first writes taking 50.004/39.605 s wall versus 5.981/5.633 s system
-CPU, reading 801–823 MB, while a 25,013-extent source took about 4.04 s (about 161 µs/extent, above the selected 140 µs
-sensitivity). Off-CPU work is substantial; those observations do not establish a universal per-extent calibration or
-justify replacing the historical predictor.
+**The fork extent warning is a standalone first-write sensitivity bound, not a whole-clone SLO, and never refuses a
+fork.** One loaded RAW observation was 60.845084042 s for 434,462 extents: 140.046964 µs/extent. At that observed rate,
+**7,140 extents** take less than 1 s and 7,141 exceed it; 1,785 fit 250 ms and 1,786 do not. The cause is unattributed.
+This is measured sensitivity, not causal calibration: the historical **12 µs/extent ASIF-era synthetic predictor remains
+unchanged** and is reported separately. Concurrent first writes and container-wide contention can change the rate, so
+neither predictor is a latency guarantee. Further attribution found 440,074-extent first writes taking 50.004/39.605 s
+wall versus 5.981/5.633 s system CPU, reading 801–823 MB, while a 25,013-extent source took about 4.04 s (about 161
+µs/extent, above the selected 140 µs sensitivity). Off-CPU work is substantial; those observations do not establish a
+universal per-extent calibration or justify replacing the historical predictor.
 
 A forkable physical generation must prove at most 7,140 extents for **both the workspace image and every build seed it
 publishes or clones**. The proof uses device/inode, length, allocated blocks, and nanosecond modification/change times

@@ -78,35 +78,37 @@ This companion owns the macOS/APFS implementation.
   its defrag target. At **7,141 extents** doctor warns and names `cowshed defrag <workspace>`; 7,140 is the standalone
   first-write sensitivity bound from 60.845084042 s / 434,462 = 140.046964 µs/extent, not a whole-fork guarantee
   (08_testing.md). The 12 µs ASIF-era synthetic predictor stays separate and unchanged; the RAW observation's cause is
-  unattributed. Before its first write, each fresh workspace or build clone proves its actual detached generation within
-  this bound, not a cached estimate of its still-writing source. A resumed pending clone is proved again. Workspace
-  initialization is followed by a flush and a second bounded proof before activation; build seeds prove their final
-  generation after their freshness mark, before publication, and revalidate it across publication. Device/inode, length,
-  allocated blocks, and nanosecond mtime/ctime bind a proof to the physical write generation, not HEAD; missing,
-  changing or oversized images cannot claim fork readiness. Admission stops counting at 7,141 runs; doctor's full
-  diagnostic walk is explicit. Proof collection is additional work. `defrag` is the remedy: it rewrites every published
-  seed of the named incarnation and its registered live build source, as well as the workspace image. Each build rewrite
-  retains its exclusive admission claim, closes Nx, refuses holders without force, restores the mount state and
-  preserves a detached seed's build-freshness time. Per-build-image counts and copied bytes are reported separately from
-  the workspace result. It detaches the workspace as `resize` does — a busy volume refuses before the image is touched —
-  copies the image's data regions with plain `pread`/`pwrite` into `<image>.defrag` beside it (never `clonefile`,
-  `copyfile(3)`, or `std::fs::copy`, all of which clone on APFS and would share the old map), punches interior holes
-  after each following write and the trailing hole after sizing the copy (APFS may allocate zero blocks when extending
-  it), `F_FULLFSYNC`s it, renames it over the image, syncs the directory, and verifies the result by attaching it before
-  restoring the mount state it found. The copy runs at 3.1–5.4 GB/s on the store volume (8.9 GiB in 1.8–3.1 s, an
-  8,871-extent image back to 579). Nothing rewrites an attached image: a DiskImages2 attachment's helper holds an
-  exclusive lock on the file (another `O_SHLOCK` or `O_EXLOCK` open fails with `EAGAIN`), and `diskutil image resize`
-  and `diskutil image create from` refuse it as well; an in-kernel attachment takes no lock ("Mounts"), and the verb's
-  own detach and the registry exclude it. The copy needs, and keeps, free space equal to the image's allocated bytes
-  while earlier clones and checkpoints still share the old blocks; the verb refuses before detaching when the store
-  volume lacks it. Nothing enumerates `<image>.defrag` as an image or sidecar; the next `defrag` replaces one an
-  interrupted run left, and `doctor` names it until then. Mains are never detached implicitly (the gateway keeps them
-  mounted), so no path rewrites main on its own. A refused resumed clone remains pending because it may contain the only
-  copy of dirty or unlanded work. Its hint names `cowshed defrag <pending-destination>`, not its source: the command
-  opens without replaying the failed fork, claims the existing creator-intent lease, revalidates the exact pending
-  metadata under its image lock, and rewrites the same payload without activating it or changing its journal phase. A
-  live creator refuses the rewrite. Retrying the original fork then resumes those same bytes; nothing deletes a pending
-  image to satisfy an extent budget.
+  unattributed. Before its first write, each fresh workspace or build clone measures its actual detached generation
+  against this bound, not a cached estimate of its still-writing source; past it the fork warns, naming the measured
+  first-write cost and `cowshed defrag <workspace>`, and proceeds: the bound is advisory and never refuses a fork. A
+  resumed pending clone is proved again. Workspace initialization is followed by a flush and a second bounded proof
+  before activation; build seeds prove their final generation after their freshness mark, before publication, and
+  revalidate it across publication. Device/inode, length, allocated blocks, and nanosecond mtime/ctime bind a proof to
+  the physical write generation, not HEAD; missing, changing images cannot claim fork readiness; an oversized one only
+  warns. The fork's walk stops counting at 7,141 runs, so its warning reports lower bounds; doctor's full diagnostic
+  walk is explicit. Proof collection is additional work. `defrag` is the remedy: it rewrites every published seed of the
+  named incarnation and its registered live build source, as well as the workspace image. Each build rewrite retains its
+  exclusive admission claim, closes Nx, refuses holders without force, restores the mount state and preserves a detached
+  seed's build-freshness time. Per-build-image counts and copied bytes are reported separately from the workspace
+  result. It detaches the workspace as `resize` does — a busy volume refuses before the image is touched — copies the
+  image's data regions with plain `pread`/`pwrite` into `<image>.defrag` beside it (never `clonefile`, `copyfile(3)`, or
+  `std::fs::copy`, all of which clone on APFS and would share the old map), punches interior holes after each following
+  write and the trailing hole after sizing the copy (APFS may allocate zero blocks when extending it), `F_FULLFSYNC`s
+  it, renames it over the image, syncs the directory, and verifies the result by attaching it before restoring the mount
+  state it found. The copy runs at 3.1–5.4 GB/s on the store volume (8.9 GiB in 1.8–3.1 s, an 8,871-extent image back to
+  579). Nothing rewrites an attached image: a DiskImages2 attachment's helper holds an exclusive lock on the file
+  (another `O_SHLOCK` or `O_EXLOCK` open fails with `EAGAIN`), and `diskutil image resize` and
+  `diskutil image create from` refuse it as well; an in-kernel attachment takes no lock ("Mounts"), and the verb's own
+  detach and the registry exclude it. The copy needs, and keeps, free space equal to the image's allocated bytes while
+  earlier clones and checkpoints still share the old blocks; the verb refuses before detaching when the store volume
+  lacks it. Nothing enumerates `<image>.defrag` as an image or sidecar; the next `defrag` replaces one an interrupted
+  run left, and `doctor` names it until then. Mains are never detached implicitly (the gateway keeps them mounted), so
+  no path rewrites main on its own. A refused resumed clone remains pending because it may contain the only copy of
+  dirty or unlanded work. Its hint names `cowshed defrag <pending-destination>`, not its source: the command opens
+  without replaying the failed fork, claims the existing creator-intent lease, revalidates the exact pending metadata
+  under its image lock, and rewrites the same payload without activating it or changing its journal phase. A live
+  creator refuses the rewrite. Retrying the original fork then resumes those same bytes; nothing deletes a pending image
+  to satisfy an extent budget.
 - **Detached growth**: under the image's lease, an `O_EXLOCK | O_NONBLOCK | O_NOFOLLOW` open refuses a file a
   DiskImages2 helper holds and excludes such an attach until the write is durable. An in-kernel attachment takes no
   lock, so growth then refuses (`EWOULDBLOCK`, as a held lock does) when a registered in-kernel drive holds the opened
