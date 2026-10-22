@@ -18,13 +18,16 @@ import {
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import fc from 'fast-check';
 import { expandOutputs, WorkspaceContext } from 'nx/src/native';
 import { pastTick } from './__tests__/past-tick.js';
 import { graphInstallationIdentity, workspaceSnapshot } from './ensure-built-witness.js';
 import {
+  AUDITED_PRELOADS,
   type GraphInputContract,
   GraphInputReadCollector,
   graphInputContractIdentity,
+  loaderPreloads,
 } from './graph-input-contract.js';
 
 const require = createRequire(import.meta.url);
@@ -281,7 +284,7 @@ describe('owning-reader external input byproducts', () => {
     await writeFile(path, '{}');
     expect(identity('tsconfig-extends')).toBeNull();
     const previous = process.env.NODE_OPTIONS;
-    process.env.NODE_OPTIONS = '--require /unbounded/preload.js';
+    process.env.NODE_OPTIONS = '--require /bounded/preload.js --import=/unbounded/loader.mjs';
     try {
       const opaque = reader();
       expect(opaque.read(join(external, 'base.json'), () => 'original-result')).toBe('original-result');
@@ -289,6 +292,34 @@ describe('owning-reader external input byproducts', () => {
         status: 'unproved',
         detail: 'unbounded loader environment: NODE_OPTIONS',
       });
+    } finally {
+      if (previous === undefined) delete process.env.NODE_OPTIONS;
+      else process.env.NODE_OPTIONS = previous;
+    }
+  });
+  it("witnesses an audited preload's file and refuses any other preload", async () => {
+    const audited = await readFile(new URL('../../cowshed/crates/cowshed-core/src/port_zero.cjs', import.meta.url));
+    // The audit pins cowshed's port-0 preload byte for byte: changing it needs a new audit and digest.
+    expect(AUDITED_PRELOADS).toEqual(new Set([createHash('sha256').update(audited).digest('hex')]));
+    const preload = join(external, 'port-zero.cjs');
+    const other = join(external, 'other.cjs');
+    await writeFile(preload, audited);
+    await writeFile(other, 'require("./config.json");\n');
+    await pastTick();
+    const previous = process.env.NODE_OPTIONS;
+    try {
+      process.env.NODE_OPTIONS = `--require ${other}`;
+      expect(reader().finish()).toMatchObject({
+        status: 'unproved',
+        detail: `unaudited preload in NODE_OPTIONS: ${other}`,
+      });
+      process.env.NODE_OPTIONS = `--require=${preload}`;
+      expect(reader().finish().status).toBe('complete');
+      expect(identity('tsconfig-extends')).not.toBeNull();
+      const before = await stat(preload);
+      await writeFile(preload, Buffer.concat([audited, Buffer.from('\n')]));
+      await utimes(preload, before.atime, before.mtime);
+      expect(identity('tsconfig-extends')).toBeNull();
     } finally {
       if (previous === undefined) delete process.env.NODE_OPTIONS;
       else process.env.NODE_OPTIONS = previous;
@@ -375,5 +406,35 @@ describe('owning-reader external input byproducts', () => {
     attrs.finish();
     await writeFile(join(root, '.git', 'info', 'attributes'), '*.ts binary\n');
     expect(identity('reference-scan')).toBeNull();
+  });
+});
+
+describe('loader preload environments', () => {
+  const flag = fc.constantFrom('--require' as const, '--preload' as const);
+  const clauses = fc.array(fc.tuple(fc.stringMatching(/^\/[A-Za-z0-9._/-]{1,24}$/), fc.boolean()), { maxLength: 4 });
+  const spell = (option: string, [file, spaced]: [string, boolean]) =>
+    spaced ? `${option} ${file}` : `${option}=${file}`;
+  it('admits exactly the files of preload-only clauses, however they are spaced', () => {
+    fc.assert(
+      fc.property(flag, clauses, fc.constantFrom(' ', '  ', '\t', '\n'), (option, chosen, gap) => {
+        const value = chosen.map((clause) => spell(option, clause)).join(gap);
+        expect(loaderPreloads(value, option)).toEqual(chosen.map(([file]) => file));
+      }),
+    );
+  });
+  it('refuses a preload-only environment with any extra token or flag in it', () => {
+    const extra = fc.oneof(
+      fc.stringMatching(/^--?[A-Za-z][A-Za-z0-9-]{0,15}(=[A-Za-z0-9/.]{0,10})?$/),
+      fc.stringMatching(/^[A-Za-z0-9./][A-Za-z0-9./-]{0,15}$/),
+      fc.stringMatching(/^[^\s]{0,6}["'\\][^\s]{0,6}$/),
+    );
+    fc.assert(
+      fc.property(flag, clauses, extra, fc.nat(), (option, chosen, token, at) => {
+        fc.pre(!token.startsWith(`${option}=`));
+        const parts = chosen.map((clause) => spell(option, clause));
+        parts.splice(at % (parts.length + 1), 0, token);
+        expect(loaderPreloads(parts.join(' '), option)).toBeNull();
+      }),
+    );
   });
 });

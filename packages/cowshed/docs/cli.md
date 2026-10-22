@@ -825,6 +825,12 @@ is `base … base+size-1`. Its size is 64 for a new workspace, may be larger aft
 may hold 16-port blocks, so read it rather than assume it. devenv offsets can derive from the block. Linux configuration
 contains no block or sentinel values.
 
+A listener that asks for port 0 binds outside the block, where nothing in the workspace can reach it. Every job's Node
+and Bun therefore load cowshed's port-0 preload through `NODE_OPTIONS` and `BUN_OPTIONS`, appended after any options you
+pass: a port-0 `listen`, `Bun.serve` or `Bun.listen` gets a free port of the block instead, and so does a child they
+spawn with `--inspect=127.0.0.1:0`. Other runtimes, and an inspector a shell script starts on port 0, still need a block
+port.
+
 Once a supervisor serves the workspace, `.cowshed/env` also exports `TMPDIR` as the workspace's own scratch directory in
 the project store: the same one every sandboxed job receives. A host shell that sources it runs with the temp directory
 a land gate runs with, never the machine's shared one, whose size every concurrent gate grows.

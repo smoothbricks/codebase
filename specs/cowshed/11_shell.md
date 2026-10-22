@@ -260,7 +260,10 @@ repository hooks; it reads only the watch list an activation reports. Before a s
 capability snapshot (15_capabilities.md) and compiles the matching child profile if that snapshot changed. Every exec
 host, one-shot command and descendant starts beneath that restriction, in its job's own process group. The child profile
 denies writes beneath `.cowshed/job/**`; ReadOnly narrows the selected authority and puts tool state in the private
-exec-temp roots.
+exec-temp roots. Every job's Node and Bun load cowshed's port-0 preload, named in `NODE_OPTIONS` and `BUN_OPTIONS` after
+the caller's own options and rewritten into the private environment before each spawn, so a port-0 listener and a
+child's `--inspect…:0` land on a port of the workspace block the job can connect to (04_sandbox.md, "A sandboxed job
+binds its listeners in its block"; 03_caches.md lists the variables).
 
 - Holds the warm exec hosts above. Host startup and activation run inside the child sandbox; no repository-controlled
   startup runs in the supervisor.

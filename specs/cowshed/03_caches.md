@@ -375,6 +375,9 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     - trust anchors as defaults a caller may override: the core's `GIT_SSL_CAINFO` and `SSL_CERT_FILE`, and each
       detected capability's own — `CARGO_HTTP_CAINFO`, `NODE_EXTRA_CA_CERTS`, `NIX_SSL_CERT_FILE` with an
       `ssl-cert-file` line appended to `NIX_CONFIG`, `UV_SYSTEM_CERTS=true` (04_sandbox.md);
+    - the port-0 preload's loader options, each appended after the caller's own options with a space:
+      `--require=<private environment>/port-zero.cjs` to `NODE_OPTIONS` and `--preload=<…>` to `BUN_OPTIONS`
+      (04_sandbox.md, "A sandboxed job binds its listeners in its block");
     - the bootstrap `PATH` (04_sandbox.md).
 
     That list is the whole job contract; everything else a job sees is what the workspace's own `.envrc`/devenv exports

@@ -1862,22 +1862,34 @@ pub(super) struct SandboxEnvironment {
     withheld: Vec<&'static str>,
     /// Set unless the caller named the variable itself.
     defaults: BTreeMap<OsString, OsString>,
-    /// A line the sandbox appends to the caller's value, or the whole value when the caller
-    /// named none, so the sandbox's line is the one that takes effect.
-    appended: BTreeMap<OsString, String>,
+    /// A clause the sandbox appends to the caller's value, or the whole value when the caller
+    /// named none, so the sandbox's clause is the one that takes effect.
+    appended: BTreeMap<OsString, Appended>,
+}
+
+/// What the sandbox adds after a caller's value of one variable: a configuration line after the
+/// caller's lines, or a loader option after the caller's options, each joined by the separator
+/// its variable is split on.
+struct Appended {
+    clause: String,
+    separator: char,
+}
+
+impl Appended {
+    /// The clause after the caller's own non-empty value, or the clause alone.
+    fn after(&self, caller: Option<&str>) -> OsString {
+        match caller {
+            Some(caller) if !caller.is_empty() => {
+                format!("{caller}{}{}", self.separator, self.clause).into()
+            }
+            _ => self.clause.as_str().into(),
+        }
+    }
 }
 
 impl SandboxEnvironment {
     fn reserved(&self, name: &str) -> bool {
         self.owned.contains_key(OsStr::new(name)) || self.withheld.contains(&name)
-    }
-
-    /// `line` after the caller's own non-empty value, or `line` alone.
-    fn append(caller: Option<&str>, line: &str) -> OsString {
-        match caller {
-            Some(caller) if !caller.is_empty() => format!("{caller}\n{line}").into(),
-            _ => line.into(),
-        }
     }
 
     /// The complete environment of a one-shot child, before shell activation.
@@ -1894,9 +1906,9 @@ impl SandboxEnvironment {
                 .entry(name.clone())
                 .or_insert_with(|| value.clone());
         }
-        for (name, line) in &self.appended {
+        for (name, appended) in &self.appended {
             let caller = name.to_str().and_then(|name| caller.get(name));
-            environment.insert(name.clone(), Self::append(caller.map(String::as_str), line));
+            environment.insert(name.clone(), appended.after(caller.map(String::as_str)));
         }
         environment
     }
@@ -1905,8 +1917,8 @@ impl SandboxEnvironment {
     pub(super) fn base(&self) -> BTreeMap<OsString, OsString> {
         let mut environment = self.owned.clone();
         environment.extend(self.defaults.clone());
-        for (name, line) in &self.appended {
-            environment.insert(name.clone(), Self::append(None, line));
+        for (name, appended) in &self.appended {
+            environment.insert(name.clone(), appended.after(None));
         }
         environment
     }
@@ -1918,7 +1930,7 @@ impl SandboxEnvironment {
             .filter(|(name, _)| !self.reserved(name))
             .map(|(name, value)| {
                 let merged = match self.appended.get(OsStr::new(name)) {
-                    Some(line) => Self::append(Some(value), line),
+                    Some(appended) => appended.after(Some(value)),
                     None => value.into(),
                 };
                 (name.into(), merged)
@@ -2184,6 +2196,24 @@ pub(super) async fn sandbox_environment(
             defaults.insert(OsString::from(name), bundle.clone().into_os_string());
         }
     }
+    // Every Node and Bun of the job loads the port-0 preload published beside the trust bundle,
+    // so a port-0 listener lands in the block the job can connect to (04_sandbox.md).
+    let preload = environment_root.join(
+        crate::port_zero::PRELOAD_NAME
+            .to_str()
+            .expect("the preload name is ASCII"),
+    );
+    let loader_options = crate::port_zero::loader_options(&preload)
+        .map_err(|error| CowshedError::integrity(error.to_string(), "cowshed doctor --json"))?;
+    for (name, clause) in loader_options {
+        appended.insert(
+            OsString::from(name),
+            Appended {
+                clause,
+                separator: ' ',
+            },
+        );
+    }
     for (&name, action) in &sandbox.capabilities.contribution.env {
         match action {
             crate::capabilities::EnvAction::Own(value) => {
@@ -2200,7 +2230,13 @@ pub(super) async fn sandbox_environment(
                 defaults.insert(name.into(), value.clone());
             }
             crate::capabilities::EnvAction::Append(value) => {
-                appended.insert(name.into(), value.clone());
+                appended.insert(
+                    name.into(),
+                    Appended {
+                        clause: value.clone(),
+                        separator: '\n',
+                    },
+                );
             }
         }
     }
@@ -8647,6 +8683,10 @@ mod workspace_toolchain_tests {
             "extra-experimental-features = flakes".to_owned(),
         );
         env.insert("CALLER_ONLY".to_owned(), "kept".to_owned());
+        env.insert(
+            "NODE_OPTIONS".to_owned(),
+            "--max-old-space-size=4096".to_owned(),
+        );
         env.insert("NODE_USE_ENV_PROXY".to_owned(), "0".to_owned());
         env.insert("HOME".to_owned(), "/caller/home".to_owned());
         // A host shell that sourced an older `.cowshed/env` still carries the bare token.
@@ -8708,6 +8748,21 @@ mod workspace_toolchain_tests {
                 )
                 .as_str()
             )
+        );
+        // Node and Bun load the port-0 preload published beside the bundle, after the caller's own
+        // options and joined by the space each runtime splits its options on.
+        let preload = mount.join(".cowshed/port-zero.cjs");
+        assert_eq!(
+            vars.get("NODE_OPTIONS").map(String::as_str),
+            Some(format!("--max-old-space-size=4096 --require={}", preload.display()).as_str())
+        );
+        assert_eq!(
+            vars.get("BUN_OPTIONS").map(String::as_str),
+            Some(format!("--preload={}", preload.display()).as_str())
+        );
+        assert_eq!(
+            std::fs::read(&preload).expect("preload"),
+            crate::port_zero::PRELOAD
         );
         let bundle_bytes = std::fs::read_to_string(&bundle).expect("bundle");
         assert!(bundle_bytes.ends_with("WORKSPACE\n-----END CERTIFICATE-----\n"));

@@ -154,6 +154,49 @@ function contractOf(options: unknown): GraphInputContract | null {
     ? contract
     : null;
 }
+/**
+ * The SHA-256 of each preload audited to leave graph evaluation alone. A preload's own bytes are not its whole input: it
+ * can load more code and read more files. So only an audited one is bounded, and every other loader stays opaque.
+ * The one entry is cowshed's port-0 preload (`packages/cowshed/crates/cowshed-core/src/port_zero.cjs`), which loads only
+ * Node and Bun builtins, reads no file and no variable but `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE`, and changes
+ * only which port a listener or a child's inspector takes. A changed preload is unaudited until its digest is added here.
+ */
+export const AUDITED_PRELOADS: ReadonlySet<string> = new Set([
+  '8e4a5d9aeba854edf74b64b732392bf680e1831a80607e5d1b4aeace002205d2',
+]);
+
+/** Each runtime's options variable and the one flag in it whose argument is a file the runtime preloads. */
+const PRELOAD_FLAGS = [
+  ['NODE_OPTIONS', '--require'],
+  ['BUN_OPTIONS', '--preload'],
+] as const;
+
+/**
+ * The files a loader variable preloads when it holds nothing but `flag <file>` or `flag=<file>` clauses, or null for
+ * any other text: another flag, a stray word, a flag without its file. Quoting is not parsed, so a quote or a backslash
+ * makes the variable opaque too.
+ */
+export function loaderPreloads(value: string, flag: '--require' | '--preload'): string[] | null {
+  if (/["'\\]/.test(value)) return null;
+  const files: string[] = [];
+  let awaitingFile = false;
+  for (const token of value.split(/\s+/)) {
+    if (token === '') continue;
+    if (awaitingFile) {
+      if (token.startsWith('-')) return null;
+      files.push(token);
+      awaitingFile = false;
+    } else if (token === flag) {
+      awaitingFile = true;
+    } else if (token.startsWith(`${flag}=`) && token.length > flag.length + 1) {
+      files.push(token.slice(flag.length + 1));
+    } else {
+      return null;
+    }
+  }
+  return awaitingFile ? null : files;
+}
+
 function witnessPath(root: string, plugin: string): string {
   return join(dataDirectory(root), `graph-input-${digest(plugin)}.json`);
 }
@@ -205,7 +248,20 @@ export class GraphInputReadCollector {
           this.refuse('Bun runtime is not the PATH-selected executable');
       }
       if (!this.before.stable) this.refuse('native file list contains an unproved node');
-      for (const name of ['NODE_OPTIONS', 'BUN_OPTIONS', 'LD_PRELOAD', 'DYLD_INSERT_LIBRARIES']) {
+      // A preload clause names one file the runtime loads: an audited preload is witnessed like any
+      // read, and anything else is opaque. A cowshed job preloads its port-0 module this way.
+      for (const [name, flag] of PRELOAD_FLAGS) {
+        const value = process.env[name];
+        if (!value) continue;
+        const files = loaderPreloads(value, flag);
+        if (files === null) this.refuse(`unbounded loader environment: ${name}`);
+        else
+          for (const file of files) {
+            this.file(file);
+            if (!AUDITED_PRELOADS.has(digest(readFileSync(file)))) this.refuse(`unaudited preload in ${name}: ${file}`);
+          }
+      }
+      for (const name of ['LD_PRELOAD', 'DYLD_INSERT_LIBRARIES']) {
         if (process.env[name]) this.refuse(`unbounded loader environment: ${name}`);
       }
     } catch (error) {
@@ -410,7 +466,7 @@ export class GraphInputReadCollector {
       const attributes: Pick<GitQueryWitness, 'cwd' | 'args' | 'stdin'> = {
         cwd: scope,
         args: ['check-attr', '--all', '-z', '--stdin'],
-        stdin: names.map((path) => path + '\0').join(''),
+        stdin: names.map((path) => `${path}\0`).join(''),
       };
       this.gitQueries.push({ ...attributes, sha256: digest(gitQuery(tool, attributes)) });
     });

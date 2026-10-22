@@ -255,6 +255,11 @@
       },
       "test-shard1": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "inputs": [
+          "default",
+          "^default",
+          "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs"
+        ],
         "options": {
           "command": "bun test --timeout=0 --timings=test-timings.json --shard=1/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
@@ -264,6 +269,11 @@
       },
       "test-shard2": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "inputs": [
+          "default",
+          "^default",
+          "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs"
+        ],
         "options": {
           "command": "bun test --timeout=0 --timings=test-timings.json --shard=2/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
@@ -273,6 +283,11 @@
       },
       "test-shard3": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "inputs": [
+          "default",
+          "^default",
+          "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs"
+        ],
         "options": {
           "command": "bun test --timeout=0 --timings=test-timings.json --shard=3/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
@@ -282,6 +297,11 @@
       },
       "test-shard4": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "inputs": [
+          "default",
+          "^default",
+          "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs"
+        ],
         "options": {
           "command": "bun test --timeout=0 --timings=test-timings.json --shard=4/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",

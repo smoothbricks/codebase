@@ -370,18 +370,66 @@ Notes:
     allocators stay correct anyway, because only the real bind claims a port.
   - With no `COWSHED_PORT_BASE` (outside cowshed, or on Linux) the consumer binds port 0 as usual. A
     `COWSHED_PORT_BLOCK_SIZE` without a base, or a base that is unaligned or not a power-of-two size, is a broken
-    environment and is refused, never guessed around. Cowshed itself supplies only the environment and this rule. It
-    does not rewrite a job's listeners, because nothing else is sound on macOS (measured):
+    environment and is refused, never guessed around.
+
+  Cowshed supplies the environment, this rule and one consumer of it, the port-0 preload. The kernel cannot steer a
+  port-0 bind into the block (measured):
   - SBPL network filters match only static `localhost`/`*` host:port literals. No filter names "a port a same-sandbox
     process bound", and no sandbox-extension class covers network.
   - A restricted `network-bind` fails `bind(0)` with EPERM instead of steering it.
   - The ephemeral range (`net.inet.ip.portrange.*`) is host-global.
   - `DYLD_INSERT_LIBRARIES` interposition is stripped from the children of every SIP launcher (`/bin/sh`,
     `/usr/bin/env`) and ignored by hardened-runtime binaries, so it would silently cover some processes and not others.
-    A third-party tool with no port knob is patched at the consumer to follow the rule. A connect it then still makes to
-    a port-0 listener fails in-band with EPERM (`connect`; Bun reports `FailedToOpenSocket` for `127.0.0.1` and
-    `ConnectionRefused` for `localhost`). Cowshed adds no message of its own. The unified-log correlation that could
-    name the denied port (denial evidence, below) is unavailable to a non-admin controller.
+
+  So the rule is applied where each runtime reads its own options, which every launcher passes on. Every job's
+  `NODE_OPTIONS` ends in `--require=<private environment>/port-zero.cjs` and its `BUN_OPTIONS` in `--preload=<…>`, each
+  appended after the caller's own options with a space (03_caches.md, "Environment variables"). Bun takes only the `=`
+  spelling: it prepends `BUN_OPTIONS` to argv, and a bare `--preload <file>` there makes `bun install` a script name. A
+  path either variable cannot carry (whitespace, a quote, a backslash) refuses the exec. The preload, written into the
+  private environment beside the trust bundle before every exec:
+  - maps a port-0 TCP listen to a candidate under this rule: Node's `net.Server.prototype.listen`, which `http`, `https`
+    and `tls` servers share, and Bun's `Bun.serve` and `Bun.listen`, which Bun's `node:http` and `node:net` call. It
+    takes only the odd-offset service ports, highest first, because an even offset is the session port of the service
+    port below it (08_testing.md). Each process and thread starts at its own offset, and its cursor moves past every
+    port it hands out. An in-use candidate is retried with the next one, and the caller sees only the listen that
+    succeeded or the last candidate's own error;
+  - rewrites a Node or Bun child's `--inspect=<host>:0`, `--inspect-brk=…`, `--inspect-wait=…` or `--inspect-port=0` to
+    a candidate (Node's `ChildProcess.prototype.spawn`, Bun's `Bun.spawn`). Both runtimes bind their inspector natively,
+    before any preload runs, so the JS parent that starts the child is the one place a hook sees the port. Only an
+    argument that is certainly the runtime's own option changes, and no table of option arities is kept. The child must
+    be `node` or `bun` (by basename, or the parent's own executable). The scan walks its leading `=`-joined options
+    (`--flag=value`), and for Bun one `test` or `run` subcommand, and stops at the first bare flag (whose operand it
+    cannot know: Bun takes a separate operand even when it starts with a dash, so `bun --preload --inspect=…` preloads a
+    file of that name), at the entrypoint and at `--`. Only an inspector option before that stop is rewritten; an
+    option's operand, the child's own arguments and every other program's arguments pass unchanged. When an inspector
+    text lies past the stop, the parent writes this one diagnostic to its stderr and leaves the text as it is:
+
+    ```text
+    cowshed: <option> for <program> was not mapped into the workspace port block: the scan of its runtime options
+    stopped at <stopper>. If it is the runtime's own inspector option it keeps port 0, which nothing in the workspace
+    can connect to: put it before that point with every option before it joined with `=` (`--flag=value`), or grant
+    the workspace --loopback-any.
+    ```
+
+    The stopper reads "the bare flag \`<flag>\`, whose operand the preload cannot know", "the entrypoint \`<arg>\`" or
+    "\`--\`". So `node --no-warnings --inspect=0 app.js` keeps port 0 and says so, while
+    `bun test --inspect=127.0.0.1:0 …` and `node --require=./x.cjs --inspect=0 app.js` are mapped. The parent probes the
+    candidate with a bind and a listen, because libuv reports a bind's `EADDRINUSE` only at the listen after it. It
+    closes the probe and passes the number on, the probe-then-reuse case above. A block with no free candidate fails the
+    spawn with that native `EADDRINUSE`;
+
+  - does nothing without a block and refuses a broken one by name, which stops the process.
+
+  Measured 2026-10-22 under a job's own profile: Stryker core 9.6.1 with the Bun runner 1.4.0 and 1.6.0 failed with
+  EPERM when its workers dialed the LoggingServer (`listen(cb)`); with the preload it completed and wrote its report,
+  through the runner's sync server (`listen(0, '127.0.0.1')`) and its `bun test --inspect=127.0.0.1:0` child. The
+  preload covers Node and Bun processes and the inspector argument of a child they spawn, nothing else. A port-0
+  listener of another runtime, or an inspector a shell script starts on port 0, stays unreachable: that tool is patched
+  at the consumer to follow the rule. A connect to such a listener fails in-band with EPERM (`connect`; Bun reports
+  `FailedToOpenSocket` for `127.0.0.1` and `ConnectionRefused` for `localhost`). Cowshed adds no message of its own. The
+  unified-log correlation that could name the denied port (denial evidence, below) is unavailable to a non-admin
+  controller.
+
 - `RunSandboxMode::ReadOnly` drops the workspace mount from the write set — for inspector-style commands that must
   observe without mutating.
 - **Read grants have one narrow meaning.** Built-in system/toolchain roots remain readable so processes can start. A

@@ -960,10 +960,15 @@ actual callback. A complete witness binds its contract, native file/hash/namespa
 callback, read file/directory stamps, missing paths, physical package resolutions, tools and environment. TypeScript
 extends and reference scans retain their existing results while recording the outside inputs they really read, including
 Git configuration origins and relevant namespace inventories. Installed Nx owns daemon/worker environment normalization;
-loader/preload settings are not silently dropped. Missing or changed declarations, missing traces, stale read evidence
-and unknown loaders, dynamic configuration or unbounded reads make the proof unproved and require the ordinary
-authoritative graph RPC. A declared kind alone is never admission, and this witness never replaces current Nx task
-hashing or artifact comparison.
+loader/preload settings are not silently dropped. A preload's own bytes are not its whole input, since it can load more
+code and read more files, so only an audited preload is bounded. A loader environment made only of preload clauses,
+`--require <file>` or `--require=<file>` in `NODE_OPTIONS` and `--preload <file>` or `--preload=<file>` in
+`BUN_OPTIONS`, whose every file's SHA-256 is in `AUDITED_PRELOADS`, is bounded, and each file is a witnessed read like
+any other input. That set holds cowshed's port-0 preload alone, which every cowshed job loads. Any other preload, any
+other text in those variables, and any `LD_PRELOAD` or `DYLD_INSERT_LIBRARIES` is an unknown loader. Missing or changed
+declarations, missing traces, stale read evidence and unknown loaders, dynamic configuration or unbounded reads make the
+proof unproved and require the ordinary authoritative graph RPC. A declared kind alone is never admission, and this
+witness never replaces current Nx task hashing or artifact comparison.
 
 The installed-package census expands each declared `files` set and relative export targets through that workspace's Nx
 native output authority, always retaining the manifest, directory/alias namespace evidence and every resolution edge;

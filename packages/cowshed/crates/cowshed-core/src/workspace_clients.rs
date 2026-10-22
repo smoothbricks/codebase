@@ -1,5 +1,5 @@
-//! The workspace trust bundle, written into the workspace's private environment (`.cowshed/`,
-//! never a tracked file).
+//! The workspace trust bundle and the port-0 preload, written into the workspace's private
+//! environment (`.cowshed/`, never a tracked file).
 //!
 //! Every sandboxed process reaches the network through the workspace gateway's proxy endpoint
 //! (the `HTTP_PROXY`/`HTTPS_PROXY` variables), where a granted host's TLS is terminated with a
@@ -8,6 +8,9 @@
 //! upstream certificate) followed by the workspace CA (for intercepted hosts). Git and OpenSSL
 //! are pointed at it by the core; each detected tool's own variable comes from its capability
 //! (15_capabilities.md).
+//!
+//! The port-0 preload (`crate::port_zero`) is the file every job's Node and Bun load, so a
+//! listener on an OS-picked port lands in the block the job can connect to (04_sandbox.md).
 //!
 //! Written when the workspace is minted and rewritten before every exec. Writes are idempotent:
 //! an unchanged file is left as it is.
@@ -64,6 +67,7 @@ pub(crate) fn publish_client_wiring(
     // The netrc an earlier wiring published for Go carried the workspace token, and no Go client
     // ever sent it; nothing else reads it but clients that would hand it to any loopback server.
     root.child(c"home")?.remove_file(c".netrc")?;
+    root.publish_file(crate::port_zero::PRELOAD_NAME, crate::port_zero::PRELOAD)?;
     match wiring.workspace_ca {
         Some(workspace_ca) => root.publish_file(
             TRUST_BUNDLE_NAME,
@@ -108,6 +112,10 @@ mod tests {
             "no Go policy file is published"
         );
         assert_eq!(read("ca-bundle.pem"), "ROOTS\nCA\n");
+        assert_eq!(
+            std::fs::read(root.join("port-zero.cjs")).unwrap(),
+            crate::port_zero::PRELOAD
+        );
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(root.join("ca-bundle.pem"))
