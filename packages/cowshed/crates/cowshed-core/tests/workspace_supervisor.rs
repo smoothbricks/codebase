@@ -370,6 +370,23 @@ struct FakeCommitments {
     order: mpsc::UnboundedSender<OrderObservation>,
 }
 
+/// Commitments recorded as [`FakeCommitments`] records them, a job's terminal one only after
+/// `delay`: a controller slow to publish a job's end, while the job is not yet concluded.
+struct SlowTerminal {
+    inner: FakeCommitments,
+    delay: Duration,
+}
+
+#[async_trait]
+impl CommitmentSink for SlowTerminal {
+    async fn record(&mut self, draft: CommitmentDraft) -> Result<()> {
+        if !self.delay.is_zero() && matches!(draft, CommitmentDraft::Terminal { .. }) {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.inner.record(draft).await
+    }
+}
+
 #[async_trait]
 impl CommitmentSink for FakeCommitments {
     async fn record(&mut self, draft: CommitmentDraft) -> Result<()> {
@@ -467,6 +484,7 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
         job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
         cpu: Arc::new(ImmediateCpu),
         build_volume_released: None,
+        nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
     }
 }
 
@@ -721,13 +739,22 @@ fn harness_with_config(
         fail_next,
         backpressure,
         None,
+        Duration::ZERO,
     )
 }
 
 /// A harness whose artifact sink commits a stdout stream that is not what the job wrote.
 fn harness_with_sealed_stdout(sealed_stdout: Vec<u8>) -> (Harness, TempRoot) {
     let root = workspace_root("test-workspace");
-    let h = harness_with_artifacts(config(&root), 1, 1024, false, false, Some(sealed_stdout));
+    let h = harness_with_artifacts(
+        config(&root),
+        1,
+        1024,
+        false,
+        false,
+        Some(sealed_stdout),
+        Duration::ZERO,
+    );
     (h, root)
 }
 
@@ -738,6 +765,7 @@ fn harness_with_artifacts(
     fail_next: bool,
     backpressure: bool,
     sealed_stdout: Option<Vec<u8>>,
+    terminal_delay: Duration,
 ) -> Harness {
     let (spawn_tx, spawned) = mpsc::unbounded_channel();
     let (process_tx, process) = mpsc::unbounded_channel();
@@ -762,10 +790,13 @@ fn harness_with_artifacts(
             observations: artifact_tx,
             order: order_tx.clone(),
         }),
-        Box::new(FakeCommitments {
-            next_order: 1,
-            observations: commitment_tx,
-            order: order_tx,
+        Box::new(SlowTerminal {
+            inner: FakeCommitments {
+                next_order: 1,
+                observations: commitment_tx,
+                order: order_tx,
+            },
+            delay: terminal_delay,
         }),
     )
     .unwrap();
@@ -7494,9 +7525,26 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
 /// the shed in use for the start and is closed once the daemon is up, so the shed is unused from
 /// then on.
 async fn shed_with_live_nx_daemon(name: &str) -> (Harness, LiveDaemon, PathBuf, TempRoot) {
+    shed_with_live_nx_daemon_publishing_after(name, Duration::ZERO).await
+}
+
+/// [`shed_with_live_nx_daemon`], whose controller publishes each job's end `terminal_delay` after
+/// the job's conclusion began.
+async fn shed_with_live_nx_daemon_publishing_after(
+    name: &str,
+    terminal_delay: Duration,
+) -> (Harness, LiveDaemon, PathBuf, TempRoot) {
     let (supervisor_config, root) = nx_project(name);
     let project = supervisor_config.workspace_root.clone();
-    let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    let mut h = harness_with_artifacts(
+        supervisor_config,
+        1,
+        1024,
+        false,
+        false,
+        None,
+        terminal_delay,
+    );
     let in_use = open_named(&h.handle, "build").await;
     let start = h.spawned.recv().await.unwrap();
     let daemon = LiveDaemon::start(&project);
@@ -7582,7 +7630,9 @@ async fn a_shed_stops_its_idle_nx_daemon_and_starts_another_only_for_a_job() {
 }
 
 /// A job in the shed is use for as long as it runs: its own Nx talks to the daemon, which stays
-/// until the shed has been unused for the interval after the job's end.
+/// until the shed has been unused for the interval after the job's end. The job's end itself
+/// starts the interval, not the last probe that saw the job run: this one ends 3 s after a probe,
+/// a probe being due every 5 s from its admission.
 #[tokio::test(start_paused = true)]
 async fn a_shed_keeps_its_nx_daemon_while_a_job_runs() {
     let (mut h, mut daemon, _project, _root) = shed_with_live_nx_daemon("lark").await;
@@ -7598,14 +7648,44 @@ async fn a_shed_keeps_its_nx_daemon_while_a_job_runs() {
         .await
         .unwrap();
     let ran = h.spawned.recv().await.unwrap();
-    tokio::time::sleep(NX_IDLE * 2).await;
+    tokio::time::sleep(NX_IDLE * 2 + Duration::from_secs(3)).await;
     assert!(daemon.running(), "a running job keeps the daemon");
 
     complete(&ran, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(job).await.unwrap();
-    tokio::time::sleep(NX_IDLE - Duration::from_secs(30)).await;
+    tokio::time::sleep(NX_IDLE - Duration::from_secs(1)).await;
     assert!(daemon.running(), "the interval starts when the job ends");
-    tokio::time::sleep(Duration::from_secs(60)).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(!daemon.running(), "the daemon stops once the shed is idle");
+}
+
+/// A job's end starts the interval once the job has concluded, not where its conclusion began:
+/// a controller that takes a whole interval to publish the end leaves the shed its daemon for a
+/// whole interval after that, the actor running no probe while it waits.
+#[tokio::test(start_paused = true)]
+async fn a_jobs_idle_interval_starts_once_its_end_has_concluded() {
+    let (mut h, mut daemon, _project, _root) =
+        shed_with_live_nx_daemon_publishing_after("tern", NX_IDLE).await;
+
+    let job = h
+        .handle
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let ran = h.spawned.recv().await.unwrap();
+    complete(&ran, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(job).await.unwrap();
+    tokio::time::sleep(NX_IDLE - Duration::from_secs(10)).await;
+    assert!(
+        daemon.running(),
+        "the interval starts once the job has concluded"
+    );
+    tokio::time::sleep(Duration::from_secs(20)).await;
     assert!(!daemon.running(), "the daemon stops once the shed is idle");
 }
 

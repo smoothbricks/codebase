@@ -64,6 +64,7 @@ use crate::runtime::job_resources::{
     Boundary, JobSampler, Member, Observation, Sampling, StreamTally,
 };
 use crate::runtime::job_spans::{JobSpanEdge, JobSpanPublisher, TraceHealth};
+pub use crate::runtime::nx_daemon::NxDaemonIdle;
 use crate::runtime::nx_daemon::{NxDaemonKeeper, Probe, Verdict};
 #[cfg(target_os = "macos")]
 use crate::runtime::process_monitor::ProcessMonitor;
@@ -195,6 +196,9 @@ pub struct WorkspaceSupervisorConfig {
     pub cpu: Arc<dyn JobCpuAdmission>,
     /// Told each build volume whose job hold ended; `None` tells nothing.
     pub build_volume_released: Option<BuildVolumeReleased>,
+    /// How long the shed may go unused before the keeper stops its Nx daemon: main's
+    /// `.cowshed.toml` `[nx] daemon_idle` (04_sandbox.md, "The Nx daemon stays on").
+    pub nx_daemon_idle: NxDaemonIdle,
 }
 
 /// How the supervisor samples its jobs' resources (07_api.md, "Job monitoring"): policy values,
@@ -378,6 +382,7 @@ impl Default for WorkspaceSupervisorConfig {
             job_sampling: JobSamplingPolicy::default(),
             cpu: Arc::new(ImmediateCpu),
             build_volume_released: None,
+            nx_daemon_idle: NxDaemonIdle::DEFAULT,
         }
     }
 }
@@ -3584,8 +3589,10 @@ impl WorkspaceSupervisor {
             authority: config.authority.clone(),
             commands,
         };
-        let nx_daemon =
-            NxDaemonKeeper::for_role(WorkspaceRole::for_name(&config.authority.workspace));
+        let nx_daemon = NxDaemonKeeper::for_role(
+            WorkspaceRole::for_name(&config.authority.workspace),
+            config.nx_daemon_idle,
+        );
         let mut actor = SupervisorActor {
             authority: config.authority,
             workspace_root: config.workspace_root,
@@ -7586,6 +7593,15 @@ impl SupervisorActor {
         job.info.exit = job.exit.clone();
         job.info.failure = failure;
         job.info.stdin.complete = true;
+        // The job has concluded, every awaited cleanup behind it: its end starts the shed's idle
+        // interval (04_sandbox.md, the kept daemon) here, not where its conclusion began, which a
+        // slow seal, publication or release would leave a stale interval behind. The keeper's own
+        // start job is maintenance, not use.
+        if let Some(keeper) = &mut self.nx_daemon
+            && keeper.starting != Some(job_id)
+        {
+            keeper.job_ended();
+        }
         if let Some(identity) = job.session_identity
             && let Some(session) = self.sessions.get_mut(&identity)
         {
@@ -9956,6 +9972,7 @@ mod lifecycle_commitment_tests {
             job_sampling: JobSamplingPolicy::default(),
             cpu: defaults.cpu,
             build_volume_released: None,
+            nx_daemon_idle: defaults.nx_daemon_idle,
         };
         // `list()`/`info()` answer from the actor's resident job set, which is this supervisor's
         // own lifetime and deliberately not the durable history: the artifact store holds every

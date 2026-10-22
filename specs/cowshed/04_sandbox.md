@@ -1077,10 +1077,14 @@ project graph on every change in the tree, per shed. Stock Nx stops a daemon aft
 file event; the patched Nx 23.2.1 uses five minutes at the same `daemon/server/shutdown-utils.js` boundary. Every file
 event of the tree restarts that timer, so a tree that keeps changing never reaches it. The keeper therefore also ends
 the daemon. A shed is in use while its supervisor's ledger holds a job (a `--host` job and a land's gate job are the
-shed's jobs like any other) or a named session, and for five minutes after a daemon comes up. The ledger is the only
-source: no probe reads the process table or waits on another process's kernel state, because a probe runs inside the
-supervisor's actor, and a blocking call there stops every hello and exec the supervisor answers. Work that runs as no
-job of the supervisor's, such as a host shell's `direnv exec <ws> nx …` on the mount, is not use, and the keeper may
+shed's jobs like any other) or a named session, and for the shed's idle bound after a job is admitted or ends, a session
+opens, or a daemon comes up. The bound is main's `.cowshed.toml` `[nx] daemon_idle` (06_cli.md, "Configuration"), a
+whole number of seconds, minutes or hours above zero such as `"10m"`, read where the sandbox's repository policy is
+read, at the supervisor's start; without it the bound is five minutes. A job's end restarts the interval itself, rather
+than the last probe that saw the job run, so the bound is measured from the moment the shed fell idle. The ledger is the
+only source: no probe reads the process table or waits on another process's kernel state, because a probe runs inside
+the supervisor's actor, and a blocking call there stops every hello and exec the supervisor answers. Work that runs as
+no job of the supervisor's, such as a host shell's `direnv exec <ws> nx …` on the mount, is not use, and the keeper may
 stop the daemon under it; such work runs through `cowshed exec`, which the ledger records. Untracked work that shows up
 again is a defect in whatever let it run outside the ledger, never a reason to bring back a process walk. Measured
 2026-10-21 at about 720 host processes and 10.25k vnode descriptors: the keeper's former look, one descriptor query of
@@ -1088,10 +1092,10 @@ every process every 30 s per shed, made 12.2k `proc_info` calls and took 47-132 
 calls waited 51 s on the descriptor of a `cowshed fork` in uninterruptible sleep, and every supervisor that looked then
 stopped answering hello and exec (`did not answer within 10 seconds`; 2.6% of 3,528 hellos over 10 s, clustered on 13 of
 21 supervisors at once). Agents then ran their work around `cowshed exec`, which made exactly the work the look had been
-written to see. Once the ledger has held no job and no session for five minutes the keeper stops the daemon as
-`nx daemon --stop` does (a SIGTERM to the pid its record names, taken from the read that verified it live; its plugin
-workers go with it), says so on its stderr, and starts none until the shed is in use again: a job, a session, or a
-daemon someone else started, which the keeper then stops after five more minutes of disuse. A kept daemon is said on
+written to see. Once the shed has gone its idle bound with no job and no session in the ledger the keeper stops the
+daemon as `nx daemon --stop` does (a SIGTERM to the pid its record names, taken from the read that verified it live; its
+plugin workers go with it), says so on its stderr, and starts none until the shed is in use again: a job, a session, or
+a daemon someone else started, which the keeper then stops after another idle bound of disuse. A kept daemon is said on
 stderr with the job or session that keeps it, each time that changes. A supervisor retires only once its keeper holds no
 daemon (11_shell.md), so no daemon outlives the supervisor that watched it. The price is one Nx's own idle stop has: the
 first host client after a shed went idle finds no daemon and starts one of its own, outside the sandbox, until the
@@ -1111,7 +1115,11 @@ after the 10 s grace, and every wait is on its exit event. A worker that outlive
 listed only after the daemon had gone, is said on stderr, and the mount census names any that still hold the checkout.
 
 An open request connection, registered watcher or graph listener retains the daemon even when silent; closing the last
-request connection resets the full idle interval. The non-default, uncached target
+request connection resets the full idle interval. A plugin worker, and the daemon itself, is the daemon's client only
+while it waits on a reply: code the daemon runs that reaches Nx through another copy of the nx package (a sync generator
+of a plugin linked from outside the checkout) asks the daemon over its own socket, and a connection it kept would retain
+the daemon for life, so each lets go of its connection once its request queue drains (packages/nx-plugin README, "The
+daemon is its own client only while it waits on a reply"). The non-default, uncached target
 `bun nx run tooling:nx-daemon-idle-proof` compiles `tooling/nx-daemon-idle-proof.ts` with the canonical Typia transform,
 then exercises a connected silent client past five minutes and the daemon's departure five minutes after disconnection,
 using its real kernel process and daemon log. It stays outside the ordinary bounded test shards.

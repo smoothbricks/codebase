@@ -2691,6 +2691,7 @@ fn supervisor_config_of(
         job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
         cpu: std::sync::Arc::new(GrantingCpu),
         build_volume_released: None,
+        nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
     }
 }
 

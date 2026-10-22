@@ -13,17 +13,15 @@
 //! none.
 //!
 //! A kept daemon is a cost per shed: a resident Node process, its plugin workers, and a file
-//! watcher that recomputes the project graph on every change in the tree. Nx stops a daemon after
-//! three hours without a request or a file event, a bound it neither lets a caller set nor
-//! applies to a tree that keeps changing, so the supervisor ends the daemon itself. A shed is
-//! used while its supervisor runs a job or holds a session, while a process other than the daemon
-//! holds one of its Nx task databases open (a host shell's run), while a process the supervisor
-//! does not run holds the checkout (a host shell's run between its tasks, asked only when the
-//! keeper is about to stop the daemon: [`super::mount_activity`]), and for [`IDLE`] after a
-//! daemon comes up. Once none of that has happened for [`IDLE`] the keeper stops the daemon, as
-//! `nx daemon --stop` does, and starts none until the shed is used again. Its foreground daemon
-//! is one admitted maintenance job, excluded from developer activity. Quiescence and retirement
-//! stop and wait for that job; the supervisor also releases any daemon its keeper watched.
+//! watcher that recomputes the project graph on every change in the tree. Nx stops a daemon only
+//! after its own inactivity interval without a request or a file event, which a tree that keeps
+//! changing never reaches, so the supervisor ends the daemon itself. A shed is used while its
+//! supervisor's ledger holds a job or a named session, when a job is admitted or ends, when a
+//! session opens, and when a daemon comes up; nothing else is asked. Once none of that has happened
+//! for the shed's [`NxDaemonIdle`] the keeper stops the daemon, as `nx daemon --stop` does, and
+//! starts none until the shed is used again. Its foreground daemon is one admitted maintenance
+//! job, excluded from developer activity. Quiescence and retirement stop and wait for that job;
+//! the supervisor also releases any daemon its keeper watched.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -80,11 +78,28 @@ pub(crate) const PAUSE_CAP: Duration = Duration::from_secs(15 * 60);
 /// and a probe that finds it gone counts afresh.
 pub(crate) const STOP_ATTEMPTS: u32 = 3;
 
-/// How long a shed must show no use of Nx before its supervisor stops the daemon it keeps. Long
-/// enough that a gate's runs, an edit and the next run share one warm daemon (a cold one
-/// recomputes the project graph and every plugin worker's state), short enough that a shed
-/// whose agent has finished costs its host five minutes of a daemon, not the rest of the day.
-pub(crate) const IDLE: Duration = Duration::from_secs(5 * 60);
+/// How long a shed must show no use of Nx before its supervisor stops the daemon it keeps: main's
+/// `.cowshed.toml` `[nx] daemon_idle`, [`NxDaemonIdle::DEFAULT`] without it (04_sandbox.md, "The
+/// Nx daemon stays on"). Never zero: a zero bound would stop a daemon at the probe after the one
+/// that found it come up.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NxDaemonIdle(Duration);
+
+impl NxDaemonIdle {
+    /// Long enough that a gate's runs, an edit and the next run share one warm daemon (a cold one
+    /// recomputes the project graph and every plugin worker's state), short enough that a shed
+    /// whose agent has finished costs its host five minutes of a daemon, not the rest of the day.
+    pub const DEFAULT: Self = Self(Duration::from_secs(5 * 60));
+
+    /// The bound `idle`; `None` for zero.
+    pub fn new(idle: Duration) -> Option<Self> {
+        (!idle.is_zero()).then_some(Self(idle))
+    }
+
+    pub const fn get(self) -> Duration {
+        self.0
+    }
+}
 
 /// The daemon of an Nx project, as its rendezvous record and the world agree on it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -527,16 +542,14 @@ pub(crate) struct NxDaemonKeeper {
     probes: Interval,
     /// The foreground daemon job admitted last, retained until a probe sees its terminal result.
     pub(super) starting: Option<JobId>,
-    /// The last probe that found the shed in use, or a daemon newly up; `None` until one does.
-    /// The supervisor's own start is no use, so a supervisor nothing uses starts no daemon.
-    last_use: Option<Instant>,
-    /// Whether the previous probe found the daemon live, to tell a daemon coming up from one
-    /// that has been up.
-    daemon_was_live: bool,
+    /// How long the shed may go unused before its daemon is stopped.
+    idle: NxDaemonIdle,
+    /// When the shed was last used, and whether the last probe found its daemon live.
+    clock: IdleClock,
     /// What in the ledger kept the live daemon at the last probe, said each time it changes.
     kept_by: Option<Use>,
-    /// Whether the last probe found the shed unused for [`IDLE`] and no daemon live: nothing is
-    /// left for the supervisor to wait for.
+    /// Whether the last probe found the shed unused for its idle bound and no daemon live:
+    /// nothing is left for the supervisor to wait for.
     pub(super) settled: bool,
     /// Starts in a row that left no daemon live, since a probe last found one live.
     failed_starts: u32,
@@ -558,7 +571,7 @@ pub(crate) struct NxDaemonKeeper {
 pub(crate) enum Verdict {
     /// The shed is in use, or its daemon is young: one is to run.
     Keep,
-    /// The shed has gone unused for [`IDLE`]: none is to run, and the one that did is stopped.
+    /// The shed has gone unused for its idle bound: none is to run, and the one that did is stopped.
     Release,
 }
 
@@ -568,7 +581,7 @@ impl NxDaemonKeeper {
     /// the ledger holds a job or a session, and one found live gets its interval. A supervisor
     /// started for anything else (a failed `rm` restoring the workspace, an ensure that runs
     /// nothing) would otherwise launch a daemon whose start processes then hold the mount.
-    pub(crate) fn for_role(role: WorkspaceRole) -> Option<Self> {
+    pub(crate) fn for_role(role: WorkspaceRole, idle: NxDaemonIdle) -> Option<Self> {
         match role {
             WorkspaceRole::Main => None,
             WorkspaceRole::Workspace => {
@@ -578,8 +591,8 @@ impl NxDaemonKeeper {
                 Some(Self {
                     probes,
                     starting: None,
-                    last_use: None,
-                    daemon_was_live: false,
+                    idle,
+                    clock: IdleClock::default(),
                     kept_by: None,
                     settled: false,
                     failed_starts: 0,
@@ -715,8 +728,14 @@ impl NxDaemonKeeper {
     /// the next probe is due at once. A job that ends before the next tick counts all the same;
     /// otherwise a short command would never be seen as use.
     pub(crate) fn used(&mut self) {
-        self.last_use = Some(Instant::now());
+        self.clock.use_at(Instant::now());
         self.probes.reset_immediately();
+    }
+
+    /// A job of the ledger other than the keeper's own start ended: the shed's idle interval
+    /// starts now, not at the last probe that saw the job run, up to [`PROBE_INTERVAL`] earlier.
+    pub(crate) fn job_ended(&mut self) {
+        self.clock.use_at(Instant::now());
     }
 
     /// A start that left no daemon live, `what` saying how: another follows at the next probe
@@ -750,8 +769,8 @@ impl NxDaemonKeeper {
 
     /// Judge one probe of the Nx project at `project_root`, whose daemon the probe found
     /// `daemon`, `working` being what the supervisor's ledger holds that uses the shed: a job it
-    /// runs or a named session it holds. Stops the daemon once the ledger has held neither for
-    /// [`IDLE`].
+    /// runs or a named session it holds. Stops the daemon once the shed has gone unused for its
+    /// idle bound ([`IdleClock::probe`]).
     ///
     /// The ledger is the only source of use. Work that runs as no job of the supervisor's is not
     /// asked about, so no probe reads the process table or waits on another process's kernel
@@ -765,12 +784,9 @@ impl NxDaemonKeeper {
         daemon: Probe,
     ) -> Verdict {
         let live = daemon == Probe::Live;
-        let now = Instant::now();
-        // A daemon that has just come up was asked for by someone: it gets a whole interval,
-        // however idle the shed looks.
-        if working.is_some() || (live && !self.daemon_was_live) {
-            self.last_use = Some(now);
-        }
+        let idleness = self
+            .clock
+            .probe(Instant::now(), self.idle, working.is_some(), live);
         let kept_by = working.filter(|_| live);
         if let Some(using) = kept_by
             .as_ref()
@@ -782,31 +798,30 @@ impl NxDaemonKeeper {
             );
         }
         self.kept_by = kept_by;
-        self.daemon_was_live = live;
-        if self
-            .last_use
-            .is_some_and(|used| now.duration_since(used) < IDLE)
-        {
-            self.settled = false;
-            return Verdict::Keep;
+        match idleness {
+            Idleness::InUse => {
+                self.settled = false;
+                Verdict::Keep
+            }
+            Idleness::Settled => {
+                self.failed_stops = 0;
+                self.settled = true;
+                Verdict::Release
+            }
+            Idleness::Stop => {
+                self.settled = false;
+                if self.may_stop() {
+                    let why = format!(
+                        "its supervisor ran no job and held no named session for {}s",
+                        self.idle.get().as_secs()
+                    );
+                    if let Err(why) = stop(project_root, &why).await {
+                        self.stop_failed(project_root, &why);
+                    }
+                }
+                Verdict::Release
+            }
         }
-        if !live {
-            self.failed_stops = 0;
-            self.settled = true;
-            return Verdict::Release;
-        }
-        self.settled = false;
-        if !self.may_stop() {
-            return Verdict::Release;
-        }
-        let why = format!(
-            "its supervisor ran no job and held no named session for {}s",
-            IDLE.as_secs()
-        );
-        if let Err(why) = stop(project_root, &why).await {
-            self.stop_failed(project_root, &why);
-        }
-        Verdict::Release
     }
 
     /// Whether a probe may try to stop the idle shed's live daemon: not once [`STOP_ATTEMPTS`]
@@ -833,8 +848,53 @@ impl NxDaemonKeeper {
         cowshed_os::eprintln!(
             "cowshed: the Nx daemon of {} has been idle for {}s and did not stop: {why}; {next}",
             project_root.display(),
-            IDLE.as_secs(),
+            self.idle.get().as_secs(),
         );
+    }
+}
+
+/// The keeper's idle clock, the pure core of [`NxDaemonKeeper::judge`]: when the shed was last
+/// used, and whether the last probe found the daemon live, to tell a daemon coming up from one
+/// that has been up.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct IdleClock {
+    /// The last use: a probe whose ledger held a job or a session, a job's admission or end, a
+    /// session's opening, or a daemon newly up; `None` until one happens. The supervisor's own
+    /// start is no use, so a supervisor nothing uses starts no daemon.
+    last_use: Option<Instant>,
+    daemon_was_live: bool,
+}
+
+/// What one probe of the [`IdleClock`] decides.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Idleness {
+    /// Used within the bound: a daemon is to run.
+    InUse,
+    /// Unused for the bound and no daemon live: nothing is left to stop.
+    Settled,
+    /// Unused for the bound and the daemon live: it is to be stopped.
+    Stop,
+}
+
+impl IdleClock {
+    /// The shed was used at `now`.
+    fn use_at(&mut self, now: Instant) {
+        self.last_use = Some(now);
+    }
+
+    /// One probe at `now`, whose ledger holds use when `working` and which found the daemon
+    /// `live`, against the bound `idle`. A daemon that has just come up was asked for by someone:
+    /// it gets a whole bound, however idle the shed looks.
+    fn probe(&mut self, now: Instant, idle: NxDaemonIdle, working: bool, live: bool) -> Idleness {
+        if working || (live && !self.daemon_was_live) {
+            self.use_at(now);
+        }
+        self.daemon_was_live = live;
+        match self.last_use {
+            Some(used) if now.duration_since(used) < idle.get() => Idleness::InUse,
+            _ if live => Idleness::Stop,
+            _ => Idleness::Settled,
+        }
     }
 }
 
@@ -992,9 +1052,100 @@ where
 mod tests {
     use std::os::unix::net::UnixListener;
 
+    use proptest::prelude::*;
+
     use super::*;
     #[cfg(target_os = "macos")]
     use cowshed_os::fork_lock::Run as _;
+
+    /// The default bound the keeper tests run against.
+    const IDLE: Duration = NxDaemonIdle::DEFAULT.get();
+
+    /// One event the keeper's idle clock hears.
+    #[derive(Clone, Debug)]
+    enum ClockEvent {
+        /// The supervisor admitted a job, opened a session, or a job ended.
+        Used,
+        /// A probe whose ledger holds use when `working`, finding the daemon `live`.
+        Probe { working: bool, live: bool },
+    }
+
+    /// Events with the time since the one before each.
+    fn clock_events() -> impl Strategy<Value = Vec<(Duration, ClockEvent)>> {
+        prop::collection::vec(
+            (
+                (0_u64..600).prop_map(Duration::from_secs),
+                prop_oneof![
+                    Just(ClockEvent::Used),
+                    (any::<bool>(), any::<bool>())
+                        .prop_map(|(working, live)| ClockEvent::Probe { working, live }),
+                ],
+            ),
+            1..40,
+        )
+    }
+
+    proptest! {
+        /// The idle clock stops a live daemon exactly once the shed has gone its whole bound
+        /// without use -- a job or session in the ledger at a probe, a job admitted or ended, a
+        /// session opened, or a daemon newly up -- and settles a shed whose daemon is gone. A probe
+        /// whose ledger holds use never stops one, and a longer bound never stops one sooner.
+        #[test]
+        fn the_idle_clock_stops_a_live_daemon_only_after_its_whole_bound_without_use(
+            idle in (1_u64..900).prop_map(Duration::from_secs),
+            more in (0_u64..900).prop_map(Duration::from_secs),
+            events in clock_events(),
+        ) {
+            let idle = NxDaemonIdle::new(idle).expect("a positive bound");
+            let longer = NxDaemonIdle::new(idle.get() + more).expect("a positive bound");
+            let mut now = Instant::now();
+            let mut clock = IdleClock::default();
+            let mut longer_clock = IdleClock::default();
+            // The model: when the shed was last used, and whether the last probe found a daemon.
+            let mut last_use: Option<Instant> = None;
+            let mut was_live = false;
+            for (after, event) in events {
+                now += after;
+                match event {
+                    ClockEvent::Used => {
+                        clock.use_at(now);
+                        longer_clock.use_at(now);
+                        last_use = Some(now);
+                    }
+                    ClockEvent::Probe { working, live } => {
+                        if working || (live && !was_live) {
+                            last_use = Some(now);
+                        }
+                        was_live = live;
+                        let unused = last_use.is_none_or(|used| now - used >= idle.get());
+                        let expected = match (unused, live) {
+                            (false, _) => Idleness::InUse,
+                            (true, true) => Idleness::Stop,
+                            (true, false) => Idleness::Settled,
+                        };
+                        let decided = clock.probe(now, idle, working, live);
+                        prop_assert_eq!(decided, expected);
+                        if working {
+                            prop_assert_eq!(decided, Idleness::InUse);
+                        }
+                        let under_longer = longer_clock.probe(now, longer, working, live);
+                        if decided == Idleness::InUse {
+                            prop_assert_eq!(under_longer, Idleness::InUse);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_idle_bound_is_refused() {
+        assert_eq!(NxDaemonIdle::new(Duration::ZERO), None);
+        assert_eq!(
+            NxDaemonIdle::new(Duration::from_secs(1)).map(NxDaemonIdle::get),
+            Some(Duration::from_secs(1))
+        );
+    }
 
     fn write_record(record: &Path, pid: u32, socket: &Path) {
         std::fs::write(
@@ -1060,7 +1211,8 @@ mod tests {
     const NO_PROJECT: &str = "/cowshed-test-no-such-nx-project";
 
     fn keeper() -> NxDaemonKeeper {
-        NxDaemonKeeper::for_role(WorkspaceRole::Workspace).expect("a shed keeps a daemon")
+        NxDaemonKeeper::for_role(WorkspaceRole::Workspace, NxDaemonIdle::DEFAULT)
+            .expect("a shed keeps a daemon")
     }
 
     async fn judge(keeper: &mut NxDaemonKeeper, working: bool, daemon: Probe) -> Verdict {
@@ -2264,6 +2416,8 @@ mod lifecycle_authority_tests {
             .arg("--kept")
             .clear_nx_environment()
             .envs(nx_environment(root))
+            // Nx Console's status check otherwise has the daemon fetch `nx@latest` in an npm child.
+            .env("NX_USE_LOCAL", "true")
             .current_dir(root)
             .process_group(0)
             .spawn_locked()
@@ -2359,5 +2513,141 @@ mod lifecycle_authority_tests {
             "the exact-identity SIGTERM ended the real daemon: {outcome:?}"
         );
         daemon.wait().expect("reap the real daemon");
+    }
+
+    /// Stops the daemon a `workspace-data` directory records when dropped, however the test ends.
+    struct StopsRecordedDaemon(PathBuf);
+
+    impl Drop for StopsRecordedDaemon {
+        fn drop(&mut self) {
+            match crate::build_volume::nx::stop_recorded_daemon(&self.0) {
+                Ok(Ok(_)) => {}
+                Ok(Err(busy)) => cowshed_os::eprintln!("the fixture's daemon did not stop: {busy}"),
+                Err(error) => cowshed_os::eprintln!("the fixture's daemon did not stop: {error}"),
+            }
+        }
+    }
+
+    /// The keeper stops an idle shed's real kept daemon once the shed has gone its configured
+    /// bound without use, and the plugin workers the daemon forked with it, although the daemon's
+    /// own sandbox refuses it every signal to them; the next Nx call then starts a daemon, which
+    /// the keeper keeps a whole bound (04_sandbox.md, "The Nx daemon stays on").
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_sheds_real_kept_daemon_stops_with_its_workers_and_the_next_nx_call_starts_one()
+    {
+        use super::super::process_events::{Darwin, ProcessReads as _};
+        let (nx, node) = declared_nx();
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "nx-daemon-idle-reap",
+        );
+        let root = scratch.join("workspace");
+        std::fs::create_dir_all(root.join("p")).expect("workspace");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"fixture","private":true}"#,
+        )
+        .expect("package.json");
+        // A graph plugin of the workspace's own, which the daemon runs in an isolated worker.
+        std::fs::write(root.join("nx.json"), r#"{"plugins":["./plugin.js"]}"#).expect("nx.json");
+        std::fs::write(
+            root.join("plugin.js"),
+            "exports.createNodesV2 = ['**/project.json', () => []];
+",
+        )
+        .expect("plugin.js");
+        std::fs::write(root.join("p/project.json"), r#"{"name":"p"}"#).expect("project.json");
+        std::fs::create_dir_all(root.join("node_modules")).expect("node_modules");
+        std::os::unix::fs::symlink(&nx, root.join("node_modules/nx"))
+            .expect("the workspace's own nx");
+        let record = nx::daemon_record(&root);
+        let _stops = StopsRecordedDaemon(nx::workspace_data(&root));
+        let mut daemon = real_daemon(&root, &node, &nx);
+        // The record, then the daemon's first fork, is the event; a daemon that dies first is
+        // noticed by its exit.
+        let workers = loop {
+            if let Some(status) = daemon.try_wait().expect("poll the daemon") {
+                panic!("the real daemon exited before it forked a plugin worker ({status})");
+            }
+            let children = Darwin
+                .children(daemon.id())
+                .expect("list the daemon's children");
+            if record.is_file() && !children.is_empty() {
+                break children
+                    .into_iter()
+                    .filter_map(|pid| {
+                        super::super::job_groups::Process::observe(
+                            i32::try_from(pid).expect("a pid fits i32"),
+                        )
+                        .expect("observe a plugin worker")
+                    })
+                    .collect::<Vec<_>>();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert!(!workers.is_empty(), "the daemon forked its plugin workers");
+
+        let idle = NxDaemonIdle::new(Duration::from_secs(90)).expect("a positive bound");
+        let mut keeper = NxDaemonKeeper::for_role(WorkspaceRole::Workspace, idle)
+            .expect("a shed keeps a daemon");
+        assert_eq!(probe(&record), Probe::Live);
+        assert_eq!(
+            keeper.judge(&root, None, Probe::Live).await,
+            Verdict::Keep,
+            "a daemon that comes up gets a whole bound"
+        );
+        tokio::time::advance(idle.get() - Duration::from_secs(1)).await;
+        assert_eq!(
+            keeper.judge(&root, None, probe(&record)).await,
+            Verdict::Keep
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            keeper.judge(&root, None, probe(&record)).await,
+            Verdict::Release,
+            "the shed went its whole bound unused"
+        );
+        let status = daemon.wait().expect("reap the real daemon");
+        let mut outlived = Vec::new();
+        for worker in &workers {
+            if worker.record().expect("read a plugin worker").is_some() {
+                outlived.push(worker.pid());
+                worker.signal(libc::SIGKILL).expect("end the stray worker");
+            }
+        }
+        assert!(
+            outlived.is_empty(),
+            "plugin workers {outlived:?} outlived their daemon's stop ({status})"
+        );
+        assert_ne!(probe(&record), Probe::Live, "the daemon is gone");
+        assert_eq!(
+            keeper.judge(&root, None, probe(&record)).await,
+            Verdict::Release
+        );
+        assert!(keeper.settled, "nothing is left to stop");
+
+        // The next Nx call finds no daemon and starts one, as any client does.
+        let shown = std::process::Command::new(&node)
+            .arg(nx.join("dist/bin/nx.js"))
+            .args(["show", "projects", "--json"])
+            .clear_nx_environment()
+            .envs(nx_environment(&root))
+            .env("NX_DAEMON", "true")
+            .env("NX_USE_LOCAL", "true")
+            .current_dir(&root)
+            .output_locked()
+            .expect("the Nx call runs");
+        assert!(
+            shown.status.success(),
+            "the Nx call: {}",
+            String::from_utf8_lossy(&shown.stderr)
+        );
+        assert_eq!(probe(&record), Probe::Live, "the Nx call started a daemon");
+        assert_eq!(
+            keeper.judge(&root, None, Probe::Live).await,
+            Verdict::Keep,
+            "the daemon the Nx call started gets a whole bound"
+        );
+        assert!(!keeper.settled);
     }
 }

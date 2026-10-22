@@ -273,6 +273,7 @@ impl Workspace {
                 stakes: self.sandbox.exec_temp_dir.join("stakes"),
             }),
             build_volume_released: None,
+            nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
         };
         let artifacts = ArtifactStoreSink::open(
             config.workspace_root.clone(),

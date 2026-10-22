@@ -320,6 +320,9 @@ pub struct CowshedConfig {
     /// `[build] state`: build state the repository declares for tools no capability detects
     /// (16_build_volumes.md, "Declared build state"), sorted, no spelling inside another.
     build_state: Vec<crate::capabilities::DeclaredState>,
+    /// `[nx] daemon_idle`: how long a shed goes unused before its supervisor stops the Nx daemon
+    /// it keeps (04_sandbox.md, "The Nx daemon stays on").
+    nx_daemon_idle: Option<crate::runtime::supervisor::NxDaemonIdle>,
 }
 
 impl CowshedConfig {
@@ -356,6 +359,13 @@ impl CowshedConfig {
     pub fn build_state(&self) -> &[crate::capabilities::DeclaredState] {
         &self.build_state
     }
+
+    /// How long a shed goes unused before its supervisor stops its Nx daemon: `[nx] daemon_idle`,
+    /// else [`crate::runtime::supervisor::NxDaemonIdle::DEFAULT`].
+    pub fn nx_daemon_idle(&self) -> crate::runtime::supervisor::NxDaemonIdle {
+        self.nx_daemon_idle
+            .unwrap_or(crate::runtime::supervisor::NxDaemonIdle::DEFAULT)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -380,8 +390,15 @@ struct ConfigFile {
     sandbox: Option<SandboxSection>,
     build: Option<BuildSection>,
     caches: Option<CachesSection>,
+    nx: Option<NxSection>,
     #[serde(default)]
     capabilities: BTreeMap<CapabilityId, CapabilitySection>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NxSection {
+    daemon_idle: Spanned<String>,
 }
 
 #[derive(Deserialize)]
@@ -426,7 +443,7 @@ struct CapabilitySection {
 }
 
 /// Parse repository-owned storage, sandbox deny, build volume capacity and declared state,
-/// repository cache and convention-only capability overrides. Unknown or duplicated settings fail
+/// repository cache, the Nx daemon idle bound and convention-only capability overrides. Unknown or duplicated settings fail
 /// rather than silently changing project detection.
 pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     let file: ConfigFile = toml::from_str(input).map_err(|error| ConfigError::Malformed {
@@ -475,6 +492,17 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
             },
         ),
     };
+    let nx_daemon_idle = file
+        .nx
+        .map(|section| {
+            nx_daemon_idle(section.daemon_idle.get_ref()).ok_or_else(|| {
+                ConfigError::InvalidNxDaemonIdle {
+                    line: line_of(input, &section.daemon_idle),
+                    value: section.daemon_idle.get_ref().clone(),
+                }
+            })
+        })
+        .transpose()?;
     let capabilities =
         file.capabilities
             .into_iter()
@@ -506,7 +534,21 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
         capabilities,
         build_capacity,
         build_state,
+        nx_daemon_idle,
     })
+}
+
+/// `[nx] daemon_idle`: a whole number of seconds, minutes or hours above zero (`"90s"`, `"5m"`,
+/// `"1h"`); `None` for anything else.
+fn nx_daemon_idle(text: &str) -> Option<crate::runtime::supervisor::NxDaemonIdle> {
+    let (count, seconds) = [('s', 1), ('m', 60), ('h', 60 * 60)]
+        .into_iter()
+        .find_map(|(unit, seconds)| Some((text.strip_suffix(unit)?, seconds)))?;
+    if count.is_empty() || !count.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let seconds = count.parse::<u64>().ok()?.checked_mul(seconds)?;
+    crate::runtime::supervisor::NxDaemonIdle::new(std::time::Duration::from_secs(seconds))
 }
 
 /// Main's `.cowshed.toml`, the only copy whose `[sandbox]` and `[caches]` sections are trusted:
@@ -676,6 +718,10 @@ pub enum ConfigError {
         outer: PathBuf,
         inner: PathBuf,
     },
+    #[error(
+        "[nx] daemon_idle {value:?} at line {line} must be a whole number of seconds, minutes or hours above zero, such as \"5m\""
+    )]
+    InvalidNxDaemonIdle { line: usize, value: String },
     #[error("the [{0}] section sets nothing")]
     EmptySection(&'static str),
     #[error("invalid ZFS pool: {0}")]

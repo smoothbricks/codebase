@@ -8843,6 +8843,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     }
                 })
             }),
+            // Main's `.cowshed.toml`, the operator's, as for the sandbox's repository policy.
+            nx_daemon_idle: crate::storage::bootstrap::main_cowshed_config(
+                &self.workspace_mount_path(&main_name())?,
+            )?
+            .nx_daemon_idle(),
         };
         // A workspace has one supervisor, its one job allocator: when another controller
         // process already serves it under this authority, or under grants published since this

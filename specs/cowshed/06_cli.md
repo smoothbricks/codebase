@@ -672,6 +672,8 @@ port = 7644                    # macOS host control plane; Linux private-netns c
 extra_workspace_dirs = ["build-out"]
 [shell]
 output_limit = "1GiB"         # combined stdout+stderr per job; explicit output-limit terminal state
+[nx]
+daemon_idle = "5m"             # a shed unused this long has its kept Nx daemon stopped (04_sandbox.md); main's copy only
 ```
 
 macOS port allocation is not a configuration setting. Fixture stores allocate from a reserved fixture partition of the

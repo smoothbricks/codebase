@@ -375,6 +375,67 @@ fn build_capacity_defaults_to_100_gibibytes_and_is_an_image_capacity() {
     }
 }
 
+/// `[nx] daemon_idle` sets how long a shed goes unused before its supervisor stops the Nx daemon
+/// it keeps; without it a shed gets five minutes. A bound is a whole number of seconds, minutes or
+/// hours above zero.
+#[test]
+fn nx_daemon_idle_defaults_to_five_minutes_and_is_a_positive_whole_duration() {
+    use cowshed_core::runtime::supervisor::NxDaemonIdle;
+    use std::time::Duration;
+    assert_eq!(
+        parse_cowshed_config("").unwrap().nx_daemon_idle(),
+        NxDaemonIdle::DEFAULT
+    );
+    assert_eq!(NxDaemonIdle::DEFAULT.get(), Duration::from_secs(300));
+    for (value, seconds) in [("90s", 90), ("10m", 600), ("2h", 7200)] {
+        assert_eq!(
+            parse_cowshed_config(&format!("[nx]\ndaemon_idle = \"{value}\"\n"))
+                .unwrap()
+                .nx_daemon_idle()
+                .get(),
+            Duration::from_secs(seconds),
+            "{value}"
+        );
+    }
+    let invalid = [
+        ("[nx]\n", "missing field `daemon_idle`"),
+        ("[nx]\ndaemon_idle = 300\n", "expected a string"),
+        (
+            "[nx]\ndaemon_idle = \"0m\"\n",
+            "[nx] daemon_idle \"0m\" at line 2",
+        ),
+        (
+            "[nx]\ndaemon_idle = \"5\"\n",
+            "[nx] daemon_idle \"5\" at line 2",
+        ),
+        (
+            "[nx]\ndaemon_idle = \"m\"\n",
+            "[nx] daemon_idle \"m\" at line 2",
+        ),
+        (
+            "[nx]\ndaemon_idle = \"-5m\"\n",
+            "[nx] daemon_idle \"-5m\" at line 2",
+        ),
+        (
+            "[nx]\ndaemon_idle = \"5 m\"\n",
+            "[nx] daemon_idle \"5 m\" at line 2",
+        ),
+        (
+            "[nx]\ndaemon_idle = \"5d\"\n",
+            "[nx] daemon_idle \"5d\" at line 2",
+        ),
+        (
+            "[nx]\ndaemon_idle = \"99999999999999999999h\"\n",
+            "[nx] daemon_idle \"99999999999999999999h\" at line 2",
+        ),
+        ("[nx]\nidle = \"5m\"\n", "unknown field `idle`"),
+    ];
+    for (source, message) in invalid {
+        let error = parse_cowshed_config(source).unwrap_err();
+        assert!(error.to_string().contains(message), "{source:?}: {error}");
+    }
+}
+
 /// `[caches] home` reuses `[sandbox] deny`'s parsing: an array of HOME-relative paths of
 /// plain components, normalized, sorted and deduplicated; an empty, absolute or escaping entry is
 /// refused, and so is a section without its key.
