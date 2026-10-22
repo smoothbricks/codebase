@@ -837,6 +837,39 @@ What the substrate does about each:
   contention instead of reducing it; the fix is fewer calls, and calls that do not starve each other.
 - **`doctor`** reports main's extent count (`main-extents`) so fragmentation is visible before it costs a fork.
 
+### The IOMedia match-notification ceiling
+
+An attach completes only when DiskImages2 sees its new device, and it sees it through a kernel match notification that
+silently stops at 1,024 entries. `diskutil image attach` waits in `-[DIDeviceHandle waitForDeviceWithError:]`, which
+registers an `IOServiceMatched` notification for every `IOMedia` on the host, drains the initial iterator and then
+waits, with no overall timeout, for a callback whose parent chain reaches the device it created. XNU caps the matches
+one user notification can hold at `IOServiceUserNotification::kMaxOutstanding = 1024` (`iokit/Kernel/IOUserClient.cpp`,
+line 809) and drops every match past it without an error (lines 1031–1038). So once the host carries more than 1,024
+`IOMedia` objects, a new image's media can fall outside the notification, the attach never sees the device it already
+published, and it waits forever. A lower count does not replay a lost match: an attach that missed its device stays
+waiting until it is cancelled. Measured 2026-10-22: 352 attached images, each contributing about three `IOMedia` (the
+whole disk, its APFS container media and the volume), gave 1,081 `IOMedia` against 1,024 notification entries; every new
+attach hung after its device was published (`BusyState 0`, no I/O errors), and the same probe found 905 of 905 once idle
+images were detached, after which a fork completed in 72 s. A notification filtered to the target device would not
+overflow; DiskImages2 does not filter.
+
+So attached media are a budget, separate from the leaked-device ceiling above (error 150): before every attach cowshed
+counts the host's live `IOMedia` with an ordinary registry enumeration (`IOServiceGetMatchingServices`, which has no
+cap) and adds the media the attach will create, about three per image and six for a fork's session and build image. When
+that sum would reach the notification ceiling, cowshed first detaches the least-recently-used idle workspaces (no job,
+no session, no Nx activity; never main), which re-attach on their next use, until the attach fits, and otherwise refuses
+the attach by name, listing the attached workspaces and the media each holds. It never starts an attach that can only
+hang. `cowshed doctor` reports live `IOMedia` against the ceiling.
+
+### Freeing an image
+
+One `unlink` of a written image frees its whole extent tree in one container transaction, and every writer of the
+store's APFS container, the Data volume's log and fork writes included, waits behind it. A thread at background I/O
+priority (`IOPOL_THROTTLE`) makes that worse, because its own metadata reads are throttled while the container waits. So
+cowshed never throttles an image free and never frees an image in one call: it cuts the image from its end with
+`ftruncate(2)` at most 1,024 physical runs per cut, then unlinks the empty file (16_build_volumes.md, "Garbage
+collection", for the measurements and the journal).
+
 ## Ownership, identity, and the volume label
 
 Three questions, three authorities, none of them the volume label:
