@@ -594,6 +594,14 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         workspace: &LifecycleWorkspace,
         checkout: &Path,
     ) -> Result<(), ApfsStorageError>;
+    /// Detach every build volume `workspace`'s checkout owns, kept whole for its next mount,
+    /// once the checkout itself is detached: a detached workspace holds none of its images
+    /// (02_workspaces.md, "Attach and detach"). Its next mount mounts the volume again
+    /// ([`Self::ensure_linked_build_volume`]).
+    fn detach_owned_build_volumes(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<(), ApfsStorageError>;
     /// Grow the workspace's image to `capacity` and restore the mount state it was found in.
     ///
     /// Refuses before touching the image when `capacity` does not exceed what the image already
@@ -1995,7 +2003,8 @@ where
         // The volume is the user's to be working in: an explicit unmount that cannot land is a
         // busy conflict for the caller to report, never grounds to force it out from under them.
         self.dispatch_with_locks(lock_paths, true, move |host, _| {
-            host.detach_mounted(&workspace, DetachIntent::WhenIdle)
+            host.detach_mounted(&workspace, DetachIntent::WhenIdle)?;
+            host.detach_owned_build_volumes(&workspace)
         })
         .await
     }

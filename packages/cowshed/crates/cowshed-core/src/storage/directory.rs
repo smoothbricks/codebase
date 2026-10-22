@@ -1733,6 +1733,11 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         )
     }
 
+    /// A directory build volume is a directory: nothing is attached to detach.
+    fn detach_owned_build_volumes(&self, _: &LifecycleWorkspace) -> Result<(), ApfsStorageError> {
+        Ok(())
+    }
+
     fn resize(
         &self,
         _workspace: &LifecycleWorkspace,

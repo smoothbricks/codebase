@@ -593,6 +593,14 @@ impl ApfsExecutionHost for FakeHost {
         Ok(())
     }
 
+    fn detach_owned_build_volumes(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<(), ApfsStorageError> {
+        self.record(format!("detach-build-volumes:{}", workspace.name()));
+        Ok(())
+    }
+
     fn resize(
         &self,
         workspace: &LifecycleWorkspace,
@@ -2272,7 +2280,14 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
         .unmount(&restored.workspace)
         .await
         .expect("unmount");
-    assert_eq!(host.events(), ["lock:1", "detach-mounted:WhenIdle"]);
+    assert_eq!(
+        host.events(),
+        [
+            "lock:1".to_owned(),
+            "detach-mounted:WhenIdle".to_owned(),
+            format!("detach-build-volumes:{}", restored.workspace.name()),
+        ]
+    );
 }
 
 /// A new workspace's clone takes its own extent map as a step of its own, between the clone and

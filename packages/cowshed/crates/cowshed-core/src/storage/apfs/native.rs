@@ -5012,6 +5012,22 @@ where
         )
     }
 
+    fn detach_owned_build_volumes(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<(), ApfsStorageError> {
+        let layout = crate::build_volume::BuildVolumeLayout::new(
+            layout(&self.config, workspace.repo())?.project(),
+        )?;
+        let owned = layout
+            .owned_by(workspace.name())
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        for id in owned {
+            self.detach_owned_build_volume(&layout, &id, workspace.name())?;
+        }
+        Ok(())
+    }
+
     fn resize(
         &self,
         workspace: &LifecycleWorkspace,

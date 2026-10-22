@@ -172,18 +172,17 @@ mod native {
     use std::collections::BTreeMap;
     use std::fmt::Display;
     use std::path::Path;
-    use std::sync::Arc;
     use std::time::SystemTime;
 
     use cowshed_apfs::SystemCommandRunner;
     use cowshed_apfs::media_cap::MediaReading;
 
     use super::{Busy, Candidate, Demand, Key, Made, Occupancy, Plan, plan};
-    use crate::build_volume::{BuildVolumeId, BuildVolumeLayout, BuildVolumeRole};
+    use crate::build_volume::BuildVolumeLayout;
     use crate::runtime::land_lease::{self, Holding};
     use crate::runtime::supervisor_socket;
     use crate::storage::StorageLayout;
-    use crate::storage::apfs::native::{BuildVolumeClaim, MacOsApfsExecutionHost};
+    use crate::storage::apfs::native::MacOsApfsExecutionHost;
     use crate::storage::apfs::{ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig};
     use crate::storage::bootstrap::ValidatedHostStorage;
     use crate::storage::lifecycle::{
@@ -193,20 +192,18 @@ mod native {
 
     type Host = MacOsApfsExecutionHost<SystemCommandRunner>;
 
-    /// One adopted project's handles: its substrate for the workspace's own image, and a host
-    /// and layout for its build volumes, whose calls block.
+    /// One adopted project's handles: its substrate, which detaches a workspace with its build
+    /// volume.
     struct Project {
         repo: AdoptedProject,
         /// The project's session directory, where each workspace's land lease lives.
         sessions: std::path::PathBuf,
         substrate: ApfsSubstrate<Host>,
-        builds: Arc<(Host, BuildVolumeLayout)>,
     }
 
-    /// An attached session workspace and the build volume it links while that is mounted.
+    /// An attached session workspace.
     struct Attached {
         workspace: LifecycleWorkspace,
-        build: Option<BuildVolumeId>,
     }
 
     /// Make room for `demand` under `cap` ([`super::plan`]), detaching idle workspaces of every
@@ -413,17 +410,14 @@ mod native {
                 },
                 Attached {
                     workspace: workspace.workspace,
-                    build,
                 },
             ));
         }
-        let host = Host::new(SystemCommandRunner, config).map_err(|error| text(&error))?;
         Ok((
             Project {
                 repo: repo.clone(),
                 sessions: layout.project().sessions.clone(),
                 substrate,
-                builds: Arc::new((host, builds)),
             },
             listed,
         ))
@@ -468,68 +462,11 @@ mod native {
             Err(error) => return Some(unreleased(repo, name, &error)),
         }
         cowshed_os::eprintln!(
-            "cowshed: detached {repo}/{name}, which nothing used, to keep IOKit's media \
-             match-notification queue under its cap; its next use attaches it again"
+            "cowshed: detached {repo}/{name} and its build volume, which nothing used, to keep \
+             IOKit's media match-notification queue under its cap; its next use attaches them \
+             again"
         );
-        if let Some(id) = attached.build.clone() {
-            let builds = Arc::clone(&project.builds);
-            let owner = name.clone();
-            let released =
-                dispatch_blocking(move || release_build(&builds.0, &builds.1, &id, &owner))
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|released| released);
-            if let Err(error) = released {
-                cowshed_os::eprintln!(
-                    "cowshed: {repo}/{name}'s build volume stays attached: {error}"
-                );
-            }
-        }
         None
-    }
-
-    /// Detach `owner`'s build volume once `owner` is detached, kept whole for its next mount:
-    /// claimed, so no job is admitted on it and no land moves a link onto it meanwhile, then
-    /// unmounted unforced. The census named the volume before the claim, so whose it is now is read
-    /// again under the claim, from its record: a volume a land gave another checkout since is left
-    /// as it is. A refused detach mounts it again before the claim is let go, as sealing does
-    /// (16_build_volumes.md, "Targets and seeds").
-    fn release_build(
-        host: &Host,
-        layout: &BuildVolumeLayout,
-        id: &BuildVolumeId,
-        owner: &crate::metadata::WorkspaceName,
-    ) -> std::result::Result<(), String> {
-        let claim = match host
-            .claim_build_volume(layout, id)
-            .map_err(|error| error.to_string())?
-        {
-            BuildVolumeClaim::Held { .. } => return Err(format!("a job holds build volume {id}")),
-            BuildVolumeClaim::Claimed(claim) => claim,
-        };
-        let record = layout
-            .read_record_present(id)
-            .map_err(|error| error.to_string())?;
-        match record.map(|record| record.role) {
-            Some(BuildVolumeRole::Linked { checkout }) if checkout == *owner => {}
-            role => {
-                return Err(format!(
-                    "build volume {id} is no longer {owner}'s (its record says {role:?}), so it is \
-                     left as it is"
-                ));
-            }
-        }
-        match host.detach_claimed_build_volume(layout, &claim) {
-            Ok(()) => Ok(()),
-            Err(refused) => {
-                let restored = match host.mount_build_volume(layout, id) {
-                    Ok(_) => "mounted again".to_owned(),
-                    Err(error) => format!("and mounting it again failed: {error}"),
-                };
-                drop(claim);
-                Err(format!("{refused}; {restored}"))
-            }
-        }
     }
 
     fn unreleased(

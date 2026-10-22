@@ -413,6 +413,51 @@ where
         }
     }
 
+    /// Detach build volume `id` of `owner`, kept whole for its next mount, once `owner` is
+    /// detached: claimed, so no job is admitted on it and no land moves a link onto it meanwhile,
+    /// then unmounted unforced. Whose it is is read again under the claim, from its record: a
+    /// volume a land gave another checkout since is left as it is. A refused detach mounts it
+    /// again before the claim is let go, as sealing does (16_build_volumes.md, "Targets and
+    /// seeds"), and answers the refusal. A volume a job holds answers `BuildVolumeHeld`.
+    pub fn detach_owned_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        id: &BuildVolumeId,
+        owner: &WorkspaceName,
+    ) -> Result<(), ApfsStorageError> {
+        let claim = match self.claim_build_volume(layout, id)? {
+            Claim::Claimed(claim) => claim,
+            Claim::Held { open } => {
+                return Err(ApfsStorageError::BuildVolumeHeld {
+                    image: layout.image(id),
+                    hold: layout.hold_path(id),
+                    holds: Vec::new(),
+                    open,
+                });
+            }
+        };
+        let role = layout
+            .read_record_present(id)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?
+            .map(|record| record.role);
+        if !matches!(role, Some(BuildVolumeRole::Linked { checkout }) if checkout == *owner) {
+            return Ok(());
+        }
+        let Err(refused) = self.detach_claimed_build_volume(layout, &claim) else {
+            return Ok(());
+        };
+        let remounted = self.mount_build_volume(layout, id);
+        drop(claim);
+        Err(match remounted {
+            Ok(_) => refused,
+            Err(cleanup) => ApfsStorageError::Cleanup {
+                operation: "mount again the build volume whose detach was refused",
+                primary: Box::new(refused),
+                cleanup: Box::new(cleanup),
+            },
+        })
+    }
+
     /// Seal the live volume before a replacement build link is published, borrowing the existing
     /// exclusive claim rather than reacquiring or upgrading it (16_build_volumes.md, "Targets
     /// and seeds"). Unlike release, this never forces or deletes the image, record, hold or

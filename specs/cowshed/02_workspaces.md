@@ -1334,10 +1334,16 @@ still finds the store changed under it (another process) is refused as retryable
 ## `cowshed attach` / `cowshed detach`
 
 Explicit attachment lifecycle for long-lived workspaces: `detach` first stops admissions and drains the supervisor and
-Linux connector, unlinks the Linux per-incarnation socket, then frees the attachment; the image/dataset and grants
-persist. `attach` mounts at the canonical path with canonical flags and, on Linux, creates the per-workspace
-socket/netns and starts exactly one connector before admitting execs. Personal macOS workspaces are typically attached
-at login by a launchd agent; Linux uses its platform service/controller lifecycle.
+Linux connector, unlinks the Linux per-incarnation socket, then frees both of the workspace's attachments: its image and
+the build volume its checkout owns (its record names the checkout as the one that links it), detached whole under the
+build-volume claim "Making room for an attach" describes. The images/dataset and grants persist. A build volume a job
+holds, or one the kernel will not unmount, refuses the detach by name after the workspace's own image is released; it is
+mounted again before its claim is let go. Every path that detaches a workspace releases both: `detach`, making room, and
+putting a detached workspace back after a refused `rm`. `attach` mounts at the canonical path with canonical flags,
+mounts the linked build volume again and, on Linux, creates the per-workspace socket/netns and starts exactly one
+connector before admitting execs. On macOS a session attaches on use: the gateway's startup pass mounts mains only
+(05_gateway.md, "Startup contract"), and every verb that reaches a detached session attaches it; Linux uses its platform
+service/controller lifecycle.
 
 ### Making room for an attach
 
@@ -1374,13 +1380,13 @@ workspace's supervisor socket lease without waiting, so no supervisor starts on 
 (`make-room`, "A land and an rm of one workspace exclude each other"), so no land or `rm` of it starts either; either
 lease held elsewhere makes the workspace busy. It then makes the unforced unmount `cowshed detach` makes, which
 revalidates the mounted volume's marker against the workspace's incarnation; a process holding the mount refuses it, and
-the workspace then counts as busy and the plan is made again without it. Its build volume detaches under a build-volume
-claim, which no job admission and no land moving a link can pass, and only if the volume's record, read again under that
-claim, still names this workspace as the checkout that links it: the census named the volume earlier, and a volume a
-land gave another checkout since is left as it is. It detaches kept whole and unforced; one that will not detach is said
-on stderr and stays. Each detach is said on stderr, and the media are read again after each round, until the images fit
-or nothing idle is left. The gateway's view of each project a detached workspace belonged to is reconciled. A detached
-workspace attaches again, with its build volume, on its next use, as any detached workspace does.
+the workspace then counts as busy and the plan is made again without it. The detach is the one `cowshed detach` makes,
+so it frees the build volume with the image (above): only a volume whose record, read again under its claim, still names
+this workspace as the checkout that links it is detached, so a volume a land gave another checkout since is left as it
+is. A build volume that will not detach is said on stderr and the workspace counts as unreleased. Each detach is said on
+stderr, and the media are read again after each round, until the images fit or nothing idle is left. The gateway's view
+of each project a detached workspace belonged to is reconciled. A detached workspace attaches again, with its build
+volume, on its next use, as any detached workspace does.
 
 When nothing idle frees enough, the verb refuses with `conflict` (exit 4) and detaches nothing. The message names the
 count, the excess and the attached workspaces, ten of them with the IOMedia each holds and why it stays (idle, main, the

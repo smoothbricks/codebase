@@ -888,6 +888,23 @@ impl BuildVolumeLayout {
         self.list_entries(false)
     }
 
+    /// Every published build volume whose record says `checkout` links it: the live volume a
+    /// checkout owns, and any an interrupted land left recorded as its as well.
+    pub fn owned_by(&self, checkout: &WorkspaceName) -> crate::Result<Vec<BuildVolumeId>> {
+        let mut owned = Vec::new();
+        for id in self.list()? {
+            if let Some(BuildVolumeRecord {
+                role: BuildVolumeRole::Linked { checkout: owner },
+                ..
+            }) = self.read_record_present(&id)?
+                && owner == *checkout
+            {
+                owned.push(id);
+            }
+        }
+        Ok(owned)
+    }
+
     /// GC's snapshot includes sidecars as well as images; seed selection never does.
     pub fn collection_ids(&self) -> crate::Result<Vec<BuildVolumeId>> {
         self.list_entries(true)
