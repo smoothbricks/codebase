@@ -32,11 +32,14 @@ use serde::{Deserialize, Serialize};
 /// "Error: Disk image operation failed with error code 150".
 const POOL_EXHAUSTED: &[u8] = b"error code 150";
 
-/// `AppleDiskImageDevice` instances, registered and leaked, at the lowest first error code 150
-/// measured: 1042 (256 registered, 786 leaked, 5 orphaned helpers) in the boot of 2026-10-21
-/// 20:12 +04, against 1090 (2026-10-10) and 1105 (the boot before that). An attach is admitted
-/// only while the instances it and the storage phase's other members may add stay below it.
-pub const POOL_CEILING: u64 = 1042;
+/// A conservative admission bound, not a documented limit: the kernel's IO-client allocation at the
+/// earliest error code 150 observed. In the boot of 2026-10-21 20:12 +04 the first 150 (06:01:48)
+/// struck with 271 images registered, 963 `DIDeviceIOUserClient` and 972 `AppleDiskImageDevice`
+/// instances allocated; each IO client maps 36 shared 2 MiB buffers, which only its `free()`
+/// returns. Counting image devices, never fewer than their clients, against it errs low. An attach
+/// is admitted only while the instances it and the storage phase's other members may add stay
+/// below it.
+pub const POOL_CEILING: u64 = 963;
 
 /// The image devices one admitted attach reserves: itself and every other member of its storage
 /// phase, each of which may pass this gate before any of them spawns (05_gateway.md,
@@ -357,8 +360,8 @@ impl fmt::Display for Budget {
         write!(
             f,
             "AppleDiskImageDevice {}; DIDeviceIOUserClient {}; AppleAPFSVolume {}; IOMedia {}. \
-             Ceiling {POOL_CEILING} image-device instances, live and leaked (the lowest at which \
-             error code 150 struck), headroom {}",
+             Ceiling {POOL_CEILING} image-device instances, live and leaked (the IO clients allocated \
+             at the earliest error code 150 observed), headroom {}",
             reading.image_devices,
             reading.user_clients,
             reading.apfs_volumes,
@@ -640,10 +643,17 @@ pub fn clear_at(path: &Path, session: &str) -> io::Result<PoolRecord> {
 /// boot's 150, and reading it as empty would admit attaches into a spent pool. The operator's
 /// clear ([`clear`]) replaces it.
 pub fn admit(need: u64) -> io::Result<Result<Budget, AttachPoolExhausted>> {
-    let boot = boot()?;
-    let reading = read_kernel()?;
-    let record = load(&record_path()?)?;
-    let budget = record.budget(&boot.session, reading);
+    admit_at(&record_path()?, &boot()?.session, read_kernel()?, need)
+}
+
+/// [`admit`] against the record at `path` during boot `session` with the kernel as `reading`.
+pub fn admit_at(
+    path: &Path,
+    session: &str,
+    reading: KernelReading,
+    need: u64,
+) -> io::Result<Result<Budget, AttachPoolExhausted>> {
+    let budget = load(path)?.budget(session, reading);
     Ok(budget.admits(need).map(|()| budget))
 }
 
@@ -778,7 +788,7 @@ mod tests {
         assert!(budget.admits(budget.headroom() + 1).is_err());
         let report = budget.to_string();
         assert!(
-            report.contains("Ceiling 1042 image-device instances"),
+            report.contains("Ceiling 963 image-device instances"),
             "{report}"
         );
         assert!(
@@ -1075,6 +1085,46 @@ mod tests {
         let cleared = load(&path).unwrap();
         assert!(cleared.spent(BOOT).is_none());
         assert_eq!(cleared.last_exhaustion, spent.last_exhaustion);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Admission reads the record strictly: bytes that do not parse may have held this boot's
+    /// 150, so they refuse until the operator's clear replaces them; a spent record refuses
+    /// whatever the kernel shows; the clear admits again. Nothing but the clear ends a spent boot.
+    #[test]
+    fn admission_refuses_a_corrupt_or_spent_record_until_the_clear() {
+        let directory = scratch("admit");
+        let path = directory.join("pool.json");
+        assert!(matches!(
+            admit_at(&path, BOOT, rebooted_host(), 1),
+            Ok(Ok(_))
+        ));
+        std::fs::write(&path, b"not json").unwrap();
+        assert_eq!(
+            admit_at(&path, BOOT, rebooted_host(), 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        clear_at(&path, BOOT).unwrap();
+        assert!(matches!(
+            admit_at(&path, BOOT, rebooted_host(), 1),
+            Ok(Ok(_))
+        ));
+        update(&path, |_| spent_record()).unwrap();
+        assert!(matches!(
+            admit_at(&path, BOOT, rebooted_host(), 1),
+            Ok(Err(_))
+        ));
+        assert!(matches!(
+            admit_at(&path, NEXT_BOOT, rebooted_host(), 1),
+            Ok(Ok(_))
+        ));
+        clear_at(&path, BOOT).unwrap();
+        assert!(matches!(
+            admit_at(&path, BOOT, rebooted_host(), 1),
+            Ok(Ok(_))
+        ));
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

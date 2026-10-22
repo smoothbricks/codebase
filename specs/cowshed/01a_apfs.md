@@ -756,28 +756,31 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    **Admission.** The system runner refuses every DiskImages2 attach (`diskutil image attach`) before it spawns, inside
    the storage lease, with `AttachPoolExhausted` and its `next:` step, in two cases: this boot is spent, or the live
    `AppleDiskImageDevice` instances, registered and leaked alike, plus the storage phase's members
-   (`DISK_PHASE_MEMBERS`, each of which may pass the gate before any of them spawns) would reach the pool's ceiling,
-   1042 instances. That is the lowest instance count at which a first 150 has struck: 256 registered, 786 leaked and 5
-   orphaned helpers in the boot of 2026-10-21 20:12 +04, against 1090 and 1105 in earlier boots. The leaked count alone
-   does not predict exhaustion (786 and 1024 leaked at two first 150s); the instances do. A failed attach leaks one more
-   device, so an attach that would fail is never started, and a refused one can run again once the pool is freed. A pool
-   whose instances or record cannot be read refuses the same way (`PoolUnread`), since nothing says the attach would not
-   fail, and so does a record whose bytes do not parse: it may have held this boot's 150. `doctor` reads such a record
-   as empty with a warning naming the file and still reports the kernel, and the next write (a 150, the operator's
-   clear) replaces it. A refusal names the recorded exhaustion and the live facts that explain its next step: proven
-   orphaned helpers first when their mappings can account for it, otherwise a reboot for leaked image devices, never a
-   guessed daemon restart for unrelated departed-volume references. Clearing a record does not repair the kernel and
-   never grants capacity by raising a ceiling. `doctor` reports `disk-image-attach-budget`: the four classes' live
-   instances, registered entries and differences, the ceiling and the headroom below it, the current boot's exhaustion
-   evidence, and disk-image commands an earlier build interrupted, each a probable leaked device (the record keeps them
-   until the boot ends; no current build writes one). It is an error while the boot is spent ("attach pool exhausted",
-   with "reboot required" only when the image devices account for it), and a warning within a quarter of the ceiling, or
-   when an earlier build interrupted a command. Its hint names a reboot for leaked image devices and proven orphaned
-   helpers first for a 150 those devices do not explain. `departed-volume-references` is a separate warning from the
-   first departed APFS-volume or IOMedia instance, with exact counts and a root `lsmp` attribution step; it neither
-   defines attach-pool capacity nor prescribes a daemon restart. Orphaned helpers are named only when two reads in a row
-   agree and no `diskutil` or `hdiutil` ran during either, since a helper whose attach is under way has no device yet
-   and killing it mid-attach is what leaks one; killing orphans frees their mappings, never a leaked device.
+   (`DISK_PHASE_MEMBERS`, each of which may pass the gate before any of them spawns) would reach the pool's ceiling, 963
+   instances. That bound is conservative, not a documented limit: in the boot of 2026-10-21 20:12 +04 the first 150
+   (06:01:48) struck with 271 images registered and 963 `DIDeviceIOUserClient` and 972 `AppleDiskImageDevice` instances
+   allocated, live and departed together. Each IO client maps 36 shared 2 MiB buffers that only its `free()` returns, so
+   the allocation, not the leaked count, is what runs out; counting devices, never fewer than their clients, errs low.
+   The recorded counts are later samples: the pool record holds 1,042 because its observer met its first 150 after 67
+   more failed attaches had each allocated a device. A failed attach leaks one more device, so an attach that would fail
+   is never started, and a refused one can run again once the pool is freed. A pool whose instances or record cannot be
+   read refuses the same way (`PoolUnread`), since nothing says the attach would not fail, and so does a record whose
+   bytes do not parse: it may have held this boot's 150. `doctor` reads such a record as empty with a warning naming the
+   file and still reports the kernel, and the next write (a 150, the operator's clear) replaces it. A refusal names the
+   recorded exhaustion and the live facts that explain its next step: proven orphaned helpers first when their mappings
+   can account for it, otherwise a reboot for leaked image devices, never a guessed daemon restart for unrelated
+   departed-volume references. Clearing a record does not repair the kernel and never grants capacity by raising a
+   ceiling. `doctor` reports `disk-image-attach-budget`: the four classes' live instances, registered entries and
+   differences, the ceiling and the headroom below it, the current boot's exhaustion evidence, and disk-image commands
+   an earlier build interrupted, each a probable leaked device (the record keeps them until the boot ends; no current
+   build writes one). It is an error while the boot is spent ("attach pool exhausted", with "reboot required" only when
+   the image devices account for it), and a warning within a quarter of the ceiling, or when an earlier build
+   interrupted a command. Its hint names a reboot for leaked image devices and proven orphaned helpers first for a 150
+   those devices do not explain. `departed-volume-references` is a separate warning from the first departed APFS-volume
+   or IOMedia instance, with exact counts and a root `lsmp` attribution step; it neither defines attach-pool capacity
+   nor prescribes a daemon restart. Orphaned helpers are named only when two reads in a row agree and no `diskutil` or
+   `hdiutil` ran during either, since a helper whose attach is under way has no device yet and killing it mid-attach is
+   what leaks one; killing orphans frees their mappings, never a leaked device.
 
    **A disk-image command is detached from its caller.** A disk-image command is one that creates or releases an image
    device: any `diskutil image …`, any `hdiutil`, and `diskutil eject` (Disk Arbitration's release of an image device,
@@ -871,9 +874,9 @@ notification that is never drained keeps a cleanly detached device and its user 
 either, which a controlled probe reproduced: one undrained `AppleDiskImageDevice` matched or terminated notification
 held a detached device and client (+1/+1), and both were freed when the probe let go. In that boot the 23 stalled
 helpers were exactly the ones holding two notifications (healthy helpers hold one), and every device terminated after
-them, 702 in all, was never freed, until the pool met error code 150 at 1042 instances. Why a stalled helper's
-termination notification stops draining is not established (its main thread still runs its run loop); the trigger, the
-ceiling, and the retention are measured.
+them, 702 in all, was never freed, until the first error code 150 at 963 IO clients and 972 devices allocated. Why a
+stalled helper's termination notification stops draining is not established (its main thread still runs its run loop);
+the trigger, the ceiling, and the retention are measured.
 
 #### The boot of 2026-10-21 20:12 +04, from its kernel and helper logs
 
@@ -888,8 +891,10 @@ ceiling, and the retention are measured.
   Their user clients stayed with them (774 retained clients = 5 orphaned helpers + 702 + 67 failed attaches).
 - At 06:10:28 the kernel counted 1,039 `AppleDiskImageDevice` instances: 256 attached, 5 behind orphaned helpers, 702
   retained after clean shutdowns, 67 from attaches that failed with error code 150 and 9 duplicate creations (error
-  155). The first 150 struck at 1,042 instances with 256 registered, 786 leaked and 5 orphaned helpers. The first kernel
-  mapping error (`DISharedBuffer::init: Can't map buffer`) appeared at 06:01, long after the retention began.
+  155). The first 150 struck at 06:01:48 with 271 images registered and 963 IO clients and 972 devices allocated, with
+  the kernel's first `DISharedBuffer::init: Can't map buffer`, long after the retention began; each later failed attach
+  allocated one more device. cowshed's pool record holds the first 150 its own commands met: 1,042 instances, 256
+  registered, 786 leaked and 5 orphaned helpers.
 - 238 of the boot's 261 helpers held one IOKit notification port; the 23 stalled ones held two, each with the device
   references of a helper that never completed its attach and no user-client connection. Apart from those helpers, no
   process holding an `IOServiceUserNotification` right was started in the 02:26 to 02:46 window.

@@ -6591,7 +6591,7 @@ mod tests {
             ),
             "{fresh:?}"
         );
-        assert!(fresh.message.contains("headroom 863"), "{fresh:?}");
+        assert!(fresh.message.contains("headroom 784"), "{fresh:?}");
 
         // The first 150 is recorded with its counts, and the next doctor says what it means.
         let spent = PoolRecord::default().exhausted(&boot, Some(spent_host.image_devices), Some(0));
@@ -6619,12 +6619,12 @@ mod tests {
             "{rebooted:?}"
         );
         let near = KernelReading {
-            image_devices: count(178 + 800, 178),
+            image_devices: count(178 + 700, 178),
             ..rebooted_host
         };
         let near = finding(&spent, next, near);
         assert_eq!(near.severity, FindingSeverity::Warning);
-        assert!(near.message.contains("headroom 63"), "{near:?}");
+        assert!(near.message.contains("headroom 84"), "{near:?}");
         assert_eq!(near.hint, REBOOT_HINT);
 
         let linux = std::io::Error::new(std::io::ErrorKind::Unsupported, "no pool");
@@ -6709,7 +6709,7 @@ mod tests {
             let unmoved = pool(&PoolRecord::default(), next, reading);
             assert_eq!(unmoved.severity, FindingSeverity::Info);
             assert_eq!(unmoved.hint, "nothing to free");
-            assert!(unmoved.message.contains("headroom 863"), "{unmoved:?}");
+            assert!(unmoved.message.contains("headroom 784"), "{unmoved:?}");
         }
         // Nothing departed, nothing to report.
         assert!(departed_volume_references_finding(&rebooted_host).is_none());

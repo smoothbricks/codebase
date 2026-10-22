@@ -473,14 +473,14 @@ which of two causes spent it.
 `disk-image-attach-budget` reports leaked disk-image devices: `AppleDiskImageDevice` and `DIDeviceIOUserClient`
 instances (`ioclasscount`) that no attached image accounts for, which only a reboot frees. It also prints the
 `AppleAPFSVolume` and `IOMedia` counts, whose departed instances take no pool slot (`departed-volume-references`,
-below), the ceiling the image devices run out at (1042 instances, live and leaked alike: the lowest at which a first 150
-has struck), the headroom left, and any disk-image command an earlier cowshed killed at its 15-minute hard deadline this
-boot, each a probable leaked device; cowshed no longer kills a disk-image command at all. "attach pool exhausted, reboot
-required" means an attach failed with error code 150 this boot with the image devices at the ceiling: reboot. Once a
-boot has met 150, cowshed refuses every image attach before it starts (a failed attach leaks one more device) until the
-boot ends or `cowshed doctor --clear-attach-budget` clears it, and it refuses an attach that would bring the image
-devices to the ceiling. Devices leak when a `diskimagesiod` helper stalls past IOKit's media match-notification cap
-(next section), which cowshed's own attaches no longer reach.
+below), the ceiling the image devices run out at (963 instances, live and leaked alike: the IO clients allocated at the
+earliest error code 150 observed, a conservative bound), the headroom left, and any disk-image command an earlier
+cowshed killed at its 15-minute hard deadline this boot, each a probable leaked device; cowshed no longer kills a
+disk-image command at all. "attach pool exhausted, reboot required" means an attach failed with error code 150 this boot
+with the image devices at the ceiling: reboot. Once a boot has met 150, cowshed refuses every image attach before it
+starts (a failed attach leaks one more device) until the boot ends or `cowshed doctor --clear-attach-budget` clears it,
+and it refuses an attach that would bring the image devices to the ceiling. Devices leak when a `diskimagesiod` helper
+stalls past IOKit's media match-notification cap (next section), which cowshed's own attaches no longer reach.
 
 The other cause is helpers that outlived their image. Every attached image has its own `diskimagesiod`, which maps 72
 MiB into the kernel; detach does not always end it, and a helper that outlived its image keeps its mapping.
