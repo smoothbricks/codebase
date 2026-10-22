@@ -18,7 +18,10 @@
 //! thread unlinked an image, and every `cowshed fork` and `ls` on the host hung behind it. So a
 //! daemon [`detach`]es its stderr first: each line goes whole onto a queue of [`QUEUE_LINES`]
 //! lines, which one writer thread writes in order. A full queue drops the line and counts it,
-//! and the writer's next write first says how many it dropped, so a loss is never silent.
+//! and the writer's next write first says how many it dropped, so a loss is never silent. A line
+//! the log itself refuses (`EIO`, `ENOSPC`, a closed descriptor) is a different loss and is
+//! counted apart: the next write the log takes says how many were lost and the error that
+//! refused the first of them, never a full queue.
 //! [`flush`] waits for the queue before the process exits.
 
 use std::fmt;
@@ -159,30 +162,65 @@ impl Drop for Detached {
 }
 
 fn drain(mut sink: impl Write, received: &Receiver<Message>, dropped: &AtomicU64) {
+    let mut refused = None;
     for message in received {
-        say_dropped(&mut sink, dropped);
-        if !message.text.is_empty() && sink.write_all(message.text.as_bytes()).is_err() {
-            dropped.fetch_add(1, Ordering::Relaxed);
+        say_lost(&mut sink, dropped, &mut refused);
+        if !message.text.is_empty()
+            && let Err(error) = sink.write_all(message.text.as_bytes())
+        {
+            Refused::count(&mut refused, error);
         }
         if let Some(written) = message.written {
             // The flusher stopped waiting only if it is gone; there is nobody left to tell.
             written.send(()).unwrap_or(());
         }
     }
-    say_dropped(&mut sink, dropped);
+    say_lost(&mut sink, dropped, &mut refused);
 }
 
-/// Say how many lines were dropped since the last time this was said, before the next line.
-fn say_dropped(sink: &mut impl Write, dropped: &AtomicU64) {
-    let count = dropped.swap(0, Ordering::Relaxed);
-    if count == 0 {
-        return;
+/// Lines the log refused since the last time that was said, and the error that refused the
+/// first: the log's own failure, which a full queue never is.
+struct Refused {
+    lines: u64,
+    first: io::Error,
+}
+
+impl Refused {
+    fn count(refused: &mut Option<Self>, error: io::Error) {
+        match refused {
+            Some(refused) => refused.lines += 1,
+            None => {
+                *refused = Some(Self {
+                    lines: 1,
+                    first: error,
+                });
+            }
+        }
     }
-    let note = format!(
-        "cowshed: {count} stderr line(s) dropped: the log took no writes while the queue was full\n"
-    );
-    if sink.write_all(note.as_bytes()).is_err() {
-        dropped.fetch_add(count, Ordering::Relaxed);
+}
+
+/// Say how many lines were dropped for a full queue, and how many the log refused and why, since
+/// the last time each was said, before the next line.
+fn say_lost(sink: &mut impl Write, dropped: &AtomicU64, refused: &mut Option<Refused>) {
+    let count = dropped.swap(0, Ordering::Relaxed);
+    if count > 0 {
+        let note = format!(
+            "cowshed: {count} stderr line(s) dropped: the log took no writes while the queue was full\n"
+        );
+        if sink.write_all(note.as_bytes()).is_err() {
+            // The log still refuses: both counts wait for a write it takes.
+            dropped.fetch_add(count, Ordering::Relaxed);
+            return;
+        }
+    }
+    if let Some(lost) = refused.take() {
+        let note = format!(
+            "cowshed: {} stderr line(s) lost: the log refused them: {}\n",
+            lost.lines, lost.first
+        );
+        if sink.write_all(note.as_bytes()).is_err() {
+            *refused = Some(lost);
+        }
     }
 }
 
@@ -208,7 +246,7 @@ macro_rules! eprint {
 #[cfg(test)]
 mod tests {
 
-    use std::io::Read as _;
+    use std::io::{Read as _, Write};
 
     use super::{Detached, Sent};
 
@@ -263,6 +301,68 @@ mod tests {
             "every line is written whole or counted"
         );
     }
+    /// A log whose writes the kernel refuses loses lines for its own reason, not a full queue's:
+    /// once it takes writes again, the next write says how many it refused and the kernel's own
+    /// error, and says no queue drop. The refusals are real: writes to a descriptor opened
+    /// read-only, which the kernel answers `EBADF`, before the log becomes a pipe.
+    #[test]
+    fn a_log_that_refuses_writes_is_said_with_its_own_error_not_as_a_full_queue() {
+        struct Refusing {
+            read_only: std::fs::File,
+            refusals: usize,
+            log: std::io::PipeWriter,
+        }
+        impl Write for Refusing {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.refusals == 0 {
+                    return self.log.write(bytes);
+                }
+                self.refusals -= 1;
+                self.read_only.write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.log.flush()
+            }
+        }
+        let path =
+            std::env::temp_dir().join(format!("cowshed-stderr-refusing-{}", std::process::id()));
+        std::fs::write(&path, b"").expect("log file");
+        let read_only = std::fs::File::open(&path).expect("open read-only");
+        let refused = read_only
+            .try_clone()
+            .expect("clone")
+            .write(b"x")
+            .expect_err("the kernel refuses a write to a read-only descriptor");
+        let (mut reader, log) = std::io::pipe().expect("pipe");
+        let detached = Detached::spawn(
+            Refusing {
+                read_only,
+                refusals: 3,
+                log,
+            },
+            16,
+        )
+        .expect("writer");
+        for line in ["one\n", "two\n", "three\n", "four\n"] {
+            assert_eq!(detached.send(line.to_owned()), Sent::Queued);
+        }
+        detached.flush();
+        drop(detached);
+        let mut text = String::new();
+        reader.read_to_string(&mut text).expect("read the log");
+        std::fs::remove_file(&path).expect("remove the log file");
+
+        // Three refusals: "one", the note that would have said so before "two", and "two". The
+        // refused note is said again, not lost, and "three" follows it.
+        assert_eq!(
+            text,
+            format!(
+                "cowshed: 2 stderr line(s) lost: the log refused them: {refused}\nthree\nfour\n"
+            ),
+        );
+        assert!(!text.contains("queue"), "a refusal is not a full queue");
+    }
+
     /// A line reaches the kernel as one write: formatting completes before anything is
     /// written, so a format argument that panics writes nothing at all, where `std`'s macro
     /// would already have written the text before it.

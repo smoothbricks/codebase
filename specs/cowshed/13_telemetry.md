@@ -483,8 +483,10 @@ Cowshed uses Arrow IPC for both, but placement and authority differ:
   the build-volume trash freed an image, and every `cowshed fork` and `ls` on the host hung. So a daemon queues each
   whole line for one writer thread of its own (`cowshed_os::stderr::detach`), up to 4,096 lines. A line that finds the
   queue full is dropped and counted, never waited for, and the writer's next write first says
-  `cowshed: <n> stderr line(s) dropped: the log took no writes while the queue was full`. The process waits for the
-  queue before it exits.
+  `cowshed: <n> stderr line(s) dropped: the log took no writes while the queue was full`. A line the log itself refuses
+  (`EIO`, `ENOSPC`, a closed descriptor) is a different loss, counted apart: the next write the log takes says
+  `cowshed: <n> stderr line(s) lost: the log refused them: <error>`, naming the error that refused the first of them,
+  never a full queue. A note the log refuses is said again, not lost. The process waits for the queue before it exits.
 
 `StreamInfo` is the shared content descriptor:
 
