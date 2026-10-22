@@ -1,5 +1,5 @@
 use crate::args::{
-    AdoptArgs, AttachArgs, CacheCommand, Cli, Command, ExecArgs, GrantTarget, MoveDestination,
+    AdoptArgs, CacheCommand, Cli, Command, ExecArgs, GrantTarget, MoveDestination,
     ProjectDiscovery, RevokeArgs, RevokeSelection, StdinSource as CliStdinSource,
 };
 use crate::forget;
@@ -445,139 +445,6 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         | Command::Version
         | Command::Help(_) => named([]),
     })
-}
-
-/// What `command` may attach once it runs (01a_apfs.md, "The IOMedia match-notification ceiling"): at most
-/// how many disk images, read from the verb and its mode alone, and every workspace it names,
-/// which making room for it never detaches. A verb that works in a workspace attaches it and its
-/// build volume when it is detached, a fork its session and build image, adoption main
-/// and its first build volume; a resize or reseed one build image or seed beside its own. Verbs
-/// that only read, preview, detach, remove or serve attach nothing, and neither does `path
-/// --no-attach`. Attaching every detached session (`attach` with no name, `attach --all`)
-/// makes no room either: detaching some sessions to attach others frees nothing, so each of its
-/// attaches past the cap meets the runner's refusal by name.
-/// Subtree verbs address the running supervisor before the runtime bridge, so they attach no images.
-fn attach_demand(command: &Command) -> (u64, Vec<&str>) {
-    fn named<'a>(names: impl IntoIterator<Item = Option<&'a str>>) -> Vec<&'a str> {
-        names.into_iter().flatten().collect()
-    }
-    match command {
-        Command::Fork(args) => (
-            2,
-            named([args.source.as_deref(), Some(args.destination.as_str())]),
-        ),
-        Command::Adopt(_) | Command::Mount(_) => (2, Vec::new()),
-        Command::Move(args) => match &args.destination {
-            MoveDestination::Workspace(destination) => (
-                2,
-                named([Some(args.source.as_str()), Some(destination.as_str())]),
-            ),
-            MoveDestination::Checkout(_) | MoveDestination::RepoId(_) => {
-                (2, named([Some(args.source.as_str())]))
-            }
-        },
-        Command::Restore(args) => (2, named([Some(args.workspace.as_str())])),
-        Command::Exec(args) => (2, named([Some(args.workspace.as_str())])),
-        Command::Grant(args) => match &args.target {
-            GrantTarget::Workspace(workspace) => (2, named([Some(workspace.as_str())])),
-            GrantTarget::Project => (0, Vec::new()),
-        },
-        Command::Revoke(args) => match &args.target {
-            GrantTarget::Workspace(workspace) => (2, named([Some(workspace.as_str())])),
-            GrantTarget::Project => (0, Vec::new()),
-        },
-        Command::Resize(args) => (1, named([Some(args.workspace.as_str())])),
-        Command::Defrag(args) => (2, named([Some(args.workspace.as_str())])),
-        Command::Rekey(args) => (2, named([Some(args.workspace.as_str())])),
-        Command::Land(args) => (
-            2,
-            named([Some(args.workspace.as_str()), args.into.as_deref()]),
-        ),
-        Command::Reseed(args) if args.dry_run => (0, Vec::new()),
-        Command::Reseed(args) => (
-            1,
-            named([Some(args.workspace.as_str()), Some(args.from.as_str())]),
-        ),
-        Command::Checkpoint(args) => (2, named([args.workspace.as_deref()])),
-        Command::Path(args) if args.no_attach => (0, Vec::new()),
-        Command::Path(args) => (2, named([args.workspace.as_deref()])),
-        Command::Attach(AttachArgs {
-            workspace: Some(workspace),
-            all: false,
-            ..
-        }) => (2, named([Some(workspace.as_str())])),
-        Command::Attach(_) => (0, Vec::new()),
-        Command::Push(args) => (2, named([args.workspace.as_deref()])),
-        Command::Rebase(args) => (2, named([args.workspace.as_deref(), args.into.as_deref()])),
-        Command::Cache(CacheCommand::Clear { workspace }) => (2, named([workspace.as_deref()])),
-        // Lock and hold own descriptors; holder queries read the kernel before the runtime bridge.
-        Command::Lock(_) | Command::LockHolders(_) | Command::Hold(_) | Command::TreeHolders(_) => {
-            (0, Vec::new())
-        }
-        Command::Remove(_)
-        | Command::Forget(_)
-        | Command::Detach(_)
-        | Command::Gc(_)
-        | Command::List(_)
-        | Command::BuildState
-        | Command::Setup(_)
-        | Command::Gateway(_)
-        | Command::DiskCommand(_)
-        | Command::LandTurn(_)
-        | Command::SubtreeRoot(_)
-        | Command::RetireDescendants(_)
-        | Command::Controller
-        | Command::Host(_)
-        | Command::Credential(_)
-        | Command::Identity(_)
-        | Command::Sccache(_)
-        | Command::Skill(_)
-        | Command::Version
-        | Command::Help(_)
-        | Command::Doctor(_) => (0, Vec::new()),
-    }
-}
-
-/// Make room under IOKit's media match-notification cap for what `command` may attach
-/// ([`cowshed_core::media_room`]), before anything opens a project: workspaces nothing uses
-/// detach, least recently used first, never one `command` names in the project at
-/// `project_root`, and the gateway's view of each project one belonged to is reconciled. A host
-/// that fits is read once and nothing else happens; one that cannot fit refuses the verb by name.
-async fn make_media_room(command: &Command, project_root: Option<&Path>) -> Result<()> {
-    let (images, named) = attach_demand(command);
-    if images == 0 {
-        return Ok(());
-    }
-    let keep = project_root.map(|root| cowshed_core::media_room::Keep {
-        project_root: root.to_path_buf(),
-        workspaces: named
-            .into_iter()
-            .filter_map(|name| WorkspaceName::new(name).ok())
-            .collect(),
-    });
-    let storage = host_storage().await?;
-    let made = cowshed_core::media_room::make_room(
-        &storage,
-        &cowshed_core::media_room::Demand { images, keep },
-        cowshed_apfs::media_cap::NOTIFICATION_CAP,
-    )
-    .await?;
-    if made.detached.is_empty() {
-        return Ok(());
-    }
-    for project in adopted_projects().await?.iter().filter(|project| {
-        made.detached
-            .iter()
-            .any(|(repo, _)| *repo == project.repo_id)
-    }) {
-        if let Some(error) = reconcile_after_mount_change(project, &storage).await {
-            cowshed_os::eprintln!(
-                "cowshed: the gateway's view of {} is stale after making room: {error}",
-                project.repo_id
-            );
-        }
-    }
-    Ok(())
 }
 
 pub struct ActorBridge {
@@ -5029,9 +4896,9 @@ fn disk_image_attach_budget_finding(
 /// Fewer images than this left under the media cap warn: about ten workspaces with build volumes.
 const MEDIA_LOW_IMAGES: u64 = 20;
 
-/// The registered IOMedia against IOKit's match-notification cap (media_cap.rs): an attach past
-/// it hangs forever, so cowshed refuses one that would cross it and makes room first. An error
-/// once one more image no longer fits, a warning while fewer than [`MEDIA_LOW_IMAGES`] do.
+/// The registered IOMedia against IOKit's match-notification ceiling (media_cap.rs), a soft one:
+/// cowshed's in-kernel attaches wait on no IOMedia notification, so verbs make room best effort
+/// and attach past it. A warning while fewer than [`MEDIA_LOW_IMAGES`] images fit, none past it.
 fn media_notification_cap_finding(
     reading: std::io::Result<cowshed_apfs::media_cap::MediaReading>,
 ) -> Option<Finding> {
@@ -5041,19 +4908,18 @@ fn media_notification_cap_finding(
             let left = reading.images_left(NOTIFICATION_CAP);
             Some(Finding {
                 code: "media-notification-cap".into(),
-                severity: if left == 0 {
-                    FindingSeverity::Error
-                } else if left < MEDIA_LOW_IMAGES {
+                severity: if left < MEDIA_LOW_IMAGES {
                     FindingSeverity::Warning
                 } else {
                     FindingSeverity::Info
                 },
                 message: format!(
-                    "{reading}; with the storage phase's and the host's reserve that commits {} \
-                     of IOKit's {NOTIFICATION_CAP}-entry IOMedia match-notification queue (XNU \
+                    "{reading}; with the host's reserve that commits {} of IOKit's \
+                     {NOTIFICATION_CAP}-entry IOMedia match-notification queue (XNU \
                      IOServiceUserNotification::kMaxOutstanding), room for {left} more image(s), \
-                     {} workspace(s) with a build volume. An attach past it hangs forever, so \
-                     cowshed refuses one that would cross it",
+                     {} workspace(s) with a build volume. Past it an unfiltered IOMedia \
+                     notification misses matches; cowshed's in-kernel attaches wait on none, so a \
+                     verb makes room where it can and attaches anyway",
                     reading.committed(),
                     left / 2
                 ),
@@ -5550,7 +5416,6 @@ where
             Err(error) => return Err(error),
         };
     let root = &resolved.root;
-    make_media_room(&cli.command, Some(root)).await?;
     let mode = runtime_open_mode(&cli.command);
     let requested_repo_id = runtime_open_repo_id(&cli.command)?;
     if mode == RuntimeOpenMode::Provision {
@@ -5613,7 +5478,6 @@ where
     W: Write + Send,
     E: Write + Send,
 {
-    make_media_room(&cli.command, None).await?;
     match cli.command {
         Command::Attach(args) if args.all && args.workspace.is_none() => {
             let mounts = attach_store_wide(args.browse).await?;
@@ -6560,66 +6424,8 @@ mod tests {
         assert!(doctor_report(vec![departed, leaked]).healthy);
     }
 
-    /// A verb's attach demand and the workspaces it keeps come from the verb and its mode as the
-    /// CLI parses them: a preview or a no-attach path makes no room, attaching every session makes
-    /// none, and a land or rebase keeps the workspace it lands into as well as its own.
-    #[test]
-    fn attach_demand_follows_each_verbs_mode_and_keeps_every_named_workspace() {
-        let demand = |argv: &[&str]| {
-            let cli = crate::args::parse_args(argv.iter().copied())
-                .unwrap_or_else(|error| panic!("{argv:?}: {}", error.message));
-            let (images, named) = attach_demand(&cli.command);
-            (
-                images,
-                named.into_iter().map(str::to_owned).collect::<Vec<_>>(),
-            )
-        };
-        let keep = |names: &[&str]| {
-            names
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(demand(&["path", "raven"]), (2, keep(&["raven"])));
-        assert_eq!(demand(&["path", "raven", "--no-attach"]), (0, keep(&[])));
-        assert_eq!(demand(&["attach", "raven"]), (2, keep(&["raven"])));
-        assert_eq!(demand(&["attach", "--all"]), (0, keep(&[])));
-        assert_eq!(demand(&["attach"]), (0, keep(&[])));
-        assert_eq!(demand(&["fork", "raven"]), (2, keep(&["raven"])));
-        assert_eq!(
-            demand(&["fork", "crow", "raven"]),
-            (2, keep(&["crow", "raven"]))
-        );
-        assert_eq!(
-            demand(&["land", "raven", "--into", "lane"]),
-            (2, keep(&["raven", "lane"]))
-        );
-        assert_eq!(demand(&["reseed", "raven", "--dry-run"]), (0, keep(&[])));
-        assert_eq!(
-            demand(&["reseed", "raven", "--from", "lane"]),
-            (1, keep(&["raven", "lane"]))
-        );
-        assert_eq!(
-            demand(&["exec", "raven", "--", "true"]),
-            (2, keep(&["raven"]))
-        );
-        for nothing in [
-            &["rm", "raven"][..],
-            &["detach", "raven"],
-            &["ls"],
-            &["gc"],
-            &["doctor"],
-            &["lock", "/tmp/x.lock", "--", "true"],
-            &["lock-holders", "/tmp/x.lock"],
-            &["tree-holders", "/tmp/tree"],
-            &["hold", "--control-fd", "3", "--state-fd", "4", "--", "true"],
-        ] {
-            assert_eq!(demand(nothing).0, 0, "{nothing:?}");
-        }
-    }
-
-    /// The media finding counts what the gate counts, errs once one more image would cross the
-    /// cap, warns while few fit, and says nothing to free while many do.
+    /// The media finding counts what making room counts, warns while few images fit, past the
+    /// ceiling too, never errs, and says nothing to free while many fit.
     #[test]
     fn doctor_reports_the_media_notification_cap_and_what_frees_media() {
         use cowshed_apfs::media_cap::{MEDIA_CAP_HINT, MediaReading};
@@ -6630,7 +6436,7 @@ mod tests {
             }))
             .expect("a reading is always reported")
         };
-        // 21 media for the phase's other attaches and 16 for the host's disks are committed too.
+        // 16 media for the host's own disks are committed too.
         let roomy = finding(900);
         assert_eq!(roomy.code, "media-notification-cap");
         assert_eq!(roomy.severity, FindingSeverity::Info);
@@ -6638,19 +6444,19 @@ mod tests {
         assert!(
             roomy.message.starts_with(
                 "900 IOMedia registered (subclasses included) and 0 image attach(es) running; \
-                 with the storage phase's and the host's reserve that commits 937 of IOKit's \
-                 1024-entry"
+                 with the host's reserve that commits 916 of IOKit's 1024-entry"
             ) && roomy
                 .message
-                .contains("room for 28 more image(s), 14 workspace(s)"),
+                .contains("room for 35 more image(s), 17 workspace(s)"),
             "{roomy:?}"
         );
         let low = finding(960);
         assert_eq!(low.severity, FindingSeverity::Warning);
         assert_eq!(low.hint, MEDIA_CAP_HINT);
-        assert!(low.message.contains("room for 8 more image(s)"), "{low:?}");
-        let full = finding(985);
-        assert_eq!(full.severity, FindingSeverity::Error);
+        assert!(low.message.contains("room for 15 more image(s)"), "{low:?}");
+        let full = finding(1_100);
+        assert_eq!(full.severity, FindingSeverity::Warning);
+        assert_eq!(full.hint, MEDIA_CAP_HINT);
         assert!(
             full.message.contains("room for 0 more image(s)"),
             "{full:?}"

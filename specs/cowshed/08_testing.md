@@ -728,11 +728,14 @@ behaviour. Fixtures attach through the production path, in the kernel (01a_apfs.
 the DiskImages2 pool, and the lane creates no image with a disk tool. The lane stays `--no-fail-fast`, so its ordinary
 failures still run to the end. The leaked-device delta across a lane run (`ioclasscount AppleDiskImageDevice` against
 the registered devices, before and after) is the check that no disk-image command still leaks on a clean run; it must
-be 0. `real_apfs_making_room_detaches_the_least_recently_used_idle_session_and_refuses_by_name` proves making room
+be 0. Nothing refuses an attach on the media count: fixtures attach in the kernel, which waits on no IOMedia
+notification (01a_apfs.md, "The IOMedia match-notification ceiling").
+`real_apfs_making_room_detaches_the_least_recently_used_idle_session_and_warns_by_name` proves making room
 (02_workspaces.md) on the real kernel: the cap is its decision input, set just short of the host's own count, and every
 count is read from the registry, never faked. Other users' attaches move the count, so each outcome is checked against
 `plan` on the readings `make_room` decided on. The decision's properties (only idle workspaces, least recently used
-first, enough or none) are proptests of `plan`.
+first, enough or none) are proptests of `plan`, and the demand each controller operation reads from its request is a
+unit test of `attach_demand`.
 
 **The suite spends a finite host budget.** Every attach→detach cycle a test makes can leak an AppleDiskImages2 device
 that the host's live sheds lose until reboot (01a_apfs.md, "How the APFS host degrades" §2), so a test pays the fewest

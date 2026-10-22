@@ -488,16 +488,17 @@ reboot is needed for them. While a disk-image tool runs, a helper may still be a
 later `cowshed doctor`. Killing orphans frees their mappings; killing a stalled helper frees the devices it retains.
 cowshed never signals a helper itself.
 
-## An attach is refused with `MediaCapReached`, or names IOKit's media match-notification queue
+## A verb warns about IOKit's media match-notification queue, or `cowshed doctor` warns `media-notification-cap`
 
-IOKit drops IOMedia match notifications past 1024, and DiskImages2 waits for its new device's match with no overall
-timeout, so an attach past the cap hangs forever. Every attached APFS image registers three IOMedia, and a workspace
-with its build volume six. cowshed refuses an attach that would cross the cap instead of starting it, and a verb that
-may attach first detaches idle workspaces (no supervisor serving them), least recently used first; each detach is said
-on stderr, and the workspace attaches again on its next use. When nothing idle frees enough, the verb refuses and names
-the attached workspaces with the IOMedia each holds and why each stays. `cowshed doctor`'s `media-notification-cap`
-reports the registered media, the attaches running and how many more images fit. Free media with `cowshed rm` for sheds
-you are done with or `cowshed detach` for ones you will return to. A reboot does not raise this cap.
+IOKit queues at most 1024 matches on one unfiltered IOMedia notification and drops the rest. Every attached APFS image
+registers three IOMedia, and a workspace with its build volume six. cowshed attaches in the kernel, which waits on no
+such notification, so nothing cowshed runs hangs or is refused past the ceiling; another program on the host that
+watches every IOMedia can miss a disk past it. A verb that may attach first detaches idle workspaces (no supervisor
+serving them), least recently used first; each detach is said on stderr, and the workspace attaches again on its next
+use. When nothing idle frees enough, the verb warns, naming the attached workspaces with the IOMedia each holds and why
+each stays, and attaches anyway. `cowshed doctor`'s `media-notification-cap` reports the registered media, the attaches
+running and how many more images fit, and warns while fewer than 20 do. Free media with `cowshed rm` for sheds you are
+done with or `cowshed detach` for ones you will return to. A reboot does not raise this ceiling.
 
 ## `cowshed doctor` warns `departed-volume-references`
 

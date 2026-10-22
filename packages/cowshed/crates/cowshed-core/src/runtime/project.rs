@@ -216,6 +216,10 @@ pub trait ProjectRuntimeHost: Send + 'static {
             "serving a workspace supervisor is unavailable for this runtime host",
         ))
     }
+    /// Make room under IOKit's IOMedia match-notification ceiling for what a verb may attach
+    /// (02_workspaces.md, "Making room for an attach"): best effort, never failing the verb. A
+    /// host without disk images has no media to make room among.
+    async fn make_media_room(&mut self, _demand: crate::media_room::AttachDemand) {}
     async fn attach(&mut self, workspace: WorkspaceName, options: AttachOptions) -> Result<()>;
     async fn detach(&mut self, workspace: WorkspaceName) -> Result<()>;
     async fn resize(
@@ -1264,6 +1268,9 @@ impl ProjectActor {
         if scope != Scope::Worker {
             require_coordinator(&authority)?;
         }
+        self.host
+            .make_media_room(crate::media_room::attach_demand(&operation))
+            .await;
         use OperationRequest as Op;
         let response = match operation {
             Op::JobLogs(params) => {
@@ -12858,6 +12865,62 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         self.snapshot_named(&main_name()).await
     }
 
+    async fn make_media_room(&mut self, demand: crate::media_room::AttachDemand) {
+        use crate::media_room::{Demand, Keep, WORKSPACE_IMAGES, make_room};
+        if !H::HAS_PHYSICAL_VOLUMES || (demand.fresh == 0 && demand.workspaces.is_empty()) {
+            return;
+        }
+        // A named workspace mounted at its path attaches nothing. The mount table is one
+        // syscall away and the IOKit count is not, so a verb in a mounted workspace reads only it.
+        let mounted = match crate::storage::lifecycle::dispatch_blocking(
+            cowshed_apfs::mounts::kernel_mounts,
+        )
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|read| read.map_err(|error| error.to_string()))
+        {
+            Ok(mounts) => mounts
+                .into_iter()
+                .map(|mount| mount.mount_point)
+                .collect::<std::collections::BTreeSet<_>>(),
+            Err(error) => {
+                cowshed_os::eprintln!(
+                    "cowshed: warning: making room counts every workspace this command names as \
+                     detached: the kernel's mounts are unreadable: {error}"
+                );
+                std::collections::BTreeSet::new()
+            }
+        };
+        let images = demand.fresh.saturating_add(
+            demand
+                .workspaces
+                .iter()
+                .filter(|name| {
+                    !self
+                        .workspace_mount_path(name)
+                        .is_ok_and(|mount| mounted.contains(&mount))
+                })
+                .map(|_| WORKSPACE_IMAGES)
+                .sum(),
+        );
+        if images == 0 {
+            return;
+        }
+        let demand = Demand {
+            images,
+            keep: Some(Keep {
+                repo: self.descriptor.repo_id.clone(),
+                workspaces: demand.workspaces.into_iter().collect(),
+            }),
+        };
+        make_room(
+            &self.descriptor.storage,
+            &demand,
+            cowshed_apfs::media_cap::NOTIFICATION_CAP,
+            self.gateway_control.as_ref(),
+        )
+        .await;
+    }
     async fn attach(&mut self, workspace: WorkspaceName, options: AttachOptions) -> Result<()> {
         use crate::storage::lifecycle::{MountIntent, Substrate};
         self.validate_binding().await?;

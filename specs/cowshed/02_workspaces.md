@@ -1405,26 +1405,29 @@ service/controller lifecycle.
 
 ### Making room for an attach
 
-IOKit drops IOMedia match notifications past 1024, and an attach whose device is matched past them hangs forever
-(01a_apfs.md, "The IOMedia match-notification ceiling"). The system runner, where every disk child spawns, refuses an
-image attach (`diskutil image attach`, `hdiutil attach`) before it starts, inside the storage lease, unless the media
-stay below 1024 once it adds its own three (`cowshed-apfs` `media_cap`). It counts the registered IOMedia, subclasses
-included; three for each image attach running on the host, any user's; three for each of the storage phase's other seven
-members, which may pass the gate before any of them spawns (05_gateway.md, "Disk-lifecycle lease"); and 16 kept for
-disks the host attaches on its own. The refusal is `MediaCapReached`, a `conflict` naming the count and what frees
-media, never a hang; a count that cannot be read refuses too, since a refused attach can run again and a hung one
-cannot. `doctor`'s `media-notification-cap` reports the same count, what it commits of the ceiling and how many more
-images fit: an error once one more image does not, a warning while fewer than 20 do. A CLI verb that may attach makes
-room first, before it opens its project, so that it is not refused. A verb's demand is an upper bound read from the verb
-and its mode alone: a verb that works in a workspace (`exec`, `path`, `attach <ws>`, `checkpoint`, `restore`, `land`, …)
-may attach it and its build volume, two images; `fork` its session and build image, six media; `adopt` and `mount main`
-main and its first build volume; `resize` and `reseed` one build image or seed beside the workspace's own. `rm`,
-`detach`, `forget`, `gc`, `ls`, `doctor`, previews (`reseed --dry-run`), `path --no-attach` and the other host verbs
+IOKit queues at most 1024 matches on one unfiltered IOMedia notification and drops the rest (01a_apfs.md, "The IOMedia
+match-notification ceiling"). Cowshed attaches every image in the kernel, which waits on no such notification and is
+measured to attach past it, so the ceiling is a soft one: nothing refuses an attach on the media count, and an operation
+that may attach first makes room where it can. The project actor does this before it runs each controller operation
+(`cowshed_core::media_room`), so the CLI, N-API clients, the gateway and a coordinator's `cowshed controller` get the
+same step; `mount main` makes the same call before it attaches a detached main. It counts the registered IOMedia,
+subclasses included; three for each image attach running on the host, any user's; and 16 kept for disks the host
+attaches on its own, and makes room when the images would bring that to 1024. `doctor`'s `media-notification-cap`
+reports the same count, what it commits of the ceiling and how many more images fit: a warning while fewer than 20 do,
+past the ceiling too, never an error.
+
+An operation's demand is read from its request alone (`cowshed_core::media_room::attach_demand`). One that works in a
+workspace (attach, exec, a shell, a checkpoint, a push, a restore, a land or rebase, a grant, a defragment, a rekey, an
+Nx state clear, a worker handle) attaches it and its build volume, two images, when it is detached; a fork or rename a
+clone and its build image; adoption main and its first build volume; a resize or reseed one build image or seed beside
+the workspace's own; moving the checkout or changing the repository identity main. A named workspace mounted at its path
+attaches nothing, read from the kernel mount table, so an operation in a mounted workspace never reads the IOKit count.
+Reads, job and session traffic, `rm`, `detach`, `gc`, `doctor`, previews (`reseed --dry-run`) and project-wide grants
 attach nothing. Attaching every detached session (`attach` with no name, `attach --all`) makes no room: detaching some
-sessions to attach others frees nothing, so each of its attaches past the cap meets the runner's refusal by name. The
-workspaces a verb names (a land's or rebase's `--into`, a reseed's `--from`, a fork's source included) are its own and
-never detached for it. A host whose count leaves room is read once, and nothing else happens; an `exec` of a mounted,
-served workspace answers before any of this (06_cli.md, "Resident workspaces").
+sessions to attach others frees nothing. The workspaces an operation names (a land's or rebase's `into`, main when it
+names none, a reseed's `from`, a fork's source included) are its own and never detached for it. A host whose count
+leaves room is read once, and nothing else happens; an `exec` of a mounted, served workspace answers before any of this
+(06_cli.md, "Resident workspaces").
 
 When the images would not fit, the verb lists every adopted project's attached workspaces and plans
 (`cowshed_core::media_room::plan`, a pure function of one media reading and that list): only idle workspaces are
@@ -1446,11 +1449,12 @@ stderr, and the media are read again after each round, until the images fit or n
 of each project a detached workspace belonged to is reconciled. A detached workspace attaches again, with its build
 volume, on its next use, as any detached workspace does.
 
-When nothing idle frees enough, the verb refuses with `conflict` (exit 4) and detaches nothing. The message names the
-count, the excess and the attached workspaces, ten of them with the IOMedia each holds and why it stays (idle, main, the
-verb's own, its supervisor serves it, a land or removal holds it, a process holds its mount, its detach failed), then
-how many more; the hint is to stop the work in a workspace one is done with and `cowshed detach` or `cowshed rm` it. A
-coordinator's `cowshed controller` does not make room: its attaches meet the runner's refusal.
+When nothing idle frees enough, nothing is detached, a warning on stderr says so, and the operation attaches anyway. The
+warning names the count, the excess and the attached workspaces, ten of them with the IOMedia each holds and why it
+stays (idle, main, the verb's own, its supervisor serves it, a land or removal holds it, a process holds its mount, its
+detach failed), then how many more; its next step is to stop the work in a workspace one is done with and
+`cowshed detach` or `cowshed rm` it. A media count or a store listing that cannot be read is a warning the same way:
+making room never fails the operation it makes room for.
 
 ### Holders cowshed does not run
 

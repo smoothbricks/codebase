@@ -166,8 +166,7 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
   `cowshed disk-command diskutil …` or another tool. `cowshed doctor` names leaked `AppleDiskImageDevice`s (freed by
   killing the stalled `diskimagesiod` it names, or a reboot) and orphaned helpers (freed by the `sudo kill -9` it
   names).
-- `MediaCapReached`, or a refusal naming IOKit's media match-notification queue: the host's attached media are at the
-  1024 cap past which an attach hangs forever. Verbs detach idle workspaces themselves first; when none is idle,
-  `cowshed rm` the sheds you are done with or `cowshed detach` the ones you will return to. `cowshed doctor` reports
-  `media-notification-cap`.
+- A warning naming IOKit's media match-notification queue, or `doctor`'s `media-notification-cap` warning: the host's
+  attached media are near or past the soft 1024 ceiling. Verbs detach idle workspaces themselves first and attach
+  anyway; to free media, `cowshed rm` the sheds you are done with or `cowshed detach` the ones you will return to.
 - "the cowshed daemon is build X; this cowshed is build Y": run `cowshed setup` from the build you mean, then retry.

@@ -15,8 +15,10 @@
 //! to start one past the cap.
 //!
 //! Nothing here refuses an attach: cowshed attaches in the kernel, which waits on no match
-//! notification. Making room, by detaching workspaces nothing uses, belongs to the layer that
-//! knows workspaces (`cowshed_core::media_room`).
+//! notification, measured to attach and detach cleanly up to 1,084 registered IOMedia. The
+//! ceiling stays a soft target, since any other unfiltered IOMedia notification on the host still
+//! misses matches past it: making room, by detaching workspaces nothing uses, belongs to the layer
+//! that knows workspaces (`cowshed_core::media_room`), and `doctor` reports the count.
 
 use std::fmt;
 use std::io;
@@ -35,7 +37,7 @@ pub const MEDIA_PER_IMAGE: u64 = 3;
 /// external drive's partitions and volumes, a Time Machine snapshot mount.
 pub const HOST_MEDIA_HEADROOM: u64 = 16;
 
-/// What frees media: the next step every refusal's caller names.
+/// What frees media: the next step `doctor` and making room name.
 pub const MEDIA_CAP_HINT: &str = "detach or remove workspaces nothing uses (`cowshed detach \
      <ws>`, `cowshed rm <ws>`): an attached image holds 3 IOMedia, a workspace with its build \
      volume 6; `cowshed doctor` reports media-notification-cap";
@@ -52,21 +54,15 @@ pub struct MediaReading {
 
 impl MediaReading {
     /// The media this reading spends before one more attach: the registered, what each running
-    /// attach and every other member of the storage phase may still add (each may pass this gate
-    /// before any of them spawns; 05_gateway.md, "Disk-lifecycle lease"), and the host's headroom.
+    /// attach may still add, and the host's headroom.
     pub fn committed(self) -> u64 {
-        let peers = u64::from(cowshed_gateway_types::DISK_PHASE_MEMBERS.get()) - 1;
         self.registered
-            .saturating_add(
-                self.attaching
-                    .saturating_add(peers)
-                    .saturating_mul(MEDIA_PER_IMAGE),
-            )
+            .saturating_add(self.attaching.saturating_mul(MEDIA_PER_IMAGE))
             .saturating_add(HOST_MEDIA_HEADROOM)
     }
 
-    /// The media to free so that `images` more images keep the total below `cap`, as the
-    /// ceiling requires (it must not be reached); 0 when they fit.
+    /// The media to free so that `images` more images keep the total below `cap`; 0 when they
+    /// fit.
     pub fn excess(self, cap: u64, images: u64) -> u64 {
         self.committed()
             .saturating_add(images.saturating_mul(MEDIA_PER_IMAGE))
@@ -111,8 +107,6 @@ pub fn read() -> io::Result<MediaReading> {
 mod tests {
     use super::*;
 
-    const PEERS: u64 = 7;
-
     fn reading(registered: u64, attaching: u64) -> MediaReading {
         MediaReading {
             registered,
@@ -120,18 +114,29 @@ mod tests {
         }
     }
 
-    /// Every running attach and every other member of the storage phase reserves an image's
-    /// media, and the host keeps its headroom.
+    /// Every running attach reserves an image's media, and the host keeps its headroom.
     #[test]
-    fn committed_reserves_running_attaches_phase_peers_and_host_headroom() {
-        assert_eq!(
-            reading(900, 0).committed(),
-            900 + PEERS * MEDIA_PER_IMAGE + HOST_MEDIA_HEADROOM
-        );
+    fn committed_reserves_running_attaches_and_host_headroom() {
+        assert_eq!(reading(900, 0).committed(), 900 + HOST_MEDIA_HEADROOM);
         assert_eq!(
             reading(900, 2).committed(),
-            900 + (2 + PEERS) * MEDIA_PER_IMAGE + HOST_MEDIA_HEADROOM
+            900 + 2 * MEDIA_PER_IMAGE + HOST_MEDIA_HEADROOM
         );
         assert_eq!(reading(u64::MAX, u64::MAX).committed(), u64::MAX);
+    }
+
+    /// An image that leaves the total one below the ceiling fits; one that reaches it is over by
+    /// the one medium too many, and no image is left.
+    #[test]
+    fn an_image_fits_below_the_ceiling_and_no_further() {
+        let below = NOTIFICATION_CAP - 1 - MEDIA_PER_IMAGE - reading(0, 0).committed();
+        assert_eq!(reading(below, 0).excess(NOTIFICATION_CAP, 1), 0);
+        assert_eq!(reading(below, 0).images_left(NOTIFICATION_CAP), 1);
+        assert_eq!(reading(below + 1, 0).excess(NOTIFICATION_CAP, 1), 1);
+        assert_eq!(reading(below + 1, 0).images_left(NOTIFICATION_CAP), 0);
+        assert_eq!(
+            reading(below, 1).excess(NOTIFICATION_CAP, 1),
+            MEDIA_PER_IMAGE
+        );
     }
 }

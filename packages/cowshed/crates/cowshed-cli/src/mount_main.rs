@@ -25,7 +25,7 @@ use cowshed_core::repository::{RepoId, RepositoryBinding};
 use cowshed_core::storage::StorageLayout;
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::{ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig};
-use cowshed_core::storage::lifecycle::{MountIntent, Substrate};
+use cowshed_core::storage::lifecycle::{MountIntent, MountState, Substrate};
 use cowshed_core::{CowshedError, Result, ValidatedHostStorage};
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
@@ -233,6 +233,19 @@ impl MainMountBackend for NativeMainMountBackend {
                     "cowshed doctor --json",
                 )
             })?;
+        if main.mount_state == MountState::Detached {
+            let gateway = crate::gateway_service::runtime_control(&self.storage)?;
+            cowshed_core::media_room::make_room(
+                &self.storage,
+                &cowshed_core::media_room::Demand {
+                    images: cowshed_core::media_room::WORKSPACE_IMAGES,
+                    keep: None,
+                },
+                cowshed_apfs::media_cap::NOTIFICATION_CAP,
+                gateway.as_ref(),
+            )
+            .await;
+        }
         substrate
             .ensure_mounted(&main.workspace, intent)
             .await

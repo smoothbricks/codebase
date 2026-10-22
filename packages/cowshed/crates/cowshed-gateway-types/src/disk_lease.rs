@@ -24,8 +24,7 @@ pub const DISK_LEASE_OP: &str = "disk-lease";
 
 /// Holders one class's phase admits at once by default. `storagekitd` answers one caller at a
 /// time, so more concurrent attaches only lengthen each one; eight keeps the queue full without
-/// that. Every attach one phase admits may pass the media-cap gate before any of them spawns, so
-/// that gate reserves the media of the other seven (cowshed-apfs `media_cap`).
+/// that.
 pub const DISK_PHASE_MEMBERS: std::num::NonZeroU8 = std::num::NonZeroU8::new(8).unwrap();
 
 /// Which side of the lease a disk command draws on.

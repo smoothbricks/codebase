@@ -1,11 +1,12 @@
 //! Making room under IOKit's match-notification cap (01a_apfs.md, "The IOMedia match-notification
 //! ceiling"; 02_workspaces.md, "Making room for an attach").
 //!
-//! Every attached image registers three IOMedia, and an attach whose device is matched past the
-//! cap's 1024th IOMedia hangs forever ([`cowshed_apfs::media_cap`]). The disk runner refuses such
-//! an attach before it spawns; this module is what a command does first so that it need not be
-//! refused: when the images it may attach would cross the cap, it detaches workspaces nothing
-//! uses, least recently used first, until they fit, and refuses by name when they cannot.
+//! Every attached image registers three IOMedia, and IOKit queues at most 1024 matches on one
+//! unfiltered IOMedia notification ([`cowshed_apfs::media_cap`]). Cowshed attaches its images in
+//! the kernel, which waits on no such notification, so the ceiling is a soft one: before a
+//! command attaches, it detaches workspaces nothing uses, least recently used first, until its
+//! images fit. When they cannot fit, or the media cannot be counted, it says so on stderr and the
+//! command attaches anyway; making room never fails the command it makes room for.
 //!
 //! The decision is [`plan`], a pure function of one media reading and the attached workspaces;
 //! [`make_room`] reads the kernel, lists the store's workspaces, carries out the plan through the
@@ -17,12 +18,13 @@
 //! again on its next use, as any detached workspace does.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::time::SystemTime;
 
 use cowshed_apfs::media_cap::{MEDIA_PER_IMAGE, MediaReading};
 
+use crate::api::operations::OperationRequest;
 use crate::metadata::WorkspaceName;
+use crate::repository::RepoId;
 
 /// Why an attached workspace keeps its images.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,8 +90,9 @@ pub enum Plan<K> {
     /// Detach these idle workspaces, least recently used first: together they free at least the
     /// excess, and without the last of them they would not.
     Detach(Vec<K>),
-    /// Every idle workspace together frees `idle_media`, less than the `excess`: detach nothing.
-    Refuse { excess: u64, idle_media: u64 },
+    /// Every idle workspace together frees `idle_media`, less than the `excess`: detach nothing,
+    /// since the images cross the ceiling either way.
+    Short { excess: u64, idle_media: u64 },
 }
 
 /// The workspaces to detach so that `images` more attach under `cap`, as `reading` and
@@ -130,14 +133,14 @@ pub fn plan<K: Clone + Ord>(
     if freed >= excess {
         Plan::Detach(chosen)
     } else {
-        Plan::Refuse {
+        Plan::Short {
             excess,
             idle_media: freed,
         }
     }
 }
 
-/// What a command about to attach asks of the cap.
+/// What a command about to attach asks of the ceiling.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Demand {
     /// The images the command may attach, at most.
@@ -149,12 +152,148 @@ pub struct Demand {
 /// A project's workspaces a command names.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Keep {
-    pub project_root: PathBuf,
+    pub repo: RepoId,
     pub workspaces: BTreeSet<WorkspaceName>,
 }
 
+/// The images a detached workspace attaches with: its own and its build volume's.
+pub const WORKSPACE_IMAGES: u64 = 2;
+
+/// What a controller operation may attach, read from its request alone (02_workspaces.md,
+/// "Making room for an attach").
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AttachDemand {
+    /// The images it attaches whatever is mounted: a fork's or a rename's clone and its build
+    /// image, adoption's main and its first build volume, the build image or seed a resize or a
+    /// reseed attaches beside the workspace's own.
+    pub fresh: u64,
+    /// The workspaces it works in: each one detached attaches [`WORKSPACE_IMAGES`], and none is
+    /// detached to make room for it.
+    pub workspaces: Vec<WorkspaceName>,
+}
+
+impl AttachDemand {
+    fn of(fresh: u64, workspaces: impl IntoIterator<Item = WorkspaceName>) -> Self {
+        Self {
+            fresh,
+            workspaces: workspaces.into_iter().collect(),
+        }
+    }
+}
+
+/// What `operation` may attach. Reads, job and session traffic, detaches, removals, grants of the
+/// whole project and the project's own maintenance attach nothing. Host and sccache operations
+/// route outside the project actor, which refuses them, so they add no project attach demand.
+pub fn attach_demand(operation: &OperationRequest) -> AttachDemand {
+    use OperationRequest as Op;
+    let one = |workspace: &WorkspaceName| AttachDemand::of(0, [workspace.clone()]);
+    let into = |workspace: &WorkspaceName, into: Option<&crate::api::dto::WorkspaceTarget>| {
+        AttachDemand::of(
+            0,
+            [
+                workspace.clone(),
+                into.map_or_else(WorkspaceName::main, |target| target.workspace().clone()),
+            ],
+        )
+    };
+    match operation {
+        Op::CoordinatorFork(request) => AttachDemand::of(
+            WORKSPACE_IMAGES,
+            [request.source.clone().unwrap_or_else(WorkspaceName::main)],
+        ),
+        Op::CoordinatorRename(request) => {
+            AttachDemand::of(WORKSPACE_IMAGES, [request.source.clone()])
+        }
+        Op::CoordinatorAdopt(_) => AttachDemand::of(WORKSPACE_IMAGES, []),
+        Op::CoordinatorMoveCheckout(_) | Op::CoordinatorChangeRepoId(_) => {
+            AttachDemand::of(0, [WorkspaceName::main()])
+        }
+        Op::CoordinatorResize(request) => AttachDemand::of(1, [request.workspace.clone()]),
+        Op::CoordinatorReseed(request) if request.dry_run => AttachDemand::default(),
+        Op::CoordinatorReseed(request) => {
+            AttachDemand::of(1, [request.workspace.clone(), request.from.clone()])
+        }
+        Op::CoordinatorRebase(request) => into(&request.workspace, request.into.as_ref()),
+        Op::CoordinatorLand(request) => into(&request.workspace, request.into.as_ref()),
+        Op::WorkspaceAttach(request) => one(&request.workspace),
+        Op::CoordinatorGrant(request) | Op::CoordinatorRevoke(request) => one(&request.workspace),
+        Op::CoordinatorRestore(request) => one(&request.workspace),
+        Op::CoordinatorDefragment(request)
+        | Op::CoordinatorRekey(request)
+        | Op::CoordinatorClearNxState(request)
+        | Op::CoordinatorWorker(request) => one(&request.workspace),
+        Op::CoordinatorExec(params) | Op::WorkerExec(params) => one(&params.workspace),
+        Op::WorkerShell(request) => one(&request.workspace),
+        Op::WorkerCheckpoint(request) => one(&request.workspace),
+        Op::WorkerPush(request) => one(&request.workspace),
+        Op::ProjectOpen(_)
+        | Op::ProjectWorkspace(_)
+        | Op::ProjectWorkspaceAt(_)
+        | Op::ProjectList(_)
+        | Op::ProjectWorkspaceInSlot(_)
+        | Op::WorkspaceInfoRead(_)
+        | Op::WorkspaceGrants(_)
+        | Op::WorkspaceBuildVolume(_)
+        | Op::CoordinatorProjectGrants(_)
+        | Op::CoordinatorGrantProject(_)
+        | Op::CoordinatorRevokeProject(_)
+        | Op::CoordinatorDetach(_)
+        | Op::CoordinatorAssignSlot(_)
+        | Op::CoordinatorDestroy(_)
+        | Op::CoordinatorGc(_)
+        | Op::CoordinatorRemoveProject(_)
+        | Op::CoordinatorRepoMirror(_)
+        | Op::CoordinatorSetCheckpointQuota(_)
+        | Op::CoordinatorDoctor(_)
+        | Op::CoordinatorServeSupervisor(_)
+        | Op::CoordinatorRefreshBuildState(_)
+        | Op::WorkerStdinChunk(_)
+        | Op::WorkerStdinClose(_)
+        | Op::WorkerListJobs(_)
+        | Op::WorkerJob(_)
+        | Op::WorkerJobByKey(_)
+        | Op::JobStatus(_)
+        | Op::JobResourcesRead(_)
+        | Op::JobSealed(_)
+        | Op::JobLogs(_)
+        | Op::JobTailRead(_)
+        | Op::JobListeningPortsRead(_)
+        | Op::JobProcesses(_)
+        | Op::JobProcessEvents(_)
+        | Op::JobProgress(_)
+        | Op::JobAttachWrite(_)
+        | Op::JobAttachClose(_)
+        | Op::JobDetach(_)
+        | Op::JobWait(_)
+        | Op::JobKill(_)
+        | Op::SessionClose(_)
+        | Op::HostListProjects(_)
+        | Op::HostAttachAll(_)
+        | Op::HostDetachAll(_)
+        | Op::HostForgetAbandoned(_)
+        | Op::HostMountMain(_)
+        | Op::HostGatewayStatus(_)
+        | Op::HostCredentialStatus(_)
+        | Op::HostCredentialRemove(_)
+        | Op::HostIdentityAdd(_)
+        | Op::HostSkillInstall(_)
+        | Op::HostBuildState(_)
+        | Op::HostClearNxStore(_)
+        | Op::HostGatewayStart(_)
+        | Op::HostGatewayStop(_)
+        | Op::HostLockHolders(_)
+        | Op::HostTreeHolders(_)
+        | Op::HostRetireDescendants(_)
+        | Op::HostDiskCommand(_)
+        | Op::HostCredentialAdd(_)
+        | Op::SccacheStart(_)
+        | Op::SccacheStop(_)
+        | Op::SccacheStatusRead(_) => AttachDemand::default(),
+    }
+}
+
 /// An attached workspace, store-wide: its project's repository and its name.
-pub type Key = (crate::repository::RepoId, WorkspaceName);
+pub type Key = (RepoId, WorkspaceName);
 
 /// What making room did.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -164,6 +303,10 @@ pub struct Made {
     /// Every reading a decision was made on, in order: the first, then one after each round of
     /// detaches.
     pub readings: Vec<MediaReading>,
+    /// Why the images may still cross the ceiling, said on stderr as a warning: the media could
+    /// not be counted, the store's workspaces could not be listed, or the idle ones free too
+    /// little. `None` when they fit.
+    pub unmet: Option<crate::CowshedError>,
 }
 
 pub use native::make_room;
@@ -179,6 +322,10 @@ mod native {
 
     use super::{Busy, Candidate, Demand, Key, Made, Occupancy, Plan, plan};
     use crate::build_volume::BuildVolumeLayout;
+    use crate::gateway_inventory::GatewayStoreBackend;
+    use crate::gateway_sessions::{
+        GatewayControl, NativeSessionInventory, effective_uid, reconcile_project,
+    };
     use crate::runtime::land_lease::{self, Holding};
     use crate::runtime::supervisor_socket;
     use crate::storage::StorageLayout;
@@ -207,28 +354,61 @@ mod native {
     }
 
     /// Make room for `demand` under `cap` ([`super::plan`]), detaching idle workspaces of every
-    /// project in `storage`'s store. A host that fits is read once and nothing else is touched.
-    /// Fails with a `conflict` naming the attached workspaces, with the IOMedia each holds and
-    /// why it stays, when the idle ones cannot free enough; nothing is detached then.
+    /// project in `storage`'s store, then reconcile `gateway`'s view of each project one belonged
+    /// to. A host that fits is read once and nothing else is touched. Best effort: what keeps
+    /// the images from fitting (a count or a store that cannot be read, or idle workspaces that
+    /// free too little, named with the IOMedia each attached workspace holds and why it stays)
+    /// is said on stderr as a warning and answered as [`Made::unmet`], never as a failure.
     pub async fn make_room(
         storage: &ValidatedHostStorage,
         demand: &Demand,
         cap: u64,
-    ) -> Result<Made> {
+        gateway: &dyn GatewayControl,
+    ) -> Made {
         let mut made = Made::default();
+        if let Err(unmet) = detach_until_fit(storage, demand, cap, &mut made).await {
+            cowshed_os::eprintln!("cowshed: warning: {}; next: {}", unmet.message, unmet.hint);
+            made.unmet = Some(unmet);
+        }
+        if made.detached.is_empty() {
+            return made;
+        }
+        let inventory =
+            NativeSessionInventory::with_backend(storage.clone(), GatewayStoreBackend::Native);
+        let repos: std::collections::BTreeSet<&crate::repository::RepoId> =
+            made.detached.iter().map(|(repo, _)| repo).collect();
+        for repo in repos {
+            if let Err(error) = reconcile_project(gateway, &inventory, repo, effective_uid()).await
+            {
+                cowshed_os::eprintln!(
+                    "cowshed: the gateway's view of {repo} is stale after making room: {error}"
+                );
+            }
+        }
+        made
+    }
+
+    /// Detach idle workspaces until `demand` fits, recording what was read and detached in
+    /// `made`; `Err` says why the images still do not fit.
+    async fn detach_until_fit(
+        storage: &ValidatedHostStorage,
+        demand: &Demand,
+        cap: u64,
+        made: &mut Made,
+    ) -> Result<()> {
         let Some(mut reading) = read().await? else {
-            return Ok(made);
+            return Ok(());
         };
         made.readings.push(reading);
         if reading.excess(cap, demand.images) == 0 {
-            return Ok(made);
+            return Ok(());
         }
         let (projects, mut candidates, attached) = census(storage, demand).await?;
         loop {
             match plan(cap, reading, demand.images, &candidates) {
-                Plan::Fits => return Ok(made),
-                Plan::Refuse { excess, idle_media } => {
-                    return Err(refusal(
+                Plan::Fits => return Ok(()),
+                Plan::Short { excess, idle_media } => {
+                    return Err(shortfall(
                         cap,
                         reading,
                         demand.images,
@@ -283,8 +463,9 @@ mod native {
             Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(None),
             Err(error) => Err(CowshedError::environment_missing(
                 format!(
-                    "could not read the registered IOMedia and the running image attaches, \
-                         which IOKit's match-notification cap is counted from: {error}"
+                    "could not read the registered IOMedia and the running image attaches that \
+                         IOKit's match-notification ceiling is counted from, so no room was made: \
+                         {error}"
                 ),
                 "cowshed doctor (media-notification-cap)",
             )),
@@ -382,25 +563,26 @@ mod native {
                 .map_err(|error| text(&error))?
                 .filter(|id| mounted.contains(&builds.mount(id)));
             let socket = supervisor_socket::socket_path(storage.store(), &repo.repo_id, &name);
-            let occupancy = if name.is_main() {
-                Occupancy::Busy(Busy::Main)
-            } else if demand.keep.as_ref().is_some_and(|keep| {
-                keep.project_root == repo.project_root && keep.workspaces.contains(&name)
-            }) {
-                Occupancy::Busy(Busy::Target)
-            } else if supervisor_socket::serving_since(&socket)
-                .map_err(|error| text(&error))?
-                .is_some()
-            {
-                Occupancy::Busy(Busy::Supervisor)
-            } else {
-                let image = layout.session_image(&name).map_err(|error| text(&error))?;
-                let mut last_used = modified(image.image())?;
-                if let Some(id) = &build {
-                    last_used = last_used.max(modified(&builds.image(id))?);
-                }
-                Occupancy::Idle { last_used }
-            };
+            let occupancy =
+                if name.is_main() {
+                    Occupancy::Busy(Busy::Main)
+                } else if demand.keep.as_ref().is_some_and(|keep| {
+                    keep.repo == repo.repo_id && keep.workspaces.contains(&name)
+                }) {
+                    Occupancy::Busy(Busy::Target)
+                } else if supervisor_socket::serving_since(&socket)
+                    .map_err(|error| text(&error))?
+                    .is_some()
+                {
+                    Occupancy::Busy(Busy::Supervisor)
+                } else {
+                    let image = layout.session_image(&name).map_err(|error| text(&error))?;
+                    let mut last_used = modified(image.image())?;
+                    if let Some(id) = &build {
+                        last_used = last_used.max(modified(&builds.image(id))?);
+                    }
+                    Occupancy::Idle { last_used }
+                };
             let images = if build.is_some() { 2 } else { 1 };
             listed.push((
                 Candidate {
@@ -480,10 +662,12 @@ mod native {
         Busy::Unreleased
     }
 
-    /// The workspaces a refusal names: ten, then how many more.
+    /// The workspaces a shortfall names: ten, then how many more.
     const NAMED: usize = 10;
 
-    fn refusal(
+    /// Why the images still cross the ceiling: the count, the excess, and every attached
+    /// workspace with the IOMedia it holds and why it stays.
+    fn shortfall(
         cap: u64,
         reading: MediaReading,
         images: u64,
@@ -515,10 +699,10 @@ mod native {
         }
         CowshedError::conflict(
             format!(
-                "attaching {images} disk image(s) would cross IOKit's {cap}-entry media \
-                 match-notification queue, past which an attach hangs forever: {reading}, {excess} \
-                 IOMedia over, and the workspaces nothing uses free only {idle_media}. Attached \
-                 workspaces: {named}"
+                "attaching {images} disk image(s) takes the host past IOKit's {cap}-entry IOMedia \
+                 match-notification queue: {reading}, {excess} IOMedia over, and the workspaces \
+                 nothing uses free only {idle_media}; attaching anyway, since an in-kernel attach \
+                 waits on no such notification. Attached workspaces: {named}"
             ),
             "stop the work in a workspace you are done with, then `cowshed detach <ws>` or \
              `cowshed rm <ws>`: each frees the IOMedia listed; `cowshed doctor` reports \
@@ -587,10 +771,10 @@ mod tests {
 
     proptest! {
         /// A plan fits exactly when the reading leaves room, detaches only idle workspaces, frees
-        /// at least the excess and no more workspaces than that needs, and refuses exactly when
-        /// every idle workspace together frees too little.
+        /// at least the excess and no more workspaces than that needs, and falls short exactly
+        /// when every idle workspace together frees too little.
         #[test]
-        fn a_plan_frees_enough_from_idle_workspaces_or_refuses(
+        fn a_plan_frees_enough_from_idle_workspaces_or_falls_short(
             reading in reading(),
             images in 0_u64..6,
             candidates in candidates(),
@@ -598,8 +782,8 @@ mod tests {
             let excess = reading.excess(NOTIFICATION_CAP, images);
             match plan(NOTIFICATION_CAP, reading, images, &candidates) {
                 Plan::Fits => prop_assert_eq!(excess, 0),
-                Plan::Refuse { excess: refused, idle_media: freed } => {
-                    prop_assert_eq!(refused, excess);
+                Plan::Short { excess: short, idle_media: freed } => {
+                    prop_assert_eq!(short, excess);
                     prop_assert_eq!(freed, idle_media(&candidates));
                     prop_assert!(freed < excess);
                 }
@@ -708,5 +892,95 @@ mod tests {
             plan(NOTIFICATION_CAP, reading, 1, &candidates),
             Plan::Detach(vec!["older"])
         );
+    }
+
+    /// A controller operation's demand comes from its request alone: a fork attaches its clone
+    /// and keeps its source, main when it names none; a land keeps what it lands into, main when
+    /// it names none; a reseed attaches one image beside its own, none for a dry run; a worker
+    /// keeps its workspace; a detach and a read attach nothing.
+    #[test]
+    fn an_operations_attach_demand_follows_its_request() {
+        use crate::api::dto::{ForkOptions, LandOptions, WorkspaceIncarnation, WorkspaceTarget};
+        use crate::api::operations::{
+            ForkRequest, LandRequest, OperationRequest as Op, ReseedRequest, WorkspaceRequest,
+        };
+        use crate::metadata::WorkspaceName;
+        use crate::repository::RepoId;
+
+        use super::{AttachDemand, WORKSPACE_IMAGES, attach_demand};
+
+        let repo = RepoId::parse("fixture/demand").expect("repository identity");
+        let session = |name: &str| WorkspaceName::session(name).expect("session name");
+        let demand = |fresh, workspaces: &[WorkspaceName]| AttachDemand {
+            fresh,
+            workspaces: workspaces.to_vec(),
+        };
+        let fork = |source: Option<WorkspaceName>| {
+            attach_demand(&Op::CoordinatorFork(ForkRequest {
+                repo_id: repo.clone(),
+                workspace: session("raven"),
+                source,
+                options: ForkOptions::default(),
+            }))
+        };
+        assert_eq!(
+            fork(None),
+            demand(WORKSPACE_IMAGES, &[WorkspaceName::main()])
+        );
+        assert_eq!(
+            fork(Some(session("crow"))),
+            demand(WORKSPACE_IMAGES, &[session("crow")])
+        );
+        let land = |into: Option<WorkspaceTarget>| {
+            attach_demand(&Op::CoordinatorLand(LandRequest {
+                repo_id: repo.clone(),
+                workspace: session("raven"),
+                into,
+                options: LandOptions::default(),
+            }))
+        };
+        assert_eq!(
+            land(None),
+            demand(0, &[session("raven"), WorkspaceName::main()])
+        );
+        let lane = WorkspaceTarget::new(
+            session("lane"),
+            WorkspaceIncarnation::new("1".repeat(32)).expect("incarnation"),
+        );
+        assert_eq!(
+            land(Some(lane)),
+            demand(0, &[session("raven"), session("lane")])
+        );
+        let reseed = |dry_run| {
+            attach_demand(&Op::CoordinatorReseed(ReseedRequest {
+                repo_id: repo.clone(),
+                workspace: session("raven"),
+                from: session("lane"),
+                dry_run,
+            }))
+        };
+        assert_eq!(reseed(true), AttachDemand::default());
+        assert_eq!(
+            reseed(false),
+            demand(1, &[session("raven"), session("lane")])
+        );
+        let request = || WorkspaceRequest {
+            repo_id: repo.clone(),
+            workspace: session("raven"),
+        };
+        assert_eq!(
+            attach_demand(&Op::CoordinatorWorker(request())),
+            demand(0, &[session("raven")])
+        );
+        for nothing in [
+            Op::CoordinatorDetach(request()),
+            Op::WorkspaceInfoRead(request()),
+        ] {
+            assert_eq!(
+                attach_demand(&nothing),
+                AttachDemand::default(),
+                "{nothing:?}"
+            );
+        }
     }
 }
