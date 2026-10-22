@@ -664,7 +664,8 @@ returns that result, written whether or not its seed or adoption happened, befor
 returns an error, the error is returned and no outcome record is written. `seeded` is true exactly when the report's
 `seed` is `frozen`; an adopted `sealBusy` outcome keeps the previous seed and records false. `skip` is the report's
 complete `AdoptionSkip` when adoption skipped, including lock paths and each holder's pid and command, and is absent
-only when adoption succeeded. Landing and target incarnations must differ. It does not replace the per-miss
+only when adoption succeeded; an ungated lane fold records `skip` `{"kind":"ungated"}` and `seeded` false
+(16_build_volumes.md, "Ungated folds"). Landing and target incarnations must differ. It does not replace the per-miss
 `LandAdoption` records. A failed audit sink is reported through audit health, never used to undo a land.
 
 The flat controller Arrow columns are exactly `commitment_kind, commitment_version, commitment_order, repo_id` plus

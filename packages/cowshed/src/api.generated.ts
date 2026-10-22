@@ -260,7 +260,8 @@ export type AdoptionSkip =
     })
   | ({ readonly kind: 'landingVolumeBusy' } & {
       readonly reason: string;
-    });
+    })
+  | { readonly kind: 'ungated' };
 
 export type AttachOptions = {
   readonly browse?: boolean;
@@ -1813,6 +1814,12 @@ export type LandBuildVolume = {
   readonly adoption: Adoption;
 };
 
+/**
+ * Whether a land, and the rebase before it, runs the target's build-state steps
+ * (02_workspaces.md "Lanes"; 16_build_volumes.md "Ungated folds").
+ */
+export type LandMode = 'gated' | 'ungated';
+
 export type LandOptions = {
   readonly targetBranch?: string;
   readonly check?: ReadonlyArray<string>;
@@ -1827,6 +1834,12 @@ export type LandOptions = {
    * "`cowshed land`" step 3).
    */
   readonly refLock?: RefLockPath;
+  /**
+   * `Ungated` folds a unit into its lane base by Git alone: no check, no carry, no seed
+   * freeze, no adoption (02_workspaces.md "Lanes"). Refused into main, with `check`, and with
+   * `push_only`.
+   */
+  readonly mode?: LandMode;
 };
 
 /**
@@ -2552,7 +2565,8 @@ export type RebaseCarrySkip =
        * Each such root's Nx state directory (`<root>/.nx`), relative to the workspace.
        */
       readonly states: ReadonlyArray<string>;
-    });
+    })
+  | { readonly kind: 'ungated' };
 
 export type RebaseOptions = {
   readonly onto?: RevisionTarget;
@@ -2565,6 +2579,11 @@ export type RebaseOptions = {
    * gate job (05_gateway.md, "A land is a gate job"). Any other rebase is background work.
    */
   readonly gate?: boolean;
+  /**
+   * `Ungated` is the rebase before an ungated land into a lane base: Git alone, no carry
+   * (02_workspaces.md "Lanes"). Refused with `gate`, and when the target is main.
+   */
+  readonly mode?: LandMode;
 };
 
 /**

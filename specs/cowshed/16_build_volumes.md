@@ -309,15 +309,15 @@ closed supervised admission and the Nx and existing Cargo-profile protocol guard
 image through the same block-atomic live-capture path as source images. The resulting APFS seed stays detached.
 
 A target's seed is made when the target is created (a clone of the seed it was forked from, or of its first build volume
-at its first touch), and **every land into the target refreshes it from the landing workspace's build volume**:
-`cowshed land` captures the guarded landing volume before the target adopts it (Land step 5.6). A named Nx or Cargo
-holder refuses capture without publishing a replacement seed. A land made outside cowshed, a plain fast-forward of the
-target's branch to a tree a live workspace has checked out (an **external land**), makes that workspace's volume the
-seed at the target's next fork (Which volume a seed holds, below). Between lands a **reseed**, the first step of every
-fork of the target (Fork step 2), refreezes the seed from the target's live volume when that volume holds a write the
-seed does not and is not farther from the fork's tree. Stopping supervised jobs alone is not writer exclusion: the named
-Nx and Cargo protocols must also admit capture. Each target keeps only its latest seed; a target's seed is deleted when
-the target retires.
+at its first touch), and **every gated land into the target refreshes it from the landing workspace's build volume** (an
+ungated fold into a lane base leaves it as it was, "Ungated folds"): `cowshed land` captures the guarded landing volume
+before the target adopts it (Land step 5.6). A named Nx or Cargo holder refuses capture without publishing a replacement
+seed. A land made outside cowshed, a plain fast-forward of the target's branch to a tree a live workspace has checked
+out (an **external land**), makes that workspace's volume the seed at the target's next fork (Which volume a seed holds,
+below). Between lands a **reseed**, the first step of every fork of the target (Fork step 2), refreezes the seed from
+the target's live volume when that volume holds a write the seed does not and is not farther from the fork's tree.
+Stopping supervised jobs alone is not writer exclusion: the named Nx and Cargo protocols must also admit capture. Each
+target keeps only its latest seed; a target's seed is deleted when the target retires.
 
 **No manual seed refresh or warm step exists.** Apart from the explicit re-adoption rule below, every seed refresh is a
 step of a land or of a fork: there is no command that refreezes one, no background warm build in the target, and no land
@@ -577,7 +577,8 @@ freeze, or `--ref` names a tree no volume was built at), the fork builds the dif
 Land's contract is 02_workspaces.md "`cowshed land`": it lands the head the caller validated into its target (main by
 default, an integration workspace with `--into <target>`), fencing the target's head under its repository lock, and
 never rebases on its own. It builds nothing on the target: it adopts the workspace's build volume. Every step reads the
-same for main and for an integration workspace; "the target" is whichever one it is.
+same for main and for an integration workspace; "the target" is whichever one it is. An ungated fold into a lane base
+runs none of steps 2 and 4 to 7 ("Ungated folds", below).
 
 1. **Refuse a dirty tree**.
 2. **Validate in the workspace**: the caller's check (`--check`, for an Nx project `nx run-many -t lint test build` over
@@ -783,7 +784,8 @@ that cannot be admitted, its workspace supervisor not answering included, is una
 the tree, so a carry the rebase cannot compute is skipped, never the rebase failed after it. The target's volume is the
 source and the workspace's is the destination. The hash computation runs as one job of the workspace per root, at
 background class, or at gate class when the rebase names `--gate`: a land's rebase, which its lander runs under the land
-lock, so that it is not queued behind the background work the land is served ahead of.
+lock, so that it is not queued behind the background work the land is served ahead of. An ungated rebase computes no
+hash and carries nothing: its report is `skipped` with `reason:{kind:"ungated"}` ("Ungated folds", below).
 
 Both volumes' shared build holds are acquired before staging and retained through commit, including while their Nx
 daemons stop. A reseed or release must not withdraw either filesystem in that interval: Nx open locks fence database
@@ -881,14 +883,37 @@ apply at every level:
 
 - Units fork the stack's head target and clone **its** seed, so they start warm with every change already landed into
   the stack, not just main's.
-- A unit lands into the stack's head target: the head adopts the unit's build volume and reseeds. Without this, every
-  fast-forward into an integration workspace would leave it cold and the next unit would rebuild what the previous one
-  built — the same problem build volumes remove from main.
+- A gated unit lands into the stack's head target: the head adopts the unit's build volume and reseeds. Without this,
+  every fast-forward into an integration workspace would leave it cold and the next unit would rebuild what the previous
+  one built — the same problem build volumes remove from main.
 - When the stack itself lands into main (its base workspace's close-out, 02_workspaces.md "Lanes"), main adopts the
   stack base's build volume and reseeds. The stack's own seeds retire with its workspaces.
 
 A stack of depth `n` therefore pays one incremental build per landed change, at the level where it lands, and nothing
-again at any level above it.
+again at any level above it. A lane whose units fold ungated pays one build in all, at its base's close-out into main.
+
+### Ungated folds
+
+A lane unit's ungated fold into its lane base (`rebase --into <lane> --ungated`, `land --into <lane> --ungated`,
+02_workspaces.md "Lanes") moves Git state only. Its rebase runs no hash probe and no carry. Its land runs no Nx cache
+initialization and no check, and skips Land steps 4 to 7: it quiesces no landing volume, carries nothing, closes no
+target Nx state, freezes no seed, adopts nothing and restores no output. The lane base keeps its build link, its build
+volume and its latest seed exactly as they were. The unit's volume is still the unit's, as after a compare-and-swap at
+Land step 3, so step 8 retires it with the unit and collection releases it like any retired checkout's volume (Garbage
+collection): nothing is adopted and nothing is left behind. The land report's seed is `unchanged` and its adoption is
+`skipped` with `reason:{kind:"ungated"}`, which its `LandOutcome` records (13_telemetry.md).
+
+Main refuses `--ungated` by name: a land into main is where a tree is gated and its built volume adopted, so main and
+every fork of it stay warm. A lane base whose units fold ungated builds the lane's whole delta once, incrementally on
+its own volume, at its own gated close-out into main, and main adopts that volume. Folds write nothing to the lane
+base's build volume, so a fork of the lane base meanwhile takes the seed the lane base already had and builds the folded
+delta incrementally, as an edit would.
+
+- **Enforced by**: unit tests of the rebase and land plans, in which an ungated fold into a lane base is Git alone and
+  retires as `rm` does, a gated plan is unchanged into main and into a lane base, and main, `--gate`, `--check` and
+  `--push-only` refuse an ungated fold; and a directory-host test in which main refuses `--ungated` by name, an ungated
+  rebase and land of a unit into its lane base report the `ungated` skips and move only the lane base's branch, every
+  build volume record but the unit's is unchanged, and the unit's volume is released with the unit.
 
 ## Garbage collection
 

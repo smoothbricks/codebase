@@ -985,6 +985,18 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         },
         ..land_first.clone()
     };
+    let land_ungated = cowshed_core::api::dto::LandedReport {
+        target_branch: "cowshed/lane".to_owned(),
+        target_was_checked_out: true,
+        retired: true,
+        build_volume: cowshed_core::api::dto::LandBuildVolume {
+            seed: cowshed_core::api::dto::LandSeed::Unchanged,
+            adoption: cowshed_core::api::dto::Adoption::Skipped {
+                reason: cowshed_core::api::dto::AdoptionSkip::Ungated,
+            },
+        },
+        ..land_first.clone()
+    };
     // One document per `RebaseCarrySkip` arm and per side: an arm absent here is one the
     // TypeScript union is not checked against.
     let rebase_carried = RebaseReport {
@@ -1227,6 +1239,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                     "adoptionSkippedOpening",
                     document("land report", &LandReport::Landed(land_opening)),
                 ),
+                ("ungated", document("land report", &LandReport::Landed(land_ungated))),
             ]),
         ),
         (
@@ -1297,6 +1310,10 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                             states: vec![PathBuf::from(".nx"), PathBuf::from("apps/web/.nx")],
                         }),
                     ),
+                ),
+                (
+                    "ungated",
+                    document("rebase report", &rebase_skipped(RebaseCarrySkip::Ungated)),
                 ),
             ]),
         ),

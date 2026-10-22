@@ -2961,6 +2961,24 @@
       "retired": true,
       "targetBranch": "main",
       "targetWasCheckedOut": true
+    },
+    "ungated": {
+      "buildVolume": {
+        "adoption": {
+          "kind": "skipped",
+          "reason": {
+            "kind": "ungated"
+          }
+        },
+        "seed": {
+          "kind": "unchanged"
+        }
+      },
+      "kind": "landed",
+      "landedHead": "1111111111111111111111111111111111111111",
+      "retired": true,
+      "targetBranch": "cowshed/lane",
+      "targetWasCheckedOut": true
     }
   },
   "PushReport": {
@@ -3043,6 +3061,15 @@
           "kind": "taskHashes",
           "reason": "node - /Users/fixture/Dev/widget/apps/web ended Exited { code: 1 }: Error: the task graph has a circular dependency",
           "state": "apps/web/.nx"
+        }
+      },
+      "oid": "7777777777777777777777777777777777777777"
+    },
+    "ungated": {
+      "buildVolume": {
+        "kind": "skipped",
+        "reason": {
+          "kind": "ungated"
         }
       },
       "oid": "7777777777777777777777777777777777777777"

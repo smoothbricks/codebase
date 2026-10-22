@@ -1024,7 +1024,7 @@ to `refs/cowshed/<ws>/wip` — see "Autosave") remain the crash-safety net. Cows
 scheduling, review, remote publication, and branch-selection policy are coordinator work (12_mcp.md), deliberately not
 baked in.
 
-### `cowshed rebase <ws> [--onto <branch-or-ref> | --into <lane>]`
+### `cowshed rebase <ws> [--onto <branch-or-ref> | --into <lane> [--ungated]]`
 
 Brings a workspace's branch up to the selected host revision. The default is `main`; `--onto` accepts a validated local
 branch or fully qualified ref in the main workspace repository. An object ID may be used as an immutable replay base,
@@ -1041,6 +1041,10 @@ and are refused together (exit 2).
   exits 0. Conflicts abort the rebase (`git rebase --abort`), leave the workspace exactly as it was, and exit 4 with
   `next:` hints naming the conflicted paths and the by-hand replay. A rebase that did not conflict then carries its
   target's Nx cache entries into the workspace's build volume (16_build_volumes.md, "Rebase carry").
+- `--ungated`, with `--into <lane>` only: the rebase before an ungated land (see "Lanes"). It fetches and replays as the
+  default mode does and then stops: it computes no task hash and carries nothing, and its report's `buildVolume` is
+  `skipped` with `reason: {kind: "ungated"}`. A rebase onto main (no `--into`, or `--into main`) refuses `--ungated`
+  with exit 2 naming main, and `--gate` is refused with it (exit 2): an ungated rebase runs no job to class.
 - `--fresh`: divergence-shedding rebase. Create a new clone from the selected current host revision, replay the branch
   onto it (`git format-patch`/`am`, or cherry-pick range), then **transplant identity** — the new clone inherits the
   workspace's name, canonical mount path, token, and grant-file binding; the old clone is destroyed (11_shell.md
@@ -1050,7 +1054,7 @@ and are refused together (exit 2).
   has uncommitted changes — replay carries commits only; commit or discard first. `--fresh` is what a coordinator runs
   against a long-lived workspace that `cowshed du` shows has drifted far from its integration base.
 
-### `cowshed land <ws> [--into <lane>] [--target <branch>] [--check <cmd>]`
+### `cowshed land <ws> [--into <lane> [--ungated]] [--target <branch>] [--check <cmd>]`
 
 The full born-from-host-return-to-host close-out, as one primitive. It lands into main, or with `--into <lane>` into
 that lane base (see "Lanes" below); "the target" below is whichever one it is. The target branch defaults to the branch
@@ -1165,6 +1169,15 @@ returns `LandReport::Delivered(PushReport)` before build-volume adoption, land c
 even with the default `retire: true`. An ordinary land returns `LandReport::Landed(LandedReport)`; its existing landed
 fields describe only an actual target advance. The canonical JSON report uses the flat `kind: delivered | landed` tag.
 
+`--ungated`, with `--into <lane>` only, folds a unit into its lane base by Git alone (see "Lanes"): steps 1, 3 and 5
+run, and steps 2 and 4 do not. It runs no check and initializes no Nx cache, and after the fast-forward it carries
+nothing, freezes no seed and adopts no build volume. The lane base keeps its build volume and seed. The unit's volume is
+still the unit's, so the retire releases it with the unit, closing its Nx state as `cowshed rm` does. The report is
+`landed` with `buildVolume: {seed: {kind: "unchanged"}, adoption: {kind: "skipped", reason: {kind: "ungated"}}}`, and
+its durable `LandOutcome` records that skip (13_telemetry.md). A land into main (no `--into`, or `--into main`) refuses
+`--ungated` with exit 2 naming main, since only a land into main gates; `--check` and `--push-only` are refused with it
+(exit 2). With `--no-retire` an ungated land keeps the unit and collects nothing, since it released no volume.
+
 A target fast-forwarded through plain Git instead is an **external land**: it forfeits carry, output restoration and
 adoption. The next fork (including `--ref` naming the target's current tree) automatically captures a live workspace at
 exactly that tree as the target's seed, under writer exclusion; no manual seed-refresh or warm command exists. `doctor`
@@ -1192,6 +1205,21 @@ workspace, `cowshed fork <lane>` (a clone of main). Its units are `cowshed fork 
 (`cowshed rebase <unit> --into <lane>`) and lands into (`cowshed land <unit> --into <lane>`) the lane base, then is
 removed. The lane completes with the ordinary close-out of its base: `cowshed rebase <lane>` and `cowshed land <lane>`
 fast-forward main and remove the lane base.
+
+A unit's fold into its lane base is ungated: `cowshed rebase <unit> --into <lane> --ungated` and
+`cowshed land <unit> --into <lane> --ungated` move its commits by Git alone. The fold does not hash tasks, run a check,
+initialize or carry Nx cache entries, freeze a seed or adopt a build volume. The lane base's build volume, link and seed
+stay as they were, and each unit's build volume is released when the unit retires. The lane is built once, at its base's
+own gated close-out into main, whose check is the lane's batch gate; the lane base builds the lane's whole delta there,
+incrementally on its own volume, and main adopts that volume (16_build_volumes.md, "Ungated folds"). Measured 2026-10-22
+on SmoothBricks folds into a lane base before folds were ungated: the rebase took 573 s, 571 s of it
+`rebase task-hashes`, and the land 177 s in `land build-volume` (`carry-stage` 80 s, `freeze-seed` 68 s, `adopt` 22 s),
+while the Git work took seconds. Without `--ungated`, a land into a lane base is the full gated close-out above, for a
+stack whose units each gate (16_build_volumes.md, "Stacks and merge queues").
+
+The rebase names `--ungated` as the land does, rather than reading it off the target: cowshed stores nothing about
+lanes, so a rebase cannot know whether the land after it gates, and a gated land into an integration workspace still
+relies on its rebase's carry.
 
 The caller (an external coordinator) tracks the tree; cowshed stores nothing about lanes. `--into` names a workspace,
 and every lane rule is read off that workspace at the moment of the call: its checked-out branch is the target, its

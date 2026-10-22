@@ -3528,6 +3528,10 @@ pub struct RebaseOptions {
     /// gate job (05_gateway.md, "A land is a gate job"). Any other rebase is background work.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub gate: bool,
+    /// `Ungated` is the rebase before an ungated land into a lane base: Git alone, no carry
+    /// (02_workspaces.md "Lanes"). Refused with `gate`, and when the target is main.
+    #[serde(skip_serializing_if = "LandMode::is_gated")]
+    pub mode: LandMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3550,6 +3554,11 @@ pub struct LandOptions {
     /// "`cowshed land`" step 3).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ref_lock: Option<RefLockPath>,
+    /// `Ungated` folds a unit into its lane base by Git alone: no check, no carry, no seed
+    /// freeze, no adoption (02_workspaces.md "Lanes"). Refused into main, with `check`, and with
+    /// `push_only`.
+    #[serde(skip_serializing_if = "LandMode::is_gated")]
+    pub mode: LandMode,
 }
 
 impl Default for LandOptions {
@@ -3563,7 +3572,28 @@ impl Default for LandOptions {
             expected_source_head: None,
             expected_target_head: None,
             ref_lock: None,
+            mode: LandMode::Gated,
         }
+    }
+}
+
+/// Whether a land, and the rebase before it, runs the target's build-state steps
+/// (02_workspaces.md "Lanes"; 16_build_volumes.md "Ungated folds").
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LandMode {
+    /// The full close-out: checks, carry, seed freeze and adoption into the target.
+    #[default]
+    Gated,
+    /// A unit's fold into its lane base: the fast-forward and the retire, Git alone. The lane
+    /// base keeps its build volume and seed; the unit's volume retires with the unit. Only a
+    /// land into main gates, so main refuses it.
+    Ungated,
+}
+
+impl LandMode {
+    pub fn is_gated(&self) -> bool {
+        matches!(self, Self::Gated)
     }
 }
 
@@ -3813,6 +3843,8 @@ pub enum RebaseCarrySkip {
         /// Each such root's Nx state directory (`<root>/.nx`), relative to the workspace.
         states: Vec<PathBuf>,
     },
+    /// The rebase was ungated: a fold into a lane base is Git alone and carries nothing.
+    Ungated,
 }
 
 impl fmt::Display for RebaseCarrySkip {
@@ -3871,6 +3903,7 @@ impl fmt::Display for RebaseCarrySkip {
                 }
                 formatter.write_str(": no Nx run cached a task into the target's build volume")
             }
+            Self::Ungated => formatter.write_str("an ungated rebase carries nothing"),
         }
     }
 }
@@ -3917,6 +3950,9 @@ pub enum AdoptionSkip {
     /// The landing volume could not be grown to the target's capacity without forcing a
     /// filesystem holder off it (step 4); adopting it would shrink the target.
     LandingVolumeBusy { reason: String },
+    /// The land was ungated: the target kept its volume and seed, and the landing workspace's
+    /// volume retires with it.
+    Ungated,
 }
 
 impl AdoptionSkip {
@@ -3934,6 +3970,7 @@ impl AdoptionSkip {
             Self::TargetOpening { .. } => "targetOpening",
             Self::TargetDaemonStayed { .. } => "targetDaemonStayed",
             Self::LandingVolumeBusy { .. } => "landingVolumeBusy",
+            Self::Ungated => "ungated",
         }
     }
 }
@@ -4026,6 +4063,9 @@ impl fmt::Display for AdoptionSkip {
             Self::LandingVolumeBusy { reason } => write!(
                 formatter,
                 "the landing build volume could not be grown to the target's capacity: {reason}"
+            ),
+            Self::Ungated => formatter.write_str(
+                "an ungated land carries no build volume: the target keeps its own, and the landing workspace's retires with it",
             ),
         }
     }

@@ -1076,6 +1076,13 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
         serde_json::to_value(land_default).unwrap(),
         json!({"retire":true,"pushOnly":false})
     );
+    // Gated is the default and travels as nothing; only a lane fold names its mode.
+    let ungated = serde_json::from_value::<LandOptions>(json!({"mode":"ungated"})).unwrap();
+    assert_eq!(ungated.mode, cowshed_core::api::dto::LandMode::Ungated);
+    assert_eq!(
+        serde_json::to_value(ungated).unwrap(),
+        json!({"retire":true,"pushOnly":false,"mode":"ungated"})
+    );
     let grant_delta = serde_json::from_value::<GrantDelta>(json!({})).unwrap();
     assert_eq!(grant_delta, GrantDelta::default());
     assert_eq!(serde_json::to_value(grant_delta).unwrap(), json!({}));
@@ -1111,6 +1118,7 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
         expected_source_head: Some(oid('a')),
         expected_onto_head: None,
         gate: false,
+        mode: cowshed_core::api::dto::LandMode::Gated,
     };
     let rebase_json = serde_json::to_value(&rebase).unwrap();
     assert_eq!(

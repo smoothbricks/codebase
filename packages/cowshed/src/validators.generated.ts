@@ -815,6 +815,11 @@ export const assertLandBuildVolumeList = typia.createAssertEquals<readonly Api.L
 export const parseLandBuildVolumeList = (json: string): readonly Api.LandBuildVolume[] =>
   assertLandBuildVolumeList(JSON.parse(json));
 
+export const assertLandMode = typia.createAssertEquals<Api.LandMode>();
+export const parseLandMode = (json: string): Api.LandMode => assertLandMode(JSON.parse(json));
+export const assertLandModeList = typia.createAssertEquals<readonly Api.LandMode[]>();
+export const parseLandModeList = (json: string): readonly Api.LandMode[] => assertLandModeList(JSON.parse(json));
+
 export const assertLandOptions = typia.createAssertEquals<Api.LandOptions>();
 export const parseLandOptions = (json: string): Api.LandOptions => assertLandOptions(JSON.parse(json));
 export const assertLandOptionsList = typia.createAssertEquals<readonly Api.LandOptions[]>();

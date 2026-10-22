@@ -3996,6 +3996,149 @@ async fn directory_a_land_carries_mains_nx_entries_into_the_volume_main_adopts_s
     );
 }
 
+/// An ungated fold of a unit into its lane base is Git alone (02_workspaces.md "Lanes";
+/// 16_build_volumes.md, "Ungated folds"). Main refuses `--ungated` by name, before anything runs.
+/// Into the lane base, the rebase carries nothing and the land fast-forwards the lane base and
+/// retires the unit, with no check, carry, seed freeze or adoption: every build volume record but
+/// the unit's is byte-for-byte what it was, so the lane base keeps its volume and seed, and the
+/// unit's volume is released with the unit.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_an_ungated_fold_into_a_lane_base_is_git_alone_substrate_lifecycle() {
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::with_directory(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
+    let reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &reads).await;
+    let layout = build_volumes(&fixture);
+    let main = fixture.checkout.clone();
+    let lane = new_workspace(&mut service, "lane").await;
+    succeed(&mut service, ["fork", "lane", "unit"]).await;
+    let unit = service
+        .path("unit", false)
+        .await
+        .expect("unit is mounted")
+        .mount;
+    fs::write(unit.join("unit.txt"), b"unit\n").unwrap();
+    git(&unit, &["add", "unit.txt"]);
+    git(&unit, &["commit", "-q", "-m", "unit"]);
+    let main_head = git_stdout(&main, &["rev-parse", "HEAD"]);
+    let lane_build = fs::read_link(lane.join(".cowshed/build")).unwrap();
+    let unit_volume = linked_volume(&layout, &unit);
+    let unit_name = WorkspaceName::new("unit").expect("workspace name");
+    // Every volume the unit owns, including superseded volumes and its seed, retires with it.
+    let unit_owned = layout
+        .list()
+        .expect("list build volumes")
+        .into_iter()
+        .filter(|id| {
+            layout
+                .read_record_present(id)
+                .expect("read a record")
+                .is_some_and(|record| record.role.owner() == &unit_name)
+        })
+        .collect::<Vec<_>>();
+    assert!(unit_owned.contains(&unit_volume), "{unit_owned:?}");
+    let records = || {
+        layout
+            .list()
+            .expect("list build volumes")
+            .into_iter()
+            .filter_map(|id| {
+                let record = layout.read_record_present(&id).expect("read a record")?;
+                Some((
+                    id,
+                    serde_json::to_value(record).expect("a record serializes"),
+                ))
+            })
+            .collect::<Vec<_>>()
+    };
+    let others = records()
+        .into_iter()
+        .filter(|(id, _)| !unit_owned.contains(id))
+        .collect::<Vec<_>>();
+
+    for args in [
+        &["land", "unit", "--ungated"][..],
+        &["land", "unit", "--into", "main", "--ungated"],
+        &["rebase", "unit", "--ungated"],
+    ] {
+        let (result, _, _) = run(&mut service, args.iter().copied()).await;
+        let refused = result.expect_err("main refuses an ungated fold");
+        assert_eq!(refused.code, ErrorCode::Usage, "{args:?}: {refused:?}");
+        assert!(
+            refused.message.contains("the target is main"),
+            "{args:?}: {}",
+            refused.message
+        );
+    }
+
+    let (stdout, _) = succeed(
+        &mut service,
+        ["--json", "rebase", "unit", "--into", "lane", "--ungated"],
+    )
+    .await;
+    let envelope: JsonEnvelope<RebaseReport> = serde_json::from_slice(&stdout).unwrap();
+    let rebased = envelope.result().expect("a successful rebase").clone();
+    assert_eq!(
+        rebased.build_volume,
+        RebaseBuildVolume::Skipped {
+            reason: RebaseCarrySkip::Ungated
+        }
+    );
+    let unit_head = git_stdout(&unit, &["rev-parse", "HEAD"]);
+    assert_eq!(rebased.oid.as_str(), unit_head);
+
+    let (stdout, _) = succeed(
+        &mut service,
+        ["--json", "land", "unit", "--into", "lane", "--ungated"],
+    )
+    .await;
+    let envelope: JsonEnvelope<LandReport> = serde_json::from_slice(&stdout).unwrap();
+    let LandReport::Landed(landed) = envelope.result().expect("a successful land").clone() else {
+        panic!("an ungated land lands: {envelope:?}");
+    };
+    assert_eq!(
+        landed.build_volume,
+        cowshed_core::api::dto::LandBuildVolume {
+            seed: LandSeed::Unchanged,
+            adoption: Adoption::Skipped {
+                reason: AdoptionSkip::Ungated
+            },
+        }
+    );
+    assert!(landed.retired);
+    assert_eq!(landed.landed_head.as_str(), unit_head);
+    assert_eq!(git_stdout(&lane, &["rev-parse", "HEAD"]), unit_head);
+    assert_eq!(
+        git_stdout(&main, &["rev-parse", "HEAD"]),
+        main_head,
+        "main moves only when the lane base lands"
+    );
+    assert_eq!(
+        fs::read_link(lane.join(".cowshed/build")).unwrap(),
+        lane_build
+    );
+    // Logical retirement returns at step 4; step 5 reclaims the mountpoint in the background.
+    eventually(|| !unit.exists()).await;
+    for id in &unit_owned {
+        eventually(|| !layout.image(id).exists()).await;
+        assert!(!layout.record(id).exists(), "{id} is released");
+    }
+    assert_eq!(
+        records(),
+        others,
+        "no seed freeze, adoption or new volume: only the unit's volume and seed are gone"
+    );
+    assert_land_outcome(fixture.storage.telemetry(), &landed);
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+    fixture.stop_gateway().await;
+}
+
 /// A rebase carries main's Nx cache entries into the rebased workspace's volume
 /// (16_build_volumes.md, "Rebase carry"), and only those the rebased tree looks up: `b`, forked
 /// before main runs the check at the original tree and before `a` lands and warms `a:build` and

@@ -546,6 +546,7 @@ pub struct RebaseOptions {
     pub expected_source_head: Option<GitOid>,
     pub expected_onto_head: Option<GitOid>,
     pub gate: bool,                      // a land's rebase: the carry's jobs run as gate-class work (05)
+    pub mode: LandMode,                  // Ungated: the rebase before an ungated fold carries nothing (02, "Lanes")
 }
 
 pub struct LandOptions {
@@ -557,6 +558,13 @@ pub struct LandOptions {
     pub expected_source_head: Option<GitOid>,
     pub expected_target_head: Option<ExpectedRefHead>,
     pub ref_lock: Option<RefLockPath>,   // absolute; held only for the head fence and fast-forward (02, land step 3)
+    pub mode: LandMode,                  // Ungated: a lane fold by Git alone; refused into main (02, "Lanes")
+}
+
+#[serde(rename_all = "camelCase")]
+pub enum LandMode {                      // default Gated, absent on the wire; `"mode": "ungated"` otherwise
+    Gated,
+    Ungated,
 }
 
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -2063,6 +2071,7 @@ is one typed field of the same request, decoded by the same validation (`JobSche
 | `--background`                                                            | every exec answers its `JobHandle` at admission                   | the same                                                  |
 | `--timeout <dur>`                                                         | the caller's own deadline over `JobHandle::wait`                  | the same, over `wait()`                                   |
 | `rebase --gate`                                                           | `RebaseOptions::gate`                                             | `RebaseOptions.gate`                                      |
+| `rebase --ungated`, `land --ungated`                                      | `RebaseOptions::mode`, `LandOptions::mode`: `LandMode::Ungated`   | `mode: 'ungated'`                                         |
 
 The gate class and host scope are the coordinator route's alone on both surfaces (`coordinator.exec`; the CLI is that
 route); a worker capability asks for background, interactive and resident work, a resident at either nice, in its own

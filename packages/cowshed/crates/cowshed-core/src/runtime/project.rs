@@ -4914,6 +4914,109 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         ))
     }
 
+    /// Land steps 1b–2 of a gated land (02_workspaces.md, "`cowshed land`"; 16_build_volumes.md,
+    /// "Carry"): admit the landing workspace's build state, initialize its Nx caches, and run
+    /// each check in its sandbox. Answers the checks that passed and the carry's stop reason.
+    async fn gate_landing(
+        &mut self,
+        workspace: &WorkspaceName,
+        current: &NativeWorkspace,
+        source_mount: &Path,
+        checks: Vec<String>,
+    ) -> Result<(CheckedLandChecks, Option<String>)> {
+        let (handle, build_volume) =
+            timed_async("land", "supervisor", self.admit_build_state(workspace)).await?;
+        // A failed cache initialization is the carry's stop reason, not a refused land: checks and
+        // the fast-forward still run, and the carry copies nothing.
+        let carry_stopped = match timed_async(
+            "land",
+            "nx-cache-init",
+            initialize_nx_caches(&handle, build_volume.clone(), source_mount),
+        )
+        .await
+        {
+            Ok(()) => None,
+            Err(error) => Some(error.message),
+        };
+        if !checks.is_empty() {
+            self.reconcile_gateway_for_work(
+                workspace,
+                current.derived.workspace.incarnation(),
+                &handle,
+            )
+            .await?;
+        }
+        let mut checked = CheckedLandChecks::default();
+        for check in &checks {
+            let spawned = std::time::SystemTime::now();
+            let job_id = timed_async(
+                "land",
+                "check-exec",
+                handle.exec(
+                    None,
+                    build_volume.clone(),
+                    land_check_request(check),
+                    AdmissionSource::Coordinator,
+                ),
+            )
+            .await?;
+            let info = timed_async("land", "check-wait", handle.wait(job_id)).await?;
+            // The exec answered at admission, so a check the host never let run ends here as a
+            // failed job: that is the environment's refusal, never the workspace's failing check.
+            if let Some(
+                failure @ (crate::api::dto::JobFailure::CpuAdmission
+                | crate::api::dto::JobFailure::Priority),
+            ) = info.failure
+            {
+                return Err(CowshedError::environment_missing(
+                    format!(
+                        "land check `{check}` never ran ({failure:?}): {}",
+                        read_job_stderr_tail(&handle, job_id).await
+                    ),
+                    "read the host CPU ledger with `cowshed gateway status`, then retry land",
+                ));
+            }
+            let exited = std::time::SystemTime::now();
+            let exit_code = match info.exit {
+                Some(crate::api::dto::ExitStatus::Exited { code }) => Some(code),
+                _ => None,
+            };
+            if exit_code != Some(0) {
+                // The check's own words are the diagnosis. Read them back through the
+                // supervisor's bounded log so a failing check can never report as a bare
+                // category, then decide whose fault this is: the workspace's, or an
+                // environment that refused to run it at all.
+                let stderr = read_job_stderr_tail(&handle, job_id).await;
+                if let Some(denial) = sandbox_denial_in(&stderr) {
+                    return Err(CowshedError::environment_missing(
+                        format!(
+                            "land check `{check}` exited {exit} inside the sandbox: {denial}",
+                            exit = exit_code
+                                .map(|code| code.to_string())
+                                .unwrap_or_else(|| "killed".into()),
+                            denial = denial,
+                        ),
+                        format!(
+                            "the sandbox refused this command (workspace grants do not cover it), not the code: run `cowshed exec {ws} -- {check}` unsandboxed-equivalent or `cowshed grant {ws} --read <path>`",
+                            ws = workspace,
+                        ),
+                    ));
+                }
+                return Err(CowshedError::conflict(
+                    format!(
+                        "land check `{check}` failed with exit {exit}: {stderr}",
+                        exit = exit_code
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "killed".into()),
+                    ),
+                    "fix the workspace and retry land",
+                ));
+            }
+            checked.capture(source_mount, check, spawned, exited)?;
+        }
+        Ok((checked, carry_stopped))
+    }
+
     /// Land steps 4–7 (16_build_volumes.md, "Land"): quiesce the landing workspace, close the
     /// target's Nx state and carry the target's cache entries into the landing volume, freeze
     /// the target's seed from that volume, move the target's build link onto it, and restore
@@ -11045,6 +11148,74 @@ mod rebase_recovery_tests {
         );
     }
 
+    /// The fold's plan (16_build_volumes.md, "Ungated folds"): ungated into a lane base is Git
+    /// alone and retires the unit as `rm` does; a gated rebase or land plans what it always did,
+    /// into main and into a lane base alike; main refuses an ungated fold by name, and an
+    /// ungated fold refuses the gate surfaces it does not run.
+    #[test]
+    fn an_ungated_fold_into_a_lane_base_plans_no_build_step_and_main_refuses_it() {
+        use crate::api::dto::{ExecClass, LandMode};
+        let lane = Lane::name("lane");
+        let main = WorkspaceName::main();
+
+        assert_eq!(
+            rebase_plan(LandMode::Ungated, false, &lane).expect("an ungated rebase"),
+            RebasePlan::GitOnly
+        );
+        let ungated = LandOptions {
+            mode: LandMode::Ungated,
+            ..LandOptions::default()
+        };
+        let plan = land_plan(&ungated, &lane).expect("an ungated land");
+        assert_eq!(plan, LandPlan::Ungated);
+        assert!(matches!(plan.retirement(), CheckoutNxCheck::CloseRecorded));
+
+        for target in [&main, &lane] {
+            assert_eq!(
+                rebase_plan(LandMode::Gated, false, target).expect("a rebase"),
+                RebasePlan::Carry {
+                    class: ExecClass::Background
+                }
+            );
+            assert_eq!(
+                rebase_plan(LandMode::Gated, true, target).expect("a land's rebase"),
+                RebasePlan::Carry {
+                    class: ExecClass::Gate
+                }
+            );
+            let plan = land_plan(&LandOptions::default(), target).expect("a land");
+            assert_eq!(plan, LandPlan::Gated);
+            assert!(matches!(plan.retirement(), CheckoutNxCheck::Held));
+        }
+
+        for refused in [
+            rebase_plan(LandMode::Ungated, false, &main).expect_err("main refuses"),
+            land_plan(&ungated, &main).expect_err("main refuses"),
+        ] {
+            assert_eq!(refused.code, crate::error::ErrorCode::Usage);
+            assert!(
+                refused.message.contains("the target is main"),
+                "{}",
+                refused.message
+            );
+        }
+        let checked = LandOptions {
+            check: Some(vec!["just verify".to_owned()]),
+            ..ungated.clone()
+        };
+        let pushed = LandOptions {
+            push_only: true,
+            ..ungated
+        };
+        for refused in [
+            rebase_plan(LandMode::Ungated, true, &lane).expect_err("no gate class"),
+            land_plan(&checked, &lane).expect_err("no check"),
+            land_plan(&pushed, &lane).expect_err("no push-only"),
+        ] {
+            assert_eq!(refused.code, crate::error::ErrorCode::Usage, "{refused:?}");
+        }
+    }
+
     #[tokio::test]
     async fn a_target_tree_with_work_the_fast_forward_would_overwrite_names_it() {
         let lane = Lane::new("target-dirty");
@@ -13761,6 +13932,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         self.wait_for_other_builds_as_a_land_step();
         let store_root = &std::sync::Arc::clone(self.git.store_root());
         require_single_destination(options.onto.as_ref(), into.as_ref())?;
+        let plan = rebase_plan(
+            options.mode,
+            options.gate,
+            &into
+                .as_ref()
+                .map_or_else(main_name, |into| into.workspace().clone()),
+        )?;
         self.validate_binding().await?;
         let current = self.current(&workspace).await?;
         if let Some(expected) = options.expected_workspace_incarnation.as_ref() {
@@ -13814,40 +13992,40 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         run_git_rebase_atomically(store_root, &root, &onto, &source_head).await?;
         let oid = git_oid(store_root, &root).await?;
         // The rebase has happened: a failed carry reads as such, never as a refused rebase.
-        let build_volume = timed_async("rebase", "carry", async {
-            // Only what the rebased tree will look up is carried, so the hashes come from it, as
-            // it is checked out now, through jobs admitted on its own build volume, at the class
-            // the caller names: a land's rebase runs them as gate-class work. Admission is the
-            // probes' to fail: a supervisor that does not answer leaves the hashes unavailable,
-            // which skips the carry rather than failing a rebase that has already happened.
-            let admitted = self.admit_build_state(&workspace).await;
-            let mount = self.workspace_mount_path(&workspace)?;
-            let class = if options.gate {
-                crate::api::dto::ExecClass::Gate
-            } else {
-                crate::api::dto::ExecClass::Background
-            };
-            let selections = timed_async(
-                "rebase",
-                "task-hashes",
-                rebased_task_hashes(admitted, &mount, class),
-            )
-            .await?;
-            self.build_volumes()?
-                .rebase_carry(root.clone(), into.mount.clone(), selections)
-                .await
-        })
-        .await
-        .map_err(|failed| {
-            CowshedError::new(
-                failed.code,
-                format!(
-                    "rebased {workspace} to {oid}, but carrying {}'s Nx cache into its build volume failed: {}",
-                    into.name, failed.message
-                ),
-                failed.hint,
-            )
-        })?;
+        let build_volume = match plan {
+    RebasePlan::GitOnly => crate::api::dto::RebaseBuildVolume::Skipped {
+        reason: crate::api::dto::RebaseCarrySkip::Ungated,
+    },
+    RebasePlan::Carry { class } => timed_async("rebase", "carry", async {
+        // Only what the rebased tree will look up is carried, so the hashes come from it, as
+        // it is checked out now, through jobs admitted on its own build volume, at the class
+        // the caller names: a land's rebase runs them as gate-class work. Admission is the
+        // probes' to fail: a supervisor that does not answer leaves the hashes unavailable,
+        // which skips the carry rather than failing a rebase that has already happened.
+        let admitted = self.admit_build_state(&workspace).await;
+        let mount = self.workspace_mount_path(&workspace)?;
+        let selections = timed_async(
+            "rebase",
+            "task-hashes",
+            rebased_task_hashes(admitted, &mount, class),
+        )
+        .await?;
+        self.build_volumes()?
+            .rebase_carry(root.clone(), into.mount.clone(), selections)
+            .await
+    })
+    .await
+    .map_err(|failed| {
+        CowshedError::new(
+            failed.code,
+            format!(
+                "rebased {workspace} to {oid}, but carrying {}'s Nx cache into its build volume failed: {}",
+                into.name, failed.message
+            ),
+            failed.hint,
+        )
+    })?,
+};
         Ok(RebaseReport { oid, build_volume })
     }
 
@@ -13859,6 +14037,12 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
     ) -> Result<LandReport> {
         self.wait_for_other_builds_as_a_land_step();
         let store_root = &std::sync::Arc::clone(self.git.store_root());
+        let plan = land_plan(
+            &options,
+            &into
+                .as_ref()
+                .map_or_else(main_name, |into| into.workspace().clone()),
+        )?;
         timed_async("land", "binding", self.validate_binding()).await?;
         // Held to the end of the land, its own retire included: an `rm` of this workspace is
         // refused meanwhile, naming this land (02_workspaces.md "A land and an rm of one workspace
@@ -13926,98 +14110,19 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         .await?;
         require_target_head(options.expected_target_head.as_ref(), previous.as_ref())?;
         let retire = options.retire;
-        let (handle, build_volume) =
-            timed_async("land", "supervisor", self.admit_build_state(&workspace)).await?;
-        // A failed cache initialization is the carry's stop reason, not a refused land: checks and
-        // the fast-forward still run, and the carry copies nothing.
-        #[cfg(target_os = "macos")]
-        let carry_stopped = match timed_async(
-            "land",
-            "nx-cache-init",
-            initialize_nx_caches(&handle, build_volume.clone(), &source_mount),
-        )
-        .await
-        {
-            Ok(()) => None,
-            Err(error) => Some(error.message),
+        // An ungated land initializes no Nx cache and runs no check: only a land into main gates.
+        let (checked, carry_stopped) = match plan {
+            LandPlan::Gated => {
+                self.gate_landing(
+                    &workspace,
+                    &current,
+                    &source_mount,
+                    options.check.unwrap_or_default(),
+                )
+                .await?
+            }
+            LandPlan::Ungated => (CheckedLandChecks::default(), None),
         };
-        let checks = options.check.unwrap_or_default();
-        if !checks.is_empty() {
-            self.reconcile_gateway_for_work(
-                &workspace,
-                current.derived.workspace.incarnation(),
-                &handle,
-            )
-            .await?;
-        }
-        let mut checked = CheckedLandChecks::default();
-        for check in &checks {
-            let spawned = std::time::SystemTime::now();
-            let job_id = timed_async(
-                "land",
-                "check-exec",
-                handle.exec(
-                    None,
-                    build_volume.clone(),
-                    land_check_request(check),
-                    AdmissionSource::Coordinator,
-                ),
-            )
-            .await?;
-            let info = timed_async("land", "check-wait", handle.wait(job_id)).await?;
-            // The exec answered at admission, so a check the host never let run ends here as a
-            // failed job: that is the environment's refusal, never the workspace's failing check.
-            if let Some(
-                failure @ (crate::api::dto::JobFailure::CpuAdmission
-                | crate::api::dto::JobFailure::Priority),
-            ) = info.failure
-            {
-                return Err(CowshedError::environment_missing(
-                    format!(
-                        "land check `{check}` never ran ({failure:?}): {}",
-                        read_job_stderr_tail(&handle, job_id).await
-                    ),
-                    "read the host CPU ledger with `cowshed gateway status`, then retry land",
-                ));
-            }
-            let exited = std::time::SystemTime::now();
-            let exit_code = match info.exit {
-                Some(crate::api::dto::ExitStatus::Exited { code }) => Some(code),
-                _ => None,
-            };
-            if exit_code != Some(0) {
-                // The check's own words are the diagnosis. Read them back through the
-                // supervisor's bounded log so a failing check can never report as a bare
-                // category, then decide whose fault this is: the workspace's, or an
-                // environment that refused to run it at all.
-                let stderr = read_job_stderr_tail(&handle, job_id).await;
-                if let Some(denial) = sandbox_denial_in(&stderr) {
-                    return Err(CowshedError::environment_missing(
-                        format!(
-                            "land check `{check}` exited {exit} inside the sandbox: {denial}",
-                            exit = exit_code
-                                .map(|code| code.to_string())
-                                .unwrap_or_else(|| "killed".into()),
-                            denial = denial,
-                        ),
-                        format!(
-                            "the sandbox refused this command (workspace grants do not cover it), not the code: run `cowshed exec {ws} -- {check}` unsandboxed-equivalent or `cowshed grant {ws} --read <path>`",
-                            ws = workspace,
-                        ),
-                    ));
-                }
-                return Err(CowshedError::conflict(
-                    format!(
-                        "land check `{check}` failed with exit {exit}: {stderr}",
-                        exit = exit_code
-                            .map(|code| code.to_string())
-                            .unwrap_or_else(|| "killed".into()),
-                    ),
-                    "fix the workspace and retry land",
-                ));
-            }
-            checked.capture(&source_mount, check, spawned, exited)?;
-        }
 
         // Land has no branch-name contract with the workspace: it delivers whatever branch the
         // workspace has checked out, whether an agent named it `cowshed/<ws>`, `wt/<ws>`, or
@@ -14088,32 +14193,42 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         .await?;
         drop(ref_lock);
         // The target has moved: a failed build-volume step reads as such, never as a refused land.
-        let build_volume = timed_async(
-            "land",
-            "build-volume",
-            self.land_build_volume(
-                super::build_volumes::Owner {
-                    name: workspace.clone(),
-                    incarnation: landing_incarnation.clone(),
-                },
-                &source_mount,
-                &into,
-                &checked,
-                retire,
-                carry_stopped,
-            ),
-        )
-        .await
-        .map_err(|failed| {
-            CowshedError::new(
-                failed.code,
-                format!(
-                    "landed {source_head} on {target_branch}, but its build volume was not adopted: {}",
-                    failed.message
+        let build_volume = match plan {
+            LandPlan::Gated => timed_async(
+                "land",
+                "build-volume",
+                self.land_build_volume(
+                    super::build_volumes::Owner {
+                        name: workspace.clone(),
+                        incarnation: landing_incarnation.clone(),
+                    },
+                    &source_mount,
+                    &into,
+                    &checked,
+                    retire,
+                    carry_stopped,
                 ),
-                failed.hint,
             )
-        })?;
+            .await
+            .map_err(|failed| {
+                CowshedError::new(
+                    failed.code,
+                    format!(
+                        "landed {source_head} on {target_branch}, but its build volume was not adopted: {}",
+                        failed.message
+                    ),
+                    failed.hint,
+        )
+    })?,
+    // The target keeps its volume and seed; the unit's volume is still the unit's, and its
+    // retire releases it (16_build_volumes.md, "Ungated folds").
+    LandPlan::Ungated => crate::api::dto::LandBuildVolume {
+        seed: crate::api::dto::LandSeed::Unchanged,
+        adoption: crate::api::dto::Adoption::Skipped {
+            reason: crate::api::dto::AdoptionSkip::Ungated,
+        },
+    },
+};
         use super::supervisor::{CommitmentDraft, CommitmentSink};
         // The landing workspace is not read again after the build-volume step (its incarnation
         // was read at the start); the target stays published.
@@ -14166,7 +14281,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     workspace.clone(),
                     RemoveOptions::default(),
                     &containment,
-                    CheckoutNxCheck::Held,
+                    plan.retirement(),
                     // The owner's own land retires the unit it just landed, however young.
                     YoungPolicy::Authorized,
                 )
@@ -14191,9 +14306,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     ));
                 }
             }
-        } else {
+        } else if plan == LandPlan::Gated {
             // Retiring collects; a land that keeps the workspace collects here, so the target's
-            // previous volume and whatever else no checkout links goes with every land.
+            // previous volume and whatever else no checkout links goes with every land. An
+            // ungated land released no volume, so it has nothing to collect.
             self.collect_build_volumes().await.map_err(|failed| {
                 CowshedError::new(
                     failed.code,
@@ -17945,6 +18061,118 @@ fn require_distinct_target(unit: &WorkspaceName, target: &WorkspaceName) -> Resu
         return Err(CowshedError::usage(
             format!("workspace {unit} cannot land into itself"),
             "name the lane base this unit was forked from, or main",
+        ));
+    }
+    Ok(())
+}
+
+/// What a rebase does once its replay has succeeded (16_build_volumes.md, "Rebase carry" and
+/// "Ungated folds").
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RebasePlan {
+    /// Hash the rebased tree's tasks as `class` jobs and carry the target's entries they name.
+    Carry { class: crate::api::dto::ExecClass },
+    /// The replay alone: the rebase before an ungated fold carries nothing.
+    GitOnly,
+}
+
+/// What a land does beside Git (02_workspaces.md, "`cowshed land`" and "Lanes";
+/// 16_build_volumes.md, "Land" and "Ungated folds").
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LandPlan {
+    /// Nx cache initialization, the checks, carry, seed freeze, adoption and output restoration.
+    Gated,
+    /// The fast-forward and the retire alone: the target keeps its build volume and seed, and
+    /// the unit's volume retires with the unit.
+    Ungated,
+}
+
+#[cfg(target_os = "macos")]
+impl LandPlan {
+    /// How the retire treats the unit's Nx state. A gated land quiesced it at Land step 4, so its
+    /// retire only inspects holders; an ungated land never quiesced it, so it retires as `rm`
+    /// does.
+    fn retirement(self) -> CheckoutNxCheck {
+        match self {
+            Self::Gated => CheckoutNxCheck::Held,
+            Self::Ungated => CheckoutNxCheck::CloseRecorded,
+        }
+    }
+}
+
+/// A rebase's plan: `gate` names the carry's job class. An ungated rebase runs no job, and folds
+/// only into a lane base.
+#[cfg(target_os = "macos")]
+fn rebase_plan(
+    mode: crate::api::dto::LandMode,
+    gate: bool,
+    target: &WorkspaceName,
+) -> Result<RebasePlan> {
+    use crate::api::dto::{ExecClass, LandMode};
+    match mode {
+        LandMode::Gated => Ok(RebasePlan::Carry {
+            class: if gate {
+                ExecClass::Gate
+            } else {
+                ExecClass::Background
+            },
+        }),
+        LandMode::Ungated => {
+            require_lane_target("rebase", target)?;
+            if gate {
+                return Err(CowshedError::usage(
+                    "an ungated rebase runs no job, so it has none to run at gate class",
+                    "drop --gate, or drop --ungated to carry the target's Nx cache entries",
+                ));
+            }
+            Ok(RebasePlan::GitOnly)
+        }
+    }
+}
+
+/// A land's plan. An ungated land runs no check and advances its lane base, so it refuses
+/// `check` and `push_only`, and folds only into a lane base.
+#[cfg(target_os = "macos")]
+fn land_plan(options: &LandOptions, target: &WorkspaceName) -> Result<LandPlan> {
+    match options.mode {
+        crate::api::dto::LandMode::Gated => Ok(LandPlan::Gated),
+        crate::api::dto::LandMode::Ungated => {
+            require_lane_target("land", target)?;
+            if options
+                .check
+                .as_ref()
+                .is_some_and(|checks| !checks.is_empty())
+            {
+                return Err(CowshedError::usage(
+                    "an ungated land runs no check: only a land into main gates",
+                    "drop --check; the lane's checks run when its lane base lands into main",
+                ));
+            }
+            if options.push_only {
+                return Err(CowshedError::usage(
+                    "an ungated land fast-forwards its lane base, and --push-only advances nothing",
+                    "drop --push-only, or drop --ungated to validate and preserve the head",
+                ));
+            }
+            Ok(LandPlan::Ungated)
+        }
+    }
+}
+
+/// Only a land into main gates (02_workspaces.md "Lanes"), so main refuses an ungated fold.
+#[cfg(target_os = "macos")]
+fn require_lane_target(verb: &str, target: &WorkspaceName) -> Result<()> {
+    if target.is_main() {
+        return Err(CowshedError::usage(
+            format!(
+                "an ungated {verb} folds a unit into its lane base, and the target is {target}: \
+                 only a land into main gates"
+            ),
+            format!(
+                "drop --ungated to {verb} into {target}, or name the lane base with --into <lane>"
+            ),
         ));
     }
     Ok(())

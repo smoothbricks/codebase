@@ -2207,6 +2207,7 @@ where
                 expected_source_head: args.expected_source_head.map(os_git_oid).transpose()?,
                 expected_onto_head: args.expected_onto_head.map(os_git_oid).transpose()?,
                 gate: args.gate,
+                mode: args.mode,
             };
             let report = service
                 .rebase(&workspace, args.into.as_deref(), options)
@@ -2246,6 +2247,7 @@ where
                 expected_source_head: args.expected_source_head.map(os_git_oid).transpose()?,
                 expected_target_head: args.expected_target_head.map(os_expected_ref).transpose()?,
                 ref_lock: args.ref_lock.map(os_ref_lock).transpose()?,
+                mode: args.mode,
             };
             let report = service
                 .land(&args.workspace, args.into.as_deref(), options)
