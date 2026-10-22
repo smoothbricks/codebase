@@ -4,14 +4,15 @@ import {
   boundedFetchEnv,
   CARGO_FETCH_DEADLINE_ENV,
   CARGO_FETCH_DEADLINE_MS,
-  DEADLINE_PATIENCE,
   describeDeadline,
+  describeTeardown,
+  EXIT_PATIENCE,
   fetchDeadline,
   GIT_HTTP_LOW_SPEED_LIMIT,
   GIT_HTTP_LOW_SPEED_TIME_S,
   judgeBound,
   judgeReap,
-  TEARDOWN_PATIENCE,
+  TOLD_PATIENCE,
 } from '../../../nx-plugin/managed/raw/tooling/direnv/cargo-fetch-bound.ts';
 
 /**
@@ -139,7 +140,7 @@ describe('the bound on a cargo fetch', () => {
     );
   });
 
-  it('says the kill reached every process only when no member was left, and names the group when one was', () => {
+  it('claims only the process group when no member was left, and names the group when one was', () => {
     const facts = {
       command: 'cargo fetch --locked',
       lockPath: '/cargo/.package-cache',
@@ -151,9 +152,22 @@ describe('the bound on a cargo fetch', () => {
         const left = describeDeadline({ ...facts, group, membersLeft: true });
         const none = describeDeadline({ ...facts, group, membersLeft: false });
         expect(left).toContain(`process group ${group} still had members`);
-        expect(left).not.toContain('every process it started');
-        expect(none).toContain('every process it started');
-        expect(none).not.toContain('process group');
+        expect(left).not.toContain('whole process group');
+        expect(none).toContain('killed with its whole process group');
+        expect(none).not.toContain('still had members');
+        // A process that left the group is beyond a group kill, so neither failure says every process was killed.
+        expect(left).not.toContain('every process');
+        expect(none).not.toContain('every process');
+      }),
+    );
+  });
+
+  it('names the command and the group in what a kill on the way out leaves to be told', () => {
+    fc.assert(
+      fc.property(fc.string({ minLength: 1 }), fc.integer({ min: 1, max: 4_194_304 }), (command, group) => {
+        const line = describeTeardown({ command, group });
+        expect(line).toContain(command);
+        expect(line).toContain(`process group ${group} still had members`);
       }),
     );
   });
@@ -193,17 +207,17 @@ describe('the kill of a process group', () => {
     );
   });
 
-  it('has patiences that signal again after a pause, the one on the way out holding the exit up for little', () => {
+  it('has patiences that signal again after a pause, the exiting process holding itself up for little', () => {
     // A kill that is not repeated misses the member forked as it went out, and so does one repeated with no pause
     // between the signals: a fork already under way joins the group after they have all been sent. A process that is
-    // ending should hold its exit up for no more than a moment, and the deadline's kill may wait for the group to
-    // empty.
-    for (const patience of [TEARDOWN_PATIENCE, DEADLINE_PATIENCE]) {
+    // exiting should hold its exit up for no more than a moment, and a kill whose leftover is told may wait for the
+    // group to empty.
+    for (const patience of [EXIT_PATIENCE, TOLD_PATIENCE]) {
       expect(Number.isInteger(patience.rounds)).toBe(true);
       expect(patience.rounds).toBeGreaterThanOrEqual(2);
       expect(patience.pauseMs).toBeGreaterThanOrEqual(1);
     }
-    expect(TEARDOWN_PATIENCE.rounds * TEARDOWN_PATIENCE.pauseMs).toBeLessThanOrEqual(100);
-    expect(DEADLINE_PATIENCE.rounds * DEADLINE_PATIENCE.pauseMs).toBeGreaterThanOrEqual(1000);
+    expect(EXIT_PATIENCE.rounds * EXIT_PATIENCE.pauseMs).toBeLessThanOrEqual(100);
+    expect(TOLD_PATIENCE.rounds * TOLD_PATIENCE.pauseMs).toBeGreaterThanOrEqual(1000);
   });
 });

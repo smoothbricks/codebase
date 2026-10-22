@@ -8,8 +8,16 @@
  * and a fetch never outlives the step that started it. Like secret-references.ts this is a managed raw script that
  * shell entry loads before anything is installed, so it imports only the runtime and its sibling.
  */
+import { writeSync } from 'node:fs';
 import { constants } from 'node:os';
-import { DEADLINE_PATIENCE, judgeBound, judgeReap, type Patience, TEARDOWN_PATIENCE } from './cargo-fetch-bound.ts';
+import {
+  describeTeardown,
+  EXIT_PATIENCE,
+  judgeBound,
+  judgeReap,
+  type Patience,
+  TOLD_PATIENCE,
+} from './cargo-fetch-bound.ts';
 
 /** The shell's two uses of time, so a caller can move it by hand. */
 export interface Clock {
@@ -40,9 +48,9 @@ export type BoundedOutcome =
   /** The command ended on its own; a signal that ended it is reported as a shell does, 128 plus its number. */
   | { readonly kind: 'exited'; readonly exitCode: number; readonly stdout: Uint8Array; readonly stderr: Uint8Array }
   /**
-   * The deadline passed with the command still running: it and everything it started were killed. The output is what
-   * was read before the kill. `membersLeft` is whether the kernel still listed members of process group `group` when
-   * the kill stopped signalling it: a member that left the group is beyond the kill's reach.
+   * The deadline passed with the command still running: it and its process group were killed. The output is what was
+   * read before the kill. `membersLeft` is whether the kernel still listed members of process group `group` when the
+   * kill stopped signalling it: a member that left the group is beyond the kill's reach.
    */
   | {
       readonly kind: 'expired';
@@ -58,18 +66,54 @@ const TEARDOWN_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
 
 /**
  * Runs `command` and returns how it ended. Failure to start it rejects; so does a failure to read its output, after
- * the group is killed. Whatever way this returns or throws, the group is not left running: it is killed on every
- * path but the command ending itself, and killed again while it still has members (`reapGroup`).
+ * the group is killed. Whatever way this returns or throws, the group is killed on every path but the command ending
+ * itself, and killed again while it still has members (`reapGroup`). What a kill on the way out could not end is said
+ * on stderr, and what the deadline's could not is in the outcome.
  */
 export async function runBounded(command: BoundedCommand, clock: Clock = systemClock): Promise<BoundedOutcome> {
-  let group: number | undefined;
-  // The paths on which nobody waits for the answer: this process is ending, or the call is failing.
-  const endGroup = (): void => {
-    if (group !== undefined) reapGroup(group, TEARDOWN_PATIENCE);
+  const commandLine = command.argv.join(' ');
+  const tell = (message: string): void => {
+    writeSync(2, `${message}\n`);
+  };
+  const couldNotEnd = (error: unknown): void => {
+    tell(`${commandLine} could not be ended on the way out: ${error instanceof Error ? error.message : String(error)}`);
+  };
+  let leader: Leader | undefined;
+  // The kill on the paths where nobody reads an outcome: a signal ends this process, or the call is failing. A failure
+  // of its own would carry what the kill could not do, and these have none, so it is said on stderr. The group is
+  // signalled at once. Everything after its leader's exit is one callback, so that none of this process's other work
+  // runs between that exit and `done`, which for a signal gives the signal back to this process.
+  const endGroup = (done: () => void): void => {
+    const running = leader;
+    if (running === undefined) {
+      done();
+      return;
+    }
+    try {
+      signalGroup(running.pid);
+    } catch (error) {
+      couldNotEnd(error);
+      done();
+      return;
+    }
+    void running.exited.then(() => {
+      try {
+        if (reapGroup(running.pid, TOLD_PATIENCE)) {
+          tell(describeTeardown({ command: commandLine, group: running.pid }));
+        }
+      } catch (error) {
+        couldNotEnd(error);
+      } finally {
+        done();
+      }
+    });
   };
   // The hooks come before the spawn: a signal that arrives from the spawn on runs its handler after this synchronous
-  // body, by which time the group is known.
-  const release = endWithThisProcess(endGroup);
+  // body, by which time the group is known. A process that is exiting can wait for nothing, not even for its leader to
+  // be reaped, so there the group is only killed again as far as the kernel lists it, and what is left goes unsaid.
+  const release = endWithThisProcess(() => {
+    if (leader !== undefined) reapGroup(leader.pid, EXIT_PATIENCE);
+  }, endGroup);
   try {
     const child = Bun.spawn({
       cmd: [...command.argv],
@@ -80,7 +124,7 @@ export async function runBounded(command: BoundedCommand, clock: Clock = systemC
       stderr: 'pipe',
       detached: true,
     });
-    group = child.pid;
+    leader = child;
     const stdout: Uint8Array[] = [];
     const stderr: Uint8Array[] = [];
     const stdoutReader = child.stdout.getReader();
@@ -106,11 +150,11 @@ export async function runBounded(command: BoundedCommand, clock: Clock = systemC
             stderr: Buffer.concat(stderr),
           };
         case 'kill': {
-          signalGroup(child.pid);
           // Until it is reaped the leader is a member of its own group, and reapGroup looks for members the kill
-          // missed: the leader's exit is awaited first.
+          // missed: the leader's exit is awaited before the group is asked about.
+          signalGroup(child.pid);
           await child.exited;
-          const membersLeft = reapGroup(child.pid, DEADLINE_PATIENCE);
+          const membersLeft = reapGroup(child.pid, TOLD_PATIENCE);
           return {
             kind: 'expired',
             elapsedMs,
@@ -125,7 +169,7 @@ export async function runBounded(command: BoundedCommand, clock: Clock = systemC
       }
     }
   } catch (error) {
-    endGroup();
+    await new Promise<void>((resolve) => endGroup(resolve));
     throw error;
   } finally {
     release();
@@ -173,6 +217,11 @@ function statusOf(child: {
   return 128 + constants.signals[signal];
 }
 
+/** The errno code of a failed system call, when it has one. */
+function errorCode(error: unknown): string | undefined {
+  return error instanceof Error && 'code' in error && typeof error.code === 'string' ? error.code : undefined;
+}
+
 /**
  * SIGKILL to every process of the group led by `pgid`. A group that is already gone is not an error, nor is one with no
  * member left that can be signalled. Nothing is asked to stop first: a fetch past its deadline is stalled, a member
@@ -183,24 +232,30 @@ function signalGroup(pgid: number): void {
   try {
     process.kill(-pgid, 'SIGKILL');
   } catch (error) {
-    // ESRCH: the group is gone. EPERM: no member of it can be signalled, which is what a member that exited and has
-    // not been reaped yet answers on macOS; groupHasMembers says whether any is left.
-    if (!(error instanceof Error && 'code' in error && (error.code === 'ESRCH' || error.code === 'EPERM'))) throw error;
+    // ESRCH: the group is gone. EPERM: no member of it can be signalled, which is what a member that exited and has not
+    // been reaped yet answers on macOS; groupHasMembers says whether any is left. Any other answer is a failure.
+    const code = errorCode(error);
+    if (code !== 'ESRCH' && code !== 'EPERM') throw error;
   }
 }
 
 /**
  * Whether the kernel lists a member of the group led by `pgid`. It is the probe the bounded-exec executor makes
- * (`processGroupHasMembers`), which this script cannot import because it runs before anything is installed. A member
- * the caller may not signal counts, and so does one that exited and has not been reaped, which macOS reports as EPERM.
- * A group outlives its reaped leader for as long as one member does, and no process can take its id meanwhile.
+ * (`processGroupHasMembers`), which this script cannot import because it runs before anything is installed. ESRCH
+ * proves the group is empty. EPERM proves a member exists that this process may not signal, such as one that exited
+ * and has not been reaped, which macOS reports that way. Any other answer proves neither and is a failure, not a
+ * verdict. A group outlives its reaped leader for as long as one member does, and no process can take its id
+ * meanwhile.
  */
 function groupHasMembers(pgid: number): boolean {
   try {
     process.kill(-pgid, 0);
     return true;
   } catch (error) {
-    return error instanceof Error && 'code' in error && error.code === 'EPERM';
+    const code = errorCode(error);
+    if (code === 'ESRCH') return false;
+    if (code === 'EPERM') return true;
+    throw error;
   }
 }
 
@@ -208,8 +263,8 @@ function groupHasMembers(pgid: number): boolean {
  * Kills the group led by `pgid` and keeps killing it while it has members, as `judgeReap` in cargo-fetch-bound.ts says:
  * a group signal reaches the members that exist when it goes out, and macOS does not hold a fork back while it does, so
  * a member forked in that moment survives it. Each round signals once and then waits `patience.pauseMs`, blocking this
- * process, because the paths that end it cannot do anything else. Returns whether members were left when the patience
- * ran out.
+ * process: while a kill is being finished nothing else is wanted of it. Returns whether members were left when the
+ * patience ran out.
  */
 function reapGroup(pgid: number, patience: Patience): boolean {
   for (let round = 0; ; round += 1) {
@@ -226,25 +281,40 @@ function reapGroup(pgid: number, patience: Patience): boolean {
   }
 }
 
+/** What the shell holds of a command it has started: its pid, which leads its process group, and its exit. */
+interface Leader {
+  readonly pid: number;
+  readonly exited: Promise<number>;
+}
+
 /**
- * Has `end` run when this process is ending: on exit, and on a SIGINT, SIGTERM or SIGHUP, which also gives the signal
- * back to the process afterwards so it still ends by that signal. A signal somebody already handles stays theirs.
- * Returns the function that takes the hooks away.
+ * Has `onExit` run when this process exits, and `onSignal` when a SIGINT, SIGTERM or SIGHUP arrives. `onSignal` is
+ * handed `giveBack`, which it calls when it is done: that gives the signal back to this process so that it still ends
+ * by it. A signal that arrives while `onSignal` is at work ends this process at once, as it would have without the
+ * hooks. A signal somebody already handles stays theirs. Returns the function that takes the hooks away.
  */
-function endWithThisProcess(end: () => void): () => void {
+function endWithThisProcess(onExit: () => void, onSignal: (giveBack: () => void) => void): () => void {
   const hooks: Array<readonly [NodeJS.Signals, () => void]> = [];
   const release = (): void => {
-    process.removeListener('exit', end);
+    process.removeListener('exit', onExit);
     for (const [signal, handler] of hooks) process.removeListener(signal, handler);
     hooks.length = 0;
   };
-  process.on('exit', end);
+  process.on('exit', onExit);
   for (const signal of TEARDOWN_SIGNALS) {
     if (process.listenerCount(signal) !== 0) continue;
-    const handler = (): void => {
-      end();
+    const giveBack = (): void => {
       release();
       process.kill(process.pid, signal);
+    };
+    let working = false;
+    const handler = (): void => {
+      if (working) {
+        giveBack();
+        return;
+      }
+      working = true;
+      onSignal(giveBack);
     };
     process.on(signal, handler);
     hooks.push([signal, handler]);

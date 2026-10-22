@@ -29,30 +29,35 @@ const RUN_MODULE = new URL('../../../nx-plugin/managed/raw/tooling/direnv/cargo-
  * go round the group. Every member holds the write end of `$1`, a FIFO, and the command says its pid, which leads the
  * group, to the FIFO `$2` once all of it is up. A forker stops after 2000 rounds, so a group nothing kills ends itself,
  * and a sleeper lasts ten minutes, longer than the no-progress backstop, so one that the kill missed is still there
- * when a case waiting for the FIFO's end of file would be ended by it.
+ * when a case waiting for the FIFO's end of file would be ended by it. A forker's `kill` can find its sleeper already
+ * taken by the group kill and say so on stderr: that is the fixture racing the kill, and the one line a case accepts.
  */
 const CHURN = [
   'exec 3>"$1"',
   'forker() {',
   '  n=0; while [ $n -lt 2000 ]; do sleep 600 & pid=$!; kill $pid; wait $pid; n=$((n+1)); done',
-  '} 2>/dev/null',
+  '}',
   'forker & forker & forker & forker &',
   'i=0; while [ $i -lt 150 ]; do sleep 600 & i=$((i+1)); done',
   'echo "$$" > "$2"',
   'wait',
 ].join('\n');
 
-/** The source of a program that runs CHURN under the real clock, for a case that ends the process running it. */
+/**
+ * The source of a program that runs CHURN for a case that ends the process running it. Its clock never wakes anything,
+ * so the deadline cannot arrive: only the signal the case sends can end the group.
+ */
 const runnerSource = (cwd: string, lifetime: string, up: string): string =>
   [
     `import { runBounded } from ${JSON.stringify(RUN_MODULE)};`,
+    'const inert = { now: () => 0, after: () => () => {} };',
     `await runBounded(${JSON.stringify({
       argv: ['sh', '-c', CHURN, 'sh', lifetime, up],
       cwd,
       env: { PATH: process.env.PATH ?? '' },
       deadlineMs: DEADLINE_MS,
       echo: false,
-    })});`,
+    })}, inert);`,
   ].join('\n');
 
 /** A clock that moves only when `advance` does, waking what is due. */
@@ -93,6 +98,15 @@ const command = (cwd: string, ...argv: string[]): BoundedCommand => ({
 
 const text = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
 
+/** What a forker of CHURN says when the group kill takes its sleeper before its own `kill` does: the race. */
+const FORKER_RACE = /: kill: .*No such process$/;
+
+/** The lines a command wrote to stderr that are not that race: a case reports them and accepts none. */
+const failures = (stderr: Uint8Array): string[] =>
+  text(stderr)
+    .split('\n')
+    .filter((line) => line !== '' && !FORKER_RACE.test(line));
+
 /**
  * Whether a process still holds the write end of the FIFO `reader` was opened on without waiting: a read that would
  * wait finds one (EAGAIN) and end of file finds none. Nothing in these tests writes to the FIFO.
@@ -107,7 +121,7 @@ function writerRemains(reader: number): boolean {
 }
 
 describe('a command run under its bound', () => {
-  it('is killed with everything it started when its deadline arrives, however its members take a signal', async () => {
+  it('is killed with its whole process group at its deadline, however its members take a signal', async () => {
     // A fetch whose git child stalls: a shell that starts two members that never end, one deaf to every polite signal,
     // then says `up`. Every member holds the write end of `lifetime`, so its end of file is the death of the last one;
     // the deadline arrives only after `up`, so every member exists when the shell kills the group.
@@ -163,10 +177,21 @@ describe('a command run under its bound', () => {
         let run: Promise<BoundedOutcome> | undefined;
         try {
           run = runBounded(command(scratch, 'sh', '-c', CHURN, 'sh', lifetime, up), time.clock);
-          const group = Number.parseInt(await said, 10);
+          // A command that cannot start, or ends before it is up, would leave the read of `up` waiting for ever.
+          const first = await Promise.race([said, run]);
+          if (typeof first !== 'string') {
+            const ending = JSON.stringify({ kind: first.kind, stderr: text(first.stderr) });
+            throw new Error(`the command ended before it was up: ${ending}`);
+          }
+          const group = Number.parseInt(first, 10);
           time.advance(DEADLINE_MS);
-          expect(await run).toMatchObject({ kind: 'expired', group });
-          expect({ attempt, writerRemains: writerRemains(reader) }).toEqual({ attempt, writerRemains: false });
+          const outcome = await run;
+          expect(outcome).toMatchObject({ kind: 'expired', group });
+          expect({ attempt, stderr: failures(outcome.stderr), writerRemains: writerRemains(reader) }).toEqual({
+            attempt,
+            stderr: [],
+            writerRemains: false,
+          });
         } finally {
           // An attempt that failed before the deadline must not leave its group running.
           time.advance(DEADLINE_MS);
@@ -180,10 +205,11 @@ describe('a command run under its bound', () => {
   });
 
   it('leaves no member behind when the process running them is ended as they fork, as they do on macOS', async () => {
-    // The same group with the kill made on the way out: a child process runs the command and is sent SIGTERM once the
-    // group is up. It must end by that signal, and the end of file of `lifetime` is the death of the last member,
-    // however long a loaded host takes to finish exiting what the kill reached. A member the kill missed is never the
-    // last to end, so a shell that kills the group once on the way out leaves a case that only the backstop ends.
+    // The same group with the kill made on the way out: a child process runs the command on a clock that never wakes,
+    // so only the SIGTERM it is sent once the group is up can end the group. It must end by that signal, saying
+    // nothing on stderr, and the end of file of `lifetime` is the death of the last member, however long a loaded host
+    // takes to finish exiting what the kill reached. A member the kill missed is never the last to end, so a shell that
+    // kills the group once on the way out leaves a case that only the backstop ends.
     const scratch = mkdtempSync(join(realpathSync(tmpdir()), 'cargo-fetch-run-'));
     try {
       for (const attempt of [1, 2, 3]) {
@@ -193,14 +219,25 @@ describe('a command run under its bound', () => {
         // Each end of a FIFO opens only once the other does: read both before the command can write.
         const lifetimeEnded = readFile(lifetime, 'utf8');
         const said = readFile(up, 'utf8');
-        const runner = spawn(process.execPath, ['-e', runnerSource(scratch, lifetime, up)], { stdio: 'ignore' });
-        const ended = new Promise<NodeJS.Signals | null>((resolve) => {
-          runner.once('exit', (_code, signal) => resolve(signal));
+        const stderr: Buffer[] = [];
+        const runner = spawn(process.execPath, ['-e', runnerSource(scratch, lifetime, up)], {
+          stdio: ['ignore', 'ignore', 'pipe'],
+        });
+        runner.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+        const ended = new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: string }>((resolve) => {
+          runner.once('exit', (code, signal) => resolve({ code, signal }));
+          runner.once('error', (error) => resolve({ code: null, signal: null, error: error.message }));
         });
         try {
-          await said;
+          // A runner that cannot start, or ends before the group is up, would leave the read of `up` waiting for ever.
+          const first = await Promise.race([said, ended]);
+          if (typeof first !== 'string') {
+            const ending = JSON.stringify({ ...first, stderr: Buffer.concat(stderr).toString() });
+            throw new Error(`the runner ended before the group was up: ${ending}`);
+          }
           runner.kill('SIGTERM');
-          expect(await ended).toBe('SIGTERM');
+          expect(await ended).toEqual({ code: null, signal: 'SIGTERM' });
+          expect({ attempt, stderr: Buffer.concat(stderr).toString() }).toEqual({ attempt, stderr: '' });
           expect(await lifetimeEnded).toBe('');
         } finally {
           // An attempt that failed before the signal must not leave its group running.

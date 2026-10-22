@@ -66,7 +66,7 @@ class CapturedCommandError extends Error {
 }
 
 /**
- * A setup command that outlived its deadline and was killed with everything it started. It has no exit code: `message`
+ * A setup command that outlived its deadline and was killed with its process group. It has no exit code: `message`
  * says what it held while it ran, and what it printed until the kill is kept for the replay.
  */
 class CommandDeadlineError extends Error {

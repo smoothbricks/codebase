@@ -11,8 +11,8 @@
  * - git drops a transfer that has all but stopped for GIT_HTTP_LOW_SPEED_TIME_S seconds (`boundedFetchEnv`). Cargo runs
  *   the `git` executable for git dependencies unless `net.git-fetch-with-cli = false`, so this reaches the HTTP(S)
  *   transfers of its fetches and not an ssh or git-protocol one, nor Cargo's own git library; and
- * - the whole fetch, with every process it started, is killed when its deadline passes (`judgeBound`), and killed
- *   again while its group still has members (`judgeReap`), which bounds whatever the first does not reach.
+ * - the fetch's whole process group is killed when its deadline passes (`judgeBound`), and killed again while the
+ *   group still has members (`judgeReap`), which bounds whatever the first does not reach.
  *
  * This file is a managed raw script like secret-references.ts: shell entry loads it before anything is installed, so
  * it imports nothing.
@@ -100,7 +100,7 @@ export type BoundVerdict =
   | { readonly kind: 'finished' }
   /** Ask again after this many milliseconds, or when the command finishes. */
   | { readonly kind: 'wait'; readonly forMs: number }
-  /** Kill the command and everything it started. */
+  /** Kill the command and its process group. */
   | { readonly kind: 'kill' };
 
 /**
@@ -125,18 +125,20 @@ export interface Patience {
 }
 
 /**
- * For a kill on the way out of this process, which should hold the exit up for as little as it can: signals a
- * millisecond apart, thirty at most. Rounds with no pause do not do it: a fork already under way when the first
- * signal goes out joins the group after they have all run.
+ * For the kill of a process that is exiting, which can wait for nothing, not even for its command's leader to be
+ * reaped: signals a millisecond apart, thirty at most. Until the leader is reaped it is listed as a member of its own
+ * group, so what is left cannot be judged there and goes unsaid. Rounds with no pause would not even do the killing: a
+ * fork already under way when the first signal goes out joins the group after they have all run.
  */
-export const TEARDOWN_PATIENCE: Patience = { rounds: 30, pauseMs: 1 };
+export const EXIT_PATIENCE: Patience = { rounds: 30, pauseMs: 1 };
 
 /**
- * For the kill at the deadline, whose outcome is told: signals 5 ms apart for up to two seconds, the time the
- * bounded-exec executor allows a force-killed command to be reaped. A host under load can take that long to finish
- * exiting what it was sent, and the group lists a member until it has.
+ * For a kill whose leftover is told, the leader having been reaped first: at the deadline, and when a signal ends the
+ * step or the fetch's run fails. Signals 5 ms apart for up to two seconds, the time the bounded-exec executor allows a
+ * force-killed command to be reaped. A host under load can take that long to finish exiting what it was sent, and the
+ * group lists a member until it has.
  */
-export const DEADLINE_PATIENCE: Patience = { rounds: 400, pauseMs: 5 };
+export const TOLD_PATIENCE: Patience = { rounds: 400, pauseMs: 5 };
 
 /** What the shell knows of the group when it asks whether to signal it again. */
 export interface ReapFacts {
@@ -167,6 +169,14 @@ export function judgeReap({ round, patience, members }: ReapFacts): ReapVerdict 
   return roundsLeft > 0 && Number.isFinite(roundsLeft) ? { kind: 'signal' } : { kind: 'members-left' };
 }
 
+/** What is told of a process group that its kill could not empty. */
+export function describeMembersLeft(group: number): string {
+  return [
+    `process group ${group} still had members when the kill gave up: one that left the group is beyond a group kill,`,
+    'and one that exited and has not been reaped yet looks the same.',
+  ].join(' ');
+}
+
 /** What the failure of a command that outlived its deadline is told. */
 export interface DeadlineFacts {
   /** The command as a person would type it. */
@@ -182,8 +192,8 @@ export interface DeadlineFacts {
 }
 
 /**
- * The failure of a command that outlived its deadline, naming the command and the lock it held. It says the kill
- * reached every process only when it did.
+ * The failure of a command that outlived its deadline, naming the command and the lock it held. A group kill reaches
+ * the process group and nothing beyond it, so the failure says the group was killed, and no more than that.
  */
 export function describeDeadline({
   command,
@@ -193,16 +203,24 @@ export function describeDeadline({
   group,
   membersLeft,
 }: DeadlineFacts): string {
-  const killed = membersLeft
-    ? [
-        `killed, but process group ${group} still had members when the kill gave up: one that left the group is`,
-        'beyond a group kill, and one that exited and has not been reaped yet looks the same.',
-      ].join(' ')
-    : 'killed with every process it started.';
+  const killed = membersLeft ? `killed, but ${describeMembersLeft(group)}` : 'killed with its whole process group.';
   return [
     `${command} was still running ${elapsedMs} ms after it started, past its ${deadlineMs} ms deadline, and was`,
     `${killed} While it runs it holds Cargo's package-cache lock (${lockPath}), which makes`,
     'every other cargo that shares this CARGO_HOME wait behind it, so a stalled fetch is ended rather than waited out.',
     "Cargo's output up to the kill follows.",
   ].join('\n');
+}
+
+/** What a kill made on the way out has to tell: the call is ending or failing, so no failure of its own carries it. */
+export interface TeardownFacts {
+  /** The command as a person would type it. */
+  readonly command: string;
+  /** The process group the command ran in, which still listed members when the kill gave up. */
+  readonly group: number;
+}
+
+/** The line a kill on the way out leaves on stderr when members of the group remain. */
+export function describeTeardown({ command, group }: TeardownFacts): string {
+  return `${command} was killed on the way out, but ${describeMembersLeft(group)}`;
 }
