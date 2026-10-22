@@ -6972,10 +6972,10 @@ async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
 /// naming the declaration and the program with its version.
 ///
 /// The `.envrc` runs through the direnv the repository's devenv shell declares
-/// (`tooling/direnv/devenv.nix`), installed in the fixture user's Nix profile, the first
-/// installation directory cowshed's bootstrap searches (15_capabilities.md, "Bootstrap
-/// executables"). A direnv the host happens to have installed answers nothing: a hosted CI runner
-/// has none.
+/// (`tooling/direnv/devenv.nix`), and the bootstrap Bun the wrapper refuses is the repository's
+/// pinned Bun, both installed in the fixture user's Nix profile, the first installation directory
+/// cowshed's bootstrap searches (15_capabilities.md, "Bootstrap executables"). A direnv or Bun the
+/// host happens to have installed answers nothing: a hosted CI runner has neither.
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_managed_bun_runs_the_declared_bun_and_refuses_another_naming_both() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -7011,6 +7011,8 @@ async fn directory_managed_bun_runs_the_declared_bun_and_refuses_another_naming_
     let profile = fixture.storage.home().join(".nix-profile/bin");
     fs::create_dir_all(&profile).unwrap();
     std::os::unix::fs::symlink(&direnv, profile.join("direnv")).unwrap();
+    let pinned_bun = host_bun();
+    std::os::unix::fs::symlink(&pinned_bun, profile.join("bun")).unwrap();
     let mut service = serve_project(&mut fixture, &[]).await;
     succeed(&mut service, ["fork", "managed"]).await;
 
@@ -7052,6 +7054,18 @@ async fn directory_managed_bun_runs_the_declared_bun_and_refuses_another_naming_
         "the activation's direnv is the repository's devenv direnv"
     );
 
+    // The workspace's private bootstrap Bun is the repository's pinned Bun the profile names.
+    let real = sh(
+        &mut service,
+        "managed",
+        "readlink \"$COWSHED_MANAGER_BIN/../real-bin/bun\"",
+    )
+    .await;
+    assert_eq!(
+        Path::new(String::from_utf8(real).unwrap().trim()),
+        pinned_bun,
+        "the bootstrap Bun is the repository's pinned Bun"
+    );
     let bootstrap = String::from_utf8(
         sh(
             &mut service,
