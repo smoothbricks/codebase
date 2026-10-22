@@ -2532,20 +2532,29 @@ impl RustToolchain {
     }
 }
 
-/// The real file of the tool Cargo runs as `program`: `variable` if set, else the first
-/// executable `program` on an absolute `PATH` entry.
+/// The real file of the tool Cargo runs as `program`: `variable` if set, else
+/// [`path_program`].
 fn cargo_tool(variable: &str, program: &str) -> PathBuf {
-    let named = std::env::var_os(variable).map(PathBuf::from).or_else(|| {
-        std::env::split_paths(&std::env::var_os("PATH").expect("the test's PATH"))
-            .filter(|directory| directory.is_absolute())
-            .map(|directory| directory.join(program))
-            .find(|candidate| {
-                candidate.metadata().is_ok_and(|metadata| {
-                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-                })
+    match std::env::var_os(variable).map(PathBuf::from) {
+        Some(named) => fs::canonicalize(&named)
+            .unwrap_or_else(|error| panic!("{program} {}: {error}", named.display())),
+        None => path_program(program),
+    }
+}
+
+/// The real file of the first executable `program` on an absolute entry of the test's `PATH`,
+/// canonicalized: the repository's devenv shell, which runs every test, puts its declared tools
+/// there, so a test takes a tool from the repository's toolchain, never from the host's installs.
+fn path_program(program: &str) -> PathBuf {
+    let named = std::env::split_paths(&std::env::var_os("PATH").expect("the test's PATH"))
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(program))
+        .find(|candidate| {
+            candidate.metadata().is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
             })
-    });
-    let named = named.unwrap_or_else(|| panic!("{variable} or an executable {program} on PATH"));
+        })
+        .unwrap_or_else(|| panic!("an executable {program} on the test's PATH"));
     fs::canonicalize(&named)
         .unwrap_or_else(|error| panic!("{program} {}: {error}", named.display()))
 }
@@ -6605,6 +6614,12 @@ async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
 /// bootstrap Bun, and the activation exports what that program reported. Where PATH names no other
 /// `bun`, the bootstrap Bun reports another version and the wrapper refuses before running it,
 /// naming the declaration and the program with its version.
+///
+/// The `.envrc` runs through the direnv the repository's devenv shell declares
+/// (`tooling/direnv/devenv.nix`), installed in the fixture user's Nix profile, the first
+/// installation directory cowshed's bootstrap searches (15_capabilities.md, "Bootstrap
+/// executables"). A direnv the host happens to have installed answers nothing: a hosted CI runner
+/// has none.
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_managed_bun_runs_the_declared_bun_and_refuses_another_naming_both() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -6636,6 +6651,10 @@ async fn directory_managed_bun_runs_the_declared_bun_and_refuses_another_naming_
         &["add", "package.json", "bun.lock", "declared", ".envrc"],
     );
     git(&fixture.checkout, &["commit", "-q", "-m", "declared bun"]);
+    let direnv = path_program("direnv");
+    let profile = fixture.storage.home().join(".nix-profile/bin");
+    fs::create_dir_all(&profile).unwrap();
+    std::os::unix::fs::symlink(&direnv, profile.join("direnv")).unwrap();
     let mut service = serve_project(&mut fixture, &[]).await;
     succeed(&mut service, ["fork", "managed"]).await;
 
@@ -6664,6 +6683,18 @@ async fn directory_managed_bun_runs_the_declared_bun_and_refuses_another_naming_
     )
     .await;
     assert_eq!(String::from_utf8(scrubbed).unwrap().trim(), declared);
+    // The workspace's private bootstrap link is the devenv direnv the profile names.
+    let linked = sh(
+        &mut service,
+        "managed",
+        "readlink \"$COWSHED_MANAGER_BIN/../bin/direnv\"",
+    )
+    .await;
+    assert_eq!(
+        Path::new(String::from_utf8(linked).unwrap().trim()),
+        direnv,
+        "the activation's direnv is the repository's devenv direnv"
+    );
 
     let bootstrap = String::from_utf8(
         sh(
