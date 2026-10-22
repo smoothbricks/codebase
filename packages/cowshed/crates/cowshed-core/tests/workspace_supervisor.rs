@@ -6991,7 +6991,11 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
 /// supervisor's own start is no use (04_sandbox.md, the kept daemon).
 /// Measured 2026-10-21: a land's rebase ran its gate-class task-hash job in
 /// an idle shed, the keeper asked its start at once, and the start's background stake waited 324 s
-/// behind other work while the land waited on the daemon and gave up.
+/// behind other work while the land waited on the daemon and gave up. A start still waiting when a
+/// gate job begins is the gate's work too. Measured 2026-10-22 in shed icm-no-python: the task-hash
+/// gate ended at 04:39:32, the keeper's start queued as background at 04:39:35, the land's gate
+/// began at 04:39:46 and waited on that daemon, and the start's stake stayed in the background
+/// queue for over 35 minutes, because only a start asked while a gate ran drew on its pool.
 #[tokio::test(start_paused = true)]
 async fn a_kept_daemons_start_draws_on_the_gate_job_its_shed_runs() {
     let (config, _root) = nx_project("land");
@@ -7006,7 +7010,7 @@ async fn a_kept_daemons_start_draws_on_the_gate_job_its_shed_runs() {
     };
     let mut h = harness_with_config(config, 1, 1024, false, false);
     let _in_use = open_named(&h.handle, "build").await;
-    let idle = staked
+    let mut idle = staked
         .recv()
         .await
         .expect("the keeper's first start asks its stake");
@@ -7030,8 +7034,23 @@ async fn a_kept_daemons_start_draws_on_the_gate_job_its_shed_runs() {
     gate_cpu.answer.send(Ok(NonZeroUsize::MIN)).unwrap();
     let gate_spawned = h.spawned.recv().await.expect("the gate runs");
 
-    // The idle start is refused, so the keeper's next probe starts again, now under the gate.
-    idle.answer
+    // The start still waits as background: once the gate runs it is asked again on the gate's
+    // pool, and its background stake leaves the host queue.
+    let rebound = staked
+        .recv()
+        .await
+        .expect("the waiting start is asked again once the gate runs");
+    assert_eq!(
+        rebound.parent.as_deref(),
+        Some(TEST_POOL),
+        "the waiting start a land waits on draws on the land's gate pool"
+    );
+    // The background stake was withdrawn: its ask dropped, leaving the host queue.
+    idle.answer.closed().await;
+
+    // That start is refused, so the keeper's next probe starts again, under the gate at once.
+    rebound
+        .answer
         .send(Err(CowshedError::conflict("the host is full", "wait")))
         .unwrap();
     let under_gate = staked

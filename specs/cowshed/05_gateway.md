@@ -1177,7 +1177,14 @@ core count.
     for the daemon and gave up. Over the same gateway log, 361 of 510 kept daemons' stakes waited 0 s, the median was 0
     s, p90 34 s, p99 208 s, the longest 852 s, and 31 (6.1%) waited more than 60 s: a background stake waits as long as
     background's room stays full, so no fixed wait bounds it. A land that runs its daemon reset and that wait as one
-    gate job waits for the daemon with no deadline.
+    gate job waits for the daemon with no deadline. A start still waiting at the host when a gate job begins is that
+    gate's work too (2026-10-22): once a gate job of the shed holds its grant, the supervisor withdraws the keeper's
+    waiting background stake, which leaves the host queue, and asks it again with the oldest running gate job's pool as
+    its `parentPool`, as if it had started under that gate; a start already drawing on a pool keeps it, and the answer
+    of a withdrawn ask is dropped, never spawned. Measured 2026-10-22 in shed `icm-no-python`: the rebase's task-hash
+    gate ended at 04:39:32, the keeper's start queued as background at 04:39:35, and the land's gate began at 04:39:46
+    and waited on that daemon; the supervisor chose the stake's holder once, at the start, so the stake stayed a
+    background ask for 2,214 s.
   - **CPU pool retirement.** Pool retirement unlinks its endpoint before closing its listener. It drains the kernel
     accept queue, not merely the runtime's readiness cache, and answers queued and already accepted connections with
     `{"ok":false,"code":"pool-retired","error":"the CPU pool owner's lease ended"}` followed by EOF. A new connection

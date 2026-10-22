@@ -4337,8 +4337,13 @@ enum CpuStanding {
 /// What a queued job's spawn needs once its grant arrives, as admission settled it: the authority
 /// and sandbox it was admitted under, never ones adopted while it waited.
 struct PendingSpawn {
-    /// Aborting it drops the gateway request, which leaves the queue.
+    /// Aborting it drops the gateway request, which leaves the queue. Its task id tells this
+    /// ask's answer from one an earlier, withdrawn ask of the job delivered before its abort.
     asking: tokio::task::AbortHandle,
+    /// The count the job asks for, kept to ask again ([`SupervisorActor::rebind_keeper_start`]).
+    want: std::num::NonZeroUsize,
+    /// The holder's live pool a resident's start stake draws on beside the host, if any.
+    parent: Option<String>,
     authority: WorkspaceAuthoritySnapshot,
     policy: SandboxPolicy,
     command: SpawnCommand,
@@ -4767,9 +4772,12 @@ impl SupervisorActor {
                         None => break,
                     }
                 }
-                granted = self.admissions.join_next(), if !self.admissions.is_empty() => {
+                granted = self.admissions.join_next_with_id(), if !self.admissions.is_empty() => {
                     match granted {
-                        Some(Ok((job_id, granted))) => self.spawn_granted(job_id, granted).await,
+                        Some(Ok((asked, (job_id, granted)))) => {
+                            self.spawn_granted(asked, job_id, granted).await;
+                            self.rebind_keeper_start();
+                        }
                         // A withdrawn request: its job ended while it was queued.
                         Some(Err(error)) if error.is_cancelled() => {}
                         Some(Err(error)) => std::panic::resume_unwind(error.into_panic()),
@@ -5997,47 +6005,13 @@ impl SupervisorActor {
                 },
             );
         }
-        // Off the actor's path: the actor keeps serving every command while the gateway queues
-        // the request. Dropping the request -- an abort, or this supervisor ending -- closes its
-        // connection, which leaves the queue. A resident holds no token for its life, but its
-        // shell's activation is work: it first waits for one token, which it holds until its
-        // command starts, drawing on the requester's pool when it names one (05_gateway.md "A
-        // resident's start holds one token").
-        let asking = {
-            let class = scheduling.class();
-            let checkout = self.workspace_root.clone();
-            let command = command_label(&info.command);
-            let start = match class {
-                ExecClass::Resident | ExecClass::InteractiveResident => Some(self.cpu.activation(
-                    checkout.clone(),
-                    command.clone(),
-                    cpu_parent.clone(),
-                )),
-                ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => None,
-            };
-            let ask = self.cpu.admit(JobCpuAsk {
-                class,
-                want: scheduling.want(),
-                checkout,
-                command,
-                job: (
-                    self.authority.repo_id.clone(),
-                    self.authority.workspace_incarnation.clone(),
-                    job_id,
-                ),
-                parent: cpu_parent,
-            });
-            self.admissions.spawn(async move {
-                let granted = match start {
-                    Some(start) => match start.await {
-                        Ok(stake) => ask.await.map(|grant| grant.holding_until_started(stake)),
-                        Err(error) => Err(error),
-                    },
-                    None => ask.await,
-                };
-                (job_id, granted)
-            })
-        };
+        let asking = self.ask_cpu(
+            job_id,
+            scheduling.class(),
+            scheduling.want(),
+            command_label(&info.command),
+            cpu_parent.clone(),
+        );
         let job = JobStateRecord {
             info,
             started_at: Instant::now(),
@@ -6078,6 +6052,8 @@ impl SupervisorActor {
             build_hold,
             cpu: CpuStanding::Queued(Box::new(PendingSpawn {
                 asking,
+                want: scheduling.want(),
+                parent: cpu_parent,
                 authority: self.authority.clone(),
                 // Rendered when this authority was taken. The request may narrow the ceiling,
                 // never widen it, and narrowing one job alters no other job.
@@ -6117,14 +6093,21 @@ impl SupervisorActor {
         Ok(())
     }
 
-    /// The host CPU budget answered for a queued job: spawn its command under the grant, or fail
-    /// the job with the refusal. A job that already ended returns the grant at once, by dropping
-    /// it.
-    async fn spawn_granted(&mut self, job_id: JobId, granted: Result<JobCpuGrant>) {
+    /// The host CPU budget answered `asked`, a queued job's ask: spawn its command under the
+    /// grant, or fail the job with the refusal. A job that already ended, or one asking again
+    /// since (`asked` is not its current ask), returns the grant at once, by dropping it.
+    async fn spawn_granted(
+        &mut self,
+        asked: tokio::task::Id,
+        job_id: JobId,
+        granted: Result<JobCpuGrant>,
+    ) {
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
         };
-        if job.terminal() || !matches!(job.cpu, CpuStanding::Queued(_)) {
+        if job.terminal()
+            || !matches!(&job.cpu, CpuStanding::Queued(pending) if pending.asking.id() == asked)
+        {
             return;
         }
         let CpuStanding::Queued(pending) = std::mem::replace(&mut job.cpu, CpuStanding::Settled)
@@ -6133,6 +6116,8 @@ impl SupervisorActor {
         };
         let PendingSpawn {
             asking: _,
+            want: _,
+            parent: _,
             authority,
             policy,
             command,
@@ -6324,6 +6309,95 @@ impl SupervisorActor {
                 ),
                 "check the cowshed store's permissions and retry",
             )),
+        }
+    }
+
+    /// Ask the host budget for `job_id`'s CPU, off the actor's path: the actor keeps serving
+    /// every command while the gateway queues the request. Aborting the returned handle -- a
+    /// withdrawal, or this supervisor ending -- drops the request and closes its connection,
+    /// which leaves the queue. A resident holds no token for its life, but its shell's
+    /// activation is work: it first waits for one token, which it holds until its command
+    /// starts, drawing on `parent`, a holder's live pool, when it names one (05_gateway.md "A
+    /// resident's start holds one token").
+    fn ask_cpu(
+        &mut self,
+        job_id: JobId,
+        class: ExecClass,
+        want: std::num::NonZeroUsize,
+        command: String,
+        parent: Option<String>,
+    ) -> tokio::task::AbortHandle {
+        let checkout = self.workspace_root.clone();
+        let start = match class {
+            ExecClass::Resident | ExecClass::InteractiveResident => Some(self.cpu.activation(
+                checkout.clone(),
+                command.clone(),
+                parent.clone(),
+            )),
+            ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => None,
+        };
+        let ask = self.cpu.admit(JobCpuAsk {
+            class,
+            want,
+            checkout,
+            command,
+            job: (
+                self.authority.repo_id.clone(),
+                self.authority.workspace_incarnation.clone(),
+                job_id,
+            ),
+            parent,
+        });
+        self.admissions.spawn(async move {
+            let granted = match start {
+                Some(start) => match start.await {
+                    Ok(stake) => ask.await.map(|grant| grant.holding_until_started(stake)),
+                    Err(error) => Err(error),
+                },
+                None => ask.await,
+            };
+            (job_id, granted)
+        })
+    }
+
+    /// A kept daemon's start still waiting at the host, asked under no holder, draws on the
+    /// oldest running gate job's pool once one runs (05_gateway.md "A kept daemon a land waits on
+    /// starts as the land's gate task"): a land waits on that daemon, so its start is the gate's
+    /// work whenever the gate began. Its background ask is withdrawn, leaving the host queue, and
+    /// asked again with the gate's pool beside the host. A start already drawing on a pool keeps
+    /// it, and one with no gate running keeps waiting as background.
+    fn rebind_keeper_start(&mut self) {
+        let Some(pool) = self.gate_pool() else {
+            return;
+        };
+        let Some(job_id) = self.nx_daemon.as_ref().and_then(|keeper| keeper.starting) else {
+            return;
+        };
+        let Some(job) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let CpuStanding::Queued(pending) = &job.cpu else {
+            return;
+        };
+        if job.terminal() || pending.parent.is_some() {
+            return;
+        }
+        pending.asking.abort();
+        let (class, want, command) = (
+            job.info.class,
+            pending.want,
+            command_label(&job.info.command),
+        );
+        cowshed_os::eprintln!(
+            "cowshed: the Nx daemon start job {} waited at the host as background; a gate job runs now, so its start asks again on that gate's pool {pool}",
+            job_id.get()
+        );
+        let asking = self.ask_cpu(job_id, class, want, command, Some(pool.clone()));
+        if let Some(job) = self.jobs.get_mut(&job_id)
+            && let CpuStanding::Queued(pending) = &mut job.cpu
+        {
+            pending.asking = asking;
+            pending.parent = Some(pool);
         }
     }
 
