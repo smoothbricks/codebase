@@ -399,9 +399,9 @@ next: cowshed fork <ws>
 <project-root>
 ```
 
-Use `cowshed adopt <checkout> --re-adopt` for an explicit format transition or to reclaim guest-freed space. Default
-adopt remains idempotent. Run re-adoption from outside the checkout, after every source and build-volume holder has
-exited; it lists each holder's PID and command and refuses, rather than killing a process or forcing an unmount.
+Use `cowshed adopt <checkout> --re-adopt` to reclaim guest-freed space. Default adopt remains idempotent. Run
+re-adoption from outside the checkout, after every source and build-volume holder has exited; it lists each holder's PID
+and command and refuses, rather than killing a process or forcing an unmount.
 
 Re-adoption replaces main through the same staged copy, verification and checkout handoff as adopt. It copies the old
 image's filesystem entries, not its free guest blocks, into a fresh sparse RAW image, and the copy includes all of
@@ -433,8 +433,8 @@ not begin a second replacement or retained generation.
 
 The old backing image and any existing `<checkout>.pre-cowshed` tree are never overwritten or deleted. cowshed reports
 their paths and keeps them until you remove them after verification. An interrupted replacement resumes its recorded
-transaction rather than starting another. An earlier ASIF main is only an input to this transaction; ordinary commands
-attach RAW images only.
+transaction rather than starting another. Every input is RAW: an image recorded in any other format is refused, naming
+its format and path, and never converted.
 
 RAW images are sparse at creation: capacity is a cap, not a reservation, and nothing returns guest-freed space
 automatically. In the RAW measurement, a deleted 1 GiB payload kept its host allocation after guest sync, image fsync,
@@ -950,14 +950,14 @@ Rewrite one workspace's image so its data is contiguous again, and print the ext
 ```
 $ cowshed defrag main
 6
-cowshed: workspace main rewritten contiguously: 2110000 extents -> 6, 239059476480 bytes copied; a clone's first write now copies a map predicted at 72.0µs instead of 25.3s
+cowshed: workspace main rewritten contiguously: 2110000 extents -> 6, 239059476480 bytes copied; a clone's first write now copies a map whose loaded RAW sensitivity is 840.282µs instead of 295.499s
 ```
 
 `fork` clones an image in milliseconds because the clone shares the source's extent map, but the first write to the
-clone copies that map, at about 12 µs per extent. Main fragments with every write it takes while clones share its
-blocks, so a long-used main can hold millions of extents and make every new workspace wait tens of seconds inside its
-attach. `cowshed doctor` reports main's extent count and the first-write cost it predicts as `main-extents`, and warns
-with this verb as the hint once that cost reaches a second.
+clone copies that map, at about 140 µs per extent in one loaded RAW observation (60.8 s for 434,462 extents). Main
+fragments with every write it takes while clones share its blocks, so a long-used main can hold millions of extents.
+`cowshed doctor` reports main's extent count and that sensitivity as `main-extents`, and warns with this verb as the
+hint past 7,140 extents, about one second at that rate, where a fork refuses.
 
 The workspace leaves the kernel exactly as it does for `resize`: a volume with a file open or a job running refuses
 before the image is touched, so run it while the checkout is idle. The data is then copied with plain reads and writes

@@ -72,11 +72,8 @@ mod macos {
                 if !metadata.is_file() {
                     continue;
                 }
-                // Canonical RAW plus the retained formats whose re-adoption evidence must survive.
-                if matches!(
-                    path.extension().and_then(|value| value.to_str()),
-                    Some("dmg" | "asif" | "sparseimage")
-                ) {
+                // Every RAW image: workspaces, checkpoints and retained re-adoption inputs.
+                if cowshed_apfs::image::is_image_path(&path) {
                     if directory == sessions {
                         let name =
                             path.file_stem()

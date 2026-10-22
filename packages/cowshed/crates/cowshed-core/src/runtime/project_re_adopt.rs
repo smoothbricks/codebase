@@ -1,5 +1,5 @@
-//! `cowshed adopt <checkout> --re-adopt` (02_workspaces.md, "Re-adoption: format transition and
-//! space reclamation"): replace an adopted main through the same staged copy, verification,
+//! `cowshed adopt <checkout> --re-adopt` (02_workspaces.md, "Re-adoption: space reclamation"):
+//! replace an adopted main through the same staged copy, verification,
 //! publication fence and checkout handoff as adopt, from its retained image, keeping its build
 //! volume's identity.
 //!
@@ -52,40 +52,32 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         // Step 1: the caller is outside the checkout, the source has no holders, and nothing is
         // ended to make it so.
         require_outside(&checkout)?;
-        let Some(replaced) = self.replaced_main(&checkout).await? else {
+        let Some(replaced) = self.replaced_main().await? else {
             // Main's image is missing: its plain checkout is the copy input.
             let source = self.record_missing_main(&options, &checkout).await?;
             return self.begin_re_adopt(options, source, None).await;
         };
         // Admission closes only if main runs no job; a running job refuses, and nothing ends it.
-        // A legacy main's supervisor, if any, is of another build and cannot prove itself idle
-        // here: nothing of it is stopped, and the holder gate below refuses, naming its
-        // processes, while anything still works in its volume.
         // The retired supervisor's socket lease is held until the re-adoption is recorded, so no
         // replacement supervisor starts on the source while it is measured.
-        let supervisor = if replaced.legacy {
-            None
-        } else {
-            let lease =
-                self.stop_supervisor_if_idle(&main)
-                    .await
-                    .map_err(|error| match error.code {
-                        ErrorCode::Conflict => CowshedError::conflict(
-                            "main cannot be re-adopted while it runs jobs",
-                            "let main's jobs finish, then retry",
-                        ),
-                        _ => error,
-                    })?;
-            if let Err(busy) =
-                check_checkout_nx(&main, &checkout, CheckoutNxCheck::CloseRecorded).await?
-            {
-                return Err(CowshedError::conflict(
-                    format!("main cannot be re-adopted while its Nx state is in use: {busy}"),
-                    "stop those processes, then retry",
-                ));
-            }
-            Some(lease)
-        };
+        let supervisor =
+            self.stop_supervisor_if_idle(&main)
+                .await
+                .map_err(|error| match error.code {
+                    ErrorCode::Conflict => CowshedError::conflict(
+                        "main cannot be re-adopted while it runs jobs",
+                        "let main's jobs finish, then retry",
+                    ),
+                    _ => error,
+                })?;
+        if let Err(busy) =
+            check_checkout_nx(&main, &checkout, CheckoutNxCheck::CloseRecorded).await?
+        {
+            return Err(CowshedError::conflict(
+                format!("main cannot be re-adopted while its Nx state is in use: {busy}"),
+                "stop those processes, then retry",
+            ));
+        }
         let volumes = self.build_volumes()?;
         let build = volumes.layout.linked(&checkout)?;
         self.refuse_re_adopt_volume_held(&replaced.image, &checkout)
@@ -93,7 +85,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let source = self
             .record_re_adopt_source(&replaced, &checkout, build.as_ref())
             .await?;
-        self.begin_re_adopt(options, source, supervisor).await
+        self.begin_re_adopt(options, source, Some(supervisor)).await
     }
 
     /// A mounted source's census runs in the storage host under its image lease: a started
@@ -393,8 +385,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         })
         .await
         .map_err(|error| CowshedError::internal(error.to_string()))??;
-        // The build images as they are on disk, in whichever format each was written: a main
-        // adopted before RAW has its build volume and seeds in the same format as itself.
+        // The build images as they are on disk.
         let inputs = build_inputs(images.images())?;
         let build = match build {
             Some(id) => {
@@ -428,11 +419,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     replacement_mount: staging
                         .join(format!("readopt-{}-build", replacement.as_str())),
                     image: ReAdoptImage {
-                        retained: retained_beside(
-                            &retained,
-                            &format!("build-{}", id.as_str()),
-                            &image,
-                        ),
+                        retained: retained_image(&retained, &format!("build-{}", id.as_str())),
                         original: image,
                         source_mount: staging.join(format!("readopt-{}-build", old.as_str())),
                         capacity_bytes,
@@ -446,11 +433,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         Ok(ReAdoptSource {
             checkout: checkout.to_owned(),
             main: ReAdoptMain::Retained(ReAdoptImage {
-                retained: retained_beside(
-                    &retained,
-                    &format!("main-{}", old.as_str()),
-                    &main_image,
-                ),
+                retained: retained_image(&retained, &format!("main-{}", old.as_str())),
                 original: main_image,
                 source_mount: staging.join(format!("readopt-{}-main", old.as_str())),
                 capacity_bytes: main_capacity,
@@ -480,17 +463,13 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let layout = self.build_volume_layout()?;
         // This is the build volume's job-admission resource claim, not a metadata mutex. It holds
         // the recorded old image's exact hold from here until the build publication below, across
-        // `replace_main` and `finish_adoption`. A legacy job holds `<old>.asif.hold`, not the new
-        // RAW-derived hold path.
+        // `replace_main` and `finish_adoption`.
         let build_claim = if let Some(build) = &source.build {
             let held_layout = layout.clone();
             let id = build.id.clone();
-            let original = build.image.original.clone();
-            let observed_hold = crate::metadata::append_suffix(&original, ".hold");
+            let observed_hold = layout.hold_path(&build.id);
             self.substrate
-                .dispatch_with_image_lock(lock.clone(), move || {
-                    held_layout.claim_re_adopt_source(&id, &original)
-                })
+                .dispatch_with_image_lock(lock.clone(), move || held_layout.claim_release(&id))
                 .await
                 .map_err(native_storage_error)?
                 .map_err(|error| {
@@ -642,19 +621,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     ) -> Result<crate::storage::lifecycle::LifecycleWorkspace> {
         use crate::storage::lifecycle::LifecyclePlanner;
         let main = main_name();
-        // A RAW main's own supervisor is retired again here, as on a replay; a legacy main's is
-        // never stopped by this build, and the retention's unforced unmount refuses, naming its
-        // processes, while anything of it still works in the volume. A missing main has none.
+        // Main's own supervisor is retired again here, as on a replay. A missing main has none.
         let _supervisor = match &source.main {
-            ReAdoptMain::Retained(image)
-                if image
-                    .original
-                    .extension()
-                    .is_some_and(|extension| extension == IMAGE_EXTENSION) =>
-            {
-                Some(self.stop_supervisor(&main).await?)
-            }
-            ReAdoptMain::Retained(_) | ReAdoptMain::Missing(_) => None,
+            ReAdoptMain::Retained(_) => Some(self.stop_supervisor(&main).await?),
+            ReAdoptMain::Missing(_) => None,
         };
         {
             let source = source.clone();
@@ -737,11 +707,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         Ok(receipt.workspace)
     }
 
-    /// The main a re-adoption replaces: the RAW main the store enumerates, or else a main left in
-    /// a format this runtime no longer enumerates, read from its own sidecar only here, for its
-    /// explicit replacement (02_workspaces.md, "Re-adoption": existing ASIF images are retained
-    /// inputs to this transaction). Either must be mounted at the checkout. `None` when main has no image at all.
-    async fn replaced_main(&self, checkout: &Path) -> Result<Option<ReplacedMain>> {
+    /// The main a re-adoption replaces, the RAW main the store enumerates; it must be mounted at
+    /// the checkout. `None` when main has no image at all.
+    async fn replaced_main(&self) -> Result<Option<ReplacedMain>> {
         let replaced = match self.current(&main_name()).await {
             Ok(current) => ReplacedMain {
                 mounted: matches!(
@@ -750,43 +718,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 ),
                 image: current.image,
                 metadata: current.metadata,
-                legacy: false,
             },
-            Err(missing) if missing.code == ErrorCode::NotFound => {
-                let Some(image) = self.legacy_main_image()? else {
-                    return Ok(None);
-                };
-                // Explicit transition input only: strict deserialization still validates the
-                // sidecar schema, grants and role. Ordinary RAW path validation stays intact.
-                let metadata: crate::metadata::DetachedWorkspaceMetadata =
-                    crate::metadata::read_json(&crate::metadata::sidecar_path(&image))
-                        .map_err(native_integrity_error)?;
-                if metadata.repo_id != self.descriptor.repo_id
-                    || metadata.workspace != main_name()
-                    || metadata.info_snapshot.project_root != checkout
-                    || metadata.publication_state != crate::metadata::PublicationState::Active
-                {
-                    return Err(CowshedError::integrity(
-                        format!(
-                            "legacy main image {} does not record this project's main at {}",
-                            image.display(),
-                            checkout.display()
-                        ),
-                        "cowshed doctor --json",
-                    ));
-                }
-                ReplacedMain {
-                    mounted: super::is_mount_point(checkout).map_err(|error| {
-                        CowshedError::environment_missing(
-                            format!("cannot inspect {}: {error}", checkout.display()),
-                            "cowshed doctor --json",
-                        )
-                    })?,
-                    image,
-                    metadata,
-                    legacy: true,
-                }
-            }
+            Err(missing) if missing.code == ErrorCode::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
         if !replaced.mounted {
@@ -797,38 +730,13 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         }
         Ok(Some(replaced))
     }
-
-    /// Main's image in a format this runtime does not enumerate, if the project directory holds
-    /// one: an adoption from before RAW, which only `cowshed adopt --re-adopt` replaces.
-    pub(super) fn legacy_main_image(&self) -> Result<Option<PathBuf>> {
-        let project = &self.layout.project().project_root;
-        for extension in LEGACY_IMAGE_EXTENSIONS {
-            let image = project.join("main").with_extension(extension);
-            match std::fs::symlink_metadata(&image) {
-                Ok(_) => return Ok(Some(image)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(CowshedError::environment_missing(
-                        format!("cannot inspect {}: {error}", image.display()),
-                        "check controller storage permissions and retry",
-                    ));
-                }
-            }
-        }
-        Ok(None)
-    }
 }
-
-/// Image formats an adoption from before RAW left, read only as re-adoption inputs.
-const LEGACY_IMAGE_EXTENSIONS: [&str; 2] = ["asif", "sparseimage"];
 
 /// The main a re-adoption replaces, as [`StorageProjectRuntimeHost::replaced_main`] found it.
 struct ReplacedMain {
     image: PathBuf,
     metadata: crate::metadata::DetachedWorkspaceMetadata,
     mounted: bool,
-    /// Read from a format this runtime does not enumerate.
-    legacy: bool,
 }
 
 /// Every path this re-adoption retained, companions included, and nothing else: what the user
@@ -1029,7 +937,7 @@ fn old_seeds(
             .is_some_and(|record| record.is_seed_of(&WorkspaceName::main(), old))
         {
             seeds.push(ReAdoptRetained {
-                retained: retained_beside(retained, &format!("seed-{}", id.as_str()), &original),
+                retained: retained_image(retained, &format!("seed-{}", id.as_str())),
                 original,
             });
         }
@@ -1104,8 +1012,7 @@ fn published_source(source: &ReAdoptSource) -> &Path {
     }
 }
 
-/// Every build volume image in `images`, RAW or written before RAW, with the identity its file
-/// name spells. Read only here, as re-adoption's inputs; nothing else enumerates a legacy one.
+/// Every build volume image in `images`, with the identity its file name spells.
 fn build_inputs(images: &Path) -> Result<Vec<(BuildVolumeId, PathBuf)>> {
     let unreadable = |error: std::io::Error| {
         CowshedError::environment_missing(
@@ -1124,12 +1031,7 @@ fn build_inputs(images: &Path) -> Result<Vec<(BuildVolumeId, PathBuf)>> {
     let mut inputs = Vec::new();
     for entry in entries {
         let path = entry.map_err(unreadable)?.path();
-        let known = path.extension().is_some_and(|extension| {
-            extension == IMAGE_EXTENSION
-                || LEGACY_IMAGE_EXTENSIONS
-                    .iter()
-                    .any(|legacy| extension == *legacy)
-        });
+        let known = cowshed_apfs::image::is_image_path(&path);
         let id = path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -1178,13 +1080,9 @@ fn read_build_record(image: &Path) -> Result<crate::build_volume::BuildVolumeRec
     })
 }
 
-/// `<retained>/<stem>.<the extension of original>`: a retained input keeps its format.
-fn retained_beside(retained: &Path, stem: &str, original: &Path) -> PathBuf {
-    let path = retained.join(stem);
-    match original.extension() {
-        Some(extension) => path.with_extension(extension),
-        None => path,
-    }
+/// `<retained>/<stem>.dmg`: where re-adoption retains the RAW image it replaced.
+fn retained_image(retained: &Path, stem: &str) -> PathBuf {
+    retained.join(stem).with_extension(IMAGE_EXTENSION)
 }
 
 #[cfg(test)]

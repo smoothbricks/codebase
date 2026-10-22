@@ -5126,15 +5126,12 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
     fixture.stop_gateway().await;
 }
 
-/// Re-adoption (02_workspaces.md, "Re-adoption: format transition and space reclamation"):
-/// RAW replacement, interrupted RAW recovery and interrupted legacy recovery are independent real walks
-/// over fresh projects.
-/// - a default adopt over a main in a format this runtime only replaces refuses before it
-///   records anything, and leaves that main's bytes alone;
+/// Re-adoption (02_workspaces.md, "Re-adoption: space reclamation"): RAW replacement and
+/// interrupted RAW recovery are independent real walks over fresh projects.
 /// - `adopt --re-adopt` replaces an adopted main with a fresh RAW image under a new incarnation,
 ///   keeping the checkout's tracked and untracked bytes, its Git HEAD and status, its build
 ///   volume's identity, owner record and warm contents, and the original `.pre-cowshed` tree;
-/// - the replaced main and build images stay at their retained paths, in their own format.
+/// - the replaced main and build images stay at their retained paths.
 #[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_raw_re_adoption_preserves_build_identity_and_replays_published_build_loss() {
     prove_re_adoption(ReAdoptionProof::RawReplacement).await;
@@ -5145,15 +5142,9 @@ async fn real_apfs_re_adopt_resumes_an_interrupted_replacement_without_a_second_
     prove_re_adoption(ReAdoptionProof::RawInterruptedRecovery).await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn real_apfs_re_adopt_resumes_legacy_inputs_without_a_second_replacement() {
-    prove_re_adoption(ReAdoptionProof::LegacyRecovery).await;
-}
-
 enum ReAdoptionProof {
     RawReplacement,
     RawInterruptedRecovery,
-    LegacyRecovery,
 }
 
 async fn prove_re_adoption(proof: ReAdoptionProof) {
@@ -5174,21 +5165,6 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
         OsString::from("--capacity"),
         OsString::from("1g"),
     ];
-
-    // A main adopted before RAW is invisible to this runtime's inventory: a default adopt must
-    // refuse rather than journal over it and mint a second main.
-    let legacy = project_root.join("main.asif");
-    fs::create_dir_all(&project_root).expect("project directory");
-    fs::write(&legacy, b"legacy main").expect("plant a legacy main");
-    let (refused, _, _) = run(&mut service, adopt_args.clone()).await;
-    let error = refused.expect_err("a default adopt over a legacy main refuses");
-    assert_eq!(error.code, ErrorCode::Conflict, "{error:?}");
-    assert!(error.hint.contains("--re-adopt"), "{error:?}");
-    assert_eq!(fs::read(&legacy).expect("legacy main"), b"legacy main");
-    assert!(!project_root.join("lifecycle-intents.json").exists());
-    assert!(!project_root.join("main.dmg").exists());
-    assert!(!pre_cowshed.exists(), "the checkout was not touched");
-    fs::remove_file(&legacy).expect("remove the planted legacy main");
 
     // An ordinary RAW main, with a linked build volume holding warm state.
     let (result, _, _) = run(&mut service, adopt_args).await;
@@ -5330,140 +5306,43 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
     }
     service.shutdown().await.expect("stop the runtime");
 
-    // Start either independent interrupted-recovery walk from this first warm RAW adoption.
-    // Only the legacy walk converts detached fixture inputs; the RAW walk keeps their format.
+    // Start the interrupted-recovery walk from this first warm RAW adoption.
     let host = MacOsApfsExecutionHost::new(
         SystemCommandRunner,
         ApfsSubstrateConfig::new(fixture.storage.store(), &fixture.checkout),
     )
     .expect("fixture controller");
-    if let ReAdoptionProof::LegacyRecovery = proof {
-        let build_image = layout.image(&main_volume);
-        for image in [&main_image, &build_image] {
-            host.detach_existing_image(image, DetachIntent::WhenIdle)
-                .expect("seal only this fixture input");
-            if image == &main_image {
-                // This own underlay blocks publication after the warm build copy, giving the
-                // prepublication crash boundary without a mock or a second volume setup.
-                fs::write(
-                    fixture.checkout.join("publication-blocker"),
-                    b"operator data\n",
-                )
-                .expect("hold the fixture's publication boundary");
-            }
-            let legacy_image = image.with_extension("asif");
-            let convert = cowshed_apfs::CommandRequest::new(
-                "/usr/sbin/diskutil",
-                [
-                    OsString::from("image"),
-                    OsString::from("create"),
-                    OsString::from("from"),
-                    OsString::from("--format"),
-                    OsString::from("ASIF"),
-                    image.as_os_str().to_os_string(),
-                    legacy_image.as_os_str().to_os_string(),
-                ],
-            );
-            let converted = SystemCommandRunner
-                .run(&convert)
-                .expect("native ASIF fixture conversion");
-            assert!(
-                converted.succeeded(),
-                "ASIF fixture conversion: {converted:?}"
-            );
-            fs::rename(image, image.with_extension("fixture-raw"))
-                .expect("retain original RAW fixture");
-            let suffixes: &[&str] = if image == &main_image {
-                &[".grants.json", ".ca.key"]
-            } else {
-                &[".json", ".hold"]
-            };
-            for suffix in suffixes {
-                let from = PathBuf::from(format!("{}{suffix}", image.display()));
-                let to = PathBuf::from(format!("{}{suffix}", legacy_image.display()));
-                if from.exists() {
-                    fs::rename(from, to).expect("carry the fixture's actual sidecar or hold");
-                }
-            }
-            let mount = if image == &main_image {
-                fixture.checkout.clone()
-            } else {
-                layout.mount(&main_volume)
-            };
-            let attach = cowshed_apfs::CommandRequest::new(
-                "/usr/sbin/diskutil",
-                [
-                    OsString::from("image"),
-                    OsString::from("attach"),
-                    OsString::from("--nobrowse"),
-                    OsString::from("--mountPoint"),
-                    mount.as_os_str().to_os_string(),
-                    legacy_image.as_os_str().to_os_string(),
-                ],
-            );
-            let attached = SystemCommandRunner
-                .run(&attach)
-                .expect("attach actual legacy fixture");
-            assert!(attached.succeeded(), "legacy fixture attach: {attached:?}");
-        }
-        assert_eq!(linked_volume(&layout, &fixture.checkout), main_volume);
-        let legacy_record: BuildVolumeRecord =
-            cowshed_core::metadata::read_json(&build_image.with_extension("asif.json"))
-                .expect("the original ASIF build owner record");
-        assert_eq!(legacy_record, record);
-        // Setup's native project list must not admit this legacy main to rebuild-only refresh.
-        // This is the exact production inventory used by NativeSetupHost::build_state_projects.
-        let setup_projects = cowshed_core::NativeGatewayInventory::new(fixture.storage.clone())
-            .adopted_projects()
-            .await
-            .expect("setup inventory preserves legacy inputs");
-        assert!(
-            setup_projects
-                .iter()
-                .all(|project| { project.repo_id != RepoId::parse("fixture/dispatch").unwrap() })
-        );
-        assert_eq!(fs::read(warm.join("build.ninja")).unwrap(), b"warm\n");
-        assert_eq!(
-            cowshed_core::metadata::read_json::<BuildVolumeRecord>(
-                &build_image.with_extension("asif.json")
-            )
-            .unwrap(),
-            record
-        );
-    } else {
-        use cowshed_core::storage::apfs::native::{KernelMountSource, SystemKernelMountSource};
-        let main_device = SystemKernelMountSource
-            .mounts()
-            .expect("own fixture mounts")
-            .into_iter()
-            .find(|mount| mount.mount_point == fixture.checkout)
-            .expect("main is mounted at its checkout")
-            .source_device;
-        let unmount = cowshed_apfs::CommandRequest::new(
-            "/sbin/umount",
-            [fixture.checkout.as_os_str().to_os_string()],
-        );
-        let result = SystemCommandRunner.run(&unmount).unwrap();
-        assert!(result.succeeded(), "own main unmount: {result:?}");
-        fs::write(
-            fixture.checkout.join("publication-blocker"),
-            b"operator data\n",
-        )
-        .expect("hold the fixture's publication boundary");
-        let remount = cowshed_apfs::CommandRequest::new(
-            "/sbin/mount_apfs",
-            [
-                OsString::from("-o"),
-                OsString::from("nobrowse,owners,noatime"),
-                OsString::from(&main_device),
-                fixture.checkout.as_os_str().to_os_string(),
-            ],
-        );
-        let result = SystemCommandRunner.run(&remount).unwrap();
-        assert!(result.succeeded(), "own main remount: {result:?}");
-        assert_eq!(git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]), head);
-        assert_eq!(fs::read(warm.join("build.ninja")).unwrap(), b"warm\n");
-    }
+    let main_device = SystemKernelMountSource
+        .mounts()
+        .expect("own fixture mounts")
+        .into_iter()
+        .find(|mount| mount.mount_point == fixture.checkout)
+        .expect("main is mounted at its checkout")
+        .source_device;
+    let unmount = cowshed_apfs::CommandRequest::new(
+        "/sbin/umount",
+        [fixture.checkout.as_os_str().to_os_string()],
+    );
+    let result = SystemCommandRunner.run(&unmount).unwrap();
+    assert!(result.succeeded(), "own main unmount: {result:?}");
+    fs::write(
+        fixture.checkout.join("publication-blocker"),
+        b"operator data\n",
+    )
+    .expect("hold the fixture's publication boundary");
+    let remount = cowshed_apfs::CommandRequest::new(
+        "/sbin/mount_apfs",
+        [
+            OsString::from("-o"),
+            OsString::from("nobrowse,owners,noatime"),
+            OsString::from(&main_device),
+            fixture.checkout.as_os_str().to_os_string(),
+        ],
+    );
+    let result = SystemCommandRunner.run(&remount).unwrap();
+    assert!(result.succeeded(), "own main remount: {result:?}");
+    assert_eq!(git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]), head);
+    assert_eq!(fs::read(warm.join("build.ninja")).unwrap(), b"warm\n");
     let mut recovery_service = fixture.open().await;
     let (refused, _, _) = run(
         &mut recovery_service,

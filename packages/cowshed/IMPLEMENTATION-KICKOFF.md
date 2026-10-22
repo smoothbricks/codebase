@@ -23,12 +23,11 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
 
 - **Substrate**: clonefile'd disk images (Option B). Shadows rejected (2.34× worse sync writes, base-file GC
   dependency). **One format: RAW (UDRW) `.dmg` holding one case-sensitive APFS volume, stored as a sparse file**
-  (01a_apfs.md §Images). No fallback, no format field anywhere, macOS 26 is the floor. Historical, pre-cutover ASIF
-  measurements: ASIF was measured faster than SPARSE on every row (2.1× create, 2.5× write, 5.6× read, 2.3× metadata;
-  clonefile equal) and equal to case-insensitive ASIF within noise; they do not describe RAW. Blank templates are
-  created unprivileged: `diskutil image create blank --format RAW --fs None`, attach `--noMount`,
-  `newfs_apfs -U/-G … -e`, `fsck_apfs -q`, `hdiutil detach`; attach is `diskutil image attach` (01a_apfs.md §Images,
-  §Mounts).
+  (01a_apfs.md §Images). No fallback, no format field anywhere, macOS 26 is the floor; an image in any other format is
+  refused by its format and path, never converted. Blank templates are created unprivileged: a sparse file of the
+  capacity created directly, an in-kernel `hdiutil attach -kernel` of the RAW class, `newfs_apfs -U/-G … -e`,
+  `fsck_apfs -q`, `hdiutil detach`; every attach is `hdiutil attach -kernel` and no DiskImages2 verb runs (01a_apfs.md
+  §Images, §Mounts).
 - **No workspace pools**: main-as-base; formatted blank templates serve image minting only. `cowshed adopt` turns the
   existing checkout into an image mounted at its original path; `cowshed fork` descriptor-clones main's live image after
   a flush, with main still mounted (filesystem crash-consistent). Safe because secrets never live in worktrees (gateway

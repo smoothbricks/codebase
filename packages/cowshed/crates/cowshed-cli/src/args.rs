@@ -655,7 +655,6 @@ pub struct LandArgs {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DoctorArgs {
     pub repair: bool,
-    pub clear_attach_budget: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1043,7 +1042,7 @@ pub fn cli_command() -> ClapCommand {
             value("ref-lock"),
             flag("ungated"),
         ]))
-        .subcommand(leaf("doctor").args([flag("repair"), flag("clear-attach-budget")]))
+        .subcommand(leaf("doctor").args([flag("repair")]))
         .subcommand(
             leaf("disk-command")
                 .arg(positional("tool", 0..=1))
@@ -2436,7 +2435,7 @@ const ADOPT: CommandSpec = CommandSpec {
         "Converts an existing checkout into this repository's image-backed main workspace, at the same path. Run it once per repository; every other verb finds its project from the cwd or `--project`. Adoption is the only operation that copies a source tree into an image, and one of only two commands that may create host storage — so the first adopt on a host may raise one administrator prompt while the cowshed volumes are created, and no ordinary command ever can.",
         "`cowshed setup` is the other, and the one every storage error points at: it repairs a host without needing a checkout to adopt. Reach for adopt when you have a repository to bring in, and for setup when the machine itself is wrong.",
         "The secret gate runs before anything changes. A refusal names every offending file and prints the exact controller-owned `waivers.json` path plus a valid entry example. Entries carry an exact repository-relative `path` and a non-empty `reason`. Only intentionally committed synthetic or public detector fixtures that can never hold live credentials may be waived — never live, temporary, copied, developer-local, deployment, or recoverable credentials. A waiver unblocks adoption while every waived finding stays retained for audit.",
-        "Default adopt is idempotent. `--re-adopt` explicitly replaces an adopted main through a durable, verified copy into a fresh sparse RAW image. It retains the old backing image and the original `.pre-cowshed` tree, carries the entire checkout and Git state, and preserves the warm build volume's identity. Use it for a format transition or guest-space reclamation; run outside the checkout with no source or build-volume holders.",
+        "Default adopt is idempotent. `--re-adopt` explicitly replaces an adopted main through a durable, verified copy into a fresh sparse RAW image. It retains the old backing image and the original `.pre-cowshed` tree, carries the entire checkout and Git state, and preserves the warm build volume's identity. Use it to reclaim guest-freed space; run outside the checkout with no source or build-volume holders.",
     ],
     options: &[
         Opt {
@@ -3590,7 +3589,7 @@ const DEFRAG: CommandSpec = CommandSpec {
     trailing: "",
     summary: "rewrite source and build images contiguously",
     about: &[
-        "Rewrites the workspace image, its registered live build source and every published seed of this incarnation. Doctor reports the actual source and seed counts separately. A fork warns, and proceeds, when a physical image generation has more than 7140 extents: a standalone first-write sensitivity limit from one loaded RAW observation at 140.046964 µs/extent, not a causal calibration or whole-fork latency guarantee. The historical ASIF-era 12 µs predictor is unchanged; multiple images and attach, mount, identity and proof work share the total budget.",
+        "Rewrites the workspace image, its registered live build source and every published seed of this incarnation. Doctor reports the actual source and seed counts separately. A fork warns, and proceeds, when a physical image generation has more than 7140 extents: a standalone first-write sensitivity limit from one loaded RAW observation at 140.046964 µs/extent, not a causal calibration or whole-fork latency guarantee. Multiple images and attach, mount, identity and proof work share the total budget.",
         "The workspace is detached the way `resize` detaches it — a volume with a file open or a job running refuses before the image is touched — then its data is copied with plain reads and writes into a sibling, flushed, renamed over the image, verified by attaching it, and mounted again if it was mounted. The copy needs as much free space as the image has allocated, and keeps it while older clones and checkpoints still share the old blocks.",
         "A refused pending clone may contain the only copy of dirty work. `defrag <pending-workspace>` rewrites that same payload without publishing or deleting it, and refuses while its original creator still holds the intent lease. Retry the original fork after the rewrite.",
     ],
@@ -3974,22 +3973,15 @@ const DOCTOR: CommandSpec = CommandSpec {
         "Checks the invariants a healthy host holds: every image has a marker, every mount matches an image, grants files parse, the caches volume and the gateway answer, autosave is fresh, and nothing reclaimable is stranded — retired trash, and staging entries (images, sidecars, mountpoints, attached volumes) that no running operation owns are each a finding with their byte count. Exit 0 when healthy, otherwise 5.",
         "With `--repair`, first validates every mounted workspace artifact frame. Duplicate or regressed sequences are refused because resequencing would change store identity and make the rewritten log attest to itself; create a fresh store instead. Repair then runs the same sweep `gc` runs, so stranded trash and orphaned staging are retired under gc's rules and reported.",
     ],
-    options: &[
-        Opt {
-            spelling: "--repair",
-            meaning: "validate artifact ordering, refuse identity-changing sequence rewrites, then reclaim what gc would",
-        },
-        Opt {
-            spelling: "--clear-attach-budget",
-            meaning: "end this boot's recorded disk-image attach-pool exhaustion and forget its recorded ceiling, once what spent it is freed",
-        },
-    ],
+    options: &[Opt {
+        spelling: "--repair",
+        meaning: "validate artifact ordering, refuse identity-changing sequence rewrites, then reclaim what gc would",
+    }],
 };
 
 fn parse_doctor(matches: &ArgMatches) -> Result<Command, UsageError> {
     Ok(Command::Doctor(DoctorArgs {
         repair: flagged(matches, "repair"),
-        clear_attach_budget: flagged(matches, "clear-attach-budget"),
     }))
 }
 
@@ -4677,45 +4669,6 @@ mod tests {
             Command::Doctor(repair).project_discovery(),
             ProjectDiscovery::Optional
         );
-    }
-
-    #[test]
-    fn doctor_clear_attach_budget_is_an_explicit_flag() {
-        let Command::Doctor(clear) = parse_args(["doctor", "--clear-attach-budget"])
-            .unwrap()
-            .command
-        else {
-            panic!("expected doctor")
-        };
-        assert!(clear.clear_attach_budget);
-        assert!(!clear.repair);
-    }
-
-    /// Every `cowshed …` command an attach-budget hint or next step prints parses as a
-    /// valid invocation: a hint that names a command the CLI refuses is a dead end at the
-    /// exact moment the operator is out of attach headroom.
-    #[test]
-    fn attach_budget_hint_commands_parse_as_cowshed_invocations() {
-        use cowshed_apfs::attach_budget::{CLEAR_COMMAND, ORPHANS_FIRST_HINT};
-        for hint in [CLEAR_COMMAND, ORPHANS_FIRST_HINT] {
-            let mut spans = 0;
-            let mut candidates: Vec<&str> = hint.split('`').skip(1).step_by(2).collect();
-            if candidates.is_empty() {
-                candidates.push(hint);
-            }
-            for span in candidates {
-                let Some(argv) = span.strip_prefix("cowshed ") else {
-                    continue;
-                };
-                spans += 1;
-                let argv: Vec<&str> = argv.split_whitespace().collect();
-                parse_args(argv.clone()).unwrap_or_else(|error| {
-                    panic!("hint command `cowshed {argv:?}` does not parse: {error}")
-                });
-            }
-            assert!(spans >= 1, "no cowshed command in hint: {hint}");
-        }
-        assert_eq!(CLEAR_COMMAND, "cowshed doctor --clear-attach-budget");
     }
 
     #[test]

@@ -1,5 +1,5 @@
-//! Read-only Git evidence for `specs/cowshed/02_workspaces.md`, "Re-adoption:
-//! format transition and space reclamation", steps 2, 4 and 5. The surrounding
+//! Read-only Git evidence for `specs/cowshed/02_workspaces.md`, "Re-adoption: space
+//! reclamation", steps 2, 4 and 5. The surrounding
 //! transaction preserves the complete filesystem, including Git's administrative
 //! files; these probes independently check Git's interpretation of that copy.
 //! `01a_apfs.md` "Images" keeps the retained source until verification passes.

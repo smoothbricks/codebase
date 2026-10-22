@@ -235,10 +235,6 @@ class HostImpl implements Host {
     await callNativeAsync(() => N.hostDetachAll(this.#native, {}));
   }
 
-  async clearAttachBudget(): Promise<void> {
-    await callNativeAsync(() => N.hostClearAttachBudget(this.#native, {}));
-  }
-
   async forgetAbandoned(repoId: Api.RepoRequest['repoId']): Promise<Api.ProjectRetirementReport> {
     return callNativeAsync(() => N.hostForgetAbandoned(this.#native, { repoId }));
   }

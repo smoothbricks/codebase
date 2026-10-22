@@ -1,56 +1,36 @@
-//! `attach-budget`: the host's DiskImages2 attach pool as one JSON line (08_testing.md, "Host
-//! limit"), read without attaching anything. Cowshed attaches its images in the kernel, so the
-//! pool gates nothing; the line is evidence for the leaked-device delta across a lane run. A pool
-//! that cannot be read prints `unread` and exits 1. `--clear` ends this boot's recorded
-//! exhaustion once the operator has freed what spent it (killed the orphaned or stalled helpers
-//! `cowshed doctor` names).
+//! `attach-budget`: the host's disk-image device classes as one JSON line (08_testing.md, "Host
+//! limit"), read without attaching anything. Cowshed runs no DiskImages2 attach, so nothing is
+//! gated on them; the line is evidence for the leaked-device delta across a lane run. Classes
+//! that cannot be read print `unread` and exit 1.
 
 use std::process::ExitCode;
 
-use cowshed_apfs::attach_budget::{self, Budget, ClassCount};
+use cowshed_apfs::attach_budget::{self, ClassCount, KernelReading};
 use serde_json::{Value, json};
 
-const USAGE: &str = "usage: attach-budget | attach-budget --clear";
+const USAGE: &str = "usage: attach-budget";
 
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
-    match (args.next().as_deref(), args.next()) {
-        (None, None) => report(),
-        (Some("--clear"), None) => clear(),
-        _ => {
-            cowshed_os::eprintln!("{USAGE}");
-            ExitCode::from(2)
-        }
+    if std::env::args().nth(1).is_some() {
+        cowshed_os::eprintln!("{USAGE}");
+        return ExitCode::from(2);
     }
-}
-
-fn report() -> ExitCode {
-    match attach_budget::observe() {
-        Ok(budget) => {
-            println!("{}", line(&budget));
+    match attach_budget::read_kernel() {
+        Ok(reading) => {
+            println!("{}", line(&reading));
             ExitCode::SUCCESS
         }
         Err(error) => {
             println!("{}", json!({ "unread": error.to_string() }));
             cowshed_os::eprintln!(
-                "attach-budget: the disk-image attach pool is unreadable: {error}"
+                "attach-budget: the disk-image device classes are unreadable: {error}"
             );
             ExitCode::from(1)
         }
     }
 }
 
-fn clear() -> ExitCode {
-    match attach_budget::clear() {
-        Ok(_) => ExitCode::SUCCESS,
-        Err(error) => {
-            cowshed_os::eprintln!("attach-budget: clear the recorded exhaustion: {error}");
-            ExitCode::from(1)
-        }
-    }
-}
-
-fn line(budget: &Budget) -> Value {
+fn line(reading: &KernelReading) -> Value {
     let class = |count: ClassCount| {
         json!({
             "instances": count.instances,
@@ -58,7 +38,6 @@ fn line(budget: &Budget) -> Value {
             "leaked": count.leaked(),
         })
     };
-    let reading = &budget.reading;
     json!({
         "classes": {
             "AppleDiskImageDevice": class(reading.image_devices),
@@ -66,7 +45,5 @@ fn line(budget: &Budget) -> Value {
             "AppleAPFSVolume": class(reading.apfs_volumes),
             "IOMedia": class(reading.media),
         },
-        "spentThisBoot": budget.spent.is_some(),
-        "probableLeaks": budget.probable_leaks,
     })
 }

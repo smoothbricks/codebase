@@ -807,46 +807,6 @@ impl CowshedError {
                     "rerun the command from a shell whose sandbox allows writing the cowshed store",
                 );
             }
-            if let Some(cowshed_apfs::ApfsError::AttachPoolExhausted(_)) =
-                error.downcast_ref::<cowshed_apfs::ApfsError>()
-            {
-                // The host's finding, not storage's: no storage repair frees the attach pool.
-                return Self::environment_missing(
-                    message,
-                    cowshed_apfs::attach_budget::EXHAUSTED_HINT,
-                );
-            }
-            if let Some(run) = error.downcast_ref::<cowshed_apfs::CommandRunError>() {
-                // Refused before it spawned: the host's media count, not storage, is in the way.
-                match &run.failure {
-                    cowshed_apfs::CommandRunFailure::MediaCap(_) => {
-                        return Self::conflict(
-                            format!("{}: {run}", message.into()),
-                            cowshed_apfs::media_cap::MEDIA_CAP_HINT,
-                        );
-                    }
-                    cowshed_apfs::CommandRunFailure::MediaUnread(_) => {
-                        return Self::environment_missing(
-                            format!("{}: {run}", message.into()),
-                            "cowshed doctor (media-notification-cap)",
-                        );
-                    }
-                    // The host's attach pool, not storage: no storage repair frees it.
-                    cowshed_apfs::CommandRunFailure::AttachPoolSpent(_) => {
-                        return Self::environment_missing(
-                            format!("{}: {run}", message.into()),
-                            cowshed_apfs::attach_budget::EXHAUSTED_HINT,
-                        );
-                    }
-                    cowshed_apfs::CommandRunFailure::PoolUnread(_) => {
-                        return Self::environment_missing(
-                            format!("{}: {run}", message.into()),
-                            "cowshed doctor (disk-image-attach-budget)",
-                        );
-                    }
-                    _ => {}
-                }
-            }
             starved |= errno == Some(libc::ENFILE)
                 || error.is::<cowshed_apfs::CommandRunError>()
                 || matches!(
@@ -1287,61 +1247,6 @@ mod tests {
             panic!("the table is read only for disk-child and ENFILE failures")
         });
         assert_eq!(error.hint, "repair");
-    }
-
-    #[test]
-    fn a_spent_attach_pool_sends_the_caller_to_doctor_not_storage_repair() {
-        use cowshed_apfs::{
-            ApfsError, AttachPoolFailure, CommandOutput, CommandRequest, ProcessStatus,
-        };
-        let spent = ApfsError::AttachPoolExhausted(Box::new(AttachPoolFailure {
-            operation: "attach image without mounting",
-            request: CommandRequest::new("/usr/sbin/diskutil", ["image", "attach"]),
-            output: CommandOutput {
-                status: ProcessStatus::Exit(1),
-                stdout: Vec::new(),
-                stderr: b"Error: Disk image operation failed with error code 150\n".to_vec(),
-            },
-        }));
-        let error = CowshedError::storage_failure_under("build volume", &spent, "repair", || {
-            panic!("a spent pool is not blamed on the vnode table")
-        });
-        assert_eq!(error.code, ErrorCode::EnvironmentMissing);
-        assert_eq!(error.hint, cowshed_apfs::attach_budget::EXHAUSTED_HINT);
-        assert_eq!(error.message, "build volume");
-    }
-
-    /// An attach the media cap refused before it spawned is a conflict that names the count and
-    /// what frees media, never a storage repair or the vnode table.
-    #[test]
-    fn an_attach_refused_at_the_media_cap_names_what_frees_media() {
-        use cowshed_apfs::media_cap::{MEDIA_CAP_HINT, MediaReading, NOTIFICATION_CAP};
-        use cowshed_apfs::{ApfsError, CommandRequest, CommandRunError, CommandRunFailure};
-        let reached = MediaReading {
-            registered: 1_050,
-            attaching: 0,
-        }
-        .admits(NOTIFICATION_CAP, 1)
-        .expect_err("over the cap");
-        let refused = ApfsError::CommandRun(CommandRunError {
-            request: CommandRequest::new("/usr/sbin/diskutil", ["image", "attach", "/x.dmg"]),
-            failure: CommandRunFailure::MediaCap(reached),
-        });
-        let error =
-            CowshedError::storage_failure_under("mount workspace", &refused, "repair", || {
-                panic!("a media-cap refusal is not blamed on the vnode table")
-            });
-        assert_eq!(error.code, ErrorCode::Conflict);
-        assert_eq!(error.hint, MEDIA_CAP_HINT);
-        assert!(
-            error
-                .message
-                .starts_with("mount workspace: refused executable \"/usr/sbin/diskutil\"")
-                && error.message.contains("MediaCapReached")
-                && error.message.contains("1050 IOMedia registered"),
-            "{}",
-            error.message
-        );
     }
 
     #[test]

@@ -97,24 +97,6 @@ fn runner_error(error: CommandRunError) -> CowshedError {
             message,
             "no disk tool renames a volume; create it under its final name (specs/cowshed/01a_apfs.md, \"Ownership, identity, and the volume label\")",
         ),
-        CommandRunFailure::MediaCap(_) => {
-            CowshedError::conflict(message, cowshed_apfs::media_cap::MEDIA_CAP_HINT)
-        }
-        CommandRunFailure::MediaUnread(_) => CowshedError::new(
-            ErrorCode::EnvironmentMissing,
-            message,
-            "cowshed doctor (media-notification-cap)",
-        ),
-        CommandRunFailure::AttachPoolSpent(_) => CowshedError::new(
-            ErrorCode::EnvironmentMissing,
-            message,
-            cowshed_apfs::attach_budget::EXHAUSTED_HINT,
-        ),
-        CommandRunFailure::PoolUnread(_) => CowshedError::new(
-            ErrorCode::EnvironmentMissing,
-            message,
-            "cowshed doctor (disk-image-attach-budget)",
-        ),
         CommandRunFailure::Spawn(_)
         | CommandRunFailure::Wait(_)
         | CommandRunFailure::Kill { .. }

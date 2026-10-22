@@ -1,7 +1,7 @@
 //! Journal proof for the explicit re-adoption intent, `LifecycleIntent::ReAdopt`.
 //!
-//! Governing specs: `specs/cowshed/02_workspaces.md` "Re-adoption: format transition and space
-//! reclamation" steps 1-5 (the durable intent records the exact source backing path, incarnation,
+//! Governing specs: `specs/cowshed/02_workspaces.md` "Re-adoption: space reclamation" steps 1-5
+//! (the durable intent records the exact source backing path, incarnation,
 //! checkout, build identity, kernel capacities and retained paths before anything changes, and an
 //! existing `<checkout>.pre-cowshed` is never overwritten); `specs/cowshed/01a_apfs.md` "Images"
 //! (capacity is recorded from the kernel before detach); `specs/cowshed/16_build_volumes.md`
@@ -622,7 +622,7 @@ fn re_adopt_source_with_malformed_fields_is_refused() {
         serde_json::to_value(fixture.intent(Some(fixture.build()))).expect("encode ReAdopt");
     let project = fixture.project.display().to_string();
     type MalformedField = (&'static str, fn(&mut Value, &str));
-    let cases: [MalformedField; 21] = [
+    let cases: [MalformedField; 20] = [
         ("image capacity as text", |v: &mut Value, _: &str| {
             v["source"]["image"]["capacityBytes"] = json!("100GiB");
         }),
@@ -720,18 +720,39 @@ fn re_adopt_source_with_malformed_fields_is_refused() {
                 v["source"]["replacement"] = json!(OLD_INCARNATION);
             },
         ),
-        (
-            "legacy main retained as if it were RAW",
-            |v: &mut Value, project: &str| {
-                v["source"]["image"]["original"] = json!(format!("{project}/main.asif"));
-            },
-        ),
     ];
     for (label, mutate) in cases {
         let mut damaged = valid.clone();
         mutate(&mut damaged, &project);
         assert_refused(damaged, label);
     }
+}
+
+/// Cowshed attaches RAW only: a record whose retained main is a file in another format is refused
+/// by that format and its path before anything is recorded or attached.
+#[test]
+fn re_adopt_record_naming_a_non_raw_input_is_refused_by_format_and_path() {
+    let fixture = Fixture::new();
+    let mut damaged =
+        serde_json::to_value(fixture.intent(Some(fixture.build()))).expect("encode ReAdopt");
+    let foreign = fixture.project.join("main.asif");
+    damaged["source"]["image"]["original"] = json!(foreign);
+    let LifecycleIntent::ReAdopt { source, .. } =
+        serde_json::from_value::<LifecycleIntent>(damaged.clone()).expect("a well-formed record")
+    else {
+        panic!("the fixture records a re-adoption");
+    };
+    let refused = source
+        .validate()
+        .expect_err("a non-RAW retained input is refused");
+    assert!(
+        refused.message.contains(&format!(
+            "image {} has extension Some(\"asif\")",
+            foreign.display()
+        )),
+        "{refused:?}"
+    );
+    assert_refused(damaged, "a non-RAW retained main");
 }
 
 #[test]

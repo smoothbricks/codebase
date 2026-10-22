@@ -128,8 +128,8 @@ No mounts, no root, no network — pure functions with table-driven cases:
   retired workspace whose 100 GiB sparse checkpoint images are mode 000 succeed, because identity is taken from `stat`
   and never opens an image; a same-size, same-time replacement image and a same-length, same-time rewritten record each
   change the identity. The unreadable-inventory fixture uses ordinary RAW `.dmg` candidates: the first candidate is
-  deferred on its inventory error while the later candidate is reclaimed. Legacy `.sparseimage` files remain excluded
-  from GC.
+  deferred on its inventory error while the later candidate is reclaimed. A file that is not a `.dmg` is never a GC
+  candidate.
 - **Push CAS and preservation model**: pure state-machine tables cover each omitted/satisfied/mismatched combination of
   expected workspace incarnation, source head, and destination ref head (including expected-missing). A mismatch is a
   `Conflict` that preserves the old destination exactly and leaves the source live; success reports one source object ID
@@ -428,11 +428,12 @@ vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool exported on te
 same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
 The panic/kill cleanup fixture reads only its own child's stdout pipe. Before ending that child it requires two complete
-line-start image records (RAW, then retained ASIF) and the worker record; neither a sibling's output nor a host
-inventory count substitutes for either record. The child runs libtest with `--nocapture --quiet`: terse output prevents
-the single-threaded pretty harness from prefixing the first record with `test <name> ... `. This matters under nextest's
-inherited `RUST_TEST_THREADS=1`, even while independent parent tests run in parallel. The strict two-record assertion
-and exact-root teardown remain unchanged; no delay, retry, dropped assertion or broad sweep repairs a framing failure.
+line-start image records (the mounted RAW image, then the retained RAW input) and the worker record; neither a sibling's
+output nor a host inventory count substitutes for either record. The child runs libtest with `--nocapture --quiet`:
+terse output prevents the single-threaded pretty harness from prefixing the first record with `test <name> ... `. This
+matters under nextest's inherited `RUST_TEST_THREADS=1`, even while independent parent tests run in parallel. The strict
+two-record assertion and exact-root teardown remain unchanged; no delay, retry, dropped assertion or broad sweep repairs
+a framing failure.
 
 Owned-image command-boundary controls pin current provider-tree projection, excluding a foreign/stale cached BSD
 descendant before any command effect, and retain moved/reused-device refusals. Fixture injectors resolve their recorded
@@ -455,12 +456,12 @@ root/source/FSID, descriptor-native naming compatibility, unforced `funmount`, r
 independent original-FSID absence; an errno or constructed fake state alone is not the oracle. Native exact-`EBUSY`
 policy controls retain monotonic grace and intent-specific force authority, while permission and other failures never
 earn grace. Exact physical-device `hdiutil detach`, post-grant guards and unchanged command named-dissenter/busy parsers
-remain covered. Real image teardown still proves the complete mounted RAW plus unmounted retained-ASIF panic/kill walk.
-An isolated pass after operator cleanup is not a repair verdict when the unchanged full gate repeats the failure;
-preserve both historical witnesses and exercise the real command cutover. The lease overlap fixture also drops B's
-returned handle before cleanup to prove exact-image recovery. A no-device cleanup control holds the backing-file lock:
-unlink refuses and preserves its bytes until an exclusive no-follow open proves it unlocked, then cleanup accepts both
-that file and an already-absent file without spending an image attach.
+remain covered. Real image teardown still proves the complete mounted RAW image plus unmounted, read-only retained RAW
+input panic/kill walk. An isolated pass after operator cleanup is not a repair verdict when the unchanged full gate
+repeats the failure; preserve both historical witnesses and exercise the real command cutover. The lease overlap fixture
+also drops B's returned handle before cleanup to prove exact-image recovery. A no-device cleanup control holds the
+backing-file lock: unlink refuses and preserves its bytes until an exclusive no-follow open proves it unlocked, then
+cleanup accepts both that file and an already-absent file without spending an image attach.
 
 The killed-caller attach fixture captures helper PIDs from the existing I/O Registry creator walker, joined to its exact
 backing image before release. After its own attach/release operations finish, two reads must find no orphan among those
@@ -489,7 +490,7 @@ production tree-copy path; atomic filesystem bindings expose them at checkout an
 connections, command supervision, lock contention, publication records and recovery journals remain real. These
 `directory_*` tests and the clone-intent recovery binary run in ordinary Cargo test shards without creating or attaching
 a disk image. Directory stores report actual tree allocation, not fabricated block-device counters; volume labels,
-physical resizing, read-only mounts and legacy-image conversion remain native-host tests. Their scratch roots use
+physical resizing and read-only mounts remain native-host tests. Their scratch roots use
 `/private/tmp/cowshed-dtest-<pid>-<n>-<label>` and share process cleanup with the image fixtures, but neither their
 setup nor their cleanup enumerates or releases disk images.
 
@@ -530,9 +531,9 @@ modification time so binding renames do not count as build writes. A missing roo
 name the actual path. The deterministic listing-then-removal regression checks those clocks and root refusal; the
 ordinary directory rebase lifecycle proves main can run Nx, fork, land and carry its indexed entries afterward.
 
-Re-adoption has independent real walks for RAW replacement, prepublication RAW recovery, and retained legacy-input
-recovery. Each interrupted walk resumes the recorded replacement through `mount main` and ordinary startup without
-issuing a second replacement or retained generation, preserving the checkout and warm build-volume identity.
+Re-adoption has independent real walks for RAW replacement and prepublication RAW recovery. Each interrupted walk
+resumes the recorded replacement through `mount main` and ordinary startup without issuing a second replacement or
+retained generation, preserving the checkout and warm build-volume identity.
 
 The Linux job-accounting fixture is a separate kernel-counter proof, not a production ZFS workspace-admission proof. It
 runs from the ordinary runner through a passwordless-sudo delegated scope; only its parent prepares and cleans up a
@@ -574,22 +575,22 @@ verdicts, and an unrelated source change preserves both cache keys.
 
 Native-host integration whose subject combines physical images with core lifecycle state runs in
 `cargo-test-group-real-apfs-host`, with its own core/CLI Cargo dependency closure. This includes actual mount and label
-assertions, image resizing, legacy-image re-adoption and native recovery boundaries. The host target depends on the
-disk-image target: the two groups never run concurrently. Each nextest group declares `max-threads = 1`.
-`.config/nextest.toml` owns their package-scoped selection filters, and the code-time wrapper rules select the same
-tests. Ordinary and exceptions shards exclude those filters. The root `host-e2e` target depends on both groups; the root
-`gate` target depends on every project's `lint`, `test` and `build` plus `host-e2e`. The land wrapper
-(`tooling/land-host.sh`) runs `nx run-many -t gate --parallel=$(sysctl -n hw.ncpu)` after rebasing and stopping the
-workspace's daemon. **The landing gate is never CPU-limited**: it runs at the core count, at default priority, with no
-`taskpolicy -b` and no outer deadline, because it is the run that moves main. Measured 2026-10-16: the same gate took 40
-minutes capped at `--parallel=2` under `taskpolicy -b` and 4m44s uncapped, and two per-test timeouts that reproduced in
-every capped run did not reproduce once the cap was removed - the failures were the cap, not the tests. Exploratory runs
-are the ones that get limited, and they are limited by being stopped rather than by being niced. This reaches the same
-checks as naming the ordinary targets and both host groups explicitly, but Nx owns the target list. Ordinary `test`
-remains free of the expensive host groups: Rule 2 keeps the inner loop cheap, while the explicit land gate includes host
-coverage and each group replays from cache unless its own inputs changed. `nx run-many -t host-e2e` is the focused host
-proof. Every test has one runner, and non-macOS inference supplies neither APFS runner; package-declared placeholders
-and explicit dependency edges may remain.
+assertions, image resizing, re-adoption and native recovery boundaries. The host target depends on the disk-image
+target: the two groups never run concurrently. Each nextest group declares `max-threads = 1`. `.config/nextest.toml`
+owns their package-scoped selection filters, and the code-time wrapper rules select the same tests. Ordinary and
+exceptions shards exclude those filters. The root `host-e2e` target depends on both groups; the root `gate` target
+depends on every project's `lint`, `test` and `build` plus `host-e2e`. The land wrapper (`tooling/land-host.sh`) runs
+`nx run-many -t gate --parallel=$(sysctl -n hw.ncpu)` after rebasing and stopping the workspace's daemon. **The landing
+gate is never CPU-limited**: it runs at the core count, at default priority, with no `taskpolicy -b` and no outer
+deadline, because it is the run that moves main. Measured 2026-10-16: the same gate took 40 minutes capped at
+`--parallel=2` under `taskpolicy -b` and 4m44s uncapped, and two per-test timeouts that reproduced in every capped run
+did not reproduce once the cap was removed - the failures were the cap, not the tests. Exploratory runs are the ones
+that get limited, and they are limited by being stopped rather than by being niced. This reaches the same checks as
+naming the ordinary targets and both host groups explicitly, but Nx owns the target list. Ordinary `test` remains free
+of the expensive host groups: Rule 2 keeps the inner loop cheap, while the explicit land gate includes host coverage and
+each group replays from cache unless its own inputs changed. `nx run-many -t host-e2e` is the focused host proof. Every
+test has one runner, and non-macOS inference supplies neither APFS runner; package-declared placeholders and explicit
+dependency edges may remain.
 
 The land gate uses `--outputStyle=static-failures-only` and must exit zero before the expected-tip fast-forward and
 workspace retirement. Any failed task, timeout or infrastructure failure stops the land: there is no bound-only retry,
@@ -724,26 +725,24 @@ per-test attach fails the lane instead of silently spending the pool. A test who
 becomes assertions in that neighbour rather than a separate test, and anything that does not need a real device is a
 pure or unit test with no image at all: the real-device lane holds a few scenario tests per fixture, not a test per
 behaviour. Fixtures attach through the production path, in the kernel (01a_apfs.md, "Mounts"), which draws nothing from
-the DiskImages2 pool; a fixture that deliberately attaches through DiskImages2 and meets error code 150 has the runner
-record it for `doctor`. The lane stays `--no-fail-fast`, so its ordinary failures still run to the end.
-`attach-budget --clear` still ends a recorded 150 after the operator freed what spent it. The leaked-device delta across
-a lane run (`ioclasscount AppleDiskImageDevice` against the registered devices, before and after) is the check that no
-disk-image command still leaks on a clean run; it must be 0. The system runner also refuses an image attach whose media
-would reach IOKit's match-notification ceiling (01a_apfs.md, "The IOMedia match-notification ceiling") with
-`MediaCapReached`, so a lane on a host near the cap fails by name instead of hanging.
-`real_apfs_making_room_detaches_the_least_recently_used_idle_session_and_refuses_by_name` proves making room
-(02_workspaces.md) on the real kernel: the cap is its decision input, set just short of the host's own count, and every
-count is read from the registry, never faked. Other users' attaches move the count, so each outcome is checked against
-`plan` on the readings `make_room` decided on. The decision's properties (only idle workspaces, least recently used
-first, enough or none) are proptests of `plan`.
+the DiskImages2 pool, and the lane creates no image with a disk tool. The lane stays `--no-fail-fast`, so its ordinary
+failures still run to the end. The leaked-device delta across a lane run (`ioclasscount AppleDiskImageDevice` against
+the registered devices, before and after) is the check that no disk-image command still leaks on a clean run; it must
+be 0. The system runner also refuses an image attach whose media would reach IOKit's match-notification ceiling
+(01a_apfs.md, "The IOMedia match-notification ceiling") with `MediaCapReached`, so a lane on a host near the cap fails
+by name instead of hanging. `real_apfs_making_room_detaches_the_least_recently_used_idle_session_and_refuses_by_name`
+proves making room (02_workspaces.md) on the real kernel: the cap is its decision input, set just short of the host's
+own count, and every count is read from the registry, never faked. Other users' attaches move the count, so each outcome
+is checked against `plan` on the readings `make_room` decided on. The decision's properties (only idle workspaces, least
+recently used first, enough or none) are proptests of `plan`.
 
 **The suite spends a finite host budget.** Every attach→detach cycle a test makes can leak an AppleDiskImages2 device
 that the host's live sheds lose until reboot (01a_apfs.md, "How the APFS host degrades" §2), so a test pays the fewest
 attach cycles that prove its behavior. A run that killed a test leaves that test's images attached until recovery
 reclaims its dead root. `real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end` proves panic and
-SIGKILL cleanup with one RAW image and one retained ASIF input. Its parent owns the helper roots: panic drops the
-child's root, while a killed child's exact reported root is reclaimed after the parent reaps it. This uses the same
-process/image/tree cleanup as root drop, without starting a host-wide sweep or waiting on unrelated dead runs.
+SIGKILL cleanup with one mounted RAW image and one read-only retained RAW input. Its parent owns the helper roots: panic
+drops the child's root, while a killed child's exact reported root is reclaimed after the parent reaps it. This uses the
+same process/image/tree cleanup as root drop, without starting a host-wide sweep or waiting on unrelated dead runs.
 Owned-attachment release selects the exact backing path the kernel holds, not the runtime image extension: a retained
 input must be released too. Ordinary runtime enumeration and attachment remain RAW-only (02_workspaces.md,
 "Re-adoption"); cleanup neither attaches nor converts an image. A scratch root's teardown and the sweep release a root's
@@ -756,8 +755,8 @@ owns and joins that thread; dropping another root never takes its handle or wait
 starter's sweep blocked while another root finishes cleanup. An individual image-release refusal retains only the dead
 root containing that image; the sweep reports every refusal and still removes other dead roots after releasing their
 images. An inventory failure retains every root, since no root's image-release safety can then be proved. Root-local
-refusal and continued reclamation have a pure, platform-independent regression; one unrelated legacy image must not
-leave another run's already-detached files behind. Nothing a test does depends on the predecessor sweep, since no sweep
+refusal and continued reclamation have a pure, platform-independent regression; one unreleased image must not leave
+another run's already-detached files behind. Nothing a test does depends on the predecessor sweep, since no sweep
 selects a live pid's root. The starter keeps its sweep alive through completion, including on unwind. Child fixtures
 whose parent owns their recovery create only their own roots; they never reset the suite run identity to force another
 host-wide scan. That old coupling made the panic witness spend 44.7 seconds joining a 52-second scan of unrelated dead
@@ -1062,19 +1061,18 @@ registration.
 **The fork extent warning is a standalone first-write sensitivity bound, not a whole-clone SLO, and never refuses a
 fork.** One loaded RAW observation was 60.845084042 s for 434,462 extents: 140.046964 µs/extent. At that observed rate,
 **7,140 extents** take less than 1 s and 7,141 exceed it; 1,785 fit 250 ms and 1,786 do not. The cause is unattributed.
-This is measured sensitivity, not causal calibration: the historical **12 µs/extent ASIF-era synthetic predictor remains
-unchanged** and is reported separately. Concurrent first writes and container-wide contention can change the rate, so
-neither predictor is a latency guarantee. Further attribution found 440,074-extent first writes taking 50.004/39.605 s
+This is measured sensitivity, not causal calibration. Concurrent first writes and container-wide contention can change
+the rate, so it is not a latency guarantee. Further attribution found 440,074-extent first writes taking 50.004/39.605 s
 wall versus 5.981/5.633 s system CPU, reading 801–823 MB, while a 25,013-extent source took about 4.04 s (about 161
 µs/extent, above the selected 140 µs sensitivity). Off-CPU work is substantial; those observations do not establish a
-universal per-extent calibration or justify replacing the historical predictor.
+universal per-extent calibration.
 
-A forkable physical generation must prove at most 7,140 extents for **both the workspace image and every build seed it
-publishes or clones**. The proof uses device/inode, length, allocated blocks, and nanosecond modification/change times
-before and after the extent walk; Git HEAD or the build tree is not a physical-generation identity. Unknown, changed or
-oversized generations refuse publication. Each admission or publication extent walk stops at the 7,141st run; proof work
+The extent warning applies to **both the workspace image and every build seed it publishes or clones**. The proof uses
+device/inode, length, allocated blocks, and nanosecond modification/change times before and after the extent walk; Git
+HEAD or the build tree is not a physical-generation identity. Unknown or changed generations refuse publication;
+oversized generations warn and proceed. Each admission or publication extent walk stops at the 7,141st run; proof work
 is additional, never an unbounded recount concealed in the cold-fork number. Doctor explicitly counts the workspace
-sources, live build sources and build seeds, reporting each image's own count and both estimates.
+sources, live build sources and build seeds, reporting each image's own count and RAW sensitivity estimate.
 
 The cold-fork row remains a primitive-path regression target, not evidence that a production whole clone meets it.
 Attach, filesystem check/mount, identity work and proof collection consume additional time. Serialized first writes of

@@ -105,7 +105,7 @@
   prove that the parent released its upstream grant (`specs/cowshed/05_gateway.md:387` "Host CPU budget").
 
 - Measure cold `new`, `fork` and `checkpoint` on RAW images against the ≤ 1 s budgets. The clonefile and attach figures
-  behind those budgets come from the earlier ASIF-era benchmark, and no RAW timing backs them
+  behind those budgets come from a benchmark of an earlier image format, and no RAW timing backs them
   (`specs/cowshed/08_testing.md:586` "APFS / Seatbelt (macOS)"; `specs/cowshed/00_overview.md:152` "Tradeoffs";
   `specs/cowshed/09_substrates.md:208` "APFS image substrate (reference)").
 

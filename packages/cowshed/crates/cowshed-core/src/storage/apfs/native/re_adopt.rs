@@ -39,22 +39,6 @@ enum SeedSource<'a> {
 }
 
 impl<'a> SeedSource<'a> {
-    /// The published volume of `build`, which `claim` claimed at `build.image.original`. A RAW
-    /// original is the published volume, so `claim` holds the very hold file a fresh claim would
-    /// lock, and the seed borrows it. A legacy original holds `<original>.hold`, a different file:
-    /// the caller's claim keeps that resource, and the published volume takes its own claim.
-    fn of_published(
-        layout: &BuildVolumeLayout,
-        build: &'a ReAdoptBuild,
-        claim: &'a ReleaseClaim,
-    ) -> Self {
-        if build.image.original == layout.image(&build.id) {
-            Self::Claimed(claim)
-        } else {
-            Self::Unclaimed(&build.id)
-        }
-    }
-
     /// The caller's claim, when it holds `id`'s own hold file: what a registration of `id`
     /// replays under instead of a creation hold of its own.
     fn claim_of(&self, id: &BuildVolumeId) -> Option<&'a ReleaseClaim> {
@@ -394,7 +378,7 @@ where
             },
             (ReAdoptMain::Retained(_), None, None) => Ok(()),
             (ReAdoptMain::Retained(_), Some(build), Some(claim)) if claim.id() == &build.id => {
-                let seed = SeedSource::of_published(layout, build, claim);
+                let seed = SeedSource::Claimed(claim);
                 // Once published, the replacement no longer reads its retained input: losing
                 // that image afterwards changes nothing, and the replay converges on what it
                 // published.
@@ -543,14 +527,8 @@ where
         claimed: Option<&ReleaseClaim>,
     ) -> Result<(), ApfsStorageError> {
         let published = layout.image(&build.id);
-        // The replacement is RAW at the build image path of its build volume identity, whatever
-        // format the retained input was.
-        if build
-            .image
-            .original
-            .with_extension(cowshed_apfs::image::IMAGE_EXTENSION)
-            != published
-        {
+        // The replacement is RAW at the build image path of its build volume identity.
+        if build.image.original != published {
             return Err(ApfsStorageError::InvalidPlan(
                 "the recorded build image is not its build volume path in this layout",
             ));
@@ -722,9 +700,9 @@ where
         }
     }
 
-    /// Unmount and detach the re-adoption input at `path` (one `source` records, in whatever
-    /// format it was written) without force, through the retained-input attachment API. A
-    /// refusal of a mounted input names the processes that hold it.
+    /// Unmount and detach the re-adoption input at `path` (one `source` records) without force,
+    /// through the retained-input attachment API. A refusal of a mounted input names the
+    /// processes that hold it.
     fn release_retained(
         &self,
         source: &ReAdoptSource,

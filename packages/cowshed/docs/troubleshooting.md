@@ -465,23 +465,18 @@ command line: a command that kept its phase ten seconds while the other class wa
 
 ## Every attach fails with `error code 150`
 
-`Failed to initialize IO manager … error code 150` (`kIOReturnNoResources`) from every image attach,
-`diskutil image info`, `cowshed fork` and cold mount, while images already attached keep working, means the host's
-disk-image attach pool is spent. A command that meets it fails with `AttachPoolExhausted`, and `cowshed doctor` says
-which of two causes spent it.
+`Failed to initialize IO manager … error code 150` (`kIOReturnNoResources`) from a `diskutil image attach`,
+`diskutil image info` or another tool's disk-image command means the host's DiskImages2 attach pool is spent. cowshed
+itself never meets it: it runs no DiskImages2 verb, attaching every image in the kernel and creating blank images as
+plain sparse files. Only your own `cowshed disk-command diskutil -- image attach …` can, and it passes the tool's 150
+through unchanged; cowshed records nothing and refuses nothing for it.
 
-`disk-image-attach-budget` reports leaked disk-image devices: `AppleDiskImageDevice` and `DIDeviceIOUserClient`
-instances (`ioclasscount`) that no attached image accounts for, which killing the one stalled `diskimagesiod` that
-retains them frees, or a reboot. It also prints the `AppleAPFSVolume` and `IOMedia` counts, whose departed instances
-take no pool slot (`departed-volume-references`, below), and any disk-image command an earlier cowshed killed at its
-15-minute hard deadline this boot, each a probable leaked device; cowshed no longer kills a disk-image command at all.
-"attach pool exhausted" means a DiskImages2 attach failed with error code 150 this boot: kill the one stalled
-`diskimagesiod` that retains the devices. Devices leak when a `diskimagesiod` helper stalls past IOKit's media
-match-notification cap (next section): its attach holds the helper's lock, its termination callback blocks on it, and
-every image device that terminates host-wide stays allocated until that helper dies. cowshed attaches its runtime images
-in the kernel, with no such helper. A DiskImages2 attach that still runs through cowshed (re-adoption's read-only attach
-of a retained ASIF input, or `cowshed disk-command diskutil -- image attach …`) is refused before it starts once its
-boot has met 150, until `cowshed doctor --clear-attach-budget` or a reboot, since a failed attach leaks one more device.
+`disk-image-attach-budget` in `cowshed doctor` reports leaked disk-image devices as a warning: `AppleDiskImageDevice`
+and `DIDeviceIOUserClient` instances (`ioclasscount`) that no attached image accounts for, which killing the one stalled
+`diskimagesiod` that retains them frees, or a reboot. It also prints the `AppleAPFSVolume` and `IOMedia` counts, whose
+departed instances take no pool slot (`departed-volume-references`, below). Devices leak when a `diskimagesiod` helper
+stalls past IOKit's media match-notification cap (next section): its attach holds the helper's lock, its termination
+callback blocks on it, and every image device that terminates host-wide stays allocated until that helper dies.
 
 The other cause is helpers that outlived their image. Every DiskImages2 attachment (`diskutil image attach`, not
 cowshed's in-kernel attach) has its own `diskimagesiod`, which maps 72 MiB into the kernel; detach does not always end
@@ -491,8 +486,7 @@ it, and a helper that outlived its image keeps its mapping. `cowshed doctor` rep
 mapping they hold, and the root command that frees it, `sudo kill -9 <pids>`. `launchctl kill` refuses them, and no
 reboot is needed for them. While a disk-image tool runs, a helper may still be attaching, so no pid is named until a
 later `cowshed doctor`. Killing orphans frees their mappings; killing a stalled helper frees the devices it retains.
-Once they are gone, `cowshed doctor --clear-attach-budget` ends the recorded exhaustion. cowshed never signals a helper
-itself.
+cowshed never signals a helper itself.
 
 ## An attach is refused with `MediaCapReached`, or names IOKit's media match-notification queue
 

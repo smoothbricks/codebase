@@ -849,55 +849,6 @@ impl BuildVolumeLayout {
         }
     }
 
-    /// Claim build volume `id` by the hold file beside its actual image, in whatever format it
-    /// was written (`<image>.hold`). Re-adoption and payload-absent legacy seed metadata GC use
-    /// this same claim; a pre-RAW job holds this file, not the RAW name. `None` while held.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn claim_re_adopt_source(
-        &self,
-        id: &BuildVolumeId,
-        image: &Path,
-    ) -> io::Result<Option<ReleaseClaim>> {
-        let path = self.source_hold_path(id, image)?;
-        let file = open_hold(&path)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(ReleaseClaim {
-                id: id.clone(),
-                _file: file,
-            })),
-            Err(fs::TryLockError::WouldBlock) => Ok(None),
-            Err(fs::TryLockError::Error(error)) => Err(error),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    /// The same actual-image hold probed for preview, without creating a missing hold file.
-    pub(crate) fn held_re_adopt_source(
-        &self,
-        id: &BuildVolumeId,
-        image: &Path,
-    ) -> io::Result<bool> {
-        hold_is_held(&self.source_hold_path(id, image)?)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn source_hold_path(&self, id: &BuildVolumeId, image: &Path) -> io::Result<PathBuf> {
-        if image.parent() != Some(self.images.as_path())
-            || image.file_stem().and_then(|stem| stem.to_str()) != Some(id.as_str())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "{} is not build volume {} in {}",
-                    image.display(),
-                    id.as_str(),
-                    self.images.display(),
-                ),
-            ));
-        }
-        Ok(crate::metadata::append_suffix(image, HOLD_SUFFIX))
-    }
-
     /// The volume a build link's target names, or `None` when the target is not one of this
     /// project's build mountpoints. Root aliases compare by their resolved parent directories.
     pub fn volume_at(&self, target: &Path) -> Option<BuildVolumeId> {

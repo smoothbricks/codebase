@@ -1,7 +1,6 @@
 use super::*;
 use cowshed_os::fork_lock::Spawn as _;
 use scratch_apfs::ScratchRoot;
-use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -650,10 +649,10 @@ const FIXTURE_WORKER: &str = "cowshed-test-fixture-worker=";
 /// Fixtures staged under `$TMPDIR` stayed attached after timed-out runs, and the stock Nx daemon a
 /// timed-out test started kept running in its deleted root. The run's worker stands in for
 /// that daemon: a process the run started that outlives it, selected, as the daemon is, by its
-/// working directory alone. The run attaches one RAW image and one retained ASIF input, as
-/// a failed re-adoption leaves both formats, so teardown and sweep must release both. The RAW
-/// image is mounted, so teardown also unmounts; the ASIF input is only attached, all its
-/// release needs, so it spends no mount.
+/// working directory alone. The run attaches two RAW images, as a failed re-adoption leaves its
+/// replacement and a retained input, so teardown and sweep must release both. The first is
+/// mounted, so teardown also unmounts; the retained input is attached read-only and unmounted,
+/// all its release needs, so it spends no mount.
 #[cfg(target_os = "macos")]
 #[test]
 fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
@@ -990,49 +989,23 @@ fn real_apfs_fixture_run_ended_by_its_parent() {
     };
     let root = ScratchRoot::new_owned("fixture-run").expect("owned scratch root");
     let backend = MacOsApfsBackend::new(SystemCommandRunner);
-    for (name, extension) in [("first", IMAGE_EXTENSION), ("retained/second", "asif")] {
-        let image = root.path().join(name).with_extension(extension);
-        let raw = image.with_extension(IMAGE_EXTENSION);
-        crate::blank_image::blank_image(&raw);
-        if extension == IMAGE_EXTENSION {
+    for name in ["first", "retained/second"] {
+        let image = root.path().join(name).with_extension(IMAGE_EXTENSION);
+        crate::blank_image::blank_image(&image);
+        if name == "first" {
             let mount = root.path().join(format!("{name}-volume"));
             fs::create_dir(&mount).expect("a fixture mountpoint");
             backend
                 .attach_mounted(&image, &mount, MountAccess::ReadWrite, false)
                 .expect("attach and mount a RAW fixture");
         } else {
-            let converted = SystemCommandRunner
-                .run(&CommandRequest::new(
-                    "/usr/sbin/diskutil",
-                    [
-                        OsString::from("image"),
-                        OsString::from("create"),
-                        OsString::from("from"),
-                        OsString::from("--format"),
-                        OsString::from("ASIF"),
-                        raw.as_os_str().to_owned(),
-                        image.as_os_str().to_owned(),
-                    ],
-                ))
-                .expect("convert the detached fixture input");
-            assert!(
-                converted.succeeded(),
-                "convert retained fixture input: {converted:?}"
-            );
-            assert!(
-                matches!(
-                    backend.attach_verified(&image),
-                    Err(ApfsError::InvalidImagePath(_))
-                ),
-                "ordinary runtime attachment still refuses a retained ASIF input"
-            );
             // Attached only: its release is the claim, and a mount would add none.
             let record = FixtureRetainedInput(&image);
             let input = RetainedInput::named_by(&record, &image)
-                .expect("the fixture records only its own converted input");
+                .expect("the fixture records only its own retained input");
             backend
                 .attach_retained_verified(&input)
-                .expect("attach the recorded historical input");
+                .expect("attach the recorded retained input read-only");
         }
         println!("{FIXTURE_IMAGE}{}", image.display());
     }

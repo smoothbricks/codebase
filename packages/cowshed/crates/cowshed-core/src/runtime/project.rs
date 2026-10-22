@@ -1645,7 +1645,6 @@ impl ProjectActor {
             Op::HostListProjects(_)
             | Op::HostAttachAll(_)
             | Op::HostDetachAll(_)
-            | Op::HostClearAttachBudget(_)
             | Op::HostForgetAbandoned(_)
             | Op::HostMountMain(_)
             | Op::HostGatewayStatus(_)
@@ -3659,7 +3658,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let recovery_intents_path = lifecycle_intents_path.clone();
         let recovery_config = config.clone();
         let recovery_repo = repo_id.clone();
-        let recovery_sessions = layout.project().sessions.clone();
         let recovery_span = cowshed_os::timing::span("open", "inventory");
         let repairs = recovery_scope.repairs();
         let recovery_names = recovery_scope.observation_names();
@@ -3681,7 +3679,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             names.insert(origin.workspace.clone());
         }
         let retired_names = observation_names.clone();
-        let (host, facts, pending, legacy, lifecycle_intents) =
+        let (host, facts, pending, lifecycle_intents) =
             crate::storage::lifecycle::dispatch_blocking(move || {
                 let lifecycle_intents = match replay_journal {
                     Some(journal) => journal,
@@ -3746,21 +3744,13 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 let pending = host
                     .pending_publications_for(&recovery_repo, observation_names.as_ref())
                     .map_err(native_storage_error)?;
-                let legacy = crate::storage::apfs::native::LegacyImageReport::read(
-                    &recovery_sessions,
-                    observation_names.as_ref(),
-                )
-                .map_err(native_storage_error)?;
-                Ok::<_, CowshedError>((host, facts, pending, legacy, lifecycle_intents))
+                Ok::<_, CowshedError>((host, facts, pending, lifecycle_intents))
             })
             .await
             .map_err(|error| {
                 CowshedError::internal(format!("APFS recovery task failed: {error}"))
             })??;
         drop(recovery_span);
-        for line in legacy.lines() {
-            cowshed_os::eprintln!("{line}");
-        }
         let retired_project_root = layout.project().project_root.clone();
         let retired_repo = repo_id.clone();
         let retired = spanned(
@@ -11581,21 +11571,6 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         if options.re_adopt {
             return Err(CowshedError::internal(
                 "a re-adoption reached plain adoption; the coordinator sends it to re_adopt",
-            ));
-        }
-        // A main adopted before RAW is invisible to this runtime's inventory, which therefore
-        // reads empty: a fresh adopt would journal over it and mint a second main. Only its
-        // explicit replacement may touch it (02_workspaces.md, "Re-adoption").
-        if let Some(image) = self.legacy_main_image()? {
-            return Err(CowshedError::conflict(
-                format!(
-                    "main is adopted as {}, a format this cowshed only replaces",
-                    image.display()
-                ),
-                format!(
-                    "cowshed adopt {} --re-adopt",
-                    self.descriptor.git_root.display()
-                ),
             ));
         }
         let intent = crate::storage::recovery::LifecycleIntent::Adopt {
@@ -21872,7 +21847,7 @@ fn merge_driver_finding(
     }
 }
 
-/// A physical image's two deliberately distinct estimates, never a whole-fork promise.
+/// A physical image's first-write sensitivity at the loaded RAW rate, never a whole-fork promise.
 #[cfg(target_os = "macos")]
 fn image_extents_finding(
     workspace: &WorkspaceName,
@@ -21880,7 +21855,6 @@ fn image_extents_finding(
     image: PathBuf,
     extents: crate::storage::lifecycle::ExtentCount,
 ) -> crate::api::dto::Finding {
-    let historical = extents.first_write_cost();
     let observed = extents.observed_first_write_cost();
     let costly = !extents.is_forkable();
     crate::api::dto::Finding {
@@ -21891,7 +21865,7 @@ fn image_extents_finding(
             crate::api::dto::FindingSeverity::Info
         },
         message: format!(
-            "{workspace} {code} image {} has {extents} extents; historical ASIF-era 12 us predictor: {historical:.1?}; loaded RAW sensitivity at 140.046964 us/extent: {observed:.3?}, standalone first-write limit 7140 extents. Cause unattributed, not causal calibration or a whole-fork guarantee: source and build images share the budget; attach, mount, identity and extent-proof work are additional",
+            "{workspace} {code} image {} has {extents} extents; loaded RAW sensitivity at 140.046964 us/extent: {observed:.3?}, standalone first-write limit 7140 extents. Cause unattributed, not causal calibration or a whole-fork guarantee: source and build images share the budget; attach, mount, identity and extent-proof work are additional",
             image.display()
         ),
         hint: if costly {
@@ -23002,7 +22976,7 @@ mod doctor_hint_tests {
     }
 
     #[test]
-    fn source_and_seed_extents_warn_at_7141_without_recalibrating_history() {
+    fn source_and_seed_extents_warn_at_7141() {
         use crate::api::dto::FindingSeverity;
         use crate::storage::lifecycle::ExtentCount;
 
@@ -23039,7 +23013,6 @@ mod doctor_hint_tests {
             assert_eq!(unknown.severity, FindingSeverity::Warning);
             assert!(unknown.message.contains("unknown"));
         }
-        assert_eq!(ExtentCount::FIRST_WRITE_NANOS_PER_EXTENT, 12_000);
         assert!(
             ExtentCount::new(7_140).observed_first_write_cost() < std::time::Duration::from_secs(1)
         );
@@ -23285,7 +23258,7 @@ mod doctor_hint_tests {
         std::fs::write(&bare_image, b"image").expect("bare image");
         std::fs::write(crate::metadata::sidecar_path(&bare_image), b"sidecar")
             .expect("bare sidecar");
-        let whole_image = live.join("falcon.asif");
+        let whole_image = live.join("falcon.dmg");
         std::fs::write(&whole_image, b"image").expect("whole image");
         std::fs::write(crate::metadata::sidecar_path(&whole_image), b"sidecar")
             .expect("whole sidecar");
@@ -24756,7 +24729,7 @@ mod binding_tests {
         ];
         let pending = PendingPublicationFact {
             workspace: destination_workspace,
-            image: root.join("main.asif"),
+            image: root.join("main.dmg"),
             mount_point: root.join("mount"),
             source_checkpoint: "baseline".to_owned(),
             source_incarnation: source.clone(),
@@ -25588,8 +25561,8 @@ mod terminal_project_cleanup_tests {
         std::fs::create_dir_all(root.join(".staging")).expect("staging");
         std::fs::create_dir_all(root.join("checkpoints/main")).expect("checkpoints");
         std::fs::create_dir_all(root.join("sessions/.trash")).expect("trash");
-        std::fs::write(root.join("sessions/raven.asif.lock"), b"").expect("session lock");
-        std::fs::write(root.join("main.asif.lock"), b"").expect("main lock");
+        std::fs::write(root.join("sessions/raven.dmg.lock"), b"").expect("session lock");
+        std::fs::write(root.join("main.dmg.lock"), b"").expect("main lock");
         std::fs::write(&binding, b"binding").expect("binding");
         std::fs::write(root.join("policy.json"), b"preserve").expect("policy");
 
@@ -25602,7 +25575,7 @@ mod terminal_project_cleanup_tests {
         assert!(!root.join(".staging").exists());
         assert!(!root.join("checkpoints").exists());
         assert!(!root.join("sessions").exists());
-        assert!(!root.join("main.asif.lock").exists());
+        assert!(!root.join("main.dmg.lock").exists());
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -25610,7 +25583,7 @@ mod terminal_project_cleanup_tests {
     fn cleanup_preserves_and_rejects_an_unreclaimed_image() {
         let root = root("blocked");
         let binding = root.join("repository.json");
-        let image = root.join("sessions/.trash/main-retired.asif");
+        let image = root.join("sessions/.trash/main-retired.dmg");
         std::fs::create_dir_all(image.parent().expect("trash")).expect("trash");
         std::fs::write(&image, b"image").expect("retained image");
         std::fs::write(&binding, b"binding").expect("binding");
@@ -25744,13 +25717,13 @@ mod terminal_project_cleanup_tests {
     fn anything_the_unbinding_could_not_delete_refuses_before_anything_is_removed() {
         for (label, artifact) in [
             ("bundle", "sessions/.trash/raven-0123.bundle"),
-            ("session", "sessions/raven.asif.grants.json"),
-            ("staged", ".staging/raven-4567.asif"),
-            ("checkpoint", "checkpoints/raven/before.asif"),
+            ("session", "sessions/raven.dmg.grants.json"),
+            ("staged", ".staging/raven-4567.dmg"),
+            ("checkpoint", "checkpoints/raven/before.dmg"),
             ("temp", "tmp/raven/scratch"),
         ] {
             let (root, paths) = project(label);
-            let lock = paths.sessions.join("raven.asif.lock");
+            let lock = paths.sessions.join("raven.dmg.lock");
             let artifact = paths.project_root.join(artifact);
             std::fs::create_dir_all(artifact.parent().expect("parent")).expect("parent");
             std::fs::create_dir_all(&paths.sessions).expect("sessions");
@@ -25835,7 +25808,7 @@ mod terminal_project_cleanup_tests {
     #[test]
     fn mains_own_checkpoints_and_temp_dir_do_not_refuse_its_restore() {
         let (root, paths) = project("main-checkpoint");
-        let checkpoint = paths.checkpoints.join("main/before.asif");
+        let checkpoint = paths.checkpoints.join("main/before.dmg");
         let scratch = paths.exec_temp.join("main/scratch");
         for owned in [&checkpoint, &scratch] {
             std::fs::create_dir_all(owned.parent().expect("parent")).expect("parent");
@@ -25852,8 +25825,8 @@ mod terminal_project_cleanup_tests {
 
     const VOLUME: &str = "0123456789abcdef0123456789abcdef";
 
-    /// Released build volumes leave `build/` with their zero-length holds (legacy `.asif` ones
-    /// too, which no collection lists) and an empty `.staging`; none of it outlives the binding.
+    /// Released build volumes leave `build/` with their zero-length holds (an orphan hold no
+    /// collection lists too) and an empty `.staging`; none of it outlives the binding.
     #[test]
     fn cleanup_removes_a_build_directory_its_released_volumes_emptied() {
         let root = root("build-emptied");
@@ -25861,11 +25834,8 @@ mod terminal_project_cleanup_tests {
         let build = root.join("build");
         std::fs::create_dir_all(build.join(".staging")).expect("build staging");
         std::fs::write(build.join(format!("{VOLUME}.dmg.hold")), b"").expect("hold");
-        std::fs::write(
-            build.join("fedcba9876543210fedcba9876543210.asif.hold"),
-            b"",
-        )
-        .expect("legacy hold");
+        std::fs::write(build.join("fedcba9876543210fedcba9876543210.dmg.hold"), b"")
+            .expect("orphan hold");
         std::fs::write(&binding, b"binding").expect("binding");
 
         clean_terminal_project_storage(&root, &binding).expect("terminal cleanup");
@@ -25879,7 +25849,7 @@ mod terminal_project_cleanup_tests {
         let root = root("build-held");
         let binding = root.join("repository.json");
         let image = root.join(format!("build/{VOLUME}.dmg"));
-        let lock = root.join("sessions/raven.asif.lock");
+        let lock = root.join("sessions/raven.dmg.lock");
         std::fs::create_dir_all(root.join(".staging")).expect("staging");
         std::fs::create_dir_all(image.parent().expect("build")).expect("build");
         std::fs::create_dir_all(lock.parent().expect("sessions")).expect("sessions");
@@ -25940,7 +25910,7 @@ mod terminal_project_cleanup_tests {
 
     #[test]
     fn anything_in_build_that_is_no_volume_refuses_the_restore() {
-        for artifact in ["fedcba9876543210fedcba9876543210.asif", "notes.txt"] {
+        for artifact in ["fedcba9876543210fedcba9876543210.img", "notes.txt"] {
             let (root, paths) = project("build-artifact");
             let artifact = paths.project_root.join("build").join(artifact);
             std::fs::create_dir_all(artifact.parent().expect("build")).expect("build");

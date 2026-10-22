@@ -1390,7 +1390,7 @@ fn listing_skips_sidecarless_session_images_that_gc_names_and_reclaims() {
         .project()
         .sessions
         .join("orphan-sparseimage.sparseimage");
-    std::fs::write(&orphan_sparseimage, b"legacy image").expect("legacy sparseimage");
+    std::fs::write(&orphan_sparseimage, b"non-RAW file").expect("non-RAW sparseimage");
 
     let published_name = WorkspaceName::session("published").expect("workspace");
     let published = layout
@@ -1428,7 +1428,7 @@ fn listing_skips_sidecarless_session_images_that_gc_names_and_reclaims() {
         plan.candidates()
             .iter()
             .all(|candidate| candidate.path() != orphan_sparseimage.as_path()),
-        "a legacy migration input is never an ordinary RAW orphan"
+        "a non-RAW file is never a RAW orphan"
     );
 
     let report = host
@@ -1437,7 +1437,7 @@ fn listing_skips_sidecarless_session_images_that_gc_names_and_reclaims() {
     assert_eq!(report.reclaimed, 1);
     assert!(report.deferred.is_empty());
     assert!(!orphan_raw.exists());
-    assert_eq!(std::fs::read(&orphan_sparseimage).unwrap(), b"legacy image");
+    assert_eq!(std::fs::read(&orphan_sparseimage).unwrap(), b"non-RAW file");
     assert!(published.image().exists());
     assert!(sidecar_path(published.image()).exists());
 }
@@ -1503,7 +1503,7 @@ fn real_apfs_gc_reports_item_local_deferrals_and_reclaims_later_session_images()
     let symlink_image = layout.project().sessions.join("y-symlink.sparseimage");
     let symlink_target = fixture.root().join("external.sparseimage");
     std::fs::write(&symlink_target, b"outside image").expect("external image");
-    symlink(&symlink_target, &symlink_image).expect("legacy image symlink");
+    symlink(&symlink_target, &symlink_image).expect("non-RAW image symlink");
     let attached_image = layout.project().sessions.join("c-attached.dmg");
     fixture.blank_image(&attached_image);
     fixture

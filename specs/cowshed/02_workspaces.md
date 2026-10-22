@@ -115,11 +115,12 @@ not a best-effort script:
    normal path has no detach, image rename, second attach, or second fsck: an attached image is never renamed, because
    its identity is the backing path it was attached from.
 
-### Re-adoption: format transition and space reclamation
+### Re-adoption: space reclamation
 
 `cowshed adopt <checkout> --re-adopt` replaces an adopted main through the same staged copy, verification, publication
-fence and checkout handoff as adopt. Default adopt remains idempotent; replacement is explicit. Re-adoption is the
-ASIF-to-RAW transition and the RAW guest-space reclaim operation, not an image converter or a second runtime format.
+fence and checkout handoff as adopt. Default adopt remains idempotent; replacement is explicit. Re-adoption is the RAW
+guest-space reclaim operation, not an image converter: every input is RAW, and a recorded input in any other format is
+refused, naming its format and path.
 
 1. Require the caller to be outside the checkout and require its source and build volumes to have no holders. Refuse
    with each holder's PID and command; never kill a user process or force an unmount. Each mounted image's holder census
@@ -160,12 +161,10 @@ ASIF-to-RAW transition and the RAW guest-space reclaim operation, not an image c
    still runs before publication. The exclusive claim on the recorded source build image's `<image>.hold` stays held
    through retention, copy, seed capture and publication. A seed of a volume published at that image's own path, warm or
    empty, captures under that same typed claim rather than opening a second exclusive claim on the same resource. A
-   legacy ASIF source's hold is distinct from the published RAW hold: the old claim remains alive while seed capture
-   independently claims the new RAW resource. A published replacement or kept build already detached is seeded before
-   its first mount, not mounted merely to detach and restore it for capture. The claim remains held through that mount
-   and the new seed's captured-clone freshness mark. This immutable captured-clone clock replaces live-source
-   re-stamping after mount. A replay keeps an existing seed's mark: it never declares old captured bytes current by
-   sampling the live image again.
+   published replacement or kept build already detached is seeded before its first mount, not mounted merely to detach
+   and restore it for capture. The claim remains held through that mount and the new seed's captured-clone freshness
+   mark. This immutable captured-clone clock replaces live-source re-stamping after mount. A replay keeps an existing
+   seed's mark: it never declares old captured bytes current by sampling the live image again.
 4. Verify the copied content before publication, including tracked and untracked-not-ignored file checksums, the entire
    `.git` state above, `git fsck`, and the build contents and identity. Re-adoption does not normalize Git
    configuration, delete lock files, prune worktree registrations or replace user hooks. Only cowshed's own marker and
@@ -198,31 +197,31 @@ ASIF-to-RAW transition and the RAW guest-space reclaim operation, not an image c
 
 #### Missing main image
 
-When main's recorded image is missing (no canonical image, sidecar or CA key, and no legacy image) and a plain Git
-checkout sits unmounted at main's checkout path, `adopt <checkout> --re-adopt` re-adopts main from that checkout. It
-refuses unless the checkout is the root of a Git repository one of whose remotes names the project's `repo_id`, and
-unless main's completed re-adoption journal for that checkout names the lost incarnation. That journal is the only
-authority left for main's metadata, image capacity (unless `--capacity` is given) and recorded build-volume identity.
-The repository identity and project records are kept. The checkout is the copy source of the same staged copy, step 4
-verification and `PendingFence` publication as adopt, and it must have no holders, as in step 1: a process with a file,
-its working directory or its executable inside the checkout refuses, named by PID and command, and nothing is stopped.
-At handoff the checkout is swapped aside to `<checkout>.readopt-<replacement incarnation>`, never `.pre-cowshed`, and
-kept there as the retained evidence. Main's build volume is the project's one build record owned by `Linked main`,
-whatever its ID: a build volume is an image of its own, so it can outlive main's image, and every land gives main a new
-one. A surviving one is kept as it is, its holders refused as in step 1, and seeded for the new incarnation. More than
-one build record owned by `Linked main` refuses with integrity. Only when none survives is main's build volume published
-as an empty RAW volume under the recorded ID, `Linked main` owner and creation time, with its built-at tree cleared; a
-build image or record still present at that ID then refuses: this recovery never publishes over a build volume. Before
-the Git state is recorded, the checkout takes main's cowshed excludes and a build link naming main's build volume, so
-the copy verifies and carries the link. Old-incarnation seeds are retained and one fresh seed is frozen as in step 3.
-The journal records the copy mode, so a replay resumes the same recovery. While nothing is published, the checkout is
-the user's live tree: a replay before the handoff proves it unheld again and records its Git state again before it
-copies, so a commit or a fetch made after an earlier attempt refused never wedges the recovery.
+When main's recorded image is missing (no canonical image, sidecar or CA key) and a plain Git checkout sits unmounted at
+main's checkout path, `adopt <checkout> --re-adopt` re-adopts main from that checkout. It refuses unless the checkout is
+the root of a Git repository one of whose remotes names the project's `repo_id`, and unless main's completed re-adoption
+journal for that checkout names the lost incarnation. That journal is the only authority left for main's metadata, image
+capacity (unless `--capacity` is given) and recorded build-volume identity. The repository identity and project records
+are kept. The checkout is the copy source of the same staged copy, step 4 verification and `PendingFence` publication as
+adopt, and it must have no holders, as in step 1: a process with a file, its working directory or its executable inside
+the checkout refuses, named by PID and command, and nothing is stopped. At handoff the checkout is swapped aside to
+`<checkout>.readopt-<replacement incarnation>`, never `.pre-cowshed`, and kept there as the retained evidence. Main's
+build volume is the project's one build record owned by `Linked main`, whatever its ID: a build volume is an image of
+its own, so it can outlive main's image, and every land gives main a new one. A surviving one is kept as it is, its
+holders refused as in step 1, and seeded for the new incarnation. More than one build record owned by `Linked main`
+refuses with integrity. Only when none survives is main's build volume published as an empty RAW volume under the
+recorded ID, `Linked main` owner and creation time, with its built-at tree cleared; a build image or record still
+present at that ID then refuses: this recovery never publishes over a build volume. Before the Git state is recorded,
+the checkout takes main's cowshed excludes and a build link naming main's build volume, so the copy verifies and carries
+the link. Old-incarnation seeds are retained and one fresh seed is frozen as in step 3. The journal records the copy
+mode, so a replay resumes the same recovery. While nothing is published, the checkout is the user's live tree: a replay
+before the handoff proves it unheld again and records its Git state again before it copies, so a commit or a fetch made
+after an earlier attempt refused never wedges the recovery.
 
 Re-adoption copies filesystem entries, not allocated-but-free guest blocks. Space returns only after verification and
-explicit release of the old image and any snapshots sharing its blocks (01a_apfs.md, "Space reclamation"). Existing ASIF
-images are retained inputs to this transaction, attached read-only through DiskImages2, the one reader of ASIF
-(01a_apfs.md, "Mounts"); ordinary runtime image enumeration and attachment use RAW only, attached in the kernel.
+explicit release of the old image and any snapshots sharing its blocks (01a_apfs.md, "Space reclamation"). Retained
+inputs are RAW and attach read-only in the kernel like every image (01a_apfs.md, "Mounts"); an input in any other format
+is refused by its format and path, never converted or attached through DiskImages2.
 
 ## Checkout layouts
 

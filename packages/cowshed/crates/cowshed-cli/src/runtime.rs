@@ -852,18 +852,6 @@ pub(crate) async fn list_projects(landing: Option<ListLanding>) -> Result<Vec<Pr
     Ok(projects)
 }
 
-/// Clear this boot's recorded attach-pool exhaustion and its recorded ceiling.
-pub(crate) fn clear_attach_budget() -> Result<()> {
-    cowshed_apfs::attach_budget::clear()
-        .map(drop)
-        .map_err(|error| {
-            CowshedError::environment_missing(
-                format!("cannot clear the recorded attach-pool exhaustion: {error}"),
-                "check the cowshed attach-pool record's permissions and retry",
-            )
-        })
-}
-
 /// The root of the git checkout containing `start`, as `--project` resolves it.
 pub(crate) async fn discover_project_root(start: &Path) -> Result<PathBuf> {
     // The CLI process serves the host store; its controller Git writes profiles there.
@@ -2093,11 +2081,11 @@ where
             let extents = ExtentCount::new(result.extents);
             output
                 .guidance(&format!(
-                    "workspace {} rewritten contiguously: {previous} extents -> {extents}, {} bytes copied; a clone's first write now copies a map predicted at {:.1?} instead of {:.1?}",
+                    "workspace {} rewritten contiguously: {previous} extents -> {extents}, {} bytes copied; a clone's first write now copies a map whose loaded RAW sensitivity is {:.3?} instead of {:.3?}",
                     result.workspace,
                     result.bytes,
-                    extents.first_write_cost(),
-                    previous.first_write_cost()
+                    extents.observed_first_write_cost(),
+                    previous.observed_first_write_cost()
                 ))
                 .map_err(output_error)?;
             Ok(success())
@@ -2286,16 +2274,6 @@ where
             }
             // Repair retires what doctor named as reclaimable the same way `gc` does — one
             // sweep, one set of reasons — rather than a second deleter with its own rules.
-            if args.clear_attach_budget {
-                clear_attach_budget()?;
-                output
-                    .guidance(
-                        "cleared this boot's recorded attach-pool exhaustion; attaches are \
-                         admitted again while the image devices stay below the pool's ceiling, \
-                         and the next error code 150 spends the boot again",
-                    )
-                    .map_err(output_error)?;
-            }
             if args.repair {
                 let swept = service
                     .gc(GcOptions {
@@ -5017,36 +4995,31 @@ fn orphaned_disk_image_helpers_finding(
     }
 }
 
-/// The host's disk-image attach pool (attach_budget.rs): the leaked image devices, user
-/// clients, volumes and media, the image-device ceiling the pool runs out at and the headroom.
-/// A pool spent this boot is an error; low headroom warns. The hint names what frees each leak.
-/// Departed volumes and media take no pool slot, so [`departed_volume_references_finding`] reports
-/// them, never this finding.
+/// The host's disk-image device classes (attach_budget.rs): leaked image devices, user clients,
+/// volumes and media. Cowshed runs no DiskImages2 attach, so nothing is gated on them: a leaked
+/// image device warns and names what frees it. Departed volumes and media take no attach-pool
+/// slot, so [`departed_volume_references_finding`] reports them, never this finding.
 fn disk_image_attach_budget_finding(
-    budget: std::io::Result<cowshed_apfs::attach_budget::Budget>,
+    reading: std::io::Result<cowshed_apfs::attach_budget::KernelReading>,
 ) -> Option<Finding> {
-    match budget {
-        Ok(budget) => Some(Finding {
+    match reading {
+        Ok(reading) => Some(Finding {
             code: "disk-image-attach-budget".into(),
-            severity: if budget.spent.is_some() {
-                FindingSeverity::Error
-            } else if budget.is_low() {
+            severity: if reading.is_leaking() {
                 FindingSeverity::Warning
             } else {
                 FindingSeverity::Info
             },
-            message: budget.to_string(),
-            hint: budget.remedy(),
+            message: reading.to_string(),
+            hint: reading.remedy().into(),
             path: None,
         }),
         Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
         Err(error) => Some(Finding {
             code: "disk-image-attach-budget".into(),
             severity: FindingSeverity::Warning,
-            message: format!("could not read the disk-image attach pool: {error}"),
-            hint: "the error names what failed: the kernel counts (ioclasscount \
-                   AppleDiskImageDevice DIDeviceIOUserClient AppleAPFSVolume IOMedia) or the \
-                   record directory (ls -ld /private/var/tmp/cowshed-attach-pool-$(id -u))"
+            message: format!("could not read the disk-image device classes: {error}"),
+            hint: "ioclasscount AppleDiskImageDevice DIDeviceIOUserClient AppleAPFSVolume IOMedia"
                 .into(),
             path: None,
         }),
@@ -5183,15 +5156,15 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
         cowshed_apfs::disk_image_helpers::OrphanedHelpers::read,
     )));
     // One snapshot answers both findings: departed volumes need no census of their own.
-    let budget = probe_sync(
+    let classes = probe_sync(
         format_args!("attach-budget"),
-        cowshed_apfs::attach_budget::observe,
+        cowshed_apfs::attach_budget::read_kernel,
     );
-    let departed = budget
+    let departed = classes
         .as_ref()
         .ok()
-        .and_then(|budget| departed_volume_references_finding(&budget.reading));
-    findings.extend(disk_image_attach_budget_finding(budget));
+        .and_then(departed_volume_references_finding);
+    findings.extend(disk_image_attach_budget_finding(classes));
     findings.extend(media_notification_cap_finding(probe_sync(
         format_args!("media-notification-cap"),
         cowshed_apfs::media_cap::read,
@@ -6488,21 +6461,16 @@ mod tests {
     }
 
     #[test]
-    fn doctor_reports_the_attach_budget_and_says_reboot_once_the_pool_ran_out() {
+    fn doctor_reports_the_disk_image_classes_and_warns_on_a_leaked_device() {
         use cowshed_apfs::attach_budget::{
-            Boot, ClassCount, KernelReading, LEAKED_DEVICES_HINT, PoolRecord,
+            ClassCount, DEPARTED_ATTRIBUTION_HINT, KernelReading, LEAKED_DEVICES_HINT,
         };
         let count = |instances, registered| ClassCount {
             instances,
             registered,
         };
-        let boot = Boot {
-            session: "C979D80A-3BC4-4F57-A9E2-1FE362B935C7".into(),
-            booted_at: 1_791_515_025,
-        };
-        let next = "0E3E6D1C-6C7B-4B53-8A1E-6C5C1E0D1F00";
         // This host at its first 150 on 2026-10-10, and just after the reboot.
-        let spent_host = KernelReading {
+        let leaking_host = KernelReading {
             image_devices: count(1090, 66),
             user_clients: count(1077, 66),
             apfs_volumes: count(1065, 81),
@@ -6514,12 +6482,11 @@ mod tests {
             apfs_volumes: count(193, 193),
             media: count(185, 185),
         };
-        let finding = |record: &PoolRecord, session: &str, reading: KernelReading| {
-            disk_image_attach_budget_finding(Ok(record.budget(session, reading)))
-                .expect("the budget is always reported")
+        let classes = |reading: KernelReading| {
+            disk_image_attach_budget_finding(Ok(reading)).expect("the classes are always reported")
         };
 
-        let fresh = finding(&PoolRecord::default(), next, rebooted_host);
+        let fresh = classes(rebooted_host);
         assert_eq!(fresh.code, "disk-image-attach-budget");
         assert_eq!(fresh.severity, FindingSeverity::Info);
         assert_eq!(fresh.hint, "nothing to free");
@@ -6529,81 +6496,25 @@ mod tests {
             ),
             "{fresh:?}"
         );
-
-        // The first 150 is recorded with its counts, and the next doctor says what it means.
-        let spent = PoolRecord::default().exhausted(&boot, Some(spent_host.image_devices), Some(0));
-        let exhausted = finding(&spent, &boot.session, spent_host);
-        assert_eq!(exhausted.severity, FindingSeverity::Error);
+        // Leaked image devices warn and name what frees them; nothing is ever an error.
+        let leaked = classes(leaking_host);
+        assert_eq!(leaked.severity, FindingSeverity::Warning);
+        assert_eq!(leaked.hint, LEAKED_DEVICES_HINT);
         assert!(
-            exhausted.message.starts_with("attach pool exhausted: "),
-            "{exhausted:?}"
-        );
-        assert!(
-            exhausted
+            leaked
                 .message
-                .contains("66 disk images attached and 1024 leaked image devices"),
-            "{exhausted:?}"
+                .starts_with("AppleDiskImageDevice 1090 instances, 66 registered, 1024 leaked"),
+            "{leaked:?}"
         );
-        assert_eq!(exhausted.hint, LEAKED_DEVICES_HINT);
 
-        // After the reboot nothing is spent; leaked image devices warn.
-        let rebooted = finding(&spent, next, rebooted_host);
-        assert_eq!(rebooted.severity, FindingSeverity::Info);
-        assert!(
-            !rebooted.message.contains("attach pool exhausted"),
-            "{rebooted:?}"
-        );
-        let near = KernelReading {
-            image_devices: count(178 + 700, 178),
-            ..rebooted_host
-        };
-        let near = finding(&spent, next, near);
-        assert_eq!(near.severity, FindingSeverity::Warning);
-        assert_eq!(near.hint, LEAKED_DEVICES_HINT);
-
-        let linux = std::io::Error::new(std::io::ErrorKind::Unsupported, "no pool");
+        let linux = std::io::Error::new(std::io::ErrorKind::Unsupported, "no classes");
         assert!(disk_image_attach_budget_finding(Err(linux)).is_none());
         let refused = std::io::Error::other("IOServiceMatching refused");
         let unread = disk_image_attach_budget_finding(Err(refused)).expect("a failed read");
         assert_eq!(unread.severity, FindingSeverity::Warning);
-    }
 
-    #[test]
-    fn doctor_reports_departed_volumes_from_the_first_one_apart_from_the_pool() {
-        use cowshed_apfs::attach_budget::{
-            Boot, ClassCount, DEPARTED_ATTRIBUTION_HINT, KernelReading, LEAKED_DEVICES_HINT,
-            PoolRecord,
-        };
-        let count = |instances, registered| ClassCount {
-            instances,
-            registered,
-        };
-        let boot = Boot {
-            session: "C979D80A-3BC4-4F57-A9E2-1FE362B935C7".into(),
-            booted_at: 1_791_515_025,
-        };
-        let next = "0E3E6D1C-6C7B-4B53-8A1E-6C5C1E0D1F00";
-        // This host at its first 150 on 2026-10-10, and just after the reboot.
-        let spent_host = KernelReading {
-            image_devices: count(1090, 66),
-            user_clients: count(1077, 66),
-            apfs_volumes: count(1065, 81),
-            media: count(1075, 80),
-        };
-        let rebooted_host = KernelReading {
-            image_devices: count(178, 178),
-            user_clients: count(178, 178),
-            apfs_volumes: count(193, 193),
-            media: count(185, 185),
-        };
-        let pool = |record: &PoolRecord, session: &str, reading: KernelReading| {
-            disk_image_attach_budget_finding(Ok(record.budget(session, reading)))
-                .expect("the budget is always reported")
-        };
-
-        // Beside a spent pool the departed volumes are a warning of their own: the pool's error
-        // names the reboot alone, and the warning's hint attributes them.
-        let departed = departed_volume_references_finding(&spent_host)
+        // Departed volumes are a warning of their own whose hint attributes them.
+        let departed = departed_volume_references_finding(&leaking_host)
             .expect("departed volumes are a finding");
         assert_eq!(departed.code, "departed-volume-references");
         assert_eq!(departed.severity, FindingSeverity::Warning);
@@ -6615,12 +6526,9 @@ mod tests {
         );
         assert_eq!(departed.hint, DEPARTED_ATTRIBUTION_HINT);
         assert_eq!(departed.path, None);
-        let spent = PoolRecord::default().exhausted(&boot, Some(spent_host.image_devices), Some(0));
-        let exhausted = pool(&spent, &boot.session, spent_host);
-        assert_eq!(exhausted.severity, FindingSeverity::Error);
-        assert_eq!(exhausted.hint, LEAKED_DEVICES_HINT);
 
-        // The first departed instance of either class warns, and the pool does not move for it.
+        // The first departed instance of either class warns, and the device classes do not move
+        // for it.
         for (reading, counts) in [
             (
                 KernelReading {
@@ -6641,7 +6549,7 @@ mod tests {
                 .expect("the first departed instance is a finding");
             assert_eq!(first.severity, FindingSeverity::Warning);
             assert!(first.message.starts_with(counts), "{first:?}");
-            let unmoved = pool(&PoolRecord::default(), next, reading);
+            let unmoved = classes(reading);
             assert_eq!(unmoved.severity, FindingSeverity::Info);
             assert_eq!(unmoved.hint, "nothing to free");
         }
@@ -6649,7 +6557,7 @@ mod tests {
         assert!(departed_volume_references_finding(&rebooted_host).is_none());
 
         // A warning never makes the host unhealthy: only an error does.
-        assert!(doctor_report(vec![departed]).healthy);
+        assert!(doctor_report(vec![departed, leaked]).healthy);
     }
 
     /// A verb's attach demand and the workspaces it keeps come from the verb and its mode as the

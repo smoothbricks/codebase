@@ -412,8 +412,6 @@ operations! {
     host json "host.attachAll" HostAttachAll(HostAttachAllRequest) -> Vec<WorkspaceInfo>;
     /// Detaches every attached session workspace of every adopted project.
     host json "host.detachAll" HostDetachAll(HostRequest) -> EmptyResult;
-    /// Clears this boot's recorded attach-pool exhaustion and its recorded ceiling.
-    host json "host.clearAttachBudget" HostClearAttachBudget(HostRequest) -> EmptyResult;
     /// Retires one project no controller can open, from store records; the call is the abandonment.
     host json "host.forgetAbandoned" HostForgetAbandoned(RepoRequest) -> ProjectRetirementReport;
     /// Mounts one project's main from store records.
@@ -568,7 +566,7 @@ pub struct WorkspaceListView {
 pub struct WorkerView(pub WorkspaceView);
 
 /// What `coordinator.adopt` made: main, and, when the call replaced main, what the replacement
-/// kept (02_workspaces.md, "Re-adoption: format transition and space reclamation", step 5).
+/// kept (02_workspaces.md, "Re-adoption: space reclamation", step 5).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdoptView {

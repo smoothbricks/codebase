@@ -11,13 +11,12 @@ description:
 
 A cowshed workspace is a full standalone checkout — source, `.git`, `node_modules`, `target/`, every build cache —
 cloned copy-on-write from the repository's warm `main` image. A `git worktree` gives an agent a cold tree whose build
-cache starts empty and a first build that costs minutes; a cowshed workspace starts warm. `cowshed fork` on a large,
-long-used repository still takes tens of seconds, and nearly all of it is two steps. The clone call returns in
-milliseconds, but the clone's first write, during its attach or mount, makes APFS copy the extent map of main's image
-file. That copy costs about 12 µs per extent, and main's image fragments with every write it takes while clones share
-its blocks: 2.1 million extents cost 25 s on a quiet host and over a minute on a busy one. Then setup walks the whole
-tree for symlinks that point outside it, about 5 s over a million entries. The number of attached images does not
-matter.
+cache starts empty and a first build that costs minutes; a cowshed workspace starts warm. On a long-used repository
+`cowshed fork` is dominated by two steps. The clone call returns in milliseconds, but the clone's first write, during
+its attach or mount, makes APFS copy the extent map of main's image file: one loaded RAW observation took about 140 µs
+per extent, and main's image fragments with every write it takes while clones share its blocks. Past 7,140 extents,
+about a second at that rate, fork refuses and names `cowshed defrag main`. Then setup walks the whole tree for symlinks
+that point outside it, about 5 s over a million entries. The number of attached images does not matter.
 
 `fork [<src>] <ws>` is the only creation verb; the source defaults to main. Every fork carries source edits and
 untracked files by default on its own `cowshed/<ws>` branch. `--clean` discards tracked edits and nonignored untracked
@@ -163,10 +162,10 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 - Exit 6 is a negotiation, not a retry: surface the named `next:` grant to the operator/coordinator; filesystem grants
   apply from the next exec. A `sandbox-denied` on a lifecycle verb saying this process is "sandboxed away from cowshed's
   store" means your shell is sandboxed — no grant helps; rerun from an unsandboxed shell.
-- Attach failures with `AttachPoolExhausted` / error 150: run `cowshed doctor`. Leaked `AppleDiskImageDevice`s free only
-  on reboot; orphaned `diskimagesiod` helpers are freed by the `sudo kill -9` doctor names, then
-  `cowshed doctor --clear-attach-budget`. Detaching sheds does not free leaked devices — do not retry-spawn into a spent
-  pool.
+- Error code 150 from a `diskutil image` command: cowshed itself runs none; it is your own
+  `cowshed disk-command diskutil …` or another tool. `cowshed doctor` names leaked `AppleDiskImageDevice`s (freed by
+  killing the stalled `diskimagesiod` it names, or a reboot) and orphaned helpers (freed by the `sudo kill -9` it
+  names).
 - `MediaCapReached`, or a refusal naming IOKit's media match-notification queue: the host's attached media are at the
   1024 cap past which an attach hangs forever. Verbs detach idle workspaces themselves first; when none is idle,
   `cowshed rm` the sheds you are done with or `cowshed detach` the ones you will return to. `cowshed doctor` reports

@@ -39,7 +39,6 @@ export interface NativeHostOperations
   extends NativeHostListProjects,
     NativeHostAttachAll,
     NativeHostDetachAll,
-    NativeHostClearAttachBudget,
     NativeHostForgetAbandoned,
     NativeHostMountMain,
     NativeHostGatewayStatus,
@@ -700,24 +699,6 @@ export async function hostBuildState(
   args: HostBuildStateArguments,
 ): Promise<Api.BuildStateListing> {
   return R.readBuildStateListing(await handle.buildState(JSON.stringify(args)));
-}
-
-/** A handle that serves `host.clearAttachBudget`. */
-export interface NativeHostClearAttachBudget {
-  clearAttachBudget(argumentsJson: string): Promise<string>;
-}
-
-/** The request fields a `host.clearAttachBudget` caller names; its handle binds the rest. */
-export type HostClearAttachBudgetArguments = Readonly<Record<string, never>>;
-
-/**
- * Clears this boot's recorded attach-pool exhaustion and its recorded ceiling.
- */
-export async function hostClearAttachBudget(
-  handle: NativeHostClearAttachBudget,
-  args: HostClearAttachBudgetArguments,
-): Promise<Api.EmptyResult> {
-  return R.readEmptyResult(await handle.clearAttachBudget(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.clearNxStore`. */

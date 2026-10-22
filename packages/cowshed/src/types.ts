@@ -158,7 +158,6 @@ export interface Host {
   listProjects(options?: HostListProjectsArguments): Promise<readonly Api.ProjectWorkspaces[]>;
   attachAll(options?: HostAttachAllArguments): Promise<readonly Api.WorkspaceInfo[]>;
   detachAll(): Promise<void>;
-  clearAttachBudget(): Promise<void>;
   /** Retires a project no controller can open; calling it is the explicit abandonment. */
   forgetAbandoned(repoId: Api.RepoRequest['repoId']): Promise<Api.ProjectRetirementReport>;
   mountMain(repoId: Api.RepoRequest['repoId']): Promise<Api.MountResult>;

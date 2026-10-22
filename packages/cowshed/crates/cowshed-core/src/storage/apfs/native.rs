@@ -405,82 +405,6 @@ pub(in crate::storage) fn warn_missing_session_sidecar(image: &Path) {
     warn_session_image_issue(image, "grants sidecar is missing");
 }
 
-/// What one read of a project's sessions directory says about its legacy images: the retained
-/// regular files, and each entry that could not be judged with the reason. Both are sorted, so
-/// the report does not depend on the order `readdir` returned. Reading it is the project open's
-/// job, once (01a_apfs.md, "Ownership, identity, and the volume label"); the enumerators that
-/// list workspaces never say anything about legacy images.
-#[derive(Debug, Default, Eq, PartialEq)]
-pub struct LegacyImageReport {
-    retained: Vec<String>,
-    unjudged: Vec<(String, String)>,
-}
-
-impl LegacyImageReport {
-    /// Read the legacy images in a project's `sessions` directory.
-    pub fn read(
-        sessions: &Path,
-        workspaces: Option<&BTreeSet<WorkspaceName>>,
-    ) -> Result<Self, ApfsStorageError> {
-        let mut entries = read_dir_paths(sessions, "enumerate legacy session images")?;
-        if let Some(names) = workspaces {
-            entries.retain(|image| {
-                let stem = image.file_stem().and_then(OsStr::to_str);
-                names.iter().any(|name| Some(name.as_str()) == stem)
-            });
-        }
-        Ok(Self::of(&entries))
-    }
-
-    /// Old image names are diagnostic evidence only, never a runtime image grammar or GC
-    /// authority. Inspect metadata, not image contents, and leave every legacy payload intact.
-    fn of(entries: &[PathBuf]) -> Self {
-        let mut report = Self::default();
-        for image in entries {
-            if !matches!(
-                image.extension().and_then(OsStr::to_str),
-                Some("asif" | "sparseimage")
-            ) {
-                continue;
-            }
-            let name = image_file_name(image);
-            match fs::symlink_metadata(image) {
-                Ok(metadata) if metadata.file_type().is_file() => report.retained.push(name),
-                Ok(_) => report
-                    .unjudged
-                    .push((name, "legacy image is not a regular file".to_owned())),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => report
-                    .unjudged
-                    .push((name, format!("cannot inspect legacy image: {error}"))),
-            }
-        }
-        report.retained.sort();
-        report.unjudged.sort();
-        report
-    }
-
-    /// One line naming every retained image, then one line per entry that could not be judged.
-    pub fn lines(&self) -> Vec<String> {
-        let mut lines = Vec::with_capacity(1 + self.unjudged.len());
-        if !self.retained.is_empty() {
-            let plural = if self.retained.len() == 1 { "" } else { "s" };
-            lines.push(format!(
-                "cowshed: warning: {} legacy session image{plural} retained; explicit transition \
-                 or retirement is required: {}",
-                self.retained.len(),
-                self.retained.join(", "),
-            ));
-        }
-        lines.extend(
-            self.unjudged
-                .iter()
-                .map(|(name, issue)| session_image_issue(name, issue)),
-        );
-        lines
-    }
-}
-
 fn gc_reason_tag(reason: StorageGcReason) -> &'static [u8] {
     match reason {
         StorageGcReason::RetiredWorkspace => b"retired-workspace",
@@ -7161,42 +7085,6 @@ pub(in crate::storage) fn clone_lineage_from(
 mod tests {
     use super::*;
     use cowshed_os::fork_lock::Run as _;
-
-    /// A project's legacy images are one line naming them all, whatever order readdir returned.
-    #[test]
-    fn legacy_images_are_one_summary_line_whatever_the_readdir_order() {
-        let sessions =
-            std::env::temp_dir().join(format!("cowshed-legacy-report-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&sessions).unwrap();
-        for name in ["b.asif", "a.sparseimage", "c.dmg"] {
-            fs::write(sessions.join(name), b"image").unwrap();
-        }
-        std::os::unix::fs::symlink("b.asif", sessions.join("linked.asif")).unwrap();
-        let entries: Vec<PathBuf> = ["b.asif", "c.dmg", "linked.asif", "a.sparseimage"]
-            .iter()
-            .map(|name| sessions.join(name))
-            .collect();
-        let report = LegacyImageReport::read(&sessions, None).unwrap();
-        assert_eq!(
-            report.lines(),
-            [
-                "cowshed: warning: 2 legacy session images retained; explicit transition or \
-                 retirement is required: a.sparseimage, b.asif",
-                "cowshed: warning: skipping session image linked.asif: legacy image is not a \
-                 regular file",
-            ]
-        );
-        let reversed: Vec<PathBuf> = entries.iter().rev().cloned().collect();
-        assert_eq!(LegacyImageReport::of(&entries), report);
-        assert_eq!(LegacyImageReport::of(&reversed), report);
-        // Nothing legacy, nothing said.
-        assert!(
-            LegacyImageReport::of(&[sessions.join("c.dmg")])
-                .lines()
-                .is_empty()
-        );
-        fs::remove_dir_all(&sessions).unwrap();
-    }
 
     /// One journal/GC walk pins exact staging ownership, a stale pre-intent plan, completion,
     /// and retained-source bytes. It needs real Git evidence, not a disk-image setup or a mock.

@@ -589,15 +589,15 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   names it: a published grant, the `PendingFence` grant of an unpublished clone, the grant every unfinished lifecycle
   intent carries (a re-adoption's main: its image sits in `retained/` or `.staging/` outside the canonical inventory
   until the intent completes), and the grants sidecar of any image outside that inventory (`retained/`, `.staging/`, a
-  fence whose payload is still staged, a legacy session image). The journal is read before the images, so a block an
-  intent moves between the two is seen in one of them. A sidecar outside the canonical inventory that cannot be read, or
-  that names another repository than the project it sits in, names a block nobody can know: allocation goes on without
-  it, says so on stderr, and doctor reports it as `port-claim-unreadable`. A live block keeps its size until a
-  `service_ports` grant (below) grows it, so 16-port blocks from before the size was raised stay valid beside 64-port
-  ones and grown ones. Alignment makes blocks nest or stay disjoint, never straddle. Two workspaces whose claimed blocks
-  share a port are a **collision**: the older workspace (by its recorded `createdAt`, then repository and name) keeps
-  the ports. Every inventory reader sees both members; only the gateway's session path — its startup install and every
-  per-project reconcile — serves the older one and not the newer, saying so on stderr with
+  fence whose payload is still staged, a sidecar whose image is not a canonical `.dmg`). The journal is read before the
+  images, so a block an intent moves between the two is seen in one of them. A sidecar outside the canonical inventory
+  that cannot be read, or that names another repository than the project it sits in, names a block nobody can know:
+  allocation goes on without it, says so on stderr, and doctor reports it as `port-claim-unreadable`. A live block keeps
+  its size until a `service_ports` grant (below) grows it, so 16-port blocks from before the size was raised stay valid
+  beside 64-port ones and grown ones. Alignment makes blocks nest or stay disjoint, never straddle. Two workspaces whose
+  claimed blocks share a port are a **collision**: the older workspace (by its recorded `createdAt`, then repository and
+  name) keeps the ports. Every inventory reader sees both members; only the gateway's session path — its startup install
+  and every per-project reconcile — serves the older one and not the newer, saying so on stderr with
   `next: cowshed doctor --repair`, so the gateway never exits and no project's reconcile fails over a collision.
   `cowshed doctor` reports each collision a project's workspace is part of as `port-block-collision`, naming both
   workspaces and the record each claim is read from. When the newer claim is that workspace's published grant,

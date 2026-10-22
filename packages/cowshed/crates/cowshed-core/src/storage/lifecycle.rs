@@ -846,10 +846,6 @@ pub struct ResizeOutcome {
 pub struct ExtentCount(u64);
 
 impl ExtentCount {
-    /// Historical ASIF-era synthetic predictor, not a RAW-image causal calibration:
-    /// 25.7 s for a 2.11M-extent image and 4.4 s for 473k.
-    pub const FIRST_WRITE_NANOS_PER_EXTENT: u64 = 12_000;
-
     /// Standalone first-write sensitivity limit from one loaded RAW observation:
     /// 60.845084042 s / 434,462 extents = 140.046964 µs/extent. The cause is unattributed.
     /// This does not budget attach, mount, identity work, proof collection or other images.
@@ -861,7 +857,7 @@ impl ExtentCount {
         self.0 <= Self::FORKABLE_MAX.0
     }
 
-    /// Sensitivity at the observed RAW rate, kept separate from the historical predictor.
+    /// Sensitivity at the observed RAW rate.
     pub fn observed_first_write_cost(self) -> Duration {
         let nanos = u128::from(self.0) * u128::from(Self::OBSERVED_FIRST_WRITE_NANOS)
             / u128::from(Self::OBSERVED_EXTENTS);
@@ -874,12 +870,6 @@ impl ExtentCount {
 
     pub const fn get(self) -> u64 {
         self.0
-    }
-
-    /// Historical ASIF-era prediction; it is not the forkable-generation admission rule.
-    pub const fn first_write_cost(self) -> Duration {
-        // Saturating: only a count no file can have overflows u64 nanoseconds.
-        Duration::from_nanos(self.0.saturating_mul(Self::FIRST_WRITE_NANOS_PER_EXTENT))
     }
 }
 
@@ -1217,10 +1207,6 @@ mod extent_policy_tests {
         assert!(over.observed_first_write_cost() > Duration::from_secs(1));
         assert!(ExtentCount::new(1_785).observed_first_write_cost() < Duration::from_millis(250));
         assert!(ExtentCount::new(1_786).observed_first_write_cost() > Duration::from_millis(250));
-        assert_eq!(
-            ExtentCount::new(1).first_write_cost(),
-            Duration::from_micros(12)
-        );
         assert_eq!(
             ExtentCount::new(ExtentCount::OBSERVED_EXTENTS).observed_first_write_cost(),
             Duration::from_nanos(60_845_084_042),

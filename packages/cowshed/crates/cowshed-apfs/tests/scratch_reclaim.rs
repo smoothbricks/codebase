@@ -20,7 +20,7 @@ fn an_unreleased_image_retains_only_its_root_and_does_not_block_later_roots() {
         prefix_peer.clone(),
     ];
     let images = BTreeSet::from([
-        refused.join("retained/first.asif"),
+        refused.join("retained/first.dmg"),
         refused.join("second.dmg"),
     ]);
     let mut removed = Vec::new();
@@ -37,7 +37,7 @@ fn an_unreleased_image_retains_only_its_root_and_does_not_block_later_roots() {
     assert_eq!(removed, [good, empty, prefix_peer]);
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].0, refused);
-    assert!(failures[0].1.contains("first.asif could not be released"));
+    assert!(failures[0].1.contains("first.dmg could not be released"));
 }
 
 #[test]

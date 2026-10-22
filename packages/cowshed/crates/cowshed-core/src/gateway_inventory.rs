@@ -1696,8 +1696,8 @@ impl NativeGatewayInventory {
                         continue;
                     }
                     let sidecar = sidecar_path(&image);
-                    // Read as the sidecar it is: `read_for_image` refuses the legacy image
-                    // extensions a legacy session image still carries.
+                    // Read as the sidecar it is: `read_for_image` refuses a sidecar beside a file
+                    // that is not a RAW image.
                     let read = verify_no_symlinks(store, &sidecar)
                         .map_err(|error| error.to_string())
                         .and_then(|()| {

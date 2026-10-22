@@ -97,10 +97,6 @@ async fn answer(request: RouterRequest) -> Result<RouterResponse> {
             report_stale(&mounts.stale)?;
             respond::<operations::HostDetachAll>(&EmptyResult {})
         }
-        Op::HostClearAttachBudget(_) => {
-            crate::runtime::clear_attach_budget()?;
-            respond::<operations::HostClearAttachBudget>(&EmptyResult {})
-        }
         Op::HostForgetAbandoned(request) => {
             let backend =
                 crate::forget::NativeForgetBackend::new(crate::runtime::host_storage().await?);

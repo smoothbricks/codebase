@@ -331,8 +331,7 @@ main receives one fresh RAW seed captured from its verified warm replacement und
 seed. This explicit retained evidence is not an active latest seed and is never silently collected as one. Re-adoption
 carries its existing exclusive source `ReleaseClaim` into build publication. A RAW source and its RAW replacement share
 the canonical hold resource, so capture borrows that claim through seal, restore and the immutable seed mark instead of
-taking a conflicting second claim. A legacy source's `<id>.asif.hold` is a different resource: its retained claim stays
-alive while capture takes the replacement's `<id>.dmg.hold` normally.
+taking a conflicting second claim.
 
 **Why a reseed.** A land freezes the seed before the target runs anything on the adopted volume. Everything the target
 runs afterwards (its own builds and gates, the land's output restoration, a developer's build in main) is written to its
@@ -1022,12 +1021,7 @@ delta incrementally, as an edit would.
   is deferred with the error, never released on a guess. Under the ordinary exclusive release claim it rechecks image
   absence, the sidecar and live links, then deletes the orphan sidecar with zero image bytes reclaimed. An image
   appearing or a record/link changing defers it; a record a live checkout's link names and retained existing seed images
-  are not relabeled or collected by this rule. This includes payload-absent legacy `<id>.asif.json` seed sidecars as the
-  explicit metadata-only exception to RAW-only enumeration (01a_apfs.md §Images). A strict Seed record is required.
-  Reuse `claim_re_adopt_source` to claim the legacy image's actual hold file, then re-read record, image absence, live
-  links and forming lifecycle work under that same claim; then remove the sidecar and its obsolete hold file, and sync
-  the images directory. No legacy payload is attached, converted, relabeled or released, and an existing legacy seed
-  image remains retained evidence. Preview creates no hold file.
+  are not relabeled or collected by this rule.
 - A fork's volume and seed exist before its workspace does: `cowshed fork` registers and clones them into the staged
   checkout, which no other process can read, and publishes the workspace afterwards. Main's first volume likewise exists
   before main's first touch links it: `cowshed adopt` registers it to main by the adopt's intent and mints it beside

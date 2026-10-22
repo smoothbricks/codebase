@@ -97,7 +97,7 @@ mod native {
             receipts.join(format!("{phase}.mounts.json")),
             serde_json::to_vec_pretty(&mounts)?,
         )?;
-        let reading = attach_budget::observe()?.reading;
+        let reading = attach_budget::read_kernel()?;
         fs::write(
             receipts.join(format!("{phase}.counts.json")),
             serde_json::to_vec_pretty(&reading)?,

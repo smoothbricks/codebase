@@ -61,21 +61,6 @@ impl Serves<HostDetachAll> for Host {
     }
 }
 
-impl Serves<HostClearAttachBudget> for Host {
-    const BOUND: &'static [&'static str] = &[];
-
-    fn request(
-        _authority: &<Self as Binder>::Fields<'_>,
-        arguments: Arguments,
-    ) -> Result<HostRequest> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct Caller {}
-        let Caller {} = decode::<HostClearAttachBudget, Caller>(arguments)?;
-        Ok(HostRequest {})
-    }
-}
-
 impl Serves<HostForgetAbandoned> for Host {
     const BOUND: &'static [&'static str] = &[];
 
@@ -1890,7 +1875,6 @@ pub(crate) fn each_served(check: &mut impl EachServed, handles: &Handles<'_>) {
     check.served::<HostListProjects, _>(handles.host, &[]);
     check.served::<HostAttachAll, _>(handles.host, &[]);
     check.served::<HostDetachAll, _>(handles.host, &[]);
-    check.served::<HostClearAttachBudget, _>(handles.host, &[]);
     check.served::<HostForgetAbandoned, _>(handles.host, &[]);
     check.served::<HostMountMain, _>(handles.host, &[]);
     check.served::<HostGatewayStatus, _>(handles.host, &[]);

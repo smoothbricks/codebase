@@ -42,7 +42,7 @@ describe('RAM temp volume output parsing', () => {
       'driver          : 683.160.3',
       'images          : 3',
       '================================================',
-      'image-path      : /private/cowshed/store/x/main.asif',
+      'image-path      : /private/cowshed/store/x/main.dmg',
       'mounting user   : example',
       'framework name  : DiskImages2',
       '/dev/disk10\t\t',
@@ -73,12 +73,12 @@ describe('RAM temp volume output parsing', () => {
 
   it('finds only the images whose backing file is on the volume', () => {
     const registry = [
-      ...registryDevice('file:///private/tmp/smoo-ram-501/501-a1b2c3/store/main%20copy.asif', 'disk280'),
-      ...registryDevice('file:///private/tmp/smoo-ram-5010/x.asif', 'disk281'),
+      ...registryDevice('file:///private/tmp/smoo-ram-501/501-a1b2c3/store/main%20copy.dmg', 'disk280'),
+      ...registryDevice('file:///private/tmp/smoo-ram-5010/x.dmg', 'disk281'),
       ...registryDevice('ram://134217728', 'disk270'),
     ].join('\n');
     expect(imagesBackedUnder(registry, '/private/tmp/smoo-ram-501/')).toEqual([
-      '/private/tmp/smoo-ram-501/501-a1b2c3/store/main copy.asif (/dev/disk280)',
+      '/private/tmp/smoo-ram-501/501-a1b2c3/store/main copy.dmg (/dev/disk280)',
     ]);
   });
 

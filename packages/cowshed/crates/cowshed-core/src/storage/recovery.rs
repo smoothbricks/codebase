@@ -424,6 +424,9 @@ impl ReAdoptSource {
             }
         }
         for seed in &self.old_seeds {
+            if let Err(reason) = require_raw(&seed.original, &seed.retained) {
+                return refuse(reason);
+            }
             let id = seed
                 .original
                 .file_stem()
@@ -520,9 +523,16 @@ impl ReAdoptSource {
 /// Where re-adoption retains the images it replaced, under the project directory.
 pub const RETAINED_NAMESPACE: &str = "retained";
 
-/// `original` is `<directory>/<stem>.<extension>` and `retained` is
-/// `<retained_directory>/<retained_stem>.<the same extension>`: a retained input keeps the
-/// format it was written in, never renamed as if it were RAW.
+/// Both paths of a retained input are RAW images. Cowshed attaches RAW only and converts nothing,
+/// so a record naming a file in another format is refused by that format and its path
+/// ([`crate::metadata::MetadataError::UnsupportedImageExtension`]), never attached.
+fn require_raw(original: &Path, retained: &Path) -> std::result::Result<(), String> {
+    crate::metadata::validate_image_path(original)
+        .and_then(|()| crate::metadata::validate_image_path(retained))
+        .map_err(|error| error.to_string())
+}
+
+/// `original` is `<directory>/<stem>.dmg` and `retained` is `<retained_directory>/<retained_stem>.dmg`.
 fn retained_at(
     original: &Path,
     retained: &Path,
@@ -531,19 +541,12 @@ fn retained_at(
     retained_directory: &Path,
     retained_stem: &str,
 ) -> bool {
-    let Some(extension) = original.extension().filter(|extension| {
-        [cowshed_apfs::image::IMAGE_EXTENSION, "asif", "sparseimage"]
-            .iter()
-            .any(|known| **extension == **known)
-    }) else {
-        return false;
+    let image = |parent: &Path, name: &str| {
+        parent
+            .join(name)
+            .with_extension(cowshed_apfs::image::IMAGE_EXTENSION)
     };
-    original.parent() == Some(directory)
-        && original.file_stem().is_some_and(|name| name == stem)
-        && retained
-            == retained_directory
-                .join(retained_stem)
-                .with_extension(extension)
+    original == image(directory, stem) && retained == image(retained_directory, retained_stem)
 }
 
 /// `image` is retained as [`retained_at`] says, read from a mount named `mount_name` in a
@@ -556,6 +559,7 @@ fn check_image(
     retained_stem: &str,
     mount_name: &str,
 ) -> std::result::Result<(), String> {
+    require_raw(&image.original, &image.retained)?;
     if !retained_at(
         &image.original,
         &image.retained,

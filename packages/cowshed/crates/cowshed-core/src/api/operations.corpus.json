@@ -243,7 +243,6 @@
   "host.listProjects": { "landing": "measure" },
   "host.attachAll": { "browse": true },
   "host.detachAll": {},
-  "host.clearAttachBudget": {},
   "host.forgetAbandoned": { "repoId": "acme/widget" },
   "host.mountMain": { "repoId": "acme/widget" },
   "host.gatewayStatus": {},

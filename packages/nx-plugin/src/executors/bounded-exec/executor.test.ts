@@ -950,7 +950,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const workspace = await createWorkspace();
     const directory = join(workspace.root, 'lease');
     await mkdir(directory);
-    const held = '/v/9-abcdef is kept: /v/9-abcdef/x.asif (/dev/disk9) still attached from below it';
+    const held = '/v/9-abcdef is kept: /v/9-abcdef/x.dmg (/dev/disk9) still attached from below it';
     const retained =
       '/v/8-ghijkl archived at /v/.archive/0001792505574623-8-ghijkl: kept until 2 newer archives replace it';
     const volume = scriptedVolume({

@@ -27,16 +27,6 @@ impl Host {
         super::json_call::<operations::HostDetachAll, _>(env, Arc::clone(&self.inner), arguments)
     }
 
-    /// Clears this boot's recorded attach-pool exhaustion and its recorded ceiling.
-    #[napi(js_name = "clearAttachBudget")]
-    pub fn clear_attach_budget(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
-        super::json_call::<operations::HostClearAttachBudget, _>(
-            env,
-            Arc::clone(&self.inner),
-            arguments,
-        )
-    }
-
     /// Retires one project no controller can open, from store records; the call is the abandonment.
     #[napi(js_name = "forgetAbandoned")]
     pub fn forget_abandoned(&self, env: Env, arguments: String) -> napi::Result<JsObject> {

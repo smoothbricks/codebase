@@ -335,7 +335,7 @@ async function nativeRamVolume(): Promise<void> {
     // registry entry is injected, so the test spends no attach of its own. The next task keeps
     // the lease and names it instead of detaching another owner's image.
     alive.delete(202);
-    const image = join(leaseB.directory, 'store', 'main.asif');
+    const image = join(leaseB.directory, 'store', 'main.dmg');
     attachedBelow.image = image;
     const third = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid), processes);
     // A failed acquire must not leave its new live-pid lease or reclaim claim behind. Reuse

@@ -211,7 +211,7 @@ As specified in 01a_apfs.md and 02_workspaces.md: one RAW image (`.dmg`) per wor
 case-sensitive APFS volume. Formatted images attach exactly once with
 `hdiutil attach -kernel -nomount -noverify -nobrowse -imagekey diskimage-class=CRawDiskImage -plist <image>`, then
 pinned `fsck_apfs -q` verifies the freshly probed owned APFS volume before `mount_apfs` mounts it. Re-adoption's
-retained inputs, which may be ASIF, attach read-only with `diskutil image attach --readOnly` instead (01a_apfs.md,
+retained inputs are RAW and attach the same way with `-readonly`; any other format is refused by name (01a_apfs.md,
 "Mounts"). The registry-proven raw pin remains held across the host lease wait and mount command, and cowshed checks the
 held mount-root/source identity before publication (01a_apfs.md, "Mounts"). There is no combined mountpoint attach,
 fallback or stale-family selection. Release uses `diskutil unmount` of each exact currently-owned mounted volume, then

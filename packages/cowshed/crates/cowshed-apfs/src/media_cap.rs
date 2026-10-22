@@ -14,17 +14,12 @@
 //! replays nothing, so an attach that already lost its match stays hung; the only defense is never
 //! to start one past the cap.
 //!
-//! The gate here runs where every disk child spawns ([`crate::SystemCommandRunner`]), inside the
-//! storage lease: no `diskutil image attach` or `hdiutil attach` starts while the media it adds
-//! would cross the cap. It is refused as [`MediaCapReached`] instead. Making room, by detaching
-//! workspaces nothing uses, belongs to the layer that knows workspaces (`cowshed_core::media_room`).
-//! This cap is separate from the attach pool's leaked devices ([`crate::attach_budget`]), which
-//! fail an attach with error code 150 rather than hanging it.
+//! Nothing here refuses an attach: cowshed attaches in the kernel, which waits on no match
+//! notification. Making room, by detaching workspaces nothing uses, belongs to the layer that
+//! knows workspaces (`cowshed_core::media_room`).
 
 use std::fmt;
 use std::io;
-
-use crate::{CommandRequest, CommandRunError, CommandRunFailure};
 
 /// XNU's `IOServiceUserNotification::kMaxOutstanding`: the matches one notification queues before
 /// its handler drops the rest (module docs).
@@ -83,19 +78,6 @@ impl MediaReading {
     pub fn images_left(self, cap: u64) -> u64 {
         cap.saturating_sub(1).saturating_sub(self.committed()) / MEDIA_PER_IMAGE
     }
-
-    /// Refuse `images` more attaches whose media would reach `cap`.
-    pub fn admits(self, cap: u64, images: u64) -> Result<(), MediaCapReached> {
-        match self.excess(cap, images) {
-            0 => Ok(()),
-            excess => Err(MediaCapReached {
-                cap,
-                images,
-                reading: self,
-                excess,
-            }),
-        }
-    }
 }
 
 impl fmt::Display for MediaReading {
@@ -107,36 +89,6 @@ impl fmt::Display for MediaReading {
         )
     }
 }
-
-/// The refusal to start attaches whose media would cross the cap: nothing was attached.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MediaCapReached {
-    pub cap: u64,
-    pub images: u64,
-    pub reading: MediaReading,
-    /// The media past the cap.
-    pub excess: u64,
-}
-
-impl fmt::Display for MediaCapReached {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "MediaCapReached: {} more disk image(s) would add {} IOMedia to {}, beside the storage \
-             phase's other attaches and {HOST_MEDIA_HEADROOM} kept for the host's own disks: {} \
-             IOMedia too many to stay below the {}-entry IOKit match-notification queue (XNU \
-             IOServiceUserNotification::kMaxOutstanding), which drops the match DiskImages2 waits \
-             for, so the attach would hang forever; nothing was attached",
-            self.images,
-            self.images.saturating_mul(MEDIA_PER_IMAGE),
-            self.reading,
-            self.excess,
-            self.cap
-        )
-    }
-}
-
-impl std::error::Error for MediaCapReached {}
 
 /// The media now.
 #[cfg(target_os = "macos")]
@@ -153,26 +105,6 @@ pub fn read() -> io::Result<MediaReading> {
         io::ErrorKind::Unsupported,
         "this kernel has no IOKit match notifications",
     ))
-}
-
-/// Refuse an image attach whose media would cross [`NOTIFICATION_CAP`], before it spawns; every
-/// other command passes. A reading that fails refuses too: an attach past the cap never returns,
-/// while a refused one can run again.
-pub(crate) fn refuse_attach_past_cap(request: &CommandRequest) -> Result<(), CommandRunError> {
-    if !crate::is_image_attach(request) {
-        return Ok(());
-    }
-    let failure = match read() {
-        Ok(reading) => match reading.admits(NOTIFICATION_CAP, 1) {
-            Ok(()) => return Ok(()),
-            Err(reached) => CommandRunFailure::MediaCap(reached),
-        },
-        Err(error) => CommandRunFailure::MediaUnread(error),
-    };
-    Err(CommandRunError {
-        request: request.clone(),
-        failure,
-    })
 }
 
 #[cfg(test)]
@@ -201,57 +133,5 @@ mod tests {
             900 + (2 + PEERS) * MEDIA_PER_IMAGE + HOST_MEDIA_HEADROOM
         );
         assert_eq!(reading(u64::MAX, u64::MAX).committed(), u64::MAX);
-    }
-
-    /// An attach that leaves the total one below the cap fits; one that reaches the cap is
-    /// refused, by the one medium too many.
-    #[test]
-    fn an_attach_fits_below_the_cap_and_no_further() {
-        let below = NOTIFICATION_CAP - 1 - MEDIA_PER_IMAGE - reading(0, 0).committed();
-        assert_eq!(reading(below, 0).admits(NOTIFICATION_CAP, 1), Ok(()));
-        assert_eq!(reading(below, 0).images_left(NOTIFICATION_CAP), 1);
-        let refused = reading(below + 1, 0)
-            .admits(NOTIFICATION_CAP, 1)
-            .expect_err("an attach that reaches the cap");
-        assert_eq!(refused.excess, 1);
-        assert_eq!(reading(below + 1, 0).images_left(NOTIFICATION_CAP), 0);
-        // A running attach reserves its image's media too.
-        assert_eq!(
-            reading(below, 1)
-                .admits(NOTIFICATION_CAP, 1)
-                .map_err(|reached| reached.excess),
-            Err(MEDIA_PER_IMAGE)
-        );
-    }
-
-    /// The refusal says what it counted, why the attach would hang, and that nothing ran.
-    #[test]
-    fn the_refusal_names_the_count_the_cap_and_that_nothing_was_attached() {
-        let said = reading(1050, 1)
-            .admits(NOTIFICATION_CAP, 2)
-            .expect_err("over the cap")
-            .to_string();
-        assert!(
-            said.starts_with(
-                "MediaCapReached: 2 more disk image(s) would add 6 IOMedia to 1050 IOMedia \
-                 registered (subclasses included) and 1 image attach(es) running"
-            ),
-            "{said}"
-        );
-        assert!(said.contains("kMaxOutstanding"), "{said}");
-        assert!(said.contains("nothing was attached"), "{said}");
-        assert!(said.ends_with("nothing was attached"), "{said}");
-    }
-
-    /// Only an image attach is gated: a detach or an info read never waits on the media count.
-    #[test]
-    fn only_an_image_attach_is_gated() {
-        for request in [
-            CommandRequest::new(crate::DISKUTIL, ["image", "info", "/x.dmg"]),
-            CommandRequest::new(crate::HDIUTIL, ["detach", "/dev/disk9"]),
-            CommandRequest::new(crate::DISKUTIL, ["info", "/dev/disk9"]),
-        ] {
-            assert!(refuse_attach_past_cap(&request).is_ok(), "{request:?}");
-        }
     }
 }

@@ -186,7 +186,7 @@ export type AdoptRequest = {
 
 /**
  * What `coordinator.adopt` made: main, and, when the call replaced main, what the replacement
- * kept (02_workspaces.md, "Re-adoption: format transition and space reclamation", step 5).
+ * kept (02_workspaces.md, "Re-adoption: space reclamation", step 5).
  */
 export type AdoptView = {
   readonly workspace: WorkspaceView;

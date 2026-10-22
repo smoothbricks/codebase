@@ -1504,13 +1504,7 @@ mod tests {
     #[test]
     fn only_raw_dmg_paths_are_workspace_images() {
         validate_image_path(Path::new("raven.dmg")).unwrap();
-        for refused in [
-            "raven.asif",
-            "raven.sparseimage",
-            "raven.img",
-            "raven",
-            "raven.dmg.lock",
-        ] {
+        for refused in ["raven.sparseimage", "raven.img", "raven", "raven.dmg.lock"] {
             assert!(
                 matches!(
                     validate_image_path(Path::new(refused)),
@@ -1534,7 +1528,7 @@ mod tests {
         );
 
         let mut marker = serde_json::to_value(marker_from_json()).unwrap();
-        marker["imageFormat"] = json!("asif");
+        marker["imageFormat"] = json!("raw");
         let error = serde_json::from_value::<WorkspaceMarker>(marker).unwrap_err();
         assert!(
             error.to_string().contains("unknown field `imageFormat`"),

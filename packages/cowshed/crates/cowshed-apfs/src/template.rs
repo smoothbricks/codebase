@@ -1,9 +1,7 @@
 //! The store's blank templates (01a_apfs.md, "Images"): one formatted, verified, detached RAW
 //! image per capacity and owner, from which every new image is cloned. A mint is then one
-//! `clonefile` and one attach. The `diskutil image create`, the formatting attach, the
-//! `newfs_apfs` and the detach are paid once per store and capacity, here, instead of once per
-//! image — and the create and the attach queue on `storagekitd` (01a_apfs.md, "How the APFS
-//! host degrades").
+//! `clonefile` and one attach. Creating the sparse file, the formatting attach, the `newfs_apfs`
+//! and the detach are paid once per store and capacity, here, instead of once per image.
 
 use std::fmt;
 use std::fs;

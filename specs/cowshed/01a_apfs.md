@@ -11,16 +11,18 @@ This companion owns the macOS/APFS implementation.
 ## Images
 
 - **Format**: one — a RAW (UDRW) image (`.dmg`) holding one case-sensitive APFS volume, stored as a sparse file on the
-  store's APFS filesystem. There is no second runtime format, fallback, or format field in metadata: `.dmg` is the only
-  image extension anything enumerates. macOS 26 remains the floor. Every image starts as a clone. The sole metadata-only
-  GC exception is specified in [16_build_volumes.md §Garbage collection](./16_build_volumes.md#garbage-collection). Each
-  store keeps one **blank template** per capacity and owner, `.blank/<capacity-bytes>-<uid>-<gid>.dmg`, and a **mint** —
-  adopt's main image, a build volume's first touch — is one `clonefile` of it to the image's canonical name plus one
-  in-kernel attach ("Mounts"), verified with pinned `fsck_apfs -q` before `mount_apfs` mounts the exact volume at the
-  requested root with `nobrowse,owners,noatime`. The clone takes the canonical name whole, so the name only ever holds a
-  complete, formatted volume. A template is minted lazily, the first time a store mints at its capacity, in five
-  unprivileged steps:
-  `diskutil image create blank --format RAW --size <capacity-bytes> --volumeName [cowshed] --fs None <stem>-minting-<nonce>.dmg`,
+  store's APFS filesystem. There is no second runtime format, fallback, converter, or format field in metadata: `.dmg`
+  is the only image extension anything enumerates or attaches. A recorded path naming a file in any other format, such
+  as a re-adoption input, is refused before anything runs, naming the format by its extension and the path. macOS 26
+  remains the floor. Every image starts as a clone. Each store keeps one **blank template** per capacity and owner,
+  `.blank/<capacity-bytes>-<uid>-<gid>.dmg`, and a **mint** — adopt's main image, a build volume's first touch — is one
+  `clonefile` of it to the image's canonical name plus one in-kernel attach ("Mounts"), verified with pinned
+  `fsck_apfs -q` before `mount_apfs` mounts the exact volume at the requested root with `nobrowse,owners,noatime`. The
+  clone takes the canonical name whole, so the name only ever holds a complete, formatted volume. A template is minted
+  lazily, the first time a store mints at its capacity, in five unprivileged steps: a sparse file of `<capacity-bytes>`
+  created exclusively (`O_CREAT|O_EXCL`, `ftruncate`, `fsync`) as `<stem>-minting-<nonce>.dmg`, with no disk tool, which
+  the kernel's RAW class attaches as a disk of that length (measured 2026-10-22: a zero-block 1 GiB file attached, took
+  `newfs_apfs`, passed `fsck_apfs -q` and detached cleanly),
   `hdiutil attach -kernel -nomount -noverify -nobrowse -imagekey diskimage-class=CRawDiskImage -plist <image>`,
   `newfs_apfs -U <uid> -G <gid> -e -v [cowshed] <whole-device>`, a `fsck_apfs -q` of the new volume, and owned-registry
   `hdiutil detach -verbose <whole-device>` of that exact whole device; only then is it renamed to its name. Only minting
@@ -77,38 +79,37 @@ This companion owns the macOS/APFS implementation.
   diagnostics select published images of current owners; a retired incarnation is not the current owner's fork source or
   its defrag target. At **7,141 extents** doctor warns and names `cowshed defrag <workspace>`; 7,140 is the standalone
   first-write sensitivity bound from 60.845084042 s / 434,462 = 140.046964 µs/extent, not a whole-fork guarantee
-  (08_testing.md). The 12 µs ASIF-era synthetic predictor stays separate and unchanged; the RAW observation's cause is
-  unattributed. Before its first write, each fresh workspace or build clone measures its actual detached generation
-  against this bound, not a cached estimate of its still-writing source; past it the fork warns, naming the measured
-  first-write cost and `cowshed defrag <workspace>`, and proceeds: the bound is advisory and never refuses a fork. A
-  resumed pending clone is proved again. Workspace initialization is followed by a flush and a second bounded proof
-  before activation; build seeds prove their final generation after their freshness mark, before publication, and
-  revalidate it across publication. Device/inode, length, allocated blocks, and nanosecond mtime/ctime bind a proof to
-  the physical write generation, not HEAD; missing, changing images cannot claim fork readiness; an oversized one only
-  warns. The fork's walk stops counting at 7,141 runs, so its warning reports lower bounds; doctor's full diagnostic
-  walk is explicit. Proof collection is additional work. `defrag` is the remedy: it rewrites every published seed of the
-  named incarnation and its registered live build source, as well as the workspace image. Each build rewrite retains its
-  exclusive admission claim, closes Nx, refuses holders without force, restores the mount state and preserves a detached
-  seed's build-freshness time. Per-build-image counts and copied bytes are reported separately from the workspace
-  result. It detaches the workspace as `resize` does — a busy volume refuses before the image is touched — copies the
-  image's data regions with plain `pread`/`pwrite` into `<image>.defrag` beside it (never `clonefile`, `copyfile(3)`, or
-  `std::fs::copy`, all of which clone on APFS and would share the old map), punches interior holes after each following
-  write and the trailing hole after sizing the copy (APFS may allocate zero blocks when extending it), `F_FULLFSYNC`s
-  it, renames it over the image, syncs the directory, and verifies the result by attaching it before restoring the mount
-  state it found. The copy runs at 3.1–5.4 GB/s on the store volume (8.9 GiB in 1.8–3.1 s, an 8,871-extent image back to
-  579). Nothing rewrites an attached image: a DiskImages2 attachment's helper holds an exclusive lock on the file
-  (another `O_SHLOCK` or `O_EXLOCK` open fails with `EAGAIN`), and `diskutil image resize` and
-  `diskutil image create from` refuse it as well; an in-kernel attachment takes no lock ("Mounts"), and the verb's own
-  detach and the registry exclude it. The copy needs, and keeps, free space equal to the image's allocated bytes while
-  earlier clones and checkpoints still share the old blocks; the verb refuses before detaching when the store volume
-  lacks it. Nothing enumerates `<image>.defrag` as an image or sidecar; the next `defrag` replaces one an interrupted
-  run left, and `doctor` names it until then. Mains are never detached implicitly (the gateway keeps them mounted), so
-  no path rewrites main on its own. A refused resumed clone remains pending because it may contain the only copy of
-  dirty or unlanded work. Its hint names `cowshed defrag <pending-destination>`, not its source: the command opens
-  without replaying the failed fork, claims the existing creator-intent lease, revalidates the exact pending metadata
-  under its image lock, and rewrites the same payload without activating it or changing its journal phase. A live
-  creator refuses the rewrite. Retrying the original fork then resumes those same bytes; nothing deletes a pending image
-  to satisfy an extent budget.
+  (08_testing.md); the RAW observation's cause is unattributed. Before its first write, each fresh workspace or build
+  clone measures its actual detached generation against this bound, not a cached estimate of its still-writing source;
+  past it the fork warns, naming the measured first-write cost and `cowshed defrag <workspace>`, and proceeds: the bound
+  is advisory and never refuses a fork. A resumed pending clone is proved again. Workspace initialization is followed by
+  a flush and a second bounded proof before activation; build seeds prove their final generation after their freshness
+  mark, before publication, and revalidate it across publication. Device/inode, length, allocated blocks, and nanosecond
+  mtime/ctime bind a proof to the physical write generation, not HEAD; missing, changing images cannot claim fork
+  readiness; an oversized one only warns. The fork's walk stops counting at 7,141 runs, so its warning reports lower
+  bounds; doctor's full diagnostic walk is explicit. Proof collection is additional work. `defrag` is the remedy: it
+  rewrites every published seed of the named incarnation and its registered live build source, as well as the workspace
+  image. Each build rewrite retains its exclusive admission claim, closes Nx, refuses holders without force, restores
+  the mount state and preserves a detached seed's build-freshness time. Per-build-image counts and copied bytes are
+  reported separately from the workspace result. It detaches the workspace as `resize` does — a busy volume refuses
+  before the image is touched — copies the image's data regions with plain `pread`/`pwrite` into `<image>.defrag` beside
+  it (never `clonefile`, `copyfile(3)`, or `std::fs::copy`, all of which clone on APFS and would share the old map),
+  punches interior holes after each following write and the trailing hole after sizing the copy (APFS may allocate zero
+  blocks when extending it), `F_FULLFSYNC`s it, renames it over the image, syncs the directory, and verifies the result
+  by attaching it before restoring the mount state it found. The copy runs at 3.1–5.4 GB/s on the store volume (8.9 GiB
+  in 1.8–3.1 s, an 8,871-extent image back to 579). Nothing rewrites an attached image: a DiskImages2 attachment's
+  helper holds an exclusive lock on the file (another `O_SHLOCK` or `O_EXLOCK` open fails with `EAGAIN`), and
+  `diskutil image resize` and `diskutil image create from` refuse it as well; an in-kernel attachment takes no lock
+  ("Mounts"), and the verb's own detach and the registry exclude it. The copy needs, and keeps, free space equal to the
+  image's allocated bytes while earlier clones and checkpoints still share the old blocks; the verb refuses before
+  detaching when the store volume lacks it. Nothing enumerates `<image>.defrag` as an image or sidecar; the next
+  `defrag` replaces one an interrupted run left, and `doctor` names it until then. Mains are never detached implicitly
+  (the gateway keeps them mounted), so no path rewrites main on its own. A refused resumed clone remains pending because
+  it may contain the only copy of dirty or unlanded work. Its hint names `cowshed defrag <pending-destination>`, not its
+  source: the command opens without replaying the failed fork, claims the existing creator-intent lease, revalidates the
+  exact pending metadata under its image lock, and rewrites the same payload without activating it or changing its
+  journal phase. A live creator refuses the rewrite. Retrying the original fork then resumes those same bytes; nothing
+  deletes a pending image to satisfy an extent budget.
 - **Detached growth**: under the image's lease, an `O_EXLOCK | O_NONBLOCK | O_NOFOLLOW` open refuses a file a
   DiskImages2 helper holds and excludes such an attach until the write is durable. An in-kernel attachment takes no
   lock, so growth then refuses (`EWOULDBLOCK`, as a held lock does) when a registered in-kernel drive holds the opened
@@ -145,79 +146,6 @@ This companion owns the macOS/APFS implementation.
   `[Excluded]` though cowshed applies no exclusion (it runs no `tmutil`). Durability is git (`cowshed push`), never
   backup.
 
-## Historical format measurements
-
-The image-format prototype (`specs/cowshed/prototypes/image-format-bench/`: harness, `results/`) compared three
-candidates on the store's APFS container, all created and mounted without root: case-sensitive ASIF (the historical
-pre-RAW format), case-insensitive ASIF (`newfs_apfs -i`, otherwise identical), and case-sensitive SPARSE
-(`hdiutil create -type SPARSE -fs "Case-sensitive APFS"`, attached with `hdiutil attach -owners on -nomount`). The data
-set is one real Bun `node_modules` (3.6 GB, 34k files, 6.5k symlinks), 40,000 further symlinks, 2 GiB of
-cargo-target-like files (24 × 64 MiB, 512 × 1 MiB), and a git repository tracking all but the target files (80,744 index
-entries, 0.75 GB of loose objects): 6.3 GB, 55,821 files, 46,575 symlinks. One churn round rewrites every target file
-(write a new file, rename it over the old) and relinks every symlink — 2 GiB and 46,575 relinks. Extents are counted as
-`doctor` counts them; the first write is one byte rewritten in place in a fresh `clonefile` of the image. The host ran a
-fleet throughout (load average 10–35), so single timings carry about ±20 %; the I/O rows interleave the three candidates
-round by round.
-
-| Metric                                                                   | ASIF, case-sensitive (historical choice)                                          | ASIF, case-insensitive                                                   | SPARSE, case-sensitive                                           |
-| ------------------------------------------------------------------------ | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | ---------------------------------------------------------------- |
-| Create, unprivileged (median of 5)                                       | 441 ms                                                                            | 448 ms                                                                   | 1,046 ms                                                         |
-| Attach + `fsck_apfs -q` + mount (median of 5)                            | 228 ms                                                                            | 204 ms                                                                   | 308 ms                                                           |
-| Detach (median of 5)                                                     | 337 ms                                                                            | 277 ms                                                                   | 360 ms                                                           |
-| Fill with the 6.3 GB data set (`ditto`, two runs)                        | 21.7 s / 16.5 s                                                                   | 17.2 s / 20.8 s                                                          | 34.7 s / 57.5 s                                                  |
-| Source extents, filled → 3 churn rounds, 4 clones held                   | 385 → 511 → 5,137 → 8,871                                                         | 425 → 550 → 5,323 → 8,952                                                | 593 → 2,244 → 5,822 → 9,441                                      |
-| First write into a fresh clone at those counts                           | 2.7 / 3 / 18.4 / 30.7 ms                                                          | 2.5 / 2.4 / 17.3 / 29.3 ms                                               | 2.8 / 9.4 / 20.6 / 36 ms                                         |
-| Source extents, same churn, no clone held                                | 468 → 576 → 629 → 655                                                             | 445 → 586 → 621 → 624                                                    | 583 → 778 → 884 → 888                                            |
-| Source extents, same churn inside a clone of it                          | 356 → 356 → 356 → 356 (shed: 472 → 5,003 → 8,699)                                 | —                                                                        | —                                                                |
-| Allocated after 3 rounds (5.9 GiB data)                                  | 8.87 GiB                                                                          | 8.87 GiB                                                                 | 9.06 GiB                                                         |
-| Defrag copy of the 4-clone image (8.9 GiB)                               | 2.0 s, 4.7 GB/s → 579 extents                                                     | 1.8 s, 5.4 GB/s → 576 extents                                            | 3.1 s, 3.1 GB/s → 598 extents                                    |
-| `git status`, 80,744 entries (interleaved median of 7)                   | 315 ms                                                                            | 344 ms                                                                   | 319 ms                                                           |
-| 20k small files: create / symlink / unlink ops/s                         | 13,811 / 26,684 / 31,149                                                          | 14,516 / 25,955 / 28,200                                                 | 1,331 / 1,690 / 4,382                                            |
-| 1 GiB sequential write (`F_FULLFSYNC`) / read (`F_NOCACHE`)              | 3,201 / 15,022 MB/s                                                               | 3,202 / 15,258 MB/s                                                      | 751 / 2,012 MB/s                                                 |
-| Space returned after 3.3 GiB written then deleted                        | 1.3 GiB on its own; `diskutil image create from` copy is 15 MiB (0.18 s)          | 1.3 GiB on its own; `diskutil image create from` copy is 15 MiB (0.13 s) | none on its own; `hdiutil compact` 0.7 s returned 57 MiB         |
-| Capacity 100 GiB vs 7.3 TiB (the store volume): create                   | 710 vs 463 ms                                                                     | —                                                                        | 1,050 vs 1,032 ms                                                |
-| … attach + fsck + mount                                                  | 288 vs 241 ms                                                                     | —                                                                        | 287 vs 525 ms                                                    |
-| … image allocated when empty                                             | 14 vs 17 MiB                                                                      | —                                                                        | 15 vs 17 MiB                                                     |
-| … `df` inside the volume (size / available)                              | 100 / 100 vs 7,449 / 2,686 GiB                                                    | —                                                                        | 100 / 100 vs 7,449 / 2,674 GiB                                   |
-| … filled, then one churn round: allocated, extents                       | 7.93 GiB, 455 vs 7.93 GiB, 932                                                    | —                                                                        | 7.92 GiB, 785 vs 7.93 GiB, 777                                   |
-| … grow 100 GiB → 7.3 TiB, detached                                       | 542 ms                                                                            | —                                                                        | 1,171 ms                                                         |
-| Rewrite of the 4-clone image: plain copy vs `diskutil image create from` | 2.4 s → 792 extents, 8.83 GiB vs 2.8 s → 217 extents, 7.95 GiB, same content: yes | —                                                                        | —                                                                |
-| Rewrite, resize, or convert while attached                               | refused: file held under exclusive lock (`EAGAIN`)                                | refused: file held under exclusive lock (`EAGAIN`)                       | refused: file held under exclusive lock (`EAGAIN`)               |
-| Grow 100 → 200 GB, detached                                              | 460 ms; volume grows with it                                                      | 539 ms; volume grows with it                                             | 498 ms; volume grows with it                                     |
-| Volume and its clone case-sensitive                                      | yes / yes                                                                         | no / no                                                                  | yes / yes                                                        |
-| Work per fork for case sensitivity                                       | none                                                                              | none                                                                     | none                                                             |
-| Largest capacity (documented / reverse-engineered)                       | just under 4 PiB                                                                  | just under 4 PiB                                                         | 128 PB (`man hdiutil`)                                           |
-| Host dies mid-write (docs)                                               | allocation directory is versioned and switched atomically                         | allocation directory is versioned and switched atomically                | power loss during `compact` can damage the image (`man hdiutil`) |
-
-The detached-grow timings above measured Apple's content resize, before the native header-growth cutover. The "while
-attached" row measured DiskImages2 attachments; an in-kernel attachment takes no lock ("Mounts"), and growth refuses it
-by the registry ("Detached growth").
-
-ASIF's 1 MiB chunks, its capacity limit, and its versioned allocation directory come from reverse engineering
-(<https://schamper.dev/dissecting-apples-sparse-image-format-asif/>), not from Apple; SPARSE's limits and its compaction
-warning come from `man hdiutil`. APFS's journal does not make the enclosing image driver's mutable allocation map a
-snapshot: `sync_volume_np(WAIT)` followed by image `fsync` and `clonefile` can capture mixed ASIF map generations. The
-pre-RAW ASIF implementation therefore captured only detached images, holding each inode with a shared no-follow lock,
-validating its allocation map and cloning through that descriptor. It unmounted and detached a mounted source without
-force and restored it afterwards; a source holder refused the capture. That policy blocked live-main forks, and the
-cause of the observed inconsistent maps was not established by the earlier successful smoke reads. It is historical, not
-the current RAW source-capture contract. RAW has no outer map; source captures remain live, while build seeds retain the
-separate writer exclusion in "Images" and 16_build_volumes.md. `fsck_apfs -q` still checks the inner filesystem before a
-mount, but cannot establish the outer ASIF map's consistency. ASIF's chunk table can mark a chunk unmapped, which fits
-it returning part of deleted space on its own; SPARSE returns nothing until `hdiutil compact`, and little then.
-`diskutil image create from` rewrites a detached ASIF image from its allocated chunks only: on the churned four-clone
-image it took 2.8 s against the plain copy's 2.4 s and left 217 extents and 7.95 GiB against 792 and 8.83 GiB, with the
-same content, case sensitivity, and owner. An ASIF capacity as large as the store volume measured no cost against 100
-GiB: creation, attach, empty allocation, and the allocation after a fill and a churn round match within noise, the
-churned image held 932 extents against 455 (about 1.5 ms more first write), and `df` inside the volume reports the
-store's own free space as available. SPARSE at that capacity attached slower (525 against 287 ms) and once refused its
-first detach with `EBUSY`.
-
-Case-sensitive ASIF therefore costs nothing that case-insensitive ASIF does not: the flag is set once at creation, no
-step recurs per fork, and every measured difference between the two sits inside the noise. SPARSE loses on creation,
-attach, fill, small-file and sequential I/O, ties on `git status`, fragments under clones exactly as ASIF does, and
-gives back less space.
-
 ## Mounts
 
 APFS image attach uses
@@ -226,11 +154,9 @@ once, naming the exact backing image. Read-only attachments add `-readonly`; att
 options select workspace visibility. `-kernel` serves the RAW image from the kernel's own file backing store (`KDIURL` →
 `KDIFileBackingStore` → `KDIReadWriteDiskImage` → `KDIDiskImageNub` → `IOHDIXHDDriveInKernel` →
 `IODiskImageBlockStorageDeviceInKernel`): no userspace image helper serves its I/O, so none can stall, outlive its image
-or hold a notification ("The IOMedia match-notification ceiling"). DiskImages2 (`diskutil image attach`, served by
-`diskimagesiod`) attaches one kind of cowshed image only: a retained re-adoption input (02_workspaces.md), read-only,
-with `diskutil image attach --readOnly --nobrowse --noMount --plist <image>`. A retained input may be ASIF, which only
-DiskImages2 reads; the in-kernel RAW class attaches ASIF bytes as a raw device and finds no volume (`NoApfsVolume`,
-measured in the real-APFS lane on 2026-10-22). That attach meets the spent-boot latch and the media gate like any other.
+or hold a notification ("The IOMedia match-notification ceiling"). A retained re-adoption input (02_workspaces.md) is
+RAW like every image and attaches the same way, read-only. Nothing cowshed attaches goes through DiskImages2
+(`diskutil image attach`, served by `diskimagesiod`), and an image in any other format is refused, never attached there.
 DiskImages2 attachments are read and released too, since an earlier build or another tool may hold one. An in-kernel
 attachment takes no lock on its backing file: with one attached, `flock` `LOCK_EX` and `LOCK_SH` and an `O_EXLOCK` open
 were all granted (2026-10-22), so no rule reads a granted lock as proof that an image is detached ("Images", detached
@@ -497,12 +423,12 @@ guard after the detach's storage lease wait. An unrelated refusal remains an err
 broaden the dissent parser, force a foreign volume, add an automatic command fallback, or weaken a fixture's complete
 cleanup expectation.
 
-On 2026-10-14 at **20:07:36 +04:00**, the real panic/kill cleanup fixture's retained `second.asif` was joined by the I/O
-Registry to driver **0x100089e2a**, helper **36162**, physical **disk177**, container **disk179** and unmounted,
-read-only volume **disk179s1** (volume UUID **02E5E265-1B57-4996-A2FE-E5B750FBC630**). Root `lsof` found no holder of
-those raw device nodes. Nevertheless, `diskutil eject disk177` caused StorageKit/DA to request unmount of cached
-**disk177s1**, marked mounted with the different UUID **73578864-29ED-47A4-BEF1-63916CA00560**, outside the image's
-registered tree. Three actual requests returned only
+On 2026-10-14 at **20:07:36 +04:00**, the real panic/kill cleanup fixture's retained second input, then a DiskImages2
+attachment, was joined by the I/O Registry to driver **0x100089e2a**, helper **36162**, physical **disk177**, container
+**disk179** and unmounted, read-only volume **disk179s1** (volume UUID **02E5E265-1B57-4996-A2FE-E5B750FBC630**). Root
+`lsof` found no holder of those raw device nodes. Nevertheless, `diskutil eject disk177` caused StorageKit/DA to request
+unmount of cached **disk177s1**, marked mounted with the different UUID **73578864-29ED-47A4-BEF1-63916CA00560**,
+outside the image's registered tree. Three actual requests returned only
 `Unmount of disk177 failed: at least one volume could not be unmounted`, with no dissenter PID. The existing
 no-dissenter refusal correctly retained the image and root; this was not the `Release` grace/force case.
 
@@ -742,16 +668,16 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
 1. **`storagekitd` serializes every `diskutil` verb, host-wide.** `diskutil image create`, `attach`, `info` and `resize`
    each make a synchronous XPC call to root `storagekitd` that re-syncs every disk on the host (`syncAllDisks`); an
    attach makes two. `storagekitd` answers one caller at a time. Measured on macOS 26 with about 390 `/dev/disk*` nodes:
-   `diskutil info` costs about 40 ms of that serial queue and an APFS ASIF attach about 85 ms, so throughput stays flat
-   (about 24 info calls/s, 12 attaches/s) while latency grows with the number of concurrent callers: an attach takes
-   0.22 s alone, 1.2 s with 16 concurrent, and 2.5 s with 32. A parallel real-image test suite peaked at 37 concurrent
-   disk-tool processes and measured 2.5–8 s for single calls that take 0.2 s idle. CPU load changes none of this; the
-   number of concurrent disk-tool calls on the host does. `hdiutil detach`, `newfs_apfs`, `fsck_apfs`, `mount_apfs` and
-   IORegistry reads do not go through `storagekitd`. Mount-table churn starves it all the same: an attach spends most of
-   its time in `syncAllDisks` after its device already exists (76% of a sampled stuck attach), and that sync does not
-   finish while mounts and unmounts keep changing the table. With no attach running, one `mount_apfs`/`umount` loop at
-   6.3 cycles/s moved a probe attach's median from 1.15 s to 12.2 s, and four loops starved every probe past 60 s; eight
-   attach loops beside two mount loops made 8 attaches in 42 s, each taking 41.7 s.
+   `diskutil info` costs about 40 ms of that serial queue and a DiskImages2 APFS image attach about 85 ms, so throughput
+   stays flat (about 24 info calls/s, 12 attaches/s) while latency grows with the number of concurrent callers: an
+   attach takes 0.22 s alone, 1.2 s with 16 concurrent, and 2.5 s with 32. A parallel real-image test suite peaked at 37
+   concurrent disk-tool processes and measured 2.5–8 s for single calls that take 0.2 s idle. CPU load changes none of
+   this; the number of concurrent disk-tool calls on the host does. `hdiutil detach`, `newfs_apfs`, `fsck_apfs`,
+   `mount_apfs` and IORegistry reads do not go through `storagekitd`. Mount-table churn starves it all the same: an
+   attach spends most of its time in `syncAllDisks` after its device already exists (76% of a sampled stuck attach), and
+   that sync does not finish while mounts and unmounts keep changing the table. With no attach running, one
+   `mount_apfs`/`umount` loop at 6.3 cycles/s moved a probe attach's median from 1.15 s to 12.2 s, and four loops
+   starved every probe past 60 s; eight attach loops beside two mount loops made 8 attaches in 42 s, each taking 41.7 s.
 2. **AppleDiskImages2 runs out, of kernel mappings held by orphaned `diskimagesiod` helpers or of leaked devices.**
    Every DiskImages2 attachment (not an in-kernel one, "Mounts") has its own `diskimagesiod` (launchd job
    `system/com.apple.diskimagesiod.<UUID>`), which maps its IO request pool into the kernel: 36 shared buffers of 2 MiB
@@ -796,35 +722,21 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    current mds discovery and missing-release mechanism, controls and mount-root policy are specified in
    [Spotlight media references](#spotlight-media-references).
 
-   The pool is bookkept per host user in `/private/var/tmp/cowshed-attach-pool-<euid>/pool.json`, a 0700 directory that
-   survives the reboot, written under a lock beside it; the pool itself is host-wide, and each user's record holds what
-   that user's commands met. The record is keyed by `kern.bootsessionuuid`, since `kern.boottime` moves within a boot
-   whenever the clock is stepped. Every 150 a disk-image command meets is `ApfsError::AttachPoolExhausted`, a host
-   finding whose next step is `cowshed doctor`, never "repair storage", and the system runner records the boot's first:
-   the boot is spent, with the image devices' counts and the orphaned helpers at that moment when they can be read,
-   until the operator, having freed what spent it, ends it with `cowshed doctor --clear-attach-budget`, or the boot
-   ends. A later successful attach does not end it. Clearing the spent-boot fact retains the last exhaustion as
-   evidence.
-
-   Cowshed attaches its runtime images in the kernel ("Mounts"), which draws nothing from this pool. The record latches
-   the DiskImages2 attaches that still run through cowshed, re-adoption's read-only retained-input attach ("Mounts") and
-   `cowshed disk-command diskutil -- image attach …`: the system runner refuses one before it spawns while its boot is
-   spent, with `AttachPoolExhausted` and its `next:` step, because a failed attach leaks one more device; a record that
-   cannot be read or does not parse refuses too (`PoolUnread`), since it may have held the 150. No device count gates
-   anything. The earliest observed 150 (06:01:48 in the boot of 2026-10-21 20:12 +04) struck with 271 images registered
-   and 963 `DIDeviceIOUserClient` and 972 `AppleDiskImageDevice` instances allocated, live and departed together; each
-   IO client maps 36 shared 2 MiB buffers that only its `free()` returns. That count is history, not a limit. The pool
-   record holds 1,042 because its observer met its first 150 after 67 more failed attaches had each allocated a device.
-   A record whose bytes do not parse proves nothing: `doctor` reads it as empty with a warning naming the file and still
-   reports the kernel, and the next write (a 150, the operator's clear) replaces it. `doctor` reports
-   `disk-image-attach-budget`: the four classes' live instances, registered entries and differences, the current boot's
-   exhaustion evidence, and disk-image commands an earlier build interrupted, each a probable leaked device (the record
-   keeps them until the boot ends; no current build writes one). It is an error while the boot is spent ("attach pool
-   exhausted"), and a warning while any image device is leaked or an earlier build interrupted a command. Its hint names
-   proven orphaned or stalled helpers first when they ran at the 150, then the stalled helper whose kill frees retained
-   devices, and a reboot only when none is stalled or the devices stay, never a guessed daemon restart for unrelated
-   departed-volume references; clearing a record repairs nothing in the kernel. `departed-volume-references` is a
-   separate warning from the first departed APFS-volume or IOMedia instance, with exact counts and a root `lsmp`
+   Nothing records this pool or latches on it. Cowshed runs no DiskImages2 verb: every image, retained re-adoption
+   inputs included, attaches in the kernel ("Mounts"), and a blank image is a sparse file cowshed creates itself
+   ("Images"), so none of its own commands draws on the pool. The one DiskImages2 attach that still runs through cowshed
+   is the user's own raw passthrough, `cowshed disk-command diskutil -- image attach …`, which runs as asked; a 150 it
+   meets is the tool's own exit status and stderr, passed through unchanged. Earlier builds kept a per-boot record under
+   `/private/var/tmp/cowshed-attach-pool-<euid>/` that refused every DiskImages2 attach for the rest of a boot after its
+   first 150; that latch is gone, and the directory it left is read by nothing. The earliest observed 150 (06:01:48 in
+   the boot of 2026-10-21 20:12 +04) struck with 271 images registered and 963 `DIDeviceIOUserClient` and 972
+   `AppleDiskImageDevice` instances allocated, live and departed together; each IO client maps 36 shared 2 MiB buffers
+   that only its `free()` returns. That count is history, not a limit. `doctor` reports `disk-image-attach-budget`: the
+   four classes' live instances, registered entries and differences, read fresh each run. It is a warning while any
+   image device is leaked and informational otherwise, never an error, since nothing cowshed does depends on the pool.
+   Its hint names the stalled helper whose kill frees retained devices, and a reboot only when none is stalled or the
+   devices stay, never a guessed daemon restart for unrelated departed-volume references. `departed-volume-references`
+   is a separate warning from the first departed APFS-volume or IOMedia instance, with exact counts and a root `lsmp`
    attribution step; it neither defines attach-pool capacity nor prescribes a daemon restart. Orphaned helpers are named
    only when two reads in a row agree and no `diskutil` or `hdiutil` ran during either, since a helper whose attach is
    under way has no device yet and killing it mid-attach is what leaks one; killing an orphan frees its mapping; killing
@@ -1016,7 +928,7 @@ page cache, not the image. The in-kernel path attaches through `KDIURL` → `KDI
 DI2 object, no image helper, and no userspace descriptor on the backing file; `IOHDIXHDDriveInKernel` carries the
 backing file as `KDIURLPath` (a string) and `image-path` (bytes, no NUL). Blank formatting, read-write use and a
 read-only attach with `fsck_apfs` and mount all pass on it. Images were attached with `hdiutil` until 2026-09-30
-(`a7af3559d`), when ASIF, a DI2-only format, replaced SPARSE for speed; that SPARSE row was the out-of-kernel driver.
+(`a7af3559d`), when a DiskImages2-only format replaced SPARSE for speed; that SPARSE row was the out-of-kernel driver.
 
 #### What multiplied the attaches
 
@@ -1027,25 +939,25 @@ read-only attach with `fsck_apfs` and mount all pass on it. Images were attached
   and left its build volume attached: before the reboot the kernel held 164 build volumes, 88 session images and 4
   mains. A land and an `rm` released both.
 
-Cowshed's runtime RAW attaches no longer go through DiskImages2: they attach in the kernel ("Mounts"), which has no
-image helper to stall at the ceiling or retain devices after it. Retained ASIF inputs still attach through DiskImages2
-for migration, and explicit DI2 passthrough attaches keep the observed error-150 latch. In-kernel attaches are measured
-to complete past the ceiling, up to 1,084 registered IOMedia (170 attaches at 0.14 to 0.27 s each, detaches leaving
-nothing allocated). 500 sheds hold about 3,000; until in-kernel attaches are measured at that count, cowshed still never
-starts any attach past the ceiling.
+Cowshed's attaches no longer go through DiskImages2: every image, retained re-adoption inputs included, attaches in the
+kernel ("Mounts"), which has no image helper to stall at the ceiling or retain devices after it. Only the user's own
+`cowshed disk-command diskutil -- image attach …` still runs one. In-kernel attaches are measured to complete past the
+ceiling, up to 1,084 registered IOMedia (170 attaches at 0.14 to 0.27 s each, detaches leaving nothing allocated). 500
+sheds hold about 3,000; until in-kernel attaches are measured at that count, cowshed still never starts any attach past
+the ceiling.
 
-Cowshed therefore never starts an attach past the ceiling. The system runner refuses an image attach whose media would
-reach 1024 before it spawns (`MediaCapReached`, `cowshed-apfs` `media_cap`; 02_workspaces.md, "Making room for an
-attach"), counting the registered IOMedia, subclasses included, three for every attach running on the host and for every
-other member of the storage phase, and 16 for disks the host attaches on its own. A verb that may attach first detaches
+The system runner refuses no attach on the media count: no attach cowshed runs waits on a match notification. A verb
+that may attach still makes room first when its media would reach 1024 (`cowshed-apfs` `media_cap`; 02_workspaces.md,
+"Making room for an attach"), counting the registered IOMedia, subclasses included, three for every attach running on
+the host and for every other member of the storage phase, and 16 for disks the host attaches on its own. It detaches
 idle workspaces, least recently used first: only workspaces with no supervisor serving them, never main, the named
 workspaces, or one a land or `rm` holds. If nothing idle frees enough, it detaches nothing and refuses by name, listing
 ten attached workspaces with the media each holds and the count of the rest. Attaching every session (`cowshed attach`
-without a name, or `--all`) and controller operations get the guard's refusal only. The gateway's startup pass mounts
-mains only and leaves sessions to attach on use (05_gateway.md, "Startup contract"), and a detach frees a workspace's
-build volume with its image (02_workspaces.md, "`cowshed attach` / `cowshed detach`"). `doctor` reports
-`media-notification-cap` and distinguishes stalled-helper retention from orphaned helpers
-(`orphaned-disk-image-helpers`): a stalled helper is not orphaned while it still owns an attached image.
+without a name, or `--all`) and controller operations make no room. The gateway's startup pass mounts mains only and
+leaves sessions to attach on use (05_gateway.md, "Startup contract"), and a detach frees a workspace's build volume with
+its image (02_workspaces.md, "`cowshed attach` / `cowshed detach`"). `doctor` reports `media-notification-cap` and
+distinguishes stalled-helper retention from orphaned helpers (`orphaned-disk-image-helpers`): a stalled helper is not
+orphaned while it still owns an attached image.
 
 ### Freeing an image
 
@@ -1086,10 +998,9 @@ refusal this replaced failed an unrelated fork and an unrelated attach of the sa
 
 An image with no sidecar is not a discoverable workspace: inventory and the store-wide port allocator skip a named
 `<workspace>.dmg` with a warning rather than failing every project. Ordinary GC may reclaim only sidecarless RAW images,
-under the exact path, lock, attachment and mount-ownership fences. Legacy `.asif` and `.sparseimage` files are reported
-as warnings — one line naming every retained image, said by each project open and never by the enumerators that list
-workspaces — and retained evidence only; removal requires an explicit transition or retirement, never filename-based
-ordinary GC. A legacy image never becomes a live workspace just because its filename resembles one.
+under the exact path, lock, attachment and mount-ownership fences. A store file with any extension but `.dmg` is never
+an image: no enumerator lists it, ordinary GC never reclaims it by its filename, and it never becomes a live workspace
+because its name resembles one. A recorded path naming one is refused by its format and path ("Images").
 
 The orphan plan fingerprints the image's inode, device, length, and modification/change times; a same-sized replacement
 invalidates the plan before any deletion. GC also checks the RAW image's kernel attachment identity, not merely the
@@ -1350,15 +1261,15 @@ retained older undo generations and choose rollback or idempotent completion. Th
 
 ## Rejected APFS alternatives
 
-**SPARSE and sparsebundle rejected; one format, no fallback.** Sparsebundle band files reintroduce thousands of host
-inodes per workspace for no benefit (network-volume support is irrelevant here). SPARSE (`.sparseimage`) is the legacy
-format: against ASIF it is slower to create, attach, and fill, several times slower on small-file operations and
-sequential I/O, and no better under clones. Keeping it as a fallback would cost a second creation path, a second attach
-and detach tool, a format field in every sidecar and marker, and an extension/metadata agreement check on every attach —
-for hosts older than macOS 26, which cowshed does not support. ASIF is not the format because a `clonefile` of a live
-ASIF image can capture mixed generations of its mutable outer allocation map, so a fork of a live source would need a
-detach first; RAW has no outer map ("Images"). A case-insensitive volume was rejected because case sensitivity costs one
-flag at creation and nothing afterwards.
+**RAW only; SPARSE, sparsebundle and formats with an outer allocation map rejected; no fallback.** Sparsebundle band
+files reintroduce thousands of host inodes per workspace for no benefit (network-volume support is irrelevant here).
+SPARSE (`.sparseimage`) measured several times slower on small-file operations and sequential I/O than the format it was
+benchmarked against, and no better under clones (`specs/cowshed/prototypes/image-format-bench/results/`). Keeping a
+second format would cost a second creation path, a second attach and detach tool, a format field in every sidecar and
+marker, and an extension/metadata agreement check on every attach. A format with its own mutable outer allocation map is
+not the format because a `clonefile` of a live image can capture mixed generations of that map, so a fork of a live
+source would need a detach first; RAW has no outer map ("Images"). A case-insensitive volume was rejected because case
+sensitivity costs one flag at creation and nothing afterwards.
 
 **`/Volumes` mount root rejected.** DiskArbitration-managed mountpoints save a mkdir/rmdir pair but put cowshed paths in
 a shared namespace where Finder surfaces them and name collisions get renamed (`widget 1`). The fixed canonical root

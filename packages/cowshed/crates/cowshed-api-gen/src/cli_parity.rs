@@ -323,7 +323,6 @@ pub const PARITY: &[Row] = &[
 
     row("doctor", "", field(&[("coordinator.doctor", "")], &[member("Coordinator.doctor")])),
     row("doctor", "repair", Counterpart::Composed { recipe: "doctor() then gc({}): the one sweep the CLI's repair runs (06_cli.md, \"Onboarding and repair\")", facade: &[member("Coordinator.doctor"), member("Coordinator.gc")] }),
-    row("doctor", "clear-attach-budget", field(&[("host.clearAttachBudget", "")], &[member("Host.clearAttachBudget")])),
 
     row("disk-command", "", field(&[("host.diskCommand", "")], &[member("Host.diskCommand")])),
     row("disk-command", "tool", field(&[("host.diskCommand", "tool")], &[argument("Host.diskCommand", 0, "tool")])),

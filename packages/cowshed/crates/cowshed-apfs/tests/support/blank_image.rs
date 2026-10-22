@@ -6,9 +6,7 @@
 //! an image gets an APFS clone of it: `clonefile` reaches no disk tool. A test whose store mints
 //! through the production host seeds the store by putting a clone where the host looks for its
 //! template (`blank_template_path`), so the store's mints clone the seed instead of each store
-//! paying a `diskutil image create` and a formatting attach — both queued on root `storagekitd`
-//! (01a_apfs.md, "How the APFS host degrades") — a `newfs_apfs` and a detach for a template of
-//! its own. Tests that prove template minting itself leave the store unseeded.
+//! paying a formatting attach, a `newfs_apfs` and a detach for a template of its own. Tests that prove template minting itself leave the store unseeded.
 //!
 //! Seeding attaches nothing. The only attach in this support code is the fixture pool's: it
 //! attaches each image in its registry once per lane run, under a lock shared by every test

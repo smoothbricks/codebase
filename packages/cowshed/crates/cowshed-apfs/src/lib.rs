@@ -32,9 +32,10 @@ use std::time::Duration;
 
 use crate::device::{DISKUTIL, container_of, identifier_depth};
 
-/// The disk-image tool. A RAW image is attached in the kernel ([`in_kernel_attach`]) and released
-/// with `hdiutil detach`; `diskutil image create` creates it. Which images are attached is read
-/// from the kernel ([`CommandRunner::attached_disk_images`]), never from `hdiutil info`.
+/// The disk-image tool. A RAW image is a sparse file cowshed creates itself
+/// ([`MacOsApfsBackend::create_blank_image`]), attached in the kernel ([`in_kernel_attach`]) and
+/// released with `hdiutil detach`. Which images are attached is read from the kernel
+/// ([`CommandRunner::attached_disk_images`]), never from `hdiutil info`.
 pub(crate) const HDIUTIL: &str = "/usr/bin/hdiutil";
 
 /// The flags of every runtime image attach (01a_apfs.md, "Images"): `-kernel` serves the RAW image from
@@ -63,27 +64,6 @@ fn in_kernel_attach(image: &Path, access: MountAccess) -> CommandRequest {
     )
 }
 
-/// `diskutil image attach` of a retained re-adoption input, read-only: the one cowshed attach
-/// outside the kernel. A retained input may be ASIF, which only DiskImages2 reads; the in-kernel
-/// RAW class attaches ASIF bytes as a raw device and finds no volume (01a_apfs.md, "Images"). As a
-/// DiskImages2 attach it meets the spent-boot latch ([`attach_budget::refuse_attach_into_spent_pool`]).
-#[cfg(any(target_os = "macos", test))]
-fn retained_input_attach(image: &Path) -> CommandRequest {
-    CommandRequest::new(
-        DISKUTIL,
-        [
-            "image",
-            "attach",
-            "--readOnly",
-            "--nobrowse",
-            "--noMount",
-            "--plist",
-        ]
-        .map(OsString::from)
-        .into_iter()
-        .chain([image.as_os_str().to_owned()]),
-    )
-}
 const FSCK_APFS: &str = "/sbin/fsck_apfs";
 /// The kernel mount helper. Workspace volumes are mounted with it rather than `diskutil mount`
 /// because `diskutil` routes the mount through Disk Arbitration, which serialises every client
@@ -196,19 +176,6 @@ pub enum CommandRunFailure {
     Wait(io::Error),
     /// Refused before spawning: a Disk Arbitration rename.
     VolumeRename,
-    /// Refused before spawning: an image attach whose media would cross IOKit's
-    /// match-notification cap, past which the attach would hang forever (media_cap.rs).
-    MediaCap(media_cap::MediaCapReached),
-    /// Refused before spawning: an image attach while the media count could not be read, so
-    /// nothing says it would not hang (media_cap.rs).
-    MediaUnread(io::Error),
-    /// Refused before spawning: a DiskImages2 attach in a boot that already met error code 150
-    /// (attach_budget.rs). A failed attach leaks one more device; the operator's clear or a reboot
-    /// ends the latch.
-    AttachPoolSpent(attach_budget::AttachPoolSpent),
-    /// Refused before spawning: a DiskImages2 attach while the pool record could not be read, so
-    /// nothing says its boot is not spent (attach_budget.rs).
-    PoolUnread(io::Error),
     /// The total budget expired before the native tool executed.
     Unspawned(Duration),
     /// The deadline expired; the owned group `pid` leads was signalled and the child's actual end
@@ -324,35 +291,6 @@ impl fmt::Display for CommandRunError {
                 fmt_command(f, program, args)?;
                 write!(f, ": {}", crate::disk_lease::VOLUME_RENAME_REFUSAL)
             }
-            CommandRunFailure::MediaCap(reached) => {
-                f.write_str("refused ")?;
-                fmt_command(f, program, args)?;
-                write!(f, ": {reached}")
-            }
-            CommandRunFailure::MediaUnread(source) => {
-                f.write_str("refused ")?;
-                fmt_command(f, program, args)?;
-                write!(
-                    f,
-                    ": the registered IOMedia and the running attaches could not be read ({source}), \
-                     so nothing says the attach would not hang past IOKit's match-notification cap; \
-                     nothing was attached"
-                )
-            }
-            CommandRunFailure::AttachPoolSpent(spent) => {
-                f.write_str("refused ")?;
-                fmt_command(f, program, args)?;
-                write!(f, ": {spent}")
-            }
-            CommandRunFailure::PoolUnread(source) => {
-                f.write_str("refused ")?;
-                fmt_command(f, program, args)?;
-                write!(
-                    f,
-                    ": the disk-image attach pool record could not be read ({source}), so nothing \
-                     says this boot has not met error code 150; nothing was attached"
-                )
-            }
         }
     }
 }
@@ -362,16 +300,12 @@ impl std::error::Error for CommandRunError {
         match &self.failure {
             CommandRunFailure::Spawn(source)
             | CommandRunFailure::Wait(source)
-            | CommandRunFailure::MediaUnread(source)
-            | CommandRunFailure::PoolUnread(source)
             | CommandRunFailure::Kill { source, .. }
             | CommandRunFailure::Reap { source, .. }
             | CommandRunFailure::Input { source, .. } => Some(source),
             CommandRunFailure::Deadline { .. }
             | CommandRunFailure::Unspawned(_)
             | CommandRunFailure::VolumeRename => None,
-            CommandRunFailure::MediaCap(reached) => Some(reached),
-            CommandRunFailure::AttachPoolSpent(spent) => Some(spent),
         }
     }
 }
@@ -688,7 +622,6 @@ impl SystemCommandRunner {
                 warn_outlived(request, policy.deadline, elapsed)
             })
         })?;
-        record_pool_outcome(request, &output);
         Ok(output)
     }
 
@@ -705,8 +638,6 @@ impl SystemCommandRunner {
     ) -> Result<CommandOutput, CommandRunError> {
         use std::io::Read;
         crate::disk_lease::refuse_volume_rename(&request.program, &request.args)?;
-        media_cap::refuse_attach_past_cap(request)?;
-        attach_budget::refuse_attach_into_spent_pool(request)?;
         if let Some(deadline) = total
             && deadline.remaining().is_none()
         {
@@ -925,25 +856,6 @@ impl fmt::Display for DiskImageVerb<'_> {
     }
 }
 
-/// Tell the attach-pool record what the host answered a disk-image command: a failure with
-/// error code 150 spends the boot until the operator clears it. A failed record is said aloud;
-/// the command's own outcome still reaches the caller.
-fn record_pool_outcome(request: &CommandRequest, output: &CommandOutput) {
-    if !is_disk_image_command(request) {
-        return;
-    }
-    if output.succeeded() || !attach_budget::reports_pool_exhausted(&output.stderr) {
-        return;
-    }
-    if let Err(error) = attach_budget::record_exhaustion() {
-        cowshed_os::eprintln!(
-            "cowshed: warning: could not record the disk-image attach pool's answer to {}: \
-         {error}",
-            request.program.display()
-        );
-    }
-}
-
 impl CommandRunner for SystemCommandRunner {
     fn run_guarded<E>(
         &self,
@@ -988,9 +900,6 @@ impl CommandRunner for SystemCommandRunner {
             Guarded::Check(error) => error,
             Guarded::Run(error) => E::from(error),
         })?;
-        if let Some(output) = &output {
-            record_pool_outcome(request, output);
-        }
         Ok(output)
     }
 
@@ -1208,14 +1117,6 @@ fn open_private_file(path: &Path, what: &str) -> io::Result<File> {
             ),
         ));
     }
-    Ok(file)
-}
-
-/// [`open_private_file`] at `path`, held under an exclusive `flock` until the answer is dropped.
-/// Fenced like the image leases, so no child forked meanwhile keeps the lock.
-pub(crate) fn locked_private_file(path: &Path) -> io::Result<Fenced<File>> {
-    let file = Fenced::new(open_private_file(path, "lock file")?);
-    lock_file(&file, libc::LOCK_EX)?;
     Ok(file)
 }
 
@@ -1772,9 +1673,10 @@ pub trait RetainedInputs {
     fn names(&self, path: &Path) -> bool;
 }
 
-/// A path named by a validated explicit re-adoption record, not another runtime image format.
-/// Ordinary operations still accept only RAW. This token enables identity inspection and
-/// read-only retained attachment, never image creation or growth.
+/// A path named by a validated explicit re-adoption record. Like every image it is RAW: a recorded
+/// input in another format is refused, naming that format and its path, before anything runs
+/// ([`ApfsError::InvalidImagePath`]). This token enables identity inspection and read-only
+/// retained attachment, never image creation or growth.
 #[derive(Clone, Copy, Debug)]
 pub struct RetainedInput<'a> {
     path: &'a Path,
@@ -2067,11 +1969,6 @@ pub enum ApfsError {
     /// Boxed: the evidence is rare, and every `Result` carrying this error would otherwise pay
     /// for it.
     DiskImageHelperUnreachable(Box<DiskImageHelperFailure>),
-    /// A disk-image command the host refused with error code 150 because its attach pool is
-    /// spent (attach_budget.rs): a host finding that killing a stalled helper or a reboot clears,
-    /// not the request's
-    /// failure. Boxed like the helper failure.
-    AttachPoolExhausted(Box<AttachPoolFailure>),
     InvalidAttachmentPlist(String),
     /// The attach succeeded but reported no APFS volume at all: the image was never formatted,
     /// or its formatting never finished. Distinct from a malformed report, which proves nothing
@@ -2141,20 +2038,22 @@ pub struct DiskImageHelperFailure {
     pub load: Option<HostLoad>,
 }
 
-/// The command the spent attach pool refused.
-#[derive(Debug)]
-pub struct AttachPoolFailure {
-    pub operation: &'static str,
-    pub request: CommandRequest,
-    pub output: CommandOutput,
-}
-
 impl fmt::Display for ApfsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidImagePath(path) => {
-                write!(f, "{} is not a .{IMAGE_EXTENSION} image", path.display())
-            }
+            Self::InvalidImagePath(path) => match path.extension() {
+                Some(format) => write!(
+                    f,
+                    "{} is a .{} file, not a RAW .{IMAGE_EXTENSION} image: cowshed attaches RAW images only and converts none",
+                    path.display(),
+                    format.to_string_lossy()
+                ),
+                None => write!(
+                    f,
+                    "{} is not a RAW .{IMAGE_EXTENSION} image",
+                    path.display()
+                ),
+            },
             Self::InvalidStagedStem(path) => write!(
                 f,
                 "staged image stem must not have an extension: {}",
@@ -2232,19 +2131,6 @@ impl fmt::Display for ApfsError {
                     None => f.write_str("load average unavailable")?,
                 }
                 f.write_str(" at the failure); ")?;
-                fmt_command_failure(
-                    f,
-                    failure.operation,
-                    failure.request.program.as_os_str(),
-                    &failure.request.args,
-                    &failure.output,
-                )
-            }
-            Self::AttachPoolExhausted(failure) => {
-                f.write_str(
-                    "AttachPoolExhausted: the host's disk-image attach pool is spent (error code \
-                     150, kIOReturnNoResources); ",
-                )?;
                 fmt_command_failure(
                     f,
                     failure.operation,
@@ -3120,32 +3006,24 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         self.detach_image_device_unlocked(path, &whole_device, DetachIntent::Release)
     }
 
+    /// A blank image is a sparse file of the image's capacity: the kernel's RAW class attaches any
+    /// file as a disk of its length, and `newfs_apfs` formats it (01a_apfs.md, "Images"). No disk
+    /// tool runs. `create_new` refuses a path that exists: a staged name is minted once.
     fn create_blank_unlocked(
         &self,
         path: &Path,
         request: &CreateImageRequest,
     ) -> Result<(), ApfsError> {
-        let create = CommandRequest::new(
-            DISKUTIL,
-            [
-                OsString::from("image"),
-                OsString::from("create"),
-                OsString::from("blank"),
-                OsString::from("--format"),
-                OsString::from("RAW"),
-                OsString::from("--size"),
-                OsString::from(capacity_argument(request.capacity)),
-                OsString::from("--volumeName"),
-                OsString::from(&request.volume_name),
-                OsString::from("--fs"),
-                OsString::from("None"),
-                path.as_os_str().to_owned(),
-            ],
-        );
         timed_apfs_step(apfs_step_leg(path), "blank-create", || {
-            self.run_checked("create sparse RAW image", create)
+            let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+            file.set_len(request.capacity.bytes())?;
+            file.sync_all()
         })
-        .map(|_| ())
+        .map_err(|source| ApfsError::FileOperation {
+            operation: "create sparse RAW image",
+            path: path.to_owned(),
+            source,
+        })
     }
 
     /// Attach the blank image at `path` and format its whole device. Returns that whole device,
@@ -3486,9 +3364,10 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         &self,
         input: &RetainedInput<'_>,
     ) -> Result<RetainedAttachment, ApfsError> {
+        validate_image_path(input.path())?;
         self.verify_attachment(
             input.path(),
-            retained_input_attach(input.path()),
+            in_kernel_attach(input.path(), MountAccess::ReadOnly),
             DetachIntent::WhenIdle,
         )
         .map(RetainedAttachment)
@@ -4058,13 +3937,6 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
     }
 }
 
-/// Every size handed to `diskutil` is a plain byte count: it reads unit letters as decimal SI,
-/// while cowshed's capacities are binary, and a byte count is the one spelling that cannot be
-/// misread.
-fn capacity_argument(capacity: ImageCapacity) -> String {
-    capacity.bytes().to_string()
-}
-
 fn container_already_spans_image(output: &CommandOutput) -> bool {
     CONTAINER_ALREADY_SPANS_IMAGE.iter().any(|code| {
         contains_bytes(&output.stdout, code.as_bytes())
@@ -4084,21 +3956,14 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 /// skips the apostrophe, which the framework spells U+2019.
 const DISK_IMAGE_HELPER_UNREACHABLE: &[u8] = b"t communicate with a helper application";
 
-/// A failed command, typed by what failed: a disk-image command the spent attach pool refused
-/// is the host's finding; one whose framework lost its helper carries the host load at the
-/// failure; every other failure is the command's own.
+/// A failed command, typed by what failed: one whose disk-image framework lost its helper carries
+/// the host load at the failure; every other failure is the command's own.
 fn command_failed(
     operation: &'static str,
     request: CommandRequest,
     output: CommandOutput,
 ) -> ApfsError {
-    if is_disk_image_command(&request) && attach_budget::reports_pool_exhausted(&output.stderr) {
-        ApfsError::AttachPoolExhausted(Box::new(AttachPoolFailure {
-            operation,
-            request,
-            output,
-        }))
-    } else if (request.program == Path::new(DISKUTIL) || request.program == Path::new(HDIUTIL))
+    if (request.program == Path::new(DISKUTIL) || request.program == Path::new(HDIUTIL))
         && contains_bytes(&output.stderr, DISK_IMAGE_HELPER_UNREACHABLE)
     {
         ApfsError::DiskImageHelperUnreachable(Box::new(DiskImageHelperFailure {
@@ -4126,16 +3991,6 @@ fn is_disk_image_command(request: &CommandRequest) -> bool {
                 .args
                 .first()
                 .is_some_and(|verb| verb == "image" || verb == "eject"))
-}
-
-/// `diskutil image attach …` or `hdiutil attach …`.
-fn is_image_attach(request: &CommandRequest) -> bool {
-    let verb = if request.program == Path::new(HDIUTIL) {
-        request.args.first()
-    } else {
-        request.args.get(1)
-    };
-    is_disk_image_command(request) && verb.is_some_and(|verb| verb == "attach")
 }
 
 /// One walk of the kernel inventory for one image: whether it is attached, its whole devices,
@@ -4900,7 +4755,7 @@ fn reported_container(entities: &[(String, String)], volume: &str) -> Result<Str
 }
 
 /// The image driver's whole media, distinct from every synthesized container and slice.
-/// RAW exposes it with no content hint; partitioned retained images name their partition map.
+/// RAW exposes it with no content hint; an image another tool partitioned names its partition map.
 fn physical_image_device(entities: &[(String, String)]) -> Result<&str, String> {
     let mut physical = entities.iter().filter(|(device, hint)| {
         device_depth(device) == 0
@@ -6862,6 +6717,11 @@ mod tests {
         ImageCapacity::parse(value).expect("test capacities are well formed")
     }
 
+    /// `hdiutil attach …`: every attach cowshed runs.
+    fn is_in_kernel_attach(request: &CommandRequest) -> bool {
+        request.program == Path::new(HDIUTIL)
+            && request.args.first().is_some_and(|verb| verb == "attach")
+    }
     fn argv(request: &CommandRequest) -> Vec<String> {
         request
             .args
@@ -6949,19 +6809,34 @@ mod tests {
     /// workspace layer's re-adoption record names exactly its retained images is its own test.
     #[test]
     fn retained_inputs_are_record_bound_read_only_and_never_forced() {
-        let retained = temp_path("retained-input", "asif");
+        let retained = temp_path("retained-input", IMAGE_EXTENSION);
         fs::create_dir_all(retained.parent().unwrap()).unwrap();
         let record = NamesOne(retained.clone());
         let input = RetainedInput::named_by(&record, &retained).expect("the record names it");
-        let unrelated = retained.with_file_name("unrecorded.asif");
+        let unrelated = retained.with_file_name("unrecorded.dmg");
         assert!(RetainedInput::named_by(&record, &unrelated).is_none());
+
+        // A recorded input that is not RAW is refused by its format and path; nothing runs.
+        let foreign = retained.with_extension("asif");
+        let foreign_record = NamesOne(foreign.clone());
+        let foreign_input =
+            RetainedInput::named_by(&foreign_record, &foreign).expect("the record names it");
+        let refusing = MacOsApfsBackend::new(RecordingRunner::default());
+        let refused = refusing
+            .attach_retained_verified(&foreign_input)
+            .expect_err("a non-RAW retained input is refused");
         assert!(
-            matches!(
-                validate_image_path(input.path()),
-                Err(ApfsError::InvalidImagePath(_))
-            ),
-            "ordinary runtime still refuses ASIF"
+            matches!(&refused, ApfsError::InvalidImagePath(path) if path == &foreign),
+            "{refused:?}"
         );
+        assert!(
+            refused.to_string().starts_with(&format!(
+                "{} is a .asif file, not a RAW .dmg image",
+                foreign.display()
+            )),
+            "{refused}"
+        );
+        assert!(refusing.runner().requests().is_empty());
 
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             no_images(),
@@ -6974,16 +6849,19 @@ mod tests {
         assert_eq!(attachment.volume_device(), "/dev/disk5s1");
         assert_eq!(attachment.0.whole_device(), "/dev/disk4");
         let requests = backend.runner().requests();
-        assert_eq!(requests[0].program, Path::new(DISKUTIL));
+        assert_eq!(requests[0].program, Path::new(HDIUTIL));
         assert_eq!(
             argv(&requests[0]),
             [
-                "image",
                 "attach",
-                "--readOnly",
-                "--nobrowse",
-                "--noMount",
-                "--plist",
+                "-readonly",
+                "-kernel",
+                "-nomount",
+                "-noverify",
+                "-nobrowse",
+                "-imagekey",
+                "diskimage-class=CRawDiskImage",
+                "-plist",
                 input.path().to_str().unwrap(),
             ]
         );
@@ -7081,11 +6959,6 @@ mod tests {
         fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
             self.steps.borrow_mut().push(Seen::Command(request.clone()));
             let args = argv(request);
-            if request.program == Path::new(DISKUTIL)
-                && args.starts_with(&["image".into(), "create".into(), "blank".into()])
-            {
-                return Ok(CommandOutput::success([]));
-            }
             if request.program == Path::new(HDIUTIL)
                 && args.first().is_some_and(|arg| arg == "attach")
             {
@@ -8181,7 +8054,6 @@ mod tests {
     fn malformed_blank_image_cleanup_failure_preserves_image_and_typed_context() {
         let stem = temp_path("malformed-blank-cleanup", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
-        fs::write(&image, b"created").unwrap();
         let backend = MacOsApfsBackend::new(StatefulMalformedAttachRunner::new(&image, &[], true));
 
         let error = backend
@@ -8232,16 +8104,15 @@ mod tests {
             other => panic!("unexpected error: {other}"),
         }
         let steps = backend.runner().steps();
-        assert_eq!(steps.len(), 7);
-        assert_eq!(argv(steps[0].command())[..3], ["image", "create", "blank"]);
-        assert_eq!(steps[1], Seen::Inventory);
+        assert_eq!(steps.len(), 6);
+        assert_eq!(steps[0], Seen::Inventory);
+        assert_eq!(steps[2], Seen::Inventory);
         assert_eq!(steps[3], Seen::Inventory);
-        assert_eq!(steps[4], Seen::Inventory);
         assert_eq!(
-            argv(steps[5].command()),
+            argv(steps[4].command()),
             ["detach", "-verbose", "/dev/disk8"]
         );
-        assert_eq!(steps[6], Seen::Inventory);
+        assert_eq!(steps[5], Seen::Inventory);
         fs::remove_file(image).unwrap();
     }
 
@@ -8287,14 +8158,12 @@ mod tests {
             let stem =
                 temp_path(&format!("malformed-inventory-{index}"), "stem").with_extension("");
             let image = stem.with_extension(IMAGE_EXTENSION);
-            fs::write(&image, b"created").unwrap();
             let cleanup_inventory = if index == 0 {
                 unreadable_inventory()
             } else {
                 images(&[(image.to_str().unwrap(), &["not-a-device"][..])])
             };
             let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-                ok([]),
                 no_images(),
                 ok("<plist><dict><key>malformed"),
                 cleanup_inventory,
@@ -8330,7 +8199,7 @@ mod tests {
                 }
                 other => panic!("unexpected error: {other}"),
             }
-            assert_eq!(backend.runner().steps().len(), 4);
+            assert_eq!(backend.runner().steps().len(), 3);
             fs::remove_file(image).unwrap();
         }
     }
@@ -8339,9 +8208,7 @@ mod tests {
     fn post_create_image_attach_failure_removes_the_image() {
         let stem = temp_path("image-attach-failure", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
-        fs::write(&image, b"partial").unwrap();
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            ok([]),
             no_images(),
             failed(1, "unsupported after create"),
             no_images(),
@@ -8366,8 +8233,8 @@ mod tests {
         ));
         assert!(!image.exists());
         let steps = backend.runner().steps();
-        assert_eq!(steps.len(), 5);
-        assert_eq!(steps[1], Seen::Inventory);
+        assert_eq!(steps.len(), 4);
+        assert_eq!(steps[0], Seen::Inventory);
         assert_eq!(
             steps
                 .iter()
@@ -8375,85 +8242,6 @@ mod tests {
                 .count(),
             3
         );
-    }
-
-    #[test]
-    fn post_create_cleanup_treats_a_missing_staged_image_as_already_removed() {
-        let stem = temp_path("image-missing-cleanup", "stem").with_extension("");
-        let image = stem.with_extension(IMAGE_EXTENSION);
-        assert!(!image.exists());
-        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            ok([]),
-            no_images(),
-            failed(9, "attach failed"),
-            no_images(),
-            no_images(),
-        ]));
-        let error = backend
-            .create_staged_image(&CreateImageRequest {
-                staged_stem: stem,
-                capacity: capacity("5g"),
-                volume_name: "main".into(),
-                owner_uid: 502,
-                owner_gid: 20,
-            })
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            ApfsError::CommandFailed {
-                operation: "attach blank RAW image",
-                output: CommandOutput {
-                    status: ProcessStatus::Exit(9),
-                    ..
-                },
-                ..
-            }
-        ));
-        assert_eq!(backend.runner().steps().len(), 5);
-    }
-
-    /// The host limit this type exists for: `diskutil image attach` exiting 1 with error code
-    /// 150 because the kernel attach pool is spent. It must arrive as the typed host finding that
-    /// names the reboot, not as one more generic exit 1, and nothing else may.
-    #[test]
-    fn an_attach_the_spent_pool_refused_is_the_typed_host_finding() {
-        let spent = "Error: Disk image operation failed with error code 150\n";
-        let attach = |stderr: &'static str| {
-            let stem = temp_path("image-pool-spent", "stem").with_extension("");
-            let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-                ok([]),
-                no_images(),
-                failed(1, stderr),
-                no_images(),
-                no_images(),
-            ]));
-            backend
-                .create_staged_image(&CreateImageRequest {
-                    staged_stem: stem,
-                    capacity: capacity("5g"),
-                    volume_name: "main".into(),
-                    owner_uid: 502,
-                    owner_gid: 20,
-                })
-                .unwrap_err()
-        };
-
-        let error = attach(spent);
-        let ApfsError::AttachPoolExhausted(failure) = &error else {
-            panic!("expected the typed pool exhaustion, got {error:?}");
-        };
-        assert_eq!(failure.operation, "attach blank RAW image");
-        assert_eq!(failure.output.stderr, spent.as_bytes());
-        let report = error.to_string();
-        assert!(report.starts_with("AttachPoolExhausted: "), "{report}");
-        assert!(report.contains("attach pool is spent"), "{report}");
-        assert!(report.contains("error code 150"), "{report}");
-
-        assert!(matches!(
-            attach("Error: Disk image operation failed with error code 15\n"),
-            ApfsError::CommandFailed { .. }
-        ));
     }
 
     /// The gate failure this type exists for: `diskutil image attach` exiting 1 because the
@@ -8465,21 +8253,22 @@ mod tests {
         let attach = |stderr: &'static str| {
             let stem = temp_path("image-helper-lost", "stem").with_extension("");
             let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-                ok([]),
                 no_images(),
                 failed(1, stderr),
                 no_images(),
                 no_images(),
             ]));
-            backend
+            let error = backend
                 .create_staged_image(&CreateImageRequest {
-                    staged_stem: stem,
+                    staged_stem: stem.clone(),
                     capacity: capacity("5g"),
                     volume_name: "main".into(),
                     owner_uid: 502,
                     owner_gid: 20,
                 })
-                .unwrap_err()
+                .unwrap_err();
+            assert!(!stem.with_extension(IMAGE_EXTENSION).exists());
+            error
         };
 
         let error = attach(helper_lost);
@@ -8574,7 +8363,6 @@ mod tests {
         let stem = temp_path("image-kernel-release", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
         let backend = graced_backend([
-            ok([]),
             no_images(),
             ok(BLANK_IMAGE_PLIST),
             holding(&image, "/dev/disk8"),
@@ -8589,19 +8377,19 @@ mod tests {
         backend.create_staged_image(&blank_request(stem)).unwrap();
 
         let steps = backend.runner().steps();
-        assert_eq!(steps.len(), 11);
-        assert_eq!(steps[4].command().program, Path::new(NEWFS_APFS));
+        assert_eq!(steps.len(), 10);
+        assert_eq!(steps[3].command().program, Path::new(NEWFS_APFS));
+        assert_eq!(steps[4], Seen::Inventory);
         assert_eq!(steps[5], Seen::Inventory);
-        assert_eq!(steps[6], Seen::Inventory);
         // The formatted volume is verified before its detach, as the template mint does.
-        assert_eq!(steps[7].command().program, Path::new(FSCK_APFS));
-        assert_eq!(argv(steps[7].command()), ["-q", "/dev/rdisk5s1"]);
-        assert_eq!(steps[8], Seen::Inventory);
+        assert_eq!(steps[6].command().program, Path::new(FSCK_APFS));
+        assert_eq!(argv(steps[6].command()), ["-q", "/dev/rdisk5s1"]);
+        assert_eq!(steps[7], Seen::Inventory);
         assert_eq!(
-            argv(steps[9].command()),
+            argv(steps[8].command()),
             ["detach", "-verbose", "/dev/disk8"]
         );
-        assert_eq!(steps[10], Seen::Inventory);
+        assert_eq!(steps[9], Seen::Inventory);
         assert!(
             !commands(&steps)
                 .iter()
@@ -8609,6 +8397,7 @@ mod tests {
             "no attachment decision reads `hdiutil info`"
         );
         assert!(backend.sleeper.waits().is_empty());
+        fs::remove_file(image).unwrap();
     }
 
     /// The canonical image adopt creates is formatted on its one attach and handed back verified:
@@ -8705,7 +8494,6 @@ mod tests {
         let stem = temp_path("image-unreadable-release", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
         let backend = graced_backend([
-            ok([]),
             no_images(),
             ok(BLANK_IMAGE_PLIST),
             holding(&image, "/dev/disk8"),
@@ -8728,15 +8516,14 @@ mod tests {
                 .any(|request| request.args.first().is_some_and(|arg| arg == "detach")),
             "an unknown mapping authorizes no eject"
         );
+        fs::remove_file(image).unwrap();
     }
 
     #[test]
     fn conflicting_blank_attachment_mapping_never_formats_or_removes_the_image() {
         let stem = temp_path("image-foreign-publication", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
-        fs::write(&image, b"created").unwrap();
         let backend = graced_backend([
-            ok([]),
             no_images(),
             ok(BLANK_IMAGE_PLIST),
             holding(&image, "/dev/disk9"),
@@ -8751,7 +8538,7 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(error, ApfsError::InvalidAttachmentInventory(_)));
-        assert_eq!(fs::read(&image).unwrap(), b"created");
+        assert!(image.exists(), "the created image is kept");
         assert!(
             backend.sleeper.waits().is_empty(),
             "conflict is not announcement lag"
@@ -8773,8 +8560,7 @@ mod tests {
     fn an_unregistered_blank_attachment_fails_closed_without_waiting_or_mutating() {
         let stem = temp_path("image-unregistered-attachment", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
-        fs::write(&image, b"created").unwrap();
-        let backend = graced_backend([ok([]), no_images(), ok(BLANK_IMAGE_PLIST), no_images()]);
+        let backend = graced_backend([no_images(), ok(BLANK_IMAGE_PLIST), no_images()]);
         let error = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: stem,
@@ -8788,7 +8574,7 @@ mod tests {
             error,
             ApfsError::InvalidAttachmentInventory(message) if message.contains("not registered")
         ));
-        assert_eq!(fs::read(&image).unwrap(), b"created");
+        assert!(image.exists(), "the created image is kept");
         assert!(backend.sleeper.waits().is_empty());
         assert!(
             !backend.runner().requests().iter().any(|request| {
@@ -8804,9 +8590,7 @@ mod tests {
     fn failed_newfs_detaches_and_removes_staged_image() {
         let stem = temp_path("image-newfs-failure", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
-        fs::write(&image, b"partial").unwrap();
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            ok([]),
             no_images(),
             ok(BLANK_IMAGE_PLIST),
             holding(&image, "/dev/disk8"),
@@ -8838,23 +8622,21 @@ mod tests {
         ));
         assert!(!image.exists());
         let steps = backend.runner().steps();
-        assert_eq!(steps.len(), 8);
-        assert_eq!(steps[4].command().program, Path::new(NEWFS_APFS));
-        assert_eq!(steps[5], Seen::Inventory);
+        assert_eq!(steps.len(), 7);
+        assert_eq!(steps[3].command().program, Path::new(NEWFS_APFS));
+        assert_eq!(steps[4], Seen::Inventory);
         assert_eq!(
-            argv(steps[6].command()),
+            argv(steps[5].command()),
             ["detach", "-verbose", "/dev/disk8"]
         );
-        assert_eq!(steps[7], Seen::Inventory);
+        assert_eq!(steps[6], Seen::Inventory);
     }
 
     #[test]
     fn failed_newfs_preserves_image_when_detach_cleanup_fails() {
         let stem = temp_path("image-detach-cleanup-failure", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
-        fs::write(&image, b"partial").unwrap();
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            ok([]),
             no_images(),
             ok(BLANK_IMAGE_PLIST),
             holding(&image, "/dev/disk8"),
@@ -8902,60 +8684,10 @@ mod tests {
     }
 
     #[test]
-    fn failed_newfs_preserves_remove_cleanup_failure_after_detach() {
-        let stem = temp_path("image-remove-cleanup-failure", "stem").with_extension("");
-        let image = stem.with_extension(IMAGE_EXTENSION);
-        fs::create_dir(&image).unwrap();
-        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            ok([]),
-            no_images(),
-            ok(BLANK_IMAGE_PLIST),
-            holding(&image, "/dev/disk8"),
-            failed(70, "format failed"),
-            holding(&image, "/dev/disk8"),
-            ok([]),
-            no_images(),
-        ]));
-        let error = backend
-            .create_staged_image(&CreateImageRequest {
-                staged_stem: stem,
-                capacity: capacity("5g"),
-                volume_name: "main".into(),
-                owner_uid: 502,
-                owner_gid: 20,
-            })
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            ApfsError::ImageCreationAndCleanupFailed {
-                primary,
-                detach: None,
-                remove: Some(remove),
-            } if matches!(
-                *primary,
-                ApfsError::CommandFailed {
-                    operation: "format RAW APFS volume",
-                    ..
-                }
-            ) && matches!(
-                *remove,
-                ApfsError::FileOperation {
-                    operation: "remove failed RAW image",
-                    ..
-                }
-            )
-        ));
-        fs::remove_dir(image).unwrap();
-    }
-
-    #[test]
     fn failed_final_image_eject_preserves_attached_image() {
         let stem = temp_path("image-final-eject-failure", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
-        fs::write(&image, b"formatted").unwrap();
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            ok([]),
             no_images(),
             ok(BLANK_IMAGE_PLIST),
             holding(&image, "/dev/disk8"),
@@ -10376,7 +10108,7 @@ mod tests {
             DiskImageSource::from_url("file:///private/tmp/a%20b.dmg"),
             DiskImageSource::File(PathBuf::from("/private/tmp/a b.dmg"))
         );
-        for url in ["ram://2048", "file://host/share/x.asif", "not a url"] {
+        for url in ["ram://2048", "file://host/share/x.dmg", "not a url"] {
             assert_eq!(
                 DiskImageSource::from_url(url),
                 DiskImageSource::Url(url.into())
@@ -11376,10 +11108,11 @@ mod tests {
 
     /// A release unmounts exactly the container's mounted volumes, each under its own
     /// revalidation, and leaves the unmounted one to the physical image's single detach. Cleanup
-    /// releases retained inputs too; it does not admit their format to ordinary runtime use.
+    /// releases the exact backing path the kernel holds, whatever its extension; that admits no
+    /// other format to ordinary runtime use.
     #[test]
     fn a_release_unmounts_only_the_mounted_volumes_then_detaches_the_physical_image_once() {
-        for extension in [IMAGE_EXTENSION, "asif"] {
+        for extension in [IMAGE_EXTENSION, "img"] {
             let image = temp_path("two-volume-mixed", extension);
             let backend = graced_backend([
                 Reply::Inventory(Ok(two_volume_image(&image))),
@@ -11892,7 +11625,7 @@ mod tests {
             assert_eq!(
                 commands
                     .iter()
-                    .filter(|command| is_image_attach(command))
+                    .filter(|command| is_in_kernel_attach(command))
                     .count(),
                 1
             );
@@ -11918,8 +11651,8 @@ mod tests {
     }
     /// Every runtime image attach is the in-kernel DI1 attach of the exact image: `hdiutil attach
     /// -kernel` with the RAW class, never mounted by the tool, read-only exactly when asked, the
-    /// image last. It is never a DiskImages2 attach, so no `diskimagesiod` helper is involved;
-    /// only a retained input's attach is ([`retained_input_attach`]).
+    /// image last. It is never a DiskImages2 attach, so no `diskimagesiod` helper is involved; a
+    /// retained re-adoption input attaches the same way, read-only.
     #[test]
     fn every_attach_is_the_in_kernel_attach_of_the_exact_image() {
         let image = Path::new("/private/cowshed/store/acme/widget/sessions/raven.dmg");
@@ -11936,7 +11669,7 @@ mod tests {
             for flag in IN_KERNEL_ATTACH {
                 assert_eq!(args.iter().filter(|arg| *arg == flag).count(), 1, "{flag}");
             }
-            assert!(is_image_attach(&request));
+            assert!(is_in_kernel_attach(&request));
         }
     }
 
@@ -11954,7 +11687,7 @@ mod tests {
         ));
         let commands = backend.runner().requests();
         assert_eq!(commands.len(), 1);
-        assert!(is_image_attach(&commands[0]));
+        assert!(is_in_kernel_attach(&commands[0]));
         assert!(argv(&commands[0]).iter().any(|arg| arg == "-nomount"));
     }
 
