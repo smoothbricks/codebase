@@ -878,9 +878,9 @@ What the substrate does about each:
 - **Test images are 1 GiB** and a fixture detaches its images on every exit path it survives, panic included; a killed
   run's images are reclaimed by the next run's sweep (08_testing.md). A leaked image costs one slot of the host's finite
   attach budget for as long as it stays attached. Tests mint one blank template per host user with the production
-  minter, at `/private/tmp/cowshed-itest-templates-uid<uid>`, and clone every test image from it; a test store that
-  mints is seeded with a clone of it. Like a store's template it outlives its minter and its name spells everything its
-  bytes depend on, so concurrent lanes and later runs clone the same one instead of each test process tree paying a
+  minter, at `/private/var/folders/cowshed/<uid>/t/templates-uid<uid>`, and clone every test image from it; a test store
+  that mints is seeded with a clone of it. Like a store's template it outlives its minter and its name spells everything
+  its bytes depend on, so concurrent lanes and later runs clone the same one instead of each test process tree paying a
   create, a formatting attach, a format and a detach before its first test. Real-APFS tests attach with `noMount` unless
   mounting is under test, reducing the departed-volume references `mds` retains; the separate real-APFS group keeps
   those tests out of ordinary per-crate runs.

@@ -438,7 +438,8 @@ fn fixture_cleanup_removes_a_store_root_replaced_by_a_file() {
     );
 }
 
-/// A store on real APFS images: a scratch root under `/private/tmp` laid out like [`Fixture`]'s,
+/// A store on real APFS images: a scratch root under the real-APFS scratch parent
+/// (`/private/var/folders/cowshed/<uid>/t`) laid out like [`Fixture`]'s,
 /// driven by the production host (real `hdiutil`/`diskutil`/`mount_apfs`, the live kernel mount
 /// table). Its attachments are detached and its tree removed when the test ends however it
 /// ends, and by the next run's sweep when it could not.
