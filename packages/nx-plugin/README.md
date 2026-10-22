@@ -79,12 +79,16 @@ volume, and `src/nx-state-location.test.ts` checks where this repository's host 
 
 The plugin's own `nx run nx-plugin:test` aggregates four bounded Bun targets. Each uses Bun's native
 `--timings=test-timings.json --shard=N/4` partition to balance measured per-file work, while normal discovery still runs
-every test file (including newly added files) exactly once. A failed shard fails the aggregate. The shard count and
-standard 120-second target deadline stay unchanged. Bun cuts the path-sorted files into four contiguous runs and costs a
-file the manifest does not name at the manifest's median, so files added without a refresh cluster into one shard and
-can push it past its deadline. The inferred `shard-timings` target makes that loud instead: for any project whose
-`bun test` targets carry both `--shard=N/M` and `--timings=<file>`, it replays Bun's discovery rules without running a
-test and fails naming every file the shards would run that the manifest does not name, with the refresh command
+every test file (including newly added files) exactly once. A failed shard fails the aggregate. Each shard, and
+`test-host`, is cached the way the unsharded `test` was: `targetDefaults.test` keys only the target named `test`, so a
+target split from it states `"cache": true` and its inputs itself (`test-host` also hashes the cowshed build it runs).
+`smoo monorepo validate` refuses a member of a cached aggregate that states no `cache`, since Nx then never caches it:
+the shards ran on every gate from 10-02 to 10-22 for that reason. The shard count and standard 120-second target
+deadline stay unchanged. Bun cuts the path-sorted files into four contiguous runs and costs a file the manifest does not
+name at the manifest's median, so files added without a refresh cluster into one shard and can push it past its
+deadline. The inferred `shard-timings` target makes that loud instead: for any project whose `bun test` targets carry
+both `--shard=N/M` and `--timings=<file>`, it replays Bun's discovery rules without running a test and fails naming
+every file the shards would run that the manifest does not name, with the refresh command
 `smoo nx refresh-test-timings <project>`. That command runs the suite once without `--shard`, adding `--update-timings`,
 and then repeats the check. Refresh after adding or slowing a test file; the manifest is scheduling data, not a test
 allowlist. The shards of one suite must share one cwd and every argument but `--shard`, pass flag values as

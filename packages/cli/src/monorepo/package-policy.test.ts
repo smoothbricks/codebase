@@ -11,6 +11,7 @@ import {
 import { generateManagedFiles } from '@smoothbricks/nx-plugin/managed-files/generator';
 import { FsTree } from 'nx/src/generators/tree.js';
 import { listPublicPackages, listPublishablePackages } from '../lib/workspace.js';
+import { projectTargetsFromNxProjects } from '../nx/index.js';
 import { validateCommitMessage } from './commit-msg.js';
 import { finishManagedFiles } from './managed-fs.js';
 import {
@@ -21,6 +22,7 @@ import {
   applyRootScriptDefaults,
   applyWorkspaceDependencyDefaults,
   listValidCommitScopes,
+  validateAggregateMemberCache,
   validateExplicitTaskInputs,
   validateNoStaleTestOutput,
   validateNxProjectNames,
@@ -80,6 +82,69 @@ describe('cached targets name their inputs', () => {
     expect(errors).toEqual([
       'app:test: cached target declares no inputs, so Nx hashes every file under its project root and ignores nx.json\'s default named input; declare its inputs, or give "test" a targetDefaults entry with "inputs": ["default", "^default"]',
     ]);
+  });
+});
+
+describe('cached aggregates run cached members', () => {
+  afterEach(() => {
+    console.error = originalConsoleError;
+  });
+
+  it('refuses a member of a cached aggregate that states no cache, and nothing else', () => {
+    const run = 'bounded-exec';
+    // Every edge form Nx accepts, through the projection the validator reads in production. Local members, which
+    // this policy judges: `app:unit-a`, `{ projects: ['app'] }`, and the patterns `unit-@(c|d)` and `test-shard*`.
+    // Not local: `^typecheck` and `{ dependencies: true }` are the dependencies' targets, `{ projects: ['other'] }`
+    // is another project's.
+    const projects = projectTargetsFromNxProjects({
+      app: {
+        root: 'packages/app',
+        targets: {
+          bench: { executor: run },
+          build: { executor: run },
+          lint: { executor: run },
+          serve: { executor: 'nx:noop', cache: false, dependsOn: ['bench'] },
+          test: {
+            executor: 'nx:noop',
+            cache: true,
+            dependsOn: [
+              '^typecheck',
+              { target: 'build', dependencies: true },
+              { target: 'lint', projects: ['other'] },
+              'app:unit-a',
+              { target: 'unit-b', projects: ['app'] },
+              'unit-@(c|d)',
+              'test-shard*',
+              'test-host',
+            ],
+          },
+          'test-host': { executor: run, cache: false },
+          'test-shard1': { executor: run },
+          'test-shard2': { executor: run, cache: true, dependsOn: ['warm'] },
+          typecheck: { executor: run },
+          'unit-a': { executor: run },
+          'unit-b': { executor: run },
+          'unit-c': { executor: run },
+          'unit-d': { executor: run, cache: true },
+          warm: { executor: run },
+        },
+      },
+      other: { root: 'packages/other', targets: { lint: { executor: run } } },
+    });
+    expect(projects.find((project) => project.project === 'app')?.localTargetDependencies?.get('test')).toEqual([
+      'unit-a',
+      'unit-b',
+      'unit-c',
+      'unit-d',
+      'test-shard1',
+      'test-shard2',
+      'test-host',
+    ]);
+    const errors = captureConsoleErrors();
+    expect(validateAggregateMemberCache(projects)).toBe(4);
+    const refusal = (member: string) =>
+      `app:${member}: the cached aggregate app:test runs it, but it states no "cache", so Nx never caches it and every run executes it again; state "cache": true with its inputs, or "cache": false where it cannot be cached`;
+    expect(errors).toEqual(['unit-a', 'unit-b', 'unit-c', 'test-shard1'].map(refusal));
   });
 });
 

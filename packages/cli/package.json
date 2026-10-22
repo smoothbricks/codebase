@@ -111,6 +111,12 @@
       },
       "test-shell-entry": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "default",
+          "^default",
+          "bunToolchain"
+        ],
         "options": {
           "command": "bun test --timeout=0 src/monorepo/setup-environment.test.ts",
           "cwd": "{projectRoot}",
@@ -120,6 +126,12 @@
       },
       "test-shard-1": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "default",
+          "^default",
+          "bunToolchain"
+        ],
         "options": {
           "command": "bun test --timeout=0 --path-ignore-patterns='**/setup-environment.test.ts' --shard=1/4",
           "cwd": "{projectRoot}",
@@ -129,6 +141,12 @@
       },
       "test-shard-2": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "default",
+          "^default",
+          "bunToolchain"
+        ],
         "options": {
           "command": "bun test --timeout=0 --path-ignore-patterns='**/setup-environment.test.ts' --shard=2/4",
           "cwd": "{projectRoot}",
@@ -138,6 +156,12 @@
       },
       "test-shard-3": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "default",
+          "^default",
+          "bunToolchain"
+        ],
         "options": {
           "command": "bun test --timeout=0 --path-ignore-patterns='**/setup-environment.test.ts' --shard=3/4",
           "cwd": "{projectRoot}",
@@ -147,6 +171,12 @@
       },
       "test-shard-4": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "default",
+          "^default",
+          "bunToolchain"
+        ],
         "options": {
           "command": "bun test --timeout=0 --path-ignore-patterns='**/setup-environment.test.ts' --shard=4/4",
           "cwd": "{projectRoot}",

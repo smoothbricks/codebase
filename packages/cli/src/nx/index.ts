@@ -6,7 +6,10 @@ import {
   untimedTestFilesReport,
 } from '@smoothbricks/nx-plugin/test-timings';
 // Nx package exports are CLI-oriented; this is the module the CLI uses for graph + daemon IPC.
+import type { ProjectGraph, ProjectGraphProjectNode } from 'nx/src/config/project-graph.js';
+import type { TargetConfiguration } from 'nx/src/config/workspace-json-project-json.js';
 import { createProjectGraphAsync } from 'nx/src/project-graph/project-graph.js';
+import { normalizeDependencyConfigDefinition } from 'nx/src/tasks-runner/utils.js';
 import { workspaceRoot as primaryWorkspaceRoot } from 'nx/src/utils/workspace-root.js';
 import typia from 'typia';
 import type { NxDependsOn, NxProjectJson, NxTargetConfig, NxTargetOptions } from '../lib/json.js';
@@ -19,6 +22,12 @@ export interface ProjectTargets {
   /** Per-target `cache`, for policies that only govern what Nx can restore. */
   targetCache?: Map<string, boolean>;
   targetDependencies?: Map<string, string[]>;
+  /**
+   * Per target, the targets of this project its `dependsOn` schedules, resolved by Nx's own normalization: `^` and
+   * `dependencies: true` edges and other projects' targets are not listed; `project:target`, `projects: [self]` and
+   * patterns over target names are.
+   */
+  localTargetDependencies?: Map<string, string[]>;
   targetExecutors?: Map<string, string>;
   /** Per-target string inputs; object inputs (`runtime`, `json`, …) are dropped. */
   targetInputs?: Map<string, string[]>;
@@ -75,7 +84,51 @@ function localDependsOnTarget(dependency: NxDependsOn): string | undefined {
     // would collect or verify outputs from the wrong project.
     return undefined;
   }
-  return dependency.target;
+  // The object form of `^target`: the dependencies' target, never this project's.
+  return dependency.dependencies === true ? `^${dependency.target}` : dependency.target;
+}
+
+/** The graph Nx's dependsOn normalization reads: each project's root, tags and targets' edges. */
+function dependencyGraph(projects: NxProjects): ProjectGraph {
+  const nodes: Record<string, ProjectGraphProjectNode> = {};
+  for (const [name, project] of Object.entries(projects)) {
+    const targets: Record<string, TargetConfiguration> = {};
+    for (const [target, config] of Object.entries(project.targets ?? {})) {
+      targets[target] = config.dependsOn === undefined ? {} : { dependsOn: config.dependsOn };
+    }
+    nodes[name] = { name, type: 'lib', data: { root: project.root ?? '', tags: project.tags ?? [], targets } };
+  }
+  return { nodes, dependencies: {} };
+}
+
+/**
+ * Per target of `project`, the local targets Nx schedules from its `dependsOn`, through the normalization its task
+ * graph uses (`tasks-runner/utils.js`, `getDependencyConfigs`). Nx rewrites the definitions it is given, so each
+ * object is copied first.
+ */
+function localDependenciesOf(
+  project: string,
+  metadata: NxProjectJson,
+  graph: ProjectGraph,
+  allTargetNames: string[],
+): Map<string, string[]> {
+  const own = new Set(targetNamesFromNxProjectJson(metadata));
+  const local = new Map<string, string[]>();
+  for (const [target, config] of Object.entries(metadata.targets ?? {})) {
+    const members = (config.dependsOn ?? []).flatMap((definition) =>
+      normalizeDependencyConfigDefinition(
+        typeof definition === 'string' ? definition : { ...definition },
+        project,
+        graph,
+        allTargetNames,
+      )
+        .filter((normalized) => normalized.dependencies !== true && normalized.projects.includes(project))
+        .map((normalized) => normalized.target)
+        .filter((member) => own.has(member)),
+    );
+    local.set(target, [...new Set(members)]);
+  }
+  return local;
 }
 
 function isInvalidDependsOn(dependency: NxDependsOn): boolean {
@@ -336,6 +389,8 @@ export function targetNamesFromProjects(projects: NxProjects): string[] {
 }
 
 export function projectTargetsFromNxProjects(projects: NxProjects): ProjectTargets[] {
+  const graph = dependencyGraph(projects);
+  const allTargetNames = targetNamesFromProjects(projects);
   return Object.entries(projects)
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([project, metadata]) => {
@@ -346,6 +401,7 @@ export function projectTargetsFromNxProjects(projects: NxProjects): ProjectTarge
         targets: targetNamesFromNxProjectJson(metadata),
         targetCache: targetCacheFromNxProjectJson(metadata),
         targetDependencies,
+        localTargetDependencies: localDependenciesOf(project, metadata, graph, allTargetNames),
         targetInputs: targetInputsFromNxProjectJson(metadata),
         targetExecutors: targetExecutorsFromNxProjectJson(metadata),
         targetOptions: targetOptionsFromNxProjectJson(metadata),

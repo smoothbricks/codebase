@@ -111,6 +111,7 @@ describe('Nx helper output formatting', () => {
         targets: ['lint'],
         targetCache: new Map(),
         targetDependencies: new Map(),
+        localTargetDependencies: new Map([['lint', []]]),
         targetExecutors: new Map(),
         targetInputs: new Map(),
         targetOptions: new Map(),
@@ -123,6 +124,10 @@ describe('Nx helper output formatting', () => {
         targets: ['build', 'test'],
         targetCache: new Map([['test', true]]),
         targetDependencies: new Map([['test', ['build']]]),
+        localTargetDependencies: new Map([
+          ['test', ['build']],
+          ['build', []],
+        ]),
         targetExecutors: new Map([['test', '@smoothbricks/nx-plugin:bounded-exec']]),
         // Object inputs carry no fileset a policy can read, so only the
         // strings survive the projection.

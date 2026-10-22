@@ -255,9 +255,11 @@
       },
       "test-shard1": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
         "inputs": [
           "default",
           "^default",
+          "bunToolchain",
           "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs"
         ],
         "options": {
@@ -269,9 +271,11 @@
       },
       "test-shard2": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
         "inputs": [
           "default",
           "^default",
+          "bunToolchain",
           "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs"
         ],
         "options": {
@@ -283,9 +287,11 @@
       },
       "test-shard3": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
         "inputs": [
           "default",
           "^default",
+          "bunToolchain",
           "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs"
         ],
         "options": {
@@ -297,9 +303,11 @@
       },
       "test-shard4": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
         "inputs": [
           "default",
           "^default",
+          "bunToolchain",
           "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs"
         ],
         "options": {
@@ -311,6 +319,19 @@
       },
       "test-host": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "default",
+          "^default",
+          "bunToolchain",
+          "{workspaceRoot}/devenv.lock",
+          "{workspaceRoot}/tooling/direnv/devenv.lock",
+          "{workspaceRoot}/packages/cowshed/bin/**/*",
+          {
+            "dependentTasksOutputFiles": "**/*",
+            "transitive": true
+          }
+        ],
         "dependsOn": [
           {
             "projects": [

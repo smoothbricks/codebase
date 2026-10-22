@@ -376,6 +376,32 @@ export function validateExplicitTaskInputs(projects: readonly ProjectTargets[]):
   return failures;
 }
 
+/**
+ * A target that a cached `nx:noop` aggregate runs from its own project states its `cache`. Nx caches a target only
+ * when its configuration or a targetDefaults entry for its name says so, so a suite split under new target names
+ * stops caching without a word: nx-plugin's and cli's Bun shards ran on every gate after their `test` became an
+ * aggregate (0 cache hits in 8-9 gates each, one shard up to 849 s). A stated `"cache": false` is a decision and
+ * passes; dependency (`^`) and cross-project edges are the other projects' own.
+ */
+export function validateAggregateMemberCache(projects: readonly ProjectTargets[]): number {
+  let failures = 0;
+  for (const project of projects) {
+    for (const aggregate of [...project.targets].sort()) {
+      if (project.targetCache?.get(aggregate) !== true || project.targetExecutors?.get(aggregate) !== 'nx:noop') {
+        continue;
+      }
+      for (const member of project.localTargetDependencies?.get(aggregate) ?? []) {
+        if (project.targetCache?.has(member) === true) continue;
+        console.error(
+          `${project.project}:${member}: the cached aggregate ${project.project}:${aggregate} runs it, but it states no "cache", so Nx never caches it and every run executes it again; state "cache": true with its inputs, or "cache": false where it cannot be cached`,
+        );
+        failures++;
+      }
+    }
+  }
+  return failures;
+}
+
 export function validateNxProjectNames(root: string): number {
   const rootPackage = readJsonObject(join(root, 'package.json'));
   const rootName = rootPackage?.name ?? null;

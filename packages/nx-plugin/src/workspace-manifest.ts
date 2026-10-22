@@ -333,6 +333,8 @@ export interface PackageExportMap {
 export interface NxDependsOnObject {
   target: string;
   projects?: string | string[];
+  /** The same target of every dependency project, as the `^target` string form says. */
+  dependencies?: boolean;
 }
 
 export type NxDependsOn = string | NxDependsOnObject;

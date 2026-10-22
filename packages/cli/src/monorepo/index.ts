@@ -30,6 +30,7 @@ import {
   applyPublicPackageDefaults,
   applyWorkspaceDependencyDefaults,
   listValidCommitScopes,
+  validateAggregateMemberCache,
   validateExplicitTaskInputs,
   validateNoStaleTestOutput,
   validateNxProjectNames,
@@ -177,6 +178,7 @@ export async function checkPolicyFailures(root: string, projectTargets: ProjectT
     validateRootPackagePolicy(root) +
     validateNxProjectNames(root) +
     validateExplicitTaskInputs(projectTargets) +
+    validateAggregateMemberCache(projectTargets) +
     validateNxReleaseConfig(root) +
     validatePublicTags(root) +
     validatePublicPackageMetadata(root) +
