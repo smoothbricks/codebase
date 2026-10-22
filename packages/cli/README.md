@@ -829,7 +829,12 @@ The hook also runs `smoo monorepo check-public-denylist --staged`. It rejects ad
 `HOME` path or a case-insensitive whole-word name of a sibling Git repository. Removed lines, unchanged context,
 unstaged edits, and untracked files are not judged. The check uses the index Git supplies, including the temporary index
 used by a partial commit. A cowshed workspace discovers siblings beside its adopted checkout, not beside its mount.
-Dot-directories, plain directories, and the repository itself are excluded.
+Dot-directories, plain directories, and the repository itself are excluded. So is a sibling whose name cannot be a
+project's: a name of only digits, or of fewer than three characters, adds no term and its directory is not inspected, so
+a stray one cannot refuse or fail a commit. A digits-only name's term would refuse every patch hunk header and line
+number that carries the number (`@@ -379,36 +384,111 @@` beside a sibling named `111`); a name of one or two characters
+is ordinary text. A name that mixes digits with other characters keeps its term, and an explicit
+`smoothbricks.publicDenylist` pattern that names a number still refuses it.
 
 Legitimate public references belong in the committed `tooling/public-denylist-allowlist.tsv`, read from that same index.
 Its tab-separated rules are `package-scope<TAB>@scope`, `repository<TAB>public-name`, or

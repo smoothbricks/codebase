@@ -50,6 +50,13 @@ const UNCONFIGURED: PublicDenylistScan = { outcome: 'unconfigured' };
 const NUMERIC_REPOSITORY_NAME = /^\d+$/;
 
 /**
+ * Fewest characters a sibling directory's name may have and still be a project's. A one- or two-character
+ * name is an ordinary word or abbreviation: as a whole-word term it would refuse text that names no
+ * project. Three keeps the shortest real project names guarded.
+ */
+export const MINIMUM_SIBLING_NAME_LENGTH = 3;
+
+/**
  * Judge what a push publishes, never the working tree: the message of every commit reachable from
  * `revisions`, then their trees. With `remote`, only the commits that remote's tracking branches do
  * not already hold are judged — what the push adds; without it, all the history behind `revisions`.
@@ -279,6 +286,17 @@ export async function checkPublicCommitDenylist(root: string, subject: PublicCom
   }
 }
 
+/**
+ * The case-insensitive whole-word pattern a sibling directory's name adds to the guard, or null when the name
+ * cannot be a project's: only digits, whose term would refuse every patch hunk header and line number that
+ * carries the number, or fewer than {@link MINIMUM_SIBLING_NAME_LENGTH} characters. A name that mixes digits
+ * with other characters stays a term.
+ */
+export function siblingTerm(name: string): string | null {
+  if ([...name].length < MINIMUM_SIBLING_NAME_LENGTH || NUMERIC_REPOSITORY_NAME.test(name)) return null;
+  return `(?<!\\w)${escapeRegex(name)}(?!\\w)`;
+}
+
 async function siblingPatterns(root: string, env: Environment): Promise<{ patterns: string[] } | { failure: string }> {
   const markerPath = join(root, '.cowshed', 'workspace.json');
   let anchor = root;
@@ -310,6 +328,9 @@ async function siblingPatterns(root: string, env: Environment): Promise<{ patter
   const patterns: string[] = [];
   for (const entry of await readdir(parent, { withFileTypes: true })) {
     if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name === basename(anchor)) continue;
+    // A name that yields no term is never probed: a stray data directory cannot refuse or fail a commit.
+    const term = siblingTerm(entry.name);
+    if (term === null) continue;
     const sibling = join(parent, entry.name);
     try {
       await stat(join(sibling, '.git'));
@@ -324,8 +345,7 @@ async function siblingPatterns(root: string, env: Environment): Promise<{ patter
     if ((await realpath(probe.stdout.trimEnd())) !== (await realpath(sibling))) {
       return { failure: `${sibling}: .git does not identify this sibling as a repository root` };
     }
-    const boundary = NUMERIC_REPOSITORY_NAME.test(entry.name) ? '[\\w.]' : '\\w';
-    patterns.push(`(?<!${boundary})${escapeRegex(entry.name)}(?!${boundary})`);
+    patterns.push(term);
   }
   return { patterns };
 }

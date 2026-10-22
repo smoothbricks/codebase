@@ -230,4 +230,36 @@ describe('managed public denylist commit hooks', () => {
       expect(git('show', 'HEAD:notes.txt')).toBe('private-store/receipt.md\n/work/.cowshed/unit-a\nSeatReviewer');
     });
   });
+
+  describe('digits-only sibling directory', () => {
+    // A stray data directory is a git root beside the checkout, but it is not a project.
+    const hunkHeader = '@@ -379,36 +384,111 @@';
+
+    beforeEach(async () => {
+      await mkdir(join(container, '111'));
+      const stray = runGit(join(container, '111'), 'init', '--quiet');
+      if (stray.exitCode !== 0) throw new Error(stray.stderr);
+    });
+
+    it('commits a hunk header and a message that carry the number, through both real hooks', async () => {
+      await stage(`${hunkHeader}\n`);
+      const result = runGit(root, 'commit', '-m', 'fix: neutral summary', '-m', `Refresh the ${hunkHeader} hunk.`);
+      expect(result.stderr).toBe('');
+      expect(result.exitCode).toBe(0);
+      expect(git('show', 'HEAD:notes.txt')).toBe(hunkHeader);
+      const calls = (await readFile(order, 'utf8')).trim().split('\n');
+      expect(calls).toContain('monorepo check-public-denylist --staged');
+      expect(calls.some((call) => call.startsWith('monorepo check-public-denylist --commit-message '))).toBe(true);
+    });
+
+    it('still refuses a real sibling name staged beside the hunk header, reporting only that line', async () => {
+      await stage(`${hunkHeader}\nSecret-Consumer\n`);
+      const head = git('rev-parse', 'HEAD');
+      const result = runGit(root, 'commit', '-m', 'fix: neutral summary');
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain('staged:notes.txt:2:Secret-Consumer');
+      expect(result.stderr).not.toContain(hunkHeader);
+      expect(git('rev-parse', 'HEAD')).toBe(head);
+    });
+  });
 });

@@ -301,22 +301,40 @@ describe('commit-time public denylist', () => {
     });
   });
 
-  it('protects numeric project names without matching larger numeric literals', async () => {
-    const project = '1'.repeat(3);
-    await sibling(project);
-    await stage(`${project}.0 0x${project} 1_${project} ${project}_0 .${project} ${project}.\n`);
-    expect((await staged()).outcome).toBe('clean');
-    await stage(`/Dev/${project}/x\n${project} project\n`);
-    expect(await staged()).toEqual({
-      outcome: 'denied',
-      matches: `staged:notes.txt:1:/Dev/${project}/x\nstaged:notes.txt:2:${project} project\n`,
-    });
+  it('derives no term from a sibling named only with digits, so hunk headers and numbers pass', async () => {
+    // A stray data directory is a git root beside the checkout, but it is not a project.
+    await sibling('111');
+    await stage('@@ -379,36 +384,111 @@\n/Dev/111/x\n111 project\n');
+    expect(await staged()).toEqual({ outcome: 'clean', patterns: 1 });
     const path = join(root, '.git', 'COMMIT_EDITMSG');
-    await writeFile(path, `fix: update /Dev/${project}/x\n`);
+    await writeFile(path, 'fix: refresh the @@ -379,36 +384,111 @@ hunk\n\n/Dev/111/x\n');
     expect(await scanPublicCommitDenylist(root, { kind: 'message', path }, environment())).toEqual({
-      outcome: 'denied',
-      matches: `message:1:fix: update /Dev/${project}/x\n`,
+      outcome: 'clean',
+      patterns: 1,
     });
+  });
+
+  it('does not probe a sibling whose name yields no term, even with a broken .git', async () => {
+    await mkdir(join(container, '111'));
+    await writeFile(join(container, '111', '.git'), 'not a gitfile\n');
+    await stage('neutral\n');
+    expect(await staged()).toEqual({ outcome: 'clean', patterns: 1 });
+  });
+
+  it('keeps the term of a three-character sibling and drops the term of a two-character one', async () => {
+    await sibling('ab');
+    await sibling('abc');
+    await stage('ab\n');
+    expect(await staged()).toEqual({ outcome: 'clean', patterns: 2 });
+    await stage('ab and ABC\n');
+    expect(await staged()).toEqual({ outcome: 'denied', matches: 'staged:notes.txt:1:ab and ABC\n' });
+  });
+
+  it('still judges a number through an explicitly configured pattern beside a digits-only sibling', async () => {
+    await sibling('111');
+    deny('111');
+    await stage('@@ -379,36 +384,111 @@\n');
+    expect(await staged()).toEqual({ outcome: 'denied', matches: 'staged:notes.txt:1:@@ -379,36 +384,111 @@\n' });
   });
 
   it('regex-escapes sibling names instead of interpreting their punctuation', async () => {
