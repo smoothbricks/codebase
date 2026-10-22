@@ -15,6 +15,7 @@ use cowshed_core::CowshedError;
 use cowshed_core::api::dto::ExitStatus;
 use cowshed_core::api::hold::{HeldDescriptor, HeldOutput, HoldEvent, HoldRequest, HoldSignal};
 use cowshed_core::runtime::child_fence::ChildFence;
+use cowshed_core::runtime::job_groups;
 
 use crate::args::HoldArgs;
 use crate::lock::{State, StateEvent};
@@ -151,14 +152,14 @@ async fn run(
     }
 }
 
-/// The holder failed once its leader ran: say so as `commandFailed` with the leader's pid, then
-/// release the leader as the end of the control descriptor does and keep answering on the state
-/// channel -- each signal this process receives, then `exited` once the leader is reaped, unless
-/// `exited` already said how it ended. When the release or the wait fails, the leader's exit
-/// cannot be observed: SIGKILL is sent to its group, as a job's is, and a last `commandFailed`
-/// says what failed and what came of the kill; a group it can no longer observe is not waited
-/// for. The channel closes after that, so no `failed` follows. A write the channel refuses has
-/// nowhere else to go: the wrapper exit code is then the caller's only word.
+/// The holder failed once its leader ran: say so as `commandFailed` with the leader's pid. No
+/// `release` can arrive any more, so the group ends as a group whose controller is gone does
+/// (11_shell.md), each signal answered; the leader is then released and its exit awaited, still
+/// answering each signal this process receives, and `exited` follows once it is reaped, unless
+/// `exited` already said how it ended. When ending the group, the release or the wait fails, a
+/// last `commandFailed` says what failed. The channel closes after that, so no `failed` follows.
+/// A write the channel refuses has nowhere else to go: the wrapper exit code is then the caller's
+/// only word.
 async fn abandon(
     fence: &ChildFence,
     exit: Option<ExitStatus>,
@@ -171,12 +172,9 @@ async fn abandon(
         pid,
         reason: error.message.clone(),
     });
-    let unobserved = |cause: String| match fence.signal(libc::SIGKILL) {
-        Ok(()) => format!("{cause}; its group was sent SIGKILL"),
-        Err(refusal) => format!("{cause}; its group was not killed: {refusal}"),
-    };
+    let ending = end_group(fence, state);
     let ended = match fence.release() {
-        Err(error) => Err(unobserved(format!("cannot release process {pid}: {error}"))),
+        Err(error) => Err(format!("cannot release process {pid}: {error}")),
         // Seen exited already, so the release reaped it.
         Ok(()) if exit.is_some() => Ok(None),
         Ok(()) => {
@@ -185,7 +183,7 @@ async fn abandon(
             loop {
                 tokio::select! {
                     biased;
-                    exited = &mut exited => break exited.map(Some).map_err(|error| unobserved(error.message)),
+                    exited = &mut exited => break exited.map(Some).map_err(|error| error.message),
                     number = interrupts.received() => {
                         let _ = match HoldSignal::numbered(number) {
                             Some(signal) => send(fence, signal, state),
@@ -199,12 +197,60 @@ async fn abandon(
             }
         }
     };
-    let _ = match ended {
-        Ok(Some(status)) => state.tell(&HoldEvent::Exited { status }),
-        Ok(None) => Ok(()),
-        Err(reason) => state.tell(&HoldEvent::CommandFailed { pid, reason }),
-    };
+    if let Ok(Some(status)) = &ended {
+        let _ = state.tell(&HoldEvent::Exited {
+            status: status.clone(),
+        });
+    }
+    let failures: Vec<String> = [ending.err(), ended.err()].into_iter().flatten().collect();
+    if !failures.is_empty() {
+        let _ = state.tell(&HoldEvent::CommandFailed {
+            pid,
+            reason: failures.join("; then "),
+        });
+    }
     state.close();
+}
+
+/// End the held group as a group whose controller is gone is ended
+/// ([`job_groups::end_held_group`]: SIGTERM, the grace, SIGKILL), saying what came of each signal
+/// on the state channel. Blocks this single-threaded runtime for at most the grace: once its
+/// controller is gone the holder has nothing else to serve. What failed is answered, every step
+/// attempted.
+fn end_group(fence: &ChildFence, state: &mut State<HoldEvent>) -> Result<(), String> {
+    let mut told = Ok(());
+    let ending = job_groups::end_held_group(fence.pid(), |number| {
+        let Some(signal) = HoldSignal::numbered(number) else {
+            return Err(std::io::Error::other(format!(
+                "signal {number} has no name a holder answers with"
+            )));
+        };
+        let sent = fence.signal(number);
+        let answered = state.tell(&match &sent {
+            Ok(()) => HoldEvent::Signalled { signal },
+            Err(refusal) => HoldEvent::NotSignalled {
+                signal,
+                reason: refusal.to_string(),
+            },
+        });
+        // The first refused answer is the one kept; later signals are still sent.
+        if told.is_ok() {
+            told = answered;
+        }
+        sent.map_err(|refusal| std::io::Error::other(refusal.to_string()))
+    });
+    let told = told.map_err(|error: CowshedError| error.message);
+    match (ending.is_clean(), told) {
+        (true, Ok(())) => Ok(()),
+        (true, Err(told)) => Err(told),
+        (false, told) => Err(format!(
+            "cannot end process group {}: {ending}{}",
+            fence.pid(),
+            told.err()
+                .map(|told| format!("; {told}"))
+                .unwrap_or_default()
+        )),
+    }
 }
 
 /// The kernel's name of this process's `descriptor`, as the leader inherits it.
@@ -260,9 +306,14 @@ async fn serve(
             request = requests.recv(), if control_open => {
                 let request = match request {
                     Some(request) => request?,
-                    // Its end is a release: a caller that dies releases.
+                    // A release is explicit. The end of the control descriptor before one is a
+                    // controller gone: the group ends as a warm host's does (11_shell.md), and
+                    // the leader is reaped once it exits. After a release it changes nothing.
                     None => {
                         control_open = false;
+                        if !released {
+                            end_group(fence, state).map_err(CowshedError::internal)?;
+                        }
                         HoldRequest::Release
                     }
                 };

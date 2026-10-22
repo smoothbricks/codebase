@@ -795,12 +795,13 @@ Runs a command held: as the leader of a new session and process group that cowsh
 is released, so its pid names it alone and its group id its group alone, and a signal sent through cowshed reaches that
 group or nothing. It is the caller's command byte for byte (argv, environment, working directory, standard streams and
 every inherited descriptor but `n` and `m`). Requests go in on `n`, one per line: `signal <SIG>` (for example
-`signal KILL`) and `release`; the end of `n` is a release. Events come out on `m`, one JSON `HoldEvent` per line:
-`started` (with the kernel's names of the leader's stdout and stderr, as `lsof -F di` prints them), `exited` (observed
-without reaping), `signalled` or `notSignalled`, `failed` (no command ran) and `commandFailed` (cowshed failed once the
-leader ran, and released it). Once released and reaped, cowshed exits with the leader's status (128 + the signal for a
-signal); its own failures use the wrapper codes 100–106. A watchdog ends a step with `signal KILL` on `n` and never
-signals a pid itself. See 11_shell.md "Held leaders: `cowshed hold`".
+`signal KILL`) and `release`. A release is explicit: the end of `n` before one ends the group (SIGTERM, the grace,
+SIGKILL), so a caller that dies leaves nothing behind; after a `release` it changes nothing. Events come out on `m`, one
+JSON `HoldEvent` per line: `started` (with the kernel's names of the leader's stdout and stderr, as `lsof -F di` prints
+them), `exited` (observed without reaping), `signalled` or `notSignalled`, `failed` (no command ran) and `commandFailed`
+(cowshed failed once the leader ran, and ended its group). Once released and reaped, cowshed exits with the leader's
+status (128 + the signal for a signal); its own failures use the wrapper codes 100–106. A watchdog ends a step with
+`signal KILL` on `n` and never signals a pid itself. See 11_shell.md "Held leaders: `cowshed hold`".
 
 ```
 $ cowshed hold --control-fd 3 --state-fd 4 -- make check 3<control.fifo 4>state.log

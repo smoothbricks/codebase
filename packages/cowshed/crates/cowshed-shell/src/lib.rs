@@ -665,13 +665,6 @@ impl Host {
     }
 }
 
-/// How long a command whose supervisor went away, or whose serving failed, has between SIGTERM
-/// and SIGKILL: the grace a supervisor gives its own jobs.
-const ORPHANED_COMMAND_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// How often an ended command's group is looked at for running processes within the grace.
-const ORPHANED_COMMAND_POLL: std::time::Duration = std::time::Duration::from_millis(10);
-
 /// A command this host forked and holds unreaped. Until it is reaped its pid -- the id of the
 /// group it leads -- names nothing else, so the group can be signalled, descendants that outlive
 /// the leader included. Signals and the reap happen in this one thread, so no signal follows the
@@ -695,28 +688,19 @@ impl Held {
         job_groups::signal_unreaped_group(self.pid, signal)
     }
 
-    /// Retire the actual parent's unreaped group, retaining every failed native operation.
+    /// Retire the actual parent's unreaped group as a group whose controller is gone is ended
+    /// ([`job_groups::end_held_group`]), then reap the leader, retaining every failed native
+    /// operation.
     fn retire(&mut self) -> io::Result<()> {
         if self.reaped {
             return Ok(());
         }
-        let term = self.signal(libc::SIGTERM);
-        let deadline = std::time::Instant::now() + ORPHANED_COMMAND_GRACE;
-        let membership = loop {
-            match job_groups::group_has_live_members(self.pid) {
-                Ok(true) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(ORPHANED_COMMAND_POLL);
-                }
-                Ok(_) => break Ok(()),
-                Err(cause) => break Err(cause),
-            }
-        };
-        let kill = self.signal(libc::SIGKILL);
+        let ending = job_groups::end_held_group(self.pid, |signal| self.signal(signal));
         let reap = self.reap();
-        match (&term, &membership, &kill, &reap) {
-            (Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
+        match (ending.is_clean(), &reap) {
+            (true, Ok(())) => Ok(()),
             _ => Err(io::Error::other(format!(
-                "retiring unreaped command group {}: TERM={term:?}; membership={membership:?}; KILL={kill:?}; reap={reap:?}",
+                "retiring unreaped command group {}: {ending}; reap={reap:?}",
                 self.pid,
             ))),
         }

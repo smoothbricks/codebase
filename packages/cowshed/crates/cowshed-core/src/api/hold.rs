@@ -116,7 +116,8 @@ impl fmt::Display for HoldSignal {
 }
 
 /// One request a holder reads on its `--control-fd`, one line each: `signal <SIG>` or `release`.
-/// The end of the descriptor is a release too, so a caller that dies releases.
+/// A release is explicit: the end of the descriptor before one is a controller gone, and the
+/// holder ends the group (SIGTERM, the grace, SIGKILL), so a caller that dies leaves none of it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HoldRequest {
     /// Send the signal to the leader's whole group, only while the leader is held unreaped.
@@ -340,8 +341,9 @@ pub enum HoldEvent {
     /// The holder failed before its leader ran: no command runs. Always the last line.
     Failed { reason: String },
     /// The holder failed once its leader `pid` ran (before `started`, when it could not give up
-    /// its standard streams, or after): it released the leader. Signal answers and `exited` may
-    /// follow; a `commandFailed` saying the leader's exit could not be observed is the last line.
+    /// its standard streams, or after): no release can arrive any more, so it ended the group as at
+    /// the end of its control descriptor before a release. Signal answers and `exited` follow; a
+    /// `commandFailed` saying what of that ending or of the wait failed is the last line.
     CommandFailed { pid: i32, reason: String },
 }
 

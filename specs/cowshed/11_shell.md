@@ -143,14 +143,18 @@ command's, and once the command runs `hold` keeps no copy of its standard stream
   `lsof -F pfdi` instead of a probe per step. `exited {status}` is the leader's exit, observed without reaping it, in
   the `ExitStatus` form every job's exit has. `signalled {signal}` and `notSignalled {signal, reason}` answer each
   signal. `failed {reason}` says no command runs and is the last line. `commandFailed {pid, reason}` says `hold` failed
-  once its leader ran -- before `started`, when it could not give up its standard streams, or after it -- and released
-  the leader as at the end of `n`; `hold` keeps `m` open, answers each signal it receives, and ends with `exited` once
-  the leader is reaped. When that release or wait fails, `hold` sends the group SIGKILL, as a job's is, and a last
-  `commandFailed` says what failed and what came of the kill; it cannot wait for a group it can no longer observe.
+  once its leader ran -- before `started`, when it could not give up its standard streams, or after it. No `release` can
+  arrive any more, so `hold` ends the group as at the end of `n` before a release, answering each signal on `m`, then
+  releases the leader, answers each signal it receives, and ends with `exited` once the leader is reaped. When ending
+  the group, that release or that wait fails, a last `commandFailed` says what failed.
 - **Control.** `n` carries one request per line. `signal <SIG>` sends `kill(-pgid, SIG)` only while the leader is held,
   and is answered `notSignalled` with the reason once the leader was reaped, when its birth was never observed, or when
-  the kernel refuses. `release` reaps the leader once it has exited; signals are still served until the reap. The end of
-  `n` is a release, so a caller that dies releases. A line that is no request is `commandFailed`.
+  the kernel refuses. `release` reaps the leader once it has exited; signals are still served until the reap. A release
+  is explicit: the end of `n` before one is a controller gone, and `hold` ends the group as a warm host ends its held
+  command's group on controller EOF (`job_groups::end_held_group`: SIGTERM, the grace while any process of the group
+  still runs, SIGKILL), answering each as `signalled` or `notSignalled`, then reaps the leader once it exits. A caller
+  that dies therefore leaves no process of the group behind; one that wants the group to outlive it sends `release`
+  first, after which the end of `n` changes nothing. A line that is no request is `commandFailed`.
 - **Exit.** Once the leader is reaped, `hold` exits with its status as a shell reports it: the code, or 128 plus the
   signal. A failure of `hold` itself uses the wrapper codes `exec` uses. SIGINT, SIGHUP and SIGTERM that `hold` receives
   are sent to the group as a `signal` request is, and answered on `m`.
@@ -158,10 +162,11 @@ command's, and once the command runs `hold` keeps no copy of its standard stream
 Under a lock it composes as `cowshed lock <lock> --state-fd 3 -- cowshed hold --control-fd 4 --state-fd 5 -- <cmd…>`:
 the waiter, the caller's direct child, keeps its `SIGUSR1` request path, and the step's group is the hold's. Each path
 has a real-boundary test: a leader that stops its whole group, ended through `hold`; an exited leader held as a zombie
-while `signal TERM` still ends a descendant holding its output; the end of `n` releasing a running leader; a signal
+while `signal TERM` still ends a descendant holding its output; the end of `n` before a release ending the whole group,
+a member that ignores SIGTERM included; an explicit release letting a running leader outlive its controller; a signal
 after a release; the exact argv, environment, working directory and descriptors; `started.output` against `lsof` (or
-procfs) of a descendant; a malformed request; a command that cannot start; a signal `hold` receives; and `hold` under
-`lock`.
+procfs) of a descendant; a malformed request, which ends the group; a command that cannot start; a signal `hold`
+receives; and `hold` under `lock`.
 
 **Freshness is direnv's own.** direnv records every input an evaluation depended on — the `.envrc`, its approval files,
 each `source_up`, `use devenv` and `watch_file` target — as `DIRENV_WATCHES` (base64url of zlib-deflated JSON

@@ -155,7 +155,15 @@ impl Hold {
             .expect("write a control line");
     }
 
+    /// Release the leader explicitly, then close the control descriptor: the group may outlive
+    /// this caller.
     fn release(&mut self) {
+        self.request("release");
+        drop(self.control.take());
+    }
+
+    /// Close the control descriptor with no release: the controller is gone.
+    fn abandon(&mut self) {
         drop(self.control.take());
     }
 
@@ -305,10 +313,11 @@ fn an_exited_leader_is_held_until_released_and_its_group_still_signalled() {
     assert_eq!(hold.rest(), "");
 }
 
-/// The end of the control descriptor is a release: a leader still running is reaped once it
-/// exits, and the hold exits with its status.
+/// An explicit release lets the leader outlive its controller: closing the control descriptor
+/// after it changes nothing, the leader is reaped once it exits, and the hold exits with its
+/// status.
 #[test]
-fn the_end_of_control_releases_a_running_leader() {
+fn an_explicit_release_lets_a_running_leader_outlive_its_controller() {
     let mut hold = Hold::start(
         &[],
         &[os("sh"), os("-c"), os("read -r line; exit 5")],
@@ -325,6 +334,53 @@ fn the_end_of_control_releases_a_running_leader() {
     );
     assert_eq!(hold.rest(), "");
     assert_eq!(hold.wait().code(), Some(5));
+}
+
+/// The end of the control descriptor before a release is a controller gone, and the group ends as
+/// a warm host's does: SIGTERM, the grace while anything of it still runs, then SIGKILL. The probe
+/// says its pid only once it ignores SIGTERM, so only the SIGKILL after the grace can end it, and
+/// the output it holds ends with it; the leader's death by SIGTERM is the hold's status.
+#[test]
+fn the_end_of_control_before_a_release_ends_the_whole_group() {
+    let mut hold = Hold::start(
+        &[],
+        &[
+            os("sh"),
+            os("-c"),
+            os(r#"sh -c 'trap "" TERM; echo $$; while :; do sleep 1; done' & wait"#),
+        ],
+        |_| {},
+    );
+    let (leader, _, _) = hold.started();
+    let mut output = BufReader::new(hold.stdout.take().expect("stdout"));
+    let mut probe = String::new();
+    output.read_line(&mut probe).expect("the probe's pid");
+    let probe: i32 = probe.trim().parse().expect("a pid");
+    assert_eq!(
+        group_of(probe),
+        leader,
+        "the probe that ignores SIGTERM is in the held group"
+    );
+    hold.abandon();
+    for signal in [HoldSignal::Term, HoldSignal::Kill] {
+        assert_eq!(hold.event(), HoldEvent::Signalled { signal });
+    }
+    assert_eq!(
+        hold.event(),
+        HoldEvent::Exited {
+            status: ExitStatus::Signaled {
+                signal: libc::SIGTERM,
+                core_dumped: false
+            }
+        }
+    );
+    let mut rest = String::new();
+    output
+        .read_to_string(&mut rest)
+        .expect("the output ends with the group");
+    assert_eq!(rest, "");
+    assert_eq!(hold.rest(), "");
+    assert_eq!(hold.wait().code(), Some(128 + libc::SIGTERM));
 }
 
 /// A leader released while it runs is still signalled until it is reaped, and is reaped as soon
@@ -408,11 +464,12 @@ done"#;
 }
 
 /// A line that is no request fails the holder once its leader runs: `commandFailed` names the
-/// leader and the line, never `failed`, which says no command ran. The holder releases the
-/// leader and keeps answering on the state channel -- a signal it receives, then the leader's
-/// exit -- and exits with the usage wrapper code once the leader is reaped.
+/// leader and the line, never `failed`, which says no command ran. No release can arrive any
+/// more, so the group ends as a controller gone's does -- SIGTERM, then SIGKILL after the grace or
+/// once nothing of it runs -- the leader's exit follows, and the holder exits with the usage
+/// wrapper code once the leader is reaped.
 #[test]
-fn a_malformed_request_fails_the_holder_and_releases_its_running_leader() {
+fn a_malformed_request_fails_the_holder_and_ends_its_group() {
     let mut hold = Hold::start(&[], &[os("sh"), os("-c"), os("read -r line")], |_| {});
     let (leader, _, _) = hold.started();
     hold.request("signal SIGKILL");
@@ -421,20 +478,9 @@ fn a_malformed_request_fails_the_holder_and_releases_its_running_leader() {
     };
     assert_eq!(pid, leader);
     assert!(reason.contains("\"signal SIGKILL\""), "{reason}");
-    // SAFETY: SIGTERM to this test's own unreaped child, the holder.
-    let sent = unsafe {
-        libc::kill(
-            i32::try_from(hold.child.id()).expect("a pid fits"),
-            libc::SIGTERM,
-        )
-    };
-    assert_eq!(sent, 0);
-    assert_eq!(
-        hold.event(),
-        HoldEvent::Signalled {
-            signal: HoldSignal::Term
-        }
-    );
+    for signal in [HoldSignal::Term, HoldSignal::Kill] {
+        assert_eq!(hold.event(), HoldEvent::Signalled { signal });
+    }
     assert_eq!(
         hold.event(),
         HoldEvent::Exited {

@@ -963,6 +963,67 @@ pub fn signal_unreaped_group(pgid: i32, signal: libc::c_int) -> io::Result<()> {
     }
 }
 
+/// How long a held group whose controller is gone has between SIGTERM and SIGKILL: the grace a
+/// supervisor gives its own jobs (11_shell.md "Process identity and signal ownership").
+pub const LOST_CONTROLLER_GRACE: Duration = Duration::from_secs(2);
+
+/// How often a group ended for a lost controller is looked at for running processes within the
+/// grace.
+const LOST_CONTROLLER_POLL: Duration = Duration::from_millis(10);
+
+/// What ending a held group did, step by step: every step is attempted whatever an earlier one
+/// answered, and each keeps its own native result.
+#[derive(Debug)]
+pub struct GroupEnding {
+    pub term: io::Result<()>,
+    pub membership: io::Result<()>,
+    pub kill: io::Result<()>,
+}
+
+impl GroupEnding {
+    /// Every step succeeded.
+    pub fn is_clean(&self) -> bool {
+        self.term.is_ok() && self.membership.is_ok() && self.kill.is_ok()
+    }
+}
+
+impl std::fmt::Display for GroupEnding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "TERM={:?}; membership={:?}; KILL={:?}",
+            self.term, self.membership, self.kill
+        )
+    }
+}
+
+/// End the group the caller's own unreaped child `pgid` leads, as a group whose controller is
+/// gone is ended (11_shell.md): SIGTERM through `signal`, the grace while any process of the group
+/// still runs, then SIGKILL. `signal` is the caller's own fenced send, so no signal leaves its
+/// fence; the caller reaps the leader afterwards. Blocks the calling thread for at most the grace.
+pub fn end_held_group(
+    pgid: i32,
+    mut signal: impl FnMut(libc::c_int) -> io::Result<()>,
+) -> GroupEnding {
+    let term = signal(libc::SIGTERM);
+    let deadline = std::time::Instant::now() + LOST_CONTROLLER_GRACE;
+    let membership = loop {
+        match group_has_live_members(pgid) {
+            Ok(true) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(LOST_CONTROLLER_POLL);
+            }
+            Ok(_) => break Ok(()),
+            Err(cause) => break Err(cause),
+        }
+    };
+    let kill = signal(libc::SIGKILL);
+    GroupEnding {
+        term,
+        membership,
+        kill,
+    }
+}
+
 /// How the caller's own child `pid` ended, read without reaping it; `None` while it runs. The
 /// child stays unreaped, so its pid -- and the id of the group it leads -- names nothing else
 /// until its parent collects it.
