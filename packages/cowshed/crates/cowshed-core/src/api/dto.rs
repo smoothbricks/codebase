@@ -9,7 +9,7 @@ pub use crate::metadata::{
 use crate::project_retirement::ProjectRetirementReport;
 use crate::repository::{BoundIdentity, RepoId};
 use crate::storage::bootstrap::{HostSetupReport, UninstallReport};
-use crate::storage::lifecycle::{DerivedWorkspace, MountState, Pin as LifecyclePin};
+use crate::storage::lifecycle::{DerivedWorkspace, MountRefusal, MountState, Pin as LifecyclePin};
 use base64::Engine;
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
@@ -80,6 +80,11 @@ pub const MAX_JOB_TAIL_BYTES: usize = MAX_INLINE_OUTPUT_BYTES;
 pub enum DtoError {
     #[error("job id must be in 1..={MAX_JOB_ID}, got {0}")]
     InvalidJobId(u64),
+    /// A listing row's `state` is attached or detached (07_api.md, "Frozen wire projections"),
+    /// and a workspace whose mount does not prove itself the workspace's is neither, so the row
+    /// refuses rather than claim one (01a_apfs.md, "Ownership, identity, and the volume label").
+    #[error("workspace {name} is neither attached nor detached: {0}", name = .0.workspace.name())]
+    UnprovenMount(Box<MountRefusal>),
     #[error("a superseded reason is one non-empty line, got {0:?}")]
     InvalidSupersededReason(String),
     #[error("invalid git object id {0:?}")]
@@ -755,14 +760,12 @@ impl WorkspaceInfo {
             workspace_incarnation: derived.workspace.incarnation().clone(),
             role: derived.workspace.role(),
             mount,
-            state: match derived.mount_state {
+            state: match &derived.mount_state {
                 MountState::Detached => WorkspaceState::Detached,
                 MountState::Mounted { .. } => WorkspaceState::Attached,
-                // `state` is attached or detached (07_api.md). An unproven mount is not attached:
-                // a marker that cannot be read, or names another, is not this workspace's
-                // (01a_apfs.md, "Ownership, identity, and the volume label"). The inventory that
-                // derives it says the refusal by name, and doctor reports it (`mount-identity`).
-                MountState::Unproven(_) => WorkspaceState::Detached,
+                MountState::Unproven(refusal) => {
+                    return Err(DtoError::UnprovenMount(refusal.clone()));
+                }
             },
             branch: snapshot.branch.clone(),
             base_commit,

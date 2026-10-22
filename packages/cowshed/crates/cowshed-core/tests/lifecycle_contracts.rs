@@ -49,6 +49,11 @@ fn workspace(name: &str, revision: u64, topology: u64) -> LifecycleWorkspace {
     )
     .unwrap()
 }
+/// The mount id the proven join of workspace `ws-{index}` carries.
+fn verdict_mount_id(index: usize) -> u64 {
+    u64::try_from(index).expect("a generated index fits u64") + 100
+}
+
 /// Workspace `ws-{index}`'s mount join for a generated verdict: 0 nothing mounted, 1 proven,
 /// 2–4 refused for each reason the identity check gives.
 fn verdict_join(index: usize, verdict: u8) -> Option<MountJoin> {
@@ -57,7 +62,7 @@ fn verdict_join(index: usize, verdict: u8) -> Option<MountJoin> {
         0 => return None,
         1 => {
             return Some(MountJoin::Proven(KernelMountFact {
-                mount_id: index as u64 + 100,
+                mount_id: verdict_mount_id(index),
                 volume_key,
             }));
         }
@@ -782,7 +787,7 @@ proptest! {
             let index: usize = item.workspace.name().as_str().strip_prefix("ws-").unwrap().parse().unwrap();
             match (verdicts[index], &item.mount_state) {
                 (0, MountState::Detached) => {}
-                (1, MountState::Mounted { mount_id }) => prop_assert_eq!(*mount_id, index as u64 + 100),
+                (1, MountState::Mounted { mount_id }) => prop_assert_eq!(*mount_id, verdict_mount_id(index)),
                 (2..=4, MountState::Unproven(refusal)) => prop_assert_eq!(&refusal.workspace, &item.workspace),
                 (verdict, state) => prop_assert!(false, "verdict {} derived {:?}", verdict, state),
             }
@@ -792,7 +797,7 @@ proptest! {
             match join.named() {
                 Ok(fact) => {
                     prop_assert_eq!(*verdict, 1);
-                    prop_assert_eq!(fact.mount_id, index as u64 + 100);
+                    prop_assert_eq!(fact.mount_id, verdict_mount_id(index));
                 }
                 Err(refusal) => {
                     prop_assert!(*verdict >= 2);

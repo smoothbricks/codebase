@@ -5605,10 +5605,15 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             mount_point: self.workspace_mount_path(name)?,
             image: workspace.image.clone(),
         };
-        let mounted = matches!(
-            workspace.derived.mount_state,
-            crate::storage::lifecycle::MountState::Mounted { .. }
-        );
+        let mounted = match &workspace.derived.mount_state {
+            crate::storage::lifecycle::MountState::Mounted { .. } => true,
+            crate::storage::lifecycle::MountState::Detached => false,
+            // Neither copy is provably this workspace's to rewrite: its marker is not in reach and
+            // its image may still be attached. The workspace's own failure, said with the others.
+            crate::storage::lifecycle::MountState::Unproven(refusal) => {
+                return Err(native_storage_error(refusal.clone().into()));
+            }
+        };
         let rewrite_root = project_root.to_owned();
         let repo_id = self.descriptor.repo_id.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {

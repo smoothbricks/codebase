@@ -3404,6 +3404,18 @@ mod tests {
         );
         let host = inventory.all_attached().await.expect("host inventory");
         assert_eq!(host.held, project.held);
+
+        // A listing row's state is attached or detached (07_api.md), so the listing that holds the
+        // unproven workspace refuses, naming it, rather than call it detached.
+        let listing = inventory
+            .load_project_workspaces(&repo)
+            .expect_err("a listing never reports an unproven workspace detached");
+        assert!(
+            listing
+                .to_string()
+                .contains("workspace ci-fhs-tools is neither attached nor detached"),
+            "{listing}"
+        );
     }
 
     #[tokio::test]

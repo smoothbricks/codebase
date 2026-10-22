@@ -121,12 +121,19 @@ fn installed_at(identity: &str, revision: u64, port: u16) -> SessionStatus {
 fn untouched_host() -> FakeInventory {
     FakeInventory {
         all: Mutex::new(None),
+        held: Vec::new(),
     }
 }
 
 fn host_with(live: Vec<WorkspaceSession>) -> FakeInventory {
+    host_holding(live, Vec::new())
+}
+
+/// A host inventory serving `live` and holding `held`, whose mounts are unproven.
+fn host_holding(live: Vec<WorkspaceSession>, held: Vec<HeldWorkspace>) -> FakeInventory {
     FakeInventory {
         all: Mutex::new(Some(live)),
+        held,
     }
 }
 
@@ -786,6 +793,37 @@ async fn stale_foreign_session_holding_a_claimed_endpoint_is_evicted_before_inst
     );
 }
 
+/// A foreign session whose workspace the host inventory holds, its mount unproven, is not a
+/// stale one: the endpoint conflict is reported and the session is never evicted.
+#[tokio::test]
+async fn held_foreign_session_on_a_claimed_endpoint_is_an_inventory_fault_not_an_eviction() {
+    let repo = RepoId::parse("example-org/example-app").expect("repo");
+    let other = RepoId::parse("example-org/other-app").expect("other repo");
+    let claimant = workspace_id(&repo, "lock-contracts", 1);
+    let held_owner = workspace_id(&other, "board-wave", 1);
+    let control = FakeControl::default();
+
+    let error = reconcile_serving(
+        &control,
+        &host_holding(
+            vec![session_at(&claimant, 2, 1, 41_536)],
+            vec![HeldWorkspace {
+                repo_id: other.clone(),
+                workspace: WorkspaceName::new("board-wave").expect("workspace"),
+            }],
+        ),
+        &project_session_prefix(&repo),
+        vec![session_at(&claimant, 2, 1, 41_536)],
+        status(vec![installed_at(&held_owner, 3, 41_536)]),
+    )
+    .await
+    .expect_err("a held owner of a claimed endpoint is an inventory fault");
+
+    assert!(error.message.contains(&held_owner), "{}", error.message);
+    assert!(control.removes.lock().expect("remove lock").is_empty());
+    assert!(control.installs.lock().expect("install lock").is_empty());
+}
+
 #[tokio::test]
 async fn live_foreign_session_on_a_claimed_endpoint_is_an_inventory_fault_not_an_eviction() {
     let repo = RepoId::parse("example-org/example-app").expect("repo");
@@ -1147,6 +1185,7 @@ async fn a_removal_superseded_by_a_newer_reconcile_is_reported_not_failed() {
 
 struct FakeInventory {
     all: Mutex<Option<Vec<WorkspaceSession>>>,
+    held: Vec<HeldWorkspace>,
 }
 
 #[async_trait]
@@ -1158,7 +1197,7 @@ impl SessionInventory for FakeInventory {
             .take()
             .map(|serve| InventorySessions {
                 serve,
-                held: Vec::new(),
+                held: self.held.clone(),
             })
             .ok_or_else(|| CowshedError::internal("inventory called twice"))
     }
@@ -1218,9 +1257,7 @@ async fn daemon_restart_restores_every_project_inventory_session() {
     let repo_b = RepoId::parse("other/tool").expect("repo B");
     let a = workspace_id(&repo_a, "main", 1);
     let b = workspace_id(&repo_b, "raven", 2);
-    let inventory = FakeInventory {
-        all: Mutex::new(Some(vec![session(&a, 2, 1), session(&b, 7, 2)])),
-    };
+    let inventory = host_with(vec![session(&a, 2, 1), session(&b, 7, 2)]);
     let gateway = FakeInstaller::default();
     let report = install_all_sessions(&inventory, &gateway)
         .await
@@ -1242,9 +1279,7 @@ async fn one_occupied_session_port_does_not_stop_the_startup_restore() {
     let repo_b = RepoId::parse("other/tool").expect("repo B");
     let a = workspace_id(&repo_a, "main", 1);
     let b = workspace_id(&repo_b, "raven", 2);
-    let inventory = FakeInventory {
-        all: Mutex::new(Some(vec![session(&a, 2, 1), session(&b, 7, 2)])),
-    };
+    let inventory = host_with(vec![session(&a, 2, 1), session(&b, 7, 2)]);
     let gateway = FakeInstaller {
         occupied: vec![a.clone()],
         ..FakeInstaller::default()
