@@ -2478,7 +2478,9 @@ mod tests {
     /// The rebase-carry probe runs as a job, so under `NX_DAEMON_START=never`. It stops the
     /// checkout's running daemon, whose file map trails the rebase, and computes the graph in its
     /// own process: it starts no daemon and never asks for one. Asking for the stopped one is what
-    /// failed a consumer's carry, through a plugin whose Nx was another checkout's.
+    /// failed a consumer's carry, through a plugin whose Nx was another checkout's. The probe runs
+    /// under a CI runner's environment (`CI=true`), where Nx's own client uses no daemon: the
+    /// daemon a host client started still trails the rebase, and is still stopped.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_task_hash_probe_computes_its_graph_without_a_daemon_under_the_job_rule() {
@@ -2508,6 +2510,7 @@ mod tests {
         }
         let mut probe = command
             .env("NX_DAEMON_START", "never")
+            .env("CI", "true")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
