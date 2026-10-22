@@ -288,6 +288,8 @@ pub const PARITY: &[Row] = &[
     row("gc", "abandoned", field(&[("coordinator.gc", "options.abandoned")], &[argument("Coordinator.gc", 0, "abandoned")])),
     row("gc", "supersede", field(&[("coordinator.gc", "options.supersede.workspace"), ("coordinator.gc", "options.supersede.head")], &[argument("Coordinator.gc", 0, "supersede.workspace"), argument("Coordinator.gc", 0, "supersede.head")])),
     row("gc", "reason", field(&[("coordinator.gc", "options.supersede.reason")], &[argument("Coordinator.gc", 0, "supersede.reason")])),
+    row("gc", "recover", field(&[("coordinator.recoverImage", "image")], &[argument("Coordinator.recoverImage", 0, "")])),
+    row("gc", "to", field(&[("coordinator.recoverImage", "to")], &[argument("Coordinator.recoverImage", 1, "")])),
 
     row("push", "", field(&[("worker.push", "")], &[member("WorkspaceHandle.push")])),
     row("push", "workspace", field(&[("coordinator.worker", "workspace")], &[argument("Coordinator.worker", 0, "")])),

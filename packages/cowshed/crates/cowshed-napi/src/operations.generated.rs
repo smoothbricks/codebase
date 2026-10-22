@@ -460,6 +460,16 @@ impl Coordinator {
         super::json_call::<operations::CoordinatorGc, _>(env, Arc::clone(&self.inner), arguments)
     }
 
+    /// Moves one recovery image, with its companions, out of the store.
+    #[napi(js_name = "recoverImage")]
+    pub fn recover_image(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::json_call::<operations::CoordinatorRecoverImage, _>(
+            env,
+            Arc::clone(&self.inner),
+            arguments,
+        )
+    }
+
     /// Removes the adopted project end to end.
     #[napi(js_name = "removeProject")]
     pub fn remove_project(&self, env: Env, arguments: String) -> napi::Result<JsObject> {

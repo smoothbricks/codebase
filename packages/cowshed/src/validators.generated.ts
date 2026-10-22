@@ -1323,6 +1323,32 @@ export const assertRebaseRequestList = typia.createAssertEquals<readonly Api.Reb
 export const parseRebaseRequestList = (json: string): readonly Api.RebaseRequest[] =>
   assertRebaseRequestList(JSON.parse(json));
 
+export const assertRecoverImageRequest = typia.createAssertEquals<Api.RecoverImageRequest>();
+export const parseRecoverImageRequest = (json: string): Api.RecoverImageRequest =>
+  assertRecoverImageRequest(JSON.parse(json));
+export const assertRecoverImageRequestList = typia.createAssertEquals<readonly Api.RecoverImageRequest[]>();
+export const parseRecoverImageRequestList = (json: string): readonly Api.RecoverImageRequest[] =>
+  assertRecoverImageRequestList(JSON.parse(json));
+
+export const assertRecoveredImage = typia.createAssertEquals<Api.RecoveredImage>();
+export const parseRecoveredImage = (json: string): Api.RecoveredImage => assertRecoveredImage(JSON.parse(json));
+export const assertRecoveredImageList = typia.createAssertEquals<readonly Api.RecoveredImage[]>();
+export const parseRecoveredImageList = (json: string): readonly Api.RecoveredImage[] =>
+  assertRecoveredImageList(JSON.parse(json));
+
+export const assertRecoveryCause = typia.createAssertEquals<Api.RecoveryCause>();
+export const parseRecoveryCause = (json: string): Api.RecoveryCause => assertRecoveryCause(JSON.parse(json));
+export const assertRecoveryCauseList = typia.createAssertEquals<readonly Api.RecoveryCause[]>();
+export const parseRecoveryCauseList = (json: string): readonly Api.RecoveryCause[] =>
+  assertRecoveryCauseList(JSON.parse(json));
+
+export const assertRecoveryRetention = typia.createAssertEquals<Api.RecoveryRetention>();
+export const parseRecoveryRetention = (json: string): Api.RecoveryRetention =>
+  assertRecoveryRetention(JSON.parse(json));
+export const assertRecoveryRetentionList = typia.createAssertEquals<readonly Api.RecoveryRetention[]>();
+export const parseRecoveryRetentionList = (json: string): readonly Api.RecoveryRetention[] =>
+  assertRecoveryRetentionList(JSON.parse(json));
+
 export const assertRefLockPath = typia.createAssertEquals<Api.RefLockPath>();
 export const parseRefLockPath = (json: string): Api.RefLockPath => assertRefLockPath(JSON.parse(json));
 export const assertRefLockPathList = typia.createAssertEquals<readonly Api.RefLockPath[]>();

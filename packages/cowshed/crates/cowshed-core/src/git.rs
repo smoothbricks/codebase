@@ -970,13 +970,14 @@ impl GitRepository {
     /// 5). Only what cowshed itself made is exempt: its `.cowshed/` directory, the volume's own
     /// bookkeeping, and each link of `build_state` exactly as `link::link_paths` made it — the
     /// paths the checkout's build volume records (16_build_volumes.md, "One link per checkout").
-    /// Every other untracked leaf must survive in the target checkout.
+    /// Every other untracked leaf must survive in the target checkout: this is the first one that
+    /// does not, in `git ls-files` order, or `None` when every one does.
     #[cfg(any(target_os = "macos", test))]
-    pub(crate) async fn has_unique_untracked_content(
+    pub(crate) async fn first_unheld_untracked(
         &self,
         checkout: &Path,
         build_state: Vec<crate::capabilities::BuildStatePath>,
-    ) -> Result<bool> {
+    ) -> Result<Option<PathBuf>> {
         let mut args = vec![
             "ls-files".to_owned(),
             "--others".to_owned(),
@@ -1004,7 +1005,8 @@ impl GitRepository {
                             && crate::build_volume::link::is_fixed_link(&root, state)
                     })
                 })
-                .any(|path| !held_by_checkout(&root, &checkout, path))
+                .find(|path| !held_by_checkout(&root, &checkout, path))
+                .map(Path::to_path_buf)
         })
         .await
         .map_err(|error| {
@@ -5802,34 +5804,30 @@ mod tests {
         let git = GitRepository::from_root(store.shared(), &root);
         fs::write(root.join(".git/info/exclude"), "/ignored\n").unwrap();
         fs::write(root.join("ignored"), b"only copy\n").unwrap();
-        fs::write(root.join(".hidden"), b"hidden copy\n").unwrap();
+        fs::write(root.join(".hidden"), b"hidden copy\\n").unwrap();
         assert!(!git.is_dirty_by(Some(&main)).await.unwrap());
-        assert!(
-            git.has_unique_untracked_content(&main, Vec::new())
-                .await
-                .unwrap()
+        assert_eq!(
+            git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
+            Some(PathBuf::from(".hidden"))
         );
         for path in ["ignored", ".hidden"] {
             fs::copy(root.join(path), main.join(path)).unwrap();
         }
-        assert!(
-            !git.has_unique_untracked_content(&main, Vec::new())
-                .await
-                .unwrap()
+        assert_eq!(
+            git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
+            None
         );
         fs::write(root.join("ignored"), b"different\n").unwrap();
-        assert!(
-            git.has_unique_untracked_content(&main, Vec::new())
-                .await
-                .unwrap()
+        assert_eq!(
+            git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
+            Some(PathBuf::from("ignored"))
         );
         fs::remove_file(root.join("ignored")).unwrap();
         fs::create_dir_all(root.join(".cowshed")).unwrap();
         fs::write(root.join(".cowshed/token"), b"controller identity").unwrap();
-        assert!(
-            !git.has_unique_untracked_content(&main, Vec::new())
-                .await
-                .unwrap()
+        assert_eq!(
+            git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
+            None
         );
     }
 
@@ -5865,34 +5863,34 @@ mod tests {
             fs::read_link(root.join(".nx/cache")).unwrap(),
             Path::new("../.cowshed/build/nx/cache")
         );
-        assert!(
-            !git.has_unique_untracked_content(&main, recorded.clone())
+        assert_eq!(
+            git.first_unheld_untracked(&main, recorded.clone())
                 .await
                 .unwrap(),
+            None,
             "cowshed's own links and bookkeeping are not the workspace's only copy"
         );
-        assert!(
-            git.has_unique_untracked_content(&main, Vec::new())
-                .await
-                .unwrap(),
+        assert_eq!(
+            git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
+            Some(PathBuf::from(".codegraph")),
             "with no record naming them, the links are judged like any other leaf"
         );
 
         symlink(".cowshed/build/turbo", root.join(".turbo")).unwrap();
-        assert!(
-            git.has_unique_untracked_content(&main, recorded.clone())
+        assert_eq!(
+            git.first_unheld_untracked(&main, recorded.clone())
                 .await
                 .unwrap(),
+            Some(PathBuf::from(".turbo")),
             "a link into the build volume at a path no record names is content"
         );
         fs::remove_file(root.join(".turbo")).unwrap();
 
         fs::remove_file(root.join(".codegraph")).unwrap();
         symlink("/elsewhere/codegraph", root.join(".codegraph")).unwrap();
-        assert!(
-            git.has_unique_untracked_content(&main, recorded)
-                .await
-                .unwrap(),
+        assert_eq!(
+            git.first_unheld_untracked(&main, recorded).await.unwrap(),
+            Some(PathBuf::from(".codegraph")),
             "a recorded path linked anywhere but its volume directory is content"
         );
     }

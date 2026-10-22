@@ -426,3 +426,216 @@ fn directory_retirement_retry_and_held_recovery_keep_complete_authority() {
     assert!(host.recover_pending(&host.config, &[committed]).is_err());
     assert!(host.recover_pending(&host.config, &[]).is_err());
 }
+
+/// `gc --recover` takes a recovery image a retirement left in a directory store out of the store:
+/// the image, its grants sidecar and CA companion move, never copied or deleted, beside a manifest
+/// naming the workspace, its incarnation and why the retirement kept it, and the trash keeps
+/// nothing a terminal removal would count (02_workspaces.md, `rm` step 5). A path that is not a
+/// recovery image, a destination inside the store and an occupied one refuse before anything
+/// moves; a move interrupted before the image went is finished by the same request.
+#[test]
+fn a_recovery_image_moves_out_of_the_store_with_its_companions_and_a_manifest() {
+    use super::*;
+    use crate::api::dto::{RecoveryCause, RecoveryRetention};
+    use crate::error::ErrorCode;
+    use crate::storage::deletion_log::{self, Caller, KeptRecovery, RetiredBy};
+    use crate::storage::recovery_image::{MANIFEST_FILE, recover};
+
+    let scratch = Scratch::new("recover-image");
+    let (host, image, metadata) = published_directory(&scratch, "selected", 1);
+    let storage = layout(&host.config, &metadata.repo_id).unwrap();
+    let project = storage.project();
+    let repo = &metadata.repo_id;
+    let trash = project.sessions.join(format!(
+        ".trash/selected-{}.dmg",
+        metadata.workspace_incarnation
+    ));
+    fs::create_dir_all(trash.parent().unwrap()).unwrap();
+    fs::hard_link(sidecar_path(&image), sidecar_path(&trash)).unwrap();
+    fs::hard_link(companion_path(&image), companion_path(&trash)).unwrap();
+    host.retire_image(&image, &trash).unwrap();
+    let key = fs::read(companion_path(&trash)).unwrap();
+    let because = vec![RecoveryCause::OnlyCopy {
+        path: PathBuf::from("notes/only.txt"),
+    }];
+    deletion_log::log_retirement(
+        &project.project_root,
+        "selected",
+        &scratch.path().join("mnt/selected"),
+        None,
+        RetiredBy {
+            caller: Caller {
+                pid: 1,
+                argv: vec!["cowshed".to_owned(), "rm".to_owned()],
+                parent: None,
+            },
+            forced: None,
+        },
+        Some(KeptRecovery {
+            image: trash.clone(),
+            because: because.clone(),
+        }),
+    );
+
+    let to = scratch.path().join("recovered");
+    let inside = project.store_root.join("kept");
+    assert_eq!(
+        recover(&storage, repo, &trash, &inside).unwrap_err().code,
+        ErrorCode::Usage
+    );
+    assert!(
+        !inside.exists(),
+        "a destination inside the store is never made"
+    );
+    assert_eq!(
+        recover(&storage, repo, &sidecar_path(&trash), &to)
+            .unwrap_err()
+            .code,
+        ErrorCode::Usage,
+        "a companion is not a recovery image"
+    );
+    assert_eq!(
+        recover(&storage, repo, &image, &to).unwrap_err().code,
+        ErrorCode::Usage,
+        "the canonical name is not the trash"
+    );
+    let directory = to.join(format!("selected-{}", metadata.workspace_incarnation));
+    fs::create_dir_all(&directory).unwrap();
+    assert_eq!(
+        recover(&storage, repo, &trash, &to).unwrap_err().code,
+        ErrorCode::Conflict,
+        "an occupied destination is never merged into"
+    );
+    fs::remove_dir(&directory).unwrap();
+    assert_eq!(
+        recover(
+            &storage,
+            repo,
+            Path::new("sessions/.trash/selected.dmg"),
+            &to
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::Usage,
+        "a relative path is refused, whatever the caller's working directory"
+    );
+    let lock = storage
+        .session_image(&metadata.workspace)
+        .unwrap()
+        .lock()
+        .to_owned();
+    let held = host
+        .lock_images(std::slice::from_ref(&lock), LockMode::Wait)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        recover(&storage, repo, &trash, &to).unwrap_err().code,
+        ErrorCode::Conflict,
+        "another operation holding the workspace's lifecycle lock refuses the move"
+    );
+    drop(held);
+    assert!(!directory.exists());
+    assert!(trash.join(WORKSPACE_MARKER_PATH).exists());
+    assert!(sidecar_path(&trash).exists());
+
+    let recovered = recover(&storage, repo, &trash, &to).unwrap();
+    let moved = directory.join(trash.file_name().unwrap());
+    assert_eq!(recovered.workspace, metadata.workspace);
+    assert_eq!(recovered.incarnation, metadata.workspace_incarnation);
+    assert_eq!(recovered.source, trash);
+    assert_eq!(recovered.directory, directory);
+    assert_eq!(recovered.manifest, directory.join(MANIFEST_FILE));
+    assert_eq!(
+        recovered.moved,
+        [sidecar_path(&moved), companion_path(&moved), moved.clone()]
+    );
+    assert!(recovered.grants);
+    assert!(matches!(
+        &recovered.retained,
+        RecoveryRetention::Recorded { because: recorded, .. } if *recorded == because
+    ));
+    assert!(moved.join(WORKSPACE_MARKER_PATH).exists());
+    assert_eq!(fs::read(companion_path(&moved)).unwrap(), key);
+    assert_eq!(
+        DetachedWorkspaceMetadata::read_for_image(&moved).unwrap(),
+        metadata
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&recovered.manifest).unwrap()).unwrap();
+    assert_eq!(manifest["workspace"], "selected");
+    assert_eq!(
+        manifest["incarnation"],
+        metadata.workspace_incarnation.as_str()
+    );
+    assert_eq!(manifest["source"], trash.to_str().unwrap());
+    assert_eq!(manifest["retained"]["because"][0]["kind"], "onlyCopy");
+    assert_eq!(
+        fs::read_dir(trash.parent().unwrap()).unwrap().count(),
+        0,
+        "the trash keeps nothing of the image"
+    );
+    let log =
+        fs::read_to_string(project.project_root.join(deletion_log::DELETION_LOG_FILE)).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("\"recover-retired-image\""))
+            .count(),
+        3
+    );
+
+    // Interrupted after its companions went and before the image did: the same request finishes.
+    fs::rename(&moved, &trash).unwrap();
+    assert_eq!(recover(&storage, repo, &trash, &to).unwrap(), recovered);
+    assert!(!trash.exists());
+    assert!(moved.join(WORKSPACE_MARKER_PATH).exists());
+    // Interrupted after everything went: the same request answers the finished move.
+    assert_eq!(recover(&storage, repo, &trash, &to).unwrap(), recovered);
+
+    // A manifest that is ordered but short, or whose grants flag contradicts its list, moves
+    // nothing: the image would otherwise leave its companions behind.
+    let image_name = trash.file_name().unwrap().to_str().unwrap().to_owned();
+    for path in [sidecar_path(&moved), companion_path(&moved), moved.clone()] {
+        fs::rename(&path, trash.with_file_name(path.file_name().unwrap())).unwrap();
+    }
+    let written = fs::read(&recovered.manifest).unwrap();
+    for (files, grants) in [
+        (serde_json::json!([image_name]), false),
+        (
+            serde_json::json!([
+                format!("{image_name}.grants.json"),
+                format!("{image_name}.ca.key"),
+                image_name
+            ]),
+            false,
+        ),
+    ] {
+        let mut tampered: serde_json::Value = serde_json::from_slice(&written).unwrap();
+        tampered["files"] = files;
+        tampered["grants"] = serde_json::Value::Bool(grants);
+        fs::write(&recovered.manifest, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        assert_eq!(
+            recover(&storage, repo, &trash, &to).unwrap_err().code,
+            ErrorCode::Integrity
+        );
+        assert!(trash.join(WORKSPACE_MARKER_PATH).exists());
+        assert!(sidecar_path(&trash).exists());
+        assert!(companion_path(&trash).exists());
+    }
+    fs::write(&recovered.manifest, &written).unwrap();
+    assert_eq!(recover(&storage, repo, &trash, &to).unwrap(), recovered);
+
+    // A link where the recovered directory belongs is never followed, even to this image's own
+    // manifest: it could aim the move anywhere, back into the store included.
+    let elsewhere = scratch.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    let relocated = elsewhere.join(directory.file_name().unwrap());
+    fs::rename(&directory, &relocated).unwrap();
+    std::os::unix::fs::symlink(&relocated, &directory).unwrap();
+    fs::rename(relocated.join(trash.file_name().unwrap()), &trash).unwrap();
+    assert!(!sidecar_path(&trash).exists());
+    assert_eq!(
+        recover(&storage, repo, &trash, &to).unwrap_err().code,
+        ErrorCode::Conflict
+    );
+    assert!(trash.join(WORKSPACE_MARKER_PATH).exists());
+}

@@ -161,6 +161,12 @@ pub trait CliService: Send {
     async fn rekey(&mut self, workspace: &str) -> Result<RekeyResult>;
     async fn doctor(&mut self) -> Result<DoctorReport>;
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport>;
+    /// Move one recovery image out of the store (`coordinator.recoverImage`).
+    async fn recover_image(
+        &mut self,
+        image: &Path,
+        to: &Path,
+    ) -> Result<cowshed_core::api::RecoveredImage>;
     async fn grants(&mut self, workspace: &str) -> Result<GrantSet>;
     async fn grant(&mut self, workspace: &str, delta: GrantDelta) -> Result<GrantSet>;
     async fn revoke(&mut self, workspace: &str, delta: GrantDelta) -> Result<GrantSet>;
@@ -943,6 +949,14 @@ impl CliService for ActorBridge {
 
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport> {
         self.coordinator()?.gc(options).await
+    }
+
+    async fn recover_image(
+        &mut self,
+        image: &Path,
+        to: &Path,
+    ) -> Result<cowshed_core::api::RecoveredImage> {
+        self.coordinator()?.recover_image(image, to).await
     }
 
     async fn grants(&mut self, workspace: &str) -> Result<GrantSet> {
@@ -2001,6 +2015,38 @@ where
             Ok(success())
         }
         Command::Gc(args) => {
+            if let Some(recover) = args.recover {
+                let absolute = |path: &Path| {
+                    std::path::absolute(path).map_err(|error| {
+                        CowshedError::usage(
+                            format!("cannot make {} absolute: {error}", path.display()),
+                            "name the path from an existing working directory",
+                        )
+                    })
+                };
+                let recovered = service
+                    .recover_image(&absolute(&recover.image)?, &absolute(&recover.to)?)
+                    .await?;
+                if json {
+                    output.success(recovered).map_err(output_error)?;
+                } else {
+                    output
+                        .bare_line(recovered.directory.as_os_str().as_bytes())
+                        .and_then(|()| {
+                            output.guidance(&format!(
+                                "moved {} ({} at {}) and {} companion file(s) out of the store; {}; manifest {}",
+                                recovered.source.display(),
+                                recovered.workspace,
+                                recovered.incarnation,
+                                recovered.moved.len().saturating_sub(1),
+                                recovered.retained,
+                                recovered.manifest.display()
+                            ))
+                        })
+                        .map_err(output_error)?;
+                }
+                return Ok(success());
+            }
             let report = service
                 .gc(GcOptions {
                     dry_run: args.dry_run,

@@ -1723,6 +1723,19 @@ cowshed gc --supersede raven/<head> --reason "rewritten as the gate refactor"
 The reason is one line and may not be blank; the deletion log records it beside each tip. `--dry-run` reports what would
 be retired and deletes nothing.
 
+A removal that could not prove every source byte held elsewhere — a forced dirty or in-progress tree, abandoned commits,
+or an untracked file main's checkout lacks — keeps the complete image as a recovery image,
+`sessions/.trash/<ws>-<incarnation>.dmg`. No `gc` reclaims one, and removing the whole project refuses while one
+remains. Take it out of the store when you are ready to look at it:
+
+```sh
+cowshed gc --recover /private/cowshed/store/acme/api/sessions/.trash/raven-<incarnation>.dmg --to ~/recovered
+```
+
+The image, its grants sidecar and its CA companion move into `~/recovered/raven-<incarnation>/` beside `recovery.json`,
+which names the project, the workspace, its incarnation and why the removal kept it. Nothing is copied or deleted. The
+directory must be outside the store, on the store's filesystem; a retry after an interruption finishes the same move.
+
 An image under `sessions/` without its grants sidecar is skipped by other commands with a named warning; `doctor`
 reports it, and `gc` can reclaim it as an orphan after mount and lock checks. `gc` keeps going when an individual
 candidate cannot be reclaimed, names it as deferred on stderr and in the `deferred` JSON array, and reports only space

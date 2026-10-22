@@ -3000,7 +3000,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 claimed_checkpoint_names.insert(name);
                 warn_session_image_issue(
                     &path,
-                    "recovery image has no grants sidecar; retained, not garbage: recover its metadata or contents deliberately",
+                    "recovery image has no grants sidecar; retained, not garbage: recover it deliberately with cowshed gc --recover <image> --to <dir>",
                 );
                 continue;
             };

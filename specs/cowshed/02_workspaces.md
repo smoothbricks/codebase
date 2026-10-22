@@ -1291,8 +1291,10 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    who retired the workspace (`retiredBy`): the `caller`, the process that ran the removal with its pid and argv and its
    parent's, which is the shell, script or agent that asked; and, for a forced removal, `forced`, naming each guard the
    force overrode (`dirty`, `inProgress` with the operation, `young` with `createdAt` and `ageSeconds`), empty when it
-   overrode none. A retirement whose tips could not be read says so on stderr and writes the line without Git facts; it
-   is never refused for that.
+   overrode none. A retirement that keeps its image as recovery (step 5) also names the trash path it kept (`image`) and
+   every reason it kept it (`retained`): `inProgress` with the operation, `dirty`, `abandoned`, `onlyCopy` with the
+   first untracked leaf the target checkout does not hold, or `main` for main's own retirement. A retirement whose tips
+   could not be read says so on stderr and writes the line without Git facts; it is never refused for that.
 
    The refusal reports whether the published branch already holds HEAD's commits; it never authorizes a removal. Only
    once the gate has refused HEAD does it measure HEAD, with the same landing module `ls` reads, against the primary
@@ -1354,6 +1356,26 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    still authorizes verified bundles only, never destruction of uncommitted or ignored image content. A refusal
    preserves source/recovery authority and is reported.
 
+   **Recovering a recovery image:** `cowshed gc --recover <image> --to <dir>` (`coordinator.recoverImage`, 07_api.md) is
+   that deliberate recovery, and the only way a recovery image leaves the store. It moves, never copies or deletes. Both
+   paths are absolute. Before anything moves it refuses a path that is not one of this project's
+   `sessions/.trash/<ws>-<incarnation>.dmg` (an abandon bundle is `gc --abandoned`'s), a grants sidecar that records
+   another project, workspace or incarnation, a `<dir>` inside the store or on another filesystem than the trash, and a
+   `<dir>/<ws>-<incarnation>` that is anything but a real directory holding this image's own manifest. It holds the
+   workspace name's lifecycle lock, the one collection and every lifecycle operation on the name take, for the whole
+   move, and refuses (`conflict`) while another operation holds it. It creates that directory, syncs its parent, and
+   durably writes `recovery.json` into it first: the project, workspace, incarnation, trash path, the files that move,
+   whether the grants sidecar was there, and why the retirement kept the image, as its `retire-workspace` line records
+   it (`unrecorded` when no line does). The files are the image's grants sidecar, CA companion and any checkpoint or
+   restore-recovery fact, then the image, as derived from the image's own path; a manifest listing anything else, or
+   these out of that order, is not this move's; nor is one that omits such a file existing on either side, or whose
+   grants flag disagrees with its list (`integrity`, nothing moves). They move in that order by no-clobber renames
+   relative to both directories, held open, syncing both after each and again before answering, so a rename an
+   interrupted run made is durable before a retry reports it: an image whose companions left first is still a retained
+   recovery image, never a reclaimable record. Each moved file appends a `recover-retired-image` line naming where it
+   went. A retry after an interruption finds the manifest and finishes the same move. What moved is no longer the
+   store's: terminal store removal no longer counts it.
+
 The in-progress Git gate follows operation state (`MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `rebase-merge`, or
 `rebase-apply`), not a leftover `.git/AUTO_MERGE` tree: Git can retain that tree after an operation finishes. A stale
 tree alone never blocks removal.
@@ -1395,7 +1417,8 @@ Each step is idempotent, so a refusal leaves the rest to the same command. A col
 changed under it (another process) is refused as retryable — `Conflict` with `Retry::GcPlanStale` — and the same command
 finishes the removal; callers never sleep and retry `gc` themselves. Recovery images can hold only-copy work even after
 all abandoned commits were bundled; they therefore refuse terminal store removal until their contents have been
-deliberately recovered. Bundle authorization alone never discards them.
+deliberately recovered with `gc --recover` (step 5), which the refusal's hint names. Bundle authorization alone never
+discards them.
 
 ## `cowshed attach` / `cowshed detach`
 

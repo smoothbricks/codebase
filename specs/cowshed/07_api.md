@@ -911,6 +911,23 @@ holds. Held jobs and land work, lifecycle/image locks and other Nx task-database
 nothing; the storage rules are 16_build_volumes.md, "Clearing a checkout's Nx state". The CLI's JSON result is
 `CacheClearReport { workspace: NxStateClearResult, store: NxStoreClearResult { repoId, entries } }`.
 
+### Recovery image recovery
+
+`coordinator.recoverImage` is a coordinator-only, JSON-only operation:
+`RecoverImageRequest { repoId: RepoId, image: PathBuf, to: PathBuf } -> RecoveredImage`, both paths absolute. Rust
+`Coordinator::recover_image` and the facade's `Coordinator.recoverImage(image, to)` use it; the CLI's
+`gc --recover <image> --to <dir>` calls it with both paths made absolute against its working directory. The move and its
+refusals are 02_workspaces.md, `rm` step 5, "Recovering a recovery image".
+
+`RecoveredImage` names `workspace`, `incarnation`, `source` (the trash path), `directory`
+(`<to>/<workspace>-<incarnation>`), `manifest`, `moved` (every file at its new path, the image last), `grants` (whether
+the grants sidecar travelled with it) and `retained`: `RecoveryRetention` is `recorded`, with the retirement's `at` and
+`because`, its `RecoveryCause` list (`inProgress` with `operation`, `dirty`, `abandoned`, `onlyCopy` with `path`,
+`main`), or `unrecorded`. A relative path, a path that is not one of the project's recovery images, and a destination
+inside the store or on another filesystem are `usage`; a missing image or trash is `notFound`; an occupied or symlinked
+destination, a lifecycle lock another operation holds, or a file present on both sides is `conflict`; a sidecar
+recording another identity is `integrity`.
+
 ### Generated surfaces
 
 Canonical declarations in `cowshed-core/src/api/dto.rs`, `operations.rs` and capability authority generate the public

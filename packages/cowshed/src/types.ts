@@ -252,6 +252,11 @@ export interface Coordinator {
   /** Removes the adopted project end to end: every session, its images and main's adoption. */
   removeProject(options?: Api.RemoveProjectOptions): Promise<Api.RemoveProjectReport>;
   gc(options?: Api.GcOptions): Promise<Api.GcReport>;
+  /**
+   * Moves one recovery image (`sessions/.trash/<ws>-<incarnation>.dmg`) with its companions and a manifest out of the
+   * store into `<to>/<ws>-<incarnation>/` (`cowshed gc --recover`); both paths absolute. It never deletes.
+   */
+  recoverImage(image: string, to: string): Promise<Api.RecoveredImage>;
   doctor(): Promise<Api.DoctorReport>;
   worker(workspace: string): Promise<WorkspaceHandle>;
   /**

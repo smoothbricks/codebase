@@ -258,6 +258,17 @@ pub trait ProjectRuntimeHost: Send + 'static {
         options: RemoveOptions,
     ) -> Result<RemoveReport>;
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport>;
+    /// Move one recovery image out of the store (`cowshed gc --recover`, 02_workspaces.md, `rm`
+    /// step 5).
+    async fn recover_image(
+        &mut self,
+        _image: PathBuf,
+        _to: PathBuf,
+    ) -> Result<crate::api::dto::RecoveredImage> {
+        Err(CowshedError::internal(
+            "recovering a recovery image is unavailable for this runtime host",
+        ))
+    }
     /// The session workspaces a listing does not show: clones whose create or fork never
     /// published them. `remove` retires them like any other.
     async fn unpublished_workspaces(&mut self) -> Result<Vec<WorkspaceName>>;
@@ -1511,6 +1522,12 @@ impl ProjectActor {
             Op::CoordinatorGc(params) => {
                 self.require_repo(&params.repo_id)?;
                 respond::<operations::CoordinatorGc>(&self.host.gc(params.options).await?)
+            }
+            Op::CoordinatorRecoverImage(params) => {
+                self.require_repo(&params.repo_id)?;
+                respond::<operations::CoordinatorRecoverImage>(
+                    &self.host.recover_image(params.image, params.to).await?,
+                )
             }
             Op::CoordinatorRemoveProject(params) => {
                 self.require_repo(&params.repo_id)?;
@@ -3211,8 +3228,10 @@ fn require_terminal_storage(project_root: &Path) -> Result<()> {
                 "main cannot be restored while the project's storage holds more than locks: {}",
                 error.message
             ),
-            "remove every session workspace (cowshed rm <ws>), delete the rm --abandon bundles in \
-             the project's sessions/.trash you no longer need, run cowshed gc, then retry",
+            "remove every session workspace (cowshed rm <ws>) and run cowshed gc --abandoned for the \
+             rm --abandon bundles; recovery images (sessions/.trash/<ws>-<incarnation>.dmg) are \
+             excluded from every gc and may hold the only copy of work, so move each out with \
+             cowshed gc --recover <image> --to <dir>, then retry",
         ),
         _ => error,
     })
@@ -6660,16 +6679,32 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         self.retire_workspace(current, disposition).await
     }
 
-    async fn source_retirement_disposition(
+    /// Every reason a session's retirement keeps its complete source image as recovery, in the
+    /// order `rm` step 5 weighs them; empty when every source byte survives elsewhere and the
+    /// image is released (02_workspaces.md, "Recovery source"). Only a removal with no other
+    /// reason reads the untracked leaves.
+    async fn source_recovery_causes(
         &self,
         mount: &Path,
         fence: &NativeRemovalGitFence,
         abandoned: bool,
         containment: &NativeContainment,
-    ) -> Result<crate::storage::apfs::RetirementDisposition> {
-        use crate::storage::apfs::RetirementDisposition;
-        if fence.dirty || fence.in_progress.is_some() || abandoned {
-            return Ok(RetirementDisposition::Recovery);
+    ) -> Result<Vec<crate::api::dto::RecoveryCause>> {
+        use crate::api::dto::RecoveryCause;
+        let mut causes = Vec::new();
+        if let Some(operation) = &fence.in_progress {
+            causes.push(RecoveryCause::InProgress {
+                operation: operation.clone(),
+            });
+        }
+        if fence.dirty {
+            causes.push(RecoveryCause::Dirty);
+        }
+        if abandoned {
+            causes.push(RecoveryCause::Abandoned);
+        }
+        if !causes.is_empty() {
+            return Ok(causes);
         }
         let git = crate::git::GitRepository::from_root(self.git.store_root(), mount);
         // The build-state links are cowshed's, named by the record of the volume they reach
@@ -6678,16 +6713,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             &mount.join(crate::build_volume::BUILD_LINK),
         )?
         .paths;
-        Ok(
-            if git
-                .has_unique_untracked_content(&containment.mount, build_state)
-                .await?
-            {
-                RetirementDisposition::Recovery
-            } else {
-                RetirementDisposition::Release
-            },
-        )
+        Ok(git
+            .first_unheld_untracked(&containment.mount, build_state)
+            .await?
+            .map(|path| RecoveryCause::OnlyCopy { path })
+            .into_iter()
+            .collect())
     }
 
     /// Refuse a session removal whose workspace is in transient Git state.
@@ -7075,15 +7106,18 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     }
 
     /// Journal a workspace's retirement (`retire-workspace`) once it committed: its Git tips when
-    /// they were read, and who retired it, with what a force overrode (02_workspaces.md, `rm`
-    /// step 1). A retirement whose tips could not be read still names its caller, and says on
-    /// stderr why it records no Git facts.
+    /// they were read, who retired it, with what a force overrode (02_workspaces.md, `rm` step
+    /// 1), and, when `recovery` names why it kept the image, the trash path it kept it at. A
+    /// retirement whose tips could not be read still names its caller, and says on stderr why it
+    /// records no Git facts.
     fn log_retirement(
         &self,
         workspace: &WorkspaceName,
+        incarnation: &WorkspaceIncarnation,
         mount: &Path,
         tips: std::result::Result<crate::storage::deletion_log::GitTips, String>,
         forced: Option<Vec<crate::storage::deletion_log::Overridden>>,
+        recovery: Vec<crate::api::dto::RecoveryCause>,
     ) {
         let git = match tips {
             Ok(tips) => Some(tips),
@@ -7104,6 +7138,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 caller: crate::storage::deletion_log::Caller::this_process(),
                 forced,
             },
+            (!recovery.is_empty()).then(|| crate::storage::deletion_log::KeptRecovery {
+                image: crate::storage::apfs::retired_image_below(
+                    &self.layout.project().sessions,
+                    workspace,
+                    incarnation,
+                ),
+                because: recovery,
+            }),
         );
     }
 
@@ -7930,17 +7972,13 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     containment,
                 )
                 .await;
-            let disposition = if workspace.is_main() {
-                crate::storage::apfs::RetirementDisposition::Recovery
+            let recovery = if workspace.is_main() {
+                vec![crate::api::dto::RecoveryCause::Main]
             } else {
-                self.source_retirement_disposition(
-                    &mount,
-                    &final_fence,
-                    abandoned.is_some(),
-                    containment,
-                )
-                .await?
+                self.source_recovery_causes(&mount, &final_fence, abandoned.is_some(), containment)
+                    .await?
             };
+            let incarnation = current.derived.workspace.incarnation().clone();
             if !workspace.is_main() {
                 self.build_volumes()?
                     .release_owned(
@@ -7952,9 +7990,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     )
                     .await?;
             }
-            self.finish_retirement(current, nx_check, disposition)
+            self.finish_retirement(current, nx_check, retirement_disposition(&recovery))
                 .await?;
-            self.log_retirement(&workspace, &mount, tips, forced);
+            self.log_retirement(&workspace, &incarnation, &mount, tips, forced, recovery);
             Ok(RemoveReport { abandoned })
         }
         .await;
@@ -9709,7 +9747,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         // An unpublished clone never landed anywhere: main is what has to hold its work.
         let containment = self.main_containment()?;
         let result = async {
-            let (retired, (abandoned, tips, mount, forced)) = substrate
+            let (retired, (abandoned, tips, mount, forced, recovery)) = substrate
                 .execute_pending_clone_retirement(metadata, identity, |stage| {
                     let this = &mut *self;
                     let containment = &containment;
@@ -9780,8 +9818,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                 containment,
                             )
                             .await;
-                        let disposition = this
-                            .source_retirement_disposition(
+                        let recovery = this
+                            .source_recovery_causes(
                                 &stage.mount_point,
                                 &last,
                                 abandoned.is_some(),
@@ -9800,14 +9838,21 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         this.unregister_workspace_in_main(workspace, git_worktree)
                             .await?;
                         Ok::<_, CowshedError>((
-                            disposition,
-                            (abandoned, tips, stage.mount_point.clone(), forced),
+                            retirement_disposition(&recovery),
+                            (abandoned, tips, stage.mount_point.clone(), forced, recovery),
                         ))
                     }
                 })
                 .await
                 .map_err(native_staged_error)?;
-            self.log_retirement(workspace, &mount, tips, forced);
+            self.log_retirement(
+                workspace,
+                retired.workspace().incarnation(),
+                &mount,
+                tips,
+                forced,
+                recovery,
+            );
             self.commitments
                 .record(CommitmentDraft::WorkspaceRetired {
                     repo_id: self.descriptor.repo_id.clone(),
@@ -9982,14 +10027,15 @@ async fn finish_store_residue<H: crate::storage::apfs::ApfsExecutionHost>(
     }
     if !retired.recorded.is_empty() {
         cowshed_os::eprintln!(
-            "cowshed: retaining {} recovery image(s) for {repo_id} under {}; recover their contents deliberately",
+            "cowshed: retaining {} recovery image(s) for {repo_id} under {}; recover their contents deliberately: cowshed gc --recover <image> --to <dir>",
             retired.recorded.len(),
             config.store_root.display(),
         );
     }
     for image in retired.unrecorded {
         cowshed_os::eprintln!(
-            "cowshed: retaining recovery image {} without its grants sidecar; recover its metadata or contents deliberately; missing authority is not proof of disposable bytes",
+            "cowshed: retaining recovery image {} without its grants sidecar; recover it deliberately with cowshed gc --recover {} --to <dir>; missing authority is not proof of disposable bytes",
+            image.display(),
             image.display(),
         );
     }
@@ -13631,6 +13677,21 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             YoungPolicy::Refuse,
         )
         .await
+    }
+
+    async fn recover_image(
+        &mut self,
+        image: PathBuf,
+        to: PathBuf,
+    ) -> Result<crate::api::dto::RecoveredImage> {
+        self.validate_binding().await?;
+        let layout = self.layout.clone();
+        let repo = self.descriptor.repo_id.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            crate::storage::recovery_image::recover(&layout, &repo, &image, &to)
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("recovery image task failed: {error}")))?
     }
 
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport> {
@@ -21027,6 +21088,19 @@ fn workspace_lineage(
         let _ = crate::metadata::write_json(&marker_path, &marker);
     }
     Ok(marker.lineage.unwrap_or_default().into_iter().collect())
+}
+
+/// A retirement keeps its image as recovery when anything is a reason to, and releases it
+/// otherwise (02_workspaces.md, `rm` step 5).
+#[cfg(target_os = "macos")]
+fn retirement_disposition(
+    recovery: &[crate::api::dto::RecoveryCause],
+) -> crate::storage::apfs::RetirementDisposition {
+    if recovery.is_empty() {
+        crate::storage::apfs::RetirementDisposition::Release
+    } else {
+        crate::storage::apfs::RetirementDisposition::Recovery
+    }
 }
 
 #[cfg(target_os = "macos")]

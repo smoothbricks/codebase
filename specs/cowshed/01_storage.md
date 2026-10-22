@@ -84,7 +84,7 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
       <workspace>.dmg.lock           # flock target for lifecycle operations
       <workspace>.intent.lock        # flock the process executing <workspace>'s lifecycle intent holds
       <workspace>.land.lock          # flock a land or an rm of <workspace> holds for its run (02 "A land and an rm of one workspace exclude each other")
-      .trash/                        # recovery images of dirty, unlanded or only-copy removals, kept until recovered
+      .trash/                        # recovery images of dirty, unlanded or only-copy removals, kept until gc --recover
       .releasing/<ws>-<inc>.dmg      # a clean removal's committed release, freed by that removal or, after a crash, recovery
     checkpoints/
       <workspace>/<label>.dmg        # clonefile snapshot
@@ -276,16 +276,16 @@ Copy-on-write divergence only ever accumulates — checkpoints, idle workspaces,
 (09_substrates.md), and APFS image-size ratchet all grow silently. `cowshed gc` enforces retention conventions.
 Background reclamation handles only explicitly released build images and provably dead scratch, never idle workspaces:
 
-| Object                                       | Default retention                                                                      | Exempt / override                                                                                        |
-| -------------------------------------------- | -------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| Checkpoints                                  | all younger than 14 days **plus the newest five per workspace, whichever keeps more**  | explicit pin from a label or `cowshed checkpoint --keep`; pins never expire until unpinned               |
-| CI failure checkpoints                       | same checkpoint rule as above                                                          | labeled `ci-fail`, therefore explicitly pinned until unpinned; `10_ci.md`                                |
-| Idle workspaces                              | _flagged_ by `cowshed doctor` after 14 days no exec, **never auto-destroyed**          | landing/removal is always explicit                                                                       |
-| Recovery images (`sessions/.trash/…`)        | retained even when their record is missing; never deleted by startup or generic `gc`   | recover their contents deliberately; clean landed source images are unlinked by retirement, not put here |
-| Historical build trash (`build/.trash/…`)    | no new entries; build images unlink inside the operation that retires or replaces them | the daemon's start and `cowshed gc` finish old entries; gc refuses if one cannot be freed                |
-| Abandon bundles (`sessions/.trash/*.bundle`) | never reclaimed by default; their tips are also kept as refs in main's repository      | explicit `cowshed gc --abandoned`                                                                        |
-| Abandoned refs (in main's repository)        | retired by every `gc` once main holds each tip, by ancestry, content or patch identity | `cowshed gc --supersede <ws>/<head> --reason <one line>`                                                 |
-| Dead shared-temp scratch                     | sockets/empty locks deleted; all other contents renamed to `<store>/.trash/scratch/`   | unknown/live owners kept; archived evidence kept for 24 hours before background deletion                 |
+| Object                                       | Default retention                                                                      | Exempt / override                                                                                                                                                            |
+| -------------------------------------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Checkpoints                                  | all younger than 14 days **plus the newest five per workspace, whichever keeps more**  | explicit pin from a label or `cowshed checkpoint --keep`; pins never expire until unpinned                                                                                   |
+| CI failure checkpoints                       | same checkpoint rule as above                                                          | labeled `ci-fail`, therefore explicitly pinned until unpinned; `10_ci.md`                                                                                                    |
+| Idle workspaces                              | _flagged_ by `cowshed doctor` after 14 days no exec, **never auto-destroyed**          | landing/removal is always explicit                                                                                                                                           |
+| Recovery images (`sessions/.trash/…`)        | retained even when their record is missing; never deleted by startup or generic `gc`   | `cowshed gc --recover <image> --to <dir>` moves one out of the store with a manifest (02_workspaces.md); clean landed source images are unlinked by retirement, not put here |
+| Historical build trash (`build/.trash/…`)    | no new entries; build images unlink inside the operation that retires or replaces them | the daemon's start and `cowshed gc` finish old entries; gc refuses if one cannot be freed                                                                                    |
+| Abandon bundles (`sessions/.trash/*.bundle`) | never reclaimed by default; their tips are also kept as refs in main's repository      | explicit `cowshed gc --abandoned`                                                                                                                                            |
+| Abandoned refs (in main's repository)        | retired by every `gc` once main holds each tip, by ancestry, content or patch identity | `cowshed gc --supersede <ws>/<head> --reason <one line>`                                                                                                                     |
+| Dead shared-temp scratch                     | sockets/empty locks deleted; all other contents renamed to `<store>/.trash/scratch/`   | unknown/live owners kept; archived evidence kept for 24 hours before background deletion                                                                                     |
 
 - `cowshed gc` evaluates both checkpoint floors independently: it deletes only an unpinned checkpoint that is at least
   14 days old **and** is not among the newest five for that workspace. A user-supplied label creates an explicit pin;

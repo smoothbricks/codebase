@@ -15,7 +15,7 @@ use super::dto::{
     ExecScope, ForkOptions, GcOptions, GcReport, GrantDelta, GrantSet, JobId, JobInfo,
     JobJournalCursor, JobListeningPorts, JobTail, JobTailLimits, LandOptions, LandReport,
     MirrorInfo, NxStateClearResult, OutputPublication, ProjectGrantDelta, PushOptions, PushReport,
-    RebaseOptions, RebaseReport, RekeyResult, RemoveOptions, RemoveProjectOptions,
+    RebaseOptions, RebaseReport, RecoveredImage, RekeyResult, RemoveOptions, RemoveProjectOptions,
     RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult, ResizeVolume, RunSandboxMode,
     ScriptCommand, SealedJob, TraceContext, UnprovenWorkspace, WorkspaceIncarnation, WorkspaceInfo,
     WorkspacePath, WorkspaceTarget,
@@ -337,6 +337,8 @@ operations! {
     coordinator json "coordinator.destroy" CoordinatorDestroy(DestroyRequest) -> RemoveReport;
     /// Collects unreferenced storage.
     coordinator json "coordinator.gc" CoordinatorGc(GcRequest) -> GcReport;
+    /// Moves one recovery image, with its companions, out of the store.
+    coordinator json "coordinator.recoverImage" CoordinatorRecoverImage(RecoverImageRequest) -> RecoveredImage;
     /// Removes the adopted project end to end.
     coordinator json "coordinator.removeProject" CoordinatorRemoveProject(RemoveProjectRequest) -> RemoveProjectReport;
     /// Points a workspace's repository mirror at a URL.
@@ -732,6 +734,17 @@ pub struct DestroyRequest {
 pub struct GcRequest {
     pub repo_id: RepoId,
     pub options: GcOptions,
+}
+
+/// `cowshed gc --recover <image> --to <dir>`: move the recovery image at `image`, one of the
+/// project's `sessions/.trash/<ws>-<incarnation>.dmg`, with its companions and a manifest, into
+/// `<to>/<ws>-<incarnation>/` outside the store. Both paths are absolute.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecoverImageRequest {
+    pub repo_id: RepoId,
+    pub image: PathBuf,
+    pub to: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

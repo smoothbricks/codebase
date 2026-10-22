@@ -1214,7 +1214,7 @@ impl DirectoryExecutionHost {
             let Some(retired) = self.retired_authority(project, repo, &path)? else {
                 warn_session_image_issue(
                     &path,
-                    "recovery payload has no grants sidecar; retained, not garbage: recover its metadata or contents deliberately",
+                    "recovery payload has no grants sidecar; retained, not garbage: recover it deliberately with cowshed gc --recover <image> --to <dir>",
                 );
                 continue;
             };

@@ -184,7 +184,7 @@ impl AttachDemand {
 /// whole project and the project's own maintenance attach nothing, and one attach of an
 /// aggregate makes no room: detaching some sessions to attach others frees nothing. Host and
 /// sccache operations route outside the project actor, which refuses them, so they add no
-/// project attach demand.
+/// project attach demand. Recovering an image renames its files without attaching it.
 pub fn attach_demand(operation: &OperationRequest) -> AttachDemand {
     use OperationRequest as Op;
     let one = |workspace: &WorkspaceName| AttachDemand::of(0, [workspace.clone()]);
@@ -248,6 +248,7 @@ pub fn attach_demand(operation: &OperationRequest) -> AttachDemand {
         | Op::CoordinatorAssignSlot(_)
         | Op::CoordinatorDestroy(_)
         | Op::CoordinatorGc(_)
+        | Op::CoordinatorRecoverImage(_)
         | Op::CoordinatorRemoveProject(_)
         | Op::CoordinatorRepoMirror(_)
         | Op::CoordinatorSetCheckpointQuota(_)

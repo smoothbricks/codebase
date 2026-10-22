@@ -3893,7 +3893,7 @@ fn undo_image(
 /// The `-` between name and incarnation is the separator [`split_retired_stem`] reverses; the two
 /// live side by side so the pair cannot drift. Incarnations are fixed-width lowercase hex, which
 /// is what keeps `rsplit_once` unambiguous even though workspace names contain hyphens.
-pub(super) fn retired_image_below(
+pub(crate) fn retired_image_below(
     sessions: &Path,
     workspace: &WorkspaceName,
     incarnation: &WorkspaceIncarnation,

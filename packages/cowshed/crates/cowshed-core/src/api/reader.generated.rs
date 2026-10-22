@@ -784,6 +784,41 @@ static REBASE_CARRY_SKIP__UNGATED: Reader = Reader::Record(&[]);
 static REBASE_CARRY_SKIP__UNINDEXED: Reader = Reader::Record(&[("states", &LEAF)]);
 static REBASE_REPORT: Reader =
     Reader::Record(&[("oid", &LEAF), ("buildVolume", &REBASE_BUILD_VOLUME)]);
+static RECOVERED_IMAGE: Reader = Reader::Record(&[
+    ("workspace", &LEAF),
+    ("incarnation", &LEAF),
+    ("source", &LEAF),
+    ("directory", &LEAF),
+    ("manifest", &LEAF),
+    ("moved", &LEAF),
+    ("grants", &LEAF),
+    ("retained", &RECOVERY_RETENTION),
+]);
+static RECOVERY_CAUSE: Reader = Reader::Internal {
+    tag: "kind",
+    arms: &[
+        ("inProgress", &RECOVERY_CAUSE__IN_PROGRESS),
+        ("dirty", &RECOVERY_CAUSE__DIRTY),
+        ("abandoned", &RECOVERY_CAUSE__ABANDONED),
+        ("onlyCopy", &RECOVERY_CAUSE__ONLY_COPY),
+        ("main", &RECOVERY_CAUSE__MAIN),
+    ],
+};
+static RECOVERY_CAUSE__ABANDONED: Reader = Reader::Record(&[]);
+static RECOVERY_CAUSE__DIRTY: Reader = Reader::Record(&[]);
+static RECOVERY_CAUSE__IN_PROGRESS: Reader = Reader::Record(&[("operation", &LEAF)]);
+static RECOVERY_CAUSE__MAIN: Reader = Reader::Record(&[]);
+static RECOVERY_CAUSE__ONLY_COPY: Reader = Reader::Record(&[("path", &LEAF)]);
+static RECOVERY_RETENTION: Reader = Reader::Internal {
+    tag: "kind",
+    arms: &[
+        ("recorded", &RECOVERY_RETENTION__RECORDED),
+        ("unrecorded", &RECOVERY_RETENTION__UNRECORDED),
+    ],
+};
+static RECOVERY_RETENTION__RECORDED: Reader =
+    Reader::Record(&[("at", &LEAF), ("because", &SEQ__RECOVERY_CAUSE)]);
+static RECOVERY_RETENTION__UNRECORDED: Reader = Reader::Record(&[]);
 static REKEY_RESULT: Reader = Reader::Record(&[
     ("workspace", &LEAF),
     ("workspaceIncarnation", &LEAF),
@@ -890,6 +925,7 @@ static SEQ__OUTLIVED_PROCESS: Reader = Reader::Seq(&OUTLIVED_PROCESS);
 static SEQ__PORT_BLOCK: Reader = Reader::Seq(&PORT_BLOCK);
 static SEQ__PRESERVED_REF: Reader = Reader::Seq(&PRESERVED_REF);
 static SEQ__PROCESS_COVERAGE_GAP: Reader = Reader::Seq(&PROCESS_COVERAGE_GAP);
+static SEQ__RECOVERY_CAUSE: Reader = Reader::Seq(&RECOVERY_CAUSE);
 static SEQ__REMOVED_WORKSPACE: Reader = Reader::Seq(&REMOVED_WORKSPACE);
 static SEQ__RETIRED_ABANDONED_REFS: Reader = Reader::Seq(&RETIRED_ABANDONED_REFS);
 static SEQ__SCRIPT_VALUE: Reader = Reader::Seq(&SCRIPT_VALUE);
@@ -1227,6 +1263,10 @@ impl Projected for crate::api::dto::PushReport {
 
 impl Projected for crate::api::dto::RebaseReport {
     const READER: &'static Reader = &REBASE_REPORT;
+}
+
+impl Projected for crate::api::dto::RecoveredImage {
+    const READER: &'static Reader = &RECOVERED_IMAGE;
 }
 
 impl Projected for crate::api::dto::RekeyResult {

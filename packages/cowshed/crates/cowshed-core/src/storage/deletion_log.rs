@@ -101,6 +101,9 @@ pub enum DeletionOp {
     KeepAbandonedTips,
     #[serde(rename = "retire-abandoned-ref")]
     RetireAbandonedRef,
+    /// A recovery image's file moved out of the store by `gc --recover`, to `recoveredTo`.
+    #[serde(rename = "recover-retired-image")]
+    RecoverRetiredImage,
 }
 
 impl std::fmt::Display for DeletionOp {
@@ -119,6 +122,7 @@ impl std::fmt::Display for DeletionOp {
             Self::RetireWorkspace => "retire-workspace",
             Self::KeepAbandonedTips => "keep-abandoned-tips",
             Self::RetireAbandonedRef => "retire-abandoned-ref",
+            Self::RecoverRetiredImage => "recover-retired-image",
         };
         formatter.write_str(tag)
     }
@@ -148,6 +152,13 @@ pub struct DeletionLogEntry {
     /// on retirement lines a build before it wrote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_by: Option<RetiredBy>,
+    /// On a `retire-workspace` line whose retirement kept its image as recovery (`image` names
+    /// the trash path), every reason it did; absent on every other line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained: Option<Vec<crate::api::dto::RecoveryCause>>,
+    /// Where a `recover-retired-image` line's artifact went, outside the store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_to: Option<PathBuf>,
 }
 
 /// A retired repository's head and every tip it held, each with what keeps it.
@@ -278,26 +289,87 @@ pub enum Overridden {
     },
 }
 
+/// A retirement that kept its image as recovery: the trash path it kept, and every reason.
+pub struct KeptRecovery {
+    pub image: PathBuf,
+    pub because: Vec<crate::api::dto::RecoveryCause>,
+}
+
 /// Append a workspace retirement's line (`retire-workspace`): its Git tips when they were read,
-/// and who retired it. Best-effort, under the same never-fail rule as [`log_deletion`].
+/// who retired it, and, when it kept its image as recovery, where and why. Best-effort, under the
+/// same never-fail rule as [`log_deletion`].
 pub fn log_retirement(
     project_root: &Path,
     workspace: &str,
     artifact: &Path,
     git: Option<GitTips>,
     retired_by: RetiredBy,
+    recovery: Option<KeptRecovery>,
 ) {
+    let (image, retained) = match recovery {
+        Some(KeptRecovery { image, because }) => (Some(image), Some(because)),
+        None => (None, None),
+    };
     let entry = DeletionLogEntry {
         at: rfc3339_utc(SystemTime::now()),
         op: DeletionOp::RetireWorkspace,
         workspace: workspace.to_owned(),
-        image: None,
+        image,
         artifact: artifact.to_path_buf(),
         kind: DeletionKind::Other,
         git,
         retired_by: Some(retired_by),
+        retained,
+        recovered_to: None,
     };
     append_entry(project_root, &entry);
+}
+
+/// Append one `recover-retired-image` line: `gc --recover` moved `artifact`, a file of the
+/// recovery image `image`, out of the store to `recovered_to`. Best-effort, under the same
+/// never-fail rule as [`log_deletion`].
+pub fn log_recovery(
+    project_root: &Path,
+    workspace: &str,
+    image: &Path,
+    artifact: &Path,
+    kind: DeletionKind,
+    recovered_to: &Path,
+) {
+    let entry = DeletionLogEntry {
+        at: rfc3339_utc(SystemTime::now()),
+        op: DeletionOp::RecoverRetiredImage,
+        workspace: workspace.to_owned(),
+        image: Some(image.to_path_buf()),
+        artifact: artifact.to_path_buf(),
+        kind,
+        git: None,
+        retired_by: None,
+        retained: None,
+        recovered_to: Some(recovered_to.to_path_buf()),
+    };
+    append_entry(project_root, &entry);
+}
+
+/// Why the retirement that left the recovery image `image` kept it: the newest
+/// `retire-workspace` line naming that trash path with its reasons. Malformed lines are skipped,
+/// and a log that cannot be read records nothing.
+pub fn recovery_retention(project_root: &Path, image: &Path) -> crate::api::dto::RecoveryRetention {
+    let Ok(bytes) = std::fs::read(project_root.join(DELETION_LOG_FILE)) else {
+        return crate::api::dto::RecoveryRetention::Unrecorded;
+    };
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<DeletionLogEntry>(line.trim()).ok())
+        .filter(|entry| {
+            entry.op == DeletionOp::RetireWorkspace && entry.image.as_deref() == Some(image)
+        })
+        .filter_map(|entry| entry.retained.map(|because| (entry.at, because)))
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map_or(
+            crate::api::dto::RecoveryRetention::Unrecorded,
+            |(at, because)| crate::api::dto::RecoveryRetention::Recorded { at, because },
+        )
 }
 
 /// Best-effort append of a line carrying Git facts, under the same never-fail rule as
@@ -318,6 +390,8 @@ pub fn log_git_tips(
         kind: DeletionKind::Other,
         git: Some(git),
         retired_by: None,
+        retained: None,
+        recovered_to: None,
     };
     append_entry(project_root, &entry);
 }
@@ -366,6 +440,8 @@ pub fn log_deletion(
         kind,
         git: None,
         retired_by: None,
+        retained: None,
+        recovered_to: None,
     };
     append_entry(project_root, &entry);
 }
@@ -615,6 +691,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&project);
     }
 
+    /// A recovery image's reason is the newest `retire-workspace` line naming its trash path with
+    /// one; a line for another image, or a release that kept nothing, says nothing about it.
+    #[test]
+    fn a_recovery_image_reads_why_its_newest_retirement_kept_it() {
+        use crate::api::dto::{RecoveryCause, RecoveryRetention};
+        let project = temp_project("retention");
+        let image = project.join("sessions/.trash/ws-0123456789abcdef0123456789abcdef.dmg");
+        assert_eq!(
+            recovery_retention(&project, &image),
+            RecoveryRetention::Unrecorded
+        );
+        let retired_by = || RetiredBy {
+            caller: Caller {
+                pid: 1,
+                argv: vec!["cowshed".to_owned(), "rm".to_owned()],
+                parent: None,
+            },
+            forced: None,
+        };
+        log_retirement(
+            &project,
+            "ws",
+            &project.join("mnt/ws"),
+            None,
+            retired_by(),
+            None,
+        );
+        log_retirement(
+            &project,
+            "other",
+            &project.join("mnt/other"),
+            None,
+            retired_by(),
+            Some(KeptRecovery {
+                image: project.join("sessions/.trash/other-0123456789abcdef0123456789abcdef.dmg"),
+                because: vec![RecoveryCause::Dirty],
+            }),
+        );
+        assert_eq!(
+            recovery_retention(&project, &image),
+            RecoveryRetention::Unrecorded
+        );
+        log_retirement(
+            &project,
+            "ws",
+            &project.join("mnt/ws"),
+            None,
+            retired_by(),
+            Some(KeptRecovery {
+                image: image.clone(),
+                because: vec![
+                    RecoveryCause::Abandoned,
+                    RecoveryCause::OnlyCopy {
+                        path: PathBuf::from("notes/only.txt"),
+                    },
+                ],
+            }),
+        );
+        let RecoveryRetention::Recorded { because, .. } = recovery_retention(&project, &image)
+        else {
+            panic!("the retirement's line names the image");
+        };
+        assert_eq!(
+            because,
+            [
+                RecoveryCause::Abandoned,
+                RecoveryCause::OnlyCopy {
+                    path: PathBuf::from("notes/only.txt")
+                }
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
     #[test]
     fn newest_tombstone_wins() {
         let project = temp_project("newest");
@@ -629,6 +779,8 @@ mod tests {
             kind: DeletionKind::Companion,
             git: None,
             retired_by: None,
+            retained: None,
+            recovered_to: None,
         };
         let newer = DeletionLogEntry {
             at: "2026-06-01T00:00:00Z".to_owned(),
@@ -639,6 +791,8 @@ mod tests {
             kind: DeletionKind::Companion,
             git: None,
             retired_by: None,
+            retained: None,
+            recovered_to: None,
         };
         append_entry(&project, &older);
         append_entry(&project, &newer);

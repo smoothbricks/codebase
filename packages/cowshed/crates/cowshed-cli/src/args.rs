@@ -614,6 +614,14 @@ pub struct GcArgs {
     pub dry_run: bool,
     pub abandoned: bool,
     pub supersede: Option<AbandonedRefSupersession>,
+    pub recover: Option<RecoverArgs>,
+}
+
+/// `gc --recover <image> --to <dir>`: the recovery image to move out of the store, and where.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoverArgs {
+    pub image: PathBuf,
+    pub to: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1014,6 +1022,8 @@ pub fn cli_command() -> ClapCommand {
             flag("abandoned"),
             value("supersede"),
             value("reason"),
+            value("recover"),
+            value("to"),
         ]))
         .subcommand(leaf("push").arg(positional("workspace", 0..=1)).args([
             value("branch"),
@@ -3705,6 +3715,7 @@ const GC: CommandSpec = CommandSpec {
         "`abandonedBundle` — under `--abandoned` only, the `<ws>-<tip>.bundle` files in `sessions/.trash/` that `rm --abandon` verified and left behind, holding commits main does not contain, which is why no plain `gc` ever deletes one. A plain `gc` still says how many the trash keeps and their allocated bytes, as `doctor` and `ls --all` do, so they are never out of sight. Before deleting any, `--abandoned` fetches each bundle's tips into main's repository as `refs/cowshed/<ws>/abandoned/<head>/HEAD` and `.../heads/<branch>` — the refs `rm --abandon` already wrote, written again for a bundle an older cowshed left without them — and records them in the project's deletion log; a bundle it cannot keep that way stops the whole sweep, naming it, and nothing is deleted. `--dry-run --abandoned` lists them with their real allocated bytes first.",
         "A bare mountpoint whose only entry is root's `0700` `.fseventsd` is retained aside by an atomic, same-parent `.root-held-<uuid>` rename instead of deleting privileged debris. A mounted filesystem, symlink substitution, rename collision or another entry (hidden included) is never overwritten or moved. The retained log is named with a quoted privileged cleanup hint in `deferred`; it does not fail collection or make doctor unhealthy. Dry-run and doctor report it as information without renaming.",
         "Also collects build volumes no checkout links and superseded seeds. A running job's shared hold or an unfinished create/fork in the lifecycle intent journal defers release; otherwise a refused unforced unmount gets bounded grace, then is forced if needed, naming each initial holder's pid and command. Both gc and opportunistic collection in rm/land say why they skip volumes, and one failed release does not hide later candidates. Dry-run reports these reasons without changing any mount or image.",
+        "`--recover <image> --to <dir>` is the one way a recovery image leaves the store. A removal that could not prove every source byte held elsewhere — a forced dirty or in-progress tree, abandoned commits, or an untracked file the target checkout lacks — keeps the complete image as `sessions/.trash/<ws>-<incarnation>.dmg`; no gc reclaims one, and removing the whole project refuses while one remains. It moves the image, its grants sidecar and CA companion into `<dir>/<ws>-<incarnation>/` beside a `recovery.json` manifest naming the project, workspace, incarnation and why the removal kept it, and deletes nothing. The directory must be outside the store, on the store's filesystem; a retry after an interruption finishes the same move.",
         "Every gc also retires the refs `rm --abandon` keeps in main's repository, `refs/cowshed/<ws>/abandoned/<head>/`, once main holds every tip by ancestry, content or patch identity — the measurement `rm` uses, so a cherry-pick, squash or conflict-resolved pick counts — and journals each in the project's deletion log as `retire-abandoned-ref`. Every other abandonment is kept and named with how many commits main does not hold, here, in `doctor` and in `ls --all`. Its owner lets one go with `--supersede <ws>/<head> --reason <one line>`, and the reason is journaled; nothing else ever deletes those refs.",
     ],
     options: &[
@@ -3723,6 +3734,14 @@ const GC: CommandSpec = CommandSpec {
         Opt {
             spelling: "--reason <one line>",
             meaning: "why the work --supersede names is no longer needed: one line, not blank",
+        },
+        Opt {
+            spelling: "--recover <image>",
+            meaning: "move this recovery image, `sessions/.trash/<ws>-<incarnation>.dmg`, with its companions and a manifest out of the store instead of collecting; requires --to",
+        },
+        Opt {
+            spelling: "--to <dir>",
+            meaning: "where --recover moves the image: `<dir>/<ws>-<incarnation>/`, outside the store on its filesystem, created if missing",
         },
     ],
 };
@@ -3769,10 +3788,38 @@ fn parse_gc(matches: &ArgMatches) -> Result<Command, UsageError> {
             })
         }
     };
+    let recover = match (os(matches, "recover"), os(matches, "to")) {
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(UsageError::new(
+                "--recover needs --to: name the directory outside the store to move the image into",
+                USAGE,
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(UsageError::new(
+                "--to only says where --recover moves an image",
+                USAGE,
+            ));
+        }
+        (Some(image), Some(to)) => {
+            if supersede.is_some() || flagged(matches, "dry-run") || flagged(matches, "abandoned") {
+                return Err(UsageError::new(
+                    "--recover moves one recovery image and collects nothing: it takes no --dry-run, --abandoned or --supersede",
+                    USAGE,
+                ));
+            }
+            Some(RecoverArgs {
+                image: PathBuf::from(image),
+                to: PathBuf::from(to),
+            })
+        }
+    };
     Ok(Command::Gc(GcArgs {
         dry_run: flagged(matches, "dry-run"),
         abandoned: flagged(matches, "abandoned"),
         supersede,
+        recover,
     }))
 }
 
@@ -4178,6 +4225,31 @@ mod tests {
                 "--reason",
                 "replaced",
             ],
+        ] {
+            assert!(parse_args(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn gc_recovers_one_image_only_into_a_named_directory() {
+        let image = "/store/project/sessions/.trash/raven-0123456789abcdef0123456789abcdef.dmg";
+        assert_eq!(
+            parse_args(["gc", "--recover", image, "--to", "/home/user/recovered"])
+                .unwrap()
+                .command,
+            Command::Gc(GcArgs {
+                recover: Some(RecoverArgs {
+                    image: PathBuf::from(image),
+                    to: PathBuf::from("/home/user/recovered"),
+                }),
+                ..GcArgs::default()
+            })
+        );
+        for refused in [
+            &["gc", "--recover", image][..],
+            &["gc", "--to", "/home/user/recovered"],
+            &["gc", "--recover", image, "--to", "/r", "--dry-run"],
+            &["gc", "--recover", image, "--to", "/r", "--abandoned"],
         ] {
             assert!(parse_args(refused).is_err(), "{refused:?}");
         }
