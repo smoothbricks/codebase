@@ -2509,10 +2509,18 @@ index 34aa44f81f1df63c5d33e58d8b55d15fcf1d7619..edf41406f465726828fa447bd10d71a4
      temporaryOutputPath(task: Task): string;
      private getRemoteCache;
 diff --git a/dist/src/tasks-runner/cache.js b/dist/src/tasks-runner/cache.js
-index 4a34ba245ca18dc4f4897fb45130e0d9dce94861..c7301119b99aa8d2a6dff507bee8f8652d2be0c4 100644
+index 4a34ba245ca18dc4f4897fb45130e0d9dce94861..56e3b8f0886315d6c39d2a4b8faac93137803a0a 100644
 --- a/dist/src/tasks-runner/cache.js
 +++ b/dist/src/tasks-runner/cache.js
-@@ -149,7 +149,11 @@ class DbCache {
+@@ -26,6 +26,7 @@ const workspace_root_1 = require("../utils/workspace-root");
+ const default_tasks_runner_1 = require("./default-tasks-runner");
+ const task_io_service_1 = require("./task-io-service");
+ const handle_import_1 = require("../utils/handle-import");
++const remote_cache_outage_1 = require("./remote-cache-outage");
+ // This function is called once during tasks runner initialization. It checks if the db cache is enabled and logs a warning if it is not.
+ function dbCacheEnabled() {
+     // ...but if on wasm and the the db cache isnt supported we shouldn't warn
+@@ -149,7 +150,11 @@ class DbCache {
          return this.cache.getCacheSize();
      }
      applyRemoteCacheResults(hash, res, outputs) {
@@ -2525,7 +2533,7 @@ index 4a34ba245ca18dc4f4897fb45130e0d9dce94861..c7301119b99aa8d2a6dff507bee8f865
      }
      async put(task, terminalOutput, outputs, code) {
          return tryAndRetry(async () => {
-@@ -162,7 +166,20 @@ class DbCache {
+@@ -162,7 +167,20 @@ class DbCache {
          });
      }
      copyFilesFromCache(_, cachedResult, outputs) {
@@ -2547,7 +2555,16 @@ index 4a34ba245ca18dc4f4897fb45130e0d9dce94861..c7301119b99aa8d2a6dff507bee8f865
      }
      removeOldCacheRecords() {
          return this.cache.removeOldCacheRecords();
-@@ -416,6 +433,7 @@ class Cache {
+@@ -257,7 +275,7 @@ class DbCache {
+             if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
+                 process.emitWarning("Setting the NODE_TLS_REJECT_UNAUTHORIZED environment variable to '0' makes TLS connections and HTTPS requests insecure by disabling certificate verification.");
+             }
+-            return new native_1.HttpRemoteCache();
++            return new remote_cache_outage_1.RemoteCacheOutageGuard(new native_1.HttpRemoteCache(), process.env.NX_SELF_HOSTED_REMOTE_CACHE_SERVER);
+         }
+         return null;
+     }
+@@ -416,6 +434,7 @@ class Cache {
                      await this.copy(cached, src);
                  }
              }));
@@ -2555,7 +2572,7 @@ index 4a34ba245ca18dc4f4897fb45130e0d9dce94861..c7301119b99aa8d2a6dff507bee8f865
          });
      }
      temporaryOutputPath(task) {
-@@ -516,6 +534,35 @@ class Cache {
+@@ -516,6 +535,35 @@ class Cache {
      }
  }
  exports.Cache = Cache;
@@ -2591,7 +2608,7 @@ index 4a34ba245ca18dc4f4897fb45130e0d9dce94861..c7301119b99aa8d2a6dff507bee8f865
  function tryAndRetry(fn) {
      let attempts = 0;
      // Generate a random number between 2 and 4 to raise to the power of attempts
-@@ -549,7 +596,29 @@ function resolveMaxCacheSize(nxJson) {
+@@ -549,7 +597,29 @@ function resolveMaxCacheSize(nxJson) {
      const rawMaxCacheSize = process.env.NX_MAX_CACHE_SIZE ?? nxJson.maxCacheSize;
      return rawMaxCacheSize !== undefined
          ? parseMaxCacheSize(rawMaxCacheSize)
@@ -3076,6 +3093,233 @@ index ab0d47a6d12a4ce8cb6b140364b1ada923fab95a..894bbfc883a7108a9fdd118691d6e2bc
          });
          console.log(JSON.stringify(timings, null, 2));
      }
+diff --git a/dist/src/tasks-runner/remote-cache-outage.d.ts b/dist/src/tasks-runner/remote-cache-outage.d.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..c90e1548c5daeb6af73703df347f3e288413d75a
+--- /dev/null
++++ b/dist/src/tasks-runner/remote-cache-outage.d.ts
+@@ -0,0 +1,34 @@
++import type { CachedResult } from '../native';
++import type { RemoteCacheV2 } from './default-tasks-runner';
++export declare const REMOTE_CACHE_ANSWER_WITHIN_MS = 90000;
++export type RemoteCacheSettlement<T> = {
++    kind: 'answered';
++    value: T;
++} | {
++    kind: 'rejected';
++    error: unknown;
++} | {
++    kind: 'unanswered';
++    withinMs: number;
++};
++export type RemoteCacheOutcome<T> = {
++    kind: 'answered';
++    value: T;
++} | {
++    kind: 'outage';
++    cause: string;
++} | {
++    kind: 'fatal';
++    error: unknown;
++};
++export declare function settleRemoteCacheRequest<T>(settlement: RemoteCacheSettlement<T>): RemoteCacheOutcome<T>;
++export declare function describeRemoteCacheOutage(server: string, request: string, cause: string): string;
++export declare class RemoteCacheOutageGuard implements RemoteCacheV2 {
++    private readonly remote;
++    private readonly server;
++    private unavailable;
++    constructor(remote: RemoteCacheV2, server: string);
++    retrieve(hash: string, cacheDirectory: string): Promise<CachedResult | null>;
++    store(hash: string, cacheDirectory: string, terminalOutput: string, code: number): Promise<boolean>;
++    private request;
++}
+diff --git a/dist/src/tasks-runner/remote-cache-outage.js b/dist/src/tasks-runner/remote-cache-outage.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..2a47f153ddaefc9f33f7c1badaaf28815e36c6b4
+--- /dev/null
++++ b/dist/src/tasks-runner/remote-cache-outage.js
+@@ -0,0 +1,181 @@
++"use strict";
++Object.defineProperty(exports, "__esModule", { value: true });
++exports.RemoteCacheOutageGuard = exports.REMOTE_CACHE_ANSWER_WITHIN_MS = void 0;
++exports.settleRemoteCacheRequest = settleRemoteCacheRequest;
++exports.describeRemoteCacheOutage = describeRemoteCacheOutage;
++const node_fs_1 = require("node:fs");
++const promises_1 = require("node:fs/promises");
++const path_1 = require("node:path");
++const logger_1 = require("../utils/logger");
++/**
++ * How long one self-hosted remote cache request may go without a result
++ * before the run goes on without the cache. The native client sets no timeout
++ * of its own, so a server that accepts and never answers held the run forever.
++ * Cowshed's gateway answers a request whose backend does not answer within its
++ * connect (5 s) and response-head (60 s) bounds with its own audited miss
++ * (specs/cowshed/05_gateway.md, "Backend outage"); this bound is longer, so it
++ * decides only when the server itself cannot answer. It covers the whole
++ * native call: a store also builds its archive inside it.
++ */
++exports.REMOTE_CACHE_ANSWER_WITHIN_MS = 90_000;
++/**
++ * The native client's messages for a request no server answered or finished
++ * (`native/cache/errors.rs` RequestError, `http_remote_cache.rs` body read).
++ */
++const UNREACHABLE = ['Failed to send request: ', 'Failed to read remote cache response body: '];
++/** A 5xx status: the server answered that it cannot serve the cache now. */
++const SERVER_ERROR = /^Misconfigured remote cache endpoint: Unexpected response status: 5\d\d\b/;
++/**
++ * Decides what a settled remote cache request means for the run. An answer is
++ * used; a request the server never answered, or answered with a server error,
++ * is an outage, which the run reads as a miss or a skipped store; every other
++ * rejection (credentials, a status that is misconfiguration, a damaged
++ * archive, local disk) is returned unchanged to fail the run as before.
++ */
++function settleRemoteCacheRequest(settlement) {
++    switch (settlement.kind) {
++        case 'answered':
++            return settlement;
++        case 'unanswered':
++            return { kind: 'outage', cause: 'no result within ' + settlement.withinMs + ' ms' };
++        case 'rejected': {
++            const { error } = settlement;
++            if (error instanceof Error &&
++                (UNREACHABLE.some((prefix) => error.message.startsWith(prefix)) || SERVER_ERROR.test(error.message))) {
++                return { kind: 'outage', cause: oneLine(error.message) };
++            }
++            return { kind: 'fatal', error };
++        }
++        default:
++            throw new Error('unknown remote cache settlement: ' + String(settlement.kind));
++    }
++}
++/** The one line a run prints when it goes on without its remote cache. */
++function describeRemoteCacheOutage(server, request, cause) {
++    return oneLine('Remote cache ' + server + ' is unavailable (' + request + ': ' + cause +
++        '); this run continues without it: lookups miss and results are not stored.');
++}
++function oneLine(text) {
++    return text.split(/\s+/).filter((part) => part.length > 0).join(' ');
++}
++/** Settles `request` as answered or rejected, or as unanswered once `withinMs` passes. */
++async function settleWithin(request, withinMs) {
++    const { promise: deadline, resolve } = Promise.withResolvers();
++    const timer = setTimeout(() => resolve({ kind: 'unanswered', withinMs }), withinMs);
++    try {
++        return await Promise.race([
++            request.then((value) => ({ kind: 'answered', value }), (error) => ({ kind: 'rejected', error })),
++            deadline,
++        ]);
++    }
++    finally {
++        clearTimeout(timer);
++    }
++}
++/**
++ * The self-hosted remote cache as a run uses it: the first outage is said once,
++ * naming the server, the request and the cause, and from then on this process
++ * asks the server nothing more. Every lookup misses and every store is skipped,
++ * so the tasks run exactly as they would with no remote cache.
++ *
++ * A native call the deadline overtook keeps running, and nothing reads its
++ * result. A late lookup would still unpack its artifact into the directory it
++ * was given, so a lookup never gets the cache directory itself: it unpacks into
++ * a staging directory of its own, and only an artifact answered in time is
++ * moved to `<cacheDirectory>/<hash>`. A miss or an outage removes the staging
++ * directory once its native call settles; one still running when the process
++ * exits is removed then.
++ */
++class RemoteCacheOutageGuard {
++    constructor(remote, server) {
++        this.remote = remote;
++        this.server = server;
++        this.unavailable = false;
++    }
++    async retrieve(hash, cacheDirectory) {
++        if (this.unavailable) {
++            return null;
++        }
++        const stagingRoot = (0, path_1.join)(cacheDirectory, 'remote-retrieve');
++        await (0, promises_1.mkdir)(stagingRoot, { recursive: true });
++        const staging = await (0, promises_1.mkdtemp)((0, path_1.join)(stagingRoot, process.pid + '-'));
++        unsettledStaging.add(staging);
++        if (this.unavailable) {
++            // Another request's outage arrived while this one prepared: ask nothing more.
++            await retire(staging);
++            return null;
++        }
++        const native = (async () => this.remote.retrieve(hash, staging))();
++        let result;
++        try {
++            result = await this.request('GET /v1/cache/' + hash, native, null);
++        }
++        catch (error) {
++            // A fatal rejection: the native call has settled.
++            await retire(staging);
++            throw error;
++        }
++        if (result === null) {
++            // A settled miss, or an outage whose native call may still unpack into the staging directory.
++            void native.then(() => retire(staging), () => retire(staging));
++            return null;
++        }
++        // Answered in time, so the native call has settled: publish its artifact under the hash.
++        const destination = (0, path_1.join)(cacheDirectory, hash);
++        await (0, promises_1.rm)(destination, { recursive: true, force: true });
++        await (0, promises_1.rename)(result.outputsPath, destination);
++        await retire(staging);
++        return { ...result, outputsPath: destination };
++    }
++    async store(hash, cacheDirectory, terminalOutput, code) {
++        if (this.unavailable) {
++            return false;
++        }
++        return this.request('PUT /v1/cache/' + hash, (async () => this.remote.store(hash, cacheDirectory, terminalOutput, code))(), false);
++    }
++    async request(request, native, skipped) {
++        if (this.unavailable) {
++            return skipped;
++        }
++        const outcome = settleRemoteCacheRequest(await settleWithin(native, exports.REMOTE_CACHE_ANSWER_WITHIN_MS));
++        switch (outcome.kind) {
++            case 'answered':
++                return outcome.value;
++            case 'fatal':
++                throw outcome.error;
++            case 'outage':
++                if (!this.unavailable) {
++                    this.unavailable = true;
++                    logger_1.logger.warn(describeRemoteCacheOutage(this.server, request, outcome.cause));
++                }
++                return skipped;
++        }
++    }
++}
++exports.RemoteCacheOutageGuard = RemoteCacheOutageGuard;
++/** Staging directories not yet removed; the process removes what is left as it exits. */
++const unsettledStaging = new Set();
++process.on('exit', () => {
++    for (const staging of unsettledStaging) {
++        try {
++            (0, node_fs_1.rmSync)(staging, { recursive: true, force: true });
++        }
++        catch (error) {
++            logger_1.logger.warn('Could not remove remote cache staging directory ' + staging + ': ' + String(error));
++        }
++    }
++});
++/**
++ * Removes a staging directory whose native lookup has settled; a removal that
++ * fails is said, never thrown. It stays listed until it is gone, so a process
++ * that exits mid-removal still removes it.
++ */
++async function retire(staging) {
++    try {
++        await (0, promises_1.rm)(staging, { recursive: true, force: true });
++        unsettledStaging.delete(staging);
++    }
++    catch (error) {
++        logger_1.logger.warn('Could not remove remote cache staging directory ' + staging + ': ' + String(error));
++    }
++}
 diff --git a/dist/src/tasks-runner/run-command.js b/dist/src/tasks-runner/run-command.js
 index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..14723620cb7d8094bff0eb70214442dd39fe9131 100644
 --- a/dist/src/tasks-runner/run-command.js

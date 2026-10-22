@@ -263,18 +263,19 @@ is. Status reads the slot without taking it.
 **An install never refuses a client connection.** A restart closes every workspace listener until the next gateway's
 startup pass restores its session (5 s and more), and a stock client cannot wait for that: measured 2026-10-20, an
 install restarted the gateway under a shed's Nx build, and Nx read the refused cache connection
-(`Failed to send request …/nx/v1/cache/…`) as fatal and failed the build. No wait can prevent it. Nx sends a cache
-lookup holding no CPU token, so between two lookups no ledger, lease or slot shows that it runs, and waiting for all
-running work would hold installs back on any busy host. A typed "restarting" error is no answer either, since Nx reads
-only HTTP statuses. So the listening sockets outlive the restart. On macOS an install that restarts the gateway —
-`gateway start` and `setup`'s refresh alike, not a `--downgrade`, whose older gateway might not take them — serves
-`listener-handoff.sock` beside the control socket from before the restart until the restarted gateway serves. The old
-gateway, as its drain begins and while it still accepts, gives the install a duplicate of every TCP workspace listener
-(`SCM_RIGHTS`), and its drain then answers what it already accepted as before (the Nx route's 404/403). The install's
-copies keep each port listening, so the kernel queues a connection made while no gateway runs. The next gateway takes
-them before it binds anything ("Startup contract" step 2) and serves each on its restored session (step 4), queued
-connections included. Only this user's processes may give or take, and the store deny keeps every sandbox off the
-socket. Every failure is what a restart was without the handoff: no install serving the socket, an old gateway that
+(`Failed to send request …/nx/v1/cache/…`) as fatal and failed the build. The carried Nx patch now reads it as a miss
+("The client half" under `/nx/v1/cache/{hash}`), which still costs every lookup of that run. No wait can prevent it. Nx
+sends a cache lookup holding no CPU token, so between two lookups no ledger, lease or slot shows that it runs, and
+waiting for all running work would hold installs back on any busy host. A typed "restarting" error is no answer either,
+since Nx reads only HTTP statuses. So the listening sockets outlive the restart. On macOS an install that restarts the
+gateway — `gateway start` and `setup`'s refresh alike, not a `--downgrade`, whose older gateway might not take them —
+serves `listener-handoff.sock` beside the control socket from before the restart until the restarted gateway serves. The
+old gateway, as its drain begins and while it still accepts, gives the install a duplicate of every TCP workspace
+listener (`SCM_RIGHTS`), and its drain then answers what it already accepted as before (the Nx route's 404/403). The
+install's copies keep each port listening, so the kernel queues a connection made while no gateway runs. The next
+gateway takes them before it binds anything ("Startup contract" step 2) and serves each on its restored session (step
+4), queued connections included. Only this user's processes may give or take, and the store deny keeps every sandbox off
+the socket. Every failure is what a restart was without the handoff: no install serving the socket, an old gateway that
 predates the handoff, an install that dies (the kernel closes its copies), or a failed take, after which the install
 closes its copies before the new gateway binds. A gateway that drains with workspace listeners and finds no install
 serving the handoff — `gateway stop`, then a fresh start — says on stderr how many it did not carry and why, so the
@@ -491,6 +492,14 @@ produced, exactly as it would with no cache. The only exception is a credential 
 401 (Placement and identity). Stock Nx 23.2.1 fails a task on any other status (Busy gateway, below), so the gateway
 never answers or forwards one: drain, a closed audit sink, a stopped actor, a queue bound, a body timeout and a backend
 response head that Nx cannot read are all the method's 404/403. The audit and the log record the cause.
+
+**The client half: an unreachable cache is a miss.** A gateway that cannot answer at all (a stopped listener, a
+host-wide stall) answers nothing the route can map. The carried Nx patch (`patches/README.md`, "A remote cache outage is
+a miss") makes the client read a refused or dropped connection, a 5xx and no result within 90 s as an outage: the lookup
+misses, the store is skipped, one line names the server and the cause, and that process asks the cache nothing more. The
+90 s exceed this route's own outage answer (`GatewayTimeouts` connect 5 s plus response head 60 s), so the gateway's
+audited miss decides whenever the gateway runs. 401 and every other status Nx reads as misconfiguration still fail the
+run.
 
 Every checkout may read its project's accepted task artifacts, during ordinary iteration as well as adoption. Nx keeps
 its local artifact cache and task database private to that checkout (16_build_volumes.md); this route shares neither

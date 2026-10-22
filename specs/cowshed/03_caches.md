@@ -435,10 +435,10 @@ because it adds immediacy, not new reach, while the store's write surface strict
 ### Nx accepted-task artifact service
 
 **This cache is an optimization for cross-shed reuse and never blocks a build.** A refusal is a miss (`GET` 404) or
-not-stored (`PUT` 403), and the task runs or keeps its own result (05_gateway.md "`/nx/v1/cache/{hash}`"). A shed's
-`PUT` is refused by authority, not reachability. The store is single-user, so its write boundary guards against an
-unverified producer, not a malicious writer: only a land whose gate verified the hashes publishes (05_gateway.md "Trust
-domain").
+not-stored (`PUT` 403), and the task runs or keeps its own result (05_gateway.md "`/nx/v1/cache/{hash}`"). A cache that
+cannot answer at all is a miss on the client too (05_gateway.md "The client half"). A shed's `PUT` is refused by
+authority, not reachability. The store is single-user, so its write boundary guards against an unverified producer, not
+a malicious writer: only a land whose gate verified the hashes publishes (05_gateway.md "Trust domain").
 
 Nx's live database and local cache remain private to each checkout/build volume. Accepted task archives are a separate
 host-owned store, not a shared `.nx` directory, blob CAS, or Cargo warm volume. Cowshed reuses the public

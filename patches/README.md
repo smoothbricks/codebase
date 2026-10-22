@@ -158,6 +158,40 @@ error, and kill an idle helper; each next acquire must take the freed slot. A he
 must hold one descriptor on its lock file. Drop these hunks only when the installed upstream orchestrator protects the
 same complete lifetime and atomic startup, retaining the regressions.
 
+## A remote cache outage is a miss
+
+Nx 23.2.1's native self-hosted cache client (`HttpRemoteCache`) sets no timeout and rejects every transport failure with
+`Failed to send request: …`; the task runner awaits it unguarded, so an unreachable cache failed the whole run and a
+server that accepts and never answers held it forever. Measured 2026-10-22: every Nx run in the affected sheds exited 1
+with `Failed to send request … http://127.0.0.1:<port>/nx/v1/cache/<hash>` while a host-wide APFS stall held the
+gateway's cache server. Cache downtime must never stop work (Danny tg#6894, tg#6926, tg#6940;
+`specs/cowshed/05_gateway.md` "`/nx/v1/cache/{hash}`", `specs/cowshed/03_caches.md` "Nx accepted-task artifact
+service").
+
+`getHttpCache` now wraps the native client in `RemoteCacheOutageGuard` (`tasks-runner/remote-cache-outage.js`). Its pure
+`settleRemoteCacheRequest` decides each settled request: an answer is used; a send or body-read failure, a 5xx status,
+or no result within `REMOTE_CACHE_ANSWER_WITHIN_MS` (90 s) is an outage; every other rejection (401, any other
+unexpected status, a damaged or unsafe archive, local disk) is rethrown unchanged and fails the run as before. The first
+outage prints one line naming the server, the request and the cause, and that process asks the server nothing more:
+every lookup misses and every store is skipped, so tasks run exactly as with no remote cache. The bound covers the whole
+native call (a store builds its archive inside it) and is longer than the gateway's own outage answer (connect 5 s plus
+response head 60 s), so it decides only when the server itself cannot answer.
+
+The native call the deadline overtook keeps running, unread, and a late lookup would still unpack its artifact into the
+directory it was given: over the entry the task wrote meanwhile, or while the task writes it. So a lookup never gets the
+cache directory. It unpacks into its own staging directory under `<cacheDirectory>/remote-retrieve/`, and only an
+artifact answered in time is moved to `<cacheDirectory>/<hash>`. A miss or an outage removes the staging directory once
+its native call settles, and one still unsettled when the process exits is removed then; a removal that fails is said. A
+store's late native call only reads the entry. Nx Cloud and the plugin caches are not wrapped.
+
+`packages/nx-plugin/src/nx-remote-cache-outage.test.ts` holds property tests of the decision and the line, and runs the
+actual installed Nx against real local servers that refuse, hang up after reading the request, accept and never answer,
+answer 503, and answer a lookup 404 then hang up on the store: each task runs and passes with exactly one diagnostic,
+and the server is asked nothing after the outage. A 400 still fails the run. A real native lookup held past the deadline
+and then answered with a real native artifact leaves the task's own entry intact, while the same native call given the
+cache directory overwrites it. Drop the hunk, and keep the test, once the pinned upstream version treats an unreachable
+cache as a miss ([nrwl/nx#36651](https://github.com/nrwl/nx/pull/36651) proposes it, unmerged).
+
 ## Non-workspace file packages
 
 Bun's `file:` protocol identifies an installation source, not workspace membership. The pinned Nx parser keeps a
