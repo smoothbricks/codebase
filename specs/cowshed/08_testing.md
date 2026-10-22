@@ -108,6 +108,15 @@ No mounts, no root, no network — pure functions with table-driven cases:
 - **Authoritative cwd resolution and env wiring**: fake-host/router tables cover deeply nested cwd success, detached and
   cross-project refusal, malicious marker-only refusal, and overlapping active-mount ambiguity, plus macOS/Linux
   `PortBlock` presence. Capability-wire tests freeze `project.workspaceAt` and reject local CLI inference.
+- **Unserved workspace refusal** (02_workspaces.md, "Workspace environment"): `repo-path.test.ts` in
+  `packages/nx-plugin/src/managed-files/` generates `.cowshed/env` files, inherited `TMPDIR` and `COWSHED_RUNTIME_LINK`
+  values and workspace names. It proves the managed PATH writer refuses exactly when the file leaves either unset or
+  relative, naming the workspace and each missing entry, whatever the caller inherited.
+  `unserved-workspace-hooks.test.ts` beside it runs a real `git commit` through the managed hooks in an interrupted-fork
+  fixture whose build link names main's Nx state, from a shell bound to main. It proves the named refusal, that no
+  commit was made, and that main's daemon record bytes and its live `d.sock` are untouched. The cli package's
+  `nx-socket-dir.test.ts` proves the socket owner refuses an unserved workspace and a runtime link that leads to another
+  checkout.
 - **Per-workspace aggregate checkpoint quota**: substrate stats fixtures freeze active allocated bytes, total checkpoint
   bytes/count, and the pinned-byte subset across mixed pinned/automatic images. Runtime state machines prove
   `existing checkpoints + one active-image charge`, exact-boundary admission, one-byte/count overflow refusal with zero

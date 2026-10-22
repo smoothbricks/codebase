@@ -3,7 +3,7 @@
 # All tooling that sets up PATH must call this instead of hardcoding paths.
 #
 # Usage:
-#   export PATH="$(tooling/direnv/repo-path)"         # shell
+#   PATH="$(tooling/direnv/repo-path)" || exit $?   # shell; refuses an unserved cowshed workspace, naming it
 #   tooling/direnv/repo-path --github-path             # CI — appends to $GITHUB_PATH
 #   tooling/direnv/repo-path --print                   # debug — one entry per line
 set -euo pipefail
@@ -46,7 +46,33 @@ case "${1:-}" in
   *)
     IFS=:
     export PATH="${entries[*]}:$PATH"
-    if [[ -f "$root/.cowshed/env" ]]; then
+    if [[ -f "$root/.cowshed/workspace.json" ]]; then
+      # A cowshed workspace is entered only once its supervisor has served it (specs/cowshed/02_workspaces.md,
+      # "Workspace environment"). A mint publishes .cowshed/env without TMPDIR and COWSHED_RUNTIME_LINK; the
+      # supervisor start that serves the workspace adds both, after its mount has settled the checkout's build link
+      # (16_build_volumes.md, "One link per checkout"). A fork interrupted before that start still links its
+      # source's build volume, so Nx entered here writes the source checkout's daemon record and task database, and
+      # a TMPDIR or Nx socket dir the caller inherited is the source's too. Both values are therefore read from the
+      # file alone, never from the caller, and a workspace whose file lacks either is refused, named.
+      unset TMPDIR COWSHED_RUNTIME_LINK
+      if [[ -f "$root/.cowshed/env" ]]; then
+        source "$root/.cowshed/env"
+      fi
+      missing=()
+      [[ "${TMPDIR:-}" == /* ]] || missing+=(TMPDIR)
+      [[ "${COWSHED_RUNTIME_LINK:-}" == /* ]] || missing+=(COWSHED_RUNTIME_LINK)
+      if ((${#missing[@]} > 0)); then
+        workspace="$root"
+        named='"workspace": *"([^"]+)"'
+        if [[ "$(<"$root/.cowshed/workspace.json")" =~ $named ]]; then
+          workspace="${BASH_REMATCH[1]}"
+        fi
+        printf -v unset_names '%s, ' "${missing[@]}"
+        printf 'repo-path: cowshed workspace %s at %s is not served: its .cowshed/env sets no %s. Its supervisor has not started since it was minted (a fork interrupted before then is left so), and until it does the checkout may still link the build volume, Nx daemon record and task database of the checkout it was forked from.\nnext: cowshed exec %s -- true\n' \
+          "$workspace" "$root" "${unset_names%, }" "$workspace" >&2
+        exit 1
+      fi
+    elif [[ -f "$root/.cowshed/env" ]]; then
       source "$root/.cowshed/env"
     fi
     if [[ -z "${COWSHED_RUNTIME_LINK:-}" ]]; then

@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
+import fc from 'fast-check';
 import { managedAssetsRoot } from '../managed-assets.js';
 
 interface RepoPathFixture {
@@ -167,6 +169,81 @@ describe('managed repo-path', () => {
       expect(result.status).toBe(0);
       const installed = join(userInfo().homedir, 'Library/Application Support/dev.cowshed/bin');
       expect(result.stdout).toBe(`${[installed, ...fixture.entries].join(':')}:${fixture.tools}\n`);
+    });
+  });
+});
+
+// A fork interrupted before its supervisor first started keeps the `.cowshed/env` its mint wrote: no TMPDIR and no
+// runtime link, and a build link that may still name its source's volume. Entered from a shell bound to that source,
+// every inherited value is the source's. The env files, inherited values and workspace names here are generated;
+// the decision is repo-path's alone, read from the file and never from the caller.
+describe('repo-path in a cowshed workspace', () => {
+  const absolute = fc.stringMatching(/^\/[a-z]{1,6}(\/[a-z]{1,6}){0,2}$/);
+  const value = fc.oneof(absolute, fc.stringMatching(/^[a-z]{1,6}$/), fc.constant(''));
+  /** One line of a `.cowshed/env`, and what it leaves TMPDIR or the runtime link as: `null` unsets it. */
+  interface EnvLine {
+    readonly text: string;
+    readonly tmp?: string | null;
+    readonly link?: string | null;
+  }
+  const line: fc.Arbitrary<EnvLine> = fc.oneof(
+    value.map((tmp) => ({ text: `export TMPDIR='${tmp}'`, tmp })),
+    value.map((link) => ({ text: `export COWSHED_RUNTIME_LINK=${link}`, link })),
+    fc.constant({ text: 'unset TMPDIR', tmp: null }),
+    fc.constant({ text: 'unset COWSHED_RUNTIME_LINK', link: null }),
+    fc.constant({ text: 'export COWSHED_PORT_BASE=37376\nexport COWSHED_PORT_BLOCK_SIZE=64' }),
+    fc.constant({ text: 'if [ "${GITHUB_ACTIONS:-}" != true ]; then unset CI; fi' }),
+  );
+  const scenario = fc.record({
+    workspace: fc.stringMatching(/^[a-z][a-z0-9-]{0,10}$/),
+    file: fc.option(fc.array(line, { maxLength: 6 }), { nil: undefined }),
+    inheritedTmp: absolute,
+    inheritedLink: absolute,
+  });
+
+  /** The entries a file leaves unset or relative, in the order repo-path names them. */
+  function unserved(file: readonly EnvLine[] | undefined): string[] {
+    let tmp: string | null = null;
+    let link: string | null = null;
+    for (const entry of file ?? []) {
+      if (entry.tmp !== undefined) tmp = entry.tmp;
+      if (entry.link !== undefined) link = entry.link;
+    }
+    return [...(tmp?.startsWith('/') ? [] : ['TMPDIR']), ...(link?.startsWith('/') ? [] : ['COWSHED_RUNTIME_LINK'])];
+  }
+
+  it('refuses, naming the workspace and each entry its file lacks, whatever the caller inherited', async () => {
+    await withRepoPath(async (fixture) => {
+      mkdirSync(join(fixture.root, '.cowshed'));
+      const env = join(fixture.root, '.cowshed/env');
+      fc.assert(
+        fc.property(scenario, ({ workspace, file, inheritedTmp, inheritedLink }) => {
+          writeFileSync(
+            join(fixture.root, '.cowshed/workspace.json'),
+            `${JSON.stringify({ version: 1, workspace, role: 'workspace' }, null, 2)}\n`,
+          );
+          if (file === undefined) rmSync(env, { force: true });
+          else writeFileSync(env, file.map(({ text }) => `${text}\n`).join(''));
+          const result = spawnSync(join(fixture.tools, 'bash'), [fixture.helper], {
+            encoding: 'utf8',
+            env: { HOME: fixture.home, PATH: fixture.tools, TMPDIR: inheritedTmp, COWSHED_RUNTIME_LINK: inheritedLink },
+          });
+          const missing = unserved(file);
+          if (missing.length === 0) {
+            expect(result.stderr).toBe('');
+            expect(result.status).toBe(0);
+            expect(result.stdout).toBe(`${fixture.entries.join(':')}:${fixture.tools}\n`);
+          } else {
+            expect(result.status).toBe(1);
+            expect(result.stdout).toBe('');
+            expect(result.stderr).toStartWith(
+              `repo-path: cowshed workspace ${workspace} at ${fixture.root} is not served: its .cowshed/env sets no ${missing.join(', ')}.`,
+            );
+            expect(result.stderr).toEndWith(`\nnext: cowshed exec ${workspace} -- true\n`);
+          }
+        }),
+        { numRuns: 64 },
+      );
     });
   });
 });

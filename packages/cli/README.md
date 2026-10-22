@@ -561,10 +561,14 @@ nothing when nothing changed:
   cache. Emit, editors and ttsc plugins keep the npm `@typescript/native` compiler. A target run outside the devenv
   shell fails on the unset variable rather than checking with another compiler under the same key.
 - `tooling/direnv/nx-socket-dir.sh` exports `NX_WORKSPACE_ROOT_PATH` and `NX_SOCKET_DIR`. A checkout gets its own socket
-  dir under `DEVENV_RUNTIME`; an inherited one that resolves into another checkout is dropped. A cowshed checkout whose
-  `.cowshed/env` names a `COWSHED_RUNTIME_LINK` uses `<that link>/nx`, the literal path cowshed gives its sandboxed
-  jobs, and creates that link if no job has yet. Host shells and sandboxed jobs then share one Nx daemon, and a
-  sandboxed daemon's plugin workers can bind their sockets whichever side connected.
+  dir under `DEVENV_RUNTIME`; an inherited one that resolves into another checkout is dropped. A cowshed workspace
+  (`.cowshed/workspace.json`) uses `<link>/nx`, where `<link>` is the `COWSHED_RUNTIME_LINK` its `.cowshed/env` names:
+  the literal path cowshed gives its sandboxed jobs. The script creates that link if no job has yet. Host shells and
+  sandboxed jobs then share one Nx daemon, and a sandboxed daemon's plugin workers can bind their sockets whichever side
+  connected. A workspace whose file names no link (cowshed has not served it since its mint) or whose link leads to
+  another checkout is refused, never given a socket dir of the shell's own. `tooling/direnv/repo-path` refuses the
+  unserved workspace first, naming it and the entries its file lacks (cowshed `specs/cowshed/02_workspaces.md`,
+  "Workspace environment").
 - On Darwin, `tooling/direnv/apple-developer.sh` hands the Apple toolchain to Xcode: it unsets `CC`/`CXX`, drops a
   `/nix/store` `SDKROOT` or `DEVELOPER_DIR`, and removes every `/nix/store` `PATH` entry that carries nixpkgs xcbuild's
   `xcrun`, which answers `unable to find sdk: 'macosx'` once the nix developer directory is gone. `xcrun` is then

@@ -1089,9 +1089,10 @@ cwd/toolchain FILE pins and proved installed closure. Public outputs are exclude
 with broad exclusions that can hide manifests or configuration. A caller probing multiple targets requires the same
 provider committed-tree identity, retaining each original producer basis, before publishing its sealed snapshot. A
 caller from another workspace never lends its socket, database or cache overrides to the provider. Inside a managed
-shell (`DEVENV_RUNTIME`), `ensureBuilt` asks the packaged `nx-socket-dir.sh` owner for the provider's binding: the
-root's verified cowshed runtime link when present, otherwise its canonical checkout spelling under that shell runtime.
-Outside a managed shell, Nx retains its normal defaults. A socket-owner refusal returns `disposition: 'failed'` with
+shell (`DEVENV_RUNTIME`), `ensureBuilt` asks the packaged `nx-socket-dir.sh` owner for the provider's binding. A cowshed
+workspace root gets its verified runtime link; the owner refuses one its `.cowshed/env` names no link for, or whose link
+leads elsewhere. Any other root gets its canonical checkout spelling under that shell runtime. Outside a managed shell,
+Nx retains its normal defaults. A socket-owner refusal returns `disposition: 'failed'` with
 `reason.kind: 'workspace-socket'`, the selected `taskId`, `workspaceRoot` and operational `detail`, before any task or
 daemon client starts. The owner's actual exit or signal is preserved; the wrapper must not report that the target ran.
 

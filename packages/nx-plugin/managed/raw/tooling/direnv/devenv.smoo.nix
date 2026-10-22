@@ -630,7 +630,9 @@ in {
       if [ -f .cowshed/env ]; then
         . "$PWD/.cowshed/env"
       fi
-      export PATH="$("$PWD/tooling/direnv/repo-path")"
+      # A bare assignment: export's status would hide repo-path's refusal of an
+      # unserved cowshed workspace, and the shell would enter with an empty PATH.
+      PATH="$("$PWD/tooling/direnv/repo-path")" || exit $?
       export PATH="${rustToolchainBin}:$PATH"
       # devenv enters the shell with TMPDIR unset (not empty) on every platform.
       # Tools then fall back to /tmp, which on Darwin is not the per-user
@@ -657,7 +659,7 @@ in {
       # gives every workspace its own socket dir, and in a cowshed checkout the
       # one literal path its host shells and sandboxed jobs all share, and
       # states why.
-      . "$DEVENV_ROOT/nx-socket-dir.sh"
+      . "$DEVENV_ROOT/nx-socket-dir.sh" || exit $?
       ${lib.optionalString pkgs.stdenv.isDarwin ''
         . "$DEVENV_ROOT/apple-developer.sh" /nix/store
       ''}
@@ -668,7 +670,7 @@ in {
     (lib.mkAfter ''
           # Project hooks may prepend real Cargo. Reuse the managed PATH writer
       # last: its served install identity is the host's, not the private HOME.
-      export PATH="$("$DEVENV_ROOT/repo-path")"
+      PATH="$("$DEVENV_ROOT/repo-path")" || exit $?
       bun "$DEVENV_ROOT/toolchain-stamp.ts" || exit $?
       if [ -n "$DEVENV_SHELL_PWD" ]; then
         cd "$DEVENV_SHELL_PWD"

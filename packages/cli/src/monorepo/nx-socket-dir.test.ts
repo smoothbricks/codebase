@@ -52,9 +52,18 @@ function withScratch(run: (scratch: Scratch) => void): void {
   }
 }
 
-/** A cowshed checkout: its runtime tree and the `.cowshed/env` cowshed writes when it serves the workspace. */
-function cowshedCheckout(scratch: Scratch): void {
+/** A cowshed workspace's marker and runtime tree, as cowshed mints them. */
+function cowshedMarker(scratch: Scratch): void {
   mkdirSync(join(scratch.checkout, '.cowshed', 'run'), { recursive: true });
+  writeFileSync(
+    join(scratch.checkout, '.cowshed', 'workspace.json'),
+    `${JSON.stringify({ version: 1, workspace: 'fixture', role: 'workspace' })}\n`,
+  );
+}
+
+/** A cowshed checkout: its marker, runtime tree and the `.cowshed/env` cowshed writes when it serves the workspace. */
+function cowshedCheckout(scratch: Scratch): void {
+  cowshedMarker(scratch);
   writeFileSync(
     join(scratch.checkout, '.cowshed', 'env'),
     `export COWSHED_PORT_BASE=37376\nexport COWSHED_PORT_BLOCK_SIZE=64\nexport TMPDIR='${scratch.hostRuntime}'\nexport COWSHED_RUNTIME_LINK=${scratch.link}\n`,
@@ -80,12 +89,9 @@ function setValue(line: string | undefined): string | undefined {
   return line?.startsWith('set:') ? line.slice('set:'.length) : undefined;
 }
 
-/**
- * Source the script the way devenv.smoo.nix's prologue does — from the
- * workspace root — and report what it exported.
- */
-function enterShell(scratch: Scratch, inherited: Record<string, string>): Entered {
-  const result = spawnSync(
+/** Source the script the way devenv.smoo.nix's prologue does — from the workspace root. */
+function sourceScript(scratch: Scratch, inherited: Record<string, string>) {
+  return spawnSync(
     'bash',
     [
       '-c',
@@ -100,6 +106,11 @@ function enterShell(scratch: Scratch, inherited: Record<string, string>): Entere
     ],
     { cwd: scratch.checkout, encoding: 'utf8', env: { PATH: process.env.PATH ?? '', ...inherited } },
   );
+}
+
+/** {@link sourceScript}, which must succeed, and what it exported. */
+function enterShell(scratch: Scratch, inherited: Record<string, string>): Entered {
+  const result = sourceScript(scratch, inherited);
   if (result.status !== 0) printCommandOutput(result.stdout ?? '', result.stderr ?? '');
   expect(result.status).toBe(0);
   const [socket = '', root = '', data, cache, daemon] = result.stdout.split('\n');
@@ -168,17 +179,40 @@ describe('nx-socket-dir.sh', () => {
     });
   });
 
-  it('reports a cowshed link that leads to another checkout and leaves it in place', () => {
+  it('refuses a cowshed link that leads to another checkout and leaves it in place', () => {
     withScratch((scratch) => {
       cowshedCheckout(scratch);
       const elsewhere = join(scratch.hostRuntime, 'another-checkout-run');
       mkdirSync(elsewhere);
       symlinkSync(elsewhere, scratch.link);
-      const host = hostShell(scratch);
-      expect(host.stderr).toContain(`${scratch.link} does not lead to this checkout's`);
+      const refused = sourceScript(scratch, { DEVENV_RUNTIME: scratch.hostRuntime });
+      expect(refused.status).toBe(1);
+      expect(refused.stdout).toBe('');
+      expect(refused.stderr).toContain(`${scratch.link} does not lead to this checkout's`);
       expect(readlinkSync(scratch.link)).toBe(elsewhere);
-      expect(host.NX_SOCKET_DIR).toStartWith(`${scratch.hostRuntime}/nx-`);
-      expect(existsSync(host.NX_SOCKET_DIR)).toBe(true);
+    });
+  });
+
+  it("refuses a cowshed workspace whose .cowshed/env its supervisor never served, never taking another's socket dir", () => {
+    withScratch((scratch) => {
+      cowshedMarker(scratch);
+      // A mint's file, as cowshed writes it before the workspace's first supervisor start.
+      writeFileSync(
+        join(scratch.checkout, '.cowshed', 'env'),
+        'export COWSHED_PORT_BASE=37376\nexport COWSHED_PORT_BLOCK_SIZE=64\nunset COWSHED_RUNTIME_LINK\n',
+      );
+      // The shell the fork was entered from was bound to its source checkout.
+      const source = join(scratch.links, 'cs-ba9876543210');
+      const refused = sourceScript(scratch, {
+        DEVENV_RUNTIME: scratch.hostRuntime,
+        COWSHED_RUNTIME_LINK: source,
+        NX_SOCKET_DIR: join(source, 'nx'),
+      });
+      expect(refused.status).toBe(1);
+      expect(refused.stdout).toBe('');
+      expect(refused.stderr).toContain(`${scratch.checkout}/.cowshed/env names no COWSHED_RUNTIME_LINK`);
+      expect(existsSync(source)).toBe(false);
+      expect(existsSync(scratch.link)).toBe(false);
     });
   });
 

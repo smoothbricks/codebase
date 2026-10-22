@@ -42,11 +42,17 @@
 # the checkout's .cowshed/env at every supervisor start; the shell reads it
 # from there, never re-deriving it, and never from the caller's environment,
 # whose COWSHED_RUNTIME_LINK may be another workspace's. A host shell creates
-# the link when cowshed has not yet, exactly as cowshed would. A link that
-# leads elsewhere is reported and left alone.
+# the link when cowshed has not yet, exactly as cowshed would.
 #
-# Without that link, a socket dir that already resolves inside this checkout
-# is cowshed's binding for the job and stays. An inherited one that resolves
+# In a cowshed workspace (.cowshed/workspace.json marks one) that link is the
+# only socket dir, and anything else fails (cowshed specs/cowshed/04_sandbox.md):
+# a .cowshed/env that names no link is a workspace its supervisor never served
+# (an interrupted fork leaves one, still linking its source's build volume), and
+# a link that leads elsewhere is another checkout's. Either is refused, and the
+# link is left alone; a socket dir of the shell's own would be a second daemon.
+#
+# Outside cowshed, a socket dir that already resolves inside this checkout is
+# the caller's binding for it and stays. An inherited one that resolves
 # elsewhere belongs to another workspace, so the workspace takes its own.
 smoo_nx_checkout="$(pwd -P)"
 if [ -n "${NX_WORKSPACE_ROOT_PATH:-}" ] &&
@@ -55,23 +61,28 @@ if [ -n "${NX_WORKSPACE_ROOT_PATH:-}" ] &&
 fi
 export NX_WORKSPACE_ROOT_PATH="$PWD"
 smoo_nx_socket=""
-smoo_nx_link=""
-if [ -d .cowshed/run ] && [ -f .cowshed/env ]; then
-  smoo_nx_link="$(sed -n 's/^export COWSHED_RUNTIME_LINK=\(\/[A-Za-z0-9._\/-]*\)$/\1/p' .cowshed/env)"
-fi
-if [ -n "$smoo_nx_link" ]; then
-  smoo_nx_run="$(cd "$smoo_nx_checkout/.cowshed/run" && pwd -P)"
+if [ -f .cowshed/workspace.json ]; then
+  smoo_nx_link=""
+  if [ -f .cowshed/env ]; then
+    smoo_nx_link="$(sed -n 's/^export COWSHED_RUNTIME_LINK=\(\/[A-Za-z0-9._\/-]*\)$/\1/p' .cowshed/env)"
+  fi
+  if [ -z "$smoo_nx_link" ]; then
+    echo "devenv: $smoo_nx_checkout/.cowshed/env names no COWSHED_RUNTIME_LINK: cowshed has not served this workspace, so Nx here has no socket dir; tooling/direnv/repo-path names the workspace and its next step" >&2
+    unset smoo_nx_checkout smoo_nx_socket smoo_nx_link
+    return 1
+  fi
+  smoo_nx_run="$(cd "$smoo_nx_checkout/.cowshed/run" && pwd -P)" || return $?
   if [ ! -e "$smoo_nx_link" ] && [ ! -L "$smoo_nx_link" ]; then
     ln -s "$smoo_nx_run" "$smoo_nx_link"
   fi
-  if [ "$(cd "$smoo_nx_link" >/dev/null 2>&1 && pwd -P)" = "$smoo_nx_run" ]; then
-    smoo_nx_socket="$smoo_nx_link/nx"
-  else
+  if [ "$(cd "$smoo_nx_link" >/dev/null 2>&1 && pwd -P)" != "$smoo_nx_run" ]; then
     echo "devenv: $smoo_nx_link does not lead to this checkout's $smoo_nx_run; Nx here cannot reach the workspace's sandboxed daemon" >&2
+    unset smoo_nx_checkout smoo_nx_socket smoo_nx_link smoo_nx_run
+    return 1
   fi
+  smoo_nx_socket="$smoo_nx_link/nx"
   unset smoo_nx_run
-fi
-if [ -z "$smoo_nx_socket" ]; then
+else
   case "$(cd "${NX_SOCKET_DIR:-/nonexistent}" >/dev/null 2>&1 && pwd -P)/" in
     "$smoo_nx_checkout"/*) smoo_nx_socket="$NX_SOCKET_DIR" ;;
     *) smoo_nx_socket="$DEVENV_RUNTIME/nx-$(printf '%s' "$smoo_nx_checkout" | cksum | cut -d' ' -f1)" ;;

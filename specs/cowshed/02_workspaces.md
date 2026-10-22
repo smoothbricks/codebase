@@ -1425,6 +1425,19 @@ source_env_if_exists .cowshed/env
 Agent processes receive the same workspace values at spawn from the supervisor (04_sandbox.md), without sourcing this
 file or requiring direnv. No verb exists to print these exports on demand.
 
+**An unserved workspace is not entered.** The served file is the workspace's readiness record. A supervisor start
+publishes it only after the start's mount has settled the checkout's build link (16_build_volumes.md, "One link per
+checkout"). A workspace whose `.cowshed/env` still lacks `TMPDIR` or `COWSHED_RUNTIME_LINK` has not been served since
+its mint, and its build link may still name its source's volume. A `cowshed fork` interrupted after its image was
+mounted and before its first supervisor start leaves one. A shell or git hook entered there runs the workspace's Nx
+against its source's daemon record and task database, with whatever `TMPDIR` and Nx socket directory the caller
+inherited. The managed PATH writer, `tooling/direnv/repo-path`, which every managed shell entry and git hook runs,
+therefore reads both values from the file alone, never from the caller's environment. In a checkout that carries
+`.cowshed/workspace.json`, it refuses when the file sets either value not at all or to a relative path. The refusal
+names the workspace, its checkout and each missing entry, with `cowshed exec <ws> -- true` as the next step: that start
+mounts the checkout, settles its link and serves the file. The managed shell's Nx socket owner likewise takes the served
+link or refuses (04_sandbox.md). Neither falls back to a temporary or socket directory of its own.
+
 **Empty mountpoints are not user-visible state.** A mountpoint directory exists only while its workspace is attached;
 detach removes it. Main workspaces are always-mounted: the gateway mounts every main across every adopted project before
 reporting healthy (05_gateway.md), and doctor treats an unreachable main as a critical finding. There is no

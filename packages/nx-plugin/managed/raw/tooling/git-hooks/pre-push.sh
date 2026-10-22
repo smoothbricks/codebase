@@ -50,7 +50,8 @@ TOOLING="$PWD/tooling"
 # gates below guard publication only, so they do not apply.
 if [ "${1:-}" = backup ]; then exit 0; fi
 
-export PATH="$("$TOOLING/direnv/repo-path")"
+# A bare assignment, not `export PATH=$(…)`: export's status would hide repo-path's refusal of an unserved workspace.
+PATH="$("$TOOLING/direnv/repo-path")" || exit $?
 # ttsc compiles with this checkout's native TypeScript compiler into this
 # checkout's plugin cache, which the dev shell names. A hook runs outside that
 # shell, in whatever environment ran `git`; ttsc-env.sh names them the same way.

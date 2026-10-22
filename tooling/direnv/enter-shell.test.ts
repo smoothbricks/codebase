@@ -187,7 +187,10 @@ it('the environment capture pass rebuilds nothing, the entry proper still does',
 
 it('direct devenv entry sources the existing workspace policy before project hooks', () => {
   const module = readFileSync(join(import.meta.dir, 'devenv.smoo.nix'), 'utf8');
-  const prologue = module.match(/\(lib\.mkBefore ''\n([\s\S]*?) {6}export PATH=/)?.[1];
+  // Everything before the managed PATH writer runs: a bare assignment, so its refusal stops the entry.
+  const prologue = module.match(
+    /\(lib\.mkBefore ''\n([\s\S]*?) {6}PATH="\$\("\$PWD\/tooling\/direnv\/repo-path"\)" \|\| exit \$\?\n/,
+  )?.[1];
   expect(prologue).toBeDefined();
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'smoo-direct-entry-')));
   try {
@@ -198,7 +201,7 @@ it('direct devenv entry sources the existing workspace policy before project hoo
       'if [ "${GITHUB_ACTIONS:-}" != true ]; then unset CI; fi\nexport RUSTC_WRAPPER=/store/pinned-sccache\n',
     );
     for (const marker of ['false', 'true']) {
-      const entered = spawnSync('/bin/sh', ['-c', `${prologue}` + 'printf \'%s\\n\' "${CI-unset}" "$RUSTC_WRAPPER"'], {
+      const entered = spawnSync('/bin/sh', ['-c', `${prologue}printf \'%s\\n\' "\${CI-unset}" "$RUSTC_WRAPPER"`], {
         encoding: 'utf8',
         env: { DEVENV_ROOT: join(root, 'tooling/direnv'), CI: 'true', GITHUB_ACTIONS: marker },
       });
