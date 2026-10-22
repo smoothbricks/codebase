@@ -1765,23 +1765,31 @@ impl DrainReads {
         }
     }
 
-    /// Wait until every owed job is read or every process it was owed to has exited, or until
-    /// `bound` passes with no read of an owed job.
-    async fn settle(&self, bound: std::time::Duration) -> Settled {
-        let mut deadline = tokio::time::Instant::now() + bound;
-        loop {
-            let settled = self.admitting.load(std::sync::atomic::Ordering::Acquire) == 0
-                && self
+    /// Whether the drain may settle now: no exec is in flight, and every owed job is read or
+    /// owed to nobody, or the idle bound `expired`. An exec in flight holds it on either path:
+    /// admission is closed, so its answer, a refusal or a recorded requester, comes at once.
+    fn may_settle(&self, expired: bool) -> bool {
+        self.admitting.load(std::sync::atomic::Ordering::Acquire) == 0
+            && (expired
+                || self
                     .drain()
                     .as_ref()
-                    .is_none_or(|drain| drain.owed.values().all(Owed::settled));
-            if settled {
-                break;
-            }
+                    .is_none_or(|drain| drain.owed.values().all(Owed::settled)))
+    }
+
+    /// Wait until every owed job is read or every process it was owed to has exited, or until
+    /// `bound` passes with no read of an owed job; on either path, until no exec is in flight.
+    async fn settle(&self, bound: std::time::Duration) -> Settled {
+        let mut deadline = tokio::time::Instant::now() + bound;
+        let mut expired = false;
+        while !self.may_settle(expired) {
             tokio::select! {
-                () = self.read.notified() => deadline = tokio::time::Instant::now() + bound,
+                () = self.read.notified() => {
+                    deadline = tokio::time::Instant::now() + bound;
+                    expired = false;
+                }
                 () = self.gone.notified() => {}
-                () = tokio::time::sleep_until(deadline) => break,
+                () = tokio::time::sleep_until(deadline), if !expired => expired = true,
             }
         }
         let drain = self.drain();
@@ -2070,6 +2078,9 @@ async fn serve_call(
     } = match answer(&caller, streams, *call, payload).await {
         Ok(answer) => answer,
         Err(error) => {
+            // A refused exec admitted nothing: the drain need not wait for its caller to read
+            // the refusal.
+            drop(admitting);
             write_json(&mut stream, &Response::Err(error)).await?;
             return Ok(Retirement::Serving);
         }
@@ -4170,6 +4181,24 @@ mod drain_read_tests {
             .await
             .expect("whole-leg watchdog: the drain settles once job 9's requester exited");
         assert_eq!(settled.abandoned, [job(9)]);
+    }
+
+    /// The idle bound gives up on unread ends, never on an exec in flight: past the bound the
+    /// drain still waits for that exec to be recorded or refused, then settles.
+    #[tokio::test]
+    async fn the_idle_bound_gives_up_on_unread_ends_never_on_an_exec_in_flight() {
+        let owed = DrainReads::default();
+        owed.begin(&background(&[7]), ends())
+            .expect("the first drain");
+        let admitting = owed.admitting();
+        assert!(!owed.may_settle(false), "job 7 is unread");
+        assert!(
+            !owed.may_settle(true),
+            "past the bound, the exec in flight holds it"
+        );
+        drop(admitting);
+        assert!(!owed.may_settle(false), "job 7 is still unread");
+        assert!(owed.may_settle(true), "past the bound, nothing holds it");
     }
 
     /// Measured 2026-10-22: a drained supervisor whose ended job's client was gone answered the
