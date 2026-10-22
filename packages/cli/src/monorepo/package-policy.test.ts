@@ -404,16 +404,47 @@ describe('root smoo monorepo policy', () => {
         ...validConfiguredNxJson(),
         namedInputs: {
           default: ['{projectRoot}/**/*', '!{projectRoot}/**/*.md'],
+          production: ['{projectRoot}/pyproject.toml', '{projectRoot}/python/**/*.py', '!{projectRoot}/**/*.md'],
+        },
+      });
+
+      expect(validateNxReleaseConfig(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses Rust crate sources in production and removes them on update', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
+    try {
+      await writeJson(join(root, 'package.json'), validRootPackage());
+      await writeJson(join(root, 'nx.json'), {
+        ...validConfiguredNxJson(),
+        namedInputs: {
+          default: ['{projectRoot}/**/*', '!{projectRoot}/**/*.md'],
           production: [
+            '{projectRoot}/src/**/*',
+            '{projectRoot}/crates/**/*',
             '{projectRoot}/Cargo.toml',
-            '{projectRoot}/src/**/*.rs',
-            '{projectRoot}/pyproject.toml',
-            '{projectRoot}/python/**/*.py',
+            '{projectRoot}/package.json',
             '!{projectRoot}/**/*.md',
           ],
         },
       });
+      const errors = captureConsoleErrors();
 
+      expect(validateNxReleaseConfig(root)).toBe(1);
+      expect(errors.join('\n')).toContain(
+        'namedInputs.production must not name Rust crate sources ({projectRoot}/crates/**/*, {projectRoot}/Cargo.toml)',
+      );
+
+      applyNxPluginDefaults(root);
+
+      const nxJson = await readJson(join(root, 'nx.json'));
+      expect(nxJson.namedInputs).toEqual({
+        default: ['{projectRoot}/**/*', '!{projectRoot}/**/*.md'],
+        production: ['{projectRoot}/src/**/*', '{projectRoot}/package.json', '!{projectRoot}/**/*.md'],
+      });
       expect(validateNxReleaseConfig(root)).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });

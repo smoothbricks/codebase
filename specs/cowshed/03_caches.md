@@ -542,7 +542,7 @@ A cached task's key is every input it declares: its files, its dependencies' fil
 toolchain inputs. With a warm cache holding a valid entry for each key, a land gate runs only the tasks whose key the
 landed commits (or a changed runtime or toolchain input) changed, plus the targets that state `"cache": false`, each for
 a reason its configuration names; a re-gate of an unchanged tree runs those uncached targets alone. A cold, evicted or
-unreachable entry runs its task again, as a cache degrade does (Nx accepted-task artifact service, above). Four rules
+unreachable entry runs its task again, as a cache degrade does (Nx accepted-task artifact service, above). Five rules
 keep the key no wider than what a task observes, each learned from a measured miss (2026-10-22, tg#9675: twenty minutes
 of gate for a one-line change).
 
@@ -559,6 +559,13 @@ of gate for a one-line change).
   through cli and cannot observe it. The named input `dependencyDefault` is `default` without `__tests__/`, `*.test.*`,
   `*.spec.*` and the Bun shard manifest `test-timings.json`; build, test and cargo-test name `^dependencyDefault`. A
   dependency's exported testing helpers (`src/testing.ts`) and runtime scripts still key its dependents.
+- **TypeScript tasks key on Rust only through its outputs.** `production` names a project's TypeScript sources and no
+  crate source: a TypeScript consumer of a Rust artifact depends on the producer target and keys on its outputs through
+  `dependentTasksOutputFiles`, a target that reads crate source as text names it in its own inputs, and cargo targets
+  key on `cargoClosure`. `smoo monorepo validate` refuses a `production` entry beneath `{projectRoot}/crates`, ending in
+  `.rs` or naming a `Cargo.toml`, and `smoo monorepo update` removes it. While a consumer workspace's `production` named
+  `{projectRoot}/crates/**/*`, one Rust integration test (`crates/<crate>/tests/*.rs`) re-keyed 237 TypeScript tasks,
+  the lint, typecheck, test and tsc-js of about 31 projects, in one land (2026-10-23, tg#9767).
 - **A gate's runners size their own test threads.** The gate's orchestrator holds one CPU token and its pool relays
   every runner's ask to the host, so it exports no `RUST_TEST_THREADS`/`NEXTEST_TEST_THREADS` (05_gateway.md, "The
   holder exports it"). While it exported 1, every Rust suite in every gate ran on one thread: `tokens=1/1` in each

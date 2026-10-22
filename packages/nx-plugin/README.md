@@ -244,6 +244,13 @@ CI workflow input. It migrates the old CI-only `sharedGlobals` reference out of 
 definition. Custom non-CI named globals and explicit workflow-target inputs remain repository-owned and unchanged;
 workflow checks can still name their own CI inputs.
 
+Policy keeps Rust crate sources out of `production`: `smoo monorepo validate` refuses a positive entry beneath
+`{projectRoot}/crates`, ending in `.rs` or naming a `Cargo.toml`, and `smoo monorepo update` removes it. TypeScript
+targets see Rust only as the producer target's outputs, through `dependsOn` and `dependentTasksOutputFiles`; a target
+that reads crate source as text names it in its own inputs; cargo targets are keyed by `cargoClosure`. Update removes
+the entry rather than keeping it, as it rewrites a broad `production` to the default: whatever reads crate source
+declares it on its own target.
+
 Policy excludes incidental Markdown through `!{projectRoot}/**/*.md` in `default` and `production`. A task that consumes
 Markdown declares it through an input set without a matching negative: Nx exclusions win over positive paths in the same
 fileset, so a later explicit path cannot re-include it. Inferred Cargo package filesets remain broad for arbitrary

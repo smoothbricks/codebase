@@ -365,10 +365,19 @@ function validateNamedInputDefaults(
     issues.push({
       path: nxJsonPath,
       message:
-        'namedInputs.production must enumerate precise production inputs. Do not include default or broad {projectRoot}/** globs; use language/tool-specific paths such as {projectRoot}/src/**/*, {projectRoot}/Cargo.toml, or {projectRoot}/pyproject.toml.',
+        'namedInputs.production must enumerate precise production inputs. Do not include default or broad {projectRoot}/** globs; use language/tool-specific paths such as {projectRoot}/src/**/*, {projectRoot}/package.json, or {projectRoot}/pyproject.toml.',
     });
-  } else if (!production.includes(MARKDOWN_EXCLUSION)) {
-    issues.push({ path: nxJsonPath, message: markdownExclusionMessage('production') });
+  } else {
+    const rustInputs = production.filter(isRustCrateSourceInput);
+    if (rustInputs.length > 0) {
+      issues.push({
+        path: nxJsonPath,
+        message: `namedInputs.production must not name Rust crate sources (${rustInputs.join(', ')}): TypeScript targets see Rust only as the producer target's outputs (dependsOn + dependentTasksOutputFiles); a target that reads crate source as text names it in its own inputs; cargo targets are keyed by cargoClosure.`,
+      });
+    }
+    if (!production.includes(MARKDOWN_EXCLUSION)) {
+      issues.push({ path: nxJsonPath, message: markdownExclusionMessage('production') });
+    }
   }
 }
 
@@ -465,9 +474,13 @@ function applyNamedInputDefaults(nxJson: Record<string, unknown>): boolean {
     namedInputs.default = defaults.filter((input) => input !== 'sharedGlobals');
     changed = true;
   }
-  const production = namedInputs.production;
-  if (!Array.isArray(production) || !isPreciseProductionNamedInput(production)) {
+  const production = Array.isArray(namedInputs.production) ? namedInputs.production : [];
+  const withoutRust = production.filter((input) => !isRustCrateSourceInput(input));
+  if (!isPreciseProductionNamedInput(withoutRust)) {
     namedInputs.production = defaultProductionNamedInput;
+    changed = true;
+  } else if (withoutRust.length < production.length) {
+    namedInputs.production = withoutRust;
     changed = true;
   }
   for (const name of ['default', 'production'] as const) {
@@ -510,6 +523,25 @@ function isPreciseProductionNamedInput(production: unknown[]): boolean {
     }
   }
   return hasPositiveProjectInput;
+}
+
+/**
+ * Rust crate source named by a positive `production` entry: a path under `{projectRoot}/crates`, a `.rs` file or a
+ * `Cargo.toml`. `production` keys a project's TypeScript tasks and, through `^production`, its dependents'. They see
+ * Rust only as the producer target's outputs (`dependsOn` + `dependentTasksOutputFiles`); cargo targets key on
+ * `cargoClosure`; a target that reads crate source as text names it in its own inputs. An exclusion names nothing.
+ */
+function isRustCrateSourceInput(input: unknown): boolean {
+  if (typeof input !== 'string' || input.startsWith('!')) {
+    return false;
+  }
+  const name = input.slice(input.lastIndexOf('/') + 1);
+  return (
+    input === '{projectRoot}/crates' ||
+    input.startsWith('{projectRoot}/crates/') ||
+    name.endsWith('.rs') ||
+    name === 'Cargo.toml'
+  );
 }
 
 function nxPluginName(plugin: PluginConfiguration): string {

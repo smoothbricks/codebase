@@ -157,6 +157,32 @@ describe('pure core: checkWorkspaceConfig', () => {
     expect(issues.some((i) => i.message.includes('enumerate precise production inputs'))).toBe(true);
   });
 
+  // A consumer's production named {projectRoot}/crates/**/*: one Rust integration test re-keyed 237 TypeScript tasks.
+  it('refuses Rust crate sources in production', () => {
+    for (const input of [
+      '{projectRoot}/crates/**/*',
+      '{projectRoot}/src/**/*.rs',
+      '{projectRoot}/Cargo.toml',
+      '{projectRoot}/crates/core/Cargo.toml',
+    ]) {
+      const nxJson = {
+        ...validNxJson(),
+        namedInputs: { ...validNamedInputs(), production: ['{projectRoot}/src/**/*', input, MARKDOWN] },
+      };
+      expect(checkWorkspaceConfig(nxJson).map((issue) => issue.message)).toEqual([
+        `namedInputs.production must not name Rust crate sources (${input}): TypeScript targets see Rust only as the producer target's outputs (dependsOn + dependentTasksOutputFiles); a target that reads crate source as text names it in its own inputs; cargo targets are keyed by cargoClosure.`,
+      ]);
+    }
+    const excluded = {
+      ...validNxJson(),
+      namedInputs: {
+        ...validNamedInputs(),
+        production: ['{projectRoot}/src/**/*', '!{projectRoot}/**/*.rs', MARKDOWN],
+      },
+    };
+    expect(checkWorkspaceConfig(excluded)).toEqual([]);
+  });
+
   it('detects missing build cache', () => {
     const issues = checkWorkspaceConfig({
       plugins: validPlugins(),
@@ -426,13 +452,41 @@ describe('pure core: applyWorkspaceConfig', () => {
     ]);
   });
 
+  it('strips Rust crate sources from production and keeps its other inputs', () => {
+    const nxJson: Record<string, unknown> = {
+      ...validNxJson(),
+      namedInputs: {
+        ...validNamedInputs(),
+        production: ['{projectRoot}/src/**/*', '{projectRoot}/crates/**/*', '{projectRoot}/package.json', MARKDOWN],
+      },
+    };
+    expect(applyWorkspaceConfig(nxJson)).toBe(true);
+    expect(expectRecord(nxJson.namedInputs).production).toEqual([
+      '{projectRoot}/src/**/*',
+      '{projectRoot}/package.json',
+      MARKDOWN,
+    ]);
+    expect(checkWorkspaceConfig(nxJson)).toEqual([]);
+    expect(applyWorkspaceConfig(nxJson)).toBe(false);
+
+    const rustOnly: Record<string, unknown> = {
+      ...validNxJson(),
+      namedInputs: {
+        ...validNamedInputs(),
+        production: ['{projectRoot}/src/**/*.rs', '{projectRoot}/Cargo.toml', MARKDOWN],
+      },
+    };
+    expect(applyWorkspaceConfig(rustOnly)).toBe(true);
+    expect(rustOnly.namedInputs).toEqual(validNamedInputs());
+  });
+
   // A README or spec edit re-keyed every task of its project and, through `^default`/`^production`, of every
   // project depending on it: 39 tasks for one package README in this repository.
   it('keeps Markdown out of default and production, appending the exclusion to custom definitions', () => {
     const nxJson = validNxJson();
     nxJson.namedInputs = {
       default: ['{projectRoot}/**/*', 'custom'],
-      production: ['{projectRoot}/src/**/*.rs', '{projectRoot}/Cargo.toml'],
+      production: ['{projectRoot}/src/**/*.py', '{projectRoot}/pyproject.toml'],
       custom: ['{workspaceRoot}/config/shared.json'],
     };
     expect(checkWorkspaceConfig(nxJson).map((issue) => issue.message)).toEqual([
@@ -442,7 +496,7 @@ describe('pure core: applyWorkspaceConfig', () => {
     expect(applyWorkspaceConfig(nxJson)).toBe(true);
     expect(nxJson.namedInputs).toEqual({
       default: ['{projectRoot}/**/*', 'custom', MARKDOWN],
-      production: ['{projectRoot}/src/**/*.rs', '{projectRoot}/Cargo.toml', MARKDOWN],
+      production: ['{projectRoot}/src/**/*.py', '{projectRoot}/pyproject.toml', MARKDOWN],
       custom: ['{workspaceRoot}/config/shared.json'],
     });
     expect(applyWorkspaceConfig(nxJson)).toBe(false);
@@ -458,7 +512,12 @@ describe('pure core: applyWorkspaceConfig', () => {
       ...validNxJson(),
       namedInputs: {
         ...validNamedInputs(),
-        production: ['{projectRoot}/src/**/*.rs', '{projectRoot}/Cargo.toml', '!{projectRoot}/**/*.test.*', MARKDOWN],
+        production: [
+          '{projectRoot}/src/**/*.py',
+          '{projectRoot}/pyproject.toml',
+          '!{projectRoot}/**/*.test.*',
+          MARKDOWN,
+        ],
       },
     };
     expect(applyWorkspaceConfig(nxJson)).toBe(false);
