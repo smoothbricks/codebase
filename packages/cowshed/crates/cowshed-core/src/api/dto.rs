@@ -820,7 +820,7 @@ pub struct WorkspaceLanding {
 
 impl WorkspaceLanding {
     /// Whether retiring the workspace destroys no commit: its head and every other local branch
-    /// are held by, or preserved in, the target's repository.
+    /// are held by the target's repository, or preserved by a branch there or a push ref in main's.
     pub fn fully_landed(&self) -> bool {
         self.commits.fully_landed() && self.branches.fully_landed()
     }
@@ -828,7 +828,8 @@ impl WorkspaceLanding {
 
 /// What the workspace's local branches other than the checked-out one hold that the target does
 /// not. A branch passes when its tip equals or is an ancestor of the target repository's branch of
-/// the same name or of its `push` ref `refs/cowshed/<ws>/heads/<branch>`, or when the target
+/// the same name or of its `push` ref `refs/cowshed/<ws>/heads/<branch>` in main's repository,
+/// where `cowshed push` writes it whichever target the workspace lands into, or when the target
 /// branch holds its content the way [`LandingCommits`] judges a head; every other branch is listed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "camelCase")]

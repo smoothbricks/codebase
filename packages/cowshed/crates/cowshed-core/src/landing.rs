@@ -43,7 +43,7 @@ pub struct LandingTarget {
     branch: String,
     tip: GitOid,
     objects: PathBuf,
-    /// The target's canonical mount, whose refs say which workspace branches it preserves.
+    /// The target's canonical mount, whose branches say which workspace branches it preserves.
     repository: PathBuf,
 }
 
@@ -202,12 +202,14 @@ pub async fn unmatched_commits(
 /// is consumed — it can never authorize a deletion, only decline to.
 ///
 /// `head` is a revision in the workspace's own repository; pass `HEAD` unless a caller has already
-/// fenced a specific oid and needs that exact commit judged. `workspace` names the workspace's
-/// `push` refs in the target repository.
+/// fenced a specific oid and needs that exact commit judged. `push_repository` is main's
+/// repository, where `cowshed push` preserves the workspace's branches, and `workspace` names
+/// them there.
 pub async fn measure(
     store_root: &std::sync::Arc<Path>,
     target: &std::result::Result<LandingTarget, String>,
     workspace_mount: &Path,
+    push_repository: &Path,
     workspace: &str,
     head: &str,
 ) -> WorkspaceLanding {
@@ -216,7 +218,14 @@ pub async fn measure(
     WorkspaceLanding {
         dirty_files,
         commits: measure_commits(store_root, target, workspace_mount, head).await,
-        branches: measure_branches(store_root, target, workspace_mount, workspace).await,
+        branches: measure_branches(
+            store_root,
+            target,
+            workspace_mount,
+            push_repository,
+            workspace,
+        )
+        .await,
     }
 }
 
@@ -224,18 +233,29 @@ pub async fn measure(
 /// measurement covers.
 ///
 /// A branch passes when its tip equals or is an ancestor of the target repository's branch of the
-/// same name or of `refs/cowshed/<workspace>/heads/<branch>`, where `cowshed push` preserves it -
-/// destroying the workspace's copy then loses nothing - or when the target branch holds each of
-/// its commits by content or patch identity, as it would a head's. Every other branch is named with its measurement. A tip equal to
-/// the target's same-named tip is decided without a process, which is what keeps a workspace
-/// carrying its source's branches cheap to list.
+/// same name or of `refs/cowshed/<workspace>/heads/<branch>` in `push_repository` - main's
+/// repository, the one place `cowshed push` writes that ref (02_workspaces.md, `push` and `rm`
+/// step 1), whichever target the workspace lands into - so destroying the workspace's copy loses
+/// nothing; or when the target branch holds each commit by content or patch identity, as it
+/// would a head's. Every other branch is named with its measurement. A tip equal to the target's
+/// same-named tip is decided without a process, which is what keeps a workspace carrying its
+/// source's branches cheap to list.
 pub async fn measure_branches(
     store_root: &std::sync::Arc<Path>,
     target: &std::result::Result<LandingTarget, String>,
     workspace_mount: &Path,
+    push_repository: &Path,
     workspace: &str,
 ) -> BranchLandings {
-    match judged_branches(store_root, target, workspace_mount, workspace).await {
+    match judged_branches(
+        store_root,
+        target,
+        workspace_mount,
+        push_repository,
+        workspace,
+    )
+    .await
+    {
         Ok(unlanded) => BranchLandings::Measured { unlanded },
         Err(reason) => BranchLandings::Indeterminate { reason },
     }
@@ -245,6 +265,7 @@ async fn judged_branches(
     store_root: &std::sync::Arc<Path>,
     target: &std::result::Result<LandingTarget, String>,
     workspace_mount: &Path,
+    push_repository: &Path,
     workspace: &str,
 ) -> std::result::Result<Vec<BranchLanding>, String> {
     let local = GitRepository::from_root(store_root, workspace_mount);
@@ -265,38 +286,24 @@ async fn judged_branches(
         return Ok(Vec::new());
     }
     let target = target.as_ref().map_err(Clone::clone)?;
-    let preserving_namespace = format!("refs/cowshed/{workspace}/heads");
     let target_repository = GitRepository::from_root(store_root, &target.repository);
-    let preserving = target_repository
-        .ref_tips(&["refs/heads", preserving_namespace.as_str()])
+    let target_branches = target_repository
+        .ref_tips(&["refs/heads"])
+        .await
+        .map_err(|error| error.message)?;
+    let push_namespace = format!("refs/cowshed/{workspace}/heads");
+    let pushed = GitRepository::from_root(store_root, push_repository);
+    let push_refs = pushed
+        .ref_tips(&[push_namespace.as_str()])
         .await
         .map_err(|error| error.message)?;
     let mut unlanded = Vec::new();
     for (name, tip) in candidates {
         let short = name.strip_prefix(b"refs/heads/").unwrap_or(&name);
-        let preserving_refs = [
-            name.clone(),
-            [preserving_namespace.as_bytes(), b"/".as_slice(), short].concat(),
-        ];
-        let mut preserved = false;
-        for preserving_ref in &preserving_refs {
-            let Some(preserving_tip) = preserving.get(preserving_ref) else {
-                continue;
-            };
-            if *preserving_tip == tip
-                || target_repository
-                    .commit_is_ancestor(
-                        &String::from_utf8_lossy(&tip),
-                        &String::from_utf8_lossy(preserving_tip),
-                    )
-                    .await
-                    .map_err(|error| error.message)?
-            {
-                preserved = true;
-                break;
-            }
-        }
-        if preserved {
+        let push_ref = [push_namespace.as_bytes(), b"/".as_slice(), short].concat();
+        if holds(&target_repository, target_branches.get(&name), &tip).await?
+            || holds(&pushed, push_refs.get(&push_ref), &tip).await?
+        {
             continue;
         }
         let tip = GitOid::new(String::from_utf8_lossy(&tip).into_owned()).map_err(|error| {
@@ -314,6 +321,28 @@ async fn judged_branches(
         }
     }
     Ok(unlanded)
+}
+
+/// Whether `preserving`, a ref tip read from `repository`, keeps `tip`: it is that commit or a
+/// descendant of it there. No ref keeps nothing.
+async fn holds(
+    repository: &GitRepository,
+    preserving: Option<&Vec<u8>>,
+    tip: &[u8],
+) -> std::result::Result<bool, String> {
+    let Some(preserving) = preserving else {
+        return Ok(false);
+    };
+    if preserving.as_slice() == tip {
+        return Ok(true);
+    }
+    repository
+        .commit_is_ancestor(
+            &String::from_utf8_lossy(tip),
+            &String::from_utf8_lossy(preserving),
+        )
+        .await
+        .map_err(|error| error.message)
 }
 
 /// The commit half of [`measure`], separated so the gate can take it without a working-tree read it
@@ -517,6 +546,7 @@ pub async fn annotate_listing<T: AsMut<WorkspaceInfo>>(
     };
     let target =
         std::sync::Arc::new(resolve_target(store_root, &main, LISTING_TARGET_BRANCH).await);
+    let main: std::sync::Arc<Path> = std::sync::Arc::from(main);
     let mut tasks = tokio::task::JoinSet::new();
     for (index, row) in rows.iter_mut().enumerate() {
         let workspace = row.as_mut();
@@ -530,13 +560,14 @@ pub async fn annotate_listing<T: AsMut<WorkspaceInfo>>(
             continue;
         }
         let target = std::sync::Arc::clone(&target);
+        let main = std::sync::Arc::clone(&main);
         let store_root = std::sync::Arc::clone(store_root);
         let mount = workspace.mount.clone();
         let name = workspace.workspace.as_str().to_owned();
         tasks.spawn(async move {
             (
                 index,
-                measure(&store_root, &target, &mount, &name, "HEAD").await,
+                measure(&store_root, &target, &mount, &main, &name, "HEAD").await,
             )
         });
     }

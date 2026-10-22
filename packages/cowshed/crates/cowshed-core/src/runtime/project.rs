@@ -6828,6 +6828,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 store_root,
                 &target,
                 &mount,
+                &self.descriptor.git_root,
                 workspace.as_str(),
             )
             .await,
@@ -10706,11 +10707,14 @@ mod rebase_recovery_tests {
         run_git(root, &["commit", "-m", message]);
     }
 
+    /// The retire gate for `unit` measured against `branch` in `target`, with `main` the
+    /// repository `cowshed push` preserves the unit's branches in, as `landed_state` reads it.
     async fn contained_in(
         store_root: &std::sync::Arc<Path>,
         target: &Path,
         branch: &str,
         unit: &Path,
+        main: &Path,
     ) -> RemovalLandedDecision {
         let head = git_oid(store_root, unit).await.expect("unit head");
         let resolved = crate::landing::resolve_target(store_root, target, branch).await;
@@ -10718,7 +10722,8 @@ mod rebase_recovery_tests {
             branch: branch.to_owned(),
             commits: crate::landing::measure_commits(store_root, &resolved, unit, head.as_str())
                 .await,
-            branches: crate::landing::measure_branches(store_root, &resolved, unit, "unit").await,
+            branches: crate::landing::measure_branches(store_root, &resolved, unit, main, "unit")
+                .await,
         };
         removal_landed_decision(landed, false)
     }
@@ -10759,14 +10764,14 @@ mod rebase_recovery_tests {
         );
         // The retire gate, measured against the branch the unit landed on, lets it go…
         assert_eq!(
-            contained_in(store_root, &lane.lane, "cowshed/lane", &unit).await,
+            contained_in(store_root, &lane.lane, "cowshed/lane", &unit, &lane.main).await,
             RemovalLandedDecision::Landed,
             "contained in the lane base"
         );
         // …and the same gate measured against main would refuse it: that is why land passes the
         // target it delivered into, and why a standalone `rm` still measures against main.
         let RemovalLandedDecision::Refused(refused) =
-            contained_in(store_root, &lane.main, "main", &unit).await
+            contained_in(store_root, &lane.main, "main", &unit, &lane.main).await
         else {
             panic!("main does not hold the unit's commit");
         };
@@ -10776,6 +10781,164 @@ mod rebase_recovery_tests {
                 LandingCommits::Measured { unlanded: 1, .. }
             ),
             "{refused:?}"
+        );
+    }
+    /// A unit on `cowshed/unit` carrying a second local branch `kept` with work found nowhere else,
+    /// landed into its lane base: what `cowshed land unit --into lane` leaves before its retire.
+    /// Answers the unit's mount, its landed head and `kept`'s tip.
+    async fn landed_unit_keeping_a_branch(lane: &Lane) -> (PathBuf, GitOid, GitOid) {
+        let store_root = lane.store.shared();
+        let unit = lane.unit("unit");
+        run_git(&unit, &["checkout", "-q", "-b", "kept"]);
+        unit_commit(&unit, "kept.txt", "kept work");
+        let kept = git_oid(store_root, &unit).await.expect("kept tip");
+        run_git(&unit, &["checkout", "-q", "cowshed/unit"]);
+        unit_commit(&unit, "unit.txt", "unit work");
+        let head = git_oid(store_root, &unit).await.expect("unit head");
+        deliver_into(
+            &Lane::name("lane"),
+            &crate::git::GitRepository::from_root(store_root, &lane.lane),
+            NativeLandingSource {
+                mount: &unit,
+                workspace: &Lane::name("unit"),
+                branch: "cowshed/unit",
+                head: &head,
+            },
+            "cowshed/lane",
+            None,
+        )
+        .await
+        .expect("land into the lane base");
+        (unit, head, kept)
+    }
+
+    /// `cowshed push unit --branch kept` writes `refs/cowshed/unit/heads/kept` into main's
+    /// repository and reports it (02_workspaces.md, `push`), and the retire gate of the land into the
+    /// lane base counts that ref as preserving `kept` (`rm` step 1, land step 5). The refusal before
+    /// the push names exactly that push, so following its `next:` retires the unit instead of naming
+    /// the same push again.
+    #[tokio::test]
+    async fn a_branch_a_lane_unit_pushed_is_preserved_for_its_land_into_the_lane_base() {
+        let lane = Lane::new("push-preserve");
+        let store_root = lane.store.shared();
+        let (unit, head, kept) = landed_unit_keeping_a_branch(&lane).await;
+
+        let RemovalLandedDecision::Refused(refused) =
+            contained_in(store_root, &lane.lane, "cowshed/lane", &unit, &lane.main).await
+        else {
+            panic!("nothing preserves kept before the push");
+        };
+        let refusal = removal_unlanded_refusal(&Lane::name("unit"), &head, &refused, None);
+        assert_eq!(
+            refusal.hint,
+            "preserve each branch: cowshed push unit --branch kept"
+        );
+
+        let pushed = preserve_workspace_branch(
+            store_root,
+            &lane.main,
+            &unit,
+            &Lane::name("unit"),
+            &crate::api::dto::BranchName::new("kept").expect("branch name"),
+            None,
+            None,
+        )
+        .await
+        .expect("push kept");
+        assert_eq!(pushed.destination_ref, "refs/cowshed/unit/heads/kept");
+        assert_eq!(pushed.source_head, kept);
+        assert_eq!(
+            git_optional_ref_oid(store_root, &lane.main, &pushed.destination_ref)
+                .await
+                .expect("read main's ref"),
+            Some(kept.clone()),
+            "the ref push reports is in main's repository, at the tip it reports"
+        );
+        assert_eq!(
+            contained_in(store_root, &lane.lane, "cowshed/lane", &unit, &lane.main).await,
+            RemovalLandedDecision::Landed,
+            "the pushed ref preserves kept, so the land into the lane base retires the unit"
+        );
+    }
+
+    /// The lane base's own branch of the same name preserves a unit's branch; a ref in any other
+    /// namespace of the lane base's repository does not (02_workspaces.md, `rm` step 1).
+    #[tokio::test]
+    async fn a_lane_base_branch_of_the_same_name_preserves_a_unit_branch_and_other_refs_do_not() {
+        let lane = Lane::new("lane-branch-preserve");
+        let store_root = lane.store.shared();
+        let (unit, _, kept) = landed_unit_keeping_a_branch(&lane).await;
+        let unit_path = unit.to_str().expect("UTF-8 unit path");
+
+        run_git(
+            &lane.lane,
+            &[
+                "fetch",
+                "-q",
+                unit_path,
+                "refs/heads/kept:refs/preserve/kept",
+            ],
+        );
+        let RemovalLandedDecision::Refused(refused) =
+            contained_in(store_root, &lane.lane, "cowshed/lane", &unit, &lane.main).await
+        else {
+            panic!("refs/preserve/kept is neither a branch of that name nor a push ref");
+        };
+        let BranchLandings::Measured { unlanded } = &refused.branches else {
+            panic!("the branches were not judged: {:?}", refused.branches);
+        };
+        assert_eq!(
+            unlanded
+                .iter()
+                .map(|branch| (branch.branch.as_str(), &branch.tip))
+                .collect::<Vec<_>>(),
+            [("kept", &kept)]
+        );
+
+        run_git(
+            &lane.lane,
+            &["fetch", "-q", unit_path, "refs/heads/kept:refs/heads/kept"],
+        );
+        assert_eq!(
+            contained_in(store_root, &lane.lane, "cowshed/lane", &unit, &lane.main).await,
+            RemovalLandedDecision::Landed,
+            "the lane base's own kept branch preserves the unit's"
+        );
+    }
+
+    /// A push whose destination ref git cannot write refuses: it never reports a ref main's repository
+    /// does not hold, and it leaves no staging ref behind (02_workspaces.md, `push`).
+    #[tokio::test]
+    async fn a_push_whose_destination_ref_cannot_be_written_refuses_and_reports_nothing() {
+        let lane = Lane::new("push-unwritable");
+        let store_root = lane.store.shared();
+        let (unit, _, _) = landed_unit_keeping_a_branch(&lane).await;
+        let held = lane.main.join(".git/refs/cowshed/unit/heads");
+        std::fs::create_dir_all(&held).expect("create the destination's ref directory");
+        std::fs::write(held.join("kept.lock"), b"").expect("hold the destination ref's lock");
+
+        preserve_workspace_branch(
+            store_root,
+            &lane.main,
+            &unit,
+            &Lane::name("unit"),
+            &crate::api::dto::BranchName::new("kept").expect("branch name"),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a destination git cannot lock is not preserved");
+        assert_eq!(
+            git_optional_ref_oid(store_root, &lane.main, "refs/cowshed/unit/heads/kept")
+                .await
+                .expect("read main's ref"),
+            None
+        );
+        assert!(
+            git(&lane.main, &["for-each-ref", "refs/cowshed/unit/staging"])
+                .stdout
+                .is_empty(),
+            "the staging ref is removed"
         );
     }
 
@@ -11223,7 +11386,7 @@ mod rebase_recovery_tests {
 
         let head = git_oid(store_root, &shed).await.expect("shed head");
         let RemovalLandedDecision::Refused(refused) =
-            contained_in(store_root, &lane.main, "main", &shed).await
+            contained_in(store_root, &lane.main, "main", &shed, &lane.main).await
         else {
             panic!("local main does not hold the published commit");
         };
@@ -11251,9 +11414,9 @@ mod rebase_recovery_tests {
                 "(main is at {main_tip}): release.txt (added: main does not have it); \
                  codebase/main (published, {published_tip}) holds it; local main has diverged \
                  from it (1 ahead, 1 behind): reconcile main, do not abandon; workspace shed \
-                 holds 1 other branch whose changes main does not hold and that no branch or \
-                 push ref in main's repository preserves: cowshed/forge at {published_tip} (1 \
-                 commit: release.txt (added: main does not have it))"
+                 holds 1 other branch whose changes main does not hold and that no branch in \
+                 main's repository and no push ref in main's repository preserves: cowshed/forge \
+                 at {published_tip} (1 commit: release.txt (added: main does not have it))"
             )),
             "{message}"
         );
@@ -11261,7 +11424,7 @@ mod rebase_recovery_tests {
         unit_commit(&shed, "unpublished.txt", "unpublished");
         let head = git_oid(store_root, &shed).await.expect("shed head");
         let RemovalLandedDecision::Refused(refused) =
-            contained_in(store_root, &lane.main, "main", &shed).await
+            contained_in(store_root, &lane.main, "main", &shed, &lane.main).await
         else {
             panic!("nothing holds the unpublished commit");
         };
@@ -11356,7 +11519,7 @@ mod rebase_recovery_tests {
         assert_eq!(by_identity.len(), 1, "{by_identity:?}");
 
         assert_eq!(
-            contained_in(store_root, &lane.main, "main", &shed).await,
+            contained_in(store_root, &lane.main, "main", &shed, &lane.main).await,
             RemovalLandedDecision::Landed,
             "main holds the shed's change beside its own edits"
         );
@@ -11364,7 +11527,7 @@ mod rebase_recovery_tests {
         commit(&shed, "notes.txt", "never picked\n", "shed notes");
         let head = git_oid(store_root, &shed).await.expect("shed head");
         let RemovalLandedDecision::Refused(refused) =
-            contained_in(store_root, &lane.main, "main", &shed).await
+            contained_in(store_root, &lane.main, "main", &shed, &lane.main).await
         else {
             panic!("main never took notes.txt");
         };
@@ -17926,8 +18089,8 @@ mod removal_refusal_tests {
             refusal.message,
             format!(
                 "workspace raven holds 1 other branch whose changes main does not hold and that \
-                 no branch or push ref in main's repository preserves: side at {} (2 commits: \
-                 side.txt (added: main does not have it))",
+                 no branch in main's repository and no push ref in main's repository preserves: \
+                 side at {} (2 commits: side.txt (added: main does not have it))",
                 oid('5')
             )
         );
@@ -21818,7 +21981,8 @@ fn removal_unlanded_refusal(
                 .join(", ");
             findings.push(format!(
                 "workspace {workspace} holds {} other branch{} whose changes {branch} does not \
-                 hold and that no branch or push ref in {branch}'s repository preserves: {named}",
+                 hold and that no branch in {branch}'s repository and no push ref in main's \
+                 repository preserves: {named}",
                 unlanded.len(),
                 if unlanded.len() == 1 { "" } else { "es" }
             ));

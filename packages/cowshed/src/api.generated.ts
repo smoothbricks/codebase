@@ -326,7 +326,8 @@ export type BranchLanding = {
 /**
  * What the workspace's local branches other than the checked-out one hold that the target does
  * not. A branch passes when its tip equals or is an ancestor of the target repository's branch of
- * the same name or of its `push` ref `refs/cowshed/<ws>/heads/<branch>`, or when the target
+ * the same name or of its `push` ref `refs/cowshed/<ws>/heads/<branch>` in main's repository,
+ * where `cowshed push` writes it whichever target the workspace lands into, or when the target
  * branch holds its content the way [`LandingCommits`] judges a head; every other branch is listed.
  */
 export type BranchLandings =

@@ -164,7 +164,15 @@ fn workspace_commit(mount: &Path, file: &str, contents: &str, message: &str) {
 
 async fn measured(fixture: &Fixture, mount: &Path) -> WorkspaceLanding {
     let target = resolve_target(fixture.store(), &fixture.parent(), TARGET).await;
-    measure(fixture.store(), &target, mount, "topic", "HEAD").await
+    measure(
+        fixture.store(),
+        &target,
+        mount,
+        &fixture.parent(),
+        "topic",
+        "HEAD",
+    )
+    .await
 }
 
 /// The counts, or a panic naming the reason the measurement was declined.
@@ -835,7 +843,15 @@ async fn a_target_branch_that_does_not_exist_is_indeterminate_rather_than_landed
     workspace_commit(&mount, "wave.txt", "wave\n", "wave work");
 
     let target = resolve_target(fixture.store(), &fixture.parent(), "release").await;
-    let landing = measure(fixture.store(), &target, &mount, "topic", "HEAD").await;
+    let landing = measure(
+        fixture.store(),
+        &target,
+        &mount,
+        &fixture.parent(),
+        "topic",
+        "HEAD",
+    )
+    .await;
     assert!(
         reason(&landing).contains("no release branch"),
         "reason must name the missing branch: {}",
@@ -867,7 +883,7 @@ async fn a_main_mount_that_is_not_a_repository_is_indeterminate_and_says_so() {
     fs::create_dir_all(stub.join(".devenv")).expect("mountpoint stub");
 
     let target = resolve_target(fixture.store(), &stub, TARGET).await;
-    let landing = measure(fixture.store(), &target, &mount, "topic", "HEAD").await;
+    let landing = measure(fixture.store(), &target, &mount, &stub, "topic", "HEAD").await;
     let reason = reason(&landing);
     assert!(
         reason.contains("could not be read") && reason.contains("unmounted-stub"),
@@ -930,6 +946,7 @@ async fn classification_follows_head_and_not_a_registered_branch_that_has_drifte
         fixture.store(),
         &resolve_target(fixture.store(), &fixture.parent(), TARGET).await,
         &mount,
+        &fixture.parent(),
         "topic",
         &registered,
     )
@@ -1039,9 +1056,10 @@ async fn a_stale_cached_remote_ref_has_no_influence_on_the_verdict() {
 }
 
 /// Every local branch besides HEAD dies with the workspace image, so each one is measured too. A
-/// branch the target repository preserves - its own branch of that name, or the
-/// `refs/cowshed/<ws>/heads/<branch>` ref `cowshed push` writes - or whose patches the target
-/// holds is never named; one carrying work found nowhere upstream is, with its tip.
+/// branch preserved - by the target repository's own branch of that name, or by the
+/// `refs/cowshed/<ws>/heads/<branch>` ref `cowshed push` writes in main's repository - or whose
+/// patches the target holds is never named; one carrying work found nowhere upstream is, with its
+/// tip.
 #[tokio::test]
 async fn other_local_branches_are_measured_and_only_unpreserved_work_is_named() {
     let fixture = Fixture::new("branches");
