@@ -1594,10 +1594,12 @@ supervisor that ran the job retires.
   TypeScript `Coordinator.adopt` resolves `Adopted = { workspace: WorkspaceRef, reAdoption: ReAdoption | null }`. The
   value is for callers. A re-adoption that startup recovery finishes answers no caller, so it logs the same paths on
   stderr for the human who reopened cowshed; the two coexist deliberately.
-  `ForkOptions = { ref?, clean, browse, slot?, register, gitWorktree }`; `AttachOptions = { browse }`;
-  `RemoveOptions = { force }`; `GcOptions = { dryRun, abandoned }`; `RebaseOptions`, `LandOptions`, and `PushOptions`
-  use the expectation fields shown above. All booleans are explicit in JSON; absence never silently means authority was
-  granted. Both GC options default to false on input; only `abandoned: true` authorizes reclaiming abandon bundles.
+  `ForkOptions = { ref?, clean, browse, slot?, register, gitWorktree }`;
+  `AttachOptions = { browse, observedPath?, aggregate }`, `aggregate` marking one attach of `attach` with no name or
+  `--all`, which makes no room (02_workspaces.md, "Making room for an attach"); `RemoveOptions = { force }`;
+  `GcOptions = { dryRun, abandoned }`; `RebaseOptions`, `LandOptions`, and `PushOptions` use the expectation fields
+  shown above. All booleans are explicit in JSON; absence never silently means authority was granted. Both GC options
+  default to false on input; only `abandoned: true` authorizes reclaiming abandon bundles.
   `coordinator.fork { repoId, workspace, source?, options: ForkOptions }` defaults an absent source to main. A ref with
   `clean: false` is a usage refusal; the CLI sets clean for `--ref`. Every fork uses the same mint, carries source edits
   and untracked files by default, and gets its own `cowshed/<ws>` branch. `coordinator.create`, `CreateOptions`, and

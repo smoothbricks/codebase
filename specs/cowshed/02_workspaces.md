@@ -1408,9 +1408,10 @@ service/controller lifecycle.
 IOKit queues at most 1024 matches on one unfiltered IOMedia notification and drops the rest (01a_apfs.md, "The IOMedia
 match-notification ceiling"). Cowshed attaches every image in the kernel, which waits on no such notification and is
 measured to attach past it, so the ceiling is a soft one: nothing refuses an attach on the media count, and an operation
-that may attach first makes room where it can. The project actor does this before it runs each controller operation
-(`cowshed_core::media_room`), so the CLI, N-API clients, the gateway and a coordinator's `cowshed controller` get the
-same step; `mount main` makes the same call before it attaches a detached main. It counts the registered IOMedia,
+that may attach first makes room where it can. The project actor does this for each controller operation once the
+operation's route has authorized and validated its request, so a refused request has no effect on the host
+(`cowshed_core::media_room`); the CLI, N-API clients, the gateway and a coordinator's `cowshed controller` get the same
+step, and `mount main` makes the same call before it attaches a detached main. It counts the registered IOMedia,
 subclasses included; three for each image attach running on the host, any user's; and 16 kept for disks the host
 attaches on its own, and makes room when the images would bring that to 1024. `doctor`'s `media-notification-cap`
 reports the same count, what it commits of the ceiling and how many more images fit: a warning while fewer than 20 do,
@@ -1418,16 +1419,22 @@ past the ceiling too, never an error.
 
 An operation's demand is read from its request alone (`cowshed_core::media_room::attach_demand`). One that works in a
 workspace (attach, exec, a shell, a checkpoint, a push, a restore, a land or rebase, a grant, a defragment, a rekey, an
-Nx state clear, a worker handle) attaches it and its build volume, two images, when it is detached; a fork or rename a
-clone and its build image; adoption main and its first build volume; a resize or reseed one build image or seed beside
-the workspace's own; moving the checkout or changing the repository identity main. A named workspace mounted at its path
-attaches nothing, read from the kernel mount table, so an operation in a mounted workspace never reads the IOKit count.
-Reads, job and session traffic, `rm`, `detach`, `gc`, `doctor`, previews (`reseed --dry-run`) and project-wide grants
-attach nothing. Attaching every detached session (`attach` with no name, `attach --all`) makes no room: detaching some
-sessions to attach others frees nothing. The workspaces an operation names (a land's or rebase's `into`, main when it
-names none, a reseed's `from`, a fork's source included) are its own and never detached for it. A host whose count
-leaves room is read once, and nothing else happens; an `exec` of a mounted, served workspace answers before any of this
-(06_cli.md, "Resident workspaces").
+Nx state clear, a worker handle) attaches it and its build volume, two images, when it is detached, and its build volume
+alone when only that is: a mounted workspace's linked build volume is read from its build link, and both mounts from the
+kernel mount table, so an operation in a mounted workspace with its build volume never reads the IOKit count. A fork or
+rename attaches its destination the same way: new, and so detached, unless a resumed one is already mounted. Adoption
+attaches main and its first build volume; a resize or reseed one build image or seed beside the workspace's own; moving
+the checkout or changing the repository identity main. Reads, job and session traffic, `rm`, `detach`, `gc`, `doctor`,
+previews (`reseed --dry-run`) and project-wide grants attach nothing. The workspaces an operation names (a fork's or
+rename's destination and source, a land's or rebase's `into`, main when it names none, a reseed's `from`) are its own
+and never detached for it. A host whose count leaves room is read once, and nothing else happens; an `exec` of a
+mounted, served workspace answers before any of this (06_cli.md, "Resident workspaces").
+
+Three paths attach without making room. Attaching every detached session (`attach` with no name, `attach --all`) is an
+aggregate: detaching some sessions to attach others frees nothing, so each of its attaches says so in its request
+(`AttachOptions.aggregate`), and the store-wide `attach --all` mounts through the substrate directly. The replay of an
+unfinished lifecycle operation when a project opens finishes an operation already admitted. The gateway's startup heal
+mounts mains only (05_gateway.md, "Startup contract").
 
 When the images would not fit, the verb lists every adopted project's attached workspaces and plans
 (`cowshed_core::media_room::plan`, a pure function of one media reading and that list): only idle workspaces are

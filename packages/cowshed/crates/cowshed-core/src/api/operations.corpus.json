@@ -5,7 +5,11 @@
   "project.workspaceInSlot": { "repoId": "acme/widget", "slot": 3 },
   "project.list": { "repoId": "acme/widget", "landing": "landed" },
   "workspace.info": { "repoId": "acme/widget", "workspace": "feature" },
-  "workspace.attach": { "repoId": "acme/widget", "workspace": "feature", "options": { "browse": false } },
+  "workspace.attach": {
+    "repoId": "acme/widget",
+    "workspace": "feature",
+    "options": { "browse": false, "aggregate": false }
+  },
   "workspace.grants": {
     "repoId": "acme/widget",
     "workspace": "feature",

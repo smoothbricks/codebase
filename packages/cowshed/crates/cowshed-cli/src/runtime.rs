@@ -1876,6 +1876,7 @@ where
                 } else {
                     Some(invocation_cwd()?)
                 },
+                aggregate: args.workspace.is_none(),
             };
             let infos = if let Some(workspace) = args.workspace {
                 vec![service.attach(&workspace, options).await?]

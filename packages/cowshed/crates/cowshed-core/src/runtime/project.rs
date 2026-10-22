@@ -1268,9 +1268,9 @@ impl ProjectActor {
         if scope != Scope::Worker {
             require_coordinator(&authority)?;
         }
-        self.host
-            .make_media_room(crate::media_room::attach_demand(&operation))
-            .await;
+        // What the operation may attach. Each arm makes room for it only after the checks that
+        // authorize and validate its request, so a refused request has no effect on the host.
+        let demand = crate::media_room::attach_demand(&operation);
         use OperationRequest as Op;
         let response = match operation {
             Op::JobLogs(params) => {
@@ -1336,6 +1336,7 @@ impl ProjectActor {
             Op::WorkspaceAttach(params) => {
                 self.require_scoped_workspace(&authority, &params.repo_id, &params.workspace)
                     .await?;
+                self.host.make_media_room(demand).await;
                 self.host.attach(params.workspace, params.options).await?;
                 respond::<operations::WorkspaceAttach>(&EmptyResult {})
             }
@@ -1345,9 +1346,9 @@ impl ProjectActor {
             Op::WorkspaceBuildVolume(params) => respond::<operations::WorkspaceBuildVolume>(
                 &self.workspace_build_volume(params).await?,
             ),
-            Op::CoordinatorAdopt(params) => {
-                respond::<operations::CoordinatorAdopt>(&self.coordinator_adopt(params).await?)
-            }
+            Op::CoordinatorAdopt(params) => respond::<operations::CoordinatorAdopt>(
+                &self.coordinator_adopt(params, demand).await?,
+            ),
             Op::CoordinatorFork(params) => {
                 self.require_repo(&params.repo_id)?;
                 if params.options.markdown_only {
@@ -1356,6 +1357,7 @@ impl ProjectActor {
                         "edit the Markdown in the checkout itself; drop markdown-only to mint a workspace",
                     ));
                 }
+                self.host.make_media_room(demand).await;
                 let snapshot = self
                     .host
                     .fork(params.source, params.workspace, params.options)
@@ -1364,24 +1366,27 @@ impl ProjectActor {
             }
             Op::CoordinatorRename(params) => {
                 self.require_repo(&params.repo_id)?;
+                self.host.make_media_room(demand).await;
                 let snapshot = self.host.rename(params.source, params.destination).await?;
                 respond::<operations::CoordinatorRename>(&workspace_view(snapshot))
             }
             Op::CoordinatorMoveCheckout(params) => {
                 self.require_repo(&params.repo_id)?;
+                self.host.make_media_room(demand).await;
                 let snapshot = self.host.move_checkout(params.destination).await?;
                 respond::<operations::CoordinatorMoveCheckout>(&workspace_view(snapshot))
             }
             Op::CoordinatorChangeRepoId(params) => {
                 self.require_repo(&params.repo_id)?;
+                self.host.make_media_room(demand).await;
                 let snapshot = self.host.change_repo_id(params.new_repo_id).await?;
                 respond::<operations::CoordinatorChangeRepoId>(&workspace_view(snapshot))
             }
             Op::CoordinatorGrant(params) => respond::<operations::CoordinatorGrant>(
-                &self.coordinator_grant(params, false).await?,
+                &self.coordinator_grant(params, false, demand).await?,
             ),
             Op::CoordinatorRevoke(params) => respond::<operations::CoordinatorRevoke>(
-                &self.coordinator_grant(params, true).await?,
+                &self.coordinator_grant(params, true, demand).await?,
             ),
             Op::CoordinatorProjectGrants(params) => {
                 self.require_repo(&params.repo_id)?;
@@ -1401,6 +1406,7 @@ impl ProjectActor {
             }
             Op::CoordinatorRebase(params) => {
                 self.require_repo(&params.repo_id)?;
+                self.host.make_media_room(demand).await;
                 let report = self
                     .host
                     .rebase(params.workspace, params.into, params.options)
@@ -1409,6 +1415,7 @@ impl ProjectActor {
             }
             Op::CoordinatorLand(params) => {
                 self.require_repo(&params.repo_id)?;
+                self.host.make_media_room(demand).await;
                 let report = self
                     .host
                     .land(params.workspace, params.into, params.options)
@@ -1417,11 +1424,13 @@ impl ProjectActor {
             }
             Op::CoordinatorRestore(params) => {
                 self.require_repo(&params.repo_id)?;
+                self.host.make_media_room(demand).await;
                 self.host.restore(params.workspace, params.label).await?;
                 respond::<operations::CoordinatorRestore>(&EmptyResult {})
             }
             Op::CoordinatorResize(params) => {
                 self.require_repo(&params.repo_id)?;
+                self.host.make_media_room(demand).await;
                 let result = self
                     .host
                     .resize(params.workspace, params.capacity, params.volume)
@@ -1430,16 +1439,19 @@ impl ProjectActor {
             }
             Op::CoordinatorDefragment(params) => {
                 self.require_repo(&params.repo_id)?;
+                self.host.make_media_room(demand).await;
                 respond::<operations::CoordinatorDefragment>(
                     &self.host.defragment(params.workspace).await?,
                 )
             }
             Op::CoordinatorRekey(params) => {
                 self.require_repo(&params.repo_id)?;
+                self.host.make_media_room(demand).await;
                 respond::<operations::CoordinatorRekey>(&self.host.rekey(params.workspace).await?)
             }
             Op::CoordinatorReseed(params) => {
                 self.require_repo(&params.repo_id)?;
+                self.host.make_media_room(demand).await;
                 respond::<operations::CoordinatorReseed>(
                     &self
                         .host
@@ -1449,6 +1461,7 @@ impl ProjectActor {
             }
             Op::CoordinatorClearNxState(params) => {
                 self.require_repo(&params.repo_id)?;
+                self.host.make_media_room(demand).await;
                 respond::<operations::CoordinatorClearNxState>(
                     &self.host.clear_nx_state(params.workspace).await?,
                 )
@@ -1514,6 +1527,7 @@ impl ProjectActor {
             }
             Op::CoordinatorWorker(params) => {
                 self.require_repo(&params.repo_id)?;
+                self.host.make_media_room(demand).await;
                 let snapshot = self.host.open_worker(params.workspace).await?;
                 respond::<operations::CoordinatorWorker>(&operations::WorkerView(workspace_view(
                     snapshot,
@@ -1521,12 +1535,18 @@ impl ProjectActor {
             }
             Op::CoordinatorExec(params) => respond::<operations::CoordinatorExec>(
                 &self
-                    .admit_exec(&authority, AdmissionSource::Coordinator, params, upload)
+                    .admit_exec(
+                        &authority,
+                        AdmissionSource::Coordinator,
+                        params,
+                        upload,
+                        demand,
+                    )
                     .await?,
             ),
             Op::WorkerExec(params) => respond::<operations::WorkerExec>(
                 &self
-                    .admit_exec(&authority, AdmissionSource::Worker, params, upload)
+                    .admit_exec(&authority, AdmissionSource::Worker, params, upload, demand)
                     .await?,
             ),
             Op::WorkerStdinChunk(params) => {
@@ -1556,6 +1576,7 @@ impl ProjectActor {
             Op::WorkerShell(params) => {
                 self.require_scoped_workspace(&authority, &params.repo_id, &params.workspace)
                     .await?;
+                self.host.make_media_room(demand).await;
                 self.host
                     .open_session(
                         params.workspace,
@@ -1612,6 +1633,7 @@ impl ProjectActor {
             Op::WorkerCheckpoint(params) => {
                 self.require_scoped_workspace(&authority, &params.repo_id, &params.workspace)
                     .await?;
+                self.host.make_media_room(demand).await;
                 respond::<operations::WorkerCheckpoint>(
                     &self
                         .host
@@ -1626,6 +1648,7 @@ impl ProjectActor {
             Op::WorkerPush(params) => {
                 self.require_scoped_workspace(&authority, &params.repo_id, &params.workspace)
                     .await?;
+                self.host.make_media_room(demand).await;
                 respond::<operations::WorkerPush>(
                     &self
                         .host
@@ -1906,7 +1929,11 @@ impl ProjectActor {
         ))
     }
 
-    async fn coordinator_adopt(&mut self, params: AdoptRequest) -> Result<AdoptView> {
+    async fn coordinator_adopt(
+        &mut self,
+        params: AdoptRequest,
+        demand: crate::media_room::AttachDemand,
+    ) -> Result<AdoptView> {
         self.require_repo(&params.repo_id)?;
         if params
             .options
@@ -1919,6 +1946,7 @@ impl ProjectActor {
                 "retry with the repository identity selected while opening the project",
             ));
         }
+        self.host.make_media_room(demand).await;
         if params.options.re_adopt {
             let (snapshot, re_adoption) = self.host.re_adopt(params.options).await?;
             return Ok(AdoptView {
@@ -1933,10 +1961,16 @@ impl ProjectActor {
         })
     }
 
-    async fn coordinator_grant(&mut self, params: GrantRequest, revoke: bool) -> Result<GrantSet> {
+    async fn coordinator_grant(
+        &mut self,
+        params: GrantRequest,
+        revoke: bool,
+        demand: crate::media_room::AttachDemand,
+    ) -> Result<GrantSet> {
         self.require_repo(&params.repo_id)?;
         requested_port_block_size(&params.delta, revoke)?;
         refuse_linux_loopback_any(&params.delta)?;
+        self.host.make_media_room(demand).await;
         self.host
             .grant(params.workspace, params.delta, revoke)
             .await
@@ -1951,11 +1985,13 @@ impl ProjectActor {
         source: AdmissionSource,
         params: ExecParams,
         upload: Option<Bytes>,
+        demand: crate::media_room::AttachDemand,
     ) -> Result<JobId> {
         source.admit(params.class, params.scope)?;
         let (scope, session, exec) = exec_request(params, upload)?;
         self.require_scoped_workspace(authority, &scope.repo_id, &scope.workspace)
             .await?;
+        self.host.make_media_room(demand).await;
         self.host
             .exec(
                 scope.workspace,
@@ -4843,6 +4879,32 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     fn build_volume_layout(&self) -> Result<crate::build_volume::BuildVolumeLayout> {
         crate::build_volume::BuildVolumeLayout::new(self.layout.project())
             .map_err(native_integrity_error)
+    }
+
+    /// The images a verb that uses `name` attaches, as the kernel's `mounted` paths stand: its
+    /// own and its build volume's when the workspace is detached, its build volume's when only
+    /// that is, none when both are mounted. A record that cannot be read counts as detached,
+    /// which costs only a media reading.
+    fn images_to_attach(
+        &self,
+        name: &WorkspaceName,
+        mounted: &std::collections::BTreeSet<PathBuf>,
+    ) -> u64 {
+        use crate::media_room::WORKSPACE_IMAGES;
+        let Ok(mount) = self.workspace_mount_path(name) else {
+            return WORKSPACE_IMAGES;
+        };
+        if !mounted.contains(&mount) {
+            return WORKSPACE_IMAGES;
+        }
+        let build = self
+            .build_volume_layout()
+            .and_then(|builds| Ok(builds.linked(&mount)?.map(|id| builds.mount(&id))));
+        match build {
+            Ok(Some(build)) if mounted.contains(&build) => 0,
+            Ok(None) => 0,
+            Ok(Some(_)) | Err(_) => 1,
+        }
     }
 
     /// The source incarnation a clone of `current` recorded: the first ancestor its own marker
@@ -12866,7 +12928,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
     }
 
     async fn make_media_room(&mut self, demand: crate::media_room::AttachDemand) {
-        use crate::media_room::{Demand, Keep, WORKSPACE_IMAGES, make_room};
+        use crate::media_room::{Demand, Keep, make_room};
         if !H::HAS_PHYSICAL_VOLUMES || (demand.fresh == 0 && demand.workspaces.is_empty()) {
             return;
         }
@@ -12895,12 +12957,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             demand
                 .workspaces
                 .iter()
-                .filter(|name| {
-                    !self
-                        .workspace_mount_path(name)
-                        .is_ok_and(|mount| mounted.contains(&mount))
-                })
-                .map(|_| WORKSPACE_IMAGES)
+                .map(|name| self.images_to_attach(name, &mounted))
                 .sum(),
         );
         if images == 0 {
@@ -12921,6 +12978,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         )
         .await;
     }
+
     async fn attach(&mut self, workspace: WorkspaceName, options: AttachOptions) -> Result<()> {
         use crate::storage::lifecycle::{MountIntent, Substrate};
         self.validate_binding().await?;

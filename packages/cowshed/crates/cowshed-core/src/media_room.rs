@@ -163,12 +163,11 @@ pub const WORKSPACE_IMAGES: u64 = 2;
 /// "Making room for an attach").
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AttachDemand {
-    /// The images it attaches whatever is mounted: a fork's or a rename's clone and its build
-    /// image, adoption's main and its first build volume, the build image or seed a resize or a
-    /// reseed attaches beside the workspace's own.
+    /// The images it attaches whatever is mounted: adoption's main and its first build volume,
+    /// the build image or seed a resize or a reseed attaches beside the workspace's own.
     pub fresh: u64,
-    /// The workspaces it works in: each one detached attaches [`WORKSPACE_IMAGES`], and none is
-    /// detached to make room for it.
+    /// The workspaces it works in or creates, a fork's or rename's destination included: each one
+    /// detached attaches [`WORKSPACE_IMAGES`], and none is detached to make room for it.
     pub workspaces: Vec<WorkspaceName>,
 }
 
@@ -182,8 +181,10 @@ impl AttachDemand {
 }
 
 /// What `operation` may attach. Reads, job and session traffic, detaches, removals, grants of the
-/// whole project and the project's own maintenance attach nothing. Host and sccache operations
-/// route outside the project actor, which refuses them, so they add no project attach demand.
+/// whole project and the project's own maintenance attach nothing, and one attach of an
+/// aggregate makes no room: detaching some sessions to attach others frees nothing. Host and
+/// sccache operations route outside the project actor, which refuses them, so they add no
+/// project attach demand.
 pub fn attach_demand(operation: &OperationRequest) -> AttachDemand {
     use OperationRequest as Op;
     let one = |workspace: &WorkspaceName| AttachDemand::of(0, [workspace.clone()]);
@@ -197,12 +198,16 @@ pub fn attach_demand(operation: &OperationRequest) -> AttachDemand {
         )
     };
     match operation {
+        // The destination is new, and so detached, or a resumed one already mounted.
         Op::CoordinatorFork(request) => AttachDemand::of(
-            WORKSPACE_IMAGES,
-            [request.source.clone().unwrap_or_else(WorkspaceName::main)],
+            0,
+            [
+                request.workspace.clone(),
+                request.source.clone().unwrap_or_else(WorkspaceName::main),
+            ],
         ),
         Op::CoordinatorRename(request) => {
-            AttachDemand::of(WORKSPACE_IMAGES, [request.source.clone()])
+            AttachDemand::of(0, [request.destination.clone(), request.source.clone()])
         }
         Op::CoordinatorAdopt(_) => AttachDemand::of(WORKSPACE_IMAGES, []),
         Op::CoordinatorMoveCheckout(_) | Op::CoordinatorChangeRepoId(_) => {
@@ -215,6 +220,7 @@ pub fn attach_demand(operation: &OperationRequest) -> AttachDemand {
         }
         Op::CoordinatorRebase(request) => into(&request.workspace, request.into.as_ref()),
         Op::CoordinatorLand(request) => into(&request.workspace, request.into.as_ref()),
+        Op::WorkspaceAttach(request) if request.options.aggregate => AttachDemand::default(),
         Op::WorkspaceAttach(request) => one(&request.workspace),
         Op::CoordinatorGrant(request) | Op::CoordinatorRevoke(request) => one(&request.workspace),
         Op::CoordinatorRestore(request) => one(&request.workspace),
@@ -894,20 +900,23 @@ mod tests {
         );
     }
 
-    /// A controller operation's demand comes from its request alone: a fork attaches its clone
-    /// and keeps its source, main when it names none; a land keeps what it lands into, main when
+    /// A controller operation's demand comes from its request alone: a fork keeps its destination
+    /// and its source, main when it names none; a land keeps what it lands into, main when
     /// it names none; a reseed attaches one image beside its own, none for a dry run; a worker
     /// keeps its workspace; a detach and a read attach nothing.
     #[test]
     fn an_operations_attach_demand_follows_its_request() {
-        use crate::api::dto::{ForkOptions, LandOptions, WorkspaceIncarnation, WorkspaceTarget};
+        use crate::api::dto::{
+            AttachOptions, ForkOptions, LandOptions, WorkspaceIncarnation, WorkspaceTarget,
+        };
         use crate::api::operations::{
-            ForkRequest, LandRequest, OperationRequest as Op, ReseedRequest, WorkspaceRequest,
+            ForkRequest, LandRequest, OperationRequest as Op, ReseedRequest,
+            WorkspaceAttachRequest, WorkspaceRequest,
         };
         use crate::metadata::WorkspaceName;
         use crate::repository::RepoId;
 
-        use super::{AttachDemand, WORKSPACE_IMAGES, attach_demand};
+        use super::{AttachDemand, attach_demand};
 
         let repo = RepoId::parse("fixture/demand").expect("repository identity");
         let session = |name: &str| WorkspaceName::session(name).expect("session name");
@@ -925,11 +934,11 @@ mod tests {
         };
         assert_eq!(
             fork(None),
-            demand(WORKSPACE_IMAGES, &[WorkspaceName::main()])
+            demand(0, &[session("raven"), WorkspaceName::main()])
         );
         assert_eq!(
             fork(Some(session("crow"))),
-            demand(WORKSPACE_IMAGES, &[session("crow")])
+            demand(0, &[session("raven"), session("crow")])
         );
         let land = |into: Option<WorkspaceTarget>| {
             attach_demand(&Op::CoordinatorLand(LandRequest {
@@ -972,6 +981,18 @@ mod tests {
             attach_demand(&Op::CoordinatorWorker(request())),
             demand(0, &[session("raven")])
         );
+        let attach = |aggregate| {
+            attach_demand(&Op::WorkspaceAttach(WorkspaceAttachRequest {
+                repo_id: repo.clone(),
+                workspace: session("raven"),
+                options: AttachOptions {
+                    aggregate,
+                    ..AttachOptions::default()
+                },
+            }))
+        };
+        assert_eq!(attach(false), demand(0, &[session("raven")]));
+        assert_eq!(attach(true), AttachDemand::default());
         for nothing in [
             Op::CoordinatorDetach(request()),
             Op::WorkspaceInfoRead(request()),

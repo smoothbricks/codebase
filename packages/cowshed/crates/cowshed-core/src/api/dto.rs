@@ -3460,6 +3460,10 @@ pub struct AttachOptions {
     pub browse: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_path: Option<PathBuf>,
+    /// One attach of an aggregate (`attach` with no name, `attach --all`): it makes no room under
+    /// IOKit's IOMedia ceiling, since detaching some sessions to attach others frees nothing
+    /// (02_workspaces.md, "Making room for an attach").
+    pub aggregate: bool,
 }
 
 /// Which of a workspace's volumes `cowshed resize` grows: its image, or its build volume and the

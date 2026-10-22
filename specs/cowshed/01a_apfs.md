@@ -946,19 +946,20 @@ ceiling, up to 1,084 registered IOMedia (170 attaches at 0.14 to 0.27 s each, de
 sheds hold about 3,000, past what has been measured, and any other unfiltered IOMedia notification on the host still
 misses matches past 1024, so the ceiling stays a soft target that cowshed keeps under where it can.
 
-Nothing refuses an attach on the media count. Before the project actor runs an operation that may attach, whoever called
-it (the CLI, an N-API client, the gateway, a coordinator's `cowshed controller`), it makes room when the images would
-bring the media to 1024 (`cowshed_core::media_room`; 02_workspaces.md, "Making room for an attach"), counting the
-registered IOMedia, subclasses included, three for every attach running on the host, and 16 for disks the host attaches
-on its own. It detaches idle workspaces, least recently used first: only workspaces with no supervisor serving them,
-never main, the named workspaces, or one a land or `rm` holds. When nothing idle frees enough, it detaches nothing and
-says so on stderr, listing ten attached workspaces with the media each holds and the count of the rest; a count it
-cannot read is said the same way. Either way the operation attaches. Attaching every session (`cowshed attach` without a
-name, or `--all`) makes no room. The gateway's startup pass mounts mains only and leaves sessions to attach on use
-(05_gateway.md, "Startup contract"), and a detach frees a workspace's build volume with its image (02_workspaces.md,
-"`cowshed attach` / `cowshed detach`"). `doctor` reports `media-notification-cap`, a warning while fewer than 20 more
-images fit and never an error, and distinguishes stalled-helper retention from orphaned helpers
-(`orphaned-disk-image-helpers`): a stalled helper is not orphaned while it still owns an attached image.
+Nothing refuses an attach on the media count. Once the project actor has authorized an operation that may attach,
+whoever called it (the CLI, an N-API client, the gateway, a coordinator's `cowshed controller`), it makes room when the
+images would bring the media to 1024 (`cowshed_core::media_room`; 02_workspaces.md, "Making room for an attach"),
+counting the registered IOMedia, subclasses included, three for every attach running on the host, and 16 for disks the
+host attaches on its own. It detaches idle workspaces, least recently used first: only workspaces with no supervisor
+serving them, never main, the named workspaces, or one a land or `rm` holds. When nothing idle frees enough, it detaches
+nothing and says so on stderr, listing ten attached workspaces with the media each holds and the count of the rest; a
+count it cannot read is said the same way. Either way the operation attaches. Attaching every session (`cowshed attach`
+without a name, or `--all`), the replay of an unfinished operation when a project opens, and the gateway's startup pass
+make no room; that pass mounts mains only and leaves sessions to attach on use (05_gateway.md, "Startup contract"), and
+a detach frees a workspace's build volume with its image (02_workspaces.md, "`cowshed attach` / `cowshed detach`").
+`doctor` reports `media-notification-cap`, a warning while fewer than 20 more images fit and never an error, and
+distinguishes stalled-helper retention from orphaned helpers (`orphaned-disk-image-helpers`): a stalled helper is not
+orphaned while it still owns an attached image.
 
 ### Freeing an image
 

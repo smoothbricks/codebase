@@ -956,9 +956,10 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
         serde_json::to_value(AttachOptions {
             browse: true,
             observed_path: Some(PathBuf::from("/Users/tester/Dev/widget")),
+            aggregate: false,
         })
         .unwrap(),
-        json!({"browse":true,"observedPath":"/Users/tester/Dev/widget"})
+        json!({"browse":true,"observedPath":"/Users/tester/Dev/widget","aggregate":false})
     );
     assert_eq!(
         serde_json::to_value(RemoveOptions {

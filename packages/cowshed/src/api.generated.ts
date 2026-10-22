@@ -266,6 +266,12 @@ export type AdoptionSkip =
 export type AttachOptions = {
   readonly browse?: boolean;
   readonly observedPath?: string;
+  /**
+   * One attach of an aggregate (`attach` with no name, `attach --all`): it makes no room under
+   * IOKit's IOMedia ceiling, since detaching some sessions to attach others frees nothing
+   * (02_workspaces.md, "Making room for an attach").
+   */
+  readonly aggregate?: boolean;
 };
 
 export type AuditDecision = 'allowed' | 'denied';
