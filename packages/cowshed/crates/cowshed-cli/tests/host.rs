@@ -11,8 +11,8 @@ use std::process::{Command, Stdio};
 use cowshed_core::api::call::{self, Arguments};
 use cowshed_core::api::dto::DiskCommandEvent;
 use cowshed_core::api::operations::{
-    HostBuildState, HostCredentialAdd, HostDiskCommand, HostLockHolders, HostRetireDescendants,
-    HostTreeHolders, SccacheStatusRead,
+    HostBuildState, HostCredentialAdd, HostDiskCommand, HostFdHolders, HostLockHolders,
+    HostRetireDescendants, HostTreeHolders, SccacheStatusRead,
 };
 use cowshed_core::build_volume::{BUILD_LINK, BuildVolumeState};
 use cowshed_core::capabilities::BuildStatePath;
@@ -252,6 +252,83 @@ async fn a_host_connection_answers_the_holder_censuses_and_retirement_as_their_v
         serde_json::to_value(&retirement).unwrap(),
         serde_json::json!({ "kind": "refused", "reason": "foldUnavailable" })
     );
+
+    drop(host);
+    let output = child
+        .wait_with_output()
+        .await
+        .expect("wait for cowshed host");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    drop(holder.stdin.take());
+    assert!(holder.wait().unwrap().success());
+}
+
+/// `host.fdHolders` answers what `fd-holders` prints: here a child handed this test's pipe as its
+/// stdout and a file as its stderr, named by both descriptors in one census, which on Darwin reads
+/// every process's pipes, sockets and files. Other users' processes come and go between the two
+/// censuses, so the holders compare whole and `uninspected` is only present in each.
+#[tokio::test]
+async fn a_host_connection_answers_fd_holders_as_the_verb_prints_them() {
+    use std::os::fd::AsRawFd as _;
+
+    let root = temp_root::TempRoot::new_in(&temp_parent::canonical_parent(), "cowshed-host-fds");
+    let file = std::fs::File::create(root.join("held")).unwrap();
+    let (_read, write) = std::io::pipe().unwrap();
+    let mut options: Vec<std::ffi::OsString> = vec!["fd-holders".into()];
+    let mut arguments = Arguments::new();
+    let mut named = Vec::new();
+    for descriptor in [write.as_raw_fd(), file.as_raw_fd()] {
+        let (kind, option, value) = match cowshed_os::process::descriptor_name(descriptor).unwrap()
+        {
+            cowshed_os::process::DescriptorName::Device(address) => {
+                ("device", "--device", format!("0x{address:x}"))
+            }
+            cowshed_os::process::DescriptorName::Inode(inode) => {
+                ("inode", "--inode", inode.to_string())
+            }
+            other => panic!("a pipe or a file is named by its address or inode, not {other:?}"),
+        };
+        options.extend([option.into(), value.clone().into()]);
+        arguments
+            .entry(format!("{kind}s"))
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(value));
+        named.push(serde_json::json!({ "kind": kind, kind: value }));
+    }
+    let mut holder = Command::new("cat")
+        .stdin(Stdio::piped())
+        .stdout(write)
+        .stderr(file)
+        .spawn()
+        .unwrap();
+    let options: Vec<&std::ffi::OsStr> =
+        options.iter().map(std::ffi::OsString::as_os_str).collect();
+    let printed = printed(&options, b"");
+
+    let (host, child) = host_without_supervisor().await;
+    let answered = call::call::<HostFdHolders, _>(&host, arguments)
+        .await
+        .expect("host.fdHolders");
+    let answered = serde_json::to_value(&answered).unwrap();
+    assert_eq!(answered["holders"], printed[0]["holders"]);
+    assert!(printed[0]["uninspected"].is_u64(), "{}", printed[0]);
+    assert!(answered["uninspected"].is_u64(), "{answered}");
+    let pid = i32::try_from(holder.id()).unwrap();
+    let held = answered["holders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|held| held["pid"] == pid)
+        .unwrap_or_else(|| panic!("the child is named: {answered}"));
+    assert_eq!(held["descriptors"], serde_json::json!([1, 2]), "{answered}");
+    assert_eq!(held["matches"], serde_json::json!(named), "{answered}");
 
     drop(host);
     let output = child

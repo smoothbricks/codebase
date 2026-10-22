@@ -52,6 +52,7 @@ export interface NativeHostOperations
     NativeHostGatewayStop,
     NativeHostLockHolders,
     NativeHostTreeHolders,
+    NativeHostFdHolders,
     NativeHostRetireDescendants,
     NativeHostCredentialAdd,
     NativeHostDiskCommand {}
@@ -839,6 +840,21 @@ export function hostDiskCommand(
   args: HostDiskCommandArguments,
 ): EventIterator<Api.DiskCommandEvent> {
   return eventIterator(() => handle.diskCommand(JSON.stringify(args)), R.readDiskCommandEvent);
+}
+
+/** A handle that serves `host.fdHolders`. */
+export interface NativeHostFdHolders {
+  fdHolders(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.fdHolders` caller names; its handle binds the rest. */
+export type HostFdHoldersArguments = Pick<Api.FdHoldersRequest, 'devices' | 'inodes'>;
+
+/**
+ * Every process with a descriptor on one of the kernel objects a caller names.
+ */
+export async function hostFdHolders(handle: NativeHostFdHolders, args: HostFdHoldersArguments): Promise<Api.FdHolders> {
+  return R.readFdHolders(await handle.fdHolders(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.forgetAbandoned`. */

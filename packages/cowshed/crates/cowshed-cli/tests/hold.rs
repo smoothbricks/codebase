@@ -12,7 +12,9 @@
 //!   holding them;
 //! - a malformed request and a command that cannot start fail the hold with cowshed's own codes,
 //!   and a signal the holder receives reaches the group as a request does;
-//! - under `cowshed lock`, the hold is the lock's command and its group is the hold's.
+//! - under `cowshed lock`, the hold is the lock's command and its group is the hold's;
+//! - `cowshed fd-holders`, given the name `started` gave the leader's stdout, names a descendant
+//!   that left the group and still holds it, once the leader exited.
 #![cfg(unix)]
 
 use std::ffi::OsStr;
@@ -587,6 +589,157 @@ fn group_of(pid: i32) -> i32 {
     let group = unsafe { libc::getpgid(pid) };
     assert!(group > 0, "getpgid({pid}): {}", io::Error::last_os_error());
     group
+}
+
+/// What `cowshed fd-holders` prints for the object `name` names, parsed, and how long the census
+/// took on this host, process start included.
+fn fd_holders(name: HeldDescriptor) -> (serde_json::Value, std::time::Duration) {
+    let (option, value) = match name {
+        HeldDescriptor::Device { device } => ("--device", device.to_string()),
+        HeldDescriptor::Inode { inode } => ("--inode", inode.to_string()),
+        other => panic!("started names an output by its address or its inode, not {other:?}"),
+    };
+    let began = std::time::Instant::now();
+    let printed = Command::new(cowshed())
+        .args(["fd-holders", option, &value])
+        .output()
+        .expect("run cowshed fd-holders");
+    let took = began.elapsed();
+    assert!(
+        printed.status.success(),
+        "fd-holders failed: {}",
+        String::from_utf8_lossy(&printed.stderr)
+    );
+    (
+        serde_json::from_slice(&printed.stdout).expect("fd-holders prints one JSON object"),
+        took,
+    )
+}
+
+/// A process this test started in a session of its own, killed when the test lets it go.
+struct Escaped(Option<i32>);
+
+impl Escaped {
+    fn end(&mut self) {
+        if let Some(pid) = self.0.take() {
+            // SAFETY: kill takes plain integers and touches no memory of ours.
+            assert_eq!(
+                unsafe { libc::kill(pid, libc::SIGKILL) },
+                0,
+                "kill {pid}: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+impl Drop for Escaped {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// The watchdog's diagnosis (02_workspaces.md "Descriptor holders: `cowshed fd-holders`"): the
+/// leader exits while a descendant that left its session and group with `setsid` keeps its
+/// stdout. Given the name `started` gave that stdout, `fd-holders` names the descendant: its pid,
+/// the life the kernel gives it (the same on a second census), its descriptor 1 and that object.
+/// The held leader, exited, holds nothing, and the holder kept no copy, so on Darwin, where the
+/// write end has an address of its own, the descendant is the only holder; on Linux the pipe's
+/// one inode is also this test's read end. Once the descendant ends, it holds nothing. Each
+/// census's wall time on this host is said on stderr for the record, never asserted.
+#[test]
+fn fd_holders_names_a_descendant_that_left_the_group_holding_the_output() {
+    let mut hold = Hold::start(
+        &[],
+        &[
+            os("sh"),
+            os("-c"),
+            os(
+                "/usr/bin/perl -MPOSIX -e '$| = 1; POSIX::setsid() > 0 or die \"setsid: $!\"; \
+                 close STDIN; print \"$$\\n\"; sleep 600' & exit 3",
+            ),
+        ],
+        |_| {},
+    );
+    let (leader, stdout, _) = hold.started();
+    assert_eq!(
+        hold.event(),
+        HoldEvent::Exited {
+            status: ExitStatus::Exited { code: 3 }
+        }
+    );
+    let mut output = BufReader::new(hold.stdout.take().expect("stdout"));
+    let mut line = String::new();
+    output.read_line(&mut line).expect("the descendant's pid");
+    let pid: i32 = line.trim().parse().expect("a pid");
+    let mut descendant = Escaped(Some(pid));
+    assert_eq!(
+        group_of(pid),
+        pid,
+        "the descendant leads a group of its own"
+    );
+    assert_ne!(
+        group_of(pid),
+        leader,
+        "the descendant left the leader's group"
+    );
+    assert!(
+        process_state(leader).starts_with('Z'),
+        "the exited leader is held unreaped"
+    );
+
+    let (first, took) = fd_holders(stdout);
+    cowshed_os::eprintln!("fd-holders census on this host: {took:?}");
+    let holders = first["holders"].as_array().expect("holders");
+    let named = holders
+        .iter()
+        .find(|holder| holder["pid"] == pid)
+        .unwrap_or_else(|| panic!("the descendant is named: {first}"));
+    assert_eq!(named["descriptors"], serde_json::json!([1]), "{first}");
+    assert_eq!(named["matches"], serde_json::json!([stdout]), "{first}");
+    let others: Vec<_> = holders
+        .iter()
+        .filter(|holder| holder["pid"] != pid)
+        .map(|holder| holder["pid"].clone())
+        .collect();
+    let this = if cfg!(target_os = "linux") {
+        vec![serde_json::json!(std::process::id())]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(others, this, "{first}");
+    assert!(first["uninspected"].is_u64(), "{first}");
+
+    let (second, took) = fd_holders(stdout);
+    cowshed_os::eprintln!("fd-holders census on this host: {took:?}");
+    let again = second["holders"]
+        .as_array()
+        .expect("holders")
+        .iter()
+        .find(|holder| holder["pid"] == pid)
+        .unwrap_or_else(|| panic!("the descendant is named again: {second}"));
+    assert_eq!(
+        again["uniqueId"], named["uniqueId"],
+        "one life, one identity"
+    );
+
+    descendant.end();
+    let mut rest = String::new();
+    output
+        .read_to_string(&mut rest)
+        .expect("the output ends with the descendant");
+    assert_eq!(rest, "");
+    let (after, _) = fd_holders(stdout);
+    let left: Vec<_> = after["holders"]
+        .as_array()
+        .expect("holders")
+        .iter()
+        .map(|holder| holder["pid"].clone())
+        .collect();
+    assert_eq!(left, this, "{after}");
+    hold.request("release");
+    assert_eq!(hold.wait().code(), Some(3));
+    assert_eq!(hold.rest(), "");
 }
 
 /// The brief's composition, `cowshed lock <lock> --state-fd 3 -- cowshed hold --control-fd 4

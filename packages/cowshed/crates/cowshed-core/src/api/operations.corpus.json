@@ -281,6 +281,7 @@
     "stdin": { "encoding": "utf8", "data": "" }
   },
   "host.treeHolders": { "path": "/trusted/acme/widget" },
+  "host.fdHolders": { "devices": ["0x1c8cfdee8d6f6f3"], "inodes": ["7"] },
   "host.retireDescendants": {
     "handle": { "jobId": 7, "index": 2, "incarnation": "0123456789abcdef0123456789abcdef" },
     "graceMs": 500

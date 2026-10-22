@@ -1300,6 +1300,13 @@ pub(crate) fn process_record(pid: i32) -> io::Result<Option<ProcessRecord>> {
     Ok(running_info(pid)?.map(|info| record_of(&info)))
 }
 
+/// The kernel's identity of the life `pid` names now: its unique id (`p_uniqueid`), which the
+/// kernel never gives another process. `None` once it has exited, reaped or not.
+#[cfg(target_os = "macos")]
+pub(crate) fn life_of(pid: i32) -> io::Result<Option<u64>> {
+    Ok(process_record(pid)?.map(|record| record.unique_id))
+}
+
 #[cfg(target_os = "macos")]
 fn record_of(info: &BsdInfoWithUniqueId) -> ProcessRecord {
     ProcessRecord {
@@ -2220,6 +2227,13 @@ fn start_time(pid: i32) -> io::Result<Option<u64>> {
         .parse()
         .map(Some)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// The identity of the life `pid` names now: its start time in clock ticks since boot, which no
+/// later process given the pid shares. `None` once nothing holds the pid.
+#[cfg(target_os = "linux")]
+pub(crate) fn life_of(pid: i32) -> io::Result<Option<u64>> {
+    start_time(pid)
 }
 
 #[cfg(test)]

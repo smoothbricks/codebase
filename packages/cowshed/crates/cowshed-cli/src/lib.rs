@@ -6,6 +6,7 @@ pub mod capabilities;
 pub mod controller_service;
 pub mod credential_service;
 pub mod disk_command;
+mod fd_holders;
 pub mod forget;
 pub mod gateway_service;
 pub mod help;

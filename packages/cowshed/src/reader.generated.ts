@@ -75,6 +75,11 @@ type ReaderName =
   | 'EXIT_STATUS__EXITED'
   | 'EXIT_STATUS__SIGNALED'
   | 'FAILED_CHECK'
+  | 'FD_HOLDER'
+  | 'FD_HOLDERS'
+  | 'FD_IDENTITY'
+  | 'FD_IDENTITY__DEVICE'
+  | 'FD_IDENTITY__INODE'
   | 'FINDING'
   | 'FINDING_SEVERITY'
   | 'GATEWAY_CPU_BUDGET'
@@ -237,6 +242,8 @@ type ReaderName =
   | 'SEQ__DATABASE_HOLDER'
   | 'SEQ__EGRESS_RULE'
   | 'SEQ__FAILED_CHECK'
+  | 'SEQ__FD_HOLDER'
+  | 'SEQ__FD_IDENTITY'
   | 'SEQ__FINDING'
   | 'SEQ__GC_CANDIDATE'
   | 'SEQ__GC_DEFERRED'
@@ -732,6 +739,33 @@ const READERS: Readers<ReaderName> = {
       ['exit', 'LEAF'],
     ],
   },
+  FD_HOLDER: {
+    kind: 'record',
+    fields: [
+      ['pid', 'LEAF'],
+      ['uniqueId', 'LEAF'],
+      ['command', 'LEAF'],
+      ['descriptors', 'LEAF'],
+      ['matches', 'SEQ__FD_IDENTITY'],
+    ],
+  },
+  FD_HOLDERS: {
+    kind: 'record',
+    fields: [
+      ['holders', 'SEQ__FD_HOLDER'],
+      ['uninspected', 'LEAF'],
+    ],
+  },
+  FD_IDENTITY: {
+    kind: 'internal',
+    tag: 'kind',
+    arms: [
+      ['device', 'FD_IDENTITY__DEVICE'],
+      ['inode', 'FD_IDENTITY__INODE'],
+    ],
+  },
+  FD_IDENTITY__DEVICE: { kind: 'record', fields: [['device', 'LEAF']] },
+  FD_IDENTITY__INODE: { kind: 'record', fields: [['inode', 'LEAF']] },
   FINDING: {
     kind: 'record',
     fields: [
@@ -1764,6 +1798,8 @@ const READERS: Readers<ReaderName> = {
   SEQ__DATABASE_HOLDER: { kind: 'seq', element: 'DATABASE_HOLDER' },
   SEQ__EGRESS_RULE: { kind: 'seq', element: 'EGRESS_RULE' },
   SEQ__FAILED_CHECK: { kind: 'seq', element: 'FAILED_CHECK' },
+  SEQ__FD_HOLDER: { kind: 'seq', element: 'FD_HOLDER' },
+  SEQ__FD_IDENTITY: { kind: 'seq', element: 'FD_IDENTITY' },
   SEQ__FINDING: { kind: 'seq', element: 'FINDING' },
   SEQ__GC_CANDIDATE: { kind: 'seq', element: 'GC_CANDIDATE' },
   SEQ__GC_DEFERRED: { kind: 'seq', element: 'GC_DEFERRED' },
@@ -2119,6 +2155,9 @@ export const readDoctorReport = (json: string): Api.DoctorReport =>
 
 export const readEmptyResult = (json: string): Api.EmptyResult =>
   V.assertEmptyResult(project(JSON.parse(json), 'EMPTY_RESULT', READERS));
+
+export const readFdHolders = (json: string): Api.FdHolders =>
+  V.assertFdHolders(project(JSON.parse(json), 'FD_HOLDERS', READERS));
 
 export const readGatewayStatus = (json: string): Api.GatewayStatus =>
   V.assertGatewayStatus(project(JSON.parse(json), 'GATEWAY_STATUS', READERS));

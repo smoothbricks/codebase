@@ -25,7 +25,9 @@ use super::dto::{
     GatewayStatus, IdentityReport, MountResult, NxStoreClearResult, ProjectWorkspaces,
     SccacheStatus, SkillInstallReport,
 };
-use super::held_lock::LockObservation;
+use super::fd_holder::FdHolders;
+use super::held_lock::{DecimalU64, LockObservation};
+use super::hold::KernelAddress;
 use super::process::{JobProcessEvent, JobProcessTree, JobSubtreeHandle, JobSubtreeRetirement};
 use super::reader::{Projected, project};
 use super::resources::{JobResourceSample, SampleInterval};
@@ -440,6 +442,8 @@ operations! {
     host json "host.lockHolders" HostLockHolders(HostPathRequest) -> LockObservation;
     /// Every process of this user holding something inside a directory tree.
     host json "host.treeHolders" HostTreeHolders(HostPathRequest) -> Vec<TreeHolder>;
+    /// Every process with a descriptor on one of the kernel objects a caller names.
+    host json "host.fdHolders" HostFdHolders(FdHoldersRequest) -> FdHolders;
     /// Asks the job supervisor this host connection runs under to retire a retained subtree.
     host json "host.retireDescendants" HostRetireDescendants(RetireDescendantsRequest) -> JobSubtreeRetirement;
     /// Enrols a scoped gateway registry credential for a project; `upload` secrets travel as the
@@ -1086,6 +1090,17 @@ pub struct GatewayStopRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HostPathRequest {
     pub path: PathBuf,
+}
+
+/// `fd-holders [--device <0x…>]… [--inode <n>]…`: the kernel objects whose holders the census
+/// names, as `hold`'s `started.output` names them; at least one.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FdHoldersRequest {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<KernelAddress>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inodes: Vec<DecimalU64>,
 }
 
 /// `retire-descendants --grace-ms`: the handle is the verb's standard input.

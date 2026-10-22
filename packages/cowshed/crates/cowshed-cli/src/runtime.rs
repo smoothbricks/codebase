@@ -258,6 +258,7 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         | Command::LockHolders(_)
         | Command::Hold(_)
         | Command::TreeHolders(_)
+        | Command::FdHolders(_)
         | Command::Controller
         | Command::Host(_)
         | Command::Credential(_)
@@ -330,6 +331,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::LockHolders(_)
         | Command::Hold(_)
         | Command::TreeHolders(_)
+        | Command::FdHolders(_)
         | Command::Controller
         | Command::Host(_)
         | Command::Credential(_)
@@ -444,6 +446,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         | Command::LockHolders(_)
         | Command::Hold(_)
         | Command::TreeHolders(_)
+        | Command::FdHolders(_)
         | Command::Controller
         | Command::Host(_)
         | Command::Sccache(_)
@@ -2222,11 +2225,13 @@ where
         Command::SubtreeRoot(_) | Command::RetireDescendants(_) => Err(CowshedError::internal(
             "subtree commands use the native supervisor socket before the runtime bridge",
         )),
-        Command::Lock(_) | Command::LockHolders(_) | Command::Hold(_) | Command::TreeHolders(_) => {
-            Err(CowshedError::internal(
-                "lock, lock-holders, hold and tree-holders name no project and are dispatched before the runtime bridge",
-            ))
-        }
+        Command::Lock(_)
+        | Command::LockHolders(_)
+        | Command::Hold(_)
+        | Command::TreeHolders(_)
+        | Command::FdHolders(_) => Err(CowshedError::internal(
+            "lock, lock-holders, hold, tree-holders and fd-holders name no project and are dispatched before the runtime bridge",
+        )),
         Command::Controller | Command::Host(_) => Err(CowshedError::internal(
             "a connection-serving verb serves its own connection and is dispatched before the runtime bridge",
         )),

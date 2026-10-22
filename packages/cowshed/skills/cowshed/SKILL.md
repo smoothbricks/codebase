@@ -75,6 +75,7 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 | See who holds a lock    | `cowshed lock-holders <path>`                                        | The kernel's account of a lock file as JSON: each descriptor's custody (`holds`, `open`, `recorded`, Darwin's `unexposed`); observes only.                                                                                                 |
 | Hold a command's group  | `cowshed hold --control-fd <n> --state-fd <m> -- <cmd>`              | Run a command as an unreaped session leader cowshed stays outside of; `signal <SIG>` on `n` reaches its whole group while held; `release` reaps, EOF before it ends the group (TERM, grace, KILL); `HoldEvent` lines on `m`.               |
 | Inspect tree holders    | `cowshed tree-holders <path>`                                        | Observe processes holding a working directory, root, executable, open file or mapping under a tree; one generated `TreeHolder` JSON value per line, with exact tagged path bytes. Never signals them.                                      |
+| Inspect fd holders      | `cowshed fd-holders --device <0x…> \| --inode <n>`                   | Observe every process with a descriptor on a pipe, socket or file named as `hold`'s `started.output` names it; one generated `FdHolders` object: each holder's pid, life, descriptors, matches, and an `uninspected` count.                |
 
 ## Merge flow
 

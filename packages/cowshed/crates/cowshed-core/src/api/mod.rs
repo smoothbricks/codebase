@@ -1,6 +1,7 @@
 pub mod call;
 pub mod capability;
 pub mod dto;
+pub mod fd_holder;
 pub(crate) mod frame;
 pub mod held_lock;
 pub mod hold;

@@ -164,6 +164,9 @@ async fn answer(request: RouterRequest) -> Result<RouterResponse> {
         Op::HostTreeHolders(request) => {
             respond::<operations::HostTreeHolders>(&crate::tree_holders::holders(&request.path)?)
         }
+        Op::HostFdHolders(request) => {
+            respond::<operations::HostFdHolders>(&crate::fd_holders::holders(&request)?)
+        }
         Op::HostRetireDescendants(request) => respond::<operations::HostRetireDescendants>(
             &crate::subtree::retire_handle(
                 request.handle,

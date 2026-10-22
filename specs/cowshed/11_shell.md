@@ -223,14 +223,15 @@ command's, and once the command runs `hold` keeps no copy of its standard stream
 - **State.** `m` carries one `HoldEvent` per line, as JSON, read with the generated validator of that type.
   `started {pid, birth, output}` names the leader, its birth identity and the descriptors it was handed as 1 and 2, in
   the form `lsof -F di` prints them: the pipe or socket address (`d`) on Darwin, the inode (`i`) otherwise, read
-  natively from `hold`'s own copies before it lets them go, so a caller names their later holders from one host-wide
-  `lsof -F pfdi` instead of a probe per step. `exited {status}` is the leader's exit, observed without reaping it, in
-  the `ExitStatus` form every job's exit has. `signalled {signal}` and `notSignalled {signal, reason}` answer each
-  signal. `failed {reason}` says no command runs and is the last line. `commandFailed {pid, reason}` says `hold` failed
-  once its leader ran -- before `started`, when it could not give up its standard streams, or after it. No `release` can
-  arrive any more, so `hold` ends the group as at the end of `n` before a release, answering each signal on `m`, then
-  releases the leader, answers each signal it receives, and ends with `exited` once the leader is reaped. When ending
-  the group, that release or that wait fails, a last `commandFailed` says what failed.
+  natively from `hold`'s own copies before it lets them go, so a caller names their later holders from one
+  `cowshed fd-holders` census (02_workspaces.md, "Descriptor holders: `cowshed fd-holders`") instead of a probe per
+  step. `exited {status}` is the leader's exit, observed without reaping it, in the `ExitStatus` form every job's exit
+  has. `signalled {signal}` and `notSignalled {signal, reason}` answer each signal. `failed {reason}` says no command
+  runs and is the last line. `commandFailed {pid, reason}` says `hold` failed once its leader ran -- before `started`,
+  when it could not give up its standard streams, or after it. No `release` can arrive any more, so `hold` ends the
+  group as at the end of `n` before a release, answering each signal on `m`, then releases the leader, answers each
+  signal it receives, and ends with `exited` once the leader is reaped. When ending the group, that release or that wait
+  fails, a last `commandFailed` says what failed.
 - **Control.** `n` carries one request per line. `signal <SIG>` sends `kill(-pgid, SIG)` only while the leader is held,
   and is answered `notSignalled` with the reason once the leader was reaped, when its birth was never observed, or when
   the kernel refuses. `release` reaps the leader once it has exited; signals are still served until the reap. A release

@@ -1041,6 +1041,69 @@ export type FailedCheck = {
 };
 
 /**
+ * One process with a descriptor on a named object.
+ */
+export type FdHolder = {
+  readonly pid: number & tags.Type<'int32'>;
+  /**
+   * The kernel's identity of the process's life, read before and after its descriptors: on
+   * Darwin its unique id (`p_uniqueid`), on Linux its start time in clock ticks since boot.
+   * With `pid` it names this process alone, never a later one given the pid.
+   */
+  readonly uniqueId: DecimalU64;
+  /**
+   * Its argument vector joined by spaces, each argument decoded lossily (or its executable's
+   * path, or `command unreadable`): never an identity.
+   */
+  readonly command: string;
+  /**
+   * Its descriptors on the named objects, ascending.
+   */
+  readonly descriptors: ReadonlyArray<number & tags.Type<'int32'>>;
+  /**
+   * The named objects those descriptors are on, each once, in the order of its first
+   * descriptor.
+   */
+  readonly matches: ReadonlyArray<FdIdentity>;
+};
+
+/**
+ * Every process with a descriptor on one of the named objects: `cowshed fd-holders`'s one JSON
+ * object, and what `host.fdHolders` answers.
+ */
+export type FdHolders = {
+  readonly holders: ReadonlyArray<FdHolder>;
+  /**
+   * The processes whose descriptors the kernel withheld from this user (another user's, unless
+   * the census runs as root). Any of them may hold an object: counted, never reported as
+   * holding none.
+   */
+  readonly uninspected: number & tags.Type<'uint32'>;
+};
+
+/**
+ * `fd-holders [--device <0x…>]… [--inode <n>]…`: the kernel objects whose holders the census
+ * names, as `hold`'s `started.output` names them; at least one.
+ */
+export type FdHoldersRequest = {
+  readonly devices?: ReadonlyArray<KernelAddress>;
+  readonly inodes?: ReadonlyArray<DecimalU64>;
+};
+
+/**
+ * One kernel object, as `lsof -F di` and `hold`'s `started.output` name it
+ * ([`super::hold::HeldDescriptor`]): a Darwin pipe end or socket by its address, anything else,
+ * and on Linux every descriptor, by its inode.
+ */
+export type FdIdentity =
+  | ({ readonly kind: 'device' } & {
+      readonly device: KernelAddress;
+    })
+  | ({ readonly kind: 'inode' } & {
+      readonly inode: DecimalU64;
+    });
+
+/**
  * Why a rebase or land refused at one of its fences (02_workspaces.md), with what the fence
  * observed. Every variant is a `Conflict` that left the source workspace and the target as they
  * were; the observed value is what a caller would otherwise read back to decide its next move.

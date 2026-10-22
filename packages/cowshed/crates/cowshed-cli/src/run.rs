@@ -315,6 +315,9 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     if let args::Command::TreeHolders(tree) = &parsed.command {
         return Ok(crate::tree_holders::dispatch(tree, &mut output));
     }
+    if let args::Command::FdHolders(request) = &parsed.command {
+        return Ok(crate::fd_holders::dispatch(request, &mut output));
+    }
     if let args::Command::Skill(skill_args) = &parsed.command {
         let outcome = skill::dispatch(skill_args, &parsed.global, &mut output);
         return Ok(finish(outcome, &mut output, json));

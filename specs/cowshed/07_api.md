@@ -2236,10 +2236,11 @@ Served rows: `host.listProjects` (`ls --all`, with `ls`'s landing selection), `h
 `host.gatewayStart`, `host.gatewayStop` (`purge`), `host.credentialStatus`, `host.credentialRemove`, `host.identityAdd`,
 `host.skillInstall`, `host.buildState`, `host.clearNxStore` (`cache clear`'s gateway half), `host.lockHolders`
 (`lock-holders`: the `LockObservation` it prints), `host.treeHolders` (`tree-holders`: its `TreeHolder` lines as one
-list) and `host.retireDescendants` (`retire-descendants`: the handle the verb reads on stdin is the request's `handle`,
-and the supervisor asked is the one `COWSHED_SUPERVISOR_SOCKET` names in the `cowshed host` process, which inherits the
-environment of the process that called `openHost`; no socket is the typed `foldUnavailable` refusal, as the verb prints
-it).
+list), `host.fdHolders` (`fd-holders`: the `FdHolders` object it prints, the `--device` and `--inode` values as the
+request's `devices` and `inodes`) and `host.retireDescendants` (`retire-descendants`: the handle the verb reads on stdin
+is the request's `handle`, and the supervisor asked is the one `COWSHED_SUPERVISOR_SOCKET` names in the `cowshed host`
+process, which inherits the environment of the process that called `openHost`; no socket is the typed `foldUnavailable`
+refusal, as the verb prints it).
 
 `host.diskCommand` (a stream row) is `disk-command` through the same runner: the host's disk lease, the child's own
 session, `deadlineMs` exactly as `--deadline-ms` (an ordinary verb's total admission-and-child budget, 120 s when

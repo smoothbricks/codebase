@@ -283,6 +283,26 @@ impl Serves<HostTreeHolders> for Host {
     }
 }
 
+impl Serves<HostFdHolders> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<FdHoldersRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            #[serde(default)]
+            devices: Vec<KernelAddress>,
+            #[serde(default)]
+            inodes: Vec<DecimalU64>,
+        }
+        let Caller { devices, inodes } = decode::<HostFdHolders, Caller>(arguments)?;
+        Ok(FdHoldersRequest { devices, inodes })
+    }
+}
+
 impl Serves<HostRetireDescendants> for Host {
     const BOUND: &'static [&'static str] = &[];
 
@@ -1914,6 +1934,7 @@ pub(crate) fn each_served(check: &mut impl EachServed, handles: &Handles<'_>) {
     check.served::<HostGatewayStop, _>(handles.host, &[]);
     check.served::<HostLockHolders, _>(handles.host, &[]);
     check.served::<HostTreeHolders, _>(handles.host, &[]);
+    check.served::<HostFdHolders, _>(handles.host, &[]);
     check.served::<HostRetireDescendants, _>(handles.host, &[]);
     check.served::<HostCredentialAdd, _>(handles.host, &[]);
     check.served::<HostDiskCommand, _>(handles.host, &[]);

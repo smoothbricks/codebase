@@ -449,6 +449,20 @@ fn listening_port(pid: libc::pid_t, local_port: libc::c_int) -> io::Result<u16> 
 /// Every descriptor of process `pid` (`PROC_PIDLISTFDS`).
 #[cfg(target_os = "macos")]
 fn descriptors(pid: libc::pid_t) -> io::Result<Vec<libc::proc_fdinfo>> {
+    listing(pid)?.map_err(|unread| {
+        let error = io::Error::from_raw_os_error(unread.errno());
+        io::Error::new(
+            error.kind(),
+            format!("the descriptors of process {pid} cannot be listed: {error}"),
+        )
+    })
+}
+
+/// Every descriptor of process `pid` (`PROC_PIDLISTFDS`), or why the kernel listed none: the
+/// process exited (`ESRCH`) or is withheld from this user (`EPERM`). Any other refusal is an
+/// error.
+#[cfg(target_os = "macos")]
+fn listing(pid: libc::pid_t) -> io::Result<Result<Vec<libc::proc_fdinfo>, Unread>> {
     let empty = libc::proc_fdinfo {
         proc_fd: 0,
         proc_fdtype: 0,
@@ -470,13 +484,14 @@ fn descriptors(pid: libc::pid_t) -> io::Result<Vec<libc::proc_fdinfo>> {
         };
         if written <= 0 {
             let error = io::Error::last_os_error();
-            return if written == 0 && error.raw_os_error() == Some(0) {
-                Ok(Vec::new())
-            } else {
-                Err(io::Error::new(
+            return match (written, error.raw_os_error()) {
+                (0, Some(0)) => Ok(Ok(Vec::new())),
+                (_, Some(libc::ESRCH)) => Ok(Err(Unread::Gone)),
+                (_, Some(libc::EPERM)) => Ok(Err(Unread::Withheld)),
+                _ => Err(io::Error::new(
                     error.kind(),
                     format!("the descriptors of process {pid} cannot be listed: {error}"),
-                ))
+                )),
             };
         }
         let written = usize::try_from(written).map_err(io::Error::other)?;
@@ -491,7 +506,7 @@ fn descriptors(pid: libc::pid_t) -> io::Result<Vec<libc::proc_fdinfo>> {
         // A full buffer is never evidence that every descriptor was listed.
         if count < descriptors.len() {
             descriptors.truncate(count);
-            return Ok(descriptors);
+            return Ok(Ok(descriptors));
         }
         let length = descriptors.len().checked_mul(2).ok_or_else(|| {
             io::Error::new(
@@ -770,7 +785,7 @@ fn socket_inode(target: &[u8]) -> Option<u64> {
 /// Darwin names a pipe or a socket by, or its `i` field, the inode of anything else, and of every
 /// descriptor on Linux, where a pipe or a socket is an inode of its own filesystem. Every process
 /// that shares the descriptor's open file description shows the same name, so a caller that read
-/// it once finds every later holder of that description in one `lsof -F pfdi` listing.
+/// it once finds every later holder of that description in one census ([`descriptor_names`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DescriptorName {
     /// lsof's `d` field: the kernel's address of a pipe end, of a TCP socket's control block, or
@@ -785,8 +800,43 @@ pub enum DescriptorName {
     Unnamed { fd_type: u32 },
 }
 
+/// Why another process's descriptors were not read ([`descriptor_names`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Unread {
+    /// The process exited, or no process has the pid, before they were read.
+    Gone,
+    /// The kernel withholds them from this user: another user's process, as a census not run as
+    /// root meets it.
+    Withheld,
+}
+
+#[cfg(target_os = "macos")]
+impl Unread {
+    /// The kernel's error for it: `ESRCH` or `EPERM`.
+    fn errno(self) -> i32 {
+        match self {
+            Self::Gone => libc::ESRCH,
+            Self::Withheld => libc::EPERM,
+        }
+    }
+}
+
+/// Which names a reading of another process's descriptors needs ([`descriptor_names`]). On
+/// Darwin each name costs one `proc_pidfdinfo`, so a census matching only pipes and sockets reads
+/// no file and one matching only files reads no pipe or socket. Linux names every descriptor by
+/// its inode and has no address to read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NameKinds {
+    /// Pipes and sockets, named by the address in lsof's `d` field (Darwin).
+    pub devices: bool,
+    /// Whatever is named by the inode in lsof's `i` field: a file on Darwin, every descriptor on
+    /// Linux.
+    pub inodes: bool,
+}
+
 /// The name `lsof -F di` gives this process's `descriptor` ([`DescriptorName`]), read from the
-/// kernel: the descriptor list and `proc_pidfdinfo` for a pipe or socket, `fstat(2)` otherwise.
+/// kernel as [`descriptor_names`] reads another process's: the descriptor list, then the one
+/// `proc_pidfdinfo` record of its kind.
 #[cfg(target_os = "macos")]
 pub fn descriptor_name(descriptor: std::os::fd::RawFd) -> io::Result<DescriptorName> {
     // SAFETY: getpid has no failure and touches no memory.
@@ -797,29 +847,13 @@ pub fn descriptor_name(descriptor: std::os::fd::RawFd) -> io::Result<DescriptorN
     else {
         return Ok(DescriptorName::Closed);
     };
-    let fd_type = libc::c_int::try_from(listed.proc_fdtype).map_err(io::Error::other)?;
-    match fd_type {
-        libc::PROX_FDTYPE_PIPE => Ok(DescriptorName::Device(
-            descriptor_info::<PipeFdInfo>(pid, descriptor, PROC_PIDFDPIPEINFO)?
-                .ppi
-                .pipe_handle,
-        )),
-        libc::PROX_FDTYPE_SOCKET => {
-            let info = descriptor_info::<SocketFdInfo>(pid, descriptor, PROC_PIDFDSOCKETINFO)?.psi;
-            Ok(DescriptorName::Device(if info.soi_kind == SOCKINFO_TCP {
-                // SAFETY: the kernel fills `pri_tcp` for a socket of kind `SOCKINFO_TCP`.
-                unsafe { info.soi_proto.pri_tcp }.tcpsi_tp
-            } else {
-                info.soi_pcb
-            }))
-        }
-        libc::PROX_FDTYPE_VNODE => {
-            Ok(inode(descriptor)?.map_or(DescriptorName::Closed, DescriptorName::Inode))
-        }
-        _ => Ok(DescriptorName::Unnamed {
-            fd_type: listed.proc_fdtype,
-        }),
-    }
+    name_of(pid, listed)?.map_err(|unread| {
+        let error = io::Error::from_raw_os_error(unread.errno());
+        io::Error::new(
+            error.kind(),
+            format!("descriptor {descriptor} cannot be read: {error}"),
+        )
+    })
 }
 
 /// [`descriptor_name`] on Linux: every descriptor is named by the inode `fstat(2)` reports, a
@@ -829,7 +863,90 @@ pub fn descriptor_name(descriptor: std::os::fd::RawFd) -> io::Result<DescriptorN
     Ok(inode(descriptor)?.map_or(DescriptorName::Closed, DescriptorName::Inode))
 }
 
+/// Every open descriptor of process `pid` of the `kinds` asked for, in descriptor order, each by
+/// number with the name [`descriptor_name`] gives it in that process; or why none were read. A
+/// descriptor closed while it is read is left out.
+#[cfg(target_os = "macos")]
+pub fn descriptor_names(
+    pid: libc::pid_t,
+    kinds: NameKinds,
+) -> io::Result<Result<Vec<(std::os::fd::RawFd, DescriptorName)>, Unread>> {
+    let listed = match listing(pid)? {
+        Ok(listed) => listed,
+        Err(unread) => return Ok(Err(unread)),
+    };
+    let mut named = Vec::new();
+    for listed in listed {
+        let wanted = match libc::c_int::try_from(listed.proc_fdtype) {
+            Ok(libc::PROX_FDTYPE_PIPE | libc::PROX_FDTYPE_SOCKET) => kinds.devices,
+            Ok(libc::PROX_FDTYPE_VNODE) => kinds.inodes,
+            _ => false,
+        };
+        if !wanted {
+            continue;
+        }
+        match name_of(pid, listed)? {
+            Ok(DescriptorName::Closed) => {}
+            Ok(name) => named.push((listed.proc_fd, name)),
+            Err(unread) => return Ok(Err(unread)),
+        }
+    }
+    Ok(Ok(named))
+}
+
+/// [`descriptor_names`] on Linux, from procfs: each `/proc/<pid>/fd` entry followed to its file,
+/// whose inode is the one `fstat(2)` in that process reports.
+#[cfg(target_os = "linux")]
+pub fn descriptor_names(
+    pid: libc::pid_t,
+    kinds: NameKinds,
+) -> io::Result<Result<Vec<(std::os::fd::RawFd, DescriptorName)>, Unread>> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let unread = |error: io::Error| match error.kind() {
+        io::ErrorKind::NotFound => Ok(Err(Unread::Gone)),
+        io::ErrorKind::PermissionDenied => Ok(Err(Unread::Withheld)),
+        _ => Err(io::Error::new(
+            error.kind(),
+            format!("the descriptors of process {pid} cannot be read: {error}"),
+        )),
+    };
+    if !kinds.inodes {
+        return Ok(Ok(Vec::new()));
+    }
+    let entries = match std::fs::read_dir(format!("/proc/{pid}/fd")) {
+        Ok(entries) => entries,
+        Err(error) => return unread(error),
+    };
+    let mut named = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => return unread(error),
+        };
+        let number = entry.file_name();
+        let descriptor = number
+            .to_str()
+            .and_then(|number| number.parse().ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("/proc/{pid}/fd lists {number:?}, which is no descriptor number"),
+                )
+            })?;
+        match std::fs::metadata(entry.path()) {
+            Ok(file) => named.push((descriptor, DescriptorName::Inode(file.ino()))),
+            // Closed since the directory was read: it names nothing now.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return unread(error),
+        }
+    }
+    named.sort_unstable_by_key(|(descriptor, _)| *descriptor);
+    Ok(Ok(named))
+}
+
 /// The inode `fstat(2)` reports for `descriptor`; `None` when it is not open.
+#[cfg(target_os = "linux")]
 fn inode(descriptor: std::os::fd::RawFd) -> io::Result<Option<u64>> {
     let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `status` is writable storage for one `stat`.
@@ -847,13 +964,71 @@ fn inode(descriptor: std::os::fd::RawFd) -> io::Result<Option<u64>> {
     Ok(Some(unsafe { status.assume_init() }.st_ino))
 }
 
-/// The record `proc_pidfdinfo` writes for `flavor` of process `pid`'s `descriptor`, whole.
+/// The name of `pid`'s listed descriptor ([`DescriptorName`]) from the one record
+/// `proc_pidfdinfo` writes for its kind: a pipe end's handle, a TCP socket's control block or
+/// another socket's protocol control block, a file's inode. A descriptor closed since its listing
+/// is closed; a revoked vnode is unnamed.
+#[cfg(target_os = "macos")]
+fn name_of(
+    pid: libc::pid_t,
+    listed: libc::proc_fdinfo,
+) -> io::Result<Result<DescriptorName, Unread>> {
+    let descriptor = listed.proc_fd;
+    let named = match libc::c_int::try_from(listed.proc_fdtype).map_err(io::Error::other)? {
+        libc::PROX_FDTYPE_PIPE => {
+            descriptor_info::<PipeFdInfo>(pid, descriptor, PROC_PIDFDPIPEINFO)?
+                .map(|info| DescriptorName::Device(info.ppi.pipe_handle))
+        }
+        libc::PROX_FDTYPE_SOCKET => {
+            descriptor_info::<SocketFdInfo>(pid, descriptor, PROC_PIDFDSOCKETINFO)?.map(|info| {
+                DescriptorName::Device(if info.psi.soi_kind == SOCKINFO_TCP {
+                    // SAFETY: the kernel fills `pri_tcp` for a socket of kind `SOCKINFO_TCP`.
+                    unsafe { info.psi.soi_proto.pri_tcp }.tcpsi_tp
+                } else {
+                    info.psi.soi_pcb
+                })
+            })
+        }
+        libc::PROX_FDTYPE_VNODE => {
+            match descriptor_info::<VnodeFdInfo>(pid, descriptor, PROC_PIDFDVNODEINFO)? {
+                Ok(info) => Ok(DescriptorName::Inode(info.pvi.vi_stat.vst_ino)),
+                // A revoked vnode (a terminal `revoke(2)` took away, which lsof shows as
+                // `(revoked)` with no node) has no inode to give: open, named by neither field.
+                Err(libc::ENOENT) => Ok(DescriptorName::Unnamed {
+                    fd_type: listed.proc_fdtype,
+                }),
+                Err(errno) => Err(errno),
+            }
+        }
+        _ => {
+            return Ok(Ok(DescriptorName::Unnamed {
+                fd_type: listed.proc_fdtype,
+            }));
+        }
+    };
+    match named {
+        Ok(name) => Ok(Ok(name)),
+        Err(libc::EBADF) => Ok(Ok(DescriptorName::Closed)),
+        Err(libc::ESRCH) => Ok(Err(Unread::Gone)),
+        Err(libc::EPERM) => Ok(Err(Unread::Withheld)),
+        Err(errno) => {
+            let error = io::Error::from_raw_os_error(errno);
+            Err(io::Error::new(
+                error.kind(),
+                format!("descriptor {descriptor} of process {pid} cannot be read: {error}"),
+            ))
+        }
+    }
+}
+
+/// The record `proc_pidfdinfo` writes for `flavor` of process `pid`'s `descriptor`, whole, or
+/// the errno the kernel refused it with.
 #[cfg(target_os = "macos")]
 fn descriptor_info<T: Copy>(
     pid: libc::pid_t,
     descriptor: std::os::fd::RawFd,
     flavor: libc::c_int,
-) -> io::Result<T> {
+) -> io::Result<Result<T, i32>> {
     let size = libc::c_int::try_from(std::mem::size_of::<T>()).map_err(io::Error::other)?;
     let mut info = std::mem::MaybeUninit::<T>::zeroed();
     // SAFETY: `info` is writable storage of exactly `size` bytes.
@@ -861,7 +1036,7 @@ fn descriptor_info<T: Copy>(
         unsafe { libc::proc_pidfdinfo(pid, descriptor, flavor, info.as_mut_ptr().cast(), size) };
     if written == size {
         // SAFETY: proc_pidfdinfo filled all `size` bytes.
-        return Ok(unsafe { info.assume_init() });
+        return Ok(Ok(unsafe { info.assume_init() }));
     }
     if written > 0 {
         return Err(io::Error::new(
@@ -872,11 +1047,7 @@ fn descriptor_info<T: Copy>(
             ),
         ));
     }
-    let error = io::Error::last_os_error();
-    Err(io::Error::new(
-        error.kind(),
-        format!("descriptor {descriptor} of process {pid} cannot be read: {error}"),
-    ))
+    Ok(Err(io::Error::last_os_error().raw_os_error().unwrap_or(0)))
 }
 
 /// `PROC_PIDFDPIPEINFO` (`<sys/proc_info.h>`), which the `libc` crate does not declare.
@@ -911,6 +1082,26 @@ const _: () = {
     assert!(offset_of!(PipeFdInfo, ppi.pipe_handle) == 160);
     assert!(offset_of!(SocketFdInfo, psi.soi_pcb) == 168);
     assert!(offset_of!(TcpSockInfo, tcpsi_tp) == 112);
+};
+
+/// `PROC_PIDFDVNODEINFO` (`<sys/proc_info.h>`), which the `libc` crate does not declare.
+#[cfg(target_os = "macos")]
+const PROC_PIDFDVNODEINFO: libc::c_int = 1;
+
+/// `struct vnode_fdinfo`: what `PROC_PIDFDVNODEINFO` writes.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct VnodeFdInfo {
+    _pfi: ProcFileInfo,
+    pvi: libc::vnode_info,
+}
+
+#[cfg(target_os = "macos")]
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<VnodeFdInfo>() == 176);
+    assert!(offset_of!(VnodeFdInfo, pvi) == 24);
 };
 
 /// Adds to `ports` the local port of each row of a procfs TCP table (`net/tcp`, `net/tcp6`) in
@@ -1283,6 +1474,48 @@ mod tests {
             descriptor_name(closed).expect("read"),
             DescriptorName::Closed
         );
+    }
+
+    /// Another process's descriptors are named as that process would name them itself: a child
+    /// handed this process's pipe end as its stdout shows that end's name at 1. Nothing is read when
+    /// no kind is asked for, a reaped child is gone, and pid 1 (launchd or init), another user's
+    /// process, is withheld unless this process is root.
+    #[test]
+    fn another_processs_descriptors_are_named_as_it_names_them() {
+        use std::os::fd::AsRawFd as _;
+
+        use crate::fork_lock::Spawn as _;
+
+        let all = NameKinds {
+            devices: true,
+            inodes: true,
+        };
+        let (_read, write) = std::io::pipe().expect("pipe");
+        let name = descriptor_name(write.as_raw_fd()).expect("read");
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read _"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(write)
+            .spawn_locked()
+            .expect("spawn a child");
+        let pid = libc::pid_t::try_from(child.id()).expect("a pid");
+        let named = descriptor_names(pid, all)
+            .expect("read")
+            .expect("this process's own child is readable");
+        assert!(named.contains(&(1, name)), "{named:?}");
+        let none = NameKinds {
+            devices: false,
+            inodes: false,
+        };
+        assert_eq!(descriptor_names(pid, none).expect("read"), Ok(Vec::new()));
+        drop(child.stdin.take());
+        child.wait().expect("reap the child");
+        assert_eq!(descriptor_names(pid, all).expect("read"), Err(Unread::Gone));
+        // SAFETY: geteuid has no failure and touches no memory.
+        let root = unsafe { libc::geteuid() } == 0;
+        let init = descriptor_names(1, all).expect("read");
+        assert_eq!(init.is_ok(), root, "{init:?}");
+        assert!(root || init == Err(Unread::Withheld), "{init:?}");
     }
 
     #[cfg(target_os = "macos")]

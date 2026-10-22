@@ -293,6 +293,10 @@ class HostImpl implements Host {
     return callNativeAsync(() => N.hostTreeHolders(this.#native, { path }));
   }
 
+  async fdHolders(request: Api.FdHoldersRequest): Promise<Api.FdHolders> {
+    return callNativeAsync(() => N.hostFdHolders(this.#native, request));
+  }
+
   async retireDescendants(
     handle: Api.RetireDescendantsRequest['handle'],
     graceMs: Api.RetireDescendantsRequest['graceMs'],

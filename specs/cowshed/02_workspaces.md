@@ -1580,6 +1580,31 @@ A census that cannot be taken writes no line and exits non-zero; a line stdout r
 exit naming the failure. A repository's land tooling asks it whether its own callers would hold a workspace the land
 retires, the same census the retire refuses with.
 
+### Descriptor holders: `cowshed fd-holders`
+
+`cowshed fd-holders [--device <0x…>]… [--inode <n>]…` names every process with a descriptor on one of the kernel objects
+named, each named as `lsof -F di` prints it and as `hold`'s `started.output` names a held leader's stdout and stderr
+(11_shell.md, "Held leaders: `cowshed hold`"): `device` the address Darwin names a pipe end or a socket by, `inode` the
+inode of a file and, on Linux, of a pipe or a socket, whose two ends share it. A watchdog whose step's leader exited and
+whose output has not ended asks it who still holds that output, a descendant that left the step's group included. It
+prints one JSON object, an `FdHolders` (`api::fd_holder`, read with its generated validator): `holders`, one
+`{pid, uniqueId, command, descriptors, matches}` per process, and `uninspected`. `uniqueId` is the kernel's identity of
+that process's life, as a decimal string: its unique id (`p_uniqueid`) on Darwin, its start time in clock ticks since
+boot on Linux. `descriptors` are its descriptors on the objects, ascending, and `matches` the objects they are on, each
+once. `command` is its argument vector joined lossily, as `tree-holders` prints it. An inode is matched by its number
+alone, as lsof's `i` field names it: on a host with several file systems, a file of the same number on another one is
+named too. A descriptor that names neither field, a revoked one (lsof's `(revoked)`) or a kqueue, names no object.
+
+The census walks every pid the kernel lists once, a lifecycle operation's included, and reads only the descriptor kinds
+the objects need. On Darwin those are `proc_pidinfo(PROC_PIDLISTFDS)` and one `proc_pidfdinfo` per pipe, socket or file,
+the reader `started` names its own descriptors with. On Linux it reads each `/proc/<pid>/fd` entry's inode. A process
+found holding one is confirmed: its life is read, its descriptors are read again, and then its life again, so what is
+printed is that life's, never a later process's given the pid. A process that exits during the census holds nothing. A
+process whose descriptors or life the kernel withholds from this user (another user's, unless it runs as root) is
+counted in `uninspected` and never reported as holding none. Any other failure writes nothing and exits non-zero. It
+names no project, asks no daemon, refuses `--json` and observes only. `host.fdHolders` answers the same object
+(07_api.md).
+
 ## Held locks: `cowshed lock` and `cowshed lock-holders`
 
 A held lock is an exclusive `flock(2)` on a caller's lock file, the one primitive behind `land --ref-lock`,

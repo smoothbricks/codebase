@@ -250,6 +250,23 @@ static EXIT_STATUS__EXITED: Reader = Reader::Record(&[("code", &LEAF)]);
 static EXIT_STATUS__SIGNALED: Reader = Reader::Record(&[("signal", &LEAF), ("coreDumped", &LEAF)]);
 static FAILED_CHECK: Reader =
     Reader::Record(&[("check", &LEAF), ("error", &LEAF), ("exit", &LEAF)]);
+static FD_HOLDER: Reader = Reader::Record(&[
+    ("pid", &LEAF),
+    ("uniqueId", &LEAF),
+    ("command", &LEAF),
+    ("descriptors", &LEAF),
+    ("matches", &SEQ__FD_IDENTITY),
+]);
+static FD_HOLDERS: Reader = Reader::Record(&[("holders", &SEQ__FD_HOLDER), ("uninspected", &LEAF)]);
+static FD_IDENTITY: Reader = Reader::Internal {
+    tag: "kind",
+    arms: &[
+        ("device", &FD_IDENTITY__DEVICE),
+        ("inode", &FD_IDENTITY__INODE),
+    ],
+};
+static FD_IDENTITY__DEVICE: Reader = Reader::Record(&[("device", &LEAF)]);
+static FD_IDENTITY__INODE: Reader = Reader::Record(&[("inode", &LEAF)]);
 static FINDING: Reader = Reader::Record(&[
     ("code", &LEAF),
     ("severity", &FINDING_SEVERITY),
@@ -915,6 +932,8 @@ static SEQ__CREDENTIAL_ROUTE: Reader = Reader::Seq(&CREDENTIAL_ROUTE);
 static SEQ__DATABASE_HOLDER: Reader = Reader::Seq(&DATABASE_HOLDER);
 static SEQ__EGRESS_RULE: Reader = Reader::Seq(&EGRESS_RULE);
 static SEQ__FAILED_CHECK: Reader = Reader::Seq(&FAILED_CHECK);
+static SEQ__FD_HOLDER: Reader = Reader::Seq(&FD_HOLDER);
+static SEQ__FD_IDENTITY: Reader = Reader::Seq(&FD_IDENTITY);
 static SEQ__FINDING: Reader = Reader::Seq(&FINDING);
 static SEQ__GC_CANDIDATE: Reader = Reader::Seq(&GC_CANDIDATE);
 static SEQ__GC_DEFERRED: Reader = Reader::Seq(&GC_DEFERRED);
@@ -1163,6 +1182,10 @@ impl Projected for crate::api::dto::DoctorReport {
 
 impl Projected for crate::api::dto::EmptyResult {
     const READER: &'static Reader = &EMPTY_RESULT;
+}
+
+impl Projected for crate::api::fd_holder::FdHolders {
+    const READER: &'static Reader = &FD_HOLDERS;
 }
 
 impl Projected for crate::api::dto::GatewayStatus {

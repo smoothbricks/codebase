@@ -183,6 +183,11 @@ export interface Host {
   /** Every process of this user holding something inside the directory tree at `path`. */
   treeHolders(path: Api.HostPathRequest['path']): Promise<readonly Api.TreeHolder[]>;
   /**
+   * Every process with a descriptor on one of the kernel objects `request` names, each as
+   * `hold`'s `started.output` names it; processes the kernel withholds are counted.
+   */
+  fdHolders(request: Api.FdHoldersRequest): Promise<Api.FdHolders>;
+  /**
    * Asks the job supervisor named by the `COWSHED_SUPERVISOR_SOCKET` this process had when it
    * opened the host to retire `handle`'s retained root and its descendants.
    */

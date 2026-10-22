@@ -22,7 +22,7 @@ pub const RUN_SUMMARY: &str = "run.json";
 /// How long a stopped daemon gets to exit after `SIGTERM`, as `nx daemon --stop` sends it.
 pub(crate) const DAEMON_EXIT_GRACE: Duration = Duration::from_secs(10);
 
-use cowshed_os::process::Holder;
+use cowshed_os::process::{DescriptorName, Holder};
 
 /// Processes, each as `pid <n> (<argv>)`, joined by `; `.
 pub struct Holders<'a>(pub &'a [Holder]);
@@ -589,18 +589,9 @@ fn walk_begins() {
 /// directory, with what it named.
 #[cfg(target_os = "linux")]
 fn procfs_census<T>(held: impl Fn(&Path) -> Option<T>) -> io::Result<Vec<(Holder, T)>> {
-    walk_begins();
     let mut holders = Vec::new();
-    for process in fs::read_dir("/proc")? {
-        let process = process?;
-        let Some(pid) = process
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<i32>().ok())
-        else {
-            continue;
-        };
-        if let Some(hold) = held(&process.path()) {
+    for pid in all_pids()? {
+        if let Some(hold) = held(Path::new(&format!("/proc/{pid}"))) {
             holders.push((
                 Holder {
                     pid,
@@ -611,6 +602,24 @@ fn procfs_census<T>(held: impl Fn(&Path) -> Option<T>) -> io::Result<Vec<(Holder
         }
     }
     Ok(holders)
+}
+
+/// Every pid procfs lists now: the one walker every Linux census starts from, counted once per
+/// census ([`walk_begins`]).
+#[cfg(target_os = "linux")]
+fn all_pids() -> io::Result<Vec<libc::pid_t>> {
+    walk_begins();
+    let mut pids = Vec::new();
+    for process in fs::read_dir("/proc")? {
+        if let Some(pid) = process?
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse().ok())
+        {
+            pids.push(pid);
+        }
+    }
+    Ok(pids)
 }
 
 /// `pid`'s argument vector joined by spaces, or its executable path, or a placeholder naming that
@@ -712,6 +721,123 @@ pub(crate) fn inode_holders(identity: (u64, u64)) -> io::Result<Vec<(Holder, Vec
         }
     }
     Ok(holders)
+}
+
+/// One process holding a kernel object a census asked about ([`object_holders`]): the process,
+/// the kernel's identity of its life ([`crate::runtime::job_groups::life_of`]), and each of its
+/// descriptors on one of the objects, in descriptor order, with the caller's key for that object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectHold<K> {
+    pub holder: Holder,
+    pub life: u64,
+    pub descriptors: Vec<(i32, K)>,
+}
+
+/// What a census of descriptor holders found ([`object_holders`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectCensus<K> {
+    /// Every process it read that holds one of the objects, in pid listing order.
+    pub holds: Vec<ObjectHold<K>>,
+    /// The processes whose descriptors the kernel withheld from this user (another user's, unless
+    /// the census runs as root). Any of them may hold an object, so they are counted, never
+    /// reported as holding none.
+    pub uninspected: u32,
+}
+
+/// Every process with a descriptor on one of `objects`, each named as
+/// [`cowshed_os::process::descriptor_name`] names it (lsof's `d` or `i`), with the caller's key
+/// for it. One pass over every live pid the kernel lists ([`all_pids`], a lifecycle operation's
+/// process included, since a holder missed is a holder never reported), reading only the names the
+/// objects need ([`NameKinds`]). A process found holding one is confirmed: its life is read, its
+/// descriptors read again, then its life again, so the descriptors reported are that life's and
+/// never a later process's given the pid. A process that exits during the census holds nothing;
+/// one whose descriptors or life the kernel withholds is counted in `uninspected`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn object_holders<K: Copy>(objects: &[(DescriptorName, K)]) -> io::Result<ObjectCensus<K>> {
+    use crate::runtime::job_groups::life_of;
+    use cowshed_os::process::{NameKinds, Unread, descriptor_names};
+
+    let kinds = NameKinds {
+        devices: objects
+            .iter()
+            .any(|(name, _)| matches!(name, DescriptorName::Device(_))),
+        inodes: objects
+            .iter()
+            .any(|(name, _)| matches!(name, DescriptorName::Inode(_))),
+    };
+    let on_objects = |pid| -> io::Result<Result<Vec<(i32, K)>, Unread>> {
+        Ok(descriptor_names(pid, kinds)?.map(|named| {
+            named
+                .into_iter()
+                .filter_map(|(descriptor, name)| {
+                    objects
+                        .iter()
+                        .find(|(object, _)| *object == name)
+                        .map(|(_, key)| (descriptor, *key))
+                })
+                .collect()
+        }))
+    };
+    let life = |pid| -> io::Result<Result<Option<u64>, Unread>> {
+        match life_of(pid) {
+            Ok(life) => Ok(Ok(life)),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                Ok(Err(Unread::Withheld))
+            }
+            Err(error) => Err(io::Error::new(
+                error.kind(),
+                format!("the life of process {pid} cannot be read: {error}"),
+            )),
+        }
+    };
+    let mut holds = Vec::new();
+    let mut uninspected = 0_usize;
+    let mut unread = |unread: Unread| uninspected += usize::from(unread == Unread::Withheld);
+    for pid in all_pids()? {
+        match on_objects(pid)? {
+            Ok(held) if held.is_empty() => continue,
+            Ok(_) => {}
+            Err(why) => {
+                unread(why);
+                continue;
+            }
+        }
+        let before = match life(pid)? {
+            Ok(Some(before)) => before,
+            Ok(None) => continue,
+            Err(why) => {
+                unread(why);
+                continue;
+            }
+        };
+        let descriptors = match on_objects(pid)? {
+            Ok(descriptors) => descriptors,
+            Err(why) => {
+                unread(why);
+                continue;
+            }
+        };
+        match life(pid)? {
+            Ok(after) if after == Some(before) && !descriptors.is_empty() => {}
+            Ok(_) => continue,
+            Err(why) => {
+                unread(why);
+                continue;
+            }
+        }
+        holds.push(ObjectHold {
+            holder: Holder {
+                pid,
+                command: command_line(pid),
+            },
+            life: before,
+            descriptors,
+        });
+    }
+    Ok(ObjectCensus {
+        holds,
+        uninspected: u32::try_from(uninspected).map_err(io::Error::other)?,
+    })
 }
 
 /// Every process holding anything on the volume mounted at `mount` -- its working or root

@@ -1,6 +1,9 @@
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Arg, ArgAction, ArgMatches, Command as ClapCommand, value_parser};
 use cowshed_apfs::DiskTool;
+use cowshed_core::api::held_lock::DecimalU64;
+use cowshed_core::api::hold::KernelAddress;
+use cowshed_core::api::operations::FdHoldersRequest;
 use cowshed_core::api::server::HostRole;
 use cowshed_core::api::{
     AbandonedRefSupersession, ExecClass, ExecScope, GitOid, GrantDelta, LandMode, SupersededReason,
@@ -55,6 +58,7 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &LOCK_HOLDERS,
     &HOLD,
     &TREE_HOLDERS,
+    &FD_HOLDERS,
     &GATEWAY,
     &CONTROLLER,
     &HOST,
@@ -132,6 +136,9 @@ pub enum Command {
     Hold(HoldArgs),
     /// `tree-holders <dir>`: every process holding something inside a directory tree, as JSON lines.
     TreeHolders(TreeHoldersArgs),
+    /// `fd-holders [--device <0x…>]… [--inode <n>]…`: every process with a descriptor on one of
+    /// the kernel objects named, as one JSON object.
+    FdHolders(FdHoldersRequest),
     Gateway(GatewayCommand),
     /// One coordinator controller connection, served on standard input for an embedding process.
     Controller,
@@ -199,6 +206,7 @@ impl Command {
             | Self::LockHolders(_)
             | Self::Hold(_)
             | Self::TreeHolders(_)
+            | Self::FdHolders(_)
             | Self::Sccache(_)
             | Self::Skill(_)
             | Self::Host(_)
@@ -1134,6 +1142,11 @@ pub fn cli_command() -> ClapCommand {
         )
         .subcommand(leaf("tree-holders").arg(positional("path", 0..=1)))
         .subcommand(
+            leaf("fd-holders")
+                .arg(append_value("device"))
+                .arg(append_value("inode")),
+        )
+        .subcommand(
             leaf("gateway")
                 .subcommand_required(true)
                 .subcommand(leaf("start"))
@@ -1290,6 +1303,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "lock-holders" => parse_lock_holders(leaf, &global)?,
         "hold" => parse_hold(leaf, &global)?,
         "tree-holders" => parse_tree_holders(leaf, &global)?,
+        "fd-holders" => parse_fd_holders(leaf, &global)?,
         "controller" => Command::Controller,
         "host" => Command::Host(HostRole::Host),
         "gateway" => parse_gateway(leaf, &global)?,
@@ -2016,6 +2030,71 @@ fn parse_tree_holders(matches: &ArgMatches, global: &GlobalOptions) -> Result<Co
         .map(PathBuf::from)
         .ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
     Ok(Command::TreeHolders(TreeHoldersArgs { path }))
+}
+
+const FD_HOLDERS: CommandSpec = CommandSpec {
+    name: "fd-holders",
+    missing: "fd-holders requires at least one --device or --inode",
+    args: "[--device <0x…>]… [--inode <n>]…",
+    trailing: "",
+    summary: "show who holds a pipe, socket or file",
+    about: &[
+        "Prints one JSON object naming every process with a descriptor on one of the kernel objects named, each named as `hold`'s `started.output` names a leader's stdout or stderr and `lsof -F di` prints it: `{\"holders\":[{\"pid\":…,\"uniqueId\":…,\"command\":…,\"descriptors\":[…],\"matches\":[…]}],\"uninspected\":…}`. Each holder carries the kernel's identity of its life (its unique id on Darwin, its start time on Linux), read before and after its descriptors, so it never names a later process given the pid; its descriptors on the objects, ascending; and the objects they are on. It reads every process once, and only the descriptor kinds asked for. A process whose descriptors the kernel withholds from this user is counted in `uninspected`, never reported as holding none.",
+        "It needs no project and asks no daemon; `--json` is refused, since the object is its whole output.",
+    ],
+    options: &[
+        Opt {
+            spelling: "--device <0x…>",
+            meaning: "repeatable: a Darwin pipe end or socket, spelled as lsof's `d` field and `started.output`'s `device` spell it: `0x` and lowercase hexadecimal digits with no leading zero",
+        },
+        Opt {
+            spelling: "--inode <n>",
+            meaning: "repeatable: an inode, spelled as lsof's `i` field and `started.output`'s `inode` spell it, in decimal: a file's, and on Linux a pipe's or socket's, whose two ends share it",
+        },
+    ],
+};
+
+fn parse_fd_holders(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &FD_HOLDERS;
+    reject_project(
+        global,
+        USAGE,
+        "--project is not valid for fd-holders: it names no project",
+    )?;
+    if global.json {
+        return Err(UsageError::new(
+            "fd-holders always writes one JSON object, never an envelope; drop --json",
+            USAGE,
+        ));
+    }
+    let devices = appended_values(matches, "device", USAGE)?
+        .iter()
+        .map(|value| {
+            KernelAddress::parse(value).ok_or_else(|| {
+                UsageError::new(
+                    format!(
+                        "--device {value} is no kernel address: 0x and lowercase hexadecimal digits with no leading zero, as lsof prints its d field"
+                    ),
+                    USAGE,
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let inodes = appended_values(matches, "inode", USAGE)?
+        .iter()
+        .map(|value| {
+            DecimalU64::parse(value).ok_or_else(|| {
+                UsageError::new(
+                    format!("--inode {value} is no inode: a decimal with no sign or leading zero"),
+                    USAGE,
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if devices.is_empty() && inodes.is_empty() {
+        return Err(UsageError::new(USAGE.missing, USAGE));
+    }
+    Ok(Command::FdHolders(FdHoldersRequest { devices, inodes }))
 }
 
 /// A land queue is keyed by one directory name: 1 to 64 of `[A-Za-z0-9._-]`, not starting with a
@@ -6075,6 +6154,7 @@ mod tests {
                 NotUsed,
             ),
             (&["tree-holders", "/tmp/tree"], NotUsed),
+            (&["fd-holders", "--inode", "7"], NotUsed),
             (&["help"], NotUsed),
         ];
 
@@ -6155,6 +6235,65 @@ mod tests {
             (
                 &["hold", "--control-fd", "3", "--state-fd", "4", "true"],
                 "hold requires `--` before the command",
+            ),
+        ];
+        for (arguments, message) in refused {
+            assert_eq!(
+                parse_args(arguments.iter().copied()).unwrap_err().message,
+                message,
+                "{arguments:?}"
+            );
+        }
+    }
+
+    /// `fd-holders` takes repeatable devices and inodes in the spelling `started.output` uses, at
+    /// least one, and refuses any other spelling by name.
+    #[test]
+    fn fd_holders_takes_devices_and_inodes_as_started_names_them() {
+        let Command::FdHolders(request) = parse_args([
+            "fd-holders",
+            "--device",
+            "0x1c8cfdee8d6f6f3",
+            "--inode",
+            "7",
+            "--device",
+            "0x0",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("fd-holders parses as fd-holders");
+        };
+        assert_eq!(
+            request,
+            FdHoldersRequest {
+                devices: vec![
+                    KernelAddress::new(0x1c8_cfde_e8d6_f6f3),
+                    KernelAddress::new(0)
+                ],
+                inodes: vec![DecimalU64::new(7)],
+            }
+        );
+        let refused: [(&[&str], &str); 5] = [
+            (
+                &["fd-holders"],
+                "fd-holders requires at least one --device or --inode",
+            ),
+            (
+                &["fd-holders", "--device", "0x01"],
+                "--device 0x01 is no kernel address: 0x and lowercase hexadecimal digits with no leading zero, as lsof prints its d field",
+            ),
+            (
+                &["fd-holders", "--device", "0xABC"],
+                "--device 0xABC is no kernel address: 0x and lowercase hexadecimal digits with no leading zero, as lsof prints its d field",
+            ),
+            (
+                &["fd-holders", "--inode", "07"],
+                "--inode 07 is no inode: a decimal with no sign or leading zero",
+            ),
+            (
+                &["fd-holders", "--json", "--inode", "7"],
+                "fd-holders always writes one JSON object, never an envelope; drop --json",
             ),
         ];
         for (arguments, message) in refused {

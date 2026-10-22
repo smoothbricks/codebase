@@ -92,6 +92,14 @@ describe('openHost', () => {
 
       expect(await host.treeHolders(root)).toEqual([]);
 
+      // No pipe end or socket has the address 0: neither census names a holder of it.
+      const fdHolders = await host.fdHolders({ devices: ['0x0'] });
+      const printedFd = spawnSync(launcher, ['fd-holders', '--device', '0x0'], { encoding: 'utf8' });
+      expect(printedFd.status).toBe(0);
+      expect(fdHolders.holders).toEqual(JSON.parse(printedFd.stdout).holders);
+      expect(fdHolders.holders).toEqual([]);
+      expect(typeof fdHolders.uninspected).toBe('number');
+
       // A handle no supervisor issued: whatever supervisor this process runs under, if any, the
       // answer is the verb's typed refusal, never an error.
       const retirement = await host.retireDescendants(

@@ -515,6 +515,27 @@ export const assertFailedCheckList = typia.createAssertEquals<readonly Api.Faile
 export const parseFailedCheckList = (json: string): readonly Api.FailedCheck[] =>
   assertFailedCheckList(JSON.parse(json));
 
+export const assertFdHolder = typia.createAssertEquals<Api.FdHolder>();
+export const parseFdHolder = (json: string): Api.FdHolder => assertFdHolder(JSON.parse(json));
+export const assertFdHolderList = typia.createAssertEquals<readonly Api.FdHolder[]>();
+export const parseFdHolderList = (json: string): readonly Api.FdHolder[] => assertFdHolderList(JSON.parse(json));
+
+export const assertFdHolders = typia.createAssertEquals<Api.FdHolders>();
+export const parseFdHolders = (json: string): Api.FdHolders => assertFdHolders(JSON.parse(json));
+export const assertFdHoldersList = typia.createAssertEquals<readonly Api.FdHolders[]>();
+export const parseFdHoldersList = (json: string): readonly Api.FdHolders[] => assertFdHoldersList(JSON.parse(json));
+
+export const assertFdHoldersRequest = typia.createAssertEquals<Api.FdHoldersRequest>();
+export const parseFdHoldersRequest = (json: string): Api.FdHoldersRequest => assertFdHoldersRequest(JSON.parse(json));
+export const assertFdHoldersRequestList = typia.createAssertEquals<readonly Api.FdHoldersRequest[]>();
+export const parseFdHoldersRequestList = (json: string): readonly Api.FdHoldersRequest[] =>
+  assertFdHoldersRequestList(JSON.parse(json));
+
+export const assertFdIdentity = typia.createAssertEquals<Api.FdIdentity>();
+export const parseFdIdentity = (json: string): Api.FdIdentity => assertFdIdentity(JSON.parse(json));
+export const assertFdIdentityList = typia.createAssertEquals<readonly Api.FdIdentity[]>();
+export const parseFdIdentityList = (json: string): readonly Api.FdIdentity[] => assertFdIdentityList(JSON.parse(json));
+
 export const assertFenceRefusal = typia.createAssertEquals<Api.FenceRefusal>();
 export const parseFenceRefusal = (json: string): Api.FenceRefusal => assertFenceRefusal(JSON.parse(json));
 export const assertFenceRefusalList = typia.createAssertEquals<readonly Api.FenceRefusal[]>();

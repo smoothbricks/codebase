@@ -290,6 +290,7 @@ pub fn attach_demand(operation: &OperationRequest) -> AttachDemand {
         | Op::HostGatewayStop(_)
         | Op::HostLockHolders(_)
         | Op::HostTreeHolders(_)
+        | Op::HostFdHolders(_)
         | Op::HostRetireDescendants(_)
         | Op::HostDiskCommand(_)
         | Op::HostCredentialAdd(_)

@@ -121,6 +121,12 @@ impl Host {
         super::json_call::<operations::HostTreeHolders, _>(env, Arc::clone(&self.inner), arguments)
     }
 
+    /// Every process with a descriptor on one of the kernel objects a caller names.
+    #[napi(js_name = "fdHolders")]
+    pub fn fd_holders(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::json_call::<operations::HostFdHolders, _>(env, Arc::clone(&self.inner), arguments)
+    }
+
     /// Asks the job supervisor this host connection runs under to retire a retained subtree.
     #[napi(js_name = "retireDescendants")]
     pub fn retire_descendants(&self, env: Env, arguments: String) -> napi::Result<JsObject> {

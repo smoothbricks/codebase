@@ -809,6 +809,21 @@ status (128 + the signal for a signal); its own failures use the wrapper codes 1
 $ cowshed hold --control-fd 3 --state-fd 4 -- make check 3<control.fifo 4>state.log
 ```
 
+### `cowshed fd-holders [--device <0x…>]… [--inode <n>]…`
+
+Names every process with a descriptor on one of the kernel objects named, each spelled as `started.output` and
+`lsof -F di` spell it: `--device` a Darwin pipe end or socket (`0x` and lowercase hexadecimal), `--inode` a file, and on
+Linux a pipe or socket too. It prints one JSON `FdHolders` object: `holders`, each with its `pid`, `uniqueId` (the
+kernel's identity of its life, read before and after its descriptors), `command`, `descriptors` and `matches`; and
+`uninspected`, the count of processes whose descriptors the kernel withheld from this user, which are never reported as
+holding none. A watchdog asks it who still holds a held step's output once the leader exited. See 02_workspaces.md
+"Descriptor holders: `cowshed fd-holders`".
+
+```
+$ cowshed fd-holders --device 0x1c8cfdee8d6f6f3
+{"holders":[{"pid":4242,"uniqueId":"81723","command":"sleep 600","descriptors":[1],"matches":[{"kind":"device","device":"0x1c8cfdee8d6f6f3"}]}],"uninspected":212}
+```
+
 ### Dev servers inside workspaces
 
 On macOS, each workspace owns a **port block** — 64 ports when the workspace is created — and the gateway data plane
