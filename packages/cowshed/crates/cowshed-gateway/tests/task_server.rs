@@ -160,7 +160,7 @@ async fn one_shot(socket: &Path, line: &str) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn units_run_without_an_assignment_and_the_queue_names_what_waits_on_what() {
     let (gateway, _root, socket) = gateway(16).await;
-    // unit-a wants 8 tokens, background's half of 16, and runs; unit-b waits on unit-a and runs
+    // unit-a wants 8 tokens, half of 16, and runs; unit-b waits on unit-a and runs
     // after its fact alone.
     let mut runner = Asker::ask(
         &socket,

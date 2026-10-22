@@ -565,7 +565,7 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
     assert_eq!(
         ledger_lines,
         [
-            "cowshed: gateway cpu budget: held 17/18 tokens, background at most 9",
+            "cowshed: gateway cpu budget: held 17/18 tokens, background holds 4, at most 9 beside gate work",
             "cowshed: gateway cpu hold past 30m: /w/older-land: pid 9, 1/1 tokens, granted 1h02m05s ago: bun test",
             "cowshed: gateway cpu hold past 30m: /w/younger-land: pid 71437, 3/18 tokens, granted 34m07s ago: cargo --frozen test -p app",
             "cowshed: gateway gate head: /w/older-land gate job 3: held 12, running 2",

@@ -4681,8 +4681,8 @@ async fn directory_an_open_cache_reader_allows_seed_capture_and_adoption_substra
 ///
 /// The job that runs across the adoption is a loop that sleeps between ticks: a resident, which
 /// holds no CPU token for its lifetime (05_gateway.md, "A resident holds no token"). The ledger
-/// has three tokens, as the macOS arm64 CI runner has, so its background room is one token
-/// ("Room for a gate"). Run as an ordinary background job, the loop held that token, so the
+/// has three tokens, as the macOS arm64 CI runner has, so its background room beside gate work is
+/// one token ("Room for a gate"). Run as an ordinary background job, the loop held that token, so the
 /// land's `--check` job queued behind it at `check-wait` and the land never reached its adoption:
 /// it hung on that runner until the idle bound, twice, and hung the same way here with this
 /// ledger at three tokens, while at four it passed. The jobs draw on that fixture ledger, never on
@@ -7557,8 +7557,8 @@ async fn cpu_budget(socket: &Path) -> cowshed_gateway_types::CpuBudgetStatus {
 /// The checkout [`LoadedHost`] holds the host for.
 const LOADING_CHECKOUT: &str = "/loaded-host/another-checkout";
 
-/// Another checkout's background work holding all of background's room in the fixture gateway's
-/// real ledger (05_gateway.md, "Room for a gate"): a background job of this project then waits
+/// Another checkout's background work holding the whole host, background's room with no gate work,
+/// in the fixture gateway's real ledger (05_gateway.md, "Room for a gate"): a background job of this project then waits
 /// for a returned token, as on a host other work has loaded. Its tokens return when it drops.
 struct LoadedHost {
     _lease: tokio::io::BufReader<tokio::net::UnixStream>,

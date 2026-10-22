@@ -75,7 +75,7 @@ const CHECKOUT: &str = "/w/job";
 /// How long a child that must wait is watched for a grant it must not get.
 const NOT_GRANTED: Duration = Duration::from_millis(200);
 
-/// A real gateway of 8 tokens, so background's room (half the host) holds a job of 3. On Linux
+/// A real gateway of 8 tokens, so background's room (the host, with no gate work) holds a job of 3. On Linux
 /// `GatewayConfig::validate` demands a data-socket root before anything else, an owned 0o700
 /// directory; this test's sockets are its control socket and the pools', so it stays empty.
 async fn gateway(root: &Path) -> (Gateway, PathBuf) {

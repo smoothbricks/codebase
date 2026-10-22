@@ -492,7 +492,7 @@ impl JobScheduling {
     /// The scheduling a request asks for. A want it names is taken as named; one it leaves
     /// unnamed is its class's own (05_gateway.md "The task server owns the live grant and
     /// nice"): background and interactive work ask for the background share `share`, the
-    /// ⌊N/2⌋ of the host's N tokens their class may hold at once ("Room for a gate"), as the CPU
+    /// ⌊N/2⌋ of the host's N tokens, their class's cap beside a gate ("Room for a gate"), as the CPU
     /// admission that will ask for it reports it; a gate asks for the one token its
     /// orchestrator uses, since its pool asks the host for each of its tasks; a resident asks for
     /// none. `None` for a resident that names a want.

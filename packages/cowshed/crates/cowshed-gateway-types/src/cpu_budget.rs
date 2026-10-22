@@ -370,11 +370,35 @@ impl CpuHolder {
     }
 }
 
-/// The most tokens background-class work holds at once on a host of `total` tokens: half the
-/// host, rounded down, and at least one (05_gateway.md "Room for a gate"). No running grant can
-/// be shrunk, so the other half is kept for gate-class work to take the moment it asks.
+/// Background's cap beside gate-class work on a host of `total` tokens: half the host, rounded
+/// down, and at least one (05_gateway.md "Room for a gate"). While gate-class work holds or waits,
+/// no background grant takes the class past it, so the gate takes back the rest at the next
+/// returned tokens. It is also the share an exec that names no want asks for, and the count of
+/// later background grants that makes a waiting background head overdue.
 pub fn background_limit(total: usize) -> usize {
     (total / 2).max(1)
+}
+
+/// Whether gate-class work holds or waits for tokens on a ledger, which decides background's cap
+/// ([`background_cap`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GateWork {
+    /// No gate-class request holds tokens or waits for them.
+    Absent,
+    /// A gate-class request holds tokens or waits for them.
+    HoldsOrWaits,
+}
+
+/// The most tokens background-class work may be granted up to on a host of `total` tokens
+/// (05_gateway.md "Room for a gate", Danny tg#9527): all of them while no gate-class work holds or
+/// waits, so no token idles while background wants it, and [`background_limit`] beside gate-class
+/// work. No grant shrinks, so background may hold more than the cap in force when a gate arrives;
+/// it then gets no grant past the cap, and the gate takes the returned tokens first.
+pub fn background_cap(total: usize, gate: GateWork) -> usize {
+    match gate {
+        GateWork::Absent => total,
+        GateWork::HoldsOrWaits => background_limit(total),
+    }
 }
 
 /// The tokens of this host's ledger: one per core the host reports (05_gateway.md "Host CPU
@@ -383,17 +407,38 @@ pub fn host_tokens() -> NonZeroUsize {
     std::thread::available_parallelism().expect("every supported host reports how many CPUs it has")
 }
 
-/// The background share of this host: [`background_limit`] of [`host_tokens`], all that its
-/// background-class work holds at once, and what an exec that names no want asks for at
-/// background or interactive class (05_gateway.md "The task server owns the live grant and nice").
+/// The background share of this host: [`background_limit`] of [`host_tokens`], what an exec
+/// that names no want asks for at background or interactive class (05_gateway.md "The task server
+/// owns the live grant and nice").
 pub fn background_share() -> NonZeroUsize {
     NonZeroUsize::new(background_limit(host_tokens().get())).unwrap_or(NonZeroUsize::MIN)
 }
 
 impl CpuBudgetStatus {
-    /// The most tokens this ledger's background-class work holds at once.
+    /// This ledger's [`background_limit`]: background's cap beside gate-class work, and the
+    /// share an exec that names no want asks for.
     pub fn background_limit(&self) -> usize {
         background_limit(self.total)
+    }
+
+    /// Whether gate-class work holds or waits on this ledger.
+    pub fn gate_work(&self) -> GateWork {
+        if self.gate_jobs.is_empty() && self.gate_queue.is_empty() {
+            GateWork::Absent
+        } else {
+            GateWork::HoldsOrWaits
+        }
+    }
+
+    /// The cap in force on this ledger's background grants ([`background_cap`]).
+    pub fn background_cap(&self) -> usize {
+        background_cap(self.total, self.gate_work())
+    }
+
+    /// The tokens background-class work holds, over the cap in force when a gate arrived after
+    /// background's grants.
+    pub fn background_held(&self) -> usize {
+        self.background.iter().map(|stake| stake.held).sum()
     }
 }
 

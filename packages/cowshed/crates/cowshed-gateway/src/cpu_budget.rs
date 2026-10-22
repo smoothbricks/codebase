@@ -9,7 +9,7 @@
 //!
 //! Grants are fair between checkouts, not between requests: the checkout holding the fewest
 //! tokens is served first, and while another checkout waits nobody is granted beyond its fair
-//! share of background's half, so a checkout with sixty runners queued cannot crowd out one with
+//! share of background's cap, so a checkout with sixty runners queued cannot crowd out one with
 //! three. That order never starves a request: a checkout's head that the background limit of
 //! later background grants has passed is overdue and served first, so a checkout whose grant
 //! stays held still gets its turn. A grant is all at once and between one and the request's
@@ -17,10 +17,12 @@
 //! can deadlock on each other's tokens.
 //!
 //! Fairness only acts when a grant is made: a running nextest or cargo cannot hand tokens back,
-//! and its FIFO, implicit make token and test-thread sizing are never resized. So the background
-//! class as a whole never holds more than half the host ([`background_limit`]), and a grant made
-//! while nobody waits cannot hold the host against a gate that asks later: the other half is free
-//! for gate-class work the moment it asks, without waiting for any background run to end. Class
+//! and its FIFO, implicit make token and test-thread sizing are never resized. Admission is
+//! work-conserving: while no gate-class work holds or waits, background may be granted every
+//! token, so none idles while background wants it. Beside gate-class work no background grant takes
+//! the class past half the host ([`background_cap`]), and a gate that arrives after background
+//! filled the host takes back its share from the next returned tokens: no grant shrinks, and
+//! nothing is killed or timed. Class
 //! ranks first: while any gate-class request waits, returned tokens go to gate-class work ahead
 //! of queued background. A land's gate runs as a gate job whose pool relays each of its tasks'
 //! asks here at gate class (`jobserver.rs`), ranked by the gate job's own admission: gate work is
@@ -40,7 +42,7 @@ use std::time::{Duration, Instant};
 
 use cowshed_gateway_types::{
     CpuBackgroundStake, CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, CpuHolder,
-    CpuWaiter, InstallRestart, background_limit, host_tokens,
+    CpuWaiter, GateWork, InstallRestart, background_cap, background_limit, host_tokens,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -177,14 +179,15 @@ struct Checkout {
 
 /// The budget's state.
 ///
-/// Invariants: `free` plus every checkout's `held` is `total`; background-class holders hold at
-/// most `background` together; a checkout is present exactly while it holds or waits; every
+/// Invariants: `free` plus every checkout's `held` is `total`; no background grant takes the
+/// class past the cap in force when it is made ([`Ledger::background_cap`]); a checkout is present exactly while it holds or waits; every
 /// ticket in `tickets` is a holder or a waiter of the checkout it names; all gate holders in one
 /// repository belong to one job, including holders in different checkouts.
 #[derive(Debug)]
 pub(crate) struct Ledger {
     total: usize,
-    /// The most background-class work holds at once.
+    /// [`background_limit`] of `total`: background's cap beside gate-class work, and the later
+    /// background grants that make a waiting background head overdue.
     background: usize,
     free: usize,
     checkouts: HashMap<Arc<str>, Checkout>,
@@ -192,8 +195,8 @@ pub(crate) struct Ledger {
 }
 
 impl Ledger {
-    /// The host's ledger: background holds at most half of it ([`background_limit`]), so a gate
-    /// that asks later finds the rest.
+    /// The host's ledger: background's cap is the whole host with no gate-class work and half of
+    /// it beside gate-class work ([`background_cap`]).
     pub(crate) fn host(limits: CpuBudgetLimits) -> Self {
         let total = limits.tokens.get();
         Self::with(total, background_limit(total))
@@ -264,10 +267,11 @@ impl Ledger {
     /// job being served and the older ones always hold the larger part.
     ///
     /// With no gate-class demand, background is fair between checkouts, within its room: the free
-    /// tokens that keep the class at or under half the host. The next grant goes to the waiting
+    /// tokens within the cap in force ([`Ledger::background_cap`]), every token when no gate-class
+    /// work holds or waits. The next grant goes to the waiting
     /// checkout that holds the fewest tokens (the older head waiter on a tie), to its oldest
     /// waiter, except that an overdue head goes first ([`Ledger::overdue`]). A checkout's fair
-    /// share is the background limit divided among the checkouts holding or waiting; its claim
+    /// share is the cap in force divided among the checkouts holding or waiting; its claim
     /// is what remains of that share, at least one. While another checkout
     /// waits, the grant is exactly the claim or the `want`, whichever is smaller, so nobody
     /// outruns a waiting peer; with nobody else waiting it is the whole room up to `want`. A head
@@ -355,9 +359,9 @@ impl Ledger {
         }
     }
 
-    /// Tokens background-class work may still take: the free ones, up to what keeps the class
-    /// within its limit — half the host for the host's ledger ([`background_limit`]). No grant can
-    /// be shrunk once made, so the other half stays for a gate to take the moment it asks.
+    /// Tokens background-class work may still take: the free ones, up to the cap in force
+    /// ([`Ledger::background_cap`]). With no gate-class work that is every free token; beside it no
+    /// grant takes the class past half the host, so a gate takes the tokens background returns.
     fn background_room(&self) -> usize {
         let held: usize = self
             .checkouts
@@ -366,7 +370,26 @@ impl Ledger {
             .filter(|holder| holder.class == Class::Background)
             .map(|holder| holder.tokens)
             .sum();
-        self.free.min(self.background.saturating_sub(held))
+        self.free.min(self.background_cap().saturating_sub(held))
+    }
+
+    /// Whether any gate-class request holds tokens or waits for them, a behind-head one included.
+    fn gate_work(&self) -> GateWork {
+        let gate = |class: &Class| class.repo().is_some();
+        if self.checkouts.values().any(|checkout| {
+            checkout.running.iter().any(|holder| gate(&holder.class))
+                || checkout.waiting.iter().any(|waiter| gate(&waiter.class))
+        }) {
+            GateWork::HoldsOrWaits
+        } else {
+            GateWork::Absent
+        }
+    }
+
+    /// Background's cap in force ([`background_cap`]): the whole host with no gate-class work, half
+    /// of it beside gate-class work.
+    fn background_cap(&self) -> usize {
+        background_cap(self.total, self.gate_work())
     }
 
     /// A running job owns its repository until its last holder leaves. Otherwise the oldest
@@ -513,7 +536,7 @@ impl Ledger {
                 Some((name, checkout, position, head))
             })
             .min_by_key(|(_, checkout, _, head)| self.turn(checkout, head))?;
-        let share = (self.background / self.checkouts.len()).max(1);
+        let share = (self.background_cap() / self.checkouts.len()).max(1);
         let least = head.want.min(share.saturating_sub(checkout.held).max(1));
         let peers_wait = self
             .checkouts
@@ -1157,12 +1180,13 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_background_request_takes_half_the_host_and_a_lone_gate_request_all_of_it() {
+    fn a_lone_background_request_and_a_lone_gate_request_each_take_the_whole_host() {
         let mut clock = Clock::new(18);
         assert_eq!(clock.ask(0, 1, "a", 4), [(1, 4)]);
         assert_eq!(clock.leave(1, 1), []);
-        assert_eq!(clock.ask(2, 2, "a", 64), [(2, 9)]);
-        assert_eq!(clock.status(2).held, 9);
+        // With no gate work, no token is kept idle for a gate that may come.
+        assert_eq!(clock.ask(2, 2, "a", 64), [(2, 18)]);
+        assert_eq!(clock.status(2).held, 18);
         assert_eq!(clock.leave(3, 2), []);
         assert_eq!(clock.ask_land(4, 3, "a", 64), [(3, 18)]);
         assert_eq!(clock.status(4).held, 18);
@@ -1172,36 +1196,42 @@ mod tests {
         assert!(clock.balanced());
     }
 
-    /// The measured hole, 2026-10-19: a background `cargo nextest run` asked for 18 tokens as the
-    /// only waiter, was granted 17, and sat at 0% CPU for 50 minutes while a land's gate that
-    /// arrived after it ran on its one token. No running grant can be shrunk, so the grant itself
-    /// leaves the room: background is granted half the host, a second background request cannot
-    /// fill the rest, and a gate that arrives 50 minutes later is granted the other half in the
-    /// ledger transition of its own ask. Its wait is zero because it waits for no departure.
+    /// Danny tg#9527, measured 2026-10-22: no gate job ran, background was capped at 9 of 18 tokens,
+    /// one shed held all 9, and three other sheds waited while 9 tokens idled. Background now takes
+    /// every token while no gate-class work holds or waits. The trade: a grant made then cannot
+    /// shrink, so a gate that arrives later is no longer granted in its own ask, as it was under the
+    /// half cap (2026-10-19: a lone `cargo nextest run` granted 17 of 18 sat at 0% CPU for 50
+    /// minutes beside a land's gate on one token). It takes back its share from the returned tokens:
+    /// each goes to gate-class work first, background keeping only its floor token, with no kill and
+    /// no timer.
     #[test]
-    fn a_gate_arriving_after_a_lone_background_grant_is_granted_the_other_half_at_once() {
+    fn a_gate_arriving_after_background_filled_the_host_takes_the_returned_tokens_first() {
         let mut clock = Clock::new(18);
-        assert_eq!(clock.ask(0, 1, "smoke", 18), [(1, 9)]);
+        assert_eq!(clock.ask(0, 1, "smoke", 18), [(1, 18)]);
         assert_eq!(clock.ask(1_000, 2, "other", 18), []);
         let later = 50 * 60 * 1_000;
-        assert_eq!(clock.ask_land(later, 10, "train", 1), [(10, 1)]);
-        assert_eq!(clock.ask_task(later, 11, 10, "train", 18), [(11, 8)]);
-        assert_eq!(clock.waited[&10], Duration::ZERO);
-        assert_eq!(clock.waited[&11], Duration::ZERO);
-        assert_eq!(clock.status(later).held, 18);
-        // The background run ends: the waiting background request takes background's half.
-        assert_eq!(clock.leave(later + 1, 1), [(2, 9)]);
+        assert_eq!(clock.ask_land(later, 10, "train", 1), []);
+        assert_eq!(clock.ask_task(later, 11, 10, "train", 18), []);
+        // The background run ends: the background checkout holding nothing keeps its floor token,
+        // and the land takes every other returned token.
+        assert_eq!(clock.leave(later + 1, 1), [(2, 1), (10, 1), (11, 16)]);
+        assert_eq!(clock.status(later + 1).gate_jobs[0].held, 17);
         assert!(clock.balanced());
     }
 
     #[test]
-    fn a_background_newcomer_waits_beside_a_runner_that_holds_the_background_limit() {
-        // Tokens are never handed back by a running job, so a background newcomer whose class
-        // already holds its half queues for the runner's departure.
+    fn a_background_newcomer_waits_beside_gate_work_while_background_holds_its_half() {
+        // Tokens are never handed back by a running job, so beside a land a background newcomer
+        // whose class already holds its half queues for the runner's departure. Once no gate work
+        // holds or waits, background's cap is the whole host again.
         let mut clock = Clock::new(36);
-        assert_eq!(clock.ask(0, 1, "carry", 18), [(1, 18)]);
-        assert_eq!(clock.ask(1, 2, "train", 18), []);
-        assert_eq!(clock.leave(2, 1), [(2, 18)]);
+        assert_eq!(clock.ask_land(0, 1, "land", 1), [(1, 1)]);
+        assert_eq!(clock.ask(0, 2, "carry", 18), [(2, 18)]);
+        assert_eq!(clock.ask(1, 3, "train", 18), []);
+        assert_eq!(clock.leave(2, 2), [(3, 18)]);
+        assert_eq!(clock.ask(3, 4, "carry", 18), []);
+        assert_eq!(clock.leave(4, 1), [(4, 18)]);
+        assert_eq!(clock.status(4).held, 36);
         assert!(clock.balanced());
     }
 
@@ -1209,32 +1239,34 @@ mod tests {
     fn with_nobody_else_waiting_a_checkout_takes_its_room_up_to_its_want() {
         let mut clock = Clock::new(36);
         assert_eq!(clock.ask(0, 1, "a", 5), [(1, 5)]);
-        // Nobody else waits, so b takes the whole room up to its want, not a share.
-        assert_eq!(clock.ask(1, 2, "b", 18), [(2, 13)]);
-        // Background's half is full now: a's second runner queues until b leaves.
-        assert_eq!(clock.ask(2, 3, "a", 18), []);
-        assert_eq!(clock.leave(3, 2), [(3, 13)]);
+        // Nobody else waits, so b takes the room up to its want, not a share.
+        assert_eq!(clock.ask(1, 2, "b", 18), [(2, 18)]);
+        // With no gate work the room is the rest of the host: a's second runner takes it.
+        assert_eq!(clock.ask(2, 3, "a", 18), [(3, 13)]);
+        assert_eq!(clock.status(2).held, 36);
         assert!(clock.balanced());
     }
 
     #[test]
     fn a_lone_waiter_takes_the_room_even_below_its_fair_share() {
         let mut clock = Clock::new(18);
-        assert_eq!(clock.ask(0, 1, "a", 6), [(1, 6)]);
+        // A land in a's checkout caps background at half the host.
+        assert_eq!(clock.ask_land(0, 1, "a", 1), [(1, 1)]);
+        assert_eq!(clock.ask(0, 2, "a", 6), [(2, 6)]);
         // b's fair share is 4 of background's 9, but no peer waits: the 3 left must not sit idle.
-        assert_eq!(clock.ask(1, 2, "b", 18), [(2, 3)]);
-        assert_eq!(clock.status(1).held, 9);
-        assert_eq!(clock.leave(2, 2), []);
-        assert_eq!(clock.leave(3, 1), []);
+        assert_eq!(clock.ask(1, 3, "b", 18), [(3, 3)]);
+        assert_eq!(clock.status(1).held, 10);
+        assert_eq!(clock.leave(2, 3), []);
+        assert_eq!(clock.leave(3, 2), []);
         assert!(clock.balanced());
     }
 
     #[test]
-    fn a_full_background_half_hands_freed_tokens_to_the_checkout_holding_least() {
-        let mut clock = Clock::new(36);
+    fn a_full_host_hands_freed_tokens_to_the_checkout_holding_least() {
+        let mut clock = Clock::new(18);
         assert_eq!(clock.ask(0, 1, "a", 18), [(1, 18)]);
         assert_eq!(clock.ask(0, 2, "a", 18), []);
-        // a's next runner queues first; b arrives later and wants the whole background half.
+        // a's next runner queues first; b arrives later and wants the whole host.
         assert_eq!(clock.ask(1, 3, "a", 1), []);
         assert_eq!(clock.ask(2, 4, "b", 18), []);
         // Two checkouts, a share of 9 each. a's head waiter is older, so the freed
@@ -1250,29 +1282,30 @@ mod tests {
         for ticket in 0..60 {
             clock.ask(0, ticket, "busy", 1);
         }
-        assert_eq!(clock.status(0).held, 12);
+        // With no gate work, busy's runners take the whole host.
+        assert_eq!(clock.status(0).held, 24);
         assert_eq!(clock.ask(1, 100, "quiet", 1), []);
         assert_eq!(clock.ask(1, 101, "quiet", 1), []);
         // Every token busy returns goes to quiet until quiet holds as much as busy would allow.
         assert_eq!(clock.leave(2, 0), [(100, 1)]);
         assert_eq!(clock.leave(3, 1), [(101, 1)]);
-        assert_eq!(clock.leave(4, 2), [(12, 1)]);
+        assert_eq!(clock.leave(4, 2), [(24, 1)]);
         let status = clock.status(4);
         assert_eq!(status.checkouts[0].checkout, "busy");
-        assert_eq!(status.checkouts[0].held, 10);
+        assert_eq!(status.checkouts[0].held, 22);
         assert_eq!(status.checkouts[1].held, 2);
         assert!(clock.balanced());
     }
 
     #[test]
     fn a_large_request_waits_for_its_share_and_is_not_starved_by_small_ones() {
-        let mut clock = Clock::new(16);
+        let mut clock = Clock::new(8);
         assert_eq!(clock.ask(0, 1, "a", 4), [(1, 4)]);
         assert_eq!(clock.ask(0, 2, "a", 3), [(2, 3)]);
         assert_eq!(clock.ask(1, 3, "b", 1), [(3, 1)]);
         assert_eq!(clock.ask(2, 4, "c", 4), []);
         assert_eq!(clock.ask(3, 5, "b", 1), []);
-        // One token frees. Three checkouts share background's 8 as 2 each; c holds least and
+        // One token frees. Three checkouts share the host's 8 as 2 each; c holds least and
         // asked first, so it waits for both tokens of its share, and b's single-token request
         // waits behind it.
         assert_eq!(clock.leave(4, 3), []);
@@ -1283,7 +1316,7 @@ mod tests {
 
     #[test]
     fn a_waiter_that_leaves_is_never_granted_and_a_holder_that_leaves_returns_its_tokens() {
-        let mut clock = Clock::new(8);
+        let mut clock = Clock::new(4);
         assert_eq!(clock.ask(0, 1, "a", 2), [(1, 2)]);
         assert_eq!(clock.ask(0, 2, "a", 2), [(2, 2)]);
         assert_eq!(clock.ask(1, 3, "b", 2), []);
@@ -1299,7 +1332,7 @@ mod tests {
 
     #[test]
     fn more_checkouts_than_tokens_share_one_token_each_in_arrival_order() {
-        let mut clock = Clock::new(4);
+        let mut clock = Clock::new(2);
         assert_eq!(clock.ask(0, 1, "a", 1), [(1, 1)]);
         assert_eq!(clock.ask(0, 2, "a", 1), [(2, 1)]);
         assert_eq!(clock.ask(1, 3, "b", 8), []);
@@ -1314,25 +1347,36 @@ mod tests {
     #[test]
     fn land_work_takes_every_returned_token_while_background_stays_queued() {
         let mut clock = Clock::new(8);
-        for ticket in 1..=3 {
+        for ticket in 1..=4 {
             assert_eq!(clock.ask(0, ticket, "fleet", 1), [(ticket, 1)]);
         }
-        assert_eq!(clock.ask(0, 4, "other", 1), [(4, 1)]);
-        assert_eq!(clock.ask(1, 5, "fleet", 1), []);
-        assert_eq!(clock.ask(1, 6, "other", 1), []);
-        // A land's gate job takes the half background left free, and its tasks ask last,
-        // through its relay pool.
-        assert_eq!(clock.ask_land(2, 9, "land", 4), [(9, 4)]);
-        assert_eq!(clock.ask_task(2, 7, 9, "land", 1), []);
-        assert_eq!(clock.ask_task(2, 8, 9, "land", 1), []);
-        // Each returned token goes to the land, ahead of the older background waiters (which
-        // already hold background's half), and a land task already running does not stop the
+        // With no gate work, background takes the whole host.
+        for ticket in 5..=8 {
+            assert_eq!(clock.ask(0, ticket, "other", 1), [(ticket, 1)]);
+        }
+        assert_eq!(clock.ask(1, 9, "fleet", 1), []);
+        assert_eq!(clock.ask(1, 10, "other", 1), []);
+        // A land's gate job arrives at the full host, and its tasks ask through its relay pool. No
+        // grant shrinks, so each waits for a returned token.
+        assert_eq!(clock.ask_land(2, 11, "land", 1), []);
+        assert_eq!(clock.ask_task(2, 12, 11, "land", 1), []);
+        assert_eq!(clock.ask_task(2, 13, 11, "land", 1), []);
+        // Each returned token goes to the land, ahead of the older background waiters, while
+        // background holds half the host or more, and a land task already running does not stop the
         // next one from being admitted.
-        assert_eq!(clock.leave(3, 1), [(7, 1)]);
-        assert_eq!(clock.leave(4, 2), [(8, 1)]);
-        // With no land work waiting, ordinary fairness resumes: the checkout holding least first.
-        assert_eq!(clock.leave(5, 3), [(5, 1)]);
-        assert_eq!(clock.leave(6, 4), [(6, 1)]);
+        assert_eq!(clock.leave(3, 1), [(11, 1)]);
+        assert_eq!(clock.leave(4, 2), [(12, 1)]);
+        assert_eq!(clock.leave(5, 3), [(13, 1)]);
+        // Beside the land, background's cap is half the host, which it still holds: a returned
+        // token stays free for the land's next task.
+        assert_eq!(clock.leave(6, 4), []);
+        // Under its cap again, background is served by ordinary fairness: the checkout holding
+        // least first.
+        assert_eq!(clock.leave(7, 5), [(9, 1)]);
+        // The land ends: background's cap is the whole host again.
+        assert_eq!(clock.leave(8, 11), []);
+        assert_eq!(clock.leave(8, 12), []);
+        assert_eq!(clock.leave(8, 13), [(10, 1)]);
         assert!(clock.balanced());
     }
 
@@ -1396,15 +1440,16 @@ mod tests {
     #[test]
     fn land_work_holds_the_larger_part_without_starving_background() {
         let mut clock = Clock::new(6);
-        assert_eq!(clock.ask(0, 1, "x", 6), [(1, 3)]);
-        // The land's gate job starts at once on the half background left free.
-        assert_eq!(clock.ask_land(1, 2, "land", 6), [(2, 3)]);
+        // With no gate work, background takes the whole host.
+        assert_eq!(clock.ask(0, 1, "x", 6), [(1, 6)]);
+        // The land's gate job and its task arrive at the full host and wait for returned tokens.
+        assert_eq!(clock.ask_land(1, 2, "land", 6), []);
         assert_eq!(clock.ask_task(1, 3, 2, "land", 6), []);
         assert_eq!(clock.ask(2, 4, "y", 1), []);
         assert_eq!(clock.ask(2, 5, "x", 1), []);
         // Each background checkout holding nothing gets one token while background stays under
-        // half the host; the land's oldest task takes the remaining one.
-        assert_eq!(clock.leave(3, 1), [(4, 1), (5, 1), (3, 1)]);
+        // half the host; the land's gate job takes the rest.
+        assert_eq!(clock.leave(3, 1), [(4, 1), (5, 1), (2, 4)]);
         let status = clock.status(3);
         assert_eq!(status.gate_jobs[0].held, 4);
         let background: usize = status.background.iter().map(|stake| stake.held).sum();
@@ -1508,25 +1553,26 @@ mod tests {
     fn a_checkout_holding_a_token_is_passed_by_at_most_the_background_limit_of_later_grants() {
         let mut clock = Clock::new(18);
         assert_eq!(clock.ask(0, 1, "scratch", 1), [(1, 1)]);
-        for ticket in 2..=9 {
+        // With no gate work, background fills the host.
+        for ticket in 2..=18 {
             assert_eq!(
                 clock.ask(0, ticket, &format!("busy{ticket}"), 1),
                 [(ticket, 1)]
             );
         }
-        assert_eq!(clock.ask(1, 10, "scratch", 1), []);
-        let mut holders: VecDeque<Ticket> = (2..=9).collect();
+        assert_eq!(clock.ask(1, 19, "scratch", 1), []);
+        let mut holders: VecDeque<Ticket> = (2..=18).collect();
         // Each returned token goes to a later checkout holding nothing, nine times.
-        for ticket in 11..=19 {
+        for ticket in 20..=28 {
             assert_eq!(clock.ask(ticket, ticket, &format!("fresh{ticket}"), 1), []);
             let returned = holders.pop_front().expect("a holder returns");
             assert_eq!(clock.leave(ticket, returned), [(ticket, 1)]);
             holders.push_back(ticket);
         }
         // Passed by the background limit's nine, the scratch ask is served before a tenth.
-        assert_eq!(clock.ask(20, 20, "fresh20", 1), []);
+        assert_eq!(clock.ask(29, 29, "fresh29", 1), []);
         let returned = holders.pop_front().expect("a holder returns");
-        assert_eq!(clock.leave(20, returned), [(10, 1)]);
+        assert_eq!(clock.leave(29, returned), [(19, 1)]);
         assert!(clock.balanced());
     }
 
@@ -1576,6 +1622,91 @@ mod tests {
                 .prop_map(|(checkout, want, gate)| Op::Ask { checkout, want, gate }),
             2 => any::<usize>().prop_map(|pick| Op::Leave { pick }),
         ]
+    }
+
+    /// One live request as the work-conserving property observes it from outside the ledger.
+    #[derive(Debug)]
+    struct Asked {
+        checkout: usize,
+        gate: bool,
+        want: usize,
+        /// The tokens it was granted, once granted.
+        held: Option<usize>,
+    }
+
+    proptest! {
+        /// Admission is work-conserving (05_gateway.md "Room for a gate", Danny tg#9527). Over any
+        /// host size and sequence of background asks, gate asks and departures: with no gate-class
+        /// request holding or waiting, a token stays free while background waits only when two or
+        /// more checkouts wait and a waiting request wants more than the free tokens, so background
+        /// may hold every token; a gate-class request never waits beside a free token, so a gate
+        /// that arrives after background filled the host takes the next returned one; and while a
+        /// gate-class request waits, background is granted only one floor token at a time, and only
+        /// while it then holds less than half the host.
+        #[test]
+        fn background_takes_every_free_token_without_gate_work_and_a_waiting_gate_takes_them_first(
+            total in 1..13usize,
+            ops in proptest::collection::vec(op(), 1..200),
+        ) {
+            let mut clock = Clock::new(total);
+            let mut live: BTreeMap<Ticket, Asked> = BTreeMap::new();
+            let mut gate_jobs: HashMap<usize, Ticket> = HashMap::new();
+            for (ticket, op) in (1..).zip(ops) {
+                let grants = match op {
+                    Op::Ask { checkout, want, gate } => {
+                        let name = format!("c{checkout}");
+                        live.insert(ticket, Asked { checkout, gate: gate.is_some(), want, held: None });
+                        match gate {
+                            None => clock.ask(ticket, ticket, &name, want),
+                            Some(repo) => {
+                                let job = *gate_jobs.entry(repo).or_insert(ticket);
+                                let class = Class::Gate(Arc::from(format!("r{repo}")));
+                                clock.ask_as(ticket, ticket, &name, want, (class, job))
+                            }
+                        }
+                    }
+                    Op::Leave { pick } => {
+                        if live.is_empty() {
+                            continue;
+                        }
+                        let gone = *live.keys().nth(pick % live.len()).expect("a live ticket");
+                        live.remove(&gone);
+                        clock.leave(ticket, gone)
+                    }
+                };
+                for (granted, tokens) in grants {
+                    let gate_waits = live.values().any(|asked| asked.gate && asked.held.is_none());
+                    let asked = live.get_mut(&granted).expect("a granted ticket is live");
+                    asked.held = Some(tokens);
+                    if !asked.gate && gate_waits {
+                        let background: usize = live
+                            .values()
+                            .filter(|asked| !asked.gate)
+                            .filter_map(|asked| asked.held)
+                            .sum();
+                        prop_assert!(
+                            tokens == 1 && 2 * background < total,
+                            "ticket {granted} was granted {tokens} while a gate waits; background holds {background} of {total}"
+                        );
+                    }
+                }
+                let free = clock.ledger.free;
+                let waiting = || live.values().filter(|asked| asked.held.is_none());
+                prop_assert!(
+                    free == 0 || !waiting().any(|asked| asked.gate),
+                    "a gate-class request waits beside {free} free tokens"
+                );
+                if free > 0 && !live.values().any(|asked| asked.gate) {
+                    let checkouts: std::collections::BTreeSet<usize> =
+                        waiting().map(|asked| asked.checkout).collect();
+                    prop_assert!(
+                        checkouts.is_empty()
+                            || (checkouts.len() > 1 && waiting().any(|asked| asked.want > free)),
+                        "{free} of {total} tokens are free with no gate work while checkouts {checkouts:?} wait"
+                    );
+                }
+            }
+        }
     }
 
     proptest! {

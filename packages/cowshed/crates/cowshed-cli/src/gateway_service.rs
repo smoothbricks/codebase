@@ -1940,16 +1940,17 @@ fn land_turn_line(queue: &LandTurnQueue) -> String {
 }
 
 /// The host CPU ledger in the operator's words (05_gateway.md "Host CPU budget"), in the order the
-/// ledger serves it: tokens held of the total; the leases held past the hold limit, oldest first,
-/// so the first lines answer who holds the host and since when (05_gateway.md "The hold limit"),
-/// each listed again under its own gate job or stake; the running gate jobs, the head — the
-/// oldest — first; the waiting gate-class requests in the order returned tokens go to them; then
-/// each checkout's background stake, served behind them. Each running gate job and background
-/// stake is followed by its leases, oldest grant first, so the reader sees who holds the tokens
-/// and since when rather than guessing from the checkout, and a background stake by its waiting
-/// requests. A queue entry is named by its process and wait age as a lease is by its grant's: one
-/// gate job's tasks are one entry each, and the job's number alone cannot tell them apart. Or why
-/// the daemon gave no ledger.
+/// ledger serves it: tokens held of the total, with what background holds and the cap in force on
+/// its grants, which is the whole host with no gate work (05_gateway.md "Room for a gate"); the
+/// leases held past the hold limit, oldest first, so the first lines answer who holds the host
+/// and since when (05_gateway.md "The hold limit"), each listed again under its own gate job or
+/// stake; the running gate jobs, the head — the oldest — first; the waiting gate-class requests in
+/// the order returned tokens go to them; then each checkout's background stake, served behind
+/// them. Each running gate job and background stake is followed by its leases, oldest grant first,
+/// so the reader sees who holds the tokens and since when rather than guessing from the checkout,
+/// and a background stake by its waiting requests. A queue entry is named by its process and wait
+/// age as a lease is by its grant's: one gate job's tasks are one entry each, and the job's number
+/// alone cannot tell them apart. Or why the daemon gave no ledger.
 fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
     let ledger = match budget {
         GatewayCpuBudget::Ledger(ledger) => ledger,
@@ -1959,11 +1960,16 @@ fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
             )];
         }
     };
+    let cap = match ledger.gate_work() {
+        cowshed_gateway_types::GateWork::Absent => "with no gate work",
+        cowshed_gateway_types::GateWork::HoldsOrWaits => "beside gate work",
+    };
     let mut lines = vec![format!(
-        "gateway cpu budget: held {}/{} tokens, background at most {}",
+        "gateway cpu budget: held {}/{} tokens, background holds {}, at most {} {cap}",
         ledger.held,
         ledger.total,
-        ledger.background_limit()
+        ledger.background_held(),
+        ledger.background_cap()
     )];
     let limit_minutes = cowshed_gateway_types::HOLD_LIMIT.as_secs() / 60;
     for (checkout, holder) in leases_past_the_hold_limit(ledger) {
@@ -4665,13 +4671,33 @@ mod tests {
 
             assert_eq!(
                 lines[0],
-                "gateway cpu budget: held 18/18 tokens, background at most 9"
+                "gateway cpu budget: held 18/18 tokens, background holds 12, at most 9 beside gate work"
             );
             assert_eq!(
                 lines[1],
                 "gateway cpu hold past 30m: /mnt/app/account-placement: pid 29272, 12/18 tokens, granted 48m18s ago: cargo --frozen test -p app_runtime"
             );
             assert_eq!(hold_lines(&lines).len(), 1, "{lines:#?}");
+        }
+
+        /// With no gate work, background's grants are capped at the whole host, and the count
+        /// says so: background may hold all 18 tokens, and the line does not claim a cap of 9 it
+        /// is not under (Danny tg#9527).
+        #[test]
+        fn with_no_gate_work_the_count_names_the_whole_host_as_backgrounds_cap() {
+            let GatewayCpuBudget::Ledger(mut ledger) =
+                ledger_with_background_lease(granted_ago(2, 0))
+            else {
+                unreachable!("the fixture is a ledger")
+            };
+            ledger.gate_jobs.clear();
+            ledger.background[0].held = 18;
+            let lines = cpu_budget_lines(&GatewayCpuBudget::Ledger(ledger));
+
+            assert_eq!(
+                lines[0],
+                "gateway cpu budget: held 18/18 tokens, background holds 18, at most 18 with no gate work"
+            );
         }
 
         /// A lease a second inside the limit is not named: with every lease within it the count is
@@ -4736,7 +4762,7 @@ mod tests {
             assert_eq!(
                 lines[..4],
                 [
-                    "gateway cpu budget: held 18/18 tokens, background at most 9",
+                    "gateway cpu budget: held 18/18 tokens, background holds 13, at most 9 beside gate work",
                     "gateway cpu hold past 30m: /mnt/app/account-placement: pid 29272, 12/18 tokens, granted 48m18s ago: cargo test",
                     "gateway cpu hold past 30m: /mnt/app/land: pid 31102, 4/18 tokens, granted 41m00s ago: nx run-many",
                     "gateway cpu hold past 30m: /mnt/app/account-placement: pid 29301, 1/1 tokens, granted 31m05s ago: bun test",

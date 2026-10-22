@@ -25,11 +25,11 @@ pub mod task_server;
 
 pub use cpu_budget::{
     CPU_POOL_ENV, CPU_TOKENS_ENV, CPU_TOKENS_OP, CpuBackgroundStake, CpuBudgetStatus,
-    CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, CpuHolder, CpuTokensRequest, CpuWaiter,
+    CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, CpuHolder, CpuTokensRequest, CpuWaiter, GateWork,
     HOLD_LIMIT, INSTALL_RESTART_CODE, INSTALL_SERVES_WITHIN, InstallRestart, JOBSERVER_OP,
     JobserverAnswer, JobserverClass, JobserverJob, JobserverRequest, RESIDENT_POOL_OP,
-    ResidentPoolRequest, background_limit, background_share, cpu_pool_directory, host_tokens,
-    inherited_cpu_pool,
+    ResidentPoolRequest, background_cap, background_limit, background_share, cpu_pool_directory,
+    host_tokens, inherited_cpu_pool,
 };
 pub use disk_lease::{
     DISK_LEASE_OP, DISK_PHASE_MEMBERS, DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState,

@@ -34,8 +34,8 @@ use tokio::io::AsyncRead;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecClass {
-    /// Every other exec, the default: checkout fairness behind the gate within half the host,
-    /// at nice +10.
+    /// Every other exec, the default: checkout fairness behind the gate, within the whole host
+    /// with no gate work and half of it beside gate work, at nice +10.
     #[default]
     Background,
     /// Work a person or model is waiting on, declared by the requester that awaits its result:

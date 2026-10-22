@@ -380,6 +380,11 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   gateway's host ledger, no background request is passed by more than `(k + 1)·⌊N/2⌋` later background grants, k the
   requests of its checkout queued ahead of it when it asked (05_gateway.md, "No background request is passed over
   without bound"); gate-class grants are not counted.
+- **CPU admission is work-conserving**: over the same generated sequences, with no gate-class request holding or waiting
+  a token stays free while background waits only when two or more checkouts wait and a waiting request wants more than
+  the free tokens; a gate-class request never waits beside a free token; and while one waits, background is granted only
+  one floor token at a time, and only while it then holds under half the host (05_gateway.md, "Room for a gate", Danny
+  tg#9527).
 
 ## Integration tests (real substrate)
 

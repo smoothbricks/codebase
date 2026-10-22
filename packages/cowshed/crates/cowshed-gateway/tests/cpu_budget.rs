@@ -299,11 +299,12 @@ async fn grant_handoff_and_selection_timings_need_no_environment_switch() {
     }
     assert!(std::env::var_os("COWSHED_TIMING").is_none());
     let (gateway, _root, socket) = gateway(2).await;
-    let mut holder = Asker::ask(&socket, 1, "/w/holder").await;
-    assert_eq!(holder.granted().await, 1);
+    // With no gate work the holder takes the whole host, so the waiter queues.
+    let mut holder = Asker::ask(&socket, 2, "/w/holder").await;
+    assert_eq!(holder.granted().await, 2);
     let mut waiter = Asker::ask(&socket, 1, "/w/waiter").await;
     let queued = ledger(&socket).await;
-    assert_eq!(queued.held, 1);
+    assert_eq!(queued.held, 2);
     assert_eq!(
         queued
             .background
@@ -351,7 +352,7 @@ async fn grant_handoff_and_selection_timings_need_no_environment_switch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
     let (gateway, _root, socket) = gateway(8).await;
-    // The holder takes background's whole half, so a second background checkout queues whole.
+    // With no gate work the holder takes the whole host, so a second background checkout queues.
     // The holder is another process, so SIGKILL is a real death: the kernel closes its socket.
     let mut holder = Command::new("/usr/bin/nc")
         .arg("-U")
@@ -362,7 +363,7 @@ async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
         .expect("spawn nc");
     let mut input = holder.stdin.take().expect("stdin");
     input
-        .write_all(request(4, "/w/killed").as_bytes())
+        .write_all(request(8, "/w/killed").as_bytes())
         .expect("ask");
     let mut answers = StdBufReader::new(holder.stdout.take().expect("stdout")).lines();
     let answers = tokio::task::spawn_blocking(move || {
@@ -373,7 +374,7 @@ async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
     .await
     .expect("read answers");
     assert!(answers.0.contains("\"queued\""), "{}", answers.0);
-    assert!(answers.1.contains("\"tokens\":4"), "{}", answers.1);
+    assert!(answers.1.contains("\"tokens\":8"), "{}", answers.1);
 
     let mut waiter = Asker::ask(&socket, 2, "/w/waiting").await;
     assert_eq!(
@@ -381,7 +382,7 @@ async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
         None
     );
     let held = ledger(&socket).await;
-    assert_eq!((held.total, held.held), (8, 4));
+    assert_eq!((held.total, held.held), (8, 8));
 
     holder.kill().expect("SIGKILL the holder");
     holder.wait().expect("reap");
@@ -405,32 +406,32 @@ async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn checkouts_share_the_background_half_and_a_lone_grant_fills_it() {
+async fn checkouts_share_the_host_and_a_lone_grant_fills_it() {
     let (gateway, _root, socket) = gateway(16).await;
 
-    // Alone, one background grant fills background's half of the host, 8 of 16.
+    // Alone, with no gate work, one background grant fills the host, 16 of 16.
     let mut whole = Asker::ask(&socket, 64, "/w/a").await;
-    assert_eq!(whole.granted().await, 8);
-    let mut a_next = Asker::ask(&socket, 8, "/w/a").await;
+    assert_eq!(whole.granted().await, 16);
+    let mut a_next = Asker::ask(&socket, 16, "/w/a").await;
     assert_eq!(
         a_next.granted_within(Duration::from_millis(300)).await,
         None
     );
-    let mut b = Asker::ask(&socket, 8, "/w/b").await;
+    let mut b = Asker::ask(&socket, 16, "/w/b").await;
     assert_eq!(b.granted_within(Duration::from_millis(300)).await, None);
 
-    // The runner returns 8: each waiting checkout takes its share of 4.
+    // The runner returns 16: each waiting checkout takes its share of 8.
     drop(whole);
-    assert_eq!(a_next.granted().await, 4);
-    assert_eq!(b.granted().await, 4);
+    assert_eq!(a_next.granted().await, 8);
+    assert_eq!(b.granted().await, 8);
     let held = ledger(&socket).await;
-    assert_eq!(held.held, 8);
+    assert_eq!(held.held, 16);
     assert_eq!(
         held.checkouts
             .iter()
             .map(|checkout| (checkout.checkout.as_str(), checkout.held))
             .collect::<Vec<_>>(),
-        [("/w/a", 4), ("/w/b", 4)]
+        [("/w/a", 8), ("/w/b", 8)]
     );
 
     // A refused request names why and holds nothing.
@@ -450,14 +451,19 @@ async fn checkouts_share_the_background_half_and_a_lone_grant_fills_it() {
 /// limit of later background grants (05_gateway.md "Fair between checkouts within one priority").
 /// Measured 2026-10-22 on gateway 89443: a scratch checkout held one token for an idle FIFO
 /// reader, and its next ask waited 2,478 s while 51 later background asks of checkouts holding
-/// nothing were granted. On a four-token host the limit is two: two later checkouts are served, then it.
+/// nothing were granted. On a four-token host the limit is two: with no gate work, background
+/// fills the host, two later checkouts are served from returned tokens, then it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_checkout_holding_a_token_is_served_after_at_most_the_background_limit_of_later_grants() {
     let (gateway, _root, socket) = gateway(4).await;
     let mut idle = Asker::ask(&socket, 1, "/w/scratch").await;
     assert_eq!(idle.granted().await, 1);
-    let mut holder = Asker::ask(&socket, 1, "/w/fresh0").await;
-    assert_eq!(holder.granted().await, 1);
+    let mut holders = std::collections::VecDeque::new();
+    for held in 0..3 {
+        let mut holder = Asker::ask(&socket, 1, &format!("/w/held{held}")).await;
+        assert_eq!(holder.granted().await, 1);
+        holders.push_back(holder);
+    }
     // Each waiter reports its grant; exactly one waiter is granted each returned token.
     let (granted, mut grants) = tokio::sync::mpsc::unbounded_channel();
     let wait = |name: String, mut asker: Asker| {
@@ -478,19 +484,19 @@ async fn a_checkout_holding_a_token_is_served_after_at_most_the_background_limit
             format!("fresh{fresh}"),
             Asker::ask(&socket, 1, &checkout).await,
         ));
-        drop(holder);
+        drop(holders.pop_front());
         let (name, asker) = grants
             .recv()
             .await
             .expect("a waiter takes the returned token");
         order.push(name);
-        holder = asker;
+        holders.push_back(asker);
     }
     assert_eq!(order, ["fresh1", "fresh2", "scratch"]);
     for waiter in waiters {
         waiter.abort();
     }
-    drop((idle, holder));
+    drop((idle, holders));
     gateway.drain().await.expect("drain");
 }
 
@@ -542,7 +548,7 @@ async fn a_jobserver_grant_names_a_fifo_and_close_returns_every_token() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_gate_takes_the_larger_part_of_returned_tokens_before_older_background_work() {
     let (gateway, _root, socket) = gateway(8).await;
-    let mut holder = Asker::ask(&socket, 8, "/w/background").await;
+    let mut holder = Asker::ask(&socket, 4, "/w/background").await;
     assert_eq!(holder.granted().await, 4);
     let mut first_gate = Asker::jobserver(&socket, 4, "/w/first-gate").await;
     assert_eq!(first_gate.granted().await, 4);
@@ -570,21 +576,31 @@ async fn a_gate_takes_the_larger_part_of_returned_tokens_before_older_background
     gateway.drain().await.expect("drain");
 }
 
-/// The measured hole, over the socket (05_gateway.md "Room for a gate"): a background run that
-/// asks for the whole host while nothing else asks is granted background's half; a second
-/// background request finds no room; and a land's gate job and then its task are granted the
-/// other half while that background grant is still held. Every grant here arrives without a token
-/// being returned, so the gate's wait is the ledger's own transition, not any run's length.
+/// Danny tg#9527 over the socket (05_gateway.md "Room for a gate"): with no gate work a background
+/// run takes the whole host, so a land's gate job that arrives then queues, since no grant
+/// shrinks. When the run returns its tokens, the background checkout holding nothing keeps its
+/// floor token and the gate job and its task take all the rest, with no kill and no timer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_gate_is_granted_the_free_half_while_a_lone_background_grant_still_holds_its_own() {
+async fn a_gate_arriving_after_background_filled_the_host_takes_the_returned_tokens_first() {
     let (gateway, _root, socket) = gateway(8).await;
     let mut smoke = Asker::ask(&socket, 8, "/w/smoke").await;
-    assert_eq!(smoke.granted().await, 4);
+    assert_eq!(smoke.granted().await, 8);
     let mut other = Asker::ask(&socket, 8, "/w/other").await;
-    assert_eq!(other.granted_within(Duration::from_millis(50)).await, None);
-    let (gate, pool) = Asker::gate_job(&socket, "/w/train").await;
+    let mut gate = Asker::send(&socket, gate_request(1, "/w/train", "nx run-many -t gate")).await;
+    let status = ledger(&socket).await;
+    assert_eq!((status.held, status.gate_queue.len()), (8, 1), "{status:?}");
+    // The background run ends.
+    drop(smoke);
+    assert_eq!(other.granted().await, 1);
+    let granted = gate.answer().await;
+    assert_eq!(granted["tokens"], 1, "{granted}");
+    let pool = PathBuf::from(
+        granted["cpuPool"]
+            .as_str()
+            .expect("a gate job names its pool"),
+    );
     let mut task = Asker::child(&pool, 8).await;
-    assert_eq!(task.granted().await, 3);
+    assert_eq!(task.granted().await, 6);
     let status = ledger(&socket).await;
     assert_eq!((status.total, status.held), (8, 8), "{status:?}");
     assert_eq!(
@@ -593,12 +609,9 @@ async fn a_gate_is_granted_the_free_half_while_a_lone_background_grant_still_hol
             .iter()
             .map(|stake| (stake.checkout.as_str(), stake.held))
             .collect::<Vec<_>>(),
-        [("/w/other", 0), ("/w/smoke", 4)],
+        [("/w/other", 1)],
         "{status:?}"
     );
-    // The background run ends: the waiting background request takes background's half.
-    drop(smoke);
-    assert_eq!(other.granted().await, 4);
     drop((gate, task, other));
     gateway.drain().await.expect("drain");
 }
@@ -1343,12 +1356,12 @@ async fn a_holder_at_backgrounds_room_has_its_childs_exec_granted_from_its_own_p
 
     let (gateway, _root, socket) = gateway(4).await;
     let admission = GatewayJobCpu::new(socket.clone());
-    // The holder takes background's whole room: 2 of 4 tokens.
+    // With no gate work the holder takes background's whole room, the host: 4 of 4 tokens.
     let holder = admission
         .admit(exec_ask(4, "/w/holder", 1, None))
         .await
         .expect("the holder is granted");
-    assert_eq!(holder.tokens(), NonZeroUsize::new(2));
+    assert_eq!(holder.tokens(), NonZeroUsize::new(4));
     // Asked of the host, the holder's child waits behind it: the host is saturated.
     let mut host_child = Box::pin(admission.admit(exec_ask(1, "/w/scratch", 2, None)));
     loop {
@@ -1376,7 +1389,7 @@ async fn a_holder_at_backgrounds_room_has_its_childs_exec_granted_from_its_own_p
     assert_eq!(child.pool().parent(), holder.pool().parent());
     let status = ledger(&socket).await;
     assert_eq!(
-        status.held, 2,
+        status.held, 4,
         "the borrowed token is the holder's, not a host one: {status:?}"
     );
 
@@ -1399,7 +1412,7 @@ async fn a_holder_at_backgrounds_room_has_its_childs_exec_granted_from_its_own_p
         refused.to_string().contains("requester's CPU pool"),
         "{refused}"
     );
-    assert_eq!(ledger(&socket).await.held, 2);
+    assert_eq!(ledger(&socket).await.held, 4);
 
     // A pool that cannot be reached is absent: the holder gone, its child asks the host and is
     // granted there once the host has room.
@@ -1516,9 +1529,10 @@ async fn a_holders_exec_on_a_full_host_with_a_busy_pool_is_granted_by_whichever_
         .admit(exec_ask(1, "/w/holder", 1, None))
         .await
         .expect("the holder is granted");
-    // Background's room is 2 of 4: the holder and another checkout's job fill it.
+    // With no gate work background's room is the host: the holder and another checkout's job
+    // fill it.
     let filler = admission
-        .admit(exec_ask(1, "/w/filler", 2, None))
+        .admit(exec_ask(3, "/w/filler", 2, None))
         .await
         .expect("the filler is granted");
 
@@ -1539,7 +1553,12 @@ async fn a_holders_exec_on_a_full_host_with_a_busy_pool_is_granted_by_whichever_
     );
     drop(sibling);
 
-    // The pool frees first: its sibling holds the pool's token, the host is full again.
+    // The pool frees first: its sibling holds the pool's token, and another filler makes the
+    // host full again.
+    let refill = admission
+        .admit(exec_ask(2, "/w/filler", 5, None))
+        .await
+        .expect("the refill is granted");
     let (sibling, _) = pool_child(holder.pool(), 1).await;
     let mut exec = Box::pin(admission.admit(exec_ask(1, "/w/scratch", 4, Some(holder.pool()))));
     tokio::select! {
@@ -1552,11 +1571,11 @@ async fn a_holders_exec_on_a_full_host_with_a_busy_pool_is_granted_by_whichever_
     waiters_reach(&socket, "/w/scratch", 0).await;
     let status = ledger(&socket).await;
     assert_eq!(
-        status.held, 2,
+        status.held, 4,
         "the pool's grant takes no host place: {status:?}"
     );
 
-    drop((by_pool, by_host, holder));
+    drop((by_pool, by_host, holder, refill));
     while ledger(&socket).await.held != 0 {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
