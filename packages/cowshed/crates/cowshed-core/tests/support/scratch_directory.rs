@@ -116,8 +116,9 @@ mod tests {
         let path = root.path().to_path_buf();
         let spawn = |cwd: &Path| {
             let mut child = Command::new("/bin/sh")
-                .args(["-c", "printf 'ready\\n'; exec /bin/sleep 60"])
+                .args(["-c", "printf 'ready\\n'; exec /bin/cat"])
                 .current_dir(cwd)
+                .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn_locked()
                 .unwrap();

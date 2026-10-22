@@ -2182,8 +2182,8 @@ impl SpawnSink for ReapedGroupSpawner {
 fn owned_group() -> std::process::Child {
     use std::os::unix::process::CommandExt as _;
     std::process::Command::new("/bin/sh")
-        .args(["-c", "sleep 300 & wait"])
-        .stdin(std::process::Stdio::null())
+        .args(["-c", "exec 3<&0; read _ <&3 & wait"])
+        .stdin(std::process::Stdio::piped())
         .process_group(0)
         .spawn_locked()
         .expect("a test-owned process group")
@@ -2327,8 +2327,11 @@ async fn a_supervisor_serves_and_carries_the_groups_its_predecessor_left_unresol
     let ledger = root.join("supervisor.groups");
     // A group whose leader exited and was reaped while a descendant holds the id.
     let mut leaderless = std::process::Command::new("/bin/sh")
-        .args(["-c", "(trap '' TERM; echo READY; exec sleep 300) & wait"])
-        .stdin(std::process::Stdio::null())
+        .args([
+            "-c",
+            "exec 3<&0; (trap '' TERM; echo READY; read _ <&3) & wait",
+        ])
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .process_group(0)
         .spawn_locked()
@@ -2338,6 +2341,8 @@ async fn a_supervisor_serves_and_carries_the_groups_its_predecessor_left_unresol
     std::io::BufReader::new(leaderless.stdout.take().unwrap())
         .read_line(&mut ready)
         .unwrap();
+    // The descendant reads this pipe: reaping the leader must not close it.
+    let held = leaderless.stdin.take();
     leaderless.kill().unwrap();
     leaderless.wait().unwrap();
     std::fs::write(
@@ -2387,6 +2392,7 @@ async fn a_supervisor_serves_and_carries_the_groups_its_predecessor_left_unresol
 
     // SAFETY: this test made the group; its id still names the test's own descendant.
     assert_eq!(unsafe { libc::killpg(pgid, libc::SIGKILL) }, 0);
+    drop(held);
     while !cowshed_core::runtime::job_groups::unresolved(&ledger)
         .unwrap()
         .is_empty()
@@ -4585,6 +4591,9 @@ struct InProcessSpawner {
     supervisor: Option<WorkspaceSupervisorHandle>,
     child: &'static [&'static str],
     spawned: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The child's stdin. The spawner holds the write end, so a child reading it runs until the
+    /// manager drops its spawner.
+    stdin: (std::io::PipeReader, std::io::PipeWriter),
 }
 
 impl cowshed_core::runtime::supervisor_manager::SupervisorSpawner for InProcessSpawner {
@@ -4612,6 +4621,7 @@ impl cowshed_core::runtime::supervisor_manager::SupervisorSpawner for InProcessS
         }
         tokio::process::Command::new(self.child[0])
             .args(&self.child[1..])
+            .stdin(self.stdin.0.try_clone()?)
             .kill_on_drop(true)
             .spawn_locked()
     }
@@ -4639,7 +4649,8 @@ async fn the_manager_starts_one_supervisor_for_concurrent_ensures() {
         Box::new(InProcessSpawner {
             store_root: store.to_path_buf(),
             supervisor: Some(h.handle.clone()),
-            child: &["sleep", "30"],
+            child: &["sh", "-c", "read _"],
+            stdin: std::io::pipe().unwrap(),
             spawned: std::sync::Arc::clone(&spawned),
         }),
         healed(),
@@ -4673,6 +4684,7 @@ async fn the_manager_reports_a_supervisor_that_exits_before_serving() {
             store_root: store.to_path_buf(),
             supervisor: None,
             child: &["sh", "-c", "exit 3"],
+            stdin: std::io::pipe().unwrap(),
             spawned: std::sync::Arc::default(),
         }),
         healed(),
@@ -4777,7 +4789,8 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
         Box::new(InProcessSpawner {
             store_root: store.to_path_buf(),
             supervisor: None,
-            child: &["sleep", "30"],
+            child: &["sh", "-c", "read _"],
+            stdin: std::io::pipe().unwrap(),
             spawned: std::sync::Arc::clone(&spawned),
         }),
         healed(),
@@ -4991,7 +5004,8 @@ async fn an_ensure_from_a_stale_grant_read_is_answered_by_the_newer_supervisor()
         Box::new(InProcessSpawner {
             store_root: store.to_path_buf(),
             supervisor: None,
-            child: &["sleep", "30"],
+            child: &["sh", "-c", "read _"],
+            stdin: std::io::pipe().unwrap(),
             spawned: std::sync::Arc::clone(&spawned),
         }),
         healed(),
@@ -5047,7 +5061,8 @@ async fn an_ensure_is_refused_by_a_supervisor_of_another_incarnation() {
         Box::new(InProcessSpawner {
             store_root: store.to_path_buf(),
             supervisor: None,
-            child: &["sleep", "30"],
+            child: &["sh", "-c", "read _"],
+            stdin: std::io::pipe().unwrap(),
             spawned: std::sync::Arc::default(),
         }),
         healed(),
@@ -5489,12 +5504,12 @@ fn warm_harness(supervisor_config: WorkspaceSupervisorConfig) -> Harness {
 }
 
 /// A group this test owns whose one process is its leader, held unreaped until [`end_group`].
-/// Resolve `sleep` through the toolchain PATH; NixOS has no `/bin/sleep`.
+/// It reads its stdin, a pipe the returned child holds, so it runs until [`end_group`] or the
+/// child's drop. Resolve `cat` through the toolchain PATH; NixOS has no `/bin/cat`.
 fn lone_group() -> std::process::Child {
     use std::os::unix::process::CommandExt as _;
-    std::process::Command::new("sleep")
-        .arg("300")
-        .stdin(std::process::Stdio::null())
+    std::process::Command::new("cat")
+        .stdin(std::process::Stdio::piped())
         .process_group(0)
         .spawn_locked()
         .expect("a test-owned process group")
@@ -7148,8 +7163,8 @@ impl LiveDaemon {
                 }
             })
         };
-        let process = std::process::Command::new("sleep")
-            .arg("3600")
+        let process = std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
             .spawn_locked()
             .unwrap();
         let record = project.join(".nx/workspace-data/d/server-process.json");
@@ -7228,9 +7243,9 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
             events: mpsc::Sender<ProcessEvent>,
         ) -> Result<Box<dyn RunningProcess>> {
             let SpawnCommand::Argv(argv) = &request.command else {
-                panic!("the fixture admits only its real sleep group");
+                panic!("the fixture admits only its real cat group");
             };
-            assert_eq!(argv, &[OsString::from("sleep"), OsString::from("300")]);
+            assert_eq!(argv, &[OsString::from("cat")]);
             let child = lone_group();
             let process = owned(&child, Instant::now());
             assert!(
@@ -7374,7 +7389,7 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
                     None,
                     None,
                     ExecRequest {
-                        command: ExecCommand::Argv(vec!["sleep".into(), "300".into()]),
+                        command: ExecCommand::Argv(vec!["cat".into()]),
                         cwd: None,
                         ..request(StdinSource::Empty)
                     },

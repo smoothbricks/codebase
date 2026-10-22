@@ -198,13 +198,14 @@ mod tests {
         use std::time::Duration;
         let (_root, sessions) = sessions();
         let lease = lease_path(&sessions, "topic");
-        // `lockf -k` takes flock(2) on the lease and runs `sleep` as its child; the child inherits
-        // the locked descriptor. Killing the whole process group ends both, as a killed land's tree.
+        // `lockf -k` takes flock(2) on the lease and runs `cat` as its child; the child inherits
+        // the locked descriptor and reads lockf's stdin, a pipe `holder` holds, so it runs until
+        // the kill. Killing the whole process group ends both, as a killed land's tree.
         let mut holder = Command::new("/usr/bin/lockf")
             .arg("-k")
             .arg(&lease)
-            .args(["/bin/sleep", "600"])
-            .stdin(Stdio::null())
+            .arg("/bin/cat")
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .process_group(0)
@@ -235,12 +236,12 @@ mod tests {
 
         let group = libc::pid_t::try_from(holder.id()).expect("a pid fits pid_t");
         // SAFETY: `holder` leads its own process group (`process_group(0)`), so its pid names the
-        // group; SIGKILL to that group ends lockf and the sleep child that holds the descriptor.
+        // group; SIGKILL to that group ends lockf and the `cat` child that holds the descriptor.
         let killed = unsafe { libc::killpg(group, libc::SIGKILL) };
         assert_eq!(killed, 0, "kill the lockf process group");
         holder.wait().expect("reap lockf");
 
-        // The lock drops when the sleep child's descriptor closes, a moment after the kill.
+        // The lock drops when the `cat` child's descriptor closes, a moment after the kill.
         loop {
             match take(&sessions, "topic", Holding::Remove) {
                 Ok(released) => {

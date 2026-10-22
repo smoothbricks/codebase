@@ -10530,8 +10530,8 @@ mod process_death_tests {
         use std::os::unix::process::CommandExt as _;
 
         let mut job = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 300 & exit 3"])
-            .stdin(std::process::Stdio::null())
+            .args(["-c", "exec 3<&0; read _ <&3 & exit 3"])
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .process_group(0)
             .spawn_locked()

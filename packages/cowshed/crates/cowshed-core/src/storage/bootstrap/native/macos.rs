@@ -8533,9 +8533,31 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
     #[test]
     fn run_disk_tool_preserves_its_total_deadline_without_inventing_daemon_failure() {
         // The child outlives the deadline, so the deadline's kill is the event: the report names
-        // the signalled group, which a runner that waited for the child to end could not.
+        // the signalled group, which a runner that waited for the child to end could not. The
+        // child blocks opening for reading a FIFO no writer ever opens: only the kill ends it.
+        use std::os::unix::ffi::OsStrExt as _;
+        let scratch = crate::temp_root::TempRoot::new("disk-tool-deadline");
+        let gate = scratch.join("gate");
+        let path =
+            std::ffi::CString::new(gate.as_os_str().as_bytes()).expect("a gate path without NUL");
+        // SAFETY: `path` is a NUL-terminated path under this test's own root.
+        let made = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(
+            made,
+            0,
+            "mkfifo {}: {}",
+            gate.display(),
+            std::io::Error::last_os_error()
+        );
         let error = run_disk_tool(
-            &HostCommand::new("/bin/sleep", ["30"]),
+            &HostCommand::new(
+                "/bin/sh",
+                [
+                    "-c".to_owned(),
+                    "exec <\"$0\"".to_owned(),
+                    gate.display().to_string(),
+                ],
+            ),
             Duration::from_millis(250),
         )
         .expect_err("deadline");

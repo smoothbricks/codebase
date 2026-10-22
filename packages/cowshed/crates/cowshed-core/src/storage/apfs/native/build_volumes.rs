@@ -1745,13 +1745,13 @@ mod tests {
     }
 
     /// A process group of its own the test leads, standing in for a job's activation or command:
-    /// the supervisor samples it like any job group.
+    /// the supervisor samples it like any job group. It reads its stdin, a pipe the returned
+    /// child holds, so it runs until [`end_group`] or the child's drop.
     fn lone_group() -> std::process::Child {
         use cowshed_os::fork_lock::Spawn as _;
         use std::os::unix::process::CommandExt as _;
-        std::process::Command::new("/bin/sleep")
-            .arg("300")
-            .stdin(std::process::Stdio::null())
+        std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
             .process_group(0)
             .spawn_locked()
             .expect("a test-owned process group")

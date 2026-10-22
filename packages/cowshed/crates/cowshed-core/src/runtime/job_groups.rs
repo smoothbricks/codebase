@@ -2035,11 +2035,13 @@ mod tests {
         member.wait().expect("reap the member");
     }
 
-    /// A job-shaped process tree: a group leader with a child, both sleeping.
+    /// A job-shaped process tree: a group leader waiting for its child, which blocks reading the
+    /// leader's stdin, a pipe the returned leader holds (`sh` would give a background job
+    /// `/dev/null`).
     fn job_group() -> std::process::Child {
         Command::new("/bin/sh")
-            .args(["-c", "sleep 300 & wait"])
-            .stdin(Stdio::null())
+            .args(["-c", "exec 3<&0; read _ <&3 & wait"])
+            .stdin(Stdio::piped())
             .process_group(0)
             .spawn_locked()
             .expect("spawn a job group")
@@ -2320,7 +2322,7 @@ os._exit(0)
 
     #[test]
     fn a_job_s_members_are_its_whole_running_group_and_none_once_it_ended() {
-        let (mut job, sleeper) = group_with_child("sleep 300 & echo $!; wait");
+        let (mut job, sleeper) = group_with_child("exec 3<&0; read _ <&3 & echo $!; wait");
         let birth = super::Birth::of(job.id());
         assert_eq!(
             pids(super::job_members(&birth).expect("members")),
@@ -2394,12 +2396,15 @@ os._exit(0)
     #[test]
     fn members_nothing_proves_the_job_s_are_an_error_never_a_membership() {
         // The leader exits at once and is reaped, while its child holds the group id on.
-        let (mut job, sleeper) = group_with_child("sleep 300 & echo $!");
+        let (mut job, sleeper) = group_with_child("exec 3<&0; read _ <&3 & echo $!");
         let birth = super::Birth::of(job.id());
+        // The child reads this pipe: reaping the leader must not close it.
+        let held = job.stdin.take();
         job.wait().expect("reap the leader");
         let orphaned = super::job_members(&birth);
         // SAFETY: plain kill of the test's own orphaned grandchild.
         unsafe { libc::kill(i32::try_from(sleeper).unwrap(), libc::SIGKILL) };
+        drop(held);
         assert!(orphaned.is_err(), "{orphaned:?}");
 
         let mut group = job_group();
@@ -2421,8 +2426,11 @@ os._exit(0)
         use std::io::BufRead as _;
 
         let child = Command::new("/bin/sh")
-            .args(["-c", "(trap '' TERM; echo READY; exec sleep 300) & wait"])
-            .stdin(Stdio::null())
+            .args([
+                "-c",
+                "exec 3<&0; (trap '' TERM; echo READY; read _ <&3) & wait",
+            ])
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .process_group(0)
             .spawn_locked()
@@ -2633,8 +2641,8 @@ os._exit(0)
         use std::io::BufRead as _;
 
         let mut child = Command::new("/bin/sh")
-            .args(["-c", "sleep 300 & echo READY; wait"])
-            .stdin(Stdio::null())
+            .args(["-c", "exec 3<&0; read _ <&3 & echo READY; wait"])
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .process_group(0)
             .spawn_locked()
@@ -2675,7 +2683,7 @@ os._exit(0)
             !leader.signal(libc::SIGKILL).unwrap(),
             "a reaped process was signalled"
         );
-        // SAFETY: the test's own group; its backgrounded sleep may still hold the id.
+        // SAFETY: the test's own group; its backgrounded reader may still hold the id.
         unsafe { libc::killpg(pgid, libc::SIGKILL) };
     }
 
@@ -2690,7 +2698,7 @@ os._exit(0)
         use std::io::{BufRead as _, Write as _};
 
         let child = Command::new("/bin/sh")
-            .args(["-c", "echo READY; read line; exec /bin/sleep 300"])
+            .args(["-c", "echo READY; read line; exec /bin/cat"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .process_group(0)
@@ -2727,7 +2735,7 @@ os._exit(0)
         }
         assert!(
             super::group_has_live_members(pgid).unwrap(),
-            "the leader runs on as `sleep` under a new version"
+            "the leader runs on as `cat` under a new version"
         );
 
         assert_eq!(
@@ -2807,7 +2815,7 @@ os._exit(0)
 
         assert!(leader.signal(libc::SIGKILL).unwrap());
         job.wait().unwrap();
-        // SAFETY: the test's own group; its backgrounded sleep may still hold the id.
+        // SAFETY: the test's own group; its backgrounded reader may still hold the id.
         unsafe { libc::killpg(pgid, libc::SIGKILL) };
     }
 
@@ -2834,7 +2842,7 @@ os._exit(0)
             leader.watch_exit().is_err(),
             "a reaped process's exit was watched"
         );
-        // SAFETY: the test's own group; its backgrounded sleep may still hold the id.
+        // SAFETY: the test's own group; its backgrounded reader may still hold the id.
         unsafe { libc::killpg(pgid, libc::SIGKILL) };
     }
 
@@ -2859,8 +2867,11 @@ os._exit(0)
         ];
         for (label, recorded) in identities {
             let child = Command::new("/bin/sh")
-                .args(["-c", "(trap '' TERM; echo READY; exec sleep 300) & wait"])
-                .stdin(Stdio::null())
+                .args([
+                    "-c",
+                    "exec 3<&0; (trap '' TERM; echo READY; read _ <&3) & wait",
+                ])
+                .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .process_group(0)
                 .spawn_locked()
@@ -2878,6 +2889,8 @@ os._exit(0)
                 (label == "start", label == "legacy birth"),
                 "{label}: recorded while the leader ran"
             );
+            // The descendant reads this pipe: reaping the leader must not close it.
+            let held = group.0.stdin.take();
             group.0.kill().unwrap();
             group.0.wait().unwrap();
             assert_eq!(super::start_time(pgid).unwrap(), None, "{label}");
@@ -2938,6 +2951,7 @@ os._exit(0)
             assert!(group_alive(pgid), "{label}: the group was signalled");
 
             drop(group);
+            drop(held);
             while super::group_has_live_members(pgid).unwrap() {
                 std::thread::sleep(Duration::from_millis(5));
             }

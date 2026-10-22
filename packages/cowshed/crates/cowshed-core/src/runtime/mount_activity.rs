@@ -143,34 +143,55 @@ mod tests {
         fs::canonicalize(root).unwrap()
     }
 
-    /// `sleep` with its working directory at `cwd`, holding `open` as descriptor 3 when given.
+    /// A holder's script: `sh` blocked reading its stdin, a pipe the returned child holds.
+    const HOLD: &str = "read _";
+    /// [`HOLD`] with the file `$0` names open as descriptor 3.
+    const HOLD_OPEN: &str = "exec 3<\"$0\"; read _";
+
+    /// `sh` with its working directory at `cwd`, holding `open` as descriptor 3 when given. It
+    /// runs until the test drops the child's stdin: no clock decides how long it holds.
     fn holder(cwd: &Path, open: Option<&Path>) -> std::process::Child {
         let mut command = std::process::Command::new("/bin/sh");
         match open {
-            Some(file) => command
-                .arg("-c")
-                .arg("exec 3<\"$0\"; exec /bin/sleep 30")
-                .arg(file),
-            None => command.arg("-c").arg("exec /bin/sleep 30"),
+            Some(file) => command.arg("-c").arg(HOLD_OPEN).arg(file),
+            None => command.arg("-c").arg(HOLD),
         };
-        command.current_dir(cwd).spawn_locked().unwrap()
+        command
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::piped())
+            .spawn_locked()
+            .unwrap()
     }
 
-    /// Asked until both children show: `sh` execs `sleep` after its redirection.
-    fn census_naming(mount: &Path, accounted: &Accounted<'_>, pids: &[i32]) -> Vec<TreeHold> {
-        for _ in 0..500 {
+    /// Asked until every child shows: `sh` opens descriptor 3 after the spawn returns. A child
+    /// that exited first fails the test by name; one that never shows is a hang the leg's
+    /// no-progress watchdog names, not a bound of this test's own.
+    fn census_naming(
+        mount: &Path,
+        accounted: &Accounted<'_>,
+        children: &mut [&mut std::process::Child],
+    ) -> Vec<TreeHold> {
+        loop {
             let held = unaccounted(mount, accounted)
                 .unwrap()
                 .map_or_else(Vec::new, |held| held.holders);
-            if pids
-                .iter()
-                .all(|pid| held.iter().any(|holder| holder.holder.pid == *pid))
-            {
+            if children.iter().all(|child| {
+                let pid = i32::try_from(child.id()).unwrap();
+                held.iter().any(|holder| holder.holder.pid == pid)
+            }) {
                 return held;
+            }
+            for child in children.iter_mut() {
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!(
+                        "holder {} exited before it held {}: {status}",
+                        child.id(),
+                        mount.display()
+                    );
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        panic!("pids {pids:?} never all held {}", mount.display());
     }
 
     /// Host work on a mount with no supervisor: one process working in it, another with one of
@@ -193,10 +214,10 @@ mod tests {
         let mut reading = holder(&beside, Some(&lock));
         let mut elsewhere = holder(&beside, None);
         let pids = [&working, &reading, &elsewhere].map(|child| i32::try_from(child.id()).unwrap());
-        let held = census_naming(&mount, &accounted, &pids[..2]);
+        let held = census_naming(&mount, &accounted, &mut [&mut working, &mut reading]);
         let named = unaccounted(&mount, &accounted).unwrap();
         for child in [&mut working, &mut reading, &mut elsewhere] {
-            child.kill().unwrap();
+            drop(child.stdin.take());
             child.wait().unwrap();
         }
         let hold_of = |pid: i32| {
@@ -217,13 +238,14 @@ mod tests {
         let said = named.expect("still held when asked again").to_string();
         for expected in [
             format!(
-                "pid {} (/bin/sleep 30), working directory {}",
+                "pid {} (/bin/sh -c {HOLD}), working directory {}",
                 pids[0],
                 packages.display()
             ),
             format!(
-                "pid {} (/bin/sleep 30), open file {}",
+                "pid {} (/bin/sh -c {HOLD_OPEN} {}), open file {}",
                 pids[1],
+                lock.display(),
                 lock.display()
             ),
         ] {
@@ -248,7 +270,7 @@ mod tests {
                 supervisor: None,
                 ledger: &ledger,
             },
-            &[pid],
+            &mut [&mut child],
         );
         let supervised = unaccounted(
             &mount,
@@ -259,7 +281,7 @@ mod tests {
         )
         .unwrap();
         let record = job_groups::process_record(pid);
-        child.kill().unwrap();
+        drop(child.stdin.take());
         child.wait().unwrap();
         assert!(
             !supervised

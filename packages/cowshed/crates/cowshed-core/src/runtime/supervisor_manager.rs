@@ -1519,9 +1519,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        // `sleep` from PATH: NixOS keeps nothing but `sh` and `env` in /bin and /usr/bin.
-        let mut job = tokio::process::Command::new("sleep")
-            .arg("60")
+        // `cat` from PATH: NixOS keeps nothing but `sh` and `env` in /bin and /usr/bin. It reads
+        // the stdin pipe `job` holds, so it runs until the stop signals it.
+        let mut job = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
             .process_group(0)
             .kill_on_drop(true)
             .spawn_locked()

@@ -1963,17 +1963,20 @@ mod tests {
         let sub = root.join("checkout/sub");
         fs::create_dir_all(&sub).unwrap();
         let sibling = scratch("tree-holders-sibling");
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("read _")
             .current_dir(&sub)
+            .stdin(std::process::Stdio::piped())
             .spawn_locked()
             .unwrap();
         let pid = i32::try_from(child.id()).unwrap();
-        // Asked while the child lives; the child is killed before anything is asserted.
+        // Asked while the child blocks reading the stdin this test holds; it is released before
+        // anything is asserted.
         let inside = tree_holders(&root).unwrap();
         let outside = tree_holders(&sibling).unwrap();
         let missing = tree_holders(&root.join("missing")).unwrap();
-        child.kill().unwrap();
+        drop(child.stdin.take());
         child.wait().unwrap();
         assert!(
             inside.iter().any(|holder| holder.pid == pid),
@@ -2587,8 +2590,10 @@ mod tests {
             paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
             fingerprint: None,
         };
-        let mut foreign = std::process::Command::new("/bin/sleep")
-            .arg("300")
+        let mut foreign = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("read _")
+            .stdin(std::process::Stdio::piped())
             .spawn_locked()
             .unwrap();
         let record = data.join(DAEMON_DIRECTORY).join(DAEMON_RECORD);
@@ -2625,7 +2630,7 @@ mod tests {
             "the foreign process is untouched"
         );
         drop(listener);
-        foreign.kill().unwrap();
+        drop(foreign.stdin.take());
         foreign.wait().unwrap();
     }
 

@@ -1153,20 +1153,22 @@ mod tests {
         let database = data.join("task-v3.db");
         std::fs::write(&database, b"").expect("database");
         // Backgrounded by an `sh` that exits at once, so launchd adopts it rather than this test
-        // process, as it adopts a host shell's run; it holds the database open on descriptor 3.
+        // process, as it adopts a host shell's run; it holds the database open on descriptor 3 and
+        // reads the shell's stdin, a pipe whose write end this test holds until it ends the run.
         let mut shell = std::process::Command::new("/bin/sh");
         shell
             .arg("-c")
             .arg(format!(
-                "/bin/sleep 600 3<'{}' </dev/null >/dev/null 2>&1 & echo $!",
+                "exec 4<&0; /bin/cat 3<'{}' <&4 >/dev/null 2>&1 & echo $!",
                 database.display()
             ))
             .current_dir(&root)
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped());
-        let started = cowshed_os::fork_lock::Spawn::spawn_locked(&mut shell)
-            .expect("start a host run")
-            .wait_with_output()
-            .expect("the shell exits");
+        let mut starting =
+            cowshed_os::fork_lock::Spawn::spawn_locked(&mut shell).expect("start a host run");
+        let held = starting.stdin.take();
+        let started = starting.wait_with_output().expect("the shell exits");
         let run: i32 = String::from_utf8(started.stdout)
             .expect("a pid")
             .trim()
@@ -1186,6 +1188,7 @@ mod tests {
         let censused = crate::build_volume::nx::process_table_walks() - walks - walked;
         // SAFETY: kill takes plain integers and touches no memory of ours.
         unsafe { libc::kill(run, libc::SIGKILL) };
+        drop(held);
         std::fs::remove_dir_all(&root).expect("remove scratch");
         let (idle, young) = verdicts.split_last().expect("probes");
         assert!(
@@ -1470,10 +1473,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn sleeper() -> std::process::Child {
         use cowshed_os::fork_lock::Spawn as _;
-        std::process::Command::new("/bin/sleep")
-            .arg("300")
+        std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
             .spawn_locked()
-            .expect("a sleeping process")
+            .expect("a process reading its stdin")
     }
 
     /// A process whose exit a watch reports only once it has ended, and whose pid observes nothing
@@ -1507,8 +1510,8 @@ mod tests {
     fn group_sleeper() -> std::process::Child {
         use cowshed_os::fork_lock::Spawn as _;
         use std::os::unix::process::CommandExt as _;
-        std::process::Command::new("/bin/sleep")
-            .arg("300")
+        std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
             .process_group(0)
             .spawn_locked()
             .expect("a sleeping group leader")
@@ -1573,7 +1576,8 @@ mod tests {
                 "/bin/sh",
                 "-c",
                 "/usr/bin/perl -MPOSIX -e 'POSIX::setsid() > 0 or die \"setsid: $!\"; \
-                 print \"WORKER $$\\n\"; close STDOUT; sleep 300' & read _",
+                 print \"WORKER $$\\n\"; close STDOUT; \
+                 select(undef, undef, undef, undef) while 1' & read _",
             ])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1866,7 +1870,8 @@ mod tests {
             "nx-daemon-survivor",
         );
         let mut leader = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 300 & echo READY; exit 0"])
+            .args(["-c", "exec 3<&0; read _ <&3 & echo READY; exit 0"])
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .process_group(0)
             .spawn_locked()
@@ -1880,6 +1885,8 @@ mod tests {
         let ledger = ledger_naming(&scratch, &leader);
         let record = scratch.join("server-process.json");
         write_record(&record, leader.id(), &scratch.join("refusing.sock"));
+        // The member reads this pipe: reaping the leader must not close it.
+        let held = leader.stdin.take();
         leader.wait().unwrap();
         assert!(
             super::super::job_groups::owned_process(&ledger, pid)
@@ -1895,6 +1902,7 @@ mod tests {
             .args(["-KILL", &format!("-{pid}")])
             .status_locked()
             .expect("kill the survivor's group");
+        drop(held);
     }
 
     /// Absent records and ledgers name nothing, a live pid without a ledger is unproven, and a

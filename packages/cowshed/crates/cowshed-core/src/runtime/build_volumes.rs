@@ -5601,9 +5601,9 @@ fn main() {
             crate::temp_root::TempRoot::new_in(&crate::temp_parent::scratch_parent(), "cs-seal");
         let socket = sockets.join("d.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let mut daemon = std::process::Command::new("/bin/sleep")
-            .arg("600")
+        let mut daemon = std::process::Command::new("/bin/cat")
             .current_dir(&data)
+            .stdin(std::process::Stdio::piped())
             .spawn_locked()
             .unwrap();
         fs::write(
@@ -6294,7 +6294,7 @@ fn main() {
                        open(my $o, '>', $out) or die "open $out: $!";
                        if (flock($h, LOCK_SH | LOCK_NB)) {
                            my $child = fork();
-                           if ($child == 0) { sleep 600; exit 0 }
+                           if ($child == 0) { select(undef, undef, undef, undef) while 1 }
                            print $o "admitted $child";
                        } else {
                            print $o "refused";
@@ -6304,7 +6304,7 @@ fn main() {
                    };
                    $| = 1;
                    print "ready\n";
-                   select(undef, undef, undef, 600) while 1;"#,
+                   select(undef, undef, undef, undef) while 1;"#,
             ])
             .arg(scratch.layout.hold_path(&live))
             .arg(&admission)
