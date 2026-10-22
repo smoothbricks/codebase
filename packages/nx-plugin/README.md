@@ -1347,6 +1347,15 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   real daemon whose resident worker globs through it and requires zero open connections after the only client exits.
   Stock Nx keeps a worker until its last registered phase, so a plugin with task hooks keeps the same connection open
   there after a graph-only request; this hunk does not retire with the worker-retention hunk.
+- **The daemon is its own client only while it waits on a reply.** Code the daemon runs, such as a sync generator, that
+  reaches Nx through another copy of the nx package finds no graph in that copy's project graph module, so it asks the
+  daemon over the daemon's own socket, and that client kept the connection after the reply. Measured 2026-10-22: two
+  shed daemons that ran `@smoothbricks/nx-plugin:managed-files` from a plugin linked outside the shed each held one
+  socket pair to itself, logged one open connection with no client left, reset their idle timer every five minutes for
+  half an hour until they were signalled by hand, and kept seven plugin workers each. The rule that releases a worker's
+  connection once its request queue drains now covers the daemon process too. A bounded regression runs a real daemon
+  whose global sync generator globs through the daemon's own client and requires zero open connections once the
+  generator finishes.
 - **A daemon whose workspace has gone stops instead of reading it.** Nx 23.2.1's native file worker reads an empty file
   map as one it has not filled yet and waits on its condition variable for files (`FilesWorker::get_files`,
   `while guard.len() == 0`). Once every file of a workspace is deleted under a running daemon, as when a checkout is

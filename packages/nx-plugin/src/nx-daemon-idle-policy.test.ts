@@ -19,6 +19,24 @@ exports.createNodesV2 = ['**/project.json', async () => {
 `;
 // The daemon logs its open connection count on every connect and close.
 const OPEN_CONNECTIONS = /Number of open connections: (\d+)$/;
+// A sync generator the daemon runs that asks the daemon for files over its socket. Code the daemon runs does that when it
+// reaches Nx through another copy of the nx package (a plugin linked from outside the workspace): that copy's project
+// graph module holds no graph, so it asks the daemon as any client would, from inside the daemon.
+const SELF_CLIENT_GENERATOR = `const { daemonClient } = require('nx/src/daemon/client/client');
+exports.default = async () => {
+  await daemonClient.glob(['**/project.json']);
+};
+`;
+const SELF_CLIENT = './generators.json:self-client';
+
+/** The open connection count the daemon log `log` reports last; `undefined` before it reports one. */
+function latestOpenConnections(log: string): string | undefined {
+  return log
+    .split('\n')
+    .map((line) => OPEN_CONNECTIONS.exec(line)?.[1])
+    .filter((count) => count !== undefined)
+    .at(-1);
+}
 
 it('serves real daemon requests with the installed five-minute inactivity policy', async () => {
   const require = createRequire(import.meta.url);
@@ -75,15 +93,45 @@ it('lets a resident plugin worker ask its daemon for files without holding the d
     await whenChanged(logPath, () => {
       const log = readFileSync(logPath, 'utf8');
       expect(log).toContain('Handled json message GLOB');
-      const open = log
-        .split('\n')
-        .map((line) => OPEN_CONNECTIONS.exec(line)?.[1])
-        .filter((count) => count !== undefined)
-        .at(-1);
-      return open === '0';
+      return latestOpenConnections(log) === '0';
     });
     const workers = (await nxDaemonProcesses(workspace)).filter(({ command }) => command.includes('plugin-worker'));
     expect(workers.length, 'the resident plugin worker that asked the daemon for files').toBeGreaterThan(0);
+  });
+});
+
+it('lets a daemon that is its own client go of its connection after the reply', async () => {
+  const repositoryRoot = join(import.meta.dir, '../../..');
+  const nxEntry = join(repositoryRoot, 'node_modules/.bin/nx');
+  await withNxFixture('nx-self-client-', async ({ workspace, socketDirectory }) => {
+    await symlink(join(repositoryRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
+    // Measured 2026-10-22: a shed daemon that ran a linked plugin's sync generator this way held its own connection,
+    // logged one open connection with no client left, and reset its five-minute idle stop for half an hour until it was signalled by hand.
+    await writeFile(join(workspace, 'nx.json'), JSON.stringify({ sync: { globalGenerators: [SELF_CLIENT] } }));
+    await writeFile(join(workspace, 'package.json'), JSON.stringify({ name: 'self-client', private: true }));
+    await writeFile(
+      join(workspace, 'generators.json'),
+      JSON.stringify({ generators: { 'self-client': { factory: './self-client.js', schema: './schema.json' } } }),
+    );
+    await writeFile(join(workspace, 'schema.json'), JSON.stringify({ type: 'object', properties: {} }));
+    await writeFile(join(workspace, 'self-client.js'), SELF_CLIENT_GENERATOR);
+    await mkdir(join(workspace, 'p'));
+    await writeFile(join(workspace, 'p/project.json'), JSON.stringify({ name: 'p' }));
+    const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
+    // The daemon computes the graph once it is up and then runs every global sync generator itself.
+    const started = spawnSync('node', [nxEntry, 'daemon', '--start'], { cwd: workspace, env, encoding: 'utf8' });
+    expect(started.status, started.stdout + started.stderr).toBe(0);
+    const logPath = join(workspace, '.nx/workspace-data/d/daemon.log');
+    // Each change the kernel reports on the log re-reads it whole: the generator's end, then the latest count, decides.
+    await whenChanged(logPath, () => {
+      const log = readFileSync(logPath, 'utf8');
+      if (log.includes(`${SELF_CLIENT} error:`))
+        throw new Error(`the sync generator failed in the daemon:
+${log}`);
+      if (!log.includes(`${SELF_CLIENT} changes:`)) return false;
+      expect(log).toContain('Handled json message GLOB');
+      return latestOpenConnections(log) === '0';
+    });
   });
 });
 
