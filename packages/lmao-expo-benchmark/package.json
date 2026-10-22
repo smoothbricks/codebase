@@ -82,7 +82,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "inputs": [
           "default",
-          "^default"
+          "^dependencyDefault"
         ],
         "dependsOn": [
           "typecheck"

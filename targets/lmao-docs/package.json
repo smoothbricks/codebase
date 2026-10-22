@@ -51,7 +51,7 @@
         },
         "inputs": [
           "default",
-          "^default"
+          "^dependencyDefault"
         ],
         "outputs": [
           "{projectRoot}/dist"

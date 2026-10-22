@@ -9,6 +9,13 @@
   },
   "namedInputs": {
     "default": ["{projectRoot}/**/*", "!{projectRoot}/**/*.md"],
+    "dependencyDefault": [
+      "default",
+      "!{projectRoot}/**/__tests__/**",
+      "!{projectRoot}/**/*.test.*",
+      "!{projectRoot}/**/*.spec.*",
+      "!{projectRoot}/test-timings.json"
+    ],
     "production": [
       "{projectRoot}/src/**/*",
       "{projectRoot}/package.json",
@@ -41,7 +48,7 @@
   "targetDefaults": {
     "build": {
       "cache": true,
-      "inputs": ["default", "^default"]
+      "inputs": ["default", "^dependencyDefault"]
     },
     "typecheck": {
       "cache": true,
@@ -49,10 +56,10 @@
     },
     "test": {
       "cache": true,
-      "inputs": ["default", "^default", "bunToolchain"]
+      "inputs": ["default", "^dependencyDefault", "bunToolchain"]
     },
     "cargo-test": {
-      "inputs": ["default", "^default"]
+      "inputs": ["default", "^dependencyDefault"]
     },
     "cargo-lint": {
       "inputs": [{ "externalDependencies": [] }]

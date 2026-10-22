@@ -258,7 +258,7 @@
         "cache": true,
         "inputs": [
           "default",
-          "^default",
+          "^dependencyDefault",
           "bunToolchain",
           "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs"
         ],
@@ -274,7 +274,7 @@
         "cache": true,
         "inputs": [
           "default",
-          "^default",
+          "^dependencyDefault",
           "bunToolchain",
           "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs"
         ],
@@ -290,7 +290,7 @@
         "cache": true,
         "inputs": [
           "default",
-          "^default",
+          "^dependencyDefault",
           "bunToolchain",
           "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs"
         ],
@@ -306,7 +306,7 @@
         "cache": true,
         "inputs": [
           "default",
-          "^default",
+          "^dependencyDefault",
           "bunToolchain",
           "{workspaceRoot}/packages/cowshed/crates/cowshed-core/src/port_zero.cjs"
         ],
@@ -322,7 +322,7 @@
         "cache": true,
         "inputs": [
           "default",
-          "^default",
+          "^dependencyDefault",
           "bunToolchain",
           "{workspaceRoot}/devenv.lock",
           "{workspaceRoot}/tooling/direnv/devenv.lock",

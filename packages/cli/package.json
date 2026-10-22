@@ -114,7 +114,7 @@
         "cache": true,
         "inputs": [
           "default",
-          "^default",
+          "^dependencyDefault",
           "bunToolchain"
         ],
         "options": {
@@ -129,7 +129,7 @@
         "cache": true,
         "inputs": [
           "default",
-          "^default",
+          "^dependencyDefault",
           "bunToolchain"
         ],
         "options": {
@@ -144,7 +144,7 @@
         "cache": true,
         "inputs": [
           "default",
-          "^default",
+          "^dependencyDefault",
           "bunToolchain"
         ],
         "options": {
@@ -159,7 +159,7 @@
         "cache": true,
         "inputs": [
           "default",
-          "^default",
+          "^dependencyDefault",
           "bunToolchain"
         ],
         "options": {
@@ -174,7 +174,7 @@
         "cache": true,
         "inputs": [
           "default",
-          "^default",
+          "^dependencyDefault",
           "bunToolchain"
         ],
         "options": {

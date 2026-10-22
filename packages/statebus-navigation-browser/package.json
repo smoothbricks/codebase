@@ -74,7 +74,7 @@
         "cache": true,
         "inputs": [
           "default",
-          "^default",
+          "^dependencyDefault",
           "bunToolchain",
           {
             "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh sh -c 'if [ -n \"${PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH:-}\" ]; then printf \"configured-chromium\\n\"; else printf \"managed-chromium\\n\"; fi'"
