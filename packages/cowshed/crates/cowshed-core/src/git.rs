@@ -5474,6 +5474,15 @@ mod tests {
             .status_locked()
             .expect("run git init");
         assert!(status.success());
+        // A fork's capture is one descriptor clone of the live image, a crash-consistent snapshot
+        // (02_workspaces.md "cowshed fork", step 2); `copy_tree` stands in for it with a per-file
+        // walk, which a file vanishing mid-walk fails. Git's own commits and fetches here would each
+        // start a detached `git maintenance run --auto` that creates and removes
+        // `objects/maintenance.lock` while the walk runs, so automatic gc and maintenance are off in
+        // the repository's own config: every git in it, its copies and its worktrees, starts none.
+        for (key, value) in [("gc.auto", "0"), ("maintenance.auto", "false")] {
+            git(root, &["config", key, value]);
+        }
         fs::write(root.join("README"), "test\n").expect("write fixture");
         let status = Command::new("git")
             .arg("-C")
