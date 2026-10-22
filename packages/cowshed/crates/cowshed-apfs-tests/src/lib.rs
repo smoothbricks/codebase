@@ -7,7 +7,7 @@ use cowshed_apfs::{
     ApfsBackend, ApfsError, AttachedImage, CommandRequest, CommandRunner, CreateImageRequest,
     DISK_CHILD_DEADLINE, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
     MountAccess, RecoveredImageAttachment, RetainedInput, RetainedInputs, SystemCommandRunner,
-    attach_budget, disk_image_helpers,
+    disk_image_helpers,
 };
 
 #[path = "../../cowshed-apfs/tests/support/blank_image.rs"]

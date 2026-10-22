@@ -473,13 +473,14 @@ which of two causes spent it.
 `disk-image-attach-budget` reports leaked disk-image devices: `AppleDiskImageDevice` and `DIDeviceIOUserClient`
 instances (`ioclasscount`) that no attached image accounts for, which only a reboot frees. It also prints the
 `AppleAPFSVolume` and `IOMedia` counts, whose departed instances take no pool slot (`departed-volume-references`,
-below), the ceiling at which this host's pool last ran out (1024 leaked devices until one is recorded: an observation
-from one host and boot, not a documented limit), the headroom left, and any disk-image command an earlier cowshed killed
-at its 15-minute hard deadline this boot, each a probable leaked device; cowshed no longer kills a disk-image command at
-all. "attach pool exhausted, reboot required" means an attach failed with error code 150 this boot with the leaked
-devices at the ceiling: reboot. A recorded ceiling only moves down and survives reboots; if the lane gate refuses
-because that ceiling alone is below the attaches it needs, and the ceiling no longer holds, `attach-budget --clear`
-forgets it.
+below), the ceiling the image devices run out at (1042 instances, live and leaked alike: the lowest at which a first 150
+has struck), the headroom left, and any disk-image command an earlier cowshed killed at its 15-minute hard deadline this
+boot, each a probable leaked device; cowshed no longer kills a disk-image command at all. "attach pool exhausted, reboot
+required" means an attach failed with error code 150 this boot with the image devices at the ceiling: reboot. Once a
+boot has met 150, cowshed refuses every image attach before it starts (a failed attach leaks one more device) until the
+boot ends or `cowshed doctor --clear-attach-budget` clears it, and it refuses an attach that would bring the image
+devices to the ceiling. Devices leak when a `diskimagesiod` helper stalls past IOKit's media match-notification cap
+(next section), which cowshed's own attaches no longer reach.
 
 The other cause is helpers that outlived their image. Every attached image has its own `diskimagesiod`, which maps 72
 MiB into the kernel; detach does not always end it, and a helper that outlived its image keeps its mapping.
@@ -488,8 +489,7 @@ row find no attached `AppleDiskImageDevice`'s user client naming as its creator,
 during either), the mapping they hold, and the root command that frees it, `sudo kill -9 <pids>`. `launchctl kill`
 refuses them, and no reboot is needed for them. While a disk-image tool runs, a helper may still be attaching, so no pid
 is named until a later `cowshed doctor`. Killing orphans frees their mappings, never a leaked device. Once they are
-gone, `attach-budget --clear` (or any successful cowshed attach) ends the recorded exhaustion. cowshed never signals a
-helper itself.
+gone, `cowshed doctor --clear-attach-budget` ends the recorded exhaustion. cowshed never signals a helper itself.
 
 ## An attach is refused with `MediaCapReached`, or names IOKit's media match-notification queue
 

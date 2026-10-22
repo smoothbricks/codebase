@@ -2263,8 +2263,9 @@ where
                 })?;
                 output
                     .guidance(
-                        "cleared this boot's recorded attach-pool exhaustion and its recorded \\
-                         ceiling; the next disk-image attach records this boot's new answer",
+                        "cleared this boot's recorded attach-pool exhaustion; attaches are \
+                         admitted again while the image devices stay below the pool's ceiling, \
+                         and the next error code 150 spends the boot again",
                     )
                     .map_err(output_error)?;
             }
@@ -5078,7 +5079,7 @@ fn orphaned_disk_image_helpers_finding(
 }
 
 /// The host's disk-image attach pool (attach_budget.rs): the leaked image devices, user
-/// clients, volumes and media, the ceiling the leaked devices run out at and the headroom left.
+/// clients, volumes and media, the image-device ceiling the pool runs out at and the headroom.
 /// A pool spent this boot is an error; low headroom warns. The hint names what frees each leak.
 /// Departed volumes and media take no pool slot, so [`departed_volume_references_finding`] reports
 /// them, never this finding.
@@ -6590,7 +6591,7 @@ mod tests {
             ),
             "{fresh:?}"
         );
-        assert!(fresh.message.contains("headroom 1024"), "{fresh:?}");
+        assert!(fresh.message.contains("headroom 863"), "{fresh:?}");
 
         // The first 150 is recorded with its counts, and the next doctor says what it means.
         let spent = PoolRecord::default().exhausted(&boot, Some(spent_host.image_devices), Some(0));
@@ -6610,17 +6611,20 @@ mod tests {
         );
         assert_eq!(exhausted.hint, REBOOT_HINT);
 
-        // After the reboot the recorded leak is the ceiling; headroom near it warns.
+        // After the reboot nothing is spent; image devices near the ceiling warn.
         let rebooted = finding(&spent, next, rebooted_host);
         assert_eq!(rebooted.severity, FindingSeverity::Info);
-        assert!(rebooted.message.contains("observed here"), "{rebooted:?}");
+        assert!(
+            !rebooted.message.contains("attach pool exhausted"),
+            "{rebooted:?}"
+        );
         let near = KernelReading {
             image_devices: count(178 + 800, 178),
             ..rebooted_host
         };
         let near = finding(&spent, next, near);
         assert_eq!(near.severity, FindingSeverity::Warning);
-        assert!(near.message.contains("headroom 224"), "{near:?}");
+        assert!(near.message.contains("headroom 63"), "{near:?}");
         assert_eq!(near.hint, REBOOT_HINT);
 
         let linux = std::io::Error::new(std::io::ErrorKind::Unsupported, "no pool");
@@ -6705,7 +6709,7 @@ mod tests {
             let unmoved = pool(&PoolRecord::default(), next, reading);
             assert_eq!(unmoved.severity, FindingSeverity::Info);
             assert_eq!(unmoved.hint, "nothing to free");
-            assert!(unmoved.message.contains("headroom 1024"), "{unmoved:?}");
+            assert!(unmoved.message.contains("headroom 863"), "{unmoved:?}");
         }
         // Nothing departed, nothing to report.
         assert!(departed_volume_references_finding(&rebooted_host).is_none());

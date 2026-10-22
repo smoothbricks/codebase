@@ -831,6 +831,19 @@ impl CowshedError {
                             "cowshed doctor (media-notification-cap)",
                         );
                     }
+                    // The host's attach pool, not storage: no storage repair frees it.
+                    cowshed_apfs::CommandRunFailure::AttachPool(_) => {
+                        return Self::environment_missing(
+                            format!("{}: {run}", message.into()),
+                            cowshed_apfs::attach_budget::EXHAUSTED_HINT,
+                        );
+                    }
+                    cowshed_apfs::CommandRunFailure::PoolUnread(_) => {
+                        return Self::environment_missing(
+                            format!("{}: {run}", message.into()),
+                            "cowshed doctor (disk-image-attach-budget)",
+                        );
+                    }
                     _ => {}
                 }
             }

@@ -48,7 +48,7 @@ use cowshed_apfs::image::ImageCapacity;
 #[cfg(all(test, target_os = "macos"))]
 use cowshed_apfs::{
     ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
-    SystemCommandRunner, attach_budget,
+    SystemCommandRunner,
 };
 #[cfg(all(test, target_os = "macos"))]
 use cowshed_apfs::{store_lock::verify_no_symlinks, template::blank_template};

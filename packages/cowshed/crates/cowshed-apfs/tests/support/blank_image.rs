@@ -46,20 +46,10 @@ pub const CAPACITY: ImageCapacity = ImageCapacity::from_gibibytes(1);
 /// The user's template, minted by whichever test asks first.
 static TEMPLATE: LazyLock<PathBuf> = LazyLock::new(mint_once);
 
-/// Refused once this boot's disk-image attach pool is spent (08_testing.md, "Host limit"):
-/// after the first error code 150 of a run, every later fixture fails with
-/// `AttachPoolExhausted` and its `next:` step instead of spending one more attach.
-fn harness_gate() {
-    if let Err(exhausted) = super::attach_budget::harness_gate() {
-        panic!("{exhausted}");
-    }
-}
-
 /// Put a formatted, detached, one-volume RAW image of [`CAPACITY`] at `destination`, which must
 /// not exist yet, creating its directory: an APFS clone of this run's template. This is how a
 /// store is seeded; it attaches nothing, so it is the only image a test may mint for itself.
 pub fn blank_image(destination: &Path) {
-    harness_gate();
     let directory = destination.parent().expect("an image has a directory");
     fs::create_dir_all(directory)
         .unwrap_or_else(|error| panic!("image directory {}: {error}", directory.display()));
@@ -229,7 +219,6 @@ pub fn shared_image_at(scenario: &str, image: &Path) -> SharedImage {
         REGISTRY.contains(&scenario),
         "no fixture-pool scenario named {scenario}; add it to the registry in blank_image.rs"
     );
-    harness_gate();
     let pool = pool_directory();
     fs::create_dir_all(&pool)
         .unwrap_or_else(|error| panic!("pool directory {}: {error}", pool.display()));

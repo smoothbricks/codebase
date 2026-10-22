@@ -1,4 +1,3 @@
-use cowshed_apfs::attach_budget;
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::store_lock::verify_no_symlinks;
 use cowshed_apfs::template::{blank_template, blank_template_path};

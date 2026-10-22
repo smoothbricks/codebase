@@ -151,6 +151,13 @@ pub enum CommandRunFailure {
     /// Refused before spawning: an image attach while the media count could not be read, so
     /// nothing says it would not hang (media_cap.rs).
     MediaUnread(io::Error),
+    /// Refused before spawning: an image attach into a pool this boot already spent (error code
+    /// 150), or whose image devices would reach the pool's ceiling (attach_budget.rs). A failed
+    /// attach leaks one more device; a refused one can run again once the pool is freed.
+    AttachPool(attach_budget::AttachPoolExhausted),
+    /// Refused before spawning: an image attach while the pool could not be read, so nothing
+    /// says the attach would not fail with error code 150 and leak its device (attach_budget.rs).
+    PoolUnread(io::Error),
     /// The total budget expired before the native tool executed.
     Unspawned(Duration),
     /// The deadline expired; the owned group `pid` leads was signalled and the child's actual end
@@ -268,6 +275,21 @@ impl fmt::Display for CommandRunError {
                      nothing was attached"
                 )
             }
+            CommandRunFailure::AttachPool(exhausted) => {
+                f.write_str("refused ")?;
+                fmt_command(f, program, args)?;
+                write!(f, ": {exhausted}")
+            }
+            CommandRunFailure::PoolUnread(source) => {
+                f.write_str("refused ")?;
+                fmt_command(f, program, args)?;
+                write!(
+                    f,
+                    ": the disk-image attach pool could not be read ({source}), so nothing says \
+                     the attach would not fail with error code 150 and leak its device; nothing \
+                     was attached"
+                )
+            }
         }
     }
 }
@@ -278,12 +300,14 @@ impl std::error::Error for CommandRunError {
             CommandRunFailure::Spawn(source)
             | CommandRunFailure::Wait(source)
             | CommandRunFailure::MediaUnread(source)
+            | CommandRunFailure::PoolUnread(source)
             | CommandRunFailure::Kill { source, .. }
             | CommandRunFailure::Reap { source, .. } => Some(source),
             CommandRunFailure::Deadline { .. }
             | CommandRunFailure::Unspawned(_)
             | CommandRunFailure::VolumeRename => None,
             CommandRunFailure::MediaCap(reached) => Some(reached),
+            CommandRunFailure::AttachPool(exhausted) => Some(exhausted),
         }
     }
 }
@@ -598,6 +622,7 @@ impl SystemCommandRunner {
         use std::io::Read;
         crate::disk_lease::refuse_volume_rename(&request.program, &request.args)?;
         media_cap::refuse_attach_past_cap(request)?;
+        attach_budget::refuse_attach_into_pool(request)?;
         if let Some(deadline) = total
             && deadline.remaining().is_none()
         {
@@ -782,20 +807,16 @@ impl fmt::Display for DiskImageVerb<'_> {
 }
 
 /// Tell the attach-pool record what the host answered a disk-image command: a failure with
-/// error code 150 spends the boot, a successful attach ends a spent boot. A failed record is
-/// said aloud; the command's own outcome still reaches the caller.
+/// error code 150 spends the boot until the operator clears it. A failed record is said aloud;
+/// the command's own outcome still reaches the caller.
 fn record_pool_outcome(request: &CommandRequest, output: &CommandOutput) {
     if !is_disk_image_command(request) {
         return;
     }
-    let recorded = if !output.succeeded() && attach_budget::reports_pool_exhausted(&output.stderr) {
-        attach_budget::record_exhaustion()
-    } else if output.succeeded() && is_image_attach(request) {
-        attach_budget::record_attach()
-    } else {
+    if output.succeeded() || !attach_budget::reports_pool_exhausted(&output.stderr) {
         return;
-    };
-    if let Err(error) = recorded {
+    }
+    if let Err(error) = attach_budget::record_exhaustion() {
         cowshed_os::eprintln!(
             "cowshed: warning: could not record the disk-image attach pool's answer to {}: \
          {error}",

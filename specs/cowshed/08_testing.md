@@ -688,14 +688,11 @@ attach past its registry, whose size — computed in code from the registry itse
 per-test attach fails the lane instead of silently spending the pool. A test whose setup and subject match a neighbour's
 becomes assertions in that neighbour rather than a separate test, and anything that does not need a real device is a
 pure or unit test with no image at all: the real-device lane holds a few scenario tests per fixture, not a test per
-behaviour. Every fixture first passes `attach_budget::harness_gate`, which reads the boot and pool record and observes
-the live class-instance counts against registered entries. Those differences are diagnostics, not a capacity estimate or
-an admission threshold. Once any test process meets error code 150, the system runner that met it records it, and every
-later fixture of the run, in whichever process, fails with `AttachPoolExhausted` and its `next:` step without attaching.
-A record the gate cannot read proves nothing about the pool, so it warns and the fixture proceeds. The lane stays
-`--no-fail-fast`, so its ordinary failures still run to the end; the refusal is the harness's own error, not a scheduler
-flag. There is no measured attach-count constant and no pre-lane admission gate: the `harness_gate` refusal at the first
-fixture that would spend into a spent pool is the fail-fast behaviour, and it needs no number from the lane.
+behaviour. Every attach a fixture makes passes the system runner's admission (01a_apfs.md, "How the APFS host degrades"
+§2): once any test process meets error code 150, the runner that met it records it, and every later attach of the run,
+in whichever process, fails with `AttachPoolExhausted` and its `next:` step without attaching, as does an attach that
+would bring the image devices to the pool's ceiling. The lane stays `--no-fail-fast`, so its ordinary failures still run
+to the end; the refusal is the runner's own error, not a scheduler flag, and needs no number from the lane.
 `attach-budget --clear` still ends a recorded 150 after the operator freed what spent it. The leaked-device delta across
 a lane run (`ioclasscount AppleDiskImageDevice` against the registered devices, before and after) is the check that no
 disk-image command still leaks on a clean run; it must be 0. The system runner also refuses an image attach whose media

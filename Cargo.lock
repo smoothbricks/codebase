@@ -833,6 +833,7 @@ dependencies = [
  "cowshed-os",
  "libc",
  "plist",
+ "proptest",
  "serde",
  "serde_json",
  "sha2",

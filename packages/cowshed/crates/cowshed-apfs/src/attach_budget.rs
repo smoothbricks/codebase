@@ -2,25 +2,25 @@
 //! 08_testing.md, "Host limit").
 //!
 //! Every `diskutil image attach` creates an `AppleDiskImageDevice`, its `DIDeviceIOUserClient`
-//! and its request pool. A device whose attach or helper was killed mid-operation can stay alive
-//! in the kernel after it leaves the registry: still counted among its class's instances, no
-//! longer registered. Once the leaked devices fill the pool, every attach, `diskutil image info`
-//! and cold mount fails with "error code 150" (`kIOReturnNoResources`), and only a reboot frees
-//! them. The same error has a second cause, kernel mappings held by orphaned `diskimagesiod`
-//! helpers ([`crate::disk_image_helpers`]), which root clears without a reboot.
+//! and its request pool. Most leave the kernel with their detach; some stay alive after they have
+//! left the registry: still counted among their class's instances, no longer registered. The
+//! pool runs out of the instances, live and leaked alike, together with the mappings orphaned
+//! `diskimagesiod` helpers hold ([`crate::disk_image_helpers`]): then every attach, `diskutil
+//! image info` and cold mount fails with "error code 150" (`kIOReturnNoResources`). Root frees
+//! orphans without a reboot; only a reboot frees leaked devices.
 //!
 //! Both sides are read unprivileged and without attaching anything: the instance counts are the
 //! registry root's `IOKitDiagnostics` class counts, which `ioclasscount` prints, and the
 //! registered counts are the registry's own entries. A device instance with no registered entry
 //! is leaked. The same subtraction for `AppleAPFSVolume` and `IOMedia` counts departed volumes
-//! and media the kernel has not freed ([`Departed`]). They take no slot in the pool, so they
-//! never spend its headroom: `doctor` reports them as a finding of their own, and what holds
-//! them is attributed by registry ID, not assumed (01a_apfs.md, "Spotlight media references").
+//! and media the kernel has not freed ([`Departed`]). They take no slot in the pool: `doctor`
+//! reports them as a finding of their own, and what holds them is attributed by registry ID, not
+//! assumed (01a_apfs.md, "Spotlight media references").
 //!
-//! The ceiling is an observation, not a documented limit: on 2026-10-10 the first 150 struck
-//! with 1090 `AppleDiskImageDevice` instances and 66 registered, exactly 1024 leaked, and no
-//! orphaned helper. That is the default; the leaked count at a later 150 that no orphaned helper
-//! explains replaces it.
+//! Two gates refuse an image attach before it spawns, so none is ever spent into a pool that
+//! cannot take it, and a failed attach, which leaks one more device, never happens on purpose:
+//! a boot that has met error code 150 is spent until the operator clears it, and an attach whose
+//! device would bring the instances to [`POOL_CEILING`] is refused by that name.
 
 use std::fmt;
 use std::io;
@@ -32,9 +32,18 @@ use serde::{Deserialize, Serialize};
 /// "Error: Disk image operation failed with error code 150".
 const POOL_EXHAUSTED: &[u8] = b"error code 150";
 
-/// Leaked image devices at which the pool ran out on the measuring host (module docs), used
-/// until this host records a 150 of its own that no orphaned helper explains.
-pub const OBSERVED_LEAK_CEILING: u64 = 1024;
+/// `AppleDiskImageDevice` instances, registered and leaked, at the lowest first error code 150
+/// measured: 1042 (256 registered, 786 leaked, 5 orphaned helpers) in the boot of 2026-10-21
+/// 20:12 +04, against 1090 (2026-10-10) and 1105 (the boot before that). An attach is admitted
+/// only while the instances it and the storage phase's other members may add stay below it.
+pub const POOL_CEILING: u64 = 1042;
+
+/// The image devices one admitted attach reserves: itself and every other member of its storage
+/// phase, each of which may pass this gate before any of them spawns (05_gateway.md,
+/// "Disk-lifecycle lease"), so concurrent attaches cannot together cross the ceiling.
+pub fn attach_reserve() -> u64 {
+    u64::from(cowshed_gateway_types::DISK_PHASE_MEMBERS.get())
+}
 
 /// What frees leaked image devices.
 pub const REBOOT_HINT: &str =
@@ -166,19 +175,11 @@ pub struct Exhaustion {
 }
 
 impl Exhaustion {
-    /// The leaked count this 150 proves is a ceiling: only when no orphaned helper's mapping
-    /// could have caused it instead.
-    fn ceiling(&self) -> Option<u64> {
-        match (self.image_devices, self.orphaned_helpers) {
-            (Some(devices), Some(0)) => Some(devices.leaked()),
-            _ => None,
-        }
-    }
-
-    /// Whether the leaked devices at this 150 alone account for it, against `ceiling`.
-    fn explained_by(&self, ceiling: u64) -> bool {
+    /// Whether the image devices at this 150 alone account for it: the instances had reached
+    /// [`POOL_CEILING`].
+    fn devices_full(&self) -> bool {
         self.image_devices
-            .is_some_and(|devices| devices.leaked() >= ceiling)
+            .is_some_and(|devices| devices.instances >= POOL_CEILING)
     }
 }
 
@@ -199,9 +200,9 @@ pub struct ProbableLeaks {
 pub struct PoolRecord {
     /// The last 150, whatever caused it.
     pub last_exhaustion: Option<Exhaustion>,
-    /// The last 150 whose leaked count is a ceiling.
-    pub ceiling: Option<Exhaustion>,
-    /// The boot whose pool is spent now, until an attach in it succeeds again.
+    /// The boot whose pool is spent, until the operator clears it. A later success does not
+    /// clear it: an attach admitted before the first 150 may still finish after it, and the boot
+    /// stays spent all the same.
     pub spent_session: Option<String>,
     pub probable_leaks: Option<ProbableLeaks>,
 }
@@ -218,41 +219,24 @@ impl PoolRecord {
         if self.spent_session.as_deref() == Some(boot.session.as_str()) {
             return self;
         }
-        let exhaustion = Exhaustion {
-            boot: boot.clone(),
-            image_devices,
-            orphaned_helpers,
-        };
         Self {
-            ceiling: if exhaustion.ceiling().is_some() {
-                Some(exhaustion.clone())
-            } else {
-                self.ceiling
-            },
-            last_exhaustion: Some(exhaustion),
+            last_exhaustion: Some(Exhaustion {
+                boot: boot.clone(),
+                image_devices,
+                orphaned_helpers,
+            }),
             spent_session: Some(boot.session.clone()),
             probable_leaks: self.probable_leaks,
         }
     }
 
-    /// The record after an attach during `session` succeeded: whatever spent the pool was
-    /// freed. The exhaustion stays as evidence and ceiling.
-    pub fn attached(self, session: &str) -> Self {
+    /// The record after the operator cleared it (`cowshed doctor --clear-attach-budget`), once
+    /// they freed what spent the pool: this boot's exhaustion ends. The last exhaustion stays as
+    /// evidence.
+    pub fn cleared(self, session: &str) -> Self {
         Self {
             spent_session: self.spent_session.filter(|spent| spent != session),
             ..self
-        }
-    }
-
-    /// The record after the operator cleared it (`cowshed doctor --clear-attach-budget`): this boot's
-    /// exhaustion ends, as after a successful attach, and the observed ceiling is forgotten,
-    /// back to [`OBSERVED_LEAK_CEILING`]. A ceiling only ever moves down and survives reboots,
-    /// so one 150 at a low leaked count would otherwise refuse the lane on every later boot,
-    /// with no attach left to raise it. The last exhaustion stays as evidence.
-    pub fn cleared(self, session: &str) -> Self {
-        Self {
-            ceiling: None,
-            ..self.attached(session)
         }
     }
 
@@ -280,28 +264,10 @@ impl PoolRecord {
             .filter(|_| self.spent_session.as_deref() == Some(session))
     }
 
-    /// The leaked image devices at which the pool runs out, as this record proves it.
-    pub fn ceiling(&self) -> Ceiling {
-        self.ceiling
-            .as_ref()
-            .and_then(|exhaustion| {
-                exhaustion.ceiling().map(|leaked| Ceiling::Observed {
-                    leaked,
-                    booted_at: exhaustion.boot.booted_at,
-                })
-            })
-            .unwrap_or(Ceiling::Default)
-    }
-
-    fn ceiling_leaked(&self) -> u64 {
-        self.ceiling().leaked()
-    }
-
     /// The pool during `session`, as `reading` and this record prove it.
     pub fn budget(&self, session: &str, reading: KernelReading) -> Budget {
         Budget {
             reading,
-            ceiling: self.ceiling(),
             spent: self.spent(session).cloned(),
             probable_leaks: self
                 .probable_leaks
@@ -312,109 +278,66 @@ impl PoolRecord {
     }
 }
 
-/// The leaked image devices at which the pool runs out.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Ceiling {
-    /// No ceiling recorded on this host: [`OBSERVED_LEAK_CEILING`].
-    Default,
-    /// The leaked devices at this host's last 150 that no orphaned helper explains.
-    Observed { leaked: u64, booted_at: i64 },
-}
-
-impl Ceiling {
-    pub fn leaked(self) -> u64 {
-        match self {
-            Self::Default => OBSERVED_LEAK_CEILING,
-            Self::Observed { leaked, .. } => leaked,
-        }
-    }
-}
-
-impl fmt::Display for Ceiling {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Default => write!(
-                f,
-                "{OBSERVED_LEAK_CEILING} leaked (the default: where one host's pool ran out, an \
-                 observation from one host and boot, not a documented limit)"
-            ),
-            Self::Observed { leaked, booted_at } => write!(
-                f,
-                "{leaked} leaked (observed here at error code 150, in the boot that began at \
-                 {booted_at})"
-            ),
-        }
-    }
-}
-
 /// The pool for the current boot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Budget {
     pub reading: KernelReading,
-    pub ceiling: Ceiling,
-    /// This boot's first 150, while nothing has attached since.
+    /// This boot's first 150, until the operator clears it.
     pub spent: Option<Exhaustion>,
     /// Disk-image commands an earlier build killed at its hard deadline this boot.
     pub probable_leaks: u64,
 }
 
 impl Budget {
-    /// Leaked image devices the pool can still take.
+    /// Image devices the pool can still take below [`POOL_CEILING`], live and leaked alike.
     pub fn headroom(&self) -> u64 {
-        self.ceiling
-            .leaked()
-            .saturating_sub(self.reading.image_devices.leaked())
+        POOL_CEILING
+            .saturating_sub(1)
+            .saturating_sub(self.reading.image_devices.instances)
     }
 
-    /// Whether `need` more attaches fit, each counted as one device it could leak: refused once
-    /// this boot's pool is spent, or when the headroom is below `need`. The real-APFS lane's gate.
+    /// Whether `need` more image devices fit: refused once this boot's pool is spent, or when
+    /// the headroom is below `need`.
     pub fn admits(&self, need: u64) -> Result<(), AttachPoolExhausted> {
-        if self.spent.is_some() || self.headroom() < need {
+        let instances = self.reading.image_devices.instances;
+        if self.spent.is_some() || instances.saturating_add(need) >= POOL_CEILING {
             return Err(AttachPoolExhausted {
                 need,
                 headroom: Some(self.headroom()),
                 detail: self.to_string(),
-                remedy: self.refusal_remedy(need),
+                remedy: self.remedy_for_refusal(),
             });
         }
         Ok(())
     }
 
-    /// What frees enough of the pool for `need` more attaches, which a refusal always names:
-    /// the orphaned helpers when the leaked devices do not explain a spent boot, the recorded
-    /// ceiling when it alone is below `need`, and otherwise a reboot, the one thing that frees
-    /// leaked image devices. Departed volumes and media take no slot, so they name nothing here.
-    fn refusal_remedy(&self, need: u64) -> String {
-        match self.ceiling {
-            _ if self.spent.is_some() && !self.devices_full() => ORPHANS_FIRST_HINT.to_owned(),
-            Ceiling::Observed { leaked, .. } if self.spent.is_none() && leaked < need => format!(
-                "the ceiling recorded at this host's last error code 150, {leaked} leaked \
-                 devices, is below the {need} attaches needed whatever leaks now; it survives \
-                 reboots and only moves down, so if it no longer holds, `{CLEAR_COMMAND}` \
-                 forgets it (back to {OBSERVED_LEAK_CEILING})"
-            ),
-            Ceiling::Observed { .. } | Ceiling::Default => REBOOT_HINT.to_owned(),
+    /// What frees the pool, which a refusal always names: the orphaned helpers first when the
+    /// image devices do not account for a spent boot, otherwise a reboot, the one thing that
+    /// frees leaked image devices. Departed volumes and media take no slot, so they name nothing.
+    fn remedy_for_refusal(&self) -> String {
+        if self.spent.is_some() && !self.devices_account() {
+            ORPHANS_FIRST_HINT.to_owned()
+        } else {
+            REBOOT_HINT.to_owned()
         }
     }
 
-    /// Whether the leaked devices alone account for the spent pool.
-    fn devices_full(&self) -> bool {
-        self.headroom() == 0
+    /// Whether the image devices alone account for the pool's state: they fill it now, or they
+    /// filled it at this boot's recorded 150.
+    fn devices_account(&self) -> bool {
+        self.headroom() == 0 || self.spent.as_ref().is_some_and(Exhaustion::devices_full)
     }
 
-    /// Whether `doctor` should warn about the pool.
+    /// Whether `doctor` should warn about the pool: spent, within a quarter of the ceiling, or
+    /// with commands an earlier build killed this boot.
     pub fn is_low(&self) -> bool {
-        self.spent.is_some()
-            || self.headroom() <= self.ceiling.leaked() / 4
-            || self.probable_leaks > 0
+        self.spent.is_some() || self.headroom() <= POOL_CEILING / 4 || self.probable_leaks > 0
     }
 
     /// What frees what leaked.
     pub fn remedy(&self) -> String {
-        if self.spent.is_some() && !self.devices_full() {
-            ORPHANS_FIRST_HINT.to_owned()
-        } else if self.spent.is_some() || self.headroom() <= self.ceiling.leaked() / 4 {
-            REBOOT_HINT.to_owned()
+        if self.spent.is_some() || self.headroom() <= POOL_CEILING / 4 {
+            self.remedy_for_refusal()
         } else {
             "nothing to free".to_owned()
         }
@@ -427,19 +350,19 @@ impl fmt::Display for Budget {
         if let Some(spent) = &self.spent {
             let spent = Spent {
                 exhaustion: spent,
-                devices_full: self.devices_full(),
+                devices_full: self.devices_account(),
             };
             write!(f, "{spent}. ")?;
         }
         write!(
             f,
             "AppleDiskImageDevice {}; DIDeviceIOUserClient {}; AppleAPFSVolume {}; IOMedia {}. \
-             Ceiling {}, headroom {} leaked image devices",
+             Ceiling {POOL_CEILING} image-device instances, live and leaked (the lowest at which \
+             error code 150 struck), headroom {}",
             reading.image_devices,
             reading.user_clients,
             reading.apfs_volumes,
             reading.media,
-            self.ceiling,
             self.headroom()
         )?;
         if self.probable_leaks > 0 {
@@ -695,27 +618,14 @@ pub fn record_exhaustion() -> io::Result<PoolRecord> {
     })
 }
 
-/// Record that an attach just succeeded, which ends this boot's exhaustion if one is recorded.
-pub fn record_attach() -> io::Result<PoolRecord> {
-    record_attach_at(&record_path()?, &boot()?.session)
-}
-
-pub fn record_attach_at(path: &Path, session: &str) -> io::Result<PoolRecord> {
-    let (record, _) = load_or_empty(path)?;
-    if record.spent(session).is_none() {
-        return Ok(record);
-    }
-    update(path, |record| record.attached(session))
-}
-
 /// Record a disk-image command killed during `session`, as an earlier build did.
 #[cfg(test)]
 pub fn record_killed_at(path: &Path, session: &str) -> io::Result<PoolRecord> {
     update(path, |record| record.killed(session))
 }
 
-/// The operator's reset ([`PoolRecord::cleared`]): end this boot's exhaustion and forget the
-/// observed ceiling. A record that does not parse is replaced.
+/// The operator's reset ([`PoolRecord::cleared`]), once they freed what spent the pool: end this
+/// boot's exhaustion. A record that does not parse is replaced.
 pub fn clear() -> io::Result<PoolRecord> {
     clear_at(&record_path()?, &boot()?.session)
 }
@@ -724,63 +634,43 @@ pub fn clear_at(path: &Path, session: &str) -> io::Result<PoolRecord> {
     update(path, |record| record.cleared(session))
 }
 
-/// Refuse `need` attaches the pool cannot take: the real-APFS lane's gate.
+/// Refuse `need` image devices the pool cannot take now.
 pub fn admit(need: u64) -> io::Result<Result<Budget, AttachPoolExhausted>> {
     let budget = observe()?;
     Ok(budget.admits(need).map(|()| budget))
 }
 
-/// Refuse a real-APFS test fixture once this boot's pool is spent (08_testing.md, "Host
-/// limit"): the runner that met the first 150, in whichever test process, recorded it, and every
-/// later fixture of the run stops here before it attaches. It reads only the boot and the
-/// record. A record it cannot read proves nothing about the pool, so it is said aloud and the
-/// fixture proceeds: only a recorded 150 refuses.
-pub fn harness_gate() -> Result<(), AttachPoolExhausted> {
-    match boot().and_then(|boot| Ok((record_path()?, boot))) {
-        Ok((path, boot)) => harness_gate_at(&path, &boot.session),
-        Err(error) if error.kind() == io::ErrorKind::Unsupported => Ok(()),
-        Err(error) => {
-            unreadable(&error);
-            Ok(())
-        }
-    }
+/// A DiskImages2 attach: `diskutil image attach`, the one verb that creates an
+/// `AppleDiskImageDevice` and so draws on this pool. A DI1 `hdiutil attach` creates an IOHDIX
+/// drive and takes no slot in it.
+fn is_disk_images2_attach(request: &crate::CommandRequest) -> bool {
+    request.program == Path::new(crate::DISKUTIL)
+        && request.args.first().is_some_and(|verb| verb == "image")
+        && request.args.get(1).is_some_and(|verb| verb == "attach")
 }
 
-/// [`harness_gate`] against the record at `path` during boot `session`.
-pub fn harness_gate_at(path: &Path, session: &str) -> Result<(), AttachPoolExhausted> {
-    let record = match load_or_empty(path) {
-        Ok((record, _)) => record,
-        Err(error) => {
-            unreadable(&error);
-            return Ok(());
-        }
-    };
-    let Some(spent) = record.spent(session) else {
+/// Refuse a DiskImages2 attach before it spawns when this boot's pool is spent or the attach's
+/// reserve ([`attach_reserve`]) would bring the image devices to [`POOL_CEILING`]; every other
+/// command passes. A pool that cannot be read refuses too: nothing says the attach would not
+/// fail with 150, and a failed attach leaks a device, while a refused one can run again. A
+/// record whose bytes do not parse reads as empty with a warning ([`load_or_empty`]); one that
+/// cannot be read at all refuses. A kernel with no attach pool has nothing to gate.
+pub(crate) fn refuse_attach_into_pool(
+    request: &crate::CommandRequest,
+) -> Result<(), crate::CommandRunError> {
+    if !is_disk_images2_attach(request) {
         return Ok(());
+    }
+    let failure = match admit(attach_reserve()) {
+        Ok(Ok(_)) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => return Ok(()),
+        Ok(Err(exhausted)) => crate::CommandRunFailure::AttachPool(exhausted),
+        Err(error) => crate::CommandRunFailure::PoolUnread(error),
     };
-    let explained = spent.explained_by(record.ceiling_leaked());
-    Err(AttachPoolExhausted {
-        need: 1,
-        headroom: None,
-        detail: Spent {
-            exhaustion: spent,
-            devices_full: explained,
-        }
-        .to_string(),
-        remedy: if explained {
-            REBOOT_HINT
-        } else {
-            ORPHANS_FIRST_HINT
-        }
-        .to_owned(),
+    Err(crate::CommandRunError {
+        request: request.clone(),
+        failure,
     })
-}
-
-fn unreadable(error: &io::Error) {
-    cowshed_os::eprintln!(
-        "cowshed: warning: the disk-image attach pool record is unreadable ({error}); attaching \
-     anyway"
-    );
 }
 
 #[cfg(test)]
@@ -869,39 +759,55 @@ mod tests {
         assert_eq!(rebooted_host().departed(), None);
     }
 
+    /// The ceiling counts image-device instances, live and leaked alike: a healthy host has the
+    /// headroom up to it, a quarter of it left warns, and none left refuses with a reboot.
     #[test]
-    fn with_no_ceiling_recorded_the_observed_1024_is_the_ceiling_and_a_healthy_host_frees_nothing()
-    {
+    fn the_ceiling_counts_live_and_leaked_image_devices_alike() {
         let budget = PoolRecord::default().budget(NEXT_BOOT, rebooted_host());
-        assert_eq!(budget.ceiling, Ceiling::Default);
-        assert_eq!(budget.headroom(), 1024);
+        assert_eq!(budget.headroom(), POOL_CEILING - 1 - 178);
         assert!(!budget.is_low());
         assert_eq!(budget.remedy(), "nothing to free");
-        assert!(budget.admits(1024).is_ok());
-        assert!(budget.admits(1025).is_err());
+        assert!(budget.admits(budget.headroom()).is_ok());
+        assert!(budget.admits(budget.headroom() + 1).is_err());
         let report = budget.to_string();
-        assert!(report.contains("not a documented limit"), "{report}");
+        assert!(
+            report.contains("Ceiling 1042 image-device instances"),
+            "{report}"
+        );
         assert!(
             report.contains("AppleDiskImageDevice 178 instances, 178 registered, 0 leaked"),
             "{report}"
         );
 
-        let full = PoolRecord::default().budget(NEXT_BOOT, leaking(1024));
+        // 256 attached and 786 leaked: where the boot of 2026-10-21 first met 150.
+        let full = PoolRecord::default().budget(
+            NEXT_BOOT,
+            KernelReading {
+                image_devices: count(POOL_CEILING, 256),
+                ..rebooted_host()
+            },
+        );
         assert_eq!(full.headroom(), 0);
         assert!(full.is_low());
         assert_eq!(full.remedy(), REBOOT_HINT);
-        assert!(full.admits(1).is_err());
-        let quarter = PoolRecord::default().budget(NEXT_BOOT, leaking(1024 - 256));
-        assert!(quarter.is_low());
-        assert!(
-            !PoolRecord::default()
-                .budget(NEXT_BOOT, leaking(1024 - 257))
-                .is_low()
-        );
+        assert_eq!(full.admits(1).unwrap_err().remedy, REBOOT_HINT);
+        let quarter = |instances| {
+            PoolRecord::default().budget(
+                NEXT_BOOT,
+                KernelReading {
+                    image_devices: count(instances, 10),
+                    ..rebooted_host()
+                },
+            )
+        };
+        assert!(quarter(POOL_CEILING - 1 - POOL_CEILING / 4).is_low());
+        assert!(!quarter(POOL_CEILING - 2 - POOL_CEILING / 4).is_low());
     }
 
+    /// A 150 spends the boot until the operator clears it. A later successful attach does not
+    /// clear it: one admitted before the 150 may still finish after it.
     #[test]
-    fn a_150_spends_the_boot_and_its_leaked_count_becomes_the_ceiling() {
+    fn a_150_spends_the_boot_until_the_operator_clears_it() {
         let record = spent_record();
         let exhaustion = Exhaustion {
             boot: boot(BOOT),
@@ -909,11 +815,11 @@ mod tests {
             orphaned_helpers: Some(0),
         };
         assert_eq!(record.last_exhaustion, Some(exhaustion.clone()));
-        assert_eq!(record.ceiling, Some(exhaustion.clone()));
-        let budget = record.budget(BOOT, spent_host());
+        let budget = record.budget(BOOT, rebooted_host());
         assert_eq!(budget.spent, Some(exhaustion));
         assert!(budget.is_low());
-        assert!(budget.admits(0).is_err());
+        let refused = budget.admits(0).expect_err("a spent boot admits nothing");
+        assert_eq!(refused.remedy, REBOOT_HINT);
         let report = budget.to_string();
         assert!(
             report.starts_with("attach pool exhausted, reboot required"),
@@ -923,7 +829,6 @@ mod tests {
             report.contains("with 66 disk images attached and 1024 leaked image devices"),
             "{report}"
         );
-        assert_eq!(budget.remedy(), REBOOT_HINT);
 
         // A second 150 in the same boot keeps where the pool first ran out.
         assert_eq!(
@@ -932,49 +837,26 @@ mod tests {
                 .exhausted(&boot(BOOT), Some(count(2000, 10)), Some(0)),
             record
         );
+        // The next boot is not spent.
+        assert_eq!(record.budget(NEXT_BOOT, rebooted_host()).spent, None);
 
-        // After the reboot the recorded leaked count is the ceiling, and nothing is spent.
-        let rebooted = record.budget(NEXT_BOOT, leaking(24));
-        assert_eq!(
-            rebooted.ceiling,
-            Ceiling::Observed {
-                leaked: 1024,
-                booted_at: 1_791_515_025
-            }
-        );
-        assert_eq!(rebooted.spent, None);
-        assert_eq!(rebooted.headroom(), 1000);
-        assert!(rebooted.admits(1000).is_ok());
-        let refused = rebooted
-            .admits(1001)
-            .expect_err("one more than the headroom");
-        let report = refused.to_string();
-        assert!(
-            report.starts_with("AttachPoolExhausted: 1001 attaches needed, 1000 of headroom"),
-            "{report}"
-        );
-        // Leaked devices are what refuse, and only a reboot frees them.
-        assert!(
-            report.ends_with(&format!("\nnext: {REBOOT_HINT}")),
-            "{report}"
-        );
-
-        // A later 150 at a lower leaked count lowers the ceiling.
-        let lowered = record
-            .exhausted(&boot(NEXT_BOOT), Some(count(310, 10)), Some(0))
-            .budget(NEXT_BOOT, leaking(0));
-        assert_eq!(lowered.ceiling.leaked(), 300);
+        // Clearing ends this boot's exhaustion and keeps the evidence; another boot's clear
+        // changes nothing.
+        let cleared = record.clone().cleared(BOOT);
+        assert_eq!(cleared.spent_session, None);
+        assert_eq!(cleared.last_exhaustion, record.last_exhaustion);
+        assert!(cleared.budget(BOOT, rebooted_host()).admits(1).is_ok());
+        assert_eq!(record.clone().cleared(NEXT_BOOT), record);
     }
 
     #[test]
-    fn a_150_the_orphans_could_explain_spends_the_boot_but_sets_no_ceiling() {
+    fn a_150_the_devices_do_not_account_for_names_the_orphans_first() {
         for orphans in [Some(10), None] {
             let record = PoolRecord::default().exhausted(&boot(BOOT), Some(count(96, 66)), orphans);
-            assert!(record.ceiling.is_none(), "{orphans:?}");
             let budget = record.budget(BOOT, leaking(30));
-            assert_eq!(budget.ceiling, Ceiling::Default);
             assert!(budget.spent.is_some());
             assert_eq!(budget.remedy(), ORPHANS_FIRST_HINT);
+            assert_eq!(budget.admits(1).unwrap_err().remedy, ORPHANS_FIRST_HINT);
             let report = budget.to_string();
             assert!(report.starts_with("attach pool exhausted: "), "{report}");
             assert!(!report.contains("reboot required"), "{report}");
@@ -982,18 +864,6 @@ mod tests {
         // The kernel unread at the 150: the boot is spent all the same.
         let unread = PoolRecord::default().exhausted(&boot(BOOT), None, None);
         assert!(unread.spent(BOOT).is_some());
-        assert!(unread.ceiling.is_none());
-    }
-
-    #[test]
-    fn an_attach_that_succeeds_again_ends_the_boots_exhaustion_but_keeps_the_ceiling() {
-        let spent = spent_record();
-        let recovered = spent.clone().attached(BOOT);
-        assert_eq!(recovered.spent_session, None);
-        assert_eq!(recovered.ceiling, spent.ceiling);
-        assert!(recovered.budget(BOOT, spent_host()).spent.is_none());
-        // A success in another boot says nothing about this one.
-        assert_eq!(spent.clone().attached(NEXT_BOOT), spent);
     }
 
     #[test]
@@ -1046,7 +916,7 @@ mod tests {
         let healthy = record.budget(NEXT_BOOT, departed(rebooted_host()));
         assert_eq!(healthy.remedy(), "nothing to free");
         assert!(!healthy.is_low());
-        assert!(healthy.admits(1024).is_ok());
+        assert!(healthy.admits(healthy.headroom()).is_ok());
 
         // The first departed instance of either class is counted, and moves nothing in the pool.
         let first_volume = KernelReading {
@@ -1075,7 +945,7 @@ mod tests {
             let budget = record.budget(NEXT_BOOT, first);
             assert!(!budget.is_low());
             assert_eq!(budget.remedy(), "nothing to free");
-            assert_eq!(budget.headroom(), 1024);
+            assert_eq!(budget.headroom(), POOL_CEILING - 1 - 178);
         }
         // Fewer instances than registered entries is no departure.
         let freed = KernelReading {
@@ -1165,26 +1035,14 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
-    #[test]
-    fn a_successful_attach_clears_the_recorded_boot() {
-        let directory = scratch("attach");
-        let path = directory.join("pool.json");
-        update(&path, |_| spent_record()).unwrap();
-        assert!(harness_gate_at(&path, BOOT).is_err());
-        record_attach_at(&path, BOOT).unwrap();
-        assert!(harness_gate_at(&path, BOOT).is_ok());
-        assert!(load(&path).unwrap().ceiling.is_some());
-        std::fs::remove_dir_all(&directory).unwrap();
-    }
-
     /// Every refusal names a step that can free the pool. Between a quarter of the ceiling and
     /// the need, the doctor remedy has nothing to free, yet the gate refuses: it says reboot.
     #[test]
     fn a_refusal_for_low_headroom_says_reboot_even_when_doctor_would_not() {
         let budget = PoolRecord::default().budget(NEXT_BOOT, leaking(700));
-        assert_eq!(budget.headroom(), 324);
+        assert_eq!(budget.headroom(), POOL_CEILING - 1 - 710);
         assert_eq!(budget.remedy(), "nothing to free");
-        let refused = budget.admits(400).expect_err("324 < 400");
+        let refused = budget.admits(400).expect_err("331 < 400");
         assert_eq!(refused.remedy, REBOOT_HINT);
         let volumes = KernelReading {
             apfs_volumes: count(1065, 81),
@@ -1193,64 +1051,28 @@ mod tests {
         let refused = PoolRecord::default()
             .budget(NEXT_BOOT, volumes)
             .admits(400)
-            .expect_err("324 < 400");
+            .expect_err("331 < 400");
         // Departed volumes add nothing to a refusal: the remedy is the reboot alone.
         assert_eq!(refused.remedy, REBOOT_HINT);
-        // A spent boot the leaked devices do not explain sends the operator to the orphans.
-        let orphaned = PoolRecord::default()
-            .exhausted(&boot(BOOT), Some(count(96, 66)), Some(10))
-            .budget(BOOT, leaking(30));
-        assert_eq!(orphaned.admits(1).unwrap_err().remedy, ORPHANS_FIRST_HINT);
     }
 
-    /// Resetting a ceiling cannot free leaked devices that still fill this boot's spent pool.
+    /// The reset ends the spent boot on disk and keeps the last exhaustion as evidence.
     #[test]
-    fn a_spent_boot_with_full_devices_needs_a_reboot_before_reset() {
-        let budget = PoolRecord::default()
-            .exhausted(&boot(BOOT), Some(count(40, 10)), Some(0))
-            .budget(BOOT, leaking(30));
-        assert_eq!(budget.admits(273).unwrap_err().remedy, REBOOT_HINT);
-    }
-
-    /// A ceiling below the need refuses whatever leaks now; the refusal names the reset, and the
-    /// reset forgets the ceiling and the spent boot, keeping the last exhaustion as evidence.
-    #[test]
-    fn a_recorded_ceiling_below_the_need_names_the_reset_that_forgets_it() {
-        let low = PoolRecord::default().exhausted(&boot(BOOT), Some(count(40, 10)), Some(0));
-        let budget = low.budget(NEXT_BOOT, leaking(0));
-        assert_eq!(budget.ceiling.leaked(), 30);
-        let refused = budget.admits(273).expect_err("30 < 273");
-        assert!(
-            refused.remedy.contains(&format!("`{CLEAR_COMMAND}`")),
-            "{refused}"
-        );
-        assert!(refused.remedy.contains("30 leaked devices"), "{refused}");
-        // A ceiling above the need with too many leaked devices is the reboot's, not the reset's.
-        let high = PoolRecord::default().exhausted(&boot(BOOT), Some(count(510, 10)), Some(0));
-        let refused = high
-            .budget(NEXT_BOOT, leaking(400))
-            .admits(273)
-            .unwrap_err();
-        assert_eq!(refused.remedy, REBOOT_HINT);
-
-        let cleared = low.clone().cleared(BOOT);
-        assert_eq!(cleared.ceiling, None);
-        assert_eq!(cleared.spent_session, None);
-        assert_eq!(cleared.last_exhaustion, low.last_exhaustion);
-        assert!(cleared.budget(NEXT_BOOT, leaking(0)).admits(273).is_ok());
-
+    fn the_reset_ends_the_spent_boot_and_keeps_the_evidence() {
         let directory = scratch("clear");
         let path = directory.join("pool.json");
-        update(&path, |_| low.clone()).unwrap();
-        assert!(harness_gate_at(&path, BOOT).is_err());
+        let spent = spent_record();
+        update(&path, |_| spent.clone()).unwrap();
+        assert!(load(&path).unwrap().spent(BOOT).is_some());
         clear_at(&path, BOOT).unwrap();
-        assert!(harness_gate_at(&path, BOOT).is_ok());
-        assert_eq!(load(&path).unwrap().ceiling(), Ceiling::Default);
+        let cleared = load(&path).unwrap();
+        assert!(cleared.spent(BOOT).is_none());
+        assert_eq!(cleared.last_exhaustion, spent.last_exhaustion);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
     /// A record that does not parse proves nothing: it reads as empty, the next 150 is still
-    /// recorded over it (so the cascade guard holds), and the reset replaces it.
+    /// recorded over it (so the boot latch holds), and the reset replaces it.
     #[test]
     fn a_record_that_does_not_parse_is_read_as_empty_and_replaced() {
         let directory = scratch("broken");
@@ -1262,7 +1084,7 @@ mod tests {
             record.exhausted(&boot(BOOT), Some(spent_host().image_devices), Some(0))
         })
         .unwrap();
-        assert!(harness_gate_at(&path, BOOT).is_err());
+        assert!(load(&path).unwrap().spent(BOOT).is_some());
 
         std::fs::write(&path, b"not json").unwrap();
         assert_eq!(clear_at(&path, BOOT).unwrap(), PoolRecord::default());
@@ -1274,34 +1096,32 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
-    /// The cascade this gate exists for: 26 tests each attaching into a spent pool. Every test
-    /// passes the gate, then attaches; the host answers 150 from the third attach on. Only that
-    /// one attach is spent on the spent pool: the 23 tests after it are refused before attaching.
+    /// The cascade the latch exists for: 26 attaches into a pool that answers 150 from the
+    /// third on, and an attach admitted before that 150 that succeeds after it. Only the one
+    /// failed attach is spent into the spent pool: the 23 after it are refused before
+    /// attaching, the late success notwithstanding, and the refusal says reboot.
     #[test]
-    fn the_harness_stops_the_run_at_the_first_150() {
-        let directory = scratch("harness");
-        let path = directory.join("pool.json");
+    fn the_latch_stops_every_attach_after_the_first_150() {
+        let mut record = PoolRecord::default();
         let mut attaches = 0;
         let mut refused = Vec::new();
-        for test in 0..26 {
-            if let Err(exhausted) = harness_gate_at(&path, BOOT) {
+        for attach in 0..26 {
+            if let Err(exhausted) = record
+                .budget(BOOT, rebooted_host())
+                .admits(attach_reserve())
+            {
                 refused.push(exhausted.to_string());
                 continue;
             }
             attaches += 1;
-            if test >= 2 {
-                update(&path, |record| {
-                    record.exhausted(&boot(BOOT), Some(spent_host().image_devices), Some(0))
-                })
-                .unwrap();
+            if attach >= 2 {
+                record = record.exhausted(&boot(BOOT), Some(spent_host().image_devices), Some(0));
             }
         }
         assert_eq!(attaches, 3);
         assert_eq!(refused.len(), 23);
         assert!(
-            refused[0].starts_with(
-                "AttachPoolExhausted: 1 attaches needed; attach pool exhausted, reboot required"
-            ),
+            refused[0].contains("attach pool exhausted, reboot required"),
             "{}",
             refused[0]
         );
@@ -1310,20 +1130,84 @@ mod tests {
             "{}",
             refused[0]
         );
-
-        // After the reboot the fixtures run again; only the lane gate weighs the ceiling.
-        assert!(harness_gate_at(&path, NEXT_BOOT).is_ok());
+        // After the reboot attaches run again.
         assert!(
-            load(&path)
-                .unwrap()
-                .budget(NEXT_BOOT, leaking(1024))
-                .admits(1)
-                .is_err()
+            record
+                .budget(NEXT_BOOT, rebooted_host())
+                .admits(attach_reserve())
+                .is_ok()
         );
+    }
 
-        // An unreadable record proves nothing: the fixture proceeds.
-        std::fs::write(&path, b"not json").unwrap();
-        assert!(harness_gate_at(&path, BOOT).is_ok());
-        std::fs::remove_dir_all(&directory).unwrap();
+    /// Only a DiskImages2 attach is gated: a detach, an info read or a DI1 attach never reads
+    /// the pool.
+    #[test]
+    fn only_an_image_attach_is_gated_by_the_pool() {
+        for request in [
+            crate::CommandRequest::new(crate::DISKUTIL, ["image", "info", "/x.dmg"]),
+            crate::CommandRequest::new(crate::HDIUTIL, ["detach", "/dev/disk9"]),
+            crate::CommandRequest::new(crate::DISKUTIL, ["info", "/dev/disk9"]),
+            crate::CommandRequest::new(crate::HDIUTIL, ["attach", "-kernel", "/x.dmg"]),
+        ] {
+            assert!(refuse_attach_into_pool(&request).is_ok(), "{request:?}");
+        }
+    }
+
+    proptest::proptest! {
+        /// The admission decision is exactly: not spent, and every reserved device stays below
+        /// the ceiling. It is monotone (more instances or a larger need never turns a refusal
+        /// into an admission), ignores departed volumes and media, and every refusal names a
+        /// step that frees the pool.
+        #[test]
+        fn admission_is_not_spent_and_below_the_ceiling(
+            instances in 0u64..2048,
+            registered in 0u64..1100,
+            need in 0u64..64,
+            departed in 0u64..4096,
+            spent in proptest::bool::ANY,
+            orphans in proptest::option::of(0u64..16),
+        ) {
+            let reading = KernelReading {
+                image_devices: count(instances, registered),
+                apfs_volumes: count(departed + 10, 10),
+                media: count(departed + 10, 10),
+                ..rebooted_host()
+            };
+            let record = if spent {
+                PoolRecord::default().exhausted(&boot(BOOT), Some(count(instances, registered)), orphans)
+            } else {
+                PoolRecord::default()
+            };
+            let budget = record.budget(BOOT, reading);
+            let admitted = budget.admits(need).is_ok();
+            proptest::prop_assert_eq!(admitted, !spent && instances + need < POOL_CEILING);
+            if let Err(refused) = budget.admits(need) {
+                proptest::prop_assert!(
+                    refused.remedy == REBOOT_HINT || refused.remedy == ORPHANS_FIRST_HINT
+                );
+            }
+            let more = record.budget(BOOT, KernelReading {
+                image_devices: count(instances + 1, registered),
+                ..reading
+            });
+            proptest::prop_assert!(admitted || more.admits(need).is_err());
+            proptest::prop_assert!(admitted || budget.admits(need + 1).is_err());
+            let without_departed = record.budget(BOOT, KernelReading {
+                apfs_volumes: rebooted_host().apfs_volumes,
+                media: rebooted_host().media,
+                ..reading
+            });
+            proptest::prop_assert_eq!(
+                budget.admits(need).map_err(|refused| refused.remedy),
+                without_departed.admits(need).map_err(|refused| refused.remedy)
+            );
+            // The record survives a cleared boot as evidence, and a clear admits what fits.
+            let cleared = record.clone().cleared(BOOT);
+            proptest::prop_assert_eq!(&cleared.last_exhaustion, &record.last_exhaustion);
+            proptest::prop_assert_eq!(
+                cleared.budget(BOOT, reading).admits(need).is_ok(),
+                instances + need < POOL_CEILING
+            );
+        }
     }
 }

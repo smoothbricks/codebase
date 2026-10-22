@@ -8,7 +8,6 @@ use std::time::{Duration, Instant, SystemTime};
 
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 
-use cowshed_apfs::attach_budget;
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::mounts::KernelMountSnapshot;
 use cowshed_apfs::store_lock::LockMode;

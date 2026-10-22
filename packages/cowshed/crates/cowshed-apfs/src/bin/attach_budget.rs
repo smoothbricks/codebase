@@ -2,15 +2,14 @@
 //!
 //! Prints the host's disk-image attach pool as one JSON line and refuses, exit 3 with
 //! `AttachPoolExhausted` and a `next:` hint on stderr, when this boot's pool is spent or its
-//! headroom is below `N`, the lane's measured attach count. A pool that cannot be read proves
+//! headroom below the image-device ceiling is below `N`, the lane's measured attach count. A pool that cannot be read proves
 //! nothing either way: the line says `unread`, stderr says why, and the exit is 0, so the lane
 //! runs with the warning visible. `--clear` ends this boot's recorded exhaustion once the
-//! operator has freed what spent it (killed the orphaned helpers `cowshed doctor` names), and
-//! forgets the ceiling a past error code 150 recorded, back to the observed default.
+//! operator has freed what spent it (killed the orphaned helpers `cowshed doctor` names).
 
 use std::process::ExitCode;
 
-use cowshed_apfs::attach_budget::{self, Budget, Ceiling, ClassCount};
+use cowshed_apfs::attach_budget::{self, Budget, ClassCount, POOL_CEILING};
 use serde_json::{Value, json};
 
 const USAGE: &str = "usage: attach-budget --need <attaches> | attach-budget --clear";
@@ -59,9 +58,7 @@ fn clear() -> ExitCode {
     match attach_budget::clear() {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => {
-            cowshed_os::eprintln!(
-                "attach-budget: clear the recorded exhaustion and ceiling: {error}"
-            );
+            cowshed_os::eprintln!("attach-budget: clear the recorded exhaustion: {error}");
             ExitCode::from(1)
         }
     }
@@ -84,13 +81,7 @@ fn report(budget: &Budget, need: u64) -> Value {
             "AppleAPFSVolume": class(reading.apfs_volumes),
             "IOMedia": class(reading.media),
         },
-        "ceiling": {
-            "leaked": budget.ceiling.leaked(),
-            "source": match budget.ceiling {
-                Ceiling::Default => "default",
-                Ceiling::Observed { .. } => "observed",
-            },
-        },
+        "ceiling": { "instances": POOL_CEILING },
         "headroom": budget.headroom(),
         "spentThisBoot": budget.spent.is_some(),
         "probableLeaks": budget.probable_leaks,

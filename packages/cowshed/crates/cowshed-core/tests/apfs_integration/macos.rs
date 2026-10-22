@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-use cowshed_apfs::attach_budget;
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::store_lock::verify_no_symlinks;
 use cowshed_apfs::template::{
