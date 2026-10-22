@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use cowshed_gateway_types::TOKEN_BYTES;
+use cowshed_gateway_types::{TOKEN_BYTES, WorkspaceCa};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
     PKCS_ECDSA_P256_SHA256,
@@ -97,42 +97,24 @@ pub fn mint_workspace_credentials(
     let certificate_path = mount_point.join(CA_CERTIFICATE_PATH);
     let token_path = mount_point.join(WORKSPACE_TOKEN_PATH);
 
-    let signing_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
-        .map_err(|_| WorkspaceCredentialError::Generation("P-256 key generation"))?;
-    let mut params = CertificateParams::new(Vec::<String>::new())
-        .map_err(|_| WorkspaceCredentialError::Generation("CA parameters"))?;
-    let mut distinguished_name = DistinguishedName::new();
-    distinguished_name.push(DnType::OrganizationName, "cowshed");
-    distinguished_name.push(
-        DnType::CommonName,
-        credential_subject(workspace.repo(), workspace.name(), workspace.incarnation()),
-    );
-    params.distinguished_name = distinguished_name;
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![
-        KeyUsagePurpose::DigitalSignature,
-        KeyUsagePurpose::KeyCertSign,
-        KeyUsagePurpose::CrlSign,
-    ];
-    let certificate = params
-        .self_signed(&signing_key)
-        .map_err(|_| WorkspaceCredentialError::Generation("self-signed CA certificate"))?;
-
-    let private_key = Zeroizing::new(signing_key.serialize_pem());
-    let certificate_pem = certificate.pem();
+    let ca = mint_workspace_ca(credential_subject(
+        workspace.repo(),
+        workspace.name(),
+        workspace.incarnation(),
+    ))?;
     let mut token_bytes = Zeroizing::new([0_u8; TOKEN_BYTES]);
     getrandom::fill(&mut token_bytes[..])
         .map_err(|_| WorkspaceCredentialError::Generation("workspace token"))?;
     let token = Zeroizing::new(URL_SAFE_NO_PAD.encode(&token_bytes[..]));
 
-    publish_asset(private_key_path, private_key.as_bytes())?;
-    publish_asset(&certificate_path, certificate_pem.as_bytes())?;
+    publish_asset(private_key_path, ca.private_key_pem.as_bytes())?;
+    publish_asset(&certificate_path, ca.certificate_pem.as_bytes())?;
     publish_asset(&token_path, token.as_bytes())?;
     // A mint knows no store and may run at a staging mount, so the sandbox's TMPDIR and runtime
     // link wait for the supervisor start that serves the minted workspace: it publishes the file
     // again with them before any shell can use it.
     publish_workspace_environment(EnvironmentMount::Minted(mount_point), platform, port_block)?;
-    publish_minted_client_wiring(&credential_directory, certificate_pem.as_bytes())?;
+    publish_minted_client_wiring(&credential_directory, ca.certificate_pem.as_bytes())?;
     sync_directory(&credential_directory, "syncing credential directory")?;
 
     // A certificate minted a line above carries the current identity, so the tightest possible
@@ -143,6 +125,35 @@ pub fn mint_workspace_credentials(
         mount_point,
         private_key_path,
     )
+}
+
+/// A fresh workspace CA under `common_name`, in the RFC 5280 §4.2.1 CA profile: a P-256 key,
+/// basicConstraints critical CA:TRUE, keyUsage critical keyCertSign and cRLSign (digitalSignature
+/// too), and the Subject Key Identifier rcgen derives for every CA. That identifier is what the
+/// gateway's minted leaves name as their Authority Key Identifier, which OpenSSL's strict chain
+/// check (Python 3.13+'s default) requires; a self-signed CA itself needs none (§4.2.1.1).
+pub fn mint_workspace_ca(common_name: String) -> Result<WorkspaceCa, WorkspaceCredentialError> {
+    let signing_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+        .map_err(|_| WorkspaceCredentialError::Generation("P-256 key generation"))?;
+    let mut params = CertificateParams::new(Vec::<String>::new())
+        .map_err(|_| WorkspaceCredentialError::Generation("CA parameters"))?;
+    let mut distinguished_name = DistinguishedName::new();
+    distinguished_name.push(DnType::OrganizationName, "cowshed");
+    distinguished_name.push(DnType::CommonName, common_name);
+    params.distinguished_name = distinguished_name;
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+    ];
+    let certificate = params
+        .self_signed(&signing_key)
+        .map_err(|_| WorkspaceCredentialError::Generation("self-signed CA certificate"))?;
+    Ok(WorkspaceCa {
+        certificate_pem: certificate.pem(),
+        private_key_pem: Zeroizing::new(signing_key.serialize_pem()),
+    })
 }
 
 /// Derives `.cowshed/env` from the image's published token, the workspace's recorded platform
@@ -749,6 +760,44 @@ mod tests {
         assert_eq!(URL_SAFE_NO_PAD.decode(token).expect("base64url").len(), 32);
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The gateway's leaves name this CA's Subject Key Identifier as their Authority Key
+    /// Identifier, and a strict verifier rejects a CA without keyCertSign or a critical
+    /// basicConstraints: the profile is the contract the whole intercepted chain rests on.
+    #[test]
+    fn the_workspace_ca_carries_the_rfc5280_ca_profile() {
+        let ca = mint_workspace_ca(
+            "cowshed:acme/widget:raven:00112233445566778899aabbccddeeff".to_owned(),
+        )
+        .expect("workspace CA");
+        let (_, pem) =
+            x509_parser::pem::parse_x509_pem(ca.certificate_pem.as_bytes()).expect("CA PEM");
+        let (_, certificate) = X509Certificate::from_der(&pem.contents).expect("CA DER");
+
+        let constraints = certificate
+            .basic_constraints()
+            .expect("one basicConstraints")
+            .expect("basicConstraints");
+        assert!(constraints.critical);
+        assert!(constraints.value.ca);
+        let usage = certificate
+            .key_usage()
+            .expect("one keyUsage")
+            .expect("keyUsage");
+        assert!(usage.critical);
+        assert!(usage.value.key_cert_sign());
+        assert!(usage.value.crl_sign());
+        let subject_key_identifier = certificate
+            .iter_extensions()
+            .find_map(|extension| match extension.parsed_extension() {
+                x509_parser::extensions::ParsedExtension::SubjectKeyIdentifier(identifier) => {
+                    Some(identifier.0)
+                }
+                _ => None,
+            })
+            .expect("subjectKeyIdentifier");
+        assert!(!subject_key_identifier.is_empty());
     }
 
     #[test]

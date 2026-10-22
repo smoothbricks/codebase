@@ -966,6 +966,7 @@ dependencies = [
  "tokio-rustls",
  "url",
  "uuid",
+ "x509-parser",
  "zeroize",
 ]
 
