@@ -511,7 +511,7 @@ fn option_inner(ty: &RustType) -> Option<&RustType> {
     }
 }
 
-fn quoted(value: &str) -> String {
+pub(crate) fn quoted(value: &str) -> String {
     let mut result = String::from("'");
     for character in value.chars() {
         match character {

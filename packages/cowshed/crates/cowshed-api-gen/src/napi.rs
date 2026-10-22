@@ -216,7 +216,7 @@ pub struct Output {
     /// The adapters' TypeScript declarations and typed wrappers.
     pub typescript: String,
     /// Every result record the TypeScript wrappers read from the addon, and how it is wrapped:
-    /// the readers `validators.generated.ts` defines for them (07_api.md, "Reader projection").
+    /// the readers `reader.generated.ts` defines for them (07_api.md, "Reader projection").
     pub reads: BTreeSet<(String, ResultShape)>,
 }
 
@@ -808,7 +808,7 @@ fn typescript(
         "{HEADER}/// <reference types=\"node\" />\n\n\
          import type * as Api from './api.generated.js';\n\
          {native_imports}\
-         import * as V from './validators.generated.js';\n\n\
+         import * as R from './reader.generated.js';\n\n\
          /** A download's answer: its chunk's metadata as JSON, and the bytes it describes. */\n\
          export interface NativeDownload {{\n  readonly json: string;\n  readonly bytes: Buffer;\n}}\n\n\
          /** An adoption's answer: main's reference, and what a re-adoption kept as JSON, or null. */\n\
@@ -902,7 +902,7 @@ fn typescript(
                 (
                     "async function",
                     format!("Promise<{ty}>"),
-                    format!("return V.{validator}(await {call});"),
+                    format!("return R.{validator}(await {call});"),
                 )
             }
             Answer::Download => {
@@ -912,7 +912,7 @@ fn typescript(
                     "async function",
                     format!("Promise<{ty} & {{ readonly bytes: Uint8Array }}>"),
                     format!(
-                        "const answer = await {call};\n  return {{ ...V.{validator}(answer.json), bytes: answer.bytes }};"
+                        "const answer = await {call};\n  return {{ ...R.{validator}(answer.json), bytes: answer.bytes }};"
                     ),
                 )
             }
@@ -930,7 +930,7 @@ fn typescript(
                         "Promise<{{ readonly workspace: NativeWorkspaceRefHandle; readonly reAdoption: Api.{re_adoption} | null }}>"
                     ),
                     format!(
-                        "const answer = await {call};\n  return {{\n    workspace: answer.workspace,\n    reAdoption: answer.reAdoption === null ? null : V.read{re_adoption}(answer.reAdoption),\n  }};"
+                        "const answer = await {call};\n  return {{\n    workspace: answer.workspace,\n    reAdoption: answer.reAdoption === null ? null : R.read{re_adoption}(answer.reAdoption),\n  }};"
                     ),
                 )
             }
@@ -941,7 +941,7 @@ fn typescript(
                 (
                     "function",
                     format!("EventIterator<{ty}>"),
-                    format!("return eventIterator(() => {call}, V.{validator});"),
+                    format!("return eventIterator(() => {call}, R.{validator});"),
                 )
             }
         };
@@ -1181,7 +1181,7 @@ mod tests {
         assert!(
             output.typescript.contains(concat!(
                 "export function jobChunks(handle: NativeJobChunks, args: JobChunksArguments): EventIterator<Api.LogsChunk> {\n",
-                "  return eventIterator(() => handle.chunks(JSON.stringify(args)), V.readLogsChunk);\n",
+                "  return eventIterator(() => handle.chunks(JSON.stringify(args)), R.readLogsChunk);\n",
                 "}",
             )),
             "{}",

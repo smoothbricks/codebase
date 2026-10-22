@@ -2480,6 +2480,20 @@ fn a_peer_result_reads_as_its_declared_projection_and_a_request_stays_strict() {
         change
     );
 
+    // Members of two untagged arms at once select neither: the strict decode refuses them rather
+    // than dropping one arm's member.
+    let usage = json!({"kind": "changed", "index": 0, "usage": {"busy": true, "cpuSysUs": 678, "cpuUserUs": 12345, "cpuWindow": {"closedUs": 2000000, "cpuPermille": 950, "openedUs": 1000000}, "io": {"kind": "read", "readBytes": 123, "writeBytes": 456}, "rssBytes": 4096, "rssPeakBytes": 8192}});
+    read_result::<JobProcessEvents>(usage.clone()).expect("a usage change");
+    let mut mixed = usage;
+    mixed["blockedOn"] = json!("clear");
+    read_result::<JobProcessEvents>(mixed).expect_err("two arms' members are not projected");
+    // An externally tagged value is one member; a second beside it is no variant to project.
+    let set = json!({"kind": "changed", "index": 0, "blockedOn": {"set": {"kind": "pipe"}}});
+    read_result::<JobProcessEvents>(set.clone()).expect("a blocker change");
+    let mut wrapped = set;
+    wrapped["blockedOn"]["futureKey"] = json!(1);
+    read_result::<JobProcessEvents>(wrapped).expect_err("an external tag with a second member");
+
     let request = json!({
         "repoId": "acme/widget",
         "workspace": "raven",

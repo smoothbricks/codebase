@@ -14,6 +14,7 @@ import type {
   JobSubtreeRetirement,
 } from './api.generated.js';
 import type { JobKillArguments } from './native.generated.js';
+import * as readers from './reader.generated.js';
 import type { GrantDelta } from './types.js';
 import * as validators from './validators.generated.js';
 
@@ -42,11 +43,12 @@ interface ResultSeam<T> extends SeamType<T> {
 }
 
 /**
- * `value` once for every non-empty object in it, at any depth, with a member `lingering` added to
- * that object alone, holding a copy of one of its own values. In a record that member is one a
- * newer peer wrote and this build does not declare; in a map (keyed by data) it is one more valid
- * entry. An empty object has no value to copy, so its kind cannot be told by its value: none is
- * widened.
+ * `value` once for every object of two or more members in it, at any depth, with a member
+ * `lingering` added to that object alone, holding a copy of one of its own values. In a record that
+ * member is one a newer peer wrote and this build does not declare; in a map (keyed by data) it is
+ * one more valid entry. An object of one member may be an externally tagged variant, which is
+ * exactly one member however new its writer, and an empty one has no value to copy: neither is
+ * widened, and a seam's root is widened by its caller.
  */
 function widenings(value: unknown): readonly unknown[] {
   if (Array.isArray(value)) {
@@ -59,11 +61,9 @@ function widenings(value: unknown): readonly unknown[] {
   }
   const members = Object.entries(value);
   const first = members[0];
-  if (first === undefined) {
-    return [];
-  }
+  const own = first !== undefined && members.length > 1 ? [{ ...value, lingering: first[1] }] : [];
   return [
-    { ...value, lingering: first[1] },
+    ...own,
     ...members.flatMap(([key, member]) => widenings(member).map((wider) => ({ ...value, [key]: wider }))),
   ];
 }
@@ -77,65 +77,65 @@ const seamTypes = {
     parseOne: validators.parseJobInfo,
     assertMany: validators.assertJobInfoList,
     parseMany: validators.parseJobInfoList,
-    readOne: validators.readJobInfo,
-    readMany: validators.readJobInfoList,
+    readOne: readers.readJobInfo,
+    readMany: readers.readJobInfoList,
   },
   JobProcessTree: {
     assertOne: validators.assertJobProcessTree,
     parseOne: validators.parseJobProcessTree,
-    readOne: validators.readJobProcessTree,
+    readOne: readers.readJobProcessTree,
   },
   JobProcessEvent: {
     assertOne: validators.assertJobProcessEvent,
     parseOne: validators.parseJobProcessEvent,
-    readOne: validators.readJobProcessEvent,
+    readOne: readers.readJobProcessEvent,
   },
   WorkspaceInfo: {
     assertOne: validators.assertWorkspaceInfo,
     parseOne: validators.parseWorkspaceInfo,
     assertMany: validators.assertWorkspaceInfoList,
     parseMany: validators.parseWorkspaceInfoList,
-    readOne: validators.readWorkspaceInfo,
+    readOne: readers.readWorkspaceInfo,
   },
   GrantSet: {
     assertOne: validators.assertGrantSet,
     parseOne: validators.parseGrantSet,
-    readOne: validators.readGrantSet,
+    readOne: readers.readGrantSet,
   },
   LandReport: {
     assertOne: validators.assertLandReport,
     parseOne: validators.parseLandReport,
-    readOne: validators.readLandReport,
+    readOne: readers.readLandReport,
   },
   RebaseReport: {
     assertOne: validators.assertRebaseReport,
     parseOne: validators.parseRebaseReport,
-    readOne: validators.readRebaseReport,
+    readOne: readers.readRebaseReport,
   },
   PushReport: {
     assertOne: validators.assertPushReport,
     parseOne: validators.parsePushReport,
-    readOne: validators.readPushReport,
+    readOne: readers.readPushReport,
   },
   GcReport: {
     assertOne: validators.assertGcReport,
     parseOne: validators.parseGcReport,
-    readOne: validators.readGcReport,
+    readOne: readers.readGcReport,
   },
   DoctorReport: {
     assertOne: validators.assertDoctorReport,
     parseOne: validators.parseDoctorReport,
-    readOne: validators.readDoctorReport,
+    readOne: readers.readDoctorReport,
   },
   RemoveReport: {
     assertOne: validators.assertRemoveReport,
     parseOne: validators.parseRemoveReport,
-    readOne: validators.readRemoveReport,
+    readOne: readers.readRemoveReport,
   },
   ResizeResult: {
     assertOne: validators.assertResizeResult,
     parseOne: validators.parseResizeResult,
-    readOne: validators.readResizeResult,
+    readOne: readers.readResizeResult,
   },
 } satisfies Record<string, ResultSeam<unknown>>;
 
@@ -249,10 +249,20 @@ describe('napi wire contract', () => {
   }
 
   it('projects no unknown variant, no missing member and no request', () => {
+    // Members of two untagged arms at once select neither, and an external tag with a second
+    // member is no variant: both refuse, as the Rust reader does.
+    const usage = seamTypes.JobProcessEvent.readOne(JSON.stringify(corpus.JobProcessEvent?.usage));
+    expect(() => readers.readJobProcessEvent(JSON.stringify({ ...usage, blockedOn: 'clear' }))).toThrow();
+    const blocker = seamTypes.JobProcessEvent.assertOne(corpus.JobProcessEvent?.blockerPipe);
+    expect(readers.readJobProcessEvent(JSON.stringify(blocker))).toEqual(blocker);
+    expect(() =>
+      readers.readJobProcessEvent(JSON.stringify({ ...blocker, blockedOn: { set: { kind: 'pipe' }, futureKey: 1 } })),
+    ).toThrow();
+
     const job = seamTypes.JobInfo.assertOne(corpus.JobInfo?.exited);
-    expect(() => validators.readJobInfo(JSON.stringify({ ...job, state: 'hibernating' }))).toThrow();
+    expect(() => readers.readJobInfo(JSON.stringify({ ...job, state: 'hibernating' }))).toThrow();
     const { jobId: _jobId, ...withoutJob } = job;
-    expect(() => validators.readJobInfo(JSON.stringify(withoutJob))).toThrow();
+    expect(() => readers.readJobInfo(JSON.stringify(withoutJob))).toThrow();
 
     const request = {
       repoId: 'smoothbricks/codebase',

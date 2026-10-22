@@ -294,7 +294,11 @@ pub fn generate(project: &Path) -> Result<Vec<GeneratedFile>, String> {
         },
         GeneratedFile {
             path: project.join("src/validators.generated.ts"),
-            contents: output.validators + &readers,
+            contents: output.validators,
+        },
+        GeneratedFile {
+            path: project.join("src/reader.generated.ts"),
+            contents: readers,
         },
         GeneratedFile {
             path: core.join("api/reader.generated.rs"),

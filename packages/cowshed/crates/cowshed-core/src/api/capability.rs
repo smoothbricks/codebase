@@ -23,6 +23,7 @@ use super::operations::{
 };
 use super::peer_credentials::PeerCredentialsError;
 use super::process::JobProcessTree;
+use super::reader::{Projected, project};
 use super::resources::{JobResourceSample, SampleInterval};
 use super::server::MAX_BINARY_FRAME_BYTES;
 #[cfg(unix)]
@@ -1551,6 +1552,9 @@ async fn read_answer(
             "controller RPC binary response exceeds the 64 KiB frame limit",
         ));
     }
+    // A peer's metadata, read through its projection (07_api.md, "Reader projection").
+    let mut result = result;
+    project(&mut result, <LogsChunk as Projected>::READER);
     let metadata: LogsChunk = serde_json::from_value(result).map_err(|error| {
         CowshedError::internal(format!(
             "controller RPC download metadata is invalid: {error}"
@@ -4697,6 +4701,49 @@ mod tests {
                 .err()
                 .unwrap();
             assert!(error.message.contains("nextOffset"));
+            server_task.await.unwrap();
+        }
+        // A newer peer's metadata member is dropped (07_api.md, "Reader projection"); the offset
+        // it carries is still held to the frame.
+        {
+            let (runtime, mut server) = actor_pair();
+            let server_task = tokio::spawn(async move {
+                let (_, request) = read_rpc_request(&mut server).await;
+                write_rpc_success(
+                    &mut server,
+                    request["id"].as_u64().unwrap(),
+                    json!({"eof": true, "nextOffset": 3, "futureKey": {"nested": 1}}),
+                    Some(3),
+                )
+                .await;
+                write_raw_frame(&mut server, b"abc").await;
+            });
+            let download = runtime
+                .download("job.logs", empty_params(), 0)
+                .await
+                .expect("a newer peer's metadata member is dropped");
+            assert_eq!(download.bytes, b"abc");
+            assert!(download.eof);
+            server_task.await.unwrap();
+        }
+        {
+            let (runtime, mut server) = actor_pair();
+            let server_task = tokio::spawn(async move {
+                let (_, request) = read_rpc_request(&mut server).await;
+                write_rpc_success(
+                    &mut server,
+                    request["id"].as_u64().unwrap(),
+                    json!({"eof": false, "nextOffset": 4, "futureKey": 1}),
+                    Some(3),
+                )
+                .await;
+            });
+            let error = runtime
+                .download("job.logs", empty_params(), 0)
+                .await
+                .err()
+                .unwrap();
+            assert!(error.message.contains("nextOffset"), "{error:?}");
             server_task.await.unwrap();
         }
         {

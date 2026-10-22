@@ -871,9 +871,10 @@ retypes one and never selects an enum arm.
 This is one generated rule, not a per-DTO exception. `cowshed-api-gen` derives every peer result's reader from its
 declaration with the same serde resolution its TypeScript type uses, so the Rust and TypeScript clients drop the same
 members. Rust clients read through `operations::read_result` over `api/reader.generated.rs`; TypeScript adapters read
-through `read<Result>` in `validators.generated.ts` (typia `assertPrune`). Every request, a controller routing a call to
-itself, and every `assert*`/`parse*` validator stay strict. A result only internal operations answer never crosses a
-connection, so its reader drops nothing.
+through `read<Result>` in `reader.generated.ts`, which walks the same derived reader table with `src/reader.ts` before
+the result's strict `assert*` validator. Every request, a controller routing a call to itself, and every
+`assert*`/`parse*` validator stay strict. A result only internal operations answer never crosses a connection, so its
+reader drops nothing.
 
 ### Build-volume reseed
 
@@ -915,7 +916,7 @@ nothing; the storage rules are 16_build_volumes.md, "Clearing a checkout's Nx st
 Canonical declarations in `cowshed-core/src/api/dto.rs`, `operations.rs` and capability authority generate the public
 protocol projections; adapters never maintain request/result field copies. Run `bun nx run cowshed:api-generate` from
 the repository root. Its declared generator writes `src/api.generated.ts`, `src/validators.generated.ts`,
-`src/native.generated.ts`, `src/declaration-ir.generated.ts`, `src/cli-parity.generated.ts`,
+`src/reader.generated.ts`, `src/native.generated.ts`, `src/declaration-ir.generated.ts`, `src/cli-parity.generated.ts`,
 `crates/cowshed-core/src/api/served.generated.rs`, `crates/cowshed-core/src/api/reader.generated.rs` and
 `crates/cowshed-napi/src/operations.generated.rs` under `packages/cowshed`. The underlying write command is
 `packages/cowshed/.cache/api-generator/cowshed-api-gen write packages/cowshed`; the target builds that canonical
