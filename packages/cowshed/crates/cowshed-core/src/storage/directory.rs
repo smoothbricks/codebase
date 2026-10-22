@@ -66,9 +66,9 @@ use super::apfs::{
 };
 use super::lifecycle::{
     CheckpointFact, DefragmentOutcome, DerivedWorkspace, KernelMountFact, LifecycleFact,
-    LifecycleWorkspace, MountState, OperationIdentity, Pin, ResizeOutcome, RetiredRef, Revision,
-    StorageFact, StorageGcOptions, StorageGcPlan, StorageGcReport, SubstrateStats,
-    derive_workspaces,
+    LifecycleWorkspace, MountJoin, MountRefusal, MountRefusalReason, MountState, OperationIdentity,
+    Pin, ResizeOutcome, RetiredRef, Revision, StorageFact, StorageGcOptions, StorageGcPlan,
+    StorageGcReport, SubstrateStats, derive_workspaces,
 };
 use super::{
     CheckpointLabel, PRE_RESTORE_PREFIX, WORKSPACE_MARKER_PATH, discover_session_images,
@@ -752,28 +752,17 @@ impl DirectoryExecutionHost {
                 };
                 let mut mounts = Vec::with_capacity(1);
                 if let Some(current) = observed_mount(&image)? {
-                    if current != mount_point
-                        || !self.marker_names(
-                            &current,
-                            repo,
-                            workspace,
-                            &metadata.workspace_incarnation,
-                        )
-                    {
-                        return Err(ApfsStorageError::Host(format!(
-                            "workspace mount identity mismatch: {} is mounted at {}, expected {} for {}/{} incarnation {}",
-                            image.display(),
-                            current.display(),
-                            mount_point.display(),
-                            repo,
-                            workspace,
-                            metadata.workspace_incarnation,
-                        )));
-                    }
-                    mounts.push(KernelMountFact {
-                        mount_id: binding_id(&image)?,
-                        volume_key: fact.volume_key.clone(),
-                    });
+                    // This read names the workspace, so its own refusal is this read's failure.
+                    mounts.push(
+                        self.join_payload(
+                            &image,
+                            current,
+                            mount_point.clone(),
+                            &fact.workspace,
+                            fact.volume_key.clone(),
+                        )?
+                        .named()?,
+                    );
                 }
                 let mut checkpoint_facts = Vec::new();
                 workspace_checkpoint_facts(
@@ -809,11 +798,60 @@ impl DirectoryExecutionHost {
         workspace: &WorkspaceName,
         incarnation: &WorkspaceIncarnation,
     ) -> bool {
-        let owned = self.config.owned_repo_ids(repo);
-        WorkspaceMarker::read_from(&tree.join(WORKSPACE_MARKER_PATH)).is_ok_and(|marker| {
-            owned.accepts(&marker.repo_id)
-                && marker.workspace == *workspace
-                && marker.workspace_incarnation == *incarnation
+        self.marker_judge(tree, repo, workspace, incarnation)
+            .is_ok()
+    }
+
+    fn marker_judge(
+        &self,
+        tree: &Path,
+        repo: &RepoId,
+        workspace: &WorkspaceName,
+        incarnation: &WorkspaceIncarnation,
+    ) -> Result<(), MountRefusalReason> {
+        MarkerExpectation {
+            repos: self.config.owned_repo_ids(repo),
+            workspace: workspace.clone(),
+            incarnation: incarnation.clone(),
+        }
+        .judge(tree)
+    }
+
+    /// Join the payload `image`'s binding names (`current`) to `workspace`, whose mountpoint is
+    /// `mount_point`, or say why it is not the workspace's mount. The refusal is a value; whether
+    /// it fails anything is the reader's to decide.
+    fn join_payload(
+        &self,
+        image: &Path,
+        current: PathBuf,
+        mount_point: PathBuf,
+        workspace: &LifecycleWorkspace,
+        volume_key: String,
+    ) -> Result<MountJoin, ApfsStorageError> {
+        let verdict = if current == mount_point {
+            self.marker_judge(
+                &current,
+                workspace.repo(),
+                workspace.name(),
+                workspace.incarnation(),
+            )
+        } else {
+            Err(MountRefusalReason::MountedElsewhere(current))
+        };
+        Ok(match verdict {
+            Ok(()) => MountJoin::Proven(KernelMountFact {
+                mount_id: binding_id(image)?,
+                volume_key,
+            }),
+            Err(reason) => MountJoin::Refused {
+                volume_key,
+                refusal: Box::new(MountRefusal {
+                    workspace: workspace.clone(),
+                    mount_point,
+                    mounted_from: image.display().to_string(),
+                    reason,
+                }),
+            },
         })
     }
 
@@ -2265,44 +2303,29 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         }
     }
 
-    /// Every published workspace mounted at its own mountpoint, whose tree carries its marker.
-    /// A published payload mounted anywhere else refuses.
-    fn mounts(&self, repo: &RepoId) -> Result<Vec<KernelMountFact>, ApfsStorageError> {
+    /// Every published workspace's payload binding, joined when it is bound at the workspace's
+    /// own mountpoint and the tree there carries its marker, refused otherwise, workspace by
+    /// workspace.
+    fn mounts(&self, repo: &RepoId) -> Result<Vec<MountJoin>, ApfsStorageError> {
         let storage = layout(&self.config, repo)?;
         let mut mounts = Vec::new();
         for fact in self.published_facts(repo)? {
-            let workspace = &fact.workspace;
             let canonical = storage
-                .canonical_image(workspace.name())?
+                .canonical_image(fact.workspace.name())?
                 .image()
                 .to_owned();
             let Some(current) = observed_mount(&canonical)? else {
                 continue;
             };
             let mount_point =
-                main_aware_mount_point(&self.config, workspace.repo(), workspace.name())?;
-            if current != mount_point
-                || !self.marker_names(
-                    &current,
-                    workspace.repo(),
-                    workspace.name(),
-                    workspace.incarnation(),
-                )
-            {
-                return Err(ApfsStorageError::Host(format!(
-                    "workspace mount identity mismatch: {} is mounted at {}, its mountpoint is {}, and the tree there must carry the {}/{} marker for incarnation {}",
-                    canonical.display(),
-                    current.display(),
-                    mount_point.display(),
-                    workspace.repo(),
-                    workspace.name(),
-                    workspace.incarnation()
-                )));
-            }
-            mounts.push(KernelMountFact {
-                mount_id: binding_id(&canonical)?,
-                volume_key: fact.volume_key,
-            });
+                main_aware_mount_point(&self.config, fact.workspace.repo(), fact.workspace.name())?;
+            mounts.push(self.join_payload(
+                &canonical,
+                current,
+                mount_point,
+                &fact.workspace,
+                fact.volume_key,
+            )?);
         }
         Ok(mounts)
     }

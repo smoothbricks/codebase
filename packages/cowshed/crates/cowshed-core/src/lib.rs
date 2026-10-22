@@ -78,9 +78,9 @@ pub use error::{
     RemovalRefusal, Result, Retry, StdinRefusal,
 };
 pub use gateway_inventory::{
-    AdoptedProject, GatewayInventoryError, GatewaySessionFact, GatewayStoreBackend,
-    NativeGatewayInventory, ProjectHealOutcome, StartupHealState, UnreachableMain,
-    forming_re_adoption_checkout,
+    AdoptedProject, AttachedInventory, GatewayInventoryError, GatewaySessionFact,
+    GatewayStoreBackend, HeldWorkspace, NativeGatewayInventory, ProjectHealOutcome,
+    StartupHealState, UnreachableMain, forming_re_adoption_checkout,
 };
 pub use project_retirement::ProjectRetirementReport;
 pub use storage::bootstrap::ValidatedHostStorage;

@@ -26,8 +26,8 @@ use crate::storage::apfs::{
 use crate::storage::bootstrap::ValidatedHostStorage;
 use crate::storage::directory::DirectoryExecutionHost;
 use crate::storage::lifecycle::{
-    CheckpointFact, DerivationError, DerivedWorkspace, KernelMountFact, LifecycleWorkspace,
-    MountIntent, MountState, StorageFact, Substrate, derive_workspaces,
+    CheckpointFact, DerivationError, DerivedWorkspace, LifecycleWorkspace, MountIntent, MountJoin,
+    MountState, StorageFact, Substrate, derive_workspaces,
 };
 use crate::storage::{StorageLayout, verify_no_symlinks};
 use crate::workspace_credentials::{
@@ -107,6 +107,23 @@ pub struct GatewaySessionFact {
     pub grants: GrantSet,
     pub port_block: PortBlock,
     pub credentials: GatewayWorkspaceCredentials,
+}
+
+/// The sessions one inventory pass found attached, and the workspaces it holds.
+#[derive(Debug, Default)]
+pub struct AttachedInventory {
+    pub attached: Vec<GatewaySessionFact>,
+    pub held: Vec<HeldWorkspace>,
+}
+
+/// A workspace whose mount is unproven (`MountState::Unproven`): something is mounted at its
+/// mountpoint that does not prove itself the workspace's, so it is neither attached nor detached.
+/// It is reported by name; nothing installs a session for it, and nothing removes the one it has,
+/// on the strength of this inventory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeldWorkspace {
+    pub repo_id: RepoId,
+    pub workspace: WorkspaceName,
 }
 
 /// One validated adopted project discovered from `<store>/<owner>/<repo>/repository.json`.
@@ -229,7 +246,7 @@ pub enum GatewayInventoryError {
 #[derive(Clone)]
 struct ProjectInventoryFacts {
     storage: Vec<StorageFact>,
-    mounts: Vec<KernelMountFact>,
+    mounts: Vec<MountJoin>,
     checkpoints: Vec<CheckpointFact>,
     mount_paths: BTreeMap<String, PathBuf>,
 }
@@ -1041,7 +1058,7 @@ impl NativeGatewayInventory {
         Ok(scan)
     }
 
-    pub async fn all_attached(&self) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {
+    pub async fn all_attached(&self) -> Result<AttachedInventory, GatewayInventoryError> {
         let inventory = self.clone();
         crate::storage::lifecycle::dispatch_blocking(move || inventory.all_attached_blocking())
             .await
@@ -1051,7 +1068,7 @@ impl NativeGatewayInventory {
     pub async fn project_attached(
         &self,
         repo_id: &RepoId,
-    ) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {
+    ) -> Result<AttachedInventory, GatewayInventoryError> {
         let inventory = self.clone();
         let repo_id = repo_id.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
@@ -1766,12 +1783,15 @@ impl NativeGatewayInventory {
         Ok(Some(metadata))
     }
 
-    fn all_attached_blocking(&self) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {
+    fn all_attached_blocking(&self) -> Result<AttachedInventory, GatewayInventoryError> {
         let repositories = discover_repositories(self.storage.store())?;
-        let mut facts = Vec::new();
+        let mut inventory = AttachedInventory::default();
         for repo in repositories {
             match self.load_project(&repo) {
-                Ok(project) => facts.extend(project),
+                Ok(project) => {
+                    inventory.attached.extend(project.attached);
+                    inventory.held.extend(project.held);
+                }
                 Err(error) => {
                     // Store-wide identity collisions stay fatal. A single project's
                     // mount/metadata mismatch is a doctor finding and must not take
@@ -1790,22 +1810,24 @@ impl NativeGatewayInventory {
                 }
             }
         }
-        facts.sort_by(|left, right| {
+        inventory.attached.sort_by(|left, right| {
             (&left.repo_id, &left.workspace).cmp(&(&right.repo_id, &right.workspace))
         });
-        Ok(facts)
+        Ok(inventory)
     }
 
     fn project_attached_blocking(
         &self,
         repo_id: &RepoId,
-    ) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {
+    ) -> Result<AttachedInventory, GatewayInventoryError> {
         if !validate_requested_repository(self.storage.store(), repo_id)? {
-            return Ok(Vec::new());
+            return Ok(AttachedInventory::default());
         }
-        let mut facts = self.load_project(repo_id)?;
-        facts.sort_by(|left, right| left.workspace.cmp(&right.workspace));
-        Ok(facts)
+        let mut inventory = self.load_project(repo_id)?;
+        inventory
+            .attached
+            .sort_by(|left, right| left.workspace.cmp(&right.workspace));
+        Ok(inventory)
     }
 
     fn workspace_attached_blocking(
@@ -1862,6 +1884,16 @@ impl NativeGatewayInventory {
             authoritative.mounts,
             authoritative.checkpoints,
         )?;
+        // Every reader of a project's inventory says each unproven workspace by name; the
+        // derivation keeps it, so each decision below meets it as its own state.
+        for workspace in &derived {
+            if let MountState::Unproven(refusal) = &workspace.mount_state {
+                cowshed_os::eprintln!(
+                    "cowshed: {repo_id}/{} is neither attached nor detached: {refusal}; next: cowshed doctor",
+                    workspace.workspace.name()
+                );
+            }
+        }
         let layout = StorageLayout::new(self.storage.store(), repo_id).map_err(|error| {
             GatewayInventoryError::InvalidMetadata {
                 path: self.storage.store().to_owned(),
@@ -1913,10 +1945,7 @@ impl NativeGatewayInventory {
             workspaces,
         })
     }
-    fn load_project(
-        &self,
-        repo_id: &RepoId,
-    ) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {
+    fn load_project(&self, repo_id: &RepoId) -> Result<AttachedInventory, GatewayInventoryError> {
         let DerivedInventory {
             layout,
             mount_paths,
@@ -1940,10 +1969,18 @@ impl NativeGatewayInventory {
                 message: error.to_string(),
             })?
             .grants;
-        let mut facts = Vec::new();
+        let mut inventory = AttachedInventory::default();
         for workspace in derived {
-            if !matches!(workspace.mount_state, MountState::Mounted { .. }) {
-                continue;
+            match workspace.mount_state {
+                MountState::Mounted { .. } => {}
+                MountState::Detached => continue,
+                MountState::Unproven(_) => {
+                    inventory.held.push(HeldWorkspace {
+                        repo_id: repo_id.clone(),
+                        workspace: workspace.workspace.name().clone(),
+                    });
+                    continue;
+                }
             }
             let volume = crate::storage::apfs::volume_key(repo_id, workspace.workspace.name());
             let mount =
@@ -1963,7 +2000,7 @@ impl NativeGatewayInventory {
             // (`expected_mount_paths`) — main at the adopted checkout, every other workspace under
             // `mnt/<owner>/<repo>/` — and `ApfsExecutionHost::mounts` only reports a volume as
             // mounted when the kernel has it at exactly that path.
-            facts.push(self.load_session_fact(
+            inventory.attached.push(self.load_session_fact(
                 &layout,
                 &owned_repo_ids,
                 &project_grants,
@@ -1972,7 +2009,7 @@ impl NativeGatewayInventory {
                 mount,
             )?);
         }
-        Ok(facts)
+        Ok(inventory)
     }
 
     fn load_session_fact(
@@ -2380,6 +2417,7 @@ fn main_mount_defect(
     Ok(match main.mount_state {
         MountState::Mounted { .. } => None,
         MountState::Detached => Some(String::from("main's volume is not mounted")),
+        MountState::Unproven(refusal) => Some(refusal.to_string()),
     })
 }
 
@@ -2422,13 +2460,17 @@ fn reject_ambiguous_native_mounts(
     Ok(())
 }
 
-fn reject_duplicate_mount_facts(mounts: &[KernelMountFact]) -> Result<(), GatewayInventoryError> {
+fn reject_duplicate_mount_facts(mounts: &[MountJoin]) -> Result<(), GatewayInventoryError> {
     let mut volumes = BTreeSet::new();
     let mut ids = BTreeSet::new();
     for mount in mounts {
-        if !volumes.insert(mount.volume_key.as_str()) || !ids.insert(mount.mount_id) {
+        let unique_id = match mount {
+            MountJoin::Proven(fact) => ids.insert(fact.mount_id),
+            MountJoin::Refused { .. } => true,
+        };
+        if !volumes.insert(mount.volume_key()) || !unique_id {
             return Err(GatewayInventoryError::AmbiguousMount(
-                mount.volume_key.clone(),
+                mount.volume_key().to_owned(),
             ));
         }
     }
@@ -2606,7 +2648,7 @@ mod tests {
     use crate::repository::{BoundIdentity, RepositoryBinding};
     use crate::storage::CheckpointLabel;
     use crate::storage::bootstrap::CanonicalRoots;
-    use crate::storage::lifecycle::{LifecycleWorkspace, Pin, Revision};
+    use crate::storage::lifecycle::{KernelMountFact, LifecycleWorkspace, Pin, Revision};
     use crate::workspace_credentials::mint_workspace_credentials;
 
     use super::*;
@@ -2725,7 +2767,7 @@ mod tests {
             let mounts: Vec<_> = recorded
                 .mounts
                 .into_iter()
-                .filter(|mount| mount.volume_key == fact.volume_key)
+                .filter(|mount| mount.volume_key() == fact.volume_key)
                 .collect();
             let mount =
                 workspace_mountpoint(&layout, &metadata.info_snapshot.project_root, workspace)?;
@@ -3267,7 +3309,7 @@ mod tests {
                 repo.clone(),
                 ProjectInventoryFacts {
                     storage: vec![storage],
-                    mounts: vec![mount.clone()],
+                    mounts: vec![mount.clone().into()],
                     checkpoints: Vec::new(),
                     mount_paths: BTreeMap::from([(mount.volume_key, path)]),
                 },
@@ -3283,6 +3325,85 @@ mod tests {
             .expect("invalid reserved binding");
         }
         (repo_a, repo_b, source)
+    }
+
+    /// A workspace whose mount does not prove itself the workspace's is held by name (01a_apfs.md,
+    /// "Ownership, identity, and the volume label"). Its project's inventory still serves every
+    /// other workspace instead of failing whole, and the held workspace is not served.
+    #[tokio::test]
+    async fn an_unproven_workspace_is_held_and_never_fails_its_project() {
+        let fixture = Fixture::new("unproven-held");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        fixture.bind(&repo);
+        let unproven = WorkspaceName::new("ci-fhs-tools").expect("unproven");
+        let source = Arc::new(FixtureSource::default());
+        let mut facts = ProjectInventoryFacts {
+            storage: Vec::new(),
+            mounts: Vec::new(),
+            checkpoints: Vec::new(),
+            mount_paths: BTreeMap::new(),
+        };
+        // Each revision differs, so each fixture mount id (revision + 100) is the workspace's own.
+        for (name, incarnation, revision) in [
+            (WorkspaceName::main(), "11111111111111111111111111111111", 7),
+            (
+                WorkspaceName::new("raven").expect("raven"),
+                "22222222222222222222222222222222",
+                8,
+            ),
+            (unproven.clone(), "f221ac9777c546caba9b48a20f9e68b4", 9),
+        ] {
+            let (storage, mounted) =
+                fixture.workspace(&repo, name.clone(), incarnation, revision, true);
+            let (mount, path) = mounted.expect("mounted");
+            facts
+                .mount_paths
+                .insert(mount.volume_key.clone(), path.clone());
+            facts.mounts.push(if name == unproven {
+                MountJoin::Refused {
+                    volume_key: mount.volume_key,
+                    refusal: Box::new(crate::storage::lifecycle::MountRefusal {
+                        workspace: storage.workspace.clone(),
+                        mount_point: path,
+                        mounted_from: "/dev/disk41s1".to_owned(),
+                        reason: crate::storage::lifecycle::MountRefusalReason::MarkerUnreadable(
+                            "No such file or directory (os error 2)".to_owned(),
+                        ),
+                    }),
+                }
+            } else {
+                mount.into()
+            });
+            facts.storage.push(storage);
+        }
+        source
+            .projects
+            .lock()
+            .expect("source")
+            .insert(repo.clone(), facts);
+        let inventory = NativeGatewayInventory::with_source(fixture.storage.clone(), source);
+
+        let project = inventory
+            .project_attached(&repo)
+            .await
+            .expect("one unproven workspace never fails its project");
+        assert_eq!(
+            project
+                .attached
+                .iter()
+                .map(|fact| fact.workspace.as_str())
+                .collect::<Vec<_>>(),
+            ["main", "raven"]
+        );
+        assert_eq!(
+            project.held,
+            [HeldWorkspace {
+                repo_id: repo.clone(),
+                workspace: unproven,
+            }]
+        );
+        let host = inventory.all_attached().await.expect("host inventory");
+        assert_eq!(host.held, project.held);
     }
 
     #[tokio::test]
@@ -3307,7 +3428,7 @@ mod tests {
             let (storage, mounted) = fixture.workspace(&repo, name, incarnation, 7, true);
             let (mount, path) = mounted.expect("mounted");
             facts.mount_paths.insert(mount.volume_key.clone(), path);
-            facts.mounts.push(mount);
+            facts.mounts.push(mount.into());
             facts.storage.push(storage);
         }
         source
@@ -3562,7 +3683,11 @@ mod tests {
             source as Arc<dyn InventorySource>,
         );
 
-        let facts = inventory.all_attached().await.expect("attached inventory");
+        let facts = inventory
+            .all_attached()
+            .await
+            .expect("attached inventory")
+            .attached;
         assert_eq!(
             facts
                 .iter()
@@ -3750,7 +3875,11 @@ mod tests {
             source as Arc<dyn InventorySource>,
         );
 
-        let facts = inventory.all_attached().await.expect("attached inventory");
+        let facts = inventory
+            .all_attached()
+            .await
+            .expect("attached inventory")
+            .attached;
         let alpha = facts
             .iter()
             .find(|fact| fact.repo_id == repo_a)
@@ -3785,7 +3914,8 @@ mod tests {
         let facts = inventory
             .all_attached()
             .await
-            .expect("other projects still served");
+            .expect("other projects still served")
+            .attached;
         assert!(facts.iter().all(|fact| fact.repo_id != repo_a));
         assert_eq!(facts.len(), 1);
     }
@@ -3850,6 +3980,7 @@ mod tests {
                 .all_attached()
                 .await
                 .expect("attached listing")
+                .attached
                 .iter()
                 .map(|fact| (&fact.repo_id, fact.port_block))
                 .collect::<Vec<_>>(),
@@ -3883,15 +4014,30 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            ids(sessions.all_sessions().await.expect("startup listing")),
+            ids(sessions
+                .all_sessions()
+                .await
+                .expect("startup listing")
+                .serve),
             std::slice::from_ref(&alpha),
             "the gateway starts serving the older workspace"
         );
         assert_eq!(
-            ids(sessions.project_sessions(&repo_a).await.expect("alpha")),
+            ids(sessions
+                .project_sessions(&repo_a)
+                .await
+                .expect("alpha")
+                .serve),
             [alpha]
         );
-        assert!(ids(sessions.project_sessions(&repo_b).await.expect("beta")).is_empty());
+        assert!(
+            ids(sessions
+                .project_sessions(&repo_b)
+                .await
+                .expect("beta")
+                .serve)
+            .is_empty()
+        );
     }
 
     /// The gateway's control socket as a reconcile sees it: one status, then the writes it
@@ -3985,7 +4131,7 @@ mod tests {
             let mut projects = source.projects.lock().expect("source");
             let beta = projects.get_mut(&repo_b).expect("beta facts");
             beta.storage.push(topic);
-            beta.mounts.push(mount.clone());
+            beta.mounts.push(mount.clone().into());
             beta.mount_paths.insert(mount.volume_key, path);
         }
         let sessions = crate::gateway_sessions::NativeSessionInventory::from_inventory(
@@ -3997,7 +4143,8 @@ mod tests {
         let alpha = sessions
             .project_sessions(&repo_a)
             .await
-            .expect("alpha sessions");
+            .expect("alpha sessions")
+            .serve;
         assert_eq!(alpha.len(), 1, "alpha serves its main");
         let control = RecordingControl::serving(vec![cowshed_gateway_types::SessionStatus {
             workspace_id: alpha[0].workspace_id.clone(),
@@ -4120,7 +4267,7 @@ mod tests {
                     valid_repo.clone(),
                     ProjectInventoryFacts {
                         storage: vec![valid_storage],
-                        mounts: vec![valid_mount.clone()],
+                        mounts: vec![valid_mount.clone().into()],
                         checkpoints: Vec::new(),
                         mount_paths: BTreeMap::from([(valid_mount.volume_key, valid_path)]),
                     },
@@ -4195,7 +4342,7 @@ mod tests {
             repo.clone(),
             ProjectInventoryFacts {
                 storage: vec![storage],
-                mounts: vec![mount.clone()],
+                mounts: vec![mount.clone().into()],
                 checkpoints: vec![
                     CheckpointFact {
                         repo: repo.clone(),
@@ -4262,7 +4409,7 @@ mod tests {
             repo.clone(),
             ProjectInventoryFacts {
                 storage: vec![storage],
-                mounts: vec![mount.clone()],
+                mounts: vec![mount.clone().into()],
                 checkpoints: Vec::new(),
                 mount_paths: BTreeMap::from([(mount.volume_key, path.clone())]),
             },
@@ -4277,7 +4424,8 @@ mod tests {
         let facts = inventory
             .project_attached(&repo)
             .await
-            .expect("direct-mount project inventory");
+            .expect("direct-mount project inventory")
+            .attached;
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].mount, path);
         assert_eq!(facts[0].mount_id, mount.mount_id);
@@ -4440,6 +4588,7 @@ mod tests {
                 .project_attached(&repo)
                 .await
                 .expect("closed inventory")
+                .attached
                 .is_empty()
         );
     }
@@ -4466,7 +4615,7 @@ mod tests {
                 repo.clone(),
                 ProjectInventoryFacts {
                     storage: vec![storage],
-                    mounts: vec![mount.clone(), duplicate],
+                    mounts: vec![mount.clone().into(), duplicate.into()],
                     checkpoints: Vec::new(),
                     mount_paths: BTreeMap::from([(mount.volume_key, path)]),
                 },
@@ -4829,7 +4978,7 @@ mod tests {
             );
             let (mounts, mount_paths) = match kernel {
                 Some((mount, path)) => (
-                    vec![mount.clone()],
+                    vec![MountJoin::Proven(mount.clone())],
                     BTreeMap::from([(mount.volume_key, path)]),
                 ),
                 None => (

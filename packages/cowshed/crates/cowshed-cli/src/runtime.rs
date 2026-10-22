@@ -3201,10 +3201,12 @@ async fn attach_project_sessions_from_store(
     let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())
         .map_err(attach_store_storage_error)?;
     let substrate = ApfsSubstrate::new(config, host);
-    let targets = substrate
+    let derived = substrate
         .list(&project.repo_id)
         .await
-        .map_err(attach_store_storage_error)?
+        .map_err(attach_store_storage_error)?;
+    report_unproven(&project.repo_id, &derived, "attach --all");
+    let targets = derived
         .into_iter()
         .filter(|derived| {
             derived.workspace.role() != WorkspaceRole::Main
@@ -3242,6 +3244,20 @@ async fn attach_project_sessions_from_store(
         return Err(error);
     }
     Ok(attached)
+}
+
+/// Say each unproven session a store-wide verb leaves alone. Its mount does not prove itself the
+/// workspace's, so it is neither attached nor detached and none of `attach --all`'s or
+/// `detach --all`'s to act on.
+fn report_unproven(repo_id: &RepoId, derived: &[DerivedWorkspace], verb: &str) {
+    for workspace in derived {
+        if let MountState::Unproven(refusal) = &workspace.mount_state {
+            cowshed_os::eprintln!(
+                "cowshed: skipping workspace {repo_id}/{} during {verb}: {refusal}",
+                workspace.workspace.name()
+            );
+        }
+    }
 }
 
 fn store_workspace_info(
@@ -3385,10 +3401,12 @@ async fn detach_project_sessions_from_store(
     let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())
         .map_err(detach_store_storage_error)?;
     let substrate = ApfsSubstrate::new(config, host);
-    let targets = substrate
+    let derived = substrate
         .list(&project.repo_id)
         .await
-        .map_err(detach_store_storage_error)?
+        .map_err(detach_store_storage_error)?;
+    report_unproven(&project.repo_id, &derived, "detach --all");
+    let targets = derived
         .into_iter()
         .filter(|derived| {
             !derived.workspace.name().is_main()

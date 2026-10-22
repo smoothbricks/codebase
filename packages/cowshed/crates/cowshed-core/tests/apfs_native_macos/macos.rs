@@ -34,8 +34,9 @@ use cowshed_core::storage::apfs::{
 };
 use cowshed_core::storage::deletion_log::DELETION_LOG_FILE;
 use cowshed_core::storage::lifecycle::{
-    LifecycleFact, LifecycleWorkspace, MountState, OperationIdentity, Pin, RetiredRef, Revision,
-    StorageGcOptions, StorageGcReason, derive_workspaces,
+    LifecycleFact, LifecycleWorkspace, MountJoin, MountRefusalReason, MountState,
+    OperationIdentity, Pin, RetiredRef, Revision, StorageGcOptions, StorageGcReason,
+    derive_workspaces,
 };
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, StorageLayoutError};
 use cowshed_core::workspace_credentials::mint_workspace_credentials;
@@ -547,6 +548,14 @@ fn unmount(mount: &Path) {
         mount.display(),
         String::from_utf8_lossy(&unmounted.stderr)
     );
+}
+
+/// The mount ids of proven joins; a refused join fails the assertion with its refusal.
+fn proven_mount_ids(joins: Vec<MountJoin>) -> Vec<u64> {
+    joins
+        .into_iter()
+        .map(|join| join.named().expect("a proven mount join").mount_id)
+        .collect()
 }
 
 /// What the kernel mounts at `mount_point` right now, if anything.
@@ -4095,7 +4104,7 @@ fn real_apfs_kernel_mount_facts_survive_host_restart_and_detach_by_mountpoint() 
 
     let first = fixture.host();
     assert_eq!(
-        first.mounts(&repo()).expect("first facts")[0].mount_id,
+        proven_mount_ids(first.mounts(&repo()).expect("first facts"))[0],
         kernel_id
     );
     drop(first);
@@ -4108,7 +4117,7 @@ fn real_apfs_kernel_mount_facts_survive_host_restart_and_detach_by_mountpoint() 
         Labelled::Renamed
     );
     assert_eq!(
-        restarted.mounts(&repo()).expect("restart facts")[0].mount_id,
+        proven_mount_ids(restarted.mounts(&repo()).expect("restart facts"))[0],
         kernel_id,
         "mount identity is read from the in-image marker, never from the volume label"
     );
@@ -4166,7 +4175,28 @@ fn real_apfs_canonical_path_with_an_unrelated_volume_fails_closed_without_detach
     let impostor = kernel_mount_at(&mount).expect("impostor mounted");
     let host = fixture.host();
 
-    let error = host.mounts(&repo()).expect_err("impostor mount");
+    // The impostor is main's finding, not a failed enumeration: every other workspace of the
+    // project still enumerates, and the read that names main refuses.
+    let joins = host
+        .mounts(&repo())
+        .expect("an impostor mount is a per-workspace finding");
+    let [MountJoin::Refused { refusal, .. }] = joins.as_slice() else {
+        panic!("the impostor is refused as main's join: {joins:?}");
+    };
+    assert_eq!(refusal.workspace.name(), workspace().name());
+    assert_eq!(refusal.mount_point, mount);
+    assert_eq!(refusal.mounted_from, impostor.source_device);
+    assert!(
+        matches!(
+            &refusal.reason,
+            MountRefusalReason::MarkerNamesAnother { repo, .. } if repo == foreign.repo()
+        ),
+        "the refusal names the marker it read: {refusal}"
+    );
+    assert!(refusal.to_string().contains("mount identity mismatch"));
+    let error = host
+        .workspace_snapshot(&repo(), workspace().name())
+        .expect_err("the read that names main refuses its impostor");
     assert!(error.to_string().contains("mount identity mismatch"));
     let error = host
         .heal_mount(&workspace(), &mount)
@@ -5759,14 +5789,29 @@ fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
         ("owners", true),
     ] {
         let mounted = shared.mount_at(&mount, options);
-        let result = host.mounts(&repo());
-        assert_eq!(result.is_ok(), expected_valid, "{options}: {result:?}");
+        let joins = host
+            .mounts(&repo())
+            .expect("flags are a per-workspace finding");
+        assert_eq!(
+            matches!(joins.as_slice(), [MountJoin::Proven(_)]),
+            expected_valid,
+            "{options}: {joins:?}"
+        );
         drop(mounted);
     }
 
     let _mounted = shared.mount_at(&mount, "noowners");
-    let result = host.mounts(&repo());
-    let wrong_flags = result.expect_err("wrong flags").to_string();
+    let joins = host
+        .mounts(&repo())
+        .expect("flags are a per-workspace finding");
+    let [MountJoin::Refused { refusal, .. }] = joins.as_slice() else {
+        panic!("wrong flags refuse main's join: {joins:?}");
+    };
+    assert!(matches!(
+        refusal.reason,
+        MountRefusalReason::NonCanonicalFlags(_)
+    ));
+    let wrong_flags = refusal.to_string();
     assert!(
         wrong_flags.contains("non-canonical flags"),
         "noowners: {wrong_flags}"
@@ -6455,7 +6500,7 @@ fn assert_back_on_its_mount<R: CommandRunner + Send + Sync + 'static>(
         "the workspace returns to its own mount point"
     );
     assert_eq!(
-        host.mounts(&repo()).expect("canonical mount facts").len(),
+        proven_mount_ids(host.mounts(&repo()).expect("canonical mount facts")).len(),
         1,
         "the remount carries the canonical flags and the workspace's marker"
     );

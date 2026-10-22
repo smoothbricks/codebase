@@ -1049,6 +1049,16 @@ Three questions, three authorities, none of them the volume label:
   after a controller restart, joining a kernel mount into enumeration — reads the marker at the mount point and refuses
   when it does not name the expected workspace. A marker that cannot be read is not ours.
 
+Joining is judged per workspace. A mount at one workspace's mountpoint that does not prove itself the workspace's, by
+its marker or by honouring owners, is that workspace's finding and never a failure of its project's enumeration.
+Inventory derives the workspace neither attached nor detached (`MountState::Unproven`, carrying the marker it read or
+the read's error), says it by name, and `doctor` reports it as `mount-identity`. Nothing acts on its absence:
+`attach --all` does not mount over it, `detach --all` does not unmount it, no build-volume collection releases what its
+checkout links, no identity change passes it, and the gateway neither installs nor removes its session (05_gateway.md).
+Only an operation that names that workspace refuses, with that refusal. On 2026-10-22 a workspace's own volume stayed in
+the kernel mount table during its 189 s detach while its marker could not be read. The project-wide refusal this
+replaced failed an unrelated fork and an unrelated attach of the same project with exit 7.
+
 An image with no sidecar is not a discoverable workspace: inventory and the store-wide port allocator skip a named
 `<workspace>.dmg` with a warning rather than failing every project. Ordinary GC may reclaim only sidecarless RAW images,
 under the exact path, lock, attachment and mount-ownership fences. Legacy `.asif` and `.sparseimage` files are reported

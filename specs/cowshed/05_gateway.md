@@ -715,6 +715,11 @@ and every attach advances. An install must exceed every revision that workspace 
 revision behind as a tombstone — and a removal must name the installed revision; either refusal is `revision-fence`, and
 a removal of a session that is already gone is `not-installed`.
 
+A workspace whose mount is unproven (01a_apfs.md, "Ownership, identity, and the volume label") is held by the inventory
+that found it: reconciliation installs no session for it and removes none of its sessions, at any incarnation. A held
+workspace's session holding an endpoint another project claims counts as live, so that conflict is reported rather than
+evicted.
+
 A resident exec checks only its own installed revision with
 `{"op":"session-current","workspaceId":"<identity>","revision":<u64>}`. The authenticated host control plane answers
 `{"ok":true,"current":true|false}` directly from the installed session table: false for an absent identity or a

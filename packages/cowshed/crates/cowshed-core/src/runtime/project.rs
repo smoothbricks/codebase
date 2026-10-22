@@ -4757,15 +4757,18 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 name: name.clone(),
                 incarnation: workspace.derived.workspace.incarnation().clone(),
             });
-            if matches!(
-                workspace.derived.mount_state,
-                crate::storage::lifecycle::MountState::Mounted { .. }
-            ) {
-                if let Some(id) = volumes.layout.linked(&checkout)? {
-                    links.volumes.insert(id);
+            match workspace.derived.mount_state {
+                crate::storage::lifecycle::MountState::Mounted { .. } => {
+                    if let Some(id) = volumes.layout.linked(&checkout)? {
+                        links.volumes.insert(id);
+                    }
                 }
-            } else {
-                links.detached.insert(name.clone());
+                // Neither checkout's link can be read: a detached one has no tree mounted, and an
+                // unproven one's tree is not proven the workspace's. Both defer what they link.
+                crate::storage::lifecycle::MountState::Detached
+                | crate::storage::lifecycle::MountState::Unproven(_) => {
+                    links.detached.insert(name.clone());
+                }
             }
             links.checkouts.insert(name, checkout);
         }
@@ -5898,7 +5901,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     ) -> Result<GitOid> {
         let store_root = &std::sync::Arc::clone(self.git.store_root());
         let named = revision_target(revision);
-        match source.derived.mount_state {
+        match &source.derived.mount_state {
             crate::storage::lifecycle::MountState::Mounted { .. } => {}
             crate::storage::lifecycle::MountState::Detached => {
                 return Err(CowshedError::conflict(
@@ -5907,6 +5910,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     ),
                     format!("cowshed attach {source_name}"),
                 ));
+            }
+            crate::storage::lifecycle::MountState::Unproven(refusal) => {
+                return Err(native_storage_error(refusal.clone().into()));
             }
         }
         let mount = self.workspace_mount_path(source_name)?;
@@ -11841,7 +11847,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let attached_sessions: Vec<_> = workspaces
             .iter()
             .filter(|workspace| !workspace.derived.workspace.name().is_main())
-            .filter(|workspace| matches!(workspace.derived.mount_state, MountState::Mounted { .. }))
+            // An unproven mount is not provably detached, so it blocks the change as an attached
+            // one does: its marker may be the one this change has to reach.
+            .filter(|workspace| !matches!(workspace.derived.mount_state, MountState::Detached))
             .map(|workspace| workspace.derived.workspace.name().to_string())
             .collect();
         if !attached_sessions.is_empty() {
@@ -13919,6 +13927,17 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                     path: Some(workspace.image),
                                 });
                             }
+                        }
+                        crate::storage::lifecycle::MountState::Unproven(refusal) => {
+                            findings.push(crate::api::dto::Finding {
+                                code: "mount-identity".into(),
+                                severity: crate::api::dto::FindingSeverity::Error,
+                                message: format!(
+                                    "workspace {workspace_name} is neither attached nor detached: {refusal}"
+                                ),
+                                hint: "inspect what is mounted there; cowshed heals, attaches over and detaches only a mount whose marker names the workspace".into(),
+                                path: Some(refusal.mount_point.clone()),
+                            });
                         }
                         crate::storage::lifecycle::MountState::Mounted { .. } => {
                             let marker_path =

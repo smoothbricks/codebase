@@ -21,9 +21,10 @@ use cowshed_core::storage::apfs::{
 };
 use cowshed_core::storage::lifecycle::{
     AdoptHandoff, AdoptRequest, CheckpointFact, DefragmentOutcome, Destination, ExtentCount,
-    KernelMountFact, LifecycleFact, LifecyclePlanner, LifecycleWorkspace, MountIntent, MountState,
-    OperationIdentity, Pin, PlanError, ResizeOutcome, RestoreMode, RetiredRef, Revision,
-    StorageFact, StorageGcOptions, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats,
+    KernelMountFact, LifecycleFact, LifecyclePlanner, LifecycleWorkspace, MountIntent, MountJoin,
+    MountState, OperationIdentity, Pin, PlanError, ResizeOutcome, RestoreMode, RetiredRef,
+    Revision, StorageFact, StorageGcOptions, StorageGcPlan, StorageGcReport, Substrate,
+    SubstrateStats,
 };
 use proptest::prelude::*;
 
@@ -1012,7 +1013,7 @@ impl ApfsExecutionHost for FakeHost {
             .collect())
     }
 
-    fn mounts(&self, repo: &RepoId) -> Result<Vec<KernelMountFact>, ApfsStorageError> {
+    fn mounts(&self, repo: &RepoId) -> Result<Vec<MountJoin>, ApfsStorageError> {
         Ok(self
             .state
             .lock()
@@ -1020,7 +1021,7 @@ impl ApfsExecutionHost for FakeHost {
             .mounted
             .iter()
             .filter(|((mounted_repo, _), _)| mounted_repo == repo)
-            .map(|(_, fact)| fact.clone())
+            .map(|(_, fact)| MountJoin::Proven(fact.clone()))
             .collect())
     }
 

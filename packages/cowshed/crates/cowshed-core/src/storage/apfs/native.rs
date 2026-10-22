@@ -41,10 +41,10 @@ use sha2::{Digest, Sha256};
 use super::super::deletion_log::{self, DeletionKind, DeletionOp};
 use super::super::lifecycle::{
     CheckpointFact, DefragmentOutcome, DerivedWorkspace, KernelMountFact, LifecycleFact,
-    LifecycleWorkspace, MountState, OperationIdentity, Pin, ResizeOutcome, RetiredRef, Revision,
-    RootHeldMountpoint, StorageFact, StorageGcCandidate, StorageGcDeferred, StorageGcOptions,
-    StorageGcPlan, StorageGcReason, StorageGcReport, StorageGcRetained, SubstrateStats,
-    derive_workspaces,
+    LifecycleWorkspace, MountJoin, MountRefusal, MountRefusalReason, MountState, OperationIdentity,
+    Pin, ResizeOutcome, RetiredRef, Revision, RootHeldMountpoint, StorageFact, StorageGcCandidate,
+    StorageGcDeferred, StorageGcOptions, StorageGcPlan, StorageGcReason, StorageGcReport,
+    StorageGcRetained, SubstrateStats, derive_workspaces,
 };
 use super::super::{
     CheckpointLabel, WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks,
@@ -501,6 +501,7 @@ pub(in crate::storage) fn gc_candidate_failure_is_fatal(error: &ApfsStorageError
         | ApfsStorageError::Io { .. }
         | ApfsStorageError::BuildVolumeHeld { .. }
         | ApfsStorageError::Host(_)
+        | ApfsStorageError::MountIdentity(_)
         | ApfsStorageError::Quarantined { .. } => false,
         ApfsStorageError::CapacityNotGrowing { .. }
         | ApfsStorageError::BlockingTask(_)
@@ -1698,17 +1699,16 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             .into_iter()
             .find(|mount| mount.mount_point.as_path() == mount_point)
         {
-            self.validate_kernel_mount(
-                &mount,
-                mount_point,
-                repo,
-                workspace,
-                &metadata.workspace_incarnation,
-            )?;
-            mounts.push(KernelMountFact {
-                mount_id: mount.mount_id,
-                volume_key: fact.volume_key.clone(),
-            });
+            // This read names the workspace, so its own refusal is this read's failure.
+            mounts.push(
+                self.join_kernel_mount(
+                    &mount,
+                    mount_point,
+                    &fact.workspace,
+                    fact.volume_key.clone(),
+                )
+                .named()?,
+            );
         }
         let mut checkpoints = Vec::new();
         workspace_checkpoint_facts(
@@ -2070,37 +2070,50 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         workspace: &WorkspaceName,
         incarnation: &WorkspaceIncarnation,
     ) -> bool {
-        let owned = self.config.owned_repo_ids(repo);
-        WorkspaceMarker::read_from(&mount_point.join(WORKSPACE_MARKER_PATH)).is_ok_and(|marker| {
-            owned.accepts(&marker.repo_id)
-                && marker.workspace == *workspace
-                && marker.workspace_incarnation == *incarnation
-        })
+        MarkerExpectation {
+            repos: self.config.owned_repo_ids(repo),
+            workspace: workspace.clone(),
+            incarnation: incarnation.clone(),
+        }
+        .judge(mount_point)
+        .is_ok()
     }
 
-    fn validate_kernel_mount(
+    /// Join the kernel mount at `expected_path` to `workspace`, or say why it is not the
+    /// workspace's: its marker has to name the workspace, and it has to honour owners. The
+    /// refusal is a value; whether it fails anything is the reader's to decide (a project-wide
+    /// enumeration carries it, a read that names the workspace fails with it).
+    fn join_kernel_mount(
         &self,
         mount: &KernelMountSnapshot,
         expected_path: &Path,
-        repo: &RepoId,
-        workspace: &WorkspaceName,
-        incarnation: &WorkspaceIncarnation,
-    ) -> Result<(), ApfsStorageError> {
-        if !self.mount_carries_marker(expected_path, repo, workspace, incarnation) {
-            return Err(ApfsStorageError::Host(format!(
-                "workspace mount identity mismatch at {}: the volume mounted from {} carries no {repo}/{workspace} marker for incarnation {incarnation}",
-                expected_path.display(),
-                mount.source_device
-            )));
+        workspace: &LifecycleWorkspace,
+        volume_key: String,
+    ) -> MountJoin {
+        let verdict = MarkerExpectation::owned(&self.config, workspace)
+            .judge(expected_path)
+            .and_then(|()| {
+                if mount.owners_honoured() {
+                    Ok(())
+                } else {
+                    Err(MountRefusalReason::NonCanonicalFlags(mount.flags()))
+                }
+            });
+        match verdict {
+            Ok(()) => MountJoin::Proven(KernelMountFact {
+                mount_id: mount.mount_id,
+                volume_key,
+            }),
+            Err(reason) => MountJoin::Refused {
+                volume_key,
+                refusal: Box::new(MountRefusal {
+                    workspace: workspace.clone(),
+                    mount_point: expected_path.to_owned(),
+                    mounted_from: mount.source_device.clone(),
+                    reason,
+                }),
+            },
         }
-        if !mount.owners_honoured() {
-            return Err(ApfsStorageError::Host(format!(
-                "workspace mount has non-canonical flags at {}: it ignores owners, which every workspace mount must honour; flags={:#x}",
-                expected_path.display(),
-                mount.flags()
-            )));
-        }
-        Ok(())
     }
 
     fn detached_image_incarnation(
@@ -5819,38 +5832,24 @@ where
         }
     }
 
-    fn mounts(&self, repo: &RepoId) -> Result<Vec<KernelMountFact>, ApfsStorageError> {
+    fn mounts(&self, repo: &RepoId) -> Result<Vec<MountJoin>, ApfsStorageError> {
         let kernel = self.mount_source.mounts()?;
-        self.published_facts(repo)?
-            .into_iter()
-            .filter_map(|fact| {
-                // The kernel reports each workspace's mount point, which for main is the checkout
-                // path under direct mount and the uniform `mnt/` path under the symlink layout.
-                let expected = main_aware_mount_point(
-                    &self.config,
-                    fact.workspace.repo(),
-                    fact.workspace.name(),
-                );
-                let expected = match expected {
-                    Ok(path) => path,
-                    Err(error) => return Some(Err(error)),
-                };
-                let mount = kernel.iter().find(|mount| mount.mount_point == expected)?;
-                if let Err(error) = self.validate_kernel_mount(
+        let mut joins = Vec::new();
+        for fact in self.published_facts(repo)? {
+            // The kernel reports each workspace's mount point, which for main is the checkout
+            // path under direct mount and the uniform `mnt/` path under the symlink layout.
+            let expected =
+                main_aware_mount_point(&self.config, fact.workspace.repo(), fact.workspace.name())?;
+            if let Some(mount) = kernel.iter().find(|mount| mount.mount_point == expected) {
+                joins.push(self.join_kernel_mount(
                     mount,
                     &expected,
-                    fact.workspace.repo(),
-                    fact.workspace.name(),
-                    fact.workspace.incarnation(),
-                ) {
-                    return Some(Err(error));
-                }
-                Some(Ok(KernelMountFact {
-                    mount_id: mount.mount_id,
-                    volume_key: fact.volume_key,
-                }))
-            })
-            .collect()
+                    &fact.workspace,
+                    fact.volume_key,
+                ));
+            }
+        }
+        Ok(joins)
     }
 
     fn checkpoints(&self, repo: &RepoId) -> Result<Vec<CheckpointFact>, ApfsStorageError> {

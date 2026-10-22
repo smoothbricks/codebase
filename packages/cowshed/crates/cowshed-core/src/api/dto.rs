@@ -758,6 +758,11 @@ impl WorkspaceInfo {
             state: match derived.mount_state {
                 MountState::Detached => WorkspaceState::Detached,
                 MountState::Mounted { .. } => WorkspaceState::Attached,
+                // `state` is attached or detached (07_api.md). An unproven mount is not attached:
+                // a marker that cannot be read, or names another, is not this workspace's
+                // (01a_apfs.md, "Ownership, identity, and the volume label"). The inventory that
+                // derives it says the refusal by name, and doctor reports it (`mount-identity`).
+                MountState::Unproven(_) => WorkspaceState::Detached,
             },
             branch: snapshot.branch.clone(),
             base_commit,

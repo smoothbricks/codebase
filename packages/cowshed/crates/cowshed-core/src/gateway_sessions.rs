@@ -25,7 +25,8 @@ use sha2::{Digest as _, Sha256};
 use crate::api::dto::hex_lower;
 use crate::error::{CowshedError, Result};
 use crate::gateway_inventory::{
-    GatewaySessionFact, NativeGatewayInventory, PortCollision, served_sessions,
+    AttachedInventory, GatewaySessionFact, HeldWorkspace, NativeGatewayInventory, PortCollision,
+    served_sessions,
 };
 use crate::metadata::{
     EgressMode as CoreEgressMode, GrantSet, WorkspaceIncarnation, WorkspaceName,
@@ -106,6 +107,26 @@ pub trait GatewayPortReallocator: Send + Sync {
     ) -> Result<WorkspaceSession>;
 }
 
+/// One inventory pass's sessions: those it serves, and the workspaces it holds. A held workspace's
+/// mount is unproven (01a_apfs.md, "Ownership, identity, and the volume label"), so reconciliation
+/// neither installs a session for it nor removes the one it has.
+#[derive(Debug, Default)]
+pub struct InventorySessions {
+    pub serve: Vec<WorkspaceSession>,
+    pub held: Vec<HeldWorkspace>,
+}
+
+/// Whether `workspace_id` is a session of a held workspace, at any incarnation: what is mounted
+/// there is unknown, so no incarnation of it is the reconcile's to remove.
+fn held_session(held: &[HeldWorkspace], workspace_id: &str) -> bool {
+    held.iter().any(|workspace| {
+        workspace_id.starts_with(&workspace_session_prefix(
+            &workspace.repo_id,
+            workspace.workspace.as_str(),
+        ))
+    })
+}
+
 /// One named authoritative session observation. The incarnation is retained from the host fact,
 /// not reconstructed from a cache identifier, so work can fence it before any gateway mutation.
 #[derive(Debug)]
@@ -116,8 +137,8 @@ pub struct WorkspaceSessionSnapshot {
 
 #[async_trait]
 pub trait SessionInventory {
-    async fn all_sessions(&self) -> Result<Vec<WorkspaceSession>>;
-    async fn project_sessions(&self, repo_id: &RepoId) -> Result<Vec<WorkspaceSession>>;
+    async fn all_sessions(&self) -> Result<InventorySessions>;
+    async fn project_sessions(&self, repo_id: &RepoId) -> Result<InventorySessions>;
     async fn workspace_session(
         &self,
         repo_id: &RepoId,
@@ -145,13 +166,17 @@ impl NativeSessionInventory {
     async fn served(
         &self,
         reporting: Option<&RepoId>,
-    ) -> Result<(Vec<GatewaySessionFact>, Vec<PortCollision>)> {
-        let (served, refused) = served_sessions(
-            self.inventory
-                .all_attached()
-                .await
-                .map_err(inventory_error)?,
-        );
+    ) -> Result<(
+        Vec<GatewaySessionFact>,
+        Vec<PortCollision>,
+        Vec<HeldWorkspace>,
+    )> {
+        let AttachedInventory { attached, held } = self
+            .inventory
+            .all_attached()
+            .await
+            .map_err(inventory_error)?;
+        let (served, refused) = served_sessions(attached);
         for collision in refused
             .iter()
             .filter(|collision| reporting.is_none_or(|repo| collision.claimed.repo == *repo))
@@ -162,7 +187,7 @@ impl NativeSessionInventory {
                 collision.claimed.workspace
             );
         }
-        Ok((served, refused))
+        Ok((served, refused, held))
     }
     pub fn with_backend(
         storage: ValidatedHostStorage,
@@ -176,24 +201,31 @@ impl NativeSessionInventory {
 
 #[async_trait]
 impl SessionInventory for NativeSessionInventory {
-    async fn all_sessions(&self) -> Result<Vec<WorkspaceSession>> {
-        sessions_from_facts(self.served(None).await?.0)
+    async fn all_sessions(&self) -> Result<InventorySessions> {
+        let (served, _, held) = self.served(None).await?;
+        Ok(InventorySessions {
+            serve: sessions_from_facts(served)?,
+            held,
+        })
     }
 
     /// One project's sessions, less each one an older workspace of any project holds a port of:
     /// which member of a collision is served is a host-wide answer.
-    async fn project_sessions(&self, repo_id: &RepoId) -> Result<Vec<WorkspaceSession>> {
+    async fn project_sessions(&self, repo_id: &RepoId) -> Result<InventorySessions> {
         let project = self
             .inventory
             .project_attached(repo_id)
             .await
             .map_err(inventory_error)?;
-        let (_, refused) = self.served(Some(repo_id)).await?;
-        sessions_from_facts(project.into_iter().filter(|fact| {
-            !refused
-                .iter()
-                .any(|collision| collision.claims(&fact.repo_id, &fact.workspace))
-        }))
+        let (_, refused, _) = self.served(Some(repo_id)).await?;
+        Ok(InventorySessions {
+            serve: sessions_from_facts(project.attached.into_iter().filter(|fact| {
+                !refused
+                    .iter()
+                    .any(|collision| collision.claims(&fact.repo_id, &fact.workspace))
+            }))?,
+            held: project.held,
+        })
     }
 
     async fn workspace_session(
@@ -268,7 +300,7 @@ where
     I: SessionInventory,
     G: GatewayInstaller,
 {
-    let sessions = inventory.all_sessions().await?;
+    let sessions = inventory.all_sessions().await?.serve;
     let mut report = SessionRestoreReport::default();
     for session in sessions {
         let workspace_id = session.workspace_id.clone();
@@ -538,7 +570,10 @@ where
         control,
         inventory,
         &workspace_session_prefix(repo_id, workspace.as_str()),
-        [observed.session],
+        InventorySessions {
+            serve: vec![observed.session],
+            held: Vec::new(),
+        },
         status,
         None,
         false,
@@ -580,7 +615,7 @@ pub async fn reconcile_against_status<C, I>(
     control: &C,
     host: &I,
     project_prefix: &str,
-    desired: Vec<WorkspaceSession>,
+    desired: InventorySessions,
     status: DaemonStatus,
 ) -> Result<ReconcileReport>
 where
@@ -594,7 +629,7 @@ async fn reconcile_against_status_inner<C, I>(
     control: &C,
     host: &I,
     scope_prefix: &str,
-    desired: impl IntoIterator<Item = WorkspaceSession>,
+    desired: InventorySessions,
     status: DaemonStatus,
     reallocator: Option<&dyn GatewayPortReallocator>,
     reconcile_foreign: bool,
@@ -604,6 +639,10 @@ where
     I: SessionInventory + ?Sized,
 {
     let mut desired_by_id = BTreeMap::new();
+    let InventorySessions {
+        serve: desired,
+        held,
+    } = desired;
     for session in desired {
         let identity = session.workspace_id.clone();
         if !identity.starts_with(scope_prefix) {
@@ -637,7 +676,9 @@ where
         .iter()
         .filter(|session| session.workspace_id.starts_with(scope_prefix))
     {
-        if !desired_ids.contains(installed.workspace_id.as_str()) {
+        if !desired_ids.contains(installed.workspace_id.as_str())
+            && !held_session(&held, &installed.workspace_id)
+        {
             match control
                 .remove(&installed.workspace_id, installed.revision)
                 .await
@@ -678,14 +719,17 @@ where
                 "cowshed doctor --repair",
             ));
         }
-        let live: BTreeSet<String> = host
-            .all_sessions()
-            .await?
+        let host_sessions = host.all_sessions().await?;
+        let live: BTreeSet<String> = host_sessions
+            .serve
             .into_iter()
             .map(|session| session.workspace_id)
             .collect();
         for (owner, claimant) in foreign_owners {
-            if live.contains(&owner.workspace_id) {
+            // A held workspace's session is not stale: what its mountpoint holds is unproven.
+            if live.contains(&owner.workspace_id)
+                || held_session(&host_sessions.held, &owner.workspace_id)
+            {
                 return Err(CowshedError::integrity(
                     format!(
                         "gateway endpoint {} is assigned to workspace {claimant} by this project and still claimed by live workspace {} of another project",

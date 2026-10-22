@@ -49,6 +49,54 @@ fn workspace(name: &str, revision: u64, topology: u64) -> LifecycleWorkspace {
     )
     .unwrap()
 }
+/// Workspace `ws-{index}`'s mount join for a generated verdict: 0 nothing mounted, 1 proven,
+/// 2–4 refused for each reason the identity check gives.
+fn verdict_join(index: usize, verdict: u8) -> Option<MountJoin> {
+    let volume_key = format!("volume-{index}");
+    let reason = match verdict {
+        0 => return None,
+        1 => {
+            return Some(MountJoin::Proven(KernelMountFact {
+                mount_id: index as u64 + 100,
+                volume_key,
+            }));
+        }
+        2 => MountRefusalReason::MarkerUnreadable("No such file or directory (os error 2)".into()),
+        3 => MountRefusalReason::MarkerNamesAnother {
+            repo: repo(),
+            workspace: WorkspaceName::session("watchdog-stop-release").unwrap(),
+            incarnation: make_incarnation('b'),
+        },
+        _ => MountRefusalReason::NonCanonicalFlags(0x0040_0000),
+    };
+    Some(MountJoin::Refused {
+        volume_key,
+        refusal: Box::new(MountRefusal {
+            workspace: workspace(&format!("ws-{index}"), 0, 0),
+            mount_point: PathBuf::from(format!("/mnt/acme/project/ws-{index}")),
+            mounted_from: format!("/dev/disk{}s1", index + 40),
+            reason,
+        }),
+    })
+}
+
+fn verdict_storage(count: usize) -> Vec<StorageFact> {
+    (0..count)
+        .map(|index| StorageFact {
+            workspace: workspace(&format!("ws-{index}"), 0, 0),
+            volume_key: format!("volume-{index}"),
+        })
+        .collect()
+}
+
+fn verdict_joins(verdicts: &[u8]) -> Vec<MountJoin> {
+    verdicts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, verdict)| verdict_join(index, *verdict))
+        .collect()
+}
+
 #[test]
 fn planning_is_deterministic_capability_free_and_has_no_effects() {
     let planner = PurePlanner;
@@ -686,7 +734,7 @@ fn duplicate_retired_checkpoint_facts_are_rejected_before_exclusion() {
                 workspace: workspace("main", 1, 1),
                 volume_key: "main-volume".to_owned(),
             }],
-            Vec::new(),
+            Vec::<MountJoin>::new(),
             vec![checkpoint.clone(), checkpoint],
         ),
         Err(DerivationError::DuplicateCheckpoint {
@@ -714,6 +762,55 @@ proptest! {
             let index: u8 = item.workspace.name().as_str().strip_prefix("ws-").unwrap().parse().unwrap();
             let expected = if mounted.contains(&index) { MountState::Mounted { mount_id: u64::from(index) + 100 } } else { MountState::Detached };
             prop_assert_eq!(item.mount_state, expected);
+        }
+    }
+
+    /// One workspace's refused mount join is that workspace's fact (01a_apfs.md, "Ownership,
+    /// identity, and the volume label"). The project enumeration never fails on it: it derives
+    /// the refused workspace `Unproven` under its own name and every other workspace as its own
+    /// join says, whatever a neighbour's verdict is. Only the read that names the refused
+    /// workspace fails, with that workspace's refusal.
+    #[test]
+    fn a_refused_mount_join_fails_only_the_read_that_names_it(
+        verdicts in proptest::collection::vec(0u8..5, 0..16),
+        neighbour in any::<proptest::sample::Index>(),
+    ) {
+        let derived = derive_workspaces(verdict_storage(verdicts.len()), verdict_joins(&verdicts), Vec::new())
+            .expect("a refused join never fails the enumeration");
+        prop_assert_eq!(derived.len(), verdicts.len());
+        for item in &derived {
+            let index: usize = item.workspace.name().as_str().strip_prefix("ws-").unwrap().parse().unwrap();
+            match (verdicts[index], &item.mount_state) {
+                (0, MountState::Detached) => {}
+                (1, MountState::Mounted { mount_id }) => prop_assert_eq!(*mount_id, index as u64 + 100),
+                (2..=4, MountState::Unproven(refusal)) => prop_assert_eq!(&refusal.workspace, &item.workspace),
+                (verdict, state) => prop_assert!(false, "verdict {} derived {:?}", verdict, state),
+            }
+        }
+        for (index, verdict) in verdicts.iter().enumerate() {
+            let Some(join) = verdict_join(index, *verdict) else { continue };
+            match join.named() {
+                Ok(fact) => {
+                    prop_assert_eq!(*verdict, 1);
+                    prop_assert_eq!(fact.mount_id, index as u64 + 100);
+                }
+                Err(refusal) => {
+                    prop_assert!(*verdict >= 2);
+                    prop_assert_eq!(refusal.workspace.name().as_str(), format!("ws-{index}"));
+                }
+            }
+        }
+        if !verdicts.is_empty() {
+            let refused = neighbour.index(verdicts.len());
+            let mut with_refusal = verdicts.clone();
+            with_refusal[refused] = 2;
+            let after = derive_workspaces(verdict_storage(verdicts.len()), verdict_joins(&with_refusal), Vec::new())
+                .expect("a neighbour's refusal never fails the enumeration");
+            for (before, after) in derived.iter().zip(&after) {
+                if before.workspace.name().as_str() != format!("ws-{refused}") {
+                    prop_assert_eq!(before, after);
+                }
+            }
         }
     }
 

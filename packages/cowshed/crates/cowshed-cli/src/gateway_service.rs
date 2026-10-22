@@ -239,6 +239,7 @@ impl GatewayPortReallocator for NativePortReallocator<'_> {
                 )
             })?;
         let fact = attached
+            .attached
             .into_iter()
             .find(|fact| {
                 stable_workspace_id(&fact.repo_id, fact.workspace.as_str(), &fact.incarnation)
@@ -292,6 +293,7 @@ impl GatewayPortReallocator for NativePortReallocator<'_> {
                     )
                     .project_sessions(self.repo_id)
                     .await?
+                    .serve
                     .into_iter()
                     .find(|current| current.workspace_id == session.workspace_id)
                     .ok_or_else(|| {
@@ -4847,11 +4849,16 @@ mod tests {
 
         #[async_trait]
         impl SessionInventory for UnreadInventory {
-            async fn all_sessions(&self) -> Result<Vec<WorkspaceSession>> {
+            async fn all_sessions(
+                &self,
+            ) -> Result<cowshed_core::gateway_sessions::InventorySessions> {
                 Err(CowshedError::internal("the inventory was read"))
             }
 
-            async fn project_sessions(&self, _: &RepoId) -> Result<Vec<WorkspaceSession>> {
+            async fn project_sessions(
+                &self,
+                _: &RepoId,
+            ) -> Result<cowshed_core::gateway_sessions::InventorySessions> {
                 Err(CowshedError::internal("the inventory was read"))
             }
 

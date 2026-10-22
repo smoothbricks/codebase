@@ -6,16 +6,16 @@
 use async_trait::async_trait;
 use cowshed_core::gateway_sessions::{
     ControlRefusal, GatewayControl, GatewayInstaller, GatewayPortReallocator, GatewayStatusError,
-    SessionInventory, SessionRestoreRefusal, WorkspaceSessionSnapshot, install_all_sessions,
-    policy_from_grants, project_session_prefix, reconcile_against_status, reconcile_project,
-    reconcile_project_with_reallocator, reconcile_workspace, stable_workspace_id,
-    workspace_session_prefix,
+    InventorySessions, ReconcileReport, SessionInventory, SessionRestoreRefusal,
+    WorkspaceSessionSnapshot, install_all_sessions, policy_from_grants, project_session_prefix,
+    reconcile_against_status, reconcile_project, reconcile_project_with_reallocator,
+    reconcile_workspace, stable_workspace_id, workspace_session_prefix,
 };
 use cowshed_core::metadata::{
     EgressMode, EgressRule, GrantSet, WorkspaceIncarnation, WorkspaceName,
 };
 use cowshed_core::repository::RepoId;
-use cowshed_core::{CowshedError, Result};
+use cowshed_core::{CowshedError, HeldWorkspace, Result};
 use cowshed_gateway_types::{
     CanonicalTarget, DaemonStatus, EgressMode as GatewayEgressMode, SessionStatus, TargetScheme,
     WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
@@ -24,6 +24,31 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Reconcile a pass that holds no workspace: `serve` is every session it found attached.
+async fn reconcile_serving<C, I>(
+    control: &C,
+    host: &I,
+    prefix: &str,
+    serve: Vec<WorkspaceSession>,
+    status: DaemonStatus,
+) -> Result<ReconcileReport>
+where
+    C: GatewayControl + ?Sized,
+    I: SessionInventory + ?Sized,
+{
+    reconcile_against_status(
+        control,
+        host,
+        prefix,
+        InventorySessions {
+            serve,
+            held: Vec::new(),
+        },
+        status,
+    )
+    .await
+}
 
 fn incarnation(value: u8) -> WorkspaceIncarnation {
     WorkspaceIncarnation::new(format!("{value:032x}")).expect("fixture incarnation")
@@ -179,14 +204,14 @@ struct SelectedInventory {
 
 #[async_trait]
 impl SessionInventory for SelectedInventory {
-    async fn all_sessions(&self) -> Result<Vec<WorkspaceSession>> {
+    async fn all_sessions(&self) -> Result<InventorySessions> {
         Err(CowshedError::integrity(
             "unrelated removed or malformed session grants must not be read",
             "cowshed doctor --json",
         ))
     }
 
-    async fn project_sessions(&self, _: &RepoId) -> Result<Vec<WorkspaceSession>> {
+    async fn project_sessions(&self, _: &RepoId) -> Result<InventorySessions> {
         Err(CowshedError::integrity(
             "unrelated removed or malformed session grants must not be read",
             "cowshed doctor --json",
@@ -492,7 +517,7 @@ async fn reconcile_rotates_workspace_incarnation_and_removes_stale_project_sessi
     assert_ne!(current, prior);
     let control = FakeControl::default();
 
-    let report = reconcile_against_status(
+    let report = reconcile_serving(
         &control,
         &untouched_host(),
         &prefix_a,
@@ -523,7 +548,7 @@ async fn empty_attached_inventory_removes_detached_session() {
     let repo = RepoId::parse("acme/widget").expect("repo");
     let identity = workspace_id(&repo, "raven", 1);
     let control = FakeControl::default();
-    let report = reconcile_against_status(
+    let report = reconcile_serving(
         &control,
         &untouched_host(),
         &project_session_prefix(&repo),
@@ -540,12 +565,50 @@ async fn empty_attached_inventory_removes_detached_session() {
     );
 }
 
+/// A workspace whose mount is unproven is held (01a_apfs.md, "Ownership, identity, and the
+/// volume label"): the reconcile neither removes its installed session, at any incarnation, nor
+/// installs one, and still removes a stale sibling's session.
+#[tokio::test]
+async fn reconcile_neither_installs_nor_removes_a_held_workspace_session() {
+    let repo = RepoId::parse("acme/widget").expect("repo");
+    let held = workspace_id(&repo, "ci-fhs-tools", 1);
+    let held_prior = workspace_id(&repo, "ci-fhs-tools", 2);
+    let stale = workspace_id(&repo, "retired", 3);
+    let control = FakeControl::default();
+    let report = reconcile_against_status(
+        &control,
+        &untouched_host(),
+        &project_session_prefix(&repo),
+        InventorySessions {
+            serve: Vec::new(),
+            held: vec![HeldWorkspace {
+                repo_id: repo.clone(),
+                workspace: WorkspaceName::new("ci-fhs-tools").expect("workspace"),
+            }],
+        },
+        status(vec![
+            installed(&held, 11),
+            installed_at(&held_prior, 9, 40_976),
+            installed_at(&stale, 3, 40_992),
+        ]),
+    )
+    .await
+    .expect("a held workspace fails nothing");
+    assert_eq!(report.installed, 0);
+    assert_eq!(report.removed, 1);
+    assert_eq!(
+        *control.removes.lock().expect("remove lock"),
+        vec![(stale, 3)]
+    );
+    assert!(control.installs.lock().expect("install lock").is_empty());
+}
+
 #[tokio::test]
 async fn unchanged_revision_is_idempotent() {
     let repo = RepoId::parse("acme/widget").expect("repo");
     let identity = workspace_id(&repo, "raven", 1);
     let control = FakeControl::default();
-    let report = reconcile_against_status(
+    let report = reconcile_serving(
         &control,
         &untouched_host(),
         &project_session_prefix(&repo),
@@ -692,7 +755,7 @@ async fn stale_foreign_session_holding_a_claimed_endpoint_is_evicted_before_inst
     let leaked = workspace_id(&deleted, "ws", 1);
     let control = FakeControl::default();
 
-    let report = reconcile_against_status(
+    let report = reconcile_serving(
         &control,
         &host_with(vec![
             session_at(&claimant, 2, 1, 41_536),
@@ -731,7 +794,7 @@ async fn live_foreign_session_on_a_claimed_endpoint_is_an_inventory_fault_not_an
     let live_owner = workspace_id(&other, "board-wave", 1);
     let control = FakeControl::default();
 
-    let error = reconcile_against_status(
+    let error = reconcile_serving(
         &control,
         &host_with(vec![
             session_at(&claimant, 2, 1, 41_536),
@@ -772,7 +835,7 @@ async fn one_refused_install_does_not_abandon_the_other_workspaces() {
     ];
     desired.sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
 
-    let error = reconcile_against_status(
+    let error = reconcile_serving(
         &control,
         &untouched_host(),
         &project_session_prefix(&repo),
@@ -904,15 +967,18 @@ struct AttachingInventory {
 
 #[async_trait]
 impl SessionInventory for AttachingInventory {
-    async fn all_sessions(&self) -> Result<Vec<WorkspaceSession>> {
+    async fn all_sessions(&self) -> Result<InventorySessions> {
         Err(CowshedError::internal("host inventory not expected"))
     }
 
-    async fn project_sessions(&self, _repo_id: &RepoId) -> Result<Vec<WorkspaceSession>> {
-        Ok(if self.status_read.load(Ordering::SeqCst) {
-            vec![session(&self.attached, 6, 1)]
-        } else {
-            Vec::new()
+    async fn project_sessions(&self, _repo_id: &RepoId) -> Result<InventorySessions> {
+        Ok(InventorySessions {
+            serve: if self.status_read.load(Ordering::SeqCst) {
+                vec![session(&self.attached, 6, 1)]
+            } else {
+                Vec::new()
+            },
+            held: Vec::new(),
         })
     }
 
@@ -1040,7 +1106,7 @@ async fn an_install_superseded_by_a_newer_reconcile_is_reported_not_failed() {
         ..FencedGateway::default()
     };
 
-    let report = reconcile_against_status(
+    let report = reconcile_serving(
         &gateway,
         &untouched_host(),
         &project_session_prefix(&repo),
@@ -1064,7 +1130,7 @@ async fn a_removal_superseded_by_a_newer_reconcile_is_reported_not_failed() {
         ..FencedGateway::holding(&raven, 6)
     };
 
-    let report = reconcile_against_status(
+    let report = reconcile_serving(
         &gateway,
         &untouched_host(),
         &project_session_prefix(&repo),
@@ -1085,22 +1151,30 @@ struct FakeInventory {
 
 #[async_trait]
 impl SessionInventory for FakeInventory {
-    async fn all_sessions(&self) -> Result<Vec<WorkspaceSession>> {
+    async fn all_sessions(&self) -> Result<InventorySessions> {
         self.all
             .lock()
             .expect("inventory lock")
             .take()
+            .map(|serve| InventorySessions {
+                serve,
+                held: Vec::new(),
+            })
             .ok_or_else(|| CowshedError::internal("inventory called twice"))
     }
 
-    async fn project_sessions(&self, repo_id: &RepoId) -> Result<Vec<WorkspaceSession>> {
+    async fn project_sessions(&self, repo_id: &RepoId) -> Result<InventorySessions> {
         let prefix = project_session_prefix(repo_id);
-        Ok(self
-            .all_sessions()
-            .await?
-            .into_iter()
-            .filter(|session| session.workspace_id.starts_with(&prefix))
-            .collect())
+        Ok(InventorySessions {
+            serve: self
+                .all_sessions()
+                .await?
+                .serve
+                .into_iter()
+                .filter(|session| session.workspace_id.starts_with(&prefix))
+                .collect(),
+            held: Vec::new(),
+        })
     }
 
     async fn workspace_session(

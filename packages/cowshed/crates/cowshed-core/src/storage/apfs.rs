@@ -19,11 +19,11 @@ use cowshed_os::timing::timed_async;
 use super::lifecycle::{
     AdoptHandoff, AdoptPlan, AdoptRequest, CheckpointFact, CheckpointPlan, CheckpointRef,
     CreatePlan, DefragmentOutcome, DerivedWorkspace, Destination, ExecuteError, ForkPlan,
-    ImmutablePlan, KernelMountFact, LifecycleBackend, LifecycleFact, LifecyclePlanner,
-    LifecycleReceipt, LifecycleWorkspace, MountIntent, MountState, Operation, OperationIdentity,
-    Pin, PlanError, PurePlanner, ResizeOutcome, RestoreMode, RestorePlan, RestoreReceipt,
-    RetirePlan, RetiredRef, Revision, StorageFact, StorageGcOptions, StorageGcPlan,
-    StorageGcReport, Substrate, SubstrateStats, execute_checked, revalidate,
+    ImmutablePlan, LifecycleBackend, LifecycleFact, LifecyclePlanner, LifecycleReceipt,
+    LifecycleWorkspace, MountIntent, MountJoin, MountRefusal, MountRefusalReason, MountState,
+    Operation, OperationIdentity, Pin, PlanError, PurePlanner, ResizeOutcome, RestoreMode,
+    RestorePlan, RestoreReceipt, RetirePlan, RetiredRef, Revision, StorageFact, StorageGcOptions,
+    StorageGcPlan, StorageGcReport, Substrate, SubstrateStats, execute_checked, revalidate,
 };
 use super::{CheckpointLabel, PRE_RESTORE_PREFIX, StorageLayout, StorageLayoutError};
 
@@ -140,6 +140,27 @@ impl MarkerExpectation {
             repos: config.owned_repo_ids(workspace.repo()),
             workspace: workspace.name().clone(),
             incarnation: workspace.incarnation().clone(),
+        }
+    }
+
+    /// Whether the marker in the tree at `root` names this workspace, and what was read instead
+    /// when it does not. A marker that cannot be read is not ours (01a_apfs.md, "Ownership,
+    /// identity, and the volume label"); the read's own error says why it could not be read.
+    pub(crate) fn judge(&self, root: &Path) -> Result<(), MountRefusalReason> {
+        let marker =
+            crate::metadata::WorkspaceMarker::read_from(&root.join(super::WORKSPACE_MARKER_PATH))
+                .map_err(|error| MountRefusalReason::MarkerUnreadable(error.to_string()))?;
+        if self.repos.accepts(&marker.repo_id)
+            && marker.workspace == self.workspace
+            && marker.workspace_incarnation == self.incarnation
+        {
+            Ok(())
+        } else {
+            Err(MountRefusalReason::MarkerNamesAnother {
+                repo: marker.repo_id,
+                workspace: marker.workspace,
+                incarnation: marker.workspace_incarnation,
+            })
         }
     }
 
@@ -735,7 +756,9 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         &self,
         repo: &RepoId,
     ) -> Result<Vec<PendingPublicationFact>, ApfsStorageError>;
-    fn mounts(&self, repo: &RepoId) -> Result<Vec<KernelMountFact>, ApfsStorageError>;
+    /// Every published workspace's mount, joined or refused workspace by workspace. A refusal is
+    /// that workspace's fact; only reading the mount table or the records at all fails the call.
+    fn mounts(&self, repo: &RepoId) -> Result<Vec<MountJoin>, ApfsStorageError>;
     fn checkpoints(&self, repo: &RepoId) -> Result<Vec<CheckpointFact>, ApfsStorageError>;
     fn recover_pending(
         &self,
@@ -861,6 +884,10 @@ pub enum ApfsStorageError {
     },
     #[error("marker does not match detached APFS metadata: {0}")]
     MarkerMismatch(String),
+    /// The workspace an operation names has a mount at its mountpoint that does not prove itself
+    /// the workspace's.
+    #[error(transparent)]
+    MountIdentity(#[from] Box<MountRefusal>),
     #[error("workspace {workspace} quarantined ({reason}): {tombstone}")]
     Quarantined {
         workspace: WorkspaceName,
@@ -1720,7 +1747,7 @@ where
                 if host
                     .mounts(workspace.repo())?
                     .iter()
-                    .any(|mount| mount.volume_key == volume)
+                    .any(|mount| mount.volume_key() == volume)
                 {
                     return Err(ApfsStorageError::InvalidPlan(
                         "restored main image remains mounted",
@@ -2718,10 +2745,19 @@ fn finish_adoption<H: ApfsExecutionHost>(
         host.mounts(workspace.repo())?,
         host.checkpoints(workspace.repo())?,
     )?;
-    let mounted = derived.into_iter().any(|candidate| {
-        candidate.workspace == *workspace
-            && matches!(candidate.mount_state, MountState::Mounted { .. })
-    });
+    // The workspace adoption names is read strictly: a mount at its checkout that does not prove
+    // itself main's refuses, rather than reading as absent and being mounted over.
+    let mut mounted = false;
+    for candidate in derived {
+        if candidate.workspace != *workspace {
+            continue;
+        }
+        match candidate.mount_state {
+            MountState::Mounted { .. } => mounted = true,
+            MountState::Detached => {}
+            MountState::Unproven(refusal) => return Err(refusal.into()),
+        }
+    }
     let expected = MarkerExpectation::owned(config, workspace);
     if mounted {
         return host.validate_marker(&checkout, &expected);

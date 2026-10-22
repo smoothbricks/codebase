@@ -811,10 +811,18 @@ pub struct SubstrateStats {
     pub pinned_checkpoint_bytes: u64,
 }
 
+/// Where a published workspace stands against the kernel mount table.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MountState {
     Detached,
-    Mounted { mount_id: u64 },
+    Mounted {
+        mount_id: u64,
+    },
+    /// Something is mounted at the workspace's mountpoint that does not prove itself the
+    /// workspace's (01a_apfs.md, "Ownership, identity, and the volume label"): enumeration refused
+    /// to join it. It is neither attached nor detached. Nothing acts on its absence, and an
+    /// operation that names it refuses with this refusal.
+    Unproven(Box<MountRefusal>),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -886,6 +894,103 @@ pub struct KernelMountFact {
     pub volume_key: String,
 }
 
+/// What enumeration made of the mount at one published workspace's mountpoint. Joining is judged
+/// per workspace (01a_apfs.md, "Ownership, identity, and the volume label": joining a kernel mount
+/// into enumeration reads the marker and refuses when it does not name the expected workspace):
+/// one workspace's refusal is that workspace's fact, never a failure of every other workspace's
+/// enumeration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MountJoin {
+    Proven(KernelMountFact),
+    Refused {
+        volume_key: String,
+        refusal: Box<MountRefusal>,
+    },
+}
+
+impl MountJoin {
+    pub fn volume_key(&self) -> &str {
+        match self {
+            Self::Proven(fact) => &fact.volume_key,
+            Self::Refused { volume_key, .. } => volume_key,
+        }
+    }
+
+    /// The join an operation that names this one workspace may act on: a refusal fails exactly
+    /// the operation that names the refused workspace.
+    pub fn named(self) -> Result<KernelMountFact, Box<MountRefusal>> {
+        match self {
+            Self::Proven(fact) => Ok(fact),
+            Self::Refused { refusal, .. } => Err(refusal),
+        }
+    }
+}
+
+impl From<KernelMountFact> for MountJoin {
+    fn from(fact: KernelMountFact) -> Self {
+        Self::Proven(fact)
+    }
+}
+
+/// A mount at `mount_point`, the mountpoint of `workspace`, that enumeration refused to join.
+/// `mounted_from` is what the mount table or directory binding says is mounted there.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("{}", refusal_message(self))]
+pub struct MountRefusal {
+    pub workspace: LifecycleWorkspace,
+    pub mount_point: PathBuf,
+    pub mounted_from: String,
+    pub reason: MountRefusalReason,
+}
+
+/// Why a mount was not joined. The marker reasons are the identity authority's two answers: a
+/// marker that cannot be read is not ours, and one that reads names someone else.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MountRefusalReason {
+    /// The marker could not be read; the error is the one the read returned.
+    MarkerUnreadable(String),
+    /// The marker reads, and names another workspace or another incarnation.
+    MarkerNamesAnother {
+        repo: RepoId,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+    },
+    /// The workspace's own volume is mounted ignoring owners.
+    NonCanonicalFlags(u64),
+    /// A directory payload whose binding names another directory than its mountpoint.
+    MountedElsewhere(PathBuf),
+}
+
+fn refusal_message(refusal: &MountRefusal) -> String {
+    let MountRefusal {
+        workspace,
+        mount_point,
+        mounted_from: source,
+        reason,
+    } = refusal;
+    let (repo, name, incarnation) = (workspace.repo(), workspace.name(), workspace.incarnation());
+    let at = mount_point.display();
+    match reason {
+        MountRefusalReason::MarkerUnreadable(error) => format!(
+            "workspace mount identity mismatch at {at}: the volume mounted from {source} carries no readable {repo}/{name} marker for incarnation {incarnation}: {error}"
+        ),
+        MountRefusalReason::MarkerNamesAnother {
+            repo: found_repo,
+            workspace: found,
+            incarnation: found_incarnation,
+        } => format!(
+            "workspace mount identity mismatch at {at}: the volume mounted from {source} carries the {found_repo}/{found} marker for incarnation {found_incarnation}, not {repo}/{name} for incarnation {incarnation}"
+        ),
+        MountRefusalReason::NonCanonicalFlags(flags) => format!(
+            "workspace mount has non-canonical flags at {at}: it ignores owners, which every workspace mount must honour; flags={flags:#x}"
+        ),
+        MountRefusalReason::MountedElsewhere(current) => format!(
+            "workspace mount identity mismatch: {source} is mounted at {}, its mountpoint is {at}, and the tree there must carry the {repo}/{name} marker for incarnation {incarnation}",
+            current.display()
+        ),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DerivedWorkspace {
     pub workspace: LifecycleWorkspace,
@@ -894,9 +999,13 @@ pub struct DerivedWorkspace {
 }
 
 /// Derive enumeration from canonical storage, kernel mounts, and versioned checkpoint facts.
+///
+/// A refused join derives its workspace [`MountState::Unproven`] and fails nothing: which
+/// operation a refusal fails is decided by the operation that names the workspace
+/// ([`MountJoin::named`]), never by the enumeration.
 pub fn derive_workspaces(
     storage: impl IntoIterator<Item = StorageFact>,
-    mounts: impl IntoIterator<Item = KernelMountFact>,
+    mounts: impl IntoIterator<Item = impl Into<MountJoin>>,
     checkpoints: impl IntoIterator<Item = CheckpointFact>,
 ) -> Result<Vec<DerivedWorkspace>, DerivationError> {
     let storage: Vec<_> = storage.into_iter().collect();
@@ -914,9 +1023,20 @@ pub fn derive_workspaces(
         }
     }
 
-    let mounts: BTreeMap<_, _> = mounts
+    let mut mounts: BTreeMap<_, _> = mounts
         .into_iter()
-        .map(|mount| (mount.volume_key, mount.mount_id))
+        .map(|mount| match mount.into() {
+            MountJoin::Proven(fact) => (
+                fact.volume_key,
+                MountState::Mounted {
+                    mount_id: fact.mount_id,
+                },
+            ),
+            MountJoin::Refused {
+                volume_key,
+                refusal,
+            } => (volume_key, MountState::Unproven(refusal)),
+        })
         .collect();
     let mut seen_checkpoints = BTreeSet::new();
     let mut checkpoints_by_workspace: BTreeMap<(RepoId, WorkspaceName), Vec<CheckpointFact>> =
@@ -942,11 +1062,8 @@ pub fn derive_workspaces(
     let mut result = Vec::with_capacity(storage.len());
     for fact in storage {
         let mount_state = mounts
-            .get(&fact.volume_key)
-            .copied()
-            .map_or(MountState::Detached, |mount_id| MountState::Mounted {
-                mount_id,
-            });
+            .remove(&fact.volume_key)
+            .unwrap_or(MountState::Detached);
         let mut checkpoints = checkpoints_by_workspace
             .remove(&(fact.workspace.repo.clone(), fact.workspace.name.clone()))
             .unwrap_or_default();
