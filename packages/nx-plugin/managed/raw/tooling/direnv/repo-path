@@ -86,14 +86,15 @@ case "${1:-}" in
         workspace="${BASH_REMATCH[1]}"
         printf 'repo-path: cowshed workspace %s at %s is not served: its .cowshed/env sets no %s. Serving it: cowshed exec %s -- true\n' \
           "$workspace" "$root" "$unset_names" "$workspace" >&2
-        # The installed cowshed (05_gateway.md, "The installed cowshed"), ahead of a checkout's launcher, which runs
-        # whatever that checkout last built (06_cli.md, "Launcher"). It gets neither the caller's TMPDIR and runtime
+        # The installed cowshed's stable name, by its path (05_gateway.md, "The installed cowshed"), never a checkout's
+        # launcher, which runs whatever that checkout last built (06_cli.md, "Launcher"): a missing install fails by
+        # name rather than finding the launcher this PATH puts first. It gets neither the caller's TMPDIR and runtime
         # link nor the unserved file's, and not the caller's stdin, where pre-push reads its refs. Everything it
         # prints goes to stderr: stdout is this script's PATH.
         serve_status=0
         serve_output="$(
           unset TMPDIR COWSHED_RUNTIME_LINK
-          { cd "$root" && PATH="$installed:$PATH" cowshed exec "$workspace" -- true </dev/null; } 2>&1
+          { cd "$root" && "$installed/cowshed" exec "$workspace" -- true </dev/null; } 2>&1
         )" || serve_status=$?
         if ((serve_status != 0)); then
           printf 'repo-path: serving cowshed workspace %s at %s failed: cowshed exec %s -- true exited %d: %s\nUntil it is served, the checkout may still link the build volume, Nx daemon record and task database of the checkout it was forked from, so it is not entered.\nnext: cowshed exec %s -- true\n' \

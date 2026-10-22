@@ -323,4 +323,35 @@ ${effect}
       expect(existsSync(log)).toBe(false);
     });
   });
+
+  it("refuses, naming the missing installed cowshed, and never runs the checkout's own launcher", async () => {
+    await withRepoPath(async (fixture) => {
+      mkdirSync(join(fixture.root, '.cowshed'));
+      writeFileSync(
+        join(fixture.root, '.cowshed/workspace.json'),
+        `${JSON.stringify({ version: 1, workspace: 'ws', role: 'workspace' }, null, 2)}\n`,
+      );
+      // The checkout's launcher is on the PATH repo-path writes. Were it run, it would serve the file and leave a mark.
+      const ran = join(fixture.root, 'launcher-ran');
+      const launcher = join(fixture.root, 'node_modules/.bin/cowshed');
+      await mkdir(dirname(launcher), { recursive: true });
+      await writeFile(
+        launcher,
+        `#!${join(fixture.tools, 'bash')}\n: > ${quoted(ran)}\nprintf '%s\\n' 'export TMPDIR=/t' 'export COWSHED_RUNTIME_LINK=/l' > .cowshed/env\n`,
+        { mode: 0o755 },
+      );
+      const result = spawnSync(join(fixture.tools, 'bash'), [fixture.helper], {
+        encoding: 'utf8',
+        env: { HOME: fixture.home, PATH: fixture.tools },
+      });
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toContain(
+        `repo-path: serving cowshed workspace ws at ${fixture.root} failed: cowshed exec ws -- true exited 127: `,
+      );
+      expect(result.stderr).toContain(`${join(fixture.installed, 'cowshed')}: No such file or directory`);
+      expect(result.stderr).toEndWith('\nnext: cowshed exec ws -- true\n');
+      expect(existsSync(ran)).toBe(false);
+    });
+  });
 });
