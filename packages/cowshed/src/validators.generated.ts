@@ -1952,3 +1952,157 @@ export const parseWorkspaceView = (json: string): Api.WorkspaceView => assertWor
 export const assertWorkspaceViewList = typia.createAssertEquals<readonly Api.WorkspaceView[]>();
 export const parseWorkspaceViewList = (json: string): readonly Api.WorkspaceView[] =>
   assertWorkspaceViewList(JSON.parse(json));
+
+export const assertPruneBuildStateListing = typia.plain.createAssertPrune<Api.BuildStateListing>();
+export const readBuildStateListing = (json: string): Api.BuildStateListing =>
+  assertPruneBuildStateListing(JSON.parse(json));
+
+export const assertPruneBuildVolume = typia.plain.createAssertPrune<Api.BuildVolume>();
+export const readBuildVolume = (json: string): Api.BuildVolume => assertPruneBuildVolume(JSON.parse(json));
+
+export const assertPruneCheckpointResult = typia.plain.createAssertPrune<Api.CheckpointResult>();
+export const readCheckpointResult = (json: string): Api.CheckpointResult =>
+  assertPruneCheckpointResult(JSON.parse(json));
+
+export const assertPruneCredentialReport = typia.plain.createAssertPrune<Api.CredentialReport>();
+export const readCredentialReport = (json: string): Api.CredentialReport =>
+  assertPruneCredentialReport(JSON.parse(json));
+
+export const assertPruneDefragmentResult = typia.plain.createAssertPrune<Api.DefragmentResult>();
+export const readDefragmentResult = (json: string): Api.DefragmentResult =>
+  assertPruneDefragmentResult(JSON.parse(json));
+
+export const assertPruneDiskCommandEvent = typia.plain.createAssertPrune<Api.DiskCommandEvent>();
+export const readDiskCommandEvent = (json: string): Api.DiskCommandEvent =>
+  assertPruneDiskCommandEvent(JSON.parse(json));
+
+export const assertPruneDoctorReport = typia.plain.createAssertPrune<Api.DoctorReport>();
+export const readDoctorReport = (json: string): Api.DoctorReport => assertPruneDoctorReport(JSON.parse(json));
+
+export const assertPruneEmptyResult = typia.plain.createAssertPrune<Api.EmptyResult>();
+export const readEmptyResult = (json: string): Api.EmptyResult => assertPruneEmptyResult(JSON.parse(json));
+
+export const assertPruneGatewayStatus = typia.plain.createAssertPrune<Api.GatewayStatus>();
+export const readGatewayStatus = (json: string): Api.GatewayStatus => assertPruneGatewayStatus(JSON.parse(json));
+
+export const assertPruneGcReport = typia.plain.createAssertPrune<Api.GcReport>();
+export const readGcReport = (json: string): Api.GcReport => assertPruneGcReport(JSON.parse(json));
+
+export const assertPruneGrantSet = typia.plain.createAssertPrune<Api.GrantSet>();
+export const readGrantSet = (json: string): Api.GrantSet => assertPruneGrantSet(JSON.parse(json));
+
+export const assertPruneIdentityReport = typia.plain.createAssertPrune<Api.IdentityReport>();
+export const readIdentityReport = (json: string): Api.IdentityReport => assertPruneIdentityReport(JSON.parse(json));
+
+export const readJobId = parseJobId;
+
+export const assertPruneJobInfo = typia.plain.createAssertPrune<Api.JobInfo>();
+export const readJobInfo = (json: string): Api.JobInfo => assertPruneJobInfo(JSON.parse(json));
+
+export const assertPruneJobInfoList = typia.plain.createAssertPrune<readonly Api.JobInfo[]>();
+export const readJobInfoList = (json: string): readonly Api.JobInfo[] => assertPruneJobInfoList(JSON.parse(json));
+
+export const assertPruneJobListeningPorts = typia.plain.createAssertPrune<Api.JobListeningPorts>();
+export const readJobListeningPorts = (json: string): Api.JobListeningPorts =>
+  assertPruneJobListeningPorts(JSON.parse(json));
+
+export const assertPruneJobProcessEvent = typia.plain.createAssertPrune<Api.JobProcessEvent>();
+export const readJobProcessEvent = (json: string): Api.JobProcessEvent => assertPruneJobProcessEvent(JSON.parse(json));
+
+export const assertPruneJobProcessTree = typia.plain.createAssertPrune<Api.JobProcessTree>();
+export const readJobProcessTree = (json: string): Api.JobProcessTree => assertPruneJobProcessTree(JSON.parse(json));
+
+export const assertPruneJobResourceSample = typia.plain.createAssertPrune<Api.JobResourceSample>();
+export const readJobResourceSample = (json: string): Api.JobResourceSample =>
+  assertPruneJobResourceSample(JSON.parse(json));
+
+export const assertPruneJobSubtreeRetirement = typia.plain.createAssertPrune<Api.JobSubtreeRetirement>();
+export const readJobSubtreeRetirement = (json: string): Api.JobSubtreeRetirement =>
+  assertPruneJobSubtreeRetirement(JSON.parse(json));
+
+export const assertPruneJobTail = typia.plain.createAssertPrune<Api.JobTail>();
+export const readJobTail = (json: string): Api.JobTail => assertPruneJobTail(JSON.parse(json));
+
+export const assertPruneLandReport = typia.plain.createAssertPrune<Api.LandReport>();
+export const readLandReport = (json: string): Api.LandReport => assertPruneLandReport(JSON.parse(json));
+
+export const assertPruneLockObservation = typia.plain.createAssertPrune<Api.LockObservation>();
+export const readLockObservation = (json: string): Api.LockObservation => assertPruneLockObservation(JSON.parse(json));
+
+export const assertPruneLogsChunk = typia.plain.createAssertPrune<Api.LogsChunk>();
+export const readLogsChunk = (json: string): Api.LogsChunk => assertPruneLogsChunk(JSON.parse(json));
+
+export const assertPruneMirrorInfo = typia.plain.createAssertPrune<Api.MirrorInfo>();
+export const readMirrorInfo = (json: string): Api.MirrorInfo => assertPruneMirrorInfo(JSON.parse(json));
+
+export const assertPruneMountResult = typia.plain.createAssertPrune<Api.MountResult>();
+export const readMountResult = (json: string): Api.MountResult => assertPruneMountResult(JSON.parse(json));
+
+export const assertPruneNxStateClearResult = typia.plain.createAssertPrune<Api.NxStateClearResult>();
+export const readNxStateClearResult = (json: string): Api.NxStateClearResult =>
+  assertPruneNxStateClearResult(JSON.parse(json));
+
+export const assertPruneNxStoreClearResult = typia.plain.createAssertPrune<Api.NxStoreClearResult>();
+export const readNxStoreClearResult = (json: string): Api.NxStoreClearResult =>
+  assertPruneNxStoreClearResult(JSON.parse(json));
+
+export const assertPruneProjectGrants = typia.plain.createAssertPrune<Api.ProjectGrants>();
+export const readProjectGrants = (json: string): Api.ProjectGrants => assertPruneProjectGrants(JSON.parse(json));
+
+export const assertPruneProjectRetirementReport = typia.plain.createAssertPrune<Api.ProjectRetirementReport>();
+export const readProjectRetirementReport = (json: string): Api.ProjectRetirementReport =>
+  assertPruneProjectRetirementReport(JSON.parse(json));
+
+export const assertPruneProjectWorkspacesList = typia.plain.createAssertPrune<readonly Api.ProjectWorkspaces[]>();
+export const readProjectWorkspacesList = (json: string): readonly Api.ProjectWorkspaces[] =>
+  assertPruneProjectWorkspacesList(JSON.parse(json));
+
+export const assertPrunePushReport = typia.plain.createAssertPrune<Api.PushReport>();
+export const readPushReport = (json: string): Api.PushReport => assertPrunePushReport(JSON.parse(json));
+
+export const assertPruneReAdoption = typia.plain.createAssertPrune<Api.ReAdoption>();
+export const readReAdoption = (json: string): Api.ReAdoption => assertPruneReAdoption(JSON.parse(json));
+
+export const assertPruneRebaseReport = typia.plain.createAssertPrune<Api.RebaseReport>();
+export const readRebaseReport = (json: string): Api.RebaseReport => assertPruneRebaseReport(JSON.parse(json));
+
+export const assertPruneRekeyResult = typia.plain.createAssertPrune<Api.RekeyResult>();
+export const readRekeyResult = (json: string): Api.RekeyResult => assertPruneRekeyResult(JSON.parse(json));
+
+export const assertPruneRemoveProjectReport = typia.plain.createAssertPrune<Api.RemoveProjectReport>();
+export const readRemoveProjectReport = (json: string): Api.RemoveProjectReport =>
+  assertPruneRemoveProjectReport(JSON.parse(json));
+
+export const assertPruneRemoveReport = typia.plain.createAssertPrune<Api.RemoveReport>();
+export const readRemoveReport = (json: string): Api.RemoveReport => assertPruneRemoveReport(JSON.parse(json));
+
+export const assertPruneReseedResult = typia.plain.createAssertPrune<Api.ReseedResult>();
+export const readReseedResult = (json: string): Api.ReseedResult => assertPruneReseedResult(JSON.parse(json));
+
+export const assertPruneResizeResult = typia.plain.createAssertPrune<Api.ResizeResult>();
+export const readResizeResult = (json: string): Api.ResizeResult => assertPruneResizeResult(JSON.parse(json));
+
+export const assertPruneSccacheStatus = typia.plain.createAssertPrune<Api.SccacheStatus>();
+export const readSccacheStatus = (json: string): Api.SccacheStatus => assertPruneSccacheStatus(JSON.parse(json));
+
+export const assertPruneSealedJob = typia.plain.createAssertPrune<Api.SealedJob>();
+export const readSealedJob = (json: string): Api.SealedJob => assertPruneSealedJob(JSON.parse(json));
+
+export const assertPruneSkillInstallReport = typia.plain.createAssertPrune<Api.SkillInstallReport>();
+export const readSkillInstallReport = (json: string): Api.SkillInstallReport =>
+  assertPruneSkillInstallReport(JSON.parse(json));
+
+export const assertPruneTreeHolderList = typia.plain.createAssertPrune<readonly Api.TreeHolder[]>();
+export const readTreeHolderList = (json: string): readonly Api.TreeHolder[] =>
+  assertPruneTreeHolderList(JSON.parse(json));
+
+export const assertPruneWorkspaceInfo = typia.plain.createAssertPrune<Api.WorkspaceInfo>();
+export const readWorkspaceInfo = (json: string): Api.WorkspaceInfo => assertPruneWorkspaceInfo(JSON.parse(json));
+
+export const assertPruneWorkspaceInfoList = typia.plain.createAssertPrune<readonly Api.WorkspaceInfo[]>();
+export const readWorkspaceInfoList = (json: string): readonly Api.WorkspaceInfo[] =>
+  assertPruneWorkspaceInfoList(JSON.parse(json));
+
+export const assertPruneWorkspaceViewList = typia.plain.createAssertPrune<readonly Api.WorkspaceView[]>();
+export const readWorkspaceViewList = (json: string): readonly Api.WorkspaceView[] =>
+  assertPruneWorkspaceViewList(JSON.parse(json));

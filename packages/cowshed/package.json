@@ -153,6 +153,7 @@
           "{projectRoot}/src/declaration-ir.generated.ts",
           "{projectRoot}/crates/cowshed-napi/src/operations.generated.rs",
           "{projectRoot}/crates/cowshed-core/src/api/served.generated.rs",
+          "{projectRoot}/crates/cowshed-core/src/api/reader.generated.rs",
           "{projectRoot}/src/cli-parity.generated.ts"
         ],
         "options": {
@@ -182,6 +183,7 @@
           "{projectRoot}/src/declaration-ir.generated.ts",
           "{projectRoot}/crates/cowshed-napi/src/operations.generated.rs",
           "{projectRoot}/crates/cowshed-core/src/api/served.generated.rs",
+          "{projectRoot}/crates/cowshed-core/src/api/reader.generated.rs",
           "{projectRoot}/src/cli-parity.generated.ts",
           "cargoToolchain",
           {

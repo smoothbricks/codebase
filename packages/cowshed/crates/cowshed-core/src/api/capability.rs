@@ -19,7 +19,7 @@ use super::operations::{
     ReseedRequest, ResizeRequest, RestoreRequest, SessionRequest, SlotRequest,
     SourceDestinationRequest, StdinWriteRequest, StreamOperation, TailRequest, WorkerScope,
     WorkerView, WorkspaceAtRequest, WorkspaceAttachRequest, WorkspaceGrantsRequest,
-    WorkspaceInSlotRequest, WorkspaceRequest, WorkspaceView, decode_result, encode_request,
+    WorkspaceInSlotRequest, WorkspaceRequest, WorkspaceView, encode_request, read_result,
 };
 use super::peer_credentials::PeerCredentialsError;
 use super::process::JobProcessTree;
@@ -632,7 +632,7 @@ pub(super) async fn invoke<O: Operation>(
     request: &O::Request,
 ) -> Result<O::Result> {
     let params = encode_request::<O>(request)?;
-    decode_result::<O>(runtime.call(O::METHOD, params).await?)
+    read_result::<O>(runtime.call(O::METHOD, params).await?)
 }
 
 /// [`invoke`], with the call's lifecycle steps sent to `steps` as the controller reports them.
@@ -642,7 +642,7 @@ async fn invoke_reporting<O: Operation>(
     steps: tokio::sync::mpsc::UnboundedSender<StepReport>,
 ) -> Result<O::Result> {
     let params = encode_request::<O>(request)?;
-    decode_result::<O>(runtime.call_reporting(O::METHOD, params, steps).await?)
+    read_result::<O>(runtime.call_reporting(O::METHOD, params, steps).await?)
 }
 
 /// [`invoke`] for an upload operation, with `bytes` as its raw-byte frame.
@@ -652,7 +652,7 @@ pub(super) async fn invoke_upload<O: Operation>(
     bytes: Bytes,
 ) -> Result<O::Result> {
     let params = encode_request::<O>(request)?;
-    decode_result::<O>(runtime.upload(O::METHOD, params, bytes).await?)
+    read_result::<O>(runtime.upload(O::METHOD, params, bytes).await?)
 }
 
 /// Calls a download operation: the chunk's metadata and its bytes, which start at the offset the
@@ -768,7 +768,7 @@ impl<O: StreamOperation> EventStream<O> {
     /// The next event, or `None` after the call's end. An error is the stream's last item.
     pub async fn next(&mut self) -> Option<Result<O::Result>> {
         let event = self.events.next().await?;
-        Some(event.and_then(decode_result::<O>))
+        Some(event.and_then(read_result::<O>))
     }
 }
 

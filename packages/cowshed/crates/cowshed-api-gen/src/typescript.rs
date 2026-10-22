@@ -454,7 +454,7 @@ impl Emitter<'_> {
 
 /// Lifetimes are ownership, which the wire projection drops. A const argument has no wire
 /// meaning, so it is refused by name rather than erased.
-fn type_arguments<'a>(
+pub(crate) fn type_arguments<'a>(
     name: &str,
     arguments: &'a [TypeArgument],
 ) -> Result<Vec<&'a RustType>, String> {
@@ -481,7 +481,7 @@ fn no_arguments(name: &str, arguments: &[&RustType]) -> Result<(), String> {
     }
 }
 
-fn primitive_projection(name: &str) -> Option<&'static str> {
+pub(crate) fn primitive_projection(name: &str) -> Option<&'static str> {
     Some(match name {
         "String" | "str" | "PathBuf" | "Path" => "string",
         "bool" => "boolean",

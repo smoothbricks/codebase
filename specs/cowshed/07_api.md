@@ -857,6 +857,24 @@ Public request/result and controller-commitment definitions live in `cowshed_cor
 `JobArtifactRecord`/manifest/record envelope and Arrow projections live in `cowshed_core::storage::job_artifact` and
 reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission rather than `null`.
 
+### Reader projection
+
+Writers are strict and readers project: a field a writer emits that the reader does not declare is dropped, because a
+closed record of an older reader cannot represent it, and the writer's own output keeps it. The controller decodes a
+request strictly: an unknown field refuses. A client reads an operation result or stream event of a peer controller,
+which may be a newer build, by projecting it through the declaration that result was generated from: an object member
+its declared record does not name is dropped, at every depth, and the reader's own strict decode then certifies the
+projection. A missing required field, a retyped value and an unknown enum variant are not projected; they still refuse
+by name: a variant outside the reader's closed set has no arm to read it as. Projection never adds a value, never
+retypes one and never selects an enum arm.
+
+This is one generated rule, not a per-DTO exception. `cowshed-api-gen` derives every peer result's reader from its
+declaration with the same serde resolution its TypeScript type uses, so the Rust and TypeScript clients drop the same
+members. Rust clients read through `operations::read_result` over `api/reader.generated.rs`; TypeScript adapters read
+through `read<Result>` in `validators.generated.ts` (typia `assertPrune`). Every request, a controller routing a call to
+itself, and every `assert*`/`parse*` validator stay strict. A result only internal operations answer never crosses a
+connection, so its reader drops nothing.
+
 ### Build-volume reseed
 
 `coordinator.reseed` is a coordinator-only, JSON-only operation:
@@ -898,8 +916,8 @@ Canonical declarations in `cowshed-core/src/api/dto.rs`, `operations.rs` and cap
 protocol projections; adapters never maintain request/result field copies. Run `bun nx run cowshed:api-generate` from
 the repository root. Its declared generator writes `src/api.generated.ts`, `src/validators.generated.ts`,
 `src/native.generated.ts`, `src/declaration-ir.generated.ts`, `src/cli-parity.generated.ts`,
-`crates/cowshed-core/src/api/served.generated.rs` and `crates/cowshed-napi/src/operations.generated.rs` under
-`packages/cowshed`. The underlying write command is
+`crates/cowshed-core/src/api/served.generated.rs`, `crates/cowshed-core/src/api/reader.generated.rs` and
+`crates/cowshed-napi/src/operations.generated.rs` under `packages/cowshed`. The underlying write command is
 `packages/cowshed/.cache/api-generator/cowshed-api-gen write packages/cowshed`; the target builds that canonical
 generator first when needed. Generated files are changed only by this generator. Handwritten TypeScript capability
 facades call the generated adapters with the generated DTO types; they do not redefine protocol records. The operation
@@ -1498,9 +1516,10 @@ supervisor that ran the job retires.
   as the two arguments `\0script` and the script's JSON, a pair no argv can produce. Every element of `argv` is the
   exact tagged `CommandArg` object `{encoding:"utf8",data:String} | {encoding:"base64",data:String}`. Serialization
   selects `utf8` if and only if the Unix argument bytes are valid UTF-8; otherwise it emits canonical standard base64.
-  Decoders deny unknown fields and encodings and reject malformed or non-canonical base64, base64 used for valid UTF-8,
-  decoded NUL, arguments above 128 KiB, total argv above 1 MiB, an empty vector or `argv[0]`, and a byte representation
-  the host platform cannot reproduce exactly. Validation happens before RPC dispatch, process allocation/spawn, and
+  The controller's request decoder denies unknown fields; a result reader projects them (Reader projection). Every
+  decoder denies unknown encodings and rejects malformed or non-canonical base64, base64 used for valid UTF-8, decoded
+  NUL, arguments above 128 KiB, total argv above 1 MiB, an empty vector or `argv[0]`, and a byte representation the host
+  platform cannot reproduce exactly. Validation happens before RPC dispatch, process allocation/spawn, and
   protected-artifact effects. Protected Arrow stores `argv` as a required `List<Binary>` and recovery revalidates each
   raw argument and both bounds. `started` is a full RFC3339 string: `Z` and numeric offsets are accepted. A `:60` value
   is normalized to UTC and accepted only when it denotes a published IERS leap instant (for example
@@ -1534,7 +1553,7 @@ supervisor that ran the job retires.
   retried. A naturally ended, previously unspent subtree returns an empty receipt on first retirement. Subtree scope is
   the retained root and its descendants through immutable parent identities, not siblings or an expanded whole-job
   process group. Linux without an observed fold refuses with `foldUnavailable`; no RAM lease substitutes for one. Every
-  subtree DTO denies unknown fields.
+  subtree DTO is closed: its writer emits exactly its fields, and a result reader projects it (Reader projection).
 - `StreamInfo = { storage, bytes, sha256, summary }` with the exact discriminated unions above. JSON decoders reject
   unknown/multiple discriminants, invalid digest hex, inline data over `MAX_INLINE_OUTPUT_BYTES`, a protected file path
   outside `.cowshed/job/**`, or a redirect source outside the writable workspace. Complete output bytes never appear in
@@ -1578,8 +1597,8 @@ supervisor that ran the job retires.
   macOS relocation; `GrantSet.loopbackAny` is present only while granted; `GrantDelta.servicePorts`,
   `GrantDelta.loopbackAny` and `GrantDelta.expectedRevision` are optional. `PortBlock` fields are private; `new`,
   `base()`, and `size()` are the public surface, and custom deserialization invokes the same validation so size zero, a
-  size that is not a power of two, a base not aligned to its size, overflow, unknown fields, and struct-literal forgery
-  fail.
+  size that is not a power of two, a base not aligned to its size, overflow, and struct-literal forgery fail; an unknown
+  field fails a request and is dropped by a result reader (Reader projection).
 - `HoldEvent` (`cowshed hold --state-fd`, one per line) is
   `{kind:"started",pid,birth:HeldBirth,output:{stdout:HeldDescriptor,stderr:HeldDescriptor}}`,
   `{kind:"exited",status:ExitStatus}`, `{kind:"signalled",signal:HoldSignal}`,

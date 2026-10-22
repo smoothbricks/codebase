@@ -17,7 +17,7 @@
 use crate::capabilities;
 use crate::ir::{Api, Field, Fields, Record, RustType, Shape, TypeArgument, last_segment};
 use crate::operations::{Lane, Operation, Scope};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use syn::{GenericArgument, PathArguments, Type};
 
@@ -215,6 +215,9 @@ pub struct Output {
     pub rust: String,
     /// The adapters' TypeScript declarations and typed wrappers.
     pub typescript: String,
+    /// Every result record the TypeScript wrappers read from the addon, and how it is wrapped:
+    /// the readers `validators.generated.ts` defines for them (07_api.md, "Reader projection").
+    pub reads: BTreeSet<(String, ResultShape)>,
 }
 
 pub fn emit(
@@ -310,10 +313,12 @@ pub fn emit(
         }
     }
     let (capability_rust, capability_typescript) = capabilities::emit(capabilities, api)?;
+    let (adapters, reads) = typescript(&classes, &served, api, capabilities)?;
     Ok(Output {
         served: serves(&classes)?,
         rust: rust(&classes)? + &capability_rust + &crate::errors::emit(api)?,
-        typescript: typescript(&classes, &served, api, capabilities)? + &capability_typescript,
+        typescript: adapters + &capability_typescript,
+        reads,
     })
 }
 
@@ -774,7 +779,8 @@ fn typescript(
     served: &BTreeMap<&str, Signature<'_>>,
     api: &Api,
     capabilities: &[capabilities::Method],
-) -> Result<String, String> {
+) -> Result<(String, BTreeSet<(String, ResultShape)>), String> {
+    let mut reads = BTreeSet::new();
     // Stream iterators and handle-local attachments retain their canonical native carriers.
     let iterates = served
         .values()
@@ -891,7 +897,8 @@ fn typescript(
         );
         let (keyword, returns, body) = match method.answer {
             Answer::Json => {
-                let (ty, validator) = operation_result_type(&operation.result, &record_name)?;
+                let (ty, validator) =
+                    operation_result_type(&operation.result, &record_name, &mut reads)?;
                 (
                     "async function",
                     format!("Promise<{ty}>"),
@@ -899,7 +906,8 @@ fn typescript(
                 )
             }
             Answer::Download => {
-                let (ty, validator) = operation_result_type(&operation.result, &record_name)?;
+                let (ty, validator) =
+                    operation_result_type(&operation.result, &record_name, &mut reads)?;
                 (
                     "async function",
                     format!("Promise<{ty} & {{ readonly bytes: Uint8Array }}>"),
@@ -915,19 +923,21 @@ fn typescript(
             ),
             Answer::Adopted => {
                 let re_adoption = record_name("ReAdoption")?;
+                reads.insert(("ReAdoption".to_owned(), ResultShape::Record));
                 (
                     "async function",
                     format!(
                         "Promise<{{ readonly workspace: NativeWorkspaceRefHandle; readonly reAdoption: Api.{re_adoption} | null }}>"
                     ),
                     format!(
-                        "const answer = await {call};\n  return {{\n    workspace: answer.workspace,\n    reAdoption: answer.reAdoption === null ? null : V.parse{re_adoption}(answer.reAdoption),\n  }};"
+                        "const answer = await {call};\n  return {{\n    workspace: answer.workspace,\n    reAdoption: answer.reAdoption === null ? null : V.read{re_adoption}(answer.reAdoption),\n  }};"
                     ),
                 )
             }
             // Each step of the loop is one demand, and leaving it early closes the call.
             Answer::Stream => {
-                let (ty, validator) = operation_result_type(&operation.result, &record_name)?;
+                let (ty, validator) =
+                    operation_result_type(&operation.result, &record_name, &mut reads)?;
                 (
                     "function",
                     format!("EventIterator<{ty}>"),
@@ -941,19 +951,19 @@ fn typescript(
         )
         .unwrap();
     }
-    Ok(output)
+    Ok((output, reads))
 }
 
 /// The outer shape of a result whose element is one named API record.
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ResultShape {
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ResultShape {
     Record,
     List,
     Optional,
 }
 
 /// A result's named record and its structural wrapper, shared by exports and adapters.
-fn operation_result_record(ty: &Type) -> Result<(String, ResultShape), String> {
+pub(crate) fn operation_result_record(ty: &Type) -> Result<(String, ResultShape), String> {
     if let Some(name) = operation_type_name(ty) {
         return Ok((name, ResultShape::Record));
     }
@@ -985,17 +995,20 @@ fn operation_result_record(ty: &Type) -> Result<(String, ResultShape), String> {
     }
 }
 
-/// A JSON result's TypeScript type and the validator that parses it.
+/// A JSON result's TypeScript type and the reader that projects it (07_api.md, "Reader
+/// projection"), recorded in `reads` so the validators define that reader.
 fn operation_result_type(
     ty: &Type,
     record_name: &impl Fn(&str) -> Result<String, String>,
+    reads: &mut BTreeSet<(String, ResultShape)>,
 ) -> Result<(String, String), String> {
     let (record, shape) = operation_result_record(ty)?;
     let name = record_name(&record)?;
+    reads.insert((record, shape));
     Ok(match shape {
-        ResultShape::Record => (format!("Api.{name}"), format!("parse{name}")),
-        ResultShape::List => (format!("readonly Api.{name}[]"), format!("parse{name}List")),
-        ResultShape::Optional => (format!("Api.{name} | null"), format!("parse{name}Option")),
+        ResultShape::Record => (format!("Api.{name}"), format!("read{name}")),
+        ResultShape::List => (format!("readonly Api.{name}[]"), format!("read{name}List")),
+        ResultShape::Optional => (format!("Api.{name} | null"), format!("read{name}Option")),
     })
 }
 
@@ -1168,7 +1181,7 @@ mod tests {
         assert!(
             output.typescript.contains(concat!(
                 "export function jobChunks(handle: NativeJobChunks, args: JobChunksArguments): EventIterator<Api.LogsChunk> {\n",
-                "  return eventIterator(() => handle.chunks(JSON.stringify(args)), V.parseLogsChunk);\n",
+                "  return eventIterator(() => handle.chunks(JSON.stringify(args)), V.readLogsChunk);\n",
                 "}",
             )),
             "{}",

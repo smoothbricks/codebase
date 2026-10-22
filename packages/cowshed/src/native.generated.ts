@@ -154,7 +154,7 @@ export async function coordinatorAdopt(
   const answer = await handle.adopt(JSON.stringify(args));
   return {
     workspace: answer.workspace,
-    reAdoption: answer.reAdoption === null ? null : V.parseReAdoption(answer.reAdoption),
+    reAdoption: answer.reAdoption === null ? null : V.readReAdoption(answer.reAdoption),
   };
 }
 
@@ -173,7 +173,7 @@ export async function coordinatorAssignSlot(
   handle: NativeCoordinatorAssignSlot,
   args: CoordinatorAssignSlotArguments,
 ): Promise<Api.EmptyResult> {
-  return V.parseEmptyResult(await handle.assignSlot(JSON.stringify(args)));
+  return V.readEmptyResult(await handle.assignSlot(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.changeRepoId`. */
@@ -209,7 +209,7 @@ export async function coordinatorClearNxState(
   handle: NativeCoordinatorClearNxState,
   args: CoordinatorClearNxStateArguments,
 ): Promise<Api.NxStateClearResult> {
-  return V.parseNxStateClearResult(await handle.clearNxState(JSON.stringify(args)));
+  return V.readNxStateClearResult(await handle.clearNxState(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.defragment`. */
@@ -227,7 +227,7 @@ export async function coordinatorDefragment(
   handle: NativeCoordinatorDefragment,
   args: CoordinatorDefragmentArguments,
 ): Promise<Api.DefragmentResult> {
-  return V.parseDefragmentResult(await handle.defragment(JSON.stringify(args)));
+  return V.readDefragmentResult(await handle.defragment(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.destroy`. */
@@ -245,7 +245,7 @@ export async function coordinatorDestroy(
   handle: NativeCoordinatorDestroy,
   args: CoordinatorDestroyArguments,
 ): Promise<Api.RemoveReport> {
-  return V.parseRemoveReport(await handle.destroy(JSON.stringify(args)));
+  return V.readRemoveReport(await handle.destroy(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.detach`. */
@@ -263,7 +263,7 @@ export async function coordinatorDetach(
   handle: NativeCoordinatorDetach,
   args: CoordinatorDetachArguments,
 ): Promise<Api.EmptyResult> {
-  return V.parseEmptyResult(await handle.detach(JSON.stringify(args)));
+  return V.readEmptyResult(await handle.detach(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.doctor`. */
@@ -281,7 +281,7 @@ export async function coordinatorDoctor(
   handle: NativeCoordinatorDoctor,
   args: CoordinatorDoctorArguments,
 ): Promise<Api.DoctorReport> {
-  return V.parseDoctorReport(await handle.doctor(JSON.stringify(args)));
+  return V.readDoctorReport(await handle.doctor(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.exec`. */
@@ -319,7 +319,7 @@ export async function coordinatorExec(
   args: CoordinatorExecArguments,
   bytes?: Uint8Array,
 ): Promise<Api.JobId> {
-  return V.parseJobId(
+  return V.readJobId(
     await handle.exec(
       JSON.stringify(args),
       bytes === undefined ? undefined : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
@@ -357,7 +357,7 @@ export type CoordinatorGcArguments = Pick<Api.GcRequest, 'options'>;
  * Collects unreferenced storage.
  */
 export async function coordinatorGc(handle: NativeCoordinatorGc, args: CoordinatorGcArguments): Promise<Api.GcReport> {
-  return V.parseGcReport(await handle.gc(JSON.stringify(args)));
+  return V.readGcReport(await handle.gc(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.grant`. */
@@ -375,7 +375,7 @@ export async function coordinatorGrant(
   handle: NativeCoordinatorGrant,
   args: CoordinatorGrantArguments,
 ): Promise<Api.GrantSet> {
-  return V.parseGrantSet(await handle.grant(JSON.stringify(args)));
+  return V.readGrantSet(await handle.grant(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.grantProject`. */
@@ -393,7 +393,7 @@ export async function coordinatorGrantProject(
   handle: NativeCoordinatorGrantProject,
   args: CoordinatorGrantProjectArguments,
 ): Promise<Api.ProjectGrants> {
-  return V.parseProjectGrants(await handle.grantProject(JSON.stringify(args)));
+  return V.readProjectGrants(await handle.grantProject(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.land`. */
@@ -411,7 +411,7 @@ export async function coordinatorLand(
   handle: NativeCoordinatorLand,
   args: CoordinatorLandArguments,
 ): Promise<Api.LandReport> {
-  return V.parseLandReport(await handle.land(JSON.stringify(args)));
+  return V.readLandReport(await handle.land(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.moveCheckout`. */
@@ -447,7 +447,7 @@ export async function coordinatorProjectGrants(
   handle: NativeCoordinatorProjectGrants,
   args: CoordinatorProjectGrantsArguments,
 ): Promise<Api.ProjectGrants> {
-  return V.parseProjectGrants(await handle.projectGrants(JSON.stringify(args)));
+  return V.readProjectGrants(await handle.projectGrants(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.rebase`. */
@@ -465,7 +465,7 @@ export async function coordinatorRebase(
   handle: NativeCoordinatorRebase,
   args: CoordinatorRebaseArguments,
 ): Promise<Api.RebaseReport> {
-  return V.parseRebaseReport(await handle.rebase(JSON.stringify(args)));
+  return V.readRebaseReport(await handle.rebase(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.rekey`. */
@@ -483,7 +483,7 @@ export async function coordinatorRekey(
   handle: NativeCoordinatorRekey,
   args: CoordinatorRekeyArguments,
 ): Promise<Api.RekeyResult> {
-  return V.parseRekeyResult(await handle.rekey(JSON.stringify(args)));
+  return V.readRekeyResult(await handle.rekey(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.removeProject`. */
@@ -501,7 +501,7 @@ export async function coordinatorRemoveProject(
   handle: NativeCoordinatorRemoveProject,
   args: CoordinatorRemoveProjectArguments,
 ): Promise<Api.RemoveProjectReport> {
-  return V.parseRemoveProjectReport(await handle.removeProject(JSON.stringify(args)));
+  return V.readRemoveProjectReport(await handle.removeProject(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.rename`. */
@@ -537,7 +537,7 @@ export async function coordinatorRepoMirror(
   handle: NativeCoordinatorRepoMirror,
   args: CoordinatorRepoMirrorArguments,
 ): Promise<Api.MirrorInfo> {
-  return V.parseMirrorInfo(await handle.repoMirror(JSON.stringify(args)));
+  return V.readMirrorInfo(await handle.repoMirror(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.reseed`. */
@@ -555,7 +555,7 @@ export async function coordinatorReseed(
   handle: NativeCoordinatorReseed,
   args: CoordinatorReseedArguments,
 ): Promise<Api.ReseedResult> {
-  return V.parseReseedResult(await handle.reseed(JSON.stringify(args)));
+  return V.readReseedResult(await handle.reseed(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.resize`. */
@@ -573,7 +573,7 @@ export async function coordinatorResize(
   handle: NativeCoordinatorResize,
   args: CoordinatorResizeArguments,
 ): Promise<Api.ResizeResult> {
-  return V.parseResizeResult(await handle.resize(JSON.stringify(args)));
+  return V.readResizeResult(await handle.resize(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.restore`. */
@@ -591,7 +591,7 @@ export async function coordinatorRestore(
   handle: NativeCoordinatorRestore,
   args: CoordinatorRestoreArguments,
 ): Promise<Api.EmptyResult> {
-  return V.parseEmptyResult(await handle.restore(JSON.stringify(args)));
+  return V.readEmptyResult(await handle.restore(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.revoke`. */
@@ -609,7 +609,7 @@ export async function coordinatorRevoke(
   handle: NativeCoordinatorRevoke,
   args: CoordinatorRevokeArguments,
 ): Promise<Api.GrantSet> {
-  return V.parseGrantSet(await handle.revoke(JSON.stringify(args)));
+  return V.readGrantSet(await handle.revoke(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.revokeProject`. */
@@ -627,7 +627,7 @@ export async function coordinatorRevokeProject(
   handle: NativeCoordinatorRevokeProject,
   args: CoordinatorRevokeProjectArguments,
 ): Promise<Api.ProjectGrants> {
-  return V.parseProjectGrants(await handle.revokeProject(JSON.stringify(args)));
+  return V.readProjectGrants(await handle.revokeProject(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.setCheckpointQuota`. */
@@ -645,7 +645,7 @@ export async function coordinatorSetCheckpointQuota(
   handle: NativeCoordinatorSetCheckpointQuota,
   args: CoordinatorSetCheckpointQuotaArguments,
 ): Promise<Api.EmptyResult> {
-  return V.parseEmptyResult(await handle.setCheckpointQuota(JSON.stringify(args)));
+  return V.readEmptyResult(await handle.setCheckpointQuota(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.worker`. */
@@ -681,7 +681,7 @@ export async function hostAttachAll(
   handle: NativeHostAttachAll,
   args: HostAttachAllArguments,
 ): Promise<readonly Api.WorkspaceInfo[]> {
-  return V.parseWorkspaceInfoList(await handle.attachAll(JSON.stringify(args)));
+  return V.readWorkspaceInfoList(await handle.attachAll(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.buildState`. */
@@ -699,7 +699,7 @@ export async function hostBuildState(
   handle: NativeHostBuildState,
   args: HostBuildStateArguments,
 ): Promise<Api.BuildStateListing> {
-  return V.parseBuildStateListing(await handle.buildState(JSON.stringify(args)));
+  return V.readBuildStateListing(await handle.buildState(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.clearAttachBudget`. */
@@ -717,7 +717,7 @@ export async function hostClearAttachBudget(
   handle: NativeHostClearAttachBudget,
   args: HostClearAttachBudgetArguments,
 ): Promise<Api.EmptyResult> {
-  return V.parseEmptyResult(await handle.clearAttachBudget(JSON.stringify(args)));
+  return V.readEmptyResult(await handle.clearAttachBudget(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.clearNxStore`. */
@@ -735,7 +735,7 @@ export async function hostClearNxStore(
   handle: NativeHostClearNxStore,
   args: HostClearNxStoreArguments,
 ): Promise<Api.NxStoreClearResult> {
-  return V.parseNxStoreClearResult(await handle.clearNxStore(JSON.stringify(args)));
+  return V.readNxStoreClearResult(await handle.clearNxStore(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.credentialAdd`. */
@@ -758,7 +758,7 @@ export async function hostCredentialAdd(
   args: HostCredentialAddArguments,
   bytes?: Uint8Array,
 ): Promise<Api.CredentialReport> {
-  return V.parseCredentialReport(
+  return V.readCredentialReport(
     await handle.credentialAdd(
       JSON.stringify(args),
       bytes === undefined ? undefined : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
@@ -781,7 +781,7 @@ export async function hostCredentialRemove(
   handle: NativeHostCredentialRemove,
   args: HostCredentialRemoveArguments,
 ): Promise<Api.CredentialReport> {
-  return V.parseCredentialReport(await handle.credentialRemove(JSON.stringify(args)));
+  return V.readCredentialReport(await handle.credentialRemove(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.credentialStatus`. */
@@ -799,7 +799,7 @@ export async function hostCredentialStatus(
   handle: NativeHostCredentialStatus,
   args: HostCredentialStatusArguments,
 ): Promise<Api.CredentialReport> {
-  return V.parseCredentialReport(await handle.credentialStatus(JSON.stringify(args)));
+  return V.readCredentialReport(await handle.credentialStatus(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.detachAll`. */
@@ -817,7 +817,7 @@ export async function hostDetachAll(
   handle: NativeHostDetachAll,
   args: HostDetachAllArguments,
 ): Promise<Api.EmptyResult> {
-  return V.parseEmptyResult(await handle.detachAll(JSON.stringify(args)));
+  return V.readEmptyResult(await handle.detachAll(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.diskCommand`. */
@@ -835,7 +835,7 @@ export function hostDiskCommand(
   handle: NativeHostDiskCommand,
   args: HostDiskCommandArguments,
 ): EventIterator<Api.DiskCommandEvent> {
-  return eventIterator(() => handle.diskCommand(JSON.stringify(args)), V.parseDiskCommandEvent);
+  return eventIterator(() => handle.diskCommand(JSON.stringify(args)), V.readDiskCommandEvent);
 }
 
 /** A handle that serves `host.forgetAbandoned`. */
@@ -853,7 +853,7 @@ export async function hostForgetAbandoned(
   handle: NativeHostForgetAbandoned,
   args: HostForgetAbandonedArguments,
 ): Promise<Api.ProjectRetirementReport> {
-  return V.parseProjectRetirementReport(await handle.forgetAbandoned(JSON.stringify(args)));
+  return V.readProjectRetirementReport(await handle.forgetAbandoned(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.gatewayStart`. */
@@ -871,7 +871,7 @@ export async function hostGatewayStart(
   handle: NativeHostGatewayStart,
   args: HostGatewayStartArguments,
 ): Promise<Api.GatewayStatus> {
-  return V.parseGatewayStatus(await handle.gatewayStart(JSON.stringify(args)));
+  return V.readGatewayStatus(await handle.gatewayStart(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.gatewayStatus`. */
@@ -889,7 +889,7 @@ export async function hostGatewayStatus(
   handle: NativeHostGatewayStatus,
   args: HostGatewayStatusArguments,
 ): Promise<Api.GatewayStatus> {
-  return V.parseGatewayStatus(await handle.gatewayStatus(JSON.stringify(args)));
+  return V.readGatewayStatus(await handle.gatewayStatus(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.gatewayStop`. */
@@ -907,7 +907,7 @@ export async function hostGatewayStop(
   handle: NativeHostGatewayStop,
   args: HostGatewayStopArguments,
 ): Promise<Api.EmptyResult> {
-  return V.parseEmptyResult(await handle.gatewayStop(JSON.stringify(args)));
+  return V.readEmptyResult(await handle.gatewayStop(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.identityAdd`. */
@@ -925,7 +925,7 @@ export async function hostIdentityAdd(
   handle: NativeHostIdentityAdd,
   args: HostIdentityAddArguments,
 ): Promise<Api.IdentityReport> {
-  return V.parseIdentityReport(await handle.identityAdd(JSON.stringify(args)));
+  return V.readIdentityReport(await handle.identityAdd(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.listProjects`. */
@@ -943,7 +943,7 @@ export async function hostListProjects(
   handle: NativeHostListProjects,
   args: HostListProjectsArguments,
 ): Promise<readonly Api.ProjectWorkspaces[]> {
-  return V.parseProjectWorkspacesList(await handle.listProjects(JSON.stringify(args)));
+  return V.readProjectWorkspacesList(await handle.listProjects(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.lockHolders`. */
@@ -961,7 +961,7 @@ export async function hostLockHolders(
   handle: NativeHostLockHolders,
   args: HostLockHoldersArguments,
 ): Promise<Api.LockObservation> {
-  return V.parseLockObservation(await handle.lockHolders(JSON.stringify(args)));
+  return V.readLockObservation(await handle.lockHolders(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.mountMain`. */
@@ -979,7 +979,7 @@ export async function hostMountMain(
   handle: NativeHostMountMain,
   args: HostMountMainArguments,
 ): Promise<Api.MountResult> {
-  return V.parseMountResult(await handle.mountMain(JSON.stringify(args)));
+  return V.readMountResult(await handle.mountMain(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.retireDescendants`. */
@@ -997,7 +997,7 @@ export async function hostRetireDescendants(
   handle: NativeHostRetireDescendants,
   args: HostRetireDescendantsArguments,
 ): Promise<Api.JobSubtreeRetirement> {
-  return V.parseJobSubtreeRetirement(await handle.retireDescendants(JSON.stringify(args)));
+  return V.readJobSubtreeRetirement(await handle.retireDescendants(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.skillInstall`. */
@@ -1015,7 +1015,7 @@ export async function hostSkillInstall(
   handle: NativeHostSkillInstall,
   args: HostSkillInstallArguments,
 ): Promise<Api.SkillInstallReport> {
-  return V.parseSkillInstallReport(await handle.skillInstall(JSON.stringify(args)));
+  return V.readSkillInstallReport(await handle.skillInstall(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.treeHolders`. */
@@ -1033,7 +1033,7 @@ export async function hostTreeHolders(
   handle: NativeHostTreeHolders,
   args: HostTreeHoldersArguments,
 ): Promise<readonly Api.TreeHolder[]> {
-  return V.parseTreeHolderList(await handle.treeHolders(JSON.stringify(args)));
+  return V.readTreeHolderList(await handle.treeHolders(JSON.stringify(args)));
 }
 
 /** A handle that serves `job.attachClose`. */
@@ -1051,7 +1051,7 @@ export async function jobAttachClose(
   handle: NativeJobAttachClose,
   args: JobAttachCloseArguments,
 ): Promise<Api.EmptyResult> {
-  return V.parseEmptyResult(await handle.attachClose(JSON.stringify(args)));
+  return V.readEmptyResult(await handle.attachClose(JSON.stringify(args)));
 }
 
 /** A handle that serves `job.attachWrite`. */
@@ -1071,7 +1071,7 @@ export async function jobAttachWrite(
   args: JobAttachWriteArguments,
   bytes?: Uint8Array,
 ): Promise<Api.EmptyResult> {
-  return V.parseEmptyResult(
+  return V.readEmptyResult(
     await handle.attachWrite(
       JSON.stringify(args),
       bytes === undefined ? undefined : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
@@ -1091,7 +1091,7 @@ export type JobDetachArguments = Readonly<Record<string, never>>;
  * Detaches from a job.
  */
 export async function jobDetach(handle: NativeJobDetach, args: JobDetachArguments): Promise<Api.EmptyResult> {
-  return V.parseEmptyResult(await handle.detach(JSON.stringify(args)));
+  return V.readEmptyResult(await handle.detach(JSON.stringify(args)));
 }
 
 /** A handle that serves `job.kill`. */
@@ -1106,7 +1106,7 @@ export type JobKillArguments = Readonly<Record<string, never>>;
  * Kills a job's complete process group.
  */
 export async function jobKill(handle: NativeJobKill, args: JobKillArguments): Promise<Api.EmptyResult> {
-  return V.parseEmptyResult(await handle.kill(JSON.stringify(args)));
+  return V.readEmptyResult(await handle.kill(JSON.stringify(args)));
 }
 
 /** A handle that serves `job.listeningPorts`. */
@@ -1124,7 +1124,7 @@ export async function jobListeningPorts(
   handle: NativeJobListeningPorts,
   args: JobListeningPortsArguments,
 ): Promise<Api.JobListeningPorts> {
-  return V.parseJobListeningPorts(await handle.listeningPorts(JSON.stringify(args)));
+  return V.readJobListeningPorts(await handle.listeningPorts(JSON.stringify(args)));
 }
 
 /** A handle that serves `job.logs`. */
@@ -1144,7 +1144,7 @@ export async function jobLogs(
   args: JobLogsArguments,
 ): Promise<Api.LogsChunk & { readonly bytes: Uint8Array }> {
   const answer = await handle.logs(JSON.stringify(args));
-  return { ...V.parseLogsChunk(answer.json), bytes: answer.bytes };
+  return { ...V.readLogsChunk(answer.json), bytes: answer.bytes };
 }
 
 /** A handle that serves `job.processEvents`. */
@@ -1162,7 +1162,7 @@ export function jobProcessEvents(
   handle: NativeJobProcessEvents,
   args: JobProcessEventsArguments,
 ): EventIterator<Api.JobProcessEvent> {
-  return eventIterator(() => handle.processEvents(JSON.stringify(args)), V.parseJobProcessEvent);
+  return eventIterator(() => handle.processEvents(JSON.stringify(args)), V.readJobProcessEvent);
 }
 
 /** A handle that serves `job.processes`. */
@@ -1180,7 +1180,7 @@ export async function jobProcesses(
   handle: NativeJobProcesses,
   args: JobProcessesArguments,
 ): Promise<Api.JobProcessTree> {
-  return V.parseJobProcessTree(await handle.processes(JSON.stringify(args)));
+  return V.readJobProcessTree(await handle.processes(JSON.stringify(args)));
 }
 
 /** A handle that serves `job.progress`. */
@@ -1199,7 +1199,7 @@ export function jobProgress(
   handle: NativeJobProgress,
   args: JobProgressArguments,
 ): EventIterator<Api.JobResourceSample> {
-  return eventIterator(() => handle.progress(JSON.stringify(args)), V.parseJobResourceSample);
+  return eventIterator(() => handle.progress(JSON.stringify(args)), V.readJobResourceSample);
 }
 
 /** A handle that serves `job.resources`. */
@@ -1217,7 +1217,7 @@ export async function jobResources(
   handle: NativeJobResources,
   args: JobResourcesArguments,
 ): Promise<Api.JobResourceSample> {
-  return V.parseJobResourceSample(await handle.resources(JSON.stringify(args)));
+  return V.readJobResourceSample(await handle.resources(JSON.stringify(args)));
 }
 
 /** A handle that serves `job.sealed`. */
@@ -1232,7 +1232,7 @@ export type JobSealedArguments = Readonly<Record<string, never>>;
  * Reads one ended job's sealed record.
  */
 export async function jobSealed(handle: NativeJobSealed, args: JobSealedArguments): Promise<Api.SealedJob> {
-  return V.parseSealedJob(await handle.sealed(JSON.stringify(args)));
+  return V.readSealedJob(await handle.sealed(JSON.stringify(args)));
 }
 
 /** A handle that serves `job.status`. */
@@ -1247,7 +1247,7 @@ export type JobStatusArguments = Readonly<Record<string, never>>;
  * Reads one job's status.
  */
 export async function jobStatus(handle: NativeJobStatus, args: JobStatusArguments): Promise<Api.JobInfo> {
-  return V.parseJobInfo(await handle.status(JSON.stringify(args)));
+  return V.readJobInfo(await handle.status(JSON.stringify(args)));
 }
 
 /** A handle that serves `job.tail`. */
@@ -1262,7 +1262,7 @@ export type JobTailArguments = Pick<Api.TailRequest, 'cursor' | 'limits'>;
  * Reads a bounded slice of both streams after a cursor, or their latest bounded tail.
  */
 export async function jobTail(handle: NativeJobTail, args: JobTailArguments): Promise<Api.JobTail> {
-  return V.parseJobTail(await handle.tail(JSON.stringify(args)));
+  return V.readJobTail(await handle.tail(JSON.stringify(args)));
 }
 
 /** A handle that serves `job.wait`. */
@@ -1277,7 +1277,7 @@ export type JobWaitArguments = Readonly<Record<string, never>>;
  * Waits for a job to end.
  */
 export async function jobWait(handle: NativeJobWait, args: JobWaitArguments): Promise<Api.JobInfo> {
-  return V.parseJobInfo(await handle.wait(JSON.stringify(args)));
+  return V.readJobInfo(await handle.wait(JSON.stringify(args)));
 }
 
 /** A handle that serves `project.list`. */
@@ -1295,7 +1295,7 @@ export async function projectList(
   handle: NativeProjectList,
   args: ProjectListArguments,
 ): Promise<readonly Api.WorkspaceView[]> {
-  return V.parseWorkspaceViewList(await handle.list(JSON.stringify(args)));
+  return V.readWorkspaceViewList(await handle.list(JSON.stringify(args)));
 }
 
 /** A handle that serves `project.workspace`. */
@@ -1367,7 +1367,7 @@ export async function sccacheStart(
   handle: NativeSccacheStart,
   args: SccacheStartArguments,
 ): Promise<Api.SccacheStatus> {
-  return V.parseSccacheStatus(await handle.start(JSON.stringify(args)));
+  return V.readSccacheStatus(await handle.start(JSON.stringify(args)));
 }
 
 /** A handle that serves `sccache.status`. */
@@ -1385,7 +1385,7 @@ export async function sccacheStatus(
   handle: NativeSccacheStatus,
   args: SccacheStatusArguments,
 ): Promise<Api.SccacheStatus> {
-  return V.parseSccacheStatus(await handle.status(JSON.stringify(args)));
+  return V.readSccacheStatus(await handle.status(JSON.stringify(args)));
 }
 
 /** A handle that serves `sccache.stop`. */
@@ -1400,7 +1400,7 @@ export type SccacheStopArguments = Readonly<Record<string, never>>;
  * Removes the sccache LaunchAgent; the daemon stops.
  */
 export async function sccacheStop(handle: NativeSccacheStop, args: SccacheStopArguments): Promise<Api.EmptyResult> {
-  return V.parseEmptyResult(await handle.stop(JSON.stringify(args)));
+  return V.readEmptyResult(await handle.stop(JSON.stringify(args)));
 }
 
 /** A handle that serves `session.close`. */
@@ -1415,7 +1415,7 @@ export type SessionCloseArguments = Pick<Api.SessionRequest, 'session'>;
  * Closes a shell session.
  */
 export async function sessionClose(handle: NativeSessionClose, args: SessionCloseArguments): Promise<Api.EmptyResult> {
-  return V.parseEmptyResult(await handle.close(JSON.stringify(args)));
+  return V.readEmptyResult(await handle.close(JSON.stringify(args)));
 }
 
 /** A handle that serves `worker.checkpoint`. */
@@ -1433,7 +1433,7 @@ export async function workerCheckpoint(
   handle: NativeWorkerCheckpoint,
   args: WorkerCheckpointArguments,
 ): Promise<Api.CheckpointResult> {
-  return V.parseCheckpointResult(await handle.checkpoint(JSON.stringify(args)));
+  return V.readCheckpointResult(await handle.checkpoint(JSON.stringify(args)));
 }
 
 /** A handle that serves `worker.exec`. */
@@ -1523,7 +1523,7 @@ export async function workerListJobs(
   handle: NativeWorkerListJobs,
   args: WorkerListJobsArguments,
 ): Promise<readonly Api.JobInfo[]> {
-  return V.parseJobInfoList(await handle.listJobs(JSON.stringify(args)));
+  return V.readJobInfoList(await handle.listJobs(JSON.stringify(args)));
 }
 
 /** A handle that serves `worker.push`. */
@@ -1538,7 +1538,7 @@ export type WorkerPushArguments = Pick<Api.PushRequest, 'options'>;
  * Pushes the workspace's branch.
  */
 export async function workerPush(handle: NativeWorkerPush, args: WorkerPushArguments): Promise<Api.PushReport> {
-  return V.parsePushReport(await handle.push(JSON.stringify(args)));
+  return V.readPushReport(await handle.push(JSON.stringify(args)));
 }
 
 /** A handle that serves `worker.shell`. */
@@ -1553,7 +1553,7 @@ export type WorkerShellArguments = Pick<Api.SessionRequest, 'session'>;
  * Opens a shell session.
  */
 export async function workerShell(handle: NativeWorkerShell, args: WorkerShellArguments): Promise<Api.EmptyResult> {
-  return V.parseEmptyResult(await handle.shell(JSON.stringify(args)));
+  return V.readEmptyResult(await handle.shell(JSON.stringify(args)));
 }
 
 /** A handle that serves `worker.stdinChunk`. */
@@ -1572,7 +1572,7 @@ export async function workerStdinChunk(
   args: WorkerStdinChunkArguments,
   bytes?: Uint8Array,
 ): Promise<Api.EmptyResult> {
-  return V.parseEmptyResult(
+  return V.readEmptyResult(
     await handle.stdinChunk(
       JSON.stringify(args),
       bytes === undefined ? undefined : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
@@ -1595,7 +1595,7 @@ export async function workerStdinClose(
   handle: NativeWorkerStdinClose,
   args: WorkerStdinCloseArguments,
 ): Promise<Api.EmptyResult> {
-  return V.parseEmptyResult(await handle.stdinClose(JSON.stringify(args)));
+  return V.readEmptyResult(await handle.stdinClose(JSON.stringify(args)));
 }
 
 /** A handle that serves `workspace.attach`. */
@@ -1613,7 +1613,7 @@ export async function workspaceAttach(
   handle: NativeWorkspaceAttach,
   args: WorkspaceAttachArguments,
 ): Promise<Api.EmptyResult> {
-  return V.parseEmptyResult(await handle.attach(JSON.stringify(args)));
+  return V.readEmptyResult(await handle.attach(JSON.stringify(args)));
 }
 
 /** A handle that serves `workspace.buildVolume`. */
@@ -1631,7 +1631,7 @@ export async function workspaceBuildVolume(
   handle: NativeWorkspaceBuildVolume,
   args: WorkspaceBuildVolumeArguments,
 ): Promise<Api.BuildVolume> {
-  return V.parseBuildVolume(await handle.buildVolume(JSON.stringify(args)));
+  return V.readBuildVolume(await handle.buildVolume(JSON.stringify(args)));
 }
 
 /** A handle that serves `workspace.grants`. */
@@ -1649,7 +1649,7 @@ export async function workspaceGrants(
   handle: NativeWorkspaceGrants,
   args: WorkspaceGrantsArguments,
 ): Promise<Api.GrantSet> {
-  return V.parseGrantSet(await handle.grants(JSON.stringify(args)));
+  return V.readGrantSet(await handle.grants(JSON.stringify(args)));
 }
 
 /** A handle that serves `workspace.info`. */
@@ -1667,7 +1667,7 @@ export async function workspaceInfo(
   handle: NativeWorkspaceInfo,
   args: WorkspaceInfoArguments,
 ): Promise<Api.WorkspaceInfo> {
-  return V.parseWorkspaceInfo(await handle.info(JSON.stringify(args)));
+  return V.readWorkspaceInfo(await handle.info(JSON.stringify(args)));
 }
 
 /** Handle-local methods declared by the core capability. */

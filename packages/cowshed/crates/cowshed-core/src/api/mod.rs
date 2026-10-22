@@ -8,6 +8,7 @@ pub mod journal_tail;
 pub mod operations;
 pub(crate) mod peer_credentials;
 pub mod process;
+pub mod reader;
 pub mod resources;
 pub mod server;
 pub mod tree_holder;

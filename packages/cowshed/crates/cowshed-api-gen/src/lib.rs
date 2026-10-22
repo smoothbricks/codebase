@@ -4,6 +4,7 @@ pub mod errors;
 pub mod ir;
 pub mod napi;
 pub mod operations;
+pub mod reader;
 pub mod records;
 pub mod typescript;
 
@@ -281,6 +282,8 @@ pub fn generate(project: &Path) -> Result<Vec<GeneratedFile>, String> {
         "./api.generated.js",
     )?;
     let projection = napi::emit(&operations, &api, &capabilities)?;
+    let readers = reader::typescript(&api, &projection.reads)?;
+    let reader_rust = reader::emit(&operations, &api)?;
     let declaration_ir = ir_types("./declaration-ir.generated.js")?;
     let cli = project.join("crates/cowshed-cli/src/args.rs");
     let parity = cli_parity::check(&read_source(&cli)?, &operations, &api)?;
@@ -291,7 +294,11 @@ pub fn generate(project: &Path) -> Result<Vec<GeneratedFile>, String> {
         },
         GeneratedFile {
             path: project.join("src/validators.generated.ts"),
-            contents: output.validators,
+            contents: output.validators + &readers,
+        },
+        GeneratedFile {
+            path: core.join("api/reader.generated.rs"),
+            contents: reader_rust,
         },
         GeneratedFile {
             path: core.join("api/served.generated.rs"),

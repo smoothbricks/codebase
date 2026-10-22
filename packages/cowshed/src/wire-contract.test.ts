@@ -34,6 +34,40 @@ interface SeamType<T> {
   readonly parseMany?: (json: string) => readonly T[];
 }
 
+/** A peer's result: its document also has the generated reader (07_api.md, "Reader projection"). */
+interface ResultSeam<T> extends SeamType<T> {
+  readonly readOne: (json: string) => T;
+  /** Present only where a peer answers the array (`listJobs`). */
+  readonly readMany?: (json: string) => readonly T[];
+}
+
+/**
+ * `value` once for every non-empty object in it, at any depth, with a member `lingering` added to
+ * that object alone, holding a copy of one of its own values. In a record that member is one a
+ * newer peer wrote and this build does not declare; in a map (keyed by data) it is one more valid
+ * entry. An empty object has no value to copy, so its kind cannot be told by its value: none is
+ * widened.
+ */
+function widenings(value: unknown): readonly unknown[] {
+  if (Array.isArray(value)) {
+    return value.flatMap((element, index) =>
+      widenings(element).map((wider) => value.map((entry, position) => (position === index ? wider : entry))),
+    );
+  }
+  if (typeof value !== 'object' || value === null) {
+    return [];
+  }
+  const members = Object.entries(value);
+  const first = members[0];
+  if (first === undefined) {
+    return [];
+  }
+  return [
+    { ...value, lingering: first[1] },
+    ...members.flatMap(([key, member]) => widenings(member).map((wider) => ({ ...value, [key]: wider }))),
+  ];
+}
+
 /** The corpus case name the Rust side uses for the array document of a listing export. */
 const LIST_CASE = 'list';
 
@@ -43,24 +77,67 @@ const seamTypes = {
     parseOne: validators.parseJobInfo,
     assertMany: validators.assertJobInfoList,
     parseMany: validators.parseJobInfoList,
+    readOne: validators.readJobInfo,
+    readMany: validators.readJobInfoList,
   },
-  JobProcessTree: { assertOne: validators.assertJobProcessTree, parseOne: validators.parseJobProcessTree },
-  JobProcessEvent: { assertOne: validators.assertJobProcessEvent, parseOne: validators.parseJobProcessEvent },
+  JobProcessTree: {
+    assertOne: validators.assertJobProcessTree,
+    parseOne: validators.parseJobProcessTree,
+    readOne: validators.readJobProcessTree,
+  },
+  JobProcessEvent: {
+    assertOne: validators.assertJobProcessEvent,
+    parseOne: validators.parseJobProcessEvent,
+    readOne: validators.readJobProcessEvent,
+  },
   WorkspaceInfo: {
     assertOne: validators.assertWorkspaceInfo,
     parseOne: validators.parseWorkspaceInfo,
     assertMany: validators.assertWorkspaceInfoList,
     parseMany: validators.parseWorkspaceInfoList,
+    readOne: validators.readWorkspaceInfo,
   },
-  GrantSet: { assertOne: validators.assertGrantSet, parseOne: validators.parseGrantSet },
-  LandReport: { assertOne: validators.assertLandReport, parseOne: validators.parseLandReport },
-  RebaseReport: { assertOne: validators.assertRebaseReport, parseOne: validators.parseRebaseReport },
-  PushReport: { assertOne: validators.assertPushReport, parseOne: validators.parsePushReport },
-  GcReport: { assertOne: validators.assertGcReport, parseOne: validators.parseGcReport },
-  DoctorReport: { assertOne: validators.assertDoctorReport, parseOne: validators.parseDoctorReport },
-  RemoveReport: { assertOne: validators.assertRemoveReport, parseOne: validators.parseRemoveReport },
-  ResizeResult: { assertOne: validators.assertResizeResult, parseOne: validators.parseResizeResult },
-} satisfies Record<string, SeamType<unknown>>;
+  GrantSet: {
+    assertOne: validators.assertGrantSet,
+    parseOne: validators.parseGrantSet,
+    readOne: validators.readGrantSet,
+  },
+  LandReport: {
+    assertOne: validators.assertLandReport,
+    parseOne: validators.parseLandReport,
+    readOne: validators.readLandReport,
+  },
+  RebaseReport: {
+    assertOne: validators.assertRebaseReport,
+    parseOne: validators.parseRebaseReport,
+    readOne: validators.readRebaseReport,
+  },
+  PushReport: {
+    assertOne: validators.assertPushReport,
+    parseOne: validators.parsePushReport,
+    readOne: validators.readPushReport,
+  },
+  GcReport: {
+    assertOne: validators.assertGcReport,
+    parseOne: validators.parseGcReport,
+    readOne: validators.readGcReport,
+  },
+  DoctorReport: {
+    assertOne: validators.assertDoctorReport,
+    parseOne: validators.parseDoctorReport,
+    readOne: validators.readDoctorReport,
+  },
+  RemoveReport: {
+    assertOne: validators.assertRemoveReport,
+    parseOne: validators.parseRemoveReport,
+    readOne: validators.readRemoveReport,
+  },
+  ResizeResult: {
+    assertOne: validators.assertResizeResult,
+    parseOne: validators.parseResizeResult,
+    readOne: validators.readResizeResult,
+  },
+} satisfies Record<string, ResultSeam<unknown>>;
 
 /**
  * The corpus is a build artifact of the Rust side, so it is validated as untrusted input rather
@@ -100,7 +177,7 @@ describe('napi wire contract', () => {
     expect(Object.keys(corpus).sort()).toEqual(Object.keys(seamTypes).sort());
   });
 
-  for (const [name, seam] of Object.entries<SeamType<unknown>>(seamTypes)) {
+  for (const [name, seam] of Object.entries<ResultSeam<unknown>>(seamTypes)) {
     describe(name, () => {
       const cases = corpus[name] ?? {};
 
@@ -130,9 +207,62 @@ describe('napi wire contract', () => {
             expect(() => parseValue(JSON.stringify(wider))).toThrow();
           }
         });
+
+        it(`reads a newer peer's ${caseName} document as the declared one at every depth`, () => {
+          // Each record through its reader, and a listing through its own where a peer answers one.
+          const read = caseName === LIST_CASE ? seam.readMany : seam.readOne;
+          const parse = caseName === LIST_CASE ? seam.parseMany : seam.parseOne;
+          const documents: readonly unknown[] =
+            caseName === LIST_CASE && Array.isArray(document) ? document : [document];
+          const cases: ReadonlyArray<readonly [unknown, (json: string) => unknown, (json: string) => unknown]> = [
+            ...documents.map((value) => [value, seam.readOne, seam.parseOne] as const),
+            ...(read === undefined || parse === undefined || read === seam.readOne
+              ? []
+              : [[document, read, parse] as const]),
+          ];
+          let projected = 0;
+          for (const [value, readValue, parseValue] of cases) {
+            // Each seam is a record, so its root takes an undeclared member even when it is empty.
+            const root =
+              typeof value === 'object' && value !== null && !Array.isArray(value)
+                ? [{ ...value, lingering: true }]
+                : [];
+            for (const newer of [...root, ...widenings(value)]) {
+              const json = JSON.stringify(newer);
+              let strict: unknown;
+              try {
+                strict = parseValue(json);
+              } catch {
+                // A member no declaration names: the reader drops it and reads the declared document.
+                expect(readValue(json)).toEqual(value);
+                projected += 1;
+                continue;
+              }
+              // A map's data key: one more entry both readers keep.
+              expect(readValue(json)).toEqual(strict);
+            }
+          }
+          expect(projected).toBeGreaterThan(0);
+        });
       }
     });
   }
+
+  it('projects no unknown variant, no missing member and no request', () => {
+    const job = seamTypes.JobInfo.assertOne(corpus.JobInfo?.exited);
+    expect(() => validators.readJobInfo(JSON.stringify({ ...job, state: 'hibernating' }))).toThrow();
+    const { jobId: _jobId, ...withoutJob } = job;
+    expect(() => validators.readJobInfo(JSON.stringify(withoutJob))).toThrow();
+
+    const request = {
+      repoId: 'smoothbricks/codebase',
+      workspace: 'raven',
+      workspaceIncarnation: '0198f2c0b7e34dc795f17b238b331c80',
+      jobId: 3,
+    };
+    expect(validators.parseJobRequest(JSON.stringify(request))).toEqual(request);
+    expect(() => validators.parseJobRequest(JSON.stringify({ ...request, lingering: true }))).toThrow();
+  });
 
   it('pins process observation identity, omitted evidence, and non-empty changes', () => {
     const tree = seamTypes.JobProcessTree.assertOne(corpus.JobProcessTree?.unread);

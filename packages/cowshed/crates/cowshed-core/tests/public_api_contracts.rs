@@ -2415,3 +2415,84 @@ fn a_host_gate_request_runs_outside_every_session() {
     assert_eq!(error.code, ErrorCode::Usage);
     assert!(error.message.contains("session"), "{}", error.message);
 }
+
+/// 07_api.md, "Reader projection": a newer controller's result carries members this build does not
+/// declare, at the top and inside tagged unions, newtype arms, wire proxies and lists. The client
+/// reads the declared projection; its own strict decode, a request and an unknown variant refuse.
+#[test]
+fn a_peer_result_reads_as_its_declared_projection_and_a_request_stays_strict() {
+    use cowshed_core::api::operations::{
+        JobProcessEvents, JobStatus, OperationRequest, WorkerListJobs, decode_result, read_result,
+    };
+
+    let info = finished_job(Some(WorkspacePath::new("packages/app").unwrap()));
+    let mut newer = serde_json::to_value(&info).expect("job JSON");
+    newer["futureField"] = json!({"nested": true});
+    newer["argv"][0]["futureKey"] = json!(1);
+    newer["stdout"]["futureKey"] = json!(1);
+    newer["stdout"]["storage"]["futureKey"] = json!(1);
+    newer["stdout"]["storage"]["artifact"]["futureKey"] = json!(1);
+    newer["exit"]["futureKey"] = json!(1);
+    newer["resources"]["leaf"]["futureKey"] = json!(1);
+    newer["resources"]["accounting"]["reconciliation"]["coverage"]["reason"]["futureKey"] =
+        json!(1);
+
+    let strict =
+        decode_result::<JobStatus>(newer.clone()).expect_err("this build's own decode is strict");
+    assert!(
+        strict.message.contains("unknown field `future"),
+        "{strict:?}"
+    );
+    assert_eq!(
+        read_result::<JobStatus>(newer.clone()).expect("projected"),
+        info
+    );
+    assert_eq!(
+        read_result::<WorkerListJobs>(json!([newer.clone()])).expect("projected list"),
+        vec![info.clone()]
+    );
+
+    let mut unknown_variant = newer.clone();
+    unknown_variant["state"] = json!("hibernating");
+    let refused =
+        read_result::<JobStatus>(unknown_variant).expect_err("an unknown variant is not projected");
+    assert!(
+        refused.message.contains("unknown variant `hibernating`"),
+        "{refused:?}"
+    );
+    let mut missing = newer;
+    missing.as_object_mut().unwrap().remove("jobId");
+    let refused = read_result::<JobStatus>(missing).expect_err("a missing field is not projected");
+    assert!(
+        refused.message.contains("missing field `jobId`"),
+        "{refused:?}"
+    );
+
+    // An internally tagged newtype arm holding an untagged union keeps its tag and its own arm.
+    let change = JobProcessEvent::Changed(JobProcessDelta::Blocker {
+        index: 1,
+        blocked_on: BlockerChange::Clear,
+    });
+    let mut newer_change = serde_json::to_value(&change).expect("event JSON");
+    newer_change["futureKey"] = json!(1);
+    assert_eq!(
+        read_result::<JobProcessEvents>(newer_change).expect("projected event"),
+        change
+    );
+
+    let request = json!({
+        "repoId": "acme/widget",
+        "workspace": "raven",
+        "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+        "jobId": 7,
+    });
+    assert!(OperationRequest::decode("job.status", &request).is_ok());
+    let mut newer_request = request;
+    newer_request["futureField"] = json!(1);
+    let refused =
+        OperationRequest::decode("job.status", &newer_request).expect_err("a request is strict");
+    assert!(
+        refused.message.contains("unknown field `futureField`"),
+        "{refused:?}"
+    );
+}

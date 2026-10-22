@@ -27,6 +27,7 @@ use super::dto::{
 };
 use super::held_lock::LockObservation;
 use super::process::{JobProcessEvent, JobProcessTree, JobSubtreeHandle, JobSubtreeRetirement};
+use super::reader::{Projected, project};
 use super::resources::{JobResourceSample, SampleInterval};
 use super::tree_holder::TreeHolder;
 use crate::build_volume::BuildStateRefresh;
@@ -101,7 +102,8 @@ pub fn encode_request<O: Operation>(request: &O::Request) -> Result<Box<RawValue
     })
 }
 
-/// Decodes a call's JSON result as the operation's declared result.
+/// Decodes a JSON result this build produced, strictly, as the operation's declared result: the
+/// controller routing a call to itself. A peer's result is read with [`read_result`].
 pub fn decode_result<O: Operation>(value: Value) -> Result<O::Result> {
     serde_json::from_value(value).map_err(|error| {
         CowshedError::new(
@@ -113,6 +115,15 @@ pub fn decode_result<O: Operation>(value: Value) -> Result<O::Result> {
             "cowshed doctor --json",
         )
     })
+}
+
+/// Reads a peer controller's JSON result or stream event as the operation's declared result
+/// (07_api.md, "Reader projection"): every object member the result's declaration does not name
+/// is dropped, at every depth, and the strict decode then certifies the projection, so a missing
+/// field or an unknown variant still refuses by name.
+pub fn read_result<O: Operation>(mut value: Value) -> Result<O::Result> {
+    project(&mut value, <O::Result as Projected>::READER);
+    decode_result::<O>(value)
 }
 
 /// Encodes an operation's declared result as its call's JSON result.
@@ -172,7 +183,7 @@ macro_rules! operations {
             const LANE: Lane;
             /// Plain data, so any task may carry a call across its awaits.
             type Request: Serialize + DeserializeOwned + Send + Sync + 'static;
-            type Result: Serialize + DeserializeOwned + Send + Sync + 'static;
+            type Result: Serialize + DeserializeOwned + Projected + Send + Sync + 'static;
 
             /// The decoded form the controller routes.
             fn request(request: Self::Request) -> OperationRequest;
