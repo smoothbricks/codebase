@@ -231,7 +231,7 @@ async function nativeRamVolume(): Promise<void> {
   // mount, unmount or place the volume are recorded in the order provisioning runs them.
   const delegate = createHostCommands();
   const host: HostCommands = {
-    async run(file, args, deadlineMs) {
+    async run(file, args, deadlineMs, binding) {
       const startedAt = Date.now();
       const starting = JSON.stringify({
         phase: 'native-host-command-start',
@@ -244,7 +244,7 @@ async function nativeRamVolume(): Promise<void> {
       process.stderr.write(`${starting}\n`);
       trace.log.info(starting);
       const delegateStartedAt = Date.now();
-      const output = await delegate.run(file, args, deadlineMs);
+      const output = await delegate.run(file, args, deadlineMs, binding);
       const endedAt = Date.now();
       const finished = JSON.stringify({
         phase: 'native-host-command-end',
@@ -267,7 +267,7 @@ async function nativeRamVolume(): Promise<void> {
   const attachedBelow: { image: string | null; failInventory: boolean } = { image: null, failInventory: false };
   const provisioning: string[] = [];
   const commands: HostCommands = {
-    async run(file, args) {
+    async run(file, args, deadlineMs, binding) {
       const step = stepOf(paths, file, args);
       if (step !== null) {
         provisioning.push(step);
@@ -280,7 +280,7 @@ async function nativeRamVolume(): Promise<void> {
         attachedBelow.failInventory = false;
         return { status: 1, stdout: '', stderr: 'injected holder inventory failure' };
       }
-      const output = await host.run(file, args);
+      const output = await host.run(file, args, deadlineMs, binding);
       return file === '/usr/sbin/ioreg' && attachedBelow.image !== null
         ? {
             ...output,
@@ -544,7 +544,7 @@ async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
     const host = createHostCommands();
     const calls: { file: string; args: readonly string[]; output: CommandOutput }[] = [];
     const commands: HostCommands = {
-      async run(file, args, deadlineMs) {
+      async run(file, args, deadlineMs, binding) {
         const record =
           stepOf(paths, file, args) !== null ||
           (file === '/usr/bin/hdiutil' && ['attach', 'detach'].includes(args[0] ?? '')) ||
@@ -556,7 +556,7 @@ async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
         const output =
           stepOf(paths, file, args) === injected
             ? { status: 1, stdout: '', stderr: 'injected' }
-            : await host.run(file, args, deadlineMs);
+            : await host.run(file, args, deadlineMs, binding);
         if (record) {
           calls.push({ file, args, output });
         }

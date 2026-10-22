@@ -23,6 +23,7 @@ import { awaitExit, ownedSocketDirectory, pidsWorkingIn, processTable, terminate
 import {
   type AttachedRamDisk,
   COWSHED_EXECUTABLE_ENV,
+  type CommandOutput,
   createHostCommands,
   describeRamTempError,
   detachRamDisk,
@@ -490,74 +491,72 @@ describe('detaching a RAM disk an inventory found', () => {
     mountpoints: [],
   };
 
-  /** Detach `disk` with `registry` as the fresh read, recording the pin, every host command and the unpin in order. */
-  async function detachAgainst(registry: string) {
-    const calls: string[] = [];
+  it('binds the detach to the registry entry the inventory read, never forced', () => {
+    expect(diskCommand('/usr/bin/hdiutil', ['detach', '/dev/disk540'], 300, { registryEntry: '0x10005557b' })).toEqual({
+      args: ['disk-command', 'hdiutil', '--registry-entry', '0x10005557b', '--', 'detach', '/dev/disk540'],
+      lifetime: 'stop-wait',
+    });
+  });
+
+  /** Detach `disk` with `output` as the host's answer, recording every call. */
+  async function detachAnswered(output: CommandOutput) {
+    const calls: unknown[] = [];
     const result = await detachRamDisk(
       {
-        async run(file, args) {
-          calls.push([file, ...args].join(' '));
-          return { status: 0, stdout: file === '/usr/sbin/ioreg' ? registry : '', stderr: '' };
+        async run(file, args, deadlineMs, binding) {
+          calls.push({ file, args, deadlineMs, binding });
+          return output;
         },
       },
       disk,
       'hdiutil detach',
-      undefined,
-      async (raw) => {
-        calls.push(`pin ${raw}`);
-        return {
-          async close() {
-            calls.push(`unpin ${raw}`);
-          },
-        };
-      },
     );
     return { result, calls };
   }
 
-  it('detaches the disk while its registry entry still holds its name, size and owner, unpinned first', async () => {
-    const { result, calls } = await detachAgainst(capturedRegistry());
+  it('issues one bound detach and reports it detached', async () => {
+    const { result, calls } = await detachAnswered({ status: 0, stdout: '"disk540" ejected.\n', stderr: '' });
     expect(result).toEqual({ ok: true, value: undefined });
     expect(calls).toEqual([
-      'pin /dev/rdisk540',
-      '/usr/sbin/ioreg -r -c IOHDIXHDDriveOutKernel -l -w0',
-      'unpin /dev/rdisk540',
-      '/usr/bin/hdiutil detach /dev/disk540',
+      {
+        file: '/usr/bin/hdiutil',
+        args: ['detach', '/dev/disk540'],
+        deadlineMs: undefined,
+        binding: { registryEntry: '0x10005557b' },
+      },
     ]);
   });
 
-  it('detaches nothing once the entry is gone, has another ID, or holds another name, size or owner', async () => {
-    const registry = capturedRegistry();
-    const cases = [
-      {
-        current: registry.slice(0, registry.indexOf('+-o IOHDIXHDDriveOutKernel@1b99')),
-        change: 'its registry entry 0x10005557b is gone',
+  it("names cowshed's refusal as the entry no longer naming the disk, and tries nothing more", async () => {
+    const stderr =
+      'cowshed: refused executable "/usr/bin/hdiutil", argv ["detach", "/dev/disk540"]: registry entry 0x10005557b is now /dev/disk541, not /dev/disk540; nothing was detached\n';
+    const { result, calls } = await detachAnswered({ status: 103, stdout: '', stderr });
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        kind: 'provision-failed',
+        step: 'hdiutil detach',
+        detail: `/dev/disk540 not detached: its registry entry 0x10005557b no longer names it (exit 103: ${stderr.trim()})`,
       },
-      {
-        current: registry.replace('id 0x10005557b,', 'id 0x10005557c,'),
-        change: 'its registry entry 0x10005557b is gone',
+    });
+    expect(calls).toHaveLength(1);
+  });
+
+  it("reports any other failure as hdiutil's own", async () => {
+    const { result, calls } = await detachAnswered({
+      status: 16,
+      stdout: '',
+      stderr: 'hdiutil: detach failed - Resource busy',
+    });
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        kind: 'provision-failed',
+        step: 'hdiutil detach',
+        detail: 'exit 16: hdiutil: detach failed - Resource busy',
       },
-      {
-        current: registry.replace('"BSD Name" = "disk540"', '"BSD Name" = "disk541"'),
-        change: 'its registry entry 0x10005557b now has whole disk /dev/disk541',
-      },
-      {
-        current: registry.replace('"image-path" = <"ram://131072">', '"image-path" = <"ram://131073">'),
-        change: 'its registry entry 0x10005557b now has ram://131073',
-      },
-    ];
-    for (const { current, change } of cases) {
-      const { result, calls } = await detachAgainst(current);
-      expect(result).toEqual({
-        ok: false,
-        error: { kind: 'provision-failed', step: 'hdiutil detach', detail: `/dev/disk540 not detached: ${change}` },
-      });
-      expect(calls).toEqual([
-        'pin /dev/rdisk540',
-        '/usr/sbin/ioreg -r -c IOHDIXHDDriveOutKernel -l -w0',
-        'unpin /dev/rdisk540',
-      ]);
-    }
+    });
+    expect(calls).toHaveLength(1);
   });
 });
 

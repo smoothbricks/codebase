@@ -1661,10 +1661,12 @@ with the last lease, in the I/O Registry (an `IOHDIXHDDriveOutKernel` entry per 
 and their mounts in the mount table, never in `hdiutil info`: measured 2026-10-22, `hdiutil info` left an attached RAM
 disk out of 2 of 10 listings while other images attached and detached, and a disk left out would read as absent. A
 registry read that does not parse whole fails the task instead. A BSD name passes to the next disk once its disk goes,
-so each detach holds the disk's raw device open, reads the registry again, and goes ahead only while the disk's registry
-entry ID is still registered with the same whole-disk name, size and owner; any change is named and nothing is detached.
-The descriptor closes just before `hdiutil detach`, which leaves only the moment between that close and hdiutil's own
-open of the name. Only a disk the task has just attached itself is detached with `-force`.
+so every detach of a disk the task did not just attach is cowshed's registry-bound detach
+(`cowshed disk-command hdiutil --registry-entry <id> -- detach <device>`, `specs/cowshed/06_cli.md`), which detaches
+only while the inventoried entry still names the device; a refusal is named and never retried with `-force`. Only a disk
+the task has just attached itself is detached with `-force`. The option is new: a cowshed that predates it answers
+`unknown flag` (exit 2), the release fails naming that output and the volume stays attached, so a host installs cowshed
+from the same main as this plugin before running it.
 
 Every `hdiutil` and `diskutil` execution goes through `cowshed disk-command`, including host-test inventory and cleanup.
 The cowshed is the installed one on `PATH`, which must provide this command, unless `COWSHED_EXECUTABLE` names another.

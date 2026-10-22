@@ -205,8 +205,16 @@ export interface CommandOutput {
 }
 
 /** The host programs the volume lifecycle runs. A seam so the state machine is testable without DiskArbitration. */
+/**
+ * Binds an `hdiutil detach <device>` to the I/O Registry entry the caller inventoried the device as: cowshed reads the
+ * entry again inside the disk admission and detaches only while it still has the device as its whole disk.
+ */
+export interface DetachBinding {
+  readonly registryEntry: string;
+}
+
 export interface HostCommands {
-  run(file: string, args: readonly string[], deadlineMs?: number): Promise<CommandOutput>;
+  run(file: string, args: readonly string[], deadlineMs?: number, binding?: DetachBinding): Promise<CommandOutput>;
 }
 
 /**
@@ -2033,74 +2041,38 @@ export function ramDisksIn(registry: string, table: string): Result<RamDisk[], s
   return { ok: true, value: disks };
 }
 
-/** A descriptor held open on a device: while it is open, no other disk takes the device's name. */
-interface DevicePin {
-  close(): Promise<void>;
-}
-
-/** Hold the raw device open read-only, as cowshed pins a volume's device. */
-async function pinDevice(raw: string): Promise<DevicePin> {
-  return await open(raw, constants.O_RDONLY);
-}
-
 /**
- * Why `disk` may no longer be detached by its name, as a fresh registry read shows the RAM disks; null when its entry is
- * still registered with the same whole disk, image size and owner. A BSD name is recycled once its disk goes, so only
- * the entry ID binds the name to the disk the inventory found.
- */
-export function ramDiskChange(disk: AttachedRamDisk, current: readonly RamDisk[]): string | null {
-  const now = current.find((candidate) => candidate.entry === disk.entry);
-  if (now === undefined) {
-    return `its registry entry ${disk.entry} is gone`;
-  }
-  const changes = [
-    now.physical === disk.physical ? null : `whole disk ${now.physical ?? 'unpublished'}`,
-    now.sectors === disk.sectors ? null : `ram://${now.sectors}`,
-    now.uid === disk.uid ? null : `owner-uid ${now.uid}`,
-  ].filter((change): change is string => change !== null);
-  return changes.length === 0 ? null : `its registry entry ${disk.entry} now has ${changes.join(', ')}`;
-}
-
-/**
- * Detach a RAM disk an inventory found, by its whole-disk name, only once a fresh registry read shows that the name still
- * belongs to the inventory's entry, with the same size and owner; otherwise detach nothing and name the change. The raw
- * device is held open across that read, so the name cannot pass to another disk meanwhile, and closed just before
- * `hdiutil detach`, which would find the disk busy. What remains is the window between that close and hdiutil's own
- * open of the name: a third party that detaches this disk then, and a new disk that takes its name, would be detached in
- * its place. Never `-force`: this process did not just attach this disk.
+ * Detach a RAM disk an inventory found, by its whole-disk name, bound to the registry entry the inventory read it as.
+ * A BSD name passes to the next disk once its disk goes, and a detach can queue for the disk admission meanwhile, so
+ * `cowshed disk-command` reads the entry again inside the admission, immediately before it spawns `hdiutil`, and
+ * refuses, detaching nothing, unless the entry still names this whole disk (specs/cowshed/06_cli.md, `--registry-entry`).
+ * That refusal is this detach's failure, named, and never retried with `-force`: this process did not just attach the
+ * disk. The window that remains is cowshed's, from its read to hdiutil's own open of the name.
  */
 export async function detachRamDisk(
   commands: HostCommands,
   disk: AttachedRamDisk,
   step: string,
   deadlineMs?: number,
-  pin: (raw: string) => Promise<DevicePin> = pinDevice,
 ): Promise<Result<void, ProvisionFailed>> {
-  const raw = disk.physical.replace(/^\/dev\/disk/, '/dev/rdisk');
-  let held: DevicePin;
-  try {
-    held = await pin(raw);
-  } catch (error) {
-    return failed(step, `${disk.physical} not detached: ${raw} cannot be held open (${errorText(error)})`);
+  const detached = await commands.run('/usr/bin/hdiutil', ['detach', disk.physical], deadlineMs, {
+    registryEntry: disk.entry,
+  });
+  if (detached.status === 0) {
+    return { ok: true, value: undefined };
   }
-  let change: string | null;
-  try {
-    const registry = await commands.run('/usr/sbin/ioreg', ['-r', '-c', 'IOHDIXHDDriveOutKernel', '-l', '-w0']);
-    const current = registry.status === 0 ? ramDisksIn(registry.stdout, '') : null;
-    change =
-      current === null
-        ? `the registry could not be read again (${commandText(registry)})`
-        : current.ok
-          ? ramDiskChange(disk, current.value)
-          : `the registry could not be read again (${current.error})`;
-  } finally {
-    await held.close();
-  }
-  if (change !== null) {
-    return failed(step, `${disk.physical} not detached: ${change}`);
-  }
-  const detached = await commands.run('/usr/bin/hdiutil', ['detach', disk.physical], deadlineMs);
-  return detached.status === 0 ? { ok: true, value: undefined } : failed(step, commandText(detached));
+  // A cowshed wrapper exit (100–106) whose stderr says it refused: the entry no longer names the disk.
+  const refused =
+    detached.status >= 100 &&
+    detached.status <= 106 &&
+    detached.stderr.includes('refused') &&
+    detached.stderr.includes('nothing was detached');
+  return failed(
+    step,
+    refused
+      ? `${disk.physical} not detached: its registry entry ${disk.entry} no longer names it (${commandText(detached)})`
+      : commandText(detached),
+  );
 }
 
 /**
@@ -2124,6 +2096,7 @@ export function diskCommand(
   file: string,
   args: readonly string[],
   deadlineMs: number,
+  binding?: DetachBinding,
 ): { args: string[]; lifetime: 'stop-wait' | 'facade-owned' } | null {
   const program = basename(file);
   if (program !== 'hdiutil' && program !== 'diskutil') {
@@ -2131,9 +2104,10 @@ export function diskCommand(
   }
   // Match SystemCommandRunner's protected-image policy, including its case-sensitive verbs.
   const image = program === 'hdiutil' || args[0] === 'image' || args[0] === 'eject';
+  const bound = binding === undefined ? [] : ['--registry-entry', binding.registryEntry];
   return {
     args: image
-      ? ['disk-command', program, '--', ...args]
+      ? ['disk-command', program, ...bound, '--', ...args]
       : ['disk-command', program, '--deadline-ms', String(deadlineMs), '--', ...args],
     lifetime: image ? 'stop-wait' : 'facade-owned',
   };
@@ -2174,9 +2148,9 @@ export function createHostCommands(
   cowshed = process.env[COWSHED_EXECUTABLE_ENV] ?? 'cowshed',
 ): HostCommands {
   return {
-    async run(file, args, callDeadlineMs) {
+    async run(file, args, callDeadlineMs, binding) {
       const deadlineMs = callDeadlineMs ?? defaultDeadlineMs;
-      const disk = diskCommand(file, args, deadlineMs);
+      const disk = diskCommand(file, args, deadlineMs, binding);
       if (disk !== null) {
         return runBounded(cowshed, disk.args, deadlineMs, disk.lifetime);
       }
