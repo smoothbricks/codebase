@@ -494,18 +494,14 @@ impl Anchors {
     /// Make durable, without freeing it, the entry an earlier attempt committed under this
     /// release's name: `false` when none is there. That attempt may have died, or failed a sync,
     /// between its rename and the rename's syncs, and its caller removes the owner record once
-    /// this answers. An entry another process has locked is that process's release, which syncs
-    /// the same directories before its first cut, so it is not waited for.
+    /// this answers. So this syncs those directories itself, whoever holds the entry: another
+    /// process's lock says it is releasing the entry, not that the rename is durable yet. Syncing
+    /// a directory cuts nothing, so it needs no lock and waits for no releaser.
     fn confirm_left(&self) -> io::Result<bool> {
-        let file = match open_entry(&self.journal, &self.entry_name)? {
+        match open_entry(&self.journal, &self.entry_name)? {
             Entry::Absent => return Ok(false),
             Entry::NotImage => return Err(not_image(self.entry_name.to_string_lossy())),
-            Entry::Image(file) => file,
-        };
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(fs::TryLockError::WouldBlock) => return Ok(true),
-            Err(fs::TryLockError::Error(error)) => return Err(error),
+            Entry::Image(_) => {}
         }
         sync_held_directory(&self.journal)?;
         sync_held_directory(&self.image_directory)?;
@@ -1111,6 +1107,26 @@ mod tests {
             "the journal, the image's directory and the journal's parent: {syncs:?}"
         );
         assert_eq!(fs::read(&entry).expect("the entry"), vec![9_u8; 64 * 1024]);
+
+        // Another releaser holding the entry, paused before its own syncs, is no proof the rename
+        // is durable: the retry still makes it so before it answers, and cuts nothing.
+        fs::remove_file(&entry).expect("drop the entry");
+        fs::write(&image, vec![9_u8; 64 * 1024]).expect("image");
+        fs::rename(&image, &entry).expect("a rename nobody synced");
+        let releaser = fs::File::open(&entry).expect("the other releaser's descriptor");
+        releaser.lock().expect("the other releaser holds the entry");
+        take_syncs();
+        assert!(
+            release_owned(&image, &entry, Reclaim::Journaled)
+                .expect("the retry beside a held entry")
+        );
+        let syncs = take_syncs();
+        assert_eq!(
+            syncs.full, 3,
+            "a held entry's rename is made durable before the retry answers: {syncs:?}"
+        );
+        assert_eq!(fs::read(&entry).expect("the entry"), vec![9_u8; 64 * 1024]);
+        drop(releaser);
         fs::remove_dir_all(&root).expect("cleanup");
     }
 }
