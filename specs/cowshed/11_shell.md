@@ -26,15 +26,17 @@ can replace the parent of later commands. A workspace with no `.envrc` above the
 activation and hold the sandbox environment itself; its argv jobs keep one-shot spawns, its script jobs run in those
 hosts. Cowshed has no other shell backend: a devenv project activates through `use devenv` in its own `.envrc`.
 
-**A host does not outlive its mount.** A host runs its program from the workspace mount, so once that mount is gone (a
-forced unmount, DiskArbitration restarting) the next page-in of code it has not yet run fails with SIGBUS. The host
-restores SIGBUS to its default disposition before it serves, so that fault ends it. The Rust runtime's stack-overflow
-handler would otherwise catch the signal, and its own code lies on the same unreadable pages, so the fault repeats
-forever: on 2026-10-22, after DiskArbitration restarted and dropped the shed mounts, 37 of 62 hosts spun in R state with
-high system time (host load 48) until killed, and a host woken by its controller's end of stream after a forced unmount
-reproduces it. An idle host keeps blocking in its control read while its mount is gone and dies at its first page-in
-after that. No job waits on a dropped host, so its supervisor writes how it ended to its log unless it exited 0, naming
-a SIGBUS as a page the host's program could not be given.
+**A host never spins once its mount is gone.** A host runs its program from the workspace mount, so once that mount is
+gone (a forced unmount, DiskArbitration restarting) the next page-in of code it has not yet run fails with SIGBUS. The
+host restores SIGBUS to its default disposition before it serves, so that fault ends it. The Rust runtime's
+stack-overflow handler would otherwise catch the signal, and its own code lies on the same unreadable pages, so the
+fault repeats forever: on 2026-10-22, after DiskArbitration restarted and dropped the shed mounts, 37 of 62 hosts spun
+in R state with high system time (host load 48) until killed, and a host woken by its controller's end of stream after a
+forced unmount reproduces it. So a host whose mount is gone ends one of three ways, never by spinning: an idle host
+keeps blocking in its control read; a host that runs only code already resident exits as it would have; any other dies
+by SIGBUS at its first page-in after the mount went. No job waits on a dropped host, so its supervisor writes how it
+ended to its log unless it exited 0, naming a SIGBUS as a page the host's program could not be given, and says so too
+when it cannot collect the host at all.
 
 **Script jobs.** Besides a byte-exact argv, a job can be a script: bash-compatible shell text as a template of literal
 `parts` and `values` (`ExecCommand::Script`, 07_api.md). At admission the supervisor binds each value to a shell

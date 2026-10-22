@@ -743,33 +743,38 @@ pub(super) struct ExecHost {
 /// its activation's group; one holding a command ends the command's group -- SIGTERM, a grace,
 /// SIGKILL -- reaps it, and exits. The host is not signalled here: a command it holds leads a
 /// group of its own, which only the host can still prove the command's. It is reaped in the
-/// background, through its fence, and any end but an idle host's exit 0 is said in this
-/// supervisor's log, since no job waits on it to say it ([`super::shell_host::DroppedHostEnd`]).
+/// background, through its fence, unless [`ExecHost::end`] already collected it for the job
+/// that saw it fail. Any end but an idle host's exit 0, and any failure to collect it, is said in
+/// this supervisor's log, since no job waits on it to say it
+/// ([`super::shell_host::DroppedHostEnd`]).
 impl Drop for ExecHost {
     fn drop(&mut self) {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            if self.fence.reaped() {
+                return;
+            }
             let fence = Arc::clone(&self.fence);
             runtime.spawn(async move {
                 let pid = fence.birth().pid();
-                match fence
-                    .wait()
-                    .await
-                    .map(|status| process_termination_from_wait(Ok(status)))
-                {
-                    Ok(Ok(exit)) => {
-                        if let Some(end) = dropped_host_end(exit) {
-                            cowshed_os::eprintln!("cowshed: dropped exec host {pid} {end}");
+                match fence.wait().await {
+                    Ok(status) => match process_termination_from_wait(Ok(status)) {
+                        Ok(exit) => {
+                            if let Some(end) = dropped_host_end(exit) {
+                                cowshed_os::eprintln!("cowshed: dropped exec host {pid} {end}");
+                            }
                         }
-                    }
-                    Ok(Err(error)) => {
+                        Err(error) => {
+                            cowshed_os::eprintln!(
+                                "cowshed: dropped exec host {pid}: {}",
+                                error.message
+                            );
+                        }
+                    },
+                    Err(error) => {
                         cowshed_os::eprintln!(
-                            "cowshed: dropped exec host {pid}: {}",
-                            error.message
+                            "cowshed: cannot reap dropped exec host {pid}: {error}"
                         );
                     }
-                    // Not waitable: `end` already reaped it for the job that saw it fail, or
-                    // child exits cannot be subscribed, which every job's own wait reports.
-                    Err(_) => {}
                 }
             });
         }

@@ -295,6 +295,11 @@ impl ChildFence {
         self.collect(&mut fenced).map(drop)
     }
 
+    /// Whether the child has been collected, so nothing remains to wait for.
+    pub(crate) fn reaped(&self) -> bool {
+        self.fenced().hold == Hold::Reaped
+    }
+
     /// Reap the child, inside the fence, if it has exited; `None` while it runs.
     pub(crate) fn try_reap(&self) -> io::Result<Option<std::process::ExitStatus>> {
         let mut fenced = self.fenced();

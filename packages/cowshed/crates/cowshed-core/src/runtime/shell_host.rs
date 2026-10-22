@@ -756,7 +756,7 @@ pub enum DroppedHostEnd {
     /// from the workspace mount ([`SHELL_HOST_DIRECTORY`]) and keeps SIGBUS at its default
     /// disposition, so this is how it ends once that mount is gone from under it: the next code
     /// it runs that is not resident cannot be paged in (11_shell.md, "Exec hosts").
-    PageUnavailable,
+    PageUnavailable { core_dumped: bool },
     /// Any end other than the clean exit an idle host makes at its controller's end of stream.
     Other(ExitStatus),
 }
@@ -767,8 +767,8 @@ pub fn dropped_host_end(exit: ExitStatus) -> Option<DroppedHostEnd> {
         ExitStatus::Exited { code: 0 } => None,
         ExitStatus::Signaled {
             signal: libc::SIGBUS,
-            ..
-        } => Some(DroppedHostEnd::PageUnavailable),
+            core_dumped,
+        } => Some(DroppedHostEnd::PageUnavailable { core_dumped }),
         other => Some(DroppedHostEnd::Other(other)),
     }
 }
@@ -776,9 +776,11 @@ pub fn dropped_host_end(exit: ExitStatus) -> Option<DroppedHostEnd> {
 impl std::fmt::Display for DroppedHostEnd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::PageUnavailable => f.write_str(
-                "died by SIGBUS: a page it touched could not be supplied, as when the workspace \
+            Self::PageUnavailable { core_dumped } => write!(
+                f,
+                "died by SIGBUS{}: a page it touched could not be supplied, as when the workspace \
                  mount its program runs from is gone",
+                if *core_dumped { " (core dumped)" } else { "" }
             ),
             Self::Other(ExitStatus::Exited { code }) => write!(f, "exited {code}"),
             Self::Other(ExitStatus::Signaled {
@@ -811,18 +813,23 @@ mod tests {
     }
 
     proptest! {
-        /// A dropped host's end is recorded unless it is the clean exit; SIGBUS, core flag or
-        /// not, is named as the page the host could not be given; every other end is kept exactly.
+        /// A dropped host's end is recorded unless it is the clean exit; SIGBUS is named as the
+        /// page the host could not be given, with its core flag; every other end is kept exactly.
         #[test]
         fn a_dropped_host_s_end_is_named_unless_it_exited_cleanly(exit in any_exit()) {
             let end = dropped_host_end(exit.clone());
             prop_assert_eq!(end.is_none(), exit == ExitStatus::Exited { code: 0 });
             prop_assert_eq!(
-                end == Some(DroppedHostEnd::PageUnavailable),
+                matches!(end, Some(DroppedHostEnd::PageUnavailable { .. })),
                 matches!(exit, ExitStatus::Signaled { signal: libc::SIGBUS, .. })
             );
-            if let Some(DroppedHostEnd::Other(kept)) = end {
-                prop_assert_eq!(kept, exit);
+            match end {
+                Some(DroppedHostEnd::PageUnavailable { core_dumped }) => prop_assert_eq!(
+                    exit,
+                    ExitStatus::Signaled { signal: libc::SIGBUS, core_dumped }
+                ),
+                Some(DroppedHostEnd::Other(kept)) => prop_assert_eq!(kept, exit),
+                None => {}
             }
         }
     }
