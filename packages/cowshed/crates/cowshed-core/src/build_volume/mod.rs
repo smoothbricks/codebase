@@ -1540,6 +1540,28 @@ mod tests {
         let error = layout.register(&bare, &registration).unwrap_err();
         assert!(error.message.contains("predate their owner"), "{error:?}");
         assert!(layout.read_record_present(&bare).unwrap().is_none());
+
+        // A re-adoption registers under the exclusive claim it already holds: a fresh shared
+        // hold on the same file is refused while that claim lives, and the claim alone keeps
+        // every release out.
+        let claimed = BuildVolumeId::mint();
+        let claim = layout.claim_release(&claimed).unwrap().unwrap();
+        layout.register_claimed(&claim, &registration).unwrap();
+        assert_eq!(
+            layout.read_record(&claimed).unwrap(),
+            registration.registered().clone()
+        );
+        assert!(layout.claim_release(&claimed).unwrap().is_none());
+        assert_eq!(
+            layout.hold_new(&claimed).unwrap_err().kind(),
+            io::ErrorKind::ResourceBusy
+        );
+        layout.register_claimed(&claim, &registration).unwrap();
+        assert!(layout.register_claimed(&claim, &other).is_err());
+        fs::write(layout.image(&claimed), b"registered bytes").unwrap();
+        assert!(layout.register_claimed(&claim, &registration).is_err());
+        drop(claim);
+        assert!(layout.claim_release(&claimed).unwrap().is_some());
         fs::remove_dir_all(&root).unwrap();
     }
 

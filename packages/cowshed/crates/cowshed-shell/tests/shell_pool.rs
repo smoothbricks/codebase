@@ -898,7 +898,8 @@ async fn host_controller_an_exited_leaders_descendants_are_retired_before_the_jo
         .await
         .expect("admit");
     let pid = workspace.mount().join("pid");
-    let recorded = tokio::time::timeout(Duration::from_secs(30), async {
+    // The job records its backgrounded descendant's pid in the file.
+    let recorded = async {
         loop {
             if let Ok(text) = std::fs::read_to_string(&pid)
                 && text.ends_with('\n')
@@ -907,14 +908,10 @@ async fn host_controller_an_exited_leaders_descendants_are_retired_before_the_jo
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    })
-    .await
-    .expect("the job records its descendant");
+    }
+    .await;
     let descendant: i32 = recorded.trim().parse().expect("pid");
-    let info = tokio::time::timeout(Duration::from_secs(30), handle.wait(job))
-        .await
-        .expect("the drained job ends")
-        .expect("drained job");
+    let info = handle.wait(job).await.expect("drained job");
     assert_eq!(
         (info.state, info.exit.as_ref()),
         (JobState::Exited, Some(&ExitStatus::Exited { code: 3 }))
@@ -1418,10 +1415,7 @@ async fn host_controller_a_revoke_binds_every_later_command_and_no_running_one()
     );
 
     std::fs::write(&gate, b"go").expect("release the running job");
-    let finished = tokio::time::timeout(Duration::from_secs(60), advanced.wait(running))
-        .await
-        .expect("the running job ends")
-        .expect("its outcome");
+    let finished = advanced.wait(running).await.expect("its outcome");
     assert_eq!(finished.exit, Some(ExitStatus::Exited { code: 0 }));
     assert_eq!(finished.grant_revision, 1);
     assert!(

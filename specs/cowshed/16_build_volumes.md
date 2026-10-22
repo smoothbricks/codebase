@@ -330,8 +330,9 @@ old-incarnation seed unchanged as retained evidence, rather than relabeling it a
 main receives one fresh RAW seed captured from its verified warm replacement under the same writer exclusion as every
 seed. This explicit retained evidence is not an active latest seed and is never silently collected as one. Re-adoption
 carries its existing exclusive source `ReleaseClaim` into build publication. A RAW source and its RAW replacement share
-the canonical hold resource, so capture borrows that claim through seal, restore and the immutable seed mark instead of
-taking a conflicting second claim.
+the canonical hold resource, so registration and an empty replacement's mint borrow that claim instead of taking a
+conflicting shared creation hold. Capture borrows it through seal, restore and the immutable seed mark instead of taking
+a second exclusive claim.
 
 **Why a reseed.** A land freezes the seed before the target runs anything on the adopted volume. Everything the target
 runs afterwards (its own builds and gates, the land's output restoration, a developer's build in main) is written to its
