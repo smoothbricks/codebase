@@ -1005,11 +1005,12 @@ read-only attach with `fsck_apfs` and mount all pass on it. Images were attached
   and left its build volume attached: before the reboot the kernel held 164 build volumes, 88 session images and 4
   mains. A land and an `rm` released both.
 
-Cowshed's own attaches no longer go through DiskImages2: every cowshed image is attached in the kernel ("Mounts"), which
-has no image helper to stall at the ceiling or retain devices after it. In-kernel attaches are measured to complete past
-the ceiling, up to 1,084 registered IOMedia (170 attaches at 0.14 to 0.27 s each, detaches leaving nothing allocated).
-500 sheds hold about 3,000; until in-kernel attaches are measured at that count, cowshed still never starts any attach
-past the ceiling.
+Cowshed's runtime RAW attaches no longer go through DiskImages2: they attach in the kernel ("Mounts"), which has no
+image helper to stall at the ceiling or retain devices after it. Retained ASIF inputs still attach through DiskImages2
+for migration, and explicit DI2 passthrough attaches keep the observed error-150 latch. In-kernel attaches are measured
+to complete past the ceiling, up to 1,084 registered IOMedia (170 attaches at 0.14 to 0.27 s each, detaches leaving
+nothing allocated). 500 sheds hold about 3,000; until in-kernel attaches are measured at that count, cowshed still never
+starts any attach past the ceiling.
 
 Cowshed therefore never starts an attach past the ceiling. The system runner refuses an image attach whose media would
 reach 1024 before it spawns (`MediaCapReached`, `cowshed-apfs` `media_cap`; 02_workspaces.md, "Making room for an
@@ -1021,8 +1022,8 @@ ten attached workspaces with the media each holds and the count of the rest. Att
 without a name, or `--all`) and controller operations get the guard's refusal only. The gateway's startup pass mounts
 mains only and leaves sessions to attach on use (05_gateway.md, "Startup contract"), and a detach frees a workspace's
 build volume with its image (02_workspaces.md, "`cowshed attach` / `cowshed detach`"). `doctor` reports
-`media-notification-cap`. A helper that stalled before these gates is an orphaned helper
-(`orphaned-disk-image-helpers`).
+`media-notification-cap` and distinguishes stalled-helper retention from orphaned helpers
+(`orphaned-disk-image-helpers`): a stalled helper is not orphaned while it still owns an attached image.
 
 ### Freeing an image
 
