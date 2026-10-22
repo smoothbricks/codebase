@@ -1,7 +1,9 @@
 //! Outage and midstream cases for the gateway's `/nx/v1/cache/{hash}` route, driven by the stock
 //! Nx client in a real workspace. Each gateway case is a fresh private fixture with its own gateway
 //! and its own `NX_SELF_HOSTED_REMOTE_CACHE_*` pointed at the gateway's session listener. Direct
-//! controls point the same client at the fixture backend with no gateway in between.
+//! controls point the same client at the fixture backend with no gateway in between, so the
+//! backend's 5xx reaches the client, which reads it as its own outage (05_gateway.md "The client
+//! half"): one line, a miss or a skipped store, and nothing more asked of that server.
 //!
 //! Contract for the gateway route, as implemented in `proxy.rs` (`nx_backend_unavailable`): when the
 //! project backend is offline, unreachable, or answers 5xx before the response head, a GET is 404 and
@@ -593,46 +595,44 @@ async fn nx_short_content_length_is_a_failed_transfer_not_a_completed_hit() {
     );
 }
 
-/// Direct control A: the client talks to the fixture backend with no gateway. Its GET 503 must fail
-/// the run before any execution.
+/// Every request line the fixture backend received, in arrival order. The backend queues each line
+/// before it answers, so a finished run's requests are all queued.
+fn received(backend: &mut FixtureBackend) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Ok(line) = backend.lines.try_recv() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// A direct run's outage (05_gateway.md "The client half"): exactly one line, naming the server,
+/// the request and the backend's 503.
+fn assert_direct_outage(output: &Output, origin: &str, request: &str) {
+    let text = run_text(output);
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains(" is unavailable ("))
+        .collect();
+    let named = format!("Remote cache {origin} is unavailable ({request}: ");
+    assert!(
+        matches!(lines.as_slice(), [line]
+            if line.starts_with(&named) && line.contains("Unexpected response status: 503")),
+        "one outage line naming {origin}, {request} and the 503: {text}"
+    );
+}
+
+/// Direct control A: the client talks to the fixture backend with no gateway, so nothing maps the
+/// backend's GET 503 to a miss. The client reads the 5xx as its own outage (05_gateway.md "The
+/// client half"): the lookup misses, the build executes once and passes, one line names the server
+/// and the request, and the process asks the backend nothing more, so no PUT follows.
 #[tokio::test]
-async fn direct_nx_client_get_503_fails_before_execution() {
+async fn direct_nx_client_get_503_is_an_outage_miss_that_executes_locally() {
     let root = super::fixture_dir::secure_fixture_dir(&format!(
         "cowshed-nx-outage-direct503-{}",
         std::process::id()
     ));
     write_workspace(root.path());
-    let backend = spawn_backend(503, 503).await;
-    let origin = format!("http://{}", backend.address);
-    let output = nx_run(
-        root.path(),
-        Some((origin.as_str(), "direct-control-token")),
-        None,
-    )
-    .await;
-    assert!(
-        !output.status.success(),
-        "a direct GET 503 must fail the run: {}",
-        run_text(&output)
-    );
-    assert_eq!(
-        executions(root.path()),
-        0,
-        "a direct GET 503 must fail before execution"
-    );
-    backend.task.abort();
-}
-
-/// Direct control B: the fixture backend answers GET 404 and PUT 503 with no gateway. The client
-/// executes locally, then its PUT 503 must fail the run after that execution.
-#[tokio::test]
-async fn direct_nx_client_get_404_put_503_fails_after_local_execution() {
-    let root = super::fixture_dir::secure_fixture_dir(&format!(
-        "cowshed-nx-outage-direct-put503-{}",
-        std::process::id()
-    ));
-    write_workspace(root.path());
-    let backend = spawn_backend(404, 503).await;
+    let mut backend = spawn_backend(503, 503).await;
     let origin = format!("http://{}", backend.address);
     let output = nx_run(
         root.path(),
@@ -640,15 +640,73 @@ async fn direct_nx_client_get_404_put_503_fails_after_local_execution() {
         Some(RUN_RECEIPT),
     )
     .await;
+    assert!(
+        output.status.success(),
+        "a direct GET 503 is a miss, never a failed run: {}",
+        run_text(&output)
+    );
     assert_eq!(
         executions(root.path()),
         1,
-        "the GET 404 is a miss, so the build executes first"
+        "the missed lookup executes the build once"
     );
+    let hash = recorded_hash(root.path(), RUN_RECEIPT);
+    assert_direct_outage(&output, &origin, &format!("GET /v1/cache/{hash}"));
+    let requests = received(&mut backend);
+    let lookup = format!("GET /v1/cache/{hash} ");
     assert!(
-        !output.status.success(),
-        "a direct PUT 503 after execution must fail the run: {}",
+        matches!(requests.as_slice(), [only] if only.starts_with(&lookup)),
+        "one lookup, after whose outage the client asks nothing more: {requests:?}"
+    );
+    backend.task.abort();
+}
+
+/// Direct control B: the fixture backend answers GET 404 and PUT 503 with no gateway. The 404 is a
+/// miss, so the build executes once. The store's 503 is the client's own outage (05_gateway.md
+/// "The client half"): the store is skipped, the run passes with the task's own result, one line
+/// names the PUT, and that PUT is the last request the backend sees.
+#[tokio::test]
+async fn direct_nx_client_get_404_put_503_skips_the_store_and_keeps_the_local_result() {
+    let root = super::fixture_dir::secure_fixture_dir(&format!(
+        "cowshed-nx-outage-direct-put503-{}",
+        std::process::id()
+    ));
+    write_workspace(root.path());
+    let mut backend = spawn_backend(404, 503).await;
+    let origin = format!("http://{}", backend.address);
+    let output = nx_run(
+        root.path(),
+        Some((origin.as_str(), "direct-control-token")),
+        Some(RUN_RECEIPT),
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "a direct PUT 503 skips the store, never fails the run: {}",
         run_text(&output)
+    );
+    assert_eq!(
+        executions(root.path()),
+        1,
+        "the GET 404 is a miss, so the build executes once"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("app/result.txt"))
+            .expect("read the task's result"),
+        "one",
+        "the skipped store keeps the task's own result"
+    );
+    let hash = recorded_hash(root.path(), RUN_RECEIPT);
+    assert_direct_outage(&output, &origin, &format!("PUT /v1/cache/{hash}"));
+    let requests = received(&mut backend);
+    let lookup = format!("GET /v1/cache/{hash} ");
+    let store = format!("PUT /v1/cache/{hash} ");
+    assert!(
+        matches!(requests.split_last(), Some((last, lookups))
+            if last.starts_with(&store)
+                && !lookups.is_empty()
+                && lookups.iter().all(|line| line.starts_with(&lookup))),
+        "lookups, then the one store after whose outage the client asks nothing more: {requests:?}"
     );
     backend.task.abort();
 }
