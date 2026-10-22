@@ -635,8 +635,15 @@ pub fn clear_at(path: &Path, session: &str) -> io::Result<PoolRecord> {
 }
 
 /// Refuse `need` image devices the pool cannot take now.
+///
+/// Unlike [`observe`], a record whose bytes do not parse is an error here: it may have held this
+/// boot's 150, and reading it as empty would admit attaches into a spent pool. The operator's
+/// clear ([`clear`]) replaces it.
 pub fn admit(need: u64) -> io::Result<Result<Budget, AttachPoolExhausted>> {
-    let budget = observe()?;
+    let boot = boot()?;
+    let reading = read_kernel()?;
+    let record = load(&record_path()?)?;
+    let budget = record.budget(&boot.session, reading);
     Ok(budget.admits(need).map(|()| budget))
 }
 
@@ -653,8 +660,8 @@ fn is_disk_images2_attach(request: &crate::CommandRequest) -> bool {
 /// reserve ([`attach_reserve`]) would bring the image devices to [`POOL_CEILING`]; every other
 /// command passes. A pool that cannot be read refuses too: nothing says the attach would not
 /// fail with 150, and a failed attach leaks a device, while a refused one can run again. A
-/// record whose bytes do not parse reads as empty with a warning ([`load_or_empty`]); one that
-/// cannot be read at all refuses. A kernel with no attach pool has nothing to gate.
+/// record that cannot be read, or whose bytes do not parse, refuses as well ([`admit`]). A kernel
+/// with no attach pool has nothing to gate.
 pub(crate) fn refuse_attach_into_pool(
     request: &crate::CommandRequest,
 ) -> Result<(), crate::CommandRunError> {

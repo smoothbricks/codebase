@@ -762,22 +762,22 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    does not predict exhaustion (786 and 1024 leaked at two first 150s); the instances do. A failed attach leaks one more
    device, so an attach that would fail is never started, and a refused one can run again once the pool is freed. A pool
    whose instances or record cannot be read refuses the same way (`PoolUnread`), since nothing says the attach would not
-   fail. A record that does not parse proves nothing: it reads as empty with a warning naming the file, the kernel is
-   still reported, and the next write (a 150, a clear) replaces it. A refusal names the recorded exhaustion and the live
-   facts that explain its next step: proven orphaned helpers first when their mappings can account for it, otherwise a
-   reboot for leaked image devices, never a guessed daemon restart for unrelated departed-volume references. Clearing a
-   record does not repair the kernel and never grants capacity by raising a ceiling. `doctor` reports
-   `disk-image-attach-budget`: the four classes' live instances, registered entries and differences, the ceiling and the
-   headroom below it, the current boot's exhaustion evidence, and disk-image commands an earlier build interrupted, each
-   a probable leaked device (the record keeps them until the boot ends; no current build writes one). It is an error
-   while the boot is spent ("attach pool exhausted", with "reboot required" only when the image devices account for it),
-   and a warning within a quarter of the ceiling, or when an earlier build interrupted a command. Its hint names a
-   reboot for leaked image devices and proven orphaned helpers first for a 150 those devices do not explain.
-   `departed-volume-references` is a separate warning from the first departed APFS-volume or IOMedia instance, with
-   exact counts and a root `lsmp` attribution step; it neither defines attach-pool capacity nor prescribes a daemon
-   restart. Orphaned helpers are named only when two reads in a row agree and no `diskutil` or `hdiutil` ran during
-   either, since a helper whose attach is under way has no device yet and killing it mid-attach is what leaks one;
-   killing orphans frees their mappings, never a leaked device.
+   fail, and so does a record whose bytes do not parse: it may have held this boot's 150. `doctor` reads such a record
+   as empty with a warning naming the file and still reports the kernel, and the next write (a 150, the operator's
+   clear) replaces it. A refusal names the recorded exhaustion and the live facts that explain its next step: proven
+   orphaned helpers first when their mappings can account for it, otherwise a reboot for leaked image devices, never a
+   guessed daemon restart for unrelated departed-volume references. Clearing a record does not repair the kernel and
+   never grants capacity by raising a ceiling. `doctor` reports `disk-image-attach-budget`: the four classes' live
+   instances, registered entries and differences, the ceiling and the headroom below it, the current boot's exhaustion
+   evidence, and disk-image commands an earlier build interrupted, each a probable leaked device (the record keeps them
+   until the boot ends; no current build writes one). It is an error while the boot is spent ("attach pool exhausted",
+   with "reboot required" only when the image devices account for it), and a warning within a quarter of the ceiling, or
+   when an earlier build interrupted a command. Its hint names a reboot for leaked image devices and proven orphaned
+   helpers first for a 150 those devices do not explain. `departed-volume-references` is a separate warning from the
+   first departed APFS-volume or IOMedia instance, with exact counts and a root `lsmp` attribution step; it neither
+   defines attach-pool capacity nor prescribes a daemon restart. Orphaned helpers are named only when two reads in a row
+   agree and no `diskutil` or `hdiutil` ran during either, since a helper whose attach is under way has no device yet
+   and killing it mid-attach is what leaks one; killing orphans frees their mappings, never a leaked device.
 
    **A disk-image command is detached from its caller.** A disk-image command is one that creates or releases an image
    device: any `diskutil image …`, any `hdiutil`, and `diskutil eject` (Disk Arbitration's release of an image device,
