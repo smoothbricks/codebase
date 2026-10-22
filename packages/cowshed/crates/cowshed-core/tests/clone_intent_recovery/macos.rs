@@ -863,8 +863,10 @@ fn image_lock_holder() {
     std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).expect("wait for the release");
 }
 
-/// Blocks until `path` exists, woken by the writes to its directory rather than by a clock.
-fn wait_for_entry(path: &Path) {
+/// Blocks until `path` exists, woken by the writes to its directory rather than by a clock, or
+/// until the process `exiting` names, when it names one, has exited, woken by its exit. Answers
+/// whether `path` exists: `false` only once that process has exited without it.
+fn wait_for_entry(path: &Path, exiting: Option<u32>) -> bool {
     let directory = fs::File::open(path.parent().expect("the entry's directory"))
         .expect("open the entry's directory");
     // SAFETY: `kqueue` takes no arguments; its answer is checked before use.
@@ -898,7 +900,45 @@ fn wait_for_entry(path: &Path) {
         path.display(),
         std::io::Error::last_os_error()
     );
-    while !path.exists() {
+    let mut exited = false;
+    if let Some(pid) = exiting {
+        let exit = libc::kevent {
+            ident: usize::try_from(pid).expect("a pid"),
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD,
+            fflags: libc::NOTE_EXIT,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // SAFETY: one valid change in, no event out, no timeout.
+        let registered = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                &raw const exit,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if registered != 0 {
+            // A process that has already exited cannot be watched: the kernel answers ESRCH.
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ESRCH),
+                "watch pid {pid}: {error}"
+            );
+            exited = true;
+        }
+    }
+    loop {
+        if path.exists() {
+            return true;
+        }
+        if exited {
+            return false;
+        }
         let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
         // SAFETY: no change in, room for one event out, no timeout.
         let woken = unsafe {
@@ -919,8 +959,29 @@ fn wait_for_entry(path: &Path) {
                 "wait for {}: {error}",
                 path.display()
             );
+        } else if woken > 0 {
+            // SAFETY: the kernel wrote the one event it counted.
+            let event = unsafe { event.assume_init() };
+            exited = event.filter == libc::EVFILT_PROC;
         }
     }
+}
+
+/// The wait for an entry that never appears ends once the process it also watches exits, so a
+/// test whose server dies before it publishes fails instead of hanging. The watched process is a
+/// real one, unreaped until the wait ends; it may have exited before the watch is registered.
+#[test]
+fn an_entry_wait_ends_when_the_watched_process_exits() {
+    let scratch = ScratchRoot::new("entry-exit").expect("scratch directory root");
+    let mut child = Command::new("/usr/bin/true")
+        .stdin(Stdio::null())
+        .spawn_locked()
+        .expect("start a process that exits at once");
+    assert!(!wait_for_entry(
+        &scratch.path().join("never"),
+        Some(child.id())
+    ));
+    assert!(child.wait().expect("reap it").success());
 }
 
 /// A workspace supervisor opens and serves while other processes hold main's image lock and its
@@ -983,7 +1044,7 @@ async fn a_supervisor_serves_while_other_processes_hold_its_image_locks() {
     fs::create_dir_all(socket.parent().expect("the socket directory")).expect("run directory");
     let published = tokio::task::spawn_blocking({
         let socket = socket.clone();
-        move || wait_for_entry(&socket)
+        move || assert!(wait_for_entry(&socket, None))
     });
     {
         let serving = supervisor.serve_supervisor(&served);
@@ -1111,15 +1172,25 @@ async fn a_supervisor_waits_for_the_holder_of_its_unsettled_workspace_lock() {
         "served stays unmounted while the holder holds its lock"
     );
     holder.release();
+    // The rest of what the supervisor says is read as it says it, so a full pipe never stops it.
+    let rest = tokio::spawn(async move {
+        let mut rest = String::new();
+        said.read_to_string(&mut rest)
+            .await
+            .expect("the supervisor's last output");
+        rest
+    });
+    let pid = supervisor.id().expect("the supervisor's pid");
     let published = tokio::task::spawn_blocking({
         let socket = socket.clone();
-        move || wait_for_entry(&socket)
-    });
-    tokio::select! {
-        ended = supervisor.wait() => {
-            panic!("the supervisor ended before it served: {ended:?}; it said: {transcript}")
-        }
-        published = published => published.expect("watch the socket directory"),
+        move || wait_for_entry(&socket, Some(pid))
+    })
+    .await
+    .expect("watch the socket directory and the supervisor");
+    if !published {
+        let status = supervisor.wait().await.expect("wait for the supervisor");
+        let rest = rest.await.expect("the supervisor's output");
+        panic!("the supervisor ended before it served: {status}; it said: {transcript}{rest}");
     }
     let hello = supervisor_socket::hello(&socket)
         .await
@@ -1133,10 +1204,8 @@ async fn a_supervisor_waits_for_the_holder_of_its_unsettled_workspace_lock() {
     supervisor_socket::drain(&socket)
         .await
         .expect("retire the supervisor");
-    said.read_to_string(&mut transcript)
-        .await
-        .expect("the supervisor's last output");
     let status = supervisor.wait().await.expect("wait for the supervisor");
+    transcript.push_str(&rest.await.expect("the supervisor's output"));
     assert!(
         status.success(),
         "the supervisor failed: {status}; it said: {transcript}"
