@@ -279,9 +279,9 @@ rights against the live I/O Registry after successful release, with the same mds
   right under `/private/tmp`, kept after detach; the same two under the Darwin per-user temporary root left none. The
   departed rights came from mounts outside `/var/folders/`: real-APFS test fixtures under `/private/tmp`, the nx-plugin
   RAM temp volume at `/Volumes` and its `/private/tmp` staging mount, and smoke projects adopted under `/private/tmp`.
-  So every test fixture mounts below `/private/var/folders/cowshed/<uid>/t` (08_testing.md) and the RAM temp below
-  `/private/var/folders/cowshed/<uid>/ram` (`packages/nx-plugin/README.md`); a main's mount at its checkout path is the
-  one cowshed mount mds still admits, once per remount.
+  So every test fixture mounts below `/private/var/folders/cowshed/<uid>/t` (08_testing.md) and the RAM temp at
+  `/private/var/folders/cowshed/<uid>/ram3`, its leaf naming the revision (`packages/nx-plugin/README.md`); a main's
+  mount at its checkout path is the one cowshed mount mds still admits, once per remount.
 
 Cowshed must not depend on mds releasing these references to finish unmount, eject, reclamation or publication.
 Attachment presence is the kernel's current registered image/device mapping, not the class's still-live instance count.

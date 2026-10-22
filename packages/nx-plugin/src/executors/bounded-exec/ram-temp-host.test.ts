@@ -28,6 +28,8 @@ import {
   archiveDeletions,
   type CommandOutput,
   createHostCommands,
+  describeRamTempError,
+  detachRamDisk,
   type HostCommands,
   leaseProcessesOn,
   mountsBelow,
@@ -112,12 +114,14 @@ async function attachedDisks(paths: RamTempPaths, capacity: number): Promise<Ram
 async function detachAll(paths: RamTempPaths, capacity: number): Promise<void> {
   const host = createHostCommands();
   for (const disk of await attachedDisks(paths, capacity)) {
-    if (disk.physical === null) {
+    const { physical } = disk;
+    if (physical === null) {
       throw new Error(`a RAM disk of ${disk.sectors} sectors has published no media to detach yet`);
     }
-    const output = await host.run('/usr/bin/hdiutil', ['detach', '-force', disk.physical]);
-    if (output.status !== 0) {
-      throw new Error(`hdiutil detach ${disk.physical}: exit ${output.status}: ${output.stderr}`);
+    // Revalidated against a fresh registry read, and never forced: teardown did not just attach this disk.
+    const detached = await detachRamDisk(host, { ...disk, physical }, 'teardown detach');
+    if (!detached.ok) {
+      throw new Error(describeRamTempError(detached.error));
     }
   }
 }

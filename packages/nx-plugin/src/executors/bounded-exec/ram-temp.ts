@@ -384,6 +384,8 @@ export function ramTempPaths(user: { uid: number }): RamTempPaths {
 
 /** An attached RAM disk, as the I/O Registry and the mount table show it. */
 export interface RamDisk {
+  /** Its `IOHDIXHDDriveOutKernel` node's registry entry ID: no later disk has it, where a BSD name passes to the next. */
+  entry: string;
   /**
    * The whole disk (`/dev/diskN`): detaching it removes its container and volumes. Null while the disk has published
    * no media yet, part way through its attach.
@@ -397,7 +399,7 @@ export interface RamDisk {
 }
 
 /** A RAM disk with its whole disk published, which a detach can name. */
-interface AttachedRamDisk extends RamDisk {
+export interface AttachedRamDisk extends RamDisk {
   physical: string;
 }
 
@@ -1377,6 +1379,7 @@ export class RamTempVolume {
     if (provisioned.ok) {
       return provisioned;
     }
+    // `-force` only here: `physical` is the disk this process's own attach just printed, which nothing else names.
     const detached = await this.commands.run('/usr/bin/hdiutil', ['detach', '-force', physical]);
     // The detach takes every volume of the disk with it. What it leaves at the staging directory and the
     // mountpoint is a bare directory on the host's Data volume each: removed here, and already absent is done.
@@ -1552,13 +1555,14 @@ export class RamTempVolume {
           return failed('reclaim', holdingText(point, held.value));
         }
       }
-      const detached = await this.commands.run(
-        '/usr/bin/hdiutil',
-        ['detach', '-force', disk.physical],
+      const detached = await detachRamDisk(
+        this.commands,
+        disk,
+        `hdiutil detach (stray ${disk.physical})`,
         STRAY_DETACH_DEADLINE_MS,
       );
-      if (detached.status !== 0) {
-        return failed(`hdiutil detach (stray ${disk.physical})`, commandText(detached));
+      if (!detached.ok) {
+        return detached;
       }
     }
     return { ok: true, value: undefined };
@@ -1609,12 +1613,9 @@ export class RamTempVolume {
     }
     // Detaching frees the archives' pages anyway, but a deletion of this process's still walking the volume holds it busy.
     await archiveDeletions();
-    let detached = await this.commands.run('/usr/bin/hdiutil', ['detach', disk.physical]);
-    if (detached.status !== 0) {
-      detached = await this.commands.run('/usr/bin/hdiutil', ['detach', '-force', disk.physical]);
-    }
-    if (detached.status !== 0) {
-      return failed('hdiutil detach', commandText(detached));
+    const detached = await detachRamDisk(this.commands, disk, 'hdiutil detach');
+    if (!detached.ok) {
+      return detached;
     }
     // No Disk Arbitration call made the mountpoint, so none removes it: this module does, now its volume is gone.
     const left = await removeMountDirectories([this.paths.mountpoint]);
@@ -1995,7 +1996,8 @@ export function ramDisksIn(registry: string, table: string): Result<RamDisk[], s
       continue;
     }
     const header = entry.slice(0, entry.indexOf('\n') === -1 ? undefined : entry.indexOf('\n'));
-    if (!header.startsWith('+-o ') || !header.includes('<class IOHDIXHDDriveOutKernel,')) {
+    const entryId = /<class IOHDIXHDDriveOutKernel, id (0x[0-9a-f]+),/.exec(header)?.[1];
+    if (!header.startsWith('+-o ') || entryId === undefined) {
       return { ok: false, error: `not an IOHDIXHDDriveOutKernel entry: ${header.slice(0, 160)}` };
     }
     // The entry's own properties end at its first child; only they name its image and owner.
@@ -2021,6 +2023,7 @@ export function ramDisksIn(registry: string, table: string): Result<RamDisk[], s
       match[1] === undefined ? [] : [match[1]],
     );
     disks.push({
+      entry: entryId,
       physical: names[0] === undefined ? null : `/dev/${names[0]}`,
       sectors: Number(sectors),
       uid: Number(owner),
@@ -2028,6 +2031,76 @@ export function ramDisksIn(registry: string, table: string): Result<RamDisk[], s
     });
   }
   return { ok: true, value: disks };
+}
+
+/** A descriptor held open on a device: while it is open, no other disk takes the device's name. */
+interface DevicePin {
+  close(): Promise<void>;
+}
+
+/** Hold the raw device open read-only, as cowshed pins a volume's device. */
+async function pinDevice(raw: string): Promise<DevicePin> {
+  return await open(raw, constants.O_RDONLY);
+}
+
+/**
+ * Why `disk` may no longer be detached by its name, as a fresh registry read shows the RAM disks; null when its entry is
+ * still registered with the same whole disk, image size and owner. A BSD name is recycled once its disk goes, so only
+ * the entry ID binds the name to the disk the inventory found.
+ */
+export function ramDiskChange(disk: AttachedRamDisk, current: readonly RamDisk[]): string | null {
+  const now = current.find((candidate) => candidate.entry === disk.entry);
+  if (now === undefined) {
+    return `its registry entry ${disk.entry} is gone`;
+  }
+  const changes = [
+    now.physical === disk.physical ? null : `whole disk ${now.physical ?? 'unpublished'}`,
+    now.sectors === disk.sectors ? null : `ram://${now.sectors}`,
+    now.uid === disk.uid ? null : `owner-uid ${now.uid}`,
+  ].filter((change): change is string => change !== null);
+  return changes.length === 0 ? null : `its registry entry ${disk.entry} now has ${changes.join(', ')}`;
+}
+
+/**
+ * Detach a RAM disk an inventory found, by its whole-disk name, only once a fresh registry read shows that the name still
+ * belongs to the inventory's entry, with the same size and owner; otherwise detach nothing and name the change. The raw
+ * device is held open across that read, so the name cannot pass to another disk meanwhile, and closed just before
+ * `hdiutil detach`, which would find the disk busy. What remains is the window between that close and hdiutil's own
+ * open of the name: a third party that detaches this disk then, and a new disk that takes its name, would be detached in
+ * its place. Never `-force`: this process did not just attach this disk.
+ */
+export async function detachRamDisk(
+  commands: HostCommands,
+  disk: AttachedRamDisk,
+  step: string,
+  deadlineMs?: number,
+  pin: (raw: string) => Promise<DevicePin> = pinDevice,
+): Promise<Result<void, ProvisionFailed>> {
+  const raw = disk.physical.replace(/^\/dev\/disk/, '/dev/rdisk');
+  let held: DevicePin;
+  try {
+    held = await pin(raw);
+  } catch (error) {
+    return failed(step, `${disk.physical} not detached: ${raw} cannot be held open (${errorText(error)})`);
+  }
+  let change: string | null;
+  try {
+    const registry = await commands.run('/usr/sbin/ioreg', ['-r', '-c', 'IOHDIXHDDriveOutKernel', '-l', '-w0']);
+    const current = registry.status === 0 ? ramDisksIn(registry.stdout, '') : null;
+    change =
+      current === null
+        ? `the registry could not be read again (${commandText(registry)})`
+        : current.ok
+          ? ramDiskChange(disk, current.value)
+          : `the registry could not be read again (${current.error})`;
+  } finally {
+    await held.close();
+  }
+  if (change !== null) {
+    return failed(step, `${disk.physical} not detached: ${change}`);
+  }
+  const detached = await commands.run('/usr/bin/hdiutil', ['detach', disk.physical], deadlineMs);
+  return detached.status === 0 ? { ok: true, value: undefined } : failed(step, commandText(detached));
 }
 
 /**

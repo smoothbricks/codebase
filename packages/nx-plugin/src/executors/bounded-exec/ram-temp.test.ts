@@ -21,9 +21,11 @@ import { whenChanged } from '../../__tests__/path-change.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { awaitExit, ownedSocketDirectory, pidsWorkingIn, processTable, terminate } from '../../testing.js';
 import {
+  type AttachedRamDisk,
   COWSHED_EXECUTABLE_ENV,
   createHostCommands,
   describeRamTempError,
+  detachRamDisk,
   diskCommand,
   hostLeaseProcesses,
   imagesBackedUnder,
@@ -57,8 +59,9 @@ describe('RAM temp volume output parsing', () => {
     expect(ramDisksIn(capturedRegistry(), table)).toEqual({
       ok: true,
       value: [
-        { physical: '/dev/disk539', sectors: 16777218, uid: 502, mountpoints: [] },
+        { entry: '0x100055578', physical: '/dev/disk539', sectors: 16777218, uid: 502, mountpoints: [] },
         {
+          entry: '0x10005557b',
           physical: '/dev/disk540',
           sectors: 131072,
           uid: 502,
@@ -473,6 +476,87 @@ describe('RAM temp volume on this host', () => {
     } finally {
       server.close();
       rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('detaching a RAM disk an inventory found', () => {
+  // The captured registry's 64 MiB disk, as an inventory read it.
+  const disk: AttachedRamDisk = {
+    entry: '0x10005557b',
+    physical: '/dev/disk540',
+    sectors: 131072,
+    uid: 502,
+    mountpoints: [],
+  };
+
+  /** Detach `disk` with `registry` as the fresh read, recording the pin, every host command and the unpin in order. */
+  async function detachAgainst(registry: string) {
+    const calls: string[] = [];
+    const result = await detachRamDisk(
+      {
+        async run(file, args) {
+          calls.push([file, ...args].join(' '));
+          return { status: 0, stdout: file === '/usr/sbin/ioreg' ? registry : '', stderr: '' };
+        },
+      },
+      disk,
+      'hdiutil detach',
+      undefined,
+      async (raw) => {
+        calls.push(`pin ${raw}`);
+        return {
+          async close() {
+            calls.push(`unpin ${raw}`);
+          },
+        };
+      },
+    );
+    return { result, calls };
+  }
+
+  it('detaches the disk while its registry entry still holds its name, size and owner, unpinned first', async () => {
+    const { result, calls } = await detachAgainst(capturedRegistry());
+    expect(result).toEqual({ ok: true, value: undefined });
+    expect(calls).toEqual([
+      'pin /dev/rdisk540',
+      '/usr/sbin/ioreg -r -c IOHDIXHDDriveOutKernel -l -w0',
+      'unpin /dev/rdisk540',
+      '/usr/bin/hdiutil detach /dev/disk540',
+    ]);
+  });
+
+  it('detaches nothing once the entry is gone, has another ID, or holds another name, size or owner', async () => {
+    const registry = capturedRegistry();
+    const cases = [
+      {
+        current: registry.slice(0, registry.indexOf('+-o IOHDIXHDDriveOutKernel@1b99')),
+        change: 'its registry entry 0x10005557b is gone',
+      },
+      {
+        current: registry.replace('id 0x10005557b,', 'id 0x10005557c,'),
+        change: 'its registry entry 0x10005557b is gone',
+      },
+      {
+        current: registry.replace('"BSD Name" = "disk540"', '"BSD Name" = "disk541"'),
+        change: 'its registry entry 0x10005557b now has whole disk /dev/disk541',
+      },
+      {
+        current: registry.replace('"image-path" = <"ram://131072">', '"image-path" = <"ram://131073">'),
+        change: 'its registry entry 0x10005557b now has ram://131073',
+      },
+    ];
+    for (const { current, change } of cases) {
+      const { result, calls } = await detachAgainst(current);
+      expect(result).toEqual({
+        ok: false,
+        error: { kind: 'provision-failed', step: 'hdiutil detach', detail: `/dev/disk540 not detached: ${change}` },
+      });
+      expect(calls).toEqual([
+        'pin /dev/rdisk540',
+        '/usr/sbin/ioreg -r -c IOHDIXHDDriveOutKernel -l -w0',
+        'unpin /dev/rdisk540',
+      ]);
     }
   });
 });
