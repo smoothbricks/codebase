@@ -384,7 +384,7 @@ index 9bd7b61bf9ad94c72a198dfe6f15fbcb68dfaac3..6b982fae848cc82a310eee9a1036be1a
      flushSyncGeneratorChangesToDisk(generators: string[]): Promise<FlushSyncGeneratorChangesResult>;
      getRegisteredSyncGenerators(): Promise<{
 diff --git a/dist/src/daemon/client/client.js b/dist/src/daemon/client/client.js
-index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..86e06f616642e61e2d7b61714849748a0183c971 100644
+index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..00c0ae10e3a5741a53a40a53f63580178c9ab471 100644
 --- a/dist/src/daemon/client/client.js
 +++ b/dist/src/daemon/client/client.js
 @@ -40,7 +40,6 @@ const nx_console_1 = require("../message-types/nx-console");
@@ -395,7 +395,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..86e06f616642e61e2d7b61714849748a
  const update_workspace_context_1 = require("../message-types/update-workspace-context");
  const tmp_dir_1 = require("../tmp-dir");
  const sandbox_socket_hint_1 = require("../sandbox-socket-hint");
-@@ -135,12 +134,51 @@ class DaemonClient {
+@@ -135,12 +134,55 @@ class DaemonClient {
                  });
                  this._enabled = false;
              }
@@ -436,18 +436,22 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..86e06f616642e61e2d7b61714849748a
 +    /**
 +     * Lets the stopped daemon's connection go, and says so once per process: every
 +     * request still queued for it fails the same way and continues the same way.
++     * The daemon is off for this process alone from here on: a tagged error the
++     * daemon itself sent (its watcher stream stopped) leaves the daemon record in
++     * place while it stops, and a later request would dial a socket that is gone.
 +     */
 +    continueWithoutDaemon(error) {
 +        if (!this.continuedWithoutDaemon) {
 +            this.continuedWithoutDaemon = true;
 +            output_1.output.note({ title: `${error.message} Continuing without the daemon.` });
 +        }
++        (0, tmp_dir_1.disableDaemonForThisProcess)(error.message);
 +        this.reset();
 +    }
      reset() {
          this.socketMessenger?.close();
          this.socketMessenger = null;
-@@ -668,27 +706,6 @@ class DaemonClient {
+@@ -668,27 +710,6 @@ class DaemonClient {
          };
          return this.sendToDaemonViaQueue(message);
      }
@@ -475,7 +479,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..86e06f616642e61e2d7b61714849748a
      getSyncGeneratorChanges(generators) {
          const message = {
              type: get_sync_generator_changes_1.GET_SYNC_GENERATOR_CHANGES,
-@@ -813,8 +830,15 @@ class DaemonClient {
+@@ -813,8 +834,15 @@ class DaemonClient {
                  }
              }
              if (!probe.available) {
@@ -493,7 +497,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..86e06f616642e61e2d7b61714849748a
              }
              this.setUpConnection();
              this._daemonStatus = DaemonStatus.CONNECTED;
-@@ -831,13 +855,29 @@ class DaemonClient {
+@@ -831,13 +859,29 @@ class DaemonClient {
          }
      }
      async sendToDaemonViaQueue(messageToDaemon, parser) {
@@ -530,7 +534,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..86e06f616642e61e2d7b61714849748a
      }
      setUpConnection() {
          const socketPath = this.getSocketPath();
-@@ -846,7 +886,13 @@ class DaemonClient {
+@@ -846,7 +890,13 @@ class DaemonClient {
          // sendMessageToDaemon method uses a keep-alive setTimeout to
          // explicitly hold the event loop open while awaiting a response.
          socket.unref();
@@ -545,7 +549,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..86e06f616642e61e2d7b61714849748a
              // it's ok for the daemon to terminate if the client doesn't wait on
              // any messages from the daemon
              if (this.queue.isEmpty()) {
-@@ -892,6 +938,12 @@ class DaemonClient {
+@@ -892,6 +942,12 @@ class DaemonClient {
              else {
                  error = daemonProcessException(err.toString());
              }
@@ -558,7 +562,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..86e06f616642e61e2d7b61714849748a
              this.currentReject(error);
              this.socketMessenger?.close();
          });
-@@ -936,7 +988,7 @@ class DaemonClient {
+@@ -936,7 +992,7 @@ class DaemonClient {
          else {
              // Failed to reconnect after all attempts, reject the pending request
              if (this.currentReject) {
@@ -567,7 +571,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..86e06f616642e61e2d7b61714849748a
              }
          }
      }
-@@ -1132,8 +1184,11 @@ class DaemonClient {
+@@ -1132,8 +1188,11 @@ class DaemonClient {
           */
          const { available, refusal: polled } = await this.waitForServerToBeAvailable({ ignoreVersionMismatch: true });
          if (available) {
@@ -581,7 +585,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..86e06f616642e61e2d7b61714849748a
          }
          else {
              // A permission refusal from either source wins, then the poll's errno,
-@@ -1161,19 +1216,31 @@ class DaemonClient {
+@@ -1161,19 +1220,31 @@ class DaemonClient {
              ].join('\n'));
          }
      }
@@ -623,7 +627,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..86e06f616642e61e2d7b61714849748a
              }
          }
          (0, tmp_dir_1.removeSocketDir)();
-@@ -1200,6 +1267,26 @@ function isDocker() {
+@@ -1200,6 +1271,26 @@ function isDocker() {
  function nxJsonIsNotPresent() {
      return !(0, nx_json_1.hasNxJson)(workspace_root_1.workspaceRoot);
  }
@@ -650,7 +654,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..86e06f616642e61e2d7b61714849748a
  /**
   * The operating system refused the connection. Most often the socket belongs to
   * another user, which is the guarantee the owner-only socket directory buys —
-@@ -1226,6 +1313,21 @@ function daemonPermissionException(socketPath, cause) {
+@@ -1226,6 +1317,21 @@ function daemonPermissionException(socketPath, cause) {
      error.daemonPermissionError = true;
      return error;
  }
@@ -1190,10 +1194,10 @@ index c2a2f8f70fe71940e47c97931c5925bac1fbd480..39582a8fc342ae59decd3d4ca25179f2
          // Bump generation synchronously so any in-flight compute fails its
 diff --git a/dist/src/daemon/server/restart-checks.d.ts b/dist/src/daemon/server/restart-checks.d.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..28f263f82b7b698ec1bf88943924696b3d9a91e7
+index 0000000000000000000000000000000000000000..3c6c7182b7f5cf29f8f6912e000d46115cc11165
 --- /dev/null
 +++ b/dist/src/daemon/server/restart-checks.d.ts
-@@ -0,0 +1,10 @@
+@@ -0,0 +1,12 @@
 +import type { Server, Socket } from 'net';
 +import type { WatchEvent } from '../../native';
 +export declare const DAEMON_VALIDITY_SAFETY_INTERVAL_MS = 5000;
@@ -1204,12 +1208,14 @@ index 0000000000000000000000000000000000000000..28f263f82b7b698ec1bf88943924696b
 +export declare function stopDaemonIfReplaced(events: WatchEvent[]): boolean;
 +export declare function stopDaemonIfOutdated(): boolean;
 +export declare function stopDaemonIfWorkspaceGone(): boolean;
++/** Stops the daemon, naming `reason` in its log: its file watcher stopped delivering. */
++export declare function stopDaemonForStoppedWatcher(reason: string): void;
 diff --git a/dist/src/daemon/server/restart-checks.js b/dist/src/daemon/server/restart-checks.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..6bd6df6e26cdbc306b33c01b363dc4b3d4475ada
+index 0000000000000000000000000000000000000000..eb5d71551fec8e2a70dd190fb70349c22ba24cd3
 --- /dev/null
 +++ b/dist/src/daemon/server/restart-checks.js
-@@ -0,0 +1,306 @@
+@@ -0,0 +1,315 @@
 +"use strict";
 +Object.defineProperty(exports, "__esModule", { value: true });
 +exports.relativeServerProcess = exports.DAEMON_VALIDITY_SAFETY_INTERVAL_MS = void 0;
@@ -1219,6 +1225,7 @@ index 0000000000000000000000000000000000000000..6bd6df6e26cdbc306b33c01b363dc4b3
 +exports.stopDaemonIfReplaced = stopDaemonIfReplaced;
 +exports.stopDaemonIfOutdated = stopDaemonIfOutdated;
 +exports.stopDaemonIfWorkspaceGone = stopDaemonIfWorkspaceGone;
++exports.stopDaemonForStoppedWatcher = stopDaemonForStoppedWatcher;
 +const fs_1 = require("fs");
 +const path_1 = require("path");
 +const file_hasher_1 = require("../../hasher/file-hasher");
@@ -1502,6 +1509,14 @@ index 0000000000000000000000000000000000000000..6bd6df6e26cdbc306b33c01b363dc4b3
 +    terminating = true;
 +    (0, shutdown_utils_1.handleServerProcessTermination)({ server: daemon.server, reason, sockets: daemon.sockets });
 +}
++// A file watcher that stopped delivering leaves the daemon blind to every
++// later change, so it stops rather than restarts: a successor it spawned
++// would inherit whatever stopped its stream (a sandbox that denies FSEvents,
++// say), and the next client or the keeper starts one in its own context.
++function stopDaemonForStoppedWatcher(reason) {
++    logger_1.serverLogger.watcherLog(reason);
++    stopDaemon(reason);
++}
 +function restartDaemon(reason) {
 +    if (!daemon || terminating) return;
 +    logger_1.serverLogger.log(`[Server] Daemon outdated: ${reason}`);
@@ -1517,7 +1532,7 @@ index 0000000000000000000000000000000000000000..6bd6df6e26cdbc306b33c01b363dc4b3
 +    (0, shutdown_utils_1.handleServerProcessTerminationWithRestart)({ server: daemon.server, reason, sockets: daemon.sockets });
 +}
 diff --git a/dist/src/daemon/server/server.js b/dist/src/daemon/server/server.js
-index b1c143e244efd435b28642ed86e999d6c86f7d94..c68bcacb9bc46babaa86ea0ac212e79de1b47244 100644
+index b1c143e244efd435b28642ed86e999d6c86f7d94..0ea9c84c3dced043459bfb15d5d44a72882a1fb1 100644
 --- a/dist/src/daemon/server/server.js
 +++ b/dist/src/daemon/server/server.js
 @@ -7,17 +7,13 @@ const fs_1 = require("fs");
@@ -1562,7 +1577,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..c68bcacb9bc46babaa86ea0ac212e79d
  let workspaceWatcherError;
  global.NX_DAEMON = true;
  process.env.NX_DAEMON_PROCESS = 'true';
-@@ -97,6 +92,9 @@ const server = (0, net_1.createServer)(async (socket) => {
+@@ -97,11 +92,16 @@ const server = (0, net_1.createServer)(async (socket) => {
          numberOfOpenConnections -= 1;
          exports.openSockets.delete(socket);
          logger_1.serverLogger.log(`Closed a connection. Number of open connections: ${numberOfOpenConnections}`);
@@ -1572,7 +1587,14 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..c68bcacb9bc46babaa86ea0ac212e79d
          (0, file_watcher_sockets_1.removeRegisteredFileWatcherSocket)(socket);
          (0, project_graph_listener_sockets_1.removeRegisteredProjectGraphListenerSocket)(socket);
      });
-@@ -134,6 +132,11 @@ async function handleMessage(socket, data) {
+ });
+ registerProcessTerminationListeners();
++/** Connections whose first file-state request found the watcher current. */
++const provenConnections = new WeakSet();
+ async function handleMessage(socket, data) {
+     if (workspaceWatcherError) {
+         await (0, shutdown_utils_1.respondWithErrorAndExit)(socket, `File watcher error in the workspace '${workspace_root_1.workspaceRoot}'.`, workspaceWatcherError);
+@@ -134,9 +134,36 @@ async function handleMessage(socket, data) {
              return;
          }
      }
@@ -1584,7 +1606,32 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..c68bcacb9bc46babaa86ea0ac212e79d
      if ((0, daemon_message_1.isDaemonMessage)(payload) && payload.env) {
          await (0, handle_client_env_1.handleClientEnv)(payload.env);
      }
-@@ -185,15 +188,6 @@ async function handleMessage(socket, data) {
++    // The first request on a connection that is answered from the workspace's
++    // files waits until every write made before it has reached the daemon: an
++    // nx command opens its connection when it starts, so it sees every write
++    // made before it. Later requests on the connection are served as Nx
++    // always did, so a write another process makes while the command runs is
++    // as visible as it was. A watcher that stopped delivering stops the daemon
++    // instead; the client is told so first, and continues without a daemon at
++    // once.
++    if (answersFromFiles(payload) && !provenConnections.has(socket)) {
++        const stopped = await (0, watcher_1.proveWatcherCurrent)();
++        if (stopped !== undefined) {
++            const error = new Error(`The Nx daemon stopped: ${stopped}. This command continues without it.`);
++            // The client's tag for "this daemon is gone; continue without one in
++            // this process" (DaemonClient.orWithoutDaemon), as when a client that
++            // may not start a daemon loses its daemon.
++            error.daemonStartForbidden = true;
++            await (0, shutdown_utils_1.respondWithError)(socket, 'watcher stream stopped', error);
++            (0, restart_checks_1.stopDaemonForStoppedWatcher)(stopped);
++            return;
++        }
++        provenConnections.add(socket);
++    }
+     if (payload.type === 'PING') {
+         await handleResult(socket, 'PING', () => Promise.resolve({ response: true, description: 'ping' }), mode);
+     }
+@@ -185,15 +212,6 @@ async function handleMessage(socket, data) {
      else if ((0, hash_glob_1.isHandleHashMultiGlobMessage)(payload)) {
          await handleResult(socket, hash_glob_1.HASH_GLOB, () => (0, handle_hash_glob_1.handleHashMultiGlob)(payload.globGroups), mode);
      }
@@ -1600,7 +1647,30 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..c68bcacb9bc46babaa86ea0ac212e79d
      else if ((0, force_shutdown_1.isHandleForceShutdownMessage)(payload)) {
          await handleResult(socket, 'FORCE_SHUTDOWN', () => (0, handle_force_shutdown_1.handleForceShutdown)(server), mode);
      }
-@@ -256,9 +250,10 @@ async function handleResult(socket, type, hrFn, mode) {
+@@ -231,6 +249,22 @@ async function handleMessage(socket, data) {
+         await (0, shutdown_utils_1.respondWithErrorAndExit)(socket, `Invalid payload from the client`, new Error(`Unsupported payload sent to daemon server: ${(0, consume_messages_from_socket_1.describeMessage)(unparsedPayload, { maxBytes: 200 })}`));
+     }
+ }
++/**
++ * Whether the answer to `payload` depends on the workspace's files: every
++ * request except liveness, shutdown, subscriptions and the Nx Console and AI
++ * agent status, which read none.
++ */
++function answersFromFiles(payload) {
++    return !(payload.type === 'PING' ||
++        payload.type === 'REQUEST_SHUTDOWN' ||
++        payload.type === 'REGISTER_FILE_WATCHER' ||
++        (0, register_project_graph_listener_1.isRegisterProjectGraphListenerMessage)(payload) ||
++        (0, force_shutdown_1.isHandleForceShutdownMessage)(payload) ||
++        (0, nx_console_1.isHandleGetNxConsoleStatusMessage)(payload) ||
++        (0, nx_console_1.isHandleSetNxConsolePreferenceAndInstallMessage)(payload) ||
++        (0, configure_ai_agents_1.isHandleGetConfigureAiAgentsStatusMessage)(payload) ||
++        (0, configure_ai_agents_1.isHandleResetConfigureAiAgentsStatusMessage)(payload));
++}
+ async function handleResult(socket, type, hrFn, mode) {
+     let hr;
+     const startMark = new Date();
+@@ -256,9 +290,10 @@ async function handleResult(socket, type, hrFn, mode) {
      logger_1.serverLogger.log(`Handled ${mode} message ${type}. Handling time: ${doneHandlingMark.getTime() - startMark.getTime()}. Response time: ${endMark.getTime() - doneHandlingMark.getTime()}.`);
  }
  function handleInactivityTimeout() {
@@ -1613,7 +1683,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..c68bcacb9bc46babaa86ea0ac212e79d
          (0, shutdown_utils_1.resetInactivityTimeout)(handleInactivityTimeout);
      }
      else {
-@@ -287,37 +282,6 @@ function registerProcessTerminationListeners() {
+@@ -287,37 +322,6 @@ function registerProcessTerminationListeners() {
          sockets: exports.openSockets,
      }));
  }
@@ -1651,7 +1721,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..c68bcacb9bc46babaa86ea0ac212e79d
  /**
   * When applicable files in the workspaces are changed (created, updated, deleted),
   * we need to recompute the cached serialized project graph so that it is readily
-@@ -339,6 +303,11 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
+@@ -339,6 +343,11 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
              return;
          }
          logger_1.serverLogger.watcherLog((0, watcher_1.convertChangeEventsToLogMessage)(changeEvents));
@@ -1663,7 +1733,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..c68bcacb9bc46babaa86ea0ac212e79d
          (0, route_workspace_changes_1.routeWorkspaceChanges)(changeEvents);
      }
      catch (err) {
-@@ -348,7 +317,43 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
+@@ -348,65 +357,68 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
          (0, file_watcher_sockets_1.notifyFileWatcherSocketsOfError)(err);
      }
  };
@@ -1707,7 +1777,11 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..c68bcacb9bc46babaa86ea0ac212e79d
      // Watch before scan: a file written during boot must be visible to the
      // watcher or the scan below. Scan-first left a blind window where such
      // files stayed invisible to both until an unrelated change arrived.
-@@ -359,54 +364,21 @@ async function startServer() {
+     if (!(0, shutdown_utils_1.getWatcherInstance)()) {
+-        (0, shutdown_utils_1.storeWatcherInstance)(await (0, watcher_1.watchWorkspace)(server, handleWorkspaceChanges));
++        (0, shutdown_utils_1.storeWatcherInstance)(await (0, watcher_1.watchWorkspace)(server, handleWorkspaceChanges, handle_outputs_changes_1.handleOutputsChanges));
+         logger_1.serverLogger.watcherLog(`Subscribed to changes within: ${workspace_root_1.workspaceRoot} (native)`);
+     }
      (0, workspace_context_1.setupWorkspaceContext)(workspace_root_1.workspaceRoot);
      // Initialize analytics for daemon process
      await (0, analytics_1.startAnalytics)();
@@ -1767,29 +1841,38 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..c68bcacb9bc46babaa86ea0ac212e79d
      return new Promise(async (resolve, reject) => {
          // `listen` reports a failed bind asynchronously on the server, which the
          // try below cannot catch — without this an EACCES became an uncaught
-@@ -432,8 +404,7 @@ async function startServer() {
+@@ -432,11 +444,9 @@ async function startServer() {
                              // Best effort; the 0700 socket directory is the primary control.
                          }
                      }
 -                    // this triggers the storage of the lock file hash
 -                    daemonIsOutdated();
+-                    if (!(0, shutdown_utils_1.getOutputWatcherInstance)()) {
+-                        (0, shutdown_utils_1.storeOutputWatcherInstance)(await (0, watcher_1.watchOutputFiles)(server, handle_outputs_changes_1.handleOutputsChanges));
+-                    }
 +                    (0, socket_utils_1.recordOwnSocket)(socketPath);
-                     if (!(0, shutdown_utils_1.getOutputWatcherInstance)()) {
-                         (0, shutdown_utils_1.storeOutputWatcherInstance)(await (0, watcher_1.watchOutputFiles)(server, handle_outputs_changes_1.handleOutputsChanges));
-                     }
++                    // The outputs are watched by the one watcher started
++                    // above (watcher.js).
+                     // listen for project graph recomputation events to collect and schedule sync generators
+                     (0, project_graph_incremental_recomputation_1.registerProjectGraphRecomputationListener)(sync_generators_1.collectAndScheduleSyncGenerators);
+                     // register file change listener to invalidate sync generator cache
 diff --git a/dist/src/daemon/server/shutdown-utils.d.ts b/dist/src/daemon/server/shutdown-utils.d.ts
-index 698fcf9e061b8e0b37057a6318614dbe6d290b9e..5470c4935d0a5f230dde3ece13bfb6ba9a58e10b 100644
+index 698fcf9e061b8e0b37057a6318614dbe6d290b9e..832d848841cb8a0f761750e24ecfb84a85fc6ff9 100644
 --- a/dist/src/daemon/server/shutdown-utils.d.ts
 +++ b/dist/src/daemon/server/shutdown-utils.d.ts
-@@ -1,6 +1,6 @@
+@@ -1,10 +1,8 @@
  import type { Server, Socket } from 'net';
  import type { Watcher } from '../../native';
 -export declare const SERVER_INACTIVITY_TIMEOUT_MS: 10800000;
 +export declare const SERVER_INACTIVITY_TIMEOUT_MS: 300000;
  export declare function storeWatcherInstance(instance: Watcher): void;
  export declare function getWatcherInstance(): Watcher;
- export declare function storeOutputWatcherInstance(instance: Watcher): void;
-@@ -12,6 +12,8 @@ interface HandleServerProcessTerminationParams {
+-export declare function storeOutputWatcherInstance(instance: Watcher): void;
+-export declare function getOutputWatcherInstance(): Watcher;
+ interface HandleServerProcessTerminationParams {
+     server: Server;
+     reason: string;
+@@ -12,6 +10,8 @@ interface HandleServerProcessTerminationParams {
  }
  export declare function handleServerProcessTermination({ server, reason, sockets, }: HandleServerProcessTerminationParams): Promise<void>;
  export declare function handleServerProcessTerminationWithRestart({ server, reason, sockets, }: HandleServerProcessTerminationParams): Promise<void>;
@@ -1799,10 +1882,18 @@ index 698fcf9e061b8e0b37057a6318614dbe6d290b9e..5470c4935d0a5f230dde3ece13bfb6ba
  export declare function respondToClient(socket: Socket, response: Buffer, description: string): Promise<unknown>;
  /**
 diff --git a/dist/src/daemon/server/shutdown-utils.js b/dist/src/daemon/server/shutdown-utils.js
-index a449f2fb3c864bc9d3d710078418c8a05879aa84..17d9f2a7569a1332105b8e1106a2b8fdfb8a3e96 100644
+index a449f2fb3c864bc9d3d710078418c8a05879aa84..c398f4ecdbe359201063b3fa4271e07147ccd2ee 100644
 --- a/dist/src/daemon/server/shutdown-utils.js
 +++ b/dist/src/daemon/server/shutdown-utils.js
-@@ -11,6 +11,7 @@ exports.resetInactivityTimeout = resetInactivityTimeout;
+@@ -3,14 +3,13 @@ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.SERVER_INACTIVITY_TIMEOUT_MS = void 0;
+ exports.storeWatcherInstance = storeWatcherInstance;
+ exports.getWatcherInstance = getWatcherInstance;
+-exports.storeOutputWatcherInstance = storeOutputWatcherInstance;
+-exports.getOutputWatcherInstance = getOutputWatcherInstance;
+ exports.handleServerProcessTermination = handleServerProcessTermination;
+ exports.handleServerProcessTerminationWithRestart = handleServerProcessTerminationWithRestart;
+ exports.resetInactivityTimeout = resetInactivityTimeout;
  exports.respondToClient = respondToClient;
  exports.respondWithError = respondWithError;
  exports.respondWithErrorAndExit = respondWithErrorAndExit;
@@ -1810,7 +1901,7 @@ index a449f2fb3c864bc9d3d710078418c8a05879aa84..17d9f2a7569a1332105b8e1106a2b8fd
  const workspace_root_1 = require("../../utils/workspace-root");
  const logger_1 = require("../logger");
  const socket_utils_1 = require("../socket-utils");
-@@ -23,16 +24,20 @@ const analytics_1 = require("../../analytics");
+@@ -23,16 +22,20 @@ const analytics_1 = require("../../analytics");
  const child_process_1 = require("child_process");
  const path_1 = require("path");
  const node_fs_1 = require("node:fs");
@@ -1835,7 +1926,7 @@ index a449f2fb3c864bc9d3d710078418c8a05879aa84..17d9f2a7569a1332105b8e1106a2b8fd
      // Use require.resolve to find the currently installed version's start.js
      // instead of using __dirname which points to the old running daemon's path
      // Resolve from workspace root to pick up the correct symlink target
-@@ -50,14 +55,21 @@ async function startNewDaemonInBackground() {
+@@ -50,14 +53,21 @@ async function startNewDaemonInBackground() {
      logger_1.serverLogger.log(`Restarting daemon with script: ${startScriptPath}`);
      logger_1.serverLogger.log(`Old daemon __dirname: ${__dirname}`);
      logger_1.serverLogger.log(`Current process.execPath: ${process.execPath}`);
@@ -1865,7 +1956,21 @@ index a449f2fb3c864bc9d3d710078418c8a05879aa84..17d9f2a7569a1332105b8e1106a2b8fd
      backgroundProcess.unref();
      logger_1.serverLogger.log('Started new daemon process in background');
  }
-@@ -85,15 +97,31 @@ async function handleServerProcessTerminationWithRestart({ server, reason, socke
+@@ -68,13 +78,6 @@ function storeWatcherInstance(instance) {
+ function getWatcherInstance() {
+     return watcherInstance;
+ }
+-let outputWatcherInstance;
+-function storeOutputWatcherInstance(instance) {
+-    outputWatcherInstance = instance;
+-}
+-function getOutputWatcherInstance() {
+-    return outputWatcherInstance;
+-}
+ async function handleServerProcessTermination({ server, reason, sockets, }) {
+     await performShutdown(server, reason, sockets);
+ }
+@@ -85,23 +88,35 @@ async function handleServerProcessTerminationWithRestart({ server, reason, socke
      await startNewDaemonInBackground();
      await performShutdown(server, reason, sockets);
  }
@@ -1901,11 +2006,61 @@ index a449f2fb3c864bc9d3d710078418c8a05879aa84..17d9f2a7569a1332105b8e1106a2b8fd
          });
          if (watcherInstance) {
              await watcherInstance.stop();
+-            logger_1.serverLogger.watcherLog(`Stopping the watcher for ${workspace_root_1.workspaceRoot} (sources)`);
+-        }
+-        if (outputWatcherInstance) {
+-            await outputWatcherInstance.stop();
+-            logger_1.serverLogger.watcherLog(`Stopping the watcher for ${workspace_root_1.workspaceRoot} (outputs)`);
++            logger_1.serverLogger.watcherLog(`Stopping the watcher for ${workspace_root_1.workspaceRoot}`);
+         }
+         (0, cache_1.deleteDaemonJsonProcessCache)();
+         (0, get_plugins_1.cleanupPlugins)();
+diff --git a/dist/src/daemon/server/watcher.d.ts b/dist/src/daemon/server/watcher.d.ts
+index 05661e2b3b8e2e84e2f914479eda5d3f12446e83..fb3c1afb74c8fd40179f783971cd5aa94e621ace 100644
+--- a/dist/src/daemon/server/watcher.d.ts
++++ b/dist/src/daemon/server/watcher.d.ts
+@@ -1,15 +1,24 @@
+ import { Server } from 'net';
+ import type { WatchEvent } from '../../native';
+ export type FileWatcherCallback = (err: Error | string | null, changeEvents: WatchEvent[] | null) => Promise<void>;
+-export declare function watchWorkspace(server: Server, cb: FileWatcherCallback): Promise<any>;
+ /**
+- * Synchronously drain anything the workspace watcher has buffered and feed
+- * it through the normal change-handling pipeline. Call this before serving
+- * a cached project graph so we never return data that the watcher has
+- * already seen invalidated but hasn't flushed yet.
++ * Starts the daemon's one file watcher. `cb` receives the changes to the
++ * workspace's files (its ignore files applied), `outputsCb` every change the
++ * watcher reports, gitignored outputs included.
++ */
++export declare function watchWorkspace(server: Server, cb: FileWatcherCallback, outputsCb: FileWatcherCallback): Promise<any>;
++/**
++ * Resolves `undefined` once everything written before the call has reached
++ * the daemon's change handling; on macOS through a probe written and seen to
++ * come back through the stream. Resolves the reason when the stream has
++ * stopped delivering: the caller tells its client and stops the daemon.
++ */
++export declare function proveWatcherCurrent(): Promise<string | undefined>;
++/**
++ * Synchronously drain anything the watcher has buffered and feed it through
++ * the normal change handling, before serving a cached project graph.
+  */
+ export declare function flushPendingWorkspaceChanges(): Promise<void>;
+-export declare function watchOutputFiles(server: Server, cb: FileWatcherCallback): Promise<any>;
+ /**
+  * NOTE: An event type of "create" will also apply to the case where the user has restored
+  * an original version of a file after modifying/deleting it by using git, so we adjust
 diff --git a/dist/src/daemon/server/watcher.js b/dist/src/daemon/server/watcher.js
-index cbc34a1a9c7650ddd50ee7309a0b487f1837e88a..11d56729bcd092605dd9ed64728232022e942384 100644
+index cbc34a1a9c7650ddd50ee7309a0b487f1837e88a..851e1efbe2e624a5049c153b028117ae4f88a312 100644
 --- a/dist/src/daemon/server/watcher.js
 +++ b/dist/src/daemon/server/watcher.js
-@@ -6,20 +6,102 @@ exports.watchOutputFiles = watchOutputFiles;
+@@ -1,25 +1,115 @@
+ "use strict";
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.watchWorkspace = watchWorkspace;
++exports.proveWatcherCurrent = proveWatcherCurrent;
+ exports.flushPendingWorkspaceChanges = flushPendingWorkspaceChanges;
+-exports.watchOutputFiles = watchOutputFiles;
  exports.convertChangeEventsToLogMessage = convertChangeEventsToLogMessage;
  const workspace_root_1 = require("../../utils/workspace-root");
  const path_1 = require("path");
@@ -1915,23 +2070,32 @@ index cbc34a1a9c7650ddd50ee7309a0b487f1837e88a..11d56729bcd092605dd9ed6472823202
 -const cache_1 = require("../cache");
  const server_1 = require("./server");
  const handle_import_1 = require("../../utils/handle-import");
+-// Captured by watchWorkspace so flushPendingWorkspaceChanges can route
+-// force-flushed events through the same handling as the async callback.
 +const workspace_context_1 = require("../../utils/workspace-context");
 +const cache_directory_1 = require("../../utils/cache-directory");
 +const restart_checks_1 = require("./restart-checks");
- // Captured by watchWorkspace so flushPendingWorkspaceChanges can route
- // force-flushed events through the same handling as the async callback.
++const ignore_1 = require("../../utils/ignore");
++const fileutils_1 = require("../../utils/fileutils");
++const path_2 = require("../../utils/path");
++const logger_1 = require("../logger");
++const ignore = require("ignore");
++// Captured by watchWorkspace so proveWatcherCurrent can route force-flushed
++// events through the same handling as the async callback.
  // Definite-assignment: dispatchWorkspaceChanges only runs after
 -// watchWorkspace has set both, so reading them as non-nullable is safe.
 +// watchWorkspace has set all four, so reading them as non-nullable is safe.
  let activeServer;
  let workspaceChangesCallback;
 -function dispatchWorkspaceChanges(events) {
+-    for (const event of events) {
+-        if (event.path.endsWith('.gitignore') || event.path === '.nxignore') {
 +let hashFile;
 +// The filesystem's own time, in nanoseconds, just before the watcher read
 +// the ignore files its filter is built from.
 +let filterReadFrom;
 +function isIgnoreFile(path) {
-+    return path.endsWith('.gitignore') || path === '.nxignore';
++    return (0, path_1.basename)(path) === '.gitignore' || path === '.nxignore';
 +}
 +/** The later of a path's ctime and mtime, in the filesystem's nanoseconds. */
 +function changedAt(path) {
@@ -2000,11 +2164,13 @@ index cbc34a1a9c7650ddd50ee7309a0b487f1837e88a..11d56729bcd092605dd9ed6472823202
 +    return ignoreFilesAtStart;
 +}
 +// Every dispatch awaits the snapshot, so batches still reach the callback in
-+// the order the watcher delivered them.
-+async function dispatchWorkspaceChanges(events) {
++// the order the watcher delivered them. `ignoreFileEvents` are the changed
++// ignore files in directories the walker reads, whether or not the files
++// themselves are workspace files: the workspace filter reads them all the
++// same.
++async function dispatchWorkspaceChanges(events, ignoreFileEvents = events) {
 +    const filterRead = await ignoreFiles();
-     for (const event of events) {
--        if (event.path.endsWith('.gitignore') || event.path === '.nxignore') {
++    for (const event of ignoreFileEvents) {
 +        // hashFile answers null for a file that is gone, which no read hash is.
 +        if (isIgnoreFile(event.path) &&
 +            (!filterRead.has(event.path) ||
@@ -2013,40 +2179,280 @@ index cbc34a1a9c7650ddd50ee7309a0b487f1837e88a..11d56729bcd092605dd9ed6472823202
              // If the ignore files themselves have changed we need to dynamically
              // update our cached ignoreGlobs
              (0, shutdown_utils_1.handleServerProcessTermination)({
-@@ -32,16 +114,20 @@ function dispatchWorkspaceChanges(events) {
-     return workspaceChangesCallback(null, events);
+@@ -29,59 +119,326 @@ function dispatchWorkspaceChanges(events) {
+             });
+         }
+     }
+-    return workspaceChangesCallback(null, events);
++    return events.length === 0 ? undefined : workspaceChangesCallback(null, events);
++}
++let outputsChangesCallback;
++// One native watcher (one FSEventStream on macOS, one inotify set on Linux)
++// carries every change the daemon acts on: the workspace's files, the
++// gitignored outputs, the daemon record and the probes below. FSEvents orders
++// events within one stream only, so a probe that came back through it proves
++// every earlier write came back first; two streams prove nothing about each
++// other.
++//
++// The native filter keeps Nx's hard-coded ignores only (node_modules, .git,
++// the caches). The ignore files Nx's native workspace watcher read decide
++// which events reach the workspace context, in its order
++// (native/watch/watch_filterer.rs): the root .nxignore first, whose ignore or
++// re-include decides; then the .gitignore files from the event's directory
++// up to the workspace root, then those between a nested workspace and its
++// git root, the nearest opinion deciding. A path under a directory those
++// rules exclude is excluded, as the walker never enters that directory. A
++// nested .nxignore, which only the walker reads, is not read here, as Nx's
++// watcher never read it: nothing cached here can go stale behind a change
++// the watcher cannot report. A change to any file read here stops the daemon
++// (dispatchWorkspaceChanges), so the rules stay the ones the workspace
++// context was built with.
++let rootNxIgnore;
++let parentIgnores;
++const gitignores = new Map();
++const excludedDirectories = new Map();
++/**
++ * The .gitignore files between a workspace nested in a git repository and
++ * that repository's root, nearest first, each with the prefix that makes a
++ * workspace-relative path relative to its own directory.
++ */
++function parentGitignores() {
++    const root = workspace_root_1.workspaceRoot;
++    const found = [];
++    if ((0, fs_1.existsSync)((0, path_1.join)(root, '.git'))) {
++        return found;
++    }
++    for (let directory = (0, path_1.dirname)(root);; directory = (0, path_1.dirname)(directory)) {
++        const content = (0, fileutils_1.readFileIfExisting)((0, path_1.join)(directory, '.gitignore'));
++        if (content) {
++            found.push({
++                prefix: `${(0, path_2.normalizePath)((0, path_1.relative)(directory, root))}/`,
++                matcher: ignore().add(content),
++            });
++        }
++        if ((0, fs_1.existsSync)((0, path_1.join)(directory, '.git'))) {
++            return found;
++        }
++        if ((0, path_1.dirname)(directory) === directory) {
++            // Outside any git repository the native filter reads no parent file.
++            return [];
++        }
++    }
++}
++function gitignoreIn(directory) {
++    let matcher = gitignores.get(directory);
++    if (matcher === undefined) {
++        const content = (0, fileutils_1.readFileIfExisting)((0, path_1.join)(workspace_root_1.workspaceRoot, directory, '.gitignore'));
++        matcher = content ? ignore().add(content) : null;
++        gitignores.set(directory, matcher);
++    }
++    return matcher;
++}
++/** `true` ignored, `false` re-included, `undefined` no opinion. */
++function opinion(matcher, path) {
++    const { ignored, unignored } = matcher.test(path);
++    return ignored ? true : unignored ? false : undefined;
++}
++/** Whether the rules exclude `path` itself (a directory when `isDirectory`). */
++function excludedByRules(path, isDirectory) {
++    const probe = isDirectory ? `${path}/` : path;
++    rootNxIgnore ??= ignore().add((0, fileutils_1.readFileIfExisting)((0, path_1.join)(workspace_root_1.workspaceRoot, '.nxignore')));
++    const nx = opinion(rootNxIgnore, probe);
++    if (nx !== undefined) {
++        return nx;
++    }
++    for (let directory = (0, ignore_1.posixDirname)(path);; directory = (0, ignore_1.posixDirname)(directory)) {
++        const matcher = gitignoreIn(directory);
++        if (matcher) {
++            const git = opinion(matcher, directory === '' ? probe : probe.slice(directory.length + 1));
++            if (git !== undefined) {
++                return git;
++            }
++        }
++        if (directory === '') {
++            break;
++        }
++    }
++    parentIgnores ??= parentGitignores();
++    for (const { prefix, matcher } of parentIgnores) {
++        const git = opinion(matcher, prefix + probe);
++        if (git !== undefined) {
++            return git;
++        }
++    }
++    return false;
++}
++function excludedDirectory(directory) {
++    if (directory === '') {
++        return false;
++    }
++    let excluded = excludedDirectories.get(directory);
++    if (excluded === undefined) {
++        excluded =
++            (0, ignore_1.isAlwaysIgnored)(`${directory}/`) ||
++                excludedDirectory((0, ignore_1.posixDirname)(directory)) ||
++                excludedByRules(directory, true);
++        excludedDirectories.set(directory, excluded);
++    }
++    return excluded;
++}
++function isWorkspaceFile(path) {
++    return (!(0, ignore_1.isAlwaysIgnored)(path) &&
++        !excludedDirectory((0, ignore_1.posixDirname)(path)) &&
++        !excludedByRules(path, false));
++}
++/** Whether the walker reads the directory holding `path`, and so its ignore files. */
++function inWalkedDirectory(path) {
++    return !excludedDirectory((0, ignore_1.posixDirname)(path));
  }
- async function watchWorkspace(server, cb) {
+-async function watchWorkspace(server, cb) {
 -    const { Watcher } = await (0, handle_import_1.handleImport)('../../native/index.js', __dirname);
++// macOS only: a probe is an empty file the daemon writes and waits to see come
++// back through its stream. It lives where no walker and no `git status` look,
++// in a directory physically inside the watched tree (a cowshed shed links its
++// workspace data onto another volume, whose events no stream rooted at the
++// workspace reports) whose probe path the root .nxignore does not ignore: the
++// native watcher applies that file to every event, whatever else it admits,
++// and a workspace that ignores every dot path (`.*`) hides `.nx` and `.git`.
++// The first of the workspace data directory, `.git` and `node_modules` that
++// qualifies holds them. With none, nothing can prove the stream current, so
++// the daemon serves no file-state request: the first one is told why and
++// continues without it, and the daemon stops, as for a stopped stream. On
++// Linux the daemon only drains its watcher: inotify has no daemon between
++// the kernel and the watcher that can stop serving it, and Nx registers no
++// inotify watch under those directories.
++const PROBE_NAME = 'nx-watch-probe-';
++let probeDirectory;
++let probeSequence = 0;
++const probesAwaited = new Map();
++function probeDirectoryInsideWorkspace() {
++    const root = (0, fs_1.realpathSync)(workspace_root_1.workspaceRoot);
++    const nxIgnore = ignore().add((0, fileutils_1.readFileIfExisting)((0, path_1.join)(workspace_root_1.workspaceRoot, '.nxignore')));
++    const refused = [];
++    for (const candidate of [
++        cache_directory_1.workspaceDataDirectory,
++        (0, path_1.join)(workspace_root_1.workspaceRoot, '.git'),
++        (0, path_1.join)(workspace_root_1.workspaceRoot, 'node_modules'),
++    ]) {
++        let real;
++        try {
++            if (!(0, fs_1.statSync)(candidate).isDirectory()) {
++                refused.push(`${candidate} is no directory`);
++                continue;
++            }
++            real = (0, fs_1.realpathSync)(candidate);
++        }
++        catch (error) {
++            if (error.code === 'ENOENT') {
++                refused.push(`${candidate} does not exist`);
++                continue;
++            }
++            throw error;
++        }
++        if (!real.startsWith(root + path_1.sep)) {
++            refused.push(`${candidate} lies outside it, at ${real}`);
++            continue;
++        }
++        const directory = (0, path_2.normalizePath)((0, path_1.relative)(root, real));
++        if (nxIgnore.ignores(`${directory}/${PROBE_NAME}0`)) {
++            refused.push(`${candidate} is ignored by its .nxignore`);
++            continue;
++        }
++        return { directory };
++    }
++    return { refused: `the file watcher of ${root} cannot be proven current: no directory takes a probe it reports (${refused.join('; ')})` };
++}
++// Routes one batch the stream delivered, in the order it delivered them.
++function routeEvents(events) {
++    const changes = [];
++    for (const event of events) {
++        const arrived = probesAwaited.get(event.path);
++        if (arrived) {
++            arrived();
++        }
++        else if (!(probeDirectory !== undefined && event.path.startsWith(`${probeDirectory}/${PROBE_NAME}`))) {
++            changes.push(event);
++        }
++    }
++    if (changes.length === 0 || (0, restart_checks_1.stopDaemonIfReplaced)(changes)) {
++        return Promise.resolve();
++    }
++    outputsChangesCallback(null, changes);
++    const workspaceChanges = changes.filter((event) => isWorkspaceFile(event.path));
++    const ignoreFileChanges = changes.filter((event) => isIgnoreFile(event.path) && inWalkedDirectory(event.path));
++    return workspaceChanges.length === 0 && ignoreFileChanges.length === 0
++        ? Promise.resolve()
++        : dispatchWorkspaceChanges(workspaceChanges, ignoreFileChanges);
++}
++async function watchWorkspace(server, cb, outputsCb) {
 +    const native = await (0, handle_import_1.handleImport)('../../native/index.js', __dirname);
 +    const { Watcher } = native;
      activeServer = server;
      workspaceChangesCallback = cb;
+-    const watcher = new Watcher(workspace_root_1.workspaceRoot);
++    outputsChangesCallback = outputsCb;
 +    hashFile = native.hashFile;
++    const admitted = [`!${restart_checks_1.relativeServerProcess}`];
++    if (process.platform === 'darwin') {
++        const location = probeDirectoryInsideWorkspace();
++        if (location.directory !== undefined) {
++            probeDirectory = location.directory;
++            admitted.push(`!${probeDirectory}/${PROBE_NAME}*`);
++        }
++        else {
++            streamStoppedReason = location.refused;
++        }
++    }
 +    filterReadFrom = filesystemNow();
-     const watcher = new Watcher(workspace_root_1.workspaceRoot);
++    const watcher = new Watcher(workspace_root_1.workspaceRoot, admitted, false);
      watcher.watch((err, events) => {
          if (err) {
++            outputsCb(err, null);
              return cb(err, null);
          }
 -        dispatchWorkspaceChanges(events);
-+        dispatchWorkspaceChanges(events).catch((error) => cb(error, null));
++        routeEvents(events).catch((error) => cb(error, null));
      });
 +    setImmediate(() => ignoreFiles().catch((error) => cb(error, null)));
      return watcher;
  }
++/** Drain whatever the watcher has buffered through the normal routing. */
++async function drainWatcher(watcher) {
++    const events = watcher.forceFlushPending();
++    if (events.length > 0) {
++        await routeEvents(events);
++    }
++    // Batches the native side already handed to the JS callback run before
++    // the caller looks again.
++    await new Promise(setImmediate);
++}
  /**
-@@ -61,21 +147,13 @@ async function flushPendingWorkspaceChanges() {
- }
- async function watchOutputFiles(server, cb) {
-     const { Watcher } = await (0, handle_import_1.handleImport)('../../native/index.js', __dirname);
+- * Synchronously drain anything the workspace watcher has buffered and feed
+- * it through the normal change-handling pipeline. Call this before serving
+- * a cached project graph so we never return data that the watcher has
+- * already seen invalidated but hasn't flushed yet.
++ * Synchronously drain anything the watcher has buffered and feed it through
++ * the normal change handling. Called before serving a cached project graph so
++ * we never return data that the watcher has already seen invalidated but
++ * hasn't flushed yet.
+  */
+ async function flushPendingWorkspaceChanges() {
+     const watcher = (0, shutdown_utils_1.getWatcherInstance)();
+-    if (!watcher)
+-        return;
+-    const events = watcher.forceFlushPending();
+-    if (events.length === 0)
+-        return;
+-    await dispatchWorkspaceChanges(events);
+-}
+-async function watchOutputFiles(server, cb) {
+-    const { Watcher } = await (0, handle_import_1.handleImport)('../../native/index.js', __dirname);
 -    const relativeServerProcess = (0, path_2.normalizePath)((0, path_1.relative)(workspace_root_1.workspaceRoot, cache_1.serverProcessJsonPath));
 -    const watcher = new Watcher(workspace_root_1.workspaceRoot, [`!${relativeServerProcess}`], false);
-+    const watcher = new Watcher(workspace_root_1.workspaceRoot, [`!${restart_checks_1.relativeServerProcess}`], false);
-     watcher.watch((err, events) => {
-         if (err) {
-             return cb(err, null);
-         }
+-    watcher.watch((err, events) => {
+-        if (err) {
+-            return cb(err, null);
+-        }
 -        for (const event of events) {
 -            if (event.path == relativeServerProcess &&
 -                (0, cache_1.getDaemonProcessIdSync)() !== process.pid) {
@@ -2055,12 +2461,88 @@ index cbc34a1a9c7650ddd50ee7309a0b487f1837e88a..11d56729bcd092605dd9ed6472823202
 -                    reason: 'this process is no longer the current daemon (native)',
 -                    sockets: server_1.openSockets,
 -                });
--            }
-+        if ((0, restart_checks_1.stopDaemonIfReplaced)(events)) {
-+            return;
++    if (watcher) {
++        await drainWatcher(watcher);
++    }
++}
++/**
++ * Resolves `undefined` once everything written before the call has reached
++ * the daemon's change handling, so an answer given after it cannot come from
++ * file state older than the call. On macOS it writes a probe and drains the
++ * stream until that probe comes back: the stream delivers in order, so every
++ * earlier write came back before it. Calls made while a probe is out share
++ * the next one.
++ *
++ * A stream that stopped delivering (fseventsd restarted or refused the
++ * stream) raises no error: Nx's native watcher drops FSEvents' rescan and
++ * dropped-event flags. Its probe never comes back. The wait has no timer of
++ * its own; DAEMON_VALIDITY_SAFETY_INTERVAL_MS only decides that the probe is
++ * lost, and this resolves the reason, "watcher stream stopped: …", for this
++ * call and every later one. The caller tells its client and stops the
++ * daemon (stopDaemonForStoppedWatcher); the next daemon starts with a fresh
++ * stream.
++ *
++ * On macOS without a directory that takes a probe it resolves, from the
++ * start, the reason nothing can prove the stream current. On Linux it drains
++ * what the watcher holds, as Nx did before serving a graph.
++ */
++let probing;
++let nextProbe;
++let streamStoppedReason;
++function proveWatcherCurrent() {
++    if (!probing) {
++        probing = probeOnce().finally(() => {
++            probing = undefined;
++        });
++        return probing;
++    }
++    nextProbe ??= probing.then(() => {
++        nextProbe = undefined;
++        return proveWatcherCurrent();
++    });
++    return nextProbe;
++}
++async function probeOnce() {
++    const watcher = (0, shutdown_utils_1.getWatcherInstance)();
++    if (!watcher || streamStoppedReason !== undefined) {
++        return streamStoppedReason;
++    }
++    if (probeDirectory === undefined) {
++        await drainWatcher(watcher);
++        return undefined;
++    }
++    const probe = `${probeDirectory}/${PROBE_NAME}${process.pid}-${++probeSequence}`;
++    const probePath = (0, path_1.join)(workspace_root_1.workspaceRoot, probe);
++    let arrived = false;
++    probesAwaited.set(probe, () => {
++        arrived = true;
++    });
++    const writtenAt = performance.now();
++    (0, fs_1.writeFileSync)(probePath, '');
++    try {
++        while (!arrived) {
++            await drainWatcher(watcher);
++            if (!arrived &&
++                performance.now() - writtenAt > restart_checks_1.DAEMON_VALIDITY_SAFETY_INTERVAL_MS) {
++                streamStoppedReason = `watcher stream stopped: probe ${probe} did not come back through the file watcher of ${workspace_root_1.workspaceRoot} within ${restart_checks_1.DAEMON_VALIDITY_SAFETY_INTERVAL_MS} ms, so changes since its last event are unknown to this daemon`;
++                return streamStoppedReason;
+             }
          }
-         if (events.length !== 0) {
-             cb(null, events);
+-        if (events.length !== 0) {
+-            cb(null, events);
+-        }
+-    });
+-    return watcher;
++        logger_1.serverLogger.watcherLog(`watcher current: probe came back in ${(performance.now() - writtenAt).toFixed(1)} ms`);
++        return undefined;
++    }
++    finally {
++        probesAwaited.delete(probe);
++        (0, fs_1.rmSync)(probePath, { force: true });
++    }
+ }
+ /**
+  * NOTE: An event type of "create" will also apply to the case where the user has restored
 diff --git a/dist/src/daemon/socket-utils.d.ts b/dist/src/daemon/socket-utils.d.ts
 index 52b621b433beccb8e6590316cfd5baa7c7ec3b80..1c13e49fb4e8e37520ecd6e7a1c00ce251d201e4 100644
 --- a/dist/src/daemon/socket-utils.d.ts

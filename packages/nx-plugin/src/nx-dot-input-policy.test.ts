@@ -229,7 +229,10 @@ it('preserves tracked input hashes and the graph while dot staging never causes 
     } finally {
       await rm(copied, { recursive: true, force: true });
     }
-    await symlink(join(repositoryRoot, 'node_modules'), join(root, 'node_modules'), 'dir');
+    // A real node_modules linking only nx: with every dot path ignored, it is where the daemon on macOS puts the probe
+    // that proves its watcher current (patches/README.md), and a linked one lies outside the checkout.
+    await mkdir(join(root, 'node_modules'));
+    await symlink(join(repositoryRoot, 'node_modules', 'nx'), join(root, 'node_modules', 'nx'), 'dir');
     await writeFile(join(root, 'nx.json'), '{}\n');
     await writeFile(join(root, 'package.json'), '{"name":"dot-graph-proof","private":true}\n');
     await mkdir(join(root, 'p'));

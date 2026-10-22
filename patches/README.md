@@ -416,6 +416,60 @@ daemon and stops it from a Seatbelt profile with the job sandbox's signal rule, 
 another sandbox. The daemon must keep running and answering on the same record and socket. On every platform it stops a
 record naming pid 1, a live process of another user, and one naming an exited process, which still stops.
 
+## A stopped watcher stream is never served from
+
+A daemon's file watcher can stop delivering without a word. Nx 23.2.1's native watcher drops FSEvents' rescan and
+dropped-event flags, and an FSEventStream fseventsd stopped serving (a restarted fseventsd, a stream refused at start)
+reports nothing. The daemon then hashed tasks, graphs and output verdicts from the files it last saw: a shed's daemon
+received no event for 33 minutes after a host-side stop, and `nx run-many` called a changed input's target
+`[existing outputs match the cache, left as is]`, so the tests ran the old build.
+
+The daemon now watches the checkout with one native watcher (`daemon/server/watcher.js`), not one for sources and one
+for outputs: FSEvents orders events within one stream only. The native filter keeps Nx's hard-coded ignores; the
+workspace view applies the ignore files Nx's native workspace watcher read, in its order (`watch_filterer.rs`): the root
+`.nxignore` first, whose ignore or re-include decides; then the `.gitignore` files from the event's directory up to the
+workspace root, then those between a nested workspace and its git root, the nearest opinion deciding. A path under a
+directory those rules exclude is excluded, as the walker never enters it. A root `.nxignore` `!p/keep.txt` therefore
+keeps a file `p/.gitignore` ignores, and a nested workspace's `!keep.txt` keeps a file its parent repository's `*.txt`
+ignores, as watcher and walker do. A nested `.nxignore`, which only the walker reads, is not read, as Nx's watcher never
+read it. A change to one of the files read stops the daemon, as before. The daemon record and the outputs tracking take
+every event, as the outputs watcher did.
+
+On macOS the first request of a connection that is answered from the workspace's files (everything but liveness,
+shutdown, subscriptions and the Nx Console and AI agent status) writes an empty probe, `nx-watch-probe-<pid>-<n>`, and
+drains the stream until the probe comes back. The probe lives in the first of the workspace data directory, `.git` and
+`node_modules` that lies physically inside the checkout (a cowshed shed links its workspace data onto another volume)
+and whose probe path the root `.nxignore` does not ignore: the native watcher applies that file to every event, and a
+workspace that ignores every dot path (`.*`, as this repository does) hides `.nx` and `.git`. Where none qualifies (a
+linked `node_modules` under such an `.nxignore`, say), nothing can prove the stream current: the daemon answers the
+first file-state request with the reason, tagged as below, and stops. Every write made before the nx command reached the
+daemon by then. Requests that arrive while a probe is out share the next one. A probe that has not come back after
+`DAEMON_VALIDITY_SAFETY_INTERVAL_MS` means the stream stopped: the daemon replies with an error tagged
+`daemonStartForbidden` (the client's "continue without this daemon in this process" tag), so the command goes on without
+a daemon at once (the client turns the daemon off for its own process, `disableDaemonForThisProcess`, so no later
+request of the command dials the stopping daemon), then logs `watcher stream stopped` and stops. It stops rather than
+restarts: a successor it spawned would inherit the cause. The next client, or the shed's keeper, starts one with a fresh
+stream. Later requests on the same connection are served as Nx always served them, so a write another process makes
+while a command runs is as visible as it was. Linux inotify has no daemon between the kernel and the watcher that can
+stop serving it, and Nx registers no watch under the hard-coded ignores where a probe could live; there the daemon only
+drains its watcher, as Nx did before serving a graph, and the inotify overflow (Rescan) path stays unproven.
+
+Measured on macOS, a 47-task chain of cache hits: stock 0.51–0.82 s per run; patched 0.79–0.96 s, one probe of 63–103 ms
+per command. A probe before every file-state request cost 51 probes of 65–78 ms, 3.3–3.9 s per run, and was dropped. A
+burst of 20000 gitignored and 2000 tracked file writes cost the daemon 810–910 ms of CPU against stock's 1040–1260 ms:
+one native stream instead of two.
+
+`packages/nx-plugin/src/nx-daemon-watch-stream-host.test.ts` runs in `nx-plugin:test-host`. On every platform a real
+fixture daemon rebuilds a target whose input was replaced by rename. On macOS a daemon started under a Seatbelt profile
+that denies FSEvents (which `sandbox_apply` refuses inside another sandbox) must tell the command
+`watcher stream stopped`, which continues without it, log it, and never call the changed input's target cached; a
+healthy daemon whose `.nxignore` hides every dot path must see its probe come back from a real `node_modules`; and one
+with nowhere to put a probe must answer `cannot be proven current` and never serve a stale verdict.
+`nx-daemon-watch-filter.test.ts` (an ordinary shard) holds a nested workspace whose `.gitignore` re-includes `keep.txt`
+under its parent repository's `*.txt`: a fresh walk indexes it, and the daemon must rebuild the target whose input it is
+once it changes. Drop these hunks only when the installed upstream watcher reports a stopped stream, retaining the
+regression.
+
 ## Canonical daemon workspace roots
 
 The daemon and plugin-worker message guard compares canonical path strings. A redundant trailing separator does not make

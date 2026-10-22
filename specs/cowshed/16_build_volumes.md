@@ -1204,6 +1204,19 @@ map, and the probe's bookkeeping must not reach either candidate image.
   daemon and starts none until the shed is in use again (04_sandbox.md), and the next Nx command starts one. What the
   rule protects is the warm state of a shed in use; a daemon nothing uses is a resident process, its plugin workers and
   a file watcher recomputing the project graph for every change in a tree nobody builds.
+- **A daemon answers from the files as they are.** A daemon whose file watcher stops delivering is blind to every later
+  change and would hash tasks from the files it last saw: a shed's daemon received no event for 33 minutes (its FSEvents
+  stream stopped with no error; Nx 23.2.1 drops FSEvents' rescan flags) and called a changed input's target "[existing
+  outputs match the cache, left as is]". The carried Nx patch watches the checkout with one stream, and on macOS an nx
+  command's first request answered from file state writes a probe the daemon must see come back through that stream; the
+  stream delivers in order, so every write made before the command reached the daemon. A probe lost for
+  `DAEMON_VALIDITY_SAFETY_INTERVAL_MS` tells the client "watcher stream stopped", which continues without a daemon, and
+  stops the daemon; the keeper (or the next host client) starts one with a fresh stream. A checkout with no directory
+  that takes a probe the watcher reports fails closed the same way. A write another process makes while a command runs
+  is as visible as Nx makes it. Linux inotify has no daemon between the kernel and the watcher that can stop serving it,
+  so there the daemon only drains its watcher; its overflow (Rescan) path stays unproven. (`patches/README.md`, "A
+  stopped watcher stream is never served from".)
+  - **Enforced by**: `packages/nx-plugin/src/nx-daemon-watch-stream-host.test.ts` (`nx-plugin:test-host`).
 - **Accepted property**: an Nx client sends its whole environment to the daemon in every message
   (`daemon/client/client.js` `getDaemonEnv`), and the daemon applies it to its own `process.env`
   (`daemon/server/handle-client-env.js`). In a workspace whose daemon runs inside the sandbox, a host client's

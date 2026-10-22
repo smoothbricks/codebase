@@ -609,7 +609,9 @@ no per-test bound kills a test: a Bun leg deletes Bun's own 5000 ms per-test dea
 carries one of its own (`packages/nx-plugin/README.md`, "Bounded Test Targets"). A group's runner carries
 `--no-tests=fail`, so a filter that selects nothing fails rather than passing a run of no test. The RAM host walk and
 real-process CPU-pool production-wiring proofs run in `test-host`, outside the four pure Bun shards, with the existing
-case bounds. The shards exclude `*-host.test.ts`; the host target names both owned host files.
+case bounds, and so do the Nx daemon proofs that apply their own Seatbelt profile (a refused daemon stop, a stopped
+FSEvents stream), which `sandbox_apply` refuses inside a cowshed job. The shards exclude `*-host.test.ts`; the host
+target names each owned host file.
 
 An unfinished test name is not holder attribution. During the final five seconds of an unchanged no-progress interval,
 the executor takes one bounded pre-signal snapshot of its runner, descendants and retained process group. Resumed

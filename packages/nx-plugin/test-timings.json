@@ -19,6 +19,7 @@
     "src/cargo-closure-input.test.ts": 28312,
     "src/cargo-closure-key.test.ts": 24927,
     "src/executors/bounded-exec/hang-diagnostics.test.ts": 24416,
+    "src/nx-daemon-watch-filter.test.ts": 19380,
     "src/owned-installation.test.ts": 17372,
     "src/nx-daemon-claim.test.ts": 16158,
     "src/index.test.ts": 12955,
