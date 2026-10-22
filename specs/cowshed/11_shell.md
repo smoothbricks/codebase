@@ -934,7 +934,8 @@ registers an exit watch on each of them when it begins (`NOTE_EXIT`, a readable 
 asks; the watch is an event, never a poll of the process table (04_sandbox.md, "a probe runs inside the supervisor's
 actor"). A process that had already exited when the drain looked is named as such. The drain lists its jobs before it
 closes admission, so a job admitted in between is owed and waited for like a listed one; whether its requester is
-recorded before or after the drain begins is decided under one lock, so it is never lost between the two.
+recorded before or after the drain begins is decided under one lock, so it is never lost between the two, and the drain
+settles only once every exec in flight on its socket has recorded its requester or been refused.
 
 A resident (`Resident` or `InteractiveResident`, 05_gateway.md "A resident holds no token") never finishes on its own:
 it runs each request its requester sends it, and nothing else reaches it. So a draining supervisor ends a running

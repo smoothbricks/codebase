@@ -1232,8 +1232,25 @@ struct DrainReads {
     drain: Mutex<Option<Drain>>,
     /// A read of an owed job: progress, and the idle bound starting over.
     read: tokio::sync::Notify,
-    /// A process an owed job was owed to exited: progress, the idle bound unchanged.
+    /// A process an owed job was owed to exited, or an exec in flight was recorded or refused:
+    /// progress, the idle bound unchanged.
     gone: tokio::sync::Notify,
+    /// Execs whose admission is in flight: each may yet admit a job the drain owes, so the
+    /// drain cannot settle until it has recorded its requester or been refused.
+    admitting: std::sync::atomic::AtomicUsize,
+}
+
+/// An exec in flight on [`DrainReads`]: held from before the actor is asked until the requester
+/// of the job it admitted is recorded, or it is refused; dropped on every path.
+struct Admitting<'a>(&'a DrainReads);
+
+impl Drop for Admitting<'_> {
+    fn drop(&mut self) {
+        self.0
+            .admitting
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.0.gone.notify_one();
+    }
 }
 
 /// The processes that asked for or about one job, each held by the identity the kernel gave its
@@ -1514,6 +1531,13 @@ impl std::fmt::Display for Settled {
 }
 
 impl DrainReads {
+    /// An exec is about to be asked of the actor.
+    fn admitting(&self) -> Admitting<'_> {
+        self.admitting
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Admitting(self)
+    }
+
     fn asked(&self) -> std::sync::MutexGuard<'_, BTreeMap<JobId, Asked>> {
         self.asked
             .lock()
@@ -1746,10 +1770,11 @@ impl DrainReads {
     async fn settle(&self, bound: std::time::Duration) -> Settled {
         let mut deadline = tokio::time::Instant::now() + bound;
         loop {
-            let settled = self
-                .drain()
-                .as_ref()
-                .is_none_or(|drain| drain.owed.values().all(Owed::settled));
+            let settled = self.admitting.load(std::sync::atomic::Ordering::Acquire) == 0
+                && self
+                    .drain()
+                    .as_ref()
+                    .is_none_or(|drain| drain.owed.values().all(Owed::settled));
             if settled {
                 break;
             }
@@ -2036,6 +2061,8 @@ async fn serve_call(
         _ => None,
     };
     let retiring = matches!(*call, Call::Retire { .. });
+    // Held across the admission and its bookkeeping, so no drain settles between them.
+    let admitting = requester.as_ref().map(|_| owed.admitting());
     let Answer {
         value,
         bytes,
@@ -2050,6 +2077,7 @@ async fn serve_call(
     if let (Some(job), Some((class, requester))) = (admitted, requester) {
         owed.admitted(job, class, requester, &caller);
     }
+    drop(admitting);
     if retiring {
         // The serving loop releases the listener and lease before acknowledging retirement.
         return Ok(Retirement::Retired {
@@ -4090,6 +4118,58 @@ mod drain_read_tests {
             settled.to_string(),
             "read by a client: []; unread after 30 minutes with no read: [7]"
         );
+    }
+
+    /// An exec the actor admitted before the drain closed admission may have its requester
+    /// recorded only after its job ended and the quiesce returned: the drain cannot settle while
+    /// that exec is in flight, so the job's obligation is never created after retirement was
+    /// decided. A refused exec owes nothing once it is done.
+    #[tokio::test]
+    async fn a_drain_settles_only_once_every_exec_in_flight_is_recorded() {
+        fn ready<F: Future>(future: std::pin::Pin<&mut F>) -> bool {
+            future
+                .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                .is_ready()
+        }
+        // Refused: once the exec is done the drain settles at once.
+        let owed = DrainReads::default();
+        owed.begin(&[], ends()).expect("the first drain");
+        let refused = owed.admitting();
+        {
+            let mut settle = std::pin::pin!(owed.settle(BOUND));
+            assert!(!ready(settle.as_mut()), "an exec in flight holds the drain");
+            drop(refused);
+            assert!(ready(settle.as_mut()), "a refused exec owes nothing");
+        }
+
+        // Admitted: its job ended and the quiesce returned before its requester was recorded.
+        let (mut child, requester) = live();
+        let ends = ends();
+        let owed = Arc::new(DrainReads::default());
+        owed.begin(&[], ends.clone()).expect("the first drain");
+        let admitting = owed.admitting();
+        let mut settle = std::pin::pin!(owed.settle(BOUND));
+        assert!(
+            !ready(settle.as_mut()),
+            "the exec in flight holds the drain"
+        );
+        owed.admitted(
+            job(9),
+            ExecClass::Background,
+            Ok(requester),
+            &ends.supervisor,
+        );
+        drop(admitting);
+        assert!(
+            !ready(settle.as_mut()),
+            "job 9 is owed to its live requester once recorded"
+        );
+        drop(child.stdin.take());
+        assert!(child.wait().await.expect("the requester exits").success());
+        let settled = tokio::time::timeout(Duration::from_secs(60), settle)
+            .await
+            .expect("whole-leg watchdog: the drain settles once job 9's requester exited");
+        assert_eq!(settled.abandoned, [job(9)]);
     }
 
     /// Measured 2026-10-22: a drained supervisor whose ended job's client was gone answered the
