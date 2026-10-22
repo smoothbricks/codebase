@@ -1489,7 +1489,7 @@ concurrent grants; a work-unit class never creates exclusive root-gate admission
   intercepted connections before admitting execution.
 - The gateway process is host-side and credential-store access is restricted to that executable identity.
 
-## Startup contract: eager heal, always
+## Startup contract: mains eagerly, sessions on use
 
 The gateway is `RunAtLoad`, so it is the first cowshed process alive after a reboot, and its startup pass is where
 mounts are restored. In order:
@@ -1500,14 +1500,15 @@ mounts are restored. In order:
    before anything binds. Then count the recorded projects and list the workspace supervisors still serving from before
    this daemon, then serve: the control socket and the supervisor manager answer from the first moment. Status answers
    throughout, and so do the audit, mirror, and simulator requests, none of which reads a workspace mount.
-3. Eagerly heal every recorded project's mounts: every project's main attached and mounted at its checkout path first,
-   then every other workspace under the mount root (02_workspaces.md). Each step is a lifecycle span of its own —
-   `startup-heal discover`, `startup-heal open <repo>`, `startup-heal mount <repo>/<workspace>` — so a slow pass reads
-   as the step that spent the time.
-4. Restore every attached workspace's session into the gateway from what step 3 mounted. A session whose endpoint an
-   install carried serves on that listener, connections queued on it included; any other binds its endpoint. Once every
-   session is restored, each carried listener no session claimed is closed, so its queued connections are reset rather
-   than left waiting for nobody.
+3. Eagerly heal every recorded project's main: attached and mounted at its checkout path. Each step is a lifecycle span
+   of its own — `startup-heal discover`, `startup-heal open <repo>`, `startup-heal mount <repo>/main` — so a slow pass
+   reads as the step that spent the time. Session workspaces are not attached by the pass: a session the kernel still
+   holds (a gateway restart without a reboot) stays attached, and every other session stays detached until a verb uses
+   it.
+4. Restore every attached workspace's session into the gateway. A session whose endpoint an install carried serves on
+   that listener, connections queued on it included; any other binds its endpoint. Once every session is restored, each
+   carried listener no session claimed is closed, so its queued connections are reset rather than left waiting for
+   nobody.
 
 Positively authorized pending project retirements are excluded from the ordinary heal set. After the control socket and
 supervisor manager are serving, startup resumes those records through the same owned drain, unforced detach and
@@ -1516,7 +1517,7 @@ missing checkout, marker or process; a failed or busy retirement remains fenced 
 healthy projects' mount restoration.
 
 Until step 4 ends, status carries `healing`: `{ mounting: { projects: N } }` with the projects not yet mounted (never 0;
-a project counts once its sessions are mounted), then `restoringSessions`; it is absent once the pass is over, and
+a project counts once its main is mounted), then `restoringSessions`; it is absent once the pass is over, and
 `cowshed gateway status`, `doctor` (`gateway-starting`), and `gateway start`'s wait say so in those words. Everything
 that depends on what the pass restores is refused by type meanwhile, never reported as an absent gateway: a session
 `install` or `remove` on the control socket with failure code `healing`, every command's reconcile with a `Conflict`
@@ -1541,6 +1542,14 @@ working.
 Heal-on-contact remains, as the fallback for everything that appears after startup: an image published while the gateway
 is already running, a gateway restart mid-session, a workspace detached and reattached by hand. The startup pass closes
 the reboot window; the stub closes everything else.
+
+Sessions, not mains, heal on contact. A session's path is under the mount root, not a checkout the user's shell, editor
+or Finder shows, and every verb that reaches a session (`path`, `exec`, `attach`, a lifecycle verb) opens it, which
+attaches a detached one (06_cli.md, "Resident workspaces"). Attaching every session at startup instead cost each shed
+two images and six registered IOMedia whether or not anyone used it: on 2026-10-22 the pass re-attached about 154 sheds,
+308 images and 931 IOMedia, most of them idle or already landed, which put the host within a hundred of IOKit's 1024
+match-notification cap (01a_apfs.md, "The IOMedia match-notification ceiling") before any work began. A session attached
+on use costs its media only while it is used, and making room (02_workspaces.md) detaches it again when it idles.
 
 Failures are per-project and never block the gateway from serving healthy ones. A project whose store, image, or mount
 cannot be healed is recorded as a finding, surfaced by `cowshed doctor` with its `next:` hint, and skipped; the

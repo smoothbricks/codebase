@@ -67,7 +67,7 @@ impl StartupHealState {
         *self.lock()
     }
 
-    /// One more project is mounted, or reported as unmountable. [`NativeGatewayInventory::heal`]
+    /// One more project's main is mounted, or reported as unmountable. [`NativeGatewayInventory::heal`]
     /// calls this once per project it was given, which is the count [`Self::mounting`] started
     /// from, so it never runs past `Mounting`.
     fn project_mounted(&self) {
@@ -139,25 +139,14 @@ pub struct UnreachableMain {
     pub reason: String,
 }
 
-/// What eager heal achieved for one project.
-///
-/// Main and sessions are reported apart because they are not equally load-bearing: main is the
-/// user's own checkout and an unmounted one is critical, while a session that fails to mount costs
-/// only that session. Each result is kept rather than counted so the failure names itself.
+/// What the startup heal achieved for one project: its main, the user's own checkout. Session
+/// workspaces are not attached by the startup pass; each attaches on use (05_gateway.md "Startup
+/// contract"), so a reboot attaches only the checkouts someone can see and the sheds someone uses.
 #[derive(Debug)]
 pub struct ProjectHealOutcome {
     pub repo_id: RepoId,
     /// Main's mountpoint, or why the project's checkout is not reachable there.
     pub main: Result<PathBuf, GatewayInventoryError>,
-    /// One entry per recorded session workspace, in inventory order. Empty when the project could
-    /// not be opened at all — there was nothing to attempt.
-    pub sessions: Vec<SessionHealOutcome>,
-}
-
-#[derive(Debug)]
-pub struct SessionHealOutcome {
-    pub workspace: WorkspaceName,
-    pub mount: Result<PathBuf, GatewayInventoryError>,
 }
 
 impl fmt::Debug for GatewaySessionFact {
@@ -602,15 +591,6 @@ struct OpenProject {
     /// The project's main. Absent only when its store records none, which for an adopted project
     /// means its main image was retired without a replacement.
     main: Option<LifecycleWorkspace>,
-    sessions: Vec<LifecycleWorkspace>,
-}
-
-/// One project between the two heal passes: its main settled, its sessions still to mount.
-struct HealedMain {
-    repo_id: RepoId,
-    /// Absent when the project could not be opened, so there is nothing left to attempt.
-    project: Option<OpenProject>,
-    main: Result<PathBuf, GatewayInventoryError>,
 }
 
 /// Read-only native inventory rooted in an already existing-only validated host store.
@@ -1123,8 +1103,8 @@ impl NativeGatewayInventory {
         .await
     }
 
-    /// Attach and mount every one of `repositories`' workspaces, mains before sessions, telling
-    /// `progress` as each project is done.
+    /// Attach and mount every one of `repositories`' mains, telling `progress` as each project is
+    /// done.
     ///
     /// This runs at gateway startup because the gateway is `RunAtLoad` and a reboot is the one
     /// window adoption's "the checkout path is never absent and never dangling" guarantee cannot
@@ -1132,14 +1112,14 @@ impl NativeGatewayInventory {
     /// mount, a bare stub directory — visible in the user's shell, editor, and Finder until
     /// something happened to touch it.
     ///
-    /// Mains go first across every project, not per project in inventory order: a main is the
-    /// user's own checkout and is always-mounted (02_workspaces.md), so no project's session
-    /// mount — which may attach, fsck, and mount a multi-gigabyte image — is allowed to stand
-    /// between another project's checkout and its mount. A project is done once its sessions
-    /// are, so `progress` counts down in the session pass.
+    /// Session workspaces are not attached here. Each costs two images (its own and its build
+    /// volume) and six registered IOMedia under IOKit's 1024 match-notification cap, and most sheds
+    /// a reboot finds are idle: attaching all of them spent the cap and the image driver's pool on
+    /// sheds nobody used. A session attaches on use instead (`path`, `exec`, `attach` and every
+    /// verb that opens it), which is the same heal-on-contact a detached session already takes.
     ///
-    /// Every step is a lifecycle span of its own (`startup-heal open|mount <repo>[/<workspace>]`),
-    /// so a slow heal reads as the step that spent the time.
+    /// Every step is a lifecycle span of its own (`startup-heal open|mount <repo>/main`), so a slow
+    /// heal reads as the step that spent the time.
     ///
     /// Failures are per-project and returned rather than raised: one project whose store or image
     /// cannot be healed must not cost every other project its gateway. A project that cannot even
@@ -1160,75 +1140,44 @@ impl NativeGatewayInventory {
             .await;
             opened.push((repo, project));
         }
-        let mut healed_mains = Vec::with_capacity(opened.len());
+        let mut outcomes = Vec::with_capacity(opened.len());
         for (repo_id, project) in opened {
-            let (project, main) = match project {
-                Ok(project) => {
-                    let main = match &project.main {
-                        Some(main) => {
-                            cowshed_os::timing::timed_async(
-                                HEAL_SCOPE,
-                                format!("mount {repo_id}/{}", main.name()),
-                                project.mounts.mount(main),
-                            )
-                            .await
-                        }
-                        None => Err(GatewayInventoryError::MissingMainWorkspace(repo_id.clone())),
-                    };
-                    (Some(project), main)
+            let main = match project {
+                Ok(OpenProject {
+                    mounts,
+                    main: Some(main),
+                }) => {
+                    cowshed_os::timing::timed_async(
+                        HEAL_SCOPE,
+                        format!("mount {repo_id}/{}", main.name()),
+                        mounts.mount(&main),
+                    )
+                    .await
                 }
-                Err(error) => (None, Err(error)),
+                Ok(OpenProject { main: None, .. }) => {
+                    Err(GatewayInventoryError::MissingMainWorkspace(repo_id.clone()))
+                }
+                Err(error) => Err(error),
             };
-            healed_mains.push(HealedMain {
-                repo_id,
-                project,
-                main,
-            });
-        }
-        let mut outcomes = Vec::with_capacity(healed_mains.len());
-        for healed in healed_mains {
-            let mut sessions = Vec::new();
-            if let Some(project) = healed.project {
-                sessions.reserve(project.sessions.len());
-                for workspace in &project.sessions {
-                    sessions.push(SessionHealOutcome {
-                        workspace: workspace.name().clone(),
-                        mount: cowshed_os::timing::timed_async(
-                            HEAL_SCOPE,
-                            format!("mount {}/{}", healed.repo_id, workspace.name()),
-                            project.mounts.mount(workspace),
-                        )
-                        .await,
-                    });
-                }
-            }
-            outcomes.push(ProjectHealOutcome {
-                repo_id: healed.repo_id,
-                main: healed.main,
-                sessions,
-            });
+            outcomes.push(ProjectHealOutcome { repo_id, main });
             progress.project_mounted();
         }
         outcomes
     }
 
-    /// Open one project's mount side and split its workspaces by class.
+    /// Open one project's mount side and find its main.
     ///
     /// Opening is separated from mounting so the whole store is prepared before the first mount:
     /// the main pass is only "mains first" if no project's preparation happens between two other
     /// projects' mains.
     async fn open_project(&self, repo: &RepoId) -> Result<OpenProject, GatewayInventoryError> {
         let mounts = self.heal.open(&self.storage, repo).await?;
-        let (mains, sessions): (Vec<_>, Vec<_>) = mounts
+        let main = mounts
             .workspaces()
             .await?
             .into_iter()
-            .partition(|workspace| workspace.name().is_main());
-        Ok(OpenProject {
-            mounts,
-            main: mains.into_iter().next(),
-            sessions,
-        })
+            .find(|workspace| workspace.name().is_main());
+        Ok(OpenProject { mounts, main })
     }
 
     /// Every adopted project whose main is not mounted where its checkout layout puts it.
@@ -4688,8 +4637,8 @@ mod tests {
     }
 
     /// While a mount is held, the pass says how many projects it still has to mount: a project
-    /// counts as mounted only once its sessions are, so the count holds through the mains and
-    /// drops as each project's sessions finish, then turns to restoring sessions.
+    /// counts as mounted once its main is, so the count drops as each main finishes, then turns to
+    /// restoring sessions. A session is never mounted by the pass.
     #[tokio::test]
     async fn the_startup_heal_counts_down_the_projects_it_still_mounts() {
         let fixture = Fixture::new("heal-progress");
@@ -4734,29 +4683,25 @@ mod tests {
             async move { inventory.heal(repositories, &progress).await }
         });
 
-        for (held, left) in [
-            ("acme/alpha/main", 2),
-            ("acme/beta/main", 2),
-            ("acme/beta/raven", 1),
-        ] {
+        for (held, left) in [("acme/alpha/main", 2), ("acme/beta/main", 1)] {
             assert_eq!(mounts.recv().await.as_deref(), Some(held));
             assert_eq!(progress.current(), mounting(left), "while {held} is held");
             permits.add_permits(1);
         }
         let outcomes = healing.await.expect("the heal ends");
         assert_eq!(outcomes.len(), 2);
+        assert!(mounts.try_recv().is_err(), "no session was mounted");
         assert_eq!(progress.current(), Some(StartupHeal::RestoringSessions));
         progress.restored();
         assert_eq!(progress.current(), None);
     }
 
-    /// Every project's main is mounted before any project's session.
+    /// The startup heal mounts every project's main and no session: a session attaches on use.
     ///
-    /// Mains are always-mounted, so the checkout a user sees must not wait behind another
-    /// project's session image — the fixture lists each project's session first precisely so
-    /// inventory order cannot pass this by accident.
+    /// The fixture lists each project's session first precisely so inventory order cannot pass this
+    /// by accident.
     #[tokio::test]
-    async fn eager_heal_mounts_every_main_before_the_first_session() {
+    async fn the_startup_heal_mounts_every_main_and_no_session() {
         let fixture = Fixture::new("heal-order");
         let alpha = RepoId::parse("acme/alpha").expect("repo alpha");
         let beta = RepoId::parse("acme/beta").expect("repo beta");
@@ -4779,12 +4724,7 @@ mod tests {
 
         assert_eq!(
             *order.lock().expect("mount order"),
-            [
-                "acme/alpha/main",
-                "acme/beta/main",
-                "acme/alpha/raven",
-                "acme/beta/raven"
-            ]
+            ["acme/alpha/main", "acme/beta/main"]
         );
         assert_eq!(
             outcomes
@@ -4795,12 +4735,9 @@ mod tests {
         );
         for outcome in &outcomes {
             assert!(outcome.main.is_ok(), "{} main healed", outcome.repo_id);
-            assert_eq!(outcome.sessions.len(), 1);
-            assert!(outcome.sessions[0].mount.is_ok());
         }
     }
-    /// One unhealable project never costs another its mounts, and an unreachable main never costs
-    /// its own project's sessions.
+    /// One unhealable project never costs another its main.
     ///
     /// A single broken checkout taking the `RunAtLoad` daemon down with it would convert one
     /// defect into a machine with no gateway at all (05_gateway.md).
@@ -4834,12 +4771,7 @@ mod tests {
 
         assert_eq!(
             *order.lock().expect("mount order"),
-            [
-                "acme/beta/main",
-                "acme/gamma/main",
-                "acme/beta/raven",
-                "acme/gamma/raven"
-            ]
+            ["acme/beta/main", "acme/gamma/main"]
         );
         let alpha_outcome = &outcomes[0];
         assert_eq!(alpha_outcome.repo_id, alpha);
@@ -4847,21 +4779,12 @@ mod tests {
             alpha_outcome.main,
             Err(GatewayInventoryError::InvalidMetadata { .. })
         ));
-        assert!(
-            alpha_outcome.sessions.is_empty(),
-            "a project that never opened has nothing to attempt"
-        );
         let beta_outcome = &outcomes[1];
         assert_eq!(beta_outcome.repo_id, beta);
         assert!(beta_outcome.main.is_err());
-        assert!(
-            beta_outcome.sessions[0].mount.is_ok(),
-            "an unreachable main still leaves its project's sessions to mount"
-        );
         let gamma_outcome = &outcomes[2];
         assert_eq!(gamma_outcome.repo_id, gamma);
         assert!(gamma_outcome.main.is_ok());
-        assert!(gamma_outcome.sessions[0].mount.is_ok());
     }
 
     /// A project whose main records no main workspace at all is reported, not skipped.
@@ -4885,7 +4808,6 @@ mod tests {
             &outcomes[0].main,
             Err(GatewayInventoryError::MissingMainWorkspace(named)) if *named == repo
         ));
-        assert!(outcomes[0].sessions[0].mount.is_ok());
     }
 
     /// The always-mounted check names main's image and its mountpoint, so a finding can point at

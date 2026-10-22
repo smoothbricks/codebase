@@ -1684,14 +1684,13 @@ fn retirement_resume_lines(
     lines
 }
 
-/// Heal every one of `repositories`, mains before sessions, counting each one down in `heal` and
-/// reporting rather than raising.
+/// Heal every one of `repositories`' mains, counting each one down in `heal` and reporting rather
+/// than raising. Sessions attach on use, not here (05_gateway.md "Startup contract").
 ///
 /// A project that cannot be healed is a finding for `cowshed doctor`; it must never stop the
-/// gateway from serving the healthy ones (05_gateway.md). Mains are logged apart from sessions
-/// because they are not equally load-bearing: an unmounted main is the user's own checkout missing
-/// from their shell and editor, which is why `doctor` reports it as critical and this line carries
-/// the remedy with it.
+/// gateway from serving the healthy ones (05_gateway.md). An unmounted main is the user's own
+/// checkout missing from their shell and editor, which is why `doctor` reports it as critical
+/// and this line carries the remedy with it.
 async fn heal_recorded_projects(
     inventory: &NativeGatewayInventory,
     repositories: Vec<RepoId>,
@@ -1704,15 +1703,6 @@ async fn heal_recorded_projects(
                 outcome.repo_id
             );
             cowshed_os::eprintln!("next: cowshed doctor");
-        }
-        for session in &outcome.sessions {
-            if let Err(error) = &session.mount {
-                cowshed_os::eprintln!(
-                    "cowshed: could not mount {}/{} at gateway startup: {error}",
-                    outcome.repo_id,
-                    session.workspace
-                );
-            }
         }
     }
 }
