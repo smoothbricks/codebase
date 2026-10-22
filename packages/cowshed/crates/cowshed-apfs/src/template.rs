@@ -9,7 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::image::{IMAGE_EXTENSION, ImageCapacity};
-use crate::store_lock::{LockMode, StoreLockError, acquire_image_locks, verify_no_symlinks};
+use crate::store_lock::{LockMode, StoreLockError, Taker, acquire_image_locks, verify_no_symlinks};
 use crate::{
     ApfsBackend, ApfsError, CommandRunner, CreateImageRequest, DetachIntent, MacOsApfsBackend,
     timed_apfs_step,
@@ -179,11 +179,14 @@ fn owner() -> (u32, u32) {
 /// detach. So an existing template needs no lock and no check — a mint clones it on sight. Only
 /// minting takes the template's lock, and a minter that finds the template once it holds the lock
 /// returns it: concurrent first mints make one template. Every staging image a minter killed
-/// partway left — attached or not, its file present or not — is released and removed first.
+/// partway left — attached or not, its file present or not — is released and removed first. The
+/// minter takes the template's lock as `taker`, recorded on it and naming who holds it when it
+/// waits.
 pub fn blank_template<R: CommandRunner>(
     backend: &MacOsApfsBackend<R>,
     store_root: &Path,
     capacity: ImageCapacity,
+    taker: &Taker,
 ) -> Result<PathBuf, TemplateError> {
     let template = blank_template_path(store_root, capacity);
     verify_no_symlinks(store_root, &template)?;
@@ -194,6 +197,7 @@ pub fn blank_template<R: CommandRunner>(
         store_root,
         &[template.with_extension("lock")],
         LockMode::Wait,
+        taker,
     )?
     .ok_or(TemplateError::InvalidPlan(
         "a waiting lock acquisition answered busy",

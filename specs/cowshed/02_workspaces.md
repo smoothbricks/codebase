@@ -1706,6 +1706,18 @@ it, stay. A holder that finds the path naming another inode once granted refuses
   unique id and a descriptor on the inode, is the owner (`recorded`), and every other descriptor on the inode is named
   `unexposed`, never counted a holder. A process of another user whose descriptors this user cannot read shows none;
   `locked` still says the inode is held.
+- **An image lock is a held lock.** Every lifecycle lock a store takes through its image-lock acquisition
+  (`main.dmg.lock` and `sessions/<ws>.dmg.lock`, 01_storage.md, the store's template lock among them) carries the same
+  record: its taker writes it once the kernel grants each lock, and empties it before it lets go. So `lock-holders` on
+  one names its owner by pid and command, and the command (`cowshed fork raven`) names the operation and the workspace
+  it runs for. A taker that finds such a lock held and waits for it says so before it queues, as a lifecycle span
+  (13_telemetry.md, "Latency spans"): `cowshed: image-lock wait <path> start`, then
+  `cowshed: image-lock wait <path> holders=<who>`, the one line of who holds the lock as `lock-holders` judges it when
+  the wait begins (one look per wait, as a land's ref lock wait), and once granted
+  `cowshed: image-lock wait <path> done elapsed=<waited> status=ok`. An uncontended take, and a try that finds the lock
+  held, says nothing. A purge counts a recorded image lock a lock, as it counts a recorded lease. Measured 2026-10-23: a
+  fork's clone waited 532.9 s on `main.dmg.lock` behind four forks and an attach while `lock-holders` answered
+  `owner: null`: no image lock recorded its holder, and no line said what the clone waited for.
 - **Only an owned, proven owner is ever signalled.** `lock <path> --owned-pid <pid>` (repeatable) names the lives the
   caller owns; the waiter holds each by the kernel's identity of its life (a pidfd on Linux, its pid version on Darwin)
   before it queues. On `SIGUSR1` while queued it proves the owner of the inode it is queued on from `lock-holders`'

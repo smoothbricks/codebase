@@ -48,7 +48,7 @@ impl RefLock {
             .map_err(|error| failure(path, "start the waiter for", &error))?;
         tokio::pin!(waiter);
         let started = Instant::now();
-        let held = holder_text(path);
+        let held = held_lock::holders(path.as_path());
         let mut report = tokio::time::interval_at(tokio::time::Instant::now(), WAIT_REPORT);
         loop {
             tokio::select! {
@@ -74,13 +74,6 @@ impl RefLock {
     /// ([`held_lock::keep_across_exec`]).
     pub fn descriptor(&self) -> std::os::fd::RawFd {
         self.held.descriptor()
-    }
-}
-
-fn holder_text(path: &RefLockPath) -> String {
-    match held_lock::observe(path.as_path()) {
-        Ok(observation) => observation.to_string(),
-        Err(error) => format!("its holders cannot be read: {error}"),
     }
 }
 

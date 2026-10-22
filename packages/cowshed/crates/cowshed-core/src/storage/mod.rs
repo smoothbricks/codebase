@@ -372,6 +372,16 @@ pub fn discover_session_images(
     discovered
 }
 
+/// Whether `file_name` is an image's lifecycle lock, `<stem>.dmg.lock` ([`ImagePaths::lock`]):
+/// a lock whatever its length, since its taker records itself on it and a taker that ended
+/// without unwinding leaves its record (`held_lock::IMAGE_LOCK_TAKER`).
+pub fn is_image_lock(file_name: &str) -> bool {
+    file_name
+        .strip_suffix(".lock")
+        .and_then(image_stem)
+        .is_some()
+}
+
 /// The non-empty stem of `<stem>.dmg`.
 fn image_stem(file_name: &str) -> Option<&str> {
     file_name

@@ -1,6 +1,12 @@
 //! Lifecycle locks anchored at a store root: `flock` on lock files opened component by
 //! component from the root with `O_NOFOLLOW`, so no symlink planted under the store can redirect
 //! a lock, and created race-free when several processes ask for a new one at once.
+//!
+//! An image lock is a held lock (02_workspaces.md, "Held locks"): its taker writes its holder
+//! record onto the inode once the kernel grants it and empties it before it lets go, so
+//! `lock-holders` names the process that holds it. A taker that finds a lock held and waits for
+//! it says so as a lifecycle span before it queues, naming the lock and who holds it, and the
+//! span's end says how long it waited.
 
 use std::ffi::CString;
 use std::fmt;
@@ -97,10 +103,6 @@ fn flock_succeeded(result: libc::c_int) -> bool {
     result == 0
 }
 
-fn lock_is_busy(mode: LockMode, kind: io::ErrorKind) -> bool {
-    matches!((mode, kind), (LockMode::Try, io::ErrorKind::WouldBlock))
-}
-
 fn should_create_directory(fd: libc::c_int, kind: io::ErrorKind) -> bool {
     matches!((fd_failed(fd), kind), (true, io::ErrorKind::NotFound))
 }
@@ -116,10 +118,66 @@ fn should_retry_lock(kind: io::ErrorKind) -> bool {
     matches!(kind, io::ErrorKind::Interrupted)
 }
 
-/// The image lifecycle locks one operation holds. Fenced: a peer's try-lock succeeds as soon as
-/// the guard is dropped, whatever this process is spawning (`fork_lock`).
+/// Who takes an image lock: how it records itself on a lock the kernel granted it, empties that
+/// record before it lets go, and names who holds a lock it finds held. The record and the census
+/// are the held lock's (cowshed-core's `held_lock::IMAGE_LOCK_TAKER`), which this crate cannot
+/// name, so every taker passes them in.
+#[derive(Clone, Copy)]
+pub struct Taker {
+    /// Write this process's holder record onto the lock file just granted.
+    pub record: fn(&File) -> io::Result<()>,
+    /// Empty the record of the lock file at the path before its holder lets go of it; one that
+    /// cannot be emptied is said, never swallowed.
+    pub clear: fn(&File, &Path),
+    /// Who holds the lock file at the path, as the kernel shows it, in one line.
+    pub holders: fn(&Path) -> String,
+}
+
+/// The image lifecycle locks one operation holds, each recorded as this process's. Fenced: a
+/// peer's try-lock succeeds as soon as the guard is dropped, whatever this process is spawning
+/// (`fork_lock`). Dropping it empties each record before the lock goes.
 pub struct ImageLockGuard {
-    _files: Vec<cowshed_os::fork_lock::Fenced<File>>,
+    taker: Taker,
+    held: Vec<(PathBuf, cowshed_os::fork_lock::Fenced<File>)>,
+}
+
+impl Drop for ImageLockGuard {
+    fn drop(&mut self) {
+        for (path, file) in &self.held {
+            (self.taker.clear)(file, path);
+        }
+    }
+}
+
+/// `flock` `file` with `operation`, again when a signal interrupts it.
+fn flock(file: &File, operation: libc::c_int) -> io::Result<()> {
+    loop {
+        // SAFETY: `file` owns the fd for the duration of the call; `flock` does not consume
+        // it. `operation` is `LOCK_EX` or `LOCK_EX|LOCK_NB`.
+        if flock_succeeded(unsafe { libc::flock(file.as_raw_fd(), operation) }) {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if !should_retry_lock(error.kind()) {
+            return Err(error);
+        }
+    }
+}
+
+/// Wait for the lock `file` at `path`, which another holds, inside a lifecycle span: its start
+/// names the lock, a `holders` line names who holds it as the kernel shows it when the wait
+/// begins (one look per wait), and its end says how long it waited.
+fn wait_for(file: &File, path: &Path, taker: &Taker) -> io::Result<()> {
+    let step = format!("wait {}", path.display());
+    cowshed_os::timing::timed("image-lock", format_args!("{step}"), || {
+        cowshed_os::timing::attribute(
+            "image-lock",
+            format_args!("{step}"),
+            "holders",
+            (taker.holders)(path),
+        );
+        flock(file, WAIT_LOCK_OPERATION)
+    })
 }
 
 fn path_component(value: &std::ffi::OsStr, path: &Path) -> Result<CString, StoreLockError> {
@@ -244,40 +302,44 @@ fn open_lock_file(root: &Path, path: &Path) -> Result<File, StoreLockError> {
     ))
 }
 
+/// Take the lifecycle locks at `paths` in path order, each recorded as `taker`'s once granted.
+/// A lock another holds answers busy under [`LockMode::Try`] (releasing, and emptying the record
+/// of, every lock already taken) and is waited for under [`LockMode::Wait`], said as a span.
 pub fn acquire_image_locks(
     root: &Path,
     paths: &[PathBuf],
     mode: LockMode,
+    taker: &Taker,
 ) -> Result<Option<ImageLockGuard>, StoreLockError> {
     let mut paths = paths.to_vec();
     paths.sort();
     paths.dedup();
-    let mut files = Vec::with_capacity(paths.len());
+    let mut guard = ImageLockGuard {
+        taker: *taker,
+        held: Vec::with_capacity(paths.len()),
+    };
     for path in paths {
         let file = cowshed_os::fork_lock::Fenced::new(open_lock_file(root, &path)?);
-        let operation = match mode {
-            LockMode::Wait => WAIT_LOCK_OPERATION,
-            LockMode::Try => TRY_LOCK_OPERATION,
-        };
-        loop {
-            // SAFETY: `file` owns the fd for the duration of the call; `flock` does
-            // not consume it. `operation` is `LOCK_EX` or `LOCK_EX|LOCK_NB`.
-            let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
-            if flock_succeeded(result) {
-                files.push(file);
-                break;
-            }
-            let error = io::Error::last_os_error();
-            if should_retry_lock(error.kind()) {
-                continue;
-            }
-            if lock_is_busy(mode, error.kind()) {
-                return Ok(None);
-            }
-            return Err(io_error("acquire lifecycle lock", &path, error));
+        match flock(&file, TRY_LOCK_OPERATION) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => match mode {
+                LockMode::Try => return Ok(None),
+                LockMode::Wait => wait_for(&file, &path, taker)
+                    .map_err(|error| io_error("acquire lifecycle lock", &path, error))?,
+            },
+            Err(error) => return Err(io_error("acquire lifecycle lock", &path, error)),
+        }
+        // The guard owns the lock before a failed record is returned, so dropping it empties
+        // whatever part of the record was written.
+        let failed = (taker.record)(&file)
+            .err()
+            .map(|error| io_error("record the holder of lifecycle lock", &path, error));
+        guard.held.push((path, file));
+        if let Some(error) = failed {
+            return Err(error);
         }
     }
-    Ok(Some(ImageLockGuard { _files: files }))
+    Ok(Some(guard))
 }
 
 /// Refuse `candidate` unless it is a plain descendant of the lexically canonical `root` and no
@@ -350,14 +412,6 @@ mod tests {
         for (fd, failed) in [(-1, true), (0, false), (1, false)] {
             assert_eq!(fd_failed(fd), failed, "fd={fd}");
             assert_eq!(flock_succeeded(fd), fd == 0, "result={fd}");
-        }
-        for (mode, kind, busy) in [
-            (LockMode::Try, io::ErrorKind::WouldBlock, true),
-            (LockMode::Wait, io::ErrorKind::WouldBlock, false),
-            (LockMode::Try, io::ErrorKind::Other, false),
-            (LockMode::Wait, io::ErrorKind::Other, false),
-        ] {
-            assert_eq!(lock_is_busy(mode, kind), busy, "{mode:?}/{kind:?}");
         }
         for (fd, kind, create) in [
             (-1, io::ErrorKind::NotFound, true),

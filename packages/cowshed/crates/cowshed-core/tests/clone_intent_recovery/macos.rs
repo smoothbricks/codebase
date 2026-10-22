@@ -934,6 +934,7 @@ fn image_lock_holder() {
         Path::new(&store),
         &[PathBuf::from(lock)],
         cowshed_apfs::store_lock::LockMode::Wait,
+        &cowshed_core::held_lock::IMAGE_LOCK_TAKER,
     )
     .expect("take the image lock")
     .expect("a waited-for lock is taken");

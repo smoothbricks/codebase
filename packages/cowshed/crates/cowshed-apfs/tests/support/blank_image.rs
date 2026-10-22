@@ -25,7 +25,8 @@
 // The pool's mount/umount run in the test process, not under a supervisor: no fork is in flight.
 #![allow(dead_code, clippy::disallowed_methods)]
 
-use std::fs;
+use std::fs::{self, File};
+use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
@@ -40,6 +41,30 @@ use super::{
 
 /// The 1 GiB test cap (08_testing.md): the template's capacity, and so every clone's.
 pub const CAPACITY: ImageCapacity = ImageCapacity::from_gibibytes(1);
+
+/// The fixture's taker of the template's lock. It records its pid on the lock and empties it
+/// before it lets go, and names a holder it waits for only as the one kind of process that takes
+/// that lock: this crate has no kernel census of a lock's holders, which the production taker
+/// (cowshed-core's `held_lock::IMAGE_LOCK_TAKER`) reads.
+const TEMPLATE_TAKER: cowshed_apfs::store_lock::Taker = cowshed_apfs::store_lock::Taker {
+    record: record_pid,
+    clear: clear_record,
+    holders: template_minter,
+};
+
+fn record_pid(file: &File) -> std::io::Result<()> {
+    file.set_len(0)?;
+    file.write_all_at(format!("{{\"pid\":{}}}", std::process::id()).as_bytes(), 0)
+}
+
+fn clear_record(file: &File, path: &Path) {
+    file.set_len(0)
+        .unwrap_or_else(|error| panic!("empty the template lock {}: {error}", path.display()));
+}
+
+fn template_minter(_: &Path) -> String {
+    "another test process minting the template".to_owned()
+}
 
 /// The user's template, minted by whichever test asks first.
 static TEMPLATE: LazyLock<PathBuf> = LazyLock::new(mint_once);
@@ -81,6 +106,7 @@ fn mint_once() -> PathBuf {
         &MacOsApfsBackend::new(SystemCommandRunner),
         &directory,
         CAPACITY,
+        &TEMPLATE_TAKER,
     )
     .unwrap_or_else(|error| panic!("mint the user's blank template: {error}"))
 }

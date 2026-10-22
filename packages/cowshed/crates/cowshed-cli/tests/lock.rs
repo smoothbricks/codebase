@@ -31,6 +31,8 @@ use std::time::Duration;
 use cowshed_core::api::dto::ExitStatus;
 use cowshed_core::api::held_lock::LockWaiterEvent;
 use cowshed_core::runtime::job_groups::{await_exit_unreaped, signal_unreaped_group};
+use cowshed_core::storage::apfs::{ApfsExecutionHost as _, ApfsSubstrateConfig};
+use cowshed_core::storage::directory::DirectoryExecutionHost;
 use serde_json::Value;
 
 const POLL: Duration = Duration::from_millis(20);
@@ -1283,5 +1285,154 @@ fn assert_raw_lock_observation(name: &std::ffi::OsStr, path_wire: Value) {
             "owner": null,
             "descriptors": [],
         })
+    );
+}
+
+/// Names the image lock, and the directory store it is in, that this test binary takes when it
+/// runs as [`image_lock_taker`].
+const IMAGE_LOCK_ENV: &str = "COWSHED_TEST_IMAGE_LOCK";
+const IMAGE_STORE_ENV: &str = "COWSHED_TEST_IMAGE_STORE";
+
+/// Not a test of its own: another process's lifecycle operation taking one image lock, as a fork
+/// takes its source's (`main.dmg.lock`) for its whole clone. Run as this binary with
+/// [`IMAGE_LOCK_ENV`] set, it takes the lock through a directory store's execution host, the
+/// path every lifecycle operation's image lock takes, says `held` on stderr once it holds it, and
+/// holds it until its stdin closes. Run any other way it does nothing.
+#[test]
+fn image_lock_taker() {
+    let Some(lock) = std::env::var_os(IMAGE_LOCK_ENV) else {
+        return;
+    };
+    let store = PathBuf::from(std::env::var_os(IMAGE_STORE_ENV).expect("the image lock's store"));
+    let host =
+        DirectoryExecutionHost::new(ApfsSubstrateConfig::new(&store, store.join("checkout")))
+            .expect("open the directory store");
+    let _held = host
+        .lock_images(
+            &[PathBuf::from(lock)],
+            cowshed_apfs::store_lock::LockMode::Wait,
+        )
+        .expect("take the image lock")
+        .expect("a waited-for lock is taken");
+    // On stderr, after every line the wait wrote there: libtest frames its own stdout.
+    io::stderr()
+        .write_all(b"held\n")
+        .expect("say the lock is held");
+    io::copy(&mut io::stdin(), &mut io::sink()).expect("wait for the release");
+}
+
+/// This test binary running as [`image_lock_taker`] of one lock, its stderr read line by line in
+/// the order it wrote them.
+struct ImageLockTaker {
+    process: TestProcess,
+    said: BufReader<ChildStderr>,
+}
+
+impl ImageLockTaker {
+    fn start(store: &Path, lock: &Path) -> Self {
+        let mut process = TestProcess::spawn(
+            Command::new(std::env::current_exe().expect("this test binary"))
+                .args(["--exact", "image_lock_taker", "--nocapture"])
+                .env(IMAGE_LOCK_ENV, lock)
+                .env(IMAGE_STORE_ENV, store)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped()),
+        );
+        let said = BufReader::new(process.stderr.take().expect("the taker's stderr"));
+        Self { process, said }
+    }
+
+    /// Its next stderr line, which it must write.
+    fn next(&mut self) -> String {
+        let mut line = String::new();
+        let read = self
+            .said
+            .read_line(&mut line)
+            .expect("read the taker's stderr");
+        assert!(read > 0, "the image lock taker ended before its next line");
+        line.trim_end().to_owned()
+    }
+
+    /// Close its stdin so it lets go of the lock, and require that it exits cleanly having said
+    /// nothing more: letting go of an image lock is silent.
+    fn release(mut self) {
+        drop(self.process.child.stdin.take());
+        let mut rest = String::new();
+        self.said
+            .read_to_string(&mut rest)
+            .expect("the taker's last output");
+        assert_eq!(
+            self.process.wait().expect("wait for the taker"),
+            ExitStatus::Exited { code: 0 },
+            "{rest}"
+        );
+        assert_eq!(rest, "", "the taker said more once released");
+    }
+}
+
+/// An image lock is a held lock (02_workspaces.md "Held locks"): the lifecycle operation that
+/// holds one has recorded itself on it, so `lock-holders` names it the owner, and one that finds
+/// it held says, before it queues, which lock it waits for and who holds it, and once granted how
+/// long it waited. The holder lets go only after the waiter's `holders` line has been read off the
+/// waiter's pipe, so that line precedes the release by order, not by a clock. Measured
+/// 2026-10-23: a clone waited 532.9 s on `main.dmg.lock` while `lock-holders` answered
+/// `owner: null` and no line said what it waited for.
+#[test]
+fn an_image_lock_names_its_holder_and_a_blocked_taker_says_whom_it_waits_for() {
+    let dir = Dir::new("image-lock");
+    let store = dir.path.join("store");
+    let lock = store.join("acme/widget/main.dmg.lock");
+    let mut holder = ImageLockTaker::start(&store, &lock);
+    assert_eq!(
+        holder.next(),
+        "held",
+        "an uncontended take says nothing first"
+    );
+    let observation = lock_holders(&lock);
+    assert_eq!(observation["locked"], true, "{observation}");
+    assert_eq!(
+        observation["owner"]["pid"],
+        holder.process.id(),
+        "{observation}"
+    );
+    let record: Value = serde_json::from_str(
+        observation["record"]["data"]
+            .as_str()
+            .expect("the holder record is UTF-8"),
+    )
+    .expect("the holder record is the held lock's");
+    assert_eq!(record["pid"], holder.process.id(), "{observation}");
+
+    let mut waiter = ImageLockTaker::start(&store, &lock);
+    let step = format!("cowshed: image-lock wait {}", lock.display());
+    assert_eq!(waiter.next(), format!("{step} start"));
+    let holders = waiter.next();
+    let custody = if cfg!(target_os = "linux") {
+        "holds it"
+    } else {
+        "holds it, as its record says"
+    };
+    assert!(
+        holders.starts_with(&format!("{step} holders=pid {} (", holder.process.id()))
+            && holders.ends_with(&format!(") {custody}")),
+        "the wait did not name its holder: {holders}"
+    );
+
+    holder.release();
+    let done = waiter.next();
+    assert!(
+        done.starts_with(&format!("{step} done elapsed=")) && done.ends_with(" status=ok"),
+        "{done}"
+    );
+    assert_eq!(waiter.next(), "held");
+    assert_eq!(lock_holders(&lock)["owner"]["pid"], waiter.process.id());
+    waiter.release();
+    let released = lock_holders(&lock);
+    assert_eq!(released["locked"], false, "{released}");
+    assert_eq!(
+        released["record"],
+        serde_json::json!({"encoding": "utf8", "data": ""}),
+        "the holder did not empty its record before it let go"
     );
 }

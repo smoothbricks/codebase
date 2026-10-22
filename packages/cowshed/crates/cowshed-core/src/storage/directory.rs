@@ -1141,7 +1141,13 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         images: &[PathBuf],
         mode: LockMode,
     ) -> Result<Option<Self::LockGuard>, ApfsStorageError> {
-        acquire_image_locks(&self.config.store_root, images, mode).map_err(Into::into)
+        acquire_image_locks(
+            &self.config.store_root,
+            images,
+            mode,
+            &crate::held_lock::IMAGE_LOCK_TAKER,
+        )
+        .map_err(Into::into)
     }
 
     fn observe(&self, expected: &[LifecycleFact]) -> Result<Vec<LifecycleFact>, ApfsStorageError> {

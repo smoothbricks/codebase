@@ -223,9 +223,14 @@ impl DirectoryExecutionHost {
         if held_locks.contains(&lock) {
             Ok(Some(None))
         } else {
-            acquire_image_locks(&self.config.store_root, &[lock], LockMode::Try)
-                .map_err(Into::into)
-                .map(|guard| guard.map(Some))
+            acquire_image_locks(
+                &self.config.store_root,
+                &[lock],
+                LockMode::Try,
+                &crate::held_lock::IMAGE_LOCK_TAKER,
+            )
+            .map_err(Into::into)
+            .map(|guard| guard.map(Some))
         }
     }
 
@@ -234,9 +239,14 @@ impl DirectoryExecutionHost {
         if held.iter().any(|path| path == lock) {
             return Ok(true);
         }
-        acquire_image_locks(&self.config.store_root, &[lock.to_owned()], LockMode::Try)
-            .map_err(Into::into)
-            .map(|guard| guard.is_some())
+        acquire_image_locks(
+            &self.config.store_root,
+            &[lock.to_owned()],
+            LockMode::Try,
+            &crate::held_lock::IMAGE_LOCK_TAKER,
+        )
+        .map_err(Into::into)
+        .map(|guard| guard.is_some())
     }
 
     /// The incarnation the marker inside a detached payload names: read in place.
@@ -1467,9 +1477,13 @@ impl DirectoryExecutionHost {
         project: &Path,
         plan: StorageGcPlan,
     ) -> Result<StorageGcReport, ApfsStorageError> {
-        let _guard =
-            acquire_image_locks(&self.config.store_root, plan.lock_paths(), LockMode::Try)?
-                .ok_or(ApfsStorageError::GcPlanStale)?;
+        let _guard = acquire_image_locks(
+            &self.config.store_root,
+            plan.lock_paths(),
+            LockMode::Try,
+            &crate::held_lock::IMAGE_LOCK_TAKER,
+        )?
+        .ok_or(ApfsStorageError::GcPlanStale)?;
         let current = self.preview_gc_project(
             project,
             plan.repo(),

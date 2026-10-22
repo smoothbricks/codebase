@@ -2122,9 +2122,14 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         if held_locks.contains(&lock) {
             Ok(Some(None))
         } else {
-            acquire_image_locks(&self.config.store_root, &[lock], LockMode::Try)
-                .map(|guard| guard.map(Some))
-                .map_err(Into::into)
+            acquire_image_locks(
+                &self.config.store_root,
+                &[lock],
+                LockMode::Try,
+                &crate::held_lock::IMAGE_LOCK_TAKER,
+            )
+            .map(|guard| guard.map(Some))
+            .map_err(Into::into)
         }
     }
 
@@ -2844,10 +2849,13 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         if held.iter().any(|path| path == lock) {
             return Ok(true);
         }
-        Ok(
-            acquire_image_locks(&self.config.store_root, &[lock.to_owned()], LockMode::Try)?
-                .is_some(),
-        )
+        Ok(acquire_image_locks(
+            &self.config.store_root,
+            &[lock.to_owned()],
+            LockMode::Try,
+            &crate::held_lock::IMAGE_LOCK_TAKER,
+        )?
+        .is_some())
     }
 
     /// The mountpoint a staging stem is attached at while its operation runs.
@@ -3521,9 +3529,13 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     where
         R: CommandRunner + Send + Sync + 'static,
     {
-        let _guard =
-            acquire_image_locks(&self.config.store_root, plan.lock_paths(), LockMode::Try)?
-                .ok_or(ApfsStorageError::GcPlanStale)?;
+        let _guard = acquire_image_locks(
+            &self.config.store_root,
+            plan.lock_paths(),
+            LockMode::Try,
+            &crate::held_lock::IMAGE_LOCK_TAKER,
+        )?
+        .ok_or(ApfsStorageError::GcPlanStale)?;
         let current = self.preview_gc_project(
             project,
             plan.repo(),
@@ -4240,7 +4252,13 @@ where
         paths: &[PathBuf],
         mode: LockMode,
     ) -> Result<Option<Self::LockGuard>, ApfsStorageError> {
-        acquire_image_locks(&self.config.store_root, paths, mode).map_err(Into::into)
+        acquire_image_locks(
+            &self.config.store_root,
+            paths,
+            mode,
+            &crate::held_lock::IMAGE_LOCK_TAKER,
+        )
+        .map_err(Into::into)
     }
 
     type Attachment = AttachedImage;

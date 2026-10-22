@@ -25,7 +25,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     ) -> Result<AttachedImage, ApfsStorageError> {
         let leg = apfs_step_leg(image);
         timed_apfs_step(leg, "mint", || {
-            let template = blank_template(&self.backend, &self.config.store_root, capacity)?;
+            let template = blank_template(
+                &self.backend,
+                &self.config.store_root,
+                capacity,
+                &crate::held_lock::IMAGE_LOCK_TAKER,
+            )?;
             timed_apfs_step(leg, "clonefile", || {
                 self.backend
                     .clone_image(&template, image, cowshed_apfs::ImageCapture::Detached)

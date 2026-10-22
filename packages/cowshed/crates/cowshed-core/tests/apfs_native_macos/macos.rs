@@ -3914,6 +3914,7 @@ fn real_apfs_a_template_mint_releases_every_leftover_staging_attachment() {
         &MacOsApfsBackend::new(SystemCommandRunner),
         &store,
         capacity,
+        &cowshed_core::held_lock::IMAGE_LOCK_TAKER,
     )
     .expect("mint over the leftovers");
 

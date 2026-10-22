@@ -1,6 +1,7 @@
 //! A held lock: an exclusive `flock(2)` on a caller's lock file, and what the kernel says about who
-//! holds it (02_workspaces.md "Held locks"). `cowshed lock`, `land --ref-lock` and
-//! `land-turn --outside-lock` take it; `cowshed lock-holders` observes it.
+//! holds it (02_workspaces.md "Held locks"). `cowshed lock`, `land --ref-lock`,
+//! `land-turn --outside-lock` and every lifecycle image lock ([`IMAGE_LOCK_TAKER`]) take it;
+//! `cowshed lock-holders` observes it.
 //!
 //! The lock is on the inode the path names. No holder unlinks the file: a holder that did would
 //! hand a waiter already blocked on it a lock on a file no path names, while the next caller
@@ -154,6 +155,30 @@ impl HeldLock {
 impl Drop for HeldLock {
     fn drop(&mut self) {
         lease_holder::clear(&self.file, &self.path);
+    }
+}
+
+/// This process as the taker of a lifecycle image lock (`main.dmg.lock`, `<ws>.dmg.lock`;
+/// 02_workspaces.md "Held locks"): it writes the held lock's record onto each lock once the
+/// kernel grants it and empties it before it lets go, so `lock-holders` names the holder, and a
+/// wait for one another holds names who holds it as `lock-holders` judges it ([`holders`]).
+pub const IMAGE_LOCK_TAKER: cowshed_apfs::store_lock::Taker = cowshed_apfs::store_lock::Taker {
+    record: record_this_process,
+    clear: lease_holder::clear,
+    holders,
+};
+
+/// Record this process, holding the lock `file` from now, on it.
+fn record_this_process(file: &File) -> io::Result<()> {
+    lease_holder::record(file, &lease_holder::Process::this()?)
+}
+
+/// Who holds the lock file at `path`, in one line, as the kernel shows it ([`observe`]); why
+/// not, when its holders cannot be read.
+pub fn holders(path: &Path) -> String {
+    match observe(path) {
+        Ok(observation) => observation.to_string(),
+        Err(error) => format!("its holders cannot be read: {error}"),
     }
 }
 

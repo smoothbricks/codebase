@@ -3087,8 +3087,10 @@ fn plan_terminal_storage_tree(path: &Path, plan: &mut Vec<TerminalEntry>) -> Res
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| {
-                // A lifecycle lease is a lock whatever record it holds (`lease_holder::is_lease`).
+                // A lifecycle lease or an image lock is a lock whatever record it holds
+                // (`lease_holder::is_lease`, `storage::is_image_lock`).
                 crate::lease_holder::is_lease(name)
+                    || crate::storage::is_image_lock(name)
                     || (metadata.len() == 0
                         && (name.ends_with(".lock")
                             || name.ends_with(crate::build_volume::HOLD_SUFFIX)))

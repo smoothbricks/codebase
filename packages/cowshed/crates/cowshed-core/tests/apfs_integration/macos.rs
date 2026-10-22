@@ -748,7 +748,13 @@ fn real_apfs_adopt_resumes_a_fenced_image_killed_between_clone_and_attach() {
     let world = KillWindow::new("adopt-kill-cloned").expect("kill window");
     world.fence().expect("fence");
     let backend = world.host().backend();
-    let template = blank_template(backend, &world.store, CAPACITY).expect("the seeded template");
+    let template = blank_template(
+        backend,
+        &world.store,
+        CAPACITY,
+        &cowshed_core::held_lock::IMAGE_LOCK_TAKER,
+    )
+    .expect("the seeded template");
     backend
         .clone_image(&template, &world.image, ImageCapture::Detached)
         .expect("the template cloned under the canonical name");
