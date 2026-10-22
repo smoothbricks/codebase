@@ -61,13 +61,15 @@ under its own scope and finished what was its; a lock held now is a live lifecyc
 holds its source's lock, `main`'s included, through its whole clone (16_build_volumes.md, "Fork" step 1), minutes on a
 large build image. Residue left since stays for that operation, or the next ordinary command, to finish.
 
-The supervisor's start mounts its workspace without waiting either. With the workspace's image lock free it settles the
-mount under that lock as every caller does. With the lock held, a workspace already mounted from its own image, its
+The supervisor's start serves a settled mount without waiting either. With the workspace's image lock free it settles
+the mount under that lock as every caller does. With the lock held, a workspace already mounted from its own image, its
 owners honoured, carrying its marker, and with its build link absent or kept on a mounted volume of its own is served as
-it stands; any other refuses as a conflict naming the lock's holders by PID and command, because only that lock
-authorizes healing, mounting or relinking it. Every other caller still waits for the lock before it settles a mount.
-Measured 2026-10-22: supervisors whose openings waited for `main.dmg.lock` behind concurrent forks' clones were killed
-at the manager's start bound as supervisors that "did not serve".
+it stands; any other waits for the lock, because only that lock authorizes healing, mounting or relinking it. Before it
+waits it says once on stderr which processes hold the lock, by PID and command. The wait is the kernel's `flock` with no
+deadline of its own: the manager's start bound (11_shell.md, "Supervisor") is its only one. Every other caller also
+waits for the lock before it settles a mount. Measured 2026-10-22: supervisors whose openings waited for `main.dmg.lock`
+behind concurrent forks' clones were killed at the manager's start bound as supervisors that "did not serve". A start
+that refused instead while its own workspace's lock was held left its caller to retry by hand once the holder let go.
 
 ## cowshed-core (Rust)
 

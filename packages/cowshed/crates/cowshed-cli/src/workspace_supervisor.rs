@@ -3,9 +3,9 @@
 //!
 //! Not a user verb and not in the command map: the process that owns a workspace's supervisor
 //! starts it. It reads the project as a verb naming the workspace does but finishes nothing, so it
-//! waits for no image lock ([`RecoveryScope::Supervisor`]). It mounts the workspace when it has
-//! to and the workspace's lock is free, serves one that already stands mounted while a live
-//! operation holds that lock, and then serves nothing but that supervisor.
+//! waits for no image lock ([`RecoveryScope::Supervisor`]). It serves a workspace that already
+//! stands mounted while a live operation holds the workspace's lock, waits for that lock to mount
+//! one that does not, and then serves nothing but that supervisor.
 
 use std::ffi::OsString;
 use std::path::PathBuf;

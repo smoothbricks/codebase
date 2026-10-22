@@ -8614,8 +8614,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             current.derived.mount_state,
             crate::storage::lifecycle::MountState::Detached
         );
-        // A supervisor's own start waits for no image lock (11_shell.md, "Supervisor"); every
-        // other caller settles the mount under the workspace's lock.
+        // A supervisor's own start serves a settled mount without the workspace's image lock and
+        // waits for that lock only to settle one (11_shell.md, "Supervisor"); every other caller
+        // settles the mount under the workspace's lock.
         let mounting = async {
             match &self.recovery_scope {
                 RecoveryScope::Supervisor(served) if served == name => {
@@ -20658,15 +20659,6 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
         // tombstone is in the message, and `rekey` consumes it — point at the repair.
         ref error @ crate::storage::apfs::ApfsStorageError::Quarantined { ref workspace, .. } => {
             CowshedError::integrity(error.to_string(), format!("cowshed rekey {workspace}"))
-        }
-
-        // A live lifecycle operation holds the lock: the store is healthy, and the remedy is that
-        // operation finishing, so the generic repair hint would mislead.
-        error @ crate::storage::apfs::ApfsStorageError::ImageLockHeld { .. } => {
-            CowshedError::conflict(
-                error.to_string(),
-                "retry once the operation holding the lock has finished",
-            )
         }
         crate::storage::apfs::ApfsStorageError::MarkerMismatch(message)
         | crate::storage::apfs::ApfsStorageError::Host(message) => {

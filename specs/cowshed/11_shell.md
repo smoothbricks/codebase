@@ -302,9 +302,10 @@ into `OsString` for `plan_exec`; no `String`, lossy rendering, or alternate supe
   waits for the keeper to settle, never became true. Every caller in another process that stops a supervisor goes
   through this one request: `detach`, `rm`, `grant` growing the port block, `doctor --repair` moving a colliding port
   block, and re-adopting main.
-- Its start waits for no image lock (07_api.md, "Authority model"): its opening finishes nothing, and while a live
-  lifecycle operation, such as a fork of its source, `main`'s included, holds the workspace's lock, an already settled
-  mount is served as it stands and one that needs settling refuses, naming the holders, rather than wait.
+- Its opening waits for no image lock (07_api.md, "Authority model"): it finishes nothing. While a live lifecycle
+  operation holds the workspace's lock (a fork of it, `main`'s included, its `rm` or its defragmentation), an already
+  settled mount is served as it stands, and one that needs settling waits for the lock after saying once on its stderr,
+  the daemon's log, which processes hold it by PID and command. Nothing but the manager's start bound ends that wait.
 
 ## Protocol
 

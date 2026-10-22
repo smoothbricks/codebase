@@ -501,7 +501,6 @@ pub(in crate::storage) fn gc_candidate_failure_is_fatal(error: &ApfsStorageError
         ApfsStorageError::Apfs(_)
         | ApfsStorageError::Io { .. }
         | ApfsStorageError::BuildVolumeHeld { .. }
-        | ApfsStorageError::ImageLockHeld { .. }
         | ApfsStorageError::Host(_)
         | ApfsStorageError::MountIdentity(_)
         | ApfsStorageError::Quarantined { .. } => false,

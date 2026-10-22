@@ -194,6 +194,15 @@ async fn ignored_only_copy_source_content_keeps_recovery_trash() {
         .expect("stop missing-record runtime");
 }
 
+/// The directory store of the fixture whose scratch root is `scratch`: its `store` directory.
+fn fixture_storage(scratch: &Path) -> ValidatedHostStorage {
+    ValidatedHostStorage::new(
+        scratch.to_path_buf(),
+        Vec::new(),
+        CanonicalRoots::at(scratch.join("store")),
+    )
+}
+
 /// One adopted project on its own real directory store.
 struct Fixture {
     /// Owned so its drop ends this test's workers and removes its tree.
@@ -220,11 +229,7 @@ impl Fixture {
         .expect("workspace hooks ignore");
         git(&checkout, &["add", "tracked", ".gitignore"]);
         git(&checkout, &["commit", "-q", "-m", "initial"]);
-        let storage = ValidatedHostStorage::new(
-            scratch.path().to_path_buf(),
-            Vec::new(),
-            CanonicalRoots::at(store),
-        );
+        let storage = fixture_storage(scratch.path());
         Self {
             _scratch: scratch,
             checkout,
@@ -1020,6 +1025,159 @@ async fn a_supervisor_serves_while_other_processes_hold_its_image_locks() {
         .shutdown()
         .await
         .expect("stop the ordinary opening");
+}
+
+/// Names the scratch root of the fixture whose `served` workspace this test binary serves when it
+/// runs as [`supervisor_process`].
+const SUPERVISOR_SCRATCH_ENV: &str = "COWSHED_TEST_SUPERVISOR_SCRATCH";
+
+/// A supervisor whose workspace needs mounting while another process holds that workspace's image
+/// lock, as its `rm`, its defragmentation or a fork of it holds it, waits for the holder and
+/// serves once the holder lets go (11_shell.md, "Supervisor"). It used to refuse as a conflict,
+/// and its caller retried by hand. The supervisor is a process of its own, so the line it says
+/// once before it waits, naming the holder, is read from its stderr; the holder is released only
+/// after that line, and the socket's publication wakes the test, so no clock orders a step.
+#[tokio::test]
+async fn a_supervisor_waits_for_the_holder_of_its_unsettled_workspace_lock() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+    let fixture = Fixture::new("sup-wait");
+    let runtime = fixture.adopt().await;
+    let minted = fixture
+        .mint(&runtime, "served", ForkOptions::default())
+        .await
+        .expect("mint the served workspace");
+    let mount = PathBuf::from(minted["info"]["mount"].as_str().expect("served's mount"));
+    fixture
+        .call(
+            &runtime,
+            "coordinator.detach",
+            json!({ "repoId": fixture.repo, "workspace": "served" }),
+        )
+        .await
+        .expect("detach served, so its supervisor has to mount it");
+    runtime
+        .shutdown()
+        .await
+        .expect("stop the controller that minted it");
+    let served = name("served");
+    let lock = fixture
+        .layout()
+        .canonical_image(&served)
+        .expect("served's image")
+        .lock()
+        .to_owned();
+    let scratch = fixture.checkout.parent().expect("the scratch root");
+    let holder = LockHolder::hold(scratch, fixture.storage.store(), &lock);
+    let holder_pid = holder.child.id();
+    let socket = supervisor_socket::socket_path(fixture.storage.store(), &fixture.repo, &served);
+    fs::create_dir_all(socket.parent().expect("the socket directory")).expect("run directory");
+    let mut supervisor =
+        tokio::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args(["--exact", "macos::supervisor_process", "--nocapture"])
+            .env(SUPERVISOR_SCRATCH_ENV, scratch)
+            .current_dir(scratch)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn_locked()
+            .expect("start the supervisor process");
+    let mut said =
+        tokio::io::BufReader::new(supervisor.stderr.take().expect("the supervisor's stderr"));
+    let waiting = "cowshed: the supervisor of served waits for its image lock ";
+    let mut transcript = String::new();
+    let line = loop {
+        let start = transcript.len();
+        let read = said
+            .read_line(&mut transcript)
+            .await
+            .expect("the supervisor's stderr");
+        assert_ne!(
+            read,
+            0,
+            "the supervisor ended before it waited for {}; it said: {transcript}",
+            lock.display()
+        );
+        if transcript[start..].starts_with(waiting) {
+            break transcript[start..].to_owned();
+        }
+    };
+    assert!(
+        line.contains(&format!("pid {holder_pid} (")),
+        "the waiting supervisor names the holder, pid {holder_pid}: {line}"
+    );
+    assert!(
+        !mount.join("tracked").exists(),
+        "served stays unmounted while the holder holds its lock"
+    );
+    holder.release();
+    let published = tokio::task::spawn_blocking({
+        let socket = socket.clone();
+        move || wait_for_entry(&socket)
+    });
+    tokio::select! {
+        ended = supervisor.wait() => {
+            panic!("the supervisor ended before it served: {ended:?}; it said: {transcript}")
+        }
+        published = published => published.expect("watch the socket directory"),
+    }
+    let hello = supervisor_socket::hello(&socket)
+        .await
+        .expect("the supervisor answers");
+    assert_eq!(Some(hello.pid), supervisor.id());
+    assert_eq!(hello.authority.workspace, served);
+    assert_eq!(
+        fs::read(mount.join("tracked")).expect("served's mount, settled by its supervisor"),
+        b"tracked\n"
+    );
+    supervisor_socket::drain(&socket)
+        .await
+        .expect("retire the supervisor");
+    said.read_to_string(&mut transcript)
+        .await
+        .expect("the supervisor's last output");
+    let status = supervisor.wait().await.expect("wait for the supervisor");
+    assert!(
+        status.success(),
+        "the supervisor failed: {status}; it said: {transcript}"
+    );
+    assert_eq!(
+        transcript
+            .lines()
+            .filter(|said| said.starts_with(waiting))
+            .count(),
+        1,
+        "the supervisor says once that it waits: {transcript}"
+    );
+}
+
+/// Not a test of its own: the supervisor process of
+/// [`a_supervisor_waits_for_the_holder_of_its_unsettled_workspace_lock`]. Run as this binary with
+/// [`SUPERVISOR_SCRATCH_ENV`] set, it opens that fixture's project as
+/// `cowshed __workspace-supervisor` does and serves `served` until it is drained. Run any other
+/// way it does nothing.
+#[tokio::test]
+async fn supervisor_process() {
+    let Some(scratch) = std::env::var_os(SUPERVISOR_SCRATCH_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let served = name("served");
+    let supervisor = ProjectRuntime::open_directory_existing_at(
+        &scratch.join("checkout"),
+        RecoveryScope::Supervisor(served.clone()),
+        fixture_storage(&scratch),
+        refusing_gateway::connect,
+    )
+    .await
+    .expect("the supervisor's opening waits on no lock");
+    supervisor
+        .serve_supervisor(&served)
+        .await
+        .expect("the supervisor serves until it is drained");
+    supervisor
+        .shutdown()
+        .await
+        .expect("stop the supervisor's runtime");
 }
 
 #[tokio::test]

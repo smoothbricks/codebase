@@ -859,19 +859,6 @@ pub enum ApfsStorageError {
         holds: Vec<cowshed_os::process::Holder>,
         open: Vec<cowshed_os::process::Holder>,
     },
-    /// A live lifecycle operation holds `workspace`'s image lock while its mount is not settled,
-    /// and the caller, a supervisor's start, does not wait for that lock. `holders` names each
-    /// process holding `lock`, or says why they cannot be named.
-    #[error(
-        "workspace {workspace}'s image lock {} is held by {} while its mount is not settled, and a supervisor's start does not wait for it",
-        .lock.display(),
-        lock_held_by(.holders)
-    )]
-    ImageLockHeld {
-        workspace: WorkspaceName,
-        lock: PathBuf,
-        holders: Result<Vec<cowshed_os::process::Holder>, String>,
-    },
     #[error("lifecycle conflict: {0}")]
     Conflict(#[from] super::lifecycle::Conflict),
     #[error("derived APFS state is inconsistent: {0}")]
@@ -998,14 +985,6 @@ fn held_by(holds: &[cowshed_os::process::Holder]) -> String {
         "nothing this user can see".to_owned()
     } else {
         crate::build_volume::nx::Holders(holds).to_string()
-    }
-}
-
-/// [`ApfsStorageError::ImageLockHeld`]'s holders of the lock, or why they cannot be named.
-fn lock_held_by(holders: &Result<Vec<cowshed_os::process::Holder>, String>) -> String {
-    match holders {
-        Ok(holders) => held_by(holders),
-        Err(error) => format!("processes that cannot be named ({error})"),
     }
 }
 
@@ -1879,14 +1858,15 @@ where
         Ok(retired)
     }
 
-    /// Mount `workspace` for the start of its supervisor, which waits for no image lock
-    /// (11_shell.md, "Supervisor"). With the workspace's lock free this is
-    /// [`Substrate::ensure_mounted`]. A held lock is a live lifecycle operation's: a fork holds its
-    /// source's through its whole clone (16_build_volumes.md, "Fork" step 1), and the command that
-    /// asked for the supervisor may hold one until the supervisor answers. A workspace that
-    /// already stands as `ensure_mounted` leaves it ([`ApfsExecutionHost::mount_settled`]) is
-    /// served as it stands, its marker validated; one that needs healing, mounting or relinking
-    /// refuses, naming the lock's holders, because only the lock authorizes settling it.
+    /// Mount `workspace` for the start of its supervisor (11_shell.md, "Supervisor"). With the
+    /// workspace's lock free this is [`Substrate::ensure_mounted`]. A held lock is a live
+    /// lifecycle operation's: a fork holds its source's through its whole clone
+    /// (16_build_volumes.md, "Fork" step 1), and an `rm` or a defragmentation holds the
+    /// workspace's own. A workspace that already stands as `ensure_mounted` leaves it
+    /// ([`ApfsExecutionHost::mount_settled`]) is served as it stands, its marker validated. One
+    /// that needs healing, mounting or relinking, which only the lock authorizes, waits for the
+    /// lock in `flock` once it has said on stderr which processes hold it. The wait has no
+    /// deadline of its own: the supervisor manager's start bound is its only one.
     #[cfg(target_os = "macos")]
     pub(crate) async fn mount_for_supervisor(
         &self,
@@ -1898,24 +1878,35 @@ where
         let config = Arc::clone(&self.config);
         self.lane
             .dispatch(move || {
-                let Some(_guard) = host.lock_images(std::slice::from_ref(&lock), LockMode::Try)?
-                else {
-                    let mount_point = mount_point(&config, &workspace)?;
-                    if !host.mount_settled(&workspace, &mount_point)? {
-                        return Err(ApfsStorageError::ImageLockHeld {
-                            workspace: workspace.name().clone(),
-                            holders: crate::build_volume::nx::holders(&lock)
-                                .map_err(|error| error.to_string()),
-                            lock,
-                        });
+                let locks = std::slice::from_ref(&lock);
+                let _guard = match host.lock_images(locks, LockMode::Try)? {
+                    Some(guard) => guard,
+                    None => {
+                        let mount_point = mount_point(&config, &workspace)?;
+                        if host.mount_settled(&workspace, &mount_point)? {
+                            host.validate_marker(
+                                &mount_point,
+                                &MarkerExpectation::owned(&config, &workspace),
+                            )?;
+                            return Ok(mount_point);
+                        }
+                        let holders = match crate::build_volume::nx::holders(&lock) {
+                            Ok(holders) => held_by(&holders),
+                            Err(error) => format!("processes that cannot be named ({error})"),
+                        };
+                        cowshed_os::eprintln!(
+                            "cowshed: the supervisor of {} waits for its image lock {}, held by {holders}, to settle its mount",
+                            workspace.name(),
+                            lock.display()
+                        );
+                        host.lock_images(locks, LockMode::Wait)?.ok_or(
+                            ApfsStorageError::InvalidPlan(
+                                "blocking image lock unexpectedly unavailable",
+                            ),
+                        )?
                     }
-                    host.validate_marker(
-                        &mount_point,
-                        &MarkerExpectation::owned(&config, &workspace),
-                    )?;
-                    return Ok(mount_point);
                 };
-                host.recover_pending(&config, std::slice::from_ref(&lock))?;
+                host.recover_pending(&config, locks)?;
                 settle_mount(host.as_ref(), &config, &workspace, MountIntent::default())
             })
             .await

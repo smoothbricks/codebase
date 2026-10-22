@@ -383,7 +383,10 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   a corrupt sibling sidecar the store-wide pass refuses and an unrecorded earlier generation of the served workspace in
   the trash: the supervisor opens, serves its settled mount and answers `hello` on its socket while both holders still
   hold; neither it nor an ordinary opening naming the workspace once the holders let go deletes the trash image, a
-  recovery image retained without its record (02_workspaces.md, `rm` step 5).
+  recovery image retained without its record (02_workspaces.md, `rm` step 5). A second boundary detaches the served
+  workspace and holds its lock in another process: the supervisor, a process of its own, says once on stderr that it
+  waits for that lock, naming the holder's PID, and mounts and serves only after the test releases the holder, its
+  socket's publication waking the test.
 - **Stateless restore recovery boundaries**: interrupt after undo-sidecar publication, each image/CA-key swap and
   rename, each canonical/undo parent fsync, pending metadata rename/fsync, staged-metadata removal, and final parent
   fsync. Restart twice from every fixture. Recovery must derive rollback/forward state only from APFS image, detached
