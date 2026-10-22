@@ -197,6 +197,10 @@ describe('one producing target per Nx output', () => {
             engine: run(['{projectRoot}/out/engine.wasm']),
           },
         },
+        mix: {
+          root: 'packages/mix',
+          targets: { b: run(['{projectRoot}/b']), split: run(['{projectRoot}/{b/c,d}/**']) },
+        },
       }),
     ).toEqual([
       'llm:tsc-js packages/llm/dist <> llm:nx-worker-bundle packages/llm/dist/nx/worker-entry.js',
@@ -207,6 +211,7 @@ describe('one producing target per Nx output', () => {
       'rt:native packages/rt/dist/native <> rt:types packages/rt/**/*.d.ts',
       'rt:types packages/rt/**/*.d.ts <> rt:engine packages/rt/out/engine.wasm',
       'rt:wasm packages/rt/out/*.wasm <> rt:engine packages/rt/out/engine.wasm',
+      'mix:b packages/mix/b <> mix:split packages/mix/{b/c,d}/**',
     ]);
   });
 
@@ -232,6 +237,7 @@ describe('one producing target per Nx output', () => {
             darwin: run(['{projectRoot}/dist/native/darwin-arm64/**']),
             native: run(['{projectRoot}/out/native']),
             wasm: run(['{projectRoot}/*/wasm/*.wasm']),
+            docs: run(['{projectRoot}/{doc/api,doc/guide}/*.md']),
           },
         },
       }),

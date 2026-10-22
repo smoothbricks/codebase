@@ -340,6 +340,7 @@
   "dependencies": {
     "@nx/js": "23.2.1",
     "jsonc-parser": "^3.3.1",
+    "minimatch": "10.2.5",
     "nx": "latest",
     "prettier": "^3.9.8",
     "smol-toml": "^1.6.1",

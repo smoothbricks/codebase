@@ -1,4 +1,5 @@
 import { posix } from 'node:path';
+import { Minimatch } from 'minimatch';
 import type { ProjectGraph, ProjectGraphProjectNode } from 'nx/src/config/project-graph';
 import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
 import { getOutputsForTargetAndConfiguration, interpolate } from 'nx/src/tasks-runner/utils';
@@ -180,12 +181,12 @@ interface PathClaim {
   readonly relative: string;
 }
 
-/** One pattern a target's output names: the directory it cannot write outside of, and the pattern itself. */
+/** One pattern a target's output names: the directory it cannot write outside of, and the pattern compiled once. */
 interface GlobClaim {
   readonly kind: 'glob';
   readonly declared: DeclaredOutput;
   readonly prefix: string;
-  readonly relative: string;
+  readonly matcher: Minimatch;
 }
 
 type OutputClaim = PathClaim | GlobClaim;
@@ -203,7 +204,13 @@ function outputClaims(declared: readonly DeclaredOutput[], root: string): Output
     const relative = posix.relative(root, absolute);
     claims.push(
       GLOB_PART.test(relative)
-        ? { kind: 'glob', declared: output, prefix: posix.resolve(root, staticPrefix(relative)), relative }
+        ? {
+            kind: 'glob',
+            declared: output,
+            prefix: posix.resolve(root, staticPrefix(relative)),
+            // Nx's own matcher, as Nx pins it. Dotfiles match: a restore writes them like any other file.
+            matcher: new Minimatch(relative, { dot: true }),
+          }
         : { kind: 'path', declared: output, absolute, relative },
     );
   }
@@ -211,28 +218,13 @@ function outputClaims(declared: readonly DeclaredOutput[], root: string): Output
 }
 
 /**
- * Whether `pattern` can match a path strictly inside `literal`, for a literal at or under the pattern's static prefix:
- * walk the literal's segments against the pattern's. A `**` reached, or pattern segments left once the literal runs
- * out, reaches inside; a segment the pattern cannot match, or a literal deeper than the pattern, does not.
+ * A pattern conflicts with a path at or above its static prefix, a path it matches, or a path it can reach inside. The
+ * last two are one partial match: minimatch expands braces before it splits segments, so an alternative that crosses a
+ * slash is walked whole, and a path whose every segment matches the pattern's leading segments is one the pattern can
+ * write at or under.
  */
-function reachesInside(pattern: string, literal: string): boolean {
-  const segments = literal.split('/');
-  for (const [index, part] of pattern.split('/').entries()) {
-    if (part === '**') return true;
-    const segment = segments[index];
-    if (segment === undefined) return true;
-    if (part !== segment && !posix.matchesGlob(segment, part)) return false;
-  }
-  return false;
-}
-
-/** A pattern conflicts with a path it matches, a path at or above its static prefix, or one it can reach inside. */
 function patternMeetsPath(pattern: GlobClaim, path: PathClaim): boolean {
-  return (
-    posix.matchesGlob(path.relative, pattern.relative) ||
-    contains(path.absolute, pattern.prefix) ||
-    (contains(pattern.prefix, path.absolute) && reachesInside(pattern.relative, path.relative))
-  );
+  return contains(path.absolute, pattern.prefix) || pattern.matcher.match(path.relative, true);
 }
 
 /**

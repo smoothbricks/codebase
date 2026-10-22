@@ -1228,10 +1228,12 @@ workspace root.
   published binary, never a borrowed executable under `target/`.
 - **Enforced by**: the consuming repository's Nx lint calls the plugin's `refuseOutputsUnderBuildState` validator with
   its already resolved graph (including project overrides), `cowshed build-state --json` path records, and its workspace
-  root. A refusal names the target, output, and build-state path. Job admission and `cowshed doctor` never construct an
-  Nx graph or execute repository plugins for this rule. Sandboxed lint resolves the installed `cowshed` through the
-  job's private `tools/bin` (15_capabilities.md, "Bootstrap executables"); its executable-only grant admits no
-  controller data or socket.
+  root. A refusal names the target, output, and build-state path. The same lint calls `refuseOverlappingOutputs` with
+  that graph and root: a target output at, under or above another target's output is refused, because a restore of
+  either replaces the other's tree, so neither target is ever a cache hit. Job admission and `cowshed doctor` never
+  construct an Nx graph or execute repository plugins for this rule. Sandboxed lint resolves the installed `cowshed`
+  through the job's private `tools/bin` (15_capabilities.md, "Bootstrap executables"); its executable-only grant admits
+  no controller data or socket.
 - `cowshed build-state --json` reads the selected checkout's volume-state record and prints
   `{paths:[{checkout,volume}]}` without opening the controller or store. It never rediscovers tools. A missing link or
   state record refuses with `environment-missing` (exit 5): "this checkout has no build volume yet; run `cowshed setup`

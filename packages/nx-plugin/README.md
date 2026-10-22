@@ -636,10 +636,10 @@ configuration, output, and contributed path. Keep cacheable artifacts under sour
 refuses any target whose output is at, under or above another target's output, in any configuration: Nx restores a
 directory output as one tree, so a second target writing inside it leaves the first target's tree unlike its cache
 artifact after every build, and the two restore over each other without either ever being a cache hit. A pattern
-conflicts with a path it matches, a path at or above its static prefix, or a path it can reach inside; two patterns are
-not judged, since only a file both match collides. `OutputOverlapError.overlaps` names both targets and outputs. Both
-validators interpolate the declarations themselves, so a declaration Nx refuses to interpolate raises
-`OutputDeclarationError` naming its target.
+conflicts with a path at or above its static prefix, or a path it matches or can reach inside under Nx's own minimatch,
+which expands brace alternatives before splitting segments; two patterns are not judged, since only a file both match
+collides. `OutputOverlapError.overlaps` names both targets and outputs. Both validators interpolate the declarations
+themselves, so a declaration Nx refuses to interpolate raises `OutputDeclarationError` naming its target.
 
 ## Test Walk Policy
 
