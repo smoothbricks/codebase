@@ -7283,7 +7283,8 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
         }
 
         fn close_stdin(&mut self) -> bool {
-            // lone_group starts with /dev/null as stdin; there is no parent write end to close.
+            // lone_group's stdin is a pipe its child handle holds, so the group runs until it is
+            // signalled: an empty stdin's close has no write end of the supervisor's to close.
             true
         }
 

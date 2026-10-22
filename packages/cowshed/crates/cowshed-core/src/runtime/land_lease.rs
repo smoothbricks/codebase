@@ -239,6 +239,8 @@ mod tests {
         // group; SIGKILL to that group ends lockf and the `cat` child that holds the descriptor.
         let killed = unsafe { libc::killpg(group, libc::SIGKILL) };
         assert_eq!(killed, 0, "kill the lockf process group");
+        // `cat` reads this pipe: reaping lockf must not end it, only the kill may.
+        let held = holder.stdin.take();
         holder.wait().expect("reap lockf");
 
         // The lock drops when the `cat` child's descriptor closes, a moment after the kill.
@@ -246,6 +248,7 @@ mod tests {
             match take(&sessions, "topic", Holding::Remove) {
                 Ok(released) => {
                     drop(released);
+                    drop(held);
                     break;
                 }
                 Err(refusal) => {

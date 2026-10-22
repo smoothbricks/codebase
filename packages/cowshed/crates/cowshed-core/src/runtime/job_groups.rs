@@ -2497,6 +2497,8 @@ os._exit(0)
             )
             .unwrap();
         assert!(group_alive(pgid));
+        // The child reads this pipe: reaping the leader must not end it, only the signals may.
+        let held = job.stdin.take();
 
         let ended = end_recorded(&ledger, Writer::Any, Duration::from_millis(200)).unwrap();
         assert_eq!(ended.signalled, vec![7]);
@@ -2505,6 +2507,7 @@ os._exit(0)
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(!group_alive(pgid), "the leader's child died with it");
+        drop(held);
         assert_eq!(
             end_recorded(&ledger, Writer::Any, Duration::ZERO).unwrap(),
             super::Ended::default(),
@@ -2655,6 +2658,18 @@ os._exit(0)
         child
     }
 
+    /// End what remains of a [`started_job_group`] once its leader is reaped: the group's id
+    /// still names its backgrounded reader. Returns once no process holds the id, so nothing the
+    /// test started outlives it holding the runner's output.
+    #[cfg(target_os = "macos")]
+    fn end_started_group(pgid: i32) {
+        // SAFETY: the test's own group; its backgrounded reader may still hold the id.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        while super::group_has_live_members(pgid).unwrap() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// A process is signalled only through the identity it was read with: the pid and that pid's
     /// version. The same pid under any other version -- the shape a reused pid takes -- is never
     /// reached, and neither is the process once it has exited and been reaped.
@@ -2683,8 +2698,7 @@ os._exit(0)
             !leader.signal(libc::SIGKILL).unwrap(),
             "a reaped process was signalled"
         );
-        // SAFETY: the test's own group; its backgrounded reader may still hold the id.
-        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        end_started_group(pgid);
     }
 
     /// A process that execs takes a new pid version, so a TERM sent under the identity read just
@@ -2815,8 +2829,7 @@ os._exit(0)
 
         assert!(leader.signal(libc::SIGKILL).unwrap());
         job.wait().unwrap();
-        // SAFETY: the test's own group; its backgrounded reader may still hold the id.
-        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        end_started_group(pgid);
     }
 
     /// A process's exit is watched only while it runs: a watch made once it exited -- here, after
@@ -2842,8 +2855,7 @@ os._exit(0)
             leader.watch_exit().is_err(),
             "a reaped process's exit was watched"
         );
-        // SAFETY: the test's own group; its backgrounded reader may still hold the id.
-        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        end_started_group(pgid);
     }
 
     /// Once a group's leader is reaped, the processes holding its id cannot be told from a

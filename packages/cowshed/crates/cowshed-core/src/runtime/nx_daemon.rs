@@ -1505,7 +1505,8 @@ mod tests {
         );
     }
 
-    /// A sleeping process that leads its own group, as a job's leader does.
+    /// A process blocked reading its stdin, a pipe the returned child holds, that leads its own
+    /// group, as a job's leader does.
     #[cfg(target_os = "macos")]
     fn group_sleeper() -> std::process::Child {
         use cowshed_os::fork_lock::Spawn as _;
@@ -1514,7 +1515,7 @@ mod tests {
             .stdin(std::process::Stdio::piped())
             .process_group(0)
             .spawn_locked()
-            .expect("a sleeping group leader")
+            .expect("a group leader reading its stdin")
     }
 
     /// A ledger that names `child`'s group as one admitted job's, the way the supervisor records it.
@@ -1562,7 +1563,7 @@ mod tests {
 
     /// A sandboxed group leader that forks one plugin worker as Nx's daemon forks each of its own
     /// (`plugins/isolation/isolated-plugin.js`): detached, leading a session of its own, and
-    /// sleeping on past its daemon's exit unless something ends it. The worker announces its pid
+    /// running on past its daemon's exit unless something ends it. The worker announces its pid
     /// once its session is its own; the leader then blocks reading its stdin.
     #[cfg(target_os = "macos")]
     fn sandboxed_daemon_with_worker() -> (std::process::Child, super::super::job_groups::Process) {
