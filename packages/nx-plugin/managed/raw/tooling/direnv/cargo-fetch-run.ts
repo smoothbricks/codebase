@@ -11,12 +11,12 @@
 import { writeSync } from 'node:fs';
 import { constants } from 'node:os';
 import {
+  DEADLINE_PATIENCE,
   describeTeardown,
-  EXIT_PATIENCE,
   judgeBound,
   judgeReap,
   type Patience,
-  TOLD_PATIENCE,
+  TEARDOWN_PATIENCE,
 } from './cargo-fetch-bound.ts';
 
 /** The shell's two uses of time, so a caller can move it by hand. */
@@ -67,53 +67,28 @@ const TEARDOWN_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
 /**
  * Runs `command` and returns how it ended. Failure to start it rejects; so does a failure to read its output, after
  * the group is killed. Whatever way this returns or throws, the group is killed on every path but the command ending
- * itself, and killed again while it still has members (`reapGroup`). What a kill on the way out could not end is said
- * on stderr, and what the deadline's could not is in the outcome.
+ * itself, and killed again while it still has members (`reapGroup`). What a kill on the way out leaves is said on
+ * stderr, and what the deadline's leaves is in the outcome.
  */
 export async function runBounded(command: BoundedCommand, clock: Clock = systemClock): Promise<BoundedOutcome> {
   const commandLine = command.argv.join(' ');
-  const tell = (message: string): void => {
-    writeSync(2, `${message}\n`);
-  };
-  const couldNotEnd = (error: unknown): void => {
-    tell(`${commandLine} could not be ended on the way out: ${error instanceof Error ? error.message : String(error)}`);
-  };
-  let leader: Leader | undefined;
-  // The kill on the paths where nobody reads an outcome: a signal ends this process, or the call is failing. A failure
-  // of its own would carry what the kill could not do, and these have none, so it is said on stderr. The group is
-  // signalled at once. Everything after its leader's exit is one callback, so that none of this process's other work
-  // runs between that exit and `done`, which for a signal gives the signal back to this process.
-  const endGroup = (done: () => void): void => {
-    const running = leader;
-    if (running === undefined) {
-      done();
-      return;
-    }
+  let group: number | undefined;
+  // The kill on the paths where nobody reads an outcome: this process is ending, or the call is failing. Nothing can be
+  // awaited there, not even the leader's exit, and until this process reaps it the kernel lists the leader as a member
+  // of its own group. So the kill cannot tell a member it missed from the leader, and what it leaves is said as listed,
+  // not as running.
+  const endGroup = (): void => {
+    if (group === undefined) return;
     try {
-      signalGroup(running.pid);
+      if (reapGroup(group, TEARDOWN_PATIENCE)) tell(describeTeardown({ command: commandLine, group }));
     } catch (error) {
-      couldNotEnd(error);
-      done();
-      return;
+      const reason = error instanceof Error ? error.message : String(error);
+      tell(`${commandLine} could not be ended on the way out: ${reason}`);
     }
-    void running.exited.then(() => {
-      try {
-        if (reapGroup(running.pid, TOLD_PATIENCE)) {
-          tell(describeTeardown({ command: commandLine, group: running.pid }));
-        }
-      } catch (error) {
-        couldNotEnd(error);
-      } finally {
-        done();
-      }
-    });
   };
   // The hooks come before the spawn: a signal that arrives from the spawn on runs its handler after this synchronous
-  // body, by which time the group is known. A process that is exiting can wait for nothing, not even for its leader to
-  // be reaped, so there the group is only killed again as far as the kernel lists it, and what is left goes unsaid.
-  const release = endWithThisProcess(() => {
-    if (leader !== undefined) reapGroup(leader.pid, EXIT_PATIENCE);
-  }, endGroup);
+  // body, by which time the group is known.
+  const release = endWithThisProcess(endGroup);
   try {
     const child = Bun.spawn({
       cmd: [...command.argv],
@@ -124,7 +99,7 @@ export async function runBounded(command: BoundedCommand, clock: Clock = systemC
       stderr: 'pipe',
       detached: true,
     });
-    leader = child;
+    group = child.pid;
     const stdout: Uint8Array[] = [];
     const stderr: Uint8Array[] = [];
     const stdoutReader = child.stdout.getReader();
@@ -154,7 +129,7 @@ export async function runBounded(command: BoundedCommand, clock: Clock = systemC
           // missed: the leader's exit is awaited before the group is asked about.
           signalGroup(child.pid);
           await child.exited;
-          const membersLeft = reapGroup(child.pid, TOLD_PATIENCE);
+          const membersLeft = reapGroup(child.pid, DEADLINE_PATIENCE);
           return {
             kind: 'expired',
             elapsedMs,
@@ -169,7 +144,7 @@ export async function runBounded(command: BoundedCommand, clock: Clock = systemC
       }
     }
   } catch (error) {
-    await new Promise<void>((resolve) => endGroup(resolve));
+    endGroup();
     throw error;
   } finally {
     release();
@@ -281,40 +256,41 @@ function reapGroup(pgid: number, patience: Patience): boolean {
   }
 }
 
-/** What the shell holds of a command it has started: its pid, which leads its process group, and its exit. */
-interface Leader {
-  readonly pid: number;
-  readonly exited: Promise<number>;
+/**
+ * Says `message` on stderr. Where stderr is gone there is nobody to tell, and a diagnostic must neither replace the
+ * failure it accompanies nor stop the signal being given back.
+ */
+function tell(message: string): void {
+  try {
+    writeSync(2, `${message}\n`);
+  } catch {
+    // Nobody is left to tell.
+  }
 }
 
 /**
- * Has `onExit` run when this process exits, and `onSignal` when a SIGINT, SIGTERM or SIGHUP arrives. `onSignal` is
- * handed `giveBack`, which it calls when it is done: that gives the signal back to this process so that it still ends
- * by it. A signal that arrives while `onSignal` is at work ends this process at once, as it would have without the
- * hooks. A signal somebody already handles stays theirs. Returns the function that takes the hooks away.
+ * Has `end` run when this process is ending: on exit, and on a SIGINT, SIGTERM or SIGHUP, which also gives the signal
+ * back to the process afterwards so it still ends by that signal. A signal somebody already handles stays theirs.
+ * Returns the function that takes the hooks away.
  */
-function endWithThisProcess(onExit: () => void, onSignal: (giveBack: () => void) => void): () => void {
+function endWithThisProcess(end: () => void): () => void {
   const hooks: Array<readonly [NodeJS.Signals, () => void]> = [];
   const release = (): void => {
-    process.removeListener('exit', onExit);
+    process.removeListener('exit', end);
     for (const [signal, handler] of hooks) process.removeListener(signal, handler);
     hooks.length = 0;
   };
-  process.on('exit', onExit);
+  process.on('exit', end);
   for (const signal of TEARDOWN_SIGNALS) {
     if (process.listenerCount(signal) !== 0) continue;
-    const giveBack = (): void => {
-      release();
-      process.kill(process.pid, signal);
-    };
-    let working = false;
     const handler = (): void => {
-      if (working) {
-        giveBack();
-        return;
+      // The signal is given back whatever `end` does: this process must still end by it.
+      try {
+        end();
+      } finally {
+        release();
+        process.kill(process.pid, signal);
       }
-      working = true;
-      onSignal(giveBack);
     };
     process.on(signal, handler);
     hooks.push([signal, handler]);

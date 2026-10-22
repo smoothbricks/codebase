@@ -206,10 +206,11 @@ describe('a command run under its bound', () => {
 
   it('leaves no member behind when the process running them is ended as they fork, as they do on macOS', async () => {
     // The same group with the kill made on the way out: a child process runs the command on a clock that never wakes,
-    // so only the SIGTERM it is sent once the group is up can end the group. It must end by that signal, saying
-    // nothing on stderr, and the end of file of `lifetime` is the death of the last member, however long a loaded host
-    // takes to finish exiting what the kill reached. A member the kill missed is never the last to end, so a shell that
-    // kills the group once on the way out leaves a case that only the backstop ends.
+    // so only the SIGTERM it is sent once the group is up can end the group. It must end by that signal, and the end of
+    // file of `lifetime` is the death of the last member, however long a loaded host takes to finish exiting what the
+    // kill reached. A member the kill missed is never the last to end, so a shell that kills the group once on the way
+    // out leaves a case that only the backstop ends. What the runner says on stderr is the shell's own account of the
+    // kill, which it can give only as listed, not as running: a failure shows it, and nothing asserts it.
     const scratch = mkdtempSync(join(realpathSync(tmpdir()), 'cargo-fetch-run-'));
     try {
       for (const attempt of [1, 2, 3]) {
@@ -236,8 +237,10 @@ describe('a command run under its bound', () => {
             throw new Error(`the runner ended before the group was up: ${ending}`);
           }
           runner.kill('SIGTERM');
-          expect(await ended).toEqual({ code: null, signal: 'SIGTERM' });
-          expect({ attempt, stderr: Buffer.concat(stderr).toString() }).toEqual({ attempt, stderr: '' });
+          expect(await ended, `runner stderr: ${Buffer.concat(stderr).toString()}`).toEqual({
+            code: null,
+            signal: 'SIGTERM',
+          });
           expect(await lifetimeEnded).toBe('');
         } finally {
           // An attempt that failed before the signal must not leave its group running.

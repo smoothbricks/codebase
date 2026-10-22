@@ -4,15 +4,15 @@ import {
   boundedFetchEnv,
   CARGO_FETCH_DEADLINE_ENV,
   CARGO_FETCH_DEADLINE_MS,
+  DEADLINE_PATIENCE,
   describeDeadline,
   describeTeardown,
-  EXIT_PATIENCE,
   fetchDeadline,
   GIT_HTTP_LOW_SPEED_LIMIT,
   GIT_HTTP_LOW_SPEED_TIME_S,
   judgeBound,
   judgeReap,
-  TOLD_PATIENCE,
+  TEARDOWN_PATIENCE,
 } from '../../../nx-plugin/managed/raw/tooling/direnv/cargo-fetch-bound.ts';
 
 /**
@@ -162,12 +162,13 @@ describe('the bound on a cargo fetch', () => {
     );
   });
 
-  it('names the command and the group in what a kill on the way out leaves to be told', () => {
+  it('names the command and the group in what a kill on the way out leaves, as listed and not as running', () => {
     fc.assert(
       fc.property(fc.string({ minLength: 1 }), fc.integer({ min: 1, max: 4_194_304 }), (command, group) => {
         const line = describeTeardown({ command, group });
         expect(line).toContain(command);
-        expect(line).toContain(`process group ${group} still had members`);
+        expect(line).toContain(`process group ${group} was still listed`);
+        expect(line).toContain('unconfirmed');
       }),
     );
   });
@@ -207,17 +208,17 @@ describe('the kill of a process group', () => {
     );
   });
 
-  it('has patiences that signal again after a pause, the exiting process holding itself up for little', () => {
+  it('has patiences that signal again after a pause, the one on the way out holding the exit up for little', () => {
     // A kill that is not repeated misses the member forked as it went out, and so does one repeated with no pause
     // between the signals: a fork already under way joins the group after they have all been sent. A process that is
-    // exiting should hold its exit up for no more than a moment, and a kill whose leftover is told may wait for the
-    // group to empty.
-    for (const patience of [EXIT_PATIENCE, TOLD_PATIENCE]) {
+    // ending should hold its exit up for no more than a moment, and the deadline's kill may wait for the group to
+    // empty.
+    for (const patience of [TEARDOWN_PATIENCE, DEADLINE_PATIENCE]) {
       expect(Number.isInteger(patience.rounds)).toBe(true);
       expect(patience.rounds).toBeGreaterThanOrEqual(2);
       expect(patience.pauseMs).toBeGreaterThanOrEqual(1);
     }
-    expect(EXIT_PATIENCE.rounds * EXIT_PATIENCE.pauseMs).toBeLessThanOrEqual(100);
-    expect(TOLD_PATIENCE.rounds * TOLD_PATIENCE.pauseMs).toBeGreaterThanOrEqual(1000);
+    expect(TEARDOWN_PATIENCE.rounds * TEARDOWN_PATIENCE.pauseMs).toBeLessThanOrEqual(100);
+    expect(DEADLINE_PATIENCE.rounds * DEADLINE_PATIENCE.pauseMs).toBeGreaterThanOrEqual(1000);
   });
 });

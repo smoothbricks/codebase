@@ -516,11 +516,10 @@ a shorter deadline in whole milliseconds and never a longer one. A signal that e
 or the step's exit ends the group with it, since the group no longer shares the terminal's signals. A group signal
 reaches only the members that exist when it goes out, and macOS does not hold a fork back while it does, so the kill is
 repeated while the kernel still lists members of the group (`judgeReap` in `tooling/direnv/cargo-fetch-bound.ts`): every
-5 ms for up to two seconds when the leftover is told (at the deadline, and when a signal ends the step or the fetch's
-run fails), and every millisecond for up to thirty when the step is exiting. If members are left when the repeats stop,
-the failure names the group and says so, as does a line on stderr when a signal ended the step or the fetch's run
-failed. A step that is exiting can wait for nothing, not even for the fetch's leader to be reaped, so it repeats the
-kill and says nothing of what is left. None of them claims the kill reached every process.
+5 ms for up to two seconds at the deadline, and every millisecond for up to thirty when the step is ending, which can
+wait for nothing. If members are left at the deadline, the failure names the group and says so. When the step is ending,
+a line on stderr says the group was still listed and that whether anything in it still runs is unconfirmed, because its
+leader is listed until the step has gone. Neither claims the kill reached every process.
 
 The step also gives the fetch `GIT_HTTP_LOW_SPEED_LIMIT=1` and `GIT_HTTP_LOW_SPEED_TIME=60`, over any value the shell
 already holds. Git has no low-speed limit unless one is set, and Cargo runs the `git` executable for git dependencies

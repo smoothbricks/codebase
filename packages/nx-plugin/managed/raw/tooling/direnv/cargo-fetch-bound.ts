@@ -125,20 +125,18 @@ export interface Patience {
 }
 
 /**
- * For the kill of a process that is exiting, which can wait for nothing, not even for its command's leader to be
- * reaped: signals a millisecond apart, thirty at most. Until the leader is reaped it is listed as a member of its own
- * group, so what is left cannot be judged there and goes unsaid. Rounds with no pause would not even do the killing: a
- * fork already under way when the first signal goes out joins the group after they have all run.
+ * For a kill on the way out of this process, which can wait for nothing and should hold the exit up for as little as it
+ * can: signals a millisecond apart, thirty at most. Rounds with no pause do not do it: a fork already under way when
+ * the first signal goes out joins the group after they have all run.
  */
-export const EXIT_PATIENCE: Patience = { rounds: 30, pauseMs: 1 };
+export const TEARDOWN_PATIENCE: Patience = { rounds: 30, pauseMs: 1 };
 
 /**
- * For a kill whose leftover is told, the leader having been reaped first: at the deadline, and when a signal ends the
- * step or the fetch's run fails. Signals 5 ms apart for up to two seconds, the time the bounded-exec executor allows a
- * force-killed command to be reaped. A host under load can take that long to finish exiting what it was sent, and the
- * group lists a member until it has.
+ * For the kill at the deadline, whose outcome is told: signals 5 ms apart for up to two seconds, the time the
+ * bounded-exec executor allows a force-killed command to be reaped. A host under load can take that long to finish
+ * exiting what it was sent, and the group lists a member until it has.
  */
-export const TOLD_PATIENCE: Patience = { rounds: 400, pauseMs: 5 };
+export const DEADLINE_PATIENCE: Patience = { rounds: 400, pauseMs: 5 };
 
 /** What the shell knows of the group when it asks whether to signal it again. */
 export interface ReapFacts {
@@ -216,11 +214,19 @@ export function describeDeadline({
 export interface TeardownFacts {
   /** The command as a person would type it. */
   readonly command: string;
-  /** The process group the command ran in, which still listed members when the kill gave up. */
+  /** The process group the command ran in, which the kernel still listed when the kill gave up. */
   readonly group: number;
 }
 
-/** The line a kill on the way out leaves on stderr when members of the group remain. */
+/**
+ * The line a kill on the way out leaves on stderr when the group is still listed. This process can wait for nothing
+ * there, not even for its command's leader to be reaped, and the kernel lists the leader as a member of its own group
+ * until then. So what is left is listed, and not known to be running.
+ */
 export function describeTeardown({ command, group }: TeardownFacts): string {
-  return `${command} was killed on the way out, but ${describeMembersLeft(group)}`;
+  return [
+    `${command} was killed on the way out, but process group ${group} was still listed when the kill gave up;`,
+    'whether a process in it still runs is unconfirmed, because its leader is listed until this process reaps it,',
+    'which it cannot do while it is ending.',
+  ].join(' ');
 }
