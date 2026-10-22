@@ -831,6 +831,25 @@ impl CowshedError {
                     "rerun the command from a shell whose sandbox allows writing the cowshed store",
                 );
             }
+            if let Some(
+                refusal @ cowshed_apfs::ApfsError::ReleaseNeedsAuthorization {
+                    device,
+                    owner_uid,
+                    ..
+                },
+            ) = error.downcast_ref::<cowshed_apfs::ApfsError>()
+            {
+                // Another user's attachment: no storage repair or retry changes who may release it.
+                let how = if *owner_uid == 0 {
+                    format!(" (`sudo hdiutil detach {device}`)")
+                } else {
+                    String::new()
+                };
+                return Self::conflict(
+                    format!("{}: {refusal}", message.into()),
+                    format!("detach {device} as uid {owner_uid}, the user that attached it{how}"),
+                );
+            }
             starved |= errno == Some(libc::ENFILE)
                 || error.is::<cowshed_apfs::CommandRunError>()
                 || matches!(
@@ -1283,6 +1302,31 @@ mod tests {
             panic!("the table is read only for disk-child and ENFILE failures")
         });
         assert_eq!(error.hint, "repair");
+    }
+
+    /// Another user's attachment is a conflict that names who may detach it, never a storage
+    /// repair: its release would wait on an administrator prompt.
+    #[test]
+    fn a_release_another_user_must_make_names_that_user() {
+        let refused = cowshed_apfs::ApfsError::ReleaseNeedsAuthorization {
+            image: "/x.dmg".into(),
+            device: "/dev/disk9".into(),
+            owner_uid: 0,
+            euid: 502,
+        };
+        let error = CowshedError::storage_failure_under("detach", &refused, "repair", || {
+            panic!("an ownership refusal is not blamed on the vnode table")
+        });
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert_eq!(
+            error.hint,
+            "detach /dev/disk9 as uid 0, the user that attached it (`sudo hdiutil detach /dev/disk9`)"
+        );
+        assert!(
+            error
+                .message
+                .starts_with("detach: /dev/disk9 of /x.dmg was attached by uid 0")
+        );
     }
 
     #[test]

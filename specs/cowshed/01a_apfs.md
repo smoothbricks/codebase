@@ -191,9 +191,9 @@ Namespace-only unmount and owned-image release use `funmount` on the same held, 
 a mountpoint path, BSD device name or Disk Arbitration view. The root's filesystem identity comes from `fstatfs` on that
 descriptor. Each ordinary attempt is unforced. The image lease and registry-proven raw volume pin preserve authority
 across namespace admission, the native operation and its compound postcondition. After every owned volume is absent and
-pins are released, guarded `hdiutil detach -verbose` releases the exact physical whole device. There is no
-general-eject, DA-unmount, path/device substitution or automatic fallback. This does not claim Spotlight releases
-departed references.
+pins are released, guarded `hdiutil detach -verbose` releases the exact physical whole device, only when this euid owns
+the attachment or is root ("Release authority"). There is no general-eject, DA-unmount, path/device substitution or
+automatic fallback. This does not claim Spotlight releases departed references.
 
 ### Owned-registry mount boundary
 
@@ -378,6 +378,45 @@ no-effect success. The caller supplies no mounted-device snapshot as release aut
 raw pins released, `hdiutil detach -verbose <physical-whole-device>` releases that exact image through the image
 driver's interface. No BSD-prefix or StorageKit cached family, `diskutil eject`, DA-unmount or automatic fallback
 selects the effect.
+
+### Release authority
+
+Disk Arbitration decides whether an unmount or eject needs authorization from one fact: the disk's owner.
+diskarbitrationd takes it from the `owner-uid` property it finds above the disk's IOMedia, which both image drivers
+(`IOHDIXHDDriveInKernel`, `AppleDiskImageDevice`) record as the attaching uid, and takes root when there is none; it
+also chowns the disk's `/dev` nodes to that owner. `DADiskUnmount` and `DADiskEject` pass outright when the owner is the
+caller's euid. Otherwise the client's `_DAAuthorize` asks authd for `system.volume.virtual.unmount` with interaction
+allowed, and that right falls to the `system.volume.` rule (`is-root`, `is-admin`, `authenticate-admin-30`): root
+passes, and a non-administrator gets a SecurityAgent prompt that holds the request until someone answers it.
+`hdiutil detach`, with or without `-force`, unmounts the whole disk through `DADiskUnmount` first.
+
+The 2026-10-22 matrix on macOS 26.6.2 measured 23 cells on throwaway 64 MiB RAW images; the probe sources, per-cell
+records and the live receipt are retained outside the repository as `detach-no-auth-20261022`. Each DA request came from
+a probe whose interposed `AuthorizationCreate` refuses, so no cell reached authd. With the image attached by the user,
+whether in-kernel read-write, in-kernel `-readonly` or DiskImages2, no unmount, whole-disk unmount (forced or not) or
+eject asked for authorization. That held whatever mounted the volume (`diskutil mount` browsable,
+`diskutil mount readOnly -mountPoint`, `mount_apfs -o nobrowse` or root's `hdiutil mountvol`) and whether it was still
+mounted or already unmounted. `hdiutil detach`, `hdiutil detach -force`, `diskutil eject` and `diskutil unmount` each
+finished in 0.05–1.5 s. With the image attached by root (`sudo hdiutil attach -kernel`: `owner-uid` 0, `/dev` nodes
+root's), every whole-disk unmount, forced whole-disk unmount and eject by uid 502 needed authorization, including after
+a `diskutil mount` / `diskutil unmount` cycle. Root's own `hdiutil detach` of that image took 0.13 s. `diskutil mount`
+by uid 502 of the root-attached volume succeeded, yet launched a SecurityAgent that exited about 28 s later.
+
+The incident of 2026-10-22 22:48 +04 was that root-attached cell. An agent attached a recovery image with
+`sudo -n hdiutil attach -kernel -readonly -nomount …`, mounted and unmounted its volume with `diskutil`, and then
+`hdiutil detach /dev/disk638` as uid 502 sat 22 minutes in
+`DADiskUnmountCommon → _DAAuthorize → AuthorizationCopyRights` behind a SecurityAgent prompt (expired credential, Touch
+ID locked out); its `-force` retry waited the same way. The browsable `diskutil mount` was incidental.
+
+Cowshed attaches only as the invoking user, so its own attachments never meet the prompt. The inventory reads each
+attachment's `owner-uid` with its devices, and treats an absent one as root's, as Disk Arbitration does. A release
+refuses an attachment another uid made with `ReleaseNeedsAuthorization`, naming the device, the image, the owner uid and
+the euid, before anything is unmounted. The guarded recheck before every `hdiutil detach`, the dissent retry and final
+`-force` included, refuses the same way rather than spawn a detach that would wait. Root releases any attachment. The
+refusal is a conflict whose hint names the owner: detach it as that uid (`sudo hdiutil detach <device>` for root). No
+authorization is requested, retried or waited on. In the 2026-10-22 23:47 +04 live receipt, `release_image` of a
+root-attached image as uid 502 returned `ReleaseNeedsAuthorization` in 37 ms and left the image attached for root to
+detach. The same call on a user-attached image mounted with `mount_apfs` released it in 0.61 s.
 
 `WhenIdle` returns a recognized busy refusal immediately, without force. `Release` gives the first recognized busy
 refusal its existing 10 s monotonic wall-clock grace, including native/command execution and disk-lease waits between

@@ -19,7 +19,7 @@ use cowshed_os::fork_lock::{Fenced, Spawn as _};
 use cowshed_os::host_load::HostLoad;
 pub use cowshed_os::process::{CommandOutput, ProcessStatus};
 use cowshed_os::process::{fmt_command, fmt_command_failure, fmt_command_spawn};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -1796,10 +1796,16 @@ pub struct AttachedDiskImage {
     pub capacity: Option<ImageCapacity>,
     /// Every BSD media node beneath the image driver, in device order.
     pub media: Vec<ImageMedia>,
+    /// The user Disk Arbitration takes as the owner of every disk this attachment exposes: the
+    /// image driver's `owner-uid`, which the attach records as the attaching user, or root when
+    /// the driver records none (diskarbitrationd's default). Only that user or root unmounts or
+    /// ejects those disks without asking authd (01a_apfs.md, "Release authority").
+    pub owner_uid: libc::uid_t,
 }
 
 impl AttachedDiskImage {
-    /// A file-backed attachment exposing `media` as `(device, content hint)` pairs.
+    /// A file-backed attachment exposing `media` as `(device, content hint)` pairs, made by
+    /// this process's user, as every cowshed attach is.
     pub fn file<'a>(
         image: impl Into<PathBuf>,
         capacity: Option<ImageCapacity>,
@@ -1815,6 +1821,7 @@ impl AttachedDiskImage {
                     content: content.to_owned(),
                 })
                 .collect(),
+            owner_uid: current_euid(),
         }
     }
 
@@ -1940,6 +1947,15 @@ pub enum ApfsError {
     InvalidStagedStem(PathBuf),
     InvalidCreateRequest(&'static str),
     InvalidDetachTarget(PathBuf),
+    /// Releasing `device` would wait on an administrator prompt: `owner_uid` attached it, and
+    /// Disk Arbitration unmounts or ejects a disk without asking authd only for its owner or root
+    /// (01a_apfs.md, "Release authority"). Refused before any unmount or detach runs.
+    ReleaseNeedsAuthorization {
+        image: PathBuf,
+        device: String,
+        owner_uid: libc::uid_t,
+        euid: libc::uid_t,
+    },
     InvalidVolumeName(String),
     InvalidVolumeDevice(String),
     /// A rename's volume is not the one mounted at the path it was found mounted at by the time
@@ -2079,6 +2095,18 @@ impl fmt::Display for ApfsError {
             Self::InvalidDetachTarget(target) => {
                 write!(f, "invalid APFS detach target: {}", target.display())
             }
+            Self::ReleaseNeedsAuthorization {
+                image,
+                device,
+                owner_uid,
+                euid,
+            } => write!(
+                f,
+                "{device} of {} was attached by uid {owner_uid}; Disk Arbitration releases it \
+                 without an administrator prompt only for uid {owner_uid} or root, so it is not \
+                 detached as uid {euid}: detach it as uid {owner_uid}",
+                image.display()
+            ),
             Self::InvalidVolumeName(name) => {
                 write!(f, "invalid APFS volume name: {name:?}")
             }
@@ -2778,6 +2806,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         Ok(self.attachment_inventory(image)?.devices)
     }
 
+    /// The kernel's mapping of `image` and the owner of each of its whole devices.
     fn attachment_inventory(&self, image: &Path) -> Result<AttachmentInventory, ApfsError> {
         let image = attachment_inventory_path(image)?;
         image_inventory(&image, &self.attachments_of(&image)?)
@@ -3256,8 +3285,16 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
 
     /// Release every currently owned attachment. The owner resolves each volume's current mount
     /// inside namespace admission; no caller's cached mounted-device set authorizes or skips it.
+    ///
+    /// An attachment another user made is refused before anything is unmounted: its detach
+    /// would wait on an administrator prompt (01a_apfs.md, "Release authority").
     pub fn release_image(&self, image: &Path, intent: DetachIntent) -> Result<(), ApfsError> {
-        for view in self.release_views(image)? {
+        let views = self.release_views(image)?;
+        let euid = current_euid();
+        for view in &views {
+            refuse_unowned_release(image, &view.whole_device, view.owner_uid, euid)?;
+        }
+        for view in views {
             for volume in view.release_volumes() {
                 self.unmount_released(&volume, intent)?;
             }
@@ -3479,17 +3516,21 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         let result =
             cowshed_os::timing::timed("apfs-command", format_args!("detach image"), || {
                 let output = self.runner.run_guarded(&request, || {
-                    let held = self.attached_whole_devices(image)?;
+                    let inventory = self.attachment_inventory(image)?;
+                    let held = inventory.devices;
                     if held.is_empty() {
                         return Ok(false);
                     }
-                    if !held.contains(target) {
+                    let Some(&owner_uid) = inventory.owners.get(target) else {
                         return Err(ApfsError::InvalidAttachmentInventory(format!(
                             "{} still holds {held:?}, not {target}; retaining the attached \
                          image rather than claiming it was released",
                             image.display()
                         )));
-                    }
+                    };
+                    // Forced or not, hdiutil's Disk Arbitration unmount of another user's disk
+                    // waits on authd's administrator prompt; refuse before spawning it.
+                    refuse_unowned_release(image, target, owner_uid, current_euid())?;
                     Ok(true)
                 })?;
                 match output {
@@ -4014,6 +4055,8 @@ fn is_disk_image_command(request: &CommandRequest) -> bool {
 /// is the image's.
 struct AttachmentInventory {
     devices: BTreeSet<String>,
+    /// Each whole device's attachment owner ([`AttachedDiskImage::owner_uid`]).
+    owners: BTreeMap<String, libc::uid_t>,
     capacity: Option<ImageCapacity>,
     matched: bool,
 }
@@ -4023,6 +4066,7 @@ fn image_inventory(
     images: &[AttachedDiskImage],
 ) -> Result<AttachmentInventory, ApfsError> {
     let mut devices = BTreeSet::new();
+    let mut owners = BTreeMap::new();
     let mut capacity = None;
     let mut matched = false;
     for attached in images
@@ -4040,6 +4084,7 @@ fn image_inventory(
             })?;
             if device_depth(&device) == 0 {
                 roots += 1;
+                owners.insert(device.clone(), attached.owner_uid);
                 devices.insert(device);
             }
         }
@@ -4059,6 +4104,7 @@ fn image_inventory(
     }
     Ok(AttachmentInventory {
         devices,
+        owners,
         capacity,
         matched,
     })
@@ -4435,6 +4481,8 @@ pub(crate) struct ReleaseView {
     image: PathBuf,
     whole_device: String,
     volumes: Vec<String>,
+    /// The attachment's owner ([`AttachedDiskImage::owner_uid`]).
+    owner_uid: libc::uid_t,
 }
 
 impl ReleaseView {
@@ -4479,9 +4527,38 @@ fn release_views_of(
                 image: image.to_owned(),
                 whole_device,
                 volumes,
+                owner_uid: attached.owner_uid,
             })
         })
         .collect()
+}
+
+/// Refuse to release `device`, which `owner_uid` attached, as `euid` when Disk Arbitration would
+/// ask authd first. DiskArbitration's `_DAAuthorize` passes an unmount or eject outright only
+/// when the disk's owner is the caller; otherwise it asks authd for
+/// `system.volume.<kind>.unmount` with interaction allowed, which root passes (`is-root`) and a
+/// non-administrator answers only at a SecurityAgent prompt (01a_apfs.md, "Release authority").
+fn refuse_unowned_release(
+    image: &Path,
+    device: &str,
+    owner_uid: libc::uid_t,
+    euid: libc::uid_t,
+) -> Result<(), ApfsError> {
+    if euid == 0 || owner_uid == euid {
+        return Ok(());
+    }
+    Err(ApfsError::ReleaseNeedsAuthorization {
+        image: image.to_owned(),
+        device: device.to_owned(),
+        owner_uid,
+        euid,
+    })
+}
+
+/// This process's effective uid.
+fn current_euid() -> libc::uid_t {
+    // SAFETY: `geteuid` reads this process's credentials; it takes no pointers and cannot fail.
+    unsafe { libc::geteuid() }
 }
 
 /// A formatted attachment's physical image device and every APFS volume in its one container.
@@ -5412,6 +5489,7 @@ mod io_registry {
         content: Cf,
         size: Cf,
         source: Cf,
+        owner: Cf,
         driver: Driver,
     }
 
@@ -5804,6 +5882,7 @@ mod io_registry {
             content: key("Content")?,
             size: key("Size")?,
             source: key(driver.source_key())?,
+            owner: key("owner-uid")?,
             driver,
         };
         let mut images: BTreeMap<u64, AttachedDiskImage> = BTreeMap::new();
@@ -5833,6 +5912,13 @@ mod io_registry {
         let Some(source) = string_property(device, &keys.source, source_key)? else {
             return Err(invalid(format!("a disk image device registers no {source_key}")).into());
         };
+        // Both drivers record the attaching uid on the device itself (measured 2026-10-22);
+        // Disk Arbitration takes a disk with none as root's.
+        let owner_uid = match u64_property(device, &keys.owner, "owner-uid")? {
+            Some(uid) => libc::uid_t::try_from(uid)
+                .map_err(|_| invalid(format!("registry property owner-uid {uid} is not a uid")))?,
+            None => 0,
+        };
         let mut found = DeviceMedia::default();
         while !read_media(device, 0, keys, &mut found)? {
             found = DeviceMedia::default();
@@ -5849,6 +5935,7 @@ mod io_registry {
                 source: keys.driver.source(&source),
                 capacity: found.capacity,
                 media: found.media,
+                owner_uid,
             },
         );
         Ok(())
@@ -6667,6 +6754,7 @@ mod io_registry {
                 content: key("Content").expect("key"),
                 size: key("Size").expect("key"),
                 source: key("KDIURLPath").expect("key"),
+                owner: key("owner-uid").expect("key"),
                 driver: Driver::InKernel,
             };
             assert!(matches!(
@@ -9216,6 +9304,67 @@ mod tests {
         );
     }
 
+    /// Disk Arbitration passes an unmount or eject outright only for the disk's owner; root passes
+    /// authd's `is-root`; anyone else waits on an administrator prompt.
+    #[test]
+    fn release_authority_is_the_attaching_user_or_root() {
+        let image = Path::new("/tmp/cowshed-owner.dmg");
+        for (owner_uid, euid, refused) in [
+            (502, 502, false),
+            (0, 0, false),
+            (502, 0, false),
+            (0, 502, true),
+            (501, 502, true),
+        ] {
+            let result = refuse_unowned_release(image, "/dev/disk9", owner_uid, euid);
+            assert_eq!(result.is_err(), refused, "owner {owner_uid}, euid {euid}");
+        }
+        let refusal = refuse_unowned_release(image, "/dev/disk9", 0, 502).unwrap_err();
+        assert_eq!(
+            refusal.to_string(),
+            "/dev/disk9 of /tmp/cowshed-owner.dmg was attached by uid 0; Disk Arbitration \
+             releases it without an administrator prompt only for uid 0 or root, so it is not \
+             detached as uid 502: detach it as uid 0"
+        );
+    }
+
+    /// Another user's attachment is refused by name before any detach spawns, forced or not,
+    /// under every intent: hdiutil's Disk Arbitration unmount would wait on authd's prompt.
+    #[test]
+    fn a_detach_of_another_users_attachment_refuses_before_spawning() {
+        let euid = current_euid();
+        assert_ne!(
+            euid, 0,
+            "root releases every attachment; run this test as a user"
+        );
+        let attachment = identity_attachment("foreign-owner");
+        let image = attachment_inventory_path(&attachment.image).unwrap();
+        for intent in [
+            DetachIntent::Release,
+            DetachIntent::WithinGrace,
+            DetachIntent::WhenIdle,
+        ] {
+            let backend = graced_backend([Reply::Inventory(Ok(vec![AttachedDiskImage {
+                owner_uid: 0,
+                ..AttachedDiskImage::file(&image, None, [(attachment.whole_device.as_str(), "")])
+            }]))]);
+            let error = backend.detach(&attachment, intent).unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    ApfsError::ReleaseNeedsAuthorization { device, owner_uid: 0, euid: refused, .. }
+                        if *device == attachment.whole_device && *refused == euid
+                ),
+                "{error}"
+            );
+            assert_eq!(
+                backend.runner().steps(),
+                [Seen::Inventory],
+                "no detach spawned"
+            );
+        }
+    }
+
     #[test]
     fn detach_of_an_image_no_longer_attached_issues_no_detach() {
         let attachment = identity_attachment("already-gone");
@@ -10461,6 +10610,7 @@ mod tests {
                 source: DiskImageSource::Url("ram://2048".into()),
                 capacity: None,
                 media: live_capture().media,
+                owner_uid: current_euid(),
             },
             AttachedDiskImage::file("/tmp/cowshed-other.dmg", None, [("/dev/disk20", "")]),
         ];
@@ -11540,6 +11690,32 @@ mod tests {
             let commands: Vec<Vec<String>> = backend.runner().requests().iter().map(argv).collect();
             assert_eq!(commands, [["detach", "-verbose", "/dev/disk4"]]);
         }
+    }
+
+    /// A release of another user's attachment is refused before its mounted volumes are touched,
+    /// so nothing is left unmounted but attached.
+    #[test]
+    fn a_release_of_another_users_attachment_refuses_before_unmounting() {
+        assert_ne!(
+            current_euid(),
+            0,
+            "root releases every attachment; run this test as a user"
+        );
+        let image = temp_path("two-volume-foreign", IMAGE_EXTENSION);
+        let mut attached = two_volume_image(&image);
+        attached[0].owner_uid = 0;
+        let backend = graced_backend([Reply::Inventory(Ok(attached))]);
+        let error = backend
+            .release_image(&image, DetachIntent::Release)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ApfsError::ReleaseNeedsAuthorization { owner_uid: 0, .. }
+            ),
+            "{error}"
+        );
+        assert_eq!(backend.runner().steps(), [Seen::Inventory]);
     }
 
     /// A release under `WhenIdle` hands a held volume's dissent straight back: no wait, no forced
