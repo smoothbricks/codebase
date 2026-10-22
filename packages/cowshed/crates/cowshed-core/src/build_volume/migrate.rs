@@ -76,81 +76,48 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
     if let Some(refusal) = tracked_source(checkout, &found.real)? {
         return Ok(Err(refusal));
     }
-    let id = match link::linked(checkout)? {
-        Some(mount) => layout.volume_at(&mount).ok_or_else(|| {
-            CowshedError::integrity(
-                format!(
-                    "{} names {}, not one of this project's build volumes",
-                    checkout.join(link::BUILD_LINK).display(),
-                    mount.display()
-                ),
-                "repair the build link and retry cowshed setup",
-            )
-        })?,
+    // A volume minted here stays held by its creation until its record is published below.
+    let (id, _creating) = match link::linked(checkout)? {
+        Some(mount) => {
+            let id = layout.volume_at(&mount).ok_or_else(|| {
+                CowshedError::integrity(
+                    format!(
+                        "{} names {}, not one of this project's build volumes",
+                        checkout.join(link::BUILD_LINK).display(),
+                        mount.display()
+                    ),
+                    "repair the build link and retry cowshed setup",
+                )
+            })?;
+            (id, None)
+        }
         None => {
-            let id = match beside {
-                MintedBeside::Volume(minted) if minted.capacity == capacity => minted.id,
+            let (id, creating) = match beside {
+                MintedBeside::Volume(minted) if minted.capacity == capacity => (minted.id, None),
                 MintedBeside::Failed(error) => return Err(error),
                 MintedBeside::Nothing | MintedBeside::Volume(_) => {
                     let id = BuildVolumeId::mint();
-                    let (mount, _creating) = host
+                    let (_, creating) = host
                         .create_build_volume(layout, &id, capacity, &registration)
                         .map_err(storage_error)?;
-                    // Linked while the creation still holds it: from here the link protects
-                    // the registered volume from GC and lets a retry find it.
-                    link::point(checkout, &mount)?;
-                    return finish(
-                        host,
-                        layout,
-                        checkout,
-                        paths,
-                        fingerprint,
-                        &found,
-                        id,
-                        &registration,
-                    );
+                    (id, Some(creating))
                 }
             };
+            // Linked while a creation still holds it: from here the link protects the
+            // registered volume from GC and lets a retry find it.
             link::point(checkout, &layout.mount(&id))?;
-            id
+            (id, creating)
         }
     };
-    finish(
-        host,
-        layout,
-        checkout,
-        paths,
-        fingerprint,
-        &found,
-        id,
-        &registration,
-    )
-}
-
-/// Link every contributed path of `checkout` into volume `id`, already linked by `checkout`,
-/// write its state, and publish its record: only after every source directory has become its
-/// fixed link.
-#[allow(clippy::too_many_arguments)]
-fn finish<H: RuntimeStorageHost>(
-    host: &H,
-    layout: &BuildVolumeLayout,
-    checkout: &Path,
-    paths: &[BuildStatePath],
-    fingerprint: String,
-    found: &Found<'_>,
-    id: BuildVolumeId,
-    registration: &Registration,
-) -> Result<
-    std::result::Result<(BuildVolumeId, Vec<DisplacedBuildStateFinding>), TrackedBuildStateRefusal>,
-> {
     let mount = host
         .mount_build_volume(layout, &id)
         .map_err(storage_error)?;
     let previous = BuildVolumeState::read(&mount)?;
     let (state, _) = previous.with_discovered(paths, fingerprint, &mount)?;
-    let displaced = adopt_preflighted(checkout, &mount, paths, found)?;
+    let displaced = adopt_preflighted(checkout, &mount, paths, &found)?;
     state.write(&mount)?;
-    layout.publish(&id, registration)?;
+    // Published only after every source directory has become its fixed link.
+    layout.publish(&id, &registration)?;
     Ok(Ok((id, displaced)))
 }
 
