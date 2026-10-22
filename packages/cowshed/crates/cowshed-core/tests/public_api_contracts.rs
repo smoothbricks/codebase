@@ -1867,6 +1867,10 @@ fn sealed_job_and_cpu_failures_keep_their_exact_wire_spellings() {
         json!("priority")
     );
     assert_eq!(
+        serde_json::to_value(JobFailure::Unlaunched).unwrap(),
+        json!("unlaunched")
+    );
+    assert_eq!(
         serde_json::to_value(ExecScope::default()).unwrap(),
         json!("workspace")
     );

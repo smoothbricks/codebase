@@ -2109,6 +2109,81 @@
         "traceId": "00112233445566778899aabbccddeeff"
       },
       "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+    },
+    "unlaunched": {
+      "argv": [
+        {
+          "data": "sh",
+          "encoding": "utf8"
+        },
+        {
+          "data": "-c",
+          "encoding": "utf8"
+        }
+      ],
+      "class": "background",
+      "cpuTokens": 1,
+      "cwd": null,
+      "durationMs": 1234,
+      "exit": {
+        "code": 102,
+        "kind": "exited"
+      },
+      "failure": "unlaunched",
+      "grantRevision": 7,
+      "jobId": 30,
+      "repoId": "smoothbricks/codebase",
+      "scope": "workspace",
+      "started": "2026-01-02T03:04:05Z",
+      "state": "failed",
+      "stderr": {
+        "bytes": 70,
+        "sha256": "7a5a36041f1e1fffaf96c5bf0a34c961a9ec6b3bea02900ffe412f4174d7a104",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "cowshed: tooling/missing does not exist, so the command did not start\n",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "cowshed: tooling/missing does not exist, so the command did not start\n",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "stdin": {
+        "bytes": 5,
+        "complete": true,
+        "kind": "inline"
+      },
+      "stdout": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "trace": {
+        "spanId": "0011223344556677",
+        "traceId": "00112233445566778899aabbccddeeff"
+      },
+      "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
     }
   },
   "JobProcessEvent": {

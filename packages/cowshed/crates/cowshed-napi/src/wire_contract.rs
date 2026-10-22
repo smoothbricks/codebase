@@ -585,6 +585,26 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         ..exited.clone()
     };
 
+    // A job whose command was never launched: its program was proven absent before the spawn,
+    // so it failed with the not-found wrapper exit, owned no process and was never observed.
+    let unlaunched = JobInfo {
+        job_id: JobId::new(30).expect("fixture job id"),
+        state: JobState::Failed,
+        exit: Some(ExitStatus::Exited { code: 102 }),
+        pid: None,
+        resources: None,
+        stdout: inline_stream(""),
+        stderr: inline_stream(
+            "cowshed: tooling/missing does not exist, so the command did not start\n",
+        ),
+        failure: Some(cowshed_core::api::JobFailure::Unlaunched),
+        class: ExecClass::Background,
+        scope: ExecScope::Workspace,
+        nice: None,
+        cpu_tokens: NonZeroUsize::new(1),
+        ..exited.clone()
+    };
+
     // A job its requester waits on: it held background tokens and ran at the supervisor's own
     // nice, above a gate (05_gateway.md "Bands").
     let interactive = JobInfo {
@@ -695,6 +715,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             document("job status", &cpu_admission_failed),
         ),
         ("priorityFailed", document("job status", &priority_failed)),
+        ("unlaunched", document("job status", &unlaunched)),
         ("interactive", document("job status", &interactive)),
         ("resident", document("job status", &resident)),
         (

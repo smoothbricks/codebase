@@ -212,6 +212,9 @@ pub enum ScriptValue {
 pub enum JobFailure {
     ScriptSyntax,                        // the script did not parse; nothing ran
     SupervisorLost,                      // its supervisor ended without seeing it end (11_shell.md)
+    CpuAdmission,                        // its CPU grant was refused or lost; its command never ran
+    Priority,                            // its class nice could not be placed; its command never ran
+    Unlaunched,                          // anything else kept its command from launching
 }
 
 pub struct OutputPublication {
@@ -1472,8 +1475,14 @@ supervisor that ran the job retires.
   The command is flattened: exactly one of `argv` and `script` is present, and an `ExecRequest` carries the same field.
   `script = { parts: string[], values: ({word:string} | {words:string[]})[] }` obeys the `ScriptCommand` bounds above.
   `failure` is present only on a `failed` job: `"scriptSyntax"` when its script did not parse (exit
-  `{kind:"exited",code:2}`, diagnostic on stderr), and `"supervisorLost"` in the terminal record the next supervisor
-  seals for a job its lost predecessor never saw end (11_shell.md). Protected Arrow stores a script in the `argv` column
+  `{kind:"exited",code:2}`, diagnostic on stderr), `"supervisorLost"` in the terminal record the next supervisor seals
+  for a job its lost predecessor never saw end (11_shell.md), and, for a job whose command never ran, `"cpuAdmission"`
+  or `"priority"` (its CPU grant or class nice refused) or `"unlaunched"` (anything else kept the command from
+  launching: a program, `#!` interpreter or `env` name proven absent, a held child refused before its exec, a host that
+  could not start it). A never-launched job's exit is the refusal's wrapper code; a host process it owned meanwhile does
+  not make its command one that ran, so `failure`, never a `pid` or a sample, says it never ran. The one exception keeps
+  its own shape: a cold activation that itself fails ends the job with the activation's status and no `failure`
+  (11_shell.md, "Activation belongs to the job that waited on it"). Protected Arrow stores a script in the `argv` column
   as the two arguments `\0script` and the script's JSON, a pair no argv can produce. Every element of `argv` is the
   exact tagged `CommandArg` object `{encoding:"utf8",data:String} | {encoding:"base64",data:String}`. Serialization
   selects `utf8` if and only if the Unix argument bytes are valid UTF-8; otherwise it emits canonical standard base64.
@@ -1786,7 +1795,7 @@ export interface ScriptCommand {
   values: ScriptValue[];
 }
 export type JobCommand = { argv: CommandArg[]; script?: never } | { script: ScriptCommand; argv?: never };
-export type JobFailure = 'scriptSyntax' | 'supervisorLost';
+export type JobFailure = 'scriptSyntax' | 'supervisorLost' | 'cpuAdmission' | 'priority' | 'unlaunched';
 
 export type JobInfo = JobCommand & {
   repoId: string;

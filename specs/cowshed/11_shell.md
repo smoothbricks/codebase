@@ -92,10 +92,10 @@ that script is absent and when it exists and is executable but its `#!` interpre
 argv command, in a one-shot child, a warm host or a host gate, the supervisor follows the links the kernel will: the
 program (relative to the cwd, or looked up on the job's PATH), the interpreter its `#!` line names, and the name an
 `env` interpreter looks up on that PATH. The first one proven absent (`ENOENT` or `ENOTDIR`) refuses the spawn as
-not-found (wrapper exit 102), naming it on the job's stderr. Only absence is judged: a path the supervisor cannot
-inspect, an unreadable script, `env` with options, and any name looked up on a PATH that shell activation sets inside
-the sandbox are the kernel's to decide, so this never becomes a second sandbox. Nothing rewrites the command: the kernel
-still runs the interpreter, and `$0` and `BASH_SOURCE` stay the script's.
+not-found (wrapper exit 102), naming it on the job's stderr, and the job fails with `failure: unlaunched`. Only absence
+is judged: a path the supervisor cannot inspect, an unreadable script, `env` with options, and any name looked up on a
+PATH that shell activation sets inside the sandbox are the kernel's to decide, so this never becomes a second sandbox.
+Nothing rewrites the command: the kernel still runs the interpreter, and `$0` and `BASH_SOURCE` stay the script's.
 
 **Process identity and signal ownership.** The process that creates a command's group observes its leader's immutable
 birth identity before anything can reap it, including a leader that exits immediately. One-shot commands and activation
@@ -222,10 +222,10 @@ activation, and a failed activation fails the job with the activation's status a
 streams carry only its own output. A spare's activation output is discarded; its failure only means there is no spare.
 An activation whose supervisor goes away — dropped the host, or its process exited — ends with its whole process group,
 since nothing can use its result. A host that cannot serve a request — it cannot run `direnv`, say — answers with the
-reason and exits; any host that breaks its protocol fails the job waiting on it as a launch that failed, with the reason
-on the job's stderr, since its command never ran. The one exception is a host that died by a signal while it activated
-for the job: a kill of the job reaches its activation, and a crash is the job's to see, so that death is the job's
-status (the reason still goes to its stderr).
+reason and exits; any host that breaks its protocol fails the job waiting on it as a launch that failed
+(`failure: unlaunched`), with the reason on the job's stderr, since its command never ran. The one exception is a host
+that died by a signal while it activated for the job: a kill of the job reaches its activation, and a crash is the job's
+to see, so that death is the job's status (the reason still goes to its stderr).
 
 The layer's other roles:
 

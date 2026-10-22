@@ -1643,7 +1643,9 @@ async fn output_limit_terms_kills_and_drains_before_terminal_commitment() {
 }
 
 /// A spawn that fails comes after the exec answered at admission: the job ends `failed` with the
-/// failure's wrapper exit code and one terminal commitment, and its stderr says why.
+/// failure's wrapper exit code, the typed failure `unlaunched` (its command never ran: an absent
+/// program, a held child the observer refused, any spawn error but a nice placement) and one
+/// terminal commitment, and its stderr says why.
 #[tokio::test]
 async fn spawn_failure_is_typed_terminal_with_one_terminal_commitment() {
     let (mut h, _root) = harness(7, 1024, true, false);
@@ -1679,6 +1681,7 @@ async fn spawn_failure_is_typed_terminal_with_one_terminal_commitment() {
         String::from_utf8_lossy(&stderr.bytes).starts_with("cowshed: "),
         "the spawn failure is said on the job's stderr"
     );
+    assert_eq!(ended.failure, Some(JobFailure::Unlaunched));
     let listed = h.handle.list().await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].job_id.get(), 7);
@@ -5971,7 +5974,13 @@ async fn a_job_that_ends_before_any_process_of_its_own_has_no_sample() {
     }
     let ended = handle.wait(job_id).await.unwrap();
     assert_eq!((ended.state, ended.resources), (JobState::Failed, None));
-    assert_eq!(handle.sealed(job_id).await.unwrap().resources, None);
+    // The host never launched the command: typed, whatever the host process owned meanwhile.
+    assert_eq!(ended.failure, Some(JobFailure::Unlaunched));
+    let sealed = handle.sealed(job_id).await.unwrap();
+    assert_eq!(
+        (sealed.resources, sealed.failure),
+        (None, Some(JobFailure::Unlaunched))
+    );
     let unsampled = handle.resources(job_id).await.unwrap_err();
     assert_eq!(unsampled.code, ErrorCode::Conflict, "{}", unsampled.message);
 }

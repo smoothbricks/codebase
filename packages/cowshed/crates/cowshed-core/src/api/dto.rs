@@ -2990,6 +2990,13 @@ pub enum JobFailure {
     CpuAdmission,
     /// The nice of the job's owned command could not be set, so the command never ran.
     Priority,
+    /// The job's command was never launched for any other reason: a program, `#!` interpreter
+    /// or `env` name proven absent before the spawn, a held child the observer refused before
+    /// its exec, or a host that could not launch it (it could not be started or broke protocol).
+    /// Its exit is the refusal's wrapper code; whatever a host process owned meanwhile, the
+    /// command never ran. The cause is on stderr. A cold activation that itself fails is not
+    /// this: the job ends with the activation's own status (11_shell.md).
+    Unlaunched,
 }
 
 #[derive(Debug)]

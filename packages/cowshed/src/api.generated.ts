@@ -1393,7 +1393,7 @@ export type JobContainment =
 /**
  * Why a job failed when no command's own status explains it.
  */
-export type JobFailure = 'scriptSyntax' | 'supervisorLost' | 'cpuAdmission' | 'priority';
+export type JobFailure = 'scriptSyntax' | 'supervisorLost' | 'cpuAdmission' | 'priority' | 'unlaunched';
 
 export type JobId = number & tags.Type<'uint64'> & tags.Minimum<1> & tags.Maximum<9007199254740991>;
 

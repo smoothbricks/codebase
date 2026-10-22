@@ -810,6 +810,10 @@ async fn host_controller_each_command_has_its_own_cwd_env_streams_status_and_std
     );
     let exited = run(&handle, sh("exit 7")).await;
     assert_eq!(exited.info.exit, Some(ExitStatus::Exited { code: 7 }));
+    assert_eq!(
+        exited.info.failure, None,
+        "a command that ran owns its exit"
+    );
 
     let echoed = run(
         &handle,
@@ -822,10 +826,20 @@ async fn host_controller_each_command_has_its_own_cwd_env_streams_status_and_std
     .ok();
     assert_eq!(echoed.stdout, "piped input");
 
-    // Proven absent before the spawn: the supervisor refuses it (not-found, wrapper code 102)
-    // and names the program, instead of the host's exec failing 127.
+    // Proven absent before the spawn: the supervisor refuses it (not-found, wrapper code 102),
+    // names the program, instead of the host's exec failing 127, and types it unlaunched.
     let missing = run(&handle, request(&["/no/such/program"])).await;
     assert_eq!(missing.info.exit, Some(ExitStatus::Exited { code: 102 }));
+    assert_eq!(missing.info.failure, Some(JobFailure::Unlaunched));
+    assert_eq!(
+        handle
+            .sealed(missing.info.job_id)
+            .await
+            .expect("its sealed record")
+            .failure,
+        Some(JobFailure::Unlaunched),
+        "the sealed record keeps why the command never ran"
+    );
     assert!(
         missing
             .stderr

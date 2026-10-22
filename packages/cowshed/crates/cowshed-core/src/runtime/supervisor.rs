@@ -6109,9 +6109,7 @@ impl SupervisorActor {
         let process = match spawn {
             Ok(process) => process,
             Err(error) => {
-                if error.priority_source().is_some() {
-                    job.failure = Some(JobFailure::Priority);
-                }
+                job.failure = Some(unlaunched(&error));
                 self.fail_before_command(job_id, KillReason::SpawnFailure, error)
                     .await;
                 return;
@@ -7024,9 +7022,7 @@ impl SupervisorActor {
                 }
                 // The same terminal shape as a spawn that failed synchronously; the job's
                 // stderr already carries the reason.
-                if error.priority_source().is_some() {
-                    job.failure = Some(JobFailure::Priority);
-                }
+                job.failure = Some(unlaunched(&error));
                 job.exit = Some(ExitStatus::Exited {
                     code: error.exec_wrapper_exit_code().into(),
                 });
@@ -8198,6 +8194,19 @@ fn adopt_birth(job: &mut JobStateRecord, ledger: bool, birth: Birth) {
     }
     job.info.pid = Some(birth.pid());
     job.birth = Some(birth);
+}
+
+/// Why a job whose command was never launched failed: its nice could not be placed
+/// (`priority`), or anything else kept the command from starting (`unlaunched`: an absent
+/// program, `#!` interpreter or `env` name; a held child the observer refused before its exec;
+/// a host that could not start it). Whatever a host process owned meanwhile, the command never
+/// ran, and the failure says so where neither a pid nor a sample can.
+fn unlaunched(error: &CowshedError) -> JobFailure {
+    if error.priority_source().is_some() {
+        JobFailure::Priority
+    } else {
+        JobFailure::Unlaunched
+    }
 }
 
 /// The job's command started, however its spawn reports it: a one-shot spawn's process at once, a

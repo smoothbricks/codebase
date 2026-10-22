@@ -4369,6 +4369,7 @@ fn failure_name(failure: crate::api::dto::JobFailure) -> &'static str {
         crate::api::dto::JobFailure::SupervisorLost => "supervisorLost",
         crate::api::dto::JobFailure::CpuAdmission => "cpuAdmission",
         crate::api::dto::JobFailure::Priority => "priority",
+        crate::api::dto::JobFailure::Unlaunched => "unlaunched",
     }
 }
 
@@ -4378,6 +4379,7 @@ fn parse_failure(name: &str) -> Result<crate::api::dto::JobFailure, ArtifactErro
         "supervisorLost" => Ok(crate::api::dto::JobFailure::SupervisorLost),
         "cpuAdmission" => Ok(crate::api::dto::JobFailure::CpuAdmission),
         "priority" => Ok(crate::api::dto::JobFailure::Priority),
+        "unlaunched" => Ok(crate::api::dto::JobFailure::Unlaunched),
         other => Err(ArtifactError::Arrow(format!(
             "unknown job failure {other:?}"
         ))),
