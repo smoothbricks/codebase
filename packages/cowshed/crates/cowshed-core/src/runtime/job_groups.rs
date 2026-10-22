@@ -1554,7 +1554,14 @@ impl ExitWatch {
         // SAFETY: pidfd_open takes plain integers; a non-negative answer is a new descriptor.
         let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
         if opened < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            // A pid whose process was reaped while its process group lives on is EINVAL to
+            // pidfd_open, not ESRCH: the kernel keeps the number for the group, with no process
+            // to open (`pidfd_prepare` finds no thread-group leader on it). No process holds it.
+            return Err(match error.raw_os_error() {
+                Some(libc::EINVAL) => io::Error::from_raw_os_error(libc::ESRCH),
+                _ => error,
+            });
         }
         let descriptor = i32::try_from(opened).map_err(io::Error::other)?;
         // SAFETY: a fresh descriptor this function alone owns.
@@ -1996,26 +2003,36 @@ mod tests {
     }
 
     /// A watch taken on a running process by pid reports it running, then its exit once it is
-    /// killed; a pid no process holds any more (reaped) is no watch at all.
+    /// killed; a pid no process holds any more (reaped) is no watch at all. The reaped process
+    /// leads a group a second member keeps alive, and neither kernel gives a live group's id to a
+    /// new process, so no process can take the pid between the reap and the second look.
     #[test]
     fn an_exit_watch_by_pid_sees_the_exit_and_none_for_a_reaped_pid() {
-        let mut child = Command::new("/bin/sleep")
-            .arg("600")
-            .stdin(Stdio::null())
-            .spawn_locked()
-            .expect("spawn sleep");
-        let pid = child.id();
+        // `/bin/sh` reading the pipe the test holds open runs until it is killed, on every host:
+        // NixOS keeps `/bin/sh` and no `/bin/sleep`.
+        let shell = |group: i32| {
+            Command::new("/bin/sh")
+                .stdin(Stdio::piped())
+                .process_group(group)
+                .spawn_locked()
+                .expect("spawn sh")
+        };
+        let mut leader = OwnedGroup(shell(0));
+        let pid = leader.0.id();
+        let mut member = shell(i32::try_from(pid).expect("leader pid"));
         let watch = super::ExitWatch::of(pid)
             .expect("watch")
             .expect("a running child is watched");
         assert!(!watch.within(Duration::from_millis(50)).expect("poll"));
-        child.kill().expect("kill");
+        leader.0.kill().expect("kill");
         watch.wait().expect("the exit is reported");
-        child.wait().expect("reap");
+        leader.0.wait().expect("reap");
         assert!(
             super::ExitWatch::of(pid).expect("watch").is_none(),
             "a reaped pid names no process"
         );
+        member.kill().expect("kill the member");
+        member.wait().expect("reap the member");
     }
 
     /// A job-shaped process tree: a group leader with a child, both sleeping.
