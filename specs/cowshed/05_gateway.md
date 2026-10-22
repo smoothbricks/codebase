@@ -1366,12 +1366,15 @@ core count.
     `-j --jobserver-auth=fifo:<path>`, beside `BOUNDED_EXEC_CPU_POOL` and `BOUNDED_EXEC_CPU_TOKENS=g`, and
     `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to `g` where it named neither: libtest and nextest test threads
     take no jobserver token, so without them a `cargo test` holding `g` tokens still runs one test thread per core. A
-    `--test-threads` count the command names outranks them, as a flag outranks the environment. The supervisor sets
-    these for a job (`CpuPlacement`), over a caller's own `CARGO_MAKEFLAGS`, `MAKEFLAGS` and `MFLAGS`, which it never
-    passes; `bounded-exec` sets them for every runner it starts ("Sized to the grant"), and a target's `options.env`
-    cannot name them. Cargo, every build script and every nested `cargo` a test starts inherit them and run rustc only
-    on tokens read from that fifo; `cargo metadata` and every query read none, so nothing needs to tell a build from a
-    query.
+    `--test-threads` count the command names outranks them, as a flag outranks the environment. A gate's relay pool
+    exports neither: its command is the orchestrator, every runner it starts asks the host and sizes its test threads to
+    its own grant, and `bounded-exec` reads an inherited count as a ceiling, so the gate's own one-token grant would run
+    every Rust suite under it on one thread (measured 2026-10-22: `tokens=1/1` in every gate runner since 10-20, and
+    `cowshed-cli`'s 487 tests summing to their 1225 s wall). The supervisor sets these for a job (`CpuPlacement`), over
+    a caller's own `CARGO_MAKEFLAGS`, `MAKEFLAGS` and `MFLAGS`, which it never passes; `bounded-exec` sets them for
+    every runner it starts ("Sized to the grant"), and a target's `options.env` cannot name them. Cargo, every build
+    script and every nested `cargo` a test starts inherit them and run rustc only on tokens read from that fifo;
+    `cargo metadata` and every query read none, so nothing needs to tell a build from a query.
   - **No holder, no configuration.** A Cargo no holder started — an agent's in a shed, a host shell's, rust-analyzer's,
     a resident's — receives none of these and runs exactly as Cargo does unconfigured, at the host's full width: the
     approved behaviour since the `cargo` launcher's deletion, unchanged by the deletion of growth. A parent make's own

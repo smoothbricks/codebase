@@ -658,6 +658,9 @@ pub struct CpuPlacement {
     pub held: Option<super::job_cpu::HeldTokens>,
     pub pool: PathBuf,
     pub nice: i32,
+    /// The job's class: a gate's pool is a relay whose runners each size their own test threads
+    /// to their own host grant (05_gateway.md "Gate admission").
+    pub class: ExecClass,
 }
 
 /// The make flags a held grant exports to Cargo and make, ahead of its fifo's path.
@@ -678,7 +681,10 @@ impl CpuPlacement {
     /// The variables only the grant's authority sets, laid over the caller's: a caller cannot
     /// name a pool, a count or a jobserver it was not granted. The fifo is the pool's own, whose
     /// bytes its socket children take, so the two never count one token twice. Test threads take
-    /// no jobserver token, so they are sized to the grant where the caller named no count.
+    /// no jobserver token, so they are sized to the grant where the caller named no count, except
+    /// under a gate: its pool is a relay that lends nothing, every runner its command starts asks
+    /// the host and sizes its own test threads to that grant, and a count here would be the
+    /// ceiling every one of them reads (05_gateway.md "The holder exports it").
     pub(super) fn environment(
         &self,
         caller: &BTreeMap<String, String>,
@@ -699,8 +705,15 @@ impl CpuPlacement {
             flags.push(&held.fifo);
             environment.push((OsString::from("CARGO_MAKEFLAGS"), flags.clone()));
             environment.push((OsString::from("MAKEFLAGS"), flags));
+            let sized_by_this_grant = match self.class {
+                ExecClass::Background
+                | ExecClass::Interactive
+                | ExecClass::Resident
+                | ExecClass::InteractiveResident => true,
+                ExecClass::Gate => false,
+            };
             for name in ["RUST_TEST_THREADS", "NEXTEST_TEST_THREADS"] {
-                if !caller.contains_key(name) {
+                if sized_by_this_grant && !caller.contains_key(name) {
                     environment.push((OsString::from(name), OsString::from(tokens.to_string())));
                 }
             }
@@ -721,6 +734,7 @@ mod cpu_placement_tests {
             }),
             pool: PathBuf::from("/pool/p.sock"),
             nice: 10,
+            class: ExecClass::Background,
         }
     }
 
@@ -762,6 +776,27 @@ mod cpu_placement_tests {
                 ("MAKEFLAGS", "-j --jobserver-auth=fifo:/pool/j"),
                 ("RUST_TEST_THREADS", "3"),
                 ("NEXTEST_TEST_THREADS", "3"),
+            ])
+        );
+    }
+
+    /// A gate's pool is a relay that lends nothing: every runner its command starts asks the host
+    /// and sizes its test threads to that runner's own grant, so the gate's own grant sets no
+    /// test-thread count that a runner would read as its ceiling (05_gateway.md "The holder
+    /// exports it").
+    #[test]
+    fn a_gate_relay_exports_its_jobserver_and_no_test_threads() {
+        let gate = CpuPlacement {
+            class: ExecClass::Gate,
+            ..placement(Some(1))
+        };
+        assert_eq!(
+            exported(&gate, &[]),
+            expected(&[
+                ("BOUNDED_EXEC_CPU_POOL", "/pool/p.sock"),
+                ("BOUNDED_EXEC_CPU_TOKENS", "1"),
+                ("CARGO_MAKEFLAGS", "-j --jobserver-auth=fifo:/pool/j"),
+                ("MAKEFLAGS", "-j --jobserver-auth=fifo:/pool/j"),
             ])
         );
     }
@@ -6113,6 +6148,7 @@ impl SupervisorActor {
             held: grant.held().cloned(),
             pool: grant.pool().to_path_buf(),
             nice: class_nice(own_nice(), job.info.class),
+            class: job.info.class,
         };
         job.info.cpu_tokens = grant.tokens();
         job.info.state = JobState::Running;
@@ -9002,6 +9038,7 @@ mod workspace_toolchain_tests {
                 held: None,
                 pool: PathBuf::from("/pool/p.sock"),
                 nice: 0,
+                class: ExecClass::Background,
             },
         };
         let (events, _received) = mpsc::channel(16);
@@ -10341,6 +10378,7 @@ mod sandbox_environment_tests {
                 held: None,
                 pool: PathBuf::from("/pool/p.sock"),
                 nice: 0,
+                class: ExecClass::Gate,
             },
             #[cfg(target_os = "linux")]
             cgroup: None,
