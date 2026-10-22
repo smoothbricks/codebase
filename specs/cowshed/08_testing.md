@@ -411,25 +411,25 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
 
 Parametrized over the substrate the host provides, and never gated off on it: a missing capability is a failure, not a
 skip. On macOS these are the `real_apfs_*` tests, compiled only for macOS: small `.dmg` images (1 GiB caps) under
-`/private/var/folders/cowshed/<uid>/t/<pid>-<n>-<label>` (`cowshed_os::scratch::macos_scratch_root`), driven by the
-production host — real `diskutil`/`hdiutil`/`fsck_apfs`/`mount_apfs`, descriptor-native `funmount` and the live kernel
-mount table. A mount state a test needs (wrong flags, an impostor volume, a busy holder) is produced on a real volume,
-never by a substitute mount source. Every scratch root selects its backing image paths, then calls the same production
-owned-attachment cleanup used by normal removal, recovery-marker reads, reverse-order teardown, duplicate-attachment
-rejection, and staging GC. Each cleanup rereads image/whole-device/volume identity and retains each owned volume's raw
-pin through namespace admission and same-root-FD `funmount`, then runs guarded `hdiutil detach` of the exact physical
-device under the image's lease. The detach guard rechecks after storage admission; a cached device number, caller mount
-set or mountpoint never authorizes an effect. A failed release keeps the scratch tree intact for the next run, rather
-than deleting a still-attached image's backing files. Before any release, a scratch root ends every process working in
-its tree, selected by the working directory the kernel reports (`proc_pidinfo` `PROC_PIDVNODEPATHINFO`, which still
-names a deleted directory): `SIGTERM`, as `nx daemon --stop` sends it, then `SIGKILL` after a 10s grace. A stock Nx
-daemon a fixture started detaches from its starter, so a failed test's unwinding otherwise never reached it and it kept
-running in the deleted root. Successful cleanup removes the root, and every run first ends the processes working under,
-then reclaims the roots and attachments of, runs whose owner pid is gone. On Linux: a scratch ZFS pool on a
-loopback/file vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool exported on teardown; the Linux leg also
-exercises `cowshed-helper` and the Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*`
-volumes/pools. The same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on
-ZFS) are tagged.
+`/private/var/folders/cowshed/<uid>/t/<pid>-<n>` (the label is said on stderr, not spelled, so sockets below fit
+`sun_path`) (`cowshed_os::scratch::macos_scratch_root`), driven by the production host — real
+`diskutil`/`hdiutil`/`fsck_apfs`/`mount_apfs`, descriptor-native `funmount` and the live kernel mount table. A mount
+state a test needs (wrong flags, an impostor volume, a busy holder) is produced on a real volume, never by a substitute
+mount source. Every scratch root selects its backing image paths, then calls the same production owned-attachment
+cleanup used by normal removal, recovery-marker reads, reverse-order teardown, duplicate-attachment rejection, and
+staging GC. Each cleanup rereads image/whole-device/volume identity and retains each owned volume's raw pin through
+namespace admission and same-root-FD `funmount`, then runs guarded `hdiutil detach` of the exact physical device under
+the image's lease. The detach guard rechecks after storage admission; a cached device number, caller mount set or
+mountpoint never authorizes an effect. A failed release keeps the scratch tree intact for the next run, rather than
+deleting a still-attached image's backing files. Before any release, a scratch root ends every process working in its
+tree, selected by the working directory the kernel reports (`proc_pidinfo` `PROC_PIDVNODEPATHINFO`, which still names a
+deleted directory): `SIGTERM`, as `nx daemon --stop` sends it, then `SIGKILL` after a 10s grace. A stock Nx daemon a
+fixture started detaches from its starter, so a failed test's unwinding otherwise never reached it and it kept running
+in the deleted root. Successful cleanup removes the root, and every run first ends the processes working under, then
+reclaims the roots and attachments of, runs whose owner pid is gone. On Linux: a scratch ZFS pool on a loopback/file
+vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool exported on teardown; the Linux leg also exercises
+`cowshed-helper` and the Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The
+same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
 The panic/kill cleanup fixture reads only its own child's stdout pipe. Before ending that child it requires two complete
 line-start image records (the mounted RAW image, then the retained RAW input) and the worker record; neither a sibling's

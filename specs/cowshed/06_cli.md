@@ -329,6 +329,15 @@ warnings thereafter, detached session, file-backed output and never-kill custody
 degrades" §2). `--deadline-ms` does not grant authority to cancel them or change that warning policy. Their caller may
 stop waiting with a bounded, named still-running report, leaving the operation and its leases alive.
 
+`cowshed disk-command hdiutil --registry-entry <id> -- detach <device>` binds a detach to the IORegistry entry ID the
+caller inventoried the device as (`0x…` or decimal; any other argv with the option is a usage error). Inside the
+disk-lifecycle admission, immediately before the spawn, the runner reads that entry again: the detach runs only while it
+is still registered with `<device>` as its whole disk. Otherwise nothing is detached, and the command fails with a
+wrapper exit and `refused … nothing was detached`. A device name that was recycled while the command queued for
+admission is never detached. The window that remains, from that read to `hdiutil`'s own open of the name, is the one
+every cowshed release has. A caller that detaches a device it did not just attach itself uses this, never `-force`
+(`packages/nx-plugin/README.md`, RAM temp).
+
 During an interrupted re-adoption (02 §Re-adoption), `adopt <checkout> --re-adopt` and
 `mount main --repo-id <owner/repo>` resolve from the existing controller checkout-path record only when a strict
 unfinished journal owns the exact repository and checkout. No Git checkout is required at that boundary. They finish the

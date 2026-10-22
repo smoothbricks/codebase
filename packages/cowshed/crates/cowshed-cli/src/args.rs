@@ -221,12 +221,29 @@ pub struct SubtreeRootArgs {
 pub struct RetireDescendantsArgs {
     pub grace: std::time::Duration,
 }
+/// Refuse a registry entry bound to anything but `hdiutil detach <device>`: the one rule the CLI's
+/// `--registry-entry` and Host.diskCommand's `registryEntry` share.
+pub fn bound_detach(tool: DiskTool, args: &[OsString]) -> Result<(), &'static str> {
+    let detach = tool == DiskTool::Hdiutil
+        && args.len() == 2
+        && args[0] == "detach"
+        && !args[1].to_string_lossy().starts_with('-');
+    if detach {
+        Ok(())
+    } else {
+        Err("--registry-entry binds only `hdiutil -- detach <device>`, with no other argument")
+    }
+}
+
 /// `disk-command <diskutil|hdiutil> -- <args…>`: the tool and its argv, bytes untouched.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiskCommandArgs {
     pub tool: DiskTool,
     pub deadline: std::time::Duration,
     pub args: Vec<OsString>,
+    /// `--registry-entry`: the IORegistry entry ID the caller inventoried the device of its
+    /// `hdiutil detach <device>` as; the detach runs only while that entry still names the device.
+    pub registry_entry: Option<u64>,
 }
 
 /// `land-turn <repo> [--workspace <ws>] [--outside-lock <path>] -- <cmd...>`: the repository whose
@@ -1057,6 +1074,7 @@ pub fn cli_command() -> ClapCommand {
             leaf("disk-command")
                 .arg(positional("tool", 0..=1))
                 .arg(value("deadline-ms"))
+                .arg(value("registry-entry"))
                 .arg(
                     Arg::new("argv")
                         .value_parser(value_parser!(OsString))
@@ -1616,10 +1634,16 @@ const DISK_COMMAND: CommandSpec = CommandSpec {
         "A command that creates or releases a disk-image device — `diskutil image …`, `diskutil eject` and every `hdiutil` verb — is never killed: past 120 s it is waited for, with a `cowshed:` warning on stderr every 30 s, because one killed mid-operation can leak its kernel device until reboot. It also ignores hangup, interrupt and terminate and writes its output to files the runner reads back, so a caller that gives up and kills this command leaves the operation to finish. Every other verb has one total monotonic budget for lease admission and child execution, 120 s by default or --deadline-ms before --. An exhausted budget never executes the native tool; an overrun kills the owned group and waits for the child's actual termination before reporting a wrapper timeout.",
         "Failures of the runner itself — the tool could not be started or waited for, or an ordinary verb hit its deadline — exit 100–106 with a `cowshed:` line on stderr and nothing on stdout, as `exec` reports its wrapper failures. `--json` is refused: the answer is the tool's own output, so ask the tool for structure (`-plist`).",
     ],
-    options: &[Opt {
-        spelling: "--deadline-ms <positive integer>",
-        meaning: "before -- only: total SAFE admission-and-child budget in milliseconds; default 120000. Image commands retain their 120 s warning-only, never-kill policy",
-    }],
+    options: &[
+        Opt {
+            spelling: "--deadline-ms <positive integer>",
+            meaning: "before -- only: total SAFE admission-and-child budget in milliseconds; default 120000. Image commands retain their 120 s warning-only, never-kill policy",
+        },
+        Opt {
+            spelling: "--registry-entry <id>",
+            meaning: "before -- only, with `hdiutil -- detach <device>` and nothing else: the IORegistry entry ID (0x… or decimal) the caller inventoried the device as. Inside the host disk admission, immediately before the spawn, the detach runs only while that entry is still registered with <device> as its whole disk; otherwise nothing is detached and the command fails 100–106, so a name recycled while the command queued is never detached",
+        },
+    ],
 };
 
 fn parse_disk_command(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
@@ -1675,10 +1699,29 @@ fn parse_disk_command(matches: &ArgMatches, global: &GlobalOptions) -> Result<Co
             std::time::Duration::from_millis(millis.get())
         }
     };
+    let registry_entry = match os(matches, "registry-entry") {
+        None => None,
+        Some(value) => {
+            let text = value.to_str().unwrap_or_default();
+            let entry = match text.strip_prefix("0x") {
+                Some(hex) => u64::from_str_radix(hex, 16).ok(),
+                None => text.parse::<u64>().ok(),
+            }
+            .ok_or_else(|| {
+                UsageError::new(
+                    "--registry-entry must be an IORegistry entry ID, 0x-prefixed hex or decimal",
+                    USAGE,
+                )
+            })?;
+            bound_detach(tool, &args).map_err(|refusal| UsageError::new(refusal, USAGE))?;
+            Some(entry)
+        }
+    };
     Ok(Command::DiskCommand(DiskCommandArgs {
         tool,
         deadline,
         args,
+        registry_entry,
     }))
 }
 
@@ -6241,8 +6284,64 @@ mod tests {
                 tool: DiskTool::Hdiutil,
                 deadline: cowshed_apfs::DISK_CHILD_DEADLINE,
                 args: vec![OsString::from("info")],
+                registry_entry: None,
             })
         );
+        let Command::DiskCommand(bound) = parse_args([
+            "disk-command",
+            "hdiutil",
+            "--registry-entry",
+            "0x100056302",
+            "--",
+            "detach",
+            "/dev/disk540",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("disk-command parses");
+        };
+        assert_eq!(bound.registry_entry, Some(0x1_0005_6302));
+        for refused in [
+            &[
+                "disk-command",
+                "hdiutil",
+                "--registry-entry",
+                "0x1",
+                "--",
+                "info",
+            ][..],
+            &[
+                "disk-command",
+                "hdiutil",
+                "--registry-entry",
+                "0x1",
+                "--",
+                "detach",
+                "-force",
+                "/dev/disk5",
+            ],
+            &[
+                "disk-command",
+                "diskutil",
+                "--registry-entry",
+                "0x1",
+                "--",
+                "eject",
+                "/dev/disk5",
+            ],
+            &[
+                "disk-command",
+                "hdiutil",
+                "--registry-entry",
+                "disk5",
+                "--",
+                "detach",
+                "/dev/disk5",
+            ],
+        ] {
+            assert!(parse_args(refused.iter().copied()).is_err(), "{refused:?}");
+        }
         assert_eq!(cli.command.project_discovery(), ProjectDiscovery::NotUsed);
 
         // Past `--` every word is the tool's, cowshed's own flags included.

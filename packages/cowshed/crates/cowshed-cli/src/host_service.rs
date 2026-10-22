@@ -224,7 +224,13 @@ async fn answer(request: RouterRequest) -> Result<RouterResponse> {
                     .into_iter()
                     .map(CommandArg::into_os_string)
                     .collect(),
+                registry_entry: request.registry_entry,
             };
+            if args.registry_entry.is_some() {
+                crate::args::bound_detach(args.tool, &args.args).map_err(|refusal| {
+                    CowshedError::usage(refusal, "cowshed disk-command --help")
+                })?;
+            }
             let input = request
                 .stdin
                 .map(BinaryData::into_bytes)

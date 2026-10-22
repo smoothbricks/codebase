@@ -351,18 +351,22 @@ impl Serves<HostDiskCommand> for Host {
             argv: Vec<CommandArg>,
             #[serde(default)]
             stdin: Option<BinaryData>,
+            #[serde(default)]
+            registry_entry: Option<u64>,
         }
         let Caller {
             tool,
             deadline_ms,
             argv,
             stdin,
+            registry_entry,
         } = decode::<HostDiskCommand, Caller>(arguments)?;
         Ok(DiskCommandRequest {
             tool,
             deadline_ms,
             argv,
             stdin,
+            registry_entry,
         })
     }
 }

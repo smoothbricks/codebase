@@ -383,7 +383,7 @@ fixtures. The runtime write-site audit also covers Git's `cowshed-ignore-rules-*
 runtime `cs-*` **symlinks** retain their existing `point_runtime_link` lifecycle; this directory reaper never follows or
 removes them. Workspace exec temp and sandbox profiles belong to the store's existing workspace and profile reclamation,
 not the shared-temp sweep. Real-image roots live outside shared temp, as
-`/private/var/folders/cowshed/<uid>/t/<pid>-<n>-<label>` beside their sweep lock/record (08_testing.md), and remain with
+`/private/var/folders/cowshed/<uid>/t/<pid>-<n>` beside their sweep lock/record (08_testing.md), and remain with
 `cowshed-apfs/tests/support/scratch_apfs.rs`: that owner stops workers and releases attached images under its own lock
 before reclaiming a root. The generic reaper still excludes and reports a `cowshed-itest-*` root an earlier build left
 in shared temp, even if it acquires a marker; moving an attached backing image here would race its existing recovery

@@ -889,6 +889,11 @@ export type DiskCommandRequest = {
   readonly deadlineMs?: number & tags.Type<'uint64'> & tags.Minimum<1>;
   readonly argv: ReadonlyArray<CommandArg>;
   readonly stdin?: BinaryData;
+  /**
+   * `--registry-entry`: the IORegistry entry ID `hdiutil detach <device>` is bound to; the
+   * detach runs only while that entry still names the device, read inside the disk admission.
+   */
+  readonly registryEntry?: number & tags.Type<'uint64'>;
 };
 
 /**

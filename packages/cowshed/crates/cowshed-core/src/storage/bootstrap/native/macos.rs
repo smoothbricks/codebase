@@ -118,7 +118,8 @@ fn run_disk_tool(
             | CommandRunFailure::Reap { .. }
             | CommandRunFailure::Input { .. }
             | CommandRunFailure::VolumeRename
-            | CommandRunFailure::Release(_) => HostError::new(format!(
+            | CommandRunFailure::Release(_)
+            | CommandRunFailure::DeviceChanged(_) => HostError::new(format!(
                 "cannot execute {:?} with argv {:?}: {error}",
                 command.program(),
                 command.args()

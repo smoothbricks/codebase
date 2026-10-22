@@ -72,9 +72,16 @@ pub(crate) async fn run(
 ) -> Result<CommandOutput, CowshedError> {
     let request = request(args);
     let deadline = CommandDeadline::new(args.deadline);
-    tokio::task::spawn_blocking(move || match input {
-        ToolInput::Inherited => SystemCommandRunner.run_with_inherited_input(&request, deadline),
-        ToolInput::Bytes(bytes) => SystemCommandRunner.run_with_input(&request, deadline, bytes),
+    let registry_entry = args.registry_entry;
+    tokio::task::spawn_blocking(move || match (registry_entry, input) {
+        // A bound detach reads no input, from either caller.
+        (Some(entry), _) => SystemCommandRunner.run_detach_of_entry(&request, entry),
+        (None, ToolInput::Inherited) => {
+            SystemCommandRunner.run_with_inherited_input(&request, deadline)
+        }
+        (None, ToolInput::Bytes(bytes)) => {
+            SystemCommandRunner.run_with_input(&request, deadline, bytes)
+        }
     })
     .await
     .map_err(|error| {
@@ -98,6 +105,10 @@ fn runner_error(error: CommandRunError) -> CowshedError {
             "no disk tool renames a volume; create it under its final name (specs/cowshed/01a_apfs.md, \"Ownership, identity, and the volume label\")",
         ),
         CommandRunFailure::Release(refusal) => CowshedError::conflict(message, refusal.hint()),
+        CommandRunFailure::DeviceChanged(_) => CowshedError::conflict(
+            message,
+            "read the I/O Registry again and detach the device its entry names now, if any",
+        ),
         CommandRunFailure::Spawn(_)
         | CommandRunFailure::Wait(_)
         | CommandRunFailure::Kill { .. }
@@ -213,6 +224,7 @@ mod tests {
             tool,
             deadline: cowshed_apfs::DISK_CHILD_DEADLINE,
             args: argv.iter().map(OsString::from).collect(),
+            registry_entry: None,
         }
     }
 

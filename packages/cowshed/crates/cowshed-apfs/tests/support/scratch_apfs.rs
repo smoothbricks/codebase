@@ -51,13 +51,17 @@ fn sweep_record() -> PathBuf {
     SCRATCH_PARENT.join("sweep.run")
 }
 
-/// One test's disposable root: `<scratch parent>/<pid>-<n>-<label>`.
+/// One test's disposable root: `<scratch parent>/<pid>-<n>`. The parent is 8 bytes longer than
+/// `/private/tmp/cowshed-itest-` was, so the label is said on stderr when the root is made and torn
+/// down, never spelled in the path: a fixture store's `store/run/<32 hex>.sock` must still fit
+/// `sockaddr_un.sun_path` (104 bytes) below it.
 ///
 /// Dropping it ends every process working in its tree, detaches every image attached from below
 /// it, then removes the tree. Only the root that started a predecessor sweep joins that sweep;
 /// another root's teardown never inherits that unrelated work.
 pub struct ScratchRoot {
     path: PathBuf,
+    label: String,
     sweep: Option<JoinHandle<()>>,
 }
 
@@ -72,12 +76,17 @@ impl ScratchRoot {
     pub(crate) fn new_owned(label: &str) -> std::io::Result<Self> {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let path = SCRATCH_PARENT.join(format!(
-            "{}-{}-{label}",
+            "{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&path)?;
-        Ok(Self { path, sweep: None })
+        cowshed_os::eprintln!("scratch root {}: {label}", path.display());
+        Ok(Self {
+            path,
+            label: label.to_owned(),
+            sweep: None,
+        })
     }
 
     fn new_with_sweep(label: &str, once: &Once, sweep: fn()) -> std::io::Result<Self> {
@@ -160,8 +169,9 @@ impl Drop for ScratchRoot {
             );
         }
         cowshed_os::eprintln!(
-            "scratch root {}: torn down in {torn_down:?}, then waited {:?} for its own sweep",
+            "scratch root {} ({}): torn down in {torn_down:?}, then waited {:?} for its own sweep",
             self.path.display(),
+            self.label,
             swept.elapsed()
         );
     }

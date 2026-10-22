@@ -826,7 +826,10 @@ export interface NativeHostDiskCommand {
 }
 
 /** The request fields a `host.diskCommand` caller names; its handle binds the rest. */
-export type HostDiskCommandArguments = Pick<Api.DiskCommandRequest, 'tool' | 'deadlineMs' | 'argv' | 'stdin'>;
+export type HostDiskCommandArguments = Pick<
+  Api.DiskCommandRequest,
+  'tool' | 'deadlineMs' | 'argv' | 'stdin' | 'registryEntry'
+>;
 
 /**
  * Runs one diskutil or hdiutil argv through cowshed's disk runner, its output after its end.

@@ -329,6 +329,7 @@ pub const PARITY: &[Row] = &[
     row("disk-command", "", field(&[("host.diskCommand", "")], &[member("Host.diskCommand")])),
     row("disk-command", "tool", field(&[("host.diskCommand", "tool")], &[argument("Host.diskCommand", 0, "tool")])),
     row("disk-command", "deadline-ms", field(&[("host.diskCommand", "deadlineMs")], &[argument("Host.diskCommand", 0, "deadlineMs")])),
+    row("disk-command", "registry-entry", field(&[("host.diskCommand", "registryEntry")], &[argument("Host.diskCommand", 0, "registryEntry")])),
     row("disk-command", "argv", field(&[("host.diskCommand", "argv")], &[argument("Host.diskCommand", 0, "argv")])),
 
     row("land-turn", "", input(member("spawnLandTurn"))),

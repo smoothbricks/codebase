@@ -119,6 +119,48 @@ impl CommandRequest {
     }
 }
 
+/// Whether `request`, exactly `hdiutil detach <device>`, still names the whole disk of the image
+/// device registered as `entry` ([`SystemCommandRunner::run_detach_of_entry`]).
+fn revalidate_detach(request: &CommandRequest, entry: u64) -> Result<(), CommandRunError> {
+    let refused = |change: String| CommandRunError {
+        request: request.clone(),
+        failure: CommandRunFailure::DeviceChanged(change),
+    };
+    let device = match request.args.as_slice() {
+        [verb, device] if request.program == Path::new(HDIUTIL) && verb == "detach" => {
+            let device = device.to_string_lossy();
+            match device.strip_prefix("/dev/") {
+                Some(_) => device.into_owned(),
+                None => format!("/dev/{device}"),
+            }
+        }
+        _ => {
+            return Err(refused(
+                "only `hdiutil detach <device>` binds to a registry entry".to_owned(),
+            ));
+        }
+    };
+    #[cfg(target_os = "macos")]
+    let whole = io_registry::whole_disk_of_entry(entry);
+    #[cfg(not(target_os = "macos"))]
+    let whole: io::Result<Option<String>> = Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "image devices are read from the macOS I/O Registry",
+    ));
+    match whole {
+        Ok(Some(whole)) if whole == device => Ok(()),
+        Ok(Some(whole)) => Err(refused(format!(
+            "registry entry {entry:#x} is now {whole}, not {device}"
+        ))),
+        Ok(None) => Err(refused(format!(
+            "registry entry {entry:#x} no longer has a whole disk ({device} was named)"
+        ))),
+        Err(error) => Err(refused(format!(
+            "registry entry {entry:#x} could not be read ({error})"
+        ))),
+    }
+}
+
 /// A disk tool the `cowshed disk-command` facade runs on a caller's behalf, through
 /// [`SystemCommandRunner`] exactly as cowshed runs its own.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,6 +223,10 @@ pub enum CommandRunFailure {
     /// `unmount`) that would wait on an administrator prompt, or whose disk's owner cannot be read
     /// (release_authority.rs).
     Release(release_authority::ReleaseRefusal),
+    /// Refused before spawning: a detach bound to a registry entry
+    /// ([`SystemCommandRunner::run_detach_of_entry`]) whose entry no longer names the device, or
+    /// could not be read, inside the host disk admission. Nothing was detached.
+    DeviceChanged(String),
     /// The total budget expired before the native tool executed.
     Unspawned(Duration),
     /// The deadline expired; the owned group `pid` leads was signalled and the child's actual end
@@ -301,6 +347,11 @@ impl fmt::Display for CommandRunError {
                 fmt_command(f, program, args)?;
                 write!(f, ": {refusal}")
             }
+            CommandRunFailure::DeviceChanged(change) => {
+                f.write_str("refused ")?;
+                fmt_command(f, program, args)?;
+                write!(f, ": {change}; nothing was detached")
+            }
         }
     }
 }
@@ -315,7 +366,8 @@ impl std::error::Error for CommandRunError {
             | CommandRunFailure::Input { source, .. } => Some(source),
             CommandRunFailure::Deadline { .. }
             | CommandRunFailure::Unspawned(_)
-            | CommandRunFailure::VolumeRename => None,
+            | CommandRunFailure::VolumeRename
+            | CommandRunFailure::DeviceChanged(_) => None,
             CommandRunFailure::Release(refusal) => Some(refusal),
         }
     }
@@ -559,6 +611,32 @@ impl SystemCommandRunner {
             ChildInput::Null,
             |deadline, run| {
                 crate::disk_lease::leased(&request.program, &request.args, deadline, run)
+            },
+        )
+    }
+
+    /// `hdiutil detach <device>` of the image device a caller inventoried as registry entry
+    /// `entry`, run as [`Self::run_with_inherited_input`] runs a command, except that the device's
+    /// identity is read again inside the host disk admission, immediately before the spawn: the
+    /// detach runs only while `entry` is still registered with `device` as its whole disk. A name
+    /// recycled while the command queued for admission is therefore never detached
+    /// ([`CommandRunFailure::DeviceChanged`]). The remaining window is the one any cowshed
+    /// release has, from that read to `hdiutil`'s own open of the name, inside the admission.
+    pub fn run_detach_of_entry(
+        &self,
+        request: &CommandRequest,
+        entry: u64,
+    ) -> Result<CommandOutput, CommandRunError> {
+        // A detach reads nothing, and a host connection's own input is its protocol socket.
+        self.run_admitted(
+            request,
+            CommandDeadline::new(DISK_CHILD_DEADLINE),
+            ChildInput::Null,
+            |deadline, run| {
+                crate::disk_lease::leased(&request.program, &request.args, deadline, || {
+                    revalidate_detach(request, entry)?;
+                    run()
+                })
             },
         )
     }
@@ -5291,6 +5369,8 @@ mod io_registry {
     #[link(name = "IOKit", kind = "framework")]
     unsafe extern "C" {
         fn IOServiceMatching(name: *const c_char) -> CfType;
+        fn IORegistryEntryIDMatching(entry_id: u64) -> CfType;
+        fn IOServiceGetMatchingService(main_port: libc::mach_port_t, matching: CfType) -> IoObject;
         fn IOServiceGetMatchingServices(
             main_port: libc::mach_port_t,
             matching: CfType,
@@ -5864,11 +5944,54 @@ mod io_registry {
         Ok(images.into_values().collect())
     }
 
-    /// The media one image device exposes: its whole media's size and every BSD media node.
+    /// The media one image device exposes: its whole media's size and node, and every BSD media
+    /// node.
     #[derive(Default)]
     struct DeviceMedia {
         capacity: Option<ImageCapacity>,
+        whole: Option<String>,
         media: Vec<ImageMedia>,
+    }
+
+    /// The whole disk (`/dev/diskN`) of the image device registered as `entry_id`, of any image
+    /// driver, a RAM disk's included: `None` once that entry has left the registry or while it
+    /// has no whole media. A detach bound to the entry reads it inside the host disk admission
+    /// ([`super::SystemCommandRunner::run_detach_of_entry`]).
+    pub(super) fn whole_disk_of_entry(entry_id: u64) -> io::Result<Option<String>> {
+        // SAFETY: the answer is a +1 matching dictionary or null.
+        let matching = unsafe { IORegistryEntryIDMatching(entry_id) };
+        if matching.is_null() {
+            return Err(io::Error::other(format!(
+                "IORegistryEntryIDMatching({entry_id:#x}) returned no matching dictionary"
+            )));
+        }
+        // SAFETY: `matching` is a +1 dictionary the call consumes; the answer is +1 or 0.
+        let service = unsafe { IOServiceGetMatchingService(MAIN_PORT_DEFAULT, matching) };
+        if service == 0 {
+            return Ok(None);
+        }
+        let device = Object(service);
+        // Source and ownership keys are not read here: only the media keys are.
+        let keys = Keys {
+            bsd_name: key("BSD Name")?,
+            content: key("Content")?,
+            size: key("Size")?,
+            source: key(Driver::InKernel.source_key())?,
+            owner: key("owner-uid")?,
+            driver: Driver::InKernel,
+        };
+        let read = (|| -> Read<Option<String>> {
+            let mut found = DeviceMedia::default();
+            while !read_media(&device, 0, &keys, &mut found)? {
+                found = DeviceMedia::default();
+            }
+            Ok(found.whole)
+        })();
+        match read {
+            Ok(whole) => Ok(whole),
+            Err(Unread::Gone) => Ok(None),
+            Err(Unread::Failed(error)) => Err(error),
+        }
     }
 
     /// Record one image device with every BSD media node in its own subtree, reading the subtree
@@ -5974,6 +6097,7 @@ mod io_registry {
         let content = string_property(media, &keys.content, "Content")?.unwrap_or_default();
         if let Some(capacity) = capacity {
             found.capacity = capacity;
+            found.whole = Some(format!("/dev/{name}"));
         }
         found.media.push(ImageMedia {
             device: format!("/dev/{name}"),
