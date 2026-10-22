@@ -88,7 +88,6 @@ enum Event {
     Detach(WorkspaceName),
     AtomicCheckoutRestore(PathBuf),
     RemoveBinding,
-    SettleReclaims,
     Gc,
     Exec {
         workspace: WorkspaceName,
@@ -281,8 +280,6 @@ struct FakeHost {
     stdin_gate: Option<Arc<Notify>>,
     /// When set, a create holds inside its clone step until this is notified.
     create_gate: Option<Arc<Notify>>,
-    /// Background reclaims `remove` started, for `settle_reclaims`.
-    reclaims: Vec<tokio::task::JoinHandle<()>>,
     /// Abandon bundles removals left in the trash, for `delete_abandon_bundles`.
     bundles: Vec<PathBuf>,
     /// What the router admitted, in order: the route that decoded each exec and its scheduling.
@@ -332,7 +329,6 @@ impl FakeHost {
             supervisors: std::collections::BTreeMap::new(),
             stdin_gate: None,
             create_gate: None,
-            reclaims: Vec::new(),
             bundles: Vec::new(),
             admitted: Arc::default(),
         }
@@ -1113,14 +1109,10 @@ impl ProjectRuntimeHost for FakeHost {
         if options.restore {
             self.events.send(Event::RemoveBinding).ok();
         }
-        let events = self.events.clone();
-        let reclaim_gate = self.reclaim_gate.clone();
-        self.reclaims.push(tokio::spawn(async move {
-            if let Some(gate) = reclaim_gate {
-                gate.notified().await;
-            }
-            events.send(Event::Reclaim(workspace)).ok();
-        }));
+        if let Some(gate) = self.reclaim_gate.clone() {
+            gate.notified().await;
+        }
+        self.events.send(Event::Reclaim(workspace)).ok();
         Ok(RemoveReport { abandoned })
     }
 
@@ -1148,16 +1140,6 @@ impl ProjectRuntimeHost for FakeHost {
 
     async fn unpublished_workspaces(&mut self) -> Result<Vec<WorkspaceName>> {
         Ok(self.removal.unpublished.iter().cloned().collect())
-    }
-
-    async fn settle_reclaims(&mut self) -> Result<()> {
-        self.events.send(Event::SettleReclaims).ok();
-        for reclaim in std::mem::take(&mut self.reclaims) {
-            reclaim
-                .await
-                .map_err(|error| CowshedError::internal(error.to_string()))?;
-        }
-        Ok(())
     }
 
     async fn delete_abandon_bundles(&mut self) -> Result<Vec<PathBuf>> {
@@ -2697,6 +2679,7 @@ fn supervisor_config_of(
         workspace_volume: None,
         job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
         cpu: std::sync::Arc::new(GrantingCpu),
+        build_volume_released: None,
     }
 }
 
@@ -6511,7 +6494,7 @@ async fn main_restore_retries_after_each_detach_and_swap_crash_boundary() {
 }
 
 #[tokio::test]
-async fn destroy_returns_after_logical_retirement_before_background_reclaim() {
+async fn destroy_waits_for_physical_reclaim_before_answering() {
     let root = test_root();
     let (events, mut receiver) = mpsc::unbounded_channel();
     let gate = Arc::new(Notify::new());
@@ -6531,22 +6514,32 @@ async fn destroy_returns_after_logical_retirement_before_background_reclaim() {
     .expect("create");
     while receiver.try_recv().is_ok() {}
 
-    route(
-        &router,
-        coordinator(repo.clone()),
-        "coordinator.destroy",
-        json!({ "repoId": repo, "workspace": "retired", "options": RemoveOptions::default() }),
-    )
-    .await
-    .expect("logical retirement");
+    let removal = tokio::spawn({
+        let router = router.clone();
+        let repo = repo.clone();
+        async move {
+            route(
+                &router,
+                coordinator(repo.clone()),
+                "coordinator.destroy",
+                json!({ "repoId": repo, "workspace": "retired", "options": RemoveOptions::default() }),
+            ).await
+        }
+    });
     let name = WorkspaceName::new("retired").expect("name");
     assert_eq!(receiver.recv().await, Some(Event::GitSafety(name.clone())));
     assert_eq!(receiver.recv().await, Some(Event::Stop(name.clone())));
     assert_eq!(receiver.recv().await, Some(Event::Retire(name.clone())));
     assert!(
-        receiver.try_recv().is_err(),
-        "reclaim ran before destroy returned"
+        !removal.is_finished(),
+        "destroy answered before physical release"
     );
+    gate.notify_one();
+    assert_eq!(receiver.recv().await, Some(Event::Reclaim(name)));
+    removal
+        .await
+        .expect("join removal")
+        .expect("physical retirement");
 
     let listed = route(
         &router,
@@ -6564,8 +6557,6 @@ async fn destroy_returns_after_logical_retirement_before_background_reclaim() {
             .all(|workspace| workspace["info"]["workspace"] != "retired")
     );
     assert_eq!(receiver.recv().await, Some(Event::SnapshotBatch));
-    gate.notify_one();
-    assert_eq!(receiver.recv().await, Some(Event::Reclaim(name)));
 }
 
 #[tokio::test]
@@ -6759,11 +6750,9 @@ async fn remove_project(
     .map(|value| serde_json::from_value(value).expect("project removal report"))
 }
 
-/// Removing a project retires every session, listed or never published, then waits for its own
-/// background reclaims before collecting: a collection that raced them would plan against images
-/// still being reclaimed and find its plan stale.
+/// Each removal finishes its physical release before project collection begins.
 #[tokio::test]
-async fn removing_a_project_settles_its_reclaims_before_collecting_then_restores_main() {
+async fn removing_a_project_finishes_each_release_before_collecting_then_restores_main() {
     let root = test_root();
     let (events, mut receiver) = mpsc::unbounded_channel();
     let gate = Arc::new(Notify::new());
@@ -6806,28 +6795,22 @@ async fn removing_a_project_settles_its_reclaims_before_collecting_then_restores
     });
     let landed = WorkspaceName::new("landed").expect("name");
     let mut retired = Vec::new();
-    loop {
-        match receiver.recv().await.expect("event") {
-            Event::Retire(name) => retired.push(name),
-            Event::SettleReclaims => break,
-            Event::Gc => panic!("collected before settling the reclaims it started"),
-            _ => {}
-        }
-    }
-    assert_eq!(retired, [landed.clone(), stray, unsafe_name.clone()]);
-    // Two image reclaims are held at the gate; the collection must wait for both.
-    gate.notify_one();
-    gate.notify_one();
     let mut reclaimed = Vec::new();
     loop {
         match receiver.recv().await.expect("event") {
+            Event::Retire(name) => {
+                if name != stray {
+                    gate.notify_one();
+                }
+                retired.push(name);
+            }
             Event::Reclaim(name) => reclaimed.push(name),
             Event::Gc => break,
             _ => {}
         }
     }
-    reclaimed.sort();
-    assert_eq!(reclaimed, [landed.clone(), unsafe_name.clone()]);
+    assert_eq!(retired, [landed.clone(), stray, unsafe_name.clone()]);
+    assert_eq!(reclaimed, [landed, unsafe_name]);
     gate.notify_one();
 
     let report = removal.await.expect("join").expect("project removal");

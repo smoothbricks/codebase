@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use super::{MacOsApfsExecutionHost, allocated_file_bytes, io_error, sync_parent_path};
 use crate::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, RECORD_SUFFIX,
-    ReleaseClaim,
+    Registrant, Registration, ReleaseClaim,
 };
 use crate::metadata::append_suffix;
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, COMPANION_SUFFIX};
@@ -52,6 +52,15 @@ impl<'a> SeedSource<'a> {
             Self::Claimed(claim)
         } else {
             Self::Unclaimed(&build.id)
+        }
+    }
+
+    /// The caller's claim, when it holds `id`'s own hold file: what a registration of `id`
+    /// replays under instead of a creation hold of its own.
+    fn claim_of(&self, id: &BuildVolumeId) -> Option<&'a ReleaseClaim> {
+        match self {
+            Self::Claimed(claim) if claim.id() == id => Some(claim),
+            Self::Claimed(_) | Self::Unclaimed(_) => None,
         }
     }
 }
@@ -390,7 +399,7 @@ where
                 // that image afterwards changes nothing, and the replay converges on what it
                 // published.
                 if retained_build(source)?.is_some() || replacement_published(layout, build)? {
-                    self.publish_build_replacement(layout, build)?;
+                    self.publish_build_replacement(layout, build, seed.claim_of(&build.id))?;
                     return self.seed_replacement(layout, source, seed, &build.owner_record);
                 }
                 // Lost before publication. Copy is not run again once main is published, so its
@@ -413,12 +422,12 @@ where
     }
 
     /// A build volume published empty (02_workspaces.md, "Re-adoption" step 3 and "Missing main
-    /// image"): an empty RAW volume minted under the recorded id at the recorded capacity and
-    /// mounted where main's build link points, its owner record written last, then one seed of
-    /// it for the replacement incarnation, captured under `seed`'s claim. Converges from an
-    /// attempt interrupted after the image was minted and before its record was written. An
-    /// image holding another record, or a record that names no image, refuses: nothing is
-    /// published over either.
+    /// image"): its recorded owner record registered under the recorded id before an empty RAW
+    /// volume is minted there at the recorded capacity, mounted where main's build link points,
+    /// and published, then one seed of it for the replacement incarnation, captured under
+    /// `seed`'s claim. Converges from an attempt interrupted after registration, whether or not
+    /// the image was minted. An image without an owner record, an image holding another record,
+    /// or another record that names no image refuses: nothing is published over any of them.
     fn publish_empty_build(
         &self,
         layout: &BuildVolumeLayout,
@@ -428,22 +437,41 @@ where
     ) -> Result<(), ApfsStorageError> {
         let image = layout.image(&build.id);
         self.verify_controller_path(&image)?;
-        let recorded = layout
-            .read_record_present(&build.id)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        match (exists(&image)?, recorded) {
-            (false, None) => {
-                self.create_build_volume(
+        let host = |error: crate::CowshedError| ApfsStorageError::Host(error.to_string());
+        // The re-adoption's own intent answers for the volume until it completes.
+        let registration = Registration::new(build.record.clone(), Registrant::Intent);
+        let recorded = layout.read_record_present(&build.id).map_err(host)?;
+        let ours = |found: &BuildVolumeRecord| {
+            found == registration.registered() || *found == registration.published()
+        };
+        let create = || match seed.claim_of(&build.id) {
+            Some(claim) => self
+                .create_claimed_build_volume(
+                    layout,
+                    claim,
+                    ImageCapacity::from_bytes(build.capacity_bytes),
+                    &registration,
+                )
+                .map(drop),
+            None => self
+                .create_build_volume(
                     layout,
                     &build.id,
                     ImageCapacity::from_bytes(build.capacity_bytes),
-                )?;
+                    &registration,
+                )
+                .map(drop),
+        };
+        match (exists(&image)?, recorded) {
+            (false, None) => create()?,
+            (false, Some(found)) if found == *registration.registered() => create()?,
+            (true, Some(found)) if ours(&found) => {
+                self.mount_build_volume(layout, &build.id)?;
             }
             (true, None) => {
-                self.mount_build_volume(layout, &build.id)?;
-            }
-            (true, Some(found)) if found == build.record => {
-                self.mount_build_volume(layout, &build.id)?;
+                return Err(ApfsStorageError::InvalidPlan(
+                    "main's build volume image has no owner record: its bytes predate their registration; refusing to publish over it",
+                ));
             }
             (true, Some(_)) => {
                 return Err(ApfsStorageError::InvalidPlan(
@@ -456,9 +484,7 @@ where
                 ));
             }
         }
-        layout
-            .write_record(&build.id, &build.record)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        layout.publish(&build.id, &registration).map_err(host)?;
         self.seed_replacement(layout, source, seed, &build.record)
     }
 
@@ -489,27 +515,32 @@ where
             return Ok(());
         }
         let destination = BuildVolumeId::mint();
-        let record = BuildVolumeRecord::new(
-            owner.tree.clone(),
-            BuildVolumeRole::Seed {
-                target: crate::metadata::WorkspaceName::main(),
-                incarnation: source.replacement.clone(),
-            },
+        let registration = Registration::new(
+            BuildVolumeRecord::new(
+                owner.tree.clone(),
+                BuildVolumeRole::Seed {
+                    target: crate::metadata::WorkspaceName::main(),
+                    incarnation: source.replacement.clone(),
+                },
+            ),
+            Registrant::Intent,
         );
-        self.clone_claimed_build_volume(layout, claim, &destination, &record)?;
+        self.clone_claimed_build_volume(layout, claim, &destination, &registration)?;
         self.mount_build_volume(layout, claim.id())?;
         Ok(())
     }
 
-    /// Publish a verified build replacement under its build volume identity: detach it without
-    /// force (an attached image is never renamed), rename it to the build image path the retained
-    /// volume left, and write the recorded owner record verbatim. Leave it detached so
-    /// `seed_replacement` can capture it before mounting (16_build_volumes.md, "Targets and seeds").
-    /// Converges from whichever step a crash interrupted.
+    /// Publish a verified build replacement under its build volume identity: register the
+    /// recorded owner record first, detach the replacement without force (an attached image is
+    /// never renamed), rename it to the build image path the retained volume left, and publish
+    /// the recorded owner record verbatim. Leave it detached so `seed_replacement` can capture it
+    /// before mounting (16_build_volumes.md, "Targets and seeds"). Converges from whichever step
+    /// a crash interrupted.
     fn publish_build_replacement(
         &self,
         layout: &BuildVolumeLayout,
         build: &ReAdoptBuild,
+        claimed: Option<&ReleaseClaim>,
     ) -> Result<(), ApfsStorageError> {
         let published = layout.image(&build.id);
         // The replacement is RAW at the build image path of its build volume identity, whatever
@@ -524,6 +555,8 @@ where
                 "the recorded build image is not its build volume path in this layout",
             ));
         }
+        let registration = Registration::new(build.owner_record.clone(), Registrant::Intent);
+        let host = |error: crate::CowshedError| ApfsStorageError::Host(error.to_string());
         match (exists(&build.replacement_image)?, exists(&published)?) {
             (true, true) => {
                 return Err(ApfsStorageError::InvalidPlan(
@@ -531,6 +564,19 @@ where
                 ));
             }
             (true, false) => {
+                // The owner record precedes the bytes at the build image path; the staged
+                // image itself is named by the re-adoption's journaled record until then.
+                // Under the caller's claim on this id when it holds one; a creation hold of its own
+                // otherwise, until publication.
+                let _creating = match claimed {
+                    Some(claim) => {
+                        layout
+                            .register_claimed(claim, &registration)
+                            .map_err(host)?;
+                        None
+                    }
+                    None => Some(layout.register(&build.id, &registration).map_err(host)?),
+                };
                 self.detach_without_force(&build.replacement_image)?;
                 remove_empty_directory(&build.replacement_mount)?;
                 rename_exclusive(&build.replacement_image, &published).map_err(|error| {
@@ -543,8 +589,22 @@ where
                 sync_parent_path(&published)?;
                 sync_parent_path(&build.replacement_image)?;
             }
-            // Published by an earlier attempt.
-            (false, true) => {}
+            // Renamed by an earlier attempt, which registered it first.
+            (false, true) => match layout.read_record_present(&build.id).map_err(host)? {
+                Some(found)
+                    if found == *registration.registered() || found == registration.published() => {
+                }
+                Some(_) => {
+                    return Err(ApfsStorageError::InvalidPlan(
+                        "the published build image holds another owner record; refusing to publish over it",
+                    ));
+                }
+                None => {
+                    return Err(ApfsStorageError::InvalidPlan(
+                        "the published build image has no owner record: its bytes predate their registration",
+                    ));
+                }
+            },
             // No payload anywhere: never write a record that names nothing.
             (false, false) => {
                 return Err(ApfsStorageError::InvalidPlan(
@@ -552,9 +612,7 @@ where
                 ));
             }
         }
-        layout
-            .write_record(&build.id, &build.owner_record)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))
+        layout.publish(&build.id, &registration).map_err(host)
     }
 
     fn retain_image<const N: usize>(

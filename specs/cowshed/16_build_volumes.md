@@ -98,8 +98,16 @@ writers at once. Content-addressed caches, whose entries are immutable and valid
   `cp -c -p -R`, takes minutes for a large workspace; cloning the image that holds it takes milliseconds. Minutes per
   land is unacceptable.
 
-The sidecar records: the git tree (`git rev-parse HEAD^{tree}`) the volume was last built at, the checkout that links
-it, whether it is a **seed** (immutable, see below), and its creation time. Nothing else is derived from it.
+The sidecar records: the git tree (`git rev-parse HEAD^{tree}`) the volume was last built at, the workspace that owns it
+(the checkout that links it, a target whose seed it is, or the workspace whose link an adoption or reseed moved off it,
+**superseded** at that workspace's incarnation), whether it is a **seed** (immutable, see below), its creation time, and
+its **stage**. Every operation that writes a build image (an empty mint, a seed capture, a fork's or refork's clone, a
+reseed's replacement, a re-adoption's replacement) writes the sidecar **registered** before the image's first byte
+exists, naming the owner and the registrant that answers for it: the existing workspace at its incarnation, or the
+unfinished create, fork, adopt or re-adopt the lifecycle intent journal records for a workspace that has none yet. It
+writes the sidecar **published** only once the image holds what the role promises. A registered seed is nobody's to fork
+from. So no build image ever exists that its sidecar does not name an owner for, and a crash leaves the exact id of what
+it was creating in that sidecar. Nothing else is derived from it.
 
 ### One link per checkout
 
@@ -130,19 +138,20 @@ directory's, for a linked worktree). Lines outside the block are left exactly as
 only ever added. A migrated checkout's `git status` shows none of its links, and the repository's `.gitignore` stays the
 repository's own.
 
-Mounting a checkout mounts the volume its link names only when that volume's sidecar records the checkout as its linker,
-or the volume has no sidecar yet (a creation in progress, whose sidecar is written last). Any other link is stale and is
-re-pointed at the one volume recorded as the checkout's. When the checkout owns none and the link names another
-checkout's live volume, a target adopted it from this checkout and a `land --no-retire` stopped before reforking it: the
-checkout takes a fresh clone of that target's latest seed, exactly as the refork would have. When the checkout owns none
-and the link names a volume whose image is gone, whatever sidecar it left, nobody owns what the link names: the checkout
-takes a fresh clone of its own latest seed, or, with no seed, loses the link, so its next build-state refresh makes its
-first volume; either is said on stderr with the lost volume's id. Every opening's mount settles this,
-`cowshed doctor --repair` and `cowshed setup` included. Anything else (several volumes, or none and no adopter's seed
-for a volume that exists) refuses. Why: the link lives inside the source image, so a restored checkpoint carries the
-link it had when taken, and a land interrupted between renaming a target's link and updating the sidecars leaves the
-target naming the landing volume. Mounting such a link as found would let the checkout write a volume a target or
-another checkout owns, or one already collected. A restore therefore never rewinds the build volume.
+Mounting a checkout mounts the volume its link names only when that volume's sidecar records the checkout as its owner,
+published or still registered (a first touch the link already names, which the next refresh finishes). An image with no
+sidecar predates owner registration: the mount refuses and names it. Any other link is stale and is re-pointed at the
+one volume recorded as the checkout's. When the checkout owns none and the link names another checkout's live volume, a
+target adopted it from this checkout and a `land --no-retire` stopped before reforking it: the checkout takes a fresh
+clone of that target's latest seed, exactly as the refork would have. When the checkout owns none and the link names a
+volume whose image is gone, whatever sidecar it left, nobody owns what the link names: the checkout takes a fresh clone
+of its own latest seed, or, with no seed, loses the link, so its next build-state refresh makes its first volume; either
+is said on stderr with the lost volume's id. Every opening's mount settles this, `cowshed doctor --repair` and
+`cowshed setup` included. Anything else (several volumes, or none and no adopter's seed for a volume that exists)
+refuses. Why: the link lives inside the source image, so a restored checkpoint carries the link it had when taken, and a
+land interrupted between renaming a target's link and updating the sidecars leaves the target naming the landing volume.
+Mounting such a link as found would let the checkout write a volume a target or another checkout owns, or one already
+collected. A restore therefore never rewinds the build volume.
 
 **Refresh.** Before a job of a checkout is admitted (exec, a land check, Land step 7 output restoration), at adoption
 for main, and from `cowshed setup` for every mounted workspace, cowshed refreshes the checkout's build state: it
@@ -366,9 +375,9 @@ which every fork of the target holds while it clones the seed, so a reseed never
    snapshot; its later writes make the seed behind again. Dropping the capture claim only unlocks the source's hold; it
    never retires or deletes the source.
 
-Native capture, clone, first-write and release-to-trash operations record each image's extent count and allocated bytes
-before and after, their signed deltas, operation and measurement time, and explicitly process-window disk-write bytes.
-Absolute extent count and growth warn separately, before a high-count image incurs another fork's first write. See
+Native capture, clone, first-write and release operations record each image's extent count and allocated bytes before
+and after, their signed deltas, operation and measurement time, and explicitly process-window disk-write bytes. Absolute
+extent count and growth warn separately, before a high-count image incurs another fork's first write. See
 13_telemetry.md, "Native image observations", for thresholds and their measured basis, Arrow fields, batching and
 queries.
 
@@ -493,11 +502,13 @@ With admission fenced, the existing Nx-close protocol stops only its own daemon;
 and command. The old build volume then seals without force: a filesystem holder or late writer refuses and is named,
 retaining the original build link. A prepublication failure restores the old canonical build mount.
 
-The replacement has a new BuildVolumeId and is held from before cloning through publication. Its `Linked <ws>` record
-precedes the atomic build-link rename; the old record becomes `Unlinked` and the old image is released under the same
-exclusive claim. A crash on either side of publication therefore leaves the link naming a correctly owned image and at
-most an unreachable image for ordinary collection, using the existing link-reconciliation rules. An already-running
-supervisor grants the replacement at its next job admission, as after a land; it is not restarted to terminate holders.
+The replacement has a new BuildVolumeId and is registered to the workspace at its incarnation before its image exists,
+held from before cloning through publication. Its published `Linked <ws>` record precedes the atomic build-link rename;
+the old record becomes `Superseded <ws>` at the workspace's incarnation, and the old image is released under the same
+exclusive claim before the reseed answers. A release that fails is the reseed's error and leaves that superseded record
+naming its owner. A crash on either side of publication therefore leaves the link naming a correctly owned image and the
+other volume still recorded as the workspace's, for its release by id. An already-running supervisor grants the
+replacement at its next job admission, as after a land; it is not restarted to terminate holders.
 
 Byte accounting is the same as build-volume garbage collection: each RAW image contributes `st_blocks * 512`, a
 directory backend its allocated tree bytes. Dry-run reports the old image's allocated bytes and the seed clone's
@@ -660,12 +671,13 @@ same for main and for an integration workspace; "the target" is whichever one it
    4. `rename(2)` a new `.cowshed/build` symlink over the target's, naming the landing workspace's build volume, and let
       go of the locks;
    5. hand ownership in the sidecars: the target owns the adopted volume, and its background label becomes
-      `build <target>`; its previous volume becomes unlinked and is released before land returns (GC below), unless a
-      running job's hold still owns it. This applies with `--no-retire` too. Nothing links it any more, so its release
-      runs beside what the land does in the target next (its supervisor, a kept workspace's fresh clone, the adoption
-      check of step 7), so the release's unmount, detach and delete can overlap them. It needs no image lock: a fork or
-      reseed that takes the lock after the rename reads the adopted volume, and none that held it before the land took
-      it still runs.
+      `build <target>`; its previous volume becomes superseded under the target at its incarnation and is released
+      before land returns (GC below), unless a running job's hold still owns it, in which case it stays the target's and
+      that job's end releases it. This applies with `--no-retire` too. Nothing links it any more, so its release runs
+      beside what the land does in the target next (its supervisor, a kept workspace's fresh clone, the adoption check
+      of step 7), so the release's unmount, detach and delete can overlap them. It needs no image lock: a fork or reseed
+      that takes the lock after the rename reads the adopted volume, and none that held it before the land took it still
+      runs.
 
    A skipped swap is reported in the land report with each holder's pid and command. The target keeps its build volume
    and builds the landed delta incrementally the next time anything builds there; forks start from the new seed until
@@ -883,13 +895,17 @@ again at any level above it.
 - The last checkout link is the reclaim moment. Removing or retiring a checkout, adopting a replacement, failing a fork,
   or superseding a seed releases every volume that no checkout links and no target keeps as its latest seed. `rm` and
   `land` (including `--no-retire`) run collection before returning, not only on a later explicit `gc`.
-- Ownership is a job hold, a land's hold on its landing volume, or an unfinished create/fork/adopt in the lifecycle
-  intent journal, not the kernel's refusal to unmount. Every admitted cowshed job holds a shared flock on the build
-  volume's `<id>.dmg.hold` for its lifetime; release must claim it exclusively. A running job therefore keeps main's
-  previous volume across a swap. Job admission takes its hold without waiting and refuses while any exclusive claim has
-  the volume (a release, a capture, a reseed, a cache clear, a dry-run probe), naming it claimed, not released. A land's
-  or a carry's hold waits out an exclusive claim instead, and then refuses only when the image is gone: only a release
-  deletes it, so a capture, a probe or a release that declines under its claim delays such a hold and never refuses it.
+- Ownership is a job hold, a land's hold on its landing volume, an unfinished create/fork/adopt in the lifecycle intent
+  journal, or a creation's own hold on the volume it registered, not the kernel's refusal to unmount. Every admitted
+  cowshed job holds a shared flock on the build volume's `<id>.dmg.hold` for its lifetime; release must claim it
+  exclusively. A running job therefore keeps main's previous volume across a swap, and that volume stays recorded as
+  main's (superseded, at main's incarnation) while it does: when the job ends, its supervisor has the controller release
+  a superseded volume then and waits for that release before it reports the job ended; a release that cannot run or
+  fails is the job's terminal failure and leaves the record naming its owner, never a later collection's work. Job
+  admission takes its hold without waiting and refuses while any exclusive claim has the volume (a release, a capture, a
+  reseed, a cache clear, a dry-run probe), naming it claimed, not released. A land's or a carry's hold waits out an
+  exclusive claim instead, and then refuses only when the image is gone: only a release deletes it, so a capture, a
+  probe or a release that declines under its claim delays such a hold and never refuses it.
 - A held lifecycle or image lock likewise defers release. A superseded seed is retired only under its target's image
   lock, which the land and reseed paths hold while they replace it, and seed retirement takes that lock as a typed
   witness, so collection never releases a seed that a land or reseed is replacing.
@@ -898,49 +914,75 @@ again at any level above it.
   releases it, main's link names a volume that no longer exists. So each release claims the volume first and reads again
   under the claim: a volume a checkout's link names now is that checkout's and stays, and one whose sidecar is no longer
   the one the collection judged it by is left to the next pass. Whatever makes a volume someone's holds it while it
-  does: a land from before its landing workspace's jobs stop until its build-volume steps end, a clone (a seed, a fork's
-  volume) from before its image exists until its sidecar is written.
-- Once no owner remains, release first requests a non-forced unmount and allows a bounded wall-clock grace for holders
-  to release it: time spent waiting on command execution or a disk lease counts, not only the requested poll sleeps. If
-  the kernel still refuses, cowshed forces the unmount, detaches the image, moves the image into the project's
-  build-volume trash and deletes its sidecar, hold file and mountpoint. At the initial unforced refusal, it records the
-  holders and names each pid and command on stderr, distinguishing release within the grace from a forced unmount.
-  Editors or indexers holding files or a working directory without a cowshed job hold cannot keep an unlinked volume
-  attached indefinitely. Force revokes their access to the volume; it does not kill them.
-- A release renames the image; the daemon deletes it. The trash is `build/.trash/<id>.dmg`, inside the images directory
-  and so on the store volume, and the move is one `rename(2)`, which never copies: a rename the kernel refuses across
-  volumes is the release's error, never a copy. Deleting a written image frees its whole extent tree: measured
-  2026-10-21, a land's slowest step was deleting its own workspace's image, one `unlink` for minutes with 84,594
-  metadata reads under it, inside the land and against every other reader of the store volume. So nothing that waits for
-  a release deletes an image. The daemon empties every project's trash at its start and then every minute, one image at
-  a time, so a released image waits at most a minute plus the deletions queued before it; with no daemon running the
-  next daemon start empties it, and `cowshed gc` empties its project's trash before it answers. Only `<id>.dmg` files
-  are deleted there; anything else is named and left. The canonical image is gone once the rename returns, so a hold
-  taken after it finds none, as before.
-- Emptying the trash never frees an image in one go. One `unlink` of a written image is one free of its whole extent
-  tree, and every writer of the store's APFS container waits behind it: measured 2026-10-22, the installed daemon's
-  trash thread sat in one `unlink` of a 300 GiB image (its first 100,000 runs held 778 MiB, a median run of 4 KiB) while
-  its main thread waited on a write to its own log and every `cowshed fork` and `ls` on the host hung. So a release cuts
-  the image from its end with `ftruncate(2)`, at most 1,024 physical runs (`F_LOG2PHYS_EXT`) per cut, and unlinks it
-  once it is empty. The 1,024 is measured: over a 131,072-extent clone on the store's container a cut of 1,024 extents
-  took 0.1 s to 0.3 s at the median, and from there a cut's length grows with its extents; the table is `STEP_EXTENTS`
-  in `storage/apfs/release.rs`. The image's length is the release's journal: a cut ends on a run boundary, so an
+  does: a land from before its landing workspace's jobs stop until its build-volume steps end, a creation (an empty
+  mint, a seed, a fork's volume) from before its sidecar is registered, ahead of its image, until it is published.
+- A creation that fails after registering releases what it registered, image and sidecar, before it answers. A creation
+  a crash interrupts leaves its registered sidecar: the next open of the project, after it recovers the lifecycle
+  intents and before it answers, reads every registered sidecar and releases each whose registrant is gone, by that
+  exact id, image and sidecar, as `interruptedBuildVolume`. A registered sidecar's authority is exact, never a workspace
+  name a later verb may reuse: its live creator's hold on that id (a creation holds the volume from before its
+  registration until it publishes it, and an adopt's mint is held by the adopt until its first touch publishes it or it
+  releases the mint), an unfinished re-adoption's journaled record naming that id, or a detached checkout's unreadable
+  link. One such authority still owns stays with it; one whose release fails, or whose sidecar or image cannot be read,
+  refuses the open, naming each, with its sidecar still naming its owner. Every collection decides registered sidecars
+  the same way. No pass looks for images nobody owns: an image with no sidecar predates owner registration, is named
+  with its path on every pass, and is never released on a guess.
+- Release retains the volume's owner record and exclusive claim while it requests a non-forced unmount and allows a
+  bounded wall-clock grace for unmanaged holders to release it. Time spent waiting on command execution or a disk lease
+  counts, not only requested poll sleeps. If the kernel still refuses, cowshed forces the unmount and detaches the
+  image. At the initial unforced refusal it records the holders and names each pid and command, distinguishing release
+  within the grace from a forced unmount. Editors or indexers without a cowshed job hold cannot retain a retiring build
+  volume indefinitely. Force revokes their access to the volume; it does not kill them.
+- Physical collection belongs to the operation that retires the owner or replaces the volume, and there is no periodic
+  deletion worker. The operation commits the release with one `rename(2)` of the detached image to
+  `build/.releasing/<id>.dmg`, inside the images directory and so on the store volume, and syncs both directories:
+  before the rename the volume is its owner's, after it no hold, mount or fork reaches it, and a hold taken after it
+  finds no image, as before. A rename the kernel refuses across volumes is the release's error, never a copy. The same
+  operation then frees the image in bounded steps (below), unlinks it and syncs the journal directory, and only then
+  removes the owner record, hold file and mountpoint and reports success. A failure refuses with its path and cause:
+  before the rename the owner record stays for the same operation's retry, after it the journal entry stays for
+  recovery. A held job retains its registered volume ownership; a later sweep is not a substitute for completing the
+  owning lifecycle operation.
+- `build/.releasing/` is a crash-recovery journal, never a queue: an entry exists only between its operation's rename
+  and that operation's own unlink, or after a crash between them. The next open of the project, `cowshed gc` and the
+  daemon's start finish every entry with the same bounded release; an entry another process is releasing is left to that
+  process, and the owning operation waits for such a releaser to finish instead of answering early. The operation locks
+  the image (`flock`) before its rename and keeps that descriptor through every cut, so a recovery finds its entry
+  locked and leaves it: no cut lands before the rename is durable. Whoever finishes an entry its operation left syncs
+  the journal and the directories around it, under the entry's lock, before the first cut, because that operation may
+  have died before syncing its rename. Nothing mounts, forks or reads an entry, and nothing is opened through a link:
+  the images directory and the journal are held by descriptor, a link or any other non-regular file at the image's name
+  or an entry's refuses or is named and left, untouched. An operation about to commit over an entry a crash left
+  finishes that entry first, because a rename over a file frees the file it replaces in one go.
+- Releasing an image never frees it in one go. One `unlink` of a written image is one free of its whole extent tree, and
+  every writer of the store's APFS container waits behind it: measured 2026-10-22, the installed daemon's trash thread
+  sat in one `unlink` of a 300 GiB image (its first 100,000 runs held 778 MiB, a median run of 4 KiB) while its main
+  thread waited on a write to its own log and every `cowshed fork` and `ls` on the host hung. So a release cuts the
+  image from its end with `ftruncate(2)`, at most 1,024 physical runs (`F_LOG2PHYS_EXT`) per cut, and unlinks it once it
+  is empty. The 1,024 is measured: over a 131,072-extent clone on the store's container a cut of 1,024 extents took 0.1
+  s to 0.3 s at the median, and from there a cut's length grows with its extents; the table is `STEP_EXTENTS` in
+  `storage/apfs/release.rs`. The image's length is the release's journal: a cut ends on a run boundary, so an
   interrupted release leaves a shorter image that the next pass walks and finishes, and nothing else records progress. A
-  release holds the image's `flock` for its whole run, and an image another process is releasing is left to it. It runs
-  at normal disk priority: a thread throttled to background priority (`IOPOL_THROTTLE`) holds the container's work while
-  its own metadata reads wait, so measured the same day it freed the same clone in 53 s instead of 7.6 s and the writers
-  beside it waited 10.6 ms at the median instead of 0.2 ms; the installed daemon's throttled `unlink` made 1,213
-  throttled 4 KiB metadata reads at a 20 ms median in 21 s.
+  release holds the image's `flock` for its whole run. It runs at normal disk priority: a thread throttled to background
+  priority (`IOPOL_THROTTLE`) holds the container's work while its own metadata reads wait, so measured the same day it
+  freed the same clone in 53 s instead of 7.6 s and the writers beside it waited 10.6 ms at the median instead of 0.2
+  ms; the installed daemon's throttled `unlink` made 1,213 throttled 4 KiB metadata reads at a 20 ms median in 21 s.
+- Historical `build/.trash/<id>.dmg` entries, renamed there by the releases of earlier builds, are committed releases
+  too: the daemon's start and `cowshed gc` finish them the same way, and gc refuses when one cannot be freed. No release
+  of this build moves an image there. Only `<id>.dmg` files qualify; anything else is named and left. Workspace images
+  containing the only copy of dirty or unlanded content keep their separate recovery rules; rebuildable build images do
+  not use that preservation mechanism.
 - Every release that deletes an image, a seed's or another volume's, whatever asked for it (collection, a land's release
   of the target's previous volume or superseded seed, a reseed, a fork that never staged), appends one line for the
   image to the project's `deletion-log.jsonl` (01_storage.md): op `release-build-volume`, kind `build-seed` when its
   sidecar recorded it as a seed and `build-volume` otherwise, and the workspace that sidecar named, read before anything
-  is deleted. A target's previous volume is recorded unlinked before its release, so its line names no workspace. A held
-  volume is not released and leaves no line; a release that finds the image already gone deletes none and leaves none.
-  The record such a release retires is journaled by a line of its own, `release-imageless-build-volume`: its artifact is
-  the sidecar record it deletes (which names the volume's id) and its image the missing path, so the journal says the
-  record went because its image was absent, not because collection reclaimed it. Without this journal, an `rm` that
-  releases the volume a land has just moved main onto leaves no trace of it.
+  is deleted. A target's previous volume is recorded superseded under the target before its release, so its line names
+  that target. A held volume is not released and leaves no line; a release that finds the image already gone deletes
+  none and leaves none. The record such a release retires is journaled by a line of its own,
+  `release-imageless-build-volume`: its artifact is the sidecar record it deletes (which names the volume's id) and its
+  image the missing path, so the journal says the record went because its image was absent, not because collection
+  reclaimed it. Without this journal, an `rm` that releases the volume a land has just moved main onto leaves no trace
+  of it.
 - Each target keeps only its latest seed; a superseded seed is released when replaced, and a target's seed is released
   when the target retires. Detached seeds do not need an attach or a rename to be deleted. Main retires last, in
   `rm main --restore` (and `--restore --purge`): its unbinding collects once main's image is retired, so main's linked
@@ -949,29 +991,30 @@ again at any level above it.
   deletes `build/` (then only empty directories and zero-length holds) and the project's `.build/<owner>/<repo>` mount
   tree.
 - GC also enumerates sidecars whose images are already gone: every seed's, and every other record collection would
-  release with its image, one recorded unlinked or naming a checkout that no longer links it. An image that does not
-  exist cannot be waiting for anything, so deferring its record would defer it on every pass with nothing that ever ends
-  the wait. Only absence authorizes this: an image that exists but whose size cannot be read is deferred with the error,
-  never released on a guess. Under the ordinary exclusive release claim it rechecks image absence, the sidecar and live
-  links, then deletes the orphan sidecar with zero image bytes reclaimed. An image appearing or a record/link changing
-  defers it; a record a live checkout's link names and retained existing seed images are not relabeled or collected by
-  this rule. This includes payload-absent legacy `<id>.asif.json` seed sidecars as the explicit metadata-only exception
-  to RAW-only enumeration (01a_apfs.md §Images). A strict Seed record is required. Reuse `claim_re_adopt_source` to
-  claim the legacy image's actual hold file, then re-read record, image absence, live links and forming lifecycle work
-  under that same claim; then remove the sidecar and its obsolete hold file, and sync the images directory. No legacy
-  payload is attached, converted, relabeled or released, and an existing legacy seed image remains retained evidence.
-  Preview creates no hold file.
-- A fork's volume and seed exist before its workspace does: `cowshed fork` clones them into the staged checkout, which
-  no other process can read, and publish the workspace afterwards. Main's first volume likewise exists before main's
-  first touch links it: `cowshed adopt` mints it beside main's image, and completes its intent only once the first touch
-  linked it or the adoption released it. While the create, fork or adopt is past its mutation fence and unfinished in
-  the lifecycle intent journal, collection in any process defers the volumes recorded as that workspace's or as its
-  seed, and every image without a record, naming the workspace. Without this, an `rm` in one process deletes the volume
-  and seed of a fork running in another, and the fork's mount refuses its link to a volume nobody owns. A verb crosses
-  its fence before it makes a volume, so collection lists the images first and then reads the journal and the
+  release with its image: one recorded superseded, registered and interrupted, or naming a checkout that no longer links
+  it. An image that does not exist cannot be waiting for anything, so deferring its record would defer it on every pass
+  with nothing that ever ends the wait. Only absence authorizes this: an image that exists but whose size cannot be read
+  is deferred with the error, never released on a guess. Under the ordinary exclusive release claim it rechecks image
+  absence, the sidecar and live links, then deletes the orphan sidecar with zero image bytes reclaimed. An image
+  appearing or a record/link changing defers it; a record a live checkout's link names and retained existing seed images
+  are not relabeled or collected by this rule. This includes payload-absent legacy `<id>.asif.json` seed sidecars as the
+  explicit metadata-only exception to RAW-only enumeration (01a_apfs.md §Images). A strict Seed record is required.
+  Reuse `claim_re_adopt_source` to claim the legacy image's actual hold file, then re-read record, image absence, live
+  links and forming lifecycle work under that same claim; then remove the sidecar and its obsolete hold file, and sync
+  the images directory. No legacy payload is attached, converted, relabeled or released, and an existing legacy seed
+  image remains retained evidence. Preview creates no hold file.
+- A fork's volume and seed exist before its workspace does: `cowshed fork` registers and clones them into the staged
+  checkout, which no other process can read, and publishes the workspace afterwards. Main's first volume likewise exists
+  before main's first touch links it: `cowshed adopt` registers it to main by the adopt's intent and mints it beside
+  main's image, and completes its intent only once the first touch linked and published it or the adoption released it.
+  While the create, fork or adopt is past its mutation fence and unfinished in the lifecycle intent journal, collection
+  in any process defers the published volumes recorded as that workspace's or as its seed, naming the workspace; what it
+  has registered and not yet published, it holds by id meanwhile. Without this, an `rm` in one process deletes the
+  volume and seed of a fork running in another, and the fork's mount refuses its link to a volume nobody owns. A verb
+  crosses its fence before it makes a volume, so collection lists the images first and then reads the journal and the
   workspaces, and decides only the images it listed: one made after the listing is left to a later pass, never decided
-  from links read before it existed. An adoption killed between the mint and the link leaves an image without a record,
-  deferred until the replayed adoption completes and collected after.
+  from links read before it existed. An adoption killed between the mint and the link leaves main's registered sidecar,
+  which no process holds any more, and the next open releases it by its id once the adoption's intent is recovered.
 - Collection says why it skips: a job hold, an unfinished create/fork/adopt, an unreadable detached checkout or record,
   or a failed release names the volume and reason. Opportunistic collection counts routine detached/still-forming
   deferrals on one line. One volume's release failure does not hide later candidates. `--dry-run` changes nothing and
@@ -1331,8 +1374,9 @@ it belongs to. Each job's sandbox grants exactly the build volume the controller
   The keeper resolves the current pointer through the same controller-owned layout as admission on every restart, even
   when no user job has been admitted since the swap. Repository links alone never authorize a mount.
 - A job admitted before the swap keeps its grant and a shared build-volume hold, so the target's previous volume stays
-  attached until the last such job exits. Its hold prevents even a forced collection; GC releases the volume once that
-  hold is gone. A host process with no job hold does not own the unlinked volume (Garbage collection).
+  attached, recorded as the target's (superseded, at its incarnation), until the last such job exits. Its hold prevents
+  even a forced collection; each such job's end releases the volume once no hold is left. A host process with no job
+  hold does not own the superseded volume (Garbage collection).
 - A long-running job that starts builds (a development server, a file watcher) keeps the grant it was admitted with:
   builds it starts after a swap resolve the links into the new volume, which that grant does not name, and the sandbox
   denies them. Restarting the job admits it on the adopted volume. Its Nx client re-subscribes to file events when the

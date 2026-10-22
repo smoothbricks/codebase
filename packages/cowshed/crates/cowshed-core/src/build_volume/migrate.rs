@@ -1,16 +1,17 @@
 //! Rebuild-only setup migration and recovery after a tool displaced a fixed build-state link.
 //!
-//! The checkout's pointer is published first so a retry finds the same volume and GC preserves
-//! it. Only contributed build-state directories are removed; fixed links, state and the image
-//! sidecar follow. A partially removed directory resumes without copying or touching source.
+//! The volume's owner record is registered before its image exists and the checkout's pointer
+//! is published next, so a retry finds the same volume and GC preserves it. Only contributed
+//! build-state directories are removed; fixed links, state and the published record follow. A
+//! partially removed directory resumes without copying or touching source.
 
 use std::fs;
 use std::io;
 use std::path::Path;
 
 use super::{
-    BuildStateTool, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeState,
-    DisplacedBuildStateFinding, TrackedBuildStateRefusal, discard, link, nx, tracked_source,
+    BuildStateTool, BuildVolumeId, BuildVolumeLayout, BuildVolumeState, DisplacedBuildStateFinding,
+    Registration, TrackedBuildStateRefusal, discard, link, nx, tracked_source,
 };
 use crate::capabilities::BuildStatePath;
 use crate::runtime::storage_host::RuntimeStorageHost;
@@ -24,7 +25,9 @@ pub struct FirstTouch<'a> {
     /// The capacity the checkout's `.cowshed.toml` asks of its first volume.
     pub capacity: ImageCapacity,
     pub beside: MintedBeside,
-    pub record: BuildVolumeRecord,
+    /// The checkout's owner record: registered before a volume it mints exists, published once
+    /// every contributed path is linked into the volume.
+    pub registration: Registration,
 }
 
 /// What `adopt` minted beside main's image for main's first touch, which decides it only when
@@ -34,17 +37,17 @@ pub struct FirstTouch<'a> {
 pub enum MintedBeside {
     /// Nothing: no adopt minted one, or nothing in the checkout can name build state.
     Nothing,
-    /// Mounted, linked by nothing and without a record. The first touch links it when it was
-    /// minted at the capacity asked now, and mints its own otherwise; the adopt releases it when
-    /// the checkout does not link it.
+    /// Mounted, linked by nothing, its record registered to main and not yet published. The
+    /// first touch links it when it was minted at the capacity asked now, and mints its own
+    /// otherwise; the adopt releases it when the checkout does not link it.
     Volume(MintedVolume),
     /// The mint failed. A first touch that needs a volume answers this error and does not mint
     /// again: it is the volume's creation failing, as when the first touch minted it.
     Failed(CowshedError),
 }
 
-/// An empty build volume minted and mounted at its layout mountpoint at `capacity`, without a
-/// record.
+/// An empty build volume minted and mounted at its layout mountpoint at `capacity`, its record
+/// registered and not yet published.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MintedVolume {
     pub id: BuildVolumeId,
@@ -67,7 +70,7 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
         fingerprint,
         capacity,
         beside,
-        record,
+        registration,
     } = migration;
     let found = preflight(checkout, paths)?;
     if let Some(refusal) = tracked_source(checkout, &found.real)? {
@@ -90,25 +93,64 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
                 MintedBeside::Failed(error) => return Err(error),
                 MintedBeside::Nothing | MintedBeside::Volume(_) => {
                     let id = BuildVolumeId::mint();
-                    host.create_build_volume(layout, &id, capacity)
+                    let (mount, _creating) = host
+                        .create_build_volume(layout, &id, capacity, &registration)
                         .map_err(storage_error)?;
-                    id
+                    // Linked while the creation still holds it: from here the link protects
+                    // the registered volume from GC and lets a retry find it.
+                    link::point(checkout, &mount)?;
+                    return finish(
+                        host,
+                        layout,
+                        checkout,
+                        paths,
+                        fingerprint,
+                        &found,
+                        id,
+                        &registration,
+                    );
                 }
             };
-            // The actual link protects this unrecorded image from GC and lets a retry find it.
             link::point(checkout, &layout.mount(&id))?;
             id
         }
     };
+    finish(
+        host,
+        layout,
+        checkout,
+        paths,
+        fingerprint,
+        &found,
+        id,
+        &registration,
+    )
+}
+
+/// Link every contributed path of `checkout` into volume `id`, already linked by `checkout`,
+/// write its state, and publish its record: only after every source directory has become its
+/// fixed link.
+#[allow(clippy::too_many_arguments)]
+fn finish<H: RuntimeStorageHost>(
+    host: &H,
+    layout: &BuildVolumeLayout,
+    checkout: &Path,
+    paths: &[BuildStatePath],
+    fingerprint: String,
+    found: &Found<'_>,
+    id: BuildVolumeId,
+    registration: &Registration,
+) -> Result<
+    std::result::Result<(BuildVolumeId, Vec<DisplacedBuildStateFinding>), TrackedBuildStateRefusal>,
+> {
     let mount = host
         .mount_build_volume(layout, &id)
         .map_err(storage_error)?;
     let previous = BuildVolumeState::read(&mount)?;
     let (state, _) = previous.with_discovered(paths, fingerprint, &mount)?;
-    let displaced = adopt_preflighted(checkout, &mount, paths, &found)?;
+    let displaced = adopt_preflighted(checkout, &mount, paths, found)?;
     state.write(&mount)?;
-    // Published only after every source directory has become its fixed link.
-    layout.write_record(&id, &record)?;
+    layout.publish(&id, registration)?;
     Ok(Ok((id, displaced)))
 }
 

@@ -272,6 +272,7 @@ impl Workspace {
                 fifo: self.jobserver(),
                 stakes: self.sandbox.exec_temp_dir.join("stakes"),
             }),
+            build_volume_released: None,
         };
         let artifacts = ArtifactStoreSink::open(
             config.workspace_root.clone(),

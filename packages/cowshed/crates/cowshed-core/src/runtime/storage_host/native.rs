@@ -41,8 +41,9 @@ where
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
         capacity: ImageCapacity,
-    ) -> Result<PathBuf, ApfsStorageError> {
-        MacOsApfsExecutionHost::create_build_volume(self, layout, id, capacity)
+        registration: &Registration,
+    ) -> Result<(PathBuf, BuildVolumeHold), ApfsStorageError> {
+        MacOsApfsExecutionHost::create_build_volume(self, layout, id, capacity, registration)
     }
 
     fn clone_build_volume(
@@ -50,9 +51,9 @@ where
         layout: &BuildVolumeLayout,
         source: &BuildVolumeId,
         destination: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(), ApfsStorageError> {
-        MacOsApfsExecutionHost::clone_build_volume(self, layout, source, destination, record)
+        MacOsApfsExecutionHost::clone_build_volume(self, layout, source, destination, registration)
     }
 
     fn clone_quiet_build_volume(
@@ -60,9 +61,15 @@ where
         layout: &BuildVolumeLayout,
         quiet: &crate::runtime::build_volumes::Quiet,
         destination: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(), ApfsStorageError> {
-        MacOsApfsExecutionHost::clone_quiet_build_volume(self, layout, quiet, destination, record)
+        MacOsApfsExecutionHost::clone_quiet_build_volume(
+            self,
+            layout,
+            quiet,
+            destination,
+            registration,
+        )
     }
 
     fn clone_claimed_build_volume(
@@ -70,9 +77,15 @@ where
         layout: &BuildVolumeLayout,
         claim: &ReleaseClaim,
         destination: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(), ApfsStorageError> {
-        MacOsApfsExecutionHost::clone_claimed_build_volume(self, layout, claim, destination, record)
+        MacOsApfsExecutionHost::clone_claimed_build_volume(
+            self,
+            layout,
+            claim,
+            destination,
+            registration,
+        )
     }
 
     fn build_volume_written(
@@ -96,9 +109,9 @@ where
         &self,
         layout: &BuildVolumeLayout,
         seed: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(BuildVolumeId, PathBuf), ApfsStorageError> {
-        MacOsApfsExecutionHost::fork_build_volume(self, layout, seed, record)
+        MacOsApfsExecutionHost::fork_build_volume(self, layout, seed, registration)
     }
 
     fn mount_build_volume(
@@ -214,5 +227,13 @@ where
         build_claim: Option<&ReleaseClaim>,
     ) -> Result<(), ApfsStorageError> {
         MacOsApfsExecutionHost::publish_re_adopt_build(self, layout, source, build_claim)
+    }
+
+    fn defragment_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        claim: &ReleaseClaim,
+    ) -> Result<crate::storage::lifecycle::DefragmentOutcome, ApfsStorageError> {
+        MacOsApfsExecutionHost::defragment_build_volume(self, layout, claim)
     }
 }

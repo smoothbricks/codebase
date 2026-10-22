@@ -839,16 +839,34 @@ pub struct ResizeOutcome {
 
 /// How many physically contiguous runs a file's allocated bytes occupy.
 ///
-/// This, not the file's size, is what cloning an image costs: `clonefile` shares the source's
-/// extent map, and the first write to either file copies that map (01a_apfs.md, "Clone cost
-/// follows extents, not size").
+/// This governs the first-write map-copy cost, not the whole clone: `clonefile` shares the
+/// source's extent map, and the first write to either file copies it (01a_apfs.md, "Clone cost
+/// follows extents, not size"). Attach, mount, identity and proof collection cost extra.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ExtentCount(u64);
 
 impl ExtentCount {
-    /// Nanoseconds the first write into a clone pays per extent of its source, measured on the
-    /// store volume: 25.7 s for a 2.11M-extent image, 4.4 s for 473k.
+    /// Historical ASIF-era synthetic predictor, not a RAW-image causal calibration:
+    /// 25.7 s for a 2.11M-extent image and 4.4 s for 473k.
     pub const FIRST_WRITE_NANOS_PER_EXTENT: u64 = 12_000;
+
+    /// Standalone first-write sensitivity limit from one loaded RAW observation:
+    /// 60.845084042 s / 434,462 extents = 140.046964 µs/extent. The cause is unattributed.
+    /// This does not budget attach, mount, identity work, proof collection or other images.
+    pub const FORKABLE_MAX: Self = Self(7_140);
+    pub const OBSERVED_FIRST_WRITE_NANOS: u64 = 60_845_084_042;
+    pub const OBSERVED_EXTENTS: u64 = 434_462;
+
+    pub const fn is_forkable(self) -> bool {
+        self.0 <= Self::FORKABLE_MAX.0
+    }
+
+    /// Sensitivity at the observed RAW rate, kept separate from the historical predictor.
+    pub fn observed_first_write_cost(self) -> Duration {
+        let nanos = u128::from(self.0) * u128::from(Self::OBSERVED_FIRST_WRITE_NANOS)
+            / u128::from(Self::OBSERVED_EXTENTS);
+        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+    }
 
     pub const fn new(extents: u64) -> Self {
         Self(extents)
@@ -858,7 +876,7 @@ impl ExtentCount {
         self.0
     }
 
-    /// The time the first write into a clone of this file is predicted to spend copying the map.
+    /// Historical ASIF-era prediction; it is not the forkable-generation admission rule.
     pub const fn first_write_cost(self) -> Duration {
         // Saturating: only a count no file can have overflows u64 nanoseconds.
         Duration::from_nanos(self.0.saturating_mul(Self::FIRST_WRITE_NANOS_PER_EXTENT))
@@ -1182,4 +1200,30 @@ pub trait Substrate: LifecyclePlanner {
         options: StorageGcOptions,
     ) -> Result<StorageGcPlan, Self::Error>;
     async fn execute_gc(&self, plan: StorageGcPlan) -> Result<StorageGcReport, Self::Error>;
+}
+
+#[cfg(test)]
+mod extent_policy_tests {
+    use super::ExtentCount;
+    use std::time::Duration;
+
+    #[test]
+    fn standalone_sensitivity_admits_7140_but_not_7141() {
+        let under = ExtentCount::new(7_140);
+        let over = ExtentCount::new(7_141);
+        assert!(under.is_forkable());
+        assert!(!over.is_forkable());
+        assert!(under.observed_first_write_cost() < Duration::from_secs(1));
+        assert!(over.observed_first_write_cost() > Duration::from_secs(1));
+        assert!(ExtentCount::new(1_785).observed_first_write_cost() < Duration::from_millis(250));
+        assert!(ExtentCount::new(1_786).observed_first_write_cost() > Duration::from_millis(250));
+        assert_eq!(
+            ExtentCount::new(1).first_write_cost(),
+            Duration::from_micros(12)
+        );
+        assert_eq!(
+            ExtentCount::new(ExtentCount::OBSERVED_EXTENTS).observed_first_write_cost(),
+            Duration::from_nanos(60_845_084_042),
+        );
+    }
 }

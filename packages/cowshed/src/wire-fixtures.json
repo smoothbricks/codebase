@@ -163,7 +163,7 @@
           "bytes": 11264,
           "identity": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
           "path": "/Users/fixture/Dev/.cowshed/gc/10",
-          "reason": "unrecordedBuildVolume"
+          "reason": "interruptedBuildVolume"
         }
       ],
       "deferred": [],

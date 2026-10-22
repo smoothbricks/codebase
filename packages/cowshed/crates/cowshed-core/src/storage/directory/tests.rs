@@ -299,6 +299,31 @@ fn directory_named_snapshot_and_mount_fence_ignore_broken_siblings() {
 }
 
 #[test]
+fn directory_source_release_keeps_canonical_authority_on_cleanup_refusal() {
+    use super::*;
+    let scratch = Scratch::new("direct-source-release");
+    let (host, image, metadata) = published_directory(&scratch, "selected", 1);
+    let workspace = metadata_workspace_ref(&metadata).unwrap();
+    let retired = RetiredRef::new(workspace, Revision::new(1));
+    let storage = layout(&host.config, &metadata.repo_id).unwrap();
+    let checkpoints = storage.project().checkpoints.join("selected");
+    fs::create_dir_all(&checkpoints).unwrap();
+    let foreign = checkpoints.join("only-copy");
+    fs::write(&foreign, b"preserve checkpoint evidence").unwrap();
+    assert!(host.release_workspace(&host.config, &retired).is_err());
+    assert!(image.exists());
+    assert!(sidecar_path(&image).exists());
+    assert!(companion_path(&image).exists());
+    assert_eq!(fs::read(&foreign).unwrap(), b"preserve checkpoint evidence");
+    fs::remove_file(&foreign).unwrap();
+    host.release_workspace(&host.config, &retired).unwrap();
+    assert!(!image.exists());
+    assert!(!sidecar_path(&image).exists());
+    assert!(!companion_path(&image).exists());
+    assert!(!storage.project().sessions.join(".trash").exists());
+}
+
+#[test]
 fn directory_retirement_retry_and_held_recovery_keep_complete_authority() {
     use super::*;
     let scratch = Scratch::new("retirement-scope");

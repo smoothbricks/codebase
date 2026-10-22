@@ -244,9 +244,6 @@ pub trait ProjectRuntimeHost: Send + 'static {
     /// The session workspaces a listing does not show: clones whose create or fork never
     /// published them. `remove` retires them like any other.
     async fn unpublished_workspaces(&mut self) -> Result<Vec<WorkspaceName>>;
-    /// Wait for every image reclamation this host started in the background, so a collection
-    /// that follows plans against a settled store instead of racing it.
-    async fn settle_reclaims(&mut self) -> Result<()>;
     /// Delete every `rm --abandon` bundle in the project's trash, answering the paths deleted,
     /// once main's repository keeps every one's tips; none is deleted when any cannot be kept.
     async fn delete_abandon_bundles(&mut self) -> Result<Vec<PathBuf>>;
@@ -2164,7 +2161,7 @@ impl ProjectActor {
 }
 
 /// Remove an adopted project end to end: retire every session workspace, listed or never
-/// published; wait for their images' reclamation; collect; delete the abandon bundles the
+/// published, finishing each physical release or recovery preservation; collect; delete the abandon bundles the
 /// removals left (only under `abandon`, which is what authorized them); then restore main, which
 /// unbinds the project and, with main retired, releases the build volumes main's link and seed
 /// kept from that collection. Every step is idempotent, so a refusal at any step leaves the rest
@@ -2196,7 +2193,6 @@ async fn remove_project(
         let report = host.remove(workspace.clone(), session_removal).await?;
         removed.push(RemovedWorkspace { workspace, report });
     }
-    host.settle_reclaims().await?;
     let collected = host.gc(GcOptions::default()).await?;
     let deleted_bundles = if options.abandon {
         host.delete_abandon_bundles().await?
@@ -2437,9 +2433,6 @@ struct StorageProjectRuntimeHost<H: RuntimeStorageHost> {
     binding_remote_validation: BindingRemoteValidation,
     /// Which unfinished lifecycle intents this opening replays; see [`RecoveryScope`].
     recovery_scope: RecoveryScope,
-    /// The image reclamations this host started in the background and has not yet seen finish:
-    /// what `settle_reclaims` waits for. Finished ones are dropped as new ones start.
-    reclaims: Vec<JoinHandle<()>>,
     /// Retirement may archive this project's storage only after every actor and healer releases it.
     /// The unbinding that ends a main restore removes it ([`Self::remove_unbound_lease`]).
     retirement_lease: crate::project_retirement::ProjectReadLease,
@@ -3771,7 +3764,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             intent_leases: std::collections::BTreeMap::new(),
             binding_remote_validation: validation,
             recovery_scope,
-            reclaims: Vec::new(),
             retirement_lease,
         })
     }
@@ -4805,20 +4797,29 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let volumes = self.build_volumes()?;
         let journal = self.lifecycle_intents_path.clone();
         let layout = volumes.layout.clone();
-        let (images, creating) = crate::storage::lifecycle::dispatch_blocking(move || {
-            let images = layout.collection_ids()?;
-            let creating = crate::storage::recovery::LifecycleIntentJournal::load(&journal)?
-                .forming()
-                .cloned()
-                .collect();
-            Ok::<_, CowshedError>((images, creating))
-        })
-        .await
-        .map_err(|error| {
-            CowshedError::internal(format!("lifecycle intent read task failed: {error}"))
-        })??;
+        let (images, creating, journaled) =
+            crate::storage::lifecycle::dispatch_blocking(move || {
+                let images = layout.collection_ids()?;
+                let intents = crate::storage::recovery::LifecycleIntentJournal::load(&journal)?;
+                let creating = intents.forming().cloned().collect();
+                // The exact build volume ids an unfinished re-adoption publishes, from its own
+                // journaled record: never a workspace name another verb could reuse.
+                let mut journaled = std::collections::BTreeSet::new();
+                for source in intents.forming_re_adoptions() {
+                    journaled.extend(source.build.iter().map(|build| build.id.clone()));
+                    if let crate::storage::recovery::ReAdoptMain::Missing(missing) = &source.main {
+                        journaled.extend(missing.build.iter().map(|build| build.id().clone()));
+                    }
+                }
+                Ok::<_, CowshedError>((images, creating, journaled))
+            })
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("lifecycle intent read task failed: {error}"))
+            })??;
         let mut links = super::build_volumes::Links {
             creating,
+            journaled,
             ..super::build_volumes::Links::default()
         };
         for workspace in self.authoritative().await? {
@@ -4880,13 +4881,46 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         Ok(())
     }
 
+    /// Next-open recovery of build volumes a creation registered and never published
+    /// (16_build_volumes.md, "Garbage collection"): their exact ids come from their own records,
+    /// read before the journal and links; whatever is no longer forming is released now, as this
+    /// open's own step, never left for a later collection. One a live authority still owns (a
+    /// forming intent, a detached checkout's link, a running creator's hold) stays with it. One
+    /// whose release failed, or whose record or image cannot be read, refuses the open, naming
+    /// each, with its owner record left naming it.
+    async fn recover_build_registrations(&self) -> Result<()> {
+        let volumes = self.build_volumes()?;
+        let registered = volumes.registered().await?;
+        if registered.is_empty() {
+            return Ok(());
+        }
+        let (_, links) = self.build_volume_links().await?;
+        let collection = volumes.recover_registered(registered, links).await?;
+        let failed = collection
+            .deferred
+            .iter()
+            .filter(|deferred| !deferred.deferral.is_owned())
+            .map(|deferred| format!("{}: {}", deferred.path.display(), deferred.deferral))
+            .collect::<Vec<_>>();
+        if failed.is_empty() {
+            return Ok(());
+        }
+        Err(CowshedError::integrity(
+            format!(
+                "an interrupted build volume creation could not be retired, and its owner record still names it: {}",
+                failed.join("; ")
+            ),
+            "repair the named path, then open the project again; the same recovery retries it",
+        ))
+    }
+
     /// Land steps 4–7 (16_build_volumes.md, "Land"): quiesce the landing workspace, close the
     /// target's Nx state and carry the target's cache entries into the landing volume, freeze
     /// the target's seed from that volume, move the target's build link onto it, and restore
     /// the declared outputs of the Nx runs already validated in the landing workspace.
     async fn land_build_volume(
         &mut self,
-        workspace: &WorkspaceName,
+        landing_owner: super::build_volumes::Owner,
         landing: &Path,
         into: &NativeLandingInto,
         checks: &CheckedLandChecks,
@@ -4894,6 +4928,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         carry_stopped: Option<String>,
     ) -> Result<crate::api::dto::LandBuildVolume> {
         use crate::api::dto::{Adoption, AdoptionSkip, LandBuildVolume, LandSeed};
+        let workspace = &landing_owner.name;
         let store_root = &std::sync::Arc::clone(self.git.store_root());
         let volumes = self.build_volumes()?;
         let skipped = |reason| LandBuildVolume {
@@ -5101,9 +5136,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 elapsed_ms,
                 previous,
             }) => {
-                // Nothing links the previous volume and its record says Unlinked, so its release
-                // (an unmount, detach and delete, each waiting on storagekitd) needs nothing the
-                // target's next steps touch, and runs beside them.
+                // Nothing links the previous volume and its record says superseded under the
+                // target, so its release (an unmount, detach and unlink, each waiting on
+                // storagekitd) needs nothing the target's next steps touch, and runs beside them.
+                // A job admitted on it before the move keeps it, recorded as the target's, until
+                // that job's end releases it.
                 let release = timed_async(
                     "land",
                     "release-previous",
@@ -5114,7 +5151,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     // under the target's image lock.
                     if !retire {
                         volumes
-                            .refork(&locked, workspace.clone(), landing.to_owned())
+                            .refork(&locked, landing_owner.clone(), landing.to_owned())
                             .await?;
                     }
                     drop(locked);
@@ -5140,11 +5177,13 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 let check = match tokio::join!(release, in_target) {
                     (Ok(()), check) => check?,
                     (Err(release), Ok(_)) => return Err(release),
-                    // The land fails for what failed in the target; the volume nothing links is
-                    // collection's to retry.
+                    // The land fails for what failed in the target; the previous volume stays
+                    // recorded superseded under the target, for its owner's retirement or the
+                    // next collection.
                     (Err(release), Err(error)) => {
                         cowshed_os::eprintln!(
-                            "cowshed: {}'s previous build volume stays: {release}; `cowshed gc` retries it",
+                            "cowshed: {}'s previous build volume stays recorded as {}'s: {release}; the next `cowshed land`, `rm` or `gc` retries it",
+                            into.name,
                             into.name
                         );
                         return Err(error);
@@ -6250,6 +6289,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         &mut self,
         current: NativeWorkspace,
         nx_check: CheckoutNxCheck,
+        disposition: crate::storage::apfs::RetirementDisposition,
     ) -> Result<()> {
         let workspace = current.derived.workspace.name().clone();
         if matches!(
@@ -6267,7 +6307,28 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let git_worktree = is_git_worktree(&current.metadata);
         self.unregister_workspace_in_main(&workspace, git_worktree)
             .await?;
-        self.retire_workspace(current).await
+        self.retire_workspace(current, disposition).await
+    }
+
+    async fn source_retirement_disposition(
+        &self,
+        mount: &Path,
+        fence: &NativeRemovalGitFence,
+        abandoned: bool,
+        containment: &NativeContainment,
+    ) -> Result<crate::storage::apfs::RetirementDisposition> {
+        use crate::storage::apfs::RetirementDisposition;
+        if fence.dirty || fence.in_progress.is_some() || abandoned {
+            return Ok(RetirementDisposition::Recovery);
+        }
+        let git = crate::git::GitRepository::from_root(self.git.store_root(), mount);
+        Ok(
+            if git.has_unique_untracked_content(&containment.mount).await? {
+                RetirementDisposition::Recovery
+            } else {
+                RetirementDisposition::Release
+            },
+        )
     }
 
     /// Refuse a session removal whose workspace is in transient Git state.
@@ -7200,10 +7261,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                             ));
                         }
                     };
-                    let (report, retired) = self
+                    let report = self
                         .retire_pending_workspace(&workspace, options, origin, metadata)
                         .await?;
-                    self.reclaim_in_background(retired);
                     return Ok(report);
                 }
                 // An unfinished create or fork that left no clone — refused after binding its
@@ -7499,7 +7559,30 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     containment,
                 )
                 .await;
-            self.finish_retirement(current, nx_check).await?;
+            let disposition = if workspace.is_main() {
+                crate::storage::apfs::RetirementDisposition::Recovery
+            } else {
+                self.source_retirement_disposition(
+                    &mount,
+                    &final_fence,
+                    abandoned.is_some(),
+                    containment,
+                )
+                .await?
+            };
+            if !workspace.is_main() {
+                self.build_volumes()?
+                    .release_owned(
+                        super::build_volumes::Owner {
+                            name: workspace.clone(),
+                            incarnation: current.derived.workspace.incarnation().clone(),
+                        },
+                        mount.clone(),
+                    )
+                    .await?;
+            }
+            self.finish_retirement(current, nx_check, disposition)
+                .await?;
             self.log_retirement(&workspace, &mount, tips, forced);
             Ok(RemoveReport { abandoned })
         }
@@ -8517,6 +8600,39 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             cpu: std::sync::Arc::new(super::job_cpu::GatewayJobCpu::new(
                 self.descriptor.storage.store().join("gateway.sock"),
             )),
+            // A job's end releases the volume it held when an adoption or reseed superseded it
+            // while the job ran: inside this controller, awaited before the job is told ended,
+            // and a release that cannot run or fails is that job's terminal failure.
+            build_volume_released: Some({
+                let host = self.substrate.shared_host();
+                let layout = self.build_volume_layout()?;
+                let store = self.descriptor.storage.store().to_owned();
+                let repo = self.descriptor.repo_id.clone();
+                super::supervisor::BuildVolumeReleased::new(move |id| {
+                    let (host, layout, store, repo) = (
+                        std::sync::Arc::clone(&host),
+                        layout.clone(),
+                        store.clone(),
+                        repo.clone(),
+                    );
+                    async move {
+                        let lease = crate::project_retirement::acquire_project_reader(&store, &repo)
+                            .map_err(|error| {
+                                CowshedError::new(
+                                    error.code,
+                                    format!(
+                                        "build volume {id} a job held cannot be released at the job's end, and stays recorded as its owner's: {}",
+                                        error.message
+                                    ),
+                                    error.hint,
+                                )
+                            })?;
+                        super::build_volumes::BuildVolumes::new(host, layout, lease)
+                            .release_superseded(id)
+                            .await
+                    }
+                })
+            }),
         };
         // A workspace has one supervisor, its one job allocator: when another controller
         // process already serves it under this authority, or under grants published since this
@@ -9096,16 +9212,15 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         Ok(())
     }
 
-    /// Retire an unpublished clone without ever publishing it. The retired image is left in trash
-    /// for the caller to reclaim: `rm` does so in the background, while `gc` sweeps it in the same
-    /// pass instead of racing a background reclaim with its own plan.
+    /// Retire an unpublished clone without activating it, using the same physical-release
+    /// or complete recovery-preservation decision as a published workspace.
     async fn retire_pending_workspace(
         &mut self,
         workspace: &WorkspaceName,
         options: RemoveOptions,
         origin: crate::storage::recovery::LifecycleIntent,
         metadata: crate::metadata::DetachedWorkspaceMetadata,
-    ) -> Result<(RemoveReport, crate::storage::lifecycle::RetiredRef)> {
+    ) -> Result<RemoveReport> {
         use super::supervisor::{CommitmentDraft, CommitmentSink};
         use crate::storage::lifecycle::{MountIntent, MountState, OperationIdentity, Substrate};
 
@@ -9235,9 +9350,29 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                 containment,
                             )
                             .await;
+                        let disposition = this
+                            .source_retirement_disposition(
+                                &stage.mount_point,
+                                &last,
+                                abandoned.is_some(),
+                                containment,
+                            )
+                            .await?;
+                        this.build_volumes()?
+                            .release_owned(
+                                super::build_volumes::Owner {
+                                    name: workspace.clone(),
+                                    incarnation: stage.workspace.incarnation().clone(),
+                                },
+                                stage.mount_point.clone(),
+                            )
+                            .await?;
                         this.unregister_workspace_in_main(workspace, git_worktree)
                             .await?;
-                        Ok::<_, CowshedError>((abandoned, tips, stage.mount_point.clone(), forced))
+                        Ok::<_, CowshedError>((
+                            disposition,
+                            (abandoned, tips, stage.mount_point.clone(), forced),
+                        ))
                     }
                 })
                 .await
@@ -9256,7 +9391,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
             )
             .await?;
-            Ok((report, retired))
+            Ok(report)
         }
         .await;
         if main_detached {
@@ -9270,7 +9405,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         result
     }
 
-    async fn retire_workspace(&mut self, current: NativeWorkspace) -> Result<()> {
+    async fn retire_workspace(
+        &mut self,
+        current: NativeWorkspace,
+        disposition: crate::storage::apfs::RetirementDisposition,
+    ) -> Result<()> {
         use super::supervisor::CommitmentSink;
         use crate::storage::lifecycle::LifecyclePlanner;
 
@@ -9280,9 +9419,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .map_err(native_integrity_error)?;
         let mut commitments = self.commitments.clone();
         let repo_id = self.descriptor.repo_id.clone();
-        let retired = self
-            .substrate
-            .execute_retire_staged(plan, move |retired| async move {
+        self.substrate
+            .execute_retire_staged(plan, disposition, move |retired| async move {
                 commitments
                     .record(super::supervisor::CommitmentDraft::WorkspaceRetired {
                         repo_id,
@@ -9292,47 +9430,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             })
             .await
             .map_err(native_retire_error)?;
-        // The volume is detached, so the slot is free for its next tenant. Released before
-        // reclamation rather than after: reclamation only ever removes an empty mountpoint the
-        // *name* derives, and a slot mountpoint is meant to outlive its tenants — the next
-        // workspace to take the slot mounts at exactly the same absolute path, which is the whole
-        // point of a slot.
+        // Physical release or durable recovery retirement completed before the slot is reusable.
         self.release_slot(current.derived.workspace.name()).await?;
-        self.reclaim_in_background(retired);
         Ok(())
-    }
-
-    /// Reclaim a retired image without holding up the verb that retired it. Best-effort by
-    /// design: an interrupted reclamation leaves trash for the next idempotent gc pass, and
-    /// `settle_reclaims` is how a caller that collects next waits for this one first.
-    fn reclaim_in_background(&mut self, retired: crate::storage::lifecycle::RetiredRef) {
-        use crate::storage::lifecycle::Substrate;
-
-        // The task can outlive this actor. Its own shared lease must exclude whole-project
-        // archival until it ends; once retirement is fenced, keep the trash as archive evidence.
-        let retirement_lease = match crate::project_retirement::acquire_project_reader(
-            self.descriptor.storage.store(),
-            &self.descriptor.repo_id,
-        ) {
-            Ok(lease) => lease,
-            Err(error) => {
-                cowshed_os::eprintln!(
-                    "cowshed: retaining {} for later reclamation: {}",
-                    retired.workspace().name(),
-                    error.message
-                );
-                return;
-            }
-        };
-        let workspace = retired.workspace().name().clone();
-        let substrate = self.substrate.clone();
-        self.reclaims.retain(|reclaim| !reclaim.is_finished());
-        self.reclaims.push(tokio::spawn(async move {
-            let _retirement_lease = retirement_lease;
-            if let Err(error) = substrate.reclaim(retired).await {
-                cowshed_os::eprintln!("cowshed: retaining retired workspace {workspace} for later reclamation: {error}");
-            }
-        }));
     }
 
     async fn retire_restored_main(&mut self, current: NativeWorkspace) -> Result<()> {
@@ -9420,12 +9520,8 @@ fn require_vacant_move_destination(destination: &Path) -> Result<()> {
     }
 }
 
-/// Finishes what interrupted work left in the project's store that the open found, before the
-/// controller serves: restores whose image was published but whose metadata was never activated,
-/// and retired images still in the trash. Returns the substrate over `host`.
-///
-/// An inspecting open finishes neither: doctor reports both from the store itself, as
-/// `pending-publication` and `retired-trash` findings.
+/// Finish interrupted restore publications before serving. Recovery trash, with or without
+/// its sidecar, is preserved; a missing record never authorizes deletion.
 #[cfg(target_os = "macos")]
 async fn finish_store_residue<H: crate::storage::apfs::ApfsExecutionHost>(
     host: H,
@@ -9437,7 +9533,6 @@ async fn finish_store_residue<H: crate::storage::apfs::ApfsExecutionHost>(
     scope: &RecoveryScope,
 ) -> Result<crate::storage::apfs::ApfsSubstrate<H>> {
     use super::supervisor::{CommitmentDraft, CommitmentSink};
-    use crate::storage::lifecycle::Substrate;
 
     if !scope.repairs() {
         return Ok(crate::storage::apfs::ApfsSubstrate::new(config, host));
@@ -9455,37 +9550,20 @@ async fn finish_store_residue<H: crate::storage::apfs::ApfsExecutionHost>(
         host.activate_restored_metadata(&publication.image)
             .map_err(native_storage_error)?;
     }
-    let substrate = crate::storage::apfs::ApfsSubstrate::new(config, host);
-    let _span = cowshed_os::timing::span("open", "reclaim");
-    for retirement in retired.recorded {
-        // Trash reclamation is best effort: the retirement is already a fact of the inventory,
-        // and an image left in the trash is reclaimed by the next open or by `gc`. A failure is
-        // said, never dropped.
-        let workspace = retirement.workspace().name().clone();
-        let incarnation = retirement.workspace().incarnation().clone();
-        if let Err(error) = substrate.reclaim(retirement).await {
-            cowshed_os::eprintln!(
-                "cowshed: retired workspace {workspace} (incarnation {incarnation}) stays in \
-             sessions/.trash: reclaiming it failed ({error}); the next cowshed command or \
-             cowshed gc retries, and cowshed doctor reports it as retired-trash"
-            );
-        }
+    if !retired.recorded.is_empty() {
+        cowshed_os::eprintln!(
+            "cowshed: retaining {} recovery image(s) for {repo_id} under {}; recover their contents deliberately",
+            retired.recorded.len(),
+            config.store_root.display(),
+        );
     }
-    // An image whose record is already gone is already reclaimed as a retirement; its bytes go
-    // the same best-effort way.
     for image in retired.unrecorded {
-        if let Err(error) = substrate
-            .reclaim_unrecorded_retired(repo_id, image.clone())
-            .await
-        {
-            cowshed_os::eprintln!(
-                "cowshed: retired image {} stays in sessions/.trash: reclaiming it failed \
-             ({error}); the next cowshed command or cowshed gc retries",
-                image.display()
-            );
-        }
+        cowshed_os::eprintln!(
+            "cowshed: retaining recovery image {} without its grants sidecar; recover its metadata or contents deliberately; missing authority is not proof of disposable bytes",
+            image.display(),
+        );
     }
-    Ok(substrate)
+    Ok(crate::storage::apfs::ApfsSubstrate::new(config, host))
 }
 
 #[cfg(target_os = "macos")]
@@ -11106,16 +11184,6 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         }
         self.supervisors.clear();
         self.sessions.clear();
-        // A retirement answers before its image is reclaimed, but the runtime that spawned the
-        // reclamation does not end before it: a process that exits under it would leave trash
-        // only a later gc collects.
-        for reclaim in std::mem::take(&mut self.reclaims) {
-            if let Err(error) = reclaim.await {
-                cowshed_os::eprintln!(
-                    "cowshed: image reclamation task failed as its runtime shut down: {error}"
-                );
-            }
-        }
     }
 
     async fn recover(&mut self) -> Result<()> {
@@ -11149,6 +11217,14 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         if self.recovery_scope.repairs() {
             cowshed_os::timing::spanned("recover", "intents", self.recover_lifecycle_intents())
                 .await?;
+            // After the intents: a create, fork or adopt replayed or retired above no longer
+            // forms, so what it registered and never published is decided now.
+            cowshed_os::timing::spanned(
+                "recover",
+                "build-registrations",
+                self.recover_build_registrations(),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -12088,7 +12164,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         destination_incarnation: destination_incarnation.clone(),
                     })
                     .await?;
-                self.finish_retirement(current, CheckoutNxCheck::CloseRecorded).await?;
+                self.finish_retirement(
+                    current,
+                    CheckoutNxCheck::CloseRecorded,
+                    crate::storage::apfs::RetirementDisposition::Recovery,
+                ).await?;
             }
             self.complete_lifecycle_intent(
                 &destination,
@@ -12640,12 +12720,61 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
     ) -> Result<crate::api::dto::DefragmentResult> {
         use crate::storage::lifecycle::Substrate;
         self.validate_binding().await?;
+        // An inspecting opening must not race the original creator, which may hold its source
+        // image lock rather than this destination's lock. Retain the existing intent lease
+        // through the rewrite, without changing the operation or its journal phase.
+        if !self.claim_intent_lease(&workspace)? {
+            return Err(another_process_is_running(&workspace));
+        }
+        let host = self.substrate.shared_host();
+        let repo = self.descriptor.repo_id.clone();
+        let name = workspace.clone();
+        let metadata = crate::storage::lifecycle::dispatch_blocking(move || {
+            host.canonical_metadata(&repo, &name)
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("defrag metadata task failed: {error}")))?
+        .map_err(native_storage_error)?;
+        if let Some(metadata) = metadata
+            && metadata.publication_state == crate::metadata::PublicationState::PendingFence
+            && !workspace.is_main()
+        {
+            let stopped = self.stop_supervisor(&workspace).await?;
+            let outcome = self
+                .substrate
+                .defragment_pending_clone(metadata)
+                .await
+                .map_err(native_storage_error)?;
+            drop(stopped);
+            return Ok(crate::api::dto::DefragmentResult {
+                workspace,
+                previous_extents: outcome.previous.get(),
+                extents: outcome.extents.get(),
+                bytes: outcome.bytes,
+            });
+        }
         let current = self.current(&workspace).await?;
         let was_mounted = matches!(
             current.derived.mount_state,
             crate::storage::lifecycle::MountState::Mounted { .. }
         );
         let stopped = self.stop_supervisor(&workspace).await?;
+        let build_outcomes = self
+            .build_volumes()?
+            .defragment(super::build_volumes::Owner {
+                name: workspace.clone(),
+                incarnation: current.derived.workspace.incarnation().clone(),
+            })
+            .await?;
+        for (image, rewritten) in build_outcomes {
+            cowshed_os::eprintln!(
+                "cowshed: defragmented {}: {} -> {} extents, {} bytes copied",
+                image.display(),
+                rewritten.previous,
+                rewritten.extents,
+                rewritten.bytes
+            );
+        }
         let outcome = self
             .substrate
             .defragment(&current.derived.workspace)
@@ -13114,22 +13243,37 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 crate::exec::profile_directory(&store_root).display()
             ),
         }
-        // The images every release moved into the build-volume trash, this sweep's included:
-        // the daemon empties it on an interval, and gc is the verb that waits for it. Their
-        // bytes are counted where they were released, so this only says what it deleted.
-        let trash = self.build_volume_layout()?.trash();
-        match tokio::task::spawn_blocking(move || crate::build_volume::empty_trash(&trash)).await {
-            Ok(Ok(emptied)) if emptied.images > 0 => cowshed_os::eprintln!(
-                "cowshed: gc deleted {} released build volume image(s) from the trash",
-                emptied.images
-            ),
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => cowshed_os::eprintln!(
-                "cowshed: gc left released build volume images in the trash; the daemon retries: {error}"
-            ),
-            Err(error) => {
-                cowshed_os::eprintln!("cowshed: emptying the build volume trash failed: {error}")
+        // Finish, before answering, the build releases a crash cut short and the historical trash
+        // earlier builds left: failure here must not report a completed physical collection.
+        let layout = self.build_volume_layout()?;
+        let directories = [layout.releasing(), layout.trash()];
+        let drained = tokio::task::spawn_blocking(move || {
+            let mut drained = crate::storage::apfs::release::Drained::default();
+            for directory in &directories {
+                drained.add(
+                    crate::build_volume::drain_released(directory).map_err(|error| {
+                        CowshedError::environment_missing(
+                            format!(
+                                "cannot finish releasing build images in {}: {error}",
+                                directory.display()
+                            ),
+                            "repair the named path, then retry cowshed gc",
+                        )
+                    })?,
+                );
             }
+            Ok::<_, CowshedError>(drained)
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("build image release task failed: {error}"))
+        })??;
+        if drained.images > 0 {
+            cowshed_os::eprintln!(
+                "cowshed: gc released {} build volume image(s), {} bytes, that an interrupted operation or an earlier build left",
+                drained.images,
+                drained.bytes
+            );
         }
         Ok(GcReport {
             examined: u64::try_from(report.examined)
@@ -13167,15 +13311,6 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .map(|(_, metadata)| metadata.workspace)
             .filter(|workspace| !workspace.is_main())
             .collect())
-    }
-
-    async fn settle_reclaims(&mut self) -> Result<()> {
-        for reclaim in std::mem::take(&mut self.reclaims) {
-            reclaim.await.map_err(|error| {
-                CowshedError::internal(format!("image reclamation task failed: {error}"))
-            })?;
-        }
-        Ok(())
     }
 
     /// The purge's last word on the trash: every bundle's tips go into main's repository first,
@@ -13956,7 +14091,17 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let build_volume = timed_async(
             "land",
             "build-volume",
-            self.land_build_volume(&workspace, &source_mount, &into, &checked, retire, carry_stopped),
+            self.land_build_volume(
+                super::build_volumes::Owner {
+                    name: workspace.clone(),
+                    incarnation: landing_incarnation.clone(),
+                },
+                &source_mount,
+                &into,
+                &checked,
+                retire,
+                carry_stopped,
+            ),
         )
         .await
         .map_err(|failed| {
@@ -14325,9 +14470,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     std::collections::BTreeSet::new()
                 }
             };
+        let mut pending_extent_images = Vec::new();
         match crate::doctor::probe("pending-publication", self.pending_metadata()).await {
             Ok(pending) => {
                 for (image, metadata) in pending {
+                    if H::HAS_PHYSICAL_VOLUMES && !metadata.workspace.is_main() {
+                        pending_extent_images.push((metadata.workspace.clone(), image.clone()));
+                    }
                     let (message, hint) = if abandoned.contains(&image) {
                         (
                             format!(
@@ -14372,9 +14521,16 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // the store once. An authoritative failure leaves this empty — and is already a
         // finding above — while the tombstone half still runs.
         let mut companion_images: Vec<(WorkspaceName, PathBuf)> = Vec::new();
+        let mut extent_owners = std::collections::BTreeMap::new();
 
         match crate::doctor::probe("workspaces", self.authoritative()).await {
             Ok(workspaces) => {
+                extent_owners.extend(workspaces.iter().map(|workspace| {
+                    (
+                        workspace.derived.workspace.name().clone(),
+                        workspace.derived.workspace.incarnation().clone(),
+                    )
+                }));
                 let seed_targets = workspaces
                     .iter()
                     .filter_map(|workspace| workspace.metadata.info_snapshot.forked_from.clone())
@@ -14841,31 +14997,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 error,
             )),
         }
-        // Every clone of main copies main's extent map on its first write, so the count predicts
-        // what the next `fork` will pay before it is paid.
-        if H::HAS_PHYSICAL_VOLUMES
-            && let Some(image) = companion_images
-                .iter()
-                .find(|(name, _)| name.is_main())
-                .map(|(_, image)| image.clone())
-        {
-            let counted = image.clone();
-            let extents = crate::doctor::probe(
-                "main-extents",
-                crate::storage::lifecycle::dispatch_blocking(move || {
-                    crate::storage::apfs::extents::count_extents(&counted)
-                }),
-            )
-            .await;
-            findings.push(match extents {
-                Ok(Ok(extents)) => main_extents_finding(image, extents),
-                Ok(Err(error)) => main_extents_unread(image, error.to_string()),
-                Err(error) => main_extents_unread(image, error.to_string()),
-            });
-        }
-        // An interrupted rewrite leaves a full copy of the image beside it, which nothing lists as
-        // an image and `gc` does not collect: say so, with its size, until a rewrite replaces it.
-        let siblings = companion_images
+        let mut siblings = companion_images
             .iter()
             .map(|(name, image)| {
                 (
@@ -14874,6 +15006,64 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 )
             })
             .collect::<Vec<_>>();
+        // Explicit diagnostics count every physical source and build seed; the fork admission
+        // walk is separately capped at 7141 and never substitutes a source-only estimate.
+        if H::HAS_PHYSICAL_VOLUMES {
+            let mut images = companion_images
+                .iter()
+                .map(|(name, image)| {
+                    let code = if name.is_main() {
+                        "main-extents"
+                    } else {
+                        "source-extents"
+                    };
+                    (name.clone(), code, image.clone())
+                })
+                .collect::<Vec<_>>();
+            match self
+                .build_volume_layout()
+                .and_then(|layout| super::build_volumes::extent_images(&layout, &extent_owners))
+            {
+                Ok(builds) => {
+                    siblings.extend(builds.iter().map(|(name, _, image)| {
+                        (
+                            name.clone(),
+                            crate::storage::apfs::extents::rewrite_sibling(image),
+                        )
+                    }));
+                    images.extend(builds);
+                }
+                Err(error) => findings.push(native_finding(
+                    "build-extents",
+                    crate::api::dto::FindingSeverity::Warning,
+                    error,
+                )),
+            }
+            for (name, image) in pending_extent_images {
+                siblings.push((
+                    name.clone(),
+                    crate::storage::apfs::extents::rewrite_sibling(&image),
+                ));
+                images.push((name, "pending-source-extents", image));
+            }
+            for (name, code, image) in images {
+                let counted = image.clone();
+                let extents = crate::doctor::probe(
+                    code,
+                    crate::storage::lifecycle::dispatch_blocking(move || {
+                        crate::storage::apfs::extents::count_extents(&counted)
+                    }),
+                )
+                .await;
+                findings.push(match extents {
+                    Ok(Ok(extents)) => image_extents_finding(&name, code, image, extents),
+                    Ok(Err(error)) => image_extents_unread(&name, code, image, error.to_string()),
+                    Err(error) => image_extents_unread(&name, code, image, error.to_string()),
+                });
+            }
+        }
+        // An interrupted rewrite leaves a full copy of the image beside it, which nothing lists as
+        // an image and `gc` does not collect: say so, with its size, until a rewrite replaces it.
         findings.extend(
             crate::doctor::probe(
                 "defrag-leftover",
@@ -19313,9 +19503,8 @@ fn supervisor_sandbox(
     })
 }
 
-/// What the project's `sessions/.trash` holds: retirements whose sidecar records them, and
-/// images whose sidecar is already gone. The latter's record was reclaimed (cowshed removes the
-/// sidecar last, so only an outside deletion leaves this), and only their bytes remain.
+/// Recovery inventory, not deletion authority: a recorded retirement or a payload whose
+/// sidecar is missing. Neither category is inferred to be disposable.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Default)]
 struct RetiredTrash {
@@ -19735,10 +19924,9 @@ mod retired_recovery_tests {
         }
     }
 
-    /// `doctor` opens the project to inspect it. Its open must leave a retired image where it is
-    /// for doctor to report; every other open reclaims it.
+    /// Both inspecting and repairing opens preserve recorded recovery trash.
     #[tokio::test]
-    async fn an_inspecting_open_leaves_retired_trash_that_a_repairing_open_reclaims() {
+    async fn inspecting_and_repairing_opens_preserve_recorded_recovery_trash() {
         let root = std::env::temp_dir().join(format!(
             "cowshed-open-residue-{}",
             uuid::Uuid::new_v4().simple()
@@ -19816,16 +20004,18 @@ mod retired_recovery_tests {
         assert!(crate::metadata::sidecar_path(&image).exists());
 
         open(RecoveryScope::Workspaces(Default::default())).await;
-        assert!(!image.exists(), "a repairing open left {}", image.display());
+        assert!(
+            image.exists(),
+            "a repairing open destroyed recovery {}",
+            image.display()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A retired entry whose grants sidecar was deleted by hand (its image and CA key left behind)
-    /// once failed every open of the project with a metadata I/O error, which blocked every land
-    /// and doctor in the repository. The record is gone, so the retirement is already reclaimed:
-    /// an open of any kind succeeds, and a repairing open reclaims the bytes that remain.
+    /// Missing metadata cannot prove that a recovery image's bytes survive elsewhere.
+    /// Both open modes preserve the image and key without blocking unrelated project work.
     #[tokio::test]
-    async fn a_trash_image_without_its_sidecar_is_reclaimed_not_an_open_failure() {
+    async fn a_trash_image_without_its_sidecar_is_preserved_not_an_open_failure() {
         let root = std::env::temp_dir().join(format!(
             "cowshed-unrecorded-trash-{}",
             uuid::Uuid::new_v4().simple()
@@ -19881,19 +20071,16 @@ mod retired_recovery_tests {
         );
 
         open(RecoveryScope::Workspaces(Default::default())).await;
-        assert!(!image.exists(), "a repairing open left {}", image.display());
         assert!(
-            !companion.exists(),
-            "a repairing open left {}",
-            companion.display()
+            image.exists(),
+            "a repairing open destroyed recovery {}",
+            image.display()
         );
-        let log = std::fs::read_to_string(project_root.join("deletion-log.jsonl"))
-            .expect("the reclaim is recorded in the deletion log");
+        assert_eq!(std::fs::read(&image).unwrap(), b"retired image");
+        assert_eq!(std::fs::read(&companion).unwrap(), b"retired CA key");
         assert!(
-            log.lines()
-                .any(|line| line.contains("\"op\":\"reclaim-image\"")
-                    && line.contains(image.to_str().unwrap())),
-            "deletion log does not record the reclaimed image: {log}"
+            !project_root.join("deletion-log.jsonl").exists(),
+            "preservation must not claim an image deletion"
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -21007,34 +21194,30 @@ fn merge_driver_finding(
     }
 }
 
-/// The first-write cost at which main's extent map alone spends the budget `cowshed fork` has for
-/// its whole cold path (08_testing.md), and the rewrite starts paying for itself.
+/// A physical image's two deliberately distinct estimates, never a whole-fork promise.
 #[cfg(target_os = "macos")]
-const CLONE_FIRST_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// Main's extent count and the first-write cost each new clone of it is predicted to pay.
-///
-/// Below the budget the count is reported for the record, with nothing to do; at or above it the
-/// finding warns and names the rewrite.
-#[cfg(target_os = "macos")]
-fn main_extents_finding(
+fn image_extents_finding(
+    workspace: &WorkspaceName,
+    code: &str,
     image: PathBuf,
     extents: crate::storage::lifecycle::ExtentCount,
 ) -> crate::api::dto::Finding {
-    let cost = extents.first_write_cost();
-    let costly = cost >= CLONE_FIRST_WRITE_BUDGET;
+    let historical = extents.first_write_cost();
+    let observed = extents.observed_first_write_cost();
+    let costly = !extents.is_forkable();
     crate::api::dto::Finding {
-        code: "main-extents".into(),
+        code: code.into(),
         severity: if costly {
             crate::api::dto::FindingSeverity::Warning
         } else {
             crate::api::dto::FindingSeverity::Info
         },
         message: format!(
-            "main's image has {extents} extents; the first write into each new clone copies that map, predicted to take {cost:.1?}"
+            "{workspace} {code} image {} has {extents} extents; historical ASIF-era 12 us predictor: {historical:.1?}; loaded RAW sensitivity at 140.046964 us/extent: {observed:.3?}, standalone first-write limit 7140 extents. Cause unattributed, not causal calibration or a whole-fork guarantee: source and build images share the budget; attach, mount, identity and extent-proof work are additional",
+            image.display()
         ),
         hint: if costly {
-            "cowshed defrag main".into()
+            format!("cowshed defrag {workspace}")
         } else {
             String::new()
         },
@@ -21042,16 +21225,24 @@ fn main_extents_finding(
     }
 }
 
-/// Main's extents could not be read, so the clone cost is unknown rather than fine.
+/// Unreadable or concurrently changed physical generations are unknown, not fork-ready.
 #[cfg(target_os = "macos")]
-fn main_extents_unread(image: PathBuf, error: String) -> crate::api::dto::Finding {
+fn image_extents_unread(
+    workspace: &WorkspaceName,
+    code: &str,
+    image: PathBuf,
+    error: String,
+) -> crate::api::dto::Finding {
     crate::api::dto::Finding {
-        code: "main-extents".into(),
+        code: code.into(),
         severity: crate::api::dto::FindingSeverity::Warning,
         message: format!(
-            "could not count main's image extents, so the first-write cost of a new clone is unknown: {error}"
+            "could not prove {workspace} {code} image {} is within 7140 extents; its physical generation and first-write cost are unknown: {error}",
+            image.display()
         ),
-        hint: "check that the store volume is readable, then rerun cowshed doctor".into(),
+        hint: format!(
+            "stop writers and check store readability, then cowshed doctor; cowshed defrag {workspace} rewrites its source and build images"
+        ),
         path: Some(image),
     }
 }
@@ -22133,28 +22324,49 @@ mod doctor_hint_tests {
     }
 
     #[test]
-    fn main_extents_warn_with_the_rewrite_once_a_clone_first_write_spends_the_new_budget() {
+    fn source_and_seed_extents_warn_at_7141_without_recalibrating_history() {
         use crate::api::dto::FindingSeverity;
         use crate::storage::lifecycle::ExtentCount;
 
-        let image = PathBuf::from("/store/acme/widget/main.dmg");
-        // 12 µs per extent: 83,333 extents copy in just under a second, 83,334 in just over.
-        let under = main_extents_finding(image.clone(), ExtentCount::new(83_333));
-        assert_eq!(under.code, "main-extents");
-        assert_eq!(under.severity, FindingSeverity::Info);
-        assert_eq!(under.hint, "");
-        assert!(under.message.contains("83333 extents"), "{}", under.message);
-
-        let over = main_extents_finding(image.clone(), ExtentCount::new(83_334));
-        assert_eq!(over.severity, FindingSeverity::Warning);
-        assert_eq!(over.hint, "cowshed defrag main");
-        assert_eq!(over.path, Some(image.clone()));
-
-        let measured = main_extents_finding(image, ExtentCount::new(2_110_000));
+        let workspace = WorkspaceName::main();
+        for (code, image) in [
+            ("main-extents", PathBuf::from("/store/acme/widget/main.dmg")),
+            (
+                "build-source-extents",
+                PathBuf::from("/store/acme/widget/build/live.dmg"),
+            ),
+            (
+                "build-seed-extents",
+                PathBuf::from("/store/acme/widget/build/seed.dmg"),
+            ),
+        ] {
+            let under =
+                image_extents_finding(&workspace, code, image.clone(), ExtentCount::new(7_140));
+            assert_eq!(under.code, code);
+            assert_eq!(under.severity, FindingSeverity::Info);
+            assert_eq!(under.hint, "");
+            assert!(under.message.contains("7140 extents"), "{}", under.message);
+            assert!(
+                under.message.contains("Cause unattributed"),
+                "{}",
+                under.message
+            );
+            let over =
+                image_extents_finding(&workspace, code, image.clone(), ExtentCount::new(7_141));
+            assert_eq!(over.severity, FindingSeverity::Warning);
+            assert_eq!(over.hint, "cowshed defrag main");
+            assert_eq!(over.path, Some(image.clone()));
+            let unknown =
+                image_extents_unread(&workspace, code, image, "generation changed".into());
+            assert_eq!(unknown.severity, FindingSeverity::Warning);
+            assert!(unknown.message.contains("unknown"));
+        }
+        assert_eq!(ExtentCount::FIRST_WRITE_NANOS_PER_EXTENT, 12_000);
         assert!(
-            measured.message.contains("25.3s"),
-            "the 2.11M-extent main that took 25.7 s predicts about that: {}",
-            measured.message
+            ExtentCount::new(7_140).observed_first_write_cost() < std::time::Duration::from_secs(1)
+        );
+        assert!(
+            ExtentCount::new(7_141).observed_first_write_cost() > std::time::Duration::from_secs(1)
         );
     }
 

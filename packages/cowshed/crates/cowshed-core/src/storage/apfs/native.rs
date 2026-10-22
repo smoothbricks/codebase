@@ -53,7 +53,8 @@ use super::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, COMPANION_SUFFIX, LockMode,
     MarkerExpectation, MetadataPolicy, PendingAdoption, PendingPublicationFact, PublicationError,
     ResumableClone, companion_path, extents, layout, main_aware_mount_point,
-    recovery_staging_mount, retired_image_below, split_retired_stem, volume_key,
+    recovery_staging_mount, releasing_image_below, retired_image_below, split_retired_stem,
+    volume_key,
 };
 use cowshed_os::timing::timed;
 use image_telemetry::{Image, ImageTelemetry};
@@ -2211,12 +2212,10 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
 
     /// The retirement a trash image records, or `None` when its grants sidecar is gone.
     ///
-    /// The sidecar is the retirement's record, and cowshed's own reclaim removes it last, after
-    /// the image. An image that outlived its sidecar was therefore reclaimed by hand or half-way
-    /// by something else: its record is already gone, and only the bytes remain for
-    /// [`Self::reclaim_recordless_bytes`]. Retirement links the record into the trash before the
-    /// image rename that commits it (`retire_image`), so no retirement ever leaves a trash image
-    /// without its record. A record whose trash image is absent is either a reclaim that already
+    /// A missing sidecar is missing authority, never proof that the image is disposable.
+    /// Retirement links the record before its image rename; external deletion of that record
+    /// must not authorize deletion of potentially only-copy source bytes.
+    /// A record whose trash image is absent is either a reclaim that already
     /// deleted the image or a retirement prepared but not committed; the latter's canonical name
     /// still exists, so its cleanup scope is `Foreign` and reaches no further than its own links.
     fn retired_authority(
@@ -2253,23 +2252,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
         let revision = Revision::new(workspace.revision().get().saturating_add(1));
         Ok(Some(RetiredRef::new(workspace, revision)))
-    }
-
-    /// Reclaims the bytes of a trash image whose retirement record is already gone (see
-    /// [`Self::retired_authority`]). Retirement writes its record before its image (see
-    /// `retire_image`), so a recordless trash image is never one mid-retirement. Without the
-    /// record nothing names the workspace's checkpoints or mountpoint; those stay for the orphan
-    /// sweeps. Said on stderr and in the deletion log, never silent.
-    fn reclaim_recordless_bytes(&self, trash_image: &Path) -> Result<(), ApfsStorageError>
-    where
-        R: CommandRunner + Send + Sync + 'static,
-    {
-        cowshed_os::eprintln!(
-            "cowshed: retired image {} has no grants sidecar; its retirement record was already \
-         reclaimed, so its remaining bytes are reclaimed too",
-            trash_image.display()
-        );
-        self.reclaim_image(trash_image)
     }
 
     fn retired_name_scope(
@@ -2687,7 +2669,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             // The caller's own retirement names the trash path, so it still authorizes the
             // workspace-scoped cleanup the missing record would have.
             (None, Some(expected)) => expected.clone(),
-            (None, None) => return self.reclaim_recordless_bytes(trash_image).map(|()| None),
+            (None, None) => {
+                return Err(ApfsStorageError::Host(format!(
+                    "retaining recovery image {}: grants sidecar is missing; recover its metadata or contents before explicit retirement",
+                    trash_image.display()
+                )));
+            }
         };
         // Recomputed per entry instead of carried in the plan, because `reclaim_retired` runs this
         // with no plan at all. A scope only ever widens as siblings are collected, so an entry that
@@ -2700,7 +2687,20 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             authority.workspace(),
             owners.get(authority.workspace().name()),
         )?;
-        let cleanup = self.retired_cleanup_artifacts(project, &authority, trash_image, scope)?;
+        self.reclaim_workspace_artifacts(project, &authority, trash_image, scope)
+    }
+
+    fn reclaim_workspace_artifacts(
+        &self,
+        project: &Path,
+        authority: &RetiredRef,
+        trash_image: &Path,
+        scope: NameScope,
+    ) -> Result<Option<RootHeldMountpoint>, ApfsStorageError>
+    where
+        R: CommandRunner + Send + Sync + 'static,
+    {
+        let cleanup = self.retired_cleanup_artifacts(project, authority, trash_image, scope)?;
         for image in cleanup.checkpoint_images {
             self.reclaim_image(&image)?;
         }
@@ -2805,8 +2805,52 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             }
             None => None,
         };
+        self.release_retired_image(project, authority, trash_image)?;
         self.reclaim_image(trash_image)?;
         Ok(retained)
+    }
+
+    /// Free `image`, the retired workspace's canonical or trashed image, through the project's
+    /// release journal (02_workspaces.md, `rm` step 5): one rename to
+    /// `sessions/.releasing/<ws>-<incarnation>.dmg` commits it, so nothing mounts, forks or reads
+    /// it again, then it is freed in bounded steps and unlinked before this returns. Its CA
+    /// companion, facts and grants sidecar stay for [`ApfsExecutionHost::reclaim_image`] to remove
+    /// after it: the record goes only once the bytes are gone. A crash after the rename leaves the
+    /// entry for [`ApfsExecutionHost::recover_pending`] or the daemon's start to finish.
+    fn release_retired_image(
+        &self,
+        project: &Path,
+        authority: &RetiredRef,
+        image: &Path,
+    ) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(image)?;
+        let workspace = authority.workspace();
+        let entry = releasing_image_below(
+            &project.join(SESSIONS_DIRECTORY),
+            workspace.name(),
+            workspace.incarnation(),
+        );
+        let released = self.image_telemetry.measure(
+            "retire",
+            &[Image {
+                role: "image",
+                before: image,
+                after: image,
+            }],
+            || {
+                super::release::release_owned(image, &entry)
+                    .map_err(|error| io_error("release a retired workspace image", image, error))
+            },
+        )?;
+        if released {
+            deletion_log::log_deletion_for_image(
+                image,
+                DeletionOp::ReclaimImage,
+                DeletionKind::Image,
+                image,
+            );
+        }
+        Ok(())
     }
 
     fn retired_trash_images(&self, trash: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
@@ -3016,9 +3060,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         named_mountpoints.insert(WorkspaceName::main().as_str().to_owned());
         for path in trash_images {
             let Some(retired) = self.retired_authority(project, repo, &path)? else {
-                // The record is gone and only bytes remain. They are reclaimed under the lock of
-                // the name the file carries, which every lifecycle verb on that name holds; a name
-                // that cannot be read cannot be locked.
+                // Missing authority is not evidence that these bytes are held elsewhere.
                 let Some((name, _)) = path
                     .file_stem()
                     .and_then(|stem| stem.to_str())
@@ -3030,16 +3072,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     );
                     continue;
                 };
-                examined = examined
-                    .checked_add(1)
-                    .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
-                lock_paths.push(super::workspace_lock_path(&self.config, repo, &name)?);
-                candidates.push(gc_candidate(
-                    StorageGcReason::RetiredWorkspace,
+                named_mountpoints.insert(name.as_str().to_owned());
+                claimed_checkpoint_names.insert(name);
+                warn_session_image_issue(
                     &path,
-                    &image_gc_paths(&path),
-                    &[],
-                )?);
+                    "recovery image has no grants sidecar; retained, not garbage: recover its metadata or contents deliberately",
+                );
                 continue;
             };
             named_mountpoints.insert(retired.workspace().name().as_str().to_owned());
@@ -3054,6 +3092,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             #[cfg(target_os = "macos")]
             if let Some(RetiredMountpoint::RootHeld(held)) = &cleanup.mount_point {
                 root_held_mountpoints.push(RootHeldMountpoint::Pending(held.path.clone()));
+            }
+            if path_exists(&path)? {
+                // Recovery trash can be the only copy of dirty or ignored bytes. Even
+                // --abandoned authorizes bundles, not destruction of an image's work.
+                continue;
             }
             let artifacts = cleanup.paths;
             examined = examined
@@ -4388,6 +4431,20 @@ where
             .clone_image(source, destination, cowshed_apfs::ImageCapture::Live)
             .map_err(ApfsError::from)
             .map_err(ApfsStorageError::from)
+    }
+
+    fn require_forkable_image(
+        &self,
+        image: &Path,
+        mount: Option<&Path>,
+    ) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(image)?;
+        crate::metadata::validate_image_path(image)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        if mount.is_some() {
+            self.backend.sync_for_freshness(image, mount)?;
+        }
+        extents::prove_forkable(image).map(|_| ())
     }
 
     /// Rewrite the image's first block with the bytes it holds: content-neutral, and the write
@@ -5751,6 +5808,36 @@ where
         )
     }
 
+    fn release_workspace(
+        &self,
+        config: &ApfsSubstrateConfig,
+        retired: &RetiredRef,
+    ) -> Result<(), ApfsStorageError> {
+        if config.store_root != self.config.store_root {
+            return Err(ApfsStorageError::InvalidPlan(
+                "workspace release config differs from host storage root",
+            ));
+        }
+        let workspace = retired.workspace();
+        let canonical = super::canonical_image_path(config, workspace)?;
+        self.verify_controller_path(&canonical)?;
+        let metadata = DetachedWorkspaceMetadata::read_for_image(&canonical)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        if metadata_workspace_ref(&metadata)? != *workspace {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "workspace release identity changed: {}",
+                canonical.display()
+            )));
+        }
+        self.validate_staged_companion(&companion_path(&canonical))?;
+        let project = layout(config, workspace.repo())?
+            .project()
+            .project_root
+            .clone();
+        self.reclaim_workspace_artifacts(&project, retired, &canonical, NameScope::Owned)?;
+        Ok(())
+    }
+
     fn reclaim_image(&self, image: &Path) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(image)?;
         match fs::symlink_metadata(image) {
@@ -5762,6 +5849,8 @@ where
                     DeletionKind::Image,
                     image,
                 );
+                // Physical deletion must be durable before its ownership metadata disappears.
+                sync_parent_path(image)?;
             }
             Ok(_) => {
                 return Err(ApfsStorageError::Host(format!(
@@ -5832,42 +5921,6 @@ where
             return Ok(());
         }
         self.reclaim_retired_authority(&project, retired.workspace().repo(), &trash, Some(retired))
-            .map(|_| ())
-    }
-
-    fn reclaim_unrecorded_retired(
-        &self,
-        config: &ApfsSubstrateConfig,
-        repo: &RepoId,
-        image: &Path,
-    ) -> Result<(), ApfsStorageError> {
-        if config.store_root != self.config.store_root {
-            return Err(ApfsStorageError::InvalidPlan(
-                "retired cleanup config differs from host storage root",
-            ));
-        }
-        let project = layout(config, repo)?.project().project_root.clone();
-        if image.parent()
-            != Some(
-                project
-                    .join(SESSIONS_DIRECTORY)
-                    .join(super::TRASH_NAMESPACE)
-                    .as_path(),
-            )
-        {
-            return Err(ApfsStorageError::InvalidPlan(
-                "unrecorded retired image is not in its project's trash",
-            ));
-        }
-        if !image
-            .try_exists()
-            .map_err(|error| io_error("inspect retired image", image, error))?
-        {
-            return Ok(());
-        }
-        // Under the name's lock the trash says what it is: a sidecar that appeared since the
-        // plan was taken is a record, and it now authorizes the full reclaim.
-        self.reclaim_retired_authority(&project, repo, image, None)
             .map(|_| ())
     }
 
@@ -5947,6 +6000,19 @@ where
             .projects(&config.store_root)?;
         for (project, workspaces) in projects {
             let sessions = project.join(SESSIONS_DIRECTORY);
+            // Image releases a crash cut short after their commit are nobody's any more: finished
+            // before a canonical sidecar their rename left imageless is read below.
+            let journal = sessions.join(super::release::JOURNAL_DIRECTORY);
+            super::release::drain(&journal, super::is_releasing_image_name, |name| {
+                // A confined pass finishes only its own workspaces' releases, as it does their
+                // stages: a sibling's entry is neither read nor waited for.
+                workspaces.as_ref().is_none_or(|workspaces| {
+                    name.strip_suffix(&format!(".{IMAGE_EXTENSION}"))
+                        .and_then(split_retired_stem)
+                        .is_some_and(|(workspace, _)| workspaces.contains(&workspace))
+                })
+            })
+            .map_err(|error| io_error("finish committed image releases", &journal, error))?;
             for directory in [project.as_path(), sessions.as_path()] {
                 for canonical_sidecar in
                     canonical_recovery_sidecars(directory, &project, workspaces.as_ref())?

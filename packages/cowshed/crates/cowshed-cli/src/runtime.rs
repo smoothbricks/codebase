@@ -373,6 +373,8 @@ fn binds_re_adoption_primary(command: &Command, resuming_re_adoption: bool) -> b
 /// never mutates: its open finishes nothing and it reports what another open would finish; only
 /// `doctor --repair` opens the way other mutating verbs do. `reseed` inspects too: its operation
 /// must refuse unfinished create/fork/adopt work, never finish it before making that decision.
+/// `defrag` likewise opens without replay: it must be able to rewrite a pending clone whose
+/// physical-generation extent gate is the reason publication cannot finish.
 fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
     fn named<'a>(names: impl IntoIterator<Item = Option<&'a str>>) -> RecoveryScope {
         RecoveryScope::Workspaces(
@@ -389,7 +391,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
             .map_err(|error| usage(error.to_string(), "use a valid workspace name"))?,
         Command::Gc(_) => RecoveryScope::Store,
         Command::Doctor(args) if !args.repair => RecoveryScope::Inspect,
-        Command::Reseed(_) => RecoveryScope::Inspect,
+        Command::Reseed(_) | Command::Defrag(_) => RecoveryScope::Inspect,
         Command::Fork(args) => named([args.source.as_deref(), Some(args.destination.as_str())]),
         Command::Move(args) => match &args.destination {
             MoveDestination::Workspace(destination) => {
@@ -410,7 +412,6 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
             GrantTarget::Project => named([]),
         },
         Command::Resize(args) => named([Some(args.workspace.as_str())]),
-        Command::Defrag(args) => named([Some(args.workspace.as_str())]),
         Command::Rekey(args) => named([Some(args.workspace.as_str())]),
         Command::Land(args) => named([Some(args.workspace.as_str())]),
         Command::Checkpoint(args) => named([args.workspace.as_deref()]),
@@ -3738,8 +3739,8 @@ const fn gc_reason(reason: GcReason) -> &'static str {
         }
         GcReason::UnlinkedBuildVolume => "build volume no checkout links",
         GcReason::SupersededSeed => "seed superseded by its target's latest, or its target retired",
-        GcReason::UnrecordedBuildVolume => {
-            "build volume an interrupted creation left without its record"
+        GcReason::InterruptedBuildVolume => {
+            "build volume an interrupted creation registered and never finished"
         }
     }
 }
@@ -7795,6 +7796,7 @@ mod tests {
         for argv in [
             &["reseed", "raven"][..],
             &["reseed", "raven", "--from", "lane", "--dry-run"],
+            &["defrag", "raven"],
         ] {
             assert_eq!(scope(argv).unwrap(), RecoveryScope::Inspect);
         }

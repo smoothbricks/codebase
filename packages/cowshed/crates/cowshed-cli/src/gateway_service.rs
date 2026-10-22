@@ -1403,32 +1403,31 @@ async fn refuse_restart_while_busy(
     }
 }
 
-/// How often the daemon empties the store's build-volume trash, so an image a release moved
-/// there waits at most this long, plus the deletions queued before it.
-const BUILD_VOLUME_TRASH_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Empty every project's build-volume trash now and then every [`BUILD_VOLUME_TRASH_INTERVAL`]
-/// for as long as the daemon runs, on a thread of its own (16_build_volumes.md, "Garbage
-/// collection"): a release only renames an image into the trash, and this is what frees it, in
-/// bounded steps at normal disk priority, so no free stalls the store's container and an
-/// interrupted one resumes from the image's length. With no daemon running, the next daemon
-/// start empties it, and so does `cowshed gc`.
-fn empty_build_volume_trash_from_now_on(store: PathBuf) {
+/// Finish, once, at the daemon's start, on a thread of its own, every image release no process
+/// owns any more (16_build_volumes.md, "Garbage collection"; 02_workspaces.md, `rm` step 5):
+/// each project's `build/.releasing` and `sessions/.releasing` entries a crash cut short after
+/// their operation committed them, and the `build/.trash` earlier builds renamed images into. No
+/// release of this build leaves either behind, so one pass at the start leaves nothing. Each image
+/// is released in bounded steps at normal disk priority, so no free stalls the store's container,
+/// and an interrupted release resumes from the image's length. A project's next open and `cowshed
+/// gc` finish its own the same way.
+fn finish_interrupted_releases(store: PathBuf) {
     let started = std::thread::Builder::new()
-        .name("build-volume-trash".to_owned())
+        .name("image-release-recovery".to_owned())
         .spawn(move || {
-            loop {
-                let emptied = cowshed_core::build_volume::empty_store_trash(&store);
-                if emptied.images > 0 {
-                    cowshed_os::eprintln!("cowshed: deleted {} released build volume image(s), {} bytes, from the trash",
-                    emptied.images, emptied.bytes);
-                }
-                std::thread::sleep(BUILD_VOLUME_TRASH_INTERVAL);
+            let mut drained = cowshed_core::build_volume::drain_store_released(&store);
+            drained.add(cowshed_core::storage::apfs::drain_store_session_releases(&store));
+            if drained.images > 0 {
+                cowshed_os::eprintln!(
+                    "cowshed: finished releasing {} image(s), {} bytes, that an interrupted operation or an earlier build left",
+                    drained.images,
+                    drained.bytes
+                );
             }
         });
     if let Err(error) = started {
         cowshed_os::eprintln!(
-            "cowshed: build-volume trash is not emptied while this daemon runs ({error}); `cowshed gc` empties it"
+            "cowshed: interrupted image releases are not finished by this daemon ({error}); each project's next open and `cowshed gc` finish them"
         );
     }
 }
@@ -1549,7 +1548,7 @@ async fn run_daemon() -> Result<()> {
     // Detached and concurrent: each recovery reports its own span, status counts what is left,
     // and nothing below waits for it.
     drop(recovery.start(Arc::new(SocketPeers)));
-    empty_build_volume_trash_from_now_on(store_root.clone());
+    finish_interrupted_releases(store_root.clone());
     reap_scratch_from_now_on(store_root.clone());
     let handle = OwnedGateway::new(gateway.handle());
     let started = async {

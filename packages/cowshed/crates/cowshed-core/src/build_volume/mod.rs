@@ -35,6 +35,7 @@ use crate::capabilities::BuildStatePath;
 use crate::metadata::{MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json};
 use crate::repository::ProjectPaths;
 use crate::storage::StorageLayoutError;
+use crate::storage::apfs::release::Drained;
 use cowshed_apfs::image::IMAGE_EXTENSION;
 use cowshed_os::fork_lock::Fenced;
 
@@ -109,14 +110,21 @@ impl<'de> Deserialize<'de> for BuildVolumeId {
     }
 }
 
-/// What a build volume is to the project.
+/// What a build volume is to the project. Every role names the workspace that owns the volume,
+/// so no record ever describes an image nobody answers for.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum BuildVolumeRole {
     /// The live volume of `checkout`, which links it.
     Linked { checkout: WorkspaceName },
-    /// A live volume no checkout took over: its checkout retired, or a target adopted another.
-    Unlinked,
+    /// The live volume `owner` at `incarnation` linked until an adoption or a reseed moved its
+    /// link onto a replacement. It stays `owner`'s: a job admitted on it before the move holds
+    /// it, and it is retired only by a release that deleted it (16_build_volumes.md, "Garbage
+    /// collection"). A release that is refused or fails leaves this record as it is.
+    Superseded {
+        owner: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+    },
     /// The latest seed of the target `target` at `incarnation`: frozen, never mounted, never
     /// written; only cloned.
     Seed {
@@ -125,7 +133,59 @@ pub enum BuildVolumeRole {
     },
 }
 
-/// The record beside a build volume's image.
+impl BuildVolumeRole {
+    /// The workspace that owns the volume: the checkout that links it, the workspace whose link
+    /// moved off it, or the target whose seed it is.
+    pub fn owner(&self) -> &WorkspaceName {
+        match self {
+            Self::Linked { checkout } => checkout,
+            Self::Superseded { owner, .. } => owner,
+            Self::Seed { target, .. } => target,
+        }
+    }
+}
+
+/// Who answers for a build volume registered before its image held what its role promises
+/// ([`BuildVolumeStage::Registered`]): the authority that finishes the volume or releases it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum Registrant {
+    /// The existing workspace the role names, at `incarnation`: its first touch, a reseed of
+    /// it, its refork, or a capture of its seed. Another incarnation of the same name is another
+    /// workspace and never finishes this volume.
+    Workspace { incarnation: WorkspaceIncarnation },
+    /// The unfinished create, fork, adopt or re-adopt the lifecycle intent journal records for
+    /// the workspace the role names, which has no incarnation until that verb publishes it. Its
+    /// authority is exact, never the workspace's name, which a later verb may reuse: the live
+    /// creator's hold on this id, which keeps every release off it until the creator publishes
+    /// it or dies, or, for a re-adoption, this id in its own journaled record. Without either it
+    /// is an interrupted creation, released by its id.
+    Intent,
+}
+
+/// Whether a build volume's image holds what its record's role promises.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum BuildVolumeStage {
+    /// Registered to its owner before any byte of its image existed, and not yet finished: the
+    /// image may be absent, partial, unmarked or not yet linked. Never a seed anyone forks from.
+    /// Only `by` finishes it; once `by` is gone it is an interrupted creation, which collection
+    /// releases by its exact id (16_build_volumes.md, "Garbage collection").
+    Registered { by: Registrant },
+    /// The image holds what the role promises.
+    #[default]
+    Published,
+}
+
+impl BuildVolumeStage {
+    pub fn is_published(&self) -> bool {
+        matches!(self, Self::Published)
+    }
+}
+
+/// The record beside a build volume's image. It is written before the image exists
+/// ([`BuildVolumeLayout::register`]) and removed only once the image is gone, so every build
+/// image in the images directory has a record naming its owner.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BuildVolumeRecord {
@@ -142,6 +202,8 @@ pub struct BuildVolumeRecord {
     /// placement at no tree cowshed knows (16_build_volumes.md, "Which volume a seed holds").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked_out: Option<GitOid>,
+    #[serde(default, skip_serializing_if = "BuildVolumeStage::is_published")]
+    pub stage: BuildVolumeStage,
 }
 
 impl BuildVolumeRecord {
@@ -152,12 +214,58 @@ impl BuildVolumeRecord {
             role,
             created_at: crate::storage::deletion_log::rfc3339_utc(std::time::SystemTime::now()),
             checked_out: None,
+            stage: BuildVolumeStage::Published,
         }
     }
 
+    pub fn is_published(&self) -> bool {
+        self.stage.is_published()
+    }
+
+    /// A published seed of `target` at `incarnation`: a registered one may still be forming.
     pub fn is_seed_of(&self, target: &WorkspaceName, incarnation: &WorkspaceIncarnation) -> bool {
-        matches!(&self.role, BuildVolumeRole::Seed { target: seeded, incarnation: at }
+        self.is_published()
+            && matches!(&self.role, BuildVolumeRole::Seed { target: seeded, incarnation: at }
             if seeded == target && at == incarnation)
+    }
+}
+
+/// A build volume's owner record before its image exists: what every operation that writes a
+/// build image takes, so no image-writing API can make bytes nobody owns. The registering
+/// operation writes [`Self::registered`] ([`BuildVolumeLayout::register`]), makes the image, and
+/// writes [`Self::published`] once the image holds what the role promises
+/// ([`BuildVolumeLayout::publish`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Registration {
+    registered: BuildVolumeRecord,
+}
+
+impl Registration {
+    /// `record`, registered by `by`; its stage is `by`'s, whatever `record` said.
+    pub fn new(record: BuildVolumeRecord, by: Registrant) -> Self {
+        Self {
+            registered: BuildVolumeRecord {
+                stage: BuildVolumeStage::Registered { by },
+                ..record
+            },
+        }
+    }
+
+    pub fn role(&self) -> &BuildVolumeRole {
+        &self.registered.role
+    }
+
+    /// The record written before the image exists.
+    pub fn registered(&self) -> &BuildVolumeRecord {
+        &self.registered
+    }
+
+    /// The record written once the image holds what the role promises.
+    pub fn published(&self) -> BuildVolumeRecord {
+        BuildVolumeRecord {
+            stage: BuildVolumeStage::Published,
+            ..self.registered.clone()
+        }
     }
 }
 
@@ -562,11 +670,12 @@ impl BuildVolumeLayout {
     }
 
     /// Journal a release of volume `id` in the project's deletion log (16_build_volumes.md,
-    /// "Garbage collection"), naming the workspace its sidecar `recorded` (the checkout that linked
-    /// it, the target whose seed it was), or nobody for one recorded unlinked or with no readable
-    /// sidecar. A release that deleted the image writes `release-build-volume` for the image; one
-    /// that found the image already gone and deleted the record writes
-    /// `release-imageless-build-volume` for the record, naming the missing image.
+    /// "Garbage collection"), naming the workspace its sidecar `recorded` as its owner (the
+    /// checkout that linked it, the workspace whose link moved off it, the target whose seed it
+    /// was), or nobody when no sidecar was there. A release that deleted the image writes
+    /// `release-build-volume` for the image; one that found the image already gone and deleted
+    /// the record writes `release-imageless-build-volume` for the record, naming the missing
+    /// image.
     pub(crate) fn journal_release(
         &self,
         id: &BuildVolumeId,
@@ -578,10 +687,11 @@ impl BuildVolumeLayout {
             Some(BuildVolumeRole::Seed { target, .. }) => {
                 (DeletionKind::BuildSeed, target.as_str())
             }
-            Some(BuildVolumeRole::Linked { checkout }) => {
-                (DeletionKind::BuildVolume, checkout.as_str())
+            Some(BuildVolumeRole::Linked { checkout: owner })
+            | Some(BuildVolumeRole::Superseded { owner, .. }) => {
+                (DeletionKind::BuildVolume, owner.as_str())
             }
-            Some(BuildVolumeRole::Unlinked) | None => (DeletionKind::BuildVolume, ""),
+            None => (DeletionKind::BuildVolume, ""),
         };
         let image = self.image(id);
         let (op, artifact) = if image_deleted {
@@ -604,34 +714,31 @@ impl BuildVolumeLayout {
         self.images.join(format!("{id}.{IMAGE_EXTENSION}"))
     }
 
-    /// The project's build-volume trash: released images waiting to be deleted
-    /// ([`empty_trash`]).
+    /// Historical build-volume trash: releases earlier builds committed by renaming their images
+    /// there, finished by the daemon's start and by `gc` ([`drain_released`]). No release of
+    /// this build moves an image there.
     pub fn trash(&self) -> PathBuf {
         self.images.join(TRASH_DIRECTORY)
     }
 
-    /// Where `id`'s image goes when it is released ([`Self::trash_image`]).
-    pub fn trashed_image(&self, id: &BuildVolumeId) -> PathBuf {
-        self.trash().join(format!("{id}.{IMAGE_EXTENSION}"))
+    /// The journal of the releases committed in this project's images directory and not yet
+    /// finished, `build/.releasing` ([`crate::storage::apfs::release::JOURNAL_DIRECTORY`]).
+    pub fn releasing(&self) -> PathBuf {
+        self.images
+            .join(crate::storage::apfs::release::JOURNAL_DIRECTORY)
     }
 
-    /// Move `id`'s image into the trash, if it is there: `true` when it was. One `rename(2)` on
-    /// the images directory's own volume, which never copies: a rename the kernel refuses across
-    /// volumes (`EXDEV`) is returned as the error it is, never redone as a copy. The canonical
-    /// image is gone once this returns, which is what a release promises a later hold.
-    pub fn trash_image(&self, id: &BuildVolumeId) -> io::Result<bool> {
-        use std::os::unix::fs::DirBuilderExt as _;
-        let trash = self.trash();
-        match fs::DirBuilder::new().mode(0o700).create(&trash) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-        match fs::rename(self.image(id), self.trashed_image(id)) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error),
-        }
+    /// Release `id`'s detached image inside the operation that retires or replaces it, and say
+    /// whether an image was there (16_build_volumes.md, "Garbage collection"): one rename into
+    /// [`Self::releasing`] commits it, then it is freed in bounded steps and unlinked, all
+    /// before this returns, so the caller removes the owner record only once the bytes are gone.
+    /// A failure before the rename leaves the image and record for the same operation's retry;
+    /// one after it leaves the journal entry for recovery.
+    pub fn release_image(&self, id: &BuildVolumeId) -> io::Result<bool> {
+        crate::storage::apfs::release::release_owned(
+            &self.image(id),
+            &self.releasing().join(format!("{id}.{IMAGE_EXTENSION}")),
+        )
     }
 
     pub fn record(&self, id: &BuildVolumeId) -> PathBuf {
@@ -708,11 +815,10 @@ impl BuildVolumeLayout {
         ))
     }
 
-    /// Hold `id` for the operation creating it, before its image exists: a clone holds the
-    /// volume it makes until its record is written, so no collection that listed the image in
-    /// between releases it as an interrupted creation. Nothing claims an id before its image
-    /// exists, so the lock is never contended; one that is refuses as
-    /// [`io::ErrorKind::ResourceBusy`].
+    /// Hold `id` for the operation creating it, before its image exists
+    /// ([`Self::register`]): no collection that listed its registered record releases it while
+    /// the creation runs. Nothing claims an id before its image exists, so the lock is never
+    /// contended; one that is refuses as [`io::ErrorKind::ResourceBusy`].
     pub fn hold_new(&self, id: &BuildVolumeId) -> io::Result<BuildVolumeHold> {
         let file = open_hold(&self.hold_path(id))?;
         match file.try_lock_shared() {
@@ -854,8 +960,8 @@ impl BuildVolumeLayout {
         })
     }
 
-    /// The record of `id`, or `None` when it has none (an unpublished creation). Every other
-    /// failure to read it is an error: an unreadable record says nothing about the volume.
+    /// The record of `id`, or `None` when it has none. Every other failure to read it is an
+    /// error: an unreadable record says nothing about the volume.
     pub fn read_record_present(
         &self,
         id: &BuildVolumeId,
@@ -881,6 +987,94 @@ impl BuildVolumeLayout {
     ) -> crate::Result<()> {
         let path = self.record(id);
         write_json(&path, record).map_err(|error| record_error(&path, &error))
+    }
+
+    /// Register `id` to `registration`'s owner before any byte of its image exists
+    /// (16_build_volumes.md, "Garbage collection"): hold it as its creation, then durably write
+    /// its registered record. The answered hold keeps every release off the volume until the
+    /// creator drops it; a creator that dies leaves the record naming its owner and registrant,
+    /// which is how a later pass finds the interrupted creation by its exact id, never by
+    /// scanning for images nobody owns. An image already at `id` refuses: its bytes would predate
+    /// their registration. A record already there refuses unless it is this registration, which
+    /// a journaled replay (re-adoption) writes again.
+    pub fn register(
+        &self,
+        id: &BuildVolumeId,
+        registration: &Registration,
+    ) -> crate::Result<BuildVolumeHold> {
+        self.require_imageless(id)?;
+        let hold = self.hold_new(id).map_err(|error| {
+            io_error(
+                "hold a build volume while it is created",
+                &self.hold_path(id),
+                &error,
+            )
+        })?;
+        self.write_registration(id, registration)?;
+        Ok(hold)
+    }
+
+    /// [`Self::register`] under the caller's exclusive claim on `claim.id()`, which keeps every
+    /// hold and release off the volume as a creation's own hold would, and which a second hold
+    /// would only collide with: a re-adoption replays its build volume's registration under the
+    /// claim it took on that id.
+    pub fn register_claimed(
+        &self,
+        claim: &ReleaseClaim,
+        registration: &Registration,
+    ) -> crate::Result<()> {
+        self.require_imageless(claim.id())?;
+        self.write_registration(claim.id(), registration)
+    }
+
+    /// Refuse an image already at `id`, whose bytes would predate their registration, and make
+    /// the project's images directory: its first registration comes before any image exists.
+    fn require_imageless(&self, id: &BuildVolumeId) -> crate::Result<()> {
+        let image = self.image(id);
+        match fs::symlink_metadata(&image) {
+            Ok(_) => {
+                return Err(crate::CowshedError::integrity(
+                    format!(
+                        "build volume {id} cannot be registered: {} already exists, so its bytes would predate their owner",
+                        image.display()
+                    ),
+                    "cowshed doctor --json",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("inspect a build volume image", &image, &error)),
+        }
+        fs::create_dir_all(&self.images)
+            .map_err(|error| io_error("create the build images directory", &self.images, &error))
+    }
+
+    /// Write `registration`'s registered record for `id`, or accept the same one a replay wrote
+    /// before; any other record refuses.
+    fn write_registration(
+        &self,
+        id: &BuildVolumeId,
+        registration: &Registration,
+    ) -> crate::Result<()> {
+        match self.read_record_present(id)? {
+            None => self.write_record(id, registration.registered())?,
+            Some(found) if &found == registration.registered() => {}
+            Some(found) => {
+                return Err(crate::CowshedError::integrity(
+                    format!(
+                        "build volume {id} cannot be registered to {}: its record already names {:?}",
+                        registration.role().owner(),
+                        found.role
+                    ),
+                    "cowshed doctor --json",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish `id`: its image now holds what `registration`'s role promises.
+    pub fn publish(&self, id: &BuildVolumeId, registration: &Registration) -> crate::Result<()> {
+        self.write_record(id, &registration.published())
     }
 
     /// Every published build volume: each `<id>.dmg` directly in the images directory.
@@ -933,8 +1127,8 @@ impl BuildVolumeLayout {
 
     /// The volume `checkout`'s build link should name, given that it names `linked`
     /// (16_build_volumes.md, "One link per checkout"). The link is kept when its volume is
-    /// recorded as linked by `checkout`, or has no record yet (a migration or fork in progress,
-    /// whose record is written last). Otherwise the link is stale: a restored checkpoint carries
+    /// recorded as `checkout`'s, published or still registered (a first touch the link already
+    /// names, which the next refresh finishes). Otherwise the link is stale: a restored checkpoint carries
     /// the link it had when taken, and an interrupted land can leave a target naming the
     /// landing volume before its record moved. It is then re-pointed at the one volume recorded
     /// as `checkout`'s. When `checkout` owns none and `linked` is another checkout's live
@@ -949,16 +1143,27 @@ impl BuildVolumeLayout {
         linked: &BuildVolumeId,
     ) -> crate::Result<LinkResolution> {
         let owns = |record: &BuildVolumeRecord| matches!(&record.role, BuildVolumeRole::Linked { checkout: owner } if owner == checkout);
-        // A creation makes the image before anything links it and a release deletes the image
-        // first, so a link to a missing image names a volume that no longer exists: its record,
-        // when one is left, speaks for nothing.
+        // A creation registers its record before the image exists and a release deletes the
+        // image first, so a link to a missing image names a volume that no longer exists: its
+        // record, when one is left, speaks for nothing.
         let vanished = !self.image(linked).exists();
         let adopter = match self.read_record_present(linked)? {
             _ if vanished => None,
             Some(record) if owns(&record) => return Ok(LinkResolution::Keep),
-            None => return Ok(LinkResolution::Keep),
+            None => {
+                return Err(crate::CowshedError::integrity(
+                    format!(
+                        "{checkout}'s build link names build volume {linked}, whose image {} has no owner record: it was made outside owner registration, so nothing proves whose it is",
+                        self.image(linked).display()
+                    ),
+                    format!(
+                        "remove {checkout}'s {BUILD_LINK} link so its next build-state refresh makes a registered volume; `cowshed gc --dry-run` names the unregistered image"
+                    ),
+                ));
+            }
             Some(BuildVolumeRecord {
                 role: BuildVolumeRole::Linked { checkout: adopter },
+                stage: BuildVolumeStage::Published,
                 ..
             }) => Some(adopter),
             Some(_) => None,
@@ -966,13 +1171,16 @@ impl BuildVolumeLayout {
         let mut owned = Vec::new();
         let mut adopter_seeds = Vec::new();
         for id in self.list()? {
+            // Only a finished volume is someone's to mount or fork from: a registered one may
+            // still be forming, or be an interrupted creation collection releases.
             match self.read_record_present(&id)? {
-                Some(record) if owns(&record) => owned.push(id),
-                Some(BuildVolumeRecord {
-                    role: BuildVolumeRole::Seed { target, .. },
-                    created_at,
-                    ..
-                }) if adopter.as_ref() == Some(&target) => adopter_seeds.push((created_at, id)),
+                Some(record) if record.is_published() && owns(&record) => owned.push(id),
+                Some(record)
+                    if record.is_published()
+                        && matches!(&record.role, BuildVolumeRole::Seed { target, .. } if adopter.as_ref() == Some(target)) =>
+                {
+                    adopter_seeds.push((record.created_at, id));
+                }
                 _ => {}
             }
         }
@@ -1007,7 +1215,6 @@ impl BuildVolumeLayout {
     ) -> crate::Result<Option<(BuildVolumeId, BuildVolumeRecord)>> {
         let mut seeds = Vec::new();
         for id in self.list()? {
-            // An image without its record is an unpublished creation: never a seed.
             let Some(record) = self.read_record_present(&id)? else {
                 continue;
             };
@@ -1046,110 +1253,45 @@ impl ReleaseClaim {
     }
 }
 
-/// What emptying a build-volume trash deleted.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct EmptiedTrash {
-    pub images: usize,
-    /// The bytes those images held on disk, read when each release opened it.
-    pub bytes: u64,
-}
-
-/// Release every image in the build-volume trash at `trash` (`<project>/build/.trash`), one at
-/// a time on the calling thread, each in bounded steps at normal disk priority
-/// ([`crate::storage::apfs::release`]): no step frees more than
-/// [`STEP_EXTENTS`](crate::storage::apfs::release::STEP_EXTENTS) extents, so no deletion is one
-/// free of a whole extent tree that every other writer of the store's container waits behind. An
-/// image another process is releasing is left to it, and an image a crash left half-released is
-/// finished from its length. A trash that does not exist is empty. Only image files of the
-/// trash's own naming are released; anything else there is left and said.
+/// Finish every release committed in `directory`, a project's [`BuildVolumeLayout::releasing`]
+/// journal or its historical [`BuildVolumeLayout::trash`], one image at a time on the calling
+/// thread, each in bounded steps at normal disk priority ([`crate::storage::apfs::release`]): no
+/// step frees more than [`STEP_EXTENTS`](crate::storage::apfs::release::STEP_EXTENTS) extents,
+/// so no deletion is one free of a whole extent tree that every other writer of the store's
+/// container waits behind. An image another process is releasing is left to it, and an image a
+/// crash left half-released is finished from its length. A directory that does not exist is
+/// empty. Only `<id>.dmg` files are released; anything else there is left and said.
 ///
 /// Normal priority, not background (`IOPOL_THROTTLE`): measured 2026-10-22, a throttled thread
 /// freeing a 131,072-extent clone took 53 s against 7.6 s unthrottled, and the writers beside it
 /// waited 10.6 ms at the median instead of 0.2 ms; the installed gateway's throttled unlink did
 /// 1,213 throttled 4 KiB metadata reads at a 20 ms median in 21 s. A throttled free holds the
 /// container's work while its own reads wait, so it slows every writer instead of yielding.
-pub fn empty_trash(trash: &Path) -> io::Result<EmptiedTrash> {
-    use crate::storage::apfs::release::{Released, STEP_EXTENTS, release_file};
-
-    let entries = match fs::read_dir(trash) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(EmptiedTrash::default());
-        }
-        Err(error) => return Err(error),
-    };
-    let mut emptied = EmptiedTrash::default();
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let image = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.strip_suffix(&format!(".{IMAGE_EXTENSION}")))
-            .and_then(BuildVolumeId::parse)
-            .is_some();
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        if !image || !metadata.is_file() {
-            cowshed_os::eprintln!(
-                "cowshed: {} is not a trashed build-volume image; it is left",
-                path.display()
-            );
-            continue;
-        }
-        match release_file(&path, STEP_EXTENTS)? {
-            Released::Freed { bytes, .. } => {
-                emptied.images += 1;
-                emptied.bytes += bytes;
-            }
-            Released::Absent => {}
-            Released::Busy => cowshed_os::eprintln!(
-                "cowshed: trashed build-volume image {} is being released by another process; it is left to that release",
-                path.display()
-            ),
-        }
-    }
-    Ok(emptied)
+pub fn drain_released(directory: &Path) -> io::Result<Drained> {
+    crate::storage::apfs::release::drain(directory, is_image_name, |_| true)
 }
 
-/// [`empty_trash`] for every project in the store at `store`: `<store>/<owner>/<repo>/build/.trash`.
-/// The daemon runs this at its start and then on an interval, so a released image waits for at
-/// most one interval, and for the next daemon start when no daemon runs; `cowshed gc` empties its
-/// own project's trash too. A project whose trash cannot be emptied is said and skipped.
-pub fn empty_store_trash(store: &Path) -> EmptiedTrash {
-    let mut emptied = EmptiedTrash::default();
-    let owners = match fs::read_dir(store) {
-        Ok(owners) => owners,
-        Err(error) => {
-            cowshed_os::eprintln!(
-                "cowshed: cannot list the store {} for build-volume trash: {error}",
-                store.display()
-            );
-            return emptied;
-        }
-    };
-    for owner in owners.flatten() {
-        let Ok(repos) = fs::read_dir(owner.path()) else {
-            continue;
-        };
-        for repo in repos.flatten() {
-            let trash = repo.path().join(IMAGES_DIRECTORY).join(TRASH_DIRECTORY);
-            match empty_trash(&trash) {
-                Ok(project) => {
-                    emptied.images += project.images;
-                    emptied.bytes += project.bytes;
-                }
-                Err(error) => cowshed_os::eprintln!(
-                    "cowshed: cannot empty the build-volume trash {}: {error}",
-                    trash.display()
-                ),
-            }
-        }
-    }
-    emptied
+/// [`drain_released`] for every project in the store at `store`: each
+/// `<store>/<owner>/<repo>/build/.releasing` and historical `build/.trash`. The daemon runs this
+/// once at its start, the recovery of releases a crash cut short while no process owned them. A
+/// project whose directory cannot be drained is said and skipped.
+pub fn drain_store_released(store: &Path) -> Drained {
+    use crate::storage::apfs::release::{JOURNAL_DIRECTORY, drain_store};
+    let mut drained = drain_store(store, IMAGES_DIRECTORY, JOURNAL_DIRECTORY, is_image_name);
+    drained.add(drain_store(
+        store,
+        IMAGES_DIRECTORY,
+        TRASH_DIRECTORY,
+        is_image_name,
+    ));
+    drained
+}
+
+/// Whether `name` is a build image's file name, `<id>.dmg`.
+fn is_image_name(name: &str) -> bool {
+    name.strip_suffix(&format!(".{IMAGE_EXTENSION}"))
+        .and_then(BuildVolumeId::parse)
+        .is_some()
 }
 
 /// Open (creating) `path`, the lock file every hold and release claim of one volume shares,
@@ -1338,6 +1480,116 @@ mod tests {
                 checkout: WorkspaceName::new("topic").unwrap()
             }
         );
+        // A record written before stages existed is a published one, and a published record
+        // writes no stage, so it reads back unchanged everywhere.
+        assert!(linked.is_published());
+        assert!(!serde_json::to_string(&linked).unwrap().contains("stage"));
+
+        // A registration names its owner and its registrant before any image exists, and its
+        // published record is the same record, finished.
+        let registration = Registration::new(
+            seed.clone(),
+            Registrant::Workspace {
+                incarnation: incarnation.clone(),
+            },
+        );
+        let json = serde_json::to_string(registration.registered()).unwrap();
+        assert!(json.contains("\"registered\""), "{json}");
+        let parsed: BuildVolumeRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(&parsed, registration.registered());
+        assert!(!parsed.is_published());
+        assert!(
+            !parsed.is_seed_of(&main, &incarnation),
+            "a registered seed may still be forming and is nobody's to fork"
+        );
+        assert_eq!(registration.published(), seed);
+        assert_eq!(registration.role().owner(), &main);
+
+        // A superseded volume keeps its owner and incarnation: the old ownerless kind is gone.
+        let superseded = BuildVolumeRecord::new(
+            None,
+            BuildVolumeRole::Superseded {
+                owner: main.clone(),
+                incarnation: incarnation.clone(),
+            },
+        );
+        let json = serde_json::to_string(&superseded).unwrap();
+        assert!(json.contains("\"kind\":\"superseded\""), "{json}");
+        assert_eq!(
+            serde_json::from_str::<BuildVolumeRecord>(&json).unwrap(),
+            superseded
+        );
+        assert!(
+            serde_json::from_str::<BuildVolumeRecord>(
+                r#"{"version":1,"tree":null,"role":{"kind":"unlinked"},"createdAt":"2026-10-05T00:00:00Z"}"#,
+            )
+            .is_err(),
+            "an ownerless record is refused, never read as nobody's"
+        );
+    }
+
+    /// Registration precedes every image byte and answers a hold that keeps a release off the
+    /// volume while it forms; an existing image refuses, and so does a record naming another
+    /// owner, while the same registration replayed is accepted.
+    #[test]
+    fn registration_precedes_the_image_and_refuses_bytes_that_predate_it() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-build-register-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let project = ProjectPaths::with_mount_root(
+            &root,
+            root.join("mnt"),
+            &RepoId::parse("acme/widget").unwrap(),
+        )
+        .unwrap();
+        let layout = BuildVolumeLayout::new(&project).unwrap();
+        fs::create_dir_all(layout.images()).unwrap();
+        let topic = WorkspaceName::new("topic").unwrap();
+        let registration = Registration::new(
+            BuildVolumeRecord::new(
+                None,
+                BuildVolumeRole::Linked {
+                    checkout: topic.clone(),
+                },
+            ),
+            Registrant::Intent,
+        );
+
+        let id = BuildVolumeId::mint();
+        let creating = layout.register(&id, &registration).unwrap();
+        assert!(!layout.image(&id).exists(), "registration makes no image");
+        assert_eq!(
+            layout.read_record(&id).unwrap(),
+            registration.registered().clone()
+        );
+        assert!(
+            layout.claim_release(&id).unwrap().is_none(),
+            "no release claims a volume while its creation holds it"
+        );
+        // A replay of the same registration converges; another owner's refuses.
+        drop(creating);
+        drop(layout.register(&id, &registration).unwrap());
+        let other = Registration::new(
+            BuildVolumeRecord::new(
+                None,
+                BuildVolumeRole::Linked {
+                    checkout: WorkspaceName::main(),
+                },
+            ),
+            Registrant::Intent,
+        );
+        let error = layout.register(&id, &other).unwrap_err();
+        assert!(error.message.contains("already names"), "{error:?}");
+        layout.publish(&id, &registration).unwrap();
+        assert!(layout.read_record(&id).unwrap().is_published());
+
+        let bare = BuildVolumeId::mint();
+        fs::write(layout.image(&bare), b"bytes nobody registered").unwrap();
+        let error = layout.register(&bare, &registration).unwrap_err();
+        assert!(error.message.contains("predate their owner"), "{error:?}");
+        assert!(layout.read_record_present(&bare).unwrap().is_none());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -1374,8 +1626,23 @@ mod tests {
         seed("2026-10-05T00:00:00Z", &main);
         let latest = seed("2026-10-05T00:00:01Z", &main);
         seed("2026-10-05T00:00:02Z", &WorkspaceName::new("lane").unwrap());
-        // An image whose record was never published is no seed of anyone.
-        fs::write(layout.image(&BuildVolumeId::mint()), b"").unwrap();
+        // A seed still registered may be partial: it is no seed of anyone until published.
+        let forming = BuildVolumeId::mint();
+        fs::write(layout.image(&forming), b"").unwrap();
+        let mut record = BuildVolumeRecord::new(
+            None,
+            BuildVolumeRole::Seed {
+                target: main.clone(),
+                incarnation: incarnation.clone(),
+            },
+        );
+        record.created_at = "2026-10-05T00:00:03Z".to_owned();
+        layout
+            .write_record(
+                &forming,
+                Registration::new(record, Registrant::Intent).registered(),
+            )
+            .unwrap();
         assert_eq!(
             layout
                 .seed_of(&main, &incarnation)
@@ -1466,23 +1733,36 @@ mod tests {
         let layout = BuildVolumeLayout::new(&project).unwrap();
         fs::create_dir_all(layout.images()).unwrap();
         let topic = WorkspaceName::new("topic").unwrap();
-        let volume = |role: Option<BuildVolumeRole>| {
+        let volume = |role: BuildVolumeRole| {
             let id = BuildVolumeId::mint();
             fs::write(layout.image(&id), b"").unwrap();
-            if let Some(role) = role {
-                layout
-                    .write_record(&id, &BuildVolumeRecord::new(None, role))
-                    .unwrap();
-            }
+            layout
+                .write_record(&id, &BuildVolumeRecord::new(None, role))
+                .unwrap();
             id
         };
-        let linked = |name: &WorkspaceName| {
-            Some(BuildVolumeRole::Linked {
-                checkout: name.clone(),
-            })
+        let linked = |name: &WorkspaceName| BuildVolumeRole::Linked {
+            checkout: name.clone(),
         };
         let own = volume(linked(&topic));
-        let unrecorded = volume(None);
+        // A first touch the link names, registered and not yet finished: the next refresh
+        // finishes it, so the link stays.
+        let touching = BuildVolumeId::mint();
+        fs::write(layout.image(&touching), b"").unwrap();
+        layout
+            .write_record(
+                &touching,
+                Registration::new(
+                    BuildVolumeRecord::new(None, linked(&topic)),
+                    Registrant::Workspace {
+                        incarnation: WorkspaceIncarnation::new("1".repeat(32)).unwrap(),
+                    },
+                )
+                .registered(),
+            )
+            .unwrap();
+        let unregistered = BuildVolumeId::mint();
+        fs::write(layout.image(&unregistered), b"").unwrap();
         let adopted = volume(linked(&WorkspaceName::main()));
         let collected = BuildVolumeId::mint();
         assert_eq!(
@@ -1490,10 +1770,12 @@ mod tests {
             LinkResolution::Keep
         );
         assert_eq!(
-            layout.resolve_link(&topic, &unrecorded).unwrap(),
+            layout.resolve_link(&topic, &touching).unwrap(),
             LinkResolution::Keep,
-            "a creation in progress keeps the link that protects it"
+            "an unfinished first touch keeps the link its refresh resumes from"
         );
+        let error = layout.resolve_link(&topic, &unregistered).unwrap_err();
+        assert!(error.message.contains("no owner record"), "{error:?}");
         for stale in [&adopted, &collected] {
             assert_eq!(
                 layout.resolve_link(&topic, stale).unwrap(),
@@ -1508,7 +1790,8 @@ mod tests {
         // A `land --no-retire` that stopped after main adopted the orphan's volume and before
         // the orphan's refork: the orphan reforks from main's latest seed instead of refusing.
         let seed = |created_at: &str| {
-            let id = volume(None);
+            let id = BuildVolumeId::mint();
+            fs::write(layout.image(&id), b"").unwrap();
             layout
                 .write_record(
                     &id,
@@ -1652,7 +1935,7 @@ mod tests {
         drop(kept);
 
         let released = hold_behind_claim(&layout, &id, || {
-            assert!(layout.trash_image(&id).unwrap());
+            assert!(layout.release_image(&id).unwrap());
             fs::remove_file(layout.hold_path(&id)).unwrap();
         })
         .unwrap_err();
@@ -1725,18 +2008,12 @@ mod tests {
             && unsafe { info.assume_init() }.run_state == libc::TH_STATE_WAITING
     }
 
-    /// A release moves the image into the trash in one rename (the same inode, no copy), the
-    /// canonical image is gone at once, and emptying the store's trash deletes exactly the trashed
-    /// images: a file of any other name there is left.
     #[test]
-    fn a_released_image_waits_in_the_trash_and_only_trashed_images_are_deleted() {
-        use std::os::unix::fs::MetadataExt as _;
-
+    fn release_frees_the_image_before_its_owner_record_is_removed() {
         let root =
-            std::env::temp_dir().join(format!("cowshed-build-trash-{}", uuid::Uuid::new_v4()));
-        let store = root.join("store");
+            std::env::temp_dir().join(format!("cowshed-build-unlink-{}", uuid::Uuid::new_v4()));
         let project = ProjectPaths::with_mount_root(
-            &store,
+            root.join("store"),
             root.join("mounts"),
             &RepoId::parse("acme/widget").unwrap(),
         )
@@ -1745,40 +2022,73 @@ mod tests {
         fs::create_dir_all(layout.images()).unwrap();
         let id = BuildVolumeId::mint();
         fs::write(layout.image(&id), vec![7_u8; 64 * 1024]).unwrap();
-        let inode = fs::metadata(layout.image(&id)).unwrap().ino();
+        fs::write(layout.record(&id), b"retained ownership").unwrap();
 
-        assert!(
-            layout.trash_image(&id).unwrap(),
-            "the image was there to move"
-        );
-        assert!(!layout.image(&id).exists(), "the canonical image is gone");
+        assert!(layout.release_image(&id).unwrap());
+        assert!(!layout.image(&id).exists(), "release physically frees");
         assert_eq!(
-            fs::metadata(layout.trashed_image(&id)).unwrap().ino(),
-            inode
+            fs::read_dir(layout.releasing()).unwrap().count(),
+            0,
+            "the operation finishes its own journal entry before it answers"
         );
         assert!(
-            !layout.trash_image(&id).unwrap(),
-            "a second release finds nothing"
+            !layout.trash().exists(),
+            "release creates no deferred trash"
         );
-        assert_eq!(
-            layout.list_entries(true).unwrap(),
-            Vec::<BuildVolumeId>::new(),
-            "a trashed image is no volume"
-        );
-        let stray = layout.trash().join("notes.txt");
-        fs::write(&stray, b"not an image").unwrap();
+        assert_eq!(fs::read(layout.record(&id)).unwrap(), b"retained ownership");
+        assert!(!layout.release_image(&id).unwrap(), "a retry is idempotent");
 
-        let emptied = empty_store_trash(&store);
-        assert_eq!(emptied.images, 1);
-        assert!(emptied.bytes > 0);
-        assert!(!layout.trashed_image(&id).exists());
-        assert!(stray.exists(), "only trashed images are deleted");
-        assert_eq!(empty_store_trash(&store), EmptiedTrash::default());
+        // A real refusal must preserve the ownership evidence and the image's name.
+        fs::create_dir(layout.image(&id)).unwrap();
+        fs::write(layout.image(&id).join("held"), b"not a regular image").unwrap();
+        assert!(layout.release_image(&id).is_err());
+        assert!(layout.image(&id).join("held").exists());
+        assert_eq!(fs::read(layout.record(&id)).unwrap(), b"retained ownership");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn draining_releases_only_build_images() {
+        let root =
+            std::env::temp_dir().join(format!("cowshed-build-trash-{}", uuid::Uuid::new_v4()));
+        let project = ProjectPaths::with_mount_root(
+            root.join("store"),
+            root.join("mounts"),
+            &RepoId::parse("acme/widget").unwrap(),
+        )
+        .unwrap();
+        let layout = BuildVolumeLayout::new(&project).unwrap();
+        for directory in [layout.trash(), layout.releasing()] {
+            fs::create_dir_all(&directory).unwrap();
+            let image = directory.join(format!("{}.dmg", BuildVolumeId::mint()));
+            fs::write(&image, vec![7_u8; 64 * 1024]).unwrap();
+            let stray = directory.join("notes.txt");
+            fs::write(&stray, b"not an image").unwrap();
+
+            let drained = drain_released(&directory).unwrap();
+            assert_eq!(drained.images, 1);
+            assert!(drained.bytes > 0);
+            assert!(!image.exists());
+            assert!(stray.exists(), "only build images are released");
+            assert_eq!(drain_released(&directory).unwrap(), Drained::default());
+            let refused = directory.join(format!("{}.dmg", BuildVolumeId::mint()));
+            std::os::unix::fs::symlink(&stray, &refused).unwrap();
+            fs::remove_file(&stray).unwrap();
+            // A dangling entry is not a regular image and is never followed or released.
+            assert_eq!(drain_released(&directory).unwrap(), Drained::default());
+            assert!(fs::symlink_metadata(&refused).is_ok());
+            fs::remove_dir_all(&directory).unwrap();
+            fs::write(&directory, b"not a directory").unwrap();
+            assert!(
+                drain_released(&directory).is_err(),
+                "an unreadable directory must refuse, not report nothing to release"
+            );
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 
     /// A detach frees exactly the build volumes whose record names the checkout as the one that
-    /// links it: never a seed, an unlinked volume, another checkout's, or one with no record.
+    /// links it: never a seed, a superseded volume, another checkout's, or one with no record.
     #[test]
     fn a_checkout_owns_the_volumes_its_records_name_it_linked_to() {
         let root = std::env::temp_dir().join(format!(
@@ -1817,7 +2127,10 @@ mod tests {
         let own = volume(Some(linked(&topic)));
         let interrupted = volume(Some(linked(&topic)));
         volume(Some(linked(&other)));
-        volume(Some(BuildVolumeRole::Unlinked));
+        volume(Some(BuildVolumeRole::Superseded {
+            owner: topic.clone(),
+            incarnation: WorkspaceIncarnation::new("00000000000000000000000000000001").unwrap(),
+        }));
         volume(Some(BuildVolumeRole::Seed {
             target: topic.clone(),
             incarnation: WorkspaceIncarnation::new("00000000000000000000000000000001").unwrap(),

@@ -137,15 +137,17 @@ No mounts, no root, no network — pure functions with table-driven cases:
 - **Foreign-session isolation and atomic retirement**: directory-backed fixtures keep sibling grants missing or corrupt
   while the selected workspace remains inspectable and reconciles without evicting sibling gateway sessions. The
   controller admits and observes 100 live jobs while project enumeration refuses its foreign inventory fault. Retirement
-  interruption/retry fixtures require complete trash grants/CA authority at the image rename commit point and no
-  published canonical image whose grants are missing. The directory cutover also runs the real controller and gateway
+  fixtures prove clean landed sources physically disappear before the removal reply without a trash rename, a real
+  immutable-file unlink refusal preserves source grants/CA authority, and dirty, unlanded and only-copy ignored content
+  survives in its live or recovery image, even after the recovery sidecar is removed and startup/GC runs again.
+  Cancellation and post-unlink crash replay retain the mutating intent until physical release finishes; recovery-image
+  rename fixtures still require complete grants/CA at commit. The directory cutover runs the real controller and gateway
   with corrupt/missing sibling grants, named mount/marker fences and held-lock recovery, plus prepared-retirement retry
-  and post-commit recovery on directory payloads. Cold named and removal opens must ignore corrupt or missing sibling
-  sidecars, preserve session-origin validation, and still refuse selected corruption; full Store/Inspect opens and
-  project enumeration retain their malformed-inventory refusals. Ordinary worker and trusted Gate exec share the core
-  scoped preparation boundary. A fixture restarting a bare gateway explicitly restores project sessions through
-  maintenance before work; job admission never repairs port allocation. These witnesses acquire no physical disk-image
-  capability.
+  and post-commit recovery. Cold named and removal opens ignore broken sibling sidecars, preserve session-origin
+  validation, and still refuse selected corruption; full Store/Inspect opens and project enumeration retain their
+  malformed-inventory refusals. Ordinary worker and trusted Gate exec share the core scoped preparation boundary. A
+  fixture restarting a bare gateway explicitly restores project sessions through maintenance before work; job admission
+  never repairs port allocation. These witnesses acquire no physical disk-image capability.
 - **MCP capability/auth codecs**: coordinator authority can be read only from the designated inherited FD/socketpair and
   never argv/environment/stderr; worker descriptors are 256-bit, 30-second, one-use, memory-only, atomic-consume,
   restart-invalidated, workspace/socket/peer-bound. Missing, expired, replayed, mismatched, or insufficient authority
@@ -357,7 +359,9 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   every cut shortens the file and frees at most one step of runs, the cuts end at zero and free every run exactly once
   in as few cuts as the bound allows, and a release resumed after any cut plans exactly the cuts left. Its real boundary
   is a fragmented file on the host's filesystem, cut a few steps, abandoned, and finished by a second release that
-  counts only what was left.
+  counts only what was left. The release journal's crash point is witnessed the same way: an image committed to
+  `.releasing/`, cut once and abandoned is finished by the journal's recovery drain and by its owner's retry, and a
+  workspace image left so is finished by project recovery, which then reconciles the record its rename left imageless.
 - **A supervisor's opening finishes nothing and waits for no image lock** (07_api.md, "Authority model"): for any
   generated workspace and probe name, a `Supervisor` opening observes what a `Workspaces` opening naming that one
   workspace observes, replays no intent, selects no rename and has no retirement target; over generated scopes it and
@@ -1024,13 +1028,36 @@ registration.
 
 ### APFS / Seatbelt (macOS)
 
-| Operation                | Budget (median, local)  | Basis                                                            |
-| ------------------------ | ----------------------- | ---------------------------------------------------------------- |
-| `cowshed fork` cold      | ≤ 1 s                   | clonefile + first write + attach + `fsck_apfs -q` + `mount_apfs` |
-| `cowshed rm` (perceived) | ≤ 100 ms to return      | rename + grant-file unlink; detach is background                 |
-| `cowshed checkpoint`     | ≤ 1 s                   | descriptor-clone path                                            |
-| `cowshed path` / `ls`    | ≤ 50 ms                 | readdir + getmntinfo only — proves the no-state-store design     |
-| exec sandbox overhead    | ≤ 50 ms over bare spawn | profile generation + sandbox-exec                                |
+| Operation                        | Budget (median, local)  | Basis                                                                                          |
+| -------------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------- |
+| `cowshed fork` cold              | ≤ 1 s                   | clonefile + first write + attach + `fsck_apfs -q` + `mount_apfs`                               |
+| `cowshed rm` complete retirement | No measured bound       | required detach and physical image unlink finish before success; no background deletion credit |
+| `cowshed checkpoint`             | ≤ 1 s                   | descriptor-clone path                                                                          |
+| `cowshed path` / `ls`            | ≤ 50 ms                 | readdir + getmntinfo only — proves the no-state-store design                                   |
+| exec sandbox overhead            | ≤ 50 ms over bare spawn | profile generation + sandbox-exec                                                              |
+
+**Extent admission is a standalone first-write sensitivity bound, not a whole-clone SLO.** One loaded RAW observation
+was 60.845084042 s for 434,462 extents: 140.046964 µs/extent. At that observed rate, **7,140 extents** take less than 1
+s and 7,141 exceed it; 1,785 fit 250 ms and 1,786 do not. The cause is unattributed. This is measured sensitivity, not
+causal calibration: the historical **12 µs/extent ASIF-era synthetic predictor remains unchanged** and is reported
+separately. Concurrent first writes and container-wide contention can change the rate, so neither predictor is a latency
+guarantee. Further attribution found 440,074-extent first writes taking 50.004/39.605 s wall versus 5.981/5.633 s system
+CPU, reading 801–823 MB, while a 25,013-extent source took about 4.04 s (about 161 µs/extent, above the selected 140 µs
+sensitivity). Off-CPU work is substantial; those observations do not establish a universal per-extent calibration or
+justify replacing the historical predictor.
+
+A forkable physical generation must prove at most 7,140 extents for **both the workspace image and every build seed it
+publishes or clones**. The proof uses device/inode, length, allocated blocks, and nanosecond modification/change times
+before and after the extent walk; Git HEAD or the build tree is not a physical-generation identity. Unknown, changed or
+oversized generations refuse publication. Each admission or publication extent walk stops at the 7,141st run; proof work
+is additional, never an unbounded recount concealed in the cold-fork number. Doctor explicitly counts the workspace
+sources, live build sources and build seeds, reporting each image's own count and both estimates.
+
+The cold-fork row remains a primitive-path regression target, not evidence that a production whole clone meets it.
+Attach, filesystem check/mount, identity work and proof collection consume additional time. Serialized first writes of
+multiple images share one budget: giving each image 7,140 extents does **not** put their sum below 1 s. No images are
+merged. Tests prove the 7,140/7,141 boundary, reject stale/replaced/missing generations, cover build-source and seed
+diagnostics, and prove that the named `cowshed defrag <workspace>` route reaches those registered images.
 
 **What the budgets are.** They are regression thresholds on medians of primitive-operation costs, not end-to-end cowshed
 SLOs: a median is stated because a small sample cannot fix a stable tail. Clone-backed images rather than shadow mounts

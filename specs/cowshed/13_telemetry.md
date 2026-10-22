@@ -91,12 +91,14 @@ The APFS host records `cowshed.image.write_first`, `cowshed.image.seed_capture`,
 `StepReport` into a caller's trace.
 
 Each capture observes both the source and the destination. An absent destination starts at zero; its delta describes the
-newly named clone's allocation, **not** newly allocated unique blocks. Retirement compares the canonical file with the
-renamed file in trash: a rename frees no extents or allocated bytes. This is the release/rename boundary, not the later
-background trash unlink. Missing files are explicitly `absent`; failed measurements are null with their cause, never
-zero. The extent count comes from `storage/apfs/extents.rs::count_extents`, the existing native `F_LOG2PHYS_EXT` walker.
-Allocation reuses that module's `allocated_bytes` (`st_blocks * 512`). Neither measures the mounted filesystem's
-contents, shared-block exclusivity, or bytes written.
+newly named clone's allocation, **not** newly allocated unique blocks. A release (a build image's, a clean removal's
+source image) compares the image before it with what is left once it answers: a release frees the whole image before it
+answers, so the image is `absent` after and its delta is everything it held. A recovery retirement compares the
+canonical file with the renamed file in trash: a rename frees no extents or allocated bytes. Missing files are
+explicitly `absent`; failed measurements are null with their cause, never zero. The extent count comes from
+`storage/apfs/extents.rs::count_extents`, the existing native `F_LOG2PHYS_EXT` walker. Allocation reuses that module's
+`allocated_bytes` (`st_blocks * 512`). Neither measures the mounted filesystem's contents, shared-block exclusivity, or
+bytes written.
 
 The custom columns are:
 

@@ -572,7 +572,7 @@ pub struct ResizeArgs {
     pub volume: cowshed_core::api::dto::ResizeVolume,
 }
 
-/// `defrag <ws|main>` — rewrite one workspace's image contiguously.
+/// `defrag <ws|main>` — rewrite a workspace's source image and owned build sources/seeds.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DefragArgs {
     pub workspace: String,
@@ -3551,10 +3551,11 @@ const DEFRAG: CommandSpec = CommandSpec {
     missing: "defrag requires a workspace",
     args: "<ws|main>",
     trailing: "",
-    summary: "rewrite an image contiguously",
+    summary: "rewrite source and build images contiguously",
     about: &[
-        "Rewrites one workspace's image so its data is contiguous again. A clone shares its source's extent map and the first write to it copies that map, at about 12 µs per extent, so a main that has fragmented into millions of extents makes every `fork` wait tens of seconds; `cowshed doctor` reports main's extent count and the cost it predicts.",
+        "Rewrites the workspace image, its registered live build source and every published seed of this incarnation. Doctor reports the actual source and seed counts separately. Fork publication requires at most 7140 extents per physical image generation: a standalone first-write sensitivity limit from one loaded RAW observation at 140.046964 µs/extent, not a causal calibration or whole-fork latency guarantee. The historical ASIF-era 12 µs predictor is unchanged; multiple images and attach, mount, identity and proof work share the total budget.",
         "The workspace is detached the way `resize` detaches it — a volume with a file open or a job running refuses before the image is touched — then its data is copied with plain reads and writes into a sibling, flushed, renamed over the image, verified by attaching it, and mounted again if it was mounted. The copy needs as much free space as the image has allocated, and keeps it while older clones and checkpoints still share the old blocks.",
+        "A refused pending clone may contain the only copy of dirty work. `defrag <pending-workspace>` rewrites that same payload without publishing or deleting it, and refuses while its original creator still holds the intent lease. Retry the original fork after the rewrite.",
     ],
     options: &[],
 };

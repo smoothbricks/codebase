@@ -1,5 +1,5 @@
 use super::*;
-use crate::build_volume::BuildVolumeRole;
+use crate::build_volume::{BuildVolumeRecord, BuildVolumeRole, Registrant};
 use crate::metadata::WorkspaceName;
 use crate::repository::{ProjectPaths, RepoId};
 use crate::sandbox::{RunSandboxMode, SandboxConfig, SandboxGrants};
@@ -61,11 +61,16 @@ fn paths() -> Vec<BuildStatePath> {
     ]
 }
 
-fn linked_record() -> BuildVolumeRecord {
-    BuildVolumeRecord::new(
-        None,
-        BuildVolumeRole::Linked {
-            checkout: WorkspaceName::main(),
+fn linked_registration() -> Registration {
+    Registration::new(
+        BuildVolumeRecord::new(
+            None,
+            BuildVolumeRole::Linked {
+                checkout: WorkspaceName::main(),
+            },
+        ),
+        Registrant::Workspace {
+            incarnation: crate::metadata::WorkspaceIncarnation::new("0".repeat(32)).unwrap(),
         },
     )
 }
@@ -305,7 +310,7 @@ fn configured_cargo_target_containing_tracked_source_refuses_before_mint_or_dele
             fingerprint: "fixture".to_owned(),
             capacity: ImageCapacity::from_gibibytes(1),
             beside: MintedBeside::Nothing,
-            record: linked_record(),
+            registration: linked_registration(),
         },
     )
     .unwrap()
@@ -343,13 +348,21 @@ fn directory_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
     git(&checkout, &["add", "source.rs"]);
     let (host, layout) = host(root.path());
     let id = BuildVolumeId::mint();
-    let mount = host
-        .create_build_volume(&layout, &id, ImageCapacity::from_gibibytes(1))
+    let (mount, creating) = host
+        .create_build_volume(
+            &layout,
+            &id,
+            ImageCapacity::from_gibibytes(1),
+            &linked_registration(),
+        )
         .unwrap();
     link::point(&checkout, &mount).unwrap();
+    drop(creating);
+    let registered = layout.read_record(&id).unwrap();
+    assert_eq!(&registered.role, linked_registration().role());
     assert!(
-        !layout.record(&id).exists(),
-        "creation must not publish a sidecar"
+        !registered.is_published(),
+        "creation registers the owner before the image and publishes nothing"
     );
     fs::write(mount.join(super::super::STATE_FILE), "broken state").unwrap();
     assert!(
@@ -362,14 +375,14 @@ fn directory_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
                 fingerprint: "fixture".to_owned(),
                 capacity: ImageCapacity::from_gibibytes(1),
                 beside: MintedBeside::Nothing,
-                record: linked_record(),
+                registration: linked_registration(),
             }
         )
         .is_err()
     );
     assert!(
-        !layout.record(&id).exists(),
-        "failure before linking leaves the sidecar absent"
+        !layout.read_record(&id).unwrap().is_published(),
+        "failure before linking leaves the record registered, never published"
     );
     assert_eq!(
         fs::read_to_string(checkout.join("target/old")).unwrap(),
@@ -387,7 +400,7 @@ fn directory_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
                 fingerprint: "fixture".to_owned(),
                 capacity: ImageCapacity::from_gibibytes(1),
                 beside: MintedBeside::Nothing,
-                record: linked_record(),
+                registration: linked_registration(),
             },
         )
         .unwrap()
@@ -396,7 +409,9 @@ fn directory_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
             linked, id,
             "a retry keeps the early pointer, never mints another image"
         );
-        assert_eq!(layout.read_record(&id).unwrap().role, linked_record().role);
+        let record = layout.read_record(&id).unwrap();
+        assert_eq!(record.role, linked_registration().role().clone());
+        assert!(record.is_published());
         let state = BuildVolumeState::read(&mount).unwrap();
         assert_eq!(state.paths, paths());
         assert_eq!(state.fingerprint.as_deref(), Some("fixture"));

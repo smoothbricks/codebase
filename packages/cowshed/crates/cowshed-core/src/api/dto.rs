@@ -1060,12 +1060,15 @@ pub enum GcReason {
     /// tips main's repository keeps as refs before it is reclaimed. A candidate only under a sweep
     /// that explicitly authorizes it (`GcOptions.abandoned`).
     AbandonedBundle,
-    /// A build volume no checkout links (16_build_volumes.md, "Garbage collection").
+    /// A build volume no checkout links: a checkout's live volume its checkout no longer links,
+    /// or one superseded under its owner once no job holds it (16_build_volumes.md, "Garbage
+    /// collection").
     UnlinkedBuildVolume,
     /// A seed that is not its target's latest, or whose target retired.
     SupersededSeed,
-    /// A build volume image an interrupted creation left without its record.
-    UnrecordedBuildVolume,
+    /// A build volume registered to its owner before its image existed whose creation was
+    /// interrupted: its registrant is gone, so it is released by its exact id.
+    InterruptedBuildVolume,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

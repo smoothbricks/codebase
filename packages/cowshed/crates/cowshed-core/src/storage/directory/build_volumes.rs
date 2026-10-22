@@ -16,8 +16,8 @@ use super::{
     observed_payload_root, remove_payload_tree, unbind, unsupported,
 };
 use crate::build_volume::{
-    BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, LinkResolution,
-    ReleaseClaim, link,
+    BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole,
+    LinkResolution, Registrant, Registration, ReleaseClaim, link,
 };
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::storage::apfs::ApfsStorageError;
@@ -195,45 +195,71 @@ impl DirectoryExecutionHost {
         }
     }
 
-    /// Mint the empty build volume `id` and mount it, without a record. A directory has no
+    /// Mint the empty build volume `id` and mount it, its owner record registered first and left
+    /// registered, held by the answered hold, until the caller publishes it. A directory has no
     /// capacity; `capacity` bounds nothing here, the store's filesystem does.
     pub fn create_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
         _capacity: ImageCapacity,
-    ) -> Result<PathBuf, ApfsStorageError> {
+        registration: &Registration,
+    ) -> Result<(PathBuf, BuildVolumeHold), ApfsStorageError> {
         let image = layout.image(id);
         self.require_store_image(&image)?;
-        if path_exists(&image)? {
-            return Err(ApfsStorageError::Host(format!(
-                "build volume payload already exists: {}",
-                image.display()
-            )));
-        }
         super::ensure_parent(&image)?;
-        fs::create_dir(&image)
-            .map_err(|error| io_error("create build volume payload", &image, error))?;
-        sync_parent_path(&image)?;
-        let mount = layout.mount(id);
-        if let Err(primary) = bind(&image, &mount) {
-            return crate::storage::apfs::combine_cleanup(
-                "mount build volume",
-                primary,
-                remove_payload_tree(&image),
-            );
+        let creating = layout.register(id, registration).map_err(host_error)?;
+        let made = (|| {
+            fs::create_dir(&image)
+                .map_err(|error| io_error("create build volume payload", &image, error))?;
+            sync_parent_path(&image)?;
+            let mount = layout.mount(id);
+            bind(&image, &mount)?;
+            Ok(mount)
+        })();
+        match made {
+            Ok(mount) => Ok((mount, creating)),
+            Err(error) => Err(self.unregister(layout, id, creating, error)),
         }
-        Ok(mount)
     }
 
-    /// Clone `source` to the new volume `destination` with `record`. A bound source is claimed
-    /// against job admission for the whole capture; the runtime caller retains Nx/Cargo guards.
+    /// Release `id`, whose registered creation failed with `primary`, joining a release that
+    /// cannot run to `primary`; the registered record then stays for collection.
+    fn unregister(
+        &self,
+        layout: &BuildVolumeLayout,
+        id: &BuildVolumeId,
+        creating: BuildVolumeHold,
+        primary: ApfsStorageError,
+    ) -> ApfsStorageError {
+        drop(creating);
+        let cleanup = match self.release_build_volume(layout, id) {
+            Ok(BuildVolumeRelease::Deleted { .. }) => Ok(()),
+            Ok(BuildVolumeRelease::Held { open }) => Err(ApfsStorageError::Host(format!(
+                "build volume {id} stays registered while another hold on it lives ({} open); its holder releases it, or the next collection does",
+                open.len()
+            ))),
+            Err(error) => Err(error),
+        };
+        match crate::storage::apfs::combine_cleanup::<std::convert::Infallible>(
+            "release a build volume whose creation failed",
+            primary,
+            cleanup,
+        ) {
+            Err(error) => error,
+            Ok(never) => match never {},
+        }
+    }
+
+    /// Clone `source` to the new volume `destination`, registered and then published as
+    /// `registration`. A bound source is claimed against job admission for the whole capture;
+    /// the runtime caller retains Nx/Cargo guards.
     pub fn clone_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         source: &BuildVolumeId,
         destination: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(), ApfsStorageError> {
         let _restoring = if Self::build_volume_bound(layout, source)? {
             match self.claim_build_volume(layout, source)? {
@@ -251,7 +277,7 @@ impl DirectoryExecutionHost {
             self.require_store_image(&layout.image(source))?;
             None
         };
-        self.clone_build_volume_under_hold(layout, source, destination, record)
+        self.clone_build_volume_under_hold(layout, source, destination, registration)
     }
 
     /// Clone a source whose caller already keeps job admission off it: the quiet landing volume,
@@ -263,10 +289,10 @@ impl DirectoryExecutionHost {
         layout: &BuildVolumeLayout,
         source: &BuildVolumeId,
         destination: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(), ApfsStorageError> {
         self.require_store_image(&layout.image(source))?;
-        self.clone_build_volume_under_hold(layout, source, destination, record)
+        self.clone_build_volume_under_hold(layout, source, destination, registration)
     }
 
     fn clone_build_volume_under_hold(
@@ -274,28 +300,41 @@ impl DirectoryExecutionHost {
         layout: &BuildVolumeLayout,
         source: &BuildVolumeId,
         destination: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(), ApfsStorageError> {
         let from = layout.image(source);
         let to = layout.image(destination);
         self.require_store_image(&to)?;
+        // The source is someone's: a published volume, or a live one its owner still writes.
+        let source_record = layout.read_record(source).map_err(host_error)?;
+        if let BuildVolumeRole::Seed { target, .. } = &source_record.role
+            && !source_record.is_published()
+        {
+            return Err(ApfsStorageError::Host(format!(
+                "seed {source} of {target} is registered and unfinished, so nothing may be cloned from it; the next collection releases it"
+            )));
+        }
         // Runtime owns the named Nx/Cargo exclusions. Other contributed paths and retained
         // guard descriptors must not refuse capture. This controlled test substrate copies a
         // tree; it does not prove the point-in-time atomicity of an APFS image clone.
-        let hold = layout.hold_path(destination);
-        let _creating = layout
-            .hold_new(destination)
-            .map_err(|error| io_error("hold a build volume while it is cloned", &hold, error))?;
         let written = self.build_volume_written(layout, source)?;
-        if let Err(error) = self.clone_tree(&from, &to) {
-            // No payload, so nothing will ever release this hold file.
-            if !path_exists(&to)? {
-                remove_if_present(&hold)?;
+        let creating = layout
+            .register(destination, registration)
+            .map_err(host_error)?;
+        let cloned = (|| {
+            self.clone_tree(&from, &to)?;
+            self.mark_seed_written(layout, destination, written)?;
+            layout
+                .publish(destination, registration)
+                .map_err(host_error)
+        })();
+        match cloned {
+            Ok(()) => {
+                drop(creating);
+                Ok(())
             }
-            return Err(error);
+            Err(error) => Err(self.unregister(layout, destination, creating, error)),
         }
-        self.mark_seed_written(layout, destination, written)?;
-        layout.write_record(destination, record).map_err(host_error)
     }
 
     /// The instant of the last write build volume `id` holds: its mark, while the tree is
@@ -362,16 +401,16 @@ impl DirectoryExecutionHost {
         sync_parent_path(&mark)
     }
 
-    /// A new live volume cloned from `seed` with `record`, bound, without the seed's Nx daemon
-    /// record (16_build_volumes.md, "Fork" steps 2 and 3).
+    /// A new live volume cloned from `seed` as `registration`, bound, without the seed's Nx
+    /// daemon record (16_build_volumes.md, "Fork" steps 2 and 3).
     pub fn fork_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         seed: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(BuildVolumeId, PathBuf), ApfsStorageError> {
         let live = BuildVolumeId::mint();
-        self.clone_build_volume(layout, seed, &live, record)?;
+        self.clone_build_volume(layout, seed, &live, registration)?;
         let mount = self.mount_build_volume(layout, &live)?;
         let state = crate::build_volume::BuildVolumeState::read(&mount).map_err(host_error)?;
         crate::build_volume::nx::discard_daemon_records(&mount, &state)
@@ -542,10 +581,15 @@ impl DirectoryExecutionHost {
             let (_, mount) = self.fork_build_volume(
                 layout,
                 seed,
-                &BuildVolumeRecord::new(
-                    tree,
-                    BuildVolumeRole::Linked {
-                        checkout: workspace.clone(),
+                &Registration::new(
+                    BuildVolumeRecord::new(
+                        tree,
+                        BuildVolumeRole::Linked {
+                            checkout: workspace.clone(),
+                        },
+                    ),
+                    Registrant::Workspace {
+                        incarnation: incarnation.clone(),
                     },
                 ),
             )?;

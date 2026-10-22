@@ -10,8 +10,8 @@ use std::time::SystemTime;
 use super::{BuildVolumes, Owner, RuntimeStorageHost, io, storage};
 use crate::api::dto::ReseedResult;
 use crate::build_volume::{
-    BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, BuildVolumeState, link,
-    nx,
+    BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, BuildVolumeState,
+    Registrant, Registration, link, nx,
 };
 use crate::storage::ImagePaths;
 use crate::storage::apfs::native::BuildVolumeClaim;
@@ -128,9 +128,12 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             let creating = layout.hold_new(&replacement)
                 .map_err(|error| io("hold the reseed replacement", &layout.hold_path(&replacement), &error))?;
             let prepared: Result<(u64, u64)> = (|| {
-                host.clone_build_volume(layout, &plan.seed, &replacement, &BuildVolumeRecord::new(
-                    plan.seed_record.tree.clone(),
-                    BuildVolumeRole::Linked { checkout: plan.workspace.owner.name.clone() },
+                host.clone_build_volume(layout, &plan.seed, &replacement, &Registration::new(
+                    BuildVolumeRecord::new(
+                        plan.seed_record.tree.clone(),
+                        BuildVolumeRole::Linked { checkout: plan.workspace.owner.name.clone() },
+                    ),
+                    Registrant::Workspace { incarnation: plan.workspace.owner.incarnation.clone() },
                 )).map_err(storage)?;
                 let mount = host.mount_build_volume(layout, &replacement).map_err(storage)?;
                 let state = BuildVolumeState::read(&mount)?;
@@ -169,9 +172,15 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 }
             };
             // The replacement record preceded the atomic link, so an interruption on either
-            // side leaves one owned link and at most an unreachable image for ordinary GC.
+            // side leaves one owned link and the other volume still recorded as the workspace's.
+            // The previous volume stays the workspace's, at its incarnation, until this release
+            // deletes it: a release that fails is the reseed's error, and the record still names
+            // its owner.
             layout.write_record(&plan.previous, &BuildVolumeRecord {
-                role: BuildVolumeRole::Unlinked,
+                role: BuildVolumeRole::Superseded {
+                    owner: plan.workspace.owner.name.clone(),
+                    incarnation: plan.workspace.owner.incarnation.clone(),
+                },
                 ..plan.previous_record.clone()
             })?;
             host.release_claimed(layout, claim).map_err(storage)?;

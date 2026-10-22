@@ -37,6 +37,163 @@ use scratch_directory::ScratchRoot;
 
 const REFUSAL: &str = "no macOS workspace port block remains";
 
+/// `rm` answers only after physical source release. Replaying the exact mutating intent
+/// after that commit must acknowledge absence without constructing retirement trash.
+#[tokio::test]
+async fn clean_landed_source_is_physically_deleted_before_reply_and_crash_replay() {
+    let fixture = Fixture::new("clean-source-release");
+    let runtime = fixture.adopt().await;
+    fixture
+        .mint(&runtime, "landed", ForkOptions::default())
+        .await
+        .expect("fork");
+    let image = fixture
+        .layout()
+        .session_image(&name("landed"))
+        .unwrap()
+        .image()
+        .to_owned();
+    fixture
+        .remove(&runtime, "landed")
+        .await
+        .expect("release source");
+    assert!(
+        !image.exists(),
+        "source image is physically absent before shutdown"
+    );
+    assert!(!cowshed_core::metadata::sidecar_path(&image).exists());
+    let trash = fixture.layout().project().sessions.join(".trash");
+    assert!(
+        !trash.exists(),
+        "clean release never prepares a trash rename"
+    );
+    runtime.shutdown().await.expect("stop runtime");
+    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+        journal.begin(LifecycleIntent::Retire {
+            workspace: name("landed"),
+            options: RemoveOptions {
+                force: true,
+                ..RemoveOptions::default()
+            },
+            origin: None,
+        });
+        journal.mark_mutating(&name("landed"))
+    })
+    .expect("simulate death after unlink before acknowledgement");
+    let restarted = fixture
+        .open_removing("landed")
+        .await
+        .expect("recover removal");
+    fixture
+        .remove(&restarted, "landed")
+        .await
+        .expect("idempotent reply");
+    assert!(matches!(
+        fixture.intent("landed").unwrap().completion,
+        Some(LifecycleIntentCompletion::Retire(_))
+    ));
+    assert!(!image.exists());
+    assert!(!trash.exists());
+    restarted.shutdown().await.expect("stop restarted runtime");
+}
+
+/// Neither a hidden name nor gitignore proves rebuildability. Only-copy source bytes keep
+/// their complete recovery image across shutdown, startup, plain gc and bundle-only gc.
+#[tokio::test]
+async fn ignored_only_copy_source_content_keeps_recovery_trash() {
+    let fixture = Fixture::new("only-copy-source");
+    let runtime = fixture.adopt().await;
+    let minted = fixture
+        .mint(&runtime, "notes", ForkOptions::default())
+        .await
+        .expect("fork");
+    let mount = PathBuf::from(minted["info"]["mount"].as_str().unwrap());
+    let image = fixture
+        .layout()
+        .session_image(&name("notes"))
+        .unwrap()
+        .image()
+        .to_owned();
+    let metadata = DetachedWorkspaceMetadata::read_for_image(&image).unwrap();
+    fs::write(mount.join(".private-notes"), b"only hidden copy\n").unwrap();
+    fs::write(mount.join("ignored-notes"), b"only ignored copy\n").unwrap();
+    let exclude = mount.join(".git/info/exclude");
+    use std::io::Write as _;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(exclude)
+        .unwrap()
+        .write_all(b"\n/ignored-notes\n")
+        .unwrap();
+    fixture
+        .remove(&runtime, "notes")
+        .await
+        .expect("retire to recovery");
+    let recovery = fixture.layout().project().sessions.join(format!(
+        ".trash/notes-{}.dmg",
+        metadata.workspace_incarnation,
+    ));
+    assert!(!image.exists());
+    assert_eq!(
+        fs::read(recovery.join(".private-notes")).unwrap(),
+        b"only hidden copy\n"
+    );
+    assert_eq!(
+        fs::read(recovery.join("ignored-notes")).unwrap(),
+        b"only ignored copy\n"
+    );
+    runtime.shutdown().await.expect("stop runtime");
+    let restarted = fixture.gc().await;
+    for abandoned in [false, true] {
+        fixture
+            .call(
+                &restarted,
+                "coordinator.gc",
+                json!({
+                    "repoId": fixture.repo,
+                    "options": { "dryRun": false, "abandoned": abandoned },
+                }),
+            )
+            .await
+            .expect("collection preserves source recovery");
+        assert_eq!(
+            fs::read(recovery.join(".private-notes")).unwrap(),
+            b"only hidden copy\n"
+        );
+        assert_eq!(
+            fs::read(recovery.join("ignored-notes")).unwrap(),
+            b"only ignored copy\n"
+        );
+        assert!(cowshed_core::metadata::sidecar_path(&recovery).exists());
+    }
+    restarted.shutdown().await.expect("stop restarted runtime");
+    fs::remove_file(cowshed_core::metadata::sidecar_path(&recovery)).unwrap();
+    let missing_record = fixture.gc().await;
+    fixture
+        .call(
+            &missing_record,
+            "coordinator.gc",
+            json!({
+                "repoId": fixture.repo,
+                "options": { "dryRun": false, "abandoned": true },
+            }),
+        )
+        .await
+        .expect("missing grants do not authorize byte deletion");
+    assert_eq!(
+        fs::read(recovery.join(".private-notes")).unwrap(),
+        b"only hidden copy\n"
+    );
+    assert_eq!(
+        fs::read(recovery.join("ignored-notes")).unwrap(),
+        b"only ignored copy\n"
+    );
+    missing_record
+        .shutdown()
+        .await
+        .expect("stop missing-record runtime");
+}
+
 /// One adopted project on its own real directory store.
 struct Fixture {
     /// Owned so its drop ends this test's workers and removes its tree.
@@ -1169,7 +1326,10 @@ async fn rm_retires_a_pending_fork_after_its_source_is_removed() {
         .remove(&rm, "wedged")
         .await
         .expect("retire the pending fork without its source");
-    assert!(!image.exists(), "the pending image is logically retired");
+    assert!(
+        !image.exists(),
+        "the clean pending image is physically released"
+    );
     let retired = fixture.intent("wedged").expect("retirement record");
     assert!(matches!(
         retired.completion,
@@ -1184,18 +1344,9 @@ async fn rm_retires_a_pending_fork_after_its_source_is_removed() {
         "the fork is never activated"
     );
     rm.shutdown().await.expect("stop the removing runtime");
-    // The retirement answered before its image was reclaimed, but the runtime that started the
-    // reclamation finishes it before it ends: nothing is left in the trash for a later gc.
+    // Clean pending clones use the same direct physical release, never recovery trash.
     let trash = fixture.layout().project().sessions.join(".trash");
-    let left = fs::read_dir(&trash)
-        .expect("trash")
-        .map(|entry| entry.expect("trash entry").file_name())
-        .filter(|entry| entry.to_string_lossy().starts_with("wedged-"))
-        .collect::<Vec<_>>();
-    assert!(
-        left.is_empty(),
-        "retired wedged left trash behind: {left:?}"
-    );
+    assert!(!trash.exists());
 
     LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Fork {
@@ -1304,6 +1455,16 @@ async fn rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed(
         )
         .await
         .expect("--abandon retires the unlanded fork");
+    let recovery = fixture
+        .layout()
+        .project()
+        .sessions
+        .join(format!(".trash/finished-{}.dmg", incarnation_of(&fork),));
+    assert_eq!(
+        head(&recovery),
+        original_head,
+        "unlanded history remains in recovery"
+    );
     rm.shutdown().await.expect("stop the abandoning runtime");
     let reference = format!("refs/cowshed/finished/abandoned/{original_head}/HEAD");
     let kept_head = json!({ "name": "HEAD", "tip": original_head, "reference": reference });
@@ -1342,6 +1503,11 @@ async fn rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed(
     gc.shutdown().await.expect("stop gc");
     assert!(!bundle.exists(), "the sweep deleted {}", bundle.display());
     assert_eq!(
+        head(&recovery),
+        original_head,
+        "bundle authorization does not discard its image"
+    );
+    assert_eq!(
         resolved(&fixture.checkout, &reference),
         original_head,
         "the sweep kept the bundle's tip in main's repository first"
@@ -1351,23 +1517,24 @@ async fn rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed(
     assert_eq!(kept["git"]["head"], json!(original_head), "{kept}");
     assert_kept_by_ref(&kept, &original_head, &fixture.checkout, &reference);
 
-    // A purge retires main's image and every ref in it, so the restore first carries each
-    // refs/cowshed ref into the retained checkout it puts back: the abandoned commit outlives
-    // the project there.
+    // A bundle is not permission to delete the complete recovery image. Terminal store
+    // removal refuses before main moves while that evidence remains.
     let purge = fixture.gc().await;
-    fixture
+    let refusal = fixture
         .call(
             &purge,
             "coordinator.removeProject",
             json!({ "repoId": fixture.repo, "options": { "force": false, "abandon": true } }),
         )
         .await
-        .expect("purge the project");
+        .expect_err("recovery image refuses terminal project removal");
+    assert_eq!(refusal.code, cowshed_core::ErrorCode::Conflict);
+    assert_eq!(head(&recovery), original_head);
     purge.shutdown().await.expect("stop the purging runtime");
     assert_eq!(
         resolved(&fixture.checkout, &reference),
         original_head,
-        "the restored checkout keeps the abandoned commit"
+        "the still-bound main checkout keeps the abandoned commit"
     );
 }
 
@@ -1443,6 +1610,22 @@ async fn rm_refuses_a_young_or_dirty_workspace_unforced_and_journals_who_forced_
         )
         .await
         .expect("--force removes it");
+    let image = fixture
+        .layout()
+        .session_image(&name("fresh"))
+        .unwrap()
+        .image()
+        .to_owned();
+    assert!(
+        !image.exists(),
+        "forced dirty retirement leaves the live namespace"
+    );
+    let recovery = fixture
+        .layout()
+        .project()
+        .sessions
+        .join(format!(".trash/fresh-{}.dmg", incarnation_of(&minted),));
+    assert_eq!(fs::read(recovery.join("draft")).unwrap(), b"first edit\n");
     runtime.shutdown().await.expect("stop the runtime");
     let retired = deletion_log(&fixture, "retire-workspace", "fresh");
     let by = &retired["retiredBy"];

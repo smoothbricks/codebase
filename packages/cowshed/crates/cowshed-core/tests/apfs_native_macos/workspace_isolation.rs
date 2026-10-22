@@ -12,6 +12,56 @@ fn published_session(layout: &StorageLayout, workspace: &str, incarnation: &str)
     image
 }
 
+/// Canonical unlink is the retirement commit for clean, recoverable source images. A real
+/// immutable-file refusal must keep its authority, and retry must release bytes without trash.
+#[test]
+fn clean_source_release_unlinks_physically_and_keeps_authority_when_unlink_refuses() {
+    const LIVE: &str = "00000000000000000000000000000024";
+    let fixture = Fixture::new("direct-source-release");
+    let config = fixture.config();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let host = native_host(&fixture, RecordingRunner::default());
+    let canonical = published_session(&layout, "raven", LIVE);
+    let workspace = host
+        .list(&repo())
+        .expect("inventory")
+        .into_iter()
+        .find(|fact| fact.workspace.name().as_str() == "raven")
+        .expect("raven")
+        .workspace;
+    let retired = RetiredRef::new(workspace, Revision::new(1));
+    let record = std::fs::read(sidecar_path(&canonical)).expect("record");
+    let key = std::fs::read(ca_key_path(&canonical)).expect("key");
+    struct MutableOnDrop(PathBuf);
+    impl Drop for MutableOnDrop {
+        fn drop(&mut self) {
+            if self.0.exists() {
+                set_file_flags(&self.0, 0);
+            }
+        }
+    }
+    let flags = MutableOnDrop(canonical.clone());
+    set_file_flags(&canonical, libc::UF_IMMUTABLE);
+    let error = host
+        .release_workspace(&config, &retired)
+        .expect_err("unlink refuses");
+    assert!(
+        canonical.exists(),
+        "failed unlink must preserve the source image: {error}"
+    );
+    assert_eq!(std::fs::read(sidecar_path(&canonical)).unwrap(), record);
+    assert_eq!(std::fs::read(ca_key_path(&canonical)).unwrap(), key);
+    assert!(!layout.project().sessions.join(".trash").exists());
+    set_file_flags(&canonical, 0);
+    drop(flags);
+    host.release_workspace(&config, &retired)
+        .expect("retry physically releases");
+    assert!(!canonical.exists());
+    assert!(!sidecar_path(&canonical).exists());
+    assert!(!ca_key_path(&canonical).exists());
+    assert!(!layout.project().sessions.join(".trash").exists());
+}
+
 /// The state a retirement leaves when it crashes right after its commit: the record and key are
 /// linked at the trash names, the image renamed onto the trash, and the canonical names not yet
 /// unlinked.
@@ -315,6 +365,17 @@ fn locked_recovery_settles_only_its_own_workspace_and_never_reads_a_broken_neigh
         std::fs::create_dir_all(record.parent().expect("record parent")).expect("record parent");
         std::fs::write(record, CORRUPT).expect("corrupt neighbour record");
     }
+    // A neighbour's committed release that cannot even be opened: a pass that read it would
+    // refuse, and one that freed it would block on a release that is not its own.
+    let neighbour_release = broken_canonical
+        .parent()
+        .expect("sessions")
+        .join(".releasing")
+        .join(format!("broken-{SIBLING}.dmg"));
+    std::fs::create_dir_all(neighbour_release.parent().expect("journal")).expect("journal");
+    std::fs::write(&neighbour_release, CORRUPT).expect("neighbour release");
+    std::fs::set_permissions(&neighbour_release, std::fs::Permissions::from_mode(0o000))
+        .expect("unreadable neighbour release");
 
     let lock = layout.session_image(&kite).expect("kite").lock().to_owned();
     host.recover_pending(&config, std::slice::from_ref(&lock))
@@ -339,6 +400,13 @@ fn locked_recovery_settles_only_its_own_workspace_and_never_reads_a_broken_neigh
     }
     host.recover_pending(&config, std::slice::from_ref(&lock))
         .expect("repeated locked recovery is idempotent");
+    assert_eq!(
+        std::fs::metadata(&neighbour_release)
+            .expect("the neighbour's release is left")
+            .len(),
+        u64::try_from(CORRUPT.len()).expect("length"),
+        "a locked pass neither reads nor frees a neighbour's committed release"
+    );
     let main_lock = layout.main_image().expect("main").lock().to_owned();
     host.recover_pending(&config, &[main_lock, lock])
         .expect("main and kite locks select main and kite only");

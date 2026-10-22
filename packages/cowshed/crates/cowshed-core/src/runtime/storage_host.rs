@@ -6,7 +6,9 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::build_volume::{BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, ReleaseClaim};
+use crate::build_volume::{
+    BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, Registration, ReleaseClaim,
+};
 use crate::metadata::{DetachedWorkspaceMetadata, WorkspaceName};
 use crate::repository::RepoId;
 use crate::storage::apfs::native::{BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease};
@@ -44,25 +46,30 @@ pub(crate) trait RuntimeStorageHost: ApfsExecutionHost<LockGuard: Sync> {
 
     fn label_image_volume(&self, image: &Path, label: &str) -> Result<Labelled, ApfsStorageError>;
 
+    /// Every operation here that writes a build image registers `registration`'s owner record
+    /// before the image's first byte exists (16_build_volumes.md, "Garbage collection"). A
+    /// created volume stays registered, held by the answered hold, until the caller publishes
+    /// it; a clone is published before it answers.
     fn create_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
         capacity: ImageCapacity,
-    ) -> Result<PathBuf, ApfsStorageError>;
+        registration: &Registration,
+    ) -> Result<(PathBuf, BuildVolumeHold), ApfsStorageError>;
     fn clone_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         source: &BuildVolumeId,
         destination: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(), ApfsStorageError>;
     fn clone_quiet_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         quiet: &super::build_volumes::Quiet,
         destination: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(), ApfsStorageError>;
     /// Capture the source `claim` claimed into seed `destination`, under that claim: a reseed
     /// takes it before it stops the source's Nx daemon, so no job (the daemon keeper's start job
@@ -73,7 +80,7 @@ pub(crate) trait RuntimeStorageHost: ApfsExecutionHost<LockGuard: Sync> {
         layout: &BuildVolumeLayout,
         claim: &ReleaseClaim,
         destination: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(), ApfsStorageError>;
     fn build_volume_written(
         &self,
@@ -90,7 +97,7 @@ pub(crate) trait RuntimeStorageHost: ApfsExecutionHost<LockGuard: Sync> {
         &self,
         layout: &BuildVolumeLayout,
         seed: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(BuildVolumeId, PathBuf), ApfsStorageError>;
     fn mount_build_volume(
         &self,
@@ -162,4 +169,11 @@ pub(crate) trait RuntimeStorageHost: ApfsExecutionHost<LockGuard: Sync> {
         source: &ReAdoptSource,
         build_claim: Option<&ReleaseClaim>,
     ) -> Result<(), ApfsStorageError>;
+
+    /// Rewrite a build image under its retained exclusive admission claim.
+    fn defragment_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        claim: &ReleaseClaim,
+    ) -> Result<crate::storage::lifecycle::DefragmentOutcome, ApfsStorageError>;
 }

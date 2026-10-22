@@ -739,6 +739,12 @@ pub fn sync_directory(path: &Path) -> io::Result<()> {
     full_sync(&options.open(path)?)
 }
 
+/// [`sync_directory`] for a directory the caller already holds by descriptor, so no path is
+/// resolved again between the change and its flush.
+pub fn sync_held_directory(directory: &File) -> io::Result<()> {
+    full_sync(directory)
+}
+
 /// Atomically rename one directory-relative entry without replacing an existing destination.
 #[cfg(target_os = "macos")]
 pub fn rename_noreplace(

@@ -337,6 +337,14 @@ pub enum RestoreExecutionError<F> {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetirementDisposition {
+    /// Every source byte is rebuildable or recoverable outside the retiring image.
+    Release,
+    /// Keep the complete source payload as recovery evidence.
+    Recovery,
+}
+
 #[derive(Debug, Error)]
 pub enum RetireExecutionError<F> {
     #[error("workspace retirement failed: {0}")]
@@ -473,6 +481,13 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         source: &Path,
         source_mount: Option<&Path>,
         destination: &Path,
+    ) -> Result<(), ApfsStorageError>;
+    /// Prove this exact physical image generation within the standalone first-write bound.
+    /// Unknown/stale images refuse; the native extent walk stops at the first over-limit run.
+    fn require_forkable_image(
+        &self,
+        image: &Path,
+        mount: Option<&Path>,
     ) -> Result<(), ApfsStorageError>;
     /// Take a fresh clone's own copy of the extent map it shares with its source, before
     /// anything attaches it. The first write into a clone copies that map, at a cost that grows
@@ -742,19 +757,17 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         staged: &Path,
     ) -> Result<(), ApfsStorageError>;
     fn retire_image(&self, canonical: &Path, trash: &Path) -> Result<(), ApfsStorageError>;
+    /// Release an exactly fenced canonical workspace, retaining its record until physical unlink.
+    fn release_workspace(
+        &self,
+        config: &ApfsSubstrateConfig,
+        retired: &RetiredRef,
+    ) -> Result<(), ApfsStorageError>;
     fn reclaim_image(&self, image: &Path) -> Result<(), ApfsStorageError>;
     fn reclaim_retired(
         &self,
         config: &ApfsSubstrateConfig,
         retired: &RetiredRef,
-    ) -> Result<(), ApfsStorageError>;
-    /// Reclaims a trash image whose retirement record, its grants sidecar, is already gone. The
-    /// caller holds the lock of the workspace name the file carries.
-    fn reclaim_unrecorded_retired(
-        &self,
-        config: &ApfsSubstrateConfig,
-        repo: &RepoId,
-        image: &Path,
     ) -> Result<(), ApfsStorageError>;
     fn list(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError>;
     /// Revalidate one published workspace's identity and mount without reading sibling records.
@@ -1151,6 +1164,34 @@ where
         .await
     }
 
+    /// Repair an unpublished clone in place without discarding its possibly only-copy contents
+    /// or activating it. A retry of the original intent remains the publication authority.
+    pub async fn defragment_pending_clone(
+        &self,
+        metadata: crate::metadata::DetachedWorkspaceMetadata,
+    ) -> Result<DefragmentOutcome, ApfsStorageError> {
+        if metadata.publication_state != crate::metadata::PublicationState::PendingFence
+            || metadata.workspace.is_main()
+        {
+            return Err(ApfsStorageError::InvalidPlan(
+                "defrag requires a pending session clone",
+            ));
+        }
+        let workspace = native::metadata_workspace_ref(&metadata)?;
+        let lock_paths = vec![workspace_lock_path(
+            &self.config,
+            workspace.repo(),
+            workspace.name(),
+        )?];
+        self.dispatch_with_locks(lock_paths, true, move |host, config| {
+            let image = canonical_image_path(&config, &workspace)?;
+            host.validate_pending_clone(&image, &metadata)?;
+            let mount = mount_point(&config, &workspace)?;
+            host.defragment(&workspace, &image, &mount)
+        })
+        .await
+    }
+
     /// Retire an unpublished main nothing will finish: release whatever the kernel still attaches
     /// from it and reclaim the image with its sidecar and companion. Only the exact `incarnation`
     /// the caller judged abandoned is touched, re-read under main's lifecycle lock; the checkout
@@ -1486,7 +1527,7 @@ where
     ) -> Result<(RetiredRef, R), StagedExecutionError<E>>
     where
         F: FnOnce(WorkspaceStage) -> Fut + Send,
-        Fut: Future<Output = Result<R, E>> + Send,
+        Fut: Future<Output = Result<(RetirementDisposition, R), E>> + Send,
         R: Send,
         E: Send,
     {
@@ -1503,7 +1544,7 @@ where
         let lock_path = workspace_lock_path(&self.config, workspace.repo(), workspace.name())?;
         let host = Arc::clone(&self.host);
         let config = Arc::clone(&self.config);
-        let (_lock, prepared) = self
+        let (lock, prepared) = self
             .lane
             .dispatch(move || {
                 let lock = host.lock_images(&[lock_path], LockMode::Wait)?.ok_or(
@@ -1526,19 +1567,25 @@ where
             .await?;
         let prepared = StagedCallbackGuard::new(
             Arc::clone(&self.host),
-            prepared,
-            restore_prepared_mount::<H>,
+            (lock, prepared),
+            |host, (lock, prepared)| {
+                let _lock = lock;
+                restore_prepared_mount(host, prepared)
+            },
         );
-        let value = match inspect(prepared.get().stage.clone()).await {
-            Ok(value) => value,
+        let (disposition, value) = match inspect(prepared.get().1.stage.clone()).await {
+            Ok((disposition, value)) => (disposition, value),
             Err(error) => {
                 // Nothing was retired, so the image goes back as it was found: a removal that
                 // mounted it to inspect it must not leave it mounted.
-                let prepared = prepared.into_prepared();
+                let (lock, prepared) = prepared.into_prepared();
                 let host = Arc::clone(&self.host);
                 let restored = self
                     .lane
-                    .dispatch(move || restore_prepared_mount(host.as_ref(), prepared))
+                    .dispatch(move || {
+                        let _lock = lock;
+                        restore_prepared_mount(host.as_ref(), prepared)
+                    })
                     .await;
                 return Err(match restored {
                     Ok(()) => StagedExecutionError::Initializer(error),
@@ -1549,12 +1596,14 @@ where
                 });
             }
         };
-        let prepared = prepared.into_prepared();
+        let (lock, prepared) = prepared.into_prepared();
         let host = Arc::clone(&self.host);
         let config = Arc::clone(&self.config);
         let retired = self
             .lane
             .dispatch(move || {
+                // Cancellation drops the waiter, not release's image ownership.
+                let _lock = lock;
                 let PreparedClone {
                     stage,
                     attachment,
@@ -1566,8 +1615,12 @@ where
                     ApfsStorageError::InvalidPlan("pending retirement revision overflow"),
                 )?;
                 host.detach(attachment, DetachIntent::Release)?;
-                host.retire_image(&image, &trash)?;
-                Ok(RetiredRef::new(stage.workspace, Revision::new(revision)))
+                let retired = RetiredRef::new(stage.workspace, Revision::new(revision));
+                match disposition {
+                    RetirementDisposition::Release => host.release_workspace(&config, &retired)?,
+                    RetirementDisposition::Recovery => host.retire_image(&image, &trash)?,
+                }
+                Ok(retired)
             })
             .await?;
         Ok((retired, value))
@@ -1721,14 +1774,12 @@ where
         }
         Ok(pending.receipt)
     }
-    /// Make a workspace durably undiscoverable, then publish its retirement before reclamation.
-    ///
-    /// A callback failure is forward-only: the returned retired reference names the preserved
-    /// trash image, allowing the caller or startup recovery to retry lifecycle publication before
-    /// idempotent reclamation.
+    /// Retire under the existing image fence, then publish the lifecycle commitment.
+    /// Clean recoverable sources are physically released; recovery sources retain trash.
     pub async fn execute_retire_staged<F, Fut, E>(
         &self,
         plan: RetirePlan,
+        disposition: RetirementDisposition,
         fence: F,
     ) -> Result<RetiredRef, RetireExecutionError<E>>
     where
@@ -1736,9 +1787,29 @@ where
         Fut: Future<Output = Result<(), E>> + Send,
         E: Send,
     {
-        let retired = match self.execute(&plan).await? {
-            Applied::Retired(retired) => retired,
-            _ => return Err(ApfsStorageError::UnexpectedResult.into()),
+        let retired = match disposition {
+            RetirementDisposition::Recovery => match self.execute(&plan).await? {
+                Applied::Retired(retired) => retired,
+                _ => return Err(ApfsStorageError::UnexpectedResult.into()),
+            },
+            RetirementDisposition::Release => {
+                let locks = operation_lock_paths(&self.config, plan.expected(), plan.operation())?;
+                self.dispatch_with_locks(locks, true, move |host, config| {
+                    revalidate(plan.expected(), &host.observe(plan.expected())?)?;
+                    let Operation::Retire { workspace, .. } = plan.operation() else {
+                        return Err(ApfsStorageError::UnexpectedResult);
+                    };
+                    let current = active_expected(plan.expected(), workspace)?;
+                    let revision = current.revision().get().checked_add(1).ok_or(
+                        ApfsStorageError::InvalidPlan("retirement revision overflow"),
+                    )?;
+                    host.detach_mounted(&current, DetachIntent::Release)?;
+                    let retired = RetiredRef::new(current, Revision::new(revision));
+                    host.release_workspace(&config, &retired)?;
+                    Ok(retired)
+                })
+                .await?
+            }
         };
         if let Err(source) = fence(retired.clone()).await {
             return Err(RetireExecutionError::Fence { source, retired });
@@ -1927,32 +1998,6 @@ where
     {
         self.dispatch_with_locks(vec![lock_path], false, move |host, _| job(host.as_ref()))
             .await
-    }
-
-    /// Reclaims a trash image whose grants sidecar is gone, under the lock of the name its
-    /// `<workspace>-<incarnation>` file name carries. Retirement holds that same lock while
-    /// preparing the complete trash record and committing its image, so collection cannot interleave.
-    pub async fn reclaim_unrecorded_retired(
-        &self,
-        repo: &RepoId,
-        image: PathBuf,
-    ) -> Result<(), ApfsStorageError> {
-        let (name, _) = image
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(split_retired_stem)
-            .ok_or_else(|| {
-                ApfsStorageError::Host(format!(
-                    "trash image is not named <workspace>-<incarnation>: {}",
-                    image.display()
-                ))
-            })?;
-        let lock_paths = vec![workspace_lock_path(&self.config, repo, &name)?];
-        let repo = repo.clone();
-        self.dispatch_with_locks(lock_paths, true, move |host, config| {
-            host.reclaim_unrecorded_retired(&config, &repo, &image)
-        })
-        .await
     }
 }
 
@@ -2896,6 +2941,18 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
                 if !H::HAS_PHYSICAL_VOLUMES {
                     return Ok(());
                 }
+                // Measure the actual detached clone, not HEAD or the still-writing source.
+                // Stop at 7141 runs: admission must never hide an unbounded recount in fork.
+                timed_apfs_step("canonical", "extent-proof", || {
+                    host.require_forkable_image(&canonical_image, None)
+                        .map_err(|error| {
+                            ApfsStorageError::Host(format!(
+                                "{error}; source image {}; next: cowshed defrag {}",
+                                source_image.display(),
+                                source.name()
+                            ))
+                        })
+                })?;
                 timed_apfs_step("canonical", "first-write", || {
                     host.write_first(&canonical_image)
                 })
@@ -2907,6 +2964,15 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
                 host.reclaim_image(&canonical_image),
             );
         }
+    }
+    if resuming && H::HAS_PHYSICAL_VOLUMES {
+        // A crash-left payload is not a retained proof of its current write generation.
+        host.require_forkable_image(&canonical_image, None).map_err(|error| {
+            ApfsStorageError::Host(format!(
+                "{error}; pending clone retained; next: cowshed defrag {}, then retry its original fork",
+                workspace.name()
+            ))
+        })?;
     }
 
     mount_clone_stage(
@@ -3066,6 +3132,16 @@ fn commit_prepared_clone<H: ApfsExecutionHost>(
             )
         })
     })?;
+    if H::HAS_PHYSICAL_VOLUMES {
+        timed_apfs_step("canonical", "publication-extent-proof", || {
+            host.require_forkable_image(&image, Some(&stage.mount_point)).map_err(|error| {
+                ApfsStorageError::Host(format!(
+                    "{error}; pending clone retained; next: cowshed defrag {}, then retry its original fork",
+                    stage.workspace.name()
+                ))
+            })
+        })?;
+    }
     timed_apfs_step("canonical", "activate", || {
         host.activate_pending(&image, &stage.workspace)
     })?;
@@ -3739,11 +3815,49 @@ pub(super) fn retired_image_below(
     workspace: &WorkspaceName,
     incarnation: &WorkspaceIncarnation,
 ) -> PathBuf {
-    sessions.join(TRASH_NAMESPACE).join(format!(
+    sessions
+        .join(TRASH_NAMESPACE)
+        .join(retired_file_name(workspace, incarnation))
+}
+
+/// `<sessions>/.releasing/<name>-<incarnation>.dmg`: where a workspace image's release is
+/// committed and, until the same operation has freed it, journaled (02_workspaces.md, `rm` step
+/// 5; [`release::JOURNAL_DIRECTORY`]). Named like its trash entry, so an incarnation names one.
+pub(super) fn releasing_image_below(
+    sessions: &Path,
+    workspace: &WorkspaceName,
+    incarnation: &WorkspaceIncarnation,
+) -> PathBuf {
+    sessions
+        .join(release::JOURNAL_DIRECTORY)
+        .join(retired_file_name(workspace, incarnation))
+}
+
+fn retired_file_name(workspace: &WorkspaceName, incarnation: &WorkspaceIncarnation) -> String {
+    format!(
         "{}-{}.{IMAGE_EXTENSION}",
         workspace.as_str(),
-        incarnation.as_str(),
-    ))
+        incarnation.as_str()
+    )
+}
+
+/// Whether `name` is a workspace image's journal name, `<name>-<incarnation>.dmg`.
+pub(crate) fn is_releasing_image_name(name: &str) -> bool {
+    name.strip_suffix(&format!(".{IMAGE_EXTENSION}"))
+        .and_then(split_retired_stem)
+        .is_some()
+}
+
+/// Finish every workspace image release a crash cut short in the store at `store`: each
+/// project's `sessions/.releasing`. The daemon runs this once at its start; a project's next
+/// lifecycle open does the same for its own.
+pub fn drain_store_session_releases(store: &Path) -> release::Drained {
+    release::drain_store(
+        store,
+        crate::repository::SESSIONS_DIRECTORY,
+        release::JOURNAL_DIRECTORY,
+        is_releasing_image_name,
+    )
 }
 
 /// Splits a `<name>-<incarnation>` trash stem: the exact inverse of the stem written by

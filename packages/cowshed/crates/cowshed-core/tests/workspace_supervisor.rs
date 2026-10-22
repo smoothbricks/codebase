@@ -466,6 +466,7 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
         workspace_volume: None,
         job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
         cpu: Arc::new(ImmediateCpu),
+        build_volume_released: None,
     }
 }
 
@@ -7731,6 +7732,28 @@ async fn nx_daemon_restart_follows_a_build_volume_swap_without_an_exec() {
     link::link_paths(&checkout, &before, &paths).unwrap();
     supervisor_config.sandbox.build_volume_mount = Some(before.clone());
     supervisor_config.build_volume_layout = Some(layout.clone());
+    // The controller's release at each job end, awaited before the job is told ended: this test
+    // records what it is told, and refuses the release of the adopted volume, as a release whose
+    // unlink fails would.
+    let (released_tx, released) = std::sync::mpsc::channel();
+    let refused = adopted_id.clone();
+    supervisor_config.build_volume_released = Some(
+        cowshed_core::runtime::supervisor::BuildVolumeReleased::new(move |id| {
+            let refuse = id == refused;
+            // A receiver gone at teardown has nothing left to learn.
+            let _ = released_tx.send(id.clone());
+            async move {
+                if refuse {
+                    return Err(cowshed_core::CowshedError::internal(format!(
+                        "release of build volume {id} failed"
+                    )));
+                }
+                Ok(())
+            }
+        }),
+    );
+    let owner = supervisor_config.authority.workspace.clone();
+    let incarnation = supervisor_config.authority.workspace_incarnation.clone();
     let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
     let _in_use = open_named(&h.handle, "build").await;
 
@@ -7745,11 +7768,21 @@ async fn nx_daemon_restart_follows_a_build_volume_swap_without_an_exec() {
     layout
         .write_record(
             &before_id,
-            &BuildVolumeRecord::new(None, BuildVolumeRole::Unlinked),
+            &BuildVolumeRecord::new(None, BuildVolumeRole::Superseded { owner, incarnation }),
         )
         .unwrap();
+    assert!(
+        released.try_recv().is_err(),
+        "nothing is told while the keeper job still holds the superseded volume"
+    );
     complete(&first, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(first.request.job_id).await.unwrap();
+    assert_eq!(
+        released.try_recv(),
+        Ok(before_id.clone()),
+        "the job's end awaited the controller's release of the volume it held, so a superseded \
+         one is released before the job is told ended, not at a later collection"
+    );
     let second = tokio::time::timeout(NX_PROBES, h.spawned.recv())
         .await
         .expect("the keeper restarts the daemon after the pivot")
@@ -7783,7 +7816,11 @@ async fn nx_daemon_restart_follows_a_build_volume_swap_without_an_exec() {
         );
     }
     complete(&second, b"", b"", ExitStatus::Exited { code: 0 }).await;
-    h.handle.wait(second.request.job_id).await.unwrap();
+    let failed =
+        h.handle.wait(second.request.job_id).await.expect_err(
+            "a release that fails is the job's terminal failure, never a quiet success",
+        );
+    assert!(failed.message.contains(adopted_id.as_str()), "{failed:?}");
     h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 

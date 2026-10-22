@@ -107,6 +107,39 @@ pub enum NxDaemonRetirement {
     ControllerOwned,
 }
 
+type BuildVolumeReleaseFuture = std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+
+/// The controller's release a job's end owes the build volume it was admitted with, once its
+/// hold is gone (16_build_volumes.md, "Garbage collection"): a volume an adoption or reseed
+/// superseded while the job ran is released then, inside the controller, and the job's end waits
+/// for it. A release that fails or cannot run is the job's terminal failure, and the volume's
+/// record keeps naming its owner; nothing is left for a later collection.
+#[derive(Clone)]
+pub struct BuildVolumeReleased(
+    Arc<dyn Fn(crate::build_volume::BuildVolumeId) -> BuildVolumeReleaseFuture + Send + Sync>,
+);
+
+impl BuildVolumeReleased {
+    pub fn new<F>(
+        released: impl Fn(crate::build_volume::BuildVolumeId) -> F + Send + Sync + 'static,
+    ) -> Self
+    where
+        F: Future<Output = Result<()>> + Send + 'static,
+    {
+        Self(Arc::new(move |volume| Box::pin(released(volume))))
+    }
+
+    async fn release(&self, volume: crate::build_volume::BuildVolumeId) -> Result<()> {
+        (self.0)(volume).await
+    }
+}
+
+impl std::fmt::Debug for BuildVolumeReleased {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BuildVolumeReleased")
+    }
+}
+
 /// Production construction inputs for exactly one mounted workspace incarnation.
 #[derive(Clone, Debug)]
 pub struct WorkspaceSupervisorConfig {
@@ -160,6 +193,8 @@ pub struct WorkspaceSupervisorConfig {
     /// The host CPU budget every job's command is admitted through before it spawns (05_gateway.md
     /// "Host CPU budget"): the gateway's grant, held until the job concludes.
     pub cpu: Arc<dyn JobCpuAdmission>,
+    /// Told each build volume whose job hold ended; `None` tells nothing.
+    pub build_volume_released: Option<BuildVolumeReleased>,
 }
 
 /// How the supervisor samples its jobs' resources (07_api.md, "Job monitoring"): policy values,
@@ -342,6 +377,7 @@ impl Default for WorkspaceSupervisorConfig {
             workspace_volume: None,
             job_sampling: JobSamplingPolicy::default(),
             cpu: Arc::new(ImmediateCpu),
+            build_volume_released: None,
         }
     }
 }
@@ -3479,6 +3515,7 @@ impl WorkspaceSupervisor {
             job_sampling: config.job_sampling,
             sample_clock: None,
             cpu: config.cpu,
+            build_volume_released: config.build_volume_released,
             admissions: tokio::task::JoinSet::new(),
         };
         // Whatever the checkout's volumes were cloned from, they are named for it from here.
@@ -4099,7 +4136,10 @@ struct JobStateRecord {
     /// The job's claim on the build volume it was admitted with, from admission until the job
     /// ends: while it lives, no release unmounts that volume, whatever moved the checkout's link
     /// meanwhile (16_build_volumes.md, "Process lifetime across a swap").
-    build_hold: Option<crate::build_volume::BuildVolumeHold>,
+    build_hold: Option<(
+        crate::build_volume::BuildVolumeId,
+        crate::build_volume::BuildVolumeHold,
+    )>,
     /// Where the job stands with the host CPU budget.
     cpu: CpuStanding,
     /// Why the job failed before any status of its own could say, when it did.
@@ -4320,6 +4360,8 @@ struct SupervisorActor {
     sample_clock: Option<tokio::time::Interval>,
     /// See [`WorkspaceSupervisorConfig::cpu`].
     cpu: Arc<dyn JobCpuAdmission>,
+    /// See [`WorkspaceSupervisorConfig::build_volume_released`].
+    build_volume_released: Option<BuildVolumeReleased>,
     /// Each queued job's CPU request, answered off the actor's path, so status, kill and every
     /// other command are served while jobs wait for their grants.
     admissions: tokio::task::JoinSet<(JobId, Result<JobCpuGrant>)>,
@@ -6081,7 +6123,12 @@ impl SupervisorActor {
     fn hold_build_volume(
         &self,
         grant: Option<&Path>,
-    ) -> Result<Option<crate::build_volume::BuildVolumeHold>> {
+    ) -> Result<
+        Option<(
+            crate::build_volume::BuildVolumeId,
+            crate::build_volume::BuildVolumeHold,
+        )>,
+    > {
         let Some(grant) = grant else {
             return Ok(None);
         };
@@ -6107,7 +6154,7 @@ impl SupervisorActor {
             )
         })?;
         match layout.admit(&id) {
-            Ok(hold) => Ok(Some(hold)),
+            Ok(hold) => Ok(Some((id, hold))),
             Err(error) if error.kind() == std::io::ErrorKind::ResourceBusy => {
                 Err(CowshedError::conflict(
                     format!(
@@ -7414,9 +7461,20 @@ impl SupervisorActor {
             "the job concluded before the write was reported whole",
         ));
         job.process = None;
-        // Nor does it run on its build volume any more: a release may take it. Nor does it hold
-        // its CPU grant: dropping it returns every token to the gateway's ledger.
-        job.build_hold = None;
+        // Nor does it run on its build volume any more: a release may take it, and the
+        // controller's release is awaited before the job is told ended, so a volume superseded
+        // while the job ran is gone by then, or the job's end says why it is not. Nor does it
+        // hold its CPU grant: dropping it returns every token to the gateway's ledger.
+        let mut state = state;
+        if let Some((volume, hold)) = job.build_hold.take() {
+            drop(hold);
+            if let Some(released) = &self.build_volume_released
+                && let Err(error) = released.release(volume).await
+            {
+                state = JobState::Failed;
+                job.terminal_cleanup_failure.get_or_insert(error);
+            }
+        }
         job.cpu = CpuStanding::Settled;
         job.info.state = state;
         job.info.duration_ms = Some(duration_ms);
@@ -9760,6 +9818,7 @@ mod lifecycle_commitment_tests {
             workspace_volume: None,
             job_sampling: JobSamplingPolicy::default(),
             cpu: defaults.cpu,
+            build_volume_released: None,
         };
         // `list()`/`info()` answer from the actor's resident job set, which is this supervisor's
         // own lifetime and deliberately not the durable history: the artifact store holds every

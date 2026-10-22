@@ -1140,7 +1140,7 @@ export type GcReason =
   | 'abandonedBundle'
   | 'unlinkedBuildVolume'
   | 'supersededSeed'
-  | 'unrecordedBuildVolume';
+  | 'interruptedBuildVolume';
 
 export type GcReport = {
   readonly examined: number & tags.Type<'uint64'>;

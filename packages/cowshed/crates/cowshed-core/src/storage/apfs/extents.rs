@@ -1,9 +1,11 @@
 //! An image file's physical layout: how many extents its data occupies, and a rewrite that lays
 //! the same bytes out again contiguously.
 //!
-//! Extents are the whole cost of cloning an image (01a_apfs.md, "Clone cost follows extents,
+//! Extents govern the first-write map-copy cost (01a_apfs.md, "Clone cost follows extents,
 //! not size"): `clonefile` shares the source's extent map and the first write to either file
-//! copies it. A main image fragments with every write it takes while clones share its blocks, so
+//! copies it. Attach, mount, identity work and other images have separate costs.
+//!
+//! A main image fragments with every write it takes while clones share its blocks, so
 //! the one remedy is to write its data again into fresh, contiguous space.
 //!
 //! The rewrite is a plain `pread`/`pwrite` copy. `clonefile`, `copyfile(3)`, and
@@ -12,6 +14,7 @@
 
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io;
+use std::ops::ControlFlow;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -26,16 +29,94 @@ const COPY_CHUNK_BYTES: u64 = 8 << 20;
 /// Count the physically contiguous runs the file's data occupies, one `F_LOG2PHYS_EXT` query per
 /// run, skipping holes.
 pub fn count_extents(path: &Path) -> Result<ExtentCount, ApfsStorageError> {
+    Ok(measure(path, None)?.extents)
+}
+
+/// A disposable witness of this file's physical write generation, never a Git tree or HEAD.
+/// No second registry is kept: callers retain this value only across the operation it proves.
+#[derive(Clone, Debug)]
+pub struct ExtentProof {
+    generation: ImageGeneration,
+    extents: ExtentCount,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ImageGeneration {
+    device: u64,
+    inode: u64,
+    length: u64,
+    blocks: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl ImageGeneration {
+    fn of(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            blocks: metadata.blocks(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+impl ExtentProof {
+    pub fn revalidate(&self, image: &Path) -> Result<(), ApfsStorageError> {
+        let metadata = fs::metadata(image)
+            .map_err(|error| io_error("revalidate image extent generation", image, error))?;
+        if self.generation != ImageGeneration::of(&metadata) {
+            return Err(ApfsStorageError::Host(format!(
+                "image {} changed physical generation during extent proof; fork readiness is unknown, stop its writers and retry",
+                image.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Refuse unknown, changing or oversized physical generations before publishing a forkable
+/// image. The walk stops at 7141, not at the end of an arbitrarily fragmented image. Its cost
+/// is still work outside the standalone first-write sensitivity, not a subsecond fork promise.
+pub fn prove_forkable(image: &Path) -> Result<ExtentProof, ApfsStorageError> {
+    let proof = measure(image, Some(ExtentCount::FORKABLE_MAX.get() + 1))?;
+    if !proof.extents.is_forkable() {
+        return Err(ApfsStorageError::Host(format!(
+            "image {} has at least {} extents, above the {} standalone first-write sensitivity limit (140.046964 us/extent; cause unattributed); defragment this workspace's source and build images with cowshed defrag <workspace> before publishing a forkable generation",
+            image.display(),
+            proof.extents,
+            ExtentCount::FORKABLE_MAX
+        )));
+    }
+    Ok(proof)
+}
+
+fn measure(path: &Path, stop_at: Option<u64>) -> Result<ExtentProof, ApfsStorageError> {
     let file =
         File::open(path).map_err(|error| io_error("open image to count extents", path, error))?;
-    let length = file
-        .metadata()
-        .map_err(|error| io_error("inspect image to count extents", path, error))?
-        .len();
+    let generation = ImageGeneration::of(
+        &file
+            .metadata()
+            .map_err(|error| io_error("inspect image to count extents", path, error))?,
+    );
     let mut extents = 0_u64;
-    for_each_run(&file, length, |_| extents += 1)
-        .map_err(|error| io_error("map image extents", path, error))?;
-    Ok(ExtentCount::new(extents))
+    for_each_run(&file, generation.length, |_| {
+        extents += 1;
+        if stop_at.is_some_and(|limit| extents >= limit) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .map_err(|error| io_error("map image extents", path, error))?;
+    let proof = ExtentProof {
+        generation,
+        extents: ExtentCount::new(extents),
+    };
+    proof.revalidate(path)?;
+    Ok(proof)
 }
 
 /// How many of `clone`'s data bytes sit on the same device blocks as the same offsets of `source`:
@@ -295,14 +376,21 @@ fn next_data_region(file: &File, offset: u64, length: u64) -> io::Result<Option<
 }
 
 /// Call `run` with the start of every physically contiguous run of the file's data, ascending,
-/// skipping holes: one `F_LOG2PHYS_EXT` query per run. Elsewhere than macOS nothing maps a file
-/// to the device and no RAW image lives there, so each data region counts as one run.
-pub(super) fn for_each_run(file: &File, length: u64, mut run: impl FnMut(u64)) -> io::Result<()> {
+/// skipping holes, until `run` breaks: one `F_LOG2PHYS_EXT` query per run. Elsewhere than macOS
+/// nothing maps a file to the device and no RAW image lives there, so each data region counts as
+/// one run.
+pub(super) fn for_each_run(
+    file: &File,
+    length: u64,
+    mut run: impl FnMut(u64) -> ControlFlow<()>,
+) -> io::Result<()> {
     let mut offset = 0;
     while let Some((start, end)) = next_data_region(file, offset, length)? {
         let mut position = start;
         while position < end {
-            run(position);
+            if run(position).is_break() {
+                return Ok(());
+            }
             position += run_bytes(file, position, end - position)?;
         }
         offset = end;
@@ -476,6 +564,54 @@ pub(super) mod tests {
         Scratch(root)
     }
 
+    #[test]
+    fn extent_proof_rejects_writes_replacements_and_missing_images() {
+        let root = scratch("generation");
+        let image = root.0.join("image.dmg");
+        fs::write(&image, vec![7_u8; 8192]).expect("image");
+        let proof = super::prove_forkable(&image).expect("small image generation");
+        proof.revalidate(&image).expect("unchanged generation");
+        let original = fs::metadata(&image)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&image)
+            .expect("open writer");
+        file.write_all_at(&[9_u8; 4096], 0)
+            .expect("same-size write");
+        file.set_modified(original)
+            .expect("restore mtime, not ctime");
+        assert!(
+            proof.revalidate(&image).is_err(),
+            "mtime alone is not generation proof"
+        );
+        drop(file);
+
+        let proof = super::prove_forkable(&image).expect("new write generation");
+        let replacement = root.0.join("replacement");
+        fs::write(&replacement, fs::read(&image).expect("read image")).expect("replacement");
+        File::options()
+            .write(true)
+            .open(&replacement)
+            .expect("replacement file")
+            .set_modified(original)
+            .expect("same mtime");
+        fs::rename(&replacement, &image).expect("replace inode");
+        assert!(
+            proof.revalidate(&image).is_err(),
+            "identical bytes are not the same generation"
+        );
+        let proof = super::prove_forkable(&image).expect("replacement generation");
+        fs::remove_file(&image).expect("remove");
+        assert!(
+            proof.revalidate(&image).is_err(),
+            "missing is unknown, not ready"
+        );
+        assert!(super::prove_forkable(&image).is_err());
+    }
+
     /// The bytes at `offset` in the fixture: every page distinct, so a misplaced page is caught.
     fn pattern(offset: u64, length: u64) -> Vec<u8> {
         (offset..offset + length)
@@ -550,6 +686,15 @@ pub(super) mod tests {
             fragmented.get() >= 256,
             "the fixture did not fragment: {fragmented} extents"
         );
+        let bounded = super::measure(&image, Some(1)).expect("bounded extent walk");
+        assert_eq!(
+            bounded.extents.get(),
+            1,
+            "stop without walking the fragmented map"
+        );
+        bounded
+            .revalidate(&image)
+            .expect("same physical generation");
         let regions_before = data_regions(&image);
         assert_eq!(regions_before, regions);
         // A copy an interrupted rewrite left behind is garbage the next rewrite replaces.

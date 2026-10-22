@@ -4611,9 +4611,12 @@ async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_j
     sh(&mut service, "main", "touch target/after").await;
     assert!(new_mount.join("target/after").is_file());
     assert!(!old_mount.join("target/after").exists());
-    assert_eq!(
-        layout.read_record(&old).expect("previous record").role,
-        BuildVolumeRole::Unlinked
+    assert!(
+        matches!(
+            layout.read_record(&old).expect("previous record").role,
+            BuildVolumeRole::Superseded { owner, .. } if owner.is_main()
+        ),
+        "the held previous volume stays recorded as main's until its release"
     );
     let (stdout, stderr) = succeed(&mut service, ["--json", "gc", "--dry-run"]).await;
     let preview: JsonEnvelope<GcReport> =
@@ -4653,12 +4656,8 @@ async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_j
         old_mount.join("target/ticking/exited").is_file(),
         "the job ran to its end in the previous volume"
     );
-    let (_, stderr) = succeed(&mut service, ["gc"]).await;
-    assert!(
-        !layout.image(&old).exists() && !layout.record(&old).exists(),
-        "the first gc once the job's hold is gone reclaims the previous volume and its record: \
-         {stderr}"
-    );
+    // The job's end releases it, inside the controller: no later collection is needed.
+    eventually(|| !layout.image(&old).exists() && !layout.record(&old).exists()).await;
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
 }

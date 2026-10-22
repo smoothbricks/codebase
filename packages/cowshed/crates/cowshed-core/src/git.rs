@@ -964,6 +964,38 @@ impl GitRepository {
         Ok(work)
     }
 
+    /// Ignored and hidden bytes are not automatically rebuildable. Only controller/volume
+    /// bookkeeping is exempt; every other untracked leaf must survive in the target checkout.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) async fn has_unique_untracked_content(&self, checkout: &Path) -> Result<bool> {
+        let mut args = vec![
+            "ls-files".to_owned(),
+            "--others".to_owned(),
+            "-z".to_owned(),
+        ];
+        for directory in std::iter::once(".cowshed").chain(cowshed_apfs::VOLUME_METADATA) {
+            args.push(format!("--exclude=/{directory}/"));
+        }
+        args.push(format!("--exclude=/{}", cowshed_apfs::SPOTLIGHT_OPT_OUT));
+        let output = self.run(args).await?;
+        if !output.status.success() {
+            return Err(git_internal("read retirement-only-copy paths", &output));
+        }
+        let root = self.root.clone();
+        let checkout = checkout.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            output
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .any(|path| !held_by_checkout(&root, &checkout, Path::new(OsStr::from_bytes(path))))
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("compare retirement-only-copy paths: {error}"))
+        })
+    }
+
     /// The tracked paths with staged or unstaged changes: exactly what makes `git rebase` refuse
     /// to start ("cannot rebase: You have unstaged changes"). Untracked files never block it.
     pub async fn tracked_change_paths(&self) -> Result<Vec<PathBuf>> {
@@ -5687,6 +5719,29 @@ mod tests {
             stdout: Vec::new(),
             stderr: stderr.to_vec(),
         }
+    }
+
+    #[tokio::test]
+    async fn source_release_requires_ignored_and_hidden_bytes_to_be_held_elsewhere() {
+        let store = crate::temp_root::FixtureStore::new();
+        let root = repository();
+        let main = repository();
+        let git = GitRepository::from_root(store.shared(), &root);
+        fs::write(root.join(".git/info/exclude"), "/ignored\n").unwrap();
+        fs::write(root.join("ignored"), b"only copy\n").unwrap();
+        fs::write(root.join(".hidden"), b"hidden copy\n").unwrap();
+        assert!(!git.is_dirty_by(Some(&main)).await.unwrap());
+        assert!(git.has_unique_untracked_content(&main).await.unwrap());
+        for path in ["ignored", ".hidden"] {
+            fs::copy(root.join(path), main.join(path)).unwrap();
+        }
+        assert!(!git.has_unique_untracked_content(&main).await.unwrap());
+        fs::write(root.join("ignored"), b"different\n").unwrap();
+        assert!(git.has_unique_untracked_content(&main).await.unwrap());
+        fs::remove_file(root.join("ignored")).unwrap();
+        fs::create_dir_all(root.join(".cowshed")).unwrap();
+        fs::write(root.join(".cowshed/token"), b"controller identity").unwrap();
+        assert!(!git.has_unique_untracked_content(&main).await.unwrap());
     }
 
     #[tokio::test]

@@ -548,10 +548,10 @@ The direction is the safe one. The reverse remote lets main **fetch from** a wor
 into main, which is the same pull-based hand-back `cowshed push`, autosave, and `land` all use, and for the same trust
 reason — the sandboxed side is never the side that initiates a write.
 
-`cowshed rm` drops the reverse registration as part of retirement, before the image is trashed, and `land` drops it at
-the same point it prunes `refs/cowshed/<ws>/*`. A registration left behind by an interrupted retire is removed
-idempotently by `cowshed gc` from the same revalidated retirement metadata that authorizes the rest of the cleanup — a
-remote naming a mount path that no longer exists is never by itself authority to delete anything.
+`cowshed rm` drops the reverse registration as part of retirement, before the image is released or preserved, and `land`
+drops it at the same point it prunes `refs/cowshed/<ws>/*`. A registration left behind by an interrupted retire is
+removed idempotently by `cowshed gc` from the same revalidated retirement metadata that authorizes the rest of the
+cleanup — a remote naming a mount path that no longer exists is never by itself authority to delete anything.
 
 ## `cowshed fork [<src>] <ws>` — create a workspace
 
@@ -819,14 +819,14 @@ or `cowshed fork` a standalone workspace when checkpointing is what is actually 
 checkpointing something that cannot be restored.
 
 `cowshed rm` drops the registration as part of retirement, in the same host-side-state-first step that drops a reverse
-remote: remove the worktree registration from main's repository, then trash the image. Unregistering is the removal of
+remote: remove the worktree registration from main's repository, then retire the image. Unregistering is the removal of
 that worktree's administrative directory and nothing else, because both commands that look more obvious are wrong here.
 `git worktree remove` deletes the working tree at the registered path — the workspace's own files, which retirement
-trashes as an image and `gc` may find already gone — and refuses on dirty state that `rm --force` has already accepted.
-`git worktree prune` unregisters _every_ worktree whose path is missing, and a merely detached cowshed workspace looks
-exactly like that. A registration orphaned by an interrupted retire is removed idempotently by `cowshed gc` from
-revalidated retirement metadata, before the image that carries that metadata is deleted — never from the mere
-observation that a registered worktree's path is not mounted.
+retires as one payload and may already have released — and refuses on dirty state that `rm --force` has already
+accepted. `git worktree prune` unregisters _every_ worktree whose path is missing, and a merely detached cowshed
+workspace looks exactly like that. A registration orphaned by an interrupted retire is removed idempotently by
+`cowshed gc` from revalidated retirement metadata, before the image that carries that metadata is deleted — never from
+the mere observation that a registered worktree's path is not mounted.
 
 The mode is recorded store-side, in the workspace's detached sidecar, for the same reason: every decision it drives —
 refusing checkpoint, requiring main mounted, pruning the registration at retirement — has to be made while the workspace
@@ -1249,14 +1249,14 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    (00_overview.md).
 
    Every retirement, abandoned or not, appends a `retire-workspace` line to the project's `deletion-log.jsonl`
-   (01_storage.md) once the image is renamed into trash: the head and every local branch tip read before the image went,
-   each with what keeps it — `{"by":"ref","repository":…,"reference":…}` for a tip the abandonment kept,
-   `{"by":"target",…}` naming the branch and head that held a tip the gate passed. The line also says who retired the
-   workspace (`retiredBy`): the `caller`, the process that ran the removal with its pid and argv and its parent's, which
-   is the shell, script or agent that asked; and, for a forced removal, `forced`, naming each guard the force overrode
-   (`dirty`, `inProgress` with the operation, `young` with `createdAt` and `ageSeconds`), empty when it overrode none. A
-   retirement whose tips could not be read says so on stderr and writes the line without Git facts; it is never refused
-   for that.
+   (01_storage.md) once physical source release or recovery retirement completes: the head and every local branch tip
+   read before the image went, each with what keeps it — `{"by":"ref","repository":…,"reference":…}` for a tip the
+   abandonment kept, `{"by":"target",…}` naming the branch and head that held a tip the gate passed. The line also says
+   who retired the workspace (`retiredBy`): the `caller`, the process that ran the removal with its pid and argv and its
+   parent's, which is the shell, script or agent that asked; and, for a forced removal, `forced`, naming each guard the
+   force overrode (`dirty`, `inProgress` with the operation, `young` with `createdAt` and `ageSeconds`), empty when it
+   overrode none. A retirement whose tips could not be read says so on stderr and writes the line without Git facts; it
+   is never refused for that.
 
    The refusal reports whether the published branch already holds HEAD's commits; it never authorizes a removal. Only
    once the gate has refused HEAD does it measure HEAD, with the same landing module `ls` reads, against the primary
@@ -1281,22 +1281,37 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    remote if one was registered, and its worktree registration if it is a git-worktree workspace (remove, then prune).
    This is the one piece of teardown that lives where the user can see it — a remote or a registration naming a trashed
    mount is a broken fetch and a broken `git worktree list` in the user's own checkout.
-4. Logically retire at one publication point: prepare complete detached grants/CA companions at
-   `sessions/.trash/<ws>-<incarnation>.dmg`, durably link them from the canonical record, then atomically rename the
-   image there and sync both parent directories. The image rename is the sole commit: before it the canonical grants/key
-   remain valid; after it the canonical image is absent and trash already holds complete recovery authority. Unlink the
-   old CA companion before the old grants sidecar. A retry before commit validates the exact canonical identity and
-   rebuilds any imageless prepared trash companions; those companions alone never authorize reclamation. The canonical
-   image disappears from enumeration and the command returns here (typically well under a second; a stubborn process
-   tree delays it by at most the kill grace). Valid checkpoint facts left behind during this asynchronous phase neither
-   republish the workspace nor authorize deletion by themselves; malformed, foreign, and duplicate facts remain
-   integrity errors.
-5. Background (spawned detached): detach the mount (escalating to `-force` after a 10 s monotonic wall-clock grace,
-   including disk-lease and command waits, not merely poll sleeps), unlink the trashed image and companions, every
-   checkpoint (including pinned checkpoints), every pre-restore undo image and companion/fact, then the empty checkpoint
-   and mountpoint directories. The process that spawned it waits for it before exiting, so a command that has already
-   answered leaves no trash behind for a later `gc`. Interrupted cleanup is resumed idempotently by `cowshed gc` only
-   from exact, revalidated retirement trash metadata; a missing canonical image alone is never cleanup authority.
+4. Release the session's owned live build volume and current-incarnation seed before its source image
+   (16_build_volumes.md, "Garbage collection"). A volume adopted by the target belongs to that target and stays. A held
+   volume or failed release refuses while the source image and unfinished retirement journal remain.
+5. **Clean landed source: physically release in this operation.** After the final dirty/in-progress, HEAD-stability and
+   all-branch containment fences, detach the exact source and remove its scoped checkpoints, restore artifacts,
+   temporary directory and empty mountpoint through the existing retirement checks. Then commit the release with one
+   rename of the canonical source image to `sessions/.releasing/<ws>-<incarnation>.dmg` and sync both directories:
+   before the rename the workspace is whole, after it nothing mounts, forks, fences or reads the image again. The same
+   removal then frees the entry in bounded steps (16_build_volumes.md, "Garbage collection"), unlinks it and syncs the
+   journal, and only then removes the CA companion and grants sidecar and answers. There is no trash, detached
+   reclamation task, periodic drain or successful reply holding source-image bytes. A failure before the rename refuses
+   with the owner metadata and mutating intent kept for the same removal to retry. `sessions/.releasing/` is a
+   crash-recovery journal, never a queue: a crash after the rename leaves the entry, which the next lifecycle open
+   holding that workspace's lock, a whole-store pass and the daemon's start finish with the same bounded release before
+   the record the rename left imageless is reconciled, and the removal's retry finds the workspace already gone. An open
+   confined to other workspaces neither reads nor waits for it.
+
+   Gitignored or hidden content is not rebuildable merely because Git calls the tree clean. Apart from the existing
+   controller/volume-bookkeeping contract, every untracked leaf must be held byte-for-byte (or by the same symlink
+   target) in the surviving target checkout before direct release. Otherwise preserve the complete image as recovery.
+   This does not weaken the ordinary dirty/unlanded refusal gates or grant a new destruction override.
+
+   **Recovery source:** authorized dirty/in-progress or unlanded removal, only-copy content, and rename preservation
+   keep the existing atomic recovery transaction: durably link complete grants/CA companions at
+   `sessions/.trash/<ws>-<incarnation>.dmg`, rename the image there, sync both parents, then unlink canonical CA and
+   grants. Before rename canonical authority remains valid; after it complete recovery authority is already in trash.
+   Imageless prepared companions authorize nothing and are rebuilt on retry. Recovery images and their scoped artifacts
+   are not startup or generic-GC garbage, even when a grants sidecar was lost: missing authority never proves the bytes
+   disposable, and the diagnostic names the retained path for deliberate metadata/content recovery. `gc --abandoned`
+   still authorizes verified bundles only, never destruction of uncommitted or ignored image content. A refusal
+   preserves source/recovery authority and is reported.
 
 The in-progress Git gate follows operation state (`MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `rebase-merge`, or
 `rebase-apply`), not a leftover `.git/AUTO_MERGE` tree: Git can retain that tree after an operation finishes. A stale
@@ -1306,18 +1321,19 @@ The verified bundle's temporary bare repository belongs to the removal attempt, 
 interrupted verification removes it before leaving the operation. So does the `.partial` bundle it stages beside the
 final name: the attempt renames it into place or removes it, cancellation included, since no sweep ever owns one.
 
-Removal persists its exact options before the authorized retirement mutation. If a process dies after canonical
-retirement but before acknowledging the call, startup observes the workspace absent and records completion without
-retiring it twice. A prepared request that never crossed the safety fence is discarded, not a deferred deletion; an
-authorized mutating request reruns the safety fences and retirement.
+Removal persists its exact options before the authorized retirement mutation and records completion only after physical
+release or durable recovery preservation completes. If a process dies after canonical unlink/retirement but before
+acknowledging the call, startup observes the workspace absent and records completion without retiring it twice. A
+prepared request that never crossed the safety fence is discarded, not a deferred deletion; an authorized mutating
+request reruns the safety fences and retirement. Cancellation cannot discard the journal while blocking release
+finishes.
 
 A named `rm` can retire an unfinished fork without activating it. The exact pending image is mounted and validated under
 its image lock, then receives the same dirty-state, HEAD-stability and landed-work checks as an active workspace. A
 refusal preserves the image and original clone intent and leaves its mount state as it found it: an image the `rm`
 attached to inspect is detached again, and one it found mounted stays mounted. Once retirement is authorized, its
-journal record retains the original clone source so an interrupted removal can recover. Once it is retired, the `rm`
-collects build volumes before it answers, as every removal does: the clone's own volume and seed, which no `gc` could
-collect while its create or fork stood journaled, go with it.
+journal record retains the original clone source so an interrupted removal can recover. The clone's owned volume and
+seed are released before its source, through the same direct-release or recovery-preservation choice, before answering.
 
 Removal-scoped startup never finishes the named target's own unpublished clone: it leaves the clone intent for the `rm`
 to retire, so whatever stopped the clone — a duplicate port block, a start revision the source no longer holds — cannot
@@ -1331,12 +1347,14 @@ unpublished before retirement does not invalidate that recovery fact.
 
 `cowshed rm main --restore --purge [--force] [--abandon]` (`Coordinator::remove_project`) removes the whole project in
 one call: every session workspace, including clones a create never published, under the given `--force`/`--abandon`;
-then it waits for the background reclamation those removals started, so its collection plans against a settled store;
-collects; with `--abandon` keeps every abandon bundle's tips in main's repository as `gc --abandoned` does
-(01_storage.md) and then deletes the bundles in `sessions/.trash`, refusing before one is deleted when any cannot be
-kept; and restores main. Each step is idempotent, so a refusal leaves the rest to the same command. A collection that
-still finds the store changed under it (another process) is refused as retryable — `Conflict` with `Retry::GcPlanStale`
-— and the same command finishes the removal; callers never sleep and retry `gc` themselves.
+each removal has already completed its physical release or recovery preservation when collection begins; collects; with
+`--abandon` keeps every abandon bundle's tips in main's repository as `gc --abandoned` does (01_storage.md) and then
+deletes the bundles in `sessions/.trash`, refusing before one is deleted when any cannot be kept; and restores main.
+Each step is idempotent, so a refusal leaves the rest to the same command. A collection that still finds the store
+changed under it (another process) is refused as retryable — `Conflict` with `Retry::GcPlanStale` — and the same command
+finishes the removal; callers never sleep and retry `gc` themselves. Recovery images can hold only-copy work even after
+all abandoned commits were bundled; they therefore refuse terminal store removal until their contents have been
+deliberately recovered. Bundle authorization alone never discards them.
 
 ## `cowshed attach` / `cowshed detach`
 

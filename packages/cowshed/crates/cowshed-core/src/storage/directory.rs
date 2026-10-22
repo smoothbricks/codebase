@@ -1260,6 +1260,14 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         self.clone_tree(source, destination)
     }
 
+    fn require_forkable_image(
+        &self,
+        _image: &Path,
+        _mount: Option<&Path>,
+    ) -> Result<(), ApfsStorageError> {
+        Err(unsupported("proving a physical image's extent budget"))
+    }
+
     /// A directory clone shares no extent map with its source: there is nothing to copy before
     /// a first write. The executor skips this step for hosts without physical volumes.
     fn write_first(&self, _image: &Path) -> Result<(), ApfsStorageError> {
@@ -2267,6 +2275,14 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         retire_payload(canonical, trash)
     }
 
+    fn release_workspace(
+        &self,
+        config: &ApfsSubstrateConfig,
+        retired: &RetiredRef,
+    ) -> Result<(), ApfsStorageError> {
+        self.release_canonical_workspace(config, retired)
+    }
+
     fn reclaim_image(&self, image: &Path) -> Result<(), ApfsStorageError> {
         use super::deletion_log::{self, DeletionKind, DeletionOp};
         if self.delete_payload(image)? {
@@ -2276,6 +2292,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
                 DeletionKind::Image,
                 image,
             );
+            sync_parent_path(image)?;
         }
         Self::remove_companion(image)?;
         for (artifact, operation, kind) in [
@@ -2311,15 +2328,6 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         retired: &RetiredRef,
     ) -> Result<(), ApfsStorageError> {
         self.reclaim_retired_record(config, retired)
-    }
-
-    fn reclaim_unrecorded_retired(
-        &self,
-        config: &ApfsSubstrateConfig,
-        repo: &RepoId,
-        image: &Path,
-    ) -> Result<(), ApfsStorageError> {
-        self.reclaim_unrecorded_retired_payload(config, repo, image)
     }
 
     fn list(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError> {

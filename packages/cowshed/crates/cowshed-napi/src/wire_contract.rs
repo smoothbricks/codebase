@@ -1039,7 +1039,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             GcReason::AbandonedBundle,
             GcReason::UnlinkedBuildVolume,
             GcReason::SupersededSeed,
-            GcReason::UnrecordedBuildVolume,
+            GcReason::InterruptedBuildVolume,
         ]
         .into_iter()
         .enumerate()

@@ -1,8 +1,9 @@
 //! Build volumes on APFS (16_build_volumes.md, "Substrate"): one RAW image each, created,
 //! cloned, attached and released through the same backend as workspace images, but with no
-//! workspace sidecar, no marker and no lifecycle intent. A build volume nothing links is
-//! garbage by construction, so an interrupted operation leaves only what garbage collection
-//! removes.
+//! workspace sidecar and no marker. Every operation that writes a build image takes a
+//! [`Registration`] and registers the volume's owner record before the first byte of the image
+//! exists, so an interrupted operation leaves a record naming its owner and registrant, which
+//! collection finds by its exact id, never an image nobody owns.
 
 use std::fs;
 use std::io;
@@ -11,8 +12,8 @@ use std::time::SystemTime;
 
 use super::{Image, MacOsApfsExecutionHost, io_error};
 use crate::build_volume::{
-    BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, LinkResolution,
-    ReleaseClaim, link,
+    BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole,
+    LinkResolution, Registrant, Registration, ReleaseClaim, link,
 };
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError};
@@ -57,32 +58,61 @@ impl<R> MacOsApfsExecutionHost<R>
 where
     R: CommandRunner + Send + Sync + 'static,
 {
-    /// Mint the empty build volume `id` at `capacity` and mount it, without a record: one
-    /// `clonefile` of the store's blank template and one attach (01a_apfs.md, "Images"). The
-    /// caller writes the record last, once the volume holds what it should (a migration's copied
-    /// build state); until then the volume is an interrupted creation, which collection deletes
-    /// unless a live build link names it. The clone carries the template's label until the
-    /// checkout's supervisor names it after the checkout (16_build_volumes.md, "Substrate"): the
-    /// label is cosmetic, so naming never runs on a provisioning path.
+    /// Mint the empty build volume `id` at `capacity` and mount it: `registration` is written
+    /// first, then one `clonefile` of the store's blank template and one attach (01a_apfs.md,
+    /// "Images"). The record stays registered, and the answered hold keeps every release off the
+    /// volume, until the caller publishes it once it holds what it should (a migration's linked
+    /// build state, main's first touch). A mint that fails releases what it registered. The
+    /// clone carries the template's label until the checkout's supervisor names it after the
+    /// checkout (16_build_volumes.md, "Substrate"): the label is cosmetic, so naming never runs
+    /// on a provisioning path.
     pub fn create_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
         capacity: ImageCapacity,
-    ) -> Result<PathBuf, ApfsStorageError> {
+        registration: &Registration,
+    ) -> Result<(PathBuf, BuildVolumeHold), ApfsStorageError> {
         let image = layout.image(id);
         self.verify_controller_path(&image)?;
         Self::ensure_parent(&image)?;
+        let creating = layout.register(id, registration).map_err(host_error)?;
+        let mount = layout.mount(id);
+        if let Err(error) = self.mint(capacity, &image, &mount) {
+            return Err(self.unregister(layout, id, creating, error));
+        }
+        Ok((mount, creating))
+    }
+
+    /// [`Self::create_build_volume`] under the caller's exclusive claim on `claim.id()`
+    /// ([`BuildVolumeLayout::register_claimed`]): a re-adoption mints its lost build volume under
+    /// the claim it holds on that id. A mint that fails leaves the registered record for the
+    /// replay that owns it, which converges on it by its exact id.
+    pub fn create_claimed_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        claim: &ReleaseClaim,
+        capacity: ImageCapacity,
+        registration: &Registration,
+    ) -> Result<PathBuf, ApfsStorageError> {
+        let id = claim.id();
+        let image = layout.image(id);
+        self.verify_controller_path(&image)?;
+        Self::ensure_parent(&image)?;
+        layout
+            .register_claimed(claim, registration)
+            .map_err(host_error)?;
         let mount = layout.mount(id);
         self.mint(capacity, &image, &mount)?;
         Ok(mount)
     }
 
-    /// Clone `source`'s image to the new volume `destination`, with `record`. The clone is not
-    /// attached. A mounted source is flushed and captured live under the runtime caller's
-    /// retained Nx/Cargo guards; other contributed paths are exempt. Immutable sources are
-    /// captured detached. The destination is held from before its image exists until its record
-    /// is written, so collection never releases it as an interrupted creation in between.
+    /// Clone `source`'s image to the new volume `destination`, registered and then published as
+    /// `registration`. The clone is not attached. A mounted source is flushed and captured live
+    /// under the runtime caller's retained Nx/Cargo guards; other contributed paths are exempt.
+    /// Immutable sources are captured detached. The destination's owner record is registered
+    /// before its image exists and held until it is published, so collection never releases it
+    /// in between, and a crash leaves the registered record naming its owner.
     ///
     /// The seed's write mark comes from the captured clone, before its extent-map first write.
     /// A mounted source is claimed ([`Self::claim_capture_source`]) and held exclusively against
@@ -93,14 +123,14 @@ where
         layout: &BuildVolumeLayout,
         source: &BuildVolumeId,
         destination: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(), ApfsStorageError> {
         if self.mounted_at(&layout.mount(source))?.is_some() {
             let claim = self.claim_capture_source(layout, source)?;
-            return self.clone_claimed_build_volume(layout, &claim, destination, record);
+            return self.clone_claimed_build_volume(layout, &claim, destination, registration);
         }
         self.verify_controller_path(&layout.image(source))?;
-        self.clone_build_volume_under_hold(layout, source, destination, record, None)
+        self.clone_build_volume_under_hold(layout, source, destination, registration, None)
     }
 
     /// Claim build volume `source` exclusively for a seed capture (16_build_volumes.md, "Targets
@@ -144,7 +174,7 @@ where
         layout: &BuildVolumeLayout,
         quiet: &crate::runtime::build_volumes::Quiet,
         destination: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(), ApfsStorageError> {
         let source = quiet.id();
         self.verify_controller_path(&layout.image(source))?;
@@ -154,7 +184,7 @@ where
             layout,
             source,
             destination,
-            record,
+            registration,
             mounted.then_some(mount.as_path()),
         )
     }
@@ -169,7 +199,7 @@ where
         layout: &BuildVolumeLayout,
         claim: &ReleaseClaim,
         destination: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(), ApfsStorageError> {
         let source = claim.id();
         self.verify_controller_path(&layout.image(source))?;
@@ -179,63 +209,138 @@ where
             layout,
             source,
             destination,
-            record,
+            registration,
             mounted.then_some(mount.as_path()),
         )
     }
 
+    /// Register `destination`, capture `source` into it, fix its freshness mark and publish it.
+    /// A seed source must be published. The captured generation is proven forkable before its
+    /// first write pays for its extent map, whatever the source is, and a seed destination is
+    /// proven again over its final generation before it is published (01a_apfs.md, "Clone cost
+    /// follows extents, not size"); a refusal names the defragmentation of the workspace whose
+    /// volume the capture came from. Every failure after registration releases what was
+    /// registered, so a refused clone leaves neither an image nor a record behind it.
     fn clone_build_volume_under_hold(
         &self,
         layout: &BuildVolumeLayout,
         source: &BuildVolumeId,
         destination: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
         mount: Option<&Path>,
     ) -> Result<(), ApfsStorageError> {
         let from = layout.image(source);
         let to = layout.image(destination);
         self.verify_controller_path(&to)?;
-        let hold = layout.hold_path(destination);
-        let _creating = layout
-            .hold_new(destination)
-            .map_err(|error| io_error("hold a build volume while it is cloned", &hold, error))?;
-        let operation = match record.role {
-            BuildVolumeRole::Seed { .. } => "seed_capture",
-            BuildVolumeRole::Linked { .. } | BuildVolumeRole::Unlinked => "clone",
-        };
-        if let Err(error) = self.image_telemetry.measure(
-            operation,
-            &[
-                Image {
-                    role: "source",
-                    before: &from,
-                    after: &from,
-                },
-                Image {
-                    role: "destination",
-                    before: &to,
-                    after: &to,
-                },
-            ],
-            || self.capture_build_seed(&from, mount, &to),
-        ) {
-            // No image, so nothing will ever release this hold file.
-            if !to.exists() {
-                remove_if_present(&hold)?;
-            }
-            return Err(error);
+        let source_record = layout.read_record(source).map_err(host_error)?;
+        if let BuildVolumeRole::Seed { target, .. } = &source_record.role
+            && !source_record.is_published()
+        {
+            return Err(ApfsStorageError::Host(format!(
+                "seed {source} of {target} is registered and unfinished, so nothing may be cloned from it; the next collection releases it"
+            )));
         }
-        let written = written_at(&to)?;
-        // The clone's own extent map, paid here rather than by its first write inside a mount.
-        cowshed_os::timing::timed(
-            "build-volume",
-            format_args!("first-write {}", to.display()),
-            || self.write_first(&to),
-        )?;
-        self.mark_seed_written(layout, destination, written)?;
-        layout
-            .write_record(destination, record)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))
+        let source_owner = source_record.role.owner();
+        let operation = match registration.role() {
+            BuildVolumeRole::Seed { .. } => "seed_capture",
+            BuildVolumeRole::Linked { .. } | BuildVolumeRole::Superseded { .. } => "clone",
+        };
+        let creating = layout
+            .register(destination, registration)
+            .map_err(host_error)?;
+        let cloned = (|| {
+            self.image_telemetry.measure(
+                operation,
+                &[
+                    Image {
+                        role: "source",
+                        before: &from,
+                        after: &from,
+                    },
+                    Image {
+                        role: "destination",
+                        before: &to,
+                        after: &to,
+                    },
+                ],
+                || self.capture_build_seed(&from, mount, &to),
+            )?;
+            // Bounded before the first write, which pays per extent of the captured map.
+            crate::storage::apfs::extents::prove_forkable(&to)
+                .map_err(|error| defragment_first(error, source_owner))?;
+            let written = written_at(&to)?;
+            // The clone's own extent map, paid here rather than by its first write inside a
+            // mount.
+            cowshed_os::timing::timed(
+                "build-volume",
+                format_args!("first-write {}", to.display()),
+                || self.write_first(&to),
+            )?;
+            self.mark_seed_written(layout, destination, written)?;
+            match registration.role() {
+                BuildVolumeRole::Seed { target, .. } => {
+                    crate::storage::apfs::extents::prove_forkable(&to)
+                        .map(Some)
+                        .map_err(|error| defragment_first(error, target))
+                }
+                BuildVolumeRole::Linked { .. } | BuildVolumeRole::Superseded { .. } => Ok(None),
+            }
+        })();
+        let proof = match cloned {
+            Ok(proof) => proof,
+            Err(error) => return Err(self.unregister(layout, destination, creating, error)),
+        };
+        if let Err(error) = layout.publish(destination, registration) {
+            return Err(self.unregister(layout, destination, creating, host_error(error)));
+        }
+        if let (Some(proof), BuildVolumeRole::Seed { target, .. }) = (proof, registration.role())
+            && let Err(error) = proof.revalidate(&to)
+        {
+            // Published over a generation that changed under the proof: back to registered, so
+            // no fork takes it, and released with the rest of the failed capture.
+            let error = defragment_first(error, target);
+            let error = match layout.write_record(destination, registration.registered()) {
+                Ok(()) => error,
+                Err(cleanup) => ApfsStorageError::Cleanup {
+                    operation: "unpublish a seed whose extent proof went stale",
+                    primary: Box::new(error),
+                    cleanup: Box::new(host_error(cleanup)),
+                },
+            };
+            return Err(self.unregister(layout, destination, creating, error));
+        }
+        drop(creating);
+        Ok(())
+    }
+
+    /// Release `id`, whose registered creation failed with `primary`: the creation's hold goes
+    /// first, so the release can claim it, and the record goes with the image or alone when no
+    /// image was made. A release that cannot run is joined to `primary`, never hidden: the
+    /// registered record then stays, naming its owner, for collection to release by its id.
+    fn unregister(
+        &self,
+        layout: &BuildVolumeLayout,
+        id: &BuildVolumeId,
+        creating: BuildVolumeHold,
+        primary: ApfsStorageError,
+    ) -> ApfsStorageError {
+        drop(creating);
+        let cleanup = match self.release_build_volume(layout, id) {
+            Ok(Release::Deleted { .. }) => Ok(()),
+            Ok(Release::Held { open }) => Err(ApfsStorageError::Host(format!(
+                "build volume {id} stays registered while another hold on it lives ({} open); its holder releases it, or the next collection does",
+                open.len()
+            ))),
+            Err(error) => Err(error),
+        };
+        match crate::storage::apfs::combine_cleanup::<std::convert::Infallible>(
+            "release a build volume whose creation failed",
+            primary,
+            cleanup,
+        ) {
+            Err(error) => error,
+            Ok(never) => match never {},
+        }
     }
 
     /// The instant of the last write build volume `id`'s image holds: its volume flushed first
@@ -269,17 +374,17 @@ where
         set_written(&image, written)
     }
 
-    /// A new live volume cloned from `seed` with `record`, mounted, without the seed's Nx daemon
-    /// record (16_build_volumes.md, "Fork" steps 2 and 3): a daemon record names another
+    /// A new live volume cloned from `seed` as `registration`, mounted, without the seed's Nx
+    /// daemon record (16_build_volumes.md, "Fork" steps 2 and 3): a daemon record names another
     /// checkout's process. The caller points a checkout's link at the answered mountpoint.
     pub fn fork_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         seed: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(BuildVolumeId, PathBuf), ApfsStorageError> {
         let live = BuildVolumeId::mint();
-        self.clone_build_volume(layout, seed, &live, record)?;
+        self.clone_build_volume(layout, seed, &live, registration)?;
         let mount = self.mount_build_volume(layout, &live)?;
         let state = crate::build_volume::BuildVolumeState::read(&mount)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
@@ -536,14 +641,10 @@ where
         Ok(())
     }
 
-    /// [`Self::release_build_volume`] of the volume `claim` claimed. Answers the unforced
-    /// unmount's refusal, when there was one. The detached image is moved into the project's
-    /// build-volume trash, one rename, and deleted from there later in the background
-    /// ([`crate::build_volume::empty_trash`]): deleting it here walked its whole extent tree and
-    /// held a land in one `unlink` for minutes (measured 2026-10-21). The claim is dropped once
-    /// the canonical image and its hold file are gone, so a hold taken after that finds no image.
-    /// The release is journaled in the project's deletion log, with whose its sidecar said the
-    /// volume was.
+    /// Release the volume while retaining its claim and ownership record until the detached
+    /// image is physically unlinked. An unlink failure refuses the retirement with its record
+    /// intact; no successful release leaves a clone in a deferred trash queue.
+    /// The deletion log names the owner read before the image and record are removed.
     pub fn release_claimed(
         &self,
         layout: &BuildVolumeLayout,
@@ -553,14 +654,20 @@ where
         let image = layout.image(id);
         self.verify_controller_path(&image)?;
         let mount = layout.mount(id);
-        let present = image.exists();
-        // Read before anything is deleted: once the volume is gone, nothing else says whose it
-        // was. Evidence only, like the log it goes to, so an unreadable sidecar names nobody.
+        let present = image
+            .try_exists()
+            .map_err(|error| io_error("inspect a build volume before release", &image, error))?;
+        // Resolve ownership before deleting anything; unreadable evidence refuses release.
         let recorded = layout
             .read_record_present(id)
-            .ok()
-            .flatten()
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?
             .map(|record| record.role);
+        if present && recorded.is_none() {
+            return Err(ApfsStorageError::Host(format!(
+                "build volume {id} at {} has no ownership record; refusing to release an unregistered image",
+                image.display()
+            )));
+        }
         let mut refused = None;
         // A minted volume is formatted before anything attaches it, so an attachment of a build
         // image is an APFS one; anything else is refused, not released.
@@ -582,28 +689,24 @@ where
             }
             self.backend.detach(&attachment, DetachIntent::Release)?;
         }
-        self.image_telemetry.measure(
+        let removed = self.image_telemetry.measure(
             "retire",
             &[Image {
                 role: "image",
                 before: &image,
-                after: &layout.trashed_image(id),
+                after: &image,
             }],
             || {
-                layout.trash_image(id).map_err(|error| {
-                    io_error(
-                        "move a released build volume image into its trash",
-                        &image,
-                        error,
-                    )
-                })
+                layout
+                    .release_image(id)
+                    .map_err(|error| io_error("release a build volume image", &image, error))
             },
         )?;
-        if present {
+        if removed {
             layout.journal_release(id, recorded.as_ref(), true);
         }
         // A volume whose image was already gone is retired by its record alone, said as such.
-        if remove_if_present(&layout.record(id))? && !present {
+        if remove_if_present(&layout.record(id))? && !removed {
             layout.journal_release(id, recorded.as_ref(), false);
         }
         remove_if_present(&layout.hold_path(id))?;
@@ -637,10 +740,15 @@ where
             let (_, mount) = self.fork_build_volume(
                 layout,
                 seed,
-                &BuildVolumeRecord::new(
-                    tree,
-                    BuildVolumeRole::Linked {
-                        checkout: workspace.clone(),
+                &Registration::new(
+                    BuildVolumeRecord::new(
+                        tree,
+                        BuildVolumeRole::Linked {
+                            checkout: workspace.clone(),
+                        },
+                    ),
+                    Registrant::Workspace {
+                        incarnation: incarnation.clone(),
                     },
                 ),
             )?;
@@ -738,6 +846,58 @@ where
             capacity: observed,
         })
     }
+
+    /// The existing contiguous rewrite, extended to the exact build source or seed that doctor
+    /// names. The caller retains the exclusive build claim and has closed its Nx daemon.
+    pub fn defragment_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        claim: &ReleaseClaim,
+    ) -> Result<crate::storage::lifecycle::DefragmentOutcome, ApfsStorageError> {
+        use crate::storage::apfs::extents;
+        let id = claim.id();
+        let image = layout.image(id);
+        self.verify_controller_path(&image)?;
+        let was_mounted = self.mounted_at(&layout.mount(id))?.is_some();
+        let written = written_at(&image)?;
+        // Extents are read once the image is detached: while it is mounted, a write its volume
+        // has not flushed has no device offset yet (`F_LOG2PHYS_EXT` answers -1 for it).
+        let rewritten = self
+            .detach_claimed_build_volume(layout, claim)
+            .and_then(|()| {
+                let previous = extents::count_extents(&image)?;
+                extents::require_room_for_rewrite(&image)?;
+                extents::rewrite_contiguously(&image).map(|bytes| (previous, bytes))
+            });
+        let (previous, bytes) = match rewritten {
+            Ok(rewritten) => rewritten,
+            Err(primary) if was_mounted => {
+                return match self.mount_build_volume(layout, id) {
+                    Ok(_) => Err(primary),
+                    Err(cleanup) => Err(ApfsStorageError::Cleanup {
+                        operation: "restore the build mount after a refused defrag",
+                        primary: Box::new(primary),
+                        cleanup: Box::new(cleanup),
+                    }),
+                };
+            }
+            Err(primary) => return Err(primary),
+        };
+        if was_mounted {
+            self.mount_build_volume(layout, id)?;
+        } else {
+            let attachment = self.backend.attach_verified(&image)?;
+            self.backend.detach(&attachment, DetachIntent::Release)?;
+            // A physical rewrite of an immutable seed does not make its build contents newer.
+            // Its ctime/inode still invalidate any earlier physical-generation extent proof.
+            set_written(&image, written)?;
+        }
+        Ok(crate::storage::lifecycle::DefragmentOutcome {
+            previous,
+            extents: extents::count_extents(&image)?,
+            bytes,
+        })
+    }
 }
 
 /// Every process that has the volume mounted at `mount` open, as the kernel answers for this
@@ -782,6 +942,15 @@ fn remove_if_present(path: &Path) -> Result<bool, ApfsStorageError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(io_error("remove build volume record", path, error)),
     }
+}
+
+fn host_error(error: crate::CowshedError) -> ApfsStorageError {
+    ApfsStorageError::Host(error.to_string())
+}
+
+/// An extent refusal of `target`'s seed, with the command that makes it forkable again.
+fn defragment_first(error: ApfsStorageError, target: &WorkspaceName) -> ApfsStorageError {
+    ApfsStorageError::Host(format!("{error}; next: cowshed defrag {target}"))
 }
 
 /// A path asked about, against the kernel's mount table. The kernel records a mount point as
@@ -870,9 +1039,15 @@ mod tests {
             let source = BuildVolumeId::mint();
             let destination = BuildVolumeId::mint();
             fs::write(layout.image(&source), &contents).unwrap();
+            layout.write_record(&source, &linked("main")).unwrap();
             let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
             let result = reporting(StepSink::new(sender), async {
-                host.clone_build_volume(&layout, &source, &destination, &linked("topic"))
+                host.clone_build_volume(
+                    &layout,
+                    &source,
+                    &destination,
+                    &registered(linked("topic")),
+                )
             })
             .await;
             let steps: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
@@ -898,7 +1073,11 @@ mod tests {
                 error.as_ref(),
                 result.as_ref().err().map(ToString::to_string).as_ref()
             );
-            assert_eq!(fs::read(layout.image(&destination)).unwrap(), contents);
+            // A failed clone releases what it registered, image and record.
+            assert_eq!(
+                fs::read(layout.image(&destination)).ok(),
+                result.is_ok().then(|| contents.clone())
+            );
             assert_eq!(layout.record(&destination).exists(), result.is_ok());
         }
         fs::remove_dir_all(root).unwrap();
@@ -966,7 +1145,7 @@ mod tests {
             },
         );
         let seed = BuildVolumeId::mint();
-        host.clone_build_volume(&layout, &source, &seed, &record)
+        host.clone_build_volume(&layout, &source, &seed, &registered(record.clone()))
             .unwrap();
         assert!(denied.load(Ordering::SeqCst));
         assert!(
@@ -996,7 +1175,8 @@ mod tests {
             .expect("job admission after capture hold release");
         let refused_seed = BuildVolumeId::mint();
         let me = i32::try_from(std::process::id()).expect("pid");
-        let refused = host.clone_build_volume(&layout, &source, &refused_seed, &record);
+        let refused =
+            host.clone_build_volume(&layout, &source, &refused_seed, &registered(record.clone()));
         let Err(ApfsStorageError::BuildVolumeHeld { holds, .. }) = &refused else {
             panic!("an admitted job refuses the capture: {refused:?}");
         };
@@ -1036,8 +1216,13 @@ mod tests {
             "the admitted job's write must make the seed behind"
         );
         let inspection = BuildVolumeId::mint();
-        host.clone_build_volume(&layout, &seed, &inspection, &linked("inspection"))
-            .unwrap();
+        host.clone_build_volume(
+            &layout,
+            &seed,
+            &inspection,
+            &registered(linked("inspection")),
+        )
+        .unwrap();
         let captured = host.mount_build_volume(&layout, &inspection).unwrap();
         assert!(!captured.join("after-admission").exists());
         assert_eq!(snapshot(&captured), before);
@@ -1126,7 +1311,7 @@ mod tests {
             let quiet = quiet.clone();
             let seed = seed.clone();
             tokio::task::spawn_blocking(move || {
-                host.clone_quiet_build_volume(&layout, &quiet, &seed, &record)
+                host.clone_quiet_build_volume(&layout, &quiet, &seed, &registered(record))
             })
         };
         capture.await.unwrap().unwrap();
@@ -1256,8 +1441,13 @@ mod tests {
         drop(replacement);
         drop(landing_hold);
         let inspection = BuildVolumeId::mint();
-        host.clone_build_volume(&layout, &seed, &inspection, &linked("inspection"))
-            .unwrap();
+        host.clone_build_volume(
+            &layout,
+            &seed,
+            &inspection,
+            &registered(linked("inspection")),
+        )
+        .unwrap();
         let captured = host.mount_build_volume(&layout, &inspection).unwrap();
         assert!(!captured.join("after-admission").exists());
         assert_eq!(snapshot(&captured), before);
@@ -1277,6 +1467,11 @@ mod tests {
                 checkout: WorkspaceName::new(name).unwrap(),
             },
         )
+    }
+
+    /// What a test's clone registers: the forming verb's, as a fork's would be.
+    fn registered(record: BuildVolumeRecord) -> Registration {
+        Registration::new(record, Registrant::Intent)
     }
 
     /// A checkout mounted from an image of its own, with its own build volume recorded, linked and
@@ -1436,17 +1631,9 @@ mod tests {
                 path.display()
             );
         }
-        // The image itself waits in the trash, the same inode moved in one rename, until the
-        // trash is emptied in the background.
-        let trashed = layout.trashed_image(&id);
-        assert_eq!(fs::metadata(&trashed).unwrap().ino(), image_inode);
-        let emptied = crate::build_volume::empty_trash(trashed.parent().unwrap()).unwrap();
-        assert_eq!(emptied.images, 1);
-        assert!(!trashed.exists(), "emptying the trash deletes the image");
-        assert_eq!(
-            crate::build_volume::empty_trash(trashed.parent().unwrap()).unwrap(),
-            crate::build_volume::EmptiedTrash::default(),
-            "an empty trash deletes nothing"
+        assert!(
+            !layout.trash().exists(),
+            "successful release leaves no image for a later collector"
         );
     }
 
@@ -1481,12 +1668,41 @@ mod tests {
                 .unwrap();
         }
         let before = snapshot(&mount);
+        let claim = layout
+            .claim_release(&source)
+            .unwrap()
+            .expect("claim idle build source");
+        host.defragment_build_volume(&layout, &claim)
+            .expect("rewrite mounted build source");
+        assert_eq!(
+            snapshot(&mount),
+            before,
+            "source rewrite restores its mount, bytes and mtimes"
+        );
+        drop(claim);
 
         let clone = BuildVolumeId::mint();
         let started = Instant::now();
-        host.clone_build_volume(&layout, &source, &clone, &linked("topic"))
+        host.clone_build_volume(&layout, &source, &clone, &registered(linked("topic")))
             .expect("clone the build volume");
         let cloned = started.elapsed();
+        let written = written_at(&layout.image(&clone)).unwrap();
+        let claim = layout
+            .claim_release(&clone)
+            .unwrap()
+            .expect("claim detached build image");
+        host.defragment_build_volume(&layout, &claim)
+            .expect("rewrite detached seed-shaped image");
+        assert_eq!(
+            written_at(&layout.image(&clone)).unwrap(),
+            written,
+            "physical seed rewrite cannot make its build contents newer"
+        );
+        assert!(
+            host.mounted_at(&layout.mount(&clone)).unwrap().is_none(),
+            "a detached seed stays detached"
+        );
+        drop(claim);
         let started = Instant::now();
         let clone_mount = host
             .mount_build_volume(&layout, &clone)
@@ -1527,6 +1743,20 @@ mod tests {
             "the hold keeps every release out"
         );
         drop(hold);
+        let claim = layout
+            .claim_release(&clone)
+            .unwrap()
+            .expect("no admitted job");
+        assert!(
+            host.defragment_build_volume(&layout, &claim).is_err(),
+            "an open build file refuses defrag without force"
+        );
+        assert_eq!(
+            snapshot(&clone_mount),
+            before,
+            "refused rewrite preserves all data"
+        );
+        drop(claim);
         match host.release_build_volume(&layout, &clone).unwrap() {
             Release::Deleted {
                 refused: Some(Refusal { open, forced }),

@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::{DirectoryExecutionHost, unsupported};
-use crate::build_volume::{BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, ReleaseClaim};
+use crate::build_volume::{
+    BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, Registration, ReleaseClaim,
+};
 use crate::metadata::{DetachedWorkspaceMetadata, WorkspaceName};
 use crate::repository::RepoId;
 use crate::runtime::build_volumes::Quiet;
@@ -59,8 +61,9 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
         capacity: ImageCapacity,
-    ) -> Result<PathBuf, ApfsStorageError> {
-        DirectoryExecutionHost::create_build_volume(self, layout, id, capacity)
+        registration: &Registration,
+    ) -> Result<(PathBuf, BuildVolumeHold), ApfsStorageError> {
+        DirectoryExecutionHost::create_build_volume(self, layout, id, capacity, registration)
     }
 
     fn clone_build_volume(
@@ -68,9 +71,9 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         layout: &BuildVolumeLayout,
         source: &BuildVolumeId,
         destination: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(), ApfsStorageError> {
-        DirectoryExecutionHost::clone_build_volume(self, layout, source, destination, record)
+        DirectoryExecutionHost::clone_build_volume(self, layout, source, destination, registration)
     }
 
     fn clone_quiet_build_volume(
@@ -78,9 +81,9 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         layout: &BuildVolumeLayout,
         quiet: &Quiet,
         destination: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(), ApfsStorageError> {
-        self.clone_held_build_volume(layout, quiet.id(), destination, record)
+        self.clone_held_build_volume(layout, quiet.id(), destination, registration)
     }
 
     fn clone_claimed_build_volume(
@@ -88,9 +91,9 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         layout: &BuildVolumeLayout,
         claim: &ReleaseClaim,
         destination: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(), ApfsStorageError> {
-        self.clone_held_build_volume(layout, claim.id(), destination, record)
+        self.clone_held_build_volume(layout, claim.id(), destination, registration)
     }
 
     fn build_volume_written(
@@ -114,9 +117,9 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         &self,
         layout: &BuildVolumeLayout,
         seed: &BuildVolumeId,
-        record: &BuildVolumeRecord,
+        registration: &Registration,
     ) -> Result<(BuildVolumeId, PathBuf), ApfsStorageError> {
-        DirectoryExecutionHost::fork_build_volume(self, layout, seed, record)
+        DirectoryExecutionHost::fork_build_volume(self, layout, seed, registration)
     }
 
     fn mount_build_volume(
@@ -227,5 +230,13 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         _build_claim: Option<&ReleaseClaim>,
     ) -> Result<(), ApfsStorageError> {
         Err(unsupported("re-adoption"))
+    }
+
+    fn defragment_build_volume(
+        &self,
+        _layout: &BuildVolumeLayout,
+        _claim: &ReleaseClaim,
+    ) -> Result<crate::storage::lifecycle::DefragmentOutcome, ApfsStorageError> {
+        Err(unsupported("defragmenting a build volume"))
     }
 }

@@ -1036,7 +1036,8 @@ mod tests {
     #[test]
     fn image_telemetry_native_seed_clone_first_write_and_release_are_all_wired() {
         use crate::build_volume::{
-            BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole,
+            BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, Registrant,
+            Registration,
         };
         use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
         use crate::repository::{ProjectPaths, RepoId};
@@ -1060,6 +1061,17 @@ mod tests {
         let seed = BuildVolumeId::mint();
         let clone = BuildVolumeId::mint();
         fs::write(layout.image(&source), [0x5a; 8192]).unwrap();
+        layout
+            .write_record(
+                &source,
+                &BuildVolumeRecord::new(
+                    None,
+                    BuildVolumeRole::Linked {
+                        checkout: WorkspaceName::main(),
+                    },
+                ),
+            )
+            .unwrap();
         let seed_record = BuildVolumeRecord::new(
             None,
             BuildVolumeRole::Seed {
@@ -1067,21 +1079,33 @@ mod tests {
                 incarnation: WorkspaceIncarnation::new("a".repeat(32)).unwrap(),
             },
         );
-        host.clone_build_volume(&layout, &source, &seed, &seed_record)
-            .unwrap();
+        host.clone_build_volume(
+            &layout,
+            &source,
+            &seed,
+            &Registration::new(seed_record, Registrant::Intent),
+        )
+        .unwrap();
         let clone_record = BuildVolumeRecord::new(
             None,
             BuildVolumeRole::Linked {
                 checkout: WorkspaceName::new("topic").unwrap(),
             },
         );
-        host.clone_build_volume(&layout, &seed, &clone, &clone_record)
-            .unwrap();
+        host.clone_build_volume(
+            &layout,
+            &seed,
+            &clone,
+            &Registration::new(clone_record, Registrant::Intent),
+        )
+        .unwrap();
         host.release_build_volume(&layout, &clone).unwrap();
         host.release_build_volume(&layout, &seed).unwrap();
+        assert!(!layout.image(&clone).exists() && !layout.image(&seed).exists());
         assert_eq!(
-            fs::read(layout.trashed_image(&clone)).unwrap(),
-            [0x5a; 8192]
+            fs::read_dir(layout.releasing()).unwrap().count(),
+            0,
+            "each release frees its image before it answers"
         );
         drop(host);
         let batches = fixture.batches();
@@ -1094,11 +1118,14 @@ mod tests {
                 }
                 let operation = text(batch, "operation", row).unwrap();
                 *counts.entry(operation).or_insert(0) += 1;
-                assert!(unsigned(batch, "extents_after", row) > 0);
-                assert_eq!(unsigned(batch, "allocated_bytes_after", row), 8192);
                 if operation == "retire" {
-                    assert_eq!(signed(batch, "extents_delta", row), 0);
-                    assert_eq!(signed(batch, "allocated_bytes_delta", row), 0);
+                    // A release frees the whole image before it answers.
+                    assert_eq!(text(batch, "image_state_after", row), Some("absent"));
+                    assert_eq!(unsigned(batch, "allocated_bytes_after", row), 0);
+                    assert_eq!(signed(batch, "allocated_bytes_delta", row), -8192);
+                } else {
+                    assert!(unsigned(batch, "extents_after", row) > 0);
+                    assert_eq!(unsigned(batch, "allocated_bytes_after", row), 8192);
                 }
                 if text(batch, "image_role", row) == Some("destination") {
                     assert_eq!(text(batch, "image_state_before", row), Some("absent"));

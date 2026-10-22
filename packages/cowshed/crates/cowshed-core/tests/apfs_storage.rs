@@ -56,6 +56,7 @@ struct FakeHost {
     fail_restored_metadata_once: Arc<AtomicBool>,
     fail_reclaim_once: Arc<AtomicBool>,
     fail_credentials_once: Arc<AtomicBool>,
+    fail_extent_proof_once: Arc<AtomicBool>,
     mounted_paths: Arc<Mutex<BTreeSet<PathBuf>>>,
 }
 
@@ -68,6 +69,7 @@ impl Default for FakeHost {
             fail_restored_metadata_once: Arc::default(),
             fail_credentials_once: Arc::default(),
             fail_reclaim_once: Arc::default(),
+            fail_extent_proof_once: Arc::default(),
             mounted_paths: Arc::default(),
         }
     }
@@ -296,6 +298,20 @@ impl ApfsExecutionHost for FakeHost {
             ));
         }
         self.record("clone");
+        Ok(())
+    }
+    fn require_forkable_image(
+        &self,
+        image: &Path,
+        _mount: Option<&Path>,
+    ) -> Result<(), ApfsStorageError> {
+        self.record_path(image);
+        self.record("extent-proof");
+        if self.fail_extent_proof_once.swap(false, Ordering::SeqCst) {
+            return Err(ApfsStorageError::Host(
+                "physical generation is over budget or unknown".into(),
+            ));
+        }
         Ok(())
     }
     fn write_first(&self, image: &Path) -> Result<(), ApfsStorageError> {
@@ -902,6 +918,20 @@ impl ApfsExecutionHost for FakeHost {
         Ok(())
     }
 
+    fn release_workspace(
+        &self,
+        _: &ApfsSubstrateConfig,
+        _: &RetiredRef,
+    ) -> Result<(), ApfsStorageError> {
+        self.record("physical-release");
+        if self.fail_reclaim_once.swap(false, Ordering::SeqCst) {
+            return Err(ApfsStorageError::Host(
+                "injected physical unlink failure".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn reclaim_image(&self, image: &Path) -> Result<(), ApfsStorageError> {
         self.record("idempotent-reclaim");
         let mut state = self.state.lock().expect("fake state");
@@ -942,15 +972,6 @@ impl ApfsExecutionHost for FakeHost {
         } else {
             Ok(())
         }
-    }
-    fn reclaim_unrecorded_retired(
-        &self,
-        _: &ApfsSubstrateConfig,
-        _: &RepoId,
-        _: &Path,
-    ) -> Result<(), ApfsStorageError> {
-        self.record("reclaim-unrecorded");
-        Ok(())
     }
 
     fn list(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError> {
@@ -2322,7 +2343,7 @@ async fn a_new_workspace_is_first_written_after_its_clone_and_before_its_attach(
         events
             .into_iter()
             .skip_while(|event| event != "clone")
-            .take(3)
+            .take(4)
             .collect()
     };
 
@@ -2339,7 +2360,12 @@ async fn a_new_workspace_is_first_written_after_its_clone_and_before_its_attach(
         .expect("create");
     assert_eq!(
         around_the_clone(host.events()),
-        ["clone", "first-write", "attach-mounted+checked"]
+        [
+            "clone",
+            "extent-proof",
+            "first-write",
+            "attach-mounted+checked"
+        ]
     );
 
     host.clear_events();
@@ -2355,8 +2381,66 @@ async fn a_new_workspace_is_first_written_after_its_clone_and_before_its_attach(
         .expect("fork");
     assert_eq!(
         around_the_clone(host.events()),
-        ["clone", "first-write", "attach-mounted+checked"]
+        [
+            "clone",
+            "extent-proof",
+            "first-write",
+            "attach-mounted+checked"
+        ]
     );
+
+    host.clear_events();
+    host.fail_extent_proof_once.store(true, Ordering::SeqCst);
+    substrate
+        .execute_fork_staged(
+            substrate
+                .plan_fork(&source, destination("over-budget", 12))
+                .expect("plan"),
+            Alongside::none(),
+            |_, ()| async { Ok::<(), &'static str>(()) },
+        )
+        .await
+        .expect_err("an unproven physical generation cannot publish");
+    let refused = host.events();
+    assert!(refused.iter().any(|event| event == "extent-proof"));
+    assert!(!refused.iter().any(|event| event == "first-write"));
+    assert!(
+        !refused
+            .iter()
+            .any(|event| event == "attach-mounted+checked")
+    );
+
+    host.clear_events();
+    let changed = host.clone();
+    substrate
+        .execute_fork_staged(
+            substrate
+                .plan_fork(&source, destination("publication-budget", 14))
+                .expect("plan"),
+            Alongside::none(),
+            move |_, ()| async move {
+                changed.fail_extent_proof_once.store(true, Ordering::SeqCst);
+                Ok::<(), &'static str>(())
+            },
+        )
+        .await
+        .expect_err("initialization cannot publish a now-unproven generation");
+    {
+        let state = host.state.lock().expect("state");
+        assert!(
+            !state
+                .published
+                .keys()
+                .any(|(_, name)| name.as_str() == "publication-budget")
+        );
+        assert!(
+            state
+                .pending
+                .values()
+                .any(|fact| fact.workspace.name().as_str() == "publication-budget"),
+            "post-initializer refusal preserves the exact pending clone"
+        );
+    }
 
     host.clear_events();
     substrate
@@ -2465,16 +2549,20 @@ async fn staged_retire_fences_after_durable_undiscovery_and_preserves_trash_on_f
     let callback_host = host.clone();
 
     let error = substrate
-        .execute_retire_staged(plan, move |retired| async move {
-            assert_eq!(retired.workspace().name().as_str(), "raven");
-            assert!(
-                callback_host
-                    .events()
-                    .contains(&"atomic-retire-to-trash".to_owned()),
-                "retirement must be durable before its lifecycle fence"
-            );
-            Err::<(), _>("injected commitment failure")
-        })
+        .execute_retire_staged(
+            plan,
+            cowshed_core::storage::apfs::RetirementDisposition::Recovery,
+            move |retired| async move {
+                assert_eq!(retired.workspace().name().as_str(), "raven");
+                assert!(
+                    callback_host
+                        .events()
+                        .contains(&"atomic-retire-to-trash".to_owned()),
+                    "retirement must be durable before its lifecycle fence"
+                );
+                Err::<(), _>("injected commitment failure")
+            },
+        )
         .await
         .expect_err("fence failure must preserve a recoverable retired reference");
     let RetireExecutionError::Fence { source, retired } = error else {
@@ -2488,6 +2576,69 @@ async fn staged_retire_fences_after_durable_undiscovery_and_preserves_trash_on_f
 
     substrate.reclaim(retired).await.expect("recovery reclaim");
     assert!(host.events().contains(&"idempotent-reclaim".to_owned()));
+}
+
+#[tokio::test]
+async fn failed_direct_source_unlink_does_not_publish_retirement_or_fall_back_to_trash() {
+    use cowshed_core::storage::apfs::RetirementDisposition;
+    let host = FakeHost::default();
+    let current = workspace("raven", 4);
+    host.seed(&current);
+    host.fail_reclaim_once.store(true, Ordering::SeqCst);
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let plan = substrate.plan_retire(&current).unwrap();
+    let callback_host = host.clone();
+    let failed = substrate
+        .execute_retire_staged(plan, RetirementDisposition::Release, move |_| async move {
+            callback_host.record("retirement-commitment");
+            Ok::<(), &'static str>(())
+        })
+        .await;
+    assert!(matches!(failed, Err(RetireExecutionError::Storage(_))));
+    assert!(!host.events().contains(&"retirement-commitment".to_owned()));
+    assert!(!host.events().contains(&"atomic-retire-to-trash".to_owned()));
+    assert!(
+        host.list(&repo())
+            .unwrap()
+            .iter()
+            .any(|fact| fact.workspace == current)
+    );
+    let retry = substrate.plan_retire(&current).unwrap();
+    substrate
+        .execute_retire_staged(retry, RetirementDisposition::Release, |_| async {
+            Ok::<(), &'static str>(())
+        })
+        .await
+        .expect("same release retries");
+}
+
+#[tokio::test]
+async fn cancelling_the_retirement_commitment_never_recreates_released_source_trash() {
+    use cowshed_core::storage::apfs::RetirementDisposition;
+    let host = FakeHost::default();
+    let current = workspace("raven", 4);
+    host.seed(&current);
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let plan = substrate.plan_retire(&current).unwrap();
+    let entered = Arc::new(AtomicBool::new(false));
+    let callback_entered = Arc::clone(&entered);
+    let callback_host = host.clone();
+    let task = tokio::spawn(async move {
+        substrate
+            .execute_retire_staged(plan, RetirementDisposition::Release, move |_| async move {
+                assert!(
+                    callback_host
+                        .events()
+                        .contains(&"physical-release".to_owned())
+                );
+                callback_entered.store(true, Ordering::SeqCst);
+                std::future::pending::<Result<(), &'static str>>().await
+            })
+            .await
+    });
+    abort_at_callback(task, entered).await;
+    assert!(!host.events().contains(&"atomic-retire-to-trash".to_owned()));
+    assert!(!host.events().contains(&"idempotent-reclaim".to_owned()));
 }
 
 #[tokio::test]
@@ -3251,10 +3402,40 @@ async fn pending_clone_retirement_inspects_before_trash_without_activation() {
             git_worktree: false,
         },
     };
+    let outcome = substrate
+        .defragment_pending_clone(metadata.clone())
+        .await
+        .expect("rewrite a pending clone without publishing or discarding it");
+    assert_eq!(outcome.extents, ExtentCount::new(1));
+    {
+        let state = host.state.lock().expect("state");
+        assert_eq!(
+            state.resumable_clone.as_ref().expect("retained").workspace,
+            pending
+        );
+        assert!(
+            state.published.is_empty(),
+            "defrag grants no publication authority"
+        );
+    }
+    let mut stale = metadata.clone();
+    stale.workspace_incarnation = incarnation(8);
+    host.clear_events();
+    substrate
+        .defragment_pending_clone(stale)
+        .await
+        .expect_err("a stale pending owner cannot rewrite another generation");
+    assert!(
+        !host
+            .events()
+            .iter()
+            .any(|event| event.starts_with("defragment:"))
+    );
+    host.clear_events();
     let refusal = substrate
         .execute_pending_clone_retirement(metadata.clone(), original.clone(), |stage| async move {
             assert!(stage.resuming);
-            Err::<(), _>(stage.mount_point)
+            Err::<(cowshed_core::storage::apfs::RetirementDisposition, ()), _>(stage.mount_point)
         })
         .await;
     let Err(StagedExecutionError::Initializer(mount)) = refusal else {
@@ -3279,7 +3460,7 @@ async fn pending_clone_retirement_inspects_before_trash_without_activation() {
     host.clear_events();
     let refusal = substrate
         .execute_pending_clone_retirement(metadata.clone(), original.clone(), |_| async move {
-            Err::<(), _>("unlanded commits")
+            Err::<(cowshed_core::storage::apfs::RetirementDisposition, ()), _>("unlanded commits")
         })
         .await;
     assert!(matches!(
@@ -3295,11 +3476,48 @@ async fn pending_clone_retirement_inspects_before_trash_without_activation() {
             .any(|event| event.starts_with("detach") || event == "unmount"),
         "{events:?}"
     );
+    let entered = Arc::new(AtomicBool::new(false));
+    let callback_entered = Arc::clone(&entered);
+    let cancelling_substrate = substrate.clone();
+    let cancelling_metadata = metadata.clone();
+    let cancelling_identity = original.clone();
+    let cancelled = tokio::spawn(async move {
+        cancelling_substrate
+            .execute_pending_clone_retirement(
+                cancelling_metadata,
+                cancelling_identity,
+                |_| async move {
+                    callback_entered.store(true, Ordering::SeqCst);
+                    std::future::pending::<
+                        Result<
+                            (cowshed_core::storage::apfs::RetirementDisposition, ()),
+                            &'static str,
+                        >,
+                    >()
+                    .await
+                },
+            )
+            .await
+    });
+    abort_at_callback(cancelled, entered).await;
+    assert_eq!(host.mounted_paths_now(), BTreeSet::from([mount.clone()]));
+    assert!(
+        !host
+            .events()
+            .iter()
+            .any(|event| event == "atomic-retire-to-trash"
+                || event == "physical-release"
+                || event == "idempotent-reclaim"),
+        "cancelled inspection must preserve the pending source"
+    );
     host.clear_events();
     let (retired, proof) = substrate
         .execute_pending_clone_retirement(metadata, original, |stage| async move {
             assert_eq!(stage.workspace, pending);
-            Ok::<_, &'static str>("landed")
+            Ok::<_, &'static str>((
+                cowshed_core::storage::apfs::RetirementDisposition::Recovery,
+                "landed",
+            ))
         })
         .await
         .expect("retire verified pending clone");

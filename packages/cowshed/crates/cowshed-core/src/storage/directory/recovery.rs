@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     DirectoryExecutionHost, MountPointState, allocated_tree_bytes, host_error, mount_point_state,
-    observed_mount, read_metadata,
+    observed_mount, read_metadata, require_home,
 };
 use crate::metadata::{
     DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, PublicationState, WorkspaceIncarnation,
@@ -814,36 +814,6 @@ impl DirectoryExecutionHost {
         self.reclaim_retired_authority(&project, retired.workspace().repo(), &trash, Some(retired))
     }
 
-    pub(super) fn reclaim_unrecorded_retired_payload(
-        &self,
-        config: &ApfsSubstrateConfig,
-        repo: &RepoId,
-        image: &Path,
-    ) -> Result<(), ApfsStorageError> {
-        if config.store_root != self.config.store_root {
-            return Err(ApfsStorageError::InvalidPlan(
-                "retired cleanup config differs from host storage root",
-            ));
-        }
-        let project = layout(config, repo)?.project().project_root.clone();
-        if image.parent()
-            != Some(
-                project
-                    .join(SESSIONS_DIRECTORY)
-                    .join(TRASH_NAMESPACE)
-                    .as_path(),
-            )
-        {
-            return Err(ApfsStorageError::InvalidPlan(
-                "unrecorded retired payload is not in its project's trash",
-            ));
-        }
-        if !path_exists(image)? {
-            return Ok(());
-        }
-        self.reclaim_retired_authority(&project, repo, image, None)
-    }
-
     /// The retirement a trash payload records, or `None` when its sidecar is already gone.
     fn retired_authority(
         &self,
@@ -1069,18 +1039,58 @@ impl DirectoryExecutionHost {
             (Some(authority), _) => authority,
             (None, Some(expected)) => expected.clone(),
             (None, None) => {
-                cowshed_os::eprintln!(
-                    "cowshed: retired payload {} has no grants sidecar; its retirement record was already reclaimed, so its remaining bytes are reclaimed too",
+                return Err(ApfsStorageError::Host(format!(
+                    "retaining recovery payload {}: grants sidecar is missing; recover its metadata or contents before explicit retirement",
                     trash_image.display()
-                );
-                return self.reclaim_image(trash_image);
+                )));
             }
         };
         let trash = project.join(SESSIONS_DIRECTORY).join(TRASH_NAMESPACE);
         let owners = retired_name_owners(&Self::retired_trash_images(&trash)?);
         let scope =
             self.retired_name_scope(&authority, owners.get(authority.workspace().name()))?;
-        let cleanup = self.retired_cleanup(project, &authority, trash_image, scope)?;
+        self.reclaim_workspace_artifacts(project, &authority, trash_image, scope)
+    }
+
+    pub(super) fn release_canonical_workspace(
+        &self,
+        config: &ApfsSubstrateConfig,
+        retired: &RetiredRef,
+    ) -> Result<(), ApfsStorageError> {
+        if config.store_root != self.config.store_root {
+            return Err(ApfsStorageError::InvalidPlan(
+                "workspace release config differs from host storage root",
+            ));
+        }
+        let workspace = retired.workspace();
+        let canonical = layout(config, workspace.repo())?
+            .canonical_image(workspace.name())?
+            .image()
+            .to_path_buf();
+        self.require_store_image(&canonical)?;
+        require_home(&canonical)?;
+        if metadata_workspace_ref(&read_metadata(&canonical)?)? != *workspace {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "workspace release identity changed: {}",
+                canonical.display()
+            )));
+        }
+        self.validate_staged_companion(&companion_path(&canonical))?;
+        let project = layout(config, workspace.repo())?
+            .project()
+            .project_root
+            .clone();
+        self.reclaim_workspace_artifacts(&project, retired, &canonical, NameScope::Owned)
+    }
+
+    fn reclaim_workspace_artifacts(
+        &self,
+        project: &Path,
+        authority: &RetiredRef,
+        trash_image: &Path,
+        scope: NameScope,
+    ) -> Result<(), ApfsStorageError> {
+        let cleanup = self.retired_cleanup(project, authority, trash_image, scope)?;
         for image in &cleanup.checkpoint_images {
             self.reclaim_image(image)?;
         }
@@ -1202,30 +1212,20 @@ impl DirectoryExecutionHost {
         let owners = retired_name_owners(&trash_images);
         for path in trash_images {
             let Some(retired) = self.retired_authority(project, repo, &path)? else {
-                let Some((name, _)) = path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .and_then(split_retired_stem)
-                else {
-                    warn_session_image_issue(
-                        &path,
-                        "retired payload has no grants sidecar and no <workspace>-<incarnation> name",
-                    );
-                    continue;
-                };
-                checked_increment(&mut examined)?;
-                lock_paths.push(workspace_lock_path(&self.config, repo, &name)?);
-                candidates.push(gc_candidate(
-                    StorageGcReason::RetiredWorkspace,
+                warn_session_image_issue(
                     &path,
-                    &payload_gc_paths(&path),
-                    &[],
-                )?);
+                    "recovery payload has no grants sidecar; retained, not garbage: recover its metadata or contents deliberately",
+                );
                 continue;
             };
             let scope =
                 self.retired_name_scope(&retired, owners.get(retired.workspace().name()))?;
             let cleanup = self.retired_cleanup(project, &retired, &path, scope)?;
+            if path_exists(&path)? {
+                // Recovery payloads are not garbage; abandon-bundle authority is not
+                // authority to destroy uncommitted or ignored source content.
+                continue;
+            }
             let mut associated = cleanup.paths;
             associated.extend(cleanup.mount_point);
             checked_increment(&mut examined)?;
@@ -1387,6 +1387,11 @@ impl DirectoryExecutionHost {
             else {
                 continue;
             };
+            if owners.contains_key(&workspace_name)
+                && !path_exists(storage.canonical_image(&workspace_name)?.image())?
+            {
+                continue;
+            }
             let mut checkpoints = Vec::new();
             for image in Self::checkpoint_payloads(&workspace_directory)? {
                 lock_paths.push(workspace_lock_path(&self.config, repo, &workspace_name)?);

@@ -24,7 +24,8 @@ use crate::api::dto::{
 use crate::build_volume::migrate::{MintedBeside, MintedVolume};
 use crate::build_volume::{
     BuildStateRefresh, BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord,
-    BuildVolumeRole, BuildVolumeState, TrackedBuildStateRefusal, cargo, carry, link, nx,
+    BuildVolumeRole, BuildVolumeStage, BuildVolumeState, Registrant, Registration,
+    TrackedBuildStateRefusal, cargo, carry, link, nx,
 };
 use crate::capabilities::BuildStatePath;
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
@@ -62,12 +63,16 @@ pub(crate) struct Owner {
 /// `checkouts` is where each existing workspace's checkout is, so a release can read that
 /// checkout's link again under its claim: a land that moves a target's link onto a volume this
 /// snapshot saw linked by nothing makes the volume the target's after the snapshot was taken.
+///
+/// `journaled` is every build volume id an unfinished re-adoption's journal record names: that
+/// record, not a workspace name, is the authority for what it publishes.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Links {
     pub volumes: BTreeSet<BuildVolumeId>,
     pub owners: BTreeSet<Owner>,
     pub detached: BTreeSet<WorkspaceName>,
     pub creating: BTreeSet<WorkspaceName>,
+    pub journaled: BTreeSet<BuildVolumeId>,
     pub checkouts: BTreeMap<WorkspaceName, PathBuf>,
 }
 
@@ -195,17 +200,18 @@ impl From<Freeze> for LandSeed {
 #[must_use = "its previous volume is released by release_previous"]
 pub(crate) struct Adopted {
     pub elapsed_ms: u64,
-    pub previous: Unlinked,
+    pub previous: Superseded,
 }
 
 /// A target's previous build volume once an adoption moved its link off it and recorded it
-/// Unlinked: [`BuildVolumes::release_previous`] releases it, and `gc` does if that fails or never
-/// runs.
+/// [`BuildVolumeRole::Superseded`] under the target at its incarnation:
+/// [`BuildVolumes::release_previous`] releases it unless a job admitted on it before the move
+/// still holds it, and then the release when that job's hold ends does.
 #[derive(Debug)]
 #[must_use = "release_previous releases the target's previous build volume"]
-pub(crate) struct Unlinked {
+pub(crate) struct Superseded {
     id: BuildVolumeId,
-    target: WorkspaceName,
+    owner: Owner,
 }
 
 /// A carry's first phase, done while the target still ran (Land step 5, "Carry").
@@ -528,12 +534,19 @@ pub(crate) struct OwnedMint<H: RuntimeStorageHost = Host> {
     slot: MintSlot,
 }
 
+/// A volume minted beside main's image, registered and not yet published, with the creation hold
+/// that keeps every release in any process off it, by its exact id, until its release takes it.
+pub(crate) struct Minted {
+    volume: MintedVolume,
+    _creating: BuildVolumeHold,
+}
+
 /// The volume an [`OwnedMint`] holds until its release takes it.
-pub(crate) type MintSlot = Arc<Mutex<Option<MintedVolume>>>;
+pub(crate) type MintSlot = Arc<Mutex<Option<Minted>>>;
 
 /// The slot's volume, under its lock. The lock guards no invariant a panic can break: a
 /// poisoned slot still names the volume or nothing.
-fn lock(slot: &MintSlot) -> MutexGuard<'_, Option<MintedVolume>> {
+fn lock(slot: &MintSlot) -> MutexGuard<'_, Option<Minted>> {
     slot.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -552,7 +565,9 @@ fn release_slot(
     checkout: &Path,
     whose: &str,
 ) {
-    if let Some(volume) = lock(slot).take() {
+    // The creation hold goes first, so the release can claim the volume.
+    if let Some(Minted { volume, _creating }) = lock(slot).take() {
+        drop(_creating);
         release_minted(host, layout, &volume, checkout, whose);
     }
 }
@@ -669,10 +684,23 @@ impl Lent {
             Self::Failed(error) => touch(MintedBeside::Failed(error.clone())),
             Self::Volume(slot) => {
                 let held = lock(slot);
-                touch(
-                    held.clone()
-                        .map_or(MintedBeside::Nothing, MintedBeside::Volume),
-                )
+                touch(held.as_ref().map_or(MintedBeside::Nothing, |minted| {
+                    MintedBeside::Volume(minted.volume.clone())
+                }))
+            }
+        }
+    }
+
+    /// Main's first touch published `id`. When that is the minted volume, the adopt's hold on it
+    /// ends here, as its creation's does once published (16_build_volumes.md, "Garbage
+    /// collection"): the slot lets it go, creation hold and all, so the claim of main's seed
+    /// capture is free to take it, and settling finds nothing left to decide. The checkout's
+    /// link keeps it from then on.
+    fn published(&self, id: &BuildVolumeId) {
+        if let Self::Volume(slot) = self {
+            let mut held = lock(slot);
+            if held.as_ref().is_some_and(|minted| &minted.volume.id == id) {
+                *held = None;
             }
         }
     }
@@ -747,13 +775,13 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     }
 
     /// The published volume `checkout` links and the state written at its root, or `None` when
-    /// it links none or an interrupted first touch left its volume without a record (which only
-    /// a fresh discovery finishes). The checkout is mounted, which mounted its volume.
+    /// it links none or an interrupted first touch left its volume registered and unpublished
+    /// (which only a fresh discovery finishes). The checkout is mounted, which mounted its volume.
     pub fn state_of(&self, checkout: &Path) -> Result<Option<(BuildVolumeId, BuildVolumeState)>> {
         let Some(id) = self.layout.linked(checkout)? else {
             return Ok(None);
         };
-        if self.layout.read_record_present(&id)?.is_none() {
+        if !self.layout.read_record(&id)?.is_published() {
             return Ok(None);
         }
         let state = BuildVolumeState::read(&self.layout.mount(&id))?;
@@ -781,8 +809,10 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     ) -> Result<std::result::Result<BuildStateRefresh, TrackedBuildStateRefusal>> {
         let linked = self.layout.linked(&checkout)?;
         self.blocking(move |host, layout| {
+            // A linked volume always has a record: one registered and unpublished is a first
+            // touch to finish; one with none at all is bytes nobody registered, which refuses.
             let published = match &linked {
-                Some(id) => layout.read_record_present(id)?.is_some(),
+                Some(id) => layout.read_record(id)?.is_published(),
                 None => false,
             };
             let (id, discovered) = match (linked, discovered) {
@@ -814,10 +844,15 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                                 fingerprint,
                                 capacity,
                                 beside,
-                                record: BuildVolumeRecord::new(
-                                    None,
-                                    BuildVolumeRole::Linked {
-                                        checkout: owner.name.clone(),
+                                registration: Registration::new(
+                                    BuildVolumeRecord::new(
+                                        None,
+                                        BuildVolumeRole::Linked {
+                                            checkout: owner.name.clone(),
+                                        },
+                                    ),
+                                    Registrant::Workspace {
+                                        incarnation: owner.incarnation.clone(),
                                     },
                                 ),
                             },
@@ -827,15 +862,21 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                         Ok(touched) => touched,
                         Err(refusal) => return Ok(Err(refusal)),
                     };
+                    lent.published(&id);
                     if layout.seed_of(&owner.name, &owner.incarnation)?.is_none() {
                         host.clone_build_volume(
                             layout,
                             &id,
                             &BuildVolumeId::mint(),
-                            &BuildVolumeRecord::new(
-                                None,
-                                BuildVolumeRole::Seed {
-                                    target: owner.name,
+                            &Registration::new(
+                                BuildVolumeRecord::new(
+                                    None,
+                                    BuildVolumeRole::Seed {
+                                        target: owner.name,
+                                        incarnation: owner.incarnation.clone(),
+                                    },
+                                ),
+                                Registrant::Workspace {
                                     incarnation: owner.incarnation,
                                 },
                             ),
@@ -888,10 +929,11 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// copies `source` into it, so the two attaches wait on `storagekitd` once
     /// (16_build_volumes.md, "Targets and seeds"): at the capacity `source`'s `.cowshed.toml`
     /// asks, and none when nothing in `source` can name build state, whose first touch makes no
-    /// volume. Nothing links it and it has no record until main's first touch at `checkout` links
-    /// it; until then the adopt's unfinished intent keeps collection off it
-    /// ([`Links::creating`]). A failed mint is answered, for the first touch to answer in turn if
-    /// it needs a volume.
+    /// volume. Its record is registered to main, by the adopt's intent, before its image exists,
+    /// and nothing links it until main's first touch at `checkout` links and publishes it; until
+    /// then the adopt's unfinished intent keeps collection off it ([`Links::creating`]). A
+    /// failed mint releases what it registered and is answered, for the first touch to answer
+    /// in turn if it needs a volume.
     ///
     /// The volume is the answer's to release: dropped unsettled, it releases itself. An adopt
     /// dropped while the mint runs leaves nobody to answer, so the mint releases what it made.
@@ -903,9 +945,29 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 capacity
                     .map(|capacity| {
                         let id = BuildVolumeId::mint();
-                        host.create_build_volume(layout, &id, capacity)
+                        // Main has no incarnation until the adopt publishes it, so the volume is
+                        // registered by the adopt's intent and held by its exact id, by the slot,
+                        // until its release takes it: never by main's name.
+                        let (_, creating) = host
+                            .create_build_volume(
+                                layout,
+                                &id,
+                                capacity,
+                                &Registration::new(
+                                    BuildVolumeRecord::new(
+                                        None,
+                                        BuildVolumeRole::Linked {
+                                            checkout: WorkspaceName::main(),
+                                        },
+                                    ),
+                                    Registrant::Intent,
+                                ),
+                            )
                             .map_err(storage)?;
-                        Ok(MintedVolume { id, capacity })
+                        Ok(Minted {
+                            volume: MintedVolume { id, capacity },
+                            _creating: creating,
+                        })
                     })
                     .transpose()
             });
@@ -961,15 +1023,19 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 .fork_build_volume(
                     layout,
                     &seed,
-                    &BuildVolumeRecord {
-                        checked_out: Some(placed),
-                        ..BuildVolumeRecord::new(
-                            record.tree.clone(),
-                            BuildVolumeRole::Linked {
-                                checkout: destination,
-                            },
-                        )
-                    },
+                    // The fork's intent answers for the volume until it publishes `destination`.
+                    &Registration::new(
+                        BuildVolumeRecord {
+                            checked_out: Some(placed),
+                            ..BuildVolumeRecord::new(
+                                record.tree.clone(),
+                                BuildVolumeRole::Linked {
+                                    checkout: destination,
+                                },
+                            )
+                        },
+                        Registrant::Intent,
+                    ),
                 )
                 .map_err(storage)?;
             Ok(Some(PreparedFork {
@@ -1021,12 +1087,15 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 layout,
                 &seed,
                 &own_seed,
-                &BuildVolumeRecord::new(
-                    tree,
-                    BuildVolumeRole::Seed {
-                        target: destination.name.clone(),
-                        incarnation: destination.incarnation.clone(),
-                    },
+                &Registration::new(
+                    BuildVolumeRecord::new(
+                        tree,
+                        BuildVolumeRole::Seed {
+                            target: destination.name.clone(),
+                            incarnation: destination.incarnation.clone(),
+                        },
+                    ),
+                    Registrant::Intent,
                 ),
             )
             .map_err(storage)?;
@@ -1252,14 +1321,19 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         let quiet = quiet.clone();
         let target = locked.target.clone();
         self.blocking(move |host, layout| {
-            let record = BuildVolumeRecord::new(
-                Some(tree),
-                BuildVolumeRole::Seed {
-                    target: target.name.clone(),
+            let registration = Registration::new(
+                BuildVolumeRecord::new(
+                    Some(tree),
+                    BuildVolumeRole::Seed {
+                        target: target.name.clone(),
+                        incarnation: target.incarnation.clone(),
+                    },
+                ),
+                Registrant::Workspace {
                     incarnation: target.incarnation.clone(),
                 },
             );
-            seal(host, layout, &quiet, &target, &record)
+            seal(host, layout, &quiet, &target, &registration)
         })
         .await
     }
@@ -1430,8 +1504,9 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// Land step 6, under the target's image lock: when nothing opened the closed target's task
     /// database since [`Self::close_target`], give the landing volume the target's daemon records
     /// in place of its own and rename the target's build link onto it. The target's previous
-    /// volume is recorded Unlinked and answered, for [`Self::release_previous`] beside what the
-    /// land does in the target next. Answers how long the move took.
+    /// volume is recorded superseded under the target at its incarnation and answered, for
+    /// [`Self::release_previous`] beside what the land does in the target next. Answers how long
+    /// the move took.
     ///
     /// The look and the rename happen under Nx's own open locks on the target's databases
     /// ([`nx::hold_opens`]). The look alone proves nothing past the moment it lists processes:
@@ -1449,7 +1524,8 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         target_checkout: PathBuf,
         tree: GitOid,
     ) -> Result<std::result::Result<Adopted, AdoptionSkip>> {
-        let target = locked.target.name.clone();
+        let owner = locked.target.clone();
+        let target = owner.name.clone();
         let linked = self.layout.linked(&target_checkout)?;
         let quiet = quiet.clone();
         self.blocking(move |_, layout| {
@@ -1493,33 +1569,122 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 },
             )?;
             let previous = previous.id;
+            // Still the target's, at its incarnation, until a release deletes it: a job admitted
+            // on it before the move holds it, and its end releases it.
             layout.write_record(
                 &previous,
                 &BuildVolumeRecord {
-                    role: BuildVolumeRole::Unlinked,
+                    role: BuildVolumeRole::Superseded {
+                        owner: owner.name.clone(),
+                        incarnation: owner.incarnation.clone(),
+                    },
                     ..layout.read_record(&previous)?
                 },
             )?;
             Ok(Ok(Adopted {
                 elapsed_ms: millis(elapsed),
-                previous: Unlinked {
+                previous: Superseded {
                     id: previous,
-                    target,
+                    owner,
                 },
             }))
         })
         .await
     }
 
-    /// Release a target's previous volume after its adoption: nothing links it, so only a job
-    /// admitted on it before the move keeps it, and the collection after that job ends
-    /// reclaims it. It needs no target lock: no fork or reseed of the target that took the lock
-    /// after the move reads it, and none that held it before the land took it still runs.
-    pub async fn release_previous(&self, previous: Unlinked) -> Result<()> {
+    /// Release a target's previous volume after its adoption, inside the land: nothing links it,
+    /// so only a job admitted on it before the move keeps it. Held, it stays recorded superseded
+    /// under the target, and that job's end releases it
+    /// ([`Self::release_superseded`]); a failed release keeps that record too and is the land's
+    /// error. It needs no target lock: no fork or reseed of the target that took the lock after
+    /// the move reads it, and none that held it before the land took it still runs.
+    pub async fn release_previous(&self, previous: Superseded) -> Result<()> {
         self.blocking(move |host, layout| {
-            let Unlinked { id, target } = previous;
+            let Superseded { id, owner } = previous;
             let release = host.release_build_volume(layout, &id).map_err(storage)?;
-            say_release(&id, &format!("{target}'s previous"), &release);
+            say_release(&id, &format!("{}'s previous", owner.name), &release);
+            Ok(())
+        })
+        .await
+    }
+
+    /// The release a job's end owes the volume it was admitted on (16_build_volumes.md,
+    /// "Garbage collection"): when that volume is recorded superseded, its owner's link having
+    /// moved off it while the job ran, it is released now unless another job still holds it,
+    /// whose end then releases it in turn. A volume recorded anything else is not this release's
+    /// to decide, and is left as it is. A refusal or failure leaves the superseded record naming
+    /// its owner, for the owner's retirement or the next collection.
+    pub async fn release_superseded(&self, id: BuildVolumeId) -> Result<()> {
+        self.blocking(move |host, layout| {
+            let Some(BuildVolumeRecord {
+                role: BuildVolumeRole::Superseded { owner, .. },
+                ..
+            }) = layout.read_record_present(&id)?
+            else {
+                return Ok(());
+            };
+            let release = host.release_build_volume(layout, &id).map_err(storage)?;
+            if let BuildVolumeRelease::Deleted { .. } = release {
+                say_release(&id, &format!("{owner}'s superseded"), &release);
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Retirement's own release (16_build_volumes.md, "Garbage collection"), before `owner`'s
+    /// image is retired: the live volume `checkout` links, when its record still names `owner`
+    /// as its checkout (a target that adopted it renamed that, and keeps it), then every other
+    /// volume recorded as `owner`'s at its incarnation: its seeds and its superseded previous
+    /// volumes, and whatever a creation it registered left unfinished. A volume that stays
+    /// refuses, naming why, so an image is never retired ahead of the volumes it owned and
+    /// nothing is left for a later sweep to find ownerless.
+    pub async fn release_owned(&self, owner: Owner, checkout: PathBuf) -> Result<()> {
+        let linked = self.layout.linked(&checkout)?;
+        self.blocking(move |host, layout| {
+            let mut owned = Vec::new();
+            if let Some(id) = linked
+                && let Some(BuildVolumeRecord {
+                    role: BuildVolumeRole::Linked { checkout: by },
+                    ..
+                }) = layout.read_record_present(&id)?
+                && by == owner.name
+            {
+                owned.push((id, "live"));
+            }
+            for id in layout.collection_ids()? {
+                if owned.iter().any(|(live, _)| *live == id) {
+                    continue;
+                }
+                let Some(record) = layout.read_record_present(&id)? else {
+                    continue;
+                };
+                if let Some(whose) = owned_at(&record, &owner) {
+                    owned.push((id, whose));
+                }
+            }
+            for (id, whose) in owned {
+                match host.release_build_volume(layout, &id).map_err(storage)? {
+                    release @ BuildVolumeRelease::Deleted { .. } => {
+                        say_release(&id, &format!("{}'s {whose}", owner.name), &release);
+                    }
+                    BuildVolumeRelease::Held { open } => {
+                        return Err(CowshedError::conflict(
+                            format!(
+                                "{}'s {whose} build volume {id} stays while a job admitted on it runs{}; {} is not retired",
+                                owner.name,
+                                if open.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" (open in {})", nx::Holders(&open))
+                                },
+                                owner.name,
+                            ),
+                            "end that job, then run the same removal again",
+                        ));
+                    }
+                }
+            }
             Ok(())
         })
         .await
@@ -1532,7 +1697,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     pub async fn refork(
         &self,
         locked: &TargetLock<H>,
-        workspace: WorkspaceName,
+        workspace: Owner,
         checkout: PathBuf,
     ) -> Result<()> {
         let seed_of = locked.target.clone();
@@ -1549,10 +1714,15 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 .fork_build_volume(
                     layout,
                     &seed,
-                    &BuildVolumeRecord::new(
-                        record.tree,
-                        BuildVolumeRole::Linked {
-                            checkout: workspace,
+                    &Registration::new(
+                        BuildVolumeRecord::new(
+                            record.tree,
+                            BuildVolumeRole::Linked {
+                                checkout: workspace.name,
+                            },
+                        ),
+                        Registrant::Workspace {
+                            incarnation: workspace.incarnation,
                         },
                     ),
                 )
@@ -1608,6 +1778,65 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         .await
     }
 
+    /// Rewrite every seed of this incarnation and its linked build source. Keeping this with
+    /// workspace defrag makes every extent refusal's named remedy reach the actual culprit.
+    pub async fn defragment(
+        &self,
+        owner: Owner,
+    ) -> Result<Vec<(PathBuf, crate::storage::lifecycle::DefragmentOutcome)>> {
+        self.blocking(move |host, layout| {
+            let images = defragment_images(layout, &owner)?;
+            let mut outcomes = Vec::with_capacity(images.len());
+            for (id, linked) in images {
+                let claim = match host.claim_build_volume(layout, &id).map_err(storage)? {
+                    BuildVolumeClaim::Claimed(claim) => claim,
+                    BuildVolumeClaim::Held { open } => {
+                        return Err(CowshedError::conflict(
+                            format!(
+                                "cannot defragment build image {} of {}: {}",
+                                layout.image(&id).display(),
+                                owner.name,
+                                volume_busy_reason(&layout.image(&id), &open)
+                            ),
+                            format!("stop its admitted jobs, then cowshed defrag {}", owner.name),
+                        ));
+                    }
+                };
+                if defragment_role(&layout.read_record(&id)?, &owner) != Some(linked) {
+                    return Err(CowshedError::conflict(
+                        format!(
+                            "build image {} changed owner or publication state before defrag",
+                            layout.image(&id).display()
+                        ),
+                        format!("cowshed doctor, then cowshed defrag {}", owner.name),
+                    ));
+                }
+                if linked {
+                    let mount = host.mount_build_volume(layout, &id).map_err(storage)?;
+                    let state = BuildVolumeState::read(&mount)?;
+                    if let Err(busy) = nx::close(&mount, &state)
+                        .map_err(|error| io("close the build volume's Nx state", &mount, &error))?
+                    {
+                        return Err(CowshedError::conflict(
+                            format!(
+                                "cannot defragment build image {} of {}: {busy}",
+                                layout.image(&id).display(),
+                                owner.name
+                            ),
+                            format!("stop what holds it, then cowshed defrag {}", owner.name),
+                        ));
+                    }
+                }
+                let outcome = host
+                    .defragment_build_volume(layout, &claim)
+                    .map_err(storage)?;
+                outcomes.push((layout.image(&id), outcome));
+            }
+            Ok(outcomes)
+        })
+        .await
+    }
+
     /// Delete (16_build_volumes.md, "Garbage collection") what [`plan`] dooms of `images`, listed
     /// before `links` was read. Each doomed volume is claimed first and decided again under the
     /// claim: one whose record now names a checkout that links it ([`relinked`]) is kept, since a
@@ -1622,75 +1851,142 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         dry_run: bool,
     ) -> Result<Collection> {
         self.blocking(move |host, layout| {
-            let plan = plan(layout, &images, &links)?;
-            let mut collection = Collection {
-                examined: plan.examined,
-                deferred: plan
-                    .deferred
-                    .into_iter()
-                    .map(|(id, deferral)| Deferred {
-                        path: layout.image(&id),
-                        deferral,
-                    })
-                    .collect(),
-                ..Collection::default()
-            };
-            for doomed in plan.doomed {
-                let (id, reason, bytes) = (doomed.id.clone(), doomed.reason, doomed.bytes);
-                let image = layout.image(&id);
-                let deferral = if dry_run {
-                    // What the release would answer, asked without claiming.
-                    match (still_doomed(layout, &links, &doomed), layout.held(&id)) {
-                        (Ok(Some(deferral)), _) => Some(deferral),
-                        (Err(error), _) => Some(Deferral::ReleaseFailed(format!(
-                            "cannot tell whether it is still garbage: {error}"
-                        ))),
-                        (Ok(None), Ok(false)) => None,
-                        (Ok(None), Ok(true)) => Some(Deferral::Held(Vec::new())),
-                        (Ok(None), Err(error)) => Some(Deferral::ReleaseFailed(format!(
-                            "cannot tell whether a job holds it: {error}"
-                        ))),
-                    }
-                } else {
-                    match release_if_still_doomed(host, layout, &links, &doomed) {
-                        Ok(Ok(refused)) => {
-                            say_release(&id, "collected", &BuildVolumeRelease::Deleted { refused });
-                            collection.reclaimed += 1;
-                            None
-                        }
-                        Ok(Err(deferral)) => Some(deferral),
-                        Err(error) => Some(Deferral::ReleaseFailed(error.to_string())),
-                    }
-                };
-                let candidate = GcCandidate {
-                    identity: Sha256Digest::compute(image.as_os_str().as_encoded_bytes()),
-                    path: image.clone(),
-                    bytes,
-                    reason,
-                };
-                match deferral {
-                    None => {
-                        collection.candidates.push(candidate);
-                        collection.freed_bytes = collection.freed_bytes.saturating_add(bytes);
-                    }
-                    Some(deferral) => {
-                        // A collection names what it tried to release; a volume a checkout
-                        // links is not garbage, and a dry run tries nothing.
-                        if !dry_run && !matches!(deferral, Deferral::Linked(_)) {
-                            collection.candidates.push(candidate);
-                        }
-                        collection.deferred.push(Deferred {
-                            path: image,
-                            deferral,
-                        });
-                    }
-                }
-            }
+            let mut collection = collect_planned(host, layout, &images, &links, dry_run)?;
             collect_legacy_seed_sidecars(layout, &links, dry_run, &mut collection)?;
             Ok(collection)
         })
         .await
     }
+
+    /// Every build volume registered and not yet published, by its exact id: what a crash
+    /// between registration and publication can leave. Read from the records alone, so an open
+    /// with nothing registered pays one record read per volume and no inventory.
+    pub async fn registered(&self) -> Result<Vec<BuildVolumeId>> {
+        self.blocking(move |_, layout| {
+            let mut registered = Vec::new();
+            for id in layout.collection_ids()? {
+                if layout
+                    .read_record_present(&id)?
+                    .is_some_and(|record| !record.is_published())
+                {
+                    registered.push(id);
+                }
+            }
+            Ok(registered)
+        })
+        .await
+    }
+
+    /// Next-open recovery of interrupted creations (16_build_volumes.md, "Garbage collection"):
+    /// each of `registered`, listed before `links` was read, whose registrant is gone is released
+    /// by its exact id now, as the open's own step, never left for a periodic or manual pass. One
+    /// still forming (a create, fork or adopt in any process, a first touch a detached checkout
+    /// may still finish) is its registrant's, and one a creator still holds defers under the
+    /// release's claim.
+    pub async fn recover_registered(
+        &self,
+        registered: Vec<BuildVolumeId>,
+        links: Links,
+    ) -> Result<Collection> {
+        self.blocking(move |host, layout| {
+            // A release a crash cut short after its commit is nobody's any more: finished first.
+            let journal = layout.releasing();
+            let drained = crate::build_volume::drain_released(&journal).map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot finish the build image releases in {}: {error}",
+                        journal.display()
+                    ),
+                    "repair the named path, then retry",
+                )
+            })?;
+            if drained.images > 0 {
+                cowshed_os::eprintln!(
+                    "cowshed: finished releasing {} build volume image(s), {} bytes, that an interrupted operation committed",
+                    drained.images,
+                    drained.bytes
+                );
+            }
+            collect_planned(host, layout, &registered, &links, false)
+        })
+        .await
+    }
+}
+
+/// [`plan`] `images` against `links` and release what it dooms, each under its own claim and
+/// decided again there; or, for a dry run, say what each release would answer.
+fn collect_planned(
+    host: &impl RuntimeStorageHost,
+    layout: &BuildVolumeLayout,
+    images: &[BuildVolumeId],
+    links: &Links,
+    dry_run: bool,
+) -> Result<Collection> {
+    let plan = plan(layout, images, links)?;
+    let mut collection = Collection {
+        examined: plan.examined,
+        deferred: plan
+            .deferred
+            .into_iter()
+            .map(|(id, deferral)| Deferred {
+                path: layout.image(&id),
+                deferral,
+            })
+            .collect(),
+        ..Collection::default()
+    };
+    for doomed in plan.doomed {
+        let (id, reason, bytes) = (doomed.id.clone(), doomed.reason, doomed.bytes);
+        let image = layout.image(&id);
+        let deferral = if dry_run {
+            // What the release would answer, asked without claiming.
+            match (still_doomed(layout, links, &doomed), layout.held(&id)) {
+                (Ok(Some(deferral)), _) => Some(deferral),
+                (Err(error), _) => Some(Deferral::ReleaseFailed(format!(
+                    "cannot tell whether it is still garbage: {error}"
+                ))),
+                (Ok(None), Ok(false)) => None,
+                (Ok(None), Ok(true)) => Some(Deferral::Held(Vec::new())),
+                (Ok(None), Err(error)) => Some(Deferral::ReleaseFailed(format!(
+                    "cannot tell whether a job holds it: {error}"
+                ))),
+            }
+        } else {
+            match release_if_still_doomed(host, layout, links, &doomed) {
+                Ok(Ok(refused)) => {
+                    say_release(&id, "collected", &BuildVolumeRelease::Deleted { refused });
+                    collection.reclaimed += 1;
+                    None
+                }
+                Ok(Err(deferral)) => Some(deferral),
+                Err(error) => Some(Deferral::ReleaseFailed(error.to_string())),
+            }
+        };
+        let candidate = GcCandidate {
+            identity: Sha256Digest::compute(image.as_os_str().as_encoded_bytes()),
+            path: image.clone(),
+            bytes,
+            reason,
+        };
+        match deferral {
+            None => {
+                collection.candidates.push(candidate);
+                collection.freed_bytes = collection.freed_bytes.saturating_add(bytes);
+            }
+            Some(deferral) => {
+                // A collection names what it tried to release; a volume a checkout links is
+                // not garbage, and a dry run tries nothing.
+                if !dry_run && !matches!(deferral, Deferral::Linked(_)) {
+                    collection.candidates.push(candidate);
+                }
+                collection.deferred.push(Deferred {
+                    path: image,
+                    deferral,
+                });
+            }
+        }
+    }
+    Ok(collection)
 }
 
 /// A payload-absent legacy seed's metadata, never a legacy runtime image.
@@ -1906,14 +2202,14 @@ fn legacy_seed_deferral(
 }
 
 /// Why `doomed` is no longer garbage, read now: its record is not the one the plan judged it by
-/// (a creation wrote it, a land handed the volume to its target), or a checkout's build link
-/// names it. A live link proves reachability by itself, whatever any record says.
+/// (a creation published it, a land handed the volume to its target), or a checkout's build
+/// link names it. A live link proves reachability by itself, whatever any record says.
 fn still_doomed(
     layout: &BuildVolumeLayout,
     links: &Links,
     doomed: &Doomed,
 ) -> Result<Option<Deferral>> {
-    if layout.read_record_present(&doomed.id)? != doomed.seen {
+    if layout.read_record_present(&doomed.id)?.as_ref() != Some(&doomed.seen) {
         return Ok(Some(Deferral::Changed));
     }
     if doomed.image_missing {
@@ -1980,13 +2276,10 @@ pub(crate) enum Deferral {
     /// finished: the staged checkout's link cannot be read, and the workspace does not exist
     /// yet, so nothing proves the volume unreachable.
     Creating(WorkspaceName),
-    /// It has no record, and workspaces whose links cannot be read yet may name it: the
-    /// detached ones until they are attached, the ones being created until their create, fork
-    /// or adopt finishes.
-    Unrecorded {
-        detached: Vec<WorkspaceName>,
-        creating: Vec<WorkspaceName>,
-    },
+    /// Its image has no owner record. Every build image is registered before its first byte,
+    /// so these bytes predate owner registration and nothing proves whose they are: the image
+    /// is named on every pass and never released on a guess.
+    Unregistered,
     /// Under the release's claim, `0`'s build link names it: whatever this collection read
     /// before (a land moved `0` onto it, a mount re-pointed `0`'s stale link), it is `0`'s.
     Linked(WorkspaceName),
@@ -2007,19 +2300,27 @@ impl Deferral {
     pub fn is_pending(&self) -> bool {
         !matches!(self, Self::Linked(_))
     }
+
+    /// Whether a live authority still answers for the volume — a job or creator's hold, a
+    /// forming intent, a detached checkout's unreadable link, a link or record that moved under
+    /// the claim — rather than a release that failed or a fact that could not be read.
+    pub fn is_owned(&self) -> bool {
+        match self {
+            Self::Held(_)
+            | Self::DetachedCheckout(_)
+            | Self::Creating(_)
+            | Self::Linked(_)
+            | Self::Changed => true,
+            Self::ReleaseFailed(_)
+            | Self::RecordUnreadable(_)
+            | Self::SizeUnreadable(_)
+            | Self::Unregistered => false,
+        }
+    }
 }
 
 impl std::fmt::Display for Deferral {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let names = |formatter: &mut std::fmt::Formatter<'_>, names: &[WorkspaceName]| {
-            for (index, name) in names.iter().enumerate() {
-                if index > 0 {
-                    formatter.write_str(", ")?;
-                }
-                write!(formatter, "{name}")?;
-            }
-            Ok(())
-        };
         match self {
             Self::Held(open) => {
                 formatter.write_str(
@@ -2048,23 +2349,9 @@ impl std::fmt::Display for Deferral {
             Self::Changed => formatter.write_str(
                 "its record changed since this collection read it; the next pass decides it",
             ),
-            Self::Unrecorded { detached, creating } => {
-                formatter.write_str("it has no record, and the links of")?;
-                if !detached.is_empty() {
-                    formatter.write_str(" detached ")?;
-                    names(formatter, detached)?;
-                    formatter.write_str(" (until attached)")?;
-                }
-                if !detached.is_empty() && !creating.is_empty() {
-                    formatter.write_str(" and")?;
-                }
-                if !creating.is_empty() {
-                    formatter.write_str(" still-forming ")?;
-                    names(formatter, creating)?;
-                    formatter.write_str(" (until their create, fork or adopt finishes)")?;
-                }
-                formatter.write_str(" cannot be read")
-            }
+            Self::Unregistered => formatter.write_str(
+                "its image has no owner record, so it predates owner registration and nothing proves whose it is; it is never released on a guess",
+            ),
         }
     }
 }
@@ -2086,14 +2373,14 @@ impl From<Deferred> for GcDeferred {
 }
 
 /// A build volume collection deletes, with why, its allocated size, and the record the plan
-/// judged it by (`None` for an unrecorded image): its release decides it again under its claim,
-/// and a record that changed since says the volume is no longer what the plan judged.
+/// judged it by: its release decides it again under its claim, and a record that changed since
+/// says the volume is no longer what the plan judged.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Doomed {
     pub id: BuildVolumeId,
     pub reason: GcReason,
     pub bytes: u64,
-    pub seen: Option<BuildVolumeRecord>,
+    pub seen: BuildVolumeRecord,
     /// The image was already gone when planned: the release retires the record alone, and an
     /// image appearing since makes the planned release stale.
     pub image_missing: bool,
@@ -2108,8 +2395,8 @@ pub(crate) struct Plan {
 }
 
 /// Which build volumes are garbage (16_build_volumes.md, "Garbage collection"): each one nothing
-/// links that is not a seed, each seed that is not its existing target's latest, and each image
-/// an interrupted creation left without a record.
+/// links that is not a seed, each seed that is not its existing target's latest, and each one a
+/// creation registered and never finished, named by its exact registered id.
 ///
 /// A live link proves reachability by itself, so a volume one names is kept before its record
 /// is read. A detached workspace's link cannot be read, so whatever it may name is deferred with
@@ -2138,26 +2425,8 @@ pub(crate) fn plan(
         }
         let record = match layout.read_record_present(&id) {
             Ok(Some(record)) => record,
-            // An image with no record is an interrupted creation — a mint that died before its
-            // record was written — so no checkout and no forming verb names it, and a detached or
-            // still-forming workspace must not block its collection: only a volume a forming verb
-            // recorded is deferred. A create or fork writes its PendingFence record before its
-            // payload appears, so its volumes are never unrecorded and are deferred by the
-            // Creating arm below. The one exception is an adopt or re-adopt of main mid-mint: its
-            // first volume exists before its record does, so while main is forming an unrecorded
-            // image may still be that mint and waits for the adopt to finish.
-            Ok(None) if links.creating.contains(&WorkspaceName::main()) => {
-                plan.deferred.push((
-                    id,
-                    Deferral::Unrecorded {
-                        detached: Vec::new(),
-                        creating: links.creating.iter().cloned().collect(),
-                    },
-                ));
-                continue;
-            }
             Ok(None) => {
-                doomed.push((id, GcReason::UnrecordedBuildVolume, None));
+                plan.deferred.push((id, Deferral::Unregistered));
                 continue;
             }
             Err(error) => {
@@ -2166,6 +2435,29 @@ pub(crate) fn plan(
                 continue;
             }
         };
+        // A registered creation is never decided by a workspace name, which a later verb may
+        // reuse. Its live creator holds it by its exact id, so its release defers under the
+        // claim; an unfinished re-adoption names it by its exact id in the journal; a detached
+        // checkout's link, which cannot be read, may name it. Anything else is an interrupted
+        // creation, released by its id.
+        if let BuildVolumeStage::Registered { .. } = &record.stage {
+            match &record.role {
+                _ if links.journaled.contains(&id) => {
+                    plan.deferred
+                        .push((id, Deferral::Creating(record.role.owner().clone())));
+                }
+                BuildVolumeRole::Linked { checkout } if links.detached.contains(checkout) => {
+                    plan.deferred
+                        .push((id, Deferral::DetachedCheckout(checkout.clone())));
+                }
+                BuildVolumeRole::Linked { .. }
+                | BuildVolumeRole::Seed { .. }
+                | BuildVolumeRole::Superseded { .. } => {
+                    doomed.push((id, GcReason::InterruptedBuildVolume, record));
+                }
+            }
+            continue;
+        }
         if matches!(&record.role, BuildVolumeRole::Seed { target, .. } if !links.creating.contains(target))
         {
             match std::fs::symlink_metadata(layout.image(&id)) {
@@ -2174,7 +2466,7 @@ pub(crate) fn plan(
                         id,
                         reason: GcReason::SupersededSeed,
                         bytes: 0,
-                        seen: Some(record),
+                        seen: record,
                         image_missing: true,
                     });
                     continue;
@@ -2202,16 +2494,16 @@ pub(crate) fn plan(
                     incarnation: incarnation.clone(),
                 };
                 if !links.owners.contains(&owner) {
-                    doomed.push((id, GcReason::SupersededSeed, Some(record)));
+                    doomed.push((id, GcReason::SupersededSeed, record));
                     continue;
                 }
                 match latest.get(&owner) {
                     Some((_, newest)) if newest.created_at >= record.created_at => {
-                        doomed.push((id, GcReason::SupersededSeed, Some(record)));
+                        doomed.push((id, GcReason::SupersededSeed, record));
                     }
                     _ => {
                         if let Some((older, seen)) = latest.insert(owner, (id, record)) {
-                            doomed.push((older, GcReason::SupersededSeed, Some(seen)));
+                            doomed.push((older, GcReason::SupersededSeed, seen));
                         }
                     }
                 }
@@ -2220,8 +2512,10 @@ pub(crate) fn plan(
                 plan.deferred
                     .push((id, Deferral::DetachedCheckout(checkout.clone())));
             }
-            BuildVolumeRole::Linked { .. } | BuildVolumeRole::Unlinked => {
-                doomed.push((id, GcReason::UnlinkedBuildVolume, Some(record)));
+            // Its owner's link moved off it: only a job admitted before the move can hold it,
+            // which the release's claim answers.
+            BuildVolumeRole::Linked { .. } | BuildVolumeRole::Superseded { .. } => {
+                doomed.push((id, GcReason::UnlinkedBuildVolume, record));
             }
         }
     }
@@ -2275,17 +2569,115 @@ pub(crate) fn plan(
     Ok(plan)
 }
 
+/// Every seed recorded for `owner` at its incarnation, published or still registered: what a new
+/// seed replaces, so a capture an earlier crash left unfinished goes with the seed it replaced.
 fn seeds_of(layout: &BuildVolumeLayout, owner: &Owner) -> Result<Vec<BuildVolumeId>> {
     let mut seeds = Vec::new();
     for id in layout.list()? {
-        if layout
-            .read_record_present(&id)?
-            .is_some_and(|record| record.is_seed_of(&owner.name, &owner.incarnation))
-        {
+        if layout.read_record_present(&id)?.is_some_and(|record| {
+            matches!(&record.role, BuildVolumeRole::Seed { target, incarnation }
+                if *target == owner.name && *incarnation == owner.incarnation)
+        }) {
             seeds.push(id);
         }
     }
     Ok(seeds)
+}
+
+/// Which of `owner`'s volumes `record` is, for its retirement, or `None` when it is not
+/// `owner`'s to release: a seed of it at its incarnation, a previous volume superseded under
+/// that incarnation, or a volume a creation registered under that incarnation left unfinished.
+/// The live volume its checkout links is decided by that link, not here.
+fn owned_at(record: &BuildVolumeRecord, owner: &Owner) -> Option<&'static str> {
+    let at = |name: &WorkspaceName, incarnation: &WorkspaceIncarnation| {
+        *name == owner.name && *incarnation == owner.incarnation
+    };
+    match (&record.role, &record.stage) {
+        (
+            BuildVolumeRole::Seed {
+                target,
+                incarnation,
+            },
+            _,
+        ) if at(target, incarnation) => Some("seed"),
+        (
+            BuildVolumeRole::Superseded {
+                owner: name,
+                incarnation,
+            },
+            _,
+        ) if at(name, incarnation) => Some("superseded"),
+        (
+            BuildVolumeRole::Linked { checkout },
+            BuildVolumeStage::Registered {
+                by: Registrant::Workspace { incarnation },
+            },
+        ) if at(checkout, incarnation) => Some("unfinished"),
+        (
+            BuildVolumeRole::Linked { .. }
+            | BuildVolumeRole::Seed { .. }
+            | BuildVolumeRole::Superseded { .. },
+            _,
+        ) => None,
+    }
+}
+
+fn defragment_images(
+    layout: &BuildVolumeLayout,
+    owner: &Owner,
+) -> Result<Vec<(BuildVolumeId, bool)>> {
+    let mut images = Vec::new();
+    for id in layout.list()? {
+        let record = layout.read_record(&id)?;
+        if let Some(linked) = defragment_role(&record, owner) {
+            images.push((id, linked));
+        }
+    }
+    Ok(images)
+}
+
+fn defragment_role(record: &BuildVolumeRecord, owner: &Owner) -> Option<bool> {
+    if !record.is_published() {
+        return None;
+    }
+    match &record.role {
+        BuildVolumeRole::Linked { checkout } if checkout == &owner.name => Some(true),
+        BuildVolumeRole::Seed {
+            target,
+            incarnation,
+        } if target == &owner.name && incarnation == &owner.incarnation => Some(false),
+        BuildVolumeRole::Linked { .. }
+        | BuildVolumeRole::Seed { .. }
+        | BuildVolumeRole::Superseded { .. } => None,
+    }
+}
+
+/// Doctor's physical build sources, from the existing owner records, not a source-only proxy.
+pub(crate) fn extent_images(
+    layout: &BuildVolumeLayout,
+    owners: &BTreeMap<WorkspaceName, WorkspaceIncarnation>,
+) -> Result<Vec<(WorkspaceName, &'static str, PathBuf)>> {
+    let mut images = Vec::new();
+    for id in layout.list()? {
+        let record = layout.read_record(&id)?;
+        if !record.is_published() {
+            continue;
+        }
+        let (owner, code) = match record.role {
+            BuildVolumeRole::Linked { checkout } if owners.contains_key(&checkout) => {
+                (checkout, "build-source-extents")
+            }
+            BuildVolumeRole::Seed {
+                target,
+                incarnation,
+            } if owners.get(&target) == Some(&incarnation) => (target, "build-seed-extents"),
+            BuildVolumeRole::Linked { .. }
+            | BuildVolumeRole::Seed { .. }
+            | BuildVolumeRole::Superseded { .. } => continue,
+        };
+        images.push((owner, code, layout.image(&id)));
+    }
+    Ok(images)
 }
 
 /// Capture the quiet landing volume under the Nx and existing Cargo profile guards.
@@ -2296,7 +2688,7 @@ fn seal(
     layout: &BuildVolumeLayout,
     quiet: &Quiet,
     target: &Owner,
-    record: &BuildVolumeRecord,
+    registration: &Registration,
 ) -> Result<std::result::Result<Freeze, AdoptionSkip>> {
     if let Err(busy) = nx::close(&quiet.mount, &quiet.state)
         .map_err(|error| io("close the landing volume's Nx state", &quiet.mount, &error))?
@@ -2337,7 +2729,7 @@ fn seal(
     })? {
         return Ok(Err(skip(busy, Side::Landing)));
     }
-    match host.clone_quiet_build_volume(layout, quiet, &BuildVolumeId::mint(), record) {
+    match host.clone_quiet_build_volume(layout, quiet, &BuildVolumeId::mint(), registration) {
         Ok(()) => {
             retire_seeds(host, layout, target, previous)?;
             Ok(Ok(Freeze::Frozen))
@@ -2426,7 +2818,7 @@ fn release_minted(
         Ok(None) => {}
         Ok(Some(release)) => say_release(id, whose, &release),
         Err(error) => cowshed_os::eprintln!(
-            "cowshed: {whose} build volume {id}, minted beside main, stays: {error}; `cowshed gc` retries it"
+            "cowshed: {whose} build volume {id}, minted beside main, stays registered to the adopt, which no longer holds it: {error}; the next open of the project releases it by its id"
         ),
     }
 }
@@ -2714,10 +3106,15 @@ fn capture(
         layout,
         &claim,
         &BuildVolumeId::mint(),
-        &BuildVolumeRecord::new(
-            tree,
-            BuildVolumeRole::Seed {
-                target: target.name.clone(),
+        &Registration::new(
+            BuildVolumeRecord::new(
+                tree,
+                BuildVolumeRole::Seed {
+                    target: target.name.clone(),
+                    incarnation: target.incarnation.clone(),
+                },
+            ),
+            Registrant::Workspace {
                 incarnation: target.incarnation.clone(),
             },
         ),
@@ -3003,12 +3400,93 @@ mod tests {
                 .unwrap();
             id
         }
+
+        /// A volume `by` registered and never published: its image may hold anything.
+        fn registered(&self, role: BuildVolumeRole, by: Registrant) -> BuildVolumeId {
+            let id = self.image();
+            self.layout
+                .write_record(
+                    &id,
+                    Registration::new(BuildVolumeRecord::new(None, role), by).registered(),
+                )
+                .unwrap();
+            id
+        }
     }
 
     impl Drop for Store {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn extent_diagnostics_and_defrag_cover_build_sources_and_exact_owner_seeds() {
+        let store = Store::new();
+        let owner = Owner {
+            name: WorkspaceName::main(),
+            incarnation: WorkspaceIncarnation::new("1".repeat(32)).unwrap(),
+        };
+        let linked = store.volume(BuildVolumeRole::Linked {
+            checkout: owner.name.clone(),
+        });
+        let seed = store.volume(BuildVolumeRole::Seed {
+            target: owner.name.clone(),
+            incarnation: owner.incarnation.clone(),
+        });
+        let older = store.volume(BuildVolumeRole::Seed {
+            target: owner.name.clone(),
+            incarnation: WorkspaceIncarnation::new("2".repeat(32)).unwrap(),
+        });
+        let superseded = store.volume(BuildVolumeRole::Superseded {
+            owner: owner.name.clone(),
+            incarnation: owner.incarnation.clone(),
+        });
+        let incomplete = store.volume(BuildVolumeRole::Seed {
+            target: owner.name.clone(),
+            incarnation: owner.incarnation.clone(),
+        });
+        let mut record = store.layout.read_record(&incomplete).unwrap();
+        record.stage = crate::build_volume::BuildVolumeStage::Registered {
+            by: crate::build_volume::Registrant::Intent,
+        };
+        store.layout.write_record(&incomplete, &record).unwrap();
+        assert_eq!(defragment_role(&record, &owner), None);
+        let mut selected = defragment_images(&store.layout, &owner).unwrap();
+        selected.sort();
+        let mut expected = vec![(linked.clone(), true), (seed.clone(), false)];
+        expected.sort();
+        assert_eq!(
+            selected, expected,
+            "detached checkout still names its registered build source"
+        );
+        let owners = BTreeMap::from([(owner.name.clone(), owner.incarnation.clone())]);
+        let diagnostic = extent_images(&store.layout, &owners).unwrap();
+        assert!(diagnostic.contains(&(
+            owner.name.clone(),
+            "build-source-extents",
+            store.layout.image(&linked)
+        )));
+        assert!(diagnostic.contains(&(
+            owner.name.clone(),
+            "build-seed-extents",
+            store.layout.image(&seed)
+        )));
+        assert!(
+            diagnostic
+                .iter()
+                .all(|(_, _, path)| path != &store.layout.image(&older))
+        );
+        assert!(
+            diagnostic
+                .iter()
+                .all(|(_, _, path)| path != &store.layout.image(&superseded))
+        );
+        assert!(
+            diagnostic
+                .iter()
+                .all(|(_, _, path)| path != &store.layout.image(&incomplete))
+        );
     }
 
     #[test]
@@ -3197,6 +3675,18 @@ mod tests {
         }
     }
 
+    fn superseded(owner: &str) -> BuildVolumeRole {
+        BuildVolumeRole::Superseded {
+            owner: name(owner),
+            incarnation: WorkspaceIncarnation::new("0".repeat(32)).unwrap(),
+        }
+    }
+
+    /// What a test's clone or fork registers: the forming verb's, as a fork's would be.
+    fn registered(record: BuildVolumeRecord) -> Registration {
+        Registration::new(record, Registrant::Intent)
+    }
+
     fn doomed(plan: &Plan) -> Vec<(BuildVolumeId, GcReason)> {
         plan.doomed
             .iter()
@@ -3375,16 +3865,21 @@ mod tests {
     }
 
     /// A live link is the proof of reachability, so it protects its volume before any record is
-    /// read: a crash can leave a linked volume whose record is missing, and deleting it would
-    /// pull the build state out from under a checkout.
+    /// read: an interrupted first touch leaves a linked volume whose record is still registered,
+    /// and deleting it would pull the build state out from under a checkout.
     #[test]
-    fn a_live_link_keeps_its_volume_recorded_or_not() {
+    fn a_live_link_keeps_its_volume_registered_or_published() {
         let store = Store::new();
-        let unrecorded = store.image();
+        let touching = store.registered(
+            linked("topic"),
+            Registrant::Workspace {
+                incarnation: WorkspaceIncarnation::new("1".repeat(32)).unwrap(),
+            },
+        );
         let recorded_elsewhere = store.volume(linked("other"));
-        let garbage = store.volume(BuildVolumeRole::Unlinked);
+        let garbage = store.volume(superseded("main"));
         let links = Links {
-            volumes: [unrecorded, recorded_elsewhere].into_iter().collect(),
+            volumes: [touching, recorded_elsewhere].into_iter().collect(),
             ..Links::default()
         };
         let plan = plan(&store.layout, &store.layout.list().unwrap(), &links).unwrap();
@@ -3399,26 +3894,36 @@ mod tests {
     }
 
     /// A detached workspace's link cannot be read, so a record naming it proves nothing: the
-    /// volume is deferred with that workspace named, never counted reachable or deleted. An
-    /// image without a record is named by no detached workspace, so it is an interrupted
-    /// creation and is collected — a detached shed does not block what it does not name.
+    /// volume is deferred with that workspace named, never counted reachable or deleted, and so
+    /// is a first touch it registered, which its next refresh may still finish. A creation an
+    /// intent registered under another name whose intent is gone is interrupted, and is
+    /// collected by its id: a detached shed does not block what it does not name.
     #[test]
     fn a_detached_checkout_defers_only_what_it_names() {
         let store = Store::new();
         let named = store.volume(linked("topic"));
-        let unrecorded = store.image();
+        let touching = store.registered(
+            linked("topic"),
+            Registrant::Workspace {
+                incarnation: WorkspaceIncarnation::new("1".repeat(32)).unwrap(),
+            },
+        );
+        let interrupted = store.registered(linked("gone"), Registrant::Intent);
         let links = Links {
             detached: [name("topic")].into_iter().collect(),
             ..Links::default()
         };
-        let plan = plan(&store.layout, &store.layout.list().unwrap(), &links).unwrap();
-        assert_eq!(
-            plan.deferred,
-            [(named, Deferral::DetachedCheckout(name("topic")))]
-        );
+        let mut plan = plan(&store.layout, &store.layout.list().unwrap(), &links).unwrap();
+        plan.deferred.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut expected = vec![
+            (named, Deferral::DetachedCheckout(name("topic"))),
+            (touching, Deferral::DetachedCheckout(name("topic"))),
+        ];
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(plan.deferred, expected);
         assert_eq!(
             doomed(&plan),
-            [(unrecorded, GcReason::UnrecordedBuildVolume)]
+            [(interrupted, GcReason::InterruptedBuildVolume)]
         );
         assert!(
             plan.deferred
@@ -3427,14 +3932,35 @@ mod tests {
         );
     }
 
+    /// Every build image is registered before its first byte, so an image with no record
+    /// predates owner registration: nothing proves whose it is, and it is named on every pass,
+    /// never released on a guess and never mistaken for anyone's interrupted creation.
+    #[test]
+    fn an_unregistered_image_is_named_and_never_released() {
+        let store = Store::new();
+        let unregistered = store.image();
+        let plan = plan(
+            &store.layout,
+            &store.layout.list().unwrap(),
+            &Links {
+                creating: [name("main")].into_iter().collect(),
+                ..Links::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(doomed(&plan), []);
+        assert_eq!(plan.deferred, [(unregistered, Deferral::Unregistered)]);
+        assert!(!Deferral::Unregistered.is_routine());
+        assert!(Deferral::Unregistered.is_pending());
+    }
+
     /// A create or fork forks its volume and seed into a staged checkout no other process can
     /// read, and an adopt mints main's first volume beside main's image, before the workspace
-    /// exists. Until its intent completes, whatever it recorded as its own — its live volume and
-    /// its seed — is deferred, never collected. An image without a record is named by no forming
-    /// verb, so it is collected and a forming shed does not block what it does not name; only an
-    /// adopt of main mid-mint defers an unrecorded image. Another process's `rm` collected the
-    /// forming shed's own volumes, and the new workspace's mount then refused a link to a volume
-    /// that was gone.
+    /// exists. Until its intent completes, whatever it registered or recorded as its own — its
+    /// live volume, its seed, a capture still running — is deferred, never collected. A creation
+    /// registered under a name no verb is forming is interrupted and collected by its id.
+    /// Another process's `rm` collected the forming shed's own volumes, and the new workspace's
+    /// mount then refused a link to a volume that was gone.
     #[test]
     fn a_forming_workspace_defers_only_the_volumes_it_names() {
         let store = Store::new();
@@ -3443,7 +3969,14 @@ mod tests {
             target: name("lane"),
             incarnation: WorkspaceIncarnation::new("1".repeat(32)).unwrap(),
         });
-        let cloning = store.image();
+        let cloning = store.registered(
+            BuildVolumeRole::Seed {
+                target: name("lane"),
+                incarnation: WorkspaceIncarnation::new("1".repeat(32)).unwrap(),
+            },
+            Registrant::Intent,
+        );
+        let interrupted = store.registered(linked("gone"), Registrant::Intent);
         let garbage = store.volume(linked("gone"));
         let links = Links {
             creating: [name("lane")].into_iter().collect(),
@@ -3458,27 +3991,187 @@ mod tests {
         ];
         expected.sort_by(|left, right| left.0.cmp(&right.0));
         assert_eq!(plan.deferred, expected);
+        // A registration is never kept by the forming name: only its creator's hold on its id
+        // keeps it, under the release's claim, so the plan dooms it like any interrupted one.
         let mut collected = doomed(&plan);
         collected.sort_by(|left, right| left.0.cmp(&right.0));
         let mut expected_doomed = vec![
-            (cloning.clone(), GcReason::UnrecordedBuildVolume),
+            (cloning.clone(), GcReason::InterruptedBuildVolume),
+            (interrupted.clone(), GcReason::InterruptedBuildVolume),
             (garbage.clone(), GcReason::UnlinkedBuildVolume),
         ];
         expected_doomed.sort_by(|left, right| left.0.cmp(&right.0));
         assert_eq!(collected, expected_doomed);
         assert!(Deferral::Creating(name("lane")).is_routine());
-        // Without the forming workspace, all three read as garbage: the collection that left
-        // a new workspace linking a volume nobody owned.
+        // Without the forming workspace, all of them read as garbage: the collection that left
+        // a new workspace linking a volume nobody owned. The unfinished capture is never the
+        // latest seed: it goes as interrupted, not as superseding the published one.
         let mut doomed = doomed(&super::plan(&store.layout, &images, &Links::default()).unwrap());
         doomed.sort_by(|left, right| left.0.cmp(&right.0));
         let mut expected = vec![
             (live, GcReason::UnlinkedBuildVolume),
             (seed, GcReason::SupersededSeed),
-            (cloning, GcReason::UnrecordedBuildVolume),
+            (cloning, GcReason::InterruptedBuildVolume),
+            (interrupted, GcReason::InterruptedBuildVolume),
             (garbage, GcReason::UnlinkedBuildVolume),
         ];
         expected.sort_by(|left, right| left.0.cmp(&right.0));
         assert_eq!(doomed, expected);
+    }
+
+    /// A registered seed is never anyone's latest: while the target exists, its published seed
+    /// stays its latest beside an unfinished capture created after it, which goes alone.
+    #[test]
+    fn an_unfinished_capture_never_supersedes_the_published_seed() {
+        let store = Store::new();
+        let lane = Owner {
+            name: name("lane"),
+            incarnation: WorkspaceIncarnation::new("1".repeat(32)).unwrap(),
+        };
+        let role = BuildVolumeRole::Seed {
+            target: lane.name.clone(),
+            incarnation: lane.incarnation.clone(),
+        };
+        let published = store.volume(role.clone());
+        let capture = store.registered(
+            role,
+            Registrant::Workspace {
+                incarnation: lane.incarnation.clone(),
+            },
+        );
+        let links = Links {
+            owners: [lane.clone()].into_iter().collect(),
+            ..Links::default()
+        };
+        let plan = plan(&store.layout, &store.layout.list().unwrap(), &links).unwrap();
+        assert_eq!(doomed(&plan), [(capture, GcReason::InterruptedBuildVolume)]);
+        assert_eq!(
+            store
+                .layout
+                .seed_of(&lane.name, &lane.incarnation)
+                .unwrap()
+                .map(|(id, _)| id),
+            Some(published)
+        );
+    }
+
+    /// The journal holds one intent per name, so a reused name's later fork must never be
+    /// authority for what an earlier, crashed fork of that name registered: even while the
+    /// later fork forms, the stale registrations are interrupted and doomed by their ids (only a
+    /// live creator's hold on an id defers it, under the release's claim), they are never its
+    /// seed or its link's re-point, and its own published volume stays. Only an exact id an
+    /// unfinished re-adoption's journaled record names is deferred as forming.
+    #[test]
+    fn a_reused_name_is_never_authority_for_an_earlier_registration() {
+        let store = Store::new();
+        let lane = Owner {
+            name: name("lane"),
+            incarnation: WorkspaceIncarnation::new("2".repeat(32)).unwrap(),
+        };
+        let stale_seed = store.registered(
+            BuildVolumeRole::Seed {
+                target: lane.name.clone(),
+                incarnation: WorkspaceIncarnation::new("1".repeat(32)).unwrap(),
+            },
+            Registrant::Intent,
+        );
+        let stale_live = store.registered(linked("lane"), Registrant::Intent);
+        let live = store.volume(linked("lane"));
+        let journaled = store.registered(linked("main"), Registrant::Intent);
+        let forming = Links {
+            creating: [lane.name.clone(), name("main")].into_iter().collect(),
+            journaled: [journaled.clone()].into_iter().collect(),
+            ..Links::default()
+        };
+        let images = store.layout.list().unwrap();
+        let plan_forming = plan(&store.layout, &images, &forming).unwrap();
+        let mut released = doomed(&plan_forming);
+        released.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut expected = vec![
+            (stale_seed.clone(), GcReason::InterruptedBuildVolume),
+            (stale_live.clone(), GcReason::InterruptedBuildVolume),
+        ];
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(released, expected, "{plan_forming:?}");
+        let mut deferred = plan_forming.deferred.clone();
+        deferred.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut expected = vec![
+            (live.clone(), Deferral::Creating(lane.name.clone())),
+            (journaled, Deferral::Creating(name("main"))),
+        ];
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(deferred, expected);
+        assert_eq!(
+            store.layout.seed_of(&lane.name, &lane.incarnation).unwrap(),
+            None
+        );
+        assert_eq!(
+            store.layout.resolve_link(&lane.name, &stale_seed).unwrap(),
+            crate::build_volume::LinkResolution::Repoint(live),
+            "a stale link re-points at the published volume, never at an unfinished one"
+        );
+    }
+
+    /// A record that cannot be read never lets its volume go: the release a job's end owes and a
+    /// retirement's own release both refuse with the error, and the image and the unreadable
+    /// record are left byte for byte, for an operator to repair.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_an_unreadable_record_refuses_release_and_keeps_its_volume() {
+        let scratch = Scratch::directory("build-corrupt-record");
+        let topic = owner("topic", '1');
+        let (checkout, live, _) = scratch.linked_checkout("topic", 1);
+        let corrupt = BuildVolumeId::mint();
+        scratch
+            .host
+            .clone_build_volume(
+                &scratch.layout,
+                &live,
+                &corrupt,
+                &registered(BuildVolumeRecord::new(
+                    None,
+                    BuildVolumeRole::Superseded {
+                        owner: topic.name.clone(),
+                        incarnation: topic.incarnation.clone(),
+                    },
+                )),
+            )
+            .unwrap();
+        fs::write(scratch.layout.record(&corrupt), b"{not json").unwrap();
+
+        let refused = scratch
+            .volumes
+            .release_superseded(corrupt.clone())
+            .await
+            .expect_err("an unreadable record is never read as nothing to release");
+        assert!(
+            refused
+                .message
+                .contains(&scratch.layout.record(&corrupt).display().to_string()),
+            "{refused}"
+        );
+        let refused = scratch
+            .volumes
+            .release_owned(topic, checkout)
+            .await
+            .expect_err("a retirement refuses while one of the records it reads is unreadable");
+        assert!(
+            refused
+                .message
+                .contains(&scratch.layout.record(&corrupt).display().to_string()),
+            "{refused}"
+        );
+        assert!(scratch.layout.image(&corrupt).exists());
+        assert_eq!(
+            fs::read(scratch.layout.record(&corrupt)).unwrap(),
+            b"{not json"
+        );
+        // Repaired, the volume is releasable again.
+        scratch
+            .layout
+            .write_record(&corrupt, &BuildVolumeRecord::new(None, linked("topic")))
+            .unwrap();
+        scratch.release_all();
     }
 
     /// Collection decides only the images it listed before it read what links them. A verb that
@@ -3489,13 +4182,13 @@ mod tests {
     #[test]
     fn an_image_made_after_the_listing_is_left_to_a_later_pass() {
         let store = Store::new();
-        let garbage = store.volume(BuildVolumeRole::Unlinked);
+        let garbage = store.volume(superseded("main"));
         // The collection lists the images, then reads the journal and the workspaces: no verb
         // is forming yet.
         let images = store.layout.list().unwrap();
         let links = Links::default();
-        // Only then does an adopt cross its fence and mint main's first volume.
-        let minted = store.image();
+        // Only then does a verb cross its fence and make a volume of its forming workspace.
+        let minted = store.volume(linked("main"));
         let plan = plan(&store.layout, &images, &links).unwrap();
         assert_eq!(
             doomed(&plan),
@@ -3504,24 +4197,15 @@ mod tests {
         );
         assert_eq!(plan.examined, 1);
         assert_eq!(plan.deferred, []);
-        // The next pass lists it, and reads the journal after: main is forming until its first
-        // touch links the volume.
+        // The next pass lists it, and reads the journal after: main is forming until its verb
+        // publishes it.
         let next = Links {
             creating: [name("main")].into_iter().collect(),
             ..Links::default()
         };
         let plan = super::plan(&store.layout, &store.layout.list().unwrap(), &next).unwrap();
         assert_eq!(doomed(&plan), [(garbage, GcReason::UnlinkedBuildVolume)]);
-        assert_eq!(
-            plan.deferred,
-            [(
-                minted,
-                Deferral::Unrecorded {
-                    detached: Vec::new(),
-                    creating: vec![name("main")],
-                }
-            )]
-        );
+        assert_eq!(plan.deferred, [(minted, Deferral::Creating(name("main")))]);
     }
 
     /// The `cowshed fork` that another process's `rm` broke, on real APFS: a fork clones main's
@@ -3541,13 +4225,13 @@ mod tests {
                 &scratch.layout,
                 &main_live,
                 &BuildVolumeId::mint(),
-                &BuildVolumeRecord::new(
+                &registered(BuildVolumeRecord::new(
                     None,
                     BuildVolumeRole::Seed {
                         target: main.name.clone(),
                         incarnation: main.incarnation.clone(),
                     },
-                ),
+                )),
             )
             .expect("seed main");
         let lane = owner("lane", '1');
@@ -3649,12 +4333,9 @@ mod tests {
         std::os::unix::fs::symlink(store.root.join("gone"), store.layout.image(&sizeless)).unwrap();
         store
             .layout
-            .write_record(
-                &sizeless,
-                &BuildVolumeRecord::new(None, BuildVolumeRole::Unlinked),
-            )
+            .write_record(&sizeless, &BuildVolumeRecord::new(None, superseded("main")))
             .unwrap();
-        let garbage = store.volume(BuildVolumeRole::Unlinked);
+        let garbage = store.volume(superseded("main"));
         let plan = plan(
             &store.layout,
             &store.layout.list().unwrap(),
@@ -3705,10 +4386,7 @@ mod tests {
         std::os::unix::fs::symlink(store.root.join("gone"), store.layout.image(&sizeless)).unwrap();
         store
             .layout
-            .write_record(
-                &sizeless,
-                &BuildVolumeRecord::new(None, BuildVolumeRole::Unlinked),
-            )
+            .write_record(&sizeless, &BuildVolumeRecord::new(None, superseded("main")))
             .unwrap();
         let plan = plan(
             &store.layout,
@@ -3722,7 +4400,7 @@ mod tests {
                 id: absent,
                 reason: GcReason::UnlinkedBuildVolume,
                 bytes: 0,
-                seen: Some(record),
+                seen: record,
                 image_missing: true,
             }],
             "{plan:?}"
@@ -3799,16 +4477,19 @@ mod tests {
 
         // Main's volume at 1 GiB, linked from its checkout, with a seed cloned from it.
         let live = BuildVolumeId::mint();
-        let mount = test_volume(&host, &layout, &live, 1);
+        let registration = Registration::new(
+            BuildVolumeRecord::new(None, linked("main")),
+            Registrant::Workspace {
+                incarnation: main.incarnation.clone(),
+            },
+        );
+        let mount = test_volume(&host, &layout, &live, 1, &registration);
         BuildVolumeState {
             paths: vec![BuildStatePath::new(".nx/workspace-data", ".nx/workspace-data").unwrap()],
             fingerprint: None,
         }
         .write(&mount)
         .unwrap();
-        layout
-            .write_record(&live, &BuildVolumeRecord::new(None, linked("main")))
-            .unwrap();
         link::point(&main_checkout, &mount).unwrap();
         // Both refusals use the same live volume before the successful resize.
         let refused = volumes
@@ -3841,13 +4522,13 @@ mod tests {
             &layout,
             &live,
             &BuildVolumeId::mint(),
-            &BuildVolumeRecord::new(
+            &registered(BuildVolumeRecord::new(
                 None,
                 BuildVolumeRole::Seed {
                     target: main.name.clone(),
                     incarnation: main.incarnation.clone(),
                 },
-            ),
+            )),
         )
         .expect("seed main");
         assert!(filesystem_bytes(&mount) <= GIB);
@@ -3933,7 +4614,7 @@ mod tests {
         host: Arc<H>,
         layout: BuildVolumeLayout,
         volumes: BuildVolumes<H>,
-        mint: fn(&H, &BuildVolumeLayout, &BuildVolumeId, u64) -> PathBuf,
+        mint: fn(&H, &BuildVolumeLayout, &BuildVolumeId, u64, &Registration) -> PathBuf,
     }
 
     #[cfg(target_os = "macos")]
@@ -3958,9 +4639,15 @@ mod tests {
                         .expect("scratch directory root"),
                 ),
                 crate::storage::directory::DirectoryExecutionHost::new,
-                |host, layout, id, gib| {
-                    host.create_build_volume(layout, id, ImageCapacity::from_gibibytes(gib))
-                        .expect("create a directory-backed build volume")
+                |host, layout, id, gib, registration| {
+                    host.create_build_volume(
+                        layout,
+                        id,
+                        ImageCapacity::from_gibibytes(gib),
+                        registration,
+                    )
+                    .expect("create a directory-backed build volume")
+                    .0
                 },
             )
         }
@@ -3973,7 +4660,7 @@ mod tests {
             make_host: impl FnOnce(
                 crate::storage::apfs::ApfsSubstrateConfig,
             ) -> std::result::Result<H, ApfsStorageError>,
-            mint: fn(&H, &BuildVolumeLayout, &BuildVolumeId, u64) -> PathBuf,
+            mint: fn(&H, &BuildVolumeLayout, &BuildVolumeId, u64, &Registration) -> PathBuf,
         ) -> Self {
             use crate::storage::apfs::ApfsSubstrateConfig;
             let store = root.path().join("store");
@@ -4010,16 +4697,18 @@ mod tests {
             }
         }
 
-        /// `name`'s checkout, linked to a new live volume recorded as its own.
+        /// `name`'s checkout, linked to a new live volume registered as its own before its image
+        /// exists and published once it is minted.
         fn linked_checkout(&self, name: &str, gib: u64) -> (PathBuf, BuildVolumeId, PathBuf) {
             let checkout = self.root.path().join(name);
             fs::create_dir_all(checkout.join(".cowshed")).unwrap();
             let id = BuildVolumeId::mint();
-            let mount = (self.mint)(&self.host, &self.layout, &id, gib);
+            let registration = registered(BuildVolumeRecord::new(None, linked(name)));
+            let creating = self.layout.register(&id, &registration).unwrap();
+            let mount = (self.mint)(&self.host, &self.layout, &id, gib, &registration);
             BuildVolumeState::default().write(&mount).unwrap();
-            self.layout
-                .write_record(&id, &BuildVolumeRecord::new(None, linked(name)))
-                .unwrap();
+            self.layout.publish(&id, &registration).unwrap();
+            drop(creating);
             link::point(&checkout, &mount).unwrap();
             (checkout, id, mount)
         }
@@ -4255,13 +4944,13 @@ mod tests {
                 &scratch.layout,
                 &main_live,
                 &seed,
-                &BuildVolumeRecord::new(
+                &registered(BuildVolumeRecord::new(
                     Some(GitOid::new("a".repeat(40)).unwrap()),
                     BuildVolumeRole::Seed {
                         target: main.name.clone(),
                         incarnation: main.incarnation.clone(),
                     },
-                ),
+                )),
             )
             .unwrap();
         // Main has newer live work, deliberately absent from its stale frozen seed.
@@ -4280,13 +4969,13 @@ mod tests {
                 &scratch.layout,
                 &old,
                 &own_seed,
-                &BuildVolumeRecord::new(
+                &registered(BuildVolumeRecord::new(
                     None,
                     BuildVolumeRole::Seed {
                         target: topic.name.clone(),
                         incarnation: topic.incarnation.clone(),
                     },
-                ),
+                )),
             )
             .unwrap();
         let own_seed_record = scratch.layout.read_record(&own_seed).unwrap();
@@ -4477,13 +5166,13 @@ mod tests {
                 &scratch.layout,
                 &main_live,
                 &seed,
-                &BuildVolumeRecord::new(
+                &registered(BuildVolumeRecord::new(
                     None,
                     BuildVolumeRole::Seed {
                         target: from.owner.name.clone(),
                         incarnation: from.owner.incarnation.clone(),
                     },
-                ),
+                )),
             )
             .unwrap();
         let plan = scratch
@@ -4917,7 +5606,7 @@ mod tests {
                     &scratch.layout,
                     &seed,
                     &fork,
-                    &BuildVolumeRecord::new(Some(tree), linked("fork")),
+                    &registered(BuildVolumeRecord::new(Some(tree), linked("fork"))),
                 )
                 .unwrap();
             let fork_mount = scratch
@@ -4990,7 +5679,7 @@ mod tests {
                 incarnation: owner("main", '0').incarnation,
             },
         );
-        fs::create_dir_all(scratch.layout.record(&seed).parent().unwrap()).unwrap();
+        fs::create_dir_all(scratch.layout.images()).unwrap();
         scratch.layout.write_record(&seed, &record).unwrap();
         assert!(
             scratch.layout.list().unwrap().is_empty(),
@@ -5663,13 +6352,13 @@ fn main() {
                 &scratch.layout,
                 &live,
                 &previous,
-                &BuildVolumeRecord::new(
+                &registered(BuildVolumeRecord::new(
                     None,
                     BuildVolumeRole::Seed {
                         target: target.name.clone(),
                         incarnation: target.incarnation.clone(),
                     },
-                ),
+                )),
             )
             .unwrap();
         let mut held = fs::File::create(mount.join("lint-cache/warm")).unwrap();
@@ -5774,13 +6463,13 @@ fn main() {
                 &scratch.layout,
                 &main_live,
                 &BuildVolumeId::mint(),
-                &BuildVolumeRecord::new(
+                &registered(BuildVolumeRecord::new(
                     Some(behind),
                     BuildVolumeRole::Seed {
                         target: main.name.clone(),
                         incarnation: main.incarnation.clone(),
                     },
-                ),
+                )),
             )
             .expect("seed main");
         fs::write(main_mount.join("marker"), "main").unwrap();
@@ -5953,13 +6642,13 @@ fn main() {
                 &scratch.layout,
                 &main_live,
                 &BuildVolumeId::mint(),
-                &BuildVolumeRecord::new(
+                &registered(BuildVolumeRecord::new(
                     Some(before.clone()),
                     BuildVolumeRole::Seed {
                         target: main.name.clone(),
                         incarnation: main.incarnation.clone(),
                     },
-                ),
+                )),
             )
             .expect("seed main");
         let peer = |name: &str, checkout: &Path| Peer {
@@ -6269,13 +6958,13 @@ fn main() {
                 &scratch.layout,
                 &live,
                 &previous,
-                &BuildVolumeRecord::new(
+                &registered(BuildVolumeRecord::new(
                     None,
                     BuildVolumeRole::Seed {
                         target: target.name.clone(),
                         incarnation: target.incarnation.clone(),
                     },
-                ),
+                )),
             )
             .unwrap();
         // Short, under the scratch parent: a Unix socket path is bounded at 104 bytes on macOS.
@@ -6388,13 +7077,13 @@ fn main() {
                 &scratch.layout,
                 &live,
                 &previous,
-                &BuildVolumeRecord::new(
+                &registered(BuildVolumeRecord::new(
                     None,
                     BuildVolumeRole::Seed {
                         target: target.name.clone(),
                         incarnation: target.incarnation.clone(),
                     },
-                ),
+                )),
             )
             .unwrap();
         let job = scratch.layout.admit(&live).expect("a job's hold");
@@ -6436,19 +7125,22 @@ fn main() {
     }
 
     /// Build volume `id`, mounted, its image recording `gib` GiB: a clone of the run's blank
-    /// image put in place and mounted the way a fork's volume is. Creation is not what these
-    /// tests prove. Above the 1 GiB test cap only the clone's sparse RAW file length grows and its
-    /// container stays the template's: these tests compare virtual image capacities, not guest free space, and
-    /// a mint at another capacity would cost the store a template of its own — a `diskutil image
-    /// create`, a formatting attach and a detach.
+    /// image put in place, once `registration` is registered, and mounted the way a fork's
+    /// volume is. Creation is not what these tests prove. Above the 1 GiB test cap only the
+    /// clone's sparse RAW file length grows and its container stays the template's: these tests
+    /// compare virtual image capacities, not guest free space, and a mint at another capacity
+    /// would cost the store a template of its own — a `diskutil image create`, a formatting
+    /// attach and a detach.
     #[cfg(target_os = "macos")]
     fn test_volume(
         host: &Host,
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
         gib: u64,
+        registration: &Registration,
     ) -> PathBuf {
         use cowshed_apfs::{CommandRunner, SystemCommandRunner};
+        let _creating = layout.register(id, registration).unwrap();
         let image = layout.image(id);
         crate::blank_image::blank_image(&image);
         let capacity = ImageCapacity::from_gibibytes(gib);
@@ -6457,6 +7149,7 @@ fn main() {
                 .grow_image(&image, capacity)
                 .expect("grow the clone's sparse image length");
         }
+        layout.publish(id, registration).unwrap();
         host.mount_build_volume(layout, id)
             .expect("mount a build volume")
     }
@@ -6529,10 +7222,11 @@ fn main() {
             scratch.volumes.layout.linked(&main_checkout).unwrap(),
             Some(topic.clone())
         );
-        // The previous volume is recorded Unlinked by the move and released by its caller.
+        // The previous volume stays the target's, at its incarnation, recorded superseded by
+        // the move, and is released by its caller.
         assert!(matches!(
             scratch.layout.read_record(&previous).unwrap().role,
-            BuildVolumeRole::Unlinked
+            BuildVolumeRole::Superseded { owner, .. } if owner.is_main()
         ));
         scratch
             .volumes
@@ -6588,7 +7282,8 @@ fn main() {
     fn minted<H: RuntimeStorageHost>(first: &FirstMint<H>) -> MintedVolume {
         match first {
             FirstMint::Minted(owned) => lock(&owned.slot)
-                .clone()
+                .as_ref()
+                .map(|minted| minted.volume.clone())
                 .expect("an unsettled mint holds its volume"),
             FirstMint::Nothing => panic!("nothing was minted beside main's image"),
             FirstMint::Failed(error) => panic!("the mint beside main's image failed: {error}"),
@@ -6764,7 +7459,15 @@ fn main() {
         link::point(&interrupted, &scratch.layout.mount(&kept.id)).unwrap();
         first.settle().await;
         assert!(scratch.layout.image(&kept.id).exists(), "linked, so kept");
-        assert_eq!(scratch.layout.read_record_present(&kept.id).unwrap(), None);
+        assert_eq!(
+            scratch
+                .layout
+                .read_record_present(&kept.id)
+                .unwrap()
+                .map(|record| (record.is_published(), record.role)),
+            Some((false, linked("main"))),
+            "registered to main by the adopt before its image existed, and never published"
+        );
         scratch.release_all();
     }
 
@@ -7114,13 +7817,13 @@ fn main() {
                 &scratch.layout,
                 &main_live,
                 &first_seed,
-                &BuildVolumeRecord::new(
+                &registered(BuildVolumeRecord::new(
                     None,
                     BuildVolumeRole::Seed {
                         target: main.name.clone(),
                         incarnation: main.incarnation.clone(),
                     },
-                ),
+                )),
             )
             .expect("seed main");
         let (topic_checkout, topic, _) = scratch.linked_checkout("topic", 1);
@@ -7209,7 +7912,7 @@ fn main() {
             .fork_build_volume(
                 &scratch.layout,
                 &seed,
-                &BuildVolumeRecord::new(record.tree.clone(), linked("lane")),
+                &registered(BuildVolumeRecord::new(record.tree.clone(), linked("lane"))),
             )
             .expect("the new clones the seed it read under main's image lock");
         assert!(
@@ -7336,7 +8039,8 @@ fn main() {
 
     /// Every build volume release is a line in the project's deletion log, saying whether the
     /// volume was a seed and whose its sidecar said it was: a land's release of main's previous
-    /// volume once left no trace at all. A held volume is not released, and leaves no line.
+    /// volume once left no trace at all, and then named nobody; superseded, it names main. A held
+    /// volume is not released, and leaves no line.
     #[cfg(target_os = "macos")]
     #[test]
     fn directory_every_build_volume_release_is_journaled() {
@@ -7354,7 +8058,7 @@ fn main() {
                     &scratch.layout,
                     &live,
                     &id,
-                    &BuildVolumeRecord::new(None, role),
+                    &registered(BuildVolumeRecord::new(None, role)),
                 )
                 .expect("clone main's volume");
             id
@@ -7363,14 +8067,14 @@ fn main() {
             target: main.name.clone(),
             incarnation: main.incarnation.clone(),
         });
-        let unlinked = clone(BuildVolumeRole::Unlinked);
+        let superseded = clone(superseded("main"));
         let job = scratch.layout.admit(&live).expect("a job's hold");
         assert!(matches!(
             scratch.host.release_build_volume(&scratch.layout, &live),
             Ok(BuildVolumeRelease::Held { .. })
         ));
         drop(job);
-        for id in [&seed, &unlinked, &live] {
+        for id in [&seed, &superseded, &live] {
             let release = scratch.host.release_build_volume(&scratch.layout, id);
             assert!(
                 matches!(release, Ok(BuildVolumeRelease::Deleted { .. })),
@@ -7406,9 +8110,399 @@ fn main() {
             journaled,
             vec![
                 release(DeletionKind::BuildSeed, "main", &seed),
-                release(DeletionKind::BuildVolume, "", &unlinked),
+                release(DeletionKind::BuildVolume, "main", &superseded),
                 release(DeletionKind::BuildVolume, "main", &live),
             ]
         );
+    }
+
+    /// A target's previous volume a job still holds after an adoption stays recorded as the
+    /// target's at its incarnation: the land's own release is refused by the hold and touches
+    /// nothing, no collection takes it while the job runs, and the release a job's end owes it
+    /// deletes it the moment the hold is gone. A volume recorded anything else is not that
+    /// release's to decide.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_a_held_previous_volume_keeps_its_owner_until_the_jobs_end_releases_it() {
+        let scratch = Scratch::directory("build-superseded-held");
+        let main = owner("main", '0');
+        let (_, previous, _) = scratch.linked_checkout("main", 1);
+        let (_, live, _) = scratch.linked_checkout("topic", 1);
+        let record = scratch.layout.read_record(&previous).unwrap();
+        scratch
+            .layout
+            .write_record(
+                &previous,
+                &BuildVolumeRecord {
+                    role: BuildVolumeRole::Superseded {
+                        owner: main.name.clone(),
+                        incarnation: main.incarnation.clone(),
+                    },
+                    ..record
+                },
+            )
+            .unwrap();
+        let superseded = scratch.layout.read_record(&previous).unwrap();
+        let job = scratch
+            .layout
+            .admit(&previous)
+            .expect("a job admitted before the move");
+
+        scratch
+            .volumes
+            .release_previous(Superseded {
+                id: previous.clone(),
+                owner: main.clone(),
+            })
+            .await
+            .expect("a held previous volume is not the land's failure");
+        assert_eq!(scratch.layout.read_record(&previous).unwrap(), superseded);
+        assert!(scratch.layout.image(&previous).exists());
+        let collected = scratch
+            .volumes
+            .collect(
+                scratch.layout.list().unwrap(),
+                Links {
+                    volumes: [live.clone()].into_iter().collect(),
+                    owners: [main.clone()].into_iter().collect(),
+                    ..Links::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            collected.deferred.iter().any(|deferred| {
+                deferred.path == scratch.layout.image(&previous)
+                    && matches!(deferred.deferral, Deferral::Held(_))
+            }),
+            "{:?}",
+            collected.deferred
+        );
+        assert_eq!(scratch.layout.read_record(&previous).unwrap(), superseded);
+
+        // The job's end: a release of anything not superseded is no business of this one.
+        scratch
+            .volumes
+            .release_superseded(live.clone())
+            .await
+            .unwrap();
+        assert!(scratch.layout.image(&live).exists());
+        scratch
+            .volumes
+            .release_superseded(previous.clone())
+            .await
+            .unwrap();
+        assert!(
+            scratch.layout.image(&previous).exists(),
+            "still held: the release declines and changes nothing"
+        );
+        assert_eq!(scratch.layout.read_record(&previous).unwrap(), superseded);
+        drop(job);
+        scratch
+            .volumes
+            .release_superseded(previous.clone())
+            .await
+            .unwrap();
+        assert!(!scratch.layout.image(&previous).exists());
+        assert!(
+            scratch
+                .layout
+                .read_record_present(&previous)
+                .unwrap()
+                .is_none()
+        );
+        scratch.release_all();
+    }
+
+    /// A retirement releases everything its workspace owns at its incarnation before its image
+    /// goes — the live volume its checkout links, its seed, a previous volume superseded under
+    /// it, a first touch it registered and never finished — and nothing another incarnation of
+    /// the same name, or another workspace, owns. A volume a job holds refuses the retirement
+    /// and keeps its owner record.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_retirement_releases_every_volume_it_owns_and_refuses_while_one_is_held() {
+        let scratch = Scratch::directory("build-retire-owned");
+        let topic = owner("topic", '1');
+        let (checkout, live, _) = scratch.linked_checkout("topic", 1);
+        let clone = |role: BuildVolumeRole| {
+            let id = BuildVolumeId::mint();
+            scratch
+                .host
+                .clone_build_volume(
+                    &scratch.layout,
+                    &live,
+                    &id,
+                    &registered(BuildVolumeRecord::new(None, role)),
+                )
+                .expect("clone topic's volume");
+            id
+        };
+        let seed = clone(BuildVolumeRole::Seed {
+            target: topic.name.clone(),
+            incarnation: topic.incarnation.clone(),
+        });
+        let previous = clone(BuildVolumeRole::Superseded {
+            owner: topic.name.clone(),
+            incarnation: topic.incarnation.clone(),
+        });
+        let other_incarnation = clone(BuildVolumeRole::Seed {
+            target: topic.name.clone(),
+            incarnation: WorkspaceIncarnation::new("2".repeat(32)).unwrap(),
+        });
+        let unfinished = BuildVolumeId::mint();
+        drop(
+            scratch
+                .layout
+                .register(
+                    &unfinished,
+                    &Registration::new(
+                        BuildVolumeRecord::new(None, linked("topic")),
+                        Registrant::Workspace {
+                            incarnation: topic.incarnation.clone(),
+                        },
+                    ),
+                )
+                .unwrap(),
+        );
+        let (_, main_live, _) = scratch.linked_checkout("main", 1);
+
+        let job = scratch
+            .layout
+            .admit(&previous)
+            .expect("a job on the previous volume");
+        let refusal = scratch
+            .volumes
+            .release_owned(topic.clone(), checkout.clone())
+            .await
+            .expect_err("a held volume refuses the retirement");
+        assert_eq!(refusal.code, crate::ErrorCode::Conflict, "{refusal}");
+        assert!(refusal.message.contains(previous.as_str()), "{refusal}");
+        assert!(
+            scratch.layout.read_record(&previous).unwrap().role
+                == BuildVolumeRole::Superseded {
+                    owner: topic.name.clone(),
+                    incarnation: topic.incarnation.clone(),
+                },
+            "the refused volume keeps its owner"
+        );
+        drop(job);
+        scratch
+            .volumes
+            .release_owned(topic.clone(), checkout)
+            .await
+            .expect("the same retirement again");
+        for id in [&live, &seed, &previous, &unfinished] {
+            assert!(
+                scratch.layout.read_record_present(id).unwrap().is_none(),
+                "{id} was topic's at its incarnation"
+            );
+            assert!(!scratch.layout.image(id).exists(), "{id}");
+        }
+        for id in [&other_incarnation, &main_live] {
+            assert!(
+                scratch.layout.read_record_present(id).unwrap().is_some(),
+                "{id}"
+            );
+        }
+        scratch.release_all();
+    }
+
+    /// A creation registered before its image existed is found again by its exact id: the
+    /// open after a crash releases one whose registrant is gone — a capture that died after its
+    /// bytes, a fork whose intent no longer forms, a registration with no bytes at all — and
+    /// leaves one a forming intent or a held creation still owns, and an unregistered image,
+    /// which nothing proves anyone's.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_next_open_releases_interrupted_registrations_by_their_ids() {
+        let scratch = Scratch::directory("build-registered-recovery");
+        let main = owner("main", '0');
+        let (_, live, _) = scratch.linked_checkout("main", 1);
+        let registration = |role: BuildVolumeRole, by: Registrant| {
+            Registration::new(BuildVolumeRecord::new(None, role), by)
+        };
+        let seed_role = BuildVolumeRole::Seed {
+            target: main.name.clone(),
+            incarnation: main.incarnation.clone(),
+        };
+        // A capture that died after its bytes and before its publication.
+        let capture = BuildVolumeId::mint();
+        let capture_registration = registration(
+            seed_role.clone(),
+            Registrant::Workspace {
+                incarnation: main.incarnation.clone(),
+            },
+        );
+        let creating = scratch
+            .layout
+            .register(&capture, &capture_registration)
+            .unwrap();
+        drop(creating);
+        fs::create_dir(scratch.layout.image(&capture)).unwrap();
+        fs::write(scratch.layout.image(&capture).join("partial"), b"torn").unwrap();
+        // A registration that died before any byte.
+        let bare = BuildVolumeId::mint();
+        drop(
+            scratch
+                .layout
+                .register(&bare, &registration(linked("gone"), Registrant::Intent))
+                .unwrap(),
+        );
+        // An earlier crashed fork of a name a later fork now forms: the name is no authority.
+        let forming = BuildVolumeId::mint();
+        drop(
+            scratch
+                .layout
+                .register(&forming, &registration(linked("lane"), Registrant::Intent))
+                .unwrap(),
+        );
+        // An unfinished re-adoption's journaled build id, and a creation still running, which
+        // holds its own: each keeps its exact id.
+        let journaled = BuildVolumeId::mint();
+        drop(
+            scratch
+                .layout
+                .register(
+                    &journaled,
+                    &registration(linked("main"), Registrant::Intent),
+                )
+                .unwrap(),
+        );
+        let running = BuildVolumeId::mint();
+        let still_creating = scratch
+            .layout
+            .register(&running, &registration(seed_role, Registrant::Intent))
+            .unwrap();
+        let unregistered = BuildVolumeId::mint();
+        fs::create_dir(scratch.layout.image(&unregistered)).unwrap();
+
+        let registered = scratch.volumes.registered().await.unwrap();
+        let mut expected = vec![
+            capture.clone(),
+            bare.clone(),
+            forming.clone(),
+            journaled.clone(),
+            running.clone(),
+        ];
+        expected.sort();
+        assert_eq!(registered, expected, "exact ids from the records alone");
+        let links = Links {
+            volumes: [live.clone()].into_iter().collect(),
+            owners: [main.clone()].into_iter().collect(),
+            creating: [name("lane")].into_iter().collect(),
+            journaled: [journaled.clone()].into_iter().collect(),
+            ..Links::default()
+        };
+        let recovered = scratch
+            .volumes
+            .recover_registered(registered, links)
+            .await
+            .unwrap();
+        assert_eq!(recovered.reclaimed, 3, "{:?}", recovered.deferred);
+        for id in [&capture, &bare, &forming] {
+            assert!(!scratch.layout.image(id).exists(), "{id}");
+            assert!(
+                scratch.layout.read_record_present(id).unwrap().is_none(),
+                "{id}"
+            );
+        }
+        assert!(
+            scratch
+                .layout
+                .read_record_present(&journaled)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            recovered
+                .deferred
+                .iter()
+                .all(|deferred| deferred.deferral.is_owned())
+        );
+        assert!(
+            scratch
+                .layout
+                .read_record_present(&running)
+                .unwrap()
+                .is_some()
+        );
+        assert!(scratch.layout.image(&unregistered).exists());
+        assert!(
+            recovered.deferred.iter().any(|deferred| {
+                deferred.path == scratch.layout.image(&running)
+                    && matches!(deferred.deferral, Deferral::Held(_))
+            }),
+            "{:?}",
+            recovered.deferred
+        );
+        assert_eq!(
+            scratch
+                .layout
+                .seed_of(&main.name, &main.incarnation)
+                .unwrap(),
+            None,
+            "no registered capture ever became main's seed"
+        );
+        drop(still_creating);
+        fs::remove_dir(scratch.layout.image(&unregistered)).unwrap();
+        scratch.release_all();
+    }
+
+    /// A clone that fails after its registration releases what it registered: no image and no
+    /// record of it are left behind, and its source keeps its own.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn directory_a_clone_refused_after_registration_leaves_nothing_registered() {
+        let scratch = Scratch::directory("build-clone-refused");
+        let (_, live, _) = scratch.linked_checkout("main", 1);
+        let destination = BuildVolumeId::mint();
+        // Its bytes would predate their owner: the registration itself refuses.
+        fs::create_dir(scratch.layout.image(&destination)).unwrap();
+        let error = scratch
+            .host
+            .clone_build_volume(
+                &scratch.layout,
+                &live,
+                &destination,
+                &registered(BuildVolumeRecord::new(None, linked("topic"))),
+            )
+            .expect_err("an image already at the id refuses");
+        assert!(error.to_string().contains("predate"), "{error}");
+        assert!(
+            scratch
+                .layout
+                .read_record_present(&destination)
+                .unwrap()
+                .is_none()
+        );
+        fs::remove_dir(scratch.layout.image(&destination)).unwrap();
+        // A source with no owner record refuses before anything is registered.
+        let ownerless = BuildVolumeId::mint();
+        fs::create_dir(scratch.layout.image(&ownerless)).unwrap();
+        let target = BuildVolumeId::mint();
+        assert!(
+            scratch
+                .host
+                .clone_build_volume(
+                    &scratch.layout,
+                    &ownerless,
+                    &target,
+                    &registered(BuildVolumeRecord::new(None, linked("topic"))),
+                )
+                .is_err()
+        );
+        assert!(!scratch.layout.image(&target).exists());
+        assert!(
+            scratch
+                .layout
+                .read_record_present(&target)
+                .unwrap()
+                .is_none()
+        );
+        assert!(scratch.layout.read_record(&live).unwrap().is_published());
+        fs::remove_dir(scratch.layout.image(&ownerless)).unwrap();
+        scratch.release_all();
     }
 }
