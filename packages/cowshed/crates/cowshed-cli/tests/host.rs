@@ -10,7 +10,9 @@ use std::process::{Command, Stdio};
 
 use cowshed_core::Host;
 use cowshed_core::api::call::{self, Arguments};
-use cowshed_core::api::operations::HostBuildState;
+use cowshed_core::api::operations::{
+    HostBuildState, HostLockHolders, HostRetireDescendants, HostTreeHolders,
+};
 use cowshed_core::build_volume::{BUILD_LINK, BuildVolumeState};
 use cowshed_core::capabilities::BuildStatePath;
 
@@ -126,4 +128,140 @@ async fn a_project_client_refuses_a_host_connection_handshake() {
         output.stdout.is_empty(),
         "the host connection never writes stdout"
     );
+}
+
+/// Starts `cowshed host` under no job supervisor and connects to it.
+async fn host_without_supervisor() -> (Host, tokio::process::Child) {
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let child = tokio::process::Command::new(cowshed())
+        .arg("host")
+        .env_remove("COWSHED_SUPERVISOR_SOCKET")
+        .stdin(Stdio::from(OwnedFd::from(theirs)))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let host = Host::connect(OwnedFd::from(ours))
+        .await
+        .expect("host handshake");
+    (host, child)
+}
+
+/// What a helper verb prints on stdout, each line one JSON value, run under no job supervisor.
+fn printed(args: &[&std::ffi::OsStr], stdin: &[u8]) -> Vec<serde_json::Value> {
+    use std::io::Write as _;
+    let mut verb = Command::new(cowshed())
+        .args(args)
+        .env_remove("COWSHED_SUPERVISOR_SOCKET")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    verb.stdin.take().unwrap().write_all(stdin).unwrap();
+    let output = verb.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect()
+}
+
+/// `host.lockHolders`, `host.treeHolders` and `host.retireDescendants` answer what
+/// `lock-holders`, `tree-holders` and `retire-descendants` print: the lock's observation, the
+/// tree's holders (here a child whose working directory is in it) as one list, and, with no
+/// supervisor socket, the typed `foldUnavailable` refusal.
+#[tokio::test]
+async fn a_host_connection_answers_the_holder_censuses_and_retirement_as_their_verbs_print_them() {
+    let root =
+        temp_root::TempRoot::new_in(&temp_parent::canonical_parent(), "cowshed-host-holders");
+    let lock = root.join("lock");
+    std::fs::write(&lock, b"").unwrap();
+    let tree = root.join("tree");
+    std::fs::create_dir(&tree).unwrap();
+    // A holder whose working directory is in the tree, until its stdin closes.
+    let mut holder = Command::new("cat")
+        .current_dir(&tree)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let handle = serde_json::json!({
+        "jobId": 7,
+        "index": 2,
+        "incarnation": "0123456789abcdef0123456789abcdef",
+    });
+
+    let lock_printed = printed(&["lock-holders".as_ref(), lock.as_os_str()], b"");
+    let tree_printed = printed(&["tree-holders".as_ref(), tree.as_os_str()], b"");
+    let retire_printed = printed(
+        &[
+            "retire-descendants".as_ref(),
+            "--grace-ms".as_ref(),
+            "0".as_ref(),
+        ],
+        handle.to_string().as_bytes(),
+    );
+
+    let (host, child) = host_without_supervisor().await;
+    let mut arguments = Arguments::new();
+    arguments.insert("path".to_owned(), serde_json::json!(lock));
+    let observation = call::call::<HostLockHolders, _>(&host, arguments)
+        .await
+        .expect("host.lockHolders");
+    assert_eq!(
+        vec![serde_json::to_value(&observation).unwrap()],
+        lock_printed
+    );
+
+    let mut arguments = Arguments::new();
+    arguments.insert("path".to_owned(), serde_json::json!(tree));
+    let holders = call::call::<HostTreeHolders, _>(&host, arguments)
+        .await
+        .expect("host.treeHolders");
+    assert_eq!(
+        serde_json::to_value(&holders).unwrap(),
+        serde_json::json!(tree_printed)
+    );
+    assert!(
+        holders
+            .iter()
+            .any(|held| held.pid == i32::try_from(holder.id()).unwrap()),
+        "{holders:?}"
+    );
+
+    let mut arguments = Arguments::new();
+    arguments.insert("handle".to_owned(), handle);
+    arguments.insert("graceMs".to_owned(), serde_json::json!(0));
+    let retirement = call::call::<HostRetireDescendants, _>(&host, arguments)
+        .await
+        .expect("host.retireDescendants");
+    assert_eq!(
+        vec![serde_json::to_value(&retirement).unwrap()],
+        retire_printed
+    );
+    assert_eq!(
+        serde_json::to_value(&retirement).unwrap(),
+        serde_json::json!({ "kind": "refused", "reason": "foldUnavailable" })
+    );
+
+    drop(host);
+    let output = child
+        .wait_with_output()
+        .await
+        .expect("wait for cowshed host");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    drop(holder.stdin.take());
+    assert!(holder.wait().unwrap().success());
 }

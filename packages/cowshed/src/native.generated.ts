@@ -48,7 +48,12 @@ export interface NativeHostOperations
     NativeHostIdentityAdd,
     NativeHostSkillInstall,
     NativeHostBuildState,
-    NativeHostClearNxStore {}
+    NativeHostClearNxStore,
+    NativeHostGatewayStart,
+    NativeHostGatewayStop,
+    NativeHostLockHolders,
+    NativeHostTreeHolders,
+    NativeHostRetireDescendants {}
 
 /** The operations a `Project` serves: exactly those its authority admits. */
 export interface NativeProjectOperations
@@ -800,6 +805,24 @@ export async function hostForgetAbandoned(
   return V.parseProjectRetirementReport(await handle.forgetAbandoned(JSON.stringify(args)));
 }
 
+/** A handle that serves `host.gatewayStart`. */
+export interface NativeHostGatewayStart {
+  gatewayStart(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.gatewayStart` caller names; its handle binds the rest. */
+export type HostGatewayStartArguments = Readonly<Record<string, never>>;
+
+/**
+ * Installs the running build and starts the gateway onto it.
+ */
+export async function hostGatewayStart(
+  handle: NativeHostGatewayStart,
+  args: HostGatewayStartArguments,
+): Promise<Api.GatewayStatus> {
+  return V.parseGatewayStatus(await handle.gatewayStart(JSON.stringify(args)));
+}
+
 /** A handle that serves `host.gatewayStatus`. */
 export interface NativeHostGatewayStatus {
   gatewayStatus(argumentsJson: string): Promise<string>;
@@ -816,6 +839,24 @@ export async function hostGatewayStatus(
   args: HostGatewayStatusArguments,
 ): Promise<Api.GatewayStatus> {
   return V.parseGatewayStatus(await handle.gatewayStatus(JSON.stringify(args)));
+}
+
+/** A handle that serves `host.gatewayStop`. */
+export interface NativeHostGatewayStop {
+  gatewayStop(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.gatewayStop` caller names; its handle binds the rest. */
+export type HostGatewayStopArguments = Pick<Api.GatewayStopRequest, 'purge'>;
+
+/**
+ * Stops the gateway; with `purge`, also removes the installed binary.
+ */
+export async function hostGatewayStop(
+  handle: NativeHostGatewayStop,
+  args: HostGatewayStopArguments,
+): Promise<Api.EmptyResult> {
+  return V.parseEmptyResult(await handle.gatewayStop(JSON.stringify(args)));
 }
 
 /** A handle that serves `host.identityAdd`. */
@@ -854,6 +895,24 @@ export async function hostListProjects(
   return V.parseProjectWorkspacesList(await handle.listProjects(JSON.stringify(args)));
 }
 
+/** A handle that serves `host.lockHolders`. */
+export interface NativeHostLockHolders {
+  lockHolders(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.lockHolders` caller names; its handle binds the rest. */
+export type HostLockHoldersArguments = Pick<Api.HostPathRequest, 'path'>;
+
+/**
+ * Who the kernel shows holding a lock file.
+ */
+export async function hostLockHolders(
+  handle: NativeHostLockHolders,
+  args: HostLockHoldersArguments,
+): Promise<Api.LockObservation> {
+  return V.parseLockObservation(await handle.lockHolders(JSON.stringify(args)));
+}
+
 /** A handle that serves `host.mountMain`. */
 export interface NativeHostMountMain {
   mountMain(argumentsJson: string): Promise<string>;
@@ -872,6 +931,24 @@ export async function hostMountMain(
   return V.parseMountResult(await handle.mountMain(JSON.stringify(args)));
 }
 
+/** A handle that serves `host.retireDescendants`. */
+export interface NativeHostRetireDescendants {
+  retireDescendants(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.retireDescendants` caller names; its handle binds the rest. */
+export type HostRetireDescendantsArguments = Pick<Api.RetireDescendantsRequest, 'handle' | 'graceMs'>;
+
+/**
+ * Asks the job supervisor this host connection runs under to retire a retained subtree.
+ */
+export async function hostRetireDescendants(
+  handle: NativeHostRetireDescendants,
+  args: HostRetireDescendantsArguments,
+): Promise<Api.JobSubtreeRetirement> {
+  return V.parseJobSubtreeRetirement(await handle.retireDescendants(JSON.stringify(args)));
+}
+
 /** A handle that serves `host.skillInstall`. */
 export interface NativeHostSkillInstall {
   skillInstall(argumentsJson: string): Promise<string>;
@@ -888,6 +965,24 @@ export async function hostSkillInstall(
   args: HostSkillInstallArguments,
 ): Promise<Api.SkillInstallReport> {
   return V.parseSkillInstallReport(await handle.skillInstall(JSON.stringify(args)));
+}
+
+/** A handle that serves `host.treeHolders`. */
+export interface NativeHostTreeHolders {
+  treeHolders(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.treeHolders` caller names; its handle binds the rest. */
+export type HostTreeHoldersArguments = Pick<Api.HostPathRequest, 'path'>;
+
+/**
+ * Every process of this user holding something inside a directory tree.
+ */
+export async function hostTreeHolders(
+  handle: NativeHostTreeHolders,
+  args: HostTreeHoldersArguments,
+): Promise<readonly Api.TreeHolder[]> {
+  return V.parseTreeHolderList(await handle.treeHolders(JSON.stringify(args)));
 }
 
 /** A handle that serves `job.attachClose`. */

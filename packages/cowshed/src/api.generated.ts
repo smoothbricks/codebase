@@ -1131,6 +1131,13 @@ export type GatewayStatus = {
   readonly landTurnsError?: string;
 };
 
+/**
+ * `gateway stop [--purge]`.
+ */
+export type GatewayStopRequest = {
+  readonly purge: boolean;
+};
+
 export type GcCandidate = {
   readonly identity: Sha256Digest;
   readonly path: string;
@@ -1385,6 +1392,13 @@ export type HostLoad1 = number & tags.Minimum<0> & tags.Maximum<1.79769313486231
 export type HostLoadSample = {
   readonly load1: HostLoad1;
   readonly cores: HostCores;
+};
+
+/**
+ * A host operation whose subject is a path the caller names, read as the CLI reads its argument.
+ */
+export type HostPathRequest = {
+  readonly path: string;
 };
 
 /**
@@ -2888,6 +2902,17 @@ export type RestoreRequest = {
   readonly repoId: RepoId;
   readonly workspace: WorkspaceName;
   readonly label: string;
+};
+
+/**
+ * `retire-descendants --grace-ms`: the handle is the verb's standard input.
+ */
+export type RetireDescendantsRequest = {
+  readonly handle: JobSubtreeHandle;
+  /**
+   * Nonnegative milliseconds; zero retires at once, without a grace interval.
+   */
+  readonly graceMs: number & tags.Type<'uint64'>;
 };
 
 /**

@@ -232,6 +232,90 @@ impl Serves<HostClearNxStore> for Host {
     }
 }
 
+impl Serves<HostGatewayStart> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<HostRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {}
+        let Caller {} = decode::<HostGatewayStart, Caller>(arguments)?;
+        Ok(HostRequest {})
+    }
+}
+
+impl Serves<HostGatewayStop> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<GatewayStopRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            purge: bool,
+        }
+        let Caller { purge } = decode::<HostGatewayStop, Caller>(arguments)?;
+        Ok(GatewayStopRequest { purge })
+    }
+}
+
+impl Serves<HostLockHolders> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<HostPathRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            path: PathBuf,
+        }
+        let Caller { path } = decode::<HostLockHolders, Caller>(arguments)?;
+        Ok(HostPathRequest { path })
+    }
+}
+
+impl Serves<HostTreeHolders> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<HostPathRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            path: PathBuf,
+        }
+        let Caller { path } = decode::<HostTreeHolders, Caller>(arguments)?;
+        Ok(HostPathRequest { path })
+    }
+}
+
+impl Serves<HostRetireDescendants> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<RetireDescendantsRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            handle: JobSubtreeHandle,
+            grace_ms: u64,
+        }
+        let Caller { handle, grace_ms } = decode::<HostRetireDescendants, Caller>(arguments)?;
+        Ok(RetireDescendantsRequest { handle, grace_ms })
+    }
+}
+
 impl Serves<ProjectWorkspace> for Project {
     const BOUND: &'static [&'static str] = &["repoId"];
 
@@ -1698,6 +1782,11 @@ pub(crate) fn each_served(
     check.served::<HostSkillInstall, _>(host, &[]);
     check.served::<HostBuildState, _>(host, &[]);
     check.served::<HostClearNxStore, _>(host, &[]);
+    check.served::<HostGatewayStart, _>(host, &[]);
+    check.served::<HostGatewayStop, _>(host, &[]);
+    check.served::<HostLockHolders, _>(host, &[]);
+    check.served::<HostTreeHolders, _>(host, &[]);
+    check.served::<HostRetireDescendants, _>(host, &[]);
     check.served::<ProjectWorkspace, _>(project, &[]);
     check.served::<ProjectWorkspaceAt, _>(project, &[]);
     check.served::<ProjectList, _>(project, &[]);

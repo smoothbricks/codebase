@@ -739,17 +739,11 @@ where
 {
     match action {
         GatewayCommand::Start => {
-            let slot = take_install_slot(&canonical_home()?).await?;
-            let status = start_service(output, &slot, Downgrade::Refuse).await?;
+            let status = start(output).await?;
             emit_gateway_status(output, json, status)?;
         }
         GatewayCommand::Stop { purge } => {
-            // A purge empties the install slot, so it waits its turn like any install does.
-            let _slot = match purge {
-                true => Some(take_install_slot(&canonical_home()?).await?),
-                false => None,
-            };
-            let purged = stop_service(purge)?;
+            let purged = stop(purge).await?;
             if json {
                 output.success(EmptyResult {}).map_err(output_error)?;
             } else {
@@ -777,6 +771,27 @@ where
         GatewayCommand::Run => run_daemon().await?,
     }
     Ok(0)
+}
+
+/// `gateway start` and `host.gatewayStart`: take the install slot, then install the running build
+/// and start the gateway onto it, refusing a downgrade.
+pub(crate) async fn start<W, E>(output: &mut Output<W, E>) -> Result<CliGatewayStatus>
+where
+    W: Write + Send,
+    E: Write + Send,
+{
+    let slot = take_install_slot(&canonical_home()?).await?;
+    start_service(output, &slot, Downgrade::Refuse).await
+}
+
+/// `gateway stop [--purge]` and `host.gatewayStop`. A purge empties the install slot, so it waits
+/// its turn like any install does.
+pub(crate) async fn stop(purge: bool) -> Result<RemovalOutcome> {
+    let _slot = match purge {
+        true => Some(take_install_slot(&canonical_home()?).await?),
+        false => None,
+    };
+    stop_service(purge)
 }
 
 /// Install the running build and start the gateway onto it. `slot` is the install slot this

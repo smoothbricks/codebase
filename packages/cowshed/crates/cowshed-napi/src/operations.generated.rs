@@ -106,6 +106,40 @@ impl Host {
     pub fn clear_nx_store(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
         super::json_call::<operations::HostClearNxStore, _>(env, Arc::clone(&self.inner), arguments)
     }
+
+    /// Installs the running build and starts the gateway onto it.
+    #[napi(js_name = "gatewayStart")]
+    pub fn gateway_start(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::json_call::<operations::HostGatewayStart, _>(env, Arc::clone(&self.inner), arguments)
+    }
+
+    /// Stops the gateway; with `purge`, also removes the installed binary.
+    #[napi(js_name = "gatewayStop")]
+    pub fn gateway_stop(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::json_call::<operations::HostGatewayStop, _>(env, Arc::clone(&self.inner), arguments)
+    }
+
+    /// Who the kernel shows holding a lock file.
+    #[napi(js_name = "lockHolders")]
+    pub fn lock_holders(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::json_call::<operations::HostLockHolders, _>(env, Arc::clone(&self.inner), arguments)
+    }
+
+    /// Every process of this user holding something inside a directory tree.
+    #[napi(js_name = "treeHolders")]
+    pub fn tree_holders(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::json_call::<operations::HostTreeHolders, _>(env, Arc::clone(&self.inner), arguments)
+    }
+
+    /// Asks the job supervisor this host connection runs under to retire a retained subtree.
+    #[napi(js_name = "retireDescendants")]
+    pub fn retire_descendants(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::json_call::<operations::HostRetireDescendants, _>(
+            env,
+            Arc::clone(&self.inner),
+            arguments,
+        )
+    }
 }
 
 #[napi]

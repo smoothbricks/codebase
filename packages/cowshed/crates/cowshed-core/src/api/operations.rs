@@ -24,8 +24,10 @@ use super::dto::{
     BuildStateListing, CredentialReport, GatewayStatus, IdentityReport, MountResult,
     NxStoreClearResult, ProjectWorkspaces, SkillInstallReport,
 };
-use super::process::{JobProcessEvent, JobProcessTree};
+use super::held_lock::LockObservation;
+use super::process::{JobProcessEvent, JobProcessTree, JobSubtreeHandle, JobSubtreeRetirement};
 use super::resources::{JobResourceSample, SampleInterval};
+use super::tree_holder::TreeHolder;
 use crate::build_volume::BuildStateRefresh;
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
@@ -414,6 +416,16 @@ operations! {
     host json "host.buildState" HostBuildState(ProjectPathRequest) -> BuildStateListing;
     /// Clears the project's Nx accepted-task store in the gateway.
     host json "host.clearNxStore" HostClearNxStore(ProjectPathRequest) -> NxStoreClearResult;
+    /// Installs the running build and starts the gateway onto it.
+    host json "host.gatewayStart" HostGatewayStart(HostRequest) -> GatewayStatus;
+    /// Stops the gateway; with `purge`, also removes the installed binary.
+    host json "host.gatewayStop" HostGatewayStop(GatewayStopRequest) -> EmptyResult;
+    /// Who the kernel shows holding a lock file.
+    host json "host.lockHolders" HostLockHolders(HostPathRequest) -> LockObservation;
+    /// Every process of this user holding something inside a directory tree.
+    host json "host.treeHolders" HostTreeHolders(HostPathRequest) -> Vec<TreeHolder>;
+    /// Asks the job supervisor this host connection runs under to retire a retained subtree.
+    host json "host.retireDescendants" HostRetireDescendants(RetireDescendantsRequest) -> JobSubtreeRetirement;
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -948,6 +960,29 @@ pub struct SkillInstallRequest {
     /// Install into this project's harness directories instead of the user's (`--project`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<PathBuf>,
+}
+
+/// `gateway stop [--purge]`.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GatewayStopRequest {
+    pub purge: bool,
+}
+
+/// A host operation whose subject is a path the caller names, read as the CLI reads its argument.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostPathRequest {
+    pub path: PathBuf,
+}
+
+/// `retire-descendants --grace-ms`: the handle is the verb's standard input.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetireDescendantsRequest {
+    pub handle: JobSubtreeHandle,
+    /// Nonnegative milliseconds; zero retires at once, without a grace interval.
+    pub grace_ms: u64,
 }
 
 #[cfg(test)]

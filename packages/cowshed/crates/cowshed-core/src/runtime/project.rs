@@ -1644,7 +1644,12 @@ impl ProjectActor {
             | Op::HostIdentityAdd(_)
             | Op::HostSkillInstall(_)
             | Op::HostBuildState(_)
-            | Op::HostClearNxStore(_) => {
+            | Op::HostClearNxStore(_)
+            | Op::HostGatewayStart(_)
+            | Op::HostGatewayStop(_)
+            | Op::HostLockHolders(_)
+            | Op::HostTreeHolders(_)
+            | Op::HostRetireDescendants(_) => {
                 return Err(CowshedError::internal(format!(
                     "host operation {method} reached the project router past its scope check"
                 )));

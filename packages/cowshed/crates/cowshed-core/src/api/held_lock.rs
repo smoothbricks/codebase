@@ -2,11 +2,14 @@
 //! `cowshed lock-holders` prints it, and the waiter's events, as `cowshed lock --state-fd` writes
 //! them; the generated TypeScript validators read both.
 
+use std::ffi::OsString;
 use std::fmt;
-use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use super::server::MAX_JSON_FRAME_BYTES;
 
 /// A kernel identifier (a device, an inode, a process's unique id) on the wire as its exact
 /// decimal string. A JSON number past 2^53 loses precision in JavaScript, and a reader that
@@ -151,6 +154,17 @@ impl Serialize for LockPath {
     }
 }
 
+/// Bounded by the one JSON frame a host answer travels in, as every byte of the observation is.
+impl<'de> Deserialize<'de> for LockPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes = super::dto::deserialize_tagged_bytes(deserializer, MAX_JSON_FRAME_BYTES)?;
+        Ok(Self(PathBuf::from(OsString::from_vec(bytes))))
+    }
+}
+
 /// A lock file's content, the holder record as written, as its exact bytes in tagged form: a
 /// record is a claim a reader parses, so it is never shown decoded lossily or refused for not
 /// being UTF-8. Empty when there is none.
@@ -177,11 +191,20 @@ impl Serialize for LockRecord {
     }
 }
 
+impl<'de> Deserialize<'de> for LockRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        super::dto::deserialize_tagged_bytes(deserializer, MAX_JSON_FRAME_BYTES).map(Self)
+    }
+}
+
 /// Who the kernel shows holding a lock file, read in one pass (`cowshed lock-holders`). Every
 /// field serializes whatever bytes the path and the file hold, so the object is always written
 /// whole.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LockObservation {
     pub path: LockPath,
     /// The inode the path names; `None` when no lock file exists.
@@ -254,6 +277,10 @@ mod tests {
             wire,
             r#"{"path":{"encoding":"utf8","data":"/t/exact.lock"},"inode":null,"locked":false,"record":{"encoding":"utf8","data":""},"owner":null,"descriptors":[]}"#
         );
+        assert_eq!(
+            serde_json::from_str::<LockObservation>(&wire).expect("decode"),
+            observation(b"/t/exact.lock", b"")
+        );
         let path = b"/t/\xff\xfe.lock";
         let record = b"{\"pid\":7,\"command\":\"a\xffb\"}";
         let wire = serde_json::to_value(observation(path, record)).expect("serialize");
@@ -268,6 +295,11 @@ mod tests {
                 "{wire}"
             );
         }
+        // A host answer decodes back into exactly the bytes the kernel and the file held.
+        assert_eq!(
+            serde_json::from_value::<LockObservation>(wire).expect("decode"),
+            observation(path, record)
+        );
     }
 
     /// Every u64, the high ones JavaScript numbers cannot hold among them, goes out as its exact

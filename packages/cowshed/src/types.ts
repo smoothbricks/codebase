@@ -136,6 +136,22 @@ export interface Host {
   skillInstall(options?: HostSkillInstallArguments): Promise<Api.SkillInstallReport>;
   buildState(project: Api.ProjectPathRequest['project']): Promise<Api.BuildStateListing>;
   clearNxStore(project: Api.ProjectPathRequest['project']): Promise<Api.NxStoreClearResult>;
+  /** Installs this package's build and starts the gateway onto it, refusing a downgrade. */
+  gatewayStart(): Promise<Api.GatewayStatus>;
+  /** Stops the gateway; `purge` also removes the installed binary. */
+  gatewayStop(options?: Partial<Api.GatewayStopRequest>): Promise<void>;
+  /** Who the kernel shows holding the lock file at `path`. */
+  lockHolders(path: Api.HostPathRequest['path']): Promise<Api.LockObservation>;
+  /** Every process of this user holding something inside the directory tree at `path`. */
+  treeHolders(path: Api.HostPathRequest['path']): Promise<readonly Api.TreeHolder[]>;
+  /**
+   * Asks the job supervisor named by the `COWSHED_SUPERVISOR_SOCKET` this process had when it
+   * opened the host to retire `handle`'s retained root and its descendants.
+   */
+  retireDescendants(
+    handle: Api.RetireDescendantsRequest['handle'],
+    graceMs: Api.RetireDescendantsRequest['graceMs'],
+  ): Promise<Api.JobSubtreeRetirement>;
   /** Ends the connection and with it the `cowshed host` process; later calls reject. */
   close(): Promise<void>;
 }

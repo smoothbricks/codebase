@@ -15,7 +15,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use cowshed_core::CowshedError;
-use cowshed_core::api::held_lock::LockWaiterEvent;
+use cowshed_core::api::held_lock::{LockObservation, LockWaiterEvent};
 use cowshed_core::held_lock::{self, HeldLock, Opened, OwnedLives};
 
 use crate::args::{LockArgs, LockHoldersArgs};
@@ -52,13 +52,18 @@ where
     W: Write + Send,
     E: Write + Send,
 {
-    let written = held_lock::observe(&args.path)
-        .map_err(|error| failure(&args.path, "observe", &error))
+    let written = holders(&args.path)
         .and_then(|observation| output.bare_record(&observation).map_err(write_failed));
     match written {
         Ok(()) => 0,
         Err(error) => report(output, &error),
     }
+}
+
+/// Who the kernel shows holding the lock at `path`: what `lock-holders` prints and
+/// `host.lockHolders` answers.
+pub(crate) fn holders(path: &Path) -> Result<LockObservation, CowshedError> {
+    held_lock::observe(path).map_err(|error| failure(path, "observe", &error))
 }
 
 pub(crate) fn report<W: Write, E: Write>(output: &mut Output<W, E>, error: &CowshedError) -> i32 {

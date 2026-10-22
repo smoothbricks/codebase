@@ -73,7 +73,7 @@ pub struct Row {
 }
 
 /// The host verbs have no N-API channel until the host operation table lands (tg#9537).
-const HOST_TABLE: &str = "the second host commit (tg#9537): disk-command, land-turn, gateway start/stop, credential add, sccache on the installed build, and the lock/hold/subtree process helpers";
+const HOST_TABLE: &str = "the remaining host rows and launchers (tg#9537): disk-command, land-turn, credential add, sccache on the installed build, and the lock/hold/subtree-root process holders";
 
 const fn member(member: &'static str) -> Facade {
     Facade {
@@ -319,23 +319,23 @@ pub const PARITY: &[Row] = &[
     gap("lock", "state-fd"),
     gap("lock", "owned-pid"),
     gap("lock", "argv"),
-    gap("lock-holders", ""),
-    gap("lock-holders", "path"),
+    row("lock-holders", "", field(&[("host.lockHolders", "")], &[member("Host.lockHolders")])),
+    row("lock-holders", "path", field(&[("host.lockHolders", "path")], &[argument("Host.lockHolders", 0, "")])),
     gap("hold", ""),
     gap("hold", "control-fd"),
     gap("hold", "state-fd"),
     gap("hold", "argv"),
-    gap("tree-holders", ""),
-    gap("tree-holders", "path"),
+    row("tree-holders", "", field(&[("host.treeHolders", "")], &[member("Host.treeHolders")])),
+    row("tree-holders", "path", field(&[("host.treeHolders", "path")], &[argument("Host.treeHolders", 0, "")])),
     gap("subtree-root", ""),
     gap("subtree-root", "handle-fd"),
     gap("subtree-root", "argv"),
-    gap("retire-descendants", ""),
-    gap("retire-descendants", "grace-ms"),
+    row("retire-descendants", "", field(&[("host.retireDescendants", "handle")], &[argument("Host.retireDescendants", 0, "")])),
+    row("retire-descendants", "grace-ms", field(&[("host.retireDescendants", "graceMs")], &[argument("Host.retireDescendants", 1, "")])),
 
-    gap("gateway start", ""),
-    gap("gateway stop", ""),
-    gap("gateway stop", "purge"),
+    row("gateway start", "", field(&[("host.gatewayStart", "")], &[member("Host.gatewayStart")])),
+    row("gateway stop", "", field(&[("host.gatewayStop", "")], &[member("Host.gatewayStop")])),
+    row("gateway stop", "purge", field(&[("host.gatewayStop", "purge")], &[argument("Host.gatewayStop", 0, "purge")])),
     row("gateway status", "", field(&[("host.gatewayStatus", "")], &[member("Host.gatewayStatus")])),
     row("gateway run", "", Counterpart::CliOnly { reason: "process entrypoint: the daemon launchd execs; a library call never becomes it and no host connection runs it (07_api.md, Host operations)" }),
 

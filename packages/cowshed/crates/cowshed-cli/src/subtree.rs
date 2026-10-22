@@ -122,14 +122,7 @@ pub(crate) async fn retire<W: Write, E: Write>(
     output: &mut Output<W, E>,
 ) -> Result<i32> {
     let handle = read_handle(tokio::io::stdin()).await?;
-    let retirement = match std::env::var_os("COWSHED_SUPERVISOR_SOCKET") {
-        Some(path) => {
-            supervisor_socket::retire_descendants(&PathBuf::from(path), handle, args.grace).await?
-        }
-        None => JobSubtreeRetirement::Refused {
-            reason: JobSubtreeRefusal::FoldUnavailable,
-        },
-    };
+    let retirement = retire_handle(handle, args.grace).await?;
     output.bare_record(&retirement).map_err(|error| {
         CowshedError::environment_missing(
             format!("could not write subtree retirement: {error}"),
@@ -137,6 +130,23 @@ pub(crate) async fn retire<W: Write, E: Write>(
         )
     })?;
     Ok(0)
+}
+
+/// Ask the supervisor named by this process's `COWSHED_SUPERVISOR_SOCKET` to retire `handle`'s
+/// retained root and its descendants: what `retire-descendants` prints and
+/// `host.retireDescendants` answers. No socket is the typed `foldUnavailable` refusal.
+pub(crate) async fn retire_handle(
+    handle: JobSubtreeHandle,
+    grace: std::time::Duration,
+) -> Result<JobSubtreeRetirement> {
+    match std::env::var_os("COWSHED_SUPERVISOR_SOCKET") {
+        Some(path) => {
+            supervisor_socket::retire_descendants(&PathBuf::from(path), handle, grace).await
+        }
+        None => Ok(JobSubtreeRetirement::Refused {
+            reason: JobSubtreeRefusal::FoldUnavailable,
+        }),
+    }
 }
 
 async fn read_handle(input: impl AsyncRead + Unpin) -> Result<JobSubtreeHandle> {

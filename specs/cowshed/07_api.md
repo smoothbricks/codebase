@@ -2170,12 +2170,16 @@ rejects. A child a host operation starts never inherits the socket: its stdin is
 
 Served rows: `host.listProjects` (`ls --all`, with `ls`'s landing selection), `host.attachAll`, `host.detachAll`,
 `host.clearAttachBudget` (`doctor --clear-attach-budget`), `host.forgetAbandoned` (`forget --abandon`: the operation is
-the authorization), `host.mountMain`, `host.gatewayStatus`, `host.credentialStatus`, `host.credentialRemove`,
-`host.identityAdd`, `host.skillInstall`, `host.buildState` and `host.clearNxStore` (`cache clear`'s gateway half).
-`disk-command`, `land-turn`, `gateway start`/`stop`, `credential add`, the `sccache` verbs and the process helpers
-`lock`, `lock-holders`, `hold`, `tree-holders`, `subtree-root` and `retire-descendants` are the parity gate's known gaps
-until their rows land: `disk-command` streams the tool's output whole and never deadlines a verb that creates or
-releases a disk-image device, `land-turn` holds its turn until its child ends whatever the connection does,
+the authorization), `host.mountMain`, `host.gatewayStatus`, `host.gatewayStart`, `host.gatewayStop` (`purge`),
+`host.credentialStatus`, `host.credentialRemove`, `host.identityAdd`, `host.skillInstall`, `host.buildState`,
+`host.clearNxStore` (`cache clear`'s gateway half), `host.lockHolders` (`lock-holders`: the `LockObservation` it
+prints), `host.treeHolders` (`tree-holders`: its `TreeHolder` lines as one list) and `host.retireDescendants`
+(`retire-descendants`: the handle the verb reads on stdin is the request's `handle`, and the supervisor asked is the one
+`COWSHED_SUPERVISOR_SOCKET` names in the `cowshed host` process, which inherits the environment of the process that
+called `openHost`; no socket is the typed `foldUnavailable` refusal, as the verb prints it). `disk-command`,
+`land-turn`, `credential add`, the `sccache` verbs and the process holders `lock`, `hold` and `subtree-root` are the
+parity gate's known gaps until their rows or launchers land: `disk-command` streams the tool's output whole and never
+deadlines a verb that creates or releases a disk-image device, `land-turn` holds its turn until its child ends,
 `credential add`'s secret is the upload frame, and the `sccache` rows are served by `cowshed sccache host` so the
 launcher's installed-build selection holds.
 

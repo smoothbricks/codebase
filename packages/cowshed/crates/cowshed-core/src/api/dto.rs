@@ -1318,6 +1318,26 @@ where
     project_tagged_bytes(bytes, |proxy| proxy.serialize(serializer))
 }
 
+/// Reads the tagged form [`serialize_tagged_bytes`] writes, refusing more than `maximum` bytes.
+pub(crate) fn deserialize_tagged_bytes<'de, D>(
+    deserializer: D,
+    maximum: usize,
+) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    decode_tagged_bytes(TaggedBytesWire::deserialize(deserializer)?, maximum).map_err(|error| {
+        match error {
+            TaggedBytesError::TooLarge => {
+                serde::de::Error::custom(format!("tagged bytes exceed {maximum} bytes"))
+            }
+            TaggedBytesError::InvalidEncoding => {
+                serde::de::Error::custom(DtoError::InvalidBinaryEncoding)
+            }
+        }
+    })
+}
+
 fn decode_tagged_bytes(wire: TaggedBytesWire, maximum: usize) -> Result<Vec<u8>, TaggedBytesError> {
     match wire.encoding {
         TaggedBytesEncoding::Utf8 => {

@@ -253,6 +253,14 @@
   "host.skillInstall": { "harnesses": ["claude"] },
   "host.buildState": { "project": "/trusted/acme/widget" },
   "host.clearNxStore": { "project": "/trusted/acme/widget" },
+  "host.gatewayStart": {},
+  "host.gatewayStop": { "purge": true },
+  "host.lockHolders": { "path": "/tmp/cowshed-lock" },
+  "host.treeHolders": { "path": "/trusted/acme/widget" },
+  "host.retireDescendants": {
+    "handle": { "jobId": 7, "index": 2, "incarnation": "0123456789abcdef0123456789abcdef" },
+    "graceMs": 500
+  },
   "session.close": {
     "repoId": "acme/widget",
     "workspace": "feature",

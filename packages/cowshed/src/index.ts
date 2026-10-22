@@ -251,6 +251,29 @@ class HostImpl implements Host {
     return callNativeAsync(() => N.hostClearNxStore(this.#native, { project }));
   }
 
+  async gatewayStart(): Promise<Api.GatewayStatus> {
+    return callNativeAsync(() => N.hostGatewayStart(this.#native, {}));
+  }
+
+  async gatewayStop(options?: Partial<Api.GatewayStopRequest>): Promise<void> {
+    await callNativeAsync(() => N.hostGatewayStop(this.#native, { purge: options?.purge ?? false }));
+  }
+
+  async lockHolders(path: Api.HostPathRequest['path']): Promise<Api.LockObservation> {
+    return callNativeAsync(() => N.hostLockHolders(this.#native, { path }));
+  }
+
+  async treeHolders(path: Api.HostPathRequest['path']): Promise<readonly Api.TreeHolder[]> {
+    return callNativeAsync(() => N.hostTreeHolders(this.#native, { path }));
+  }
+
+  async retireDescendants(
+    handle: Api.RetireDescendantsRequest['handle'],
+    graceMs: Api.RetireDescendantsRequest['graceMs'],
+  ): Promise<Api.JobSubtreeRetirement> {
+    return callNativeAsync(() => N.hostRetireDescendants(this.#native, { handle, graceMs }));
+  }
+
   async close(): Promise<void> {
     await callNativeAsync(() => this.#native.close());
   }

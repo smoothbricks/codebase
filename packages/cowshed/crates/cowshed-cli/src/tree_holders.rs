@@ -4,6 +4,7 @@
 //! project, no daemon, no runtime.
 
 use std::io::{self, Write};
+use std::path::Path;
 
 use cowshed_core::CowshedError;
 use cowshed_core::api::tree_holder::TreeHolder;
@@ -17,23 +18,11 @@ where
     W: Write + Send,
     E: Write + Send,
 {
-    let written = nx::tree_holds(&args.path)
-        .map_err(|error| {
-            CowshedError::environment_missing(
-                format!(
-                    "cannot read who holds the tree {}: {error}",
-                    args.path.display()
-                ),
-                "name a directory this user can read",
-            )
-        })
-        .and_then(|holds| {
-            holds.iter().try_for_each(|held| {
-                output
-                    .bare_record(&TreeHolder::from(held))
-                    .map_err(write_failed)
-            })
-        });
+    let written = holders(&args.path).and_then(|holders| {
+        holders
+            .iter()
+            .try_for_each(|holder| output.bare_record(holder).map_err(write_failed))
+    });
     match written {
         Ok(()) => 0,
         Err(error) => {
@@ -44,6 +33,19 @@ where
             i32::from(error.exec_wrapper_exit_code())
         }
     }
+}
+
+/// Every holder of the tree at `path`: what `tree-holders` prints, one per line, and
+/// `host.treeHolders` answers.
+pub(crate) fn holders(path: &Path) -> Result<Vec<TreeHolder>, CowshedError> {
+    nx::tree_holds(path)
+        .map(|holds| holds.into_iter().map(TreeHolder::from).collect())
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!("cannot read who holds the tree {}: {error}", path.display()),
+                "name a directory this user can read",
+            )
+        })
 }
 
 fn write_failed(error: io::Error) -> CowshedError {

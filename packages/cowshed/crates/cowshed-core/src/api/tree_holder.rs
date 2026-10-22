@@ -1,16 +1,20 @@
 //! The wire shape of one holder of a directory tree, as `cowshed tree-holders` prints it
 //! (02_workspaces.md "Holders cowshed does not run"); the generated TypeScript validator reads it.
-//! Every field borrows the census's own record, so a line is written without a copy.
+//! Every field moves out of the census's own record, so a line is written without a copy, and a
+//! host connection's answer decodes into the same value.
 
-use std::os::unix::ffi::OsStrExt as _;
-use std::path::Path;
+use std::ffi::OsString;
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+use std::path::PathBuf;
 
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use super::server::MAX_JSON_FRAME_BYTES;
 
 use crate::build_volume::nx::{Hold, TreeHold};
 
 /// How a process holds the tree: the first hold the census found, cheapest first.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TreeHoldKind {
     /// Its working directory is in the tree.
@@ -28,10 +32,10 @@ pub enum TreeHoldKind {
 /// A path inside the tree, exactly as the kernel names it: its bytes as tagged bytes, `utf8` when
 /// they are UTF-8 and canonical standard base64 otherwise, so no path is lost or refused.
 #[cfg_attr(any(), cowshed_api(wire = "TaggedBytesRef"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TreePath<'a>(&'a Path);
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreePath(PathBuf);
 
-impl Serialize for TreePath<'_> {
+impl Serialize for TreePath {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -40,23 +44,34 @@ impl Serialize for TreePath<'_> {
     }
 }
 
+/// Bounded by the one JSON frame a host answer travels in.
+impl<'de> Deserialize<'de> for TreePath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes = super::dto::deserialize_tagged_bytes(deserializer, MAX_JSON_FRAME_BYTES)?;
+        Ok(Self(PathBuf::from(OsString::from_vec(bytes))))
+    }
+}
+
 /// One process holding something inside a directory tree: one line of `cowshed tree-holders`, its
 /// fields in the order a reader matches them, the pid and how it holds the tree first. The pid
 /// names the process; the path is exact; the command is for a person to read.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TreeHolder<'a> {
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TreeHolder {
     pub pid: i32,
     pub hold: TreeHoldKind,
-    pub path: TreePath<'a>,
+    pub path: TreePath,
     /// Its argument vector joined by spaces, each argument decoded lossily (or its executable's
     /// path, or `command unreadable`): never an identity.
-    pub command: &'a str,
+    pub command: String,
 }
 
-impl<'a> From<&'a TreeHold> for TreeHolder<'a> {
-    fn from(held: &'a TreeHold) -> Self {
-        let (hold, path) = match &held.hold {
+impl From<TreeHold> for TreeHolder {
+    fn from(held: TreeHold) -> Self {
+        let (hold, path) = match held.hold {
             Hold::WorkingDirectory(path) => (TreeHoldKind::WorkingDirectory, path),
             Hold::RootDirectory(path) => (TreeHoldKind::RootDirectory, path),
             Hold::Executable(path) => (TreeHoldKind::Executable, path),
@@ -67,7 +82,7 @@ impl<'a> From<&'a TreeHold> for TreeHolder<'a> {
             pid: held.holder.pid,
             hold,
             path: TreePath(path),
-            command: &held.holder.command,
+            command: held.holder.command,
         }
     }
 }
@@ -111,7 +126,12 @@ mod tests {
             let path = serde_json::to_string(hold.path().to_str().expect("a UTF-8 fixture path"))
                 .expect("a JSON string");
             let tree_hold = held(hold);
-            let wire = serde_json::to_string(&TreeHolder::from(&tree_hold)).expect("serialize");
+            let holder = TreeHolder::from(tree_hold);
+            let wire = serde_json::to_string(&holder).expect("serialize");
+            assert_eq!(
+                serde_json::from_str::<TreeHolder>(&wire).expect("decode"),
+                holder
+            );
             assert_eq!(
                 wire,
                 format!(
@@ -128,8 +148,16 @@ mod tests {
     fn a_path_that_is_not_utf8_goes_out_as_its_exact_bytes() {
         let bytes = b"/t/shed-\xff\xfe/x";
         let tree_hold = held(Hold::OpenFile(PathBuf::from(OsStr::from_bytes(bytes))));
-        let wire: serde_json::Value =
-            serde_json::to_value(TreeHolder::from(&tree_hold)).expect("serialize");
+        let holder = TreeHolder::from(tree_hold);
+        let wire: serde_json::Value = serde_json::to_value(&holder).expect("serialize");
+        assert_eq!(
+            serde_json::from_value::<TreeHolder>(wire.clone()).expect("decode"),
+            holder
+        );
+        assert_eq!(
+            holder.path,
+            TreePath(PathBuf::from(OsStr::from_bytes(bytes)))
+        );
         assert_eq!(wire["path"]["encoding"], "base64", "{wire}");
         let data = wire["path"]["data"].as_str().expect("base64 text");
         assert_eq!(

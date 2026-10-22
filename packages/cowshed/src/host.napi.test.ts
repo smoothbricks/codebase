@@ -78,6 +78,33 @@ describe('openHost', () => {
     }
   });
 
+  it('answers the holder censuses as lock-holders and tree-holders print them, and retirement as a typed value', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cowshed-host-napi-holders-'));
+    const lock = join(root, 'lock');
+    await writeFile(lock, '');
+    const host = await openHost();
+    try {
+      const observation = await host.lockHolders(lock);
+      const printedLock = spawnSync(launcher, ['lock-holders', lock], { encoding: 'utf8' });
+      expect(printedLock.status).toBe(0);
+      expect(observation).toEqual(JSON.parse(printedLock.stdout));
+      expect(observation.path).toEqual({ encoding: 'utf8', data: lock });
+
+      expect(await host.treeHolders(root)).toEqual([]);
+
+      // A handle no supervisor issued: whatever supervisor this process runs under, if any, the
+      // answer is the verb's typed refusal, never an error.
+      const retirement = await host.retireDescendants(
+        { jobId: 7, index: 2, incarnation: '0123456789abcdef0123456789abcdef' },
+        0,
+      );
+      expect(retirement.kind).toBe('refused');
+    } finally {
+      await host.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('installs the skill into the named project only, and refuses an unknown harness writing nothing', async () => {
     const project = await mkdtemp(join(tmpdir(), 'cowshed-host-napi-skill-'));
     const host = await openHost();

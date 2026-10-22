@@ -147,6 +147,30 @@ async fn answer(request: RouterRequest) -> Result<RouterResponse> {
                 .await?;
             respond::<operations::HostClearNxStore>(&cleared)
         }
+        Op::HostGatewayStart(_) => {
+            // Guidance the verb says while the gateway comes up goes to this process's stderr.
+            let mut output = Output::new(std::io::sink(), std::io::stderr(), false);
+            respond::<operations::HostGatewayStart>(
+                &crate::gateway_service::start(&mut output).await?,
+            )
+        }
+        Op::HostGatewayStop(request) => {
+            crate::gateway_service::stop(request.purge).await?;
+            respond::<operations::HostGatewayStop>(&EmptyResult {})
+        }
+        Op::HostLockHolders(request) => {
+            respond::<operations::HostLockHolders>(&crate::lock::holders(&request.path)?)
+        }
+        Op::HostTreeHolders(request) => {
+            respond::<operations::HostTreeHolders>(&crate::tree_holders::holders(&request.path)?)
+        }
+        Op::HostRetireDescendants(request) => respond::<operations::HostRetireDescendants>(
+            &crate::subtree::retire_handle(
+                request.handle,
+                std::time::Duration::from_millis(request.grace_ms),
+            )
+            .await?,
+        ),
         other => Err(CowshedError::internal(format!(
             "{} reached the host router past the connection's scope check",
             other.method()
