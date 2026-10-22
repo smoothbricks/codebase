@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'bun:test';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { closeSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { churnScript, openForProbe, writerRemains } from '../../__tests__/churn-group.js';
 import { whenChanged } from '../../__tests__/directory-change.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { awaitExit, ownedSocketDirectory, pidsWorkingIn, processTable, terminate } from '../../testing.js';
@@ -198,10 +199,38 @@ describe('RAM temp volume on this host', () => {
         lifetime,
       ]);
       expect(result.status).not.toBe(0);
-      expect(result.stderr).toMatch(/^no answer within 500 ms; killed process group \d+$/);
+      // The group is called killed only when it was left empty; a group still listed at the end says so.
+      expect(result.stderr).toMatch(
+        /^no answer within 500 ms; (?:killed process group \d+|signalled its process group, but .*)$/,
+      );
       expect(result.stdout.trim()).toMatch(/^\d+$/);
       expect(await ended).toBe('');
     } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves no member of a deadlined command behind when members fork as the kill goes out', async () => {
+    // macOS does not hold a fork back for a group signal in flight, so a member forked as SIGKILL goes out is not
+    // reached by it. The command is a group that forks as fast as it can. The deadline is the subject, and wherever it
+    // lands in the group's start the same must hold: the bound returns only once the group lists no member or has
+    // given up, so every member is gone when it does. The end of file of the FIFO every member holds is the proof, and
+    // a kill that is not repeated leaves a member that only the backstop ends.
+    const directory = mkdtempSync(join(realpathSync(tmpdir()), 'deadline-churn-'));
+    const lifetime = join(directory, 'lifetime.fifo');
+    execFileSync('mkfifo', [lifetime]);
+    const reader = openForProbe(lifetime);
+    try {
+      const gone = readFile(lifetime, 'utf8');
+      const result = await createHostCommands(500).run('/bin/sh', ['-c', churnScript(), 'sh', lifetime, '/dev/null']);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(
+        /^no answer within 500 ms; (?:killed process group \d+|signalled its process group, but .*)$/,
+      );
+      expect(writerRemains(reader), result.stderr).toBe(false);
+      expect(await gone).toBe('');
+    } finally {
+      closeSync(reader);
       rmSync(directory, { recursive: true, force: true });
     }
   });

@@ -19,6 +19,7 @@ import {
 import { Socket } from 'node:net';
 import { basename, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { DEADLINE_PATIENCE, describeMembersLeft, killProcessGroup } from '../../process-group.js';
 import {
   awaitExit,
   type ProcessEntry,
@@ -2023,6 +2024,8 @@ function runBounded(
   child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
   child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
   const text = (chunks: Buffer[]) => Buffer.concat(chunks).toString('utf8');
+  // Set once the deadline has fired and is killing the group: from then on it owns the result.
+  let timedOut = false;
   // Safe disk commands have no Node timer: the CLI owns the total admission + child budget,
   // kills only its owned safe child, and returns after reap. Protected image output is already
   // file-backed in cowshed, so only that caller may close its pipes and stop waiting.
@@ -2049,18 +2052,21 @@ function runBounded(
             });
             return;
           }
-          resolve({
-            status: 1,
-            stdout: text(stdout),
-            stderr: `no answer within ${deadlineMs} ms; ${killGroup(child)}`,
+          // A `close` that comes while the group is being killed must not end the call with an ordinary completion
+          // before the kill is done: the deadline answers.
+          timedOut = true;
+          void killGroup(child).then((killed) => {
+            resolve({ status: 1, stdout: text(stdout), stderr: `no answer within ${deadlineMs} ms; ${killed}` });
           });
         }, deadlineMs);
   child.on('error', (error) => {
     clearTimeout(timer);
+    if (timedOut) return;
     resolve({ status: 1, stdout: text(stdout), stderr: error.message });
   });
   child.on('close', (code, signal) => {
     clearTimeout(timer);
+    if (timedOut) return;
     const error = text(stderr);
     resolve({
       status: code ?? 1,
@@ -2071,14 +2077,19 @@ function runBounded(
   return promise;
 }
 
-/** SIGKILL the child's whole process group; what happened, for the error. */
-function killGroup(child: ChildProcess): string {
+/**
+ * SIGKILL the child's whole process group, again while it lists members; what happened, for the error. A group that
+ * is still listed when the kill gives up is not called killed.
+ */
+async function killGroup(child: ChildProcess): Promise<string> {
   if (child.pid === undefined) {
     return 'never started';
   }
   try {
-    process.kill(-child.pid, 'SIGKILL');
-    return `killed process group ${child.pid}`;
+    const left = await killProcessGroup(child.pid, DEADLINE_PATIENCE);
+    return left
+      ? `signalled its process group, but ${describeMembersLeft(child.pid)}`
+      : `killed process group ${child.pid}`;
   } catch (error) {
     return `killing process group ${child.pid} failed: ${errorText(error)}`;
   }

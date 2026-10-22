@@ -1,7 +1,16 @@
 import { type ChildProcess, type ChildProcessByStdio, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { channel } from 'node:diagnostics_channel';
-import { accessSync, constants, existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import {
+  accessSync,
+  constants,
+  existsSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  writeSync,
+} from 'node:fs';
 import { lstat, mkdir, readdir, readFile, readlink, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
@@ -10,6 +19,7 @@ import type { Readable } from 'node:stream';
 import native from 'nx/src/native/index.js';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 import { CARGO_TOOLCHAIN_PIN_INPUTS } from './cargo-toolchain-policy.js';
+import { describeTeardown, killProcessGroupNow, TEARDOWN_PATIENCE } from './process-group.js';
 import { rustTokens } from './rust-tokens.js';
 
 const { IS_WASM, WorkspaceContext } = native;
@@ -125,22 +135,46 @@ export interface CargoPathInputsOptions {
  * soon as it is spawned, and a signal that reached this process before its
  * hooks would end it on the default action with Cargo's group left running.
  * Uncatchable SIGKILL cannot execute either hook.
+ * Each child is kept with what it is called when something is told of it.
  */
-const cargoChildren = new Set<ChildProcess>();
+const cargoChildren = new Map<ChildProcess, string>();
 
-function killCargoChild(child: ChildProcess): void {
-  if (process.platform === 'win32' || child.pid === undefined) child.kill('SIGKILL');
-  else {
-    try {
-      process.kill(-child.pid, 'SIGKILL');
-    } catch (error) {
-      if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) throw error;
-    }
+/**
+ * Ends the child's process group, and keeps ending it while the kernel lists members: a member forked as the signal
+ * goes out survives it, and one that holds Cargo's output pipe keeps `close` from ever coming, so the call would never
+ * settle. Every caller is synchronous, so the child stays unreaped until this returns and the kernel lists it as a
+ * member of its own group however dead it is: a group left listed cannot be told from one with a survivor, and is said
+ * on stderr as listed, not as running (`describeTeardown`). A kill that fails is said too. Neither is thrown: the
+ * callers are ending this process or failing a call, and the failure they carry, the other children still to be ended
+ * and the signal still to be given back all come before a diagnostic.
+ */
+function killCargoChild(child: ChildProcess, command: string): void {
+  if (process.platform === 'win32' || child.pid === undefined) {
+    child.kill('SIGKILL');
+    return;
+  }
+  try {
+    if (killProcessGroupNow(child.pid, TEARDOWN_PATIENCE)) tell(describeTeardown({ command, group: child.pid }));
+  } catch (error) {
+    tell(`${command} could not be ended: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
+ * Says `message` on stderr, now: the exit hook and the signal handler run where nothing is awaited. Where stderr is
+ * gone there is nobody to tell, and a diagnostic must neither replace the failure it accompanies nor stop the signal
+ * being given back.
+ */
+function tell(message: string): void {
+  try {
+    writeSync(2, `${message}\n`);
+  } catch {
+    // Nobody is left to tell.
   }
 }
 
 function killCargoChildren(): void {
-  for (const child of cargoChildren) killCargoChild(child);
+  for (const [child, command] of cargoChildren) killCargoChild(child, command);
 }
 
 type CargoSignal = 'SIGINT' | 'SIGTERM' | 'SIGHUP';
@@ -156,10 +190,14 @@ function removeCargoSignalHandlers(): void {
   forwardedSignals.clear();
 }
 
+/** Ends the children, then gives the signal back so that this process still ends by it, whatever the kill did. */
 function forwardCargoSignal(signal: CargoSignal): void {
-  killCargoChildren();
-  removeCargoSignalHandlers();
-  process.kill(process.pid, signal);
+  try {
+    killCargoChildren();
+  } finally {
+    removeCargoSignalHandlers();
+    process.kill(process.pid, signal);
+  }
 }
 
 function ownCargoChildren(): void {
@@ -203,7 +241,8 @@ function runCargo(args: readonly string[], cwd: string, boundMs: number = CARGO_
       if (cargoChildren.size === 0) disownCargoChildren();
       throw error;
     }
-    cargoChildren.add(child);
+    const command = `cargo ${args.join(' ')}`;
+    cargoChildren.set(child, command);
     let stdout = '';
     let stderr = '';
     let stdoutBytes = 0;
@@ -211,7 +250,7 @@ function runCargo(args: readonly string[], cwd: string, boundMs: number = CARGO_
     let failure: Error | undefined;
     const fail = (error: Error): void => {
       failure ??= error;
-      killCargoChild(child);
+      killCargoChild(child, command);
     };
     const timer = setTimeout(
       () =>
@@ -673,6 +712,9 @@ export class CargoResolveLockError extends Error {
   }
 }
 
+/** What the child that waits for the Cargo resolve lock is called when something is told of it. */
+const LOCK_WAITER = 'the Cargo resolve lock waiter';
+
 /**
  * The pinned Nx binding has only blocking acquisition. Isolate that syscall in
  * one child per cold flight so the caller's deadline can kill and reap it.
@@ -705,7 +747,7 @@ export function acquireCargoResolveLock(
     let stderr = '';
     const fail = (error: Error): void => {
       failure ??= error;
-      killCargoChild(child);
+      killCargoChild(child, LOCK_WAITER);
     };
     const timer = setTimeout(
       () => fail(new CargoResolveLockError(lockFile, boundMs, Math.ceil(performance.now() - started), child.pid)),
@@ -762,7 +804,7 @@ export function acquireCargoResolveLock(
     child.stdout.on('error', fail);
     child.stderr.on('error', fail);
     if (cargoChildren.size === 0) ownCargoChildren();
-    cargoChildren.add(child);
+    cargoChildren.set(child, LOCK_WAITER);
   });
 }
 
@@ -852,10 +894,10 @@ export async function hashCargoPathInputs(
       const fromCargo = relative(cargo.root, directory);
       if (
         fromRoot !== '..' &&
-        !fromRoot.startsWith('..' + sep) &&
+        !fromRoot.startsWith(`..${sep}`) &&
         !isAbsolute(fromRoot) &&
         fromCargo !== '..' &&
-        !fromCargo.startsWith('..' + sep) &&
+        !fromCargo.startsWith(`..${sep}`) &&
         !isAbsolute(fromCargo) &&
         !fromRoot.split(sep).includes('node_modules')
       )
@@ -875,7 +917,7 @@ export async function hashCargoPathInputs(
       for (const name of CARGO_ANCESTOR_INPUTS) {
         const file = join(ancestor, name);
         if (statSync(file, { throwIfNoEntry: false })?.isFile()) {
-          includeFile(await realpath(file), inputKey(pkg, 'ancestor', depth + '/' + name));
+          includeFile(await realpath(file), inputKey(pkg, 'ancestor', `${depth}/${name}`));
         }
       }
     }
@@ -892,7 +934,7 @@ export async function hashCargoPathInputs(
       if (skipped.has(entry.name)) continue;
       const path = join(canonical, entry.name);
       if (ignored(path)) continue;
-      const localPath = within === '' ? entry.name : within + '/' + entry.name;
+      const localPath = within === '' ? entry.name : `${within}/${entry.name}`;
       if (entry.isSymbolicLink())
         links.set(path, { key: inputKey(owner, 'link', localPath), target: await readlink(path) });
       const info = entry.isSymbolicLink() ? await lstat(await realpath(path)) : entry;
@@ -922,7 +964,7 @@ export async function hashCargoPathInputs(
     const scan: SourceScan = { directory, owner, sources: [...compiledSourceFiles(directory)], found: new Map() };
     for (const source of scan.sources) scans.set(source, scan);
     // Equal package identities can interleave, so their discovery shares one boundary.
-    const prefix = JSON.stringify([owner.name, owner.version]).slice(0, -1) + ',';
+    const prefix = `${JSON.stringify([owner.name, owner.version]).slice(0, -1)},`;
     const group = groups.get(prefix);
     if (group === undefined) groups.set(prefix, [scan]);
     else group.push(scan);
@@ -957,7 +999,7 @@ export async function hashCargoPathInputs(
     // All ordinary sources have a file identity before this package's include identities.
     // Earlier includes may already have consumed a later package's source; only its
     // discovered references survive that boundary, never the source buffer.
-    const boundary = prefix + '"include",';
+    const boundary = `${prefix}"include",`;
     while (next < scheduled.length && scheduled[next].key < boundary) await consume(scheduled[next++]);
     const included: FileInput[] = [];
     for (const scan of group) {
@@ -973,7 +1015,7 @@ export async function hashCargoPathInputs(
         if (ignored(input.file)) continue;
         const accepted = includeFile(
           await realpath(input.file),
-          inputKey(scan.owner, 'include', relative(scan.directory, input.source) + '\0' + input.literal),
+          inputKey(scan.owner, 'include', `${relative(scan.directory, input.source)}\0${input.literal}`),
         );
         if (accepted !== undefined) included.push(accepted);
       }

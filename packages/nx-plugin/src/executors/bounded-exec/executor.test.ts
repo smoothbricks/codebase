@@ -1,9 +1,11 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, jest } from 'bun:test';
 import { spawnSync } from 'node:child_process';
+import { closeSync } from 'node:fs';
 import { access, mkdir, mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { churnScript, openForProbe, writerRemains } from '../../__tests__/churn-group.js';
 import { FAKE_BUN_INVOKED, FAKE_BUN_RAN, fakeBun } from '../../__tests__/fake-bun.js';
 import {
   closeServer,
@@ -16,6 +18,7 @@ import {
 } from '../../__tests__/gateway-stand-in.js';
 import { onProgressClock } from '../../__tests__/progress-clock.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
+import { processGroupHasMembers } from '../../process-group.js';
 import { ownedSocketDirectory } from '../../testing.js';
 import { CPU_POOL_ENV, type CpuPool, createCpuPool, type InheritedCpuPool, readInheritedCpuPool } from './cpu-pool.js';
 import { CPU_TOKENS_ENV, type CpuBudget, gatewayCpuBudget, type TokenGrant } from './cpu-tokens.js';
@@ -647,11 +650,11 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
     const workspace = await createWorkspace();
     const ignoring = ignoresTerm(workspace.root);
-    const calls: string[] = [];
+    const calls: Array<{ pid: number; signal: NodeJS.Signals }> = [];
     const killer: ProcessTreeKiller = {
       async kill(pid, signal) {
         if (signal === 'SIGTERM') await ignoring.armed();
-        calls.push(signal);
+        calls.push({ pid, signal });
         process.kill(-pid, signal);
       },
     };
@@ -669,7 +672,49 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     );
 
     expect(result.success).toBe(false);
-    expect(calls).toEqual(['SIGTERM', 'SIGKILL']);
+    // The graceful signal comes first and once; every signal after it is a SIGKILL, at least one, and each names the
+    // one group.
+    expect(calls[0]?.signal).toBe('SIGTERM');
+    const forced = calls.slice(1);
+    expect(forced.length).toBeGreaterThanOrEqual(1);
+    expect(forced.every(({ signal }) => signal === 'SIGKILL')).toBe(true);
+    expect(new Set(calls.map(({ pid }) => pid)).size).toBe(1);
+  });
+
+  it('says a graceful signal that failed, and ends the command all the same', async () => {
+    if (process.platform === 'win32') {
+      return;
+    }
+
+    const workspace = await createWorkspace();
+    const real = createProcessTreeKiller();
+    let signalled: number | undefined;
+    const killer: ProcessTreeKiller = {
+      async kill(pid, signal) {
+        signalled = pid;
+        ownedProcessGroups.add(pid);
+        if (signal === 'SIGTERM') throw new Error('the signal was refused');
+        await real.kill(pid, signal);
+      },
+    };
+
+    // Nothing waits on the graceful pass, so the force-kill is what ends the command, and it is made although the pass
+    // before it failed.
+    const result = await runBoundedExec(
+      { command: 'exec sleep 600', timeoutMs: 1, killAfterMs: 0 },
+      workspace.context,
+      killer,
+      null,
+      null,
+    );
+
+    if (signalled === undefined) throw new Error('the killer was never asked to signal the command');
+    const group = signalled;
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain(`Terminating process group ${group} failed: the signal was refused`);
+    // The force-kill returns once the group is empty or has given up, so a group still listed is a survivor.
+    expect(processGroupHasMembers(group), result.terminalOutput).toBe(false);
+    ownedProcessGroups.delete(group);
   });
 
   it('returns after force-kill even when the process tree ignores SIGKILL', async () => {
@@ -849,6 +894,56 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       [...ownedProcessGroups],
       'leader exit and straggler FIFO EOF retire cleanup authority; afterEach must not signal their stale PGID',
     ).toEqual([]);
+  });
+
+  it('force-kills a group whose members fork as the force-kill goes out, leaving none behind', async () => {
+    if (process.platform === 'win32') {
+      return;
+    }
+
+    const workspace = await createWorkspace();
+    const lifetime = join(workspace.root, 'churn-lifetime.fifo');
+    const ready = join(workspace.root, 'churn-ready.fifo');
+    expect(spawnSync('mkfifo', [lifetime, ready]).status).toBe(0);
+    // macOS does not hold a fork back for a group signal in flight, so a member forked as SIGKILL goes out is not
+    // reached by it. The command exits on SIGTERM; its forkers and sleepers ignore it and keep forking, so the
+    // force-kill is made on a group that forks as fast as it can. Every member holds the write end of `lifetime`: its
+    // end of file is the death of the last one, and a force-kill that is not repeated leaves a member that only the
+    // backstop ends. The bound only starts the termination, and the killer holds its first signal until the group is up,
+    // so the force-kill is made while the forkers still fork.
+    await workspace.write('churn.sh', churnScript({ ignoreTerm: true }));
+    const reader = openForProbe(lifetime);
+    const gone = readToEnd(lifetime);
+    const termination = armedKiller('churn group', async (pid) => {
+      expect(await readToEnd(ready), `churn readiness must name the command's own pid=${pid}`).toBe(`${pid}\n`);
+    });
+
+    const result = await runBoundedExec(
+      { command: `exec sh churn.sh ${lifetime} ${ready}`, timeoutMs: 1, killAfterMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+      workspace.context,
+      termination.killer,
+      null,
+      null,
+    );
+
+    await termination.armed();
+    try {
+      // The force-kill returns once the group is empty or has given up, so no member is dying: a holder of the FIFO is
+      // a survivor.
+      expect(writerRemains(reader), result.terminalOutput).toBe(false);
+    } finally {
+      closeSync(reader);
+    }
+    expect(await gone, result.terminalOutput).toBe('');
+    termination.release();
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain('Force-killing what the timed-out command left in its process group');
+    // The graceful signal goes first and once; then only SIGKILL, at least one, and every one names the one group.
+    const [first, ...forced] = termination.delivered;
+    expect(first?.signal).toBe('SIGTERM');
+    expect(forced.length).toBeGreaterThanOrEqual(1);
+    expect(forced.every(({ signal }) => signal === 'SIGKILL')).toBe(true);
+    expect(new Set(termination.delivered.map(({ pid }) => pid)).size).toBe(1);
   });
 
   it('runs the command with its RAM lease as TMPDIR, names held dead leases, and ends the lease after it exits', async () => {
@@ -1940,10 +2035,12 @@ async function readToEnd(path: string): Promise<string> {
 function armedKiller(subject: string, ready: (pid: number) => Promise<void>) {
   const real = createProcessTreeKiller();
   const calls: NodeJS.Signals[] = [];
+  const delivered: Array<{ pid: number; signal: NodeJS.Signals }> = [];
   let armed: Promise<void> | undefined;
   let group: number | undefined;
   return {
     calls,
+    delivered,
     killer: {
       async kill(pid: number, signal: NodeJS.Signals) {
         group = pid;
@@ -1951,6 +2048,7 @@ function armedKiller(subject: string, ready: (pid: number) => Promise<void>) {
         armed ??= ready(pid);
         await armed;
         calls.push(signal);
+        delivered.push({ pid, signal });
         await real.kill(pid, signal);
       },
     } satisfies ProcessTreeKiller,

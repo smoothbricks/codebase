@@ -6,6 +6,7 @@
     "tsBuildInfoFile": "dist/tsconfig.lib.tsbuildinfo",
     "emitDeclarationOnly": false,
     "forceConsistentCasingInFileNames": true,
+    "lib": ["es2022", "es2024.sharedmemory"],
     "types": ["node"]
   },
   "include": ["src/**/*.ts", "src/**/*.cts"],

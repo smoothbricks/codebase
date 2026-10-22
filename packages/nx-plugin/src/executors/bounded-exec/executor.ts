@@ -5,6 +5,13 @@ import { delimiter, isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Duplex } from 'node:stream';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
+import {
+  DEADLINE_PATIENCE,
+  describeMembersLeft,
+  killProcessGroup,
+  processGroupHasMembers,
+  signalProcessGroup,
+} from '../../process-group.js';
 
 import {
   CPU_POOL_ENV,
@@ -327,6 +334,15 @@ export async function runBoundedExec(
     const text = chunk.toString();
     outputChunks.push(text);
     process.stderr.write(text);
+  };
+  // Told, never thrown, wherever the command is being ended: a diagnostic must neither replace the failure it
+  // accompanies nor skip the cleanup that follows (the signal handlers, the CPU grant, the RAM lease, the run's record).
+  const tell = (text: string): void => {
+    try {
+      appendStderr(text);
+    } catch {
+      // Nobody is left to tell.
+    }
   };
 
   // A leg that runs bun runs the Bun its workspace declares, or it does not run. This comes before the RAM lease and the
@@ -753,21 +769,28 @@ export async function runBoundedExec(
     appendStderr(text);
   });
 
-  const killChildTree = async (force: boolean): Promise<void> => {
+  // The graceful pass: SIGTERM to the whole group. A signal that fails is told, not thrown: every caller has more to do
+  // after it, `terminate` the force-kill and the signal handler its releases and the signal it gives back.
+  const killChildTree = async (): Promise<void> => {
     const pid = child.pid;
     if (!pid) {
       return;
     }
-    await killer.kill(pid, force ? 'SIGKILL' : 'SIGTERM');
+    try {
+      await killer.kill(pid, 'SIGTERM');
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      tell(`Terminating process group ${pid} failed: ${reason}\n`);
+    }
   };
 
   const onProcessExit = (): void => {
-    void killChildTree(false);
+    void killChildTree();
   };
   const onTerminationSignal = (signal: NodeJS.Signals): void => {
     removeSignalHandlers();
     cancelCapture();
-    void killChildTree(false)
+    void killChildTree()
       .finally(releaseCpu)
       .finally(() => releaseLease(true))
       .finally(() => process.kill(process.pid, signal));
@@ -856,24 +879,49 @@ export async function runBoundedExec(
     termination = terminate();
   };
 
+  // Whether the group still lists members. A probe that fails proves nothing about the group, so it is told, and the
+  // group is taken as listed: a force-kill that was not needed costs nothing, and one that was is not skipped.
+  const groupListed = (pid: number): boolean => {
+    try {
+      return processGroupHasMembers(pid);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      tell(`Probing process group ${pid} for members failed: ${reason}; taking it as still listing members\n`);
+      return true;
+    }
+  };
+
   // A timed-out run ends with its whole process group, not with its leader.
   // The graceful signal reaches every member that exists when it is sent, but
   // a member that ignores SIGTERM, or one forked while the signal goes out
   // (macOS does not hold a fork back for a group signal in flight), outlives
   // a leader that exits on it. The grace ends when the leader exits or
   // killAfterMs passes, whichever comes first; whatever is left then is killed.
+  // SIGKILL is no different: a member forked while it goes out survives it too,
+  // so the force-kill is repeated while the group lists members. What the repeats
+  // cannot end is said, and a failure of the probe or of a signal is shown.
+  const forceKill = async (pid: number): Promise<void> => {
+    try {
+      if (await killProcessGroup(pid, DEADLINE_PATIENCE, (group) => killer.kill(group, 'SIGKILL'))) {
+        tell(`${describeMembersLeft(pid)}\n`);
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      tell(`Force-kill of process group ${pid} failed: ${reason}\n`);
+    }
+  };
   const terminate = async (): Promise<void> => {
-    await ignoreKillError(killChildTree(false));
+    await killChildTree();
     if (!state.settled && killAfterMs > 0) {
       await settledWithin(exitPromise, killAfterMs);
     }
     if (state.settled) {
-      if (child.pid !== undefined && processGroupHasMembers(child.pid)) {
+      if (child.pid !== undefined && groupListed(child.pid)) {
         state.forceKillNeeded = true;
         appendStderr(
           `Force-killing what the ${state.expiry === null ? 'command' : 'timed-out command'} left in its process group: ${command}\n`,
         );
-        await ignoreKillError(killChildTree(true));
+        await forceKill(child.pid);
       }
       return;
     }
@@ -881,8 +929,12 @@ export async function runBoundedExec(
     appendStderr(
       `Force-killing ${state.expiry === null ? 'command' : 'timed out command'} after killAfterMs=${killAfterMs}: ${command}\n`,
     );
-    await ignoreKillError(killChildTree(true));
-    await settledWithin(exitPromise, REAP_AFTER_FORCE_KILL_MS);
+    if (child.pid !== undefined) await forceKill(child.pid);
+    // The repeats wait for the group to empty, the leader with it. Windows has no process groups, so there they have
+    // nothing to wait on once the one signal is sent, and the leader's exit is awaited as it always was.
+    if (process.platform === 'win32' || child.pid === undefined) {
+      await settledWithin(exitPromise, REAP_AFTER_FORCE_KILL_MS);
+    }
     if (!state.settled) {
       resolveExit({ code: 1, signal: 'SIGKILL' });
     }
@@ -956,43 +1008,10 @@ export async function runBoundedExec(
 
 export function createProcessTreeKiller(): ProcessTreeKiller {
   return {
-    kill(pid, signal) {
-      return killProcessGroup(pid, signal);
+    async kill(pid, signal) {
+      signalProcessGroup(pid, signal);
     },
   };
-}
-
-function killProcessGroup(pid: number, signal: NodeJS.Signals): Promise<void> {
-  try {
-    // On POSIX the executor spawns with detached: true, so the child leads a
-    // process group of its own and -pid signals all of it at once, including
-    // grandchildren that tree-walk libraries miss when parents die and
-    // children get reparented to init. Only the group is named: the leader may
-    // already be reaped, and its pid reused by an unrelated process, while the
-    // group lives on in its other members. Windows has no process groups.
-    process.kill(process.platform === 'win32' ? pid : -pid, signal);
-  } catch {
-    // ESRCH: the group (or the Windows process) has already exited.
-  }
-  return Promise.resolve();
-}
-
-/**
- * Whether any process is left in the group `pgid` leads. A group outlives its
- * reaped leader for as long as one member does, and no process can take its id
- * meanwhile. Windows has no process groups, so there is nothing left to name.
- */
-function processGroupHasMembers(pgid: number): boolean {
-  if (process.platform === 'win32') {
-    return false;
-  }
-  try {
-    process.kill(-pgid, 0);
-    return true;
-  } catch (error) {
-    // EPERM: a member exists but runs as another user.
-    return error instanceof Error && 'code' in error && error.code === 'EPERM';
-  }
 }
 
 function resolveCwd(cwd: string | undefined, root: string): string {
@@ -1050,14 +1069,6 @@ function signalToExitCode(signal: NodeJS.Signals | null): number {
     return 1;
   }
   return EXIT_CODE_BY_SIGNAL[signal] ?? 1;
-}
-
-async function ignoreKillError(promise: Promise<void>): Promise<void> {
-  try {
-    await promise;
-  } catch {
-    // The process tree may have already exited between timeout and kill.
-  }
 }
 
 /** Resolves when `promise` settles or `ms` passes, whichever is first, leaving no timer behind. */

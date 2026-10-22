@@ -4,6 +4,7 @@ import { once } from 'node:events';
 import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { churnFailures, startChurn } from '../../__tests__/churn-group.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { processTable } from '../../testing.js';
 import {
@@ -314,6 +315,21 @@ describe('pre-expiry hang diagnostics', () => {
     } finally {
       probe.stdout.destroy();
       probe.stderr.destroy();
+    }
+  });
+
+  it('ends a probe whose members fork as it is stopped, leaving none behind', async () => {
+    // macOS does not hold a fork back for a group signal in flight, so a member forked as SIGKILL goes out is not
+    // reached by it. The probe is a group that forks as fast as it can; the end of file of the FIFO every member holds
+    // is the death of the last one, and a stop that is not repeated leaves a case that only the backstop ends. The
+    // probe is unreaped while the stop waits, so it says the group is still listed: that is not the proof.
+    const directory = await mkdtemp(join(tmpdir(), 'hang-probe-churn-'));
+    try {
+      const churn = await startChurn(directory);
+      stopProbe('sh', churn.group);
+      expect({ gone: await churn.gone, stderr: churnFailures(churn.stderr()) }).toEqual({ gone: '', stderr: [] });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
     }
   });
 

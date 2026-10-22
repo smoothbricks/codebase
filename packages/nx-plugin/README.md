@@ -1405,6 +1405,20 @@ What it wires:
 force-kill grace period. Test targets use this executor so hung test processes fail predictably instead of blocking Nx
 indefinitely.
 
+A run that ends at its bound ends with its whole process group, not its leader: SIGTERM, then SIGKILL after the grace. A
+group signal reaches only the members that exist when it goes out, and macOS does not hold a fork back while it does, so
+each force-kill is repeated while the kernel still lists members of the group. One module, `src/process-group.ts`,
+decides that (`judgeReap`) and does it for this executor, the RAM temp volume's deadline, the hang-diagnostics probes
+and the Cargo children of `cargo-source-hash`: every 5 ms for up to two seconds at a bound, and every millisecond for up
+to thirty where a process is ending and can wait for nothing. What a kill that waits on the event loop cannot end is
+named with its process group on stderr, or in the capture or error that reports the bound, and never called killed. A
+kill that blocks (the Cargo children's, the probe stop's) cannot reap the group's leader, which the kernel lists as a
+member until it is reaped, so what it leaves is told as listed and unconfirmed, not as running. A signal or probe that
+fails is told too, and never thrown past the cleanup that follows it. A process that left the group is beyond a group
+kill, and one that exited and has not been reaped yet is listed like a live one. The managed script
+`tooling/direnv/cargo-fetch-run.ts` makes the same decision with its own copy, since it runs before anything is
+installed.
+
 A test target is bounded by progress alone: `idleTimeoutMs`, 180 s (`BOUNDED_TEST_IDLE_TIMEOUT_MS`, the hang backstop of
 `specs/cowshed/08_testing.md`), with no `timeoutMs`. The bound re-arms whenever the runner reports a finished test: a
 nextest status line carrying its run counter (`PASS [   0.438s] (1/4) …`), a libtest `test … ... ok` line, or a bun

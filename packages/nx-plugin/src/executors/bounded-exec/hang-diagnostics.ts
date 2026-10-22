@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { describeTeardown, killProcessGroupNow, TEARDOWN_PATIENCE } from '../../process-group.js';
 import { type ProcessEntry, withDescendants } from '../../testing.js';
 import {
   describeHolders,
@@ -273,14 +274,20 @@ export function captureHangDiagnostics(
 }
 
 /**
- * Ends a probe at its limit without waiting for it. An ordinary probe runs as this user, so SIGKILL to its process group
- * ends it and anything it started. `sudo` keeps this user's real uid but runs its command as root, which no signal from
- * this user reaches: a group SIGKILL would end sudo alone and orphan the command. Signalled itself, sudo relays SIGTERM
- * to its command and exits only after it. While sudo starts it holds root's real uid, and this throws EPERM.
+ * Ends a probe at its limit without waiting for it, and says whether its group still lists members. An ordinary probe
+ * runs as this user, so SIGKILL to its process group ends it and anything it started, and the kill is repeated while
+ * the group lists members, since one forked as the signal goes out survives it. `sudo` keeps this user's real uid but
+ * runs its command as root, which no signal from this user reaches: a group SIGKILL would end sudo alone and orphan
+ * the command. Signalled itself, sudo relays SIGTERM to its command and exits only after it. While sudo starts it
+ * holds root's real uid, and this throws EPERM. A probe is its caller's child and stays unreaped while the caller
+ * waits here, and the kernel lists it as a member of its own group until then, so a group left listed is expected.
  */
-export function stopProbe(file: string, pid: number): void {
-  if (file === 'sudo') process.kill(pid, 'SIGTERM');
-  else process.kill(-pid, 'SIGKILL');
+export function stopProbe(file: string, pid: number): boolean {
+  if (file === 'sudo') {
+    process.kill(pid, 'SIGTERM');
+    return false;
+  }
+  return killProcessGroupNow(pid, TEARDOWN_PATIENCE);
 }
 
 /** A probe owns its group and output pipes; its deadline never waits for an unresponsive child to reap. */
@@ -316,7 +323,9 @@ function runProbe(
       let killFailure = '';
       if (child.pid !== undefined) {
         try {
-          stopProbe(file, child.pid);
+          if (stopProbe(file, child.pid)) {
+            killFailure = `; probe group cleanup: ${describeTeardown({ command: file, group: child.pid })}`;
+          }
         } catch (error) {
           killFailure = `; probe ${file === 'sudo' ? 'stop through sudo' : 'group cleanup'}: ${error instanceof Error ? error.message : String(error)}`;
         }
