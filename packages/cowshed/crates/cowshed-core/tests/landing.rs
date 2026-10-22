@@ -16,9 +16,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cowshed_core::api::{
-    BranchLandings, LandingCommits, UnlandedChange, UnlandedPaths, WorkspaceLanding,
+    BranchLandings, LandingCommits, UnlandedChange, UnlandedPaths, WorkspaceIncarnation,
+    WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspaceRole, WorkspaceState,
 };
-use cowshed_core::landing::{measure, resolve_target, unmatched_commits};
+use cowshed_core::landing::{annotate_listing, measure, resolve_target, unmatched_commits};
+use cowshed_core::repository::RepoId;
 use cowshed_os::fork_lock::Run as _;
 
 #[path = "support/temp_parent.rs"]
@@ -1095,4 +1097,57 @@ async fn other_local_branches_are_measured_and_only_unpreserved_work_is_named() 
         !landing.fully_landed(),
         "a landed head beside an unlanded branch is not a landed workspace"
     );
+}
+
+/// A listing measures with the controller Git of the store it is given, a fixture's own here,
+/// and on macOS that Git writes its Seatbelt profile into that store (04_sandbox.md, "Exec
+/// pipeline" step 4). Publish run 39822015838's hosted macOS runner has no host store: a listing that ran its Git
+/// for the host's withheld every attached session as unreadable, "cannot write controller git's
+/// sandbox profile into /private/cowshed/store/run/profiles".
+#[tokio::test]
+async fn a_listing_measures_with_the_controller_git_of_the_store_it_is_given() {
+    let fixture = Fixture::new("listing-store");
+    let quiet = fixture.clone_workspace("quiet");
+    let row = |name: &str, role: WorkspaceRole, mount: PathBuf| WorkspaceInfo {
+        repo_id: RepoId::parse("fixture/listing").expect("fixture repo id"),
+        workspace: WorkspaceName::new(name).expect("fixture workspace name"),
+        workspace_incarnation: WorkspaceIncarnation::new("0123456789abcdef0123456789abcdef")
+            .expect("fixture incarnation"),
+        role,
+        mount,
+        state: WorkspaceState::Attached,
+        branch: None,
+        base_commit: None,
+        created_at: None,
+        checkpoints: Vec::new(),
+        snapshot_stale: false,
+        landing: None,
+    };
+    let mut rows = vec![
+        row("main", WorkspaceRole::Main, fixture.parent()),
+        row("quiet", WorkspaceRole::Workspace, quiet),
+    ];
+
+    annotate_listing(fixture.store(), &mut rows).await;
+
+    assert!(
+        rows[0].landing.is_none(),
+        "main is the target, never measured"
+    );
+    let landing = rows[1].landing.as_ref().expect("the session was measured");
+    assert_eq!(counts(landing), (0, 0, 0));
+    // Only macOS runs controller Git under a Seatbelt profile file; elsewhere Git runs unsandboxed
+    // and writes none.
+    #[cfg(target_os = "macos")]
+    {
+        let profiles = fs::read_dir(cowshed_core::exec::profile_directory(fixture.store()))
+            .expect("the given store holds the controller Git's profile directory")
+            .map(|entry| entry.expect("profile entry").path())
+            .filter(|path| path.extension() == Some(OsStr::new("sb")))
+            .count();
+        assert!(
+            profiles > 0,
+            "the listing's controller Git wrote its profile into the given store"
+        );
+    }
 }

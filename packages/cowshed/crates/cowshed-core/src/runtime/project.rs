@@ -1835,9 +1835,12 @@ impl ProjectActor {
             unproven,
         } = self.host.snapshots().await?;
         let mut views: Vec<WorkspaceView> = workspaces.into_iter().map(workspace_view).collect();
+        // The store this controller serves, a fixture's own in a test: never the host's.
+        let store_root =
+            std::sync::Arc::clone(self.host.descriptor().storage.roots().shared_store());
         Ok(Box::pin(async move {
             if let Some(selection) = params.landing {
-                crate::landing::annotate_listing(&mut views).await;
+                crate::landing::annotate_listing(&store_root, &mut views).await;
                 if selection == ListLanding::Landed {
                     crate::landing::retain_fully_landed(&mut views);
                 }

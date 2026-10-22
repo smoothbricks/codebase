@@ -715,8 +715,11 @@ pub(crate) async fn list_projects(landing: Option<ListLanding>) -> Result<Vec<Pr
     let mut projects = list_all_adopted_projects().await?;
     sort_project_listing(&mut projects);
     if let Some(landing) = landing {
+        // These are the host's projects, so their Git runs for the host store.
+        let roots = cowshed_core::storage::bootstrap::CanonicalRoots::global();
+        let host_store = roots.shared_store();
         for project in &mut projects {
-            cowshed_core::landing::annotate_listing(&mut project.workspaces).await;
+            cowshed_core::landing::annotate_listing(host_store, &mut project.workspaces).await;
             if landing == ListLanding::Landed {
                 cowshed_core::landing::retain_fully_landed(&mut project.workspaces);
             }

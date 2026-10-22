@@ -493,7 +493,14 @@ const LISTING_TARGET_BRANCH: &str = crate::runtime::project::DEFAULT_LANDING_BRA
 /// One task per workspace, because the measurement is process-bound rather than CPU-bound and the
 /// serial version costs the sum of every workspace's history walk — which on a project whose main
 /// has been rewritten is the slowest thing a listing could be asked to do.
-pub async fn annotate_listing<T: AsMut<WorkspaceInfo>>(rows: &mut [T]) {
+///
+/// Its Git runs for `store_root`, the store the measuring process serves: the controller's own
+/// (a test fixture's in a test), or the host's for `ls --all`. Controller Git writes its sandbox
+/// profile there and nowhere else (04_sandbox.md, "Exec pipeline" step 4).
+pub async fn annotate_listing<T: AsMut<WorkspaceInfo>>(
+    store_root: &std::sync::Arc<Path>,
+    rows: &mut [T],
+) {
     let Some(main) = rows
         .iter_mut()
         .map(AsMut::as_mut)
@@ -508,11 +515,8 @@ pub async fn annotate_listing<T: AsMut<WorkspaceInfo>>(rows: &mut [T]) {
         }
         return;
     };
-    // A listing reads the host's projects, so its Git runs for the host store.
-    let host_store =
-        std::sync::Arc::clone(crate::storage::bootstrap::CanonicalRoots::global().shared_store());
     let target =
-        std::sync::Arc::new(resolve_target(&host_store, &main, LISTING_TARGET_BRANCH).await);
+        std::sync::Arc::new(resolve_target(store_root, &main, LISTING_TARGET_BRANCH).await);
     let mut tasks = tokio::task::JoinSet::new();
     for (index, row) in rows.iter_mut().enumerate() {
         let workspace = row.as_mut();
@@ -526,13 +530,13 @@ pub async fn annotate_listing<T: AsMut<WorkspaceInfo>>(rows: &mut [T]) {
             continue;
         }
         let target = std::sync::Arc::clone(&target);
-        let host_store = std::sync::Arc::clone(&host_store);
+        let store_root = std::sync::Arc::clone(store_root);
         let mount = workspace.mount.clone();
         let name = workspace.workspace.as_str().to_owned();
         tasks.spawn(async move {
             (
                 index,
-                measure(&host_store, &target, &mount, &name, "HEAD").await,
+                measure(&store_root, &target, &mount, &name, "HEAD").await,
             )
         });
     }
