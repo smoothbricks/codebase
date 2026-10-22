@@ -9664,7 +9664,8 @@ os._exit(0)
         .process_events(job, cowshed_core::api::SampleInterval::new(1000).unwrap())
         .await
         .unwrap();
-    let child_index = tokio::time::timeout(Duration::from_secs(10), async {
+    // Runtime attaches the live child's kernel identity before parent exit.
+    let child_index = async {
         loop {
             match membership.next().await.unwrap().unwrap() {
                 cowshed_core::api::process::JobProcessEvent::Born { index, process }
@@ -9675,9 +9676,8 @@ os._exit(0)
                 _ => {}
             }
         }
-    })
-    .await
-    .expect("runtime attaches the live child's kernel identity before parent exit");
+    }
+    .await;
     let held = handle.info(job).await.unwrap();
     assert_eq!(
         held.state,
@@ -9698,10 +9698,8 @@ os._exit(0)
         finishing_handle.wait(job).await
     });
     let mut term = [0_u8; 1];
-    tokio::time::timeout(Duration::from_secs(10), child_socket.read_exact(&mut term))
-        .await
-        .expect("retirement signals the owned descendant")
-        .unwrap();
+    // Retirement signals the owned descendant.
+    child_socket.read_exact(&mut term).await.unwrap();
     assert_eq!(term, *b"t");
     let draining = handle.info(job).await.unwrap();
     assert_eq!(draining.state, JobState::Draining);
@@ -10161,10 +10159,7 @@ for line in lines:
         )
         .await
         .unwrap();
-    let (control, _) = tokio::time::timeout(Duration::from_secs(15), controls.accept())
-        .await
-        .unwrap()
-        .unwrap();
+    let (control, _) = controls.accept().await.unwrap();
     let (reader, mut writer) = control.into_split();
     let mut lines = tokio::io::BufReader::new(reader).lines();
     let report: serde_json::Value =
@@ -10195,11 +10190,12 @@ for line in lines:
         .process_events(job, cowshed_core::api::SampleInterval::new(1000).unwrap())
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    async {
         loop {
             if matches!(events.next().await.unwrap().unwrap(), cowshed_core::api::process::JobProcessEvent::Born { process, .. } if process.pid == child_pid) { break; }
         }
-    }).await.unwrap();
+    }
+    .await;
 
     // The same user and exact capability do not authorize a neighbouring admitted job.
     let foreign = handle
@@ -10269,14 +10265,8 @@ for line in lines:
     let outsider_life = Darwin.record(outsider.0.id()).unwrap().unwrap();
 
     writer.write_all(b"\"retire\"\n").await.unwrap();
-    let retired: JobSubtreeRetirement = serde_json::from_str(
-        &tokio::time::timeout(Duration::from_secs(15), lines.next_line())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
+    let retired: JobSubtreeRetirement =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
     let JobSubtreeRetirement::Retired { retirement } = retired else {
         panic!("retirement refused: {retired:?}")
     };

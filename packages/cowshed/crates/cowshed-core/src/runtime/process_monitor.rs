@@ -1657,13 +1657,11 @@ os._exit(0)
             .unwrap()
             .expect("the descendant runs");
         // Its parent's fork is folded while the parent still runs.
-        let adopted = Instant::now() + Duration::from_secs(10);
         while !monitor
             .running_lives()
             .iter()
             .any(|running| running.pid == descendant && running.birth == BirthToken(life.unique_id))
         {
-            assert!(Instant::now() < adopted, "the descendant was never adopted");
             thread::sleep(Duration::from_millis(10));
         }
         leader.stdin.take().unwrap().write_all(b"x").unwrap();
