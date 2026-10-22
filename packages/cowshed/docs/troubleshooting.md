@@ -483,15 +483,16 @@ in the kernel, with no such helper. A DiskImages2 attach that still runs through
 of a retained ASIF input, or `cowshed disk-command diskutil -- image attach …`) is refused before it starts once its
 boot has met 150, until `cowshed doctor --clear-attach-budget` or a reboot, since a failed attach leaks one more device.
 
-The other cause is helpers that outlived their image. Every attached image has its own `diskimagesiod`, which maps 72
-MiB into the kernel; detach does not always end it, and a helper that outlived its image keeps its mapping.
-`cowshed doctor` reports them as `orphaned-disk-image-helpers`: the count, the pids (running helpers that two reads in a
-row find no attached `AppleDiskImageDevice`'s user client naming as its creator, with no `diskutil` or `hdiutil` running
-during either), the mapping they hold, and the root command that frees it, `sudo kill -9 <pids>`. `launchctl kill`
-refuses them, and no reboot is needed for them. While a disk-image tool runs, a helper may still be attaching, so no pid
-is named until a later `cowshed doctor`. Killing orphans frees their mappings; killing a stalled helper frees the
-devices it retains. Once they are gone, `cowshed doctor --clear-attach-budget` ends the recorded exhaustion. cowshed
-never signals a helper itself.
+The other cause is helpers that outlived their image. Every DiskImages2 attachment (`diskutil image attach`, not
+cowshed's in-kernel attach) has its own `diskimagesiod`, which maps 72 MiB into the kernel; detach does not always end
+it, and a helper that outlived its image keeps its mapping. `cowshed doctor` reports them as
+`orphaned-disk-image-helpers`: the count, the pids (running helpers that two reads in a row find no attached
+`AppleDiskImageDevice`'s user client naming as its creator, with no `diskutil` or `hdiutil` running during either), the
+mapping they hold, and the root command that frees it, `sudo kill -9 <pids>`. `launchctl kill` refuses them, and no
+reboot is needed for them. While a disk-image tool runs, a helper may still be attaching, so no pid is named until a
+later `cowshed doctor`. Killing orphans frees their mappings; killing a stalled helper frees the devices it retains.
+Once they are gone, `cowshed doctor --clear-attach-budget` ends the recorded exhaustion. cowshed never signals a helper
+itself.
 
 ## An attach is refused with `MediaCapReached`, or names IOKit's media match-notification queue
 

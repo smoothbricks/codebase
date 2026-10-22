@@ -731,9 +731,10 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    6.3 cycles/s moved a probe attach's median from 1.15 s to 12.2 s, and four loops starved every probe past 60 s; eight
    attach loops beside two mount loops made 8 attaches in 42 s, each taking 41.7 s.
 2. **AppleDiskImages2 runs out, of kernel mappings held by orphaned `diskimagesiod` helpers or of leaked devices.**
-   Every attached image has its own `diskimagesiod` (launchd job `system/com.apple.diskimagesiod.<UUID>`), which maps
-   its IO request pool into the kernel: 36 shared buffers of 2 MiB each (queue depth 36, 2 MiB max IO), 72 MiB per
-   helper, so 100 attached images hold about 7 GiB mapped. When the kernel cannot map a new pool the kernel log reads
+   Every DiskImages2 attachment (not an in-kernel one, "Mounts") has its own `diskimagesiod` (launchd job
+   `system/com.apple.diskimagesiod.<UUID>`), which maps its IO request pool into the kernel: 36 shared buffers of 2 MiB
+   each (queue depth 36, 2 MiB max IO), 72 MiB per helper, so 100 attached images hold about 7 GiB mapped. When the
+   kernel cannot map a new pool the kernel log reads
    `DISharedBuffer::init: Can't map buffer at user address … size 2097152 to kernel` and
    `DIDeviceRequestPool::AllocateRequests: Can't allocate all buffers, allocated 0/36`, and the attach fails with "error
    code 150" ("Failed to initialize IO manager: Driver returned error code -536870210", `kIOReturnNoResources`). So does
