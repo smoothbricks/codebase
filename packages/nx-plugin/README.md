@@ -1528,9 +1528,9 @@ and it runs on from there when the last wait closes. stderr says `bounded-exec: 
 and an expiry names the queued time it did not count (`specs/cowshed/05_gateway.md`, "A queued descendant is not idle").
 `timeoutMs` is never stopped.
 
-The final-five-second pre-signal snapshot attributes the runner's process tree and observed resources, with explicit
-incomplete/raced results and no delay to termination. Its timing, visibility and evidence contract is defined in
-`specs/cowshed/08_testing.md`, "Integration tests (real substrate)".
+The final-five-second pre-signal snapshot attributes the runner's process tree, its leader and leaf call stacks and
+observed resources, with explicit incomplete/raced results and no delay to termination. Its timing, visibility and
+evidence contract is defined in `specs/cowshed/08_testing.md`, "Integration tests (real substrate)".
 
 The snapshot-reset regression orders capture, test completion, and expiry through IPC, not heartbeat cadence. It
 deliberately holds the first capture's progress publication while another heartbeat arrives; only the observed PASS

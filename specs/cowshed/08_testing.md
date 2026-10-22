@@ -655,9 +655,19 @@ progress discards and cancels that interval's snapshot. At expiry the executor e
 explicit incomplete-capture result, and starts termination immediately without awaiting a probe. Diagnostic capture does
 not extend the configured no-progress deadline. Capture timestamps, the offset from the scheduled expiry and the actual
 expiry-to-capture interval accompany the observation. Process rows retain PID, PPID, PGID, state, percent CPU, elapsed
-time, start identity and command. On macOS the open-resource probe invokes `/usr/sbin/lsof` through noninteractive sudo,
-with an explicitly limited ordinary-user fallback. A missing tool, denied privilege, timeout, truncated output, other
-probe stderr or changing process identity is incomplete evidence, never an empty holder set. lsof's mount-table fallback
+time, start identity and command. On macOS the snapshot also holds call stacks: the runner and up to four leaf processes
+of its tree (members with no live child; further leaves are named, not sampled) are each sampled for one second by
+`sudo -n sample <pid> 1 -mayDie -file /dev/stdout`, all at once and beside the open-resource probe, inside the same
+five-second window. Each sample is limited to three seconds (its second of sampling and the symbolication after it) and
+leaves the closing process census its one second; the report is kept through its call graph, without its binary-image
+list, and is written to the probe's pipe alone, never to a file in `/tmp`. A stack names the call a process waits in
+(`read`, `open`, a condition wait), which the open-resource probe cannot. A sample that sudo refuses, that fails or that
+reaches its limit is named, with its stderr, as no stack for that process: it never delays termination and does not
+change the holder outcome, which stacks do not establish. Other platforms record that no stack is sampled. The case this
+answers: GateTriageH1's deadlock was located only from `sample` stacks taken by hand while the run hung. On macOS the
+open-resource probe invokes `/usr/sbin/lsof` through noninteractive sudo, with an explicitly limited ordinary-user
+fallback. A missing tool, denied privilege, timeout, truncated output, other probe stderr or changing process identity
+is incomplete evidence, never an empty holder set. lsof's mount-table fallback
 (`can't stat() <type> file system <mount>` ... `assuming "dev=<hex>" from mount table`) is the one stderr kept without
 that verdict: it names a mount lsof could not stat(), such as one detaching under a concurrent shed, and omits no
 descriptor of the selected processes. Successful observations with resources, successful observations without matches
@@ -693,6 +703,12 @@ The real process-snapshot witness keeps its child, grandchild and opened file al
 is a tagged, newline-terminated string, not a console-inspected number that inherited color settings can decorate. The
 reader assembles a complete line across chunks within an abortable readiness bound; EOF and expiry report the text
 observed rather than treating a partial buffer as a PID.
+
+The stack-sample witness runs, under bounded-exec, a command that ignores SIGTERM and opens a FIFO the test owns and
+never opens for writing, so it waits in open(2). The clock is moved to the capture once the command says it is opening,
+and to the expiry only after the real snapshot has returned; the bound then force-kills the command and its group
+empties. On macOS the snapshot carries the command's sampled stack down to `__open`; elsewhere it records that no stack
+is sampled.
 
 Re-executed libtest fixture roles that report a line protocol use `--nocapture --quiet`. With an inherited
 `RUST_TEST_THREADS=1`, ordinary libtest output prefixes the first report with its unfinished test-name line; a reader

@@ -33,19 +33,44 @@ const request = (): HangCaptureRequest => ({
   deadlineMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
 });
 
-function scriptedHost(results: readonly HangProbeResult[]) {
+/** A `sample` report as the tool prints it: header, call graph, then the binary-image list a snapshot omits. */
+const SAMPLE_REPORT = [
+  'Analysis of sampling runner (pid 101) every 1 millisecond',
+  'Call graph:',
+  '    1000 Thread_1   DispatchQueue_1: com.apple.main-thread  (serial)',
+  '      1000 read  (in libsystem_kernel.dylib) + 8  [0x18dd5a1c8]',
+  '',
+  'Binary Images:',
+  '       0x100000000 -        0x100001000 +runner <00000000-0000-0000-0000-000000000000> /fixture/runner',
+  '',
+].join('\n');
+
+/**
+ * Answers the census probes in order from `results`, and every `sudo -n sample` stack probe, which runs beside them,
+ * from `sample`.
+ */
+function scriptedHost(
+  results: readonly HangProbeResult[],
+  sample: (pid: number) => HangProbeResult | Promise<HangProbeResult> = () => exited(SAMPLE_REPORT),
+) {
   const calls: { file: string; args: readonly string[]; timeoutMs: number }[] = [];
+  const samples: { pid: number; args: readonly string[]; timeoutMs: number }[] = [];
   let index = 0;
   const host: HangDiagnosticHost = {
     platform: 'darwin',
     async probe(file, args, timeoutMs) {
+      if (file === 'sudo' && args[1] === 'sample') {
+        const pid = Number(args[2]);
+        samples.push({ pid, args, timeoutMs });
+        return sample(pid);
+      }
       calls.push({ file, args, timeoutMs });
       const result = results[index++];
       if (result === undefined) throw new Error(`unexpected probe ${file}`);
       return result;
     },
   };
-  return { host, calls };
+  return { host, calls, samples };
 }
 
 /** The first complete line a process prints. A stream that ends first fails, naming what it did print. */
@@ -285,11 +310,68 @@ describe('pre-expiry hang diagnostics', () => {
   });
 
   it('keeps process-only visibility explicit on platforms without the Darwin open-file probe', async () => {
-    const { host, calls } = scriptedHost([exited(rootRow), exited(rootRow)]);
+    const { host, calls, samples } = scriptedHost([exited(rootRow), exited(rootRow)]);
     const capture = await captureHangDiagnostics(request(), { ...host, platform: 'linux' });
     expect(capture.outcome).toBe('holders');
     expect(capture.text).toContain('observations below name processes only');
+    expect(capture.text).toContain('Stack samples not provided on linux');
+    expect(samples).toEqual([]);
     expect(calls.map((call) => call.file)).toEqual(['ps', 'ps']);
+  });
+
+  it('samples the runner and its leaf processes beside the open-file census, and closes the census after them', async () => {
+    const answers: ((result: HangProbeResult) => void)[] = [];
+    let allStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      allStarted = resolve;
+    });
+    const { host, calls, samples } = scriptedHost(
+      [exited(census), exited(fileObservation), exited('', 1), exited(census)],
+      () =>
+        new Promise<HangProbeResult>((resolve) => {
+          answers.push(resolve);
+          if (answers.length === 3) allStarted();
+        }),
+    );
+    const capturing = captureHangDiagnostics(request(), host);
+    // Every stack sample has started while none has answered, beside the open-file census; the closing census waits.
+    await started;
+    expect(samples.map((sample) => sample.pid)).toEqual([ROOT, 303, 404]);
+    expect(calls[1]?.args).toEqual(['-n', 'lsof', '-nP', '-p', '101,202,303,404']);
+    expect(calls.filter((call) => call.file === 'ps')).toHaveLength(1);
+    for (const answer of answers) answer(exited(SAMPLE_REPORT));
+    const capture = await capturing;
+    expect(capture.outcome, capture.text).toBe('holders');
+    expect(calls.map((call) => call.file)).toEqual(['ps', 'sudo', 'sudo', 'ps']);
+    expect(samples[1]?.args).toEqual(['-n', 'sample', '303', '1', '-mayDie', '-file', '/dev/stdout']);
+    for (const sample of samples) expect(sample.timeoutMs).toBeLessThanOrEqual(3_000);
+    expect(capture.text).toContain('stack sample pid 303 (1s; binary image list omitted):');
+    expect(capture.text).toContain('1000 read  (in libsystem_kernel.dylib) + 8');
+    expect(capture.text).not.toContain('Binary Images:');
+    expect(capture.text).not.toContain('/fixture/runner');
+  });
+
+  it('bounds stack samples to the runner and four live leaf processes, and names the leaves it left out', async () => {
+    const workers = [601, 602, 603, 604, 605, 606].map(
+      (pid) => `${pid} ${ROOT} ${ROOT} S 0.0 03:00 ${STARTED} worker ${pid}`,
+    );
+    const zombie = `607 ${ROOT} ${ROOT} Z 0.0 03:00 ${STARTED} (worker)`;
+    const rows = [rootRow, ...workers, zombie].join('\n');
+    const { host, samples } = scriptedHost([exited(rows), exited('', 1), exited(rows)]);
+    const capture = await captureHangDiagnostics(request(), host);
+    expect(capture.outcome, capture.text).toBe('none');
+    expect(samples.map((sample) => sample.pid)).toEqual([ROOT, 601, 602, 603, 604]);
+    expect(capture.text).toContain('not sampled: pid 605, 606\n');
+  });
+
+  it('records a stack sample sudo refuses as no stack, keeping the holder outcome and the closing census', async () => {
+    const refused = exited('', 1, 'sudo: a password is required\n');
+    const { host, calls } = scriptedHost([exited(rootRow), exited('', 1), exited(rootRow)], () => refused);
+    const capture = await captureHangDiagnostics(request(), host);
+    expect(capture.outcome, capture.text).toBe('none');
+    expect(calls.map((call) => call.file)).toEqual(['ps', 'sudo', 'ps']);
+    expect(capture.text).toContain('stack sample pid 101 stderr:\nsudo: a password is required');
+    expect(capture.text).toContain('stack sample pid 101: no stack;');
   });
 
   it('ends a privileged probe through sudo, so its root lsof does not outlive sudo', async () => {

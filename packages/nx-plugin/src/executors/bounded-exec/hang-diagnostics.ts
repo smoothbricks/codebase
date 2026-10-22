@@ -14,6 +14,16 @@ export const HANG_CAPTURE_MS = 5_000;
 const MAX_PROBE_BYTES = 4 * 1024 * 1024;
 const PS_FIELDS = 'pid=,ppid=,pgid=,stat=,%cpu=,etime=,lstart=,command=';
 /**
+ * Stack samples: `sample` suspends a process every millisecond for one second and reports its threads' call graph. The
+ * runner and at most this many leaf processes are sampled, all at once.
+ */
+const MAX_SAMPLED_LEAVES = 4;
+const SAMPLE_SECONDS = 1;
+/** One sample's limit: its second of sampling plus symbolication, measured at 1.3-1.7 s on an idle host. */
+const SAMPLE_LIMIT_MS = 3_000;
+/** A process census's limit; the stack samples leave the closing census this much of the window. */
+const CENSUS_LIMIT_MS = 1_000;
+/**
  * lsof's mount-table fallback (darwin libproc dmnt.c, readmnt()): a mount it cannot stat(), such as one detaching under a
  * concurrent shed, is kept with its mount-table device. Descriptors come per process from libproc, so this warning omits
  * none of the selected processes' rows.
@@ -24,6 +34,12 @@ const LSOF_MOUNT_FALLBACK =
 /** The lsof stderr that makes its census incomplete: everything except its mount-table fallback. */
 function lsofFaults(stderr: string): string {
   return stderr.replace(LSOF_MOUNT_FALLBACK, '').trim();
+}
+
+/** A `sample` report up to its binary-image list: its header and call graph name the stacks; the load map is bulk. */
+function callGraph(report: string): string {
+  const end = report.indexOf('\nBinary Images:');
+  return (end === -1 ? report : report.slice(0, end)).trim();
 }
 
 export interface HangDiagnostics {
@@ -76,7 +92,8 @@ export function captureHangDiagnostics(
     `Hang snapshot: pid=${request.pid} pgid=${request.pgid ?? 'unknown'} startedAtMs=${startedAtMs}`,
     'Open files and process observations are evidence, not proof of a contested lock or its owner.',
   ];
-  let active = 'process census';
+  const active = new Set<string>();
+  const during = (): string => (active.size === 0 ? 'process census' : [...active].join(', '));
   let finished = false;
   let waits: readonly LockWait[] = [];
   // This package targets lib es2022, which does not declare Promise.withResolvers.
@@ -99,12 +116,12 @@ export function captureHangDiagnostics(
       });
     };
     const timer = setTimeout(() => {
-      lines.push(`Capture incomplete: ${budgetMs}ms deadline reached during ${active}; no empty-holder conclusion.`);
+      lines.push(`Capture incomplete: ${budgetMs}ms deadline reached during ${during()}; no empty-holder conclusion.`);
       finish('incomplete');
     }, budgetMs);
     const cancelled = (): void => {
       if (finished) return;
-      lines.push(`Capture cancelled during ${active}; its progress generation is no longer current.`);
+      lines.push(`Capture cancelled during ${during()}; its progress generation is no longer current.`);
       finish('incomplete');
     };
     request.signal?.addEventListener('abort', cancelled, { once: true });
@@ -118,7 +135,7 @@ export function captureHangDiagnostics(
       return;
     }
     const probe = async (name: string, file: string, args: readonly string[], limitMs: number) => {
-      active = name;
+      active.add(name);
       lines.push(`${name}: ${file} ${args.join(' ')}`);
       const result = await source.probe(
         file,
@@ -126,6 +143,7 @@ export function captureHangDiagnostics(
         Math.max(0, Math.min(limitMs, endsAtMs - Date.now())),
         controller.signal,
       );
+      active.delete(name);
       if (!finished) {
         lines.push(
           `${name}: ${result.status}${result.status === 'exited' ? ` code=${result.code}` : ` ${result.detail}`}`,
@@ -136,7 +154,7 @@ export function captureHangDiagnostics(
     };
     const census = async (name: string): Promise<ObservedProcess[] | null> => {
       // Bare `ps`, resolved through PATH like testing.ts's processTable: NixOS has no /bin/ps.
-      const result = await probe(name, 'ps', ['-A', '-o', PS_FIELDS], 1_000);
+      const result = await probe(name, 'ps', ['-A', '-o', PS_FIELDS], CENSUS_LIMIT_MS);
       if (finished) return null;
       if (result.status !== 'exited' || result.code !== 0) {
         lines.push(`${name}: could not inspect the process table; not an empty process tree.`);
@@ -177,6 +195,41 @@ export function captureHangDiagnostics(
       }
       return tree;
     };
+    /**
+     * One-second call stacks of the runner and of its tree's leaf processes, taken at once: a stack names the call a
+     * process waits in, which the open-file census cannot. A sample sudo refuses, or one that does not answer, is named
+     * as no stack for that process; stacks never change the holder outcome.
+     */
+    const stackSamples = async (tree: readonly ObservedProcess[]): Promise<void> => {
+      const live = tree.filter((entry) => !entry.stat.startsWith('Z'));
+      const parents = new Set(live.map((entry) => entry.ppid));
+      const leaves = live.filter((entry) => entry.pid !== request.pid && !parents.has(entry.pid));
+      const omitted = leaves.slice(MAX_SAMPLED_LEAVES).map((entry) => entry.pid);
+      if (omitted.length > 0)
+        lines.push(
+          `Stack samples bounded to the runner and ${MAX_SAMPLED_LEAVES} leaf processes; not sampled: pid ${omitted.join(', ')}`,
+        );
+      const limitMs = Math.min(SAMPLE_LIMIT_MS, endsAtMs - Date.now() - CENSUS_LIMIT_MS);
+      const sampled = [request.pid, ...leaves.slice(0, MAX_SAMPLED_LEAVES).map((entry) => entry.pid)];
+      await Promise.all(
+        sampled.map(async (pid) => {
+          const name = `stack sample pid ${pid}`;
+          // `-file /dev/stdout` writes the report to the probe's pipe alone, not also to a root-owned file in /tmp.
+          const args = ['-n', 'sample', String(pid), String(SAMPLE_SECONDS), '-mayDie', '-file', '/dev/stdout'];
+          const result = await probe(name, 'sudo', args, limitMs);
+          if (finished) return;
+          const report = callGraph(result.stdout);
+          if (result.status === 'exited' && result.code === 0 && report !== '') {
+            lines.push(`${name} (${SAMPLE_SECONDS}s; binary image list omitted):\n${report}`);
+            return;
+          }
+          if (report !== '') lines.push(`Partial ${name} output:\n${report}`);
+          lines.push(
+            `${name}: no stack; sudo -n sample did not answer, so the call this process waits in is not observed.`,
+          );
+        }),
+      );
+    };
     const collect = async (): Promise<void> => {
       const before = await census('ps before');
       if (finished) return;
@@ -184,56 +237,62 @@ export function captureHangDiagnostics(
       let incomplete = false;
       let observed = before.length > 0;
       if (source.platform === 'darwin') {
-        const args = ['-nP', '-p', before.map((entry) => entry.pid).join(',')];
-        // Bare `sudo`/`lsof` through PATH, like `ps` above: NixOS provides neither /usr/bin/sudo nor /usr/sbin/lsof.
-        let resources = await probe('lsof privileged', 'sudo', ['-n', 'lsof', ...args], 1_500);
-        if (finished) return;
-        const answered = (result: HangProbeResult): boolean =>
-          result.status === 'exited' && (result.code === 0 || (result.code === 1 && lsofFaults(result.stderr) === ''));
-        if (!answered(resources)) {
-          incomplete = true;
-          if (resources.stdout.trim() !== '')
-            lines.push(`Partial privileged lsof output:\n${resources.stdout.trimEnd()}`);
-          lines.push(
-            'Privileged resource census unavailable; fallback is ordinary-user visibility only, not proof of no holders.',
-          );
-          resources = await probe('lsof user-scoped fallback', 'lsof', args, 1_000);
+        const openFiles = async (): Promise<void> => {
+          const args = ['-nP', '-p', before.map((entry) => entry.pid).join(',')];
+          // Bare `sudo`/`lsof` through PATH, like `ps` above: NixOS provides neither /usr/bin/sudo nor /usr/sbin/lsof.
+          let resources = await probe('lsof privileged', 'sudo', ['-n', 'lsof', ...args], 1_500);
           if (finished) return;
-        }
-        if (resources.stdout.trim() !== '')
-          lines.push(`lsof open files/sockets (not contested-lock proof):\n${resources.stdout.trimEnd()}`);
-        if (!answered(resources) || lsofFaults(resources.stderr) !== '') incomplete = true;
-        else if (resources.stderr.trim() !== '')
-          lines.push(
-            'lsof warned only that it could not stat() the named mounts and kept their mount-table devices; that omits no descriptor of the selected processes.',
-          );
-        observed = resources.stdout.trim() !== '';
-        if (!observed && answered(resources))
-          lines.push('lsof reported no open-file matches within its stated visibility.');
-        // A lock wait needs a complete census of the run's files: a regular file the run holds on a numbered descriptor
-        // that another process also holds open. One privileged lsof names those holders; a probe that did not answer
-        // makes the capture incomplete, never an empty holder set.
-        const rows = incomplete ? [] : parseLsofTable(resources.stdout);
-        const candidates = lockCandidates(rows);
-        if (candidates.length > 0) {
-          const holders = await probe(
-            'lsof lock holders',
-            'sudo',
-            ['-n', 'lsof', '-nP', '-F', 'pcn', '--', ...candidates],
-            1_500,
-          );
-          if (finished) return;
-          const openers =
-            answered(holders) && lsofFaults(holders.stderr) === '' ? parseLsofFields(holders.stdout) : null;
-          if (openers === null) {
+          const answered = (result: HangProbeResult): boolean =>
+            result.status === 'exited' &&
+            (result.code === 0 || (result.code === 1 && lsofFaults(result.stderr) === ''));
+          if (!answered(resources)) {
             incomplete = true;
-            lines.push('Lock holder census incomplete; no lock wait is named.');
-          } else {
-            waits = lockWaits(rows, new Set(before.map((entry) => entry.pid)), openers);
+            if (resources.stdout.trim() !== '')
+              lines.push(`Partial privileged lsof output:\n${resources.stdout.trimEnd()}`);
+            lines.push(
+              'Privileged resource census unavailable; fallback is ordinary-user visibility only, not proof of no holders.',
+            );
+            resources = await probe('lsof user-scoped fallback', 'lsof', args, 1_000);
+            if (finished) return;
           }
-        }
+          if (resources.stdout.trim() !== '')
+            lines.push(`lsof open files/sockets (not contested-lock proof):\n${resources.stdout.trimEnd()}`);
+          if (!answered(resources) || lsofFaults(resources.stderr) !== '') incomplete = true;
+          else if (resources.stderr.trim() !== '')
+            lines.push(
+              'lsof warned only that it could not stat() the named mounts and kept their mount-table devices; that omits no descriptor of the selected processes.',
+            );
+          observed = resources.stdout.trim() !== '';
+          if (!observed && answered(resources))
+            lines.push('lsof reported no open-file matches within its stated visibility.');
+          // A lock wait needs a complete census of the run's files: a regular file the run holds on a numbered descriptor
+          // that another process also holds open. One privileged lsof names those holders; a probe that did not answer
+          // makes the capture incomplete, never an empty holder set.
+          const rows = incomplete ? [] : parseLsofTable(resources.stdout);
+          const candidates = lockCandidates(rows);
+          if (candidates.length > 0) {
+            const holders = await probe(
+              'lsof lock holders',
+              'sudo',
+              ['-n', 'lsof', '-nP', '-F', 'pcn', '--', ...candidates],
+              1_500,
+            );
+            if (finished) return;
+            const openers =
+              answered(holders) && lsofFaults(holders.stderr) === '' ? parseLsofFields(holders.stdout) : null;
+            if (openers === null) {
+              incomplete = true;
+              lines.push('Lock holder census incomplete; no lock wait is named.');
+            } else {
+              waits = lockWaits(rows, new Set(before.map((entry) => entry.pid)), openers);
+            }
+          }
+        };
+        await Promise.all([openFiles(), stackSamples(before)]);
+        if (finished) return;
       } else {
         lines.push(`Open-file census not provided on ${source.platform}; observations below name processes only.`);
+        lines.push(`Stack samples not provided on ${source.platform}; no blocking call is observed.`);
       }
       const after = await census('ps after');
       if (finished) return;
@@ -267,7 +326,7 @@ export function captureHangDiagnostics(
     };
     void collect().catch((error: unknown) => {
       if (finished) return;
-      lines.push(`Capture incomplete during ${active}: ${error instanceof Error ? error.message : String(error)}`);
+      lines.push(`Capture incomplete during ${during()}: ${error instanceof Error ? error.message : String(error)}`);
       finish('incomplete');
     });
   });

@@ -33,7 +33,7 @@ import {
   runBoundedExec,
   type TempVolume,
 } from './executor.js';
-import type { HangDiagnostics } from './hang-diagnostics.js';
+import { captureHangDiagnostics, type HangDiagnostics } from './hang-diagnostics.js';
 import { createNoSpaceWatch } from './no-space.js';
 import { cowshedSubtreeOwner, type SubtreeOwner } from './owned-subtree.js';
 import type { RamTempAcquisition, RamTempError, RamTempLease, Result } from './ram-temp.js';
@@ -342,6 +342,91 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         expect(result.terminalOutput).toContain('capture incomplete at expiry');
         expect(result.terminalOutput).toContain('no empty-holder conclusion');
       }
+    }
+  });
+
+  it('samples the stack a command hung on a FIFO waits in before the progress bound force-kills it', async () => {
+    if (process.platform === 'win32') {
+      return;
+    }
+
+    const workspace = await createWorkspace();
+    // The test owns the FIFO and never opens it for writing, so the command's open(2) of it never returns.
+    const fifo = spawnSync('mkfifo', [join(workspace.root, 'hang.fifo')], { encoding: 'utf8' });
+    expect(fifo.status, fifo.stderr).toBe(0);
+    const real = createProcessTreeKiller();
+    const signals: string[] = [];
+    const killer: ProcessTreeKiller = {
+      async kill(pid, signal) {
+        signals.push(signal);
+        ownedProcessGroups.add(pid);
+        await real.kill(pid, signal);
+      },
+    };
+    let opening!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      opening = resolve;
+    });
+    let captured!: (snapshot: HangDiagnostics) => void;
+    const snapshot = new Promise<HangDiagnostics>((resolve) => {
+      captured = resolve;
+    });
+    let group: number | undefined;
+    const watch = (chunk: string | Uint8Array): boolean => {
+      if ((typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')).includes('opening\n')) opening();
+      return true;
+    };
+    // The clock moves only at the two steps below: the capture starts once the command has said it is opening the
+    // FIFO, and the bound expires once the real snapshot, its stack samples included, has finished. The command ignores
+    // SIGTERM, so only the force-kill ends it.
+    jest.useFakeTimers();
+    process.stdout.write = watch;
+    process.stderr.write = watch;
+    try {
+      const running = runBoundedExec(
+        {
+          command: `perl -e '$SIG{TERM} = "IGNORE"; $| = 1; print "opening\\n"; open(F, "<", "hang.fifo") or die "open: $!"'`,
+          idleTimeoutMs: 10_000,
+          killAfterMs: 0,
+        },
+        workspace.context,
+        killer,
+        null,
+        null,
+        null,
+        async (request) => {
+          group = request.pid;
+          const taken = await captureHangDiagnostics(request);
+          captured(taken);
+          return taken;
+        },
+      );
+      await ready;
+      jest.advanceTimersByTime(5_000);
+      const taken = await snapshot;
+      // The executor records the snapshot in promise reactions; an I/O completion runs only once the microtask queue
+      // has drained, so after it the expiry finds the snapshot recorded.
+      await access(workspace.root);
+      jest.advanceTimersByTime(5_000);
+      const result = await running;
+      expect(result.success).toBe(false);
+      expect(result.terminalOutput).toContain('Command made no progress: no test finished for 10000ms');
+      expect(result.terminalOutput).toContain(taken.text);
+      if (process.platform === 'darwin') {
+        // perl's sampled stack names the open(2) it is blocked in.
+        expect(taken.text).toMatch(/Perl_pp_open[\s\S]*\d+ __open\s+\(in libsystem_kernel\.dylib\)/);
+      } else {
+        expect(taken.text).toContain(`Stack samples not provided on ${process.platform}`);
+      }
+      expect(signals).toContain('SIGKILL');
+      if (group === undefined) throw new Error('the snapshot was never asked for');
+      // The force-kill returns once the group is empty or has given up, so a group still listed is a survivor.
+      expect(processGroupHasMembers(group), result.terminalOutput).toBe(false);
+      ownedProcessGroups.delete(group);
+    } finally {
+      process.stdout.write = originalStdoutWrite;
+      process.stderr.write = originalStderrWrite;
+      jest.useRealTimers();
     }
   });
 
