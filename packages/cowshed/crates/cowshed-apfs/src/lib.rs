@@ -66,6 +66,7 @@ fn in_kernel_attach(image: &Path, access: MountAccess) -> CommandRequest {
 /// outside the kernel. A retained input may be ASIF, which only DiskImages2 reads; the in-kernel
 /// RAW class attaches ASIF bytes as a raw device and finds no volume (01a_apfs.md, "Images"). As a
 /// DiskImages2 attach it meets the spent-boot latch ([`attach_budget::refuse_attach_into_spent_pool`]).
+#[cfg(any(target_os = "macos", test))]
 fn retained_input_attach(image: &Path) -> CommandRequest {
     CommandRequest::new(
         DISKUTIL,

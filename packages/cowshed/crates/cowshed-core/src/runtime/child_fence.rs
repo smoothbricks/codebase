@@ -340,10 +340,8 @@ fn exit_of(status: std::process::ExitStatus) -> Option<ExitStatus> {
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
-    use std::sync::Arc;
 
     use proptest::prelude::*;
-    use tokio::sync::oneshot;
 
     use super::*;
 
@@ -613,7 +611,10 @@ mod tests {
     #[tokio::test]
     async fn a_group_is_signalled_only_while_its_reaper_holds_the_leader() {
         use std::io::BufRead as _;
+        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
+
+        use tokio::sync::oneshot;
 
         // The OwnedGroup test idiom keeps cleanup around the assertions, not after them.
         struct OwnedGroup(std::process::Child, Option<std::process::ChildStdin>);

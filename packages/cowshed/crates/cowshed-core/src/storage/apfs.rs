@@ -1887,6 +1887,7 @@ where
     /// already stands as `ensure_mounted` leaves it ([`ApfsExecutionHost::mount_settled`]) is
     /// served as it stands, its marker validated; one that needs healing, mounting or relinking
     /// refuses, naming the lock's holders, because only the lock authorizes settling it.
+    #[cfg(target_os = "macos")]
     pub(crate) async fn mount_for_supervisor(
         &self,
         workspace: &LifecycleWorkspace,
