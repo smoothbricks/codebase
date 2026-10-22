@@ -20,12 +20,17 @@ use super::dto::{
     ScriptCommand, SealedJob, TraceContext, WorkspaceIncarnation, WorkspaceInfo, WorkspacePath,
     WorkspaceTarget,
 };
+use super::dto::{
+    BuildStateListing, CredentialReport, GatewayStatus, IdentityReport, MountResult,
+    NxStoreClearResult, ProjectWorkspaces, SkillInstallReport,
+};
 use super::process::{JobProcessEvent, JobProcessTree};
 use super::resources::{JobResourceSample, SampleInterval};
 use crate::build_volume::BuildStateRefresh;
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
 use crate::project_policy::ProjectGrants;
+use crate::project_retirement::ProjectRetirementReport;
 use crate::repository::{RepoId, RepositoryBinding};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -45,6 +50,9 @@ pub enum Scope {
     Worker,
     /// Routed only from inside the controller process; never accepted from a connection.
     Internal,
+    /// Host connections only (`cowshed host`): the host's own verbs, which no project controller
+    /// serves and no project connection may call.
+    Host,
 }
 
 /// The single bounded raw-byte frame that may accompany an operation.
@@ -127,12 +135,13 @@ fn encode_params(method: &str, request: &impl Serialize) -> Result<Value> {
 }
 
 /// Expands the operation table. Each row is
-/// `scope lane "method" Marker(Request) -> Result;` where `scope` is `coordinator`, `worker` or
-/// `internal`, and `lane` is `json`, `upload`, `download(offset_field)` or `stream`.
+/// `scope lane "method" Marker(Request) -> Result;` where `scope` is `coordinator`, `worker`,
+/// `internal` or `host`, and `lane` is `json`, `upload`, `download(offset_field)` or `stream`.
 macro_rules! operations {
     (@scope coordinator) => { Scope::Coordinator };
     (@scope worker) => { Scope::Worker };
     (@scope internal) => { Scope::Internal };
+    (@scope host) => { Scope::Host };
     (@lane json) => { Lane::Json };
     (@lane upload) => { Lane::Upload };
     (@lane download ($offset:ident)) => { Lane::Download };
@@ -379,6 +388,32 @@ operations! {
     worker json "job.kill" JobKill(JobRequest) -> EmptyResult;
     /// Closes a shell session.
     worker json "session.close" SessionClose(SessionRequest) -> EmptyResult;
+    /// Lists every adopted project on the host with its published workspaces.
+    host json "host.listProjects" HostListProjects(HostListRequest) -> Vec<ProjectWorkspaces>;
+    /// Attaches every detached session workspace of every adopted project.
+    host json "host.attachAll" HostAttachAll(HostAttachAllRequest) -> Vec<WorkspaceInfo>;
+    /// Detaches every attached session workspace of every adopted project.
+    host json "host.detachAll" HostDetachAll(HostRequest) -> EmptyResult;
+    /// Clears this boot's recorded attach-pool exhaustion and its recorded ceiling.
+    host json "host.clearAttachBudget" HostClearAttachBudget(HostRequest) -> EmptyResult;
+    /// Retires one project no controller can open, from store records; the call is the abandonment.
+    host json "host.forgetAbandoned" HostForgetAbandoned(RepoRequest) -> ProjectRetirementReport;
+    /// Mounts one project's main from store records.
+    host json "host.mountMain" HostMountMain(RepoRequest) -> MountResult;
+    /// Reports the gateway service's health.
+    host json "host.gatewayStatus" HostGatewayStatus(HostRequest) -> GatewayStatus;
+    /// Lists a project's enrolled credential routes.
+    host json "host.credentialStatus" HostCredentialStatus(ProjectPathRequest) -> CredentialReport;
+    /// Removes one of a project's credentials.
+    host json "host.credentialRemove" HostCredentialRemove(CredentialRemoveRequest) -> CredentialReport;
+    /// Binds a remote the project's main checkout already configures.
+    host json "host.identityAdd" HostIdentityAdd(IdentityAddRequest) -> IdentityReport;
+    /// Installs the cowshed skill into the named agent harnesses.
+    host json "host.skillInstall" HostSkillInstall(SkillInstallRequest) -> SkillInstallReport;
+    /// Reads a checkout's recorded build-state paths, opening no controller.
+    host json "host.buildState" HostBuildState(ProjectPathRequest) -> BuildStateListing;
+    /// Clears the project's Nx accepted-task store in the gateway.
+    host json "host.clearNxStore" HostClearNxStore(ProjectPathRequest) -> NxStoreClearResult;
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -858,6 +893,61 @@ pub struct ProgressRequest {
     pub workspace_incarnation: WorkspaceIncarnation,
     pub job_id: JobId,
     pub every_ms: SampleInterval,
+}
+
+/// A host operation that names nothing: the host is its whole subject.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostRequest {}
+
+/// Every adopted project's listing (`ls --all`), measured for landing when asked.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostListRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing: Option<ListLanding>,
+}
+
+/// `attach --all [--browse]`.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostAttachAllRequest {
+    #[serde(default)]
+    pub browse: bool,
+}
+
+/// A host operation whose subject is a project: its checkout, resolved as `--project` is.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectPathRequest {
+    pub project: PathBuf,
+}
+
+/// `credential rm --origin`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CredentialRemoveRequest {
+    pub project: PathBuf,
+    pub origin: String,
+}
+
+/// `identity add <remote>`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IdentityAddRequest {
+    pub project: PathBuf,
+    pub remote: String,
+}
+
+/// `[--project <root>] skill install [--harness]`: no harness installs every detected one.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillInstallRequest {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub harnesses: Vec<String>,
+    /// Install into this project's harness directories instead of the user's (`--project`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<PathBuf>,
 }
 
 #[cfg(test)]

@@ -367,6 +367,30 @@
           }
         }
       },
+      "host-napi-test": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "default",
+          "^default"
+        ],
+        "dependsOn": [
+          "napi-debug",
+          "tsc-js",
+          "build",
+          "^build"
+        ],
+        "options": {
+          "comment": "openHost end to end: the built addon starts the package launcher's cowshed host, so the launcher's binary must be this checkout's build.",
+          "command": "bun test --config=../bunfig.napi-test.toml --timeout=0 host.napi.test.ts",
+          "cwd": "{projectRoot}/src",
+          "env": {
+            "NAPI_DEBUG_ADDON": "1"
+          },
+          "idleTimeoutMs": 180000,
+          "killAfterMs": 10000
+        }
+      },
       "napi-test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,

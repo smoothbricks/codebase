@@ -34,6 +34,22 @@ export interface NativeEvents {
   close(): Promise<void>;
 }
 
+/** The operations a `Host` serves: exactly those its authority admits. */
+export interface NativeHostOperations
+  extends NativeHostListProjects,
+    NativeHostAttachAll,
+    NativeHostDetachAll,
+    NativeHostClearAttachBudget,
+    NativeHostForgetAbandoned,
+    NativeHostMountMain,
+    NativeHostGatewayStatus,
+    NativeHostCredentialStatus,
+    NativeHostCredentialRemove,
+    NativeHostIdentityAdd,
+    NativeHostSkillInstall,
+    NativeHostBuildState,
+    NativeHostClearNxStore {}
+
 /** The operations a `Project` serves: exactly those its authority admits. */
 export interface NativeProjectOperations
   extends NativeProjectWorkspace,
@@ -638,6 +654,240 @@ export async function coordinatorWorker(
   args: CoordinatorWorkerArguments,
 ): Promise<NativeWorkspaceHandle> {
   return handle.worker(JSON.stringify(args));
+}
+
+/** A handle that serves `host.attachAll`. */
+export interface NativeHostAttachAll {
+  attachAll(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.attachAll` caller names; its handle binds the rest. */
+export type HostAttachAllArguments = Pick<Api.HostAttachAllRequest, 'browse'>;
+
+/**
+ * Attaches every detached session workspace of every adopted project.
+ */
+export async function hostAttachAll(
+  handle: NativeHostAttachAll,
+  args: HostAttachAllArguments,
+): Promise<readonly Api.WorkspaceInfo[]> {
+  return V.parseWorkspaceInfoList(await handle.attachAll(JSON.stringify(args)));
+}
+
+/** A handle that serves `host.buildState`. */
+export interface NativeHostBuildState {
+  buildState(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.buildState` caller names; its handle binds the rest. */
+export type HostBuildStateArguments = Pick<Api.ProjectPathRequest, 'project'>;
+
+/**
+ * Reads a checkout's recorded build-state paths, opening no controller.
+ */
+export async function hostBuildState(
+  handle: NativeHostBuildState,
+  args: HostBuildStateArguments,
+): Promise<Api.BuildStateListing> {
+  return V.parseBuildStateListing(await handle.buildState(JSON.stringify(args)));
+}
+
+/** A handle that serves `host.clearAttachBudget`. */
+export interface NativeHostClearAttachBudget {
+  clearAttachBudget(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.clearAttachBudget` caller names; its handle binds the rest. */
+export type HostClearAttachBudgetArguments = Readonly<Record<string, never>>;
+
+/**
+ * Clears this boot's recorded attach-pool exhaustion and its recorded ceiling.
+ */
+export async function hostClearAttachBudget(
+  handle: NativeHostClearAttachBudget,
+  args: HostClearAttachBudgetArguments,
+): Promise<Api.EmptyResult> {
+  return V.parseEmptyResult(await handle.clearAttachBudget(JSON.stringify(args)));
+}
+
+/** A handle that serves `host.clearNxStore`. */
+export interface NativeHostClearNxStore {
+  clearNxStore(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.clearNxStore` caller names; its handle binds the rest. */
+export type HostClearNxStoreArguments = Pick<Api.ProjectPathRequest, 'project'>;
+
+/**
+ * Clears the project's Nx accepted-task store in the gateway.
+ */
+export async function hostClearNxStore(
+  handle: NativeHostClearNxStore,
+  args: HostClearNxStoreArguments,
+): Promise<Api.NxStoreClearResult> {
+  return V.parseNxStoreClearResult(await handle.clearNxStore(JSON.stringify(args)));
+}
+
+/** A handle that serves `host.credentialRemove`. */
+export interface NativeHostCredentialRemove {
+  credentialRemove(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.credentialRemove` caller names; its handle binds the rest. */
+export type HostCredentialRemoveArguments = Pick<Api.CredentialRemoveRequest, 'project' | 'origin'>;
+
+/**
+ * Removes one of a project's credentials.
+ */
+export async function hostCredentialRemove(
+  handle: NativeHostCredentialRemove,
+  args: HostCredentialRemoveArguments,
+): Promise<Api.CredentialReport> {
+  return V.parseCredentialReport(await handle.credentialRemove(JSON.stringify(args)));
+}
+
+/** A handle that serves `host.credentialStatus`. */
+export interface NativeHostCredentialStatus {
+  credentialStatus(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.credentialStatus` caller names; its handle binds the rest. */
+export type HostCredentialStatusArguments = Pick<Api.ProjectPathRequest, 'project'>;
+
+/**
+ * Lists a project's enrolled credential routes.
+ */
+export async function hostCredentialStatus(
+  handle: NativeHostCredentialStatus,
+  args: HostCredentialStatusArguments,
+): Promise<Api.CredentialReport> {
+  return V.parseCredentialReport(await handle.credentialStatus(JSON.stringify(args)));
+}
+
+/** A handle that serves `host.detachAll`. */
+export interface NativeHostDetachAll {
+  detachAll(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.detachAll` caller names; its handle binds the rest. */
+export type HostDetachAllArguments = Readonly<Record<string, never>>;
+
+/**
+ * Detaches every attached session workspace of every adopted project.
+ */
+export async function hostDetachAll(
+  handle: NativeHostDetachAll,
+  args: HostDetachAllArguments,
+): Promise<Api.EmptyResult> {
+  return V.parseEmptyResult(await handle.detachAll(JSON.stringify(args)));
+}
+
+/** A handle that serves `host.forgetAbandoned`. */
+export interface NativeHostForgetAbandoned {
+  forgetAbandoned(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.forgetAbandoned` caller names; its handle binds the rest. */
+export type HostForgetAbandonedArguments = Pick<Api.RepoRequest, 'repoId'>;
+
+/**
+ * Retires one project no controller can open, from store records; the call is the abandonment.
+ */
+export async function hostForgetAbandoned(
+  handle: NativeHostForgetAbandoned,
+  args: HostForgetAbandonedArguments,
+): Promise<Api.ProjectRetirementReport> {
+  return V.parseProjectRetirementReport(await handle.forgetAbandoned(JSON.stringify(args)));
+}
+
+/** A handle that serves `host.gatewayStatus`. */
+export interface NativeHostGatewayStatus {
+  gatewayStatus(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.gatewayStatus` caller names; its handle binds the rest. */
+export type HostGatewayStatusArguments = Readonly<Record<string, never>>;
+
+/**
+ * Reports the gateway service's health.
+ */
+export async function hostGatewayStatus(
+  handle: NativeHostGatewayStatus,
+  args: HostGatewayStatusArguments,
+): Promise<Api.GatewayStatus> {
+  return V.parseGatewayStatus(await handle.gatewayStatus(JSON.stringify(args)));
+}
+
+/** A handle that serves `host.identityAdd`. */
+export interface NativeHostIdentityAdd {
+  identityAdd(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.identityAdd` caller names; its handle binds the rest. */
+export type HostIdentityAddArguments = Pick<Api.IdentityAddRequest, 'project' | 'remote'>;
+
+/**
+ * Binds a remote the project's main checkout already configures.
+ */
+export async function hostIdentityAdd(
+  handle: NativeHostIdentityAdd,
+  args: HostIdentityAddArguments,
+): Promise<Api.IdentityReport> {
+  return V.parseIdentityReport(await handle.identityAdd(JSON.stringify(args)));
+}
+
+/** A handle that serves `host.listProjects`. */
+export interface NativeHostListProjects {
+  listProjects(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.listProjects` caller names; its handle binds the rest. */
+export type HostListProjectsArguments = Pick<Api.HostListRequest, 'landing'>;
+
+/**
+ * Lists every adopted project on the host with its published workspaces.
+ */
+export async function hostListProjects(
+  handle: NativeHostListProjects,
+  args: HostListProjectsArguments,
+): Promise<readonly Api.ProjectWorkspaces[]> {
+  return V.parseProjectWorkspacesList(await handle.listProjects(JSON.stringify(args)));
+}
+
+/** A handle that serves `host.mountMain`. */
+export interface NativeHostMountMain {
+  mountMain(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.mountMain` caller names; its handle binds the rest. */
+export type HostMountMainArguments = Pick<Api.RepoRequest, 'repoId'>;
+
+/**
+ * Mounts one project's main from store records.
+ */
+export async function hostMountMain(
+  handle: NativeHostMountMain,
+  args: HostMountMainArguments,
+): Promise<Api.MountResult> {
+  return V.parseMountResult(await handle.mountMain(JSON.stringify(args)));
+}
+
+/** A handle that serves `host.skillInstall`. */
+export interface NativeHostSkillInstall {
+  skillInstall(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `host.skillInstall` caller names; its handle binds the rest. */
+export type HostSkillInstallArguments = Pick<Api.SkillInstallRequest, 'harnesses' | 'project'>;
+
+/**
+ * Installs the cowshed skill into the named agent harnesses.
+ */
+export async function hostSkillInstall(
+  handle: NativeHostSkillInstall,
+  args: HostSkillInstallArguments,
+): Promise<Api.SkillInstallReport> {
+  return V.parseSkillInstallReport(await handle.skillInstall(JSON.stringify(args)));
 }
 
 /** A handle that serves `job.attachClose`. */

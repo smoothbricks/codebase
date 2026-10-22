@@ -11,6 +11,7 @@ pub enum Scope {
     Coordinator,
     Worker,
     Internal,
+    Host,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,6 +111,7 @@ fn row(input: ParseStream<'_>) -> syn::Result<Operation> {
         "coordinator" => Scope::Coordinator,
         "worker" => Scope::Worker,
         "internal" => Scope::Internal,
+        "host" => Scope::Host,
         _ => return Err(syn::Error::new_spanned(scope, "unknown operation scope")),
     };
     let lane: Ident = input.parse()?;

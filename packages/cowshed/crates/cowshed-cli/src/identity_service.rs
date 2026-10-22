@@ -20,6 +20,13 @@ pub async fn dispatch<W: std::io::Write + Send, E: std::io::Write + Send>(
     json: bool,
     output: &mut Output<W, E>,
 ) -> Result<i32> {
+    let IdentityCommand::Add { remote } = command;
+    report(add(project_root, &remote).await?, json, output)
+}
+
+/// Bind `remote` as an identity of the project at `project_root`: what `identity add` and
+/// `host.identityAdd` both do.
+pub async fn add(project_root: &Path, remote: &str) -> Result<IdentityReport> {
     // The binding belongs to the project, not to a workspace: the open finishes only `main`'s
     // unfinished lifecycle work.
     let runtime = ProjectRuntime::open_existing(
@@ -28,13 +35,9 @@ pub async fn dispatch<W: std::io::Write + Send, E: std::io::Write + Send>(
         crate::gateway_service::runtime_control,
     )
     .await?;
-    let outcome = match command {
-        IdentityCommand::Add { remote } => {
-            bind_remote_identity(runtime.descriptor(), &remote).await
-        }
-    };
+    let outcome = bind_remote_identity(runtime.descriptor(), remote).await;
     runtime.shutdown().await?;
-    report(outcome?, json, output)
+    outcome
 }
 
 fn report<W: std::io::Write + Send, E: std::io::Write + Send>(

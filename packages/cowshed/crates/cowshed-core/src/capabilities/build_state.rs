@@ -30,6 +30,10 @@ impl RelPath {
     pub fn as_path(&self) -> &Path {
         &self.0
     }
+
+    pub fn into_path_buf(self) -> PathBuf {
+        self.0
+    }
 }
 
 /// The volume namespace of declared build state: `<checkout path>` lives at

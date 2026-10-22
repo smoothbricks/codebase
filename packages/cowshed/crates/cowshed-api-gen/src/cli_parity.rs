@@ -73,7 +73,7 @@ pub struct Row {
 }
 
 /// The host verbs have no N-API channel until the host operation table lands (tg#9537).
-const HOST_TABLE: &str = "the host operation table (tg#9537): host verbs have no N-API channel yet";
+const HOST_TABLE: &str = "the second host commit (tg#9537): disk-command, land-turn, gateway start/stop, credential add, sccache on the installed build, and the lock/hold/subtree process helpers";
 
 const fn member(member: &'static str) -> Facade {
     Facade {
@@ -163,16 +163,16 @@ pub const PARITY: &[Row] = &[
     row("restore", "label", field(&[("coordinator.restore", "label")], &[argument("Coordinator.restore", 1, "")])),
 
     row("ls", "", field(&[("project.list", "")], &[member("Project.listWorkspaces")])),
-    gap("ls", "all"),
-    row("ls", "landing", field(&[("project.list", "landing")], &[argument("Project.listWorkspaces", 0, "landing")])),
-    row("ls", "landed", field(&[("project.list", "landing")], &[argument("Project.listWorkspaces", 0, "landing")])),
+    row("ls", "all", field(&[("host.listProjects", "")], &[member("Host.listProjects")])),
+    row("ls", "landing", field(&[("project.list", "landing"), ("host.listProjects", "landing")], &[argument("Project.listWorkspaces", 0, "landing"), argument("Host.listProjects", 0, "landing")])),
+    row("ls", "landed", field(&[("project.list", "landing"), ("host.listProjects", "landing")], &[argument("Project.listWorkspaces", 0, "landing"), argument("Host.listProjects", 0, "landing")])),
 
     row("path", "", field(&[("project.workspace", ""), ("workspace.attach", ""), ("workspace.info", "")], &[member("Project.path")])),
     row("path", "workspace", field(&[("project.workspace", "workspace")], &[argument("Project.path", 0, "")])),
     row("path", "slot", field(&[("project.workspaceInSlot", "slot")], &[argument("Project.workspaceInSlot", 0, "")])),
     row("path", "no-attach", Counterpart::Composed { recipe: "the controller is never asked to attach: Project.path skips workspace.attach on noAttach, as the CLI does", facade: &[argument("Project.path", 1, "noAttach")] }),
 
-    gap("build-state", ""),
+    row("build-state", "", field(&[("host.buildState", "project")], &[argument("Host.buildState", 0, "")])),
 
     row("exec", "", field(&[("worker.exec", ""), ("coordinator.exec", "")], &[member("WorkspaceHandle.exec"), member("Coordinator.exec")])),
     row("exec", "workspace", field(&[("coordinator.worker", "workspace")], &[argument("Coordinator.worker", 0, "")])),
@@ -222,22 +222,22 @@ pub const PARITY: &[Row] = &[
     row("rm", "abandon", field(&[("coordinator.destroy", "options.abandon"), ("coordinator.removeProject", "options.abandon")], &[argument("Coordinator.remove", 1, "abandon"), argument("Coordinator.removeProject", 0, "abandon")])),
     row("rm", "purge", field(&[("coordinator.removeProject", "")], &[member("Coordinator.removeProject")])),
 
-    gap("forget", ""),
-    gap("forget", "repo"),
-    gap("forget", "abandon"),
+    row("forget", "", field(&[("host.forgetAbandoned", "")], &[member("Host.forgetAbandoned")])),
+    row("forget", "repo", field(&[("host.forgetAbandoned", "repoId")], &[argument("Host.forgetAbandoned", 0, "")])),
+    row("forget", "abandon", Counterpart::Composed { recipe: "the operation is the authorization: host.forgetAbandoned retires only on its own explicit name, as the parser refuses forget without --abandon", facade: &[member("Host.forgetAbandoned")] }),
 
     row("attach", "", field(&[("workspace.attach", "")], &[member("WorkspaceRef.attach")])),
     row("attach", "workspace", field(&[("project.workspace", "workspace")], &[argument("Project.workspace", 0, "")])),
-    gap("attach", "all"),
-    row("attach", "browse", field(&[("workspace.attach", "options.browse")], &[argument("WorkspaceRef.attach", 0, "browse")])),
+    row("attach", "all", field(&[("host.attachAll", "")], &[member("Host.attachAll")])),
+    row("attach", "browse", field(&[("workspace.attach", "options.browse"), ("host.attachAll", "browse")], &[argument("WorkspaceRef.attach", 0, "browse"), argument("Host.attachAll", 0, "browse")])),
 
     row("detach", "", field(&[("coordinator.detach", "")], &[member("Coordinator.detach")])),
     row("detach", "workspace", field(&[("coordinator.detach", "workspace")], &[argument("Coordinator.detach", 0, "")])),
-    gap("detach", "all"),
+    row("detach", "all", field(&[("host.detachAll", "")], &[member("Host.detachAll")])),
 
-    gap("mount", ""),
-    gap("mount", "target"),
-    gap("mount", "repo-id"),
+    row("mount", "", field(&[("host.mountMain", "")], &[member("Host.mountMain")])),
+    row("mount", "target", Counterpart::Composed { recipe: "main is the only mount target, so the operation names it: host.mountMain", facade: &[member("Host.mountMain")] }),
+    row("mount", "repo-id", field(&[("host.mountMain", "repoId")], &[argument("Host.mountMain", 0, "")])),
 
     row("resize", "", field(&[("coordinator.resize", "")], &[member("Coordinator.resize")])),
     row("resize", "workspace", field(&[("coordinator.resize", "workspace")], &[argument("Coordinator.resize", 0, "")])),
@@ -255,8 +255,7 @@ pub const PARITY: &[Row] = &[
     row("rekey", "", field(&[("coordinator.rekey", "")], &[member("Coordinator.rekey")])),
     row("rekey", "workspace", field(&[("coordinator.rekey", "workspace")], &[argument("Coordinator.rekey", 0, "")])),
 
-    // The controller half is coordinator.clearNxState; the gateway's store half is a host verb.
-    gap("cache clear", ""),
+    row("cache clear", "", field(&[("coordinator.clearNxState", ""), ("host.clearNxStore", "")], &[member("Coordinator.clearNxState"), member("Host.clearNxStore")])),
     row("cache clear", "workspace", field(&[("coordinator.clearNxState", "workspace")], &[argument("Coordinator.clearNxState", 0, "")])),
 
     row("gc", "", field(&[("coordinator.gc", "")], &[member("Coordinator.gc")])),
@@ -299,7 +298,7 @@ pub const PARITY: &[Row] = &[
 
     row("doctor", "", field(&[("coordinator.doctor", "")], &[member("Coordinator.doctor")])),
     row("doctor", "repair", Counterpart::Composed { recipe: "doctor() then gc({}): the one sweep the CLI's repair runs (06_cli.md, \"Onboarding and repair\")", facade: &[member("Coordinator.doctor"), member("Coordinator.gc")] }),
-    gap("doctor", "clear-attach-budget"),
+    row("doctor", "clear-attach-budget", field(&[("host.clearAttachBudget", "")], &[member("Host.clearAttachBudget")])),
 
     gap("disk-command", ""),
     gap("disk-command", "tool"),
@@ -337,10 +336,11 @@ pub const PARITY: &[Row] = &[
     gap("gateway start", ""),
     gap("gateway stop", ""),
     gap("gateway stop", "purge"),
-    gap("gateway status", ""),
-    gap("gateway run", ""),
+    row("gateway status", "", field(&[("host.gatewayStatus", "")], &[member("Host.gatewayStatus")])),
+    row("gateway run", "", Counterpart::CliOnly { reason: "process entrypoint: the daemon launchd execs; a library call never becomes it and no host connection runs it (07_api.md, Host operations)" }),
 
     row("controller", "", Counterpart::Composed { recipe: "an embedding process starts `cowshed controller` on one end of a socketpair and passes the other to coordinatorEndpoint (07_api.md, \"cowshed-napi\")", facade: &[member("coordinatorEndpoint")] }),
+    row("host", "", Counterpart::Composed { recipe: "an embedding process calls openHost, which starts `cowshed host` through the package launcher on a socketpair and connects to it (07_api.md, Host operations)", facade: &[member("openHost")] }),
 
     gap("credential add", ""),
     gap("credential add", "origin"),
@@ -349,21 +349,21 @@ pub const PARITY: &[Row] = &[
     gap("credential add", "secret-env"),
     gap("credential add", "secret-command"),
     gap("credential add", "secret-stdin"),
-    gap("credential ls", ""),
-    gap("credential status", ""),
-    gap("credential rm", ""),
-    gap("credential rm", "origin"),
+    row("credential ls", "", field(&[("host.credentialStatus", "project")], &[argument("Host.credentialStatus", 0, "")])),
+    row("credential status", "", field(&[("host.credentialStatus", "project")], &[argument("Host.credentialStatus", 0, "")])),
+    row("credential rm", "", field(&[("host.credentialRemove", "project")], &[argument("Host.credentialRemove", 0, "")])),
+    row("credential rm", "origin", field(&[("host.credentialRemove", "origin")], &[argument("Host.credentialRemove", 1, "")])),
 
-    gap("identity add", ""),
-    gap("identity add", "remote"),
+    row("identity add", "", field(&[("host.identityAdd", "project")], &[argument("Host.identityAdd", 0, "")])),
+    row("identity add", "remote", field(&[("host.identityAdd", "remote")], &[argument("Host.identityAdd", 1, "")])),
 
     gap("sccache start", ""),
     gap("sccache start", "capacity"),
     gap("sccache stop", ""),
     gap("sccache status", ""),
 
-    gap("skill install", ""),
-    gap("skill install", "harness"),
+    row("skill install", "", field(&[("host.skillInstall", "")], &[member("Host.skillInstall")])),
+    row("skill install", "harness", field(&[("host.skillInstall", "harnesses")], &[argument("Host.skillInstall", 0, "harnesses")])),
 ];
 
 /// What the check found, for the generator's one summary line.

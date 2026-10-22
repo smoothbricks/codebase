@@ -170,6 +170,19 @@ export const parseBuildId = (json: string): Api.BuildId => assertBuildId(JSON.pa
 export const assertBuildIdList = typia.createAssertEquals<readonly Api.BuildId[]>();
 export const parseBuildIdList = (json: string): readonly Api.BuildId[] => assertBuildIdList(JSON.parse(json));
 
+export const assertBuildStateLink = typia.createAssertEquals<Api.BuildStateLink>();
+export const parseBuildStateLink = (json: string): Api.BuildStateLink => assertBuildStateLink(JSON.parse(json));
+export const assertBuildStateLinkList = typia.createAssertEquals<readonly Api.BuildStateLink[]>();
+export const parseBuildStateLinkList = (json: string): readonly Api.BuildStateLink[] =>
+  assertBuildStateLinkList(JSON.parse(json));
+
+export const assertBuildStateListing = typia.createAssertEquals<Api.BuildStateListing>();
+export const parseBuildStateListing = (json: string): Api.BuildStateListing =>
+  assertBuildStateListing(JSON.parse(json));
+export const assertBuildStateListingList = typia.createAssertEquals<readonly Api.BuildStateListing[]>();
+export const parseBuildStateListingList = (json: string): readonly Api.BuildStateListing[] =>
+  assertBuildStateListingList(JSON.parse(json));
+
 export const assertBuildVolume = typia.createAssertEquals<Api.BuildVolume>();
 export const parseBuildVolume = (json: string): Api.BuildVolume => assertBuildVolume(JSON.parse(json));
 export const assertBuildVolumeList = typia.createAssertEquals<readonly Api.BuildVolume[]>();
@@ -345,6 +358,13 @@ export const assertCpuWaiter = typia.createAssertEquals<Api.CpuWaiter>();
 export const parseCpuWaiter = (json: string): Api.CpuWaiter => assertCpuWaiter(JSON.parse(json));
 export const assertCpuWaiterList = typia.createAssertEquals<readonly Api.CpuWaiter[]>();
 export const parseCpuWaiterList = (json: string): readonly Api.CpuWaiter[] => assertCpuWaiterList(JSON.parse(json));
+
+export const assertCredentialRemoveRequest = typia.createAssertEquals<Api.CredentialRemoveRequest>();
+export const parseCredentialRemoveRequest = (json: string): Api.CredentialRemoveRequest =>
+  assertCredentialRemoveRequest(JSON.parse(json));
+export const assertCredentialRemoveRequestList = typia.createAssertEquals<readonly Api.CredentialRemoveRequest[]>();
+export const parseCredentialRemoveRequestList = (json: string): readonly Api.CredentialRemoveRequest[] =>
+  assertCredentialRemoveRequestList(JSON.parse(json));
 
 export const assertCredentialReport = typia.createAssertEquals<Api.CredentialReport>();
 export const parseCredentialReport = (json: string): Api.CredentialReport => assertCredentialReport(JSON.parse(json));
@@ -597,10 +617,23 @@ export const parseHoldSignal = (json: string): Api.HoldSignal => assertHoldSigna
 export const assertHoldSignalList = typia.createAssertEquals<readonly Api.HoldSignal[]>();
 export const parseHoldSignalList = (json: string): readonly Api.HoldSignal[] => assertHoldSignalList(JSON.parse(json));
 
+export const assertHostAttachAllRequest = typia.createAssertEquals<Api.HostAttachAllRequest>();
+export const parseHostAttachAllRequest = (json: string): Api.HostAttachAllRequest =>
+  assertHostAttachAllRequest(JSON.parse(json));
+export const assertHostAttachAllRequestList = typia.createAssertEquals<readonly Api.HostAttachAllRequest[]>();
+export const parseHostAttachAllRequestList = (json: string): readonly Api.HostAttachAllRequest[] =>
+  assertHostAttachAllRequestList(JSON.parse(json));
+
 export const assertHostCores = typia.createAssertEquals<Api.HostCores>();
 export const parseHostCores = (json: string): Api.HostCores => assertHostCores(JSON.parse(json));
 export const assertHostCoresList = typia.createAssertEquals<readonly Api.HostCores[]>();
 export const parseHostCoresList = (json: string): readonly Api.HostCores[] => assertHostCoresList(JSON.parse(json));
+
+export const assertHostListRequest = typia.createAssertEquals<Api.HostListRequest>();
+export const parseHostListRequest = (json: string): Api.HostListRequest => assertHostListRequest(JSON.parse(json));
+export const assertHostListRequestList = typia.createAssertEquals<readonly Api.HostListRequest[]>();
+export const parseHostListRequestList = (json: string): readonly Api.HostListRequest[] =>
+  assertHostListRequestList(JSON.parse(json));
 
 export const assertHostLoad1 = typia.createAssertEquals<Api.HostLoad1>();
 export const parseHostLoad1 = (json: string): Api.HostLoad1 => assertHostLoad1(JSON.parse(json));
@@ -612,6 +645,19 @@ export const parseHostLoadSample = (json: string): Api.HostLoadSample => assertH
 export const assertHostLoadSampleList = typia.createAssertEquals<readonly Api.HostLoadSample[]>();
 export const parseHostLoadSampleList = (json: string): readonly Api.HostLoadSample[] =>
   assertHostLoadSampleList(JSON.parse(json));
+
+export const assertHostRequest = typia.createAssertEquals<Api.HostRequest>();
+export const parseHostRequest = (json: string): Api.HostRequest => assertHostRequest(JSON.parse(json));
+export const assertHostRequestList = typia.createAssertEquals<readonly Api.HostRequest[]>();
+export const parseHostRequestList = (json: string): readonly Api.HostRequest[] =>
+  assertHostRequestList(JSON.parse(json));
+
+export const assertIdentityAddRequest = typia.createAssertEquals<Api.IdentityAddRequest>();
+export const parseIdentityAddRequest = (json: string): Api.IdentityAddRequest =>
+  assertIdentityAddRequest(JSON.parse(json));
+export const assertIdentityAddRequestList = typia.createAssertEquals<readonly Api.IdentityAddRequest[]>();
+export const parseIdentityAddRequestList = (json: string): readonly Api.IdentityAddRequest[] =>
+  assertIdentityAddRequestList(JSON.parse(json));
 
 export const assertIdentityReport = typia.createAssertEquals<Api.IdentityReport>();
 export const parseIdentityReport = (json: string): Api.IdentityReport => assertIdentityReport(JSON.parse(json));
@@ -1133,6 +1179,20 @@ export const assertProjectOpenedList = typia.createAssertEquals<readonly Api.Pro
 export const parseProjectOpenedList = (json: string): readonly Api.ProjectOpened[] =>
   assertProjectOpenedList(JSON.parse(json));
 
+export const assertProjectPathRequest = typia.createAssertEquals<Api.ProjectPathRequest>();
+export const parseProjectPathRequest = (json: string): Api.ProjectPathRequest =>
+  assertProjectPathRequest(JSON.parse(json));
+export const assertProjectPathRequestList = typia.createAssertEquals<readonly Api.ProjectPathRequest[]>();
+export const parseProjectPathRequestList = (json: string): readonly Api.ProjectPathRequest[] =>
+  assertProjectPathRequestList(JSON.parse(json));
+
+export const assertProjectRetirementReport = typia.createAssertEquals<Api.ProjectRetirementReport>();
+export const parseProjectRetirementReport = (json: string): Api.ProjectRetirementReport =>
+  assertProjectRetirementReport(JSON.parse(json));
+export const assertProjectRetirementReportList = typia.createAssertEquals<readonly Api.ProjectRetirementReport[]>();
+export const parseProjectRetirementReportList = (json: string): readonly Api.ProjectRetirementReport[] =>
+  assertProjectRetirementReportList(JSON.parse(json));
+
 export const assertProjectWorkspaces = typia.createAssertEquals<Api.ProjectWorkspaces>();
 export const parseProjectWorkspaces = (json: string): Api.ProjectWorkspaces =>
   assertProjectWorkspaces(JSON.parse(json));
@@ -1435,6 +1495,13 @@ export const parseSkillInstallReport = (json: string): Api.SkillInstallReport =>
 export const assertSkillInstallReportList = typia.createAssertEquals<readonly Api.SkillInstallReport[]>();
 export const parseSkillInstallReportList = (json: string): readonly Api.SkillInstallReport[] =>
   assertSkillInstallReportList(JSON.parse(json));
+
+export const assertSkillInstallRequest = typia.createAssertEquals<Api.SkillInstallRequest>();
+export const parseSkillInstallRequest = (json: string): Api.SkillInstallRequest =>
+  assertSkillInstallRequest(JSON.parse(json));
+export const assertSkillInstallRequestList = typia.createAssertEquals<readonly Api.SkillInstallRequest[]>();
+export const parseSkillInstallRequestList = (json: string): readonly Api.SkillInstallRequest[] =>
+  assertSkillInstallRequestList(JSON.parse(json));
 
 export const assertSkillInstallStatus = typia.createAssertEquals<Api.SkillInstallStatus>();
 export const parseSkillInstallStatus = (json: string): Api.SkillInstallStatus =>

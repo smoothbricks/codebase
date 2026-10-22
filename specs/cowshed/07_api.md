@@ -2147,3 +2147,37 @@ keyless workspace's CA identity (`rekey`) and re-derives that workspace's gatewa
 answers, both for the CLI and the addon alike: a held gateway identity never outlives its key until some later exec. The
 rotation republishes the grants sidecar at revision + 1 whether its source was the quarantine entry or the live sidecar,
 because the gateway installs only a higher revision and never bypasses that fence.
+
+## Host operations
+
+The host's own verbs — whose subject is the host, or a project no controller serves — are rows of the one `operations!`
+table with scope `host`, projected like every other row: generated request and result records, validators, served
+construction and N-API adapters, onto a `Host` handle that binds no request field. A project-subject host operation
+names the project by a path inside its checkout (`project`), resolved as `--project` resolves it.
+
+A host row is served by exactly one route, a `cowshed host` connection, and nothing else serves it: a project connection
+refuses a host method before decoding it, the project router refuses one that reaches it, and a host connection refuses
+every method that is not a host row. `cowshed host` is the CLI binary serving one connection on the socket it inherits
+as standard input, with the controller's frames, handshake version and limits; its handshake answer is
+`{version, nonce, host: "host"}`, which a project client does not decode, and a project controller's answer does not
+decode as a host's. Every operation calls the function its CLI verb calls and answers with what that function computes;
+only rendering is the verb's. Guidance goes to `cowshed host`'s stderr; stdout is never written.
+
+TypeScript reaches it through `openHost(): Promise<Host>`: the addon makes a socketpair, starts the package launcher
+(`bin/cowshed host`, 06_cli.md "Launcher") with one end as its standard input and the caller's stdout and stderr, and
+connects on the other. `Host.close()` ends the connection and resolves once the process has exited; every call after it
+rejects. A child a host operation starts never inherits the socket: its stdin is the request's own bytes or `/dev/null`.
+
+Served rows: `host.listProjects` (`ls --all`, with `ls`'s landing selection), `host.attachAll`, `host.detachAll`,
+`host.clearAttachBudget` (`doctor --clear-attach-budget`), `host.forgetAbandoned` (`forget --abandon`: the operation is
+the authorization), `host.mountMain`, `host.gatewayStatus`, `host.credentialStatus`, `host.credentialRemove`,
+`host.identityAdd`, `host.skillInstall`, `host.buildState` and `host.clearNxStore` (`cache clear`'s gateway half).
+`disk-command`, `land-turn`, `gateway start`/`stop`, `credential add`, the `sccache` verbs and the process helpers
+`lock`, `lock-holders`, `hold`, `tree-holders`, `subtree-root` and `retire-descendants` are the parity gate's known gaps
+until their rows land: `disk-command` streams the tool's output whole and never deadlines a verb that creates or
+releases a disk-image device, `land-turn` holds its turn until its child ends whatever the connection does,
+`credential add`'s secret is the upload frame, and the `sccache` rows are served by `cowshed sccache host` so the
+launcher's installed-build selection holds.
+
+One verb has no counterpart by name: `gateway run` is the process launchd execs as the daemon. A library call never
+becomes that process and no host connection runs it.

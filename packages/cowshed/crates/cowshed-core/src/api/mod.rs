@@ -13,7 +13,7 @@ pub mod server;
 pub mod tree_holder;
 
 pub use capability::{
-    Adopted, Coordinator, CoordinatorToken, Cowshed, EventStream, JobAttachment, JobHandle,
+    Adopted, Coordinator, CoordinatorToken, Cowshed, EventStream, Host, JobAttachment, JobHandle,
     JobStdin, Project, RawByteStream, Session, WorkspaceHandle, WorkspaceRef,
 };
 pub use dto::*;

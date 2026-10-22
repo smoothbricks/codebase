@@ -6,7 +6,231 @@
 
 use super::*;
 use crate::api::call::{Arguments, Binder, Serves, decode, owned};
-use crate::api::capability::{Coordinator, JobHandle, Project, WorkspaceHandle, WorkspaceRef};
+use crate::api::capability::{
+    Coordinator, Host, JobHandle, Project, WorkspaceHandle, WorkspaceRef,
+};
+
+impl Serves<HostListProjects> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<HostListRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            #[serde(default)]
+            landing: Option<ListLanding>,
+        }
+        let Caller { landing } = decode::<HostListProjects, Caller>(arguments)?;
+        Ok(HostListRequest { landing })
+    }
+}
+
+impl Serves<HostAttachAll> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<HostAttachAllRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            #[serde(default)]
+            browse: bool,
+        }
+        let Caller { browse } = decode::<HostAttachAll, Caller>(arguments)?;
+        Ok(HostAttachAllRequest { browse })
+    }
+}
+
+impl Serves<HostDetachAll> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<HostRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {}
+        let Caller {} = decode::<HostDetachAll, Caller>(arguments)?;
+        Ok(HostRequest {})
+    }
+}
+
+impl Serves<HostClearAttachBudget> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<HostRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {}
+        let Caller {} = decode::<HostClearAttachBudget, Caller>(arguments)?;
+        Ok(HostRequest {})
+    }
+}
+
+impl Serves<HostForgetAbandoned> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<RepoRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            repo_id: RepoId,
+        }
+        let Caller { repo_id } = decode::<HostForgetAbandoned, Caller>(arguments)?;
+        Ok(RepoRequest { repo_id })
+    }
+}
+
+impl Serves<HostMountMain> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<RepoRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            repo_id: RepoId,
+        }
+        let Caller { repo_id } = decode::<HostMountMain, Caller>(arguments)?;
+        Ok(RepoRequest { repo_id })
+    }
+}
+
+impl Serves<HostGatewayStatus> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<HostRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {}
+        let Caller {} = decode::<HostGatewayStatus, Caller>(arguments)?;
+        Ok(HostRequest {})
+    }
+}
+
+impl Serves<HostCredentialStatus> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<ProjectPathRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            project: PathBuf,
+        }
+        let Caller { project } = decode::<HostCredentialStatus, Caller>(arguments)?;
+        Ok(ProjectPathRequest { project })
+    }
+}
+
+impl Serves<HostCredentialRemove> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<CredentialRemoveRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            project: PathBuf,
+            origin: String,
+        }
+        let Caller { project, origin } = decode::<HostCredentialRemove, Caller>(arguments)?;
+        Ok(CredentialRemoveRequest { project, origin })
+    }
+}
+
+impl Serves<HostIdentityAdd> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<IdentityAddRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            project: PathBuf,
+            remote: String,
+        }
+        let Caller { project, remote } = decode::<HostIdentityAdd, Caller>(arguments)?;
+        Ok(IdentityAddRequest { project, remote })
+    }
+}
+
+impl Serves<HostSkillInstall> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<SkillInstallRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            #[serde(default)]
+            harnesses: Vec<String>,
+            #[serde(default)]
+            project: Option<PathBuf>,
+        }
+        let Caller { harnesses, project } = decode::<HostSkillInstall, Caller>(arguments)?;
+        Ok(SkillInstallRequest { harnesses, project })
+    }
+}
+
+impl Serves<HostBuildState> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<ProjectPathRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            project: PathBuf,
+        }
+        let Caller { project } = decode::<HostBuildState, Caller>(arguments)?;
+        Ok(ProjectPathRequest { project })
+    }
+}
+
+impl Serves<HostClearNxStore> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<ProjectPathRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            project: PathBuf,
+        }
+        let Caller { project } = decode::<HostClearNxStore, Caller>(arguments)?;
+        Ok(ProjectPathRequest { project })
+    }
+}
 
 impl Serves<ProjectWorkspace> for Project {
     const BOUND: &'static [&'static str] = &["repoId"];
@@ -1454,12 +1678,26 @@ pub(crate) trait EachServed {
 #[cfg(test)]
 pub(crate) fn each_served(
     check: &mut impl EachServed,
+    host: &Host,
     project: &Project,
     workspace_ref: &WorkspaceRef,
     coordinator: &Coordinator,
     workspace_handle: &WorkspaceHandle,
     job_handle: &JobHandle,
 ) {
+    check.served::<HostListProjects, _>(host, &[]);
+    check.served::<HostAttachAll, _>(host, &[]);
+    check.served::<HostDetachAll, _>(host, &[]);
+    check.served::<HostClearAttachBudget, _>(host, &[]);
+    check.served::<HostForgetAbandoned, _>(host, &[]);
+    check.served::<HostMountMain, _>(host, &[]);
+    check.served::<HostGatewayStatus, _>(host, &[]);
+    check.served::<HostCredentialStatus, _>(host, &[]);
+    check.served::<HostCredentialRemove, _>(host, &[]);
+    check.served::<HostIdentityAdd, _>(host, &[]);
+    check.served::<HostSkillInstall, _>(host, &[]);
+    check.served::<HostBuildState, _>(host, &[]);
+    check.served::<HostClearNxStore, _>(host, &[]);
     check.served::<ProjectWorkspace, _>(project, &[]);
     check.served::<ProjectWorkspaceAt, _>(project, &[]);
     check.served::<ProjectList, _>(project, &[]);

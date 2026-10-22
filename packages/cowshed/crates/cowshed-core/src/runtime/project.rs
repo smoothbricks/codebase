@@ -1244,6 +1244,13 @@ impl ProjectActor {
         let scope = operations::operation(method)
             .map(|info| info.scope)
             .ok_or_else(|| CowshedError::internal(format!("{method} has no declaration")))?;
+        if scope == Scope::Host {
+            return Err(CowshedError::new(
+                ErrorCode::SandboxDenied,
+                format!("{method} is a host operation, which no project controller serves"),
+                "call it on a cowshed host connection",
+            ));
+        }
         if scope != Scope::Worker {
             require_coordinator(&authority)?;
         }
@@ -1625,6 +1632,23 @@ impl ProjectActor {
                     .await?;
                 respond::<operations::JobDetach>(&EmptyResult {})
             }
+            Op::HostListProjects(_)
+            | Op::HostAttachAll(_)
+            | Op::HostDetachAll(_)
+            | Op::HostClearAttachBudget(_)
+            | Op::HostForgetAbandoned(_)
+            | Op::HostMountMain(_)
+            | Op::HostGatewayStatus(_)
+            | Op::HostCredentialStatus(_)
+            | Op::HostCredentialRemove(_)
+            | Op::HostIdentityAdd(_)
+            | Op::HostSkillInstall(_)
+            | Op::HostBuildState(_)
+            | Op::HostClearNxStore(_) => {
+                return Err(CowshedError::internal(format!(
+                    "host operation {method} reached the project router past its scope check"
+                )));
+            }
             Op::SessionClose(params) => {
                 self.require_scoped_workspace(&authority, &params.repo_id, &params.workspace)
                     .await?;
@@ -1642,7 +1666,7 @@ impl ProjectActor {
     }
 
     fn validate_connection_authority(&self, authority: &ConnectionAuthority) -> Result<()> {
-        if authority.repo_id() != &self.host.descriptor().repo_id {
+        if authority.repo_id() != Some(&self.host.descriptor().repo_id) {
             return Err(CowshedError::conflict(
                 "connection repository authority does not match this project runtime",
                 "reopen the project through its bound controller descriptor",

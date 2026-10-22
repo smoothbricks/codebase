@@ -351,6 +351,17 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
         .map(|()| 0);
         return Ok(finish(outcome, &mut output, json));
     }
+    // An embedding process's host connection: like the controller it lasts as long as that
+    // process keeps its end open. It names no project, so nothing is resolved before it serves.
+    if matches!(parsed.command, args::Command::Host) {
+        let outcome = async {
+            let socket = controller_service::take_inherited_socket()?;
+            crate::host_service::serve(socket).await
+        }
+        .await
+        .map(|()| 0);
+        return Ok(finish(outcome, &mut output, json));
+    }
     // Enrolment is a host operation with a project subject: it needs the repository identity a
     // credential record binds to, and nothing else the project bridge provides.
     if let args::Command::Credential(action) = parsed.command.clone() {

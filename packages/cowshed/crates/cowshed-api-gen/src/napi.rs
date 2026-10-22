@@ -48,6 +48,15 @@ const WORKSPACE_AUTHORITY: &[&str] = &["repoId", "workspace", "workspaceIncarnat
 const JOB_AUTHORITY: &[&str] = &["repoId", "workspace", "workspaceIncarnation", "jobId"];
 
 const CLASSES: &[Class] = &[
+    // The host's own operations bind nothing: each names its whole subject, a project by its
+    // checkout path.
+    Class {
+        rust: "Host",
+        namespaces: &["host"],
+        scopes: &[Scope::Host],
+        fence: &[],
+        authority: &[],
+    },
     Class {
         rust: "Project",
         namespaces: &["project"],
@@ -239,8 +248,9 @@ pub fn emit(
                 });
             }
             // A request that names none of the class's authority is how a handle is reached, not
-            // a method of one: `project.open` opens the project the handles belong to.
-            if bound.is_empty() {
+            // a method of one: `project.open` opens the project the handles belong to. A handle
+            // whose authority is empty, the host's, binds nothing for any of its methods.
+            if bound.is_empty() && !class.authority.is_empty() {
                 continue;
             }
             if let Some(missing) = class
@@ -502,7 +512,7 @@ fn serves(classes: &[(&Class, Vec<Method<'_>>)]) -> Result<String, String> {
          //! arguments as a record of exactly those fields.\n\n\
          use super::*;\n\
          use crate::api::call::{{Arguments, Binder, Serves, decode, owned}};\n\
-         use crate::api::capability::{{Coordinator, JobHandle, Project, WorkspaceHandle, WorkspaceRef}};\n"
+         use crate::api::capability::{{Coordinator, Host, JobHandle, Project, WorkspaceHandle, WorkspaceRef}};\n"
     );
     for (class, methods) in classes {
         for method in methods {
@@ -562,9 +572,12 @@ fn serve(output: &mut String, class: &Class, method: &Method<'_>) -> Result<(), 
     writeln!(
         output,
         "\nimpl Serves<{}> for {} {{\n    const BOUND: &'static [&'static str] = &[{bound}];\n\n    \
-         fn request(authority: &<Self as Binder>::Fields<'_>, arguments: Arguments) -> Result<{}> {{\n        \
+         fn request({}: &<Self as Binder>::Fields<'_>, arguments: Arguments) -> Result<{}> {{\n        \
          #[derive(Deserialize)]",
-        operation.marker, class.rust, request.name
+        operation.marker,
+        class.rust,
+        if method.bound.is_empty() { "_authority" } else { "authority" },
+        request.name
     )
     .unwrap();
     let container = [
@@ -658,7 +671,7 @@ fn parameter(class: &str) -> String {
 fn rust(classes: &[(&Class, Vec<Method<'_>>)]) -> Result<String, String> {
     let mut output = format!(
         "{HEADER}//! One adapter per controller operation, on each handle that serves it.\n\n\
-         use super::{{Coordinator, JobHandle, Project, WorkspaceHandle, WorkspaceRef}};\n\
+         use super::{{Coordinator, Host, JobHandle, Project, WorkspaceHandle, WorkspaceRef}};\n\
          use cowshed_core::api::operations;\n\
          use napi::{{Env, JsObject, bindgen_prelude::Buffer}};\n\
          use napi_derive::napi;\n\

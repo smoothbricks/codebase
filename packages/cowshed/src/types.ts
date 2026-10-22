@@ -1,8 +1,20 @@
 import type * as Api from './api.generated.js';
-import type { JobLogsArguments, ProjectListArguments } from './native.generated.js';
+import type {
+  HostAttachAllArguments,
+  HostListProjectsArguments,
+  HostSkillInstallArguments,
+  JobLogsArguments,
+  ProjectListArguments,
+} from './native.generated.js';
 
 export type * from './api.generated.js';
-export type { JobLogsArguments, ProjectListArguments } from './native.generated.js';
+export type {
+  HostAttachAllArguments,
+  HostListProjectsArguments,
+  HostSkillInstallArguments,
+  JobLogsArguments,
+  ProjectListArguments,
+} from './native.generated.js';
 
 export type CowshedErrorOptions = ErrorOptions &
   Pick<Api.CowshedError, 'admission' | 'cpuAdmission' | 'priority' | 'stdin'>;
@@ -96,6 +108,36 @@ export interface Project {
    * landing branch; `'landed'` keeps only the sessions whose work is provably fully landed.
    */
   listWorkspaces(options?: ProjectListArguments): Promise<readonly Api.WorkspaceInfo[]>;
+}
+
+/**
+ * The host's own verbs over one `cowshed host` connection, served by the binary the package
+ * launcher picks (07_api.md, "Host operations"). A project-subject operation names the project by
+ * a path inside its checkout, as `--project` does.
+ */
+export interface Host {
+  listProjects(options?: HostListProjectsArguments): Promise<readonly Api.ProjectWorkspaces[]>;
+  attachAll(options?: HostAttachAllArguments): Promise<readonly Api.WorkspaceInfo[]>;
+  detachAll(): Promise<void>;
+  clearAttachBudget(): Promise<void>;
+  /** Retires a project no controller can open; calling it is the explicit abandonment. */
+  forgetAbandoned(repoId: Api.RepoRequest['repoId']): Promise<Api.ProjectRetirementReport>;
+  mountMain(repoId: Api.RepoRequest['repoId']): Promise<Api.MountResult>;
+  gatewayStatus(): Promise<Api.GatewayStatus>;
+  credentialStatus(project: Api.ProjectPathRequest['project']): Promise<Api.CredentialReport>;
+  credentialRemove(
+    project: Api.CredentialRemoveRequest['project'],
+    origin: Api.CredentialRemoveRequest['origin'],
+  ): Promise<Api.CredentialReport>;
+  identityAdd(
+    project: Api.IdentityAddRequest['project'],
+    remote: Api.IdentityAddRequest['remote'],
+  ): Promise<Api.IdentityReport>;
+  skillInstall(options?: HostSkillInstallArguments): Promise<Api.SkillInstallReport>;
+  buildState(project: Api.ProjectPathRequest['project']): Promise<Api.BuildStateListing>;
+  clearNxStore(project: Api.ProjectPathRequest['project']): Promise<Api.NxStoreClearResult>;
+  /** Ends the connection and with it the `cowshed host` process; later calls reject. */
+  close(): Promise<void>;
 }
 
 export interface Coordinator {

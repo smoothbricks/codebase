@@ -343,6 +343,22 @@ export type BranchName = string;
 export type BuildId = string;
 
 /**
+ * One recorded build-state link of a checkout: the tool path in the checkout and the volume path
+ * that holds it (16_build_volumes.md).
+ */
+export type BuildStateLink = {
+  readonly checkout: string;
+  readonly volume: string;
+};
+
+/**
+ * `cowshed build-state` and `host.buildState`: every recorded build-state link of a checkout.
+ */
+export type BuildStateListing = {
+  readonly paths: ReadonlyArray<BuildStateLink>;
+};
+
+/**
  * The build volume a job would be granted, or `None` when the checkout links none. Always an
  * object: an RPC envelope carries no result for a bare `null`.
  */
@@ -743,6 +759,14 @@ export type CpuWaiter = {
    * Milliseconds since it asked.
    */
   readonly waitedMs: number & tags.Type<'uint64'>;
+};
+
+/**
+ * `credential rm --origin`.
+ */
+export type CredentialRemoveRequest = {
+  readonly project: string;
+  readonly origin: string;
 };
 
 export type CredentialReport = {
@@ -1333,9 +1357,23 @@ export type HoldSignal =
   | 'WINCH';
 
 /**
+ * `attach --all [--browse]`.
+ */
+export type HostAttachAllRequest = {
+  readonly browse: boolean;
+};
+
+/**
  * Online host cores, independent of the current process's affinity mask.
  */
 export type HostCores = number & tags.Type<'uint32'> & tags.Minimum<1> & tags.Maximum<65535>;
+
+/**
+ * Every adopted project's listing (`ls --all`), measured for landing when asked.
+ */
+export type HostListRequest = {
+  readonly landing?: ListLanding;
+};
 
 /**
  * The host's one-minute run-queue load, never a missing observation filled with zero. Finite:
@@ -1347,6 +1385,19 @@ export type HostLoad1 = number & tags.Minimum<0> & tags.Maximum<1.79769313486231
 export type HostLoadSample = {
   readonly load1: HostLoad1;
   readonly cores: HostCores;
+};
+
+/**
+ * A host operation that names nothing: the host is its whole subject.
+ */
+export type HostRequest = { readonly [key in string]: never };
+
+/**
+ * `identity add <remote>`.
+ */
+export type IdentityAddRequest = {
+  readonly project: string;
+  readonly remote: string;
 };
 
 /**
@@ -2495,6 +2546,23 @@ export type ProjectOpened = {
   readonly storeRoot: string;
 };
 
+/**
+ * A host operation whose subject is a project: its checkout, resolved as `--project` is.
+ */
+export type ProjectPathRequest = {
+  readonly project: string;
+};
+
+/**
+ * What `cowshed forget <owner/repo> --abandon` reports: the project it retired, where its whole
+ * tree now stands, and how many backing images that tree carries.
+ */
+export type ProjectRetirementReport = {
+  readonly repoId: RepoId;
+  readonly archive: string;
+  readonly images: number & tags.Type<'uint64'>;
+};
+
 export type ProjectWorkspaces = {
   readonly repoId: RepoId;
   readonly workspaces: ReadonlyArray<WorkspaceInfo>;
@@ -2951,6 +3019,17 @@ export type SkillInstall = {
 export type SkillInstallReport = {
   readonly skill: string;
   readonly installs: ReadonlyArray<SkillInstall>;
+};
+
+/**
+ * `[--project <root>] skill install [--harness]`: no harness installs every detected one.
+ */
+export type SkillInstallRequest = {
+  readonly harnesses?: ReadonlyArray<string>;
+  /**
+   * Install into this project's harness directories instead of the user's (`--project`).
+   */
+  readonly project?: string;
 };
 
 /**

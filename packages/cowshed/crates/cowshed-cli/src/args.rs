@@ -56,6 +56,7 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &TREE_HOLDERS,
     &GATEWAY,
     &CONTROLLER,
+    &HOST,
     &CREDENTIAL,
     &IDENTITY,
     &SCCACHE,
@@ -133,6 +134,8 @@ pub enum Command {
     Gateway(GatewayCommand),
     /// One coordinator controller connection, served on standard input for an embedding process.
     Controller,
+    /// One host connection, served on standard input for an embedding process.
+    Host,
     Credential(CredentialCommand),
     Identity(IdentityCommand),
     Sccache(SccacheCommand),
@@ -196,6 +199,7 @@ impl Command {
             | Self::TreeHolders(_)
             | Self::Sccache(_)
             | Self::Skill(_)
+            | Self::Host
             | Self::Version
             | Self::Help(_) => ProjectDiscovery::NotUsed,
         }
@@ -1109,6 +1113,7 @@ pub fn cli_command() -> ClapCommand {
                 .subcommand(leaf("run")),
         )
         .subcommand(leaf("controller"))
+        .subcommand(leaf("host"))
         .subcommand(
             leaf("credential")
                 .subcommand_required(true)
@@ -1256,6 +1261,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "hold" => parse_hold(leaf, &global)?,
         "tree-holders" => parse_tree_holders(leaf, &global)?,
         "controller" => Command::Controller,
+        "host" => Command::Host,
         "gateway" => parse_gateway(leaf, &global)?,
         "credential" => parse_credential(leaf)?,
         "identity" => parse_identity(leaf)?,
@@ -2078,6 +2084,18 @@ const CONTROLLER: CommandSpec = CommandSpec {
     options: &[],
 };
 
+const HOST: CommandSpec = CommandSpec {
+    name: "host",
+    missing: "host requires an argument",
+    args: "",
+    trailing: "",
+    summary: "serve the host's own verbs to an embedding process",
+    about: &[
+        "Serves one host connection on standard input, which must be a Unix socket: an embedding process makes a socketpair, starts this command with one end as its standard input, and calls the host operations on the other end (`openHost` in N-API, which starts it through the package launcher). It answers the host's own verbs — listings and mounts across every project, gateway health, credentials, identities, the skill, build state — with exactly what each verb computes, and names no project. Nothing is written to stdout; guidance goes to stderr; the command exits 0 when the embedding process closes its end.",
+    ],
+    options: &[],
+};
+
 const GATEWAY: CommandSpec = CommandSpec {
     name: "gateway",
     missing: "gateway action is required",
@@ -2385,23 +2403,8 @@ fn parse_skill(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
     } else {
         crate::skill::Scope::Global
     };
-    for name in &harnesses {
-        if crate::skill::harness_named(scope, name).is_none() {
-            let suggestions = crate::skill::harness_suggestions(scope, name);
-            let detail = if suggestions.is_empty() {
-                format!(
-                    "known harnesses include {}",
-                    crate::skill::harness_names(scope)
-                )
-            } else {
-                format!("did you mean {}?", suggestions.join(" or "))
-            };
-            return Err(UsageError::new(
-                format!("unknown harness `{name}`; {detail}"),
-                USAGE,
-            ));
-        }
-    }
+    crate::skill::select_harnesses(scope, &harnesses)
+        .map_err(|message| UsageError::new(message, USAGE))?;
     Ok(Command::Skill(SkillArgs {
         action: SkillCommand::Install,
         harnesses,

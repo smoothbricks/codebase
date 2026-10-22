@@ -4,10 +4,10 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
+use cowshed_core::api::{BuildStateLink, BuildStateListing};
 use cowshed_core::build_volume::{BUILD_LINK, BuildVolumeState};
 use cowshed_core::capabilities::BuildStatePath;
 use cowshed_core::{CowshedError, Result};
-use serde::Serialize;
 
 use crate::output::Output;
 
@@ -45,16 +45,23 @@ pub fn read(checkout: &Path) -> Result<BuildVolumeState> {
     BuildVolumeState::read_optional(&link)?.ok_or_else(missing_volume)
 }
 
-#[derive(Serialize)]
-struct Listing<'a> {
-    paths: &'a [BuildStatePath],
+/// The checkout's recorded build-state links, as `--json` prints them and `host.buildState`
+/// answers.
+pub fn listing(state: BuildVolumeState) -> BuildStateListing {
+    BuildStateListing {
+        paths: state
+            .paths
+            .into_iter()
+            .map(|path: BuildStatePath| BuildStateLink {
+                checkout: path.checkout.into_path_buf(),
+                volume: path.volume.into_path_buf(),
+            })
+            .collect(),
+    }
 }
 
-pub fn dispatch<W: Write, E: Write>(
-    start: &Path,
-    json: bool,
-    output: &mut Output<W, E>,
-) -> Result<i32> {
+/// The recorded build state of the checkout containing `start`.
+pub fn read_at(start: &Path) -> Result<BuildVolumeState> {
     let start = fs::canonicalize(start).map_err(|error| {
         CowshedError::environment_missing(
             format!(
@@ -70,13 +77,17 @@ pub fn dispatch<W: Write, E: Write>(
             "run from a git checkout or pass --project <git-root>",
         )
     })?;
-    let state = read(checkout)?;
+    read(checkout)
+}
+
+pub fn dispatch<W: Write, E: Write>(
+    start: &Path,
+    json: bool,
+    output: &mut Output<W, E>,
+) -> Result<i32> {
+    let state = read_at(start)?;
     if json {
-        output
-            .bare_record(&Listing {
-                paths: &state.paths,
-            })
-            .map_err(write_error)?;
+        output.bare_record(&listing(state)).map_err(write_error)?;
     } else {
         for path in &state.paths {
             output

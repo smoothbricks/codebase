@@ -15,8 +15,8 @@
 //! a second field list, decides what the call accepts.
 
 use super::capability::{
-    Adopted, ControllerRuntime, Coordinator, EventStream, JobHandle, Project, WorkspaceHandle,
-    WorkspaceRef, invoke, invoke_download, invoke_stream, invoke_upload,
+    Adopted, ControllerRuntime, Coordinator, EventStream, Host, JobHandle, Project,
+    WorkspaceHandle, WorkspaceRef, invoke, invoke_download, invoke_stream, invoke_upload,
 };
 use super::dto::{JobId, JobInfo, WorkspaceIncarnation};
 use super::operations::{
@@ -71,6 +71,10 @@ pub struct Binding<'a, F> {
     pub(super) authority: F,
 }
 
+/// The fields a [`Host`] binds: none. A host operation names its whole subject.
+#[doc(hidden)]
+pub struct HostFields;
+
 /// The fields a [`Project`] or [`Coordinator`] binds: its repository.
 #[doc(hidden)]
 pub struct RepoFields<'a> {
@@ -95,6 +99,7 @@ pub struct JobFields<'a> {
     pub(super) job_id: &'a JobId,
 }
 
+impl sealed::Sealed for Host {}
 impl sealed::Sealed for Project {}
 impl sealed::Sealed for WorkspaceRef {}
 impl sealed::Sealed for Coordinator {}

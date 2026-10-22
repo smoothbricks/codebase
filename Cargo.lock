@@ -992,6 +992,7 @@ dependencies = [
  "cowshed-api-gen",
  "cowshed-cli",
  "cowshed-core",
+ "cowshed-os",
  "libc",
  "napi",
  "napi-build",

@@ -282,6 +282,41 @@ pub fn base_directory(project: Option<&Path>) -> Result<(PathBuf, Scope), Cowshe
     Ok((PathBuf::from(home), Scope::Global))
 }
 
+/// The named harnesses of `scope`, or the first unknown name refused with its correction: a typo
+/// must never fall through to installing into every detected harness instead.
+pub fn select_harnesses(scope: Scope, names: &[String]) -> Result<Vec<Harness>, String> {
+    names
+        .iter()
+        .map(|name| {
+            harness_named(scope, name).ok_or_else(|| {
+                let suggestions = harness_suggestions(scope, name);
+                let detail = if suggestions.is_empty() {
+                    format!("known harnesses include {}", harness_names(scope))
+                } else {
+                    format!("did you mean {}?", suggestions.join(" or "))
+                };
+                format!("unknown harness `{name}`; {detail}")
+            })
+        })
+        .collect()
+}
+
+/// Install the skill into the named harnesses, every detected one when none is named, under
+/// `project` when given; what `skill install` and `host.skillInstall` both do.
+pub fn install_skill(
+    project: Option<&Path>,
+    harnesses: &[String],
+) -> Result<SkillInstallReport, CowshedError> {
+    let (base, scope) = base_directory(project)?;
+    let selected = select_harnesses(scope, harnesses).map_err(|message| {
+        CowshedError::usage(message, "cowshed skill install --harness <name>")
+    })?;
+    let planned = plan(&base, scope, &selected, &|path| path.exists());
+    install(&base, &planned).map_err(|error| {
+        CowshedError::internal(format!("could not install the {SKILL_NAME} skill: {error}"))
+    })
+}
+
 /// Run `skill install`.
 ///
 /// This never reaches the coordinator or host storage: installing a skill has to
@@ -297,16 +332,7 @@ where
     E: io::Write,
 {
     let SkillCommand::Install = args.action;
-    let (base, scope) = base_directory(global.project.as_deref())?;
-    let selected: Vec<Harness> = args
-        .harnesses
-        .iter()
-        .filter_map(|name| harness_named(scope, name))
-        .collect();
-    let planned = plan(&base, scope, &selected, &|path| path.exists());
-    let report = install(&base, &planned).map_err(|error| {
-        CowshedError::internal(format!("could not install the {SKILL_NAME} skill: {error}"))
-    })?;
+    let report = install_skill(global.project.as_deref(), &args.harnesses)?;
 
     if global.json {
         output.success(report).map_err(output_error)?;
@@ -345,6 +371,38 @@ fn output_error(error: io::Error) -> CowshedError {
 
 #[cfg(test)]
 mod tests {
+
+    /// host.skillInstall reaches install_skill without the parser: an unknown harness still
+    /// refuses as usage and writes nothing, and a known one installs into the named project only.
+    #[test]
+    fn install_skill_refuses_an_unknown_harness_and_scopes_to_the_project() {
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "cowshed-skill-scope",
+        );
+        let project = root.to_path_buf();
+        let refused = install_skill(Some(&project), &["no-such-harness".to_owned()])
+            .expect_err("an unknown harness is refused");
+        assert_eq!(refused.code, cowshed_core::ErrorCode::Usage);
+        assert_eq!(
+            std::fs::read_dir(&project).unwrap().count(),
+            0,
+            "nothing was written"
+        );
+        let first = harnesses(Scope::Project)
+            .first()
+            .expect("a project harness")
+            .name
+            .to_owned();
+        let report = install_skill(Some(&project), &[first]).expect("a known harness installs");
+        assert!(!report.installs.is_empty());
+        for entry in &report.installs {
+            assert!(
+                entry.path.starts_with(&project),
+                "{entry:?} stays in the project"
+            );
+        }
+    }
     use super::*;
 
     fn never(_: &Path) -> bool {

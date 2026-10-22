@@ -251,6 +251,7 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         | Command::Hold(_)
         | Command::TreeHolders(_)
         | Command::Controller
+        | Command::Host
         | Command::Credential(_)
         | Command::Identity(_)
         | Command::Sccache(_)
@@ -322,6 +323,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Hold(_)
         | Command::TreeHolders(_)
         | Command::Controller
+        | Command::Host
         | Command::Credential(_)
         | Command::Identity(_)
         | Command::Sccache(_)
@@ -435,6 +437,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         | Command::Hold(_)
         | Command::TreeHolders(_)
         | Command::Controller
+        | Command::Host
         | Command::Sccache(_)
         | Command::Skill(_)
         | Command::Version
@@ -522,6 +525,7 @@ fn attach_demand(command: &Command) -> (u64, Vec<&str>) {
         | Command::SubtreeRoot(_)
         | Command::RetireDescendants(_)
         | Command::Controller
+        | Command::Host
         | Command::Credential(_)
         | Command::Identity(_)
         | Command::Sccache(_)
@@ -800,7 +804,7 @@ impl ActorBridge {
     }
 }
 
-async fn host_storage() -> Result<ValidatedHostStorage> {
+pub(crate) async fn host_storage() -> Result<ValidatedHostStorage> {
     let home = gateway_service::canonical_home()?;
     validate_existing_host_storage(&home).await
 }
@@ -828,6 +832,45 @@ async fn doctor_projects() -> Result<(
         .doctor_projects()
         .await
         .map_err(project_inventory_error)
+}
+
+/// Every adopted project's listing, sorted, measured for landing as `landing` asks: what
+/// `ls --all` and `host.listProjects` both read (`landed` keeps only the provably landed rows).
+pub(crate) async fn list_projects(landing: Option<ListLanding>) -> Result<Vec<ProjectWorkspaces>> {
+    let mut projects = list_all_adopted_projects().await?;
+    sort_project_listing(&mut projects);
+    if let Some(landing) = landing {
+        for project in &mut projects {
+            cowshed_core::landing::annotate_listing(&mut project.workspaces).await;
+            if landing == ListLanding::Landed {
+                cowshed_core::landing::retain_fully_landed(&mut project.workspaces);
+            }
+        }
+    }
+    Ok(projects)
+}
+
+/// Clear this boot's recorded attach-pool exhaustion and its recorded ceiling.
+pub(crate) fn clear_attach_budget() -> Result<()> {
+    cowshed_apfs::attach_budget::clear()
+        .map(drop)
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!("cannot clear the recorded attach-pool exhaustion: {error}"),
+                "check the cowshed attach-pool record's permissions and retry",
+            )
+        })
+}
+
+/// The root of the git checkout containing `start`, as `--project` resolves it.
+pub(crate) async fn discover_project_root(start: &Path) -> Result<PathBuf> {
+    // The CLI process serves the host store; its controller Git writes profiles there.
+    GitRepository::discover(
+        cowshed_core::storage::bootstrap::CanonicalRoots::global().shared_store(),
+        start,
+    )
+    .await
+    .map(|repository| repository.root().to_path_buf())
 }
 
 async fn list_all_adopted_projects() -> Result<Vec<ProjectWorkspaces>> {
@@ -1415,13 +1458,7 @@ async fn resolve_project_context(cli: &Cli) -> Result<ResolvedProjectRoot> {
             )
         })?,
     };
-    // The CLI process serves the host store; its controller Git writes profiles there.
-    let root = GitRepository::discover(
-        cowshed_core::storage::bootstrap::CanonicalRoots::global().shared_store(),
-        &start,
-    )
-    .await
-    .map(|repository| repository.root().to_path_buf());
+    let root = discover_project_root(&start).await;
     // A retained source can be restored read-only while recovery is pending. Its Git
     // checkout then exists again, but this invocation still finishes the recorded intent.
     if matches!(&cli.command, Command::Adopt(args) if args.re_adopt) {
@@ -1689,8 +1726,7 @@ where
         }
         Command::List(args) => {
             if args.all {
-                let mut projects = service.list_all().await?;
-                sort_project_listing(&mut projects);
+                let projects = list_projects(listing_landing(args)).await?;
                 emit_project_listing(output, json, args, projects).await?;
                 if !json {
                     emit_kept_abandon_bundles(output, &service.kept_abandon_bundles().await?)?;
@@ -2242,12 +2278,7 @@ where
             // Repair retires what doctor named as reclaimable the same way `gc` does — one
             // sweep, one set of reasons — rather than a second deleter with its own rules.
             if args.clear_attach_budget {
-                cowshed_apfs::attach_budget::clear().map_err(|error| {
-                    CowshedError::environment_missing(
-                        format!("cannot clear the recorded attach-pool exhaustion: {error}"),
-                        "check the cowshed attach-pool record's permissions and retry",
-                    )
-                })?;
+                clear_attach_budget()?;
                 output
                     .guidance(
                         "cleared this boot's recorded attach-pool exhaustion; attaches are \
@@ -2292,8 +2323,8 @@ where
                 "lock, lock-holders, hold and tree-holders name no project and are dispatched before the runtime bridge",
             ))
         }
-        Command::Controller => Err(CowshedError::internal(
-            "the controller verb serves its own connection and is dispatched before the runtime bridge",
+        Command::Controller | Command::Host => Err(CowshedError::internal(
+            "a connection-serving verb serves its own connection and is dispatched before the runtime bridge",
         )),
         Command::BuildState => Err(CowshedError::internal(
             "build-state is read-only and must be dispatched before the runtime bridge",
@@ -2928,7 +2959,7 @@ fn emit_grants<W: Write, E: Write>(output: &mut Output<W, E>, grants: &GrantSet)
 /// The mounts happened; the daemon's view of them did not. A caller who does not hear this
 /// believes the gateway can see workspaces it cannot, which is the failure mode that made this
 /// worth reporting rather than swallowing.
-fn report_stale_gateway_views<W: Write, E: Write>(
+pub(crate) fn report_stale_gateway_views<W: Write, E: Write>(
     output: &mut Output<W, E>,
     stale: &[(RepoId, CowshedError)],
 ) -> Result<()> {
@@ -3067,9 +3098,9 @@ async fn attach_scoped_sessions(
 /// cannot turn the command into a failure — reporting one for work that completed teaches the
 /// caller to retry an idempotent operation forever. It cannot be silence either: the daemon's view
 /// of those sessions is stale until something reconciles it, and this is the only place that knows.
-struct StoreWideMounts<T> {
-    result: T,
-    stale: Vec<(RepoId, CowshedError)>,
+pub(crate) struct StoreWideMounts<T> {
+    pub(crate) result: T,
+    pub(crate) stale: Vec<(RepoId, CowshedError)>,
 }
 
 /// Tell the gateway that a project's session mounts changed, keeping any refusal as a value.
@@ -3110,7 +3141,7 @@ async fn reconcile_after_mount_change(
         .err()
 }
 
-async fn attach_store_wide(browse: bool) -> Result<StoreWideMounts<Vec<WorkspaceInfo>>> {
+pub(crate) async fn attach_store_wide(browse: bool) -> Result<StoreWideMounts<Vec<WorkspaceInfo>>> {
     let storage = host_storage().await?;
     let projects = NativeGatewayInventory::new(storage.clone())
         .adopted_projects()
@@ -3321,7 +3352,7 @@ async fn detach_scoped_sessions(service: &mut dyn CliService) -> Result<()> {
     Ok(())
 }
 
-async fn detach_store_wide() -> Result<StoreWideMounts<()>> {
+pub(crate) async fn detach_store_wide() -> Result<StoreWideMounts<()>> {
     let storage = host_storage().await?;
     let projects = NativeGatewayInventory::new(storage.clone())
         .adopted_projects()
@@ -3870,11 +3901,6 @@ async fn emit_project_listing<W: Write, E: Write>(
     args: crate::args::ListArgs,
     mut projects: Vec<ProjectWorkspaces>,
 ) -> Result<()> {
-    if landing_requested(args) {
-        for project in &mut projects {
-            cowshed_core::landing::annotate_listing(&mut project.workspaces).await;
-        }
-    }
     if args.landed {
         for project in &mut projects {
             let withheld = cowshed_core::landing::retain_fully_landed(&mut project.workspaces);
@@ -5609,8 +5635,7 @@ where
             forget::dispatch_forget(&backend, &args.repo_id, cli.global.json, output).await
         }
         Command::List(args) => {
-            let mut projects = list_all_adopted_projects().await?;
-            sort_project_listing(&mut projects);
+            let projects = list_projects(listing_landing(args)).await?;
             emit_project_listing(output, cli.global.json, args, projects).await?;
             if !cli.global.json {
                 emit_kept_abandon_bundles(output, &kept_abandon_bundles().await?)?;

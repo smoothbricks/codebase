@@ -38,6 +38,18 @@ pub async fn dispatch<W: std::io::Write + Send, E: std::io::Write + Send>(
     json: bool,
     output: &mut Output<W, E>,
 ) -> Result<i32> {
+    let (repo_id, store_root) = project(project_root).await?;
+    match command {
+        CredentialCommand::Add(args) => add(&repo_id, &store_root, args, json, output).await,
+        CredentialCommand::Status => report(&repo_id, &store_root, json, output).await,
+        CredentialCommand::Remove { origin } => {
+            remove(&repo_id, &store_root, &origin, json, output).await
+        }
+    }
+}
+
+/// The project's identity and its store, opened as every credential verb opens it.
+pub(crate) async fn project(project_root: &Path) -> Result<(RepoId, std::path::PathBuf)> {
     // Credentials are per project and name no workspace: the open finishes only `main`'s
     // unfinished lifecycle work, never another workspace's.
     let runtime = ProjectRuntime::open_existing(
@@ -48,13 +60,62 @@ pub async fn dispatch<W: std::io::Write + Send, E: std::io::Write + Send>(
     .await?;
     let repo_id = runtime.descriptor().repo_id.clone();
     let store_root = runtime.descriptor().storage.store().to_path_buf();
-    match command {
-        CredentialCommand::Add(args) => add(&repo_id, &store_root, args, json, output).await,
-        CredentialCommand::Status => report(&repo_id, &store_root, json, output).await,
-        CredentialCommand::Remove { origin } => {
-            remove(&repo_id, &store_root, &origin, json, output).await
-        }
+    Ok((repo_id, store_root))
+}
+
+/// `credential status` as `host.credentialStatus` answers it.
+pub async fn status(project_root: &Path) -> Result<CredentialReport> {
+    let (repo_id, store_root) = project(project_root).await?;
+    routes(&repo_id, &store_root).await
+}
+
+/// `credential rm` as `host.credentialRemove` answers it: the routes left.
+pub async fn remove_origin(project_root: &Path, origin: &str) -> Result<CredentialReport> {
+    let (repo_id, store_root) = project(project_root).await?;
+    unenroll(&repo_id, &store_root, origin).await?;
+    routes(&repo_id, &store_root).await
+}
+
+/// Remove `origin`'s credential and route: whether either existed.
+async fn unenroll(repo_id: &RepoId, store_root: &Path, origin: &str) -> Result<(String, bool)> {
+    let origin = canonical_origin(origin)?;
+    let presence = remove_scoped_credential(repo_id.as_str(), PROTOCOL, &origin)
+        .await
+        .map_err(scope_error)?;
+    let mut host = HostConfig::load_for_store(store_root).map_err(host_error)?;
+    let recorded = host.remove_credential_route(repo_id.as_str(), &origin);
+    if recorded {
+        host.save(store_root).map_err(host_error)?;
     }
+    Ok((
+        origin,
+        !matches!((presence, recorded), (CredentialPresence::Absent, false)),
+    ))
+}
+
+/// Every enrolled route of the project, with the scope its stored credential carries.
+async fn routes(repo_id: &RepoId, store_root: &Path) -> Result<CredentialReport> {
+    let host = HostConfig::load_for_store(store_root).map_err(host_error)?;
+    let mut routes = Vec::new();
+    for route in host
+        .credential_routes()
+        .iter()
+        .filter(|route| route.repo_id == repo_id.as_str())
+    {
+        // The record answers with its scope and nothing else: the secret it also carries is
+        // dropped, and zeroed, before this returns.
+        let scope = scoped_credential_scope(repo_id.as_str(), PROTOCOL, &route.origin)
+            .await
+            .map_err(scope_error)?;
+        routes.push(CredentialRouteReport {
+            repo_id: repo_id.clone(),
+            origin: route.origin.clone(),
+            withheld_env_names: route.secret_env_names.clone(),
+            installed: scope.is_some(),
+            path_prefixes: scope.unwrap_or_default(),
+        });
+    }
+    Ok(CredentialReport { routes })
 }
 
 async fn add<W: std::io::Write + Send, E: std::io::Write + Send>(
@@ -123,19 +184,12 @@ async fn remove<W: std::io::Write + Send, E: std::io::Write + Send>(
     json: bool,
     output: &mut Output<W, E>,
 ) -> Result<i32> {
-    let origin = canonical_origin(origin)?;
-    let presence = remove_scoped_credential(repo_id.as_str(), PROTOCOL, &origin)
-        .await
-        .map_err(scope_error)?;
-    let mut host = HostConfig::load_for_store(store_root).map_err(host_error)?;
-    let recorded = host.remove_credential_route(repo_id.as_str(), &origin);
-    if recorded {
-        host.save(store_root).map_err(host_error)?;
-    }
+    let (origin, enrolled) = unenroll(repo_id, store_root, origin).await?;
     if !json {
-        let state = match (presence, recorded) {
-            (CredentialPresence::Absent, false) => "was not enrolled",
-            _ => "removed",
+        let state = if enrolled {
+            "removed"
+        } else {
+            "was not enrolled"
         };
         output
             .announce(&format!("{origin} {state} for {repo_id}"))
@@ -150,26 +204,7 @@ async fn report<W: std::io::Write + Send, E: std::io::Write + Send>(
     json: bool,
     output: &mut Output<W, E>,
 ) -> Result<i32> {
-    let host = HostConfig::load_for_store(store_root).map_err(host_error)?;
-    let mut routes = Vec::new();
-    for route in host
-        .credential_routes()
-        .iter()
-        .filter(|route| route.repo_id == repo_id.as_str())
-    {
-        // The record answers with its scope and nothing else: the secret it also carries is
-        // dropped, and zeroed, before this returns.
-        let scope = scoped_credential_scope(repo_id.as_str(), PROTOCOL, &route.origin)
-            .await
-            .map_err(scope_error)?;
-        routes.push(CredentialRouteReport {
-            repo_id: repo_id.clone(),
-            origin: route.origin.clone(),
-            withheld_env_names: route.secret_env_names.clone(),
-            installed: scope.is_some(),
-            path_prefixes: scope.unwrap_or_default(),
-        });
-    }
+    let CredentialReport { routes } = routes(repo_id, store_root).await?;
     if json {
         output
             .success(CredentialReport { routes })

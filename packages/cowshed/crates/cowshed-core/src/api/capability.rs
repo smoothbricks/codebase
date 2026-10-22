@@ -1,4 +1,4 @@
-use super::call::{Binder, Binding, JobFields, RepoFields, WorkspaceFields};
+use super::call::{Binder, Binding, HostFields, JobFields, RepoFields, WorkspaceFields};
 use super::dto::{
     AdmissionKey, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota,
     DefragmentResult, DoctorReport, EmptyResult, ExecRequest, ForkOptions, GcOptions, GcReport,
@@ -133,6 +133,8 @@ pub(crate) type Params = Box<RawValue>;
 #[async_trait]
 pub(crate) trait ControllerRuntime: Send + Sync {
     async fn call(&self, method: &'static str, params: Params) -> Result<Value>;
+    /// End the connection; every call after it, and every call still pending, refuses.
+    async fn close(&self) -> Result<()>;
     /// A call whose lifecycle steps are sent to `steps` as the controller reports them, all of
     /// them before the call returns.
     async fn call_reporting(
@@ -201,6 +203,11 @@ enum ActorMessage {
         id: u64,
         reply: oneshot::Sender<Result<StreamStep>>,
     },
+    /// Ends the connection on its owner's word: the write half closes, so the peer reads its
+    /// end, and every pending call is answered with the closing. `closed` hears it is done.
+    Close {
+        closed: oneshot::Sender<()>,
+    },
 }
 
 /// What one demand on a stream-lane call is answered with.
@@ -266,6 +273,20 @@ impl ActorRuntime {
 impl ControllerRuntime for ActorRuntime {
     async fn call(&self, method: &'static str, params: Params) -> Result<Value> {
         self.json(method, params, None).await
+    }
+
+    async fn close(&self) -> Result<()> {
+        let (closed, done) = oneshot::channel();
+        // An actor that already ended has closed the connection itself.
+        if self
+            .sender
+            .send(ActorMessage::Close { closed })
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+        done.await.map_err(|_| actor_reply_error())
     }
 
     async fn call_reporting(
@@ -1579,6 +1600,7 @@ async fn run_controller_actor(
     let mut listeners = std::collections::HashMap::<u64, mpsc::UnboundedSender<StepReport>>::new();
     let mut streams = std::collections::HashMap::<u64, OpenStream>::new();
     let mut next_id = 1_u64;
+    let mut closing = None;
     let failure = loop {
         let call = tokio::select! {
             () = std::future::ready(()),
@@ -1608,6 +1630,13 @@ async fn run_controller_actor(
                         streams.insert(id, OpenStream { waiting: Some(first), closing: false });
                         let _ = opened.send(Ok(id));
                         continue;
+                    }
+                    ActorMessage::Close { closed } => {
+                        closing = Some(closed);
+                        break CowshedError::conflict(
+                            "this connection was closed by its owner",
+                            "open a new connection",
+                        );
                     }
                     ActorMessage::Next { id, reply } => {
                         let Some(stream) = streams
@@ -1734,6 +1763,8 @@ async fn run_controller_actor(
             listeners.insert(id, steps);
         }
     };
+    // Dropping the write half shuts it: the peer reads end of stream and ends the connection.
+    drop(writer);
     messages.close();
     for (_, reply) in pending.drain() {
         let _ = reply.send(Err(failure.clone()));
@@ -1758,7 +1789,13 @@ async fn run_controller_actor(
             ActorMessage::Next { reply, .. } => {
                 let _ = reply.send(Err(failure.clone()));
             }
+            ActorMessage::Close { closed } => {
+                let _ = closed.send(());
+            }
         }
+    }
+    if let Some(closed) = closing {
+        let _ = closed.send(());
     }
 }
 
@@ -1848,6 +1885,56 @@ async fn acquire_coordinator_token(descriptor: OwnedFd) -> Result<(Cowshed, Coor
         },
         token,
     ))
+}
+
+/// The host's own operations (07_api.md, "Host operations"), over one `cowshed host` connection.
+/// It binds no request field: a host operation names its whole subject, a project by its checkout.
+pub struct Host {
+    runtime: Arc<dyn ControllerRuntime>,
+}
+
+impl Host {
+    /// Connect over an inherited socket whose peer is `cowshed host`. A project controller's
+    /// handshake answer is refused: it does not decode as a host's.
+    #[cfg(unix)]
+    pub async fn connect(descriptor: OwnedFd) -> Result<Self> {
+        verify_peer(&descriptor)?;
+        let stream = std::os::unix::net::UnixStream::from(descriptor);
+        stream
+            .set_nonblocking(true)
+            .map_err(|error| handshake_error(format!("host descriptor setup failed: {error}")))?;
+        let mut stream = tokio::net::UnixStream::from_std(stream)
+            .map_err(|error| handshake_error(format!("host descriptor setup failed: {error}")))?;
+        let nonce = fresh_nonce();
+        let hello = codec::encode_client_hello(&nonce)
+            .map_err(|error| handshake_error(format!("host handshake encoding failed: {error}")))?;
+        write_frame(&mut stream, &hello).await?;
+        let response = read_frame(&mut stream).await?;
+        let (version, response_nonce) = codec::decode_host_hello(&response).map_err(|error| {
+            handshake_error(format!("host handshake response is invalid: {error}"))
+        })?;
+        if version != HANDSHAKE_VERSION || response_nonce != nonce {
+            return Err(handshake_error(
+                "host handshake nonce or protocol version did not match",
+            ));
+        }
+        let (runtime, _other_build) = spawn_controller_actor(stream);
+        Ok(Self { runtime })
+    }
+}
+
+impl Host {
+    /// End the host connection: `cowshed host` reads end of stream and exits; every call still
+    /// pending, and every call after this, refuses.
+    pub async fn close(&self) -> Result<()> {
+        self.runtime.close().await
+    }
+}
+
+impl fmt::Debug for Host {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Host(<host connection>)")
+    }
 }
 
 /// Sole project mutation and cross-workspace authority.
@@ -2247,6 +2334,17 @@ impl Coordinator {
     /// The worker capability the controller minted as `view`.
     pub(super) fn worker_handle(&self, view: WorkspaceView) -> WorkspaceHandle {
         WorkspaceHandle::new(self.workspace_ref(view), Arc::clone(&self.runtime))
+    }
+}
+
+impl Binder for Host {
+    type Fields<'a> = HostFields;
+
+    fn binding(&self) -> Binding<'_, HostFields> {
+        Binding {
+            runtime: &self.runtime,
+            authority: HostFields,
+        }
     }
 }
 
@@ -2712,6 +2810,10 @@ mod tests {
 
     #[async_trait]
     impl ControllerRuntime for TestRuntime {
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+
         async fn call(&self, method: &'static str, _params: Params) -> Result<Value> {
             self.rpc_calls.fetch_add(1, Ordering::SeqCst);
             match method {
@@ -4062,8 +4164,12 @@ mod tests {
                 .expect("the corpus is a JSON object of requests"),
             checked: std::collections::BTreeSet::new(),
         };
+        let host = Host {
+            runtime: Arc::clone(&runtime),
+        };
         operations::served::each_served(
             &mut agrees,
+            &host,
             coordinator.project(),
             &workspace_ref(Arc::clone(&runtime)),
             &coordinator,

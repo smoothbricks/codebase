@@ -78,7 +78,10 @@ impl TestClient {
         authority: ConnectionAuthority,
         router: RouterHandle,
     ) -> (Self, JoinHandle<cowshed_core::Result<()>>) {
-        let expected_repo = authority.repo_id().clone();
+        let expected_repo = authority
+            .repo_id()
+            .expect("a project connection names its repository")
+            .clone();
         let (client, server) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         client.set_nonblocking(true).expect("nonblocking client");
         let stream = tokio::net::UnixStream::from_std(client).expect("Tokio client stream");
@@ -251,6 +254,12 @@ fn connection_methods() -> impl Iterator<Item = &'static str> {
         .map(|operation| operation.method)
 }
 
+fn is_host_method(method: &str) -> bool {
+    OPERATIONS
+        .iter()
+        .any(|operation| operation.method == method && operation.scope == Scope::Host)
+}
+
 fn is_worker_method(method: &str) -> bool {
     OPERATIONS
         .iter()
@@ -374,6 +383,19 @@ async fn every_capability_method_is_explicitly_routed_or_rejected_by_authority()
         TestClient::connect(coordinator_authority(), router.clone()).await;
 
     for method in connection_methods() {
+        if is_host_method(method) {
+            let response = coordinator.request(method, params(method), None).await;
+            assert!(
+                !response.envelope.ok,
+                "a project coordinator reached {method}"
+            );
+            assert_eq!(
+                response.envelope.error.expect("typed authority error").code,
+                ErrorCode::Conflict
+            );
+            assert!(records.try_recv().is_err());
+            continue;
+        }
         if is_stream_method(method) {
             let id = coordinator.next_id;
             let (event, end) = coordinator.stream_request(method, params(method)).await;

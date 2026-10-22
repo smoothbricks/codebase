@@ -44,6 +44,7 @@ pub fn collect_api(project: &Path) -> Result<ir::Api, String> {
         "land_turn.rs",
         "build_volume/mod.rs",
         "runtime/supervisor_socket.rs",
+        "project_retirement.rs",
     ] {
         let module = module_of("cowshed_core", name)?;
         parse_module(&core.join(name), &module, true, &mut api)?;

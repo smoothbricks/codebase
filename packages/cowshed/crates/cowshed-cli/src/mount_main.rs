@@ -274,6 +274,22 @@ fn write_error(error: std::io::Error) -> CowshedError {
 /// Resolve from the backend's store root and mount main, reporting the live
 /// mountpoint. No pre-flight mount or git checks: an empty or stale stub
 /// proceeds to the mount path, which heals it.
+/// Mount `repo_id`'s main from store records: what `mount main` and `host.mountMain` both do.
+pub async fn mount_main<B: MainMountBackend>(backend: &B, repo_id: &RepoId) -> Result<MountResult> {
+    let resolved = resolve_main_mount(backend.store_root(), repo_id)?;
+    let mount = backend
+        .ensure_main_mounted(&resolved, CANONICAL_MOUNT_INTENT)
+        .await?;
+    let workspace = WorkspaceName::new("main").map_err(|error| {
+        CowshedError::internal(format!("the fixed main workspace name is invalid: {error}"))
+    })?;
+    Ok(MountResult {
+        workspace,
+        mount,
+        base_commit: None,
+    })
+}
+
 pub async fn dispatch_mount_main<B, W, E>(
     backend: &B,
     repo_id: &RepoId,
@@ -285,21 +301,10 @@ where
     W: Write,
     E: Write,
 {
-    let resolved = resolve_main_mount(backend.store_root(), repo_id)?;
-    let mountpoint = backend
-        .ensure_main_mounted(&resolved, CANONICAL_MOUNT_INTENT)
-        .await?;
-    let main = WorkspaceName::new("main").map_err(|error| {
-        CowshedError::internal(format!("the fixed main workspace name is invalid: {error}"))
-    })?;
+    let mounted = mount_main(backend, repo_id).await?;
+    let mountpoint = mounted.mount.clone();
     if json {
-        output
-            .success(MountResult {
-                workspace: main,
-                mount: mountpoint.clone(),
-                base_commit: None,
-            })
-            .map_err(write_error)?;
+        output.success(mounted).map_err(write_error)?;
     } else {
         output
             .bare_line(mountpoint.as_os_str().as_bytes())

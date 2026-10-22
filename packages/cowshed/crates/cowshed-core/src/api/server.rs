@@ -51,6 +51,20 @@ pub(crate) mod codec {
         repo_id: Cow<'a, RepoId>,
     }
 
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    enum HostMarker {
+        Host,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct HostHelloFields<'a> {
+        version: u32,
+        nonce: Cow<'a, str>,
+        host: HostMarker,
+    }
+
     /// One schema for both directions: a client frames its operation's pre-serialized params
     /// verbatim (`P = &RawValue`), and the controller decodes them as JSON (`P = Value`).
     #[derive(Debug, Serialize, Deserialize)]
@@ -332,6 +346,24 @@ pub(crate) mod codec {
 
     pub(crate) fn decode_server_hello(bytes: &[u8]) -> Result<DecodedServerHello, WireCodecError> {
         decode::<ServerHelloFields<'static>>(bytes, MAX_HANDSHAKE_BYTES).map(DecodedServerHello)
+    }
+
+    /// A host connection's answer names no project: its `host` marker is what a client checks it
+    /// reached `cowshed host` and not a project controller, whose answer does not decode as this.
+    pub(crate) fn encode_host_hello(nonce: &str) -> Result<Vec<u8>, WireCodecError> {
+        encode(
+            &HostHelloFields {
+                version: HANDSHAKE_VERSION,
+                nonce: Cow::Borrowed(nonce),
+                host: HostMarker::Host,
+            },
+            MAX_HANDSHAKE_BYTES,
+        )
+    }
+
+    pub(crate) fn decode_host_hello(bytes: &[u8]) -> Result<(u32, String), WireCodecError> {
+        decode::<HostHelloFields<'static>>(bytes, MAX_HANDSHAKE_BYTES)
+            .map(|hello| (hello.version, hello.nonce.into_owned()))
     }
 
     /// `params` is the request already serialized by its declared operation, framed verbatim.
@@ -670,12 +702,16 @@ pub enum ConnectionAuthority {
         workspace: WorkspaceName,
         workspace_incarnation: WorkspaceIncarnation,
     },
+    /// A `cowshed host` connection: the host's own operations, bound to no project.
+    Host,
 }
 
 impl ConnectionAuthority {
-    pub fn repo_id(&self) -> &RepoId {
+    /// The project a connection is bound to; a host connection is bound to none.
+    pub fn repo_id(&self) -> Option<&RepoId> {
         match self {
-            Self::Coordinator { repo_id } | Self::Worker { repo_id, .. } => repo_id,
+            Self::Coordinator { repo_id } | Self::Worker { repo_id, .. } => Some(repo_id),
+            Self::Host => None,
         }
     }
 }
@@ -928,7 +964,11 @@ pub async fn serve_controller_connection(
     })?;
     let (version, nonce) = hello.into_parts();
     validate_hello(version, &nonce)?;
-    let response = codec::encode_server_hello(&nonce, authority.repo_id()).map_err(|error| {
+    let response = match authority.repo_id() {
+        Some(repo_id) => codec::encode_server_hello(&nonce, repo_id),
+        None => codec::encode_host_hello(&nonce),
+    }
+    .map_err(|error| {
         if error.is_too_large() {
             protocol_error("controller handshake response has invalid length")
         } else {
@@ -1350,6 +1390,22 @@ fn validate_request(
     })?;
 
     match authority {
+        ConnectionAuthority::Host => {
+            if operation.scope != Scope::Host {
+                return Err(authority_error(format!(
+                    "host authority cannot call project method {}",
+                    operation.method
+                )));
+            }
+        }
+        ConnectionAuthority::Coordinator { .. } | ConnectionAuthority::Worker { .. }
+            if operation.scope == Scope::Host =>
+        {
+            return Err(authority_error(format!(
+                "project authority cannot call host method {}",
+                operation.method
+            )));
+        }
         ConnectionAuthority::Coordinator { repo_id } => {
             if operation.method != ProjectOpen::METHOD {
                 require_string(params, "repoId", repo_id.as_str())?;

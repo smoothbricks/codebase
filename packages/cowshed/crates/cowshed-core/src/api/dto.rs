@@ -4640,6 +4640,22 @@ pub struct SkillInstall {
     pub status: SkillInstallStatus,
 }
 
+/// One recorded build-state link of a checkout: the tool path in the checkout and the volume path
+/// that holds it (16_build_volumes.md).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BuildStateLink {
+    pub checkout: PathBuf,
+    pub volume: PathBuf,
+}
+
+/// `cowshed build-state` and `host.buildState`: every recorded build-state link of a checkout.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BuildStateListing {
+    pub paths: Vec<BuildStateLink>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SkillInstallReport {

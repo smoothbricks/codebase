@@ -5,6 +5,7 @@ import typia from 'typia';
 import type {
   NativeCoordinatorOperations,
   NativeEvents,
+  NativeHostOperations,
   NativeJobAttachmentCapabilities,
   NativeJobHandleCapabilities,
   NativeJobHandleOperations,
@@ -33,6 +34,9 @@ export interface NativeWorkspaceRefHandle extends NativeWorkspaceRefOperations {
 }
 
 export type NativeCoordinatorHandle = NativeCoordinatorOperations;
+
+/** A host connection's adapters and the close that ends it. */
+export type NativeHostHandle = NativeHostOperations & { close(): Promise<void> };
 
 export interface NativeWorkspaceHandle extends NativeWorkspaceHandleOperations {
   readonly workspaceIncarnation: string;
@@ -102,6 +106,7 @@ interface NativeModule {
   coordinatorEndpoint(descriptor: number): CoordinatorEndpoint;
   openProject(endpoint: CoordinatorEndpoint, path: string): Promise<NativeProjectHandle>;
   connectCoordinator(endpoint: CoordinatorEndpoint, path: string): Promise<NativeCoordinatorHandle>;
+  openHost(launcher: string): Promise<NativeHostHandle>;
 }
 
 const assertNativeModule = typia.createAssert<NativeModule>();

@@ -1,12 +1,13 @@
 import typia from 'typia';
 import type * as Api from './api.generated.js';
 import { coordinatorExec, exec } from './exec.js';
-import { packageRootFromModule, runLauncher } from './launcher.js';
+import { launcherPath, packageRootFromModule, runLauncher } from './launcher.js';
 import * as N from './native.generated.js';
 import {
   type EventIterator,
   loadNativeModule,
   type NativeCoordinatorHandle,
+  type NativeHostHandle,
   type NativeJobAttachmentHandle,
   type NativeJobHandle,
   type NativeProjectHandle,
@@ -19,6 +20,10 @@ import {
   type CoordinatorEndpoint,
   CowshedError,
   type ExecRequest,
+  type Host,
+  type HostAttachAllArguments,
+  type HostListProjectsArguments,
+  type HostSkillInstallArguments,
   type JobAttachment,
   type JobAttachOptions,
   type JobHandle,
@@ -178,6 +183,76 @@ class WorkspaceRefImpl implements WorkspaceRef {
 
   async grants(): Promise<Api.GrantSet> {
     return callNativeAsync(() => N.workspaceGrants(this.#native, {}));
+  }
+}
+
+class HostImpl implements Host {
+  readonly #native: NativeHostHandle;
+
+  constructor(nativeHost: NativeHostHandle) {
+    this.#native = nativeHost;
+  }
+
+  async listProjects(options?: HostListProjectsArguments): Promise<readonly Api.ProjectWorkspaces[]> {
+    return callNativeAsync(() => N.hostListProjects(this.#native, options ?? {}));
+  }
+
+  async attachAll(options?: HostAttachAllArguments): Promise<readonly Api.WorkspaceInfo[]> {
+    return callNativeAsync(() => N.hostAttachAll(this.#native, options ?? { browse: false }));
+  }
+
+  async detachAll(): Promise<void> {
+    await callNativeAsync(() => N.hostDetachAll(this.#native, {}));
+  }
+
+  async clearAttachBudget(): Promise<void> {
+    await callNativeAsync(() => N.hostClearAttachBudget(this.#native, {}));
+  }
+
+  async forgetAbandoned(repoId: Api.RepoRequest['repoId']): Promise<Api.ProjectRetirementReport> {
+    return callNativeAsync(() => N.hostForgetAbandoned(this.#native, { repoId }));
+  }
+
+  async mountMain(repoId: Api.RepoRequest['repoId']): Promise<Api.MountResult> {
+    return callNativeAsync(() => N.hostMountMain(this.#native, { repoId }));
+  }
+
+  async gatewayStatus(): Promise<Api.GatewayStatus> {
+    return callNativeAsync(() => N.hostGatewayStatus(this.#native, {}));
+  }
+
+  async credentialStatus(project: Api.ProjectPathRequest['project']): Promise<Api.CredentialReport> {
+    return callNativeAsync(() => N.hostCredentialStatus(this.#native, { project }));
+  }
+
+  async credentialRemove(
+    project: Api.CredentialRemoveRequest['project'],
+    origin: Api.CredentialRemoveRequest['origin'],
+  ): Promise<Api.CredentialReport> {
+    return callNativeAsync(() => N.hostCredentialRemove(this.#native, { project, origin }));
+  }
+
+  async identityAdd(
+    project: Api.IdentityAddRequest['project'],
+    remote: Api.IdentityAddRequest['remote'],
+  ): Promise<Api.IdentityReport> {
+    return callNativeAsync(() => N.hostIdentityAdd(this.#native, { project, remote }));
+  }
+
+  async skillInstall(options?: HostSkillInstallArguments): Promise<Api.SkillInstallReport> {
+    return callNativeAsync(() => N.hostSkillInstall(this.#native, options ?? {}));
+  }
+
+  async buildState(project: Api.ProjectPathRequest['project']): Promise<Api.BuildStateListing> {
+    return callNativeAsync(() => N.hostBuildState(this.#native, { project }));
+  }
+
+  async clearNxStore(project: Api.ProjectPathRequest['project']): Promise<Api.NxStoreClearResult> {
+    return callNativeAsync(() => N.hostClearNxStore(this.#native, { project }));
+  }
+
+  async close(): Promise<void> {
+    await callNativeAsync(() => this.#native.close());
   }
 }
 
@@ -502,14 +577,24 @@ export async function connectCoordinator(endpoint: CoordinatorEndpoint, path: st
 }
 
 /**
+ * Starts `cowshed host` through the package's `bin/cowshed` launcher — the binary every verb runs —
+ * on a socketpair, and connects to it. Its stdout and stderr are this process's; closing the
+ * connection ends it.
+ */
+export async function openHost(): Promise<Host> {
+  const launcher = launcherPath(packageRootFromModule(import.meta.url));
+  return new HostImpl(await callNativeAsync(() => native.openHost(launcher)));
+}
+
+/**
  * Runs any CLI verb with the exact argv, stdout/stderr, and exit-code contract of the standalone
  * binary, because it *is* the standalone binary: this runs the package's `bin/cowshed` launcher,
  * which picks the same packaged `cowshed` the `cowshed` command runs.
  *
- * This is the escape hatch for host-management verbs — gateway, sccache, skill, setup, version,
- * help — that do not belong to a project capability. It is not an in-process runtime: the addon
- * does not link the CLI, so there is exactly one implementation of these verbs and exactly one
- * place a missing binary is reported from.
+ * For typed calls to the host's own verbs use `openHost`; this runs a verb with the binary's exact
+ * argv, stdout and exit status. It is not an in-process runtime: the addon does not link the CLI,
+ * so there is exactly one implementation of every verb and exactly one place a missing binary is
+ * reported from.
  */
 export async function runCli(argv: readonly string[]): Promise<number> {
   return runLauncher(packageRootFromModule(import.meta.url), typia.assert<readonly string[]>(argv));
