@@ -57,6 +57,13 @@ const NUMERIC_REPOSITORY_NAME = /^\d+$/;
 export const MINIMUM_SIBLING_NAME_LENGTH = 3;
 
 /**
+ * Regex flags of a sibling-name match and of the allowlist reference that exempts it. One constant keeps one
+ * case rule: both are case-insensitive, as `git grep -i` is, so an allowed public name is exempt in every
+ * casing the match flags.
+ */
+const SIBLING_MATCH_FLAGS = 'gi';
+
+/**
  * Judge what a push publishes, never the working tree: the message of every commit reachable from
  * `revisions`, then their trees. With `remote`, only the commits that remote's tracking branches do
  * not already hold are judged — what the push adds; without it, all the history behind `revisions`.
@@ -601,11 +608,15 @@ async function judgeAddedLines(
       if ('failure' in spans) return spans;
       if (spans.rows !== '') {
         const references = [
-          ...allowlist.scopes.map((scope) => new RegExp(`${escapeRegex(scope)}(?:/|%2[fF])[a-zA-Z0-9._-]+`, 'g')),
-          ...allowlist.repositories.map((repository) => new RegExp(`(?<!\\w)${escapeRegex(repository)}(?!\\w)`, 'g')),
+          ...allowlist.scopes.map(
+            (scope) => new RegExp(`${escapeRegex(scope)}(?:/|%2[fF])[a-zA-Z0-9._-]+`, SIBLING_MATCH_FLAGS),
+          ),
+          ...allowlist.repositories.map(
+            (repository) => new RegExp(`(?<!\\w)${escapeRegex(repository)}(?!\\w)`, SIBLING_MATCH_FLAGS),
+          ),
         ];
         const exemptions = new Map<number, Exemption>();
-        const siblingRegexes = siblings.map((pattern) => new RegExp(pattern, 'gi'));
+        const siblingRegexes = siblings.map((pattern) => new RegExp(pattern, SIBLING_MATCH_FLAGS));
         const flagged = new Set<number>();
         for (const row of spans.rows.split('\n')) {
           if (row === '') continue;

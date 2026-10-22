@@ -839,11 +839,13 @@ is ordinary text. A name that mixes digits with other characters keeps its term,
 Legitimate public references belong in the committed `tooling/public-denylist-allowlist.tsv`, read from that same index.
 Its tab-separated rules are `package-scope<TAB>@scope`, `repository<TAB>public-name`, or
 `line<TAB>repository-relative-path<TAB>exact-text`. A package-scope rule exempts only its package references, including
-encoded patch filenames; an exact-line rule applies only to its named path. An allowed reference does not exempt a
-different private name on the same line, and no rule exempts the real `HOME` path. Filesystem, Git, or policy errors
-refuse the commit with diagnostics rather than silently disabling the guard. The allowlist exempts discovered sibling
-names only. Explicit `smoothbricks.publicDenylist` or `SMOOTHBRICKS_PUBLIC_DENYLIST` patterns still judge the original
-text and remain authoritative, just as in the push gate.
+encoded patch filenames; an exact-line rule applies only to its named path. Package-scope and repository rules follow
+the sibling match's case rule, so `repository<TAB>smoothbricks` also allows `SmoothBricks`; an exact-line rule stays
+exact. An allowed reference does not exempt a different private name on the same line, and no rule exempts the real
+`HOME` path. Filesystem, Git, or policy errors refuse the commit with diagnostics rather than silently disabling the
+guard. The allowlist exempts discovered sibling names only. Explicit `smoothbricks.publicDenylist` or
+`SMOOTHBRICKS_PUBLIC_DENYLIST` patterns still judge the original text and remain authoritative, just as in the push
+gate.
 
 Receiving a merge is the one exception to diffing the index against `HEAD`. Lines an incoming side carries were judged
 when they were published, so a clone may declare its public tracking ref once, locally:
