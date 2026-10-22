@@ -53,7 +53,8 @@ export interface NativeHostOperations
     NativeHostGatewayStop,
     NativeHostLockHolders,
     NativeHostTreeHolders,
-    NativeHostRetireDescendants {}
+    NativeHostRetireDescendants,
+    NativeHostDiskCommand {}
 
 /** The operations a `Project` serves: exactly those its authority admits. */
 export interface NativeProjectOperations
@@ -785,6 +786,24 @@ export async function hostDetachAll(
   args: HostDetachAllArguments,
 ): Promise<Api.EmptyResult> {
   return V.parseEmptyResult(await handle.detachAll(JSON.stringify(args)));
+}
+
+/** A handle that serves `host.diskCommand`. */
+export interface NativeHostDiskCommand {
+  diskCommand(argumentsJson: string): Promise<NativeEvents>;
+}
+
+/** The request fields a `host.diskCommand` caller names; its handle binds the rest. */
+export type HostDiskCommandArguments = Pick<Api.DiskCommandRequest, 'tool' | 'deadlineMs' | 'argv' | 'stdin'>;
+
+/**
+ * Runs one diskutil or hdiutil argv through cowshed's disk runner, its output after its end.
+ */
+export function hostDiskCommand(
+  handle: NativeHostDiskCommand,
+  args: HostDiskCommandArguments,
+): EventIterator<Api.DiskCommandEvent> {
+  return eventIterator(() => handle.diskCommand(JSON.stringify(args)), V.parseDiskCommandEvent);
 }
 
 /** A handle that serves `host.forgetAbandoned`. */

@@ -1649,7 +1649,8 @@ impl ProjectActor {
             | Op::HostGatewayStop(_)
             | Op::HostLockHolders(_)
             | Op::HostTreeHolders(_)
-            | Op::HostRetireDescendants(_) => {
+            | Op::HostRetireDescendants(_)
+            | Op::HostDiskCommand(_) => {
                 return Err(CowshedError::internal(format!(
                     "host operation {method} reached the project router past its scope check"
                 )));

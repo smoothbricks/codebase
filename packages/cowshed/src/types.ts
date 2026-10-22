@@ -1,6 +1,7 @@
 import type * as Api from './api.generated.js';
 import type {
   HostAttachAllArguments,
+  HostDiskCommandArguments,
   HostListProjectsArguments,
   HostSkillInstallArguments,
   JobLogsArguments,
@@ -10,6 +11,7 @@ import type {
 export type * from './api.generated.js';
 export type {
   HostAttachAllArguments,
+  HostDiskCommandArguments,
   HostListProjectsArguments,
   HostSkillInstallArguments,
   JobLogsArguments,
@@ -152,6 +154,13 @@ export interface Host {
     handle: Api.RetireDescendantsRequest['handle'],
     graceMs: Api.RetireDescendantsRequest['graceMs'],
   ): Promise<Api.JobSubtreeRetirement>;
+  /**
+   * Runs one `diskutil` or `hdiutil` argv through cowshed's disk runner, as `disk-command` does:
+   * under the host's disk lease, an image verb never killed. `stdin` is the tool's whole input.
+   * The events come once the tool has ended: its whole stdout in order, then its whole stderr,
+   * then its exit.
+   */
+  diskCommand(request: HostDiskCommandArguments): AsyncIterable<Api.DiskCommandEvent>;
   /** Ends the connection and with it the `cowshed host` process; later calls reject. */
   close(): Promise<void>;
 }

@@ -22,6 +22,7 @@ import {
   type ExecRequest,
   type Host,
   type HostAttachAllArguments,
+  type HostDiskCommandArguments,
   type HostListProjectsArguments,
   type HostSkillInstallArguments,
   type JobAttachment,
@@ -272,6 +273,10 @@ class HostImpl implements Host {
     graceMs: Api.RetireDescendantsRequest['graceMs'],
   ): Promise<Api.JobSubtreeRetirement> {
     return callNativeAsync(() => N.hostRetireDescendants(this.#native, { handle, graceMs }));
+  }
+
+  diskCommand(request: HostDiskCommandArguments): AsyncIterable<Api.DiskCommandEvent> {
+    return callNativeEvents(N.hostDiskCommand(this.#native, request));
   }
 
   async close(): Promise<void> {

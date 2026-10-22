@@ -10,8 +10,9 @@ use std::process::{Command, Stdio};
 
 use cowshed_core::Host;
 use cowshed_core::api::call::{self, Arguments};
+use cowshed_core::api::dto::DiskCommandEvent;
 use cowshed_core::api::operations::{
-    HostBuildState, HostLockHolders, HostRetireDescendants, HostTreeHolders,
+    HostBuildState, HostDiskCommand, HostLockHolders, HostRetireDescendants, HostTreeHolders,
 };
 use cowshed_core::build_volume::{BUILD_LINK, BuildVolumeState};
 use cowshed_core::capabilities::BuildStatePath;
@@ -264,4 +265,65 @@ async fn a_host_connection_answers_the_holder_censuses_and_retirement_as_their_v
     );
     drop(holder.stdin.take());
     assert!(holder.wait().unwrap().success());
+}
+
+/// `host.diskCommand` runs the verb's runner: `hdiutil info`, an image verb, given a 1 ms
+/// `deadlineMs` is neither refused nor killed, and answers its whole stdout then exit 0, as
+/// `disk-command hdiutil -- info` exits.
+#[tokio::test]
+async fn a_host_disk_command_is_the_verbs_run_its_output_then_its_exit() {
+    let verb = Command::new(cowshed())
+        .args([
+            "disk-command",
+            "hdiutil",
+            "--deadline-ms",
+            "1",
+            "--",
+            "info",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        verb.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&verb.stderr)
+    );
+
+    let (host, child) = host_without_supervisor().await;
+    let mut arguments = Arguments::new();
+    arguments.insert("tool".to_owned(), serde_json::json!("hdiutil"));
+    arguments.insert("deadlineMs".to_owned(), serde_json::json!(1));
+    arguments.insert(
+        "argv".to_owned(),
+        serde_json::json!([{ "encoding": "utf8", "data": "info" }]),
+    );
+    let mut events = call::call_stream::<HostDiskCommand, _>(&host, arguments)
+        .await
+        .expect("host.diskCommand");
+    let mut stdout = Vec::new();
+    let mut ended = None;
+    while let Some(event) = events.next().await {
+        assert!(ended.is_none(), "an event after exit");
+        match event.expect("a disk-command event") {
+            DiskCommandEvent::Stdout { data } => stdout.extend_from_slice(data.as_bytes()),
+            DiskCommandEvent::Stderr { .. } => {}
+            DiskCommandEvent::Exit { code } => ended = Some(code),
+        }
+    }
+    assert_eq!(ended, Some(0));
+    assert!(!stdout.is_empty(), "hdiutil info printed nothing");
+
+    drop(events);
+    drop(host);
+    let output = child
+        .wait_with_output()
+        .await
+        .expect("wait for cowshed host");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

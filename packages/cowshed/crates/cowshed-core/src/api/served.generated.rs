@@ -316,6 +316,38 @@ impl Serves<HostRetireDescendants> for Host {
     }
 }
 
+impl Serves<HostDiskCommand> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<DiskCommandRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            tool: DiskCommandTool,
+            #[serde(default)]
+            deadline_ms: Option<std::num::NonZeroU64>,
+            argv: Vec<CommandArg>,
+            #[serde(default)]
+            stdin: Option<BinaryData>,
+        }
+        let Caller {
+            tool,
+            deadline_ms,
+            argv,
+            stdin,
+        } = decode::<HostDiskCommand, Caller>(arguments)?;
+        Ok(DiskCommandRequest {
+            tool,
+            deadline_ms,
+            argv,
+            stdin,
+        })
+    }
+}
+
 impl Serves<ProjectWorkspace> for Project {
     const BOUND: &'static [&'static str] = &["repoId"];
 
@@ -1787,6 +1819,7 @@ pub(crate) fn each_served(
     check.served::<HostLockHolders, _>(host, &[]);
     check.served::<HostTreeHolders, _>(host, &[]);
     check.served::<HostRetireDescendants, _>(host, &[]);
+    check.served::<HostDiskCommand, _>(host, &[]);
     check.served::<ProjectWorkspace, _>(project, &[]);
     check.served::<ProjectWorkspaceAt, _>(project, &[]);
     check.served::<ProjectList, _>(project, &[]);

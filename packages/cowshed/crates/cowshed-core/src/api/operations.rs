@@ -21,8 +21,9 @@ use super::dto::{
     WorkspaceTarget,
 };
 use super::dto::{
-    BuildStateListing, CredentialReport, GatewayStatus, IdentityReport, MountResult,
-    NxStoreClearResult, ProjectWorkspaces, SkillInstallReport,
+    BinaryData, BuildStateListing, CredentialReport, DiskCommandEvent, DiskCommandTool,
+    GatewayStatus, IdentityReport, MountResult, NxStoreClearResult, ProjectWorkspaces,
+    SkillInstallReport,
 };
 use super::held_lock::LockObservation;
 use super::process::{JobProcessEvent, JobProcessTree, JobSubtreeHandle, JobSubtreeRetirement};
@@ -426,6 +427,8 @@ operations! {
     host json "host.treeHolders" HostTreeHolders(HostPathRequest) -> Vec<TreeHolder>;
     /// Asks the job supervisor this host connection runs under to retire a retained subtree.
     host json "host.retireDescendants" HostRetireDescendants(RetireDescendantsRequest) -> JobSubtreeRetirement;
+    /// Runs one diskutil or hdiutil argv through cowshed's disk runner, its output after its end.
+    host stream "host.diskCommand" HostDiskCommand(DiskCommandRequest) -> DiskCommandEvent;
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -960,6 +963,22 @@ pub struct SkillInstallRequest {
     /// Install into this project's harness directories instead of the user's (`--project`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<PathBuf>,
+}
+
+/// `disk-command <tool> [--deadline-ms] -- <argv>`. The verb's inherited standard input is
+/// `stdin`: the tool's whole input, closed after it, empty when absent, so the tool reads end of
+/// input at once; a host connection never hands a child its own.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiskCommandRequest {
+    pub tool: DiskCommandTool,
+    /// The total admission-and-child budget of an ordinary verb, 120 s when absent, exactly as
+    /// `--deadline-ms`: an image verb keeps its warning-only, never-kill policy whatever it says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<std::num::NonZeroU64>,
+    pub argv: Vec<CommandArg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin: Option<BinaryData>,
 }
 
 /// `gateway stop [--purge]`.

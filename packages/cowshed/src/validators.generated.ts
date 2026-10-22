@@ -401,6 +401,25 @@ export const assertDestroyRequestList = typia.createAssertEquals<readonly Api.De
 export const parseDestroyRequestList = (json: string): readonly Api.DestroyRequest[] =>
   assertDestroyRequestList(JSON.parse(json));
 
+export const assertDiskCommandEvent = typia.createAssertEquals<Api.DiskCommandEvent>();
+export const parseDiskCommandEvent = (json: string): Api.DiskCommandEvent => assertDiskCommandEvent(JSON.parse(json));
+export const assertDiskCommandEventList = typia.createAssertEquals<readonly Api.DiskCommandEvent[]>();
+export const parseDiskCommandEventList = (json: string): readonly Api.DiskCommandEvent[] =>
+  assertDiskCommandEventList(JSON.parse(json));
+
+export const assertDiskCommandRequest = typia.createAssertEquals<Api.DiskCommandRequest>();
+export const parseDiskCommandRequest = (json: string): Api.DiskCommandRequest =>
+  assertDiskCommandRequest(JSON.parse(json));
+export const assertDiskCommandRequestList = typia.createAssertEquals<readonly Api.DiskCommandRequest[]>();
+export const parseDiskCommandRequestList = (json: string): readonly Api.DiskCommandRequest[] =>
+  assertDiskCommandRequestList(JSON.parse(json));
+
+export const assertDiskCommandTool = typia.createAssertEquals<Api.DiskCommandTool>();
+export const parseDiskCommandTool = (json: string): Api.DiskCommandTool => assertDiskCommandTool(JSON.parse(json));
+export const assertDiskCommandToolList = typia.createAssertEquals<readonly Api.DiskCommandTool[]>();
+export const parseDiskCommandToolList = (json: string): readonly Api.DiskCommandTool[] =>
+  assertDiskCommandToolList(JSON.parse(json));
+
 export const assertDoctorReport = typia.createAssertEquals<Api.DoctorReport>();
 export const parseDoctorReport = (json: string): Api.DoctorReport => assertDoctorReport(JSON.parse(json));
 export const assertDoctorReportList = typia.createAssertEquals<readonly Api.DoctorReport[]>();

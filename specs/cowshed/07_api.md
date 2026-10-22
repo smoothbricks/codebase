@@ -2176,10 +2176,19 @@ the authorization), `host.mountMain`, `host.gatewayStatus`, `host.gatewayStart`,
 prints), `host.treeHolders` (`tree-holders`: its `TreeHolder` lines as one list) and `host.retireDescendants`
 (`retire-descendants`: the handle the verb reads on stdin is the request's `handle`, and the supervisor asked is the one
 `COWSHED_SUPERVISOR_SOCKET` names in the `cowshed host` process, which inherits the environment of the process that
-called `openHost`; no socket is the typed `foldUnavailable` refusal, as the verb prints it). `disk-command`,
+called `openHost`; no socket is the typed `foldUnavailable` refusal, as the verb prints it).
+
+`host.diskCommand` (a stream row) is `disk-command` through the same runner: the host's disk lease, the child's own
+session, `deadlineMs` exactly as `--deadline-ms` (an ordinary verb's total admission-and-child budget, 120 s when
+absent), and a verb that creates or releases a disk-image device detached, file-backed and never killed, past 120 s
+warned about and waited for whatever `deadlineMs` says. The child's standard input is the request's `stdin` bytes,
+written whole on a fresh pipe and closed (empty when absent), never the connection's socket. The runner collects the
+tool's output and delivers it once the tool has ended, as the verb does: the events are its whole stdout in order, in
+chunks of at most one inline frame, then its whole stderr the same way, then `exit` with the code the verb exits with
+(its exit code, or 128 plus its signal). A runner failure is the call's error, as the verb's wrapper codes are.
+
 `land-turn`, `credential add`, the `sccache` verbs and the process holders `lock`, `hold` and `subtree-root` are the
-parity gate's known gaps until their rows or launchers land: `disk-command` streams the tool's output whole and never
-deadlines a verb that creates or releases a disk-image device, `land-turn` holds its turn until its child ends,
+parity gate's known gaps until their rows or launchers land: `land-turn` holds its turn until its child ends,
 `credential add`'s secret is the upload frame, and the `sccache` rows are served by `cowshed sccache host` so the
 launcher's installed-build selection holds.
 

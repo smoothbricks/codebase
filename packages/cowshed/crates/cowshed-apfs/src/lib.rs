@@ -27,6 +27,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::device::{DISKUTIL, container_of, identifier_depth};
@@ -105,15 +106,18 @@ pub const SECTOR_BYTES: u64 = 512;
 const CONTAINER_ALREADY_SPANS_IMAGE: [&str; 2] = ["Error: -69743:", "Error: -69519:"];
 
 /// Where a disk child's standard input comes from. A parameter of the run, not of the
-/// [`CommandRequest`]: only [`SystemCommandRunner::run_with_inherited_input`] asks for anything
-/// but `/dev/null`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// [`CommandRequest`]: only [`SystemCommandRunner::run_with_inherited_input`] and
+/// [`SystemCommandRunner::run_with_input`] ask for anything but `/dev/null`.
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ChildInput {
     /// `/dev/null`: every command cowshed runs on its own behalf.
     Null,
     /// This process's own standard input, for `cowshed disk-command`, whose caller may pipe a
     /// passphrase to `diskutil apfs unlockVolume … -stdinpassphrase`.
     Inherited,
+    /// These bytes, written whole and then closed, for a host connection's `host.diskCommand`,
+    /// whose own standard input is its protocol socket and never a child's.
+    Bytes(Arc<Vec<u8>>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -226,6 +230,12 @@ pub enum CommandRunFailure {
         deadline: Duration,
         source: io::Error,
     },
+    /// The child ended with `ended`, but the bytes given as its standard input could not be
+    /// written to it for a reason other than the child closing its end.
+    Input {
+        source: io::Error,
+        ended: ProcessStatus,
+    },
 }
 
 #[derive(Debug)]
@@ -302,6 +312,13 @@ impl fmt::Display for CommandRunError {
                     " did not finish within {deadline:?}; the owned process group was signalled, but could not reap the child: {source}"
                 )
             }
+            CommandRunFailure::Input { source, ended } => {
+                fmt_command(f, program, args)?;
+                write!(
+                    f,
+                    " ended with {ended}, but its standard input could not be written: {source}"
+                )
+            }
             CommandRunFailure::VolumeRename => {
                 f.write_str("refused ")?;
                 fmt_command(f, program, args)?;
@@ -348,7 +365,8 @@ impl std::error::Error for CommandRunError {
             | CommandRunFailure::MediaUnread(source)
             | CommandRunFailure::PoolUnread(source)
             | CommandRunFailure::Kill { source, .. }
-            | CommandRunFailure::Reap { source, .. } => Some(source),
+            | CommandRunFailure::Reap { source, .. }
+            | CommandRunFailure::Input { source, .. } => Some(source),
             CommandRunFailure::Deadline { .. }
             | CommandRunFailure::Unspawned(_)
             | CommandRunFailure::VolumeRename => None,
@@ -603,12 +621,32 @@ impl SystemCommandRunner {
         request: &CommandRequest,
         deadline: CommandDeadline,
     ) -> Result<CommandOutput, CommandRunError> {
+        self.run_facade(request, deadline, ChildInput::Inherited)
+    }
+
+    /// The facade run with `input` as the child's whole standard input, closed after it: the
+    /// same lease, budget and image policy as [`Self::run_with_inherited_input`].
+    pub fn run_with_input(
+        &self,
+        request: &CommandRequest,
+        deadline: CommandDeadline,
+        input: Vec<u8>,
+    ) -> Result<CommandOutput, CommandRunError> {
+        self.run_facade(request, deadline, ChildInput::Bytes(Arc::new(input)))
+    }
+
+    fn run_facade(
+        &self,
+        request: &CommandRequest,
+        deadline: CommandDeadline,
+        input: ChildInput,
+    ) -> Result<CommandOutput, CommandRunError> {
         let deadline = if is_disk_image_command(request) {
             CommandDeadline::new(DISK_CHILD_DEADLINE)
         } else {
             deadline
         };
-        self.run_admitted(request, deadline, ChildInput::Inherited, |deadline, run| {
+        self.run_admitted(request, deadline, input, |deadline, run| {
             crate::disk_lease::leased(&request.program, &request.args, deadline, run)
         })
     }
@@ -646,7 +684,7 @@ impl SystemCommandRunner {
         let policy = DeadlinePolicy::for_request(request, deadline.duration);
         let total = matches!(policy.past_deadline, PastDeadline::Kill).then_some(deadline);
         let output = lease(total, &mut || {
-            Self::run_unleased(request, input, policy, total, &mut |elapsed| {
+            Self::run_unleased(request, input.clone(), policy, total, &mut |elapsed| {
                 warn_outlived(request, policy.deadline, elapsed)
             })
         })?;
@@ -677,11 +715,21 @@ impl SystemCommandRunner {
                 failure: CommandRunFailure::Unspawned(deadline.duration),
             });
         }
+        let feed = match &input {
+            ChildInput::Bytes(bytes) => Some(Arc::clone(bytes)),
+            ChildInput::Null | ChildInput::Inherited => None,
+        };
         let (mut child, output_files) =
             spawn_disk_child(request, input, total).map_err(|failure| CommandRunError {
                 request: request.clone(),
                 failure,
             })?;
+        // Given bytes are written by this run between its polls, never blocking it, and the pipe is
+        // closed once they are written whole, once the child closes its end, or when the run ends
+        // whichever way: a descendant that keeps the pipe and never reads holds nothing up.
+        let mut feed = feed
+            .zip(child.stdin.take())
+            .map(|(bytes, stdin)| Feed::new(bytes, stdin));
         // Drain both pipes on dedicated threads while the deadline poll runs, exactly as
         // `Command::output` drains while it waits: a verbose child (fsck) must never wedge
         // on a full pipe just because the parent is polling instead of reading. A child
@@ -735,12 +783,27 @@ impl SystemCommandRunner {
         let started = total.map_or_else(std::time::Instant::now, |deadline| deadline.started);
         let mut warned = 0;
         loop {
+            if let Some(feed) = feed.as_mut() {
+                feed.pump();
+            }
             match child.try_wait().map_err(|source| CommandRunError {
                 request: request.clone(),
                 failure: CommandRunFailure::Wait(source),
             })? {
                 Some(status) => {
+                    // Closed before the output is collected: a descendant that waits for the end
+                    // of its input is not left waiting on this run.
+                    let input_failure = feed.take().and_then(Feed::close);
                     let (stdout, stderr) = collect(stdout, stderr);
+                    if let Some(source) = input_failure {
+                        return Err(CommandRunError {
+                            request: request.clone(),
+                            failure: CommandRunFailure::Input {
+                                source,
+                                ended: ProcessStatus::from(status),
+                            },
+                        });
+                    }
                     let output = std::process::Output {
                         status,
                         stdout,
@@ -749,18 +812,28 @@ impl SystemCommandRunner {
                     return Ok(CommandOutput::from(output));
                 }
                 None => match policy.step(started.elapsed(), warned) {
-                    DeadlineStep::Wait => std::thread::sleep(
-                        total
+                    DeadlineStep::Wait => {
+                        let length = total
                             .and_then(CommandDeadline::remaining)
                             .map_or(Duration::from_millis(25), |remaining| {
                                 remaining.min(Duration::from_millis(25))
-                            }),
-                    ),
+                            });
+                        match feed.as_mut() {
+                            Some(feed) => feed.wait(length),
+                            None => std::thread::sleep(length),
+                        }
+                    }
                     DeadlineStep::Warn => {
                         warned += 1;
                         warn(started.elapsed());
                     }
                     DeadlineStep::Kill => {
+                        // Closed before the group is killed and its output collected, as at a
+                        // normal end. The run's failure is its deadline; a feed failure before it
+                        // is said here, never dropped.
+                        if let Some(failure) = feed.take().and_then(Feed::close) {
+                            warn_input_failed(request, &failure);
+                        }
                         let pid = child.id();
                         let failure = match kill_disk_child_group(&mut child) {
                             Ok(()) => match child.wait() {
@@ -1258,6 +1331,111 @@ fn spawn_disk_child(
     })
 }
 
+/// Given bytes on their way into a disk child's standard input, owned by the run that spawned it.
+/// The pipe is non-blocking, so a write takes what the pipe holds and the run goes on; it is closed
+/// once every byte is written, once the child closes its end, or when the run drops it, whatever
+/// outcome ends the run.
+struct Feed {
+    bytes: Arc<Vec<u8>>,
+    written: usize,
+    stdin: Option<std::process::ChildStdin>,
+    failure: Option<io::Error>,
+}
+
+impl Feed {
+    fn new(bytes: Arc<Vec<u8>>, stdin: std::process::ChildStdin) -> Self {
+        let mut feed = Self {
+            bytes,
+            written: 0,
+            stdin: None,
+            failure: None,
+        };
+        match set_nonblocking(&stdin) {
+            Ok(()) => {
+                feed.stdin = Some(stdin);
+                feed.pump();
+            }
+            Err(error) => feed.failure = Some(error),
+        }
+        feed
+    }
+
+    /// Write what the pipe takes now. A child that closed its end chose not to read; any other
+    /// failure closes the pipe and is kept for the run's end.
+    fn pump(&mut self) {
+        use std::io::Write as _;
+        while let Some(stdin) = self.stdin.as_mut() {
+            let rest = &self.bytes[self.written..];
+            if rest.is_empty() {
+                self.stdin = None;
+                return;
+            }
+            match stdin.write(rest) {
+                Ok(written) => self.written += written,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => self.stdin = None,
+                Err(error) => {
+                    self.failure = Some(error);
+                    self.stdin = None;
+                }
+            }
+        }
+    }
+
+    /// Wait `length` before the next poll of the child, waking early once the pipe can take more.
+    /// A poll the kernel refuses for any reason but a signal is a failure of the feed, as a refused
+    /// write is: kept, and the pipe closed; the wait then takes its whole length.
+    fn wait(&mut self, length: Duration) {
+        let Some(stdin) = self.stdin.as_ref() else {
+            std::thread::sleep(length);
+            return;
+        };
+        let mut ready = libc::pollfd {
+            fd: stdin.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let timeout = libc::c_int::try_from(length.as_millis()).unwrap_or(libc::c_int::MAX);
+        // SAFETY: one `pollfd` this frame owns, naming a descriptor the feed owns.
+        if unsafe { libc::poll(&mut ready, 1, timeout) } >= 0 {
+            return;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            self.failure = Some(error);
+            self.stdin = None;
+            std::thread::sleep(length);
+        }
+    }
+    /// Close the pipe, unwritten bytes and all, answering a write failure if one was kept.
+    fn close(self) -> Option<io::Error> {
+        self.failure
+    }
+}
+
+fn set_nonblocking(stdin: &std::process::ChildStdin) -> io::Result<()> {
+    let fd = stdin.as_raw_fd();
+    // SAFETY: `fcntl` reads and then sets the status flags of a descriptor this process owns.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    // SAFETY: as above.
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Say that the input given to a command the deadline then killed had failed, on the channel the
+/// runner says every other warning on: the run's failure is the deadline, and this is not lost.
+fn warn_input_failed(request: &CommandRequest, failure: &io::Error) {
+    use std::io::Write;
+    let line = format!(
+        "cowshed: warning: writing the standard input of {} failed before its deadline: {failure}\n",
+        request.program.display()
+    );
+    let _ = io::stderr().lock().write_all(line.as_bytes());
+}
+
 /// `spawn_disk_child` with the detachment decided by the caller, so tests can detach a
 /// stand-in child without naming a real disk tool.
 fn spawn_disk_child_as(
@@ -1270,6 +1448,7 @@ fn spawn_disk_child_as(
     command.args(&request.args).stdin(match input {
         ChildInput::Null => std::process::Stdio::null(),
         ChildInput::Inherited => std::process::Stdio::inherit(),
+        ChildInput::Bytes(_) => std::process::Stdio::piped(),
     });
     let output_files = if detached {
         let directory = std::env::temp_dir().join(format!(
@@ -7594,6 +7773,201 @@ mod tests {
             stdout.contains("null=eof inherited=got passphrase"),
             "{stdout}"
         );
+    }
+
+    /// A disk child run with given bytes reads exactly them, then end of input; none at all is end
+    /// of input at once. Bytes larger than any pipe buffer reach a child that echoes them while its
+    /// output drains, and a child that never reads them is no failure: it chose not to.
+    #[test]
+    fn a_disk_child_reads_exactly_the_given_bytes_then_end_of_input() {
+        let deadline = || CommandDeadline::new(DISK_CHILD_DEADLINE);
+        let read = CommandRequest::new(
+            "/bin/sh",
+            [
+                "-c",
+                "if read line; then printf 'got %s' \"$line\"; else printf eof; fi; cat",
+            ],
+        );
+        let given = SystemCommandRunner
+            .run_with_input(&read, deadline(), b"passphrase\nrest".to_vec())
+            .expect("child given bytes");
+        assert_eq!(given.stdout, b"got passphraserest");
+        let empty = SystemCommandRunner
+            .run_with_input(&read, deadline(), Vec::new())
+            .expect("child given nothing");
+        assert_eq!(empty.stdout, b"eof");
+
+        let large: Vec<u8> = (0..(1 << 20))
+            .map(|index: u32| index.to_le_bytes()[0])
+            .collect();
+        let echoed = SystemCommandRunner
+            .run_with_input(
+                &CommandRequest::new("/bin/cat", Vec::<OsString>::new()),
+                deadline(),
+                large.clone(),
+            )
+            .expect("cat given a megabyte");
+        assert_eq!(echoed.status, ProcessStatus::Exit(0));
+        assert!(
+            echoed.stdout == large,
+            "cat echoed {} bytes",
+            echoed.stdout.len()
+        );
+
+        let ignored = SystemCommandRunner
+            .run_with_input(
+                &CommandRequest::new("/usr/bin/true", Vec::<OsString>::new()),
+                deadline(),
+                large,
+            )
+            .expect("a child that never reads its input");
+        assert_eq!(ignored.status, ProcessStatus::Exit(0));
+    }
+
+    /// The witness's descendant and its fixture. From construction it holds both ends of the
+    /// `ended` fifo, so the descendant's open of it never waits for a reader and the test's read
+    /// waits for the descendant's line, not for a writer. Dropped on any outcome, it releases a
+    /// descendant still blocked on `release` and removes the fixture; a cleanup step that fails
+    /// for any reason but the expected ones (no reader left, nothing left to remove) is said.
+    struct Descendant {
+        root: PathBuf,
+        release: PathBuf,
+        ended: PathBuf,
+        acknowledged: io::BufReader<File>,
+        _writer: File,
+    }
+
+    impl Descendant {
+        fn new(root: PathBuf) -> Self {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            fs::create_dir_all(&root).unwrap();
+            let fifo = |name: &str| {
+                let fifo = root.join(name);
+                let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+                // SAFETY: a NUL-terminated path this frame owns.
+                assert_eq!(
+                    unsafe { libc::mkfifo(path.as_ptr(), 0o600) },
+                    0,
+                    "{}",
+                    io::Error::last_os_error()
+                );
+                fifo
+            };
+            let release = fifo("release");
+            let ended = fifo("ended");
+            // Opened for reading without waiting for a writer, then made blocking; with this
+            // writer held too, a read waits for a line and never meets end of file.
+            let reader = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&ended)
+                .unwrap();
+            let writer = OpenOptions::new().write(true).open(&ended).unwrap();
+            // SAFETY: `fcntl` reads and then sets the status flags of a descriptor this frame owns.
+            let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+            // SAFETY: as above.
+            let cleared = unsafe {
+                libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK)
+            };
+            assert!(flags >= 0 && cleared == 0, "{}", io::Error::last_os_error());
+            Self {
+                root,
+                release,
+                ended,
+                acknowledged: io::BufReader::new(reader),
+                _writer: writer,
+            }
+        }
+
+        /// The line the descendant writes as its last act.
+        fn acknowledgment(&mut self) -> String {
+            use std::io::BufRead as _;
+            let mut line = String::new();
+            self.acknowledged
+                .read_line(&mut line)
+                .expect("the descendant says it ends");
+            line
+        }
+    }
+
+    impl Drop for Descendant {
+        fn drop(&mut self) {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            // A reader still waiting on the fifo takes this at once; with none, the open is
+            // refused with ENXIO and there is nobody left to release.
+            match OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.release)
+            {
+                Ok(mut release) => {
+                    if let Err(error) = release.write_all(b"go\n") {
+                        cowshed_os::eprintln!("cannot release the witness's descendant: {error}");
+                    }
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {}
+                Err(error) => {
+                    cowshed_os::eprintln!("cannot open the witness's release fifo: {error}");
+                }
+            }
+            match fs::remove_dir_all(&self.root) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    cowshed_os::eprintln!("cannot remove {}: {error}", self.root.display());
+                }
+            }
+        }
+    }
+
+    /// A child that exits while a descendant keeps its input pipe and never reads ends the run:
+    /// the run owns the feed, so a megabyte nobody reads wedges nothing. The descendant, still
+    /// holding the pipe when the run returns, is released through a fifo and its exit observed
+    /// through another, never a clock.
+    #[test]
+    fn a_descendant_that_keeps_the_input_and_never_reads_holds_up_no_run() {
+        let mut descendant = Descendant::new(temp_path("retained-stdin", "fifo"));
+        let request = CommandRequest::new(
+            "/bin/sh",
+            [
+                OsString::from("-c"),
+                // An asynchronous list's stdin is /dev/null unless redirected, so the descendant
+                // takes the pipe from a descriptor saved before it starts.
+                OsString::from(
+                    "exec 3<&0; sh -c 'read line < \"$1\"; echo ended > \"$2\"' sh \"$1\" \"$2\" <&3 >/dev/null 2>&1 & echo $!",
+                ),
+                OsString::from("sh"),
+                descendant.release.clone().into_os_string(),
+                descendant.ended.clone().into_os_string(),
+            ],
+        );
+        let large = vec![b'x'; 1 << 20];
+        let ran = SystemCommandRunner
+            .run_with_input(&request, CommandDeadline::new(DISK_CHILD_DEADLINE), large)
+            .expect("the child ends the run");
+        assert_eq!(ran.status, ProcessStatus::Exit(0));
+        let pid: libc::pid_t = String::from_utf8(ran.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("the descendant's pid");
+        // SAFETY: signal zero only asks whether the descendant still runs.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "the descendant still holds the pipe"
+        );
+        {
+            use std::io::Write as _;
+            OpenOptions::new()
+                .write(true)
+                .open(&descendant.release)
+                .and_then(|mut release| release.write_all(b"go\n"))
+                .expect("release the descendant");
+        }
+        // The descendant's last act before it exits.
+        assert_eq!(descendant.acknowledgment(), "ended\n");
     }
 
     #[test]

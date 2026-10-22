@@ -256,6 +256,12 @@
   "host.gatewayStart": {},
   "host.gatewayStop": { "purge": true },
   "host.lockHolders": { "path": "/tmp/cowshed-lock" },
+  "host.diskCommand": {
+    "tool": "diskutil",
+    "deadlineMs": 5000,
+    "argv": [{ "encoding": "utf8", "data": "list" }],
+    "stdin": { "encoding": "utf8", "data": "" }
+  },
   "host.treeHolders": { "path": "/trusted/acme/widget" },
   "host.retireDescendants": {
     "handle": { "jobId": 7, "index": 2, "incarnation": "0123456789abcdef0123456789abcdef" },

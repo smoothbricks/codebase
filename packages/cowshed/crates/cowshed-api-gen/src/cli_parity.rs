@@ -73,7 +73,7 @@ pub struct Row {
 }
 
 /// The host verbs have no N-API channel until the host operation table lands (tg#9537).
-const HOST_TABLE: &str = "the remaining host rows and launchers (tg#9537): disk-command, land-turn, credential add, sccache on the installed build, and the lock/hold/subtree-root process holders";
+const HOST_TABLE: &str = "the remaining host rows and launchers (tg#9537): land-turn, credential add, sccache on the installed build, and the lock/hold/subtree-root process holders";
 
 const fn member(member: &'static str) -> Facade {
     Facade {
@@ -300,10 +300,10 @@ pub const PARITY: &[Row] = &[
     row("doctor", "repair", Counterpart::Composed { recipe: "doctor() then gc({}): the one sweep the CLI's repair runs (06_cli.md, \"Onboarding and repair\")", facade: &[member("Coordinator.doctor"), member("Coordinator.gc")] }),
     row("doctor", "clear-attach-budget", field(&[("host.clearAttachBudget", "")], &[member("Host.clearAttachBudget")])),
 
-    gap("disk-command", ""),
-    gap("disk-command", "tool"),
-    gap("disk-command", "deadline-ms"),
-    gap("disk-command", "argv"),
+    row("disk-command", "", field(&[("host.diskCommand", "")], &[member("Host.diskCommand")])),
+    row("disk-command", "tool", field(&[("host.diskCommand", "tool")], &[argument("Host.diskCommand", 0, "tool")])),
+    row("disk-command", "deadline-ms", field(&[("host.diskCommand", "deadlineMs")], &[argument("Host.diskCommand", 0, "deadlineMs")])),
+    row("disk-command", "argv", field(&[("host.diskCommand", "argv")], &[argument("Host.diskCommand", 0, "argv")])),
 
     gap("land-turn", ""),
     gap("land-turn", "repo"),

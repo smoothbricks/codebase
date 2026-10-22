@@ -11,9 +11,10 @@ use std::num::NonZeroUsize;
 use std::os::fd::OwnedFd;
 
 use cowshed_core::api::EmptyResult;
+use cowshed_core::api::dto::{BinaryData, CommandArg, DiskCommandTool};
 use cowshed_core::api::operations::{self, Operation, OperationRequest, encode_result};
 use cowshed_core::api::server::{
-    ConnectionAuthority, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
+    ConnectionAuthority, EventSource, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
     serve_controller_connection,
 };
 use cowshed_core::{CowshedError, Result};
@@ -171,10 +172,48 @@ async fn answer(request: RouterRequest) -> Result<RouterResponse> {
             )
             .await?,
         ),
+        Op::HostDiskCommand(request) => {
+            let args = crate::args::DiskCommandArgs {
+                tool: match request.tool {
+                    DiskCommandTool::Diskutil => cowshed_apfs::DiskTool::Diskutil,
+                    DiskCommandTool::Hdiutil => cowshed_apfs::DiskTool::Hdiutil,
+                },
+                deadline: request
+                    .deadline_ms
+                    .map_or(cowshed_apfs::DISK_CHILD_DEADLINE, |deadline| {
+                        std::time::Duration::from_millis(deadline.get())
+                    }),
+                args: request
+                    .argv
+                    .into_iter()
+                    .map(CommandArg::into_os_string)
+                    .collect(),
+            };
+            let input = request
+                .stdin
+                .map(BinaryData::into_bytes)
+                .unwrap_or_default();
+            let ran = crate::disk_command::run(&args, crate::disk_command::ToolInput::Bytes(input))
+                .await?;
+            Ok(RouterResponse::events(Box::new(DiskEvents(
+                crate::disk_command::OutputEvents::new(ran),
+            ))))
+        }
         other => Err(CowshedError::internal(format!(
             "{} reached the host router past the connection's scope check",
             other.method()
         ))),
+    }
+}
+
+/// A finished disk tool's output, then its end, each event made on its demand.
+struct DiskEvents(crate::disk_command::OutputEvents);
+
+#[async_trait::async_trait]
+impl EventSource for DiskEvents {
+    async fn next(&mut self) -> Option<Result<serde_json::Value>> {
+        let event = self.0.next_event()?;
+        Some(event.and_then(|event| encode_result::<operations::HostDiskCommand>(&event)))
     }
 }
 

@@ -140,6 +140,16 @@ impl Host {
             arguments,
         )
     }
+
+    /// Runs one diskutil or hdiutil argv through cowshed's disk runner, its output after its end.
+    #[napi(js_name = "diskCommand")]
+    pub fn disk_command(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::stream_call::<operations::HostDiskCommand, _>(
+            env,
+            Arc::clone(&self.inner),
+            arguments,
+        )
+    }
 }
 
 #[napi]

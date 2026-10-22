@@ -105,6 +105,25 @@ describe('openHost', () => {
     }
   });
 
+  it('streams a disk command as its whole stdout, then its exit, the last event', async () => {
+    const host = await openHost();
+    try {
+      const kinds: string[] = [];
+      let exit: number | undefined;
+      for await (const event of host.diskCommand({ tool: 'hdiutil', argv: [{ encoding: 'utf8', data: 'info' }] })) {
+        expect(exit).toBeUndefined();
+        kinds.push(event.kind);
+        if (event.kind === 'exit') {
+          exit = event.code;
+        }
+      }
+      expect(exit).toBe(0);
+      expect(kinds[0]).toBe('stdout');
+    } finally {
+      await host.close();
+    }
+  });
+
   it('installs the skill into the named project only, and refuses an unknown harness writing nothing', async () => {
     const project = await mkdtemp(join(tmpdir(), 'cowshed-host-napi-skill-'));
     const host = await openHost();

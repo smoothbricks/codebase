@@ -14,6 +14,7 @@ use cowshed_apfs::{
     CommandDeadline, CommandOutput, CommandRequest, CommandRunError, CommandRunFailure,
     ProcessStatus, SystemCommandRunner,
 };
+use cowshed_core::api::dto::{BinaryData, DiskCommandEvent, MAX_INLINE_OUTPUT_BYTES};
 use cowshed_core::{CowshedError, ErrorCode};
 
 use crate::args::DiskCommandArgs;
@@ -33,7 +34,7 @@ where
     W: Write + Send,
     E: Write + Send,
 {
-    let outcome = match run(args).await {
+    let outcome = match run(args, ToolInput::Inherited).await {
         Ok(ran) => {
             let (stdout, stderr) = output.writers_mut();
             deliver(&ran, stdout, stderr)
@@ -54,14 +55,26 @@ where
     }
 }
 
+/// Where the tool's standard input comes from.
+pub(crate) enum ToolInput {
+    /// This process's own, so a caller of the verb can pipe a passphrase to it.
+    Inherited,
+    /// These bytes, closed after them: a host connection's request, whose own standard input is
+    /// its protocol socket and never the tool's.
+    Bytes(Vec<u8>),
+}
+
 /// The tool's outcome, waited for off the async runtime: a disk-image command can run for as
-/// long as it takes. The tool reads this process's standard input, so a caller can pipe a
-/// passphrase to it.
-async fn run(args: &DiskCommandArgs) -> Result<CommandOutput, CowshedError> {
+/// long as it takes.
+pub(crate) async fn run(
+    args: &DiskCommandArgs,
+    input: ToolInput,
+) -> Result<CommandOutput, CowshedError> {
     let request = request(args);
     let deadline = CommandDeadline::new(args.deadline);
-    tokio::task::spawn_blocking(move || {
-        SystemCommandRunner.run_with_inherited_input(&request, deadline)
+    tokio::task::spawn_blocking(move || match input {
+        ToolInput::Inherited => SystemCommandRunner.run_with_inherited_input(&request, deadline),
+        ToolInput::Bytes(bytes) => SystemCommandRunner.run_with_input(&request, deadline, bytes),
     })
     .await
     .map_err(|error| {
@@ -105,7 +118,8 @@ fn runner_error(error: CommandRunError) -> CowshedError {
         CommandRunFailure::Spawn(_)
         | CommandRunFailure::Wait(_)
         | CommandRunFailure::Kill { .. }
-        | CommandRunFailure::Reap { .. } => CowshedError::internal(message),
+        | CommandRunFailure::Reap { .. }
+        | CommandRunFailure::Input { .. } => CowshedError::internal(message),
     }
 }
 
@@ -128,12 +142,80 @@ pub fn deliver(
             ran.status
         )));
     }
-    match ran.status {
+    exit_code(ran.status)
+}
+
+/// The exit code a status maps to: its exit code, or 128 plus the signal that ended it.
+fn exit_code(status: ProcessStatus) -> Result<i32, CowshedError> {
+    match status {
         ProcessStatus::Exit(code) => Ok(code),
         ProcessStatus::Signal(signal) => Ok(128 + signal),
         ProcessStatus::Unknown => Err(CowshedError::internal(
             "the disk tool ended, but the kernel reported neither its exit code nor its signal",
         )),
+    }
+}
+
+/// The tool's outcome as `host.diskCommand` delivers it, one event per demand: its whole stdout in
+/// order, in chunks of at most one inline frame, then its whole stderr the same way, and last its
+/// exit — or, when the kernel reported no status, the error `disk-command` reports after writing
+/// the same bytes. It holds the run's own output: a stream that fits one frame moves its buffer
+/// into its one event, and a larger one copies one bounded chunk per event.
+pub(crate) struct OutputEvents {
+    stdout: Stream,
+    stderr: Stream,
+    end: Option<Result<DiskCommandEvent, CowshedError>>,
+}
+
+/// One of the tool's streams and how much of it has been delivered.
+struct Stream {
+    bytes: Vec<u8>,
+    delivered: usize,
+}
+
+impl Stream {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            delivered: 0,
+        }
+    }
+
+    fn next_chunk(&mut self) -> Option<BinaryData> {
+        let rest = self.bytes.len() - self.delivered;
+        if rest == 0 {
+            return None;
+        }
+        let data = if self.delivered == 0 && rest <= MAX_INLINE_OUTPUT_BYTES {
+            BinaryData::new(std::mem::take(&mut self.bytes))
+        } else {
+            let length = rest.min(MAX_INLINE_OUTPUT_BYTES);
+            let chunk = &self.bytes[self.delivered..self.delivered + length];
+            self.delivered += length;
+            BinaryData::new(chunk)
+        };
+        Some(data.expect("a chunk cut to the inline bound fits it"))
+    }
+}
+
+impl OutputEvents {
+    pub(crate) fn new(ran: CommandOutput) -> Self {
+        Self {
+            stdout: Stream::new(ran.stdout),
+            stderr: Stream::new(ran.stderr),
+            end: Some(exit_code(ran.status).map(|code| DiskCommandEvent::Exit { code })),
+        }
+    }
+
+    /// The next event, made now; `None` once the exit (or the error) has been delivered.
+    pub(crate) fn next_event(&mut self) -> Option<Result<DiskCommandEvent, CowshedError>> {
+        if let Some(data) = self.stdout.next_chunk() {
+            return Some(Ok(DiskCommandEvent::Stdout { data }));
+        }
+        if let Some(data) = self.stderr.next_chunk() {
+            return Some(Ok(DiskCommandEvent::Stderr { data }));
+        }
+        self.end.take()
     }
 }
 
@@ -204,6 +286,71 @@ mod tests {
         let error = deliver(&unknown, &mut stdout, &mut Vec::new()).unwrap_err();
         assert_eq!(stdout, b"out", "the bytes are delivered before the refusal");
         assert_eq!(error.exec_wrapper_exit_code(), 100);
+    }
+
+    /// `host.diskCommand` answers the same outcome as ordered events: stdout cut to the inline
+    /// bound in order, then stderr, then the exit code `disk-command` exits with; a status the
+    /// kernel did not report still delivers every byte before its error.
+    #[test]
+    fn the_host_events_are_the_whole_output_in_order_then_the_exit() {
+        let stdout: Vec<u8> = (0..=MAX_INLINE_OUTPUT_BYTES)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
+        let ran = CommandOutput {
+            status: ProcessStatus::Signal(libc::SIGTERM),
+            stdout: stdout.clone(),
+            stderr: b"err".to_vec(),
+        };
+        let mut events = OutputEvents::new(ran);
+        let mut next = || events.next_event().map(Result::unwrap);
+        assert_eq!(
+            next(),
+            Some(DiskCommandEvent::Stdout {
+                data: BinaryData::new(&stdout[..MAX_INLINE_OUTPUT_BYTES]).unwrap()
+            })
+        );
+        assert_eq!(
+            next(),
+            Some(DiskCommandEvent::Stdout {
+                data: BinaryData::new(&stdout[MAX_INLINE_OUTPUT_BYTES..]).unwrap()
+            })
+        );
+        assert_eq!(
+            next(),
+            Some(DiskCommandEvent::Stderr {
+                data: BinaryData::new(&b"err"[..]).unwrap()
+            })
+        );
+        assert_eq!(
+            next(),
+            Some(DiskCommandEvent::Exit {
+                code: 128 + libc::SIGTERM
+            })
+        );
+        assert_eq!(next(), None);
+
+        // Output that fits one frame is moved into its event: the same buffer, never a copy.
+        let single = b"out".to_vec();
+        let buffer = single.as_ptr();
+        let mut events = OutputEvents::new(CommandOutput {
+            status: ProcessStatus::Unknown,
+            stdout: single,
+            stderr: Vec::new(),
+        });
+        let Some(Ok(DiskCommandEvent::Stdout { data })) = events.next_event() else {
+            panic!("the single stdout frame comes first");
+        };
+        assert_eq!(data.as_bytes(), b"out");
+        assert_eq!(data.as_bytes().as_ptr(), buffer);
+        assert_eq!(
+            events
+                .next_event()
+                .unwrap()
+                .unwrap_err()
+                .exec_wrapper_exit_code(),
+            100
+        );
+        assert!(events.next_event().is_none());
     }
 
     /// A reader that closed its end.

@@ -828,6 +828,43 @@ export type DestroyRequest = {
   readonly options: RemoveOptions;
 };
 
+/**
+ * One event of a `host.diskCommand` stream. The runner collects the tool's output and delivers
+ * it once the tool has ended, as `disk-command` does: its whole stdout in order, in chunks of at
+ * most one inline frame, then its whole stderr the same way, then its exit, the last event.
+ */
+export type DiskCommandEvent =
+  | ({ readonly kind: 'stdout' } & {
+      readonly data: BinaryData;
+    })
+  | ({ readonly kind: 'stderr' } & {
+      readonly data: BinaryData;
+    })
+  | ({ readonly kind: 'exit' } & {
+      readonly code: number & tags.Type<'int32'>;
+    });
+
+/**
+ * `disk-command <tool> [--deadline-ms] -- <argv>`. The verb's inherited standard input is
+ * `stdin`: the tool's whole input, closed after it, empty when absent, so the tool reads end of
+ * input at once; a host connection never hands a child its own.
+ */
+export type DiskCommandRequest = {
+  readonly tool: DiskCommandTool;
+  /**
+   * The total admission-and-child budget of an ordinary verb, 120 s when absent, exactly as
+   * `--deadline-ms`: an image verb keeps its warning-only, never-kill policy whatever it says.
+   */
+  readonly deadlineMs?: number & tags.Type<'uint64'> & tags.Minimum<1>;
+  readonly argv: ReadonlyArray<CommandArg>;
+  readonly stdin?: BinaryData;
+};
+
+/**
+ * The disk tool `host.diskCommand` runs, as `disk-command` names it: never a path.
+ */
+export type DiskCommandTool = 'diskutil' | 'hdiutil';
+
 export type DoctorReport = {
   readonly healthy: boolean;
   readonly findings: ReadonlyArray<Finding>;

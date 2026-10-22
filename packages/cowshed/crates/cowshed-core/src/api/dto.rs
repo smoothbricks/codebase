@@ -1721,6 +1721,38 @@ pub enum ExitStatus {
     Signaled { signal: i32, core_dumped: bool },
 }
 
+/// The disk tool `host.diskCommand` runs, as `disk-command` names it: never a path.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiskCommandTool {
+    Diskutil,
+    Hdiutil,
+}
+
+/// One event of a `host.diskCommand` stream. The runner collects the tool's output and delivers
+/// it once the tool has ended, as `disk-command` does: its whole stdout in order, in chunks of at
+/// most one inline frame, then its whole stderr the same way, then its exit, the last event.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum DiskCommandEvent {
+    Stdout {
+        data: BinaryData,
+    },
+    Stderr {
+        data: BinaryData,
+    },
+    /// The tool's status as `disk-command` exits with it: its exit code, or 128 plus the signal
+    /// that ended it.
+    Exit {
+        code: i32,
+    },
+}
+
 impl ExitStatus {
     /// The status as a shell reports it: the exit code, or 128 plus the signal that ended it.
     pub const fn shell_code(&self) -> i32 {

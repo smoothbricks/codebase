@@ -116,6 +116,7 @@ fn run_disk_tool(
             | CommandRunFailure::Wait(_)
             | CommandRunFailure::Kill { .. }
             | CommandRunFailure::Reap { .. }
+            | CommandRunFailure::Input { .. }
             | CommandRunFailure::VolumeRename
             | CommandRunFailure::MediaCap(_)
             | CommandRunFailure::MediaUnread(_)
