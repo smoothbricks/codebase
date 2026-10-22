@@ -2762,7 +2762,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 after: image,
             }],
             || {
-                super::release::release_owned(image, &entry)
+                super::release::release_owned(image, &entry, super::release::Reclaim::Now)
                     .map_err(|error| io_error("release a retired workspace image", image, error))
             },
         )?;

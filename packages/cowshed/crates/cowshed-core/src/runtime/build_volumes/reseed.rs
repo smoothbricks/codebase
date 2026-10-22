@@ -183,7 +183,8 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 },
                 ..plan.previous_record.clone()
             })?;
-            host.release_claimed(layout, claim).map_err(storage)?;
+            host.release_claimed(layout, claim, crate::storage::apfs::release::Reclaim::Now)
+                .map_err(storage)?;
             drop(creating);
             Ok(ReseedResult {
                 replacement_volume: Some(replacement.to_string()),

@@ -1421,8 +1421,9 @@ async fn refuse_restart_while_busy(
 /// Finish, once, at the daemon's start, on a thread of its own, every image release no process
 /// owns any more (16_build_volumes.md, "Garbage collection"; 02_workspaces.md, `rm` step 5):
 /// each project's `build/.releasing` and `sessions/.releasing` entries a crash cut short after
-/// their operation committed them, and the `build/.trash` earlier builds renamed images into. No
-/// release of this build leaves either behind, so one pass at the start leaves nothing. Each image
+/// their operation committed them, the superseded seeds a fork's refresh committed to
+/// `build/.releasing` without freeing them, and the `build/.trash` earlier builds renamed images
+/// into. Between starts, a project's `rm`, land and `gc` finish its journal. Each image
 /// is released in bounded steps at normal disk priority, so no free stalls the store's container,
 /// and an interrupted release resumes from the image's length. A project's next open and `cowshed
 /// gc` finish its own the same way.

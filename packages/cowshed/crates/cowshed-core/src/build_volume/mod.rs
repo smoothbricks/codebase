@@ -35,7 +35,7 @@ use crate::capabilities::BuildStatePath;
 use crate::metadata::{MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json};
 use crate::repository::ProjectPaths;
 use crate::storage::StorageLayoutError;
-use crate::storage::apfs::release::Drained;
+use crate::storage::apfs::release::{Drained, Reclaim};
 use cowshed_apfs::image::IMAGE_EXTENSION;
 use cowshed_os::fork_lock::Fenced;
 
@@ -728,17 +728,20 @@ impl BuildVolumeLayout {
             .join(crate::storage::apfs::release::JOURNAL_DIRECTORY)
     }
 
+    /// `id`'s entry in [`Self::releasing`] once its release is committed.
+    pub fn released(&self, id: &BuildVolumeId) -> PathBuf {
+        self.releasing().join(format!("{id}.{IMAGE_EXTENSION}"))
+    }
+
     /// Release `id`'s detached image inside the operation that retires or replaces it, and say
     /// whether an image was there (16_build_volumes.md, "Garbage collection"): one rename into
-    /// [`Self::releasing`] commits it, then it is freed in bounded steps and unlinked, all
-    /// before this returns, so the caller removes the owner record only once the bytes are gone.
-    /// A failure before the rename leaves the image and record for the same operation's retry;
-    /// one after it leaves the journal entry for recovery.
-    pub fn release_image(&self, id: &BuildVolumeId) -> io::Result<bool> {
-        crate::storage::apfs::release::release_owned(
-            &self.image(id),
-            &self.releasing().join(format!("{id}.{IMAGE_EXTENSION}")),
-        )
+    /// [`Self::releasing`] commits it. With [`Reclaim::Now`] it is then freed in bounded steps
+    /// and unlinked, all before this returns, so the caller removes the owner record only once
+    /// the bytes are gone; with [`Reclaim::Journaled`] the entry stays for the journal's next
+    /// drain. A failure before the rename leaves the image and record for the same operation's
+    /// retry; one after it leaves the journal entry for recovery.
+    pub fn release_image(&self, id: &BuildVolumeId, reclaim: Reclaim) -> io::Result<bool> {
+        crate::storage::apfs::release::release_owned(&self.image(id), &self.released(id), reclaim)
     }
 
     pub fn record(&self, id: &BuildVolumeId) -> PathBuf {
@@ -1224,7 +1227,8 @@ pub fn drain_released(directory: &Path) -> io::Result<Drained> {
 
 /// [`drain_released`] for every project in the store at `store`: each
 /// `<store>/<owner>/<repo>/build/.releasing` and historical `build/.trash`. The daemon runs this
-/// once at its start, the recovery of releases a crash cut short while no process owned them. A
+/// once at its start: the recovery of releases a crash cut short while no process owned them,
+/// and of the superseded seeds a fork's refresh committed and left. A
 /// project whose directory cannot be drained is said and skipped.
 pub fn drain_store_released(store: &Path) -> Drained {
     use crate::storage::apfs::release::{JOURNAL_DIRECTORY, drain_store};
@@ -1908,7 +1912,7 @@ mod tests {
         drop(kept);
 
         let released = hold_behind_claim(&layout, &id, || {
-            assert!(layout.release_image(&id).unwrap());
+            assert!(layout.release_image(&id, Reclaim::Now).unwrap());
             fs::remove_file(layout.hold_path(&id)).unwrap();
         })
         .unwrap_err();
@@ -1997,7 +2001,7 @@ mod tests {
         fs::write(layout.image(&id), vec![7_u8; 64 * 1024]).unwrap();
         fs::write(layout.record(&id), b"retained ownership").unwrap();
 
-        assert!(layout.release_image(&id).unwrap());
+        assert!(layout.release_image(&id, Reclaim::Now).unwrap());
         assert!(!layout.image(&id).exists(), "release physically frees");
         assert_eq!(
             fs::read_dir(layout.releasing()).unwrap().count(),
@@ -2009,12 +2013,15 @@ mod tests {
             "release creates no deferred trash"
         );
         assert_eq!(fs::read(layout.record(&id)).unwrap(), b"retained ownership");
-        assert!(!layout.release_image(&id).unwrap(), "a retry is idempotent");
+        assert!(
+            !layout.release_image(&id, Reclaim::Now).unwrap(),
+            "a retry is idempotent"
+        );
 
         // A real refusal must preserve the ownership evidence and the image's name.
         fs::create_dir(layout.image(&id)).unwrap();
         fs::write(layout.image(&id).join("held"), b"not a regular image").unwrap();
-        assert!(layout.release_image(&id).is_err());
+        assert!(layout.release_image(&id, Reclaim::Now).is_err());
         assert!(layout.image(&id).join("held").exists());
         assert_eq!(fs::read(layout.record(&id)).unwrap(), b"retained ownership");
         fs::remove_dir_all(&root).unwrap();

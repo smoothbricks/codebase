@@ -127,7 +127,14 @@ pub(crate) trait RuntimeStorageHost: ApfsExecutionHost<LockGuard: Sync> {
         &self,
         layout: &BuildVolumeLayout,
         claim: ReleaseClaim,
+        reclaim: crate::storage::apfs::release::Reclaim,
     ) -> Result<Option<BuildVolumeRefusal>, ApfsStorageError>;
+    /// Finish every release committed to the project's build journal (16_build_volumes.md,
+    /// "Garbage collection"), leaving what another process is freeing or still holds.
+    fn finish_build_releases(
+        &self,
+        layout: &BuildVolumeLayout,
+    ) -> Result<crate::storage::apfs::release::Drained, ApfsStorageError>;
     fn build_volume_capacity(
         &self,
         layout: &BuildVolumeLayout,

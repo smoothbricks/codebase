@@ -13907,31 +13907,28 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 crate::exec::profile_directory(&store_root).display()
             ),
         }
-        // Finish, before answering, the build releases a crash cut short and the historical trash
-        // earlier builds left: failure here must not report a completed physical collection.
-        let layout = self.build_volume_layout()?;
-        let directories = [layout.releasing(), layout.trash()];
-        let drained = tokio::task::spawn_blocking(move || {
-            let mut drained = crate::storage::apfs::release::Drained::default();
-            for directory in &directories {
-                drained.add(
-                    crate::build_volume::drain_released(directory).map_err(|error| {
-                        CowshedError::environment_missing(
-                            format!(
-                                "cannot finish releasing build images in {}: {error}",
-                                directory.display()
-                            ),
-                            "repair the named path, then retry cowshed gc",
-                        )
-                    })?,
-                );
-            }
-            Ok::<_, CowshedError>(drained)
-        })
-        .await
-        .map_err(|error| {
-            CowshedError::internal(format!("build image release task failed: {error}"))
-        })??;
+        // Finish, before answering, the build releases a fork's seed refresh journaled or a crash
+        // cut short, and the historical trash earlier builds left: failure here must not report a
+        // completed physical collection.
+        let mut drained = self.build_volumes()?.finish_releases().await?;
+        let trash = self.build_volume_layout()?.trash();
+        drained.add(
+            tokio::task::spawn_blocking(move || {
+                crate::build_volume::drain_released(&trash).map_err(|error| {
+                    CowshedError::environment_missing(
+                        format!(
+                            "cannot finish releasing build images in {}: {error}",
+                            trash.display()
+                        ),
+                        "repair the named path, then retry cowshed gc",
+                    )
+                })
+            })
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("build image release task failed: {error}"))
+            })??,
+        );
         if drained.images > 0 {
             cowshed_os::eprintln!(
                 "cowshed: gc released {} build volume image(s), {} bytes, that an interrupted operation or an earlier build left",

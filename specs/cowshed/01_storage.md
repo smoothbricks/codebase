@@ -92,7 +92,7 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
       <id>.dmg                       # one build volume: Cargo target dirs + Nx cache and task DB (16_build_volumes.md)
       <id>.dmg.json                  # its sidecar: built-at tree, linking checkout, checked-out tree when placed, seed flag, created
       <id>.dmg.hold                  # flock each job on the volume holds shared; a release claims it exclusive, then deletes it
-      .releasing/<id>.dmg            # a committed release, freed by its own operation or, after a crash, recovery
+      .releasing/<id>.dmg            # a committed release, freed by its own operation; a seed a fork's refresh superseded, or one a crash left, by the next rm/land release, gc or daemon start
       .trash/<id>.dmg                # earlier builds' releases only; the daemon's start and `gc` finish them
     tmp/
       <workspace>/                   # its TMPDIR, 0700: writable by its own sandbox only; reclaimed with its retired image,

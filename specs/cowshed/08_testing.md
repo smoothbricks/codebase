@@ -403,7 +403,10 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   is a fragmented file on the host's filesystem, cut a few steps, abandoned, and finished by a second release that
   counts only what was left. The release journal's crash point is witnessed the same way: an image committed to
   `.releasing/`, cut once and abandoned is finished by the journal's recovery drain and by its owner's retry, and a
-  workspace image left so is finished by project recovery, which then reconciles the record its rename left imageless.
+  workspace image left so is finished by project recovery, which then reconciles the record its rename left imageless. A
+  journaled release returns with its entry whole and unlocked, and a drain finishes it; a directory store's seed refresh
+  whose superseded seed a process holds publishes the new seed and answers with the old tree committed whole, and the
+  journal's finisher leaves that tree while it is held and deletes it once it is not.
 - **A supervisor's opening finishes nothing and waits for no image lock** (07_api.md, "Authority model"): for any
   generated workspace and probe name, a `Supervisor` opening observes what a `Workspaces` opening naming that one
   workspace observes, replays no intent, selects no rename and has no retirement target; over generated scopes it and

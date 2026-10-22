@@ -25,6 +25,7 @@ use crate::storage::apfs::native::{
     BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease, io_error, path_exists,
     sync_parent_path,
 };
+use crate::storage::apfs::release::{Drained, Reclaim};
 use crate::storage::lifecycle::ResizeOutcome;
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_os::process::Holder;
@@ -146,6 +147,45 @@ fn scan_clock_entries(
     }
     Ok(())
 }
+/// Commit the release of `id`'s unbound payload tree: one rename to its entry in the project's
+/// build journal, both directories synced. Nothing is deleted until
+/// [`DirectoryExecutionHost::finish_build_releases`].
+fn journal_payload_tree(
+    layout: &BuildVolumeLayout,
+    id: &BuildVolumeId,
+) -> Result<(), ApfsStorageError> {
+    let image = layout.image(id);
+    let entry = layout.released(id);
+    super::ensure_parent(&entry)?;
+    fs::rename(&image, &entry).map_err(|error| {
+        io_error(
+            "commit a build volume release to the journal",
+            &entry,
+            error,
+        )
+    })?;
+    sync_parent_path(&entry)?;
+    sync_parent_path(&image)
+}
+
+/// The bytes the files under `root` hold on disk, links never followed.
+fn tree_bytes(root: &Path) -> io::Result<u64> {
+    let mut bytes = 0;
+    let mut pending = vec![root.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let path = entry?.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.is_dir() {
+                pending.push(path);
+            } else {
+                bytes += metadata.blocks().saturating_mul(512);
+            }
+        }
+    }
+    Ok(bytes)
+}
+
 /// Whether `path` was there to remove.
 fn remove_if_present(path: &Path) -> Result<bool, ApfsStorageError> {
     match fs::remove_file(path) {
@@ -447,7 +487,7 @@ impl DirectoryExecutionHost {
                     return Ok(BuildVolumeRelease::Held { open });
                 }
                 Ok(BuildVolumeRelease::Deleted {
-                    refused: self.release_claimed(layout, claim)?,
+                    refused: self.release_claimed(layout, claim, Reclaim::Now)?,
                 })
             }
             BuildVolumeClaim::Held { open } => Ok(BuildVolumeRelease::Held { open }),
@@ -508,15 +548,19 @@ impl DirectoryExecutionHost {
         }
     }
 
-    /// Unbind and delete the volume `claim` claimed, with its record, mark, hold and
-    /// mountpoint, journaled in the project's deletion log. A process that still has anything
-    /// open inside the tree refuses the release before anything changes: there is no forced
-    /// fallback, so a held seed is never deleted from under its holder. A release that goes
+    /// Unbind and release the volume `claim` claimed, deleting its record, mark, hold and
+    /// mountpoint, journaled in the project's deletion log. With [`Reclaim::Now`] the tree is
+    /// deleted before this answers, and a process that still has anything open inside it
+    /// refuses the release before anything changes: there is no forced fallback, so a held seed
+    /// is never deleted from under its holder. With [`Reclaim::Journaled`] the tree is only
+    /// renamed into the project's build journal, which deletes nothing, so a holder keeps what
+    /// it has open and [`Self::finish_build_releases`] waits it out. A release that goes
     /// through has no refusal to report.
     pub fn release_claimed(
         &self,
         layout: &BuildVolumeLayout,
         claim: ReleaseClaim,
+        reclaim: Reclaim,
     ) -> Result<Option<BuildVolumeRefusal>, ApfsStorageError> {
         let id = claim.id();
         let image = layout.image(id);
@@ -528,7 +572,7 @@ impl DirectoryExecutionHost {
             .ok()
             .flatten()
             .map(|record| record.role);
-        if present {
+        if present && reclaim == Reclaim::Now {
             let open = holders_of(&image)?;
             if !open.is_empty() {
                 return Err(ApfsStorageError::BuildVolumeHeld {
@@ -543,7 +587,10 @@ impl DirectoryExecutionHost {
         // image already gone has nothing to unbind: its record alone is retired, said as such.
         if present {
             unbind(&image, &mount, cowshed_apfs::DetachIntent::Release)?;
-            remove_payload_tree(&image)?;
+            match reclaim {
+                Reclaim::Now => remove_payload_tree(&image)?,
+                Reclaim::Journaled => journal_payload_tree(layout, id)?,
+            }
             layout.journal_release(id, recorded.as_ref(), true);
         }
         remove_if_present(&written_mark_path(&image))?;
@@ -564,6 +611,51 @@ impl DirectoryExecutionHost {
         }
         drop(claim);
         Ok(None)
+    }
+
+    /// Finish every release committed to the project's build journal: delete each payload tree
+    /// a [`Reclaim::Journaled`] release moved there. A tree a process still holds anything
+    /// inside is said and left for a later pass, never deleted from under its holder; anything
+    /// that is not a directory is said and left, untouched.
+    pub fn finish_build_releases(
+        &self,
+        layout: &BuildVolumeLayout,
+    ) -> Result<Drained, ApfsStorageError> {
+        let journal = layout.releasing();
+        let listing = |error| io_error("list the build release journal", &journal, error);
+        let entries = match fs::read_dir(&journal) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Drained::default()),
+            Err(error) => return Err(listing(error)),
+        };
+        let mut drained = Drained::default();
+        for entry in entries {
+            let entry = entry.map_err(listing)?.path();
+            let is_tree = fs::symlink_metadata(&entry)
+                .map_err(|error| io_error("inspect a released build volume", &entry, error))?
+                .is_dir();
+            if !is_tree {
+                cowshed_os::eprintln!(
+                    "cowshed: {} is not a released build volume; it is left",
+                    entry.display()
+                );
+                continue;
+            }
+            let open = holders_of(&entry)?;
+            if !open.is_empty() {
+                cowshed_os::eprintln!(
+                    "cowshed: released build volume {} stays while {} process(es) hold it; a later release or cowshed gc deletes it",
+                    entry.display(),
+                    open.len()
+                );
+                continue;
+            }
+            let bytes = tree_bytes(&entry)
+                .map_err(|error| io_error("measure a released build volume", &entry, error))?;
+            remove_payload_tree(&entry)?;
+            drained.add(Drained { images: 1, bytes });
+        }
+        Ok(drained)
     }
 
     /// Bind what `workspace`'s checkout links once the link is settled
@@ -817,7 +909,10 @@ mod detach_tests {
         host.mount_build_volume(&layout, &id).unwrap();
         assert_eq!(fs::read(mount.join("warm")).unwrap(), b"old build state\n");
         host.detach_claimed_build_volume(&layout, &claim).unwrap();
-        assert_eq!(host.release_claimed(&layout, claim).unwrap(), None);
+        assert_eq!(
+            host.release_claimed(&layout, claim, Reclaim::Now).unwrap(),
+            None
+        );
         for path in [
             image,
             layout.record(&id),

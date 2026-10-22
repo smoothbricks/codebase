@@ -16,6 +16,7 @@ use crate::build_volume::{
     LinkResolution, Registrant, Registration, ReleaseClaim, link,
 };
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
+use crate::storage::apfs::release::{Drained, Reclaim};
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError};
 use crate::storage::lifecycle::ResizeOutcome;
 use cowshed_apfs::image::ImageCapacity;
@@ -485,7 +486,7 @@ where
     ) -> Result<Release, ApfsStorageError> {
         match self.claim_build_volume(layout, id)? {
             Claim::Claimed(claim) => Ok(Release::Deleted {
-                refused: self.release_claimed(layout, claim)?,
+                refused: self.release_claimed(layout, claim, Reclaim::Now)?,
             }),
             Claim::Held { open } => Ok(Release::Held { open }),
         }
@@ -641,14 +642,17 @@ where
         Ok(())
     }
 
-    /// Release the volume while retaining its claim and ownership record until the detached
-    /// image is physically unlinked. An unlink failure refuses the retirement with its record
-    /// intact; no successful release leaves a clone in a deferred trash queue.
-    /// The deletion log names the owner read before the image and record are removed.
+    /// Release the volume while retaining its claim and ownership record until its detached
+    /// image's release is committed to the journal and, with [`Reclaim::Now`], physically
+    /// unlinked. A failure refuses the retirement with its record intact. With
+    /// [`Reclaim::Journaled`] the record goes once the commit is durable and the entry waits
+    /// for [`Self::finish_build_releases`]. The deletion log names the owner read before the
+    /// image and record are removed.
     pub fn release_claimed(
         &self,
         layout: &BuildVolumeLayout,
         claim: ReleaseClaim,
+        reclaim: Reclaim,
     ) -> Result<Option<Refusal>, ApfsStorageError> {
         let id = claim.id();
         let image = layout.image(id);
@@ -698,7 +702,7 @@ where
             }],
             || {
                 layout
-                    .release_image(id)
+                    .release_image(id, reclaim)
                     .map_err(|error| io_error("release a build volume image", &image, error))
             },
         )?;
@@ -719,6 +723,18 @@ where
         }
         drop(claim);
         Ok(refused)
+    }
+
+    /// Finish every release committed to the project's build journal
+    /// ([`crate::build_volume::drain_released`]): the superseded seeds a fork's refresh journaled
+    /// and the entries a crash cut short. An entry another process is freeing is left to it.
+    pub fn finish_build_releases(
+        &self,
+        layout: &BuildVolumeLayout,
+    ) -> Result<Drained, ApfsStorageError> {
+        let journal = layout.releasing();
+        crate::build_volume::drain_released(&journal)
+            .map_err(|error| io_error("finish the build image releases", &journal, error))
     }
 
     /// Mount what `workspace`'s checkout links, whose build link names `linked`, once the link
@@ -1623,7 +1639,10 @@ mod tests {
             "publication rollback can restore the old volume"
         );
         host.detach_claimed_build_volume(&layout, &claim).unwrap();
-        assert_eq!(host.release_claimed(&layout, claim).unwrap(), None);
+        assert_eq!(
+            host.release_claimed(&layout, claim, Reclaim::Now).unwrap(),
+            None
+        );
         for path in [&image, &layout.record(&id), &layout.hold_path(&id), &mount] {
             assert!(
                 !path.exists(),
