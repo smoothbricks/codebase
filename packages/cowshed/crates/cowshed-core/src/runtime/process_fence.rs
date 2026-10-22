@@ -17,6 +17,48 @@ pub(crate) struct HeldEnds {
     pub(crate) go: OwnedFd,
 }
 
+impl HeldEnds {
+    /// The hold a child forked in this same process runs. That child inherits every descriptor
+    /// open at its fork, the gate's own ends included, and while it keeps the gate's release end
+    /// a gate dropped without releasing never reads as the end of that pipe: the child would wait
+    /// for a release nobody can send, and the spawn for its exec. So it closes the gate's ends
+    /// first. A child forked by another process (a warm host) never had them.
+    pub(crate) fn in_process(&self, gate: &LeaderGate) -> InProcessHold {
+        InProcessHold {
+            ready: self.ready.as_raw_fd(),
+            go: self.go.as_raw_fd(),
+            gate: [gate.ready.as_raw_fd(), gate.go.as_raw_fd()],
+        }
+    }
+}
+
+/// The descriptor numbers a held child of this process uses between fork and exec: its report
+/// and release ends, and the gate's ends it inherited and closes before it waits.
+#[derive(Clone, Copy)]
+pub(crate) struct InProcessHold {
+    ready: RawFd,
+    go: RawFd,
+    gate: [RawFd; 2],
+}
+
+impl InProcessHold {
+    /// Called between fork and exec. Allocates nothing and calls only close/getpid/write/read
+    /// (async-signal-safe).
+    pub(crate) fn hold(self) -> io::Result<()> {
+        for end in self.gate {
+            // SAFETY: this child's own copy of a gate end; no other process's descriptor changes.
+            // Darwin and Linux release the descriptor even when close reports EINTR.
+            if unsafe { libc::close(end) } == -1 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+        hold_before_exec(self.ready, self.go)
+    }
+}
+
 pub(crate) fn leader_gate() -> io::Result<(LeaderGate, HeldEnds)> {
     let (ready_read, ready_write) = close_on_exec_pipe()?;
     let (go_read, go_write) = close_on_exec_pipe()?;
@@ -52,8 +94,10 @@ fn close_on_exec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     })
 }
 
-/// Called between fork and exec: report this pid and wait for the observer's byte.
-/// The implementation allocates nothing and calls only getpid/write/read (async-signal-safe).
+/// Called between fork and exec: report this pid and wait for the observer's byte. The end of the
+/// release pipe before that byte means the observer withdrew the release: ECANCELED, the errno
+/// the parent's spawn then fails with. The implementation allocates nothing and calls only
+/// getpid/write/read (async-signal-safe).
 pub fn hold_before_exec(ready: RawFd, go: RawFd) -> io::Result<()> {
     // SAFETY: getpid has no preconditions.
     let pid = unsafe { libc::getpid() }.to_ne_bytes();
@@ -76,7 +120,7 @@ pub fn hold_before_exec(ready: RawFd, go: RawFd) -> io::Result<()> {
         // SAFETY: one writable byte, the gate descriptor inherited before the fork.
         match unsafe { libc::read(go, (&raw mut byte).cast(), 1) } {
             1 => return Ok(()),
-            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+            0 => return Err(io::Error::from_raw_os_error(libc::ECANCELED)),
             _ => {
                 let error = io::Error::last_os_error();
                 if error.kind() != io::ErrorKind::Interrupted {
@@ -106,5 +150,47 @@ impl LeaderGate {
         watch(pid)?;
         std::fs::File::from(self.go).write_all(b"x")?;
         Ok(Some(pid))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cowshed_os::fork_lock::Spawn as _;
+    use std::os::unix::process::CommandExt as _;
+
+    /// A refused attachment withdraws the release: the held child reads the end of the release
+    /// pipe, its exec fails, and the spawn returns instead of waiting for an exec that never
+    /// comes (07_api.md, "Process-tree observations").
+    #[test]
+    fn a_refused_attachment_fails_the_held_exec() {
+        let (gate, held) = leader_gate().expect("the fence's pipes");
+        let hold = held.in_process(&gate);
+        let mut command = std::process::Command::new("/usr/bin/true");
+        // SAFETY: the hold calls only close/getpid/write/read, all async-signal-safe.
+        unsafe {
+            command.pre_exec(move || hold.hold());
+        }
+        std::thread::scope(|scope| {
+            let spawning = scope.spawn(move || {
+                let child = command.spawn_locked();
+                drop(held);
+                child
+            });
+            let observed = gate.observe(|_| Err(io::Error::other("the attachment is refused")));
+            let spawned = spawning.join().expect("the spawning thread");
+            assert_eq!(
+                observed
+                    .expect_err("the refusal is the observation's answer")
+                    .to_string(),
+                "the attachment is refused"
+            );
+            assert_eq!(
+                spawned
+                    .expect_err("a withdrawn release fails the exec")
+                    .raw_os_error(),
+                Some(libc::ECANCELED)
+            );
+        });
     }
 }

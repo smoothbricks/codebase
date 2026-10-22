@@ -2449,13 +2449,10 @@ async fn spawn_fenced(
                 "inspect descriptor availability before retrying the command",
             )
         })?;
-        let (ready, go) = (
-            std::os::fd::AsRawFd::as_raw_fd(&held.ready),
-            std::os::fd::AsRawFd::as_raw_fd(&held.go),
-        );
-        // SAFETY: the fence calls only getpid/write/read, all async-signal-safe.
+        let hold = held.in_process(&gate);
+        // SAFETY: the hold calls only close/getpid/write/read, all async-signal-safe.
         unsafe {
-            command.pre_exec(move || super::process_fence::hold_before_exec(ready, go));
+            command.pre_exec(move || hold.hold());
         }
         let command = command.into_std();
         let source = monitor.clone();
