@@ -92,7 +92,7 @@ fn runner_error(error: CommandRunError) -> CowshedError {
             message,
             "cowshed doctor (media-notification-cap)",
         ),
-        CommandRunFailure::AttachPool(_) => CowshedError::new(
+        CommandRunFailure::AttachPoolSpent(_) => CowshedError::new(
             ErrorCode::EnvironmentMissing,
             message,
             cowshed_apfs::attach_budget::EXHAUSTED_HINT,

@@ -176,12 +176,12 @@ pub enum CommandRunFailure {
     /// Refused before spawning: an image attach while the media count could not be read, so
     /// nothing says it would not hang (media_cap.rs).
     MediaUnread(io::Error),
-    /// Refused before spawning: an image attach into a pool this boot already spent (error code
-    /// 150), or whose image devices would reach the pool's ceiling (attach_budget.rs). A failed
-    /// attach leaks one more device; a refused one can run again once the pool is freed.
-    AttachPool(attach_budget::AttachPoolExhausted),
-    /// Refused before spawning: an image attach while the pool could not be read, so nothing
-    /// says the attach would not fail with error code 150 and leak its device (attach_budget.rs).
+    /// Refused before spawning: a DiskImages2 attach in a boot that already met error code 150
+    /// (attach_budget.rs). A failed attach leaks one more device; the operator's clear or a reboot
+    /// ends the latch.
+    AttachPoolSpent(attach_budget::AttachPoolSpent),
+    /// Refused before spawning: a DiskImages2 attach while the pool record could not be read, so
+    /// nothing says its boot is not spent (attach_budget.rs).
     PoolUnread(io::Error),
     /// The total budget expired before the native tool executed.
     Unspawned(Duration),
@@ -300,19 +300,18 @@ impl fmt::Display for CommandRunError {
                      nothing was attached"
                 )
             }
-            CommandRunFailure::AttachPool(exhausted) => {
+            CommandRunFailure::AttachPoolSpent(spent) => {
                 f.write_str("refused ")?;
                 fmt_command(f, program, args)?;
-                write!(f, ": {exhausted}")
+                write!(f, ": {spent}")
             }
             CommandRunFailure::PoolUnread(source) => {
                 f.write_str("refused ")?;
                 fmt_command(f, program, args)?;
                 write!(
                     f,
-                    ": the disk-image attach pool could not be read ({source}), so nothing says \
-                     the attach would not fail with error code 150 and leak its device; nothing \
-                     was attached"
+                    ": the disk-image attach pool record could not be read ({source}), so nothing \
+                     says this boot has not met error code 150; nothing was attached"
                 )
             }
         }
@@ -332,7 +331,7 @@ impl std::error::Error for CommandRunError {
             | CommandRunFailure::Unspawned(_)
             | CommandRunFailure::VolumeRename => None,
             CommandRunFailure::MediaCap(reached) => Some(reached),
-            CommandRunFailure::AttachPool(exhausted) => Some(exhausted),
+            CommandRunFailure::AttachPoolSpent(spent) => Some(spent),
         }
     }
 }
@@ -647,7 +646,7 @@ impl SystemCommandRunner {
         use std::io::Read;
         crate::disk_lease::refuse_volume_rename(&request.program, &request.args)?;
         media_cap::refuse_attach_past_cap(request)?;
-        attach_budget::refuse_attach_into_pool(request)?;
+        attach_budget::refuse_attach_into_spent_pool(request)?;
         if let Some(deadline) = total
             && deadline.remaining().is_none()
         {
@@ -11355,8 +11354,7 @@ mod tests {
     }
     /// Every cowshed attach is the in-kernel DI1 attach of the exact image: `hdiutil attach -kernel`
     /// with the RAW class, never mounted by the tool, read-only exactly when asked, the image last.
-    /// It is never a DiskImages2 attach, so neither the DI2 pool gate nor a `diskimagesiod` helper
-    /// is involved.
+    /// It is never a DiskImages2 attach, so no `diskimagesiod` helper is involved.
     #[test]
     fn every_attach_is_the_in_kernel_attach_of_the_exact_image() {
         let image = Path::new("/private/cowshed/store/acme/widget/sessions/raven.dmg");
@@ -11374,7 +11372,6 @@ mod tests {
                 assert_eq!(args.iter().filter(|arg| *arg == flag).count(), 1, "{flag}");
             }
             assert!(is_image_attach(&request));
-            assert!(crate::attach_budget::refuse_attach_into_pool(&request).is_ok());
         }
     }
 

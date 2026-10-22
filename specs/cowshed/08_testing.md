@@ -688,11 +688,9 @@ attach past its registry, whose size — computed in code from the registry itse
 per-test attach fails the lane instead of silently spending the pool. A test whose setup and subject match a neighbour's
 becomes assertions in that neighbour rather than a separate test, and anything that does not need a real device is a
 pure or unit test with no image at all: the real-device lane holds a few scenario tests per fixture, not a test per
-behaviour. Every attach a fixture makes passes the system runner's admission (01a_apfs.md, "How the APFS host degrades"
-§2): once any test process meets error code 150, the runner that met it records it, and every later attach of the run,
-in whichever process, fails with `AttachPoolExhausted` and its `next:` step without attaching, as does an attach that
-would bring the image devices to the pool's ceiling. The lane stays `--no-fail-fast`, so its ordinary failures still run
-to the end; the refusal is the runner's own error, not a scheduler flag, and needs no number from the lane.
+behaviour. Fixtures attach through the production path, in the kernel (01a_apfs.md, "Mounts"), which draws nothing from
+the DiskImages2 pool; a fixture that deliberately attaches through DiskImages2 and meets error code 150 has the runner
+record it for `doctor`. The lane stays `--no-fail-fast`, so its ordinary failures still run to the end.
 `attach-budget --clear` still ends a recorded 150 after the operator freed what spent it. The leaked-device delta across
 a lane run (`ioclasscount AppleDiskImageDevice` against the registered devices, before and after) is the check that no
 disk-image command still leaks on a clean run; it must be 0. The system runner also refuses an image attach whose media

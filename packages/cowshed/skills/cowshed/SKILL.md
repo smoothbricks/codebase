@@ -156,7 +156,7 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 - Attach failures with `AttachPoolExhausted` / error 150: run `cowshed doctor`. Leaked `AppleDiskImageDevice`s free only
   on reboot; orphaned `diskimagesiod` helpers are freed by the `sudo kill -9` doctor names, then
   `cowshed doctor --clear-attach-budget`. Detaching sheds does not free leaked devices — do not retry-spawn into a spent
-  pool; once a boot met 150, cowshed refuses every attach until that clear or a reboot.
+  pool.
 - `MediaCapReached`, or a refusal naming IOKit's media match-notification queue: the host's attached media are at the
   1024 cap past which an attach hangs forever. Verbs detach idle workspaces themselves first; when none is idle,
   `cowshed rm` the sheds you are done with or `cowshed detach` the ones you will return to. `cowshed doctor` reports

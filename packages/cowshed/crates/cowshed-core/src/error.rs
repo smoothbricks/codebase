@@ -832,7 +832,7 @@ impl CowshedError {
                         );
                     }
                     // The host's attach pool, not storage: no storage repair frees it.
-                    cowshed_apfs::CommandRunFailure::AttachPool(_) => {
+                    cowshed_apfs::CommandRunFailure::AttachPoolSpent(_) => {
                         return Self::environment_missing(
                             format!("{}: {run}", message.into()),
                             cowshed_apfs::attach_budget::EXHAUSTED_HINT,
