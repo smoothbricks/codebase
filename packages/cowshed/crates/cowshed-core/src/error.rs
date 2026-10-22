@@ -816,6 +816,24 @@ impl CowshedError {
                     cowshed_apfs::attach_budget::EXHAUSTED_HINT,
                 );
             }
+            if let Some(run) = error.downcast_ref::<cowshed_apfs::CommandRunError>() {
+                // Refused before it spawned: the host's media count, not storage, is in the way.
+                match &run.failure {
+                    cowshed_apfs::CommandRunFailure::MediaCap(_) => {
+                        return Self::conflict(
+                            format!("{}: {run}", message.into()),
+                            cowshed_apfs::media_cap::MEDIA_CAP_HINT,
+                        );
+                    }
+                    cowshed_apfs::CommandRunFailure::MediaUnread(_) => {
+                        return Self::environment_missing(
+                            format!("{}: {run}", message.into()),
+                            "cowshed doctor (media-notification-cap)",
+                        );
+                    }
+                    _ => {}
+                }
+            }
             starved |= errno == Some(libc::ENFILE)
                 || error.is::<cowshed_apfs::CommandRunError>()
                 || matches!(
@@ -1278,6 +1296,39 @@ mod tests {
         assert_eq!(error.code, ErrorCode::EnvironmentMissing);
         assert_eq!(error.hint, cowshed_apfs::attach_budget::EXHAUSTED_HINT);
         assert_eq!(error.message, "build volume");
+    }
+
+    /// An attach the media cap refused before it spawned is a conflict that names the count and
+    /// what frees media, never a storage repair or the vnode table.
+    #[test]
+    fn an_attach_refused_at_the_media_cap_names_what_frees_media() {
+        use cowshed_apfs::media_cap::{MEDIA_CAP_HINT, MediaReading, NOTIFICATION_CAP};
+        use cowshed_apfs::{ApfsError, CommandRequest, CommandRunError, CommandRunFailure};
+        let reached = MediaReading {
+            registered: 1_050,
+            attaching: 0,
+        }
+        .admits(NOTIFICATION_CAP, 1)
+        .expect_err("over the cap");
+        let refused = ApfsError::CommandRun(CommandRunError {
+            request: CommandRequest::new("/usr/sbin/diskutil", ["image", "attach", "/x.dmg"]),
+            failure: CommandRunFailure::MediaCap(reached),
+        });
+        let error =
+            CowshedError::storage_failure_under("mount workspace", &refused, "repair", || {
+                panic!("a media-cap refusal is not blamed on the vnode table")
+            });
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert_eq!(error.hint, MEDIA_CAP_HINT);
+        assert!(
+            error
+                .message
+                .starts_with("mount workspace: refused executable \"/usr/sbin/diskutil\"")
+                && error.message.contains("MediaCapReached")
+                && error.message.contains("1050 IOMedia registered"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

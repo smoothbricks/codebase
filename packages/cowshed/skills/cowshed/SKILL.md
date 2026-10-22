@@ -157,4 +157,8 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
   on reboot; orphaned `diskimagesiod` helpers are freed by the `sudo kill -9` doctor names, then
   `cowshed doctor --clear-attach-budget`. Detaching sheds does not free leaked devices — do not retry-spawn into a spent
   pool.
+- `MediaCapReached`, or a refusal naming IOKit's media match-notification queue: the host's attached media are at the
+  1024 cap past which an attach hangs forever. Verbs detach idle workspaces themselves first; when none is idle,
+  `cowshed rm` the sheds you are done with or `cowshed detach` the ones you will return to. `cowshed doctor` reports
+  `media-notification-cap`.
 - "the cowshed daemon is build X; this cowshed is build Y": run `cowshed setup` from the build you mean, then retry.

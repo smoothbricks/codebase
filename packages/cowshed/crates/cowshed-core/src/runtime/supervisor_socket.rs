@@ -765,23 +765,22 @@ fn socket_error(path: &Path, what: &str, error: io::Error) -> CowshedError {
     )
 }
 
-/// Bind the supervisor's socket at `path`: mode `0600` in a directory only this user can enter.
-/// The lease serializes binders; old builds must drain first. Only a socket the kernel proves
-/// unattached is removed before the new private listener is published.
-pub async fn bind(path: &Path) -> Result<BoundSocket> {
+/// The lease beside the socket at `path`, `<digest>.sock.lock`, opened (created `0600` in a
+/// `0700` directory when missing) and not yet locked. Whoever holds it is the one binder of that
+/// workspace's supervisor socket, or a lifecycle operation that keeps every binder out.
+fn open_lease(path: &Path) -> Result<Fenced<std::fs::File>> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let io = |what: &str, error: io::Error| socket_error(path, what, error);
     let directory = path.parent().ok_or_else(|| {
         CowshedError::internal(format!(
             "supervisor socket {} has no parent",
             path.display()
         ))
     })?;
-    let io = |what: &str, error: io::Error| socket_error(path, what, error);
     std::fs::create_dir_all(directory).map_err(|error| io("create the directory of", error))?;
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
         .map_err(|error| io("restrict the directory of", error))?;
-    let lock_path = path.with_extension("sock.lock");
-    let lease = Fenced::new(
+    Ok(Fenced::new(
         std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -789,9 +788,45 @@ pub async fn bind(path: &Path) -> Result<BoundSocket> {
             .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(&lock_path)
+            .open(path.with_extension("sock.lock"))
             .map_err(|error| io("open the socket lease of", error))?,
-    );
+    ))
+}
+
+/// The lease of the supervisor socket at `path`, taken without waiting while no supervisor
+/// serves it, so that none binds there until it is dropped; `None` while a supervisor serves it
+/// or another lifecycle operation holds the lease. Making room for an attach detaches a workspace
+/// only under it (media_room.rs).
+pub(crate) fn lease_unserved(path: &Path) -> Result<Option<Fenced<std::fs::File>>> {
+    let lease = open_lease(path)?;
+    match lease.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => {
+            return Err(socket_error(path, "lock the socket lease of", error));
+        }
+    }
+    match occupant(path)
+        .map_err(|error| socket_error(path, "inspect the current server of", error))?
+    {
+        Occupant::Live => Ok(None),
+        Occupant::Absent | Occupant::Stopped => Ok(Some(lease)),
+    }
+}
+
+/// Bind the supervisor's socket at `path`: mode `0600` in a directory only this user can enter.
+/// The lease serializes binders; old builds must drain first. Only a socket the kernel proves
+/// unattached is removed before the new private listener is published.
+pub async fn bind(path: &Path) -> Result<BoundSocket> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let directory = path.parent().ok_or_else(|| {
+        CowshedError::internal(format!(
+            "supervisor socket {} has no parent",
+            path.display()
+        ))
+    })?;
+    let io = |what: &str, error: io::Error| socket_error(path, what, error);
+    let lease = open_lease(path)?;
     match lease.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {

@@ -1171,7 +1171,8 @@ reading its workspace back afterwards, answered `not-found` and its wrapper skip
 moved. So a land, from just after it validates the binding to its end (its own retire included), and an `rm`, for its
 whole run, each hold `sessions/<ws>.land.lock` exclusively: a `flock(2)` on a descriptor the process owns, so the kernel
 drops it when that process ends however it ends, and a killed land never keeps its workspace from being removed. The
-file records the holder (`land` or `remove`, its pid, since when, its command line); the operation refused names it —
+file records the holder (`land`, `remove`, or `make-room` while making room for an attach detaches an idle workspace,
+"Making room for an attach"; its pid, since when, its command line); the operation refused names it —
 `cannot remove workspace <ws>: it is being landed by pid …` — and is never queued behind it. A land reads its
 workspace's incarnation once, at its start, and never reads the workspace back after the fast-forward. A land whose own
 retire finds the workspace already gone (removed by a cowshed that predates the lease, or by hand) reports `landed` and
@@ -1337,6 +1338,55 @@ Linux connector, unlinks the Linux per-incarnation socket, then frees the attach
 persist. `attach` mounts at the canonical path with canonical flags and, on Linux, creates the per-workspace
 socket/netns and starts exactly one connector before admitting execs. Personal macOS workspaces are typically attached
 at login by a launchd agent; Linux uses its platform service/controller lifecycle.
+
+### Making room for an attach
+
+IOKit drops IOMedia match notifications past 1024, and an attach whose device is matched past them hangs forever
+(01a_apfs.md, "The IOMedia match-notification ceiling"). The system runner, where every disk child spawns, refuses an
+image attach (`diskutil image attach`, `hdiutil attach`) before it starts, inside the storage lease, unless the media
+stay below 1024 once it adds its own three (`cowshed-apfs` `media_cap`). It counts the registered IOMedia, subclasses
+included; three for each image attach running on the host, any user's; three for each of the storage phase's other seven
+members, which may pass the gate before any of them spawns (05_gateway.md, "Disk-lifecycle lease"); and 16 kept for
+disks the host attaches on its own. The refusal is `MediaCapReached`, a `conflict` naming the count and what frees
+media, never a hang; a count that cannot be read refuses too, since a refused attach can run again and a hung one
+cannot. `doctor`'s `media-notification-cap` reports the same count, what it commits of the ceiling and how many more
+images fit: an error once one more image does not, a warning while fewer than 20 do. A CLI verb that may attach makes
+room first, before it opens its project, so that it is not refused. A verb's demand is an upper bound read from the verb
+and its mode alone: a verb that works in a workspace (`exec`, `path`, `attach <ws>`, `checkpoint`, `restore`, `land`, …)
+may attach it and its build volume, two images; `fork` its session and build image, six media; `adopt` and `mount main`
+main and its first build volume; `resize` and `reseed` one build image or seed beside the workspace's own. `rm`,
+`detach`, `forget`, `gc`, `ls`, `doctor`, previews (`reseed --dry-run`), `path --no-attach` and the other host verbs
+attach nothing. Attaching every detached session (`attach` with no name, `attach --all`) makes no room: detaching some
+sessions to attach others frees nothing, so each of its attaches past the cap meets the runner's refusal by name. The
+workspaces a verb names (a land's or rebase's `--into`, a reseed's `--from`, a fork's source included) are its own and
+never detached for it. A host whose count leaves room is read once, and nothing else happens; an `exec` of a mounted,
+served workspace answers before any of this (06_cli.md, "Resident workspaces").
+
+When the images would not fit, the verb lists every adopted project's attached workspaces and plans
+(`cowshed_core::media_room::plan`, a pure function of one media reading and that list): only idle workspaces are
+detached, the least recently used first, and only as many as free the excess; when every idle one together frees too
+little, none is. A workspace is idle by its supervisor's own definition: no supervisor serves it, since one retires only
+after 30 minutes with no named session, no job and no Nx daemon (11_shell.md, "Supervisor"). Never idle are a project's
+main, the workspaces the verb names in its own project, a workspace whose supervisor serves it or whose supervisor
+socket lease a lifecycle operation holds, and one a land or an `rm` holds. When a workspace was last used is the latest
+modification time of its images' backing files, which every write to a mounted volume moves. Each detach takes the
+workspace's supervisor socket lease without waiting, so no supervisor starts on it meanwhile, and its land lease
+(`make-room`, "A land and an rm of one workspace exclude each other"), so no land or `rm` of it starts either; either
+lease held elsewhere makes the workspace busy. It then makes the unforced unmount `cowshed detach` makes, which
+revalidates the mounted volume's marker against the workspace's incarnation; a process holding the mount refuses it, and
+the workspace then counts as busy and the plan is made again without it. Its build volume detaches under a build-volume
+claim, which no job admission and no land moving a link can pass, and only if the volume's record, read again under that
+claim, still names this workspace as the checkout that links it: the census named the volume earlier, and a volume a
+land gave another checkout since is left as it is. It detaches kept whole and unforced; one that will not detach is said
+on stderr and stays. Each detach is said on stderr, and the media are read again after each round, until the images fit
+or nothing idle is left. The gateway's view of each project a detached workspace belonged to is reconciled. A detached
+workspace attaches again, with its build volume, on its next use, as any detached workspace does.
+
+When nothing idle frees enough, the verb refuses with `conflict` (exit 4) and detaches nothing. The message names the
+count, the excess and the attached workspaces, ten of them with the IOMedia each holds and why it stays (idle, main, the
+verb's own, its supervisor serves it, a land or removal holds it, a process holds its mount, its detach failed), then
+how many more; the hint is to stop the work in a workspace one is done with and `cowshed detach` or `cowshed rm` it. A
+coordinator's `cowshed controller` does not make room: its attaches meet the runner's refusal.
 
 ### Holders cowshed does not run
 

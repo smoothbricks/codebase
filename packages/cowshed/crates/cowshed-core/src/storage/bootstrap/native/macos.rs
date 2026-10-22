@@ -116,7 +116,9 @@ fn run_disk_tool(
             | CommandRunFailure::Wait(_)
             | CommandRunFailure::Kill { .. }
             | CommandRunFailure::Reap { .. }
-            | CommandRunFailure::VolumeRename => HostError::new(format!(
+            | CommandRunFailure::VolumeRename
+            | CommandRunFailure::MediaCap(_)
+            | CommandRunFailure::MediaUnread(_) => HostError::new(format!(
                 "cannot execute {:?} with argv {:?}: {error}",
                 command.program(),
                 command.args()

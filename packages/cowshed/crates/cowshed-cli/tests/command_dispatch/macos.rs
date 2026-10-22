@@ -1471,6 +1471,228 @@ async fn directory_detach_and_rm_refuse_a_host_process_holding_the_mount() {
     fixture.stop_gateway().await;
 }
 
+/// Making room under IOKit's media match-notification cap on the real kernel (02_workspaces.md,
+/// "Making room for an attach"), with a small cap as the decision input rather than a fake
+/// registry: every count is the host's own, read by `make_room` itself.
+///
+/// With both sessions idle (the runtime that served their supervisors shut down), a cap nothing
+/// can meet refuses by name and detaches nothing. A process working in the older session keeps it
+/// attached while the newer one is the command's own: the refusal names the holder's hold, and a
+/// land holding its lease keeps it attached the same way. Once
+/// the holder is gone, a cap one medium short detaches the least recently used session first and
+/// leaves the host under the cap, and the detached session attaches again on its next `exec`. The
+/// host's count moves under other users' attaches, so each outcome is checked against
+/// [`cowshed_core::media_room::plan`] on the readings `make_room` decided on.
+#[tokio::test(flavor = "multi_thread")]
+async fn real_apfs_making_room_detaches_the_least_recently_used_idle_session_and_refuses_by_name() {
+    use cowshed_apfs::media_cap::{MediaReading, read};
+    use cowshed_core::media_room::{Demand, Keep, make_room};
+
+    let mut fixture = Fixture::with(Project::Plain);
+    let mut service = fixture.open().await;
+    adopt(&fixture, &mut service).await;
+    fixture.start_gateway().await;
+    service
+        .reconcile_gateway()
+        .await
+        .expect("serve the project");
+    let older = new_workspace(&mut service, "older").await;
+    let newer = new_workspace(&mut service, "newer").await;
+    // Idle by the supervisor's own definition: no supervisor serves either session.
+    service
+        .shutdown()
+        .await
+        .expect("stop the runtime and its supervisors");
+    let repo = RepoId::parse("fixture/dispatch").expect("repository identity");
+    let project = cowshed_core::NativeGatewayInventory::new(fixture.storage.clone())
+        .adopted_projects()
+        .await
+        .expect("the fixture store's projects")
+        .into_iter()
+        .find(|project| project.repo_id == repo)
+        .expect("the fixture project is adopted");
+    let layout = cowshed_core::storage::StorageLayout::new(fixture.storage.store(), &repo)
+        .expect("project layout");
+    let written = |name: &str, at: SystemTime| {
+        let image = layout
+            .session_image(&WorkspaceName::session(name).expect("session name"))
+            .expect("session image")
+            .image()
+            .to_owned();
+        fs::File::open(&image)
+            .and_then(|file| file.set_modified(at))
+            .unwrap_or_else(|error| panic!("date {}: {error}", image.display()));
+    };
+    let mounted = |mount: &Path| mount.join(".git/HEAD").is_file();
+    // The refusal's entry for one workspace: its name through the next `;`.
+    let entry = |message: &str, name: &str| -> String {
+        let start = message
+            .find(&format!("{name} "))
+            .unwrap_or_else(|| panic!("{name} is not named: {message}"));
+        message[start..]
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let key = |name: &str| {
+        (
+            repo.clone(),
+            WorkspaceName::session(name).expect("session name"),
+        )
+    };
+    let demand = |keep: &[&str]| Demand {
+        images: 1,
+        keep: Some(Keep {
+            project_root: project.project_root.clone(),
+            workspaces: keep
+                .iter()
+                .map(|name| WorkspaceName::session(*name).expect("session name"))
+                .collect(),
+        }),
+    };
+    // One medium past the cap as this test reads the host.
+    let one_short = |reading: MediaReading| reading.excess(0, 1) - 1;
+
+    // Nothing can meet a cap of zero: refused by name, nothing detached.
+    let refusal = make_room(&fixture.storage, &demand(&[]), 0)
+        .await
+        .expect_err("no workspace frees a whole cap");
+    assert_eq!(refusal.code, ErrorCode::Conflict, "{refusal}");
+    for named in [
+        "fixture/dispatch/main ",
+        "fixture/dispatch/older ",
+        "fixture/dispatch/newer ",
+        "(main, never detached)",
+        "(idle)",
+        "match-notification queue",
+    ] {
+        assert!(
+            refusal.message.contains(named),
+            "{named}: {}",
+            refusal.message
+        );
+    }
+    assert!(
+        refusal.hint.contains("cowshed detach <ws>"),
+        "{}",
+        refusal.hint
+    );
+    assert!(
+        mounted(&older) && mounted(&newer),
+        "a refusal detaches nothing"
+    );
+
+    // A process working in the older session holds it, and the newer one is the command's own.
+    let mut host = HostProcesses(Vec::new());
+    host.start(&older, None);
+    let cap = one_short(read().expect("read the host's media"));
+    match make_room(&fixture.storage, &demand(&["newer"]), cap).await {
+        Err(refusal) => {
+            cowshed_os::eprintln!("making room: refused for a held mount: {}", refusal.message);
+            assert_eq!(refusal.code, ErrorCode::Conflict, "{refusal}");
+            let message = &refusal.message;
+            assert!(
+                entry(message, "fixture/dispatch/older").ends_with("(a process holds its mount)"),
+                "{message}"
+            );
+            assert!(
+                entry(message, "fixture/dispatch/newer").ends_with("(this command's own)"),
+                "{message}"
+            );
+        }
+        // The host's count fell between this test's reading and make_room's: nothing to do.
+        Ok(made) => {
+            cowshed_os::eprintln!("making room: the host fit before the held mount: {made:?}");
+            assert!(made.detached.is_empty(), "{made:?}");
+            assert_eq!(made.readings.len(), 1, "{made:?}");
+            assert_eq!(made.readings[0].excess(cap, 1), 0, "{made:?}");
+        }
+    }
+    assert!(mounted(&older), "the held session stays attached");
+    host.end();
+
+    // A land of the older session holds its land lease: making room counts it busy too.
+    let landing = land_lease::take(&layout.project().sessions, "older", Holding::Land)
+        .expect("hold the older session's land lease");
+    let cap = one_short(read().expect("read the host's media"));
+    match make_room(&fixture.storage, &demand(&["newer"]), cap).await {
+        Err(refusal) => {
+            cowshed_os::eprintln!("making room: refused for a land lease: {}", refusal.message);
+            assert_eq!(refusal.code, ErrorCode::Conflict, "{refusal}");
+            assert!(
+                entry(&refusal.message, "fixture/dispatch/older")
+                    .ends_with("(a land or removal holds it)"),
+                "{}",
+                refusal.message
+            );
+        }
+        Ok(made) => {
+            cowshed_os::eprintln!("making room: the host fit before the land lease: {made:?}");
+            assert!(made.detached.is_empty(), "{made:?}");
+            assert_eq!(made.readings[0].excess(cap, 1), 0, "{made:?}");
+        }
+    }
+    assert!(mounted(&older), "the landing session stays attached");
+    drop(landing);
+
+    // The older session was last written long ago, the newer one later than anything now.
+    written(
+        "older",
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_577_836_800),
+    );
+    written("newer", SystemTime::now() + Duration::from_secs(86_400));
+    let cap = one_short(read().expect("read the host's media"));
+    let made = make_room(&fixture.storage, &demand(&[]), cap)
+        .await
+        .expect("an idle session frees enough");
+    cowshed_os::eprintln!(
+        "making room: detached {:?} on readings {:?}",
+        made.detached,
+        made.readings
+    );
+    let first = made.readings[0];
+    if first.excess(cap, 1) == 0 {
+        assert!(made.detached.is_empty(), "{made:?}");
+    } else {
+        assert_eq!(made.detached.first(), Some(&key("older")), "{made:?}");
+        assert!(
+            made.detached.len() == 1 || made.detached == [key("older"), key("newer")],
+            "{made:?}"
+        );
+        // One reading before the first round, one after each round, and a round detaches one
+        // workspace or more.
+        assert!(
+            (2..=made.detached.len() + 1).contains(&made.readings.len()),
+            "{made:?}"
+        );
+    }
+    let last = made.readings[made.readings.len() - 1];
+    assert_eq!(last.excess(cap, 1), 0, "room was made: {made:?}");
+    for (name, mount) in [("older", &older), ("newer", &newer)] {
+        assert_eq!(
+            mounted(mount),
+            !made.detached.contains(&key(name)),
+            "{name}: {made:?}"
+        );
+    }
+
+    // A detached session attaches again on its next use.
+    let mut service = fixture.reopen().await;
+    service
+        .reconcile_gateway()
+        .await
+        .expect("serve the project again");
+    succeed(&mut service, ["exec", "older", "--", "/usr/bin/true"]).await;
+    assert!(mounted(&older), "exec attached the older session again");
+    cowshed_os::eprintln!(
+        "making room: exec found older mounted again (it was detached: {})",
+        made.detached.contains(&key("older"))
+    );
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
+
 /// The checkout's ordinary Bun-installed patched Nx and its actual Node runtime.
 fn repository_nx() -> (PathBuf, PathBuf) {
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR")

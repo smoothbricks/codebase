@@ -607,6 +607,11 @@ one on the next run. A volume the kernel still refuses to unmount is a `conflict
 open file, a working directory or an executable on the volume), with stopping them as the next move. It is not a storage
 failure. When no process of this user holds it, the refusal says so and names what is mounted inside it.
 
+A verb that may attach an image first makes room under IOKit's media match-notification cap (02_workspaces.md, "Making
+room for an attach"): idle workspaces of any project detach, least recently used first, each said on stderr. A host
+where nothing idle frees enough refuses the verb with `conflict` (exit 4), naming the attached workspaces and the
+IOMedia each holds.
+
 ### Resident workspaces
 
 `path <ws>` and `exec <ws> -- …` name one workspace, and when that workspace is mounted and its daemon-owned supervisor

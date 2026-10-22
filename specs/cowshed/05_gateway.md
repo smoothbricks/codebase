@@ -774,6 +774,10 @@ so attaches stall beside mount churn and stay fast once the two are kept apart. 
 - Members of one class share the running phase, up to 8 at once. A request of the running class with room in the phase
   and nobody waiting enters at once; an idle gateway starts a phase for it. A request asked `alone` takes all 8 places:
   it enters only a phase that has no other member and runs with none beside it.
+- **The media cap's reserve.** Every attach a storage phase admits may pass the system runner's media-cap gate before
+  any of them spawns its tool (01a_apfs.md, "The IOMedia match-notification ceiling"), so that gate reserves the media
+  of the phase's other members. `DISK_PHASE_MEMBERS` (8, `cowshed-gateway-types`) is the one default the phase and the
+  gate both read.
 - Once a member of the other class waits, the running phase admits nobody new, so a steady stream of one class cannot
   starve the other. When the phase drains, the next goes to the other class, whose oldest waiters enter it in arrival
   order up to the cap, none overtaking an older one the phase has no room for; with both classes waiting, phases

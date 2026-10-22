@@ -37,6 +37,8 @@ pub fn lease_path(sessions: &Path, workspace: &str) -> PathBuf {
 pub enum Holding {
     Land,
     Remove,
+    /// Detaching an idle workspace to make room under IOKit's media cap (media_room.rs).
+    MakeRoom,
 }
 
 impl Holding {
@@ -44,6 +46,7 @@ impl Holding {
         match self {
             Self::Land => "landed",
             Self::Remove => "removed",
+            Self::MakeRoom => "detached to make room for an attach",
         }
     }
 }
@@ -124,6 +127,7 @@ fn refused(workspace: &str, wanted: Holding, holder: Option<&Holder>) -> Cowshed
     let doing = match wanted {
         Holding::Land => "land",
         Holding::Remove => "remove",
+        Holding::MakeRoom => "detach",
     };
     match holder {
         Some(holder) => CowshedError::conflict(
@@ -140,6 +144,10 @@ fn refused(workspace: &str, wanted: Holding, holder: Option<&Holder>) -> Cowshed
                      the workspace if the land kept it"
                 }
                 Holding::Remove => "wait for the removal to end",
+                Holding::MakeRoom => {
+                    "wait for that detach to end; it detaches only a workspace nothing uses, which \
+                     attaches again on its next use"
+                }
             },
         ),
         None => CowshedError::conflict(

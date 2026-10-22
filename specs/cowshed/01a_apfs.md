@@ -721,7 +721,8 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    its behavior, and `doctor` names orphaned helpers (a `diskimagesiod` whose pid created no attached device's user
    client) with the root command that clears them. Idle-unmount is dropped because it reclaims nothing. Idle workspaces
    remain mounted; source and build images are released by explicit lifecycle operations, not a background idle-unmount
-   policy.
+   policy. The one exception is the IOMedia match-notification ceiling (below): a verb whose attach would reach it first
+   detaches idle workspaces, then and for that reason, never on a timer.
 
    The same error has a second cause, and only a reboot clears it: **leaked image devices.** Every attach creates an
    `AppleDiskImageDevice`, its `DIDeviceIOUserClient` and a `DIDeviceRequestPool`. Most leave the kernel with their

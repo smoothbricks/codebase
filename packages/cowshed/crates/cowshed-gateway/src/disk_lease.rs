@@ -18,15 +18,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use cowshed_gateway_types::{ConfigError, DiskClass, PhaseShare};
+use cowshed_gateway_types::{ConfigError, DISK_PHASE_MEMBERS, DiskClass, PhaseShare};
 use tokio::sync::{mpsc, oneshot};
 
 /// How many holders one class's phase admits, and how long a holder may keep a phase the other
 /// class is waiting for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DiskLeaseLimits {
-    /// Holders one phase admits at once. `storagekitd` answers one caller at a time, so more
-    /// concurrent attaches only lengthen each one; eight keeps the queue full without that.
+    /// Holders one phase admits at once ([`DISK_PHASE_MEMBERS`] by default).
     pub per_class: NonZeroUsize,
     /// How long a holder may keep its phase once the other class waits. A leased attach takes
     /// 0.9 s at the median and 1.8 s at p95 under load 170–210, and a mount or unmount well under
@@ -37,7 +36,7 @@ pub struct DiskLeaseLimits {
 impl Default for DiskLeaseLimits {
     fn default() -> Self {
         Self {
-            per_class: NonZeroUsize::new(8).expect("8 is non-zero"),
+            per_class: NonZeroUsize::from(DISK_PHASE_MEMBERS),
             phase_bound: Duration::from_secs(10),
         }
     }

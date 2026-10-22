@@ -491,6 +491,17 @@ is named until a later `cowshed doctor`. Killing orphans frees their mappings, n
 gone, `attach-budget --clear` (or any successful cowshed attach) ends the recorded exhaustion. cowshed never signals a
 helper itself.
 
+## An attach is refused with `MediaCapReached`, or names IOKit's media match-notification queue
+
+IOKit drops IOMedia match notifications past 1024, and DiskImages2 waits for its new device's match with no overall
+timeout, so an attach past the cap hangs forever. Every attached APFS image registers three IOMedia, and a workspace
+with its build volume six. cowshed refuses an attach that would cross the cap instead of starting it, and a verb that
+may attach first detaches idle workspaces (no supervisor serving them), least recently used first; each detach is said
+on stderr, and the workspace attaches again on its next use. When nothing idle frees enough, the verb refuses and names
+the attached workspaces with the IOMedia each holds and why each stays. `cowshed doctor`'s `media-notification-cap`
+reports the registered media, the attaches running and how many more images fit. Free media with `cowshed rm` for sheds
+you are done with or `cowshed detach` for ones you will return to. A reboot does not raise this cap.
+
 ## `cowshed doctor` warns `departed-volume-references`
 
 `departed-volume-references` counts the `AppleAPFSVolume` and `IOMedia` instances that outlive their registry entries:

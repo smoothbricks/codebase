@@ -8,6 +8,7 @@ pub mod device;
 pub mod disk_image_helpers;
 pub mod disk_lease;
 pub mod image;
+pub mod media_cap;
 pub mod mounts;
 pub mod store_lock;
 pub mod template;
@@ -144,6 +145,12 @@ pub enum CommandRunFailure {
     Wait(io::Error),
     /// Refused before spawning: a Disk Arbitration rename.
     VolumeRename,
+    /// Refused before spawning: an image attach whose media would cross IOKit's
+    /// match-notification cap, past which the attach would hang forever (media_cap.rs).
+    MediaCap(media_cap::MediaCapReached),
+    /// Refused before spawning: an image attach while the media count could not be read, so
+    /// nothing says it would not hang (media_cap.rs).
+    MediaUnread(io::Error),
     /// The total budget expired before the native tool executed.
     Unspawned(Duration),
     /// The deadline expired; the owned group `pid` leads was signalled and the child's actual end
@@ -246,6 +253,21 @@ impl fmt::Display for CommandRunError {
                 fmt_command(f, program, args)?;
                 write!(f, ": {}", crate::disk_lease::VOLUME_RENAME_REFUSAL)
             }
+            CommandRunFailure::MediaCap(reached) => {
+                f.write_str("refused ")?;
+                fmt_command(f, program, args)?;
+                write!(f, ": {reached}")
+            }
+            CommandRunFailure::MediaUnread(source) => {
+                f.write_str("refused ")?;
+                fmt_command(f, program, args)?;
+                write!(
+                    f,
+                    ": the registered IOMedia and the running attaches could not be read ({source}), \
+                     so nothing says the attach would not hang past IOKit's match-notification cap; \
+                     nothing was attached"
+                )
+            }
         }
     }
 }
@@ -255,11 +277,13 @@ impl std::error::Error for CommandRunError {
         match &self.failure {
             CommandRunFailure::Spawn(source)
             | CommandRunFailure::Wait(source)
+            | CommandRunFailure::MediaUnread(source)
             | CommandRunFailure::Kill { source, .. }
             | CommandRunFailure::Reap { source, .. } => Some(source),
             CommandRunFailure::Deadline { .. }
             | CommandRunFailure::Unspawned(_)
             | CommandRunFailure::VolumeRename => None,
+            CommandRunFailure::MediaCap(reached) => Some(reached),
         }
     }
 }
@@ -573,6 +597,7 @@ impl SystemCommandRunner {
     ) -> Result<CommandOutput, CommandRunError> {
         use std::io::Read;
         crate::disk_lease::refuse_volume_rename(&request.program, &request.args)?;
+        media_cap::refuse_attach_past_cap(request)?;
         if let Some(deadline) = total
             && deadline.remaining().is_none()
         {
@@ -4815,7 +4840,9 @@ pub struct RegisteredApfsVolume {
 #[cfg(target_os = "macos")]
 pub use io_registry::registered_apfs_containers;
 #[cfg(target_os = "macos")]
-pub(crate) use io_registry::{disk_image_class_counts, disk_image_user_client_creators};
+pub(crate) use io_registry::{
+    disk_image_class_counts, disk_image_user_client_creators, registered_media,
+};
 
 /// What one `AppleAPFSMedia` registers. `reference` is absent until the media's BSD client has
 /// published the device node: such a container is arriving, not yet addressable.
@@ -5560,6 +5587,13 @@ mod io_registry {
             apfs_volumes,
             media,
         })
+    }
+
+    /// Every registered IOMedia, subclasses included (`AppleAPFSMedia`, `AppleAPFSVolume`): what
+    /// an unfiltered IOMedia match notification enumerates, which IOKit caps (media_cap.rs).
+    pub(crate) fn registered_media() -> io::Result<u64> {
+        u64::try_from(registered(c"IOMedia")?.count())
+            .map_err(|_| invalid("more registered media than a u64 counts"))
     }
 
     /// Registered entries whose class is exactly `class`, subclasses excluded, as the kernel's

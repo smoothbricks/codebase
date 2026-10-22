@@ -171,6 +171,33 @@ fn running_command(pid: libc::pid_t, now: SystemTime) -> io::Result<Option<Runni
     }))
 }
 
+/// Image attaches running on the host, any user's: a `diskutil image attach` or an `hdiutil
+/// attach` (media_cap.rs). A disk-image tool whose command line cannot be read is counted, since
+/// an attach is what its silence must not hide; one that exits meanwhile is not.
+#[cfg(target_os = "macos")]
+pub fn running_attaches() -> io::Result<u64> {
+    let mut attaching = 0;
+    for pid in scan_processes()?.disk_tools {
+        match cowshed_os::process::process_arguments(pid) {
+            Ok(arguments) if !attaches(&arguments.argv) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+            Ok(_) | Err(_) => attaching += 1,
+        }
+    }
+    Ok(attaching)
+}
+
+/// Whether `argv`, program first, attaches an image: `hdiutil attach …` or `diskutil image
+/// attach …`.
+#[cfg(any(target_os = "macos", test))]
+fn attaches(argv: &[Vec<u8>]) -> bool {
+    match argv {
+        [_, verb, ..] if verb.as_slice() == b"attach" => true,
+        [_, noun, verb, ..] => noun.as_slice() == b"image" && verb.as_slice() == b"attach",
+        _ => false,
+    }
+}
+
 /// The helper's executable.
 pub const HELPER_EXECUTABLE: &str = "/usr/libexec/diskimagesiod";
 
@@ -459,6 +486,35 @@ mod tests {
 
     fn pids(pids: &[libc::pid_t]) -> BTreeSet<libc::pid_t> {
         pids.iter().copied().collect()
+    }
+
+    /// An attach is `hdiutil attach` or `diskutil image attach`; a detach, an info read or a
+    /// bare program is not.
+    #[test]
+    fn an_attach_is_told_from_every_other_disk_image_command() {
+        let argv = |words: &[&str]| -> Vec<Vec<u8>> {
+            words.iter().map(|word| word.as_bytes().to_vec()).collect()
+        };
+        for attach in [
+            &["/usr/bin/hdiutil", "attach", "/x.dmg"][..],
+            &[
+                "/usr/sbin/diskutil",
+                "image",
+                "attach",
+                "--noMount",
+                "/x.dmg",
+            ],
+        ] {
+            assert!(attaches(&argv(attach)), "{attach:?}");
+        }
+        for other in [
+            &["/usr/bin/hdiutil", "detach", "/dev/disk9"][..],
+            &["/usr/sbin/diskutil", "image", "info", "/x.dmg"],
+            &["/usr/sbin/diskutil", "eject", "/dev/disk9"],
+            &["/usr/sbin/diskutil"],
+        ] {
+            assert!(!attaches(&argv(other)), "{other:?}");
+        }
     }
 
     /// The measured state: helpers that serve attached images are named by their device's user

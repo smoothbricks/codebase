@@ -32,7 +32,8 @@ pub use cpu_budget::{
     inherited_cpu_pool,
 };
 pub use disk_lease::{
-    DISK_LEASE_OP, DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState, PhaseShare,
+    DISK_LEASE_OP, DISK_PHASE_MEMBERS, DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState,
+    PhaseShare,
 };
 pub use policy::{
     CanonicalHost, CanonicalTarget, EgressGrant, EgressMode, HostPattern, MirrorProtocol,
