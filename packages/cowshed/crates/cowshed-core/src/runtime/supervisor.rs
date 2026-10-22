@@ -816,18 +816,94 @@ mod cpu_placement_tests {
         )]);
         assert_eq!(granted_jobserver_fifo(&foreign), None);
     }
+
+    /// A band lowers from whatever nice the supervisor itself runs at, so a supervisor started
+    /// nice -- under `cowshed exec --host`, a gate's runner -- still places every class, and the
+    /// lowest priority bounds the bands rather than refusing them (05_gateway.md "Bands").
+    #[test]
+    fn class_nice_lowers_from_the_supervisors_own() {
+        let classes = [
+            ExecClass::Interactive,
+            ExecClass::InteractiveResident,
+            ExecClass::Gate,
+            ExecClass::Background,
+            ExecClass::Resident,
+        ];
+        for (own, placed) in [
+            (0, [0, 0, 5, 10, 10]),
+            (10, [10, 10, 15, LOWEST_NICE, LOWEST_NICE]),
+            (17, [17, 17, LOWEST_NICE, LOWEST_NICE, LOWEST_NICE]),
+            (LOWEST_NICE, [LOWEST_NICE; 5]),
+        ] {
+            assert_eq!(
+                classes.map(|class| class_nice(own, class)),
+                placed,
+                "supervisor at nice {own}"
+            );
+        }
+    }
+
+    /// The bound is the kernel's own: a held command placed at the lowest nice reads that same
+    /// nice back, the readback every placement requires.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_lowest_nice_is_placed_and_read_back() {
+        use cowshed_os::fork_lock::Spawn as _;
+        // The command waits on its stdin, whose writer this test holds until it has placed it.
+        let mut child = std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn_locked()
+            .expect("a command to place");
+        let placed = place_nice(child.id(), LOWEST_NICE);
+        child.kill().expect("end the placed command");
+        child.wait().expect("reap the placed command");
+        assert_eq!(
+            placed.map_err(|failure| format!("{failure:?}")),
+            Ok(LOWEST_NICE)
+        );
+    }
 }
 
-/// The nice a class's command runs at, its row of 05_gateway.md "Bands": interactive and an
-/// interactive resident at the supervisor's own, a gate five below it, background and a resident
-/// ten below it. Never negative: raising a priority takes a privilege no supervisor holds, so the
-/// order is made by lowering the others. The two residents differ here and nowhere else.
-pub(super) const fn class_nice(class: ExecClass) -> i32 {
-    match class {
+/// The lowest priority setpriority places and reads back: Darwin places PRIO_MAX, 20, itself;
+/// Linux stops at MAX_NICE, 19, below its PRIO_MAX of 20, and clamps a larger request to it
+/// (getpriority(2)), so a placement asking 20 there would read back 19 and be refused.
+#[cfg(target_os = "macos")]
+pub const LOWEST_NICE: i32 = libc::PRIO_MAX;
+#[cfg(target_os = "linux")]
+pub const LOWEST_NICE: i32 = 19;
+/// The nice a class's command runs at, its row of 05_gateway.md "Bands", from `own`, the nice this
+/// supervisor runs at: interactive and an interactive resident at the supervisor's own, a gate
+/// five below it, background and a resident ten below it, never past the kernel's lowest
+/// priority. Only lowering: raising a priority above the supervisor's own takes a privilege no
+/// supervisor holds. The two residents differ here and nowhere else.
+pub(super) const fn class_nice(own: i32, class: ExecClass) -> i32 {
+    let below = match class {
         ExecClass::Interactive | ExecClass::InteractiveResident => 0,
         ExecClass::Gate => 5,
         ExecClass::Background | ExecClass::Resident => 10,
+    };
+    let nice = own.saturating_add(below);
+    if nice > LOWEST_NICE {
+        LOWEST_NICE
+    } else {
+        nice
     }
+}
+
+/// The nice this supervisor runs at, which its classes' bands are placed from ("Bands").
+fn own_nice() -> i32 {
+    super::shell_host::clear_errno();
+    // SAFETY: a plain read of this process's own priority.
+    let nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    // -1 is a nice as well as getpriority's error; a process reading its own priority has no
+    // error to report, so a set errno here is an impossible state, not a placement.
+    let read = io::Error::last_os_error();
+    assert!(
+        nice != -1 || read.raw_os_error() == Some(0),
+        "this process reads its own nice: {read}"
+    );
+    nice
 }
 
 /// Set the held command `pid` -- forked, leading its own group, not yet running anything of the
@@ -5993,7 +6069,7 @@ impl SupervisorActor {
         let cpu = CpuPlacement {
             held: grant.held().cloned(),
             pool: grant.pool().to_path_buf(),
-            nice: class_nice(job.info.class),
+            nice: class_nice(own_nice(), job.info.class),
         };
         job.info.cpu_tokens = grant.tokens();
         job.info.state = JobState::Running;

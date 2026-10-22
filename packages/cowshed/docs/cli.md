@@ -1801,18 +1801,19 @@ budget"), at a class and demand its request names; the class also fixes the nice
 "Bands"). An ordinary command is `background` and asks for the background share of the host, the half of its tokens
 background work may hold, so the runners it starts run side by side; `--want <n>` names the tokens a command can use at
 once instead, and its grant is between one and `n`. Background work never holds more than half the host.
-`--class interactive` names a command someone is waiting on: it takes its tokens as background work does and runs at
-nice 0, ahead of a gate at +5 and background at +10 on a contended core, and a workspace's own capability may ask for
-it. `--class gate` admits the command as the operator's gate: it starts at once on the half background leaves free while
-no other gate work holds it, and otherwise waits for whole returned tokens ahead of queued background work with no
-deadline; it runs at nice +5. Neither a gate nor `--host` can name a `--session`. Only this trusted route may ask for a
-gate: a workspace's own capability (`worker.exec`) is refused with a typed class-not-permitted error before anything
-runs, and no environment variable confers the class. `--host` runs the command once at the host boundary, outside the
-workspace sandbox, at the class it names: host unit work at the default background class takes background tokens, and
-only a land's `--class gate --host` takes the gate order. Only the trusted route may name `--host`, at any class.
-`--class resident` holds no token and runs at +10; its descendants ask its pool for their own. `JobInfo` reports the
-admitted `class` and `scope`, the observed `nice`, and the granted `cpuTokens`. Every one of these is the same typed
-field of the API's exec request (07_api.md, "Exec and grants"), so the CLI asks for nothing an embedding process cannot.
+`--class interactive` names a command someone is waiting on: it takes its tokens as background work does and runs at its
+supervisor's own nice, ahead of a gate at +5 and background at +10 on a contended core, and a workspace's own capability
+may ask for it. `--class gate` admits the command as the operator's gate: it starts at once on the half background
+leaves free while no other gate work holds it, and otherwise waits for whole returned tokens ahead of queued background
+work with no deadline; it runs at nice +5. Neither a gate nor `--host` can name a `--session`. Only this trusted route
+may ask for a gate: a workspace's own capability (`worker.exec`) is refused with a typed class-not-permitted error
+before anything runs, and no environment variable confers the class. `--host` runs the command once at the host
+boundary, outside the workspace sandbox, at the class it names: host unit work at the default background class takes
+background tokens, and only a land's `--class gate --host` takes the gate order. Only the trusted route may name
+`--host`, at any class. `--class resident` holds no token and runs at +10; its descendants ask its pool for their own.
+`JobInfo` reports the admitted `class` and `scope`, the observed `nice`, and the granted `cpuTokens`. Every one of these
+is the same typed field of the API's exec request (07_api.md, "Exec and grants"), so the CLI asks for nothing an
+embedding process cannot.
 
 A host exec's child starts from an empty environment. `--host` carries the operator's environment, including custom
 operator and project variables, in the normal request. There is no execution environment-name allowlist: the existing

@@ -481,6 +481,14 @@ fn held(tokens: NonZeroUsize) -> HeldTokens {
     }
 }
 
+/// The nice a class `below` the supervisor's own is placed at: these supervisors run in this test
+/// process, so its own nice is theirs (05_gateway.md "Bands").
+fn class_nice(below: i32) -> i32 {
+    // SAFETY: a plain read of this process's own priority.
+    let own = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    (own + below).min(cowshed_core::runtime::supervisor::LOWEST_NICE)
+}
+
 /// The gateway's CPU budget for these tests: each request is granted its whole want at once, so
 /// a job spawns as soon as it is admitted; a resident is granted its pool alone, as the gateway
 /// answers one.
@@ -6939,7 +6947,7 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
     assert_eq!(first.request.mode, RunSandboxMode::ReadWrite);
     assert_eq!(
         (first.request.cpu.held.as_ref(), first.request.cpu.nice),
-        (None, 10),
+        (None, class_nice(10)),
         "the daemon holds no token and runs at background nice"
     );
     let started = h.handle.info(first.request.job_id).await.unwrap();
@@ -8705,7 +8713,7 @@ async fn a_job_spawns_under_its_actual_grant_and_returns_it_when_it_concludes() 
         (
             Some(held(NonZeroUsize::new(4).unwrap())),
             Path::new(TEST_POOL),
-            10,
+            class_nice(10),
             ExecScope::Workspace
         ),
         "the command runs under the granted count, not its want, at background nice"
@@ -8713,7 +8721,11 @@ async fn a_job_spawns_under_its_actual_grant_and_returns_it_when_it_concludes() 
     let running = h.handle.info(job).await.unwrap();
     assert_eq!(
         (running.state, running.cpu_tokens, running.nice),
-        (JobState::Running, NonZeroUsize::new(4), Some(10))
+        (
+            JobState::Running,
+            NonZeroUsize::new(4),
+            Some(class_nice(10))
+        )
     );
     let mut released = cpu.released;
     assert!(
@@ -8724,7 +8736,11 @@ async fn a_job_spawns_under_its_actual_grant_and_returns_it_when_it_concludes() 
     let ended = h.handle.wait(job).await.unwrap();
     assert_eq!(
         (ended.cpu_tokens, ended.nice, ended.class),
-        (NonZeroUsize::new(4), Some(10), ExecClass::Background)
+        (
+            NonZeroUsize::new(4),
+            Some(class_nice(10)),
+            ExecClass::Background
+        )
     );
     released
         .await
@@ -9119,13 +9135,18 @@ async fn a_worker_interactive_job_asks_its_class_and_runs_above_the_gate() {
     let job = exec.await.unwrap().unwrap();
     let spawned = h.spawned.recv().await.unwrap();
     assert_eq!(
-        spawned.request.cpu.nice, 0,
+        spawned.request.cpu.nice,
+        class_nice(0),
         "interactive runs above the gate"
     );
     let info = h.handle.info(job).await.unwrap();
     assert_eq!(
         (info.class, info.nice, info.cpu_tokens),
-        (ExecClass::Interactive, Some(0), NonZeroUsize::new(2))
+        (
+            ExecClass::Interactive,
+            Some(class_nice(0)),
+            NonZeroUsize::new(2)
+        )
     );
     complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(job).await.unwrap();
@@ -9163,12 +9184,12 @@ async fn a_coordinator_gate_runs_at_gate_nice_and_may_reach_the_host_boundary() 
         let spawned = h.spawned.recv().await.unwrap();
         assert_eq!(
             (spawned.request.scope, spawned.request.cpu.nice),
-            (scope, 5)
+            (scope, class_nice(5))
         );
         let info = h.handle.info(job).await.unwrap();
         assert_eq!(
             (info.class, info.scope, info.nice),
-            (ExecClass::Gate, scope, Some(5))
+            (ExecClass::Gate, scope, Some(class_nice(5)))
         );
         complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
         h.handle.wait(job).await.unwrap();
@@ -9239,7 +9260,7 @@ async fn a_coordinator_host_job_at_the_default_class_asks_a_background_token() {
     let spawned = h.spawned.recv().await.unwrap();
     assert_eq!(
         (spawned.request.scope, spawned.request.cpu.nice),
-        (ExecScope::HostGate, 10)
+        (ExecScope::HostGate, class_nice(10))
     );
     let info = h.handle.info(job).await.unwrap();
     assert_eq!(
@@ -9247,7 +9268,7 @@ async fn a_coordinator_host_job_at_the_default_class_asks_a_background_token() {
         (
             ExecClass::Background,
             ExecScope::HostGate,
-            Some(10),
+            Some(class_nice(10)),
             NonZeroUsize::new(4)
         )
     );
@@ -9284,7 +9305,7 @@ async fn the_sealed_record_keeps_the_class_scope_grant_and_observed_nice() {
             ExecClass::Gate,
             ExecScope::Workspace,
             NonZeroUsize::new(2),
-            Some(5)
+            Some(class_nice(5))
         )
     );
 }

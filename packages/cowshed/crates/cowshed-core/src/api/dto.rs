@@ -39,7 +39,7 @@ pub enum ExecClass {
     #[default]
     Background,
     /// Work a person or model is waiting on, declared by the requester that awaits its result:
-    /// it asks the ledger as background and runs at nice 0, above the gate. A worker may ask
+    /// it asks the ledger as background and runs at the supervisor's own nice, above the gate. A worker may ask
     /// for it, since it buys a band and no token.
     Interactive,
     /// A land's gate job and every task its pool relays: first for returned tokens, at nice +5.
@@ -54,7 +54,7 @@ pub enum ExecClass {
     Resident,
     /// A resident that serves work a person or model is waiting on -- a worker whose requests
     /// are focused checks a session awaits. It differs from [`ExecClass::Resident`] in its nice
-    /// alone: it runs at nice 0, the interactive band, and holds no token, its pool asking the
+    /// alone: it runs at the supervisor's own nice, the interactive band, and holds no token, its pool asking the
     /// host ledger at background class exactly as a resident's does (05_gateway.md "A resident
     /// holds no token", "Bands"). A worker may ask for it, and it names no want.
     InteractiveResident,

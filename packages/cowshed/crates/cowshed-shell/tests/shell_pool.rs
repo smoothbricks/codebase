@@ -32,7 +32,7 @@ use cowshed_core::runtime::job_cpu::{
 use cowshed_core::runtime::shell_host::ShellHostProgram;
 use cowshed_core::runtime::shell_pool::ShellPoolConfig;
 use cowshed_core::runtime::supervisor::{
-    ArtifactStoreSink, CommitmentDraft, CommitmentSink, SessionToken, SystemSpawnSink,
+    ArtifactStoreSink, CommitmentDraft, CommitmentSink, LOWEST_NICE, SessionToken, SystemSpawnSink,
     WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,
     WorkspaceSupervisorHandle,
 };
@@ -1633,24 +1633,25 @@ async fn host_controller_owned_commands_run_under_their_grant_at_their_class_nic
             format!("3|{TEST_POOL}"),
             "warm {warm}: the grant's count and pool, never the caller's"
         );
+        // The nice this test, and so its supervisor, runs at: every class lowers from it, never
+        // past the lowest priority (05_gateway.md "Bands").
+        let base = kernel_nice(std::process::id());
+        let below = |offset: i32| (base + offset).min(LOWEST_NICE);
         assert_eq!(
             (ran.info.cpu_tokens, ran.info.nice, ran.info.class),
-            (NonZeroUsize::new(3), Some(10), ExecClass::Background),
+            (NonZeroUsize::new(3), Some(below(10)), ExecClass::Background),
             "warm {warm}"
         );
 
-        // The nice this test, and so its supervisor, already runs at: a class nice below it
-        // would need a privilege no supervisor holds, and is refused rather than faked.
-        let base = kernel_nice(std::process::id());
         for (request, source, nice) in [
-            (sh("read _"), AdmissionSource::Worker, 10),
+            (sh("read _"), AdmissionSource::Worker, below(10)),
             (
                 ExecRequest {
                     class: ExecClass::Interactive,
                     ..sh("read _")
                 },
                 AdmissionSource::Worker,
-                0,
+                below(0),
             ),
             (
                 ExecRequest {
@@ -1658,7 +1659,7 @@ async fn host_controller_owned_commands_run_under_their_grant_at_their_class_nic
                     ..sh("read _")
                 },
                 AdmissionSource::Worker,
-                10,
+                below(10),
             ),
             (
                 ExecRequest {
@@ -1666,58 +1667,24 @@ async fn host_controller_owned_commands_run_under_their_grant_at_their_class_nic
                     ..sh("read _")
                 },
                 AdmissionSource::Worker,
-                0,
+                below(0),
             ),
-            (gate(sh("read _")), AdmissionSource::Coordinator, 5),
+            (gate(sh("read _")), AdmissionSource::Coordinator, below(5)),
         ] {
             // The two residents differ in their nice alone: each holds no token while it runs
             // (05_gateway.md "A resident holds no token").
             let resident = request.class.is_resident();
-            if base <= nice {
-                let (observed, info) = held_nice(&handle, request, source).await;
+            let (observed, info) = held_nice(&handle, request, source).await;
+            assert_eq!(
+                (observed, info.nice),
+                (nice, Some(nice)),
+                "warm {warm}: the kernel and the record agree on the class nice"
+            );
+            if resident {
                 assert_eq!(
-                    (observed, info.nice),
-                    (nice, Some(nice)),
-                    "warm {warm}: the kernel and the record agree on the class nice"
-                );
-                if resident {
-                    assert_eq!(
-                        info.cpu_tokens, None,
-                        "warm {warm}: a running {:?} holds no token",
-                        info.class
-                    );
-                }
-            } else {
-                // Answered at admission: the class nice is refused at spawn, so the job fails
-                // typed, its exit the refusal's wrapper code and the placement it asked for on
-                // its stderr.
-                let job = handle
-                    .exec(None, None, request, source)
-                    .await
-                    .expect("answered at admission, before its nice is placed");
-                let failed = handle.wait(job).await.expect("the refused job's outcome");
-                assert_eq!(
-                    (
-                        failed.state,
-                        failed.failure,
-                        failed.pid,
-                        failed.exit.clone()
-                    ),
-                    (
-                        JobState::Failed,
-                        Some(JobFailure::Priority),
-                        None,
-                        Some(ExitStatus::Exited {
-                            code: ErrorCode::SandboxDenied.exec_wrapper_exit_code().into()
-                        })
-                    ),
-                    "warm {warm}: a nice below the supervisor's own is refused"
-                );
-                let stderr = read_stream(&handle, &failed, StreamKind::Stderr).await;
-                assert!(
-                    String::from_utf8_lossy(&stderr).contains(&format!("at nice {nice}:")),
-                    "warm {warm}: the refusal names the nice it asked for: {}",
-                    String::from_utf8_lossy(&stderr)
+                    info.cpu_tokens, None,
+                    "warm {warm}: a running {:?} holds no token",
+                    info.class
                 );
             }
         }
@@ -1785,7 +1752,7 @@ async fn host_controller_a_coordinator_host_gate_runs_outside_the_sandbox() {
         (
             ExecClass::Gate,
             ExecScope::HostGate,
-            Some(5),
+            Some((kernel_nice(std::process::id()) + 5).min(LOWEST_NICE)),
             NonZeroUsize::new(2)
         )
     );
