@@ -973,6 +973,21 @@ core count.
   free yet waits for it, and so does everyone behind it within the same priority. A large request is never starved by a
   stream of smaller requests at that priority; a gate with sixty runners queued cannot crowd out one with three at the
   same priority.
+- **No background request is passed over without bound** (2026-10-22). Fewest-held order alone starves a checkout whose
+  grant stays held while checkouts holding nothing keep asking: `held` counts every class the checkout holds, so neither
+  the next grant nor the floor token ("Gate admission" below) ever reached it. Measured 2026-10-22 on gateway 89443:
+  scratch checkout `ax-resources-18390-1` held one token for an idle FIFO reader, and its next one-token ask, ticket 95,
+  waited 2,478 s while 51 later background asks (and 8 gate-class ones) were granted; in the same log the kept-daemon
+  start stake of shed `icm-no-python`, whose checkout held its land's gate token, waited 2,214 s while 75 later
+  background asks were granted, and the first token returned after the gate's own token left was its. So a checkout's
+  waiting background head counts the background grants made to requests that asked after it (by admission ticket) while
+  it is that head; once `⌊N/2⌋` of them (the background limit, 9 of 18) have passed it, it is overdue. Overdue heads are
+  served before fewest-held order, the oldest first, at the same least grant, and an overdue head takes the floor token
+  as a checkout holding nothing does. **The guarantee: a background request at its checkout's head is passed by at most
+  `⌊N/2⌋` later background grants**, and one with k requests of its checkout queued ahead of it by at most
+  `(k + 1)·⌊N/2⌋`. Gate-class grants outrank background and do not count. The bound counts grants, never time, so no
+  clock decides an order. A heavy checkout loses little fairness by it: an overdue head takes its least grant, and the
+  next head of that checkout starts counting from zero.
 - **All at once.** A request is granted once and never holds part of a grant while waiting for more, so no two requests
   can deadlock on each other's tokens. A grant never grows (2026-10-19, Danny: "Ok delete"): it runs with the count it
   was granted until its connection closes, and a returned token goes only to a waiting request.
@@ -991,12 +1006,12 @@ core count.
   child releases too. An earlier ticket enqueued late cannot preempt a running job. These heads are derived from the
   existing holders and waiters, not a second admission registry. Among eligible repository heads, the oldest job's next
   request takes `min(want, free)`, in that job's request order, ahead of queued background. A background checkout or a
-  younger head **of another repository** holding nothing gets one floor token first, oldest request first, while work
-  behind the job being served still holds less than half of N. The younger repository's orchestrator can therefore start
-  while the older one's tasks take every returned token they want. A behind-head gate in the same repository stays
-  queued even beside free tokens; it cannot enter through the background selector. Background still uses its own free
-  room when no eligible gate wants tokens. Running grants are never preempted or resized. Conservation remains
-  `free + Σ held = N`.
+  younger head **of another repository** holding nothing, and an overdue background head ("No background request is
+  passed over without bound" above), gets one floor token first, oldest request first, while work behind the job being
+  served still holds less than half of N. The younger repository's orchestrator can therefore start while the older
+  one's tasks take every returned token they want. A behind-head gate in the same repository stays queued even beside
+  free tokens; it cannot enter through the background selector. Background still uses its own free room when no eligible
+  gate wants tokens. Running grants are never preempted or resized. Conservation remains `free + Σ held = N`.
 - **A land is a gate job, and its tasks are gate-class requests.** The selecting authority is the land queue holder:
   `~/Dev/.land-lock.sh` runs main's `tooling/land-host.sh`, the only path that gates a tree before `cowshed land`
   fast-forwards to it, and it runs that gate as `cowshed exec <workspace> --class gate --host -- …`. The trusted route

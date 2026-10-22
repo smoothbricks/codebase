@@ -446,6 +446,54 @@ async fn checkouts_share_the_background_half_and_a_lone_grant_fills_it() {
     gateway.drain().await.expect("drain");
 }
 
+/// A background ask of a checkout that already holds a token is passed by at most the background
+/// limit of later background grants (05_gateway.md "Fair between checkouts within one priority").
+/// Measured 2026-10-22 on gateway 89443: a scratch checkout held one token for an idle FIFO
+/// reader, and its next ask waited 2,478 s while 51 later background asks of checkouts holding
+/// nothing were granted. On a four-token host the limit is two: two later checkouts are served, then it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_checkout_holding_a_token_is_served_after_at_most_the_background_limit_of_later_grants() {
+    let (gateway, _root, socket) = gateway(4).await;
+    let mut idle = Asker::ask(&socket, 1, "/w/scratch").await;
+    assert_eq!(idle.granted().await, 1);
+    let mut holder = Asker::ask(&socket, 1, "/w/fresh0").await;
+    assert_eq!(holder.granted().await, 1);
+    // Each waiter reports its grant; exactly one waiter is granted each returned token.
+    let (granted, mut grants) = tokio::sync::mpsc::unbounded_channel();
+    let wait = |name: String, mut asker: Asker| {
+        let granted = granted.clone();
+        tokio::spawn(async move {
+            assert_eq!(asker.granted().await, 1);
+            let _ = granted.send((name, asker));
+        })
+    };
+    let mut waiters = vec![wait(
+        "scratch".to_owned(),
+        Asker::ask(&socket, 1, "/w/scratch").await,
+    )];
+    let mut order = Vec::new();
+    for fresh in 1..=3 {
+        let checkout = format!("/w/fresh{fresh}");
+        waiters.push(wait(
+            format!("fresh{fresh}"),
+            Asker::ask(&socket, 1, &checkout).await,
+        ));
+        drop(holder);
+        let (name, asker) = grants
+            .recv()
+            .await
+            .expect("a waiter takes the returned token");
+        order.push(name);
+        holder = asker;
+    }
+    assert_eq!(order, ["fresh1", "fresh2", "scratch"]);
+    for waiter in waiters {
+        waiter.abort();
+    }
+    drop((idle, holder));
+    gateway.drain().await.expect("drain");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_jobserver_grant_names_a_fifo_and_close_returns_every_token() {
     let (gateway, _root, socket) = gateway(8).await;

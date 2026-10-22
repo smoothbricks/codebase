@@ -47,5 +47,6 @@ security-framework-sys = "2"
 
 [dev-dependencies]
 cowshed-apfs = { path = "../cowshed-apfs" }
+proptest = "1"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 tokio = { workspace = true, features = ["test-util"] }

@@ -10,9 +10,11 @@
 //! Grants are fair between checkouts, not between requests: the checkout holding the fewest
 //! tokens is served first, and while another checkout waits nobody is granted beyond its fair
 //! share of background's half, so a checkout with sixty runners queued cannot crowd out one with
-//! three. A grant is all at once and between one and the request's `want`; a request never holds
-//! part of a grant while waiting for the rest, so no two requests can deadlock on each other's
-//! tokens.
+//! three. That order never starves a request: a checkout's head that the background limit of
+//! later background grants has passed is overdue and served first, so a checkout whose grant
+//! stays held still gets its turn. A grant is all at once and between one and the request's
+//! `want`; a request never holds part of a grant while waiting for the rest, so no two requests
+//! can deadlock on each other's tokens.
 //!
 //! Fairness only acts when a grant is made: a running nextest or cargo cannot hand tokens back,
 //! and its FIFO, implicit make token and test-thread sizing are never resized. So the background
@@ -124,6 +126,9 @@ struct Waiter {
     /// The count asked for, as asked.
     want: usize,
     asked: Instant,
+    /// The background grants made to requests that asked after it while it headed its
+    /// checkout's background queue; at the background limit it is overdue ([`Ledger::overdue`]).
+    passed: usize,
     claim: Claim,
 }
 
@@ -145,6 +150,14 @@ struct Holder {
     claim: Claim,
     /// When it was granted: the lease's age starts here.
     granted: Instant,
+}
+
+/// A background head's place in checkout fairness, the smaller first: an overdue head, the oldest
+/// first, before every head in fewest-held order (the older head on a tie).
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Turn {
+    Overdue(Ticket),
+    Fair { held: usize, ticket: Ticket },
 }
 
 /// The ledger's next step: start the waiter at `position` in `checkout`'s queue with `tokens`.
@@ -246,15 +259,16 @@ impl Ledger {
     /// order. A land takes every returned token its tasks want before a younger repository head
     /// gets more than its floor, and both before queued background. The work behind the job being
     /// served is not starved: a background checkout, or a younger head of another repository,
-    /// that waits holding nothing still gets one token
+    /// that waits holding nothing, and an overdue background head, each still get one token
     /// first, as long as that work as a whole then still holds less than half the host, so the
     /// job being served and the older ones always hold the larger part.
     ///
     /// With no gate-class demand, background is fair between checkouts, within its room: the free
     /// tokens that keep the class at or under half the host. The next grant goes to the waiting
     /// checkout that holds the fewest tokens (the older head waiter on a tie), to its oldest
-    /// waiter. A checkout's fair share is the background limit divided among the checkouts holding
-    /// or waiting; its claim is what remains of that share, at least one. While another checkout
+    /// waiter, except that an overdue head goes first ([`Ledger::overdue`]). A checkout's fair
+    /// share is the background limit divided among the checkouts holding or waiting; its claim
+    /// is what remains of that share, at least one. While another checkout
     /// waits, the grant is exactly the claim or the `want`, whichever is smaller, so nobody
     /// outruns a waiting peer; with nobody else waiting it is the whole room up to `want`. A head
     /// waiter whose least grant is not in the room yet waits for it, and so does everyone behind
@@ -289,6 +303,9 @@ impl Ledger {
                 granted: now,
             });
             self.free -= tokens;
+            if waiter.class == Class::Background {
+                self.pass_over(waiter.ticket);
+            }
             grants.push(Grant {
                 ticket: waiter.ticket,
                 tokens,
@@ -300,6 +317,41 @@ impl Ledger {
                 job: waiter.job,
                 head,
             });
+        }
+    }
+
+    /// A background grant to `granted` passes every checkout's background head that asked
+    /// before it. Only a head counts: the requests behind it wait for it first, in order.
+    fn pass_over(&mut self, granted: Ticket) {
+        for head in self.checkouts.values_mut().filter_map(|checkout| {
+            checkout
+                .waiting
+                .iter_mut()
+                .find(|waiter| waiter.class == Class::Background)
+        }) {
+            if head.ticket < granted {
+                head.passed += 1;
+            }
+        }
+    }
+
+    /// Whether the background limit of later background grants has passed `head`. Fewest-held
+    /// order alone starves a checkout whose grant stays held while checkouts holding nothing keep
+    /// asking, so an overdue head goes first in checkout fairness and takes the floor token:
+    /// no head is passed by more than the background limit of later background grants.
+    fn overdue(&self, head: &Waiter) -> bool {
+        head.passed >= self.background
+    }
+
+    /// `head`'s place in `checkout`'s turn for background tokens.
+    fn turn(&self, checkout: &Checkout, head: &Waiter) -> Turn {
+        if self.overdue(head) {
+            Turn::Overdue(head.ticket)
+        } else {
+            Turn::Fair {
+                held: checkout.held,
+                ticket: head.ticket,
+            }
         }
     }
 
@@ -404,15 +456,12 @@ impl Ledger {
                 self.checkouts
                     .iter()
                     .flat_map(|(name, checkout)| {
-                        let background = (checkout.held == 0)
-                            .then(|| {
-                                checkout
-                                    .waiting
-                                    .iter()
-                                    .enumerate()
-                                    .find(|(_, waiter)| waiter.class == Class::Background)
-                            })
-                            .flatten();
+                        let background = checkout
+                            .waiting
+                            .iter()
+                            .enumerate()
+                            .find(|(_, waiter)| waiter.class == Class::Background)
+                            .filter(|(_, waiter)| checkout.held == 0 || self.overdue(waiter));
                         let younger_gates =
                             checkout
                                 .waiting
@@ -463,7 +512,7 @@ impl Ledger {
                     .find(|(_, waiter)| waiter.class == Class::Background)?;
                 Some((name, checkout, position, head))
             })
-            .min_by_key(|(_, checkout, _, head)| (checkout.held, head.ticket))?;
+            .min_by_key(|(_, checkout, _, head)| self.turn(checkout, head))?;
         let share = (self.background / self.checkouts.len()).max(1);
         let least = head.want.min(share.saturating_sub(checkout.held).max(1));
         let peers_wait = self
@@ -804,6 +853,7 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                         ticket,
                         want: want.get(),
                         asked: Instant::now(),
+                        passed: 0,
                         claim,
                         class,
                         job,
@@ -888,6 +938,7 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     /// A ledger of `total` tokens driven at explicit instants, collecting each step's grants as
     /// `(ticket, tokens)` and how long each granted request waited.
@@ -972,6 +1023,7 @@ mod tests {
                     job,
                     want: NonZeroUsize::new(want).unwrap().get(),
                     asked: now,
+                    passed: 0,
                     claim: Claim::new(&format!("t{ticket}"), Some(7)),
                 },
                 &mut self.effects,
@@ -1445,5 +1497,146 @@ mod tests {
         assert_eq!(clock.leave(3, 10), []);
         assert_eq!(clock.leave(4, 11), [(5, 1)]);
         assert_eq!(clock.leave(5, 5), []);
+    }
+
+    /// The measured starvation, 2026-10-22 on gateway 89443: scratch checkout
+    /// ax-resources-18390-1 held one token for an idle FIFO reader, and its next one-token ask,
+    /// ticket 95, waited 2,478 s while 51 later background asks of checkouts holding nothing were
+    /// granted, because the fewest-held order put it behind every one of them. A background head
+    /// is passed by at most the background limit of later background grants, then served.
+    #[test]
+    fn a_checkout_holding_a_token_is_passed_by_at_most_the_background_limit_of_later_grants() {
+        let mut clock = Clock::new(18);
+        assert_eq!(clock.ask(0, 1, "scratch", 1), [(1, 1)]);
+        for ticket in 2..=9 {
+            assert_eq!(
+                clock.ask(0, ticket, &format!("busy{ticket}"), 1),
+                [(ticket, 1)]
+            );
+        }
+        assert_eq!(clock.ask(1, 10, "scratch", 1), []);
+        let mut holders: VecDeque<Ticket> = (2..=9).collect();
+        // Each returned token goes to a later checkout holding nothing, nine times.
+        for ticket in 11..=19 {
+            assert_eq!(clock.ask(ticket, ticket, &format!("fresh{ticket}"), 1), []);
+            let returned = holders.pop_front().expect("a holder returns");
+            assert_eq!(clock.leave(ticket, returned), [(ticket, 1)]);
+            holders.push_back(ticket);
+        }
+        // Passed by the background limit's nine, the scratch ask is served before a tenth.
+        assert_eq!(clock.ask(20, 20, "fresh20", 1), []);
+        let returned = holders.pop_front().expect("a holder returns");
+        assert_eq!(clock.leave(20, returned), [(10, 1)]);
+        assert!(clock.balanced());
+    }
+
+    /// The same starvation beside a land: while a gate wants every returned token, background is
+    /// served only by the floor token, and the floor went only to checkouts holding nothing.
+    #[test]
+    fn an_overdue_background_head_takes_the_floor_token_beside_a_land() {
+        let mut clock = Clock::new(18);
+        assert_eq!(clock.ask(0, 1, "scratch", 1), [(1, 1)]);
+        for ticket in 2..=6 {
+            assert_eq!(
+                clock.ask(0, ticket, &format!("busy{ticket}"), 1),
+                [(ticket, 1)]
+            );
+        }
+        assert_eq!(clock.ask_land(1, 7, "land", 12), [(7, 12)]);
+        assert_eq!(clock.ask_task(1, 8, 7, "land", 18), []);
+        assert_eq!(clock.ask(2, 9, "scratch", 1), []);
+        let mut holders: VecDeque<Ticket> = (2..=6).collect();
+        for ticket in 10..=18 {
+            assert_eq!(clock.ask(ticket, ticket, &format!("fresh{ticket}"), 1), []);
+            let returned = holders.pop_front().expect("a holder returns");
+            assert_eq!(clock.leave(ticket, returned), [(ticket, 1)]);
+            holders.push_back(ticket);
+        }
+        assert_eq!(clock.ask(19, 19, "fresh19", 1), []);
+        let returned = holders.pop_front().expect("a holder returns");
+        assert_eq!(clock.leave(19, returned), [(9, 1)]);
+        assert!(clock.balanced());
+    }
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Ask {
+            checkout: usize,
+            want: usize,
+            gate: Option<usize>,
+        },
+        Leave {
+            pick: usize,
+        },
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            3 => (0..6usize, 1..5usize, proptest::option::weighted(0.2, 0..2usize))
+                .prop_map(|(checkout, want, gate)| Op::Ask { checkout, want, gate }),
+            2 => any::<usize>().prop_map(|pick| Op::Leave { pick }),
+        ]
+    }
+
+    proptest! {
+        /// No background ask waits behind an unbounded number of later asks of its rank: each
+        /// background request of its own checkout queued ahead of it, and its own turn at the
+        /// head, is passed by at most the background limit of later background grants. Gate
+        /// grants outrank background and are not counted.
+        #[test]
+        fn no_background_ask_is_passed_by_more_than_the_limit_of_later_background_grants(
+            total in 1..13usize,
+            ops in proptest::collection::vec(op(), 1..200),
+        ) {
+            let bound = background_limit(total);
+            let mut clock = Clock::new(total);
+            // The waiting background asks: ticket to (checkout, asks of it queued ahead, passes).
+            let mut waiting: BTreeMap<Ticket, (usize, usize, usize)> = BTreeMap::new();
+            let mut live: Vec<Ticket> = Vec::new();
+            let mut gate_jobs: HashMap<usize, Ticket> = HashMap::new();
+            for (ticket, op) in (1..).zip(ops) {
+                let grants = match op {
+                    Op::Ask { checkout, want, gate } => {
+                        live.push(ticket);
+                        let name = format!("c{checkout}");
+                        match gate {
+                            None => {
+                                let ahead = waiting
+                                    .values()
+                                    .filter(|(queued, ..)| *queued == checkout)
+                                    .count();
+                                waiting.insert(ticket, (checkout, ahead, 0));
+                                clock.ask(ticket, ticket, &name, want)
+                            }
+                            Some(repo) => {
+                                let job = *gate_jobs.entry(repo).or_insert(ticket);
+                                let class = Class::Gate(Arc::from(format!("r{repo}")));
+                                clock.ask_as(ticket, ticket, &name, want, (class, job))
+                            }
+                        }
+                    }
+                    Op::Leave { pick } => {
+                        if live.is_empty() {
+                            continue;
+                        }
+                        let gone = live.swap_remove(pick % live.len());
+                        waiting.remove(&gone);
+                        clock.leave(ticket, gone)
+                    }
+                };
+                for (granted, _) in grants {
+                    if waiting.remove(&granted).is_none() {
+                        continue;
+                    }
+                    for (older, (_, ahead, passed)) in waiting.range_mut(..granted) {
+                        *passed += 1;
+                        prop_assert!(
+                            *passed <= (*ahead + 1) * bound,
+                            "ticket {older} was passed by {passed} later background grants, {ahead} of its checkout's asks ahead, bound {bound}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

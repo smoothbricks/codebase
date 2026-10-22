@@ -949,6 +949,7 @@ dependencies = [
  "idna",
  "libc",
  "pin-project-lite",
+ "proptest",
  "rcgen",
  "rustls",
  "rustls-pemfile",

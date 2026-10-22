@@ -364,6 +364,10 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   metadata, grant/CA, and `.restore.json` facts; converge idempotently; accept only the corresponding token/incarnation;
   and leave no `.restore-fences`, runtime journal, or second mutable fact (the restore audit record may be emitted more
   than once across retries — it gates nothing).
+- **CPU admission bound**: over any generated host size and sequence of background asks, gate asks and departures on the
+  gateway's host ledger, no background request is passed by more than `(k + 1)·⌊N/2⌋` later background grants, k the
+  requests of its checkout queued ahead of it when it asked (05_gateway.md, "No background request is passed over
+  without bound"); gate-class grants are not counted.
 
 ## Integration tests (real substrate)
 
