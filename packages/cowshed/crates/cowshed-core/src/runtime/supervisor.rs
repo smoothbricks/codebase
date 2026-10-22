@@ -8912,11 +8912,11 @@ mod workspace_toolchain_tests {
         );
     }
 
-    /// A plain repository gets the core contract and nothing tool-specific: no tool's variables,
-    /// its trust bundle only through the core's Git and OpenSSL anchors.
+    /// A plain repository gets the core contract, including the two exact port-0 loader options,
+    /// but no capability wiring. Its trust bundle uses only the core Git and OpenSSL anchors.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn a_plain_repository_gets_no_tool_wiring() {
+    async fn a_plain_repository_gets_port_loaders_but_no_tool_wiring() {
         let root = scratch("plain");
         let mount = root.join("workspace");
         std::fs::create_dir_all(mount.join(".cowshed")).expect("private root");
@@ -8937,9 +8937,23 @@ mod workspace_toolchain_tests {
         let environment = sandbox_environment(&sandbox, &BTreeMap::new())
             .await
             .expect("environment");
-        let names: Vec<String> = environment
-            .child(&BTreeMap::new())
-            .into_keys()
+        let mut child = environment.child(&BTreeMap::new());
+        let preload = mount.join(".cowshed/port-zero.cjs");
+        assert_eq!(
+            child.remove(OsStr::new("NODE_OPTIONS")),
+            Some(OsString::from(format!("--require={}", preload.display())))
+        );
+        assert_eq!(
+            child.remove(OsStr::new("BUN_OPTIONS")),
+            Some(OsString::from(format!("--preload={}", preload.display())))
+        );
+        assert_eq!(
+            std::fs::read(&preload).expect("port-0 preload"),
+            crate::port_zero::PRELOAD
+        );
+        let names: Vec<String> = child
+            .keys()
+            .cloned()
             .filter_map(|name| name.into_string().ok())
             .collect();
         for prefix in [
@@ -8952,7 +8966,6 @@ mod workspace_toolchain_tests {
             );
         }
         let bundle = mount.join(".cowshed/ca-bundle.pem").into_os_string();
-        let child = environment.child(&BTreeMap::new());
         for core in ["GIT_SSL_CAINFO", "SSL_CERT_FILE"] {
             assert_eq!(child.get(OsStr::new(core)), Some(&bundle), "{core}");
         }
