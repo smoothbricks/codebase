@@ -21161,6 +21161,16 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
             CowshedError::integrity(error.to_string(), format!("cowshed rekey {workspace}"))
         }
 
+        // A process holds the build volume: the store is healthy, and the remedy is that process
+        // ending, so the generic repair hint would mislead.
+        ref error @ crate::storage::apfs::ApfsStorageError::BuildVolumeHeld {
+            ref holds,
+            ref open,
+            ..
+        } => CowshedError::conflict(
+            error.to_string(),
+            crate::storage::apfs::build_volume_held_hint(holds, open),
+        ),
         // An operation taking image locks without waiting found one held: its caller, a pass
         // finishing residue, keeps the locks to wait for them alone (01_storage.md, "Lock order").
         ref error @ crate::storage::apfs::ApfsStorageError::ImageLocksHeld { ref held } => {
@@ -23479,6 +23489,35 @@ mod doctor_hint_tests {
             !rendered.hint.contains("doctor"),
             "rekey owns this condition, not doctor; hint was {}",
             rendered.hint
+        );
+    }
+
+    /// The exit-5 storage failure a host holder once produced ("repair APFS storage and retry") is
+    /// a conflict naming the holder, whose hint is to end it or wait.
+    #[test]
+    fn a_busy_build_volume_is_a_conflict_naming_its_holder_not_a_storage_repair() {
+        let rendered =
+            native_storage_error(crate::storage::apfs::ApfsStorageError::BuildVolumeHeld {
+                image: PathBuf::from("/store/acme/widget/build/v.dmg"),
+                hold: PathBuf::from("/store/acme/widget/build/v.dmg.hold"),
+                holds: Vec::new(),
+                open: vec![cowshed_os::process::Holder {
+                    pid: 64266,
+                    command: "cat /tmp/fifo".to_owned(),
+                }],
+            });
+        assert_eq!(rendered.code, ErrorCode::Conflict);
+        assert!(
+            rendered
+                .message
+                .contains("is open in pid 64266 (cat /tmp/fifo)"),
+            "{}",
+            rendered.message
+        );
+        assert!(!rendered.message.contains("job"), "{}", rendered.message);
+        assert_eq!(
+            rendered.hint,
+            "end pid 64266 (cat /tmp/fifo) or wait for it to exit, then retry"
         );
     }
 

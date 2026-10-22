@@ -845,14 +845,11 @@ pub enum ApfsStorageError {
         #[source]
         source: io::Error,
     },
-    /// A job admitted on the build volume holds it, so it cannot be claimed. `holds` names each
-    /// process holding `hold` (a job's supervisor), `open` each that has the volume open; either
-    /// is empty when none of this user's processes is visible there.
-    #[error(
-        "build volume {image} is held by a job admitted on it: {hold} is held by {}{}",
-        held_by(.holds),
-        open_in(.open)
-    )]
+    /// The build volume is in use, so it cannot be claimed. `holds` names each process holding
+    /// `hold` (a job admitted on the volume, through its supervisor), `open` each that has the
+    /// volume open; either is empty when none of this user's processes is visible there. The
+    /// message names whichever holds it ([`build_volume_held`]).
+    #[error("{}", build_volume_held(image, hold, holds, open))]
     BuildVolumeHeld {
         image: PathBuf,
         hold: PathBuf,
@@ -1046,6 +1043,55 @@ fn held_by(holds: &[cowshed_os::process::Holder]) -> String {
     }
 }
 
+/// [`ApfsStorageError::BuildVolumeHeld`] said by what holds the volume: a job admitted on it
+/// (its hold file's holders), else the processes that have it open, else neither, visibly.
+fn build_volume_held(
+    image: &Path,
+    hold: &Path,
+    holds: &[cowshed_os::process::Holder],
+    open: &[cowshed_os::process::Holder],
+) -> String {
+    let image = image.display();
+    match (holds.is_empty(), open.is_empty()) {
+        (false, _) => format!(
+            "build volume {image} is held by a job admitted on it: {} is held by {}{}",
+            hold.display(),
+            crate::build_volume::nx::Holders(holds),
+            open_in(open)
+        ),
+        (true, false) => format!(
+            "build volume {image} is in use: it is open in {}",
+            crate::build_volume::nx::Holders(open)
+        ),
+        (true, true) => format!(
+            "build volume {image} is in use, but no process of this user holds {} or has the volume open",
+            hold.display()
+        ),
+    }
+}
+
+/// What to do about a [`ApfsStorageError::BuildVolumeHeld`]: end the process that has it, or
+/// wait for it. Nothing about the store needs repair.
+#[cfg(target_os = "macos")]
+pub(crate) fn build_volume_held_hint(
+    holds: &[cowshed_os::process::Holder],
+    open: &[cowshed_os::process::Holder],
+) -> String {
+    match (holds.is_empty(), open.is_empty()) {
+        (false, _) => format!(
+            "wait for the job holding it ({}) to finish, or end it, then retry",
+            crate::build_volume::nx::Holders(holds)
+        ),
+        (true, false) => format!(
+            "end {} or wait for it to exit, then retry",
+            crate::build_volume::nx::Holders(open)
+        ),
+        (true, true) => "no process of this user holds it: another user's process (Spotlight's \
+             `mds`) or the kernel does, and `sudo lsof +f -- <its mountpoint>` is the next look; \
+             end it or wait, then retry"
+            .to_owned(),
+    }
+}
 /// [`ApfsStorageError::BuildVolumeHeld`]'s processes with the volume open, when there are any.
 fn open_in(open: &[cowshed_os::process::Holder]) -> String {
     if open.is_empty() {
@@ -4033,6 +4079,48 @@ pub fn build_volume_label(repo: &RepoId, checkout: &WorkspaceName) -> String {
 mod tests {
     use super::*;
     use crate::metadata::GrantSet;
+
+    /// A busy build volume names what holds it: the job when its hold file is held, the process
+    /// with the volume open otherwise (live: a host `cat` with its cwd on the mount, pid 64266,
+    /// once read "held by a job admitted on it"), and says so when no holder is visible.
+    #[test]
+    fn a_busy_build_volume_names_its_actual_holder() {
+        let holder = |pid, command: &str| cowshed_os::process::Holder {
+            pid,
+            command: command.to_owned(),
+        };
+        let held = |holds: Vec<cowshed_os::process::Holder>, open| {
+            ApfsStorageError::BuildVolumeHeld {
+                image: PathBuf::from("/store/acme/widget/build/v.dmg"),
+                hold: PathBuf::from("/store/acme/widget/build/v.dmg.hold"),
+                holds,
+                open,
+            }
+            .to_string()
+        };
+        let open_only = held(Vec::new(), vec![holder(64266, "cat /tmp/fifo")]);
+        assert_eq!(
+            open_only,
+            "build volume /store/acme/widget/build/v.dmg is in use: it is open in pid 64266 (cat /tmp/fifo)"
+        );
+        assert!(!open_only.contains("job"), "{open_only}");
+        let by_job = held(vec![holder(7, "cowshed supervisor")], Vec::new());
+        assert!(
+            by_job.starts_with("build volume /store/acme/widget/build/v.dmg is held by a job admitted on it: /store/acme/widget/build/v.dmg.hold is held by pid 7 (cowshed supervisor)"),
+            "{by_job}"
+        );
+        let unseen = held(Vec::new(), Vec::new());
+        assert!(unseen.contains("no process of this user holds"), "{unseen}");
+        #[cfg(target_os = "macos")]
+        {
+            let hint = build_volume_held_hint(&[], &[holder(64266, "cat /tmp/fifo")]);
+            assert_eq!(
+                hint,
+                "end pid 64266 (cat /tmp/fifo) or wait for it to exit, then retry"
+            );
+            assert!(!hint.contains("repair"), "{hint}");
+        }
+    }
 
     fn identity() -> OperationIdentity {
         OperationIdentity {

@@ -1427,12 +1427,16 @@ Linux connector, unlinks the Linux per-incarnation socket, then frees both of th
 the build volume its checkout owns (its record names the checkout as the one that links it), detached whole under the
 build-volume claim "Making room for an attach" describes. The images/dataset and grants persist. A build volume a job
 holds, or one the kernel will not unmount, refuses the detach by name after the workspace's own image is released; it is
-mounted again before its claim is let go. Every path that detaches a workspace releases both: `detach`, making room, and
-putting a detached workspace back after a refused `rm`. `attach` mounts at the canonical path with canonical flags,
-mounts the linked build volume again and, on Linux, creates the per-workspace socket/netns and starts exactly one
-connector before admitting execs. On macOS a session attaches on use: the gateway's startup pass mounts mains only
-(05_gateway.md, "Startup contract"), and every verb that reaches a detached session attaches it; Linux uses its platform
-service/controller lifecycle.
+mounted again before its claim is let go. The refusal is a conflict, never a storage failure: it names a job admitted on
+the volume when the volume's hold file is held, otherwise each process that has the volume open ("in use: it is open in
+pid N (command)"), otherwise that no process of this user holds it, and its hint is to end that holder or wait, with
+`sudo lsof +f -- <mount>` as the next look for an unseen one ("When a detach's unmount is still refused"). The
+workspace's own jobs are not such holders: the drain above waits for them first. Every path that detaches a workspace
+releases both: `detach`, making room, and putting a detached workspace back after a refused `rm`. `attach` mounts at the
+canonical path with canonical flags, mounts the linked build volume again and, on Linux, creates the per-workspace
+socket/netns and starts exactly one connector before admitting execs. On macOS a session attaches on use: the gateway's
+startup pass mounts mains only (05_gateway.md, "Startup contract"), and every verb that reaches a detached session
+attaches it; Linux uses its platform service/controller lifecycle.
 
 ### Making room for an attach
 
