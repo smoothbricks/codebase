@@ -1160,9 +1160,11 @@ ordinary remedy `git rebase --onto <new-main> e9e596563`; it never replays that 
    source head, destroy the workspace (supervisor tree first — 11_shell.md) and prune its `refs/cowshed/<ws>/*`
    preservation refs on the host. The retire gate is `rm`'s, measured against the branch the workspace just landed on,
    in the target's repository: a lane unit whose commits its lane base holds retires, though main does not hold them
-   yet. A retire refused at this point (the check left work behind, say) keeps the workspace and exits with the refusal,
-   but its message starts with the landed head and target: the target has moved, so the next step is `cowshed rm`, not
-   another land.
+   yet. Of the ways `rm` step 1 lets another local branch pass, the branch of the same name is read in the target's
+   repository, but the `push` ref `refs/cowshed/<ws>/heads/<branch>` is read in main's repository, where `push` writes
+   it whichever target the unit lands into. A retire refused at this point (the check left work behind, say) keeps the
+   workspace and exits with the refusal, but its message starts with the landed head and target: the target has moved,
+   so the next step is `cowshed rm`, not another land.
 
 `--no-retire` keeps the workspace after a successful land (for a coordinator that wants to reuse it via
 `rebase --fresh`). `--push-only` performs steps 1–2 and installs the validated head in the workspace's durable
