@@ -1,6 +1,6 @@
 import { expect, it } from 'bun:test';
-import { spawnSync } from 'node:child_process';
-import { watch as fsWatch, readFileSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
@@ -69,25 +69,49 @@ it('lets a resident plugin worker ask its daemon for files without holding the d
     // The daemon logs its open connection count on every connect and close, so the wait ends on that log. A connection
     // the worker kept would keep the daemon from its five-minute idle stop for as long as the worker lives, and the daemon
     // keeps a worker with graph hooks for as long as it lives.
-    let open: string | undefined;
-    let notify: (() => void) | undefined;
-    const watcher = fsWatch(dirname(logPath), () => notify?.());
+    // `tail -F` is the wakeup, not the record: it prints the log from its first line and then every append, through
+    // kqueue, which reports data past the reader's offset for as long as there is any, so every write is followed by
+    // output that comes after it. Each output re-reads the whole log, and its latest count decides, as one read of it
+    // did before. Bun's fs.watch on macOS loses appends now and then (its FSEvents stream reported nothing for 2 of 200
+    // single appends on an idle host), and a lost last count line left this wait running until the leg's no-progress
+    // bound killed the shard.
+    const tail = spawn('/usr/bin/tail', ['-n', '+1', '-F', logPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const tailClosed = Promise.withResolvers<void>();
+    tail.once('close', () => tailClosed.resolve());
     try {
-      while (open !== '0') {
-        // Armed before the read, so a count written while the read is in flight still wakes the next wait.
-        const changed = Promise.withResolvers<void>();
-        notify = () => changed.resolve();
-        const log = await readFile(logPath, 'utf8');
-        expect(log).toContain('Handled json message GLOB');
-        open = log
-          .split('\n')
-          .map((line) => OPEN_CONNECTIONS.exec(line)?.[1])
-          .filter((count) => count !== undefined)
-          .at(-1);
-        if (open !== '0') await changed.promise;
-      }
+      const { promise: idle, resolve, reject } = Promise.withResolvers<void>();
+      let stderr = '';
+      tail.once('error', (error) => {
+        tailClosed.resolve();
+        reject(error);
+      });
+      tail.stderr.setEncoding('utf8').on('data', (text: string) => {
+        stderr += text;
+      });
+      tail.once('exit', (code, signal) =>
+        reject(
+          new Error(`tail -F ${logPath} ended (${code ?? signal}) before the log said 0 open connections: ${stderr}`),
+        ),
+      );
+      // Started before the first read, so a count written while a read is in flight still brings another output.
+      tail.stdout.on('data', () => {
+        try {
+          const log = readFileSync(logPath, 'utf8');
+          expect(log).toContain('Handled json message GLOB');
+          const open = log
+            .split('\n')
+            .map((line) => OPEN_CONNECTIONS.exec(line)?.[1])
+            .filter((count) => count !== undefined)
+            .at(-1);
+          if (open === '0') resolve();
+        } catch (error) {
+          reject(error);
+        }
+      });
+      await idle;
     } finally {
-      watcher.close();
+      tail.kill();
+      await tailClosed.promise;
     }
     const workers = (await nxDaemonProcesses(workspace)).filter(({ command }) => command.includes('plugin-worker'));
     expect(workers.length, 'the resident plugin worker that asked the daemon for files').toBeGreaterThan(0);
