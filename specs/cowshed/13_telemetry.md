@@ -367,8 +367,11 @@ executes locally once, and its ordinary read-only PUT is refused with 403. A has
 the 503 backend returns `false` without another task execution and records a failed `nx-backend-unavailable` PUT. The
 ordinary short-Content-Length case commits a 200 head and visible body prefix before closing the upstream early. It
 requires a client-visible short body and a failed `nx-transfer-failed` audit, never a completed read. Direct-client
-controls expose why the gateway mapping is needed: an unmodified upstream GET503 fails before execution; GET404 followed
-by PUT503 fails after local execution.
+controls run the same client against the fixture backend with no gateway, so the backend's 503 reaches the client, which
+reads it as its own outage (05_gateway.md "The client half"): a GET 503 is a miss, the task executes once and the run
+succeeds; a PUT 503 after that execution skips the store and keeps the result. Each run prints exactly one outage line
+naming the server, the request and the 503, and asks that server nothing more; with no gateway there is no audit.
+Through the gateway the same backend stays an audited 404/403, the contrast these controls exist to show.
 
 Run fresh one-task cold controls both without an endpoint and through the gateway. Record each wall-time row, its
 cacheable-task count, execution marker, gateway statuses and backend-request count in a dated proof receipt. The rows
