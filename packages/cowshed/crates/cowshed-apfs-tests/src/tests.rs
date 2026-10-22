@@ -440,7 +440,8 @@ impl Drop for TestPaths {
 /// A's attachment is also the image-growth witness, so growth spends no attach of its own: an
 /// in-kernel attachment takes no lock on its file, so growth refuses it by the registry
 /// (01a_apfs.md, "Images"); growing A while attached is refused outright and nothing is
-/// written; once A is detached, the grow lands and A's capacity reports it.
+/// written, and a detached capture of A is refused the same way; once A is detached, the grow
+/// lands and A's capacity reports it.
 #[cfg(target_os = "macos")]
 #[test]
 fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
@@ -487,6 +488,20 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
             Err(ApfsError::FileOperation { operation: "grow RAW image", source, .. })
                 if source.kind() == io::ErrorKind::WouldBlock
         ));
+        // A detached capture refuses the attached source too, and writes no clone.
+        let capture = root
+            .path()
+            .join("lease-held-capture")
+            .with_extension(IMAGE_EXTENSION);
+        assert!(matches!(
+            backend.clone_image(&image_a, &capture, ImageCapture::Detached),
+            Err(cowshed_apfs::CloneFileError::SourceAttached { source }) if source == image_a
+        ));
+        assert!(
+            !capture.exists(),
+            "a refused capture wrote {}",
+            capture.display()
+        );
 
         std::os::unix::fs::symlink(image_a.parent().expect("temp parent"), &alias_parent)
             .expect("symlinked-parent alias");
@@ -778,12 +793,13 @@ fn wait_for_exit(pid: libc::pid_t) -> io::Result<()> {
 #[cfg(target_os = "macos")]
 const FIXTURE_KILL_ROOT: &str = "COWSHED_TEST_FIXTURE_KILL_ROOT";
 
-/// An in-kernel attach killed with its caller leaves nothing behind: the caller is ended the
-/// way an agent tool kills a tree — SIGTERM to every process working in its root, the
-/// attaching `hdiutil` among them, then SIGKILL to the caller itself — mid-attach. The next
-/// invocation (this parent, after the kill) releases whatever the attach left, attached or not:
-/// no whole device of the image remains, no attachment still backs the file, nothing keeps
-/// running in its root, and no diskimagesiod ever served the image. The host's departed-drive
+/// An in-kernel attach outlives its caller: the caller is ended the way an agent tool kills a
+/// tree — SIGTERM to every process working in its root, the attaching `hdiutil` among them,
+/// then SIGKILL to the caller itself — mid-attach. The protected disk-image child (`hdiutil`
+/// starts with those signals ignored and blocked) finishes regardless, so the next invocation
+/// (this parent, after the kill) finds the image attached and releases it cleanly: no whole
+/// device of the image remains, no attachment still backs the file, nothing keeps running in
+/// its root, and no diskimagesiod ever served the image. The host's departed-drive
 /// count is the lane's check (specs/cowshed/08_testing.md, "Host limit"), not one test's on a
 /// shared host.
 #[cfg(target_os = "macos")]
@@ -865,13 +881,12 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
             wait_for_exit(pid).expect("watch a detached disk child's exit");
         }
     }
-    // A SIGTERM may land before or after the kernel attached the image; either is recovered.
-    let attached = !backend
-        .attached_whole_devices(&image)
-        .expect("attachment inventory")
-        .is_empty();
-    cowshed_os::eprintln!(
-        "cowshed: the killed attach (hdiutil {attach}) left the image attached: {attached}"
+    assert!(
+        !backend
+            .attached_whole_devices(&image)
+            .expect("attachment inventory")
+            .is_empty(),
+        "the killed caller's attach (hdiutil {attach}) did not complete"
     );
     let image_helpers = crate::disk_image_helpers::image_helper_pids(&image)
         .expect("join this image to its helper PIDs");

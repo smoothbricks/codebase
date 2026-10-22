@@ -89,15 +89,21 @@ This companion owns the macOS/APFS implementation.
   are never detached implicitly (the gateway keeps them mounted), so no path rewrites main on its own.
 - **Detached growth**: under the image's lease, an `O_EXLOCK | O_NONBLOCK | O_NOFOLLOW` open refuses a file a
   DiskImages2 helper holds and excludes such an attach until the write is durable. An in-kernel attachment takes no
-  lock, so growth then refuses (`EWOULDBLOCK`, as a held lock does) when any registered attachment's backing path names
-  the same file by device and inode, an alias path included; the lease excludes cowshed's own attach of the image until
-  the write is durable. A backing path that no longer exists is passed over, since only an image renamed while attached
-  could still name the file, and cowshed renames none. The RAW file's length is its virtual capacity. Refuse a requested
+  lock, so growth then refuses (`EWOULDBLOCK`, as a held lock does) when a registered in-kernel drive holds the opened
+  file. The kernel names each drive's backing file in its `backingstore-id` property,
+  `{"writeable-components" | "readonly-components" = ("d<dev>:i<ino>")}` (read from `ioreg` for a read-write and a
+  read-only attach, 2026-10-22), which still names the file after its path was renamed or unlinked, so an alias path is
+  refused too and no path is stat'd; a drive that names no backing file fails the check. The lease excludes cowshed's
+  own attach of the image until the write is durable. The RAW file's length is its virtual capacity. Refuse a requested
   length not aligned to 4 KiB or not strictly larger than the existing length; extend with `ftruncate` and power-loss
   flush before closing. Extending creates holes, not a host allocation of the larger capacity. There is no image header
   or allocation map to parse or rewrite. Cowshed then attaches and verifies its own image, grows the container with
   `diskutil apfs resizeContainer`, and checks kernel capacity. A crash between file and container growth leaves a larger
   image around the old container: equal-capacity resize is refused, while a larger resize completes both steps.
+- **Detached capture** (a blank template, an unmounted seed): the clone holds the source's image lease and a shared
+  `O_SHLOCK | O_NONBLOCK | O_NOFOLLOW` descriptor through `fclonefileat`, and refuses (`SourceAttached`) a source any
+  registered in-kernel drive holds, by the `backingstore-id` rule of detached growth. The lock excludes a DiskImages2
+  attach, the lease cowshed's own in-kernel attach of that path; a mounted source is captured live instead.
 - **Volume name**: the repository name for `main`, `<repo> — <workspace>` for every other workspace. The volume name is
   a label and nothing else: Finder shows it in place of the directory name for a mounted volume's directory, so it is
   written for the person looking at it. Nothing parses it, nothing classifies a volume by it, and nothing derives
@@ -777,28 +783,29 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    ends. A later successful attach does not end it. Clearing the spent-boot fact retains the last exhaustion as
    evidence.
 
-   Cowshed attaches its own images in the kernel ("Mounts"), which draws nothing from this pool. The record latches what
-   DiskImages2 attaches still run through cowshed (`cowshed disk-command diskutil -- image attach …`): the system runner
-   refuses one before it spawns while its boot is spent, with `AttachPoolExhausted` and its `next:` step, because a
-   failed attach leaks one more device; a record that cannot be read or does not parse refuses too (`PoolUnread`), since
-   it may have held the 150. No device count gates anything. The earliest observed 150 (06:01:48 in the boot of
-   2026-10-21 20:12 +04) struck with 271 images registered and 963 `DIDeviceIOUserClient` and 972 `AppleDiskImageDevice`
-   instances allocated, live and departed together; each IO client maps 36 shared 2 MiB buffers that only its `free()`
-   returns. That count is history, not a limit. The pool record holds 1,042 because its observer met its first 150 after
-   67 more failed attaches had each allocated a device. A record whose bytes do not parse proves nothing: `doctor` reads
-   it as empty with a warning naming the file and still reports the kernel, and the next write (a 150, the operator's
-   clear) replaces it. `doctor` reports `disk-image-attach-budget`: the four classes' live instances, registered entries
-   and differences, the current boot's exhaustion evidence, and disk-image commands an earlier build interrupted, each a
-   probable leaked device (the record keeps them until the boot ends; no current build writes one). It is an error while
-   the boot is spent ("attach pool exhausted"), and a warning while any image device is leaked or an earlier build
-   interrupted a command. Its hint names proven orphaned or stalled helpers first when they ran at the 150, then the
-   stalled helper whose kill frees retained devices, and a reboot only when none is stalled or the devices stay, never a
-   guessed daemon restart for unrelated departed-volume references; clearing a record repairs nothing in the kernel.
-   `departed-volume-references` is a separate warning from the first departed APFS-volume or IOMedia instance, with
-   exact counts and a root `lsmp` attribution step; it neither defines attach-pool capacity nor prescribes a daemon
-   restart. Orphaned helpers are named only when two reads in a row agree and no `diskutil` or `hdiutil` ran during
-   either, since a helper whose attach is under way has no device yet and killing it mid-attach is what leaks one;
-   killing an orphan frees its mapping; killing the stalled helper that retains departed devices frees them.
+   Cowshed attaches its runtime images in the kernel ("Mounts"), which draws nothing from this pool. The record latches
+   the DiskImages2 attaches that still run through cowshed, re-adoption's read-only retained-input attach ("Mounts") and
+   `cowshed disk-command diskutil -- image attach …`: the system runner refuses one before it spawns while its boot is
+   spent, with `AttachPoolExhausted` and its `next:` step, because a failed attach leaks one more device; a record that
+   cannot be read or does not parse refuses too (`PoolUnread`), since it may have held the 150. No device count gates
+   anything. The earliest observed 150 (06:01:48 in the boot of 2026-10-21 20:12 +04) struck with 271 images registered
+   and 963 `DIDeviceIOUserClient` and 972 `AppleDiskImageDevice` instances allocated, live and departed together; each
+   IO client maps 36 shared 2 MiB buffers that only its `free()` returns. That count is history, not a limit. The pool
+   record holds 1,042 because its observer met its first 150 after 67 more failed attaches had each allocated a device.
+   A record whose bytes do not parse proves nothing: `doctor` reads it as empty with a warning naming the file and still
+   reports the kernel, and the next write (a 150, the operator's clear) replaces it. `doctor` reports
+   `disk-image-attach-budget`: the four classes' live instances, registered entries and differences, the current boot's
+   exhaustion evidence, and disk-image commands an earlier build interrupted, each a probable leaked device (the record
+   keeps them until the boot ends; no current build writes one). It is an error while the boot is spent ("attach pool
+   exhausted"), and a warning while any image device is leaked or an earlier build interrupted a command. Its hint names
+   proven orphaned or stalled helpers first when they ran at the 150, then the stalled helper whose kill frees retained
+   devices, and a reboot only when none is stalled or the devices stay, never a guessed daemon restart for unrelated
+   departed-volume references; clearing a record repairs nothing in the kernel. `departed-volume-references` is a
+   separate warning from the first departed APFS-volume or IOMedia instance, with exact counts and a root `lsmp`
+   attribution step; it neither defines attach-pool capacity nor prescribes a daemon restart. Orphaned helpers are named
+   only when two reads in a row agree and no `diskutil` or `hdiutil` ran during either, since a helper whose attach is
+   under way has no device yet and killing it mid-attach is what leaks one; killing an orphan frees its mapping; killing
+   the stalled helper that retains departed devices frees them.
 
    **A disk-image command is detached from its caller.** A disk-image command is one that creates or releases an image
    device: any `diskutil image …`, any `hdiutil`, and `diskutil eject` (Disk Arbitration's release of an image device,

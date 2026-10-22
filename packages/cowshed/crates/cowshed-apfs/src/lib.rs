@@ -1037,31 +1037,18 @@ mod raw {
         cowshed_os::fsio::Durability::PowerLoss.sync_file(&file)
     }
 
-    /// Refuse (`WouldBlock`, as a held lock does) when any registered attachment is backed by the
-    /// file `file` opened, compared by device and inode, so an alias path is refused as well. A
-    /// backing path that no longer exists is passed over: it can name this file only if the image
-    /// was renamed while attached, which cowshed never does.
-    fn refuse_attached(file: &File, image: &Path) -> io::Result<()> {
+    /// Refuse (`WouldBlock`, as a held lock does) when a registered in-kernel drive holds the
+    /// file `file` opened. The kernel names each drive's backing file by device and inode
+    /// ([`super::io_registry::in_kernel_backing_files`]), so an alias path, or a path renamed or
+    /// unlinked since the attach, is refused as well. A DiskImages2 attachment is refused by its
+    /// helper's lock, which the caller's open meets.
+    pub(super) fn refuse_attached(file: &File, image: &Path) -> io::Result<()> {
         let opened = file.metadata()?;
-        for attached in super::io_registry::attached_disk_images()? {
-            let crate::DiskImageSource::File(backing) = &attached.source else {
-                continue;
-            };
-            let backing_file = match std::fs::metadata(backing) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            if (backing_file.dev(), backing_file.ino()) == (opened.dev(), opened.ino()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!(
-                        "{} is attached through {}",
-                        image.display(),
-                        backing.display()
-                    ),
-                ));
-            }
+        if super::io_registry::in_kernel_backing_files()?.contains(&(opened.dev(), opened.ino())) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("{} is attached in the kernel", image.display()),
+            ));
         }
         Ok(())
     }
@@ -3628,6 +3615,21 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
         #[cfg(target_os = "macos")]
         {
             let leg = apfs_step_leg(destination);
+            // Cowshed attaches only under the image's lease, so a detached capture holds the
+            // source's lease through the clone: an in-kernel attachment takes no file lock
+            // that the source's shared lock could exclude (01a_apfs.md, "Images").
+            let _lease = match capture {
+                ImageCapture::Detached => {
+                    self.runner
+                        .image_lease(source)
+                        .map_err(|error| CloneFileError::Io {
+                            source_path: source.to_owned(),
+                            destination_path: destination.to_owned(),
+                            source: error,
+                        })?
+                }
+                ImageCapture::Live => None,
+            };
             let held = timed_apfs_step(leg, "hold-source", || {
                 ImageSource::hold(source, destination, capture)
             })?;
@@ -4796,8 +4798,10 @@ fn raw_device_from(device: &str) -> String {
 }
 
 /// One source inode retained from no-follow open through descriptor cloning. Detached captures
-/// also retain the shared lock that excludes an image driver. Live workspace and guarded build
-/// captures retain no attachment lock and leave the source mounted; callers own writer admission.
+/// also retain the shared lock that excludes a DiskImages2 helper, and refuse a source any
+/// registered attachment backs, which an in-kernel attach is ([`raw::refuse_attached`]). Live
+/// workspace and guarded build captures retain no attachment lock and leave the source mounted;
+/// callers own writer admission.
 #[cfg(target_os = "macos")]
 struct ImageSource<'a> {
     file: File,
@@ -4832,6 +4836,14 @@ impl<'a> ImageSource<'a> {
                 },
                 _ => failed(error),
             })?;
+        if capture == ImageCapture::Detached {
+            raw::refuse_attached(&file, path).map_err(|error| match error.kind() {
+                io::ErrorKind::WouldBlock => CloneFileError::SourceAttached {
+                    source: path.to_owned(),
+                },
+                _ => failed(error),
+            })?;
+        }
         // SAFETY: `file` owns a live descriptor for the duration of the call.
         if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
             return Err(failed(io::Error::last_os_error()));
@@ -5233,6 +5245,9 @@ mod io_registry {
         fn CFNumberGetValue(number: CfType, number_type: CfIndex, value: *mut c_void) -> u8;
         fn CFDictionaryGetTypeID() -> usize;
         fn CFDictionaryGetValue(dictionary: CfType, key: CfType) -> CfType;
+        fn CFArrayGetTypeID() -> usize;
+        fn CFArrayGetCount(array: CfType) -> CfIndex;
+        fn CFArrayGetValueAtIndex(array: CfType, index: CfIndex) -> CfType;
 
         fn CFRetain(object: CfType) -> CfType;
         fn CFDictionaryCreateMutable(
@@ -5515,6 +5530,77 @@ mod io_registry {
             attached.extend(image_devices(registered(driver.class())?, driver)?);
         }
         Ok(attached)
+    }
+
+    /// The backing files every registered in-kernel drive holds, as `(device, inode)`: the
+    /// kernel's own `backingstore-id`, `{"writeable-components" | "readonly-components" =
+    /// ("d<dev>:i<ino>", …)}`, which names the file the drive holds open whatever path names it
+    /// now. A drive that left the registry mid-read is departing and passed over; one that names
+    /// no backing file fails the read, since its file cannot be told apart from any other.
+    pub(super) fn in_kernel_backing_files() -> io::Result<Vec<(u64, u64)>> {
+        let backing = key("backingstore-id")?;
+        let lists = [key("writeable-components")?, key("readonly-components")?];
+        let mut files = Vec::new();
+        for drive in registered(Driver::InKernel.class())? {
+            settle((|| -> Read<()> {
+                let Some(identity) = property(&drive, &backing)? else {
+                    return Err(invalid("an in-kernel drive registers no backingstore-id").into());
+                };
+                files.extend(backing_components(&identity, &lists)?);
+                Ok(())
+            })())?;
+        }
+        Ok(files)
+    }
+
+    /// The `d<dev>:i<ino>` components of one drive's `backingstore-id` dictionary.
+    fn backing_components(identity: &Cf, lists: &[Cf; 2]) -> io::Result<Vec<(u64, u64)>> {
+        // SAFETY: `identity` is a live CF object.
+        if unsafe { CFGetTypeID(identity.0) != CFDictionaryGetTypeID() } {
+            return Err(invalid(
+                "registry property backingstore-id is not a dictionary",
+            ));
+        }
+        let mut files = Vec::new();
+        for list_key in lists {
+            // SAFETY: `identity` is a live CFDictionary; the answer is borrowed from it, or null.
+            let list = unsafe { CFDictionaryGetValue(identity.0, list_key.0) };
+            if list.is_null() {
+                continue;
+            }
+            // SAFETY: `list` is a live CF object borrowed from `identity`.
+            if unsafe { CFGetTypeID(list) != CFArrayGetTypeID() } {
+                return Err(invalid("a backingstore-id component list is not an array"));
+            }
+            // SAFETY: `list` is a live CFArray.
+            for index in 0..unsafe { CFArrayGetCount(list) } {
+                // SAFETY: `index` is below the array's count; the value is borrowed from it.
+                let component = unsafe { CFArrayGetValueAtIndex(list, index) };
+                files.push(parse_backing_component(&cf_string(
+                    component,
+                    "backingstore-id component",
+                )?)?);
+            }
+        }
+        if files.is_empty() {
+            return Err(invalid(
+                "registry property backingstore-id names no backing file",
+            ));
+        }
+        Ok(files)
+    }
+
+    /// One `backingstore-id` component, `d<dev>:i<ino>` in decimal, as `(device, inode)`.
+    fn parse_backing_component(component: &str) -> io::Result<(u64, u64)> {
+        component
+            .strip_prefix('d')
+            .and_then(|rest| rest.split_once(":i"))
+            .and_then(|(device, inode)| Some((device.parse().ok()?, inode.parse().ok()?)))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "backingstore-id component {component:?} is not d<dev>:i<ino>"
+                ))
+            })
     }
 
     /// Every attachment the kernel holds for the local file at `image`: each driver's
@@ -6019,20 +6105,25 @@ mod io_registry {
         let Some(value) = property(entry, key)? else {
             return Ok(None);
         };
+        Ok(Some(cf_string(value.0, name)?))
+    }
+
+    /// The UTF-8 text of `value`, a live CF object borrowed for the call, which must be a string.
+    fn cf_string(value: CfType, name: &str) -> io::Result<String> {
         // SAFETY: `value` is a live CF object.
-        if unsafe { CFGetTypeID(value.0) != CFStringGetTypeID() } {
-            return Err(invalid(format!("registry property {name} is not a string")).into());
+        if unsafe { CFGetTypeID(value) != CFStringGetTypeID() } {
+            return Err(invalid(format!("registry property {name} is not a string")));
         }
         let range = CfRange {
             location: 0,
             // SAFETY: `value` is a live CFString.
-            length: unsafe { CFStringGetLength(value.0) },
+            length: unsafe { CFStringGetLength(value) },
         };
         let mut needed: CfIndex = 0;
         // SAFETY: a null buffer asks only for the UTF-8 length of the whole range.
         let measured = unsafe {
             CFStringGetBytes(
-                value.0,
+                value,
                 range,
                 CF_STRING_ENCODING_UTF8,
                 0,
@@ -6049,7 +6140,7 @@ mod io_registry {
         // SAFETY: `bytes` is writable for `needed` bytes, the capacity the call is given.
         let converted = unsafe {
             CFStringGetBytes(
-                value.0,
+                value,
                 range,
                 CF_STRING_ENCODING_UTF8,
                 0,
@@ -6062,12 +6153,10 @@ mod io_registry {
         if measured != range.length || converted != range.length || used != needed {
             return Err(invalid(format!(
                 "registry property {name} did not convert to UTF-8 whole"
-            ))
-            .into());
+            )));
         }
-        let text = String::from_utf8(bytes)
-            .map_err(|_| invalid(format!("registry property {name} is not UTF-8")))?;
-        Ok(Some(text))
+        String::from_utf8(bytes)
+            .map_err(|_| invalid(format!("registry property {name} is not UTF-8")))
     }
 
     fn u64_property(entry: &Object, key: &Cf, name: &str) -> Read<Option<u64>> {
@@ -6116,6 +6205,23 @@ mod io_registry {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The kernel spells a drive's backing file `d<dev>:i<ino>`, as `ioreg` showed it for
+        /// a read-write and a read-only in-kernel attach (01a_apfs.md, "Images").
+        #[test]
+        fn a_backing_component_is_the_device_and_inode_the_kernel_spells() {
+            assert_eq!(
+                parse_backing_component("d16777231:i1374749620").unwrap(),
+                (16_777_231, 1_374_749_620)
+            );
+            for malformed in ["16777231:i1", "d1:1", "d1:i", "dx:i1", "d1:i1x", ""] {
+                assert_eq!(
+                    parse_backing_component(malformed).unwrap_err().kind(),
+                    io::ErrorKind::InvalidData,
+                    "{malformed:?}"
+                );
+            }
+        }
 
         /// `MACH_PORT_RIGHT_DEAD_NAME`.
         const DEAD_NAME: libc::c_uint = 4;
@@ -11415,9 +11521,10 @@ mod tests {
             fs::remove_dir(mount).unwrap();
         }
     }
-    /// Every cowshed attach is the in-kernel DI1 attach of the exact image: `hdiutil attach -kernel`
-    /// with the RAW class, never mounted by the tool, read-only exactly when asked, the image last.
-    /// It is never a DiskImages2 attach, so no `diskimagesiod` helper is involved.
+    /// Every runtime image attach is the in-kernel DI1 attach of the exact image: `hdiutil attach
+    /// -kernel` with the RAW class, never mounted by the tool, read-only exactly when asked, the
+    /// image last. It is never a DiskImages2 attach, so no `diskimagesiod` helper is involved;
+    /// only a retained input's attach is ([`retained_input_attach`]).
     #[test]
     fn every_attach_is_the_in_kernel_attach_of_the_exact_image() {
         let image = Path::new("/private/cowshed/store/acme/widget/sessions/raven.dmg");

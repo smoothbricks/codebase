@@ -10,11 +10,12 @@
 //! IOMedia match-notification ceiling"); its death frees them, as killing orphaned helpers
 //! frees their mappings ([`crate::disk_image_helpers`]).
 //!
-//! Cowshed attaches its images in the kernel (`hdiutil attach -kernel`), so none of its own
-//! attaches draws on this pool. This module records the 150s the host's DiskImages2 commands
-//! meet, reports the pool to `doctor`, and refuses a DiskImages2 attach that still runs through
-//! cowshed (`cowshed disk-command diskutil -- image attach …`) once its boot has met a 150: a
-//! failed attach leaks one more device. No device count is a limit; only the observed 150 is.
+//! Cowshed attaches its runtime images in the kernel (`hdiutil attach -kernel`), so none of
+//! those attaches draws on this pool. This module records the 150s the host's DiskImages2
+//! commands meet, reports the pool to `doctor`, and refuses a DiskImages2 attach that still runs
+//! through cowshed once its boot has met a 150: re-adoption's read-only attach of a retained
+//! input, which may be ASIF, or `cowshed disk-command diskutil -- image attach …`. A failed
+//! attach leaks one more device. No device count is a limit; only the observed 150 is.
 //!
 //! Both sides are read unprivileged and without attaching anything: the instance counts are the
 //! registry root's `IOKitDiagnostics` class counts, which `ioclasscount` prints, and the
@@ -383,8 +384,8 @@ pub fn spent_refusal_at(path: &Path, session: &str) -> io::Result<Option<AttachP
 }
 
 /// A DiskImages2 attach: `diskutil image attach`, the one verb that creates an
-/// `AppleDiskImageDevice` and draws on this pool. An in-kernel `hdiutil attach -kernel` creates
-/// an IOHDIX drive and never meets the latch.
+/// `AppleDiskImageDevice` and draws on this pool (a retained input's attach, or a passthrough).
+/// An in-kernel `hdiutil attach -kernel` creates an IOHDIX drive and never meets the latch.
 fn is_disk_images2_attach(request: &crate::CommandRequest) -> bool {
     request.program == Path::new(crate::DISKUTIL)
         && request.args.first().is_some_and(|verb| verb == "image")

@@ -478,10 +478,10 @@ take no pool slot (`departed-volume-references`, below), and any disk-image comm
 "attach pool exhausted" means a DiskImages2 attach failed with error code 150 this boot: kill the one stalled
 `diskimagesiod` that retains the devices. Devices leak when a `diskimagesiod` helper stalls past IOKit's media
 match-notification cap (next section): its attach holds the helper's lock, its termination callback blocks on it, and
-every image device that terminates host-wide stays allocated until that helper dies. cowshed attaches its own images in
-the kernel, with no such helper. A DiskImages2 attach that still runs through cowshed
-(`cowshed disk-command diskutil -- image attach …`) is refused before it starts once its boot has met 150, until
-`cowshed doctor --clear-attach-budget` or a reboot, since a failed attach leaks one more device.
+every image device that terminates host-wide stays allocated until that helper dies. cowshed attaches its runtime images
+in the kernel, with no such helper. A DiskImages2 attach that still runs through cowshed (re-adoption's read-only attach
+of a retained ASIF input, or `cowshed disk-command diskutil -- image attach …`) is refused before it starts once its
+boot has met 150, until `cowshed doctor --clear-attach-budget` or a reboot, since a failed attach leaks one more device.
 
 The other cause is helpers that outlived their image. Every attached image has its own `diskimagesiod`, which maps 72
 MiB into the kernel; detach does not always end it, and a helper that outlived its image keeps its mapping.
