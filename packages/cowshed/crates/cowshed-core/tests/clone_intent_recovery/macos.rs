@@ -1,6 +1,8 @@
 use std::fs;
+use std::io::{BufRead as _, BufReader, Write as _};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use arrow_ipc::reader::StreamReader;
 use cowshed_core::api::ControllerCommitment;
@@ -22,7 +24,7 @@ use cowshed_core::storage::recovery::{
     LifecycleIntentPhase, LifecycleIntentRecord,
 };
 use cowshed_core::{CowshedError, Result};
-use cowshed_os::fork_lock::Run as _;
+use cowshed_os::fork_lock::{Run as _, Spawn as _};
 use serde_json::{Value, json};
 
 #[path = "../support/refusing_gateway.rs"]
@@ -118,6 +120,18 @@ impl Fixture {
     /// What `cowshed fork <workspace>` and other verbs naming it open: their own intents and
     /// main's are replayed, and a failed replay fails the opening.
     async fn open_naming(&self, workspace: &str) -> Result<ProjectRuntime> {
+        ProjectRuntime::open_directory_existing_at(
+            &self.checkout,
+            RecoveryScope::Workspaces([name(workspace)].into()),
+            self.storage.clone(),
+            refusing_gateway::connect,
+        )
+        .await
+    }
+
+    /// What `cowshed __workspace-supervisor <checkout> <workspace>` opens before it serves
+    /// `workspace`.
+    async fn open_as_supervisor(&self, workspace: &str) -> Result<ProjectRuntime> {
         ProjectRuntime::open_directory_existing_at(
             &self.checkout,
             RecoveryScope::Workspaces([name(workspace)].into()),
@@ -604,6 +618,250 @@ async fn cold_named_open_reads_selected_authority_and_preserves_full_diagnostics
         }
     }
     fs::write(&selected_sidecar, selected_original).expect("restore selected fixture metadata");
+}
+
+/// Names the image lock this test binary holds when it runs as [`image_lock_holder`].
+const HELD_LOCK_ENV: &str = "COWSHED_TEST_HELD_IMAGE_LOCK";
+/// Names the store root that lock is in.
+const HELD_STORE_ENV: &str = "COWSHED_TEST_HELD_IMAGE_STORE";
+
+/// Another process holding one image lock as a lifecycle operation of its own holds it (a fork
+/// holds its source's for the whole of its clone): this test binary run as
+/// [`image_lock_holder`]. It holds the lock until [`Self::release`] closes its stdin.
+struct LockHolder {
+    child: std::process::Child,
+    said: BufReader<std::process::ChildStderr>,
+}
+
+impl LockHolder {
+    /// Start the holder beneath `scratch`, so the fixture's cleanup ends it, and return once it
+    /// says on stderr that it holds `lock`. Its stdout is libtest's, which frames the test's own
+    /// output: run on one thread, as nextest runs it, `held` would follow `test … ... ` on one line.
+    fn hold(scratch: &Path, store: &Path, lock: &Path) -> Self {
+        let mut child = Command::new(std::env::current_exe().expect("this test binary"))
+            .args(["--exact", "macos::image_lock_holder", "--nocapture"])
+            .env(HELD_LOCK_ENV, lock)
+            .env(HELD_STORE_ENV, store)
+            .current_dir(scratch)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn_locked()
+            .expect("start the lock holder");
+        let mut said = BufReader::new(child.stderr.take().expect("the holder's stderr"));
+        let mut transcript = String::new();
+        loop {
+            let start = transcript.len();
+            let read = said
+                .read_line(&mut transcript)
+                .expect("the holder's stderr");
+            assert_ne!(
+                read,
+                0,
+                "the lock holder ended before it held {}; it said: {transcript}",
+                lock.display()
+            );
+            if transcript[start..].trim_end() == "held" {
+                break;
+            }
+        }
+        Self { child, said }
+    }
+
+    /// Close the holder's stdin so it lets go of the lock, and require that it held the lock
+    /// until then and exited cleanly.
+    fn release(mut self) {
+        drop(self.child.stdin.take());
+        std::io::copy(&mut self.said, &mut std::io::sink()).expect("the holder's last output");
+        let status = self.child.wait().expect("wait for the lock holder");
+        assert!(status.success(), "the lock holder failed: {status}");
+    }
+}
+
+/// Not a test of its own: the other process of [`LockHolder`]. Run as this binary with
+/// [`HELD_LOCK_ENV`] set, it takes that image lock as a lifecycle operation takes it, says
+/// `held` on stderr, and holds it until its stdin closes. Run any other way it does nothing.
+#[test]
+fn image_lock_holder() {
+    let Some(lock) = std::env::var_os(HELD_LOCK_ENV) else {
+        return;
+    };
+    let store = std::env::var_os(HELD_STORE_ENV).expect("the held lock's store");
+    let _held = cowshed_apfs::store_lock::acquire_image_locks(
+        Path::new(&store),
+        &[PathBuf::from(lock)],
+        cowshed_apfs::store_lock::LockMode::Wait,
+    )
+    .expect("take the image lock")
+    .expect("a waited-for lock is taken");
+    // On stderr, which libtest neither captures nor frames (see [`LockHolder::hold`]).
+    std::io::stderr()
+        .write_all(b"held\n")
+        .expect("say the lock is held");
+    std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).expect("wait for the release");
+}
+
+/// Blocks until `path` exists, woken by the writes to its directory rather than by a clock.
+fn wait_for_entry(path: &Path) {
+    let directory = fs::File::open(path.parent().expect("the entry's directory"))
+        .expect("open the entry's directory");
+    // SAFETY: `kqueue` takes no arguments; its answer is checked before use.
+    let queue = unsafe { libc::kqueue() };
+    assert!(queue >= 0, "kqueue: {}", std::io::Error::last_os_error());
+    // SAFETY: `queue` is a descriptor this function was just handed and alone owns.
+    let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+    let watch = libc::kevent {
+        ident: usize::try_from(directory.as_raw_fd()).expect("a descriptor"),
+        filter: libc::EVFILT_VNODE,
+        flags: libc::EV_ADD | libc::EV_CLEAR,
+        fflags: libc::NOTE_WRITE,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: one valid change in, no event out, no timeout.
+    let registered = unsafe {
+        libc::kevent(
+            queue.as_raw_fd(),
+            &raw const watch,
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(
+        registered,
+        0,
+        "watch {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+    while !path.exists() {
+        let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
+        // SAFETY: no change in, room for one event out, no timeout.
+        let woken = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                event.as_mut_ptr(),
+                1,
+                std::ptr::null(),
+            )
+        };
+        if woken < 0 {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted,
+                "wait for {}: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// A workspace supervisor opens and serves while other processes hold main's image lock and its
+/// own workspace's, as forks cloning them hold each for minutes on a large build image. Its
+/// opening used to wait for those locks, and its manager killed it at the start bound as a
+/// supervisor that "did not serve" (measured 2026-10-22: a new supervisor spent every sample of
+/// over two minutes in `flock` on `main.dmg.lock`, under `acquire_image_locks` in the project
+/// opening). Its opening finishes nothing and runs no store-wide pass, which would refuse the
+/// corrupt sibling below; it leaves an earlier generation of its workspace in the trash, whose
+/// reclamation is that workspace's lock's to authorize, and an ordinary opening reclaims it once
+/// the holders let go. Its mount, already settled, is served as it stands under the held lock.
+#[tokio::test]
+async fn a_supervisor_serves_while_other_processes_hold_its_image_locks() {
+    use cowshed_core::metadata::sidecar_path;
+    let fixture = Fixture::new("sup-locks");
+    let runtime = fixture.adopt().await;
+    for workspace in ["served", "broken"] {
+        fixture
+            .mint(&runtime, workspace, ForkOptions::default())
+            .await
+            .expect("mint a fixture workspace");
+    }
+    runtime
+        .shutdown()
+        .await
+        .expect("stop the controller that minted them");
+    let layout = fixture.layout();
+    let broken = layout
+        .canonical_image(&name("broken"))
+        .expect("the sibling's image")
+        .image()
+        .to_owned();
+    fs::write(sidecar_path(&broken), b"{ broken sibling").expect("corrupt the sibling's sidecar");
+    // An earlier generation of `served` whose retirement record is already gone: only an opening
+    // that finishes residue reclaims it, holding `served`'s lock.
+    let residue = layout
+        .project()
+        .sessions
+        .join(".trash")
+        .join("served-0123456789abcdef0123456789abcdef.dmg");
+    fs::create_dir_all(&residue).expect("plant an earlier generation of served in the trash");
+    fs::write(residue.join("left"), b"an earlier generation").expect("its bytes");
+    let scratch = fixture.checkout.parent().expect("the scratch root");
+    let served = name("served");
+    let holders = [WorkspaceName::main(), served.clone()].map(|workspace| {
+        let lock = layout
+            .canonical_image(&workspace)
+            .expect("a selected image")
+            .lock()
+            .to_owned();
+        LockHolder::hold(scratch, fixture.storage.store(), &lock)
+    });
+
+    let supervisor = fixture
+        .open_as_supervisor("served")
+        .await
+        .expect("the supervisor's opening waits on no lock another operation holds");
+    let socket = supervisor_socket::socket_path(fixture.storage.store(), &fixture.repo, &served);
+    fs::create_dir_all(socket.parent().expect("the socket directory")).expect("run directory");
+    let published = tokio::task::spawn_blocking({
+        let socket = socket.clone();
+        move || wait_for_entry(&socket)
+    });
+    {
+        let serving = supervisor.serve_supervisor(&served);
+        tokio::pin!(serving);
+        tokio::select! {
+            ended = &mut serving => panic!("the supervisor ended before it served: {ended:?}"),
+            published = published => published.expect("watch the socket directory"),
+        }
+        let hello = supervisor_socket::hello(&socket)
+            .await
+            .expect("the supervisor answers");
+        assert_eq!(hello.pid, std::process::id());
+        assert_eq!(hello.authority.workspace, served);
+        supervisor_socket::drain(&socket)
+            .await
+            .expect("retire the supervisor");
+        serving.await.expect("the supervisor retires cleanly");
+    }
+    supervisor
+        .shutdown()
+        .await
+        .expect("stop the supervisor's runtime");
+    assert_eq!(
+        fs::read(residue.join("left")).expect("the residue the supervisor left"),
+        b"an earlier generation"
+    );
+    for holder in holders {
+        holder.release();
+    }
+    let ordinary = fixture
+        .open_naming("served")
+        .await
+        .expect("a verb naming served opens once the holders let go");
+    assert!(
+        !residue.exists(),
+        "the ordinary opening reclaims the residue the supervisor left"
+    );
+    ordinary
+        .shutdown()
+        .await
+        .expect("stop the ordinary opening");
 }
 
 #[tokio::test]
