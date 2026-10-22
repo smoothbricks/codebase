@@ -493,6 +493,12 @@ that need the ports are launched after the grant. The next exec starts a fresh s
 Seatbelt profile and `COWSHED_PORT_BASE`/`COWSHED_PORT_BLOCK_SIZE` (04_sandbox.md). The reserved range is a finite host
 resource shared by every workspace: a block that has no free aligned place is refused.
 
+`cowshed grant <ws> --loopback-any` (macOS) lets every job of the workspace connect to any loopback port, the control
+plane's and every sibling's included, for a tool whose port-0 listener the Node and Bun preload cannot move
+(04_sandbox.md). It sets `GrantDelta.loopbackAny` (07_api.md), prints a warning naming that reach, lists as its own
+`loopback` row, and advances the grant revision; `cowshed revoke <ws> --loopback-any` withdraws it.
+`--project-wide --loopback-any` is a usage error on both verbs, and Linux refuses the grant.
+
 `cowshed exec` and `cowshed shell` accept `--session <name>` to bind to a named session in the workspace supervisor,
 whose cwd and environment overlay apply to each of its commands; with or without it, the command runs in a warm exec
 host of the workspace shell (11_shell.md). `cowshed exec` waits for its command however long it runs and exits with the

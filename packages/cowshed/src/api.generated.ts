@@ -1185,6 +1185,14 @@ export type GrantDelta = {
   readonly repos?: ReadonlyArray<RepoRule>;
   readonly sim?: ReadonlyArray<SimVerb>;
   /**
+   * macOS only: `grant` admits connects from every job of the workspace to any loopback TCP
+   * port (`GrantSet::loopback_any`), and `revoke` withdraws that. False changes nothing. Like
+   * a filesystem grant it advances the grant revision, and the next exec runs under the
+   * widened profile. Linux refuses it: each workspace's private loopback already reaches every
+   * port.
+   */
+  readonly loopbackAny?: boolean;
+  /**
    * macOS only: the minimum number of service ports the workspace's port block must hold,
    * excluding the gateway listener at its base. Growth is monotone: a count the block already
    * holds is a no-op on its own, and `revoke` refuses the field. The block grows into a
@@ -1227,6 +1235,13 @@ export type GrantSet = {
   readonly egress: ReadonlyArray<EgressRule>;
   readonly repos?: ReadonlyArray<RepoRule>;
   readonly sim: ReadonlyArray<SimVerb>;
+  /**
+   * macOS: every job of the workspace may connect to any loopback TCP port, not only to its
+   * own blocks: the control plane, every sibling's block and every port-0 listener included
+   * (04_sandbox.md). Granted and revoked explicitly, listed with the other grants, and absent
+   * from the record while it is not granted.
+   */
+  readonly loopbackAny?: boolean;
 };
 
 /**

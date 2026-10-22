@@ -865,6 +865,7 @@ fn grant_sets() -> BTreeMap<&'static str, Value> {
         ],
         repos: vec![RepoRule("smoothbricks/*".to_owned())],
         sim: vec![SimVerb::OpenUrl, SimVerb::Install],
+        loopback_any: true,
     };
 
     BTreeMap::from([

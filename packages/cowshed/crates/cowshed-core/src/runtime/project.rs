@@ -1876,6 +1876,7 @@ impl ProjectActor {
     async fn coordinator_grant(&mut self, params: GrantRequest, revoke: bool) -> Result<GrantSet> {
         self.require_repo(&params.repo_id)?;
         requested_port_block_size(&params.delta, revoke)?;
+        refuse_linux_loopback_any(&params.delta)?;
         self.host
             .grant(params.workspace, params.delta, revoke)
             .await
@@ -13670,6 +13671,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         self.validate_binding().await?;
         let mut current = self.current(&workspace).await?;
         let required_size = requested_port_block_size(&delta, revoke)?;
+        refuse_linux_loopback_any(&delta)?;
         delta.service_ports = None;
         let previous_block = current.metadata.grants.port_block.ok_or_else(|| {
             CowshedError::integrity("workspace has no port block", "cowshed doctor --json")
@@ -19115,6 +19117,18 @@ fn requested_port_block_size(delta: &GrantDelta, revoke: bool) -> Result<Option<
         })
 }
 
+/// A loopback-any grant widens the macOS connect allowlist past the port blocks. A Linux
+/// workspace's private loopback already reaches every port, so the field is refused there rather
+/// than recorded.
+fn refuse_linux_loopback_any(delta: &GrantDelta) -> Result<()> {
+    if delta.loopback_any && cfg!(target_os = "linux") {
+        return Err(CowshedError::usage(
+            "Linux workspaces already reach every port of their private loopback",
+            "connect to the port directly inside the workspace",
+        ));
+    }
+    Ok(())
+}
 #[cfg(target_os = "macos")]
 fn normalize_grant_delta(delta: &mut GrantDelta, revoke: bool) -> Result<()> {
     normalize_grant_paths(&mut delta.read)?;
@@ -19292,6 +19306,9 @@ fn apply_grant_delta(grants: &mut GrantSet, delta: GrantDelta, revoke: bool) {
     update_egress(&mut grants.egress, delta.egress, revoke);
     update_ordered_set(&mut grants.repos, delta.repos, revoke);
     update_ordered_set(&mut grants.sim, delta.sim, revoke);
+    if delta.loopback_any {
+        grants.loopback_any = !revoke;
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -19534,6 +19551,31 @@ mod grant_unit_tests {
         assert_eq!(
             grants.egress,
             [rule("registry.example.test", EgressMode::Intercept)]
+        );
+    }
+
+    /// Naming loopback-any grants it and, in a revocation, withdraws it; a delta that does not
+    /// name it leaves it as it was.
+    #[test]
+    fn loopback_any_is_granted_and_revoked_only_when_named() {
+        let mut grants = GrantSet::default();
+        let named = || GrantDelta {
+            loopback_any: true,
+            ..GrantDelta::default()
+        };
+        apply_grant_delta(&mut grants, named(), false);
+        assert!(grants.loopback_any);
+        apply_grant_delta(&mut grants, egress_delta("api.example.test"), true);
+        assert!(
+            grants.loopback_any,
+            "a revocation that does not name it keeps it"
+        );
+        apply_grant_delta(&mut grants, named(), true);
+        assert!(!grants.loopback_any);
+        apply_grant_delta(&mut grants, egress_delta("api.example.test"), false);
+        assert!(
+            !grants.loopback_any,
+            "a grant that does not name it adds nothing"
         );
     }
 

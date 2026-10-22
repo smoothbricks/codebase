@@ -232,6 +232,7 @@
           "ports": [22, 443]
         }
       ],
+      "loopbackAny": true,
       "portBlock": {
         "base": 40960,
         "size": 128

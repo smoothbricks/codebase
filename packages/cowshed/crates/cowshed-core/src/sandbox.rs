@@ -30,6 +30,8 @@ pub struct SandboxGrants {
     /// Workspace-relative paths no job may read or write.
     pub deny: Vec<PathBuf>,
     pub egress: Vec<EgressGrant>,
+    /// Outbound loopback TCP to every port, not only to the held blocks' literal ports.
+    pub loopback_any: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -418,6 +420,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
                     ports: rule.ports.clone(),
                 })
                 .collect(),
+            loopback_any: grants.loopback_any,
         },
         allowed_unix_sockets: Vec::new(),
         additional_denies,
@@ -900,16 +903,24 @@ pub fn seatbelt_profile(
             ),
         );
     }
-    // Every port of every block the workspace holds, current and retained, one literal each.
-    for block in held_port_blocks(config) {
-        for port in block.ports().map_err(|_| SandboxError::InvalidPortBlock {
-            base: block.base,
-            size: block.size,
-        })? {
-            push_line(
-                &mut profile,
-                &format!("(allow network-outbound (remote tcp \"localhost:{port}\"))"),
-            );
+    // Every port of every block the workspace holds, current and retained, one literal each; a
+    // loopback-any grant admits every loopback port instead (04_sandbox.md).
+    if config.grants.loopback_any {
+        push_line(
+            &mut profile,
+            "(allow network-outbound (remote tcp \"localhost:*\"))",
+        );
+    } else {
+        for block in held_port_blocks(config) {
+            for port in block.ports().map_err(|_| SandboxError::InvalidPortBlock {
+                base: block.base,
+                size: block.size,
+            })? {
+                push_line(
+                    &mut profile,
+                    &format!("(allow network-outbound (remote tcp \"localhost:{port}\"))"),
+                );
+            }
         }
     }
 
@@ -1581,6 +1592,7 @@ mod tests {
                     host: "example.com".into(),
                     ports: vec![443],
                 }],
+                loopback_any: false,
             },
             allowed_unix_sockets: vec![PathBuf::from("/var/run/nix/daemon-socket/socket")],
             cpu_pool_directory: None,
@@ -2581,6 +2593,36 @@ mod tests {
                 size: 16
             })
         );
+    }
+
+    /// A loopback-any grant admits outbound loopback TCP to every port with one wildcard rule in
+    /// place of the held blocks' literal ports, and leaves bind and inbound as they were.
+    #[test]
+    fn loopback_any_admits_every_loopback_port_in_place_of_the_block_literals() {
+        let mut config = config(RunSandboxMode::ReadWrite);
+        config.retained_port_blocks = vec![PortBlock::new(41_024, 16).unwrap()];
+        config.grants.loopback_any = true;
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
+        let outbound: Vec<&str> = profile
+            .lines()
+            .filter(|line| line.contains("(remote tcp "))
+            .collect();
+        assert_eq!(
+            outbound,
+            ["(allow network-outbound (remote tcp \"localhost:*\"))"]
+        );
+        assert!(
+            profile.contains("(allow network-bind network-inbound (local tcp \"localhost:*\"))")
+        );
+
+        config.grants.loopback_any = false;
+        let blocks = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
+        assert!(!blocks.contains("(remote tcp \"localhost:*\")"));
+        assert!(blocks.contains("(allow network-outbound (remote tcp \"localhost:41024\"))"));
     }
 
     /// The git-worktree hole, stated as what the profile actually says: narrowed to `.git`, and

@@ -829,7 +829,7 @@ A listener that asks for port 0 binds outside the block, where nothing in the wo
 and Bun therefore load cowshed's port-0 preload through `NODE_OPTIONS` and `BUN_OPTIONS`, appended after any options you
 pass: a port-0 `listen`, `Bun.serve` or `Bun.listen` gets a free port of the block instead, and so does a child they
 spawn with `--inspect=127.0.0.1:0`. Other runtimes, and an inspector a shell script starts on port 0, still need a block
-port.
+port, or a [`--loopback-any` grant](#sandbox-grants) for the workspace.
 
 Once a supervisor serves the workspace, `.cowshed/env` also exports `TMPDIR` as the workspace's own scratch directory in
 the project store: the same one every sandboxed job receives. A host shell that sources it runs with the temp directory
@@ -1047,7 +1047,7 @@ next: cowshed attach raven
 
 ## Sandbox grants
 
-### `cowshed grant <name> [--read <path...>] [--write <path...>] [--deny-write <relative-path...>] [--deny <relative-path...>] [--egress <host>] [--opaque] [--ports <N>]`
+### `cowshed grant <name> [--read <path...>] [--write <path...>] [--deny-write <relative-path...>] [--deny <relative-path...>] [--egress <host>] [--opaque] [--ports <N>] [--loopback-any]`
 
 Workspaces start **closed**: write access to their own volume, the shared caches of the tools their project uses (at
 each tool's own default in the host HOME), and temp; read access to the toolchains and system; egress to the localhost
@@ -1126,6 +1126,14 @@ next: cowshed exec raven -- <retry your command>
   next: cowshed exec raven -- <retry your command>
   ```
 
+- `--loopback-any` (macOS) lets every job of the workspace connect to any loopback port, not only its own port blocks:
+  the control plane's and every sibling workspace's ports included. It is the escape for a tool that listens on a port
+  it picks itself where cowshed's Node and Bun preload cannot move it (another runtime, or an inspector a shell script
+  starts on port 0). The grant prints a warning naming that reach, is listed as a `loopback` row, changes the grant
+  revision like a filesystem grant (the next exec runs under a profile that admits every loopback port), and is
+  withdrawn with `cowshed revoke <name> --loopback-any`. `--project-wide --loopback-any` is a usage error, and Linux
+  refuses it: each workspace's private network namespace already reaches every loopback port.
+
 - `cowshed grant <name>` with no flags prints the current grant set (TSV; `--json` for the envelope):
 
 ```
@@ -1133,12 +1141,14 @@ $ cowshed grant raven
 read	<project-root>/reference-corpus
 write	<project-root>/shared-assets
 egress	registry.internal.example	443,80	intercept
+loopback	any
 ```
 
 ### `cowshed revoke <name> …` / `cowshed revoke --project-wide …`
 
 ```sh
 cowshed revoke raven --egress api.example.com
+cowshed revoke raven --loopback-any
 cowshed revoke raven --all
 cowshed revoke --project-wide --egress api.example.com
 ```

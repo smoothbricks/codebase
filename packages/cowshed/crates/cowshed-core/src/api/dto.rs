@@ -3653,6 +3653,13 @@ pub struct GrantDelta {
     pub repos: Vec<RepoRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sim: Vec<SimVerb>,
+    /// macOS only: `grant` admits connects from every job of the workspace to any loopback TCP
+    /// port (`GrantSet::loopback_any`), and `revoke` withdraws that. False changes nothing. Like
+    /// a filesystem grant it advances the grant revision, and the next exec runs under the
+    /// widened profile. Linux refuses it: each workspace's private loopback already reaches every
+    /// port.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loopback_any: bool,
     /// macOS only: the minimum number of service ports the workspace's port block must hold,
     /// excluding the gateway listener at its base. Growth is monotone: a count the block already
     /// holds is a no-op on its own, and `revoke` refuses the field. The block grows into a

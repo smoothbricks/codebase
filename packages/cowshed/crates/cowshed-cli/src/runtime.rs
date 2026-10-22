@@ -1754,7 +1754,8 @@ where
                 || !args.deny_write.is_empty()
                 || !args.deny.is_empty()
                 || !args.egress.is_empty()
-                || args.service_ports.is_some();
+                || args.service_ports.is_some()
+                || args.loopback_any;
             let workspace = match args.target {
                 GrantTarget::Workspace(workspace) => workspace,
                 GrantTarget::Project => {
@@ -1784,6 +1785,7 @@ where
                             deny: args.deny,
                             egress,
                             service_ports: args.service_ports.map(NonZeroU16::get),
+                            loopback_any: args.loopback_any,
                             ..GrantDelta::default()
                         },
                     )
@@ -1835,6 +1837,13 @@ where
                             block.base(),
                             block.size(),
                             block.size() - 1
+                        ))
+                        .map_err(output_error)?;
+                }
+                if grants.loopback_any {
+                    output
+                        .warning(&format!(
+                            "every job of {workspace} may now connect to any loopback port, the control plane's and every sibling workspace's included; cowshed revoke {workspace} --loopback-any withdraws it"
                         ))
                         .map_err(output_error)?;
                 }
@@ -2752,6 +2761,7 @@ async fn revoke<S: CliService, W: Write, E: Write>(
                         egress: grants.egress,
                         repos: grants.repos,
                         sim: grants.sim,
+                        loopback_any: grants.loopback_any,
                         expected_revision: Some(grants.revision),
                         ..GrantDelta::default()
                     }
@@ -2906,6 +2916,9 @@ fn emit_grants<W: Write, E: Write>(output: &mut Output<W, E>, grants: &GrantSet)
         output
             .bare_line(format!("egress\t{}\t{ports}\t{mode}", rule.host).as_bytes())
             .map_err(output_error)?;
+    }
+    if grants.loopback_any {
+        output.bare_line(b"loopback\tany").map_err(output_error)?;
     }
     Ok(())
 }
@@ -6919,6 +6932,27 @@ mod tests {
         report_stale_gateway_views(&mut quiet, &[]).expect("no stale views");
         let (stdout, stderr) = quiet.into_inner();
         assert!(stdout.is_empty() && stderr.is_empty());
+    }
+
+    /// The bare `cowshed grant <ws>` listing is where an operator audits a workspace's reach, so a
+    /// loopback-any grant is a row of its own, after the paths and egress, and absent otherwise.
+    #[test]
+    fn the_grant_listing_names_a_loopback_any_grant() {
+        let listed = |loopback_any| {
+            let mut output = Output::new(Vec::new(), Vec::new(), false);
+            emit_grants(
+                &mut output,
+                &GrantSet {
+                    read: vec![PathBuf::from("/opt/shared")],
+                    loopback_any,
+                    ..GrantSet::default()
+                },
+            )
+            .expect("listing");
+            String::from_utf8(output.into_inner().0).expect("utf-8 listing")
+        };
+        assert_eq!(listed(true), "read\t/opt/shared\nloopback\tany\n");
+        assert_eq!(listed(false), "read\t/opt/shared\n");
     }
 
     /// `--json`, `--landing` and `--landed` have one precedence, and the project-scoped and

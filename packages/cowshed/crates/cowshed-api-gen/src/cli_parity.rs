@@ -202,6 +202,7 @@ pub const PARITY: &[Row] = &[
     row("grant", "egress", field(&[("coordinator.grant", "delta.egress.host"), ("coordinator.grantProject", "delta.egress.host")], &[argument("Coordinator.grant", 1, "egress"), argument("Coordinator.grantProject", 0, "egress")])),
     row("grant", "opaque", field(&[("coordinator.grant", "delta.egress.mode"), ("coordinator.grantProject", "delta.egress.mode")], &[argument("Coordinator.grant", 1, "egress"), argument("Coordinator.grantProject", 0, "egress")])),
     row("grant", "ports", field(&[("coordinator.grant", "delta.servicePorts")], &[argument("Coordinator.grant", 1, "servicePorts")])),
+    row("grant", "loopback-any", field(&[("coordinator.grant", "delta.loopbackAny")], &[argument("Coordinator.grant", 1, "loopbackAny")])),
 
     row("revoke", "", field(&[("coordinator.revoke", ""), ("coordinator.revokeProject", "")], &[member("Coordinator.revoke"), member("Coordinator.revokeProject")])),
     row("revoke", "workspace", field(&[("coordinator.revoke", "workspace")], &[argument("Coordinator.revoke", 0, "")])),
@@ -211,6 +212,7 @@ pub const PARITY: &[Row] = &[
     row("revoke", "deny-write", field(&[("coordinator.revoke", "delta.denyWrite"), ("coordinator.revokeProject", "delta.denyWrite")], &[argument("Coordinator.revoke", 1, "denyWrite"), argument("Coordinator.revokeProject", 0, "denyWrite")])),
     row("revoke", "deny", field(&[("coordinator.revoke", "delta.deny"), ("coordinator.revokeProject", "delta.deny")], &[argument("Coordinator.revoke", 1, "deny"), argument("Coordinator.revokeProject", 0, "deny")])),
     row("revoke", "egress", field(&[("coordinator.revoke", "delta.egress.host"), ("coordinator.revokeProject", "delta.egress.host")], &[argument("Coordinator.revoke", 1, "egress"), argument("Coordinator.revokeProject", 0, "egress")])),
+    row("revoke", "loopback-any", field(&[("coordinator.revoke", "delta.loopbackAny")], &[argument("Coordinator.revoke", 1, "loopbackAny")])),
     row("revoke", "all", Counterpart::Composed { recipe: "read the grants and revoke every granted item at their revision (expectedRevision), as the CLI does", facade: &[member("WorkspaceRef.grants"), argument("Coordinator.revoke", 1, "expectedRevision"), member("Coordinator.projectGrants"), argument("Coordinator.revokeProject", 0, "expectedRevision")] }),
 
     row("rm", "", field(&[("coordinator.destroy", ""), ("coordinator.removeProject", "")], &[member("Coordinator.remove"), member("Coordinator.removeProject")])),

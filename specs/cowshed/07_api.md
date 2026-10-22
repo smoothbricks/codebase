@@ -483,6 +483,7 @@ pub struct GrantSet {
     pub egress: Vec<EgressRule>,         // { host, ports, mode }
     pub repos: Vec<RepoRule>,            // repo-scoped mirror grants (05_gateway.md)
     pub sim: Vec<SimVerb>,               // personal-session simulator broker verbs (04/05/14_nix.md)
+    pub loopback_any: bool,              // macOS: jobs may connect to any loopback port; omitted from JSON while false
 }
 pub enum SimVerb { OpenUrl, Install }    // closed enum; unknown verbs are usage errors
 pub struct PortBlock { base: u16, size: u16 } // private; `new` and custom JSON decode enforce a power-of-two size ≥ 2, a base aligned to it, and a checked end; new blocks are 64
@@ -494,6 +495,7 @@ pub enum EgressMode { Intercept, Opaque }
 pub struct GrantDelta {
     pub read: Vec<PathBuf>, pub write: Vec<PathBuf>, pub deny_write: Vec<PathBuf>, pub deny: Vec<PathBuf>,
     pub egress: Vec<EgressRule>, pub repos: Vec<RepoRule>, pub sim: Vec<SimVerb>,
+    pub loopback_any: bool,              // macOS: grant sets / revoke clears GrantSet::loopback_any; false = no change
     pub service_ports: Option<u16>,      // macOS: minimum service ports in the block, gateway excluded; grows only
     pub expected_revision: Option<u64>,  // CAS: reject with Conflict if the on-disk revision differs
 }
@@ -522,6 +524,12 @@ and the advertised base/size follow the current `port_block`. Growth into a bloc
 nothing, and a later block that contains a retained block drops that entry without releasing a port; retained blocks are
 otherwise released only at retirement. The next exec launches a supervisor, and so a `SandboxSpec`, from the new
 snapshot. A block with no free aligned place in the host's reserved range is refused.
+
+`GrantDelta::loopback_any` is the workspace's explicit loopback escape (04_sandbox.md, "`--loopback-any` is the
+explicit, separately audited escape"): `grant` with it true records `GrantSet::loopback_any`, `revoke` with it true
+clears it, and false changes nothing. It changes the Seatbelt profile, so it advances the grant revision like a
+filesystem grant. `ProjectGrantDelta` has no such field, and Linux refuses it. The CLI's `grant --loopback-any` and
+`revoke --loopback-any` are its wire counterparts, held to the parity table like every other grant flag.
 
 This is the controller integration point: a trusted orchestrator holds a `Coordinator`, hands each worker a
 `WorkspaceHandle`, calls `Coordinator::grant` as policy allows, and either lets cowshed spawn (`exec`) or takes a
@@ -1565,10 +1573,11 @@ supervisor that ran the job retires.
   `cowshed.fork(workspace, { source, ... })`.
 - `GrantSet`, `GrantDelta`, `PortBlock`, `EgressRule`, `RepoRule`, and `SimVerb` reuse the metadata definitions.
   `GrantSet.portBlock` is present on macOS and omitted on Linux; `GrantSet.retainedPortBlocks` is present only after a
-  macOS relocation; `GrantDelta.servicePorts` and `GrantDelta.expectedRevision` are optional. `PortBlock` fields are
-  private; `new`, `base()`, and `size()` are the public surface, and custom deserialization invokes the same validation
-  so size zero, a size that is not a power of two, a base not aligned to its size, overflow, unknown fields, and
-  struct-literal forgery fail.
+  macOS relocation; `GrantSet.loopbackAny` is present only while granted; `GrantDelta.servicePorts`,
+  `GrantDelta.loopbackAny` and `GrantDelta.expectedRevision` are optional. `PortBlock` fields are private; `new`,
+  `base()`, and `size()` are the public surface, and custom deserialization invokes the same validation so size zero, a
+  size that is not a power of two, a base not aligned to its size, overflow, unknown fields, and struct-literal forgery
+  fail.
 - `HoldEvent` (`cowshed hold --state-fd`, one per line) is
   `{kind:"started",pid,birth:HeldBirth,output:{stdout:HeldDescriptor,stderr:HeldDescriptor}}`,
   `{kind:"exited",status:ExitStatus}`, `{kind:"signalled",signal:HoldSignal}`,

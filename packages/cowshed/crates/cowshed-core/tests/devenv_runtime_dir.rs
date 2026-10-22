@@ -1768,7 +1768,8 @@ process.stdout.write(`${process.argv[3]}watch-ready\n`);
 
 /// A workspace sandbox built by the production builder, [`workspace_sandbox`], for a mount the
 /// fixture prepares the way `cowshed fork` leaves one: private bin and token in place. `deny` is
-/// the workspace's granted read+write deny, `repository_deny` main's `[sandbox] deny`.
+/// the workspace's granted read+write deny, `repository_deny` main's `[sandbox] deny`, and
+/// `loopback_any` the workspace's loopback-any grant.
 #[expect(
     clippy::too_many_arguments,
     reason = "one fixture input per builder input"
@@ -1782,6 +1783,7 @@ fn production_workspace(
     port_base: u16,
     deny: Vec<PathBuf>,
     repository_deny: &[PathBuf],
+    loopback_any: bool,
 ) -> SandboxConfig {
     std::fs::create_dir_all(mount.join(".cowshed/bin")).expect("private bin");
     std::fs::write(
@@ -1797,11 +1799,16 @@ fn production_workspace(
         project_root: &root.join("project"),
         main_mount: main,
         telemetry_root: &root.join("telemetry"),
-        grants: &GrantSet {
-            port_block: Some(PortBlock::new(port_base, 16).expect("port block")),
-            deny,
-            ..GrantSet::default()
-        },
+        grants: &cowshed_core::project_policy::effective_grants(
+            &GrantSet {
+                port_block: Some(PortBlock::new(port_base, 16).expect("port block")),
+                deny,
+                loopback_any,
+                ..GrantSet::default()
+            },
+            &cowshed_core::project_policy::ProjectGrants::default(),
+        )
+        .expect("effective grants"),
         repository_deny,
         repository_caches: &[],
         program_directories: &cowshed_core::capabilities::host_program_directories(home),
@@ -1816,6 +1823,68 @@ fn production_workspace(
         .expect("a valid workspace incarnation"),
     })
     .expect("production workspace sandbox")
+}
+
+/// A loopback-any grant reaches the kernel through the production path: the workspace's grant
+/// set, the workspace sandbox builder, the rendered policy and the real spawn of a job. While it
+/// is granted, a job connects to a loopback listener outside every block; once it is withdrawn,
+/// the next job's same connect is refused (04_sandbox.md, the loopback-any escape).
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_loopback_any_grant_reaches_any_loopback_port_until_withdrawn() {
+    let root = scratch("loopback-any");
+    let home = root.join("home");
+    let mount_root = root.join("mounts");
+    let main = root.join("main");
+    std::fs::create_dir_all(&main).expect("main checkout");
+    std::fs::create_dir_all(&home).expect("host HOME");
+    let outside =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("listener outside every block");
+    let port = outside.local_addr().expect("listener address").port();
+    let mut outcomes = Vec::new();
+    for loopback_any in [true, false] {
+        let sandbox = production_workspace(
+            &root,
+            &home,
+            &mount_root,
+            &main,
+            mount_root.join("acme/widget/raven"),
+            42_592,
+            Vec::new(),
+            &[],
+            loopback_any,
+        );
+        let (exit, _, stderr) = run_in_sandbox(
+            &sandbox,
+            &sandbox.workspace_mount,
+            ["/usr/bin/nc", "-z", "-v", "127.0.0.1", &port.to_string()]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+        )
+        .await;
+        outcomes.push((
+            loopback_any,
+            exit,
+            String::from_utf8_lossy(&stderr).into_owned(),
+        ));
+    }
+    assert_eq!(
+        outcomes[0].1,
+        ExitStatus::Exited { code: 0 },
+        "{outcomes:?}"
+    );
+    assert_ne!(
+        outcomes[1].1,
+        ExitStatus::Exited { code: 0 },
+        "{outcomes:?}"
+    );
+    assert!(
+        outcomes[1].2.contains("Operation not permitted"),
+        "{outcomes:?}"
+    );
+    drop(outside);
+    std::fs::remove_dir_all(&root).expect("remove scratch");
 }
 
 /// What `cat` of each path printed, or why it was refused.
@@ -1873,6 +1942,7 @@ async fn host_controller_a_workspace_reads_neither_main_nor_home_outside_its_all
         42_496,
         Vec::new(),
         &[],
+        false,
     );
     let sandbox = production_workspace(
         &root,
@@ -1883,6 +1953,7 @@ async fn host_controller_a_workspace_reads_neither_main_nor_home_outside_its_all
         42_512,
         Vec::new(),
         &[],
+        false,
     );
     let own = raven.join("own.txt");
     std::fs::write(&own, "own-sentinel").expect("own fixture");
@@ -1953,6 +2024,7 @@ async fn host_controller_a_real_build_runs_under_the_home_read_deny() {
         42_528,
         Vec::new(),
         &[],
+        false,
     );
     install_real_tool(&sandbox, "direnv");
     let mount = &sandbox.workspace_mount;
@@ -2062,6 +2134,7 @@ async fn host_controller_a_workspace_relative_deny_hides_reads_and_writes() {
         42_544,
         vec![PathBuf::from(".runtime")],
         &[PathBuf::from("secrets/vault")],
+        false,
     );
     let granted = raven.join(".runtime/token");
     let declared = raven.join("secrets/vault/key");
@@ -2161,6 +2234,7 @@ async fn host_controller_a_bun_project_runs_bun_before_its_envrc_evaluates() {
         42_560,
         Vec::new(),
         &[],
+        false,
     );
 
     let (exit, stdout, stderr) = run_in_sandbox(

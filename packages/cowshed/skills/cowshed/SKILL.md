@@ -52,6 +52,7 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 | Grant network reach     | `cowshed grant <ws> --egress <host>`                                 | Admit one host through the gateway; separately audited.                                                                                                                                                                                    |
 | Grant a pinned client   | `cowshed grant <ws> --egress <host> --opaque`                        | Tunnel without interception for a client that verifies the real certificate (Go on macOS).                                                                                                                                                 |
 | Grant service ports     | `cowshed grant <ws> --ports <N>`                                     | macOS: grow the port block to at least N service ports before launching services.                                                                                                                                                          |
+| Grant any loopback port | `cowshed grant <ws> --loopback-any`                                  | macOS: let every job connect to any loopback port, siblings' and the control plane's included; for a tool whose port-0 listener the preload cannot move. Listed and warned; `revoke --loopback-any` withdraws it.                          |
 | List this project       | `cowshed ls`                                                         | Show its workspaces.                                                                                                                                                                                                                       |
 | List every project      | `cowshed ls --all`                                                   | Show workspaces store-wide.                                                                                                                                                                                                                |
 | Inspect host            | `cowshed doctor`                                                     | Check host and workspace invariants without mutation.                                                                                                                                                                                      |
@@ -122,8 +123,8 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 - macOS loopback inside exec: only the shed's own port block (`$COWSHED_PORT_BASE`, 64 ports) is connectable; 127.0.0.1
   outside it is EPERM. Bind services at `$COWSHED_PORT_BASE + 1…`, and `grant --ports <N>` before starting them. Node
   and Bun port-0 listeners, and a child they start with `--inspect=…:0`, land in the block on their own through
-  cowshed's preload in `NODE_OPTIONS`/`BUN_OPTIONS`; other runtimes still need a block port. Linux sheds get private
-  loopback with all ports.
+  cowshed's preload in `NODE_OPTIONS`/`BUN_OPTIONS`; other runtimes still need a block port, or `grant --loopback-any`.
+  Linux sheds get private loopback with all ports.
 
 ## Keep builds shareable
 

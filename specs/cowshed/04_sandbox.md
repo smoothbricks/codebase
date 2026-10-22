@@ -102,6 +102,8 @@ writes — but cannot add a permission absent from the enclosing execution profi
 ;; The same single-port rules cover every block in `retainedPortBlocks`: blocks this
 ;; workspace moved away from and still owns, so a process started under an old block
 ;; stays reachable. They carry no gateway listener and are not advertised in the env.
+;; A loopback-any grant (below) replaces every one of these per-port rules with
+;; (allow network-outbound (remote tcp "localhost:*")).
 ;; Everything else on loopback — 7644 (control plane), every sibling's block and
 ;; ephemeral listeners — falls through to (deny default) for CONNECT: a sibling
 ;; may bind anything, but this workspace cannot reach it (measured: EPERM).
@@ -425,10 +427,22 @@ Notes:
   through the runner's sync server (`listen(0, '127.0.0.1')`) and its `bun test --inspect=127.0.0.1:0` child. The
   preload covers Node and Bun processes and the inspector argument of a child they spawn, nothing else. A port-0
   listener of another runtime, or an inspector a shell script starts on port 0, stays unreachable: that tool is patched
-  at the consumer to follow the rule. A connect to such a listener fails in-band with EPERM (`connect`; Bun reports
-  `FailedToOpenSocket` for `127.0.0.1` and `ConnectionRefused` for `localhost`). Cowshed adds no message of its own. The
-  unified-log correlation that could name the denied port (denial evidence, below) is unavailable to a non-admin
-  controller.
+  at the consumer to follow the rule, or the workspace is granted `--loopback-any` (below). A connect to such a listener
+  fails in-band with EPERM (`connect`; Bun reports `FailedToOpenSocket` for `127.0.0.1` and `ConnectionRefused` for
+  `localhost`). Cowshed adds no message of its own. The unified-log correlation that could name the denied port (denial
+  evidence, below) is unavailable to a non-admin controller.
+
+- **`--loopback-any` is the explicit, separately audited escape (macOS).** `cowshed grant <ws> --loopback-any` records
+  `loopbackAny: true` in the workspace's own grant set (`GrantDelta.loopbackAny`, 07_api.md), and its profile then
+  carries one `(allow network-outbound (remote tcp "localhost:*"))` in place of every per-port rule. Every job of that
+  workspace may connect to any loopback port: its own blocks, every sibling's block and ephemeral listeners, and the
+  control plane at 7644. That gives up the cross-workspace connect boundary above for that one workspace, so it is never
+  implied: no project-wide form exists (`--project-wide --loopback-any` is a usage error), no capability or preload sets
+  it, the grant prints a warning naming that reach, and the grant listing shows it as its own `loopback` row
+  (`loopbackAny` in `--json`). Like a filesystem grant it advances the grant revision, so the next exec runs under the
+  widened profile (11_shell.md, "Grant-change propagation"); `cowshed revoke <ws> --loopback-any` withdraws it the same
+  way, and `revoke --all` includes it. Bind and inbound rules are unchanged. Linux refuses the grant: each workspace's
+  private loopback already reaches every port.
 
 - `RunSandboxMode::ReadOnly` drops the workspace mount from the write set — for inspector-style commands that must
   observe without mutating.

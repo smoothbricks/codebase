@@ -498,6 +498,9 @@ pub struct GrantArgs {
     /// `--ports N`: the minimum number of service ports this workspace's port block must hold,
     /// excluding the gateway listener. Zero is not a request, so it is unrepresentable here.
     pub service_ports: Option<NonZeroU16>,
+    /// `--loopback-any`: every job of the workspace may connect to any loopback port, not only to
+    /// its own port blocks. A separate decision from the others, and listed apart from them.
+    pub loopback_any: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -939,7 +942,8 @@ pub fn cli_command() -> ClapCommand {
                 ])
                 .arg(append_value("egress"))
                 .arg(flag("opaque"))
-                .arg(value("ports")),
+                .arg(value("ports"))
+                .arg(flag("loopback-any")),
         )
         .subcommand(
             leaf("revoke")
@@ -952,6 +956,7 @@ pub fn cli_command() -> ClapCommand {
                     path_values("deny"),
                 ])
                 .arg(append_value("egress"))
+                .arg(flag("loopback-any"))
                 .arg(flag("all")),
         )
         .subcommand(leaf("rm").arg(positional("workspace", 0..=1)).args([
@@ -3028,6 +3033,7 @@ const GRANT: CommandSpec = CommandSpec {
         "`--deny` hides workspace-relative paths from every job: reads and writes beneath them fail with EPERM. The same denies can be declared durably in main's `.cowshed.toml` as `[sandbox] deny = [\"<relative-path>\", …]`; cowshed reads that section only from main's checkout, never from a workspace's copy, and adds it to every workspace's grants from its next supervisor launch.",
         "An egress host is intercepted by default: the gateway terminates its TLS under the workspace CA, audits each request, and can attach a credential the host holds. `--opaque` grants the hosts named in the same invocation as opaque tunnels instead, for a client that verifies the real certificate — a pinned client, or Go on macOS, whose platform verifier never trusts the workspace CA. A host holds one rule, so granting it again restates its mode.",
         "On macOS a workspace's port block starts at 64 ports: the gateway listener at `$COWSHED_PORT_BASE` and 63 service ports above it, and a sandboxed process can connect only to its own blocks. `--ports <N>` grows the block to hold at least N service ports, not counting the gateway port — `cowshed grant raven --ports 80` yields a 128-port block. A block never shrinks, and a count it already holds changes nothing. The block grows into a larger block that contains it when one is free, and otherwise moves to a free larger block; a block it moved from stays reserved to the workspace, and connectable by its jobs, until the workspace is removed. Growth needs an idle workspace: while any of its jobs is running the grant is refused at once rather than queued, so grant ports before launching services. The next exec gets the new `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE` and the matching sandbox profile. The ports come from the host's finite reserved range, so a block that cannot be placed is refused. Linux has no port block — each workspace's private loopback already holds every port — and refuses `--ports`.",
+        "On macOS a job connects only to its workspace's own port blocks, and Node and Bun move their port-0 listeners there. A tool that listens on a port it picked anywhere else can be reached only after `--loopback-any`, which lets every job of that one workspace connect to any loopback port: the control plane's and every sibling workspace's included. It is listed as `loopback any`, changes the grant revision like a filesystem grant, and is withdrawn with `cowshed revoke <ws> --loopback-any`. Linux refuses it, because each workspace's private loopback already reaches every port.",
     ],
     options: &[
         Opt {
@@ -3062,6 +3068,10 @@ const GRANT: CommandSpec = CommandSpec {
             spelling: "--ports <N>",
             meaning: "macOS, one workspace only: grow the port block to hold at least N service ports, a positive integer that excludes the gateway port; never shrinks it",
         },
+        Opt {
+            spelling: "--loopback-any",
+            meaning: "macOS, one workspace only: let its jobs connect to any loopback port, the control plane's and every sibling's included",
+        },
     ],
 };
 
@@ -3083,6 +3093,12 @@ fn parse_grant(matches: &ArgMatches) -> Result<Command, UsageError> {
         if os(matches, "ports").is_some() {
             return Err(UsageError::new(
                 "a project-wide grant carries reads and egress; --ports sizes one workspace's port block",
+                USAGE,
+            ));
+        }
+        if flagged(matches, "loopback-any") {
+            return Err(UsageError::new(
+                "a project-wide grant carries reads and egress; --loopback-any widens one workspace's loopback reach",
                 USAGE,
             ));
         }
@@ -3140,6 +3156,7 @@ fn parse_grant(matches: &ArgMatches) -> Result<Command, UsageError> {
         egress,
         egress_mode,
         service_ports: parse_service_ports(matches, USAGE)?,
+        loopback_any: flagged(matches, "loopback-any"),
     }))
 }
 
@@ -3210,6 +3227,10 @@ const REVOKE: CommandSpec = CommandSpec {
             meaning: "remove a host or exact invalid recorded key; repeat for more",
         },
         Opt {
+            spelling: "--loopback-any",
+            meaning: "withdraw the workspace's reach to every loopback port; its jobs connect to its own port blocks again",
+        },
+        Opt {
             spelling: "--all",
             meaning: "remove all own grant vectors under the observed revision's CAS; no selectors",
         },
@@ -3219,9 +3240,12 @@ const REVOKE: CommandSpec = CommandSpec {
 fn parse_revoke(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &REVOKE;
     let target = if flagged(matches, "project-wide") {
-        if os(matches, "workspace").is_some() || matches.get_many::<PathBuf>("write").is_some() {
+        if os(matches, "workspace").is_some()
+            || matches.get_many::<PathBuf>("write").is_some()
+            || flagged(matches, "loopback-any")
+        {
             return Err(UsageError::new(
-                "project-wide revoke takes no workspace or write allow",
+                "project-wide revoke takes no workspace, write allow or --loopback-any",
                 USAGE,
             ));
         }
@@ -3254,13 +3278,15 @@ fn parse_revoke(matches: &ArgMatches) -> Result<Command, UsageError> {
                 mode: EgressMode::Intercept,
             })
             .collect(),
+        loopback_any: flagged(matches, "loopback-any"),
         ..GrantDelta::default()
     };
     let has_items = !delta.read.is_empty()
         || !delta.write.is_empty()
         || !delta.deny_write.is_empty()
         || !delta.deny.is_empty()
-        || !delta.egress.is_empty();
+        || !delta.egress.is_empty()
+        || delta.loopback_any;
     let selection = match (flagged(matches, "all"), has_items) {
         (true, false) => RevokeSelection::All,
         (false, true) => RevokeSelection::Items(delta),
@@ -4518,6 +4544,54 @@ mod tests {
 
         let missing = parse_args(["grant", "--ports", "80"]).expect_err("no workspace");
         assert!(missing.message.contains("grant requires a workspace"));
+    }
+
+    /// `--loopback-any` is one workspace's grant and revocation alike, never project policy, and
+    /// it is the whole of a revocation that names nothing else.
+    #[test]
+    fn loopback_any_is_granted_and_revoked_for_one_workspace() {
+        let Command::Grant(grant) = parse_args(["grant", "raven", "--loopback-any"])
+            .expect("loopback grant parses")
+            .command
+        else {
+            panic!("expected grant")
+        };
+        assert_eq!(grant.target, GrantTarget::Workspace("raven".to_owned()));
+        assert!(grant.loopback_any);
+        let Command::Grant(listed) = parse_args(["grant", "raven"])
+            .expect("listing parses")
+            .command
+        else {
+            panic!("expected grant")
+        };
+        assert!(!listed.loopback_any);
+
+        let Command::Revoke(revoke) = parse_args(["revoke", "raven", "--loopback-any"])
+            .expect("loopback revocation parses")
+            .command
+        else {
+            panic!("expected revoke")
+        };
+        assert_eq!(
+            revoke.selection,
+            RevokeSelection::Items(GrantDelta {
+                loopback_any: true,
+                ..GrantDelta::default()
+            })
+        );
+
+        for argv in [
+            ["grant", "--project-wide", "--loopback-any"],
+            ["revoke", "--project-wide", "--loopback-any"],
+        ] {
+            let error = parse_args(argv).expect_err("project-wide loopback refused");
+            assert_eq!(error.kind, UsageErrorKind::InvalidArguments, "{argv:?}");
+            assert!(
+                error.message.contains("--loopback-any"),
+                "{}",
+                error.message
+            );
+        }
     }
 
     /// The pre-parse walk answers about output shape exactly as the parser would, and it does not

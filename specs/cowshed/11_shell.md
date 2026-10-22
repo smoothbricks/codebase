@@ -837,12 +837,12 @@ and controller commitments; no client recaptures output or derives authority fro
 
 ## Grant-change propagation
 
-When a coordinator applies an effective filesystem `grant`/`revoke` (04_sandbox.md, 07_api.md), the revision a command
-needs moves past the one its workspace's supervisor serves. The supervisor runs no workspace code, so it needs no
-process per revision: each exec host and one-shot command starts under the profile compiled for the revision the
-supervisor serves at that moment. So the next command's ensure finds the supervisor serving the older revision of the
-same incarnation and tells it to advance; it re-reads the workspace's and the project's grants, compiles the profile for
-them, and from then on:
+When a coordinator applies an effective filesystem or `--loopback-any` `grant`/`revoke` (04_sandbox.md, 07_api.md), the
+revision a command needs moves past the one its workspace's supervisor serves. The supervisor runs no workspace code, so
+it needs no process per revision: each exec host and one-shot command starts under the profile compiled for the revision
+the supervisor serves at that moment. So the next command's ensure finds the supervisor serving the older revision of
+the same incarnation and tells it to advance; it re-reads the workspace's and the project's grants, compiles the profile
+for them, and from then on:
 
 1. starts every new exec host and command under that profile; exec hosts, keyed by grant revision, are never reused
    across revisions;

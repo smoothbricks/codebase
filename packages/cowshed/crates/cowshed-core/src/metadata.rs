@@ -939,6 +939,12 @@ pub struct GrantSet {
     pub repos: Vec<RepoRule>,
     #[serde(default)]
     pub sim: Vec<SimVerb>,
+    /// macOS: every job of the workspace may connect to any loopback TCP port, not only to its
+    /// own blocks: the control plane, every sibling's block and every port-0 listener included
+    /// (04_sandbox.md). Granted and revoked explicitly, listed with the other grants, and absent
+    /// from the record while it is not granted.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub loopback_any: bool,
 }
 
 impl GrantSet {

@@ -697,6 +697,7 @@ mod tests {
                 deny_write: Vec::new(),
                 deny: Vec::new(),
                 egress: Vec::new(),
+                loopback_any: false,
             },
             allowed_unix_sockets: Vec::new(),
             additional_denies: Vec::new(),
