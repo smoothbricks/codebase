@@ -148,11 +148,14 @@ async function secondDaemonDefers(
       await exited;
     }
     stopWatching.abort();
-    await tookRecord.catch((error: unknown) => {
-      if (error !== stopWatching.signal.reason) throw error;
-    });
-    // Stopped under the environment that started it, before the caller removes the socket directory it bound.
-    await stopFixtureNxDaemon(workspace, servingEnv);
+    try {
+      // Stopped under the environment that started it, before the caller removes the socket directory it bound.
+      await stopFixtureNxDaemon(workspace, servingEnv);
+    } finally {
+      await tookRecord.catch((error: unknown) => {
+        if (error !== stopWatching.signal.reason) throw error;
+      });
+    }
   }
 }
 

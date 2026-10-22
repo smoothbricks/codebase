@@ -43,8 +43,8 @@ export class WakerArmError extends Error {
  *
  * The wait ends on a kernel event, never on a timer; one that never comes is the leg's no-progress bound to report. It
  * fails with `WakerArmError` when the watch cannot be armed, with the waker's stderr when the waker ends first, with
- * what `find` throws, and with `signal`'s reason once it aborts. The waker is killed and its close awaited before this
- * settles, so none outlives the wait.
+ * what `find` throws, and with `signal`'s reason once it aborts. The waker is killed and its close awaited, and a
+ * judgment in flight is joined, before this settles, so neither outlives the wait.
  */
 export async function whenFound<T>(
   path: string,
@@ -64,14 +64,10 @@ export async function whenFound<T>(
     settled = true;
     outcome.reject(error);
   };
-  let judging = false;
+  // The judgment in flight, if any: the wait joins it before it settles, so no `find` still reads its fixture after.
+  let judging: Promise<void> | null = null;
   let again = false;
   const judge = async (): Promise<void> => {
-    if (judging) {
-      again = true;
-      return;
-    }
-    judging = true;
     try {
       do {
         again = false;
@@ -81,7 +77,7 @@ export async function whenFound<T>(
     } catch (error) {
       reject(error);
     } finally {
-      judging = false;
+      judging = null;
     }
   };
   const aborted = () => reject(signal?.reason);
@@ -91,7 +87,9 @@ export async function whenFound<T>(
     stderr += text;
   });
   waker.stdout.on('data', () => {
-    if (!settled) void judge();
+    if (settled) return;
+    if (judging === null) judging = judge();
+    else again = true;
   });
   waker.once('error', (error) => {
     closed.resolve();
@@ -113,6 +111,7 @@ export async function whenFound<T>(
     signal?.removeEventListener('abort', aborted);
     waker.kill();
     await closed.promise;
+    await judging;
   }
 }
 

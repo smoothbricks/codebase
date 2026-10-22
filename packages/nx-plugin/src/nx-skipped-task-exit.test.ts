@@ -137,17 +137,21 @@ process.exit(1);
       const describe = () => `pid ${child.pid}, exit ${child.exitCode}, signal ${child.signalCode}\n${output}`;
       const retire = async () => {
         stopReady.abort();
-        await ready?.catch((error: unknown) => {
-          if (error !== stopReady.signal.reason) throw error;
-        });
-        if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
-          try {
-            process.kill(process.platform === 'win32' ? child.pid : -child.pid, 'SIGKILL');
-          } catch (error) {
-            if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) throw error;
+        try {
+          if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
+            try {
+              process.kill(process.platform === 'win32' ? child.pid : -child.pid, 'SIGKILL');
+            } catch (error) {
+              if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) throw error;
+            }
           }
+          await ended.promise;
+        } finally {
+          // Nx and its tasks are reaped first; a failure of the readiness wait is still reported after.
+          await ready?.catch((error: unknown) => {
+            if (error !== stopReady.signal.reason) throw error;
+          });
         }
-        await ended.promise;
       };
       onTestFinished(retire);
       try {

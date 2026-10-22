@@ -398,8 +398,9 @@ async function startDaemon(workspace: string, env: Record<string, string>): Prom
 }
 
 /**
- * Runs `action`, then resolves with the record that names a process other than `previous`. The record directory is
- * watched before `action` runs, so a record written at any point is seen.
+ * Runs `action`, then resolves with the record that names a process other than `previous`. The record is judged whole
+ * once its directory is watched and after every change there, so a record written at any point, before or while
+ * `action` runs, is seen.
  */
 function replacementAfter({ workspace, previous, action, what }: Replacement): Promise<DaemonRecord> {
   return watchUntil(
