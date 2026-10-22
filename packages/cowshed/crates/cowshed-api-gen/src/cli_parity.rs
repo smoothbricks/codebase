@@ -50,10 +50,25 @@ pub enum Counterpart {
         recipe: &'static str,
         facade: &'static [Facade],
     },
+    /// The verb's holder is the process that runs it, so no connection carries it: a typed
+    /// launcher of the facade spawns it through the package launcher (07_api.md, "Launchers").
+    Launcher { side: Side },
     /// Pure terminal presentation, or a human step a library caller cannot provide.
     CliOnly { reason: &'static str },
-    /// No typed counterpart exists yet; `owner` is the unit that adds it and deletes this row.
-    KnownGap { owner: &'static str },
+}
+
+/// Which side of a launcher carries a word.
+#[derive(Clone, Copy, Debug)]
+pub enum Side {
+    /// The launcher itself, or a property of its options (`argument` 0).
+    Input(Facade),
+    /// A caller-opened descriptor the verb names: a member of the launcher's resolved run, of a
+    /// type the facade assertion checks it extends. A descriptor number is never an input.
+    Result {
+        launcher: &'static str,
+        member: &'static str,
+        extends: &'static str,
+    },
 }
 
 /// One public TypeScript member: `Interface.method` of `src/types.ts`, or an export of
@@ -73,9 +88,25 @@ pub struct Row {
     pub counterpart: Counterpart,
 }
 
-/// The process-holder verbs have no typed counterpart until their launchers land (tg#9537).
-const HOST_TABLE: &str =
-    "the process-holder launchers (tg#9537): land-turn, lock, hold and subtree-root";
+const fn input(facade: Facade) -> Counterpart {
+    Counterpart::Launcher {
+        side: Side::Input(facade),
+    }
+}
+
+const fn descriptor(
+    launcher: &'static str,
+    member: &'static str,
+    extends: &'static str,
+) -> Counterpart {
+    Counterpart::Launcher {
+        side: Side::Result {
+            launcher,
+            member,
+            extends,
+        },
+    }
+}
 
 const fn member(member: &'static str) -> Facade {
     Facade {
@@ -106,14 +137,6 @@ const fn row(command: &'static str, argument: &'static str, counterpart: Counter
         argument,
         counterpart,
     }
-}
-
-const fn gap(command: &'static str, argument: &'static str) -> Row {
-    row(
-        command,
-        argument,
-        Counterpart::KnownGap { owner: HOST_TABLE },
-    )
 }
 
 const SETUP_DIALOG: &str = "setup's administrator authorization dialog is a human step a library \
@@ -307,31 +330,31 @@ pub const PARITY: &[Row] = &[
     row("disk-command", "deadline-ms", field(&[("host.diskCommand", "deadlineMs")], &[argument("Host.diskCommand", 0, "deadlineMs")])),
     row("disk-command", "argv", field(&[("host.diskCommand", "argv")], &[argument("Host.diskCommand", 0, "argv")])),
 
-    gap("land-turn", ""),
-    gap("land-turn", "repo"),
-    gap("land-turn", "workspace"),
-    gap("land-turn", "outside-lock"),
-    gap("land-turn", "argv"),
+    row("land-turn", "", input(member("spawnLandTurn"))),
+    row("land-turn", "repo", input(argument("spawnLandTurn", 0, "repo"))),
+    row("land-turn", "workspace", input(argument("spawnLandTurn", 0, "workspace"))),
+    row("land-turn", "outside-lock", input(argument("spawnLandTurn", 0, "outsideLock"))),
+    row("land-turn", "argv", input(argument("spawnLandTurn", 0, "argv"))),
     
 
     // Host process helpers for scripts: a held lock, a holder census, a held command and a
     // process-subtree root, each over the caller's own inherited descriptors.
-    gap("lock", ""),
-    gap("lock", "path"),
-    gap("lock", "state-fd"),
-    gap("lock", "owned-pid"),
-    gap("lock", "argv"),
+    row("lock", "", input(member("spawnLock"))),
+    row("lock", "path", input(argument("spawnLock", 0, "path"))),
+    row("lock", "state-fd", descriptor("spawnLock", "state", "AsyncIterable<Cowshed.LockWaiterEvent>")),
+    row("lock", "owned-pid", input(argument("spawnLock", 0, "ownedPids"))),
+    row("lock", "argv", input(argument("spawnLock", 0, "argv"))),
     row("lock-holders", "", field(&[("host.lockHolders", "")], &[member("Host.lockHolders")])),
     row("lock-holders", "path", field(&[("host.lockHolders", "path")], &[argument("Host.lockHolders", 0, "")])),
-    gap("hold", ""),
-    gap("hold", "control-fd"),
-    gap("hold", "state-fd"),
-    gap("hold", "argv"),
+    row("hold", "", input(member("spawnHold"))),
+    row("hold", "control-fd", descriptor("spawnHold", "control", "Cowshed.HoldControl")),
+    row("hold", "state-fd", descriptor("spawnHold", "state", "AsyncIterable<Cowshed.HoldEvent>")),
+    row("hold", "argv", input(argument("spawnHold", 0, "argv"))),
     row("tree-holders", "", field(&[("host.treeHolders", "")], &[member("Host.treeHolders")])),
     row("tree-holders", "path", field(&[("host.treeHolders", "path")], &[argument("Host.treeHolders", 0, "")])),
-    gap("subtree-root", ""),
-    gap("subtree-root", "handle-fd"),
-    gap("subtree-root", "argv"),
+    row("subtree-root", "", input(member("spawnSubtreeRoot"))),
+    row("subtree-root", "handle-fd", descriptor("spawnSubtreeRoot", "admission", "Promise<Cowshed.SubtreeAdmissionOutcome>")),
+    row("subtree-root", "argv", input(argument("spawnSubtreeRoot", 0, "argv"))),
     row("retire-descendants", "", field(&[("host.retireDescendants", "handle")], &[argument("Host.retireDescendants", 0, "")])),
     row("retire-descendants", "grace-ms", field(&[("host.retireDescendants", "graceMs")], &[argument("Host.retireDescendants", 1, "")])),
 
@@ -445,12 +468,12 @@ pub fn check_rows(
             .count()
     };
     let summary = format!(
-        "cli parity: {} verbs and arguments: {} wire fields, {} composed, {} cli-only, {} known gaps ({HOST_TABLE})",
+        "cli parity: {} verbs and arguments: {} wire fields, {} composed, {} launcher, {} cli-only",
         cli.len(),
         count(|counterpart| matches!(counterpart, Counterpart::Field { .. })),
         count(|counterpart| matches!(counterpart, Counterpart::Composed { .. })),
+        count(|counterpart| matches!(counterpart, Counterpart::Launcher { .. })),
         count(|counterpart| matches!(counterpart, Counterpart::CliOnly { .. })),
-        count(|counterpart| matches!(counterpart, Counterpart::KnownGap { .. })),
     );
     Ok(Checked {
         typescript: typescript(cli_spellings(cli), rows, &summary),
@@ -556,46 +579,64 @@ fn typescript(spellings: BTreeMap<(&str, &str), &str>, rows: &[Row], summary: &s
     let mut functions = false;
     let mut body = String::new();
     for row in rows {
-        let (facade, kind) = match row.counterpart {
-            Counterpart::Field { facade, .. } => (facade, "wire"),
-            Counterpart::Composed { facade, .. } => (facade, "composed"),
-            Counterpart::CliOnly { .. } | Counterpart::KnownGap { .. } => continue,
-        };
         let spelling = spellings
             .get(&(row.command, row.argument))
             .copied()
             .unwrap_or_default();
-        let types: Vec<String> = facade
-            .iter()
-            .map(|facade| {
-                let base = match facade.member.split_once('.') {
-                    Some((interface, method)) => {
-                        interfaces.insert(interface);
-                        format!("{interface}['{method}']")
-                    }
-                    None => {
-                        functions = true;
-                        format!("typeof Cowshed.{}", facade.member)
-                    }
-                };
-                let Some(index) = facade.argument else {
-                    return base;
-                };
-                facade
-                    .path
-                    .split('.')
-                    .filter(|segment| !segment.is_empty())
-                    .fold(
-                        format!("NonNullable<Parameters<{base}>[{index}]>"),
-                        |inner, segment| match segment.split_once(':') {
-                            Some((name, kind)) => {
-                                format!("Variant<At<{inner}, '{name}'>, '{kind}'>")
-                            }
-                            None => format!("At<{inner}, '{segment}'>"),
-                        },
-                    )
-            })
-            .collect();
+        let mut facade_type = |facade: &Facade| {
+            let base = match facade.member.split_once('.') {
+                Some((interface, method)) => {
+                    interfaces.insert(interface);
+                    format!("{interface}['{method}']")
+                }
+                None => {
+                    functions = true;
+                    format!("typeof Cowshed.{}", facade.member)
+                }
+            };
+            let Some(index) = facade.argument else {
+                return base;
+            };
+            facade
+                .path
+                .split('.')
+                .filter(|segment| !segment.is_empty())
+                .fold(
+                    format!("NonNullable<Parameters<{base}>[{index}]>"),
+                    |inner, segment| match segment.split_once(':') {
+                        Some((name, kind)) => format!("Variant<At<{inner}, '{name}'>, '{kind}'>"),
+                        None => format!("At<{inner}, '{segment}'>"),
+                    },
+                )
+        };
+        let (types, kind): (Vec<String>, &str) = match row.counterpart {
+            Counterpart::Field { facade, .. } => {
+                (facade.iter().map(&mut facade_type).collect(), "wire")
+            }
+            Counterpart::Composed { facade, .. } => {
+                (facade.iter().map(&mut facade_type).collect(), "composed")
+            }
+            Counterpart::Launcher {
+                side: Side::Input(facade),
+            } => (vec![facade_type(&facade)], "launcher input"),
+            Counterpart::Launcher {
+                side:
+                    Side::Result {
+                        launcher,
+                        member,
+                        extends,
+                    },
+            } => {
+                functions = true;
+                (
+                    vec![format!(
+                        "Extends<At<Awaited<ReturnType<typeof Cowshed.{launcher}>>, '{member}'>, {extends}>"
+                    )],
+                    "launcher result",
+                )
+            }
+            Counterpart::CliOnly { .. } => continue,
+        };
         writeln!(body, "  /** `cowshed {spelling}` ({kind}). */").unwrap();
         writeln!(body, "  readonly '{spelling}': [{}];", types.join(", ")).unwrap();
     }
@@ -618,7 +659,9 @@ fn typescript(spellings: BTreeMap<(&str, &str), &str>, rows: &[Row], summary: &s
          type At<T, K extends keyof NonNullable<T>> = NonNullable<T>[K];\n\
          /** One variant of a tagged union; a tag the union does not declare does not compile. */\n\
          type Variant<T, K extends Tag<T>> = Extract<NonNullable<T>, { readonly kind: K }>;\n\
-         type Tag<T> = NonNullable<T> extends infer U ? (U extends { readonly kind: infer V } ? V : never) : never;\n\n\
+         type Tag<T> = NonNullable<T> extends infer U ? (U extends { readonly kind: infer V } ? V : never) : never;\n\
+         /** A launcher result member; one whose type does not extend the stated type does not compile. */\n\
+         type Extends<T extends U, U> = T;\n\n\
          /** Every CLI verb and argument with a typed counterpart, as the public members that reach it. */\n\
          export interface CliParity {\n",
     );

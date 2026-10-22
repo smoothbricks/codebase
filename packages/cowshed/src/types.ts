@@ -22,8 +22,17 @@ export type {
   SccacheStartArguments,
 } from './native.generated.js';
 
+/** A line a launched verb's descriptor carried that the verb's protocol does not allow (07_api.md, "Launchers"). */
+export type ProtocolViolation = {
+  readonly descriptor: 'state' | 'handle';
+  readonly bytes: Uint8Array;
+  readonly reason: string;
+};
+
 export type CowshedErrorOptions = ErrorOptions &
-  Pick<Api.CowshedError, 'admission' | 'cpuAdmission' | 'priority' | 'stdin'>;
+  Pick<Api.CowshedError, 'admission' | 'cpuAdmission' | 'priority' | 'stdin'> & {
+    readonly violation?: ProtocolViolation;
+  };
 
 export class CowshedError extends Error {
   readonly code: Api.ErrorCode;
@@ -35,6 +44,8 @@ export class CowshedError extends Error {
   /** Present only when an owned job's child could not be placed at its nice, so its command never ran. */
   readonly priority?: Api.PriorityFailure;
   readonly stdin: Api.StdinRefusal | undefined;
+  /** Present only on a launcher's `integrity` error: the line its verb's descriptor broke the protocol with. */
+  readonly violation?: ProtocolViolation;
 
   constructor(code: Api.ErrorCode, message: string, hint: string, options?: CowshedErrorOptions) {
     super(message, options);
@@ -51,6 +62,9 @@ export class CowshedError extends Error {
       this.priority = options.priority;
     }
     this.stdin = options?.stdin;
+    if (options?.violation !== undefined) {
+      this.violation = options.violation;
+    }
   }
 }
 

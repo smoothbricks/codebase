@@ -385,8 +385,8 @@
           "^build"
         ],
         "options": {
-          "comment": "openHost end to end: the built addon starts the package launcher's cowshed host, so the launcher's binary must be this checkout's build.",
-          "command": "bun test --config=../bunfig.napi-test.toml --timeout=0 host.napi.test.ts",
+          "comment": "openHost and the typed launchers end to end: the built addon starts the package launcher's cowshed host, and each launcher spawns its verb through the package launcher, so the launcher's binary must be this checkout's build.",
+          "command": "bun test --config=../bunfig.napi-test.toml --timeout=0 host.napi.test.ts launchers.napi.test.ts",
           "cwd": "{projectRoot}/src",
           "env": {
             "NAPI_DEBUG_ADDON": "1"

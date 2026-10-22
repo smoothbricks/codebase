@@ -2146,7 +2146,13 @@ its clap definition declares: positionals, flags, values and the trailing argv. 
 - **CLI-only**, narrowly: pure terminal presentation (`--json`, `--quiet`, help, version) or a human step a library
   caller cannot provide (`setup`'s administrator authorization dialog, 06_cli.md rule 3). A refusal-only flag is not
   CLI-only: `fork --markdown-only` is `ForkOptions.markdownOnly`, which the controller refuses for every caller.
-- **Known gap**: a host verb with no N-API channel yet; the host operation table that adds its channel deletes the row.
+- **Launcher**: a verb whose holder is the process that runs it — `lock` holds a lock, `hold` holds a command's group
+  leader unreaped from outside that group, `subtree-root` execs its command in its own life, `land-turn` keeps a land
+  turn until its child ends — so no connection carries it. Its counterpart is a typed launcher of the facade
+  ("Launchers" below). A word is either an **input**, the launcher or a property of its options, or a **result**: a
+  caller-opened descriptor the verb's argv names (`--state-fd`, `--control-fd`, `--handle-fd`) is a member of the
+  launcher's resolved run whose type the facade assertion checks it extends. A descriptor number is never an input: the
+  launcher chooses it.
 
 The gate is `cowshed-api-gen`'s `cli_parity` module, run by every `api-generate` and `api-check`. It reads the grammar
 from `cli_command()` in `crates/cowshed-cli/src/args.rs` without building the CLI, accepting only the builder vocabulary
@@ -2155,11 +2161,13 @@ builds. Its `PARITY` table holds one row per word with the counterpart and, for 
 without a row, a row naming a word the CLI no longer parses, a wire field the request record does not carry (resolved
 through the same declarations the projections are generated from, serde renames and flattening included) and an
 operation that is internal or undeclared each refuse generation by name. The facade half is
-`src/cli-parity.generated.ts`: one property per wire or composed word whose type indexes the facade member and the
-parameter property that carries it, so a facade that lacks the member or the property fails the package's typecheck. A
-word carried by one variant of a tagged union (`credential add --secret-env` is `secret` tagged `env`, its `name`) is
-checked through that variant, selected by a tag the union must declare, so a word is never satisfied by a sibling
-variant's field. Its header states the counts per class.
+`src/cli-parity.generated.ts`: one property per wire, composed or launcher word whose type indexes the facade member and
+the parameter property that carries it, so a facade that lacks the member or the property fails the package's typecheck;
+a launcher result word is the resolved run's member, asserted to extend its stated type (`Extends`). A word carried by
+one variant of a tagged union (`credential add --secret-env` is `secret` tagged `env`, its `name`) is checked through
+that variant, selected by a tag the union must declare, so a word is never satisfied by a sibling variant's field. Its
+header states the counts per class. Every word the CLI parses is wire, composed, launcher or CLI-only: the gate has no
+class for a word without a counterpart.
 
 The project-scoped words the facade could not reach are operations of their own: `project.list` carries an optional
 `landing` selection (`measure` measures every attached session against main's landing branch with
@@ -2227,8 +2235,46 @@ concurrent-close contract; `Host` never opens it. A host connection's handshake 
 or `{host: "sccache"}`), a client refuses an answer of another role, and the connection serves exactly its role's scope:
 every other method, the other role's and every project method, is refused before it is decoded.
 
-`land-turn` and the process holders `lock`, `hold` and `subtree-root` are the parity gate's known gaps until their
-launchers land: `land-turn` holds its turn until its child ends.
+### Launchers
+
+The process-holder verbs are reached through typed launchers of the public facade. Each spawns its verb through the
+package launcher (`bin/cowshed`, 06_cli.md "Launcher") with Node's `stdio` array: every descriptor the verb's argv names
+is a pipe the launcher owns, numbered from 3, and the verb's own lines on it are decoded with the generated validators
+of their event DTOs. The CLI is the one implementation; a launcher types it. The process inherits the caller's
+environment, working directory and standard streams, as the CLI verb does, and a launcher adds no option of its own.
+
+| launcher                                                  | spawns                                                    | resolves to                                            |
+| --------------------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------ |
+| `spawnLock({ path, ownedPids?, argv })`                   | `lock <path> --state-fd 3 [--owned-pid …] -- argv`        | `LockRun { state, cancelOwner(), forward(sig), exit }` |
+| `spawnHold({ argv })`                                     | `hold --control-fd 3 --state-fd 4 -- argv`                | `HoldRun { control: HoldControl, state, exit }`        |
+| `spawnSubtreeRoot({ argv })`                              | `subtree-root --handle-fd 3 -- argv`                      | `SubtreeRootRun { admission, exit }`                   |
+| `spawnLandTurn({ repo, workspace?, outsideLock?, argv })` | `land-turn <repo> [--workspace] [--outside-lock] -- argv` | `LandTurnRun { exit }`                                 |
+
+No run exposes the process or a way to signal it freely; each holder is reached only through its verb's documented
+requests. `LockRun.forward` sends INT, HUP or TERM, which cowshed forwards to the command once it holds the lock (before
+that, the signal ends the waiter and gives up its place). `LockRun.cancelOwner` is the `--owned-pid` request, SIGUSR1:
+it is sent only when the decoder has seen `queued` and none of `acquired`, `failed`, `signalled` or `commandFailed`
+(`canCancelOwner`), because cowshed watches SIGUSR1 only from the moment it queues; otherwise it throws `usage` and
+sends nothing. `HoldControl` writes the `hold` control lines: `signal(HoldSignal)`, `release()`, and `close()`, which
+before a `release` is the controller end of file that tears the held group down (11_shell.md), and after one only closes
+the channel; `signal` and `release` after `close` throw `usage`.
+
+`exit` always resolves, once the process has ended and its descriptors were read to their end, with
+`LauncherExit { status, violation?, failure? }`: the real status (cowshed's, which is the command's or a wrapper code),
+the first protocol violation, and a descriptor that could not be read or written. A spawn that cannot start rejects
+`environment-missing`; nothing has started. Operational outcomes are the verb's events: `failed`, `commandFailed`,
+`signalled` and `notSignalled` are yielded values, and end of file without a last line is no violation (the verb defines
+those ends; `exit.status` says what happened). A violation (`ProtocolViolation { descriptor, bytes, reason }`) is a line
+that is not JSON or fails its validator, a line truncated at end of file, a line after one the verb sends last (lock's
+`failed` or `signalled`, hold's `failed`), or a second admission record; `LineDecoder` decides it without I/O. `state`
+throws `CowshedError { code: 'integrity', violation }` carrying it, and `exit.violation` keeps it. A descriptor that
+cannot be read throws `internal` with the failure, which `exit.failure` keeps. After either the launcher ends what it
+can no longer observe: `hold` closes the control descriptor unless released, `lock` forwards TERM; `subtree-root` ends
+nothing, since the process may already be the command. `admission` resolves `{ kind: 'record', admission }` (typed
+refusals included) or `{ kind: 'unknown', violation? }` when the descriptor did not carry exactly one well-formed
+record; an unknown admission is never turned into a refusal. A `state` the consumer abandons is still read and validated
+to its end; for `hold`, abandoning it before a `release` closes the control descriptor, so a group nobody observes is
+torn down.
 
 One verb has no counterpart by name: `gateway run` is the process launchd execs as the daemon. A library call never
 becomes that process and no host connection runs it.

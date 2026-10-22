@@ -29,8 +29,9 @@ package's own build — `dist/bin/<platform>/cowshed`, restoring an execute bit 
 `target/release/cowshed` of the workspace a linked checkout sits in — `setup` and `gateway` included, since they install
 the invoking build. A host with none of them gets exit 5 naming every path looked in. It is a shell script rather than
 Node because it runs before every command, and Node's own start (~30 ms) costs more than the fastest verbs take in
-total; `exec` hands the binary the command's signals, exit status and standard streams unchanged. The library's `runCli`
-runs the CLI through the same script, so one rule picks the binary.
+total; `exec` hands the binary the command's signals, exit status and standard streams unchanged. The library's
+`runCli`, `openHost`, `openSccacheHost` and the typed launchers (`spawnLock`, `spawnHold`, `spawnSubtreeRoot`,
+`spawnLandTurn`; 07_api.md, "Launchers") run the CLI through the same script, so one rule picks the binary.
 
 The launcher is how a build that is not installed yet is run — a checkout's `packages/cowshed/bin/cowshed setup`
 installs that checkout's build — and not the `cowshed` on `PATH`. After `setup`, the `cowshed` on `PATH` is the

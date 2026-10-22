@@ -44,6 +44,30 @@ import {
 } from './types.js';
 import { parseWorkspaceTarget } from './validators.generated.js';
 
+export {
+  ADMISSION_LAST,
+  canCancelOwner,
+  type Decoded,
+  HOLD_LAST,
+  type HoldControl,
+  type HoldRun,
+  type LandTurnRun,
+  type LauncherExit,
+  type LauncherStatus,
+  LineDecoder,
+  LOCK_LAST,
+  type LockRun,
+  type SpawnHoldOptions,
+  type SpawnLandTurnOptions,
+  type SpawnLockOptions,
+  type SpawnSubtreeRootOptions,
+  type SubtreeAdmissionOutcome,
+  type SubtreeRootRun,
+  spawnHold,
+  spawnLandTurn,
+  spawnLock,
+  spawnSubtreeRoot,
+} from './launchers.js';
 export type * from './types.js';
 export { CowshedError } from './types.js';
 
