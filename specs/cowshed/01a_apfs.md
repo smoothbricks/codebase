@@ -731,14 +731,16 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    registry its live entries, and the difference is the leak. In one observed failure the first 150 struck with 1090
    device instances against 66 attached, exactly 1024 leaked, and no orphaned helper. Root `lsmp -a` showed no userspace
    reference to a leaked device (only the 66 live helpers held `DIDevice` rights, one each); restarting `mds` and
-   `diskarbitrationd` freed none of them, and the reboot freed all (178 instances, 178 registered, after it). The likely
-   cause is a device stuck in termination with an unfinished request pool because its attach or helper was killed
-   mid-operation; the check that confirms it is the leaked-device delta across one real-APFS lane run, which must be 0
-   now that cowshed kills no disk-image command at all (below). 1024 is an observation of one host and boot, not a
-   documented limit. Departed APFS-volume and IOMedia references are separate from this image-device pool. Their owner
-   must be measured by joining exact registry IDs to root `lsmp`, not inferred from the class name. An earlier host
-   attributed 1064 APFS-volume and 1067 IOMedia rights to DA; the later 7,221-object cohort belonged to mds, with none
-   held by DA. The current mds discovery and missing-release mechanism, controls and mount-root policy are specified in
+   `diskarbitrationd` freed none of them, and the reboot freed all (178 instances, 178 registered, after it). A clean
+   attach→detach cycle leaks nothing: on 2026-10-22, 20 cycles each of cowshed's exact noMount attach, a default-mounted
+   attach and a DI1 attach left no device or client behind, and neither did 8 concurrent attaches over 10 rounds or a
+   live wave of `rm`, `land` and `detach`. The measured cause is the IOMedia match-notification ceiling below: a helper
+   stalled past it stops draining its device-termination notification, which keeps every image device terminated
+   afterwards alive. The pool's capacity is in instances, live and leaked alike, and no documented limit names it.
+   Departed APFS-volume and IOMedia references are separate from this image-device pool. Their owner must be measured by
+   joining exact registry IDs to root `lsmp`, not inferred from the class name. An earlier host attributed 1064
+   APFS-volume and 1067 IOMedia rights to DA; the later 7,221-object cohort belonged to mds, with none held by DA. The
+   current mds discovery and missing-release mechanism, controls and mount-root policy are specified in
    [Spotlight media references](#spotlight-media-references).
 
    The pool is bookkept per host user in `/private/var/tmp/cowshed-attach-pool-<euid>/pool.json`, a 0700 directory that
@@ -747,22 +749,30 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    whenever the clock is stepped. Every 150 a disk-image command meets is `ApfsError::AttachPoolExhausted`, a host
    finding whose next step is `cowshed doctor`, never "repair storage", and the system runner records the boot's first:
    the boot is spent, with the image devices' counts and the orphaned helpers at that moment when they can be read,
-   until a later attach in the same boot succeeds (killing orphans frees the pool without a reboot) or
-   `cowshed doctor --clear-attach-budget` ends it. The exhaustion record is evidence, never a capacity ceiling: leaked
-   devices are the live class-instance count minus the live registered entries, read at each gate, and no remembered
-   count defines headroom or survives a reboot as an admission limit. The harness refuses only a recorded spent boot,
-   not a forecast of how many attaches remain (08_testing.md, "Host limit"). Clearing the spent-boot fact retains the
-   last exhaustion as evidence. A record that does not parse proves nothing: it reads as empty with a warning naming the
-   file, the kernel is still reported, and the next write (a 150, a clear) replaces it. A refusal names the recorded
-   exhaustion and the live facts that explain its next step: proven orphaned helpers first when their mappings can
-   account for it, otherwise a reboot for leaked image devices, never a guessed daemon restart for unrelated
-   departed-volume references. Clearing a record does not repair the kernel and never grants capacity by raising a
-   ceiling. `doctor` reports `disk-image-attach-budget`: the four classes' live instances, registered entries and
-   differences, the current boot's exhaustion evidence, and disk-image commands an earlier build interrupted, each a
-   probable leaked device (the record keeps them until the boot ends; no current build writes one). It is an error while
-   the boot is spent ("attach pool exhausted", with "reboot required" only when the leaked devices account for it), and
-   a warning when a clean run increases a leak count or an earlier build interrupted a command. Its hint names a reboot
-   for leaked image devices and proven orphaned helpers first for a 150 those devices do not explain.
+   until the operator, having freed what spent it, ends it with `cowshed doctor --clear-attach-budget`, or the boot
+   ends. A later successful attach does not end it: an attach admitted before the first 150 can finish after it.
+   Clearing the spent-boot fact retains the last exhaustion as evidence.
+
+   **Admission.** The system runner refuses every DiskImages2 attach (`diskutil image attach`) before it spawns, inside
+   the storage lease, with `AttachPoolExhausted` and its `next:` step, in two cases: this boot is spent, or the live
+   `AppleDiskImageDevice` instances, registered and leaked alike, plus the storage phase's members
+   (`DISK_PHASE_MEMBERS`, each of which may pass the gate before any of them spawns) would reach the pool's ceiling,
+   1042 instances. That is the lowest instance count at which a first 150 has struck: 256 registered, 786 leaked and 5
+   orphaned helpers in the boot of 2026-10-21 20:12 +04, against 1090 and 1105 in earlier boots. The leaked count alone
+   does not predict exhaustion (786 and 1024 leaked at two first 150s); the instances do. A failed attach leaks one more
+   device, so an attach that would fail is never started, and a refused one can run again once the pool is freed. A pool
+   whose instances or record cannot be read refuses the same way (`PoolUnread`), since nothing says the attach would not
+   fail. A record that does not parse proves nothing: it reads as empty with a warning naming the file, the kernel is
+   still reported, and the next write (a 150, a clear) replaces it. A refusal names the recorded exhaustion and the live
+   facts that explain its next step: proven orphaned helpers first when their mappings can account for it, otherwise a
+   reboot for leaked image devices, never a guessed daemon restart for unrelated departed-volume references. Clearing a
+   record does not repair the kernel and never grants capacity by raising a ceiling. `doctor` reports
+   `disk-image-attach-budget`: the four classes' live instances, registered entries and differences, the ceiling and the
+   headroom below it, the current boot's exhaustion evidence, and disk-image commands an earlier build interrupted, each
+   a probable leaked device (the record keeps them until the boot ends; no current build writes one). It is an error
+   while the boot is spent ("attach pool exhausted", with "reboot required" only when the image devices account for it),
+   and a warning within a quarter of the ceiling, or when an earlier build interrupted a command. Its hint names a
+   reboot for leaked image devices and proven orphaned helpers first for a 150 those devices do not explain.
    `departed-volume-references` is a separate warning from the first departed APFS-volume or IOMedia instance, with
    exact counts and a root `lsmp` attribution step; it neither defines attach-pool capacity nor prescribes a daemon
    restart. Orphaned helpers are named only when two reads in a row agree and no `diskutil` or `hdiutil` ran during
@@ -840,32 +850,107 @@ What the substrate does about each:
 
 ### The IOMedia match-notification ceiling
 
-An attach completes only when DiskImages2 sees its new device, and it sees it through a kernel match notification that
-silently stops at 1,024 entries. `diskutil image attach` waits in `-[DIDeviceHandle waitForDeviceWithError:]`, which
-registers an `IOServiceMatched` notification for every `IOMedia` on the host, drains the initial iterator and then
-waits, with no overall timeout, for a callback whose parent chain reaches the device it created. XNU caps the matches
-one user notification can hold at `IOServiceUserNotification::kMaxOutstanding = 1024` (`iokit/Kernel/IOUserClient.cpp`,
-line 809) and drops every match past it without an error (lines 1031–1038). So once the host carries more than 1,024
-`IOMedia` objects, a new image's media can fall outside the notification, the attach never sees the device it already
-published, and it waits forever. A lower count does not replay a lost match: an attach that missed its device stays
-waiting until it is cancelled. Measured 2026-10-22: 352 attached images, each contributing about three `IOMedia` (the
-whole disk, its APFS container media and the volume), gave 1,081 `IOMedia` against 1,024 notification entries; every new
-attach hung after its device was published (`BusyState 0`, no I/O errors), and the same probe found 905 of 905 once idle
-images were detached, after which a fork completed in 72 s. A notification filtered to the target device would not
-overflow; DiskImages2 does not filter.
+IOKit queues at most 1024 matches on one user notification and drops the rest without a word
+(`IOServiceUserNotification::kMaxOutstanding = 1024`, XNU `iokit/Kernel/IOUserClient.cpp:809`; its `handler` adds a
+match to the notification's queue only while the queue holds fewer), and a matching notification is seeded with every
+registered service it matches. Every attached APFS image registers three IOMedia (its whole disk, its container's
+`AppleAPFSMedia` and its `AppleAPFSVolume`), so a workspace with its build volume holds six, and an unfiltered IOMedia
+match on a host with about 334 images attached enumerates 1024.
 
-So attached media are a budget, separate from the leaked-device ceiling above (error 150). Every image attach, from any
-cowshed path, is guarded where its command starts: cowshed counts the host's registered `IOMedia` family with an
-ordinary registry enumeration (`IOServiceGetMatchingServices`, subclasses included and uncapped), adds about three for
-each attach already running and for each the storage phase may still admit, keeps a reserve for the host's own disks,
-adds the three this attach creates, and refuses the attach before it starts when the sum would reach the ceiling
-(02_workspaces.md, "Making room for an attach"; 05_gateway.md, "The media cap's reserve"). A CLI verb that will attach
-named workspaces first makes room: it detaches the least-recently-used idle workspaces (no supervisor serving them;
-never main, the workspaces it names, or one a land or `rm` holds), which re-attach on their next use, until its images
-fit. If nothing idle frees enough it detaches nothing and refuses by name, listing ten attached workspaces with the
-media each holds and the count of the rest. Attaching every session (`cowshed attach` without a name, or `--all`) and
-controller operations get the guard's refusal only. No path starts an attach that can only hang. `cowshed doctor`
-reports live `IOMedia` against the ceiling.
+A DI2 attach waits for its own device's media. Its `diskimagesiod` helper registers an unfiltered `IOServiceMatched`
+notification on IOMedia (`-[DIDeviceHandle waitForDeviceWithError:]`) and spins its run loop until the match names its
+device. Past the ceiling that match is dropped, and the attach never returns. Measured from the kernel and helper logs
+of the boot of 2026-10-21 20:12 +04: all 2,884 attaches that completed ran with at most 333 images attached, and all 23
+that stalled started with 334 to 352. Each stalled helper logged `IOServiceWaitQuiet done` and nothing after it, where a
+healthy one goes on to log its device's BSD name.
+
+A stalled helper also leaks every image device that terminates afterwards. Each `diskimagesiod` registers an unfiltered
+`IOServiceTerminate` notification on `AppleDiskImageDevice` (static disassembly of `/usr/libexec/diskimagesiod`,
+`terminationCallback`). The kernel keeps every matched service in the notification's queue until the client drains it. A
+notification that is never drained keeps a cleanly detached device and its user client alive with no userspace right to
+either, which a controlled probe reproduced: one undrained `AppleDiskImageDevice` matched or terminated notification
+held a detached device and client (+1/+1), and both were freed when the probe let go. In that boot the 23 stalled
+helpers were exactly the ones holding two notifications (healthy helpers hold one), and every device terminated after
+them, 702 in all, was never freed, until the pool met error code 150 at 1042 instances. Why a stalled helper's
+termination notification stops draining is not established (its main thread still runs its run loop); the trigger, the
+ceiling, and the retention are measured.
+
+#### The boot of 2026-10-21 20:12 +04, from its kernel and helper logs
+
+- Until 02:26:11 every clean helper shutdown was followed by the kernel's `AppleDiskImageDevice::free()` (1,944
+  shutdowns, 1,485 frees in the retained log; earlier kernel history was not retained). No helper shut down between
+  02:26:11 and 02:46:30.
+- The first stall was helper 55068 at 02:30:07.993, whose attach took the attached images from 333 to 334. All 2,884
+  attaches that completed in that boot ran with at most 333 images attached; all 23 that stalled started with 334
+  to 352. The registered IOMedia family then was the host's own base (about 21 to 25 media) plus three per image.
+- From 02:46:30 no helper shutdown was followed by a free: 702 devices left the registry after a clean helper shutdown
+  and stayed allocated, 148 of them created before 02:30 (129 of those by the startup heal's burst) and 554 after 04:10.
+  Their user clients stayed with them (774 retained clients = 5 orphaned helpers + 702 + 67 failed attaches).
+- At 06:10:28 the kernel counted 1,039 `AppleDiskImageDevice` instances: 256 attached, 5 behind orphaned helpers, 702
+  retained after clean shutdowns, 67 from attaches that failed with error code 150 and 9 duplicate creations (error
+  155). The first 150 struck at 1,042 instances with 256 registered, 786 leaked and 5 orphaned helpers. The first kernel
+  mapping error (`DISharedBuffer::init: Can't map buffer`) appeared at 06:01, long after the retention began.
+- 238 of the boot's 261 helpers held one IOKit notification port; the 23 stalled ones held two, each with the device
+  references of a helper that never completed its attach and no user-client connection. Apart from those helpers, no
+  process holding an `IOServiceUserNotification` right was started in the 02:26 to 02:46 window.
+
+#### What holds departed volumes, and what does not
+
+`mds` and `diskarbitrationd` hold departed APFS volumes and media, never image devices. Spotlight's constructor leak
+(above) holds one `AppleAPFSVolume` right per mounted, admitted volume. After the reboot only the four adopted mains,
+mounted under the user's home, gave `mds` a right; shed and build volumes under `/private/var/folders/cowshed` gave it
+none. Disk Arbitration holds rights to media briefly after a detach: all 15 it held right after a measured wave of
+detaches were gone 294 s later. Killing both freed 1,795 departed volumes before the reboot but no image device: those
+were held in the kernel, by the stalled helpers' notification queues, where `lsmp` shows no right to them.
+
+#### The retention, reproduced
+
+A 40-line probe arms one `IOServiceAddMatchingNotification` on `AppleDiskImageDevice` (matched or terminated), drains
+its initial iterator once and then never runs its port. While it lives, one DI2 noMount attach and detach of a throwaway
+1 GiB RAW image leaves the departed device and user client at 0 → 1 after the helper's clean shutdown → 1 sixty seconds
+later → 0 once the probe releases its iterator and port, for both notification types. The probe's process holds only its
+`IOServiceUserNotification` right, and its receive queue holds the one pending ping. An undrained notification on
+IOMedia instead retains only the IOMedia, `AppleAPFSMedia` and `AppleAPFSVolume`, never the device or its client. Clean
+cycles with no such subscriber leak nothing: 20 noMount cycles of cowshed's exact attach argv, 20 default-mounted
+cycles, and 8 concurrent attach and detach pairs over 10 rounds all left 0 departed devices.
+
+#### The two drivers, measured on one 1 GiB RAW image
+
+| Driver and argv                                                                                          | Helper              | 128 MiB write + `F_FULLSYNC` | 1000 × 4 KiB creates | unlinks    | Retained per cycle (20 cycles) |
+| -------------------------------------------------------------------------------------------------------- | ------------------- | ---------------------------- | -------------------- | ---------- | ------------------------------ |
+| DI2: `diskutil image attach --nobrowse --noMount --plist`                                                | `diskimagesiod`     | 691.2 MiB/s                  | 4,836/s              | 19,248/s   | 0                              |
+| DI1 out of kernel: `hdiutil attach -nomount -noverify -nobrowse -imagekey diskimage-class=CRawDiskImage` | `diskimages-helper` | 37.9 MiB/s                   | 62.6/s               | 796/s      | 0                              |
+| DI1 in kernel: the same with `-kernel`                                                                   | none                | 769.8 MiB/s                  | 2,435.8/s            | 32,259.1/s | 0                              |
+
+Medians of three rounds on a loaded host, not a causal ratio. Reads ran at 13 to 17 GB/s for all three, which is the
+page cache, not the image. The in-kernel path attaches through `KDIURL` → `KDIFileBackingStore` →
+`KDIReadWriteDiskImage` → `KDIDiskImageNub` → `IOHDIXHDDriveInKernel` → `IODiskImageBlockStorageDeviceInKernel`, with no
+DI2 object, no image helper, and no userspace descriptor on the backing file; `IOHDIXHDDriveInKernel` carries the
+backing file as `KDIURLPath` (a string) and `image-path` (bytes, no NUL). Blank formatting, read-write use and a
+read-only attach with `fsck_apfs` and mount all pass on it. Images were attached with `hdiutil` until 2026-09-30
+(`a7af3559d`), when ASIF, a DI2-only format, replaced SPARSE for speed; that SPARSE row was the out-of-kernel driver.
+
+#### What multiplied the attaches
+
+- The startup heal attached every session: after this reboot it re-attached 154 sheds (4 mains and 150 sessions), 308
+  images, 931 registered IOMedia, in 171.5 s, most of them idle or already landed, and no exec or shell on any workspace
+  was served until it ended.
+- `cowshed detach`, making room and putting a detached workspace back after a refused `rm` released the workspace image
+  and left its build volume attached: before the reboot the kernel held 164 build volumes, 88 session images and 4
+  mains. A land and an `rm` released both.
+
+Cowshed therefore never starts an attach past the ceiling. The system runner refuses an image attach whose media would
+reach 1024 before it spawns (`MediaCapReached`, `cowshed-apfs` `media_cap`; 02_workspaces.md, "Making room for an
+attach"), counting the registered IOMedia, subclasses included, three for every attach running on the host and for every
+other member of the storage phase, and 16 for disks the host attaches on its own. A verb that may attach first detaches
+idle workspaces, least recently used first: only workspaces with no supervisor serving them, never main, the named
+workspaces, or one a land or `rm` holds. If nothing idle frees enough, it detaches nothing and refuses by name, listing
+ten attached workspaces with the media each holds and the count of the rest. Attaching every session (`cowshed attach`
+without a name, or `--all`) and controller operations get the guard's refusal only. The gateway's startup pass mounts
+mains only and leaves sessions to attach on use (05_gateway.md, "Startup contract"), and a detach frees a workspace's
+build volume with its image (02_workspaces.md, "`cowshed attach` / `cowshed detach`"). `doctor` reports
+`media-notification-cap`. A helper that stalled before these gates is an orphaned helper
+(`orphaned-disk-image-helpers`).
 
 ### Freeing an image
 
