@@ -13,6 +13,11 @@ pub(crate) mod processes;
 
 pub(crate) const ROOT_PREFIX: &str = "cowshed-dtest-";
 
+/// The file in each root that names the test which made it. The name stays out of the path: the
+/// store's Unix sockets (`run/<32 hex>.sock`, the CPU pools' `run/cpu/<22>/<22>`) must fit
+/// `sun_path` (104 bytes on macOS), so a root's length is fixed by its pid and counter alone.
+pub(crate) const LABEL_FILE: &str = "label";
+
 pub struct ScratchRoot {
     path: PathBuf,
 }
@@ -30,12 +35,23 @@ impl ScratchRoot {
         }
         drop(swept);
         let path = PathBuf::from(format!(
-            "/private/tmp/{ROOT_PREFIX}{}-{}-{label}",
+            "/private/tmp/{ROOT_PREFIX}{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir(&path)?;
-        Ok(Self { path })
+        match fs::create_dir(&path) {
+            Ok(()) => {}
+            // No other live process has this pid and the counter never repeats, so the root is a
+            // dead process's under a reused pid, which the sweep keeps because the pid is live.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                reclaim(&path)?;
+                fs::create_dir(&path)?;
+            }
+            Err(error) => return Err(error),
+        }
+        let root = Self { path };
+        fs::write(root.path.join(LABEL_FILE), label)?;
+        Ok(root)
     }
 
     pub fn path(&self) -> &Path {
@@ -107,6 +123,26 @@ mod tests {
             fs::read_to_string(outside.path().join("kept")).unwrap(),
             "outside"
         );
+    }
+
+    #[test]
+    fn a_long_label_leaves_room_for_the_stores_deepest_sockets() {
+        let label = "clean_landed_source_is_physically_deleted_before_reply_and_crash_replay";
+        let root = ScratchRoot::new(label).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.path().join(LABEL_FILE)).unwrap(),
+            label
+        );
+        let run = root.path().join("store/run");
+        let pool = run.join("cpu").join("p".repeat(22));
+        fs::create_dir_all(&pool).unwrap();
+        for socket in [
+            run.join(format!("{}.sock", "0".repeat(32))),
+            pool.join("e".repeat(22)),
+        ] {
+            std::os::unix::net::UnixListener::bind(&socket)
+                .unwrap_or_else(|error| panic!("bind {}: {error}", socket.display()));
+        }
     }
 
     #[test]

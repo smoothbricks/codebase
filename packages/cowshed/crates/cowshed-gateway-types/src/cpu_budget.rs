@@ -495,7 +495,7 @@ mod tests {
     #[test]
     fn pool_scope_is_store_local_and_fits_the_existing_fixture_socket_budget() {
         let incarnation = "0123456789abcdef0123456789abcdef";
-        let store = Path::new("/private/tmp/cowshed-dtest-79675-0-cli/store");
+        let store = Path::new("/private/tmp/cowshed-dtest-99999-99999/store");
         let scope = super::cpu_pool_directory(store, incarnation).unwrap();
         let endpoint = scope.join("abcdefghijklmnopqrstuv");
         assert!(scope.starts_with(store));

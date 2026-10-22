@@ -494,8 +494,9 @@ connections, command supervision, lock contention, publication records and recov
 `directory_*` tests and the clone-intent recovery binary run in ordinary Cargo test shards without creating or attaching
 a disk image. Directory stores report actual tree allocation, not fabricated block-device counters; volume labels,
 physical resizing and read-only mounts remain native-host tests. Their scratch roots use
-`/private/tmp/cowshed-dtest-<pid>-<n>-<label>` and share process cleanup with the image fixtures, but neither their
-setup nor their cleanup enumerates or releases disk images.
+`/private/tmp/cowshed-dtest-<pid>-<n>` and name their test in the root's `label` file, not its path, so every Unix
+socket a store binds beneath one fits macOS's 104-byte `sun_path` whatever the test is called. They share process
+cleanup with the image fixtures, but neither their setup nor their cleanup enumerates or releases disk images.
 
 Cargo lifecycle fixtures run the real Cargo that drives the test: canonical `CARGO`, never a `cargo` found on `PATH`,
 where an earlier install's link may still answer to the name. `rustc` and `rustdoc` resolve by Cargo's own rule
