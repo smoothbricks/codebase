@@ -4,6 +4,13 @@ version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 
+# One runner was the gate's tail: 487 tests, 1130 s of them in a few dozen command_dispatch
+# directory-substrate cases (up to 170 s each), run on one token after the rest of the gate had
+# finished (2026-10-22: 1225 s, sum of test times equal to the wall). Eight runners each take
+# their own grant; membership stays derived from nextest's test-name hash.
+[package.metadata.smoothbricks.test]
+shards = 8
+
 [[bin]]
 name = "cowshed"
 path = "src/main.rs"
