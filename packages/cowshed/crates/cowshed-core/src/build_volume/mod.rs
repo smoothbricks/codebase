@@ -1776,4 +1776,59 @@ mod tests {
         assert_eq!(empty_store_trash(&store), EmptiedTrash::default());
         fs::remove_dir_all(&root).unwrap();
     }
+
+    /// A detach frees exactly the build volumes whose record names the checkout as the one that
+    /// links it: never a seed, an unlinked volume, another checkout's, or one with no record.
+    #[test]
+    fn a_checkout_owns_the_volumes_its_records_name_it_linked_to() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-build-owned-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let project = ProjectPaths::with_mount_root(
+            &root,
+            root.join("mnt"),
+            &RepoId::parse("acme/widget").unwrap(),
+        )
+        .unwrap();
+        let layout = BuildVolumeLayout::new(&project).unwrap();
+        assert!(
+            layout
+                .owned_by(&WorkspaceName::new("topic").unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        fs::create_dir_all(layout.images()).unwrap();
+        let topic = WorkspaceName::new("topic").unwrap();
+        let other = WorkspaceName::new("other").unwrap();
+        let volume = |role: Option<BuildVolumeRole>| {
+            let id = BuildVolumeId::mint();
+            fs::write(layout.image(&id), b"").unwrap();
+            if let Some(role) = role {
+                layout
+                    .write_record(&id, &BuildVolumeRecord::new(None, role))
+                    .unwrap();
+            }
+            id
+        };
+        let linked = |name: &WorkspaceName| BuildVolumeRole::Linked {
+            checkout: name.clone(),
+        };
+        let own = volume(Some(linked(&topic)));
+        let interrupted = volume(Some(linked(&topic)));
+        volume(Some(linked(&other)));
+        volume(Some(BuildVolumeRole::Unlinked));
+        volume(Some(BuildVolumeRole::Seed {
+            target: topic.clone(),
+            incarnation: WorkspaceIncarnation::new("00000000000000000000000000000001").unwrap(),
+        }));
+        volume(None);
+        let mut owned = layout.owned_by(&topic).unwrap();
+        owned.sort();
+        let mut expected = vec![own, interrupted];
+        expected.sort();
+        assert_eq!(owned, expected);
+        assert_eq!(layout.owned_by(&other).unwrap().len(), 1);
+        fs::remove_dir_all(&root).unwrap();
+    }
 }
