@@ -853,13 +853,17 @@ attach hung after its device was published (`BusyState 0`, no I/O errors), and t
 images were detached, after which a fork completed in 72 s. A notification filtered to the target device would not
 overflow; DiskImages2 does not filter.
 
-So attached media are a budget, separate from the leaked-device ceiling above (error 150): before every attach cowshed
-counts the host's live `IOMedia` with an ordinary registry enumeration (`IOServiceGetMatchingServices`, which has no
-cap) and adds the media the attach will create, about three per image and six for a fork's session and build image. When
-that sum would reach the notification ceiling, cowshed first detaches the least-recently-used idle workspaces (no job,
-no session, no Nx activity; never main), which re-attach on their next use, until the attach fits, and otherwise refuses
-the attach by name, listing the attached workspaces and the media each holds. It never starts an attach that can only
-hang. `cowshed doctor` reports live `IOMedia` against the ceiling.
+So attached media are a budget, separate from the leaked-device ceiling above (error 150). Every image attach, from any
+cowshed path, is guarded where its command starts: cowshed counts the host's registered `IOMedia` family with an
+ordinary registry enumeration (`IOServiceGetMatchingServices`, subclasses included and uncapped), adds about three for
+each attach already running and for each the storage phase may still admit, keeps a reserve for the host's own disks,
+adds the three this attach creates, and refuses the attach before it starts when the sum would reach the ceiling
+(02_workspaces.md, "Making room for an attach"; 05_gateway.md, "The media cap's reserve"). A CLI verb that will attach
+first makes room: it detaches the least-recently-used idle workspaces (no supervisor serving them; never main, the
+workspaces it names, or one a land or `rm` holds), which re-attach on their next use, until its images fit. If nothing
+idle frees enough it detaches nothing and refuses by name, listing ten attached workspaces with the media each holds and
+the count of the rest. Controller operations get the guard's refusal only. No path starts an attach that can only hang.
+`cowshed doctor` reports live `IOMedia` against the ceiling.
 
 ### Freeing an image
 
