@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { churnScript, openForProbe, writerRemains } from '../../__tests__/churn-group.js';
-import { whenChanged } from '../../__tests__/directory-change.js';
+import { whenChanged } from '../../__tests__/path-change.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { awaitExit, ownedSocketDirectory, pidsWorkingIn, processTable, terminate } from '../../testing.js';
 import {

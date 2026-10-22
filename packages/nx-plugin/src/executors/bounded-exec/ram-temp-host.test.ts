@@ -20,7 +20,7 @@ import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { OpContextBinding } from '@smoothbricks/lmao';
 import { useTestSpan } from '@smoothbricks/lmao/testing/bun';
-import { whenChanged } from '../../__tests__/directory-change.js';
+import { whenChanged } from '../../__tests__/path-change.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { processTable, terminate } from '../../testing.js';
 import {

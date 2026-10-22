@@ -221,6 +221,17 @@ Host-controller tests that need the global identities of the real host (the shar
 the host's own store) name each such identity explicitly in the test. No blanket bypass of the workspace's block or
 grants is permitted.
 
+A fixture that waits for a file or directory to change waits on a kernel watch it armed itself, never on a timer and
+never on Bun's `fs.watch`. On darwin, Bun 1.4.3's `fs.watch` is one FSEvents stream per process. The stream starts
+since-now after the call returns and restarts whenever a watcher is added or removed; it missed 24 of 1000 single
+creates made 0-100 ms after the wait was armed. The nx-plugin tests use `whenChanged`
+(`packages/nx-plugin/src/__tests__/path-change.ts`). It runs a waker process that holds a kqueue `EVFILT_VNODE` watch on
+darwin or an inotify watch on linux, and writes one byte once the watch is armed and one after every event. Each byte
+re-judges the whole predicate, and the first judgment comes only after the watch is armed, so no change can fall between
+a read and its wait. A watch that cannot be armed fails the wait with the syscall and its errno; it never falls back to
+another watcher. The waker is killed and its exit awaited before the wait returns, so no waker outlives its fixture. The
+leg's watchdog stays the only hang bound.
+
 Known limitation: dead-run reclaim of the shared Nx fixture root enumerates live processes with `ps`, and the installed
 cowshed workspace denies that spawn, so reclaim cannot run there. A focused hook proof may use the host's direnv only to
 reclaim; that is neither a subject grant nor a cutover claim.
