@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'bun:test';
 import type { ProjectGraph } from 'nx/src/config/project-graph';
 import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
-import { BuildStateOutputError, refuseOutputsUnderBuildState } from './build-state-output-policy.js';
+import {
+  BuildStateOutputError,
+  type DeclaredOutput,
+  OutputDeclarationError,
+  OutputOverlapError,
+  refuseOutputsUnderBuildState,
+  refuseOverlappingOutputs,
+} from './build-state-output-policy.js';
 
 const workspaceRoot = '/checkout';
 const buildStatePaths = [
@@ -111,5 +118,145 @@ describe('build-state Nx output policy', () => {
     if (!project) throw new Error('fixture project missing');
     project.data.targets = { archive: { outputs: ['{workspaceRoot}/target/overridden'] } };
     expect(() => refuseOutputsUnderBuildState(resolved, buildStatePaths, workspaceRoot)).toThrow(BuildStateOutputError);
+  });
+});
+
+type Projects = Record<string, { readonly root: string; readonly targets: Record<string, TargetConfiguration> }>;
+
+function projects(spec: Projects): ProjectGraph {
+  const nodes: ProjectGraph['nodes'] = {};
+  const dependencies: ProjectGraph['dependencies'] = {};
+  for (const [name, { root, targets }] of Object.entries(spec)) {
+    nodes[name] = { name, type: 'lib', data: { root, targets } };
+    dependencies[name] = [];
+  }
+  return { nodes, dependencies };
+}
+
+/** The refusal as `task output <> task output` lines; [] when every output has one producer. */
+function overlaps(spec: Projects): string[] {
+  try {
+    refuseOverlappingOutputs(projects(spec), workspaceRoot);
+    return [];
+  } catch (error) {
+    if (!(error instanceof OutputOverlapError)) throw error;
+    const task = ({ project, target, configuration }: DeclaredOutput) =>
+      `${project}:${target}${configuration ? `:${configuration}` : ''}`;
+    return error.overlaps.map(({ left, right }) => `${task(left)} ${left.output} <> ${task(right)} ${right.output}`);
+  }
+}
+
+const run = (outputs: string[], extra: Partial<TargetConfiguration> = {}): TargetConfiguration => ({
+  executor: 'nx:run-commands',
+  outputs,
+  options: { command: 'true' },
+  ...extra,
+});
+
+describe('one producing target per Nx output', () => {
+  it('refuses an output at, under or above another target output, in every configuration and project', () => {
+    expect(
+      overlaps({
+        llm: {
+          root: 'packages/llm',
+          targets: {
+            'tsc-js': run(['{projectRoot}/dist']),
+            'nx-worker-bundle': run(['{projectRoot}/dist/nx/worker-entry.js']),
+          },
+        },
+        facts: {
+          root: 'packages/facts',
+          targets: { 'tsc-js': run(['{projectRoot}/dist-types']), 'build-types': run(['{projectRoot}/dist-types/']) },
+        },
+        ttsc: { root: 'packages/ttsc', targets: { build: run(['{projectRoot}/dist']) } },
+        bun: {
+          root: 'packages/bun',
+          targets: {
+            'test-script-compiler': run(['{options.daemon}'], {
+              options: { command: 'true', daemon: 'packages/ttsc/dist/native-script-daemon' },
+            }),
+          },
+        },
+        app: {
+          root: 'packages/app',
+          targets: {
+            build: run(['{projectRoot}/dist']),
+            bundle: run(['{options.out}'], {
+              options: { command: 'true', out: 'packages/app/bundle' },
+              configurations: { production: { out: 'packages/app/dist/bundle.js' } },
+            }),
+          },
+        },
+        rt: {
+          root: 'packages/rt',
+          targets: {
+            native: run(['{projectRoot}/dist/native']),
+            darwin: run(['{projectRoot}/dist/native/darwin/**']),
+            types: run(['{projectRoot}/**/*.d.ts']),
+            wasm: run(['{projectRoot}/out/*.wasm']),
+            engine: run(['{projectRoot}/out/engine.wasm']),
+          },
+        },
+      }),
+    ).toEqual([
+      'llm:tsc-js packages/llm/dist <> llm:nx-worker-bundle packages/llm/dist/nx/worker-entry.js',
+      'facts:tsc-js packages/facts/dist-types <> facts:build-types packages/facts/dist-types',
+      'ttsc:build packages/ttsc/dist <> bun:test-script-compiler packages/ttsc/dist/native-script-daemon',
+      'app:build packages/app/dist <> app:bundle:production packages/app/dist/bundle.js',
+      'rt:native packages/rt/dist/native <> rt:darwin packages/rt/dist/native/darwin/**',
+      'rt:native packages/rt/dist/native <> rt:types packages/rt/**/*.d.ts',
+      'rt:types packages/rt/**/*.d.ts <> rt:engine packages/rt/out/engine.wasm',
+      'rt:wasm packages/rt/out/*.wasm <> rt:engine packages/rt/out/engine.wasm',
+    ]);
+  });
+
+  it('passes disjoint outputs, two patterns, a negation and a pattern that cannot reach inside a path', () => {
+    expect(
+      overlaps({
+        llm: {
+          root: 'packages/llm',
+          targets: {
+            'tsc-js': run(['{projectRoot}/dist']),
+            'nx-worker-bundle': run(['{projectRoot}/dist-nx-bundle/worker-entry.js']),
+            'script-prelude': run([
+              '{projectRoot}/dist-prelude/script-prelude.json',
+              '{projectRoot}/dist-prelude/x.json',
+            ]),
+          },
+        },
+        rt: {
+          root: 'packages/rt',
+          targets: {
+            'tsc-js': run(['{projectRoot}/dist/**/*.{js,d.ts}{,.map}', '{projectRoot}/dist/.build.tsbuildinfo']),
+            build: run(['{projectRoot}/dist/*.wasm', '!{projectRoot}/dist']),
+            darwin: run(['{projectRoot}/dist/native/darwin-arm64/**']),
+            native: run(['{projectRoot}/out/native']),
+            wasm: run(['{projectRoot}/*/wasm/*.wasm']),
+          },
+        },
+      }),
+    ).toEqual([]);
+  });
+
+  it('names the target whose output Nx refuses to interpolate, and reads the next graph whole', () => {
+    // Nx's own error names only the output.
+    let refusal: unknown;
+    try {
+      refuseOverlappingOutputs(graph({ outputs: ['{projectRoot}/{workspaceRoot}/archive'] }), workspaceRoot);
+    } catch (error) {
+      refusal = error;
+    }
+    expect(refusal).toBeInstanceOf(OutputDeclarationError);
+    expect(refusal instanceof Error ? refusal.message : refusal).toStartWith(
+      "example:archive: Output '{projectRoot}/{workspaceRoot}/archive' is invalid.",
+    );
+    expect(
+      overlaps({
+        app: {
+          root: 'packages/app',
+          targets: { build: run(['{projectRoot}/dist']), bundle: run(['{projectRoot}/dist/a.js']) },
+        },
+      }),
+    ).toEqual(['app:build packages/app/dist <> app:bundle packages/app/dist/a.js']);
   });
 });

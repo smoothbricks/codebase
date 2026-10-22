@@ -632,6 +632,15 @@ are resolved against the caller's workspace root. `BuildStateOutputError.finding
 configuration, output, and contributed path. Keep cacheable artifacts under source-tree paths such as `dist/` and
 `.cache/nextest/`; restoring an output under `target/` or `.nx/` can replace a build-volume link with a real directory.
 
+`refuseOverlappingOutputs(graph, workspaceRoot)` from the same module gives each output path one producing target. It
+refuses any target whose output is at, under or above another target's output, in any configuration: Nx restores a
+directory output as one tree, so a second target writing inside it leaves the first target's tree unlike its cache
+artifact after every build, and the two restore over each other without either ever being a cache hit. A pattern
+conflicts with a path it matches, a path at or above its static prefix, or a path it can reach inside; two patterns are
+not judged, since only a file both match collides. `OutputOverlapError.overlaps` names both targets and outputs. Both
+validators interpolate the declarations themselves, so a declaration Nx refuses to interpolate raises
+`OutputDeclarationError` naming its target.
+
 ## Test Walk Policy
 
 A test pays its setup once and asserts after each step; two cases that test one path are one test. Consuming
