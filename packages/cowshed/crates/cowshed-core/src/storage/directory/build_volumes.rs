@@ -3,9 +3,10 @@
 //! file and job-admission claims as an image volume. A directory has no capacity, so nothing
 //! here reads or grows one.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File};
 use std::io;
+use std::ops::ControlFlow;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -31,6 +32,7 @@ use crate::storage::apfs::native::{
 use crate::storage::apfs::release::{Drained, Reclaim};
 use crate::storage::lifecycle::ResizeOutcome;
 use cowshed_apfs::image::ImageCapacity;
+use cowshed_os::fsio::AnchoredDirectory;
 use cowshed_os::process::Holder;
 
 /// The record beside a build volume of the write instant it holds everything up to
@@ -163,33 +165,46 @@ fn held_images(layout: &BuildVolumeLayout) -> Result<File, ApfsStorageError> {
         .map_err(|error| io_error("open the build images directory", layout.images(), error))
 }
 
-/// The project's build journal held by descriptor, `None` when it does not exist, refusing a
-/// link or a non-directory at its name.
-fn held_journal(layout: &BuildVolumeLayout) -> Result<Option<File>, ApfsStorageError> {
+/// The project's build journal held by descriptor, absent when missing. Every component
+/// is opened without following links; the pathname is never used again for its entries.
+fn held_journal(layout: &BuildVolumeLayout) -> Result<Option<AnchoredDirectory>, ApfsStorageError> {
     let journal = layout.releasing();
-    match cowshed_os::fsio::open_directory_nofollow(&journal) {
+    match AnchoredDirectory::open(&journal) {
         Ok(held) => Ok(Some(held)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(io_error("open the build release journal", &journal, error)),
     }
 }
 
-/// The bytes the files under `root` hold on disk, links never followed.
-fn tree_bytes(root: &Path) -> io::Result<u64> {
-    let mut bytes = 0;
-    let mut pending = vec![root.to_owned()];
-    while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(&directory)? {
-            let path = entry?.path();
-            let metadata = fs::symlink_metadata(&path)?;
-            if metadata.is_dir() {
-                pending.push(path);
-            } else {
-                bytes += metadata.blocks().saturating_mul(512);
-            }
-        }
+/// A held release prepared for deletion. Its preparation owns the rename's durability barrier;
+/// finishing consumes it and never resolves the journal's path again.
+struct DirectoryRelease<'a> {
+    journal: &'a AnchoredDirectory,
+    name: &'a CStr,
+    tree: AnchoredDirectory,
+}
+
+impl<'a> DirectoryRelease<'a> {
+    fn prepare(
+        images: &File,
+        journal: &'a AnchoredDirectory,
+        name: &'a CStr,
+        tree: AnchoredDirectory,
+    ) -> io::Result<Self> {
+        // This entry was observed before these syncs. A committer may have stopped just after
+        // its rename; do not delete any byte until both directory changes are durable.
+        journal.sync()?;
+        cowshed_os::fsio::sync_held_directory(images)?;
+        Ok(Self {
+            journal,
+            name,
+            tree,
+        })
     }
-    Ok(bytes)
+
+    fn finish(self) -> io::Result<u64> {
+        self.journal.remove_tree(self.name, &self.tree)
+    }
 }
 
 /// Whether `path` was there to remove.
@@ -199,6 +214,60 @@ fn remove_if_present(path: &Path) -> Result<bool, ApfsStorageError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(io_error("remove build volume record", path, error)),
     }
+}
+
+/// Inspect holders without opening the payload ourselves: that descriptor would itself be a
+/// holder. The path is derived from the held journal's current kernel name, and its entry must
+/// keep the fd-relative identity observed before the census. Deletion never uses this path.
+fn held_tree_holders(
+    journal: &AnchoredDirectory,
+    name: &CStr,
+    expected: &libc::stat,
+) -> io::Result<Vec<Holder>> {
+    let directory = journal.current_path()?;
+    let path = directory.join(OsStr::from_bytes(name.to_bytes()));
+    let require_identity = || {
+        let at = journal.stat_child(name)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} vanished during holder inspection", path.display()),
+            )
+        })?;
+        if at.st_dev == expected.st_dev
+            && at.st_ino == expected.st_ino
+            && at.st_mode & libc::S_IFMT == libc::S_IFDIR
+            && same_directory(&fs::symlink_metadata(&path)?, &at)
+        {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!(
+                    "{} no longer names the observed released tree",
+                    path.display()
+                ),
+            ))
+        }
+    };
+    require_identity()?;
+    let open = holders_of(&path).map_err(io::Error::other)?;
+    require_identity()?;
+    if journal.current_path()? != directory {
+        return Err(io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            format!(
+                "{} moved while its holders were inspected",
+                directory.display()
+            ),
+        ));
+    }
+    Ok(open)
+}
+
+fn same_directory(observed: &fs::Metadata, expected: &libc::stat) -> bool {
+    observed.is_dir()
+        && i128::from(observed.dev()) == i128::from(expected.st_dev)
+        && u128::from(observed.ino()) == u128::from(expected.st_ino)
 }
 
 /// Every process holding anything inside the payload tree at `image`, confirmed by a second
@@ -673,30 +742,31 @@ impl DirectoryExecutionHost {
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
     ) -> Result<bool, ApfsStorageError> {
-        let entry = layout.released(id);
         let images = held_images(layout)?;
         let Some(journal) = held_journal(layout)? else {
             return Ok(false);
         };
-        match fs::symlink_metadata(&entry) {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => {
-                return Err(ApfsStorageError::Host(format!(
-                    "{} is not a released build volume; it is left",
-                    entry.display()
-                )));
-            }
+        self.confirm_held_journaled_tree(layout, id, &images, &journal)
+    }
+
+    fn confirm_held_journaled_tree(
+        &self,
+        layout: &BuildVolumeLayout,
+        id: &BuildVolumeId,
+        images: &File,
+        journal: &AnchoredDirectory,
+    ) -> Result<bool, ApfsStorageError> {
+        let entry = layout.released(id);
+        match journal.existing_child(&leaf(&entry)?) {
+            Ok(_tree) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => {
-                return Err(io_error("inspect a released build volume", &entry, error));
-            }
+            Err(error) => return Err(io_error("open a released build volume", &entry, error)),
         }
-        let synced = |directory: &File, path: &Path| {
-            cowshed_os::fsio::sync_held_directory(directory)
-                .map_err(|error| io_error("sync the build release journal", path, error))
-        };
-        synced(&journal, &layout.releasing())?;
-        synced(&images, layout.images())?;
+        journal.sync().map_err(|error| {
+            io_error("sync the build release journal", &layout.releasing(), error)
+        })?;
+        cowshed_os::fsio::sync_held_directory(images)
+            .map_err(|error| io_error("sync the build images directory", layout.images(), error))?;
         Ok(true)
     }
 
@@ -714,41 +784,47 @@ impl DirectoryExecutionHost {
         let Some(held) = held_journal(layout)? else {
             return Ok(Drained::default());
         };
-        let listing = |error| io_error("list the build release journal", &journal, error);
+        let images = held_images(layout)?;
+        self.finish_held_build_releases(layout, &images, &held)
+    }
+
+    fn finish_held_build_releases(
+        &self,
+        layout: &BuildVolumeLayout,
+        images: &File,
+        held: &AnchoredDirectory,
+    ) -> Result<Drained, ApfsStorageError> {
+        let journal = layout.releasing();
         let mut drained = Drained::default();
-        for entry in fs::read_dir(&journal).map_err(listing)? {
-            let entry = entry.map_err(listing)?.path();
-            let named = entry
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(crate::build_volume::is_image_name);
-            let is_tree = named
-                && fs::symlink_metadata(&entry)
-                    .map_err(|error| io_error("inspect a released build volume", &entry, error))?
-                    .is_dir();
-            if !is_tree {
+        held.visit_entries(|name| {
+            let entry = journal.join(OsStr::from_bytes(name.to_bytes()));
+            let named = name.to_str().ok().is_some_and(crate::build_volume::is_image_name);
+            let metadata = if named { held.stat_child(name)? } else { None };
+            let Some(metadata) = metadata.filter(|at| at.st_mode & libc::S_IFMT == libc::S_IFDIR) else {
                 cowshed_os::eprintln!(
-                    "cowshed: {} is not a released build volume; it is left",
-                    entry.display()
+                    "cowshed: {} is not a released build volume; it is left", entry.display()
                 );
-                continue;
-            }
-            let open = holders_of(&entry)?;
+                return Ok(ControlFlow::Continue(()));
+            };
+            let open = held_tree_holders(held, name, &metadata)?;
             if !open.is_empty() {
                 cowshed_os::eprintln!(
                     "cowshed: released build volume {} stays while {} process(es) hold it; a later release or cowshed gc deletes it",
-                    entry.display(),
-                    open.len()
+                    entry.display(), open.len()
                 );
-                continue;
+                return Ok(ControlFlow::Continue(()));
             }
-            let bytes = tree_bytes(&entry)
-                .map_err(|error| io_error("measure a released build volume", &entry, error))?;
-            remove_payload_tree(&entry)?;
+            let tree = held.existing_child(name)?;
+            if !same_directory(&tree.metadata()?, &metadata) {
+                return Err(io::Error::new(io::ErrorKind::ResourceBusy,
+                    format!("{} changed after its holders were inspected", entry.display())));
+            }
+            let bytes = DirectoryRelease::prepare(images, held, name, tree)?.finish()?;
             drained.add(Drained { images: 1, bytes });
-        }
+            Ok(ControlFlow::Continue(()))
+        }).map_err(|error| io_error("drain the held build release journal", &journal, error))?;
         if drained.images > 0 {
-            cowshed_os::fsio::sync_held_directory(&held)
+            held.sync()
                 .map_err(|error| io_error("sync the build release journal", &journal, error))?;
         }
         Ok(drained)
@@ -905,6 +981,150 @@ mod journal_tests {
     use super::*;
     use crate::repository::{ProjectPaths, RepoId};
     use crate::storage::apfs::ApfsSubstrateConfig;
+
+    fn swap_fixture() -> (PathBuf, DirectoryExecutionHost, BuildVolumeLayout) {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-directory-journal-swap-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let store = root.join("store");
+        let host =
+            DirectoryExecutionHost::new(ApfsSubstrateConfig::new(&store, root.join("checkout")))
+                .unwrap();
+        let project = ProjectPaths::with_mount_root(
+            &store,
+            root.join("mnt"),
+            &RepoId::parse("acme/widget").unwrap(),
+        )
+        .unwrap();
+        let layout = BuildVolumeLayout::new(&project).unwrap();
+        fs::create_dir_all(layout.releasing()).unwrap();
+        (root, host, layout)
+    }
+
+    #[test]
+    fn a_retry_never_confirms_a_foreign_tree_after_the_journal_path_is_swapped() {
+        let (root, host, layout) = swap_fixture();
+        let ours = BuildVolumeId::mint();
+        let theirs = BuildVolumeId::mint();
+        fs::create_dir(layout.released(&ours)).unwrap();
+        let foreign = root.join("foreign");
+        fs::create_dir_all(foreign.join(format!("{theirs}.dmg"))).unwrap();
+        let images = held_images(&layout).unwrap();
+        let journal = held_journal(&layout).unwrap().unwrap();
+        fs::rename(layout.releasing(), root.join("held-journal")).unwrap();
+        std::os::unix::fs::symlink(&foreign, layout.releasing()).unwrap();
+
+        assert!(
+            !host
+                .confirm_held_journaled_tree(&layout, &theirs, &images, &journal)
+                .unwrap(),
+            "the foreign journal's tree is not our durable release"
+        );
+        assert!(
+            host.confirm_held_journaled_tree(&layout, &ours, &images, &journal)
+                .unwrap(),
+            "confirmation follows the held journal, not its replaced name"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_drain_never_deletes_foreign_data_after_the_journal_path_is_swapped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, host, layout) = swap_fixture();
+        let ours = BuildVolumeId::mint();
+        let theirs = BuildVolumeId::mint();
+        let image = layout.released(&ours);
+        fs::create_dir_all(image.join("sealed/nested")).unwrap();
+        fs::write(image.join("sealed/nested/warm"), b"superseded seed").unwrap();
+        let foreign = root.join("foreign");
+        let foreign_tree = foreign.join(format!("{theirs}.dmg"));
+        fs::create_dir_all(&foreign_tree).unwrap();
+        fs::write(foreign_tree.join("kept"), b"not the store's").unwrap();
+        std::os::unix::fs::symlink(&foreign_tree, image.join("foreign-link")).unwrap();
+        let bytes = [image.join("sealed/nested/warm"), image.join("foreign-link")]
+            .iter()
+            .map(|path| fs::symlink_metadata(path).unwrap().blocks() * 512)
+            .sum();
+        fs::set_permissions(image.join("sealed"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(
+            image.join("sealed/nested"),
+            fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        let journal = held_journal(&layout).unwrap().unwrap();
+        let retained = root.join("held-journal");
+        fs::rename(layout.releasing(), &retained).unwrap();
+        std::os::unix::fs::symlink(&foreign, layout.releasing()).unwrap();
+
+        let images = held_images(&layout).unwrap();
+        let drained = host
+            .finish_held_build_releases(&layout, &images, &journal)
+            .unwrap();
+        assert_eq!(
+            fs::read(foreign_tree.join("kept")).unwrap(),
+            b"not the store's"
+        );
+        assert_eq!(drained, Drained { images: 1, bytes });
+        assert!(!retained.join(format!("{ours}.dmg")).exists());
+        assert!(
+            fs::symlink_metadata(layout.releasing())
+                .unwrap()
+                .is_symlink()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_unsynced_directory_rename_is_durable_before_the_drain_deletes_any_bytes() {
+        let (root, _host, layout) = swap_fixture();
+        let images = held_images(&layout).unwrap();
+        let journal = held_journal(&layout).unwrap().unwrap();
+        let id = BuildVolumeId::mint();
+        let image = layout.image(&id);
+        fs::create_dir(&image).unwrap();
+        fs::write(image.join("warm"), b"unsynced seed").unwrap();
+        let entry = layout.released(&id);
+        fs::rename(&image, &entry).unwrap();
+        let name = leaf(&entry).unwrap();
+        let tree = journal.existing_child(&name).unwrap();
+        cowshed_os::fsio::take_syncs();
+
+        let release = DirectoryRelease::prepare(&images, &journal, &name, tree).unwrap();
+        assert_eq!(
+            cowshed_os::fsio::take_syncs().full,
+            2,
+            "the journal and source directory must sync before deletion is admitted"
+        );
+        assert_eq!(
+            fs::read(entry.join("warm")).unwrap(),
+            b"unsynced seed",
+            "neither sync is deferred until after the first deletion"
+        );
+        release.finish().unwrap();
+        assert!(!entry.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_drain_counts_real_self_holds_but_not_its_own_observation() {
+        let (root, host, layout) = swap_fixture();
+        let id = BuildVolumeId::mint();
+        let entry = layout.released(&id);
+        fs::create_dir(&entry).unwrap();
+        fs::write(entry.join("warm"), b"held seed").unwrap();
+        let held = File::open(entry.join("warm")).unwrap();
+        assert_eq!(host.finish_build_releases(&layout).unwrap().images, 0);
+        assert_eq!(fs::read(entry.join("warm")).unwrap(), b"held seed");
+        drop(held);
+        assert_eq!(host.finish_build_releases(&layout).unwrap().images, 1);
+        assert!(!entry.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     /// The build journal is the store's own. A link planted at `build/.releasing` is never
     /// followed: a journaled release refuses with the seed, its record and the foreign tree

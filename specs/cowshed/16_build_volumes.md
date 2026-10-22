@@ -995,7 +995,12 @@ delta incrementally, as an edit would.
   died before syncing its rename. Nothing mounts, forks or reads an entry, and nothing is opened through a link: the
   images directory and the journal are held by descriptor, a link or any other non-regular file at the image's name or
   an entry's refuses or is named and left, untouched. An operation about to commit over an entry a crash left finishes
-  that entry first, because a rename over a file frees the file it replaces in one go.
+  that entry first, because a rename over a file frees the file it replaces in one go. For the directory substrate,
+  retry confirmation and the drain's listing, accounting and recursive deletion resolve each child against its held
+  parent descriptor, never the journal's replaceable pathname. Holder discovery uses the held journal's current kernel
+  name with entry-identity checks around the census; a changed name refuses the drain. The payload is opened only after
+  that census (so the observer is not itself a holder), checked against the observed identity, and both the journal and
+  source directory are synced for that entry before its first deletion.
 - Releasing an image never frees it in one go. One `unlink` of a written image is one free of its whole extent tree, and
   every writer of the store's APFS container waits behind it: measured 2026-10-22, the installed daemon's trash thread
   sat in one `unlink` of a 300 GiB image (its first 100,000 runs held 778 MiB, a median run of 4 KiB) while its main

@@ -406,7 +406,12 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   workspace image left so is finished by project recovery, which then reconciles the record its rename left imageless. A
   journaled release returns with its entry whole and unlocked, and a drain finishes it; a directory store's seed refresh
   whose superseded seed a process holds publishes the new seed and answers with the old tree committed whole, and the
-  journal's finisher leaves that tree while it is held and deletes it once it is not.
+  journal's finisher leaves that tree while it is held and deletes it once it is not. An unsynced native entry held by
+  another releaser still requires all rename syncs before a journaled retry answers. Directory regressions replace the
+  journal pathname after acquisition: neither retry confirmation nor the drain may follow the foreign tree. The drain
+  syncs both held directories while the unsynced entry is still intact, then deletes through those descriptors; a
+  replaced opened child and foreign symlink targets remain untouched. A real self-held payload stays, but the drain's
+  own observation does not retain it.
 - **A supervisor's opening finishes nothing and waits for no image lock** (07_api.md, "Authority model"): for any
   generated workspace and probe name, a `Supervisor` opening observes what a `Workspaces` opening naming that one
   workspace observes, replays no intent, selects no rename and has no retirement target; over generated scopes it and

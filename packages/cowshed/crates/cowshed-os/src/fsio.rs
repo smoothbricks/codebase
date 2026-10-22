@@ -8,9 +8,10 @@ use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
+use std::ops::ControlFlow;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// A held directory capability. Child preparation never re-resolves a mutable
@@ -66,7 +67,6 @@ impl AnchoredDirectory {
         self.child_with(name, true)
     }
 
-    #[cfg(target_os = "macos")]
     pub fn existing_child(&self, name: &CStr) -> io::Result<Self> {
         self.child_with(name, false)
     }
@@ -106,7 +106,6 @@ impl AnchoredDirectory {
         Ok(Self(unsafe { File::from_raw_fd(fd) }))
     }
 
-    #[cfg(target_os = "macos")]
     pub fn metadata(&self) -> io::Result<fs::Metadata> {
         self.0.metadata()
     }
@@ -136,12 +135,13 @@ impl AnchoredDirectory {
         }
     }
 
-    /// Enumerate the held directory, not its path. A new open has its own directory offset;
-    /// dup would share an offset and make a second check see the first check's EOF.
-    #[cfg(target_os = "macos")]
-    pub fn contains_only(&self, expected: &CStr) -> io::Result<bool> {
-        validate_directory_leaf(expected)?;
-        // SAFETY: "." is a constant leaf below the live held directory.
+    /// Enumerate this held directory, never its pathname. Each visit opens a fresh stream so
+    /// its offset cannot affect another visit. Break stops early; errors still close the stream.
+    pub fn visit_entries(
+        &self,
+        mut visit: impl FnMut(&CStr) -> io::Result<ControlFlow<()>>,
+    ) -> io::Result<()> {
+        // SAFETY: the held descriptor and constant leaf outlive openat.
         let fd = unsafe {
             libc::openat(
                 self.0.as_raw_fd(),
@@ -152,51 +152,170 @@ impl AnchoredDirectory {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: fd is a new directory descriptor. On success fdopendir owns it.
+        // SAFETY: fd is a new directory descriptor; a successful fdopendir owns it.
         let directory = unsafe { libc::fdopendir(fd) };
         if directory.is_null() {
             let error = io::Error::last_os_error();
-            // SAFETY: fdopendir failed, so the descriptor still belongs to this call.
+            // SAFETY: fdopendir failed, leaving fd owned by this call.
             drop(unsafe { File::from_raw_fd(fd) });
             return Err(error);
         }
-        let mut found = false;
         let result = loop {
-            // SAFETY: errno is thread-local; readdir uses zero to distinguish EOF from error.
-            unsafe { *libc::__error() = 0 };
-            // SAFETY: directory is held until closed below.
+            #[cfg(target_os = "macos")]
+            // SAFETY: errno is thread-local; zero distinguishes readdir EOF from failure.
+            unsafe {
+                *libc::__error() = 0
+            };
+            #[cfg(target_os = "linux")]
+            // SAFETY: errno is thread-local; zero distinguishes readdir EOF from failure.
+            unsafe {
+                *libc::__errno_location() = 0
+            };
+            // SAFETY: the directory stream remains held until closed below.
             let entry = unsafe { libc::readdir(directory) };
             if entry.is_null() {
                 let error = io::Error::last_os_error();
                 break if error.raw_os_error() == Some(0) {
-                    Ok(found)
+                    Ok(())
                 } else {
                     Err(error)
                 };
             }
-            // SAFETY: POSIX readdir returns a NUL-terminated name, live until the next call.
+            // SAFETY: readdir returned a NUL-terminated name live until its next call.
             let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
             if name == c"." || name == c".." {
                 continue;
             }
-            if name != expected || found {
-                break Ok(false);
+            match visit(name) {
+                Ok(ControlFlow::Continue(())) => {}
+                Ok(ControlFlow::Break(())) => break Ok(()),
+                Err(error) => break Err(error),
             }
-            found = true;
         };
-        // SAFETY: this call owns directory; closedir also closes its descriptor.
+        // SAFETY: this call owns the stream; closedir also closes its descriptor.
         if unsafe { libc::closedir(directory) } == 0 {
             result
         } else {
             let close = io::Error::last_os_error();
             match result {
-                Ok(_) => Err(close),
+                Ok(()) => Err(close),
                 Err(error) => Err(io::Error::new(
                     error.kind(),
                     format!("{error}; closing directory: {close}"),
                 )),
             }
         }
+    }
+
+    /// Whether the only entry in this held directory is the expected leaf.
+    #[cfg(target_os = "macos")]
+    pub fn contains_only(&self, expected: &CStr) -> io::Result<bool> {
+        validate_directory_leaf(expected)?;
+        let mut found = false;
+        self.visit_entries(|name| {
+            if name != expected || found {
+                found = false;
+                return Ok(ControlFlow::Break(()));
+            }
+            found = true;
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(found)
+    }
+
+    /// The kernel's current name for this directory, for a path-based observation only. The
+    /// caller must check the path still names this inode around that observation. Mutations
+    /// remain descriptor-relative even when the directory has moved.
+    pub fn current_path(&self) -> io::Result<PathBuf> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut path =
+                vec![0_u8; usize::try_from(libc::PATH_MAX).expect("PATH_MAX fits usize")];
+            // SAFETY: F_GETPATH fills at most PATH_MAX bytes of the live directory's path.
+            if unsafe { libc::fcntl(self.0.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let length = CStr::from_bytes_until_nul(&path)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+                .to_bytes()
+                .len();
+            path.truncate(length);
+            Ok(PathBuf::from(OsString::from_vec(path)))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            fs::read_link(format!("/proc/self/fd/{}", self.0.as_raw_fd()))
+        }
+    }
+
+    /// Remove the supplied held child's contents and then its name, never following a link.
+    /// The child must still be this parent's entry before descent and before its final unlink.
+    /// Return allocated file/link bytes, excluding directory metadata, as the release report does.
+    pub fn remove_tree(&self, name: &CStr, tree: &Self) -> io::Result<u64> {
+        let require_child = || {
+            let mut held = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: the child's held descriptor is live and fstat fills held on success.
+            if unsafe { libc::fstat(tree.0.as_raw_fd(), held.as_mut_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: fstat initialized held.
+            let held = unsafe { held.assume_init() };
+            let named = self.stat_child(name)?.is_some_and(|at| {
+                at.st_mode & libc::S_IFMT == libc::S_IFDIR
+                    && at.st_dev == held.st_dev
+                    && at.st_ino == held.st_ino
+            });
+            if named {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "{} no longer names the held directory",
+                        name.to_string_lossy()
+                    ),
+                ))
+            }
+        };
+        require_child()?;
+        let bytes = tree.remove_contents()?;
+        require_child()?;
+        // SAFETY: unlinkat removes only this held parent's empty child, never a link target.
+        if unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(bytes)
+    }
+
+    fn remove_contents(&self) -> io::Result<u64> {
+        let metadata = self.metadata()?;
+        // SAFETY: geteuid reads no caller-owned memory and cannot fail.
+        if metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o700 != 0o700 {
+            // Tools seal cache directories. Restore only our own directory's access by fd.
+            self.0.set_permissions(fs::Permissions::from_mode(
+                (metadata.mode() & 0o7777) | 0o700,
+            ))?;
+        }
+        let mut bytes = 0;
+        self.visit_entries(|name| {
+            let Some(metadata) = self.stat_child(name)? else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                let child = self.existing_child(name)?;
+                bytes += self.remove_tree(name, &child)?;
+            } else {
+                let blocks = u64::try_from(metadata.st_blocks)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                // SAFETY: only this held parent's leaf is unlinked, without following links.
+                if unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                bytes += blocks.saturating_mul(512);
+            }
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(bytes)
     }
 
     /// Both names resolve against this held parent; an existing destination is never replaced.
@@ -1187,6 +1306,38 @@ mod tests {
                 }
                 Err(error) => panic!("remove test root {}: {error}", self.0.display()),
             }
+        }
+    }
+
+    #[test]
+    fn held_tree_removal_refuses_a_replaced_child_without_touching_either_tree() {
+        let root = TempRoot::new_in(&canonical_parent(), "fsio-held-tree");
+        let parent = AnchoredDirectory::create(&root.join("parent")).unwrap();
+        let child = parent.child(c"child").unwrap();
+        fs::write(root.join("parent/child/ours"), b"our tree").unwrap();
+        let foreign = root.join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("kept"), b"foreign tree").unwrap();
+        fs::rename(root.join("parent/child"), root.join("retained")).unwrap();
+        std::os::unix::fs::symlink(&foreign, root.join("parent/child")).unwrap();
+
+        assert_eq!(
+            parent.remove_tree(c"child", &child).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(fs::read(foreign.join("kept")).unwrap(), b"foreign tree");
+        assert_eq!(fs::read(root.join("retained/ours")).unwrap(), b"our tree");
+        assert_eq!(child.current_path().unwrap(), root.join("retained"));
+        for _ in 0..2 {
+            let mut seen = 0;
+            child
+                .visit_entries(|name| {
+                    assert_eq!(name, c"ours");
+                    seen += 1;
+                    Ok(ControlFlow::Continue(()))
+                })
+                .unwrap();
+            assert_eq!(seen, 1, "each descriptor listing starts at its own offset");
         }
     }
 
