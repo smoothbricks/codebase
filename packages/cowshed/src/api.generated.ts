@@ -1469,6 +1469,11 @@ export type HostPathRequest = {
 export type HostRequest = { readonly [key in string]: never };
 
 /**
+ * Which host connection this is, fixed by its handshake: each serves exactly one scope.
+ */
+export type HostRole = 'host' | 'sccache';
+
+/**
  * `identity add <remote>`.
  */
 export type IdentityAddRequest = {
@@ -3003,6 +3008,14 @@ export type RunSandboxMode = 'readWrite' | 'readOnly';
  * within the bound every projection holds exactly.
  */
 export type SampleInterval = number & tags.Type<'uint64'> & tags.Minimum<1> & tags.Maximum<9007199254740991>;
+
+/**
+ * `sccache start [--capacity]`: the cache cap, as `--capacity` spells it (`40g`, `1t`); absent
+ * derives it from the store.
+ */
+export type SccacheStartRequest = {
+  readonly capacity?: string;
+};
 
 /**
  * What the running sccache daemon reports about itself.

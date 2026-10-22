@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use codec::Demand;
 use cowshed_os::timing::StepSink;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::num::NonZeroUsize;
 use std::os::fd::OwnedFd;
@@ -26,7 +26,8 @@ pub const MAX_BINARY_FRAME_BYTES: usize = 64 * 1024;
 
 pub(crate) mod codec {
     use super::{
-        CowshedError, HANDSHAKE_VERSION, MAX_HANDSHAKE_BYTES, MAX_JSON_FRAME_BYTES, RepoId, Value,
+        CowshedError, HANDSHAKE_VERSION, HostRole, MAX_HANDSHAKE_BYTES, MAX_JSON_FRAME_BYTES,
+        RepoId, Value,
     };
     use crate::api::dto::StepReport;
     use serde::de::DeserializeOwned;
@@ -52,17 +53,11 @@ pub(crate) mod codec {
     }
 
     #[derive(Debug, Serialize, Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    enum HostMarker {
-        Host,
-    }
-
-    #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
     struct HostHelloFields<'a> {
         version: u32,
         nonce: Cow<'a, str>,
-        host: HostMarker,
+        host: HostRole,
     }
 
     /// One schema for both directions: a client frames its operation's pre-serialized params
@@ -348,22 +343,28 @@ pub(crate) mod codec {
         decode::<ServerHelloFields<'static>>(bytes, MAX_HANDSHAKE_BYTES).map(DecodedServerHello)
     }
 
-    /// A host connection's answer names no project: its `host` marker is what a client checks it
-    /// reached `cowshed host` and not a project controller, whose answer does not decode as this.
-    pub(crate) fn encode_host_hello(nonce: &str) -> Result<Vec<u8>, WireCodecError> {
+    /// A host connection's answer names no project: its `host` role is what a client checks it
+    /// reached the host connection it asked for and not a project controller, whose answer does
+    /// not decode as this.
+    pub(crate) fn encode_host_hello(
+        nonce: &str,
+        role: HostRole,
+    ) -> Result<Vec<u8>, WireCodecError> {
         encode(
             &HostHelloFields {
                 version: HANDSHAKE_VERSION,
                 nonce: Cow::Borrowed(nonce),
-                host: HostMarker::Host,
+                host: role,
             },
             MAX_HANDSHAKE_BYTES,
         )
     }
 
-    pub(crate) fn decode_host_hello(bytes: &[u8]) -> Result<(u32, String), WireCodecError> {
+    pub(crate) fn decode_host_hello(
+        bytes: &[u8],
+    ) -> Result<(u32, String, HostRole), WireCodecError> {
         decode::<HostHelloFields<'static>>(bytes, MAX_HANDSHAKE_BYTES)
-            .map(|hello| (hello.version, hello.nonce.into_owned()))
+            .map(|hello| (hello.version, hello.nonce.into_owned(), hello.host))
     }
 
     /// `params` is the request already serialized by its declared operation, framed verbatim.
@@ -702,8 +703,8 @@ pub enum ConnectionAuthority {
         workspace: WorkspaceName,
         workspace_incarnation: WorkspaceIncarnation,
     },
-    /// A `cowshed host` connection: the host's own operations, bound to no project.
-    Host,
+    /// A host connection, bound to no project: exactly its role's operations.
+    Host(HostRole),
 }
 
 impl ConnectionAuthority {
@@ -711,7 +712,28 @@ impl ConnectionAuthority {
     pub fn repo_id(&self) -> Option<&RepoId> {
         match self {
             Self::Coordinator { repo_id } | Self::Worker { repo_id, .. } => Some(repo_id),
-            Self::Host => None,
+            Self::Host(_) => None,
+        }
+    }
+}
+
+/// Which host connection this is, fixed by its handshake: each serves exactly one scope.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HostRole {
+    /// `cowshed host`: the host's own verbs.
+    Host,
+    /// `cowshed sccache host`: the sccache daemon's control, on the build the launcher routes the
+    /// `sccache` verb to.
+    Sccache,
+}
+
+impl HostRole {
+    /// The one scope a connection of this role serves.
+    pub const fn scope(self) -> Scope {
+        match self {
+            Self::Host => Scope::Host,
+            Self::Sccache => Scope::Sccache,
         }
     }
 }
@@ -964,9 +986,12 @@ pub async fn serve_controller_connection(
     })?;
     let (version, nonce) = hello.into_parts();
     validate_hello(version, &nonce)?;
-    let response = match authority.repo_id() {
-        Some(repo_id) => codec::encode_server_hello(&nonce, repo_id),
-        None => codec::encode_host_hello(&nonce),
+    let response = match &authority {
+        ConnectionAuthority::Coordinator { repo_id }
+        | ConnectionAuthority::Worker { repo_id, .. } => {
+            codec::encode_server_hello(&nonce, repo_id)
+        }
+        ConnectionAuthority::Host(role) => codec::encode_host_hello(&nonce, *role),
     }
     .map_err(|error| {
         if error.is_too_large() {
@@ -1390,16 +1415,16 @@ fn validate_request(
     })?;
 
     match authority {
-        ConnectionAuthority::Host => {
-            if operation.scope != Scope::Host {
+        ConnectionAuthority::Host(role) => {
+            if operation.scope != role.scope() {
                 return Err(authority_error(format!(
-                    "host authority cannot call project method {}",
+                    "a {role:?} host connection cannot call method {}",
                     operation.method
                 )));
             }
         }
         ConnectionAuthority::Coordinator { .. } | ConnectionAuthority::Worker { .. }
-            if operation.scope == Scope::Host =>
+            if matches!(operation.scope, Scope::Host | Scope::Sccache) =>
         {
             return Err(authority_error(format!(
                 "project authority cannot call host method {}",

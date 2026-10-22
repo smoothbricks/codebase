@@ -698,6 +698,11 @@ export const assertHostRequestList = typia.createAssertEquals<readonly Api.HostR
 export const parseHostRequestList = (json: string): readonly Api.HostRequest[] =>
   assertHostRequestList(JSON.parse(json));
 
+export const assertHostRole = typia.createAssertEquals<Api.HostRole>();
+export const parseHostRole = (json: string): Api.HostRole => assertHostRole(JSON.parse(json));
+export const assertHostRoleList = typia.createAssertEquals<readonly Api.HostRole[]>();
+export const parseHostRoleList = (json: string): readonly Api.HostRole[] => assertHostRoleList(JSON.parse(json));
+
 export const assertIdentityAddRequest = typia.createAssertEquals<Api.IdentityAddRequest>();
 export const parseIdentityAddRequest = (json: string): Api.IdentityAddRequest =>
   assertIdentityAddRequest(JSON.parse(json));
@@ -1483,6 +1488,13 @@ export const parseSampleInterval = (json: string): Api.SampleInterval => assertS
 export const assertSampleIntervalList = typia.createAssertEquals<readonly Api.SampleInterval[]>();
 export const parseSampleIntervalList = (json: string): readonly Api.SampleInterval[] =>
   assertSampleIntervalList(JSON.parse(json));
+
+export const assertSccacheStartRequest = typia.createAssertEquals<Api.SccacheStartRequest>();
+export const parseSccacheStartRequest = (json: string): Api.SccacheStartRequest =>
+  assertSccacheStartRequest(JSON.parse(json));
+export const assertSccacheStartRequestList = typia.createAssertEquals<readonly Api.SccacheStartRequest[]>();
+export const parseSccacheStartRequestList = (json: string): readonly Api.SccacheStartRequest[] =>
+  assertSccacheStartRequestList(JSON.parse(json));
 
 export const assertSccacheStats = typia.createAssertEquals<Api.SccacheStats>();
 export const parseSccacheStats = (json: string): Api.SccacheStats => assertSccacheStats(JSON.parse(json));

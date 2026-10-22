@@ -353,10 +353,10 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     }
     // An embedding process's host connection: like the controller it lasts as long as that
     // process keeps its end open. It names no project, so nothing is resolved before it serves.
-    if matches!(parsed.command, args::Command::Host) {
+    if let args::Command::Host(role) = parsed.command {
         let outcome = async {
             let socket = controller_service::take_inherited_socket()?;
-            crate::host_service::serve(socket).await
+            crate::host_service::serve(socket, role).await
         }
         .await
         .map(|()| 0);

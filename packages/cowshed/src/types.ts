@@ -7,6 +7,7 @@ import type {
   HostSkillInstallArguments,
   JobLogsArguments,
   ProjectListArguments,
+  SccacheStartArguments,
 } from './native.generated.js';
 
 export type * from './api.generated.js';
@@ -18,6 +19,7 @@ export type {
   HostSkillInstallArguments,
   JobLogsArguments,
   ProjectListArguments,
+  SccacheStartArguments,
 } from './native.generated.js';
 
 export type CowshedErrorOptions = ErrorOptions &
@@ -179,6 +181,21 @@ export interface Host {
    */
   diskCommand(request: HostDiskCommandArguments): AsyncIterable<Api.DiskCommandEvent>;
   /** Ends the connection and with it the `cowshed host` process; later calls reject. */
+  close(): Promise<void>;
+}
+
+/**
+ * The sccache daemon's control over one `cowshed sccache host` connection, which the package
+ * launcher routes to the installed build as it routes every `sccache` verb (07_api.md, "Host
+ * operations"). A connection and a process of its own: `Host` never opens it.
+ */
+export interface SccacheHost {
+  /** Installs (or repairs) the sccache LaunchAgent, its cap `capacity` (`40g`, `1t`) or derived. */
+  start(options?: SccacheStartArguments): Promise<Api.SccacheStatus>;
+  /** Removes the sccache LaunchAgent; the daemon stops. */
+  stop(): Promise<void>;
+  status(): Promise<Api.SccacheStatus>;
+  /** Ends the connection and with it the `cowshed sccache host` process; later calls reject. */
   close(): Promise<void>;
 }
 

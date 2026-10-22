@@ -8,15 +8,15 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use cowshed_core::Host;
 use cowshed_core::api::call::{self, Arguments};
 use cowshed_core::api::dto::DiskCommandEvent;
 use cowshed_core::api::operations::{
     HostBuildState, HostCredentialAdd, HostDiskCommand, HostLockHolders, HostRetireDescendants,
-    HostTreeHolders,
+    HostTreeHolders, SccacheStatusRead,
 };
 use cowshed_core::build_volume::{BUILD_LINK, BuildVolumeState};
 use cowshed_core::capabilities::BuildStatePath;
+use cowshed_core::{Host, SccacheHost};
 
 /// The `cowshed` binary under test, read when the test runs (see tests/controller.rs).
 fn cowshed() -> PathBuf {
@@ -383,4 +383,85 @@ async fn a_host_credential_upload_is_the_stdin_secret_and_nothing_else() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Starts `cowshed <verb>` on a socketpair and answers our end, as `openHost` and
+/// `openSccacheHost` start theirs (the built binary here, not the launcher's choice).
+fn serving(verb: &[&str]) -> (OwnedFd, tokio::process::Child) {
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let child = tokio::process::Command::new(cowshed())
+        .args(verb)
+        .stdin(Stdio::from(OwnedFd::from(theirs)))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    (OwnedFd::from(ours), child)
+}
+
+/// `cowshed sccache host` serves `sccache.status` with what `sccache status --json` prints
+/// (the daemon's installed and running state; its counters move between two reads), and each
+/// client refuses a connection of the other role at the handshake, before any call.
+#[tokio::test]
+async fn a_sccache_host_connection_serves_the_sccache_rows_and_no_other_role() {
+    let verb = Command::new(cowshed())
+        .args(["--json", "sccache", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        verb.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verb.stderr)
+    );
+    let printed: serde_json::Value = serde_json::from_slice(&verb.stdout).unwrap();
+
+    let (socket, child) = serving(&["sccache", "host"]);
+    let sccache = SccacheHost::connect(socket)
+        .await
+        .expect("sccache host handshake");
+    let status = call::call::<SccacheStatusRead, _>(&sccache, Arguments::new())
+        .await
+        .expect("sccache.status");
+    let answered = serde_json::to_value(&status).unwrap();
+    for field in ["installed", "running", "socket"] {
+        assert_eq!(
+            answered[field], printed["result"][field],
+            "{field}: {answered} {printed}"
+        );
+    }
+    drop(sccache);
+    let output = child
+        .wait_with_output()
+        .await
+        .expect("wait for cowshed sccache host");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "the connection never writes stdout"
+    );
+
+    let (socket, child) = serving(&["sccache", "host"]);
+    let refused = Host::connect(socket)
+        .await
+        .expect_err("a host client refuses sccache host");
+    assert!(refused.message.contains("Sccache"), "{refused:?}");
+    child
+        .wait_with_output()
+        .await
+        .expect("wait for cowshed sccache host");
+
+    let (socket, child) = serving(&["host"]);
+    let refused = SccacheHost::connect(socket)
+        .await
+        .expect_err("a sccache host client refuses cowshed host");
+    assert!(refused.message.contains("Host"), "{refused:?}");
+    child
+        .wait_with_output()
+        .await
+        .expect("wait for cowshed host");
 }

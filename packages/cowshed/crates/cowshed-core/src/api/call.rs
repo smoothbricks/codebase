@@ -15,7 +15,7 @@
 //! a second field list, decides what the call accepts.
 
 use super::capability::{
-    Adopted, ControllerRuntime, Coordinator, EventStream, Host, JobHandle, Project,
+    Adopted, ControllerRuntime, Coordinator, EventStream, Host, JobHandle, Project, SccacheHost,
     WorkspaceHandle, WorkspaceRef, invoke, invoke_download, invoke_stream, invoke_upload,
 };
 use super::dto::{JobId, JobInfo, WorkspaceIncarnation};
@@ -100,6 +100,7 @@ pub struct JobFields<'a> {
 }
 
 impl sealed::Sealed for Host {}
+impl sealed::Sealed for SccacheHost {}
 impl sealed::Sealed for Project {}
 impl sealed::Sealed for WorkspaceRef {}
 impl sealed::Sealed for Coordinator {}

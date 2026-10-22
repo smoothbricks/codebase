@@ -57,6 +57,14 @@ const CLASSES: &[Class] = &[
         fence: &[],
         authority: &[],
     },
+    // The sccache daemon's control, on its own connection: `cowshed sccache host`.
+    Class {
+        rust: "SccacheHost",
+        namespaces: &["sccache"],
+        scopes: &[Scope::Sccache],
+        fence: &[],
+        authority: &[],
+    },
     Class {
         rust: "Project",
         namespaces: &["project"],
@@ -512,7 +520,7 @@ fn serves(classes: &[(&Class, Vec<Method<'_>>)]) -> Result<String, String> {
          //! arguments as a record of exactly those fields.\n\n\
          use super::*;\n\
          use crate::api::call::{{Arguments, Binder, Serves, decode, owned}};\n\
-         use crate::api::capability::{{Coordinator, Host, JobHandle, Project, WorkspaceHandle, WorkspaceRef}};\n"
+         use crate::api::capability::{{Coordinator, Host, JobHandle, Project, SccacheHost, WorkspaceHandle, WorkspaceRef}};\n"
     );
     for (class, methods) in classes {
         for method in methods {
@@ -528,14 +536,25 @@ fn serves(classes: &[(&Class, Vec<Method<'_>>)]) -> Result<String, String> {
              where\n        \
                  O::Request: PartialEq + std::fmt::Debug;\n\
          }\n\n\
-         /// Runs `check` over every operation each handle serves, through the given handles.\n\
+         /// One of each handle [`each_served`] runs its check through.\n\
          #[cfg(test)]\n\
-         pub(crate) fn each_served(\n    check: &mut impl EachServed,\n",
+         pub(crate) struct Handles<'a> {\n",
     );
     for (class, _) in classes {
-        writeln!(output, "    {}: &{},", parameter(class.rust), class.rust).unwrap();
+        writeln!(
+            output,
+            "    pub(crate) {}: &'a {},",
+            parameter(class.rust),
+            class.rust
+        )
+        .unwrap();
     }
-    output.push_str(") {\n");
+    output.push_str(
+        "}\n\n\
+         /// Runs `check` over every operation each handle serves, through the given handles.\n\
+         #[cfg(test)]\n\
+         pub(crate) fn each_served(check: &mut impl EachServed, handles: &Handles<'_>) {\n",
+    );
     for (class, methods) in classes {
         for method in methods {
             let absent = method
@@ -547,7 +566,7 @@ fn serves(classes: &[(&Class, Vec<Method<'_>>)]) -> Result<String, String> {
                 .join(", ");
             writeln!(
                 output,
-                "    check.served::<{}, _>({}, &[{absent}]);",
+                "    check.served::<{}, _>(handles.{}, &[{absent}]);",
                 method.operation.marker,
                 parameter(class.rust)
             )
@@ -671,7 +690,7 @@ fn parameter(class: &str) -> String {
 fn rust(classes: &[(&Class, Vec<Method<'_>>)]) -> Result<String, String> {
     let mut output = format!(
         "{HEADER}//! One adapter per controller operation, on each handle that serves it.\n\n\
-         use super::{{Coordinator, Host, JobHandle, Project, WorkspaceHandle, WorkspaceRef}};\n\
+         use super::{{Coordinator, Host, JobHandle, Project, SccacheHost, WorkspaceHandle, WorkspaceRef}};\n\
          use cowshed_core::api::operations;\n\
          use napi::{{Env, JsObject, bindgen_prelude::Buffer}};\n\
          use napi_derive::napi;\n\
@@ -1085,7 +1104,7 @@ mod tests {
         assert!(
             output
                 .served
-                .contains("    check.served::<JobLogs, _>(job_handle, &[]);"),
+                .contains("    check.served::<JobLogs, _>(handles.job_handle, &[]);"),
             "{}",
             output.served
         );
@@ -1222,7 +1241,9 @@ mod tests {
             assert!(implementation.contains(bound), "{implementation}");
             assert!(implementation.contains(construction), "{implementation}");
             assert!(
-                served.contains(&format!("    check.served::<{operation}, _>({absent});")),
+                served.contains(&format!(
+                    "    check.served::<{operation}, _>(handles.{absent});"
+                )),
                 "{served}"
             );
         }
@@ -1505,7 +1526,7 @@ mod tests {
         );
         assert!(
             served.contains(
-                r#"check.served::<WorkspaceQualifiedGrants, _>(workspace_ref, &["workspaceIncarnation"]);"#
+                r#"check.served::<WorkspaceQualifiedGrants, _>(handles.workspace_ref, &["workspaceIncarnation"]);"#
             ),
             "{served}"
         );

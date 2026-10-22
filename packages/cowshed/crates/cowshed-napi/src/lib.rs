@@ -22,11 +22,12 @@ use bytes::Bytes;
 use cowshed_core::{
     Coordinator as CoreCoordinator, Cowshed, CowshedError, EventStream, Host as CoreHost,
     JobAttachment as CoreJobAttachment, JobHandle as CoreJobHandle, JobStdin as CoreJobStdin,
-    Project as CoreProject, WorkspaceHandle as CoreWorkspaceHandle,
+    Project as CoreProject, SccacheHost as CoreSccacheHost, WorkspaceHandle as CoreWorkspaceHandle,
     WorkspaceRef as CoreWorkspaceRef,
     api::{
         call::{self, Arguments, NamesJob, Serves},
         operations::{AdoptView, LogsChunk, Operation, StreamOperation, WorkerView, WorkspaceView},
+        server::HostRole,
     },
 };
 use napi::{
@@ -539,15 +540,7 @@ pub fn connect_coordinator(
 #[napi]
 pub struct Host {
     inner: Arc<CoreHost>,
-    /// The `cowshed host` process's ending: awaited under the lock by the first close, kept for
-    /// every close after it.
-    exited: Arc<Mutex<HostExit>>,
-}
-
-/// How the `cowshed host` process ended, once the thread that reaps it has said so.
-enum HostExit {
-    Pending(HostReaped),
-    Ended(Result<std::process::ExitStatus, String>),
+    process: HostProcess,
 }
 
 #[napi]
@@ -558,31 +551,32 @@ impl Host {
     #[napi]
     pub fn close(&self, env: Env) -> napi::Result<JsObject> {
         let host = Arc::clone(&self.inner);
-        let exited = Arc::clone(&self.exited);
+        let process = self.process.clone();
         spawn_promise(env, async move {
             host.close().await.map_err(AddonFailure::from)?;
-            // Held across the wait, so a concurrent close waits for the same ending.
-            let mut state = exited.lock().await;
-            if let HostExit::Pending(reaped) = &mut *state {
-                let ended = match reaped.await {
-                    Ok(Ok(status)) => Ok(status),
-                    Ok(Err(error)) => Err(format!(
-                        "the cowshed host process could not be reaped: {error}"
-                    )),
-                    Err(_) => Err("the cowshed host reaper ended without an answer".to_owned()),
-                };
-                *state = HostExit::Ended(ended);
-            }
-            match &*state {
-                HostExit::Ended(Ok(status)) if status.success() => Ok(()),
-                HostExit::Ended(Ok(status)) => Err(AddonFailure::internal(format!(
-                    "cowshed host ended with {status}"
-                ))),
-                HostExit::Ended(Err(message)) => Err(AddonFailure::internal(message.clone())),
-                HostExit::Pending(_) => Err(AddonFailure::internal(
-                    "the cowshed host ending was not recorded",
-                )),
-            }
+            process.ended().await
+        })
+    }
+}
+
+/// The sccache daemon's control over one `cowshed sccache host` connection (07_api.md, "Host
+/// operations"), a connection and a process of its own.
+#[napi]
+pub struct SccacheHost {
+    inner: Arc<CoreSccacheHost>,
+    process: HostProcess,
+}
+
+#[napi]
+impl SccacheHost {
+    /// End the connection and wait for `cowshed sccache host` to exit, as `Host.close` does.
+    #[napi]
+    pub fn close(&self, env: Env) -> napi::Result<JsObject> {
+        let host = Arc::clone(&self.inner);
+        let process = self.process.clone();
+        spawn_promise(env, async move {
+            host.close().await.map_err(AddonFailure::from)?;
+            process.ended().await
         })
     }
 }
@@ -593,57 +587,129 @@ impl Host {
 /// closing the connection ends it, and a thread of its own reaps it.
 #[napi(js_name = "openHost")]
 pub fn open_host(env: Env, launcher: String) -> napi::Result<JsObject> {
-    let started = start_host(&launcher);
+    let started = HostProcess::start(&launcher, HostRole::Host);
     spawn_promise(env, async move {
-        let (socket, exited) = started?;
+        let (socket, process) = started?;
         let host = CoreHost::connect(socket)
             .await
             .map_err(AddonFailure::from)?;
         Ok(Host {
             inner: Arc::new(host),
-            exited: Arc::new(Mutex::new(HostExit::Pending(exited))),
+            process,
+        })
+    })
+}
+
+/// Starts `launcher sccache host` as `openHost` starts `launcher host`: the launcher routes the
+/// `sccache` verb to the installed build, so the daemon this controls is the one `cowshed sccache`
+/// controls.
+#[napi(js_name = "openSccacheHost")]
+pub fn open_sccache_host(env: Env, launcher: String) -> napi::Result<JsObject> {
+    let started = HostProcess::start(&launcher, HostRole::Sccache);
+    spawn_promise(env, async move {
+        let (socket, process) = started?;
+        let host = CoreSccacheHost::connect(socket)
+            .await
+            .map_err(AddonFailure::from)?;
+        Ok(SccacheHost {
+            inner: Arc::new(host),
+            process,
         })
     })
 }
 
 type HostReaped = tokio::sync::oneshot::Receiver<io::Result<std::process::ExitStatus>>;
 
-fn start_host(launcher: &str) -> AddonResult<(OwnedFd, HostReaped)> {
-    use cowshed_os::fork_lock::Spawn as _;
-    // Darwin has no SOCK_CLOEXEC: made under the fork lock, no spawn of this process inherits the
-    // pair between the socketpair and the close-on-exec that follows it (cowshed_os::fork_lock).
-    let (ours, theirs) = cowshed_os::fork_lock::create(std::os::unix::net::UnixStream::pair)
-        .map_err(|error| {
-            AddonFailure::internal(format!(
-                "cannot make the host connection's socketpair: {error}"
-            ))
-        })?;
-    let mut child = std::process::Command::new(launcher)
-        .arg("host")
-        .stdin(std::process::Stdio::from(OwnedFd::from(theirs)))
-        .spawn_locked()
-        .map_err(|error| {
-            AddonFailure::usage(
-                format!("cannot start {launcher} host: {error}"),
-                "build or install the package's cowshed binary (06_cli.md, Launcher)",
-            )
-        })?;
-    let (reaped, exited) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
-        // A Host dropped without close has no one waiting for how its process ended, so an
-        // ending that is not a clean exit is said here instead of lost.
-        match reaped.send(child.wait()) {
-            Ok(()) => {}
-            Err(Ok(status)) if status.success() => {}
-            Err(Ok(status)) => cowshed_os::eprintln!("cowshed: cowshed host ended with {status}"),
-            Err(Err(error)) => {
-                cowshed_os::eprintln!(
-                    "cowshed: the cowshed host process could not be reaped: {error}"
-                );
+/// How a host connection's process ended, once the thread that reaps it has said so.
+enum HostExit {
+    Pending(HostReaped),
+    Ended(Result<std::process::ExitStatus, String>),
+}
+
+/// A host connection's process: its verb, and its ending, awaited under the lock by the first
+/// close and kept for every close after it.
+#[derive(Clone)]
+struct HostProcess {
+    verb: &'static str,
+    exited: Arc<Mutex<HostExit>>,
+}
+
+impl HostProcess {
+    fn start(launcher: &str, role: HostRole) -> AddonResult<(OwnedFd, Self)> {
+        use cowshed_os::fork_lock::Spawn as _;
+        let (verb, named): (&[&str], &'static str) = match role {
+            HostRole::Host => (&["host"], "cowshed host"),
+            HostRole::Sccache => (&["sccache", "host"], "cowshed sccache host"),
+        };
+        // Darwin has no SOCK_CLOEXEC: made under the fork lock, no spawn of this process inherits
+        // the pair between the socketpair and the close-on-exec that follows it
+        // (cowshed_os::fork_lock).
+        let (ours, theirs) = cowshed_os::fork_lock::create(std::os::unix::net::UnixStream::pair)
+            .map_err(|error| {
+                AddonFailure::internal(format!(
+                    "cannot make the {named} connection's socketpair: {error}"
+                ))
+            })?;
+        let mut child = std::process::Command::new(launcher)
+            .args(verb)
+            .stdin(std::process::Stdio::from(OwnedFd::from(theirs)))
+            .spawn_locked()
+            .map_err(|error| {
+                AddonFailure::usage(
+                    format!("cannot start {launcher} {}: {error}", verb.join(" ")),
+                    "build or install the package's cowshed binary (06_cli.md, Launcher)",
+                )
+            })?;
+        let (reaped, exited) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            // A handle dropped without close has no one waiting for how its process ended, so an
+            // ending that is not a clean exit is said here instead of lost.
+            match reaped.send(child.wait()) {
+                Ok(()) => {}
+                Err(Ok(status)) if status.success() => {}
+                Err(Ok(status)) => cowshed_os::eprintln!("cowshed: {named} ended with {status}"),
+                Err(Err(error)) => {
+                    cowshed_os::eprintln!(
+                        "cowshed: the {named} process could not be reaped: {error}"
+                    );
+                }
             }
+        });
+        let process = Self {
+            verb: named,
+            exited: Arc::new(Mutex::new(HostExit::Pending(exited))),
+        };
+        Ok((OwnedFd::from(ours), process))
+    }
+
+    /// Wait for the process to end, after its connection closed. Held across the wait, so a
+    /// concurrent close waits for the same ending and answers with it.
+    async fn ended(&self) -> AddonResult<()> {
+        let mut state = self.exited.lock().await;
+        if let HostExit::Pending(reaped) = &mut *state {
+            let ended = match reaped.await {
+                Ok(Ok(status)) => Ok(status),
+                Ok(Err(error)) => Err(format!(
+                    "the {} process could not be reaped: {error}",
+                    self.verb
+                )),
+                Err(_) => Err(format!("the {} reaper ended without an answer", self.verb)),
+            };
+            *state = HostExit::Ended(ended);
         }
-    });
-    Ok((OwnedFd::from(ours), exited))
+        match &*state {
+            HostExit::Ended(Ok(status)) if status.success() => Ok(()),
+            HostExit::Ended(Ok(status)) => Err(AddonFailure::internal(format!(
+                "{} ended with {status}",
+                self.verb
+            ))),
+            HostExit::Ended(Err(message)) => Err(AddonFailure::internal(message.clone())),
+            HostExit::Pending(_) => Err(AddonFailure::internal(format!(
+                "the {} ending was not recorded",
+                self.verb
+            ))),
+        }
+    }
 }
 
 fn utf8_path(env: Env, path: &std::path::Path, what: &str) -> napi::Result<String> {

@@ -11,6 +11,7 @@ import {
   type NativeJobAttachmentHandle,
   type NativeJobHandle,
   type NativeProjectHandle,
+  type NativeSccacheHostHandle,
   type NativeWorkspaceHandle,
   type NativeWorkspaceRefHandle,
 } from './native.js';
@@ -35,6 +36,8 @@ import {
   type Project,
   type ProjectListArguments,
   type RebaseOptions,
+  type SccacheHost,
+  type SccacheStartArguments,
   type Session,
   type WorkspaceHandle,
   type WorkspaceRef,
@@ -283,6 +286,30 @@ class HostImpl implements Host {
 
   diskCommand(request: HostDiskCommandArguments): AsyncIterable<Api.DiskCommandEvent> {
     return callNativeEvents(N.hostDiskCommand(this.#native, request));
+  }
+
+  async close(): Promise<void> {
+    await callNativeAsync(() => this.#native.close());
+  }
+}
+
+class SccacheHostImpl implements SccacheHost {
+  readonly #native: NativeSccacheHostHandle;
+
+  constructor(nativeHost: NativeSccacheHostHandle) {
+    this.#native = nativeHost;
+  }
+
+  async start(options?: SccacheStartArguments): Promise<Api.SccacheStatus> {
+    return callNativeAsync(() => N.sccacheStart(this.#native, options ?? {}));
+  }
+
+  async stop(): Promise<void> {
+    await callNativeAsync(() => N.sccacheStop(this.#native, {}));
+  }
+
+  async status(): Promise<Api.SccacheStatus> {
+    return callNativeAsync(() => N.sccacheStatus(this.#native, {}));
   }
 
   async close(): Promise<void> {
@@ -618,6 +645,16 @@ export async function connectCoordinator(endpoint: CoordinatorEndpoint, path: st
 export async function openHost(): Promise<Host> {
   const launcher = launcherPath(packageRootFromModule(import.meta.url));
   return new HostImpl(await callNativeAsync(() => native.openHost(launcher)));
+}
+
+/**
+ * Starts `cowshed sccache host` through the package's `bin/cowshed` launcher, which runs the
+ * installed build for every `sccache` verb, on a socketpair, and connects to it. Its stdout and
+ * stderr are this process's; closing the connection ends it.
+ */
+export async function openSccacheHost(): Promise<SccacheHost> {
+  const launcher = launcherPath(packageRootFromModule(import.meta.url));
+  return new SccacheHostImpl(await callNativeAsync(() => native.openSccacheHost(launcher)));
 }
 
 /**

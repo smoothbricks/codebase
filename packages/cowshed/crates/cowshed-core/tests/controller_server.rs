@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::operations::{Lane, OPERATIONS, OperationRequest, Scope};
 use cowshed_core::api::server::{
-    ConnectionAuthority, EventSource, HANDSHAKE_VERSION, MAX_BINARY_FRAME_BYTES,
+    ConnectionAuthority, EventSource, HANDSHAKE_VERSION, HostRole, MAX_BINARY_FRAME_BYTES,
     MAX_JSON_FRAME_BYTES, RouterHandle, RouterResponse, serve_controller_connection,
 };
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
@@ -92,6 +92,33 @@ impl TestClient {
         assert_eq!(hello.version, HANDSHAKE_VERSION);
         assert_eq!(hello.nonce, NONCE);
         assert_eq!(hello.repo_id, expected_repo);
+        (client, task)
+    }
+
+    /// A host connection of `role`, whose handshake answer names that role and no project.
+    async fn connect_host(
+        role: HostRole,
+        router: RouterHandle,
+    ) -> (Self, JoinHandle<cowshed_core::Result<()>>) {
+        let (client, server) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        client.set_nonblocking(true).expect("nonblocking client");
+        let stream = tokio::net::UnixStream::from_std(client).expect("Tokio client stream");
+        let descriptor: OwnedFd = server.into();
+        let task = tokio::spawn(serve_controller_connection(
+            descriptor,
+            ConnectionAuthority::Host(role),
+            router,
+        ));
+        let mut client = Self { stream, next_id: 1 };
+        client
+            .write_json(&json!({ "version": HANDSHAKE_VERSION, "nonce": NONCE }))
+            .await;
+        let hello: Value =
+            serde_json::from_slice(&client.read_frame().await).expect("a host hello");
+        assert_eq!(
+            hello,
+            json!({ "version": HANDSHAKE_VERSION, "nonce": NONCE, "host": role })
+        );
         (client, task)
     }
 
@@ -254,10 +281,19 @@ fn connection_methods() -> impl Iterator<Item = &'static str> {
         .map(|operation| operation.method)
 }
 
+/// A method only a host connection of some role serves: `host`'s or `sccache`'s.
 fn is_host_method(method: &str) -> bool {
+    OPERATIONS.iter().any(|operation| {
+        operation.method == method && matches!(operation.scope, Scope::Host | Scope::Sccache)
+    })
+}
+
+fn scope_of(method: &str) -> Scope {
     OPERATIONS
         .iter()
-        .any(|operation| operation.method == method && operation.scope == Scope::Host)
+        .find(|operation| operation.method == method)
+        .map(|operation| operation.scope)
+        .unwrap_or_else(|| panic!("{method} is declared"))
 }
 
 fn is_worker_method(method: &str) -> bool {
@@ -374,6 +410,48 @@ async fn a_workspace_authority_cannot_reach_any_identity_verb() {
     // Refused at the authority gate, so the project router never saw them.
     assert!(records.try_recv().is_err());
     assert_clean_disconnect(worker, worker_server).await;
+}
+
+/// Each host connection serves exactly its role's scope: every method of that scope reaches the
+/// router as declared; every other method, the other role's and every project method, is refused
+/// with the authority error before the router sees it.
+#[tokio::test]
+async fn a_host_connection_serves_exactly_its_role() {
+    for role in [HostRole::Host, HostRole::Sccache] {
+        let (router, mut records, _actor) = recording_router();
+        let (mut host, server) = TestClient::connect_host(role, router).await;
+        for method in connection_methods() {
+            if scope_of(method) != role.scope() {
+                let response = host.request(method, params(method), None).await;
+                assert!(
+                    !response.envelope.ok,
+                    "a {role:?} connection reached {method}"
+                );
+                assert_eq!(
+                    response.envelope.error.expect("typed authority error").code,
+                    ErrorCode::Conflict
+                );
+                assert!(records.try_recv().is_err(), "{method} reached the router");
+                continue;
+            }
+            if is_stream_method(method) {
+                let (_event, end) = host.stream_request(method, params(method)).await;
+                assert!(
+                    end.ok,
+                    "{role:?} stream {method} ended with {:?}",
+                    end.error
+                );
+            } else {
+                let upload = is_upload_method(method).then_some(&b"input"[..]);
+                let response = host.request(method, params(method), upload).await;
+                assert!(response.envelope.ok, "{role:?} rejected {method}");
+            }
+            let recorded = records.recv().await.expect("host request recorded");
+            assert_eq!(recorded.authority, ConnectionAuthority::Host(role));
+            assert_eq!((recorded.method, recorded.params), (method, params(method)));
+        }
+        assert_clean_disconnect(host, server).await;
+    }
 }
 
 #[tokio::test]

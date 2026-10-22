@@ -2196,9 +2196,17 @@ caller's, and withholds the variable from every child of the project; `command` 
 with no stdin; `upload` (`--secret-stdin`) is the call's upload frame, trimmed UTF-8 as the verb's pipe is. A frame
 beside any other source is refused as usage before a project is opened. The answer is the project's routes.
 
-`land-turn`, the `sccache` verbs and the process holders `lock`, `hold` and `subtree-root` are the parity gate's known
-gaps until their rows or launchers land: `land-turn` holds its turn until its child ends, and the `sccache` rows are
-served by `cowshed sccache host` so the launcher's installed-build selection holds.
+The `sccache` verbs are rows of their own scope, `sccache`: `sccache.start` (`capacity` as `--capacity` spells it),
+`sccache.stop` and `sccache.status`. They are served only by a `cowshed sccache host` connection, which the package
+launcher routes to the installed build as it routes every `sccache` verb (06_cli.md, "Launcher"), so a typed caller
+controls the same daemon `cowshed sccache start` does. TypeScript reaches it through
+`openSccacheHost(): Promise<SccacheHost>`, a handle of its own with `Host`'s start, handshake, close and
+concurrent-close contract; `Host` never opens it. A host connection's handshake answer names its role (`{host: "host"}`
+or `{host: "sccache"}`), a client refuses an answer of another role, and the connection serves exactly its role's scope:
+every other method, the other role's and every project method, is refused before it is decoded.
+
+`land-turn` and the process holders `lock`, `hold` and `subtree-root` are the parity gate's known gaps until their
+launchers land: `land-turn` holds its turn until its child ends.
 
 One verb has no counterpart by name: `gateway run` is the process launchd execs as the daemon. A library call never
 becomes that process and no host connection runs it.

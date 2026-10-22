@@ -7,7 +7,7 @@
 use super::*;
 use crate::api::call::{Arguments, Binder, Serves, decode, owned};
 use crate::api::capability::{
-    Coordinator, Host, JobHandle, Project, WorkspaceHandle, WorkspaceRef,
+    Coordinator, Host, JobHandle, Project, SccacheHost, WorkspaceHandle, WorkspaceRef,
 };
 
 impl Serves<HostListProjects> for Host {
@@ -379,6 +379,54 @@ impl Serves<HostDiskCommand> for Host {
             argv,
             stdin,
         })
+    }
+}
+
+impl Serves<SccacheStart> for SccacheHost {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<SccacheStartRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            #[serde(default)]
+            capacity: Option<String>,
+        }
+        let Caller { capacity } = decode::<SccacheStart, Caller>(arguments)?;
+        Ok(SccacheStartRequest { capacity })
+    }
+}
+
+impl Serves<SccacheStop> for SccacheHost {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<HostRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {}
+        let Caller {} = decode::<SccacheStop, Caller>(arguments)?;
+        Ok(HostRequest {})
+    }
+}
+
+impl Serves<SccacheStatusRead> for SccacheHost {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<HostRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {}
+        let Caller {} = decode::<SccacheStatusRead, Caller>(arguments)?;
+        Ok(HostRequest {})
     }
 }
 
@@ -1824,96 +1872,103 @@ pub(crate) trait EachServed {
         O::Request: PartialEq + std::fmt::Debug;
 }
 
+/// One of each handle [`each_served`] runs its check through.
+#[cfg(test)]
+pub(crate) struct Handles<'a> {
+    pub(crate) host: &'a Host,
+    pub(crate) sccache_host: &'a SccacheHost,
+    pub(crate) project: &'a Project,
+    pub(crate) workspace_ref: &'a WorkspaceRef,
+    pub(crate) coordinator: &'a Coordinator,
+    pub(crate) workspace_handle: &'a WorkspaceHandle,
+    pub(crate) job_handle: &'a JobHandle,
+}
+
 /// Runs `check` over every operation each handle serves, through the given handles.
 #[cfg(test)]
-pub(crate) fn each_served(
-    check: &mut impl EachServed,
-    host: &Host,
-    project: &Project,
-    workspace_ref: &WorkspaceRef,
-    coordinator: &Coordinator,
-    workspace_handle: &WorkspaceHandle,
-    job_handle: &JobHandle,
-) {
-    check.served::<HostListProjects, _>(host, &[]);
-    check.served::<HostAttachAll, _>(host, &[]);
-    check.served::<HostDetachAll, _>(host, &[]);
-    check.served::<HostClearAttachBudget, _>(host, &[]);
-    check.served::<HostForgetAbandoned, _>(host, &[]);
-    check.served::<HostMountMain, _>(host, &[]);
-    check.served::<HostGatewayStatus, _>(host, &[]);
-    check.served::<HostCredentialStatus, _>(host, &[]);
-    check.served::<HostCredentialRemove, _>(host, &[]);
-    check.served::<HostIdentityAdd, _>(host, &[]);
-    check.served::<HostSkillInstall, _>(host, &[]);
-    check.served::<HostBuildState, _>(host, &[]);
-    check.served::<HostClearNxStore, _>(host, &[]);
-    check.served::<HostGatewayStart, _>(host, &[]);
-    check.served::<HostGatewayStop, _>(host, &[]);
-    check.served::<HostLockHolders, _>(host, &[]);
-    check.served::<HostTreeHolders, _>(host, &[]);
-    check.served::<HostRetireDescendants, _>(host, &[]);
-    check.served::<HostCredentialAdd, _>(host, &[]);
-    check.served::<HostDiskCommand, _>(host, &[]);
-    check.served::<ProjectWorkspace, _>(project, &[]);
-    check.served::<ProjectWorkspaceAt, _>(project, &[]);
-    check.served::<ProjectList, _>(project, &[]);
-    check.served::<ProjectWorkspaceInSlot, _>(project, &[]);
-    check.served::<WorkspaceInfoRead, _>(workspace_ref, &[]);
-    check.served::<WorkspaceAttach, _>(workspace_ref, &[]);
-    check.served::<WorkspaceGrants, _>(workspace_ref, &["workspaceIncarnation"]);
-    check.served::<WorkspaceBuildVolume, _>(workspace_ref, &[]);
-    check.served::<CoordinatorRename, _>(coordinator, &[]);
-    check.served::<CoordinatorAdopt, _>(coordinator, &[]);
-    check.served::<CoordinatorFork, _>(coordinator, &[]);
-    check.served::<CoordinatorMoveCheckout, _>(coordinator, &[]);
-    check.served::<CoordinatorChangeRepoId, _>(coordinator, &[]);
-    check.served::<CoordinatorGrant, _>(coordinator, &[]);
-    check.served::<CoordinatorRevoke, _>(coordinator, &[]);
-    check.served::<CoordinatorProjectGrants, _>(coordinator, &[]);
-    check.served::<CoordinatorGrantProject, _>(coordinator, &[]);
-    check.served::<CoordinatorRevokeProject, _>(coordinator, &[]);
-    check.served::<CoordinatorRebase, _>(coordinator, &[]);
-    check.served::<CoordinatorLand, _>(coordinator, &[]);
-    check.served::<CoordinatorRestore, _>(coordinator, &[]);
-    check.served::<CoordinatorResize, _>(coordinator, &[]);
-    check.served::<CoordinatorDefragment, _>(coordinator, &[]);
-    check.served::<CoordinatorRekey, _>(coordinator, &[]);
-    check.served::<CoordinatorReseed, _>(coordinator, &[]);
-    check.served::<CoordinatorClearNxState, _>(coordinator, &[]);
-    check.served::<CoordinatorDetach, _>(coordinator, &[]);
-    check.served::<CoordinatorAssignSlot, _>(coordinator, &[]);
-    check.served::<CoordinatorDestroy, _>(coordinator, &[]);
-    check.served::<CoordinatorGc, _>(coordinator, &[]);
-    check.served::<CoordinatorRemoveProject, _>(coordinator, &[]);
-    check.served::<CoordinatorRepoMirror, _>(coordinator, &[]);
-    check.served::<CoordinatorSetCheckpointQuota, _>(coordinator, &[]);
-    check.served::<CoordinatorDoctor, _>(coordinator, &[]);
-    check.served::<CoordinatorWorker, _>(coordinator, &[]);
-    check.served::<CoordinatorExec, _>(coordinator, &[]);
-    check.served::<WorkspaceGrants, _>(workspace_handle, &[]);
-    check.served::<WorkerExec, _>(workspace_handle, &[]);
-    check.served::<WorkerStdinChunk, _>(workspace_handle, &[]);
-    check.served::<WorkerStdinClose, _>(workspace_handle, &[]);
-    check.served::<WorkerShell, _>(workspace_handle, &[]);
-    check.served::<WorkerListJobs, _>(workspace_handle, &[]);
-    check.served::<WorkerJob, _>(workspace_handle, &[]);
-    check.served::<WorkerJobByKey, _>(workspace_handle, &[]);
-    check.served::<WorkerCheckpoint, _>(workspace_handle, &[]);
-    check.served::<WorkerPush, _>(workspace_handle, &[]);
-    check.served::<SessionClose, _>(workspace_handle, &[]);
-    check.served::<JobStatus, _>(job_handle, &[]);
-    check.served::<JobResourcesRead, _>(job_handle, &[]);
-    check.served::<JobSealed, _>(job_handle, &[]);
-    check.served::<JobLogs, _>(job_handle, &[]);
-    check.served::<JobTailRead, _>(job_handle, &[]);
-    check.served::<JobListeningPortsRead, _>(job_handle, &[]);
-    check.served::<JobProcesses, _>(job_handle, &[]);
-    check.served::<JobProcessEvents, _>(job_handle, &[]);
-    check.served::<JobProgress, _>(job_handle, &[]);
-    check.served::<JobAttachWrite, _>(job_handle, &[]);
-    check.served::<JobAttachClose, _>(job_handle, &[]);
-    check.served::<JobDetach, _>(job_handle, &[]);
-    check.served::<JobWait, _>(job_handle, &[]);
-    check.served::<JobKill, _>(job_handle, &[]);
+pub(crate) fn each_served(check: &mut impl EachServed, handles: &Handles<'_>) {
+    check.served::<HostListProjects, _>(handles.host, &[]);
+    check.served::<HostAttachAll, _>(handles.host, &[]);
+    check.served::<HostDetachAll, _>(handles.host, &[]);
+    check.served::<HostClearAttachBudget, _>(handles.host, &[]);
+    check.served::<HostForgetAbandoned, _>(handles.host, &[]);
+    check.served::<HostMountMain, _>(handles.host, &[]);
+    check.served::<HostGatewayStatus, _>(handles.host, &[]);
+    check.served::<HostCredentialStatus, _>(handles.host, &[]);
+    check.served::<HostCredentialRemove, _>(handles.host, &[]);
+    check.served::<HostIdentityAdd, _>(handles.host, &[]);
+    check.served::<HostSkillInstall, _>(handles.host, &[]);
+    check.served::<HostBuildState, _>(handles.host, &[]);
+    check.served::<HostClearNxStore, _>(handles.host, &[]);
+    check.served::<HostGatewayStart, _>(handles.host, &[]);
+    check.served::<HostGatewayStop, _>(handles.host, &[]);
+    check.served::<HostLockHolders, _>(handles.host, &[]);
+    check.served::<HostTreeHolders, _>(handles.host, &[]);
+    check.served::<HostRetireDescendants, _>(handles.host, &[]);
+    check.served::<HostCredentialAdd, _>(handles.host, &[]);
+    check.served::<HostDiskCommand, _>(handles.host, &[]);
+    check.served::<SccacheStart, _>(handles.sccache_host, &[]);
+    check.served::<SccacheStop, _>(handles.sccache_host, &[]);
+    check.served::<SccacheStatusRead, _>(handles.sccache_host, &[]);
+    check.served::<ProjectWorkspace, _>(handles.project, &[]);
+    check.served::<ProjectWorkspaceAt, _>(handles.project, &[]);
+    check.served::<ProjectList, _>(handles.project, &[]);
+    check.served::<ProjectWorkspaceInSlot, _>(handles.project, &[]);
+    check.served::<WorkspaceInfoRead, _>(handles.workspace_ref, &[]);
+    check.served::<WorkspaceAttach, _>(handles.workspace_ref, &[]);
+    check.served::<WorkspaceGrants, _>(handles.workspace_ref, &["workspaceIncarnation"]);
+    check.served::<WorkspaceBuildVolume, _>(handles.workspace_ref, &[]);
+    check.served::<CoordinatorRename, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorAdopt, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorFork, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorMoveCheckout, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorChangeRepoId, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorGrant, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorRevoke, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorProjectGrants, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorGrantProject, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorRevokeProject, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorRebase, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorLand, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorRestore, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorResize, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorDefragment, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorRekey, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorReseed, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorClearNxState, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorDetach, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorAssignSlot, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorDestroy, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorGc, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorRemoveProject, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorRepoMirror, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorSetCheckpointQuota, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorDoctor, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorWorker, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorExec, _>(handles.coordinator, &[]);
+    check.served::<WorkspaceGrants, _>(handles.workspace_handle, &[]);
+    check.served::<WorkerExec, _>(handles.workspace_handle, &[]);
+    check.served::<WorkerStdinChunk, _>(handles.workspace_handle, &[]);
+    check.served::<WorkerStdinClose, _>(handles.workspace_handle, &[]);
+    check.served::<WorkerShell, _>(handles.workspace_handle, &[]);
+    check.served::<WorkerListJobs, _>(handles.workspace_handle, &[]);
+    check.served::<WorkerJob, _>(handles.workspace_handle, &[]);
+    check.served::<WorkerJobByKey, _>(handles.workspace_handle, &[]);
+    check.served::<WorkerCheckpoint, _>(handles.workspace_handle, &[]);
+    check.served::<WorkerPush, _>(handles.workspace_handle, &[]);
+    check.served::<SessionClose, _>(handles.workspace_handle, &[]);
+    check.served::<JobStatus, _>(handles.job_handle, &[]);
+    check.served::<JobResourcesRead, _>(handles.job_handle, &[]);
+    check.served::<JobSealed, _>(handles.job_handle, &[]);
+    check.served::<JobLogs, _>(handles.job_handle, &[]);
+    check.served::<JobTailRead, _>(handles.job_handle, &[]);
+    check.served::<JobListeningPortsRead, _>(handles.job_handle, &[]);
+    check.served::<JobProcesses, _>(handles.job_handle, &[]);
+    check.served::<JobProcessEvents, _>(handles.job_handle, &[]);
+    check.served::<JobProgress, _>(handles.job_handle, &[]);
+    check.served::<JobAttachWrite, _>(handles.job_handle, &[]);
+    check.served::<JobAttachClose, _>(handles.job_handle, &[]);
+    check.served::<JobDetach, _>(handles.job_handle, &[]);
+    check.served::<JobWait, _>(handles.job_handle, &[]);
+    check.served::<JobKill, _>(handles.job_handle, &[]);
 }

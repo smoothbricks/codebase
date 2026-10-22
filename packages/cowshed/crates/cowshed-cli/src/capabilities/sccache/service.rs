@@ -65,14 +65,7 @@ where
                                 "use a capacity such as 40g, 120g, or 1t",
                             )
                         })
-                        .and_then(|text| {
-                            ImageCapacity::parse(text).map_err(|error| {
-                                CowshedError::usage(
-                                    error.to_string(),
-                                    "use a capacity such as 40g, 120g, or 1t",
-                                )
-                            })
-                        })
+                        .and_then(parse_capacity)
                 })
                 .transpose()?;
             let status = start_service(capacity).await?;
@@ -94,6 +87,13 @@ where
         }
     }
     Ok(0)
+}
+
+/// `--capacity` as `sccache start` reads it, and `sccache.start`'s `capacity`.
+pub(crate) fn parse_capacity(text: &str) -> Result<ImageCapacity> {
+    ImageCapacity::parse(text).map_err(|error| {
+        CowshedError::usage(error.to_string(), "use a capacity such as 40g, 120g, or 1t")
+    })
 }
 
 /// Install (or repair) the agent and wait for its socket.
@@ -328,7 +328,7 @@ pub(crate) async fn derived_capacity(storage: &ValidatedHostStorage) -> Result<I
     ))
 }
 
-fn stop_service() -> Result<()> {
+pub(crate) fn stop_service() -> Result<()> {
     let home = canonical_home()?;
     remove_launch_agent(&control_target(&home)?)?;
     remove_stale_socket(&server_socket())?;

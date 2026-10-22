@@ -57,6 +57,9 @@ export interface NativeHostOperations
     NativeHostCredentialAdd,
     NativeHostDiskCommand {}
 
+/** The operations a `SccacheHost` serves: exactly those its authority admits. */
+export interface NativeSccacheHostOperations extends NativeSccacheStart, NativeSccacheStop, NativeSccacheStatus {}
+
 /** The operations a `Project` serves: exactly those its authority admits. */
 export interface NativeProjectOperations
   extends NativeProjectWorkspace,
@@ -1347,6 +1350,57 @@ export async function projectWorkspaceInSlot(
   args: ProjectWorkspaceInSlotArguments,
 ): Promise<NativeWorkspaceRefHandle> {
   return handle.workspaceInSlot(JSON.stringify(args));
+}
+
+/** A handle that serves `sccache.start`. */
+export interface NativeSccacheStart {
+  start(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `sccache.start` caller names; its handle binds the rest. */
+export type SccacheStartArguments = Pick<Api.SccacheStartRequest, 'capacity'>;
+
+/**
+ * Installs (or repairs) the sccache LaunchAgent and waits for its socket.
+ */
+export async function sccacheStart(
+  handle: NativeSccacheStart,
+  args: SccacheStartArguments,
+): Promise<Api.SccacheStatus> {
+  return V.parseSccacheStatus(await handle.start(JSON.stringify(args)));
+}
+
+/** A handle that serves `sccache.status`. */
+export interface NativeSccacheStatus {
+  status(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `sccache.status` caller names; its handle binds the rest. */
+export type SccacheStatusArguments = Readonly<Record<string, never>>;
+
+/**
+ * Reports the sccache daemon's state.
+ */
+export async function sccacheStatus(
+  handle: NativeSccacheStatus,
+  args: SccacheStatusArguments,
+): Promise<Api.SccacheStatus> {
+  return V.parseSccacheStatus(await handle.status(JSON.stringify(args)));
+}
+
+/** A handle that serves `sccache.stop`. */
+export interface NativeSccacheStop {
+  stop(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `sccache.stop` caller names; its handle binds the rest. */
+export type SccacheStopArguments = Readonly<Record<string, never>>;
+
+/**
+ * Removes the sccache LaunchAgent; the daemon stops.
+ */
+export async function sccacheStop(handle: NativeSccacheStop, args: SccacheStopArguments): Promise<Api.EmptyResult> {
+  return V.parseEmptyResult(await handle.stop(JSON.stringify(args)));
 }
 
 /** A handle that serves `session.close`. */

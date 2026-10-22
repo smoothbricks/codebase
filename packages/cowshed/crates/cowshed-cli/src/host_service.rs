@@ -16,8 +16,8 @@ use cowshed_core::api::operations::{
     self, CredentialSecretSource, Operation, OperationRequest, encode_result,
 };
 use cowshed_core::api::server::{
-    ConnectionAuthority, EventSource, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
-    serve_controller_connection,
+    ConnectionAuthority, EventSource, HostRole, RouterCommand, RouterHandle, RouterRequest,
+    RouterResponse, serve_controller_connection,
 };
 use cowshed_core::{CowshedError, Result};
 use tokio::sync::mpsc;
@@ -30,11 +30,12 @@ use crate::output::Output;
 /// 64 open, so this is never the bound a caller meets.
 const RELAY_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).expect("nonzero");
 
-/// Serve one host connection on `socket` until its peer closes it.
-pub async fn serve(socket: OwnedFd) -> Result<()> {
+/// Serve one host connection of `role` on `socket` until its peer closes it. The connection
+/// refuses every method outside the role's scope before it reaches the router.
+pub async fn serve(socket: OwnedFd, role: HostRole) -> Result<()> {
     let (router, calls) = RouterHandle::channel(RELAY_CAPACITY);
     let relay = tokio::spawn(relay(calls));
-    let served = serve_controller_connection(socket, ConnectionAuthority::Host, router).await;
+    let served = serve_controller_connection(socket, ConnectionAuthority::Host(role), router).await;
     // The connection's router handle is gone once it returns, so the relay drains what it holds
     // and ends.
     relay
@@ -238,6 +239,23 @@ async fn answer(request: RouterRequest) -> Result<RouterResponse> {
                 crate::disk_command::OutputEvents::new(ran),
             ))))
         }
+        Op::SccacheStart(request) => {
+            let capacity = request
+                .capacity
+                .as_deref()
+                .map(crate::capabilities::sccache::service::parse_capacity)
+                .transpose()?;
+            respond::<operations::SccacheStart>(
+                &crate::capabilities::sccache::service::start_service(capacity).await?,
+            )
+        }
+        Op::SccacheStop(_) => {
+            crate::capabilities::sccache::service::stop_service()?;
+            respond::<operations::SccacheStop>(&EmptyResult {})
+        }
+        Op::SccacheStatusRead(_) => respond::<operations::SccacheStatusRead>(
+            &crate::capabilities::sccache::service::service_status().await?,
+        ),
         other => Err(CowshedError::internal(format!(
             "{} reached the host router past the connection's scope check",
             other.method()

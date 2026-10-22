@@ -27,7 +27,7 @@ use super::resources::{JobResourceSample, SampleInterval};
 use super::server::MAX_BINARY_FRAME_BYTES;
 #[cfg(unix)]
 use super::server::{
-    HANDSHAKE_VERSION, MAX_HANDSHAKE_BYTES, MAX_IN_FLIGHT_REQUESTS,
+    HANDSHAKE_VERSION, HostRole, MAX_HANDSHAKE_BYTES, MAX_IN_FLIGHT_REQUESTS,
     MAX_JSON_FRAME_BYTES as MAX_RPC_BYTES, codec,
 };
 use crate::error::{CowshedError, ErrorCode, OtherBuild, Result};
@@ -1895,35 +1895,13 @@ pub struct Host {
 
 impl Host {
     /// Connect over an inherited socket whose peer is `cowshed host`. A project controller's
-    /// handshake answer is refused: it does not decode as a host's.
+    /// handshake answer, and a `cowshed sccache host`'s, are refused.
     #[cfg(unix)]
     pub async fn connect(descriptor: OwnedFd) -> Result<Self> {
-        verify_peer(&descriptor)?;
-        let stream = std::os::unix::net::UnixStream::from(descriptor);
-        stream
-            .set_nonblocking(true)
-            .map_err(|error| handshake_error(format!("host descriptor setup failed: {error}")))?;
-        let mut stream = tokio::net::UnixStream::from_std(stream)
-            .map_err(|error| handshake_error(format!("host descriptor setup failed: {error}")))?;
-        let nonce = fresh_nonce();
-        let hello = codec::encode_client_hello(&nonce)
-            .map_err(|error| handshake_error(format!("host handshake encoding failed: {error}")))?;
-        write_frame(&mut stream, &hello).await?;
-        let response = read_frame(&mut stream).await?;
-        let (version, response_nonce) = codec::decode_host_hello(&response).map_err(|error| {
-            handshake_error(format!("host handshake response is invalid: {error}"))
-        })?;
-        if version != HANDSHAKE_VERSION || response_nonce != nonce {
-            return Err(handshake_error(
-                "host handshake nonce or protocol version did not match",
-            ));
-        }
-        let (runtime, _other_build) = spawn_controller_actor(stream);
+        let runtime = connect_host(descriptor, HostRole::Host).await?;
         Ok(Self { runtime })
     }
-}
 
-impl Host {
     /// End the host connection: `cowshed host` reads end of stream and exits; every call still
     /// pending, and every call after this, refuses.
     pub async fn close(&self) -> Result<()> {
@@ -1935,6 +1913,67 @@ impl fmt::Debug for Host {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("Host(<host connection>)")
     }
+}
+
+/// The sccache daemon's control (07_api.md, "Host operations"), over one `cowshed sccache host`
+/// connection, which the package launcher routes to the installed build as it routes every
+/// `sccache` verb. It binds no request field.
+pub struct SccacheHost {
+    runtime: Arc<dyn ControllerRuntime>,
+}
+
+impl SccacheHost {
+    /// Connect over an inherited socket whose peer is `cowshed sccache host`. Any other
+    /// connection's handshake answer is refused.
+    #[cfg(unix)]
+    pub async fn connect(descriptor: OwnedFd) -> Result<Self> {
+        let runtime = connect_host(descriptor, HostRole::Sccache).await?;
+        Ok(Self { runtime })
+    }
+
+    /// End the connection: `cowshed sccache host` reads end of stream and exits; every call still
+    /// pending, and every call after this, refuses.
+    pub async fn close(&self) -> Result<()> {
+        self.runtime.close().await
+    }
+}
+
+impl fmt::Debug for SccacheHost {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SccacheHost(<sccache host connection>)")
+    }
+}
+
+/// The handshake of a host connection of `role`: an answer that is not a host's, or names another
+/// role, is refused before any call is made.
+#[cfg(unix)]
+async fn connect_host(descriptor: OwnedFd, role: HostRole) -> Result<Arc<dyn ControllerRuntime>> {
+    verify_peer(&descriptor)?;
+    let stream = std::os::unix::net::UnixStream::from(descriptor);
+    stream
+        .set_nonblocking(true)
+        .map_err(|error| handshake_error(format!("host descriptor setup failed: {error}")))?;
+    let mut stream = tokio::net::UnixStream::from_std(stream)
+        .map_err(|error| handshake_error(format!("host descriptor setup failed: {error}")))?;
+    let nonce = fresh_nonce();
+    let hello = codec::encode_client_hello(&nonce)
+        .map_err(|error| handshake_error(format!("host handshake encoding failed: {error}")))?;
+    write_frame(&mut stream, &hello).await?;
+    let response = read_frame(&mut stream).await?;
+    let (version, response_nonce, answered) = codec::decode_host_hello(&response)
+        .map_err(|error| handshake_error(format!("host handshake response is invalid: {error}")))?;
+    if version != HANDSHAKE_VERSION || response_nonce != nonce {
+        return Err(handshake_error(
+            "host handshake nonce or protocol version did not match",
+        ));
+    }
+    if answered != role {
+        return Err(handshake_error(format!(
+            "asked for a {role:?} host connection, but the peer serves {answered:?}"
+        )));
+    }
+    let (runtime, _other_build) = spawn_controller_actor(stream);
+    Ok(runtime)
 }
 
 /// Sole project mutation and cross-workspace authority.
@@ -2338,6 +2377,17 @@ impl Coordinator {
 }
 
 impl Binder for Host {
+    type Fields<'a> = HostFields;
+
+    fn binding(&self) -> Binding<'_, HostFields> {
+        Binding {
+            runtime: &self.runtime,
+            authority: HostFields,
+        }
+    }
+}
+
+impl Binder for SccacheHost {
     type Fields<'a> = HostFields;
 
     fn binding(&self) -> Binding<'_, HostFields> {
@@ -4167,14 +4217,20 @@ mod tests {
         let host = Host {
             runtime: Arc::clone(&runtime),
         };
+        let sccache = SccacheHost {
+            runtime: Arc::clone(&runtime),
+        };
         operations::served::each_served(
             &mut agrees,
-            &host,
-            coordinator.project(),
-            &workspace_ref(Arc::clone(&runtime)),
-            &coordinator,
-            &workspace_handle(runtime),
-            &job,
+            &operations::served::Handles {
+                host: &host,
+                sccache_host: &sccache,
+                project: coordinator.project(),
+                workspace_ref: &workspace_ref(Arc::clone(&runtime)),
+                coordinator: &coordinator,
+                workspace_handle: &workspace_handle(runtime),
+                job_handle: &job,
+            },
         );
         // `project.open` is how a project is reached, not a method of a handle; every other
         // operation a caller may reach is served by some handle and was checked.

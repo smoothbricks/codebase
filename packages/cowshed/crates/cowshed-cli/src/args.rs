@@ -1,6 +1,7 @@
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Arg, ArgAction, ArgMatches, Command as ClapCommand, value_parser};
 use cowshed_apfs::DiskTool;
+use cowshed_core::api::server::HostRole;
 use cowshed_core::api::{
     AbandonedRefSupersession, ExecClass, ExecScope, GitOid, GrantDelta, LandMode, SupersededReason,
 };
@@ -134,8 +135,9 @@ pub enum Command {
     Gateway(GatewayCommand),
     /// One coordinator controller connection, served on standard input for an embedding process.
     Controller,
-    /// One host connection, served on standard input for an embedding process.
-    Host,
+    /// One host connection of this role, served on standard input for an embedding process:
+    /// `host` the host's own verbs, `sccache host` the sccache daemon's control.
+    Host(HostRole),
     Credential(CredentialCommand),
     Identity(IdentityCommand),
     Sccache(SccacheCommand),
@@ -199,7 +201,7 @@ impl Command {
             | Self::TreeHolders(_)
             | Self::Sccache(_)
             | Self::Skill(_)
-            | Self::Host
+            | Self::Host(_)
             | Self::Version
             | Self::Help(_) => ProjectDiscovery::NotUsed,
         }
@@ -1139,7 +1141,8 @@ pub fn cli_command() -> ClapCommand {
                 .subcommand_required(true)
                 .subcommand(leaf("start").arg(value("capacity")))
                 .subcommand(leaf("stop"))
-                .subcommand(leaf("status")),
+                .subcommand(leaf("status"))
+                .subcommand(leaf("host")),
         )
         .subcommand(
             leaf("skill")
@@ -1261,7 +1264,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "hold" => parse_hold(leaf, &global)?,
         "tree-holders" => parse_tree_holders(leaf, &global)?,
         "controller" => Command::Controller,
-        "host" => Command::Host,
+        "host" => Command::Host(HostRole::Host),
         "gateway" => parse_gateway(leaf, &global)?,
         "credential" => parse_credential(leaf)?,
         "identity" => parse_identity(leaf)?,
@@ -2325,12 +2328,13 @@ fn parse_secret_command(
 const SCCACHE: CommandSpec = CommandSpec {
     name: "sccache",
     missing: "sccache action is required",
-    args: "<start|stop|status>",
+    args: "<start|stop|status|host>",
     trailing: "",
     summary: "manage the host sccache daemon",
     about: &[
         "Runs the shared compile cache as a supervised LaunchAgent, so its configuration is pinned before any client speaks to it. sccache reads its store path, its cache cap, and its base directories once, at server start, and never again. A first client that spawned a server implicitly would therefore freeze its own environment into the daemon every later workspace shares; starting it deliberately keeps the cap and the store where the host meant them.",
         "The gateway daemon starts this agent itself, so a healthy host already has it; these verbs are for repair, inspection, and resizing. `status` reports launchd and socket health without starting anything, and surfaces the daemon's own statistics whenever it answers. Hits are reported per language on purpose: cross-workspace C and C++ reuse needs no build slot, so a healthy aggregate hit rate routinely hides a Rust hit rate of zero.",
+        "`host` serves one sccache host connection on standard input, which must be a Unix socket, for an embedding process: `start`, `stop` and `status` as typed operations (`openSccacheHost` in N-API, which starts it through the package launcher, so the installed build answers as it answers every `sccache` verb). It serves nothing else; nothing is written to stdout, and it exits 0 when the embedding process closes its end.",
     ],
     options: &[Opt {
         spelling: "--capacity <size>",
@@ -2350,6 +2354,7 @@ fn parse_sccache(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command
         },
         "stop" => SccacheCommand::Stop,
         "status" => SccacheCommand::Status,
+        "host" => return Ok(Command::Host(HostRole::Sccache)),
         other => {
             return Err(UsageError::new(
                 format!("unknown sccache action `{other}`"),
