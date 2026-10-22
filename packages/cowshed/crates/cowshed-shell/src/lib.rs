@@ -108,7 +108,8 @@ fn unexecutable_exit(error: &io::Error) -> ExitStatus {
 }
 
 /// Run the exec host on [`CONTROL_DESCRIPTOR`] until the supervisor closes it. Returns the
-/// process exit code.
+/// process exit code (71 when it cannot put SIGBUS back to its default disposition and so
+/// refuses to serve); a page of its own program it cannot be given ends it by SIGBUS instead.
 pub fn serve() -> i32 {
     // SAFETY: fcntl(F_GETFD) only queries the descriptor table.
     if unsafe { libc::fcntl(CONTROL_DESCRIPTOR, libc::F_GETFD) } < 0 {
@@ -119,6 +120,22 @@ pub fn serve() -> i32 {
     let socket = unsafe { UnixStream::from_raw_fd(CONTROL_DESCRIPTOR) };
     // SAFETY: plain fcntl on an owned descriptor; commands must not inherit the control socket.
     unsafe { libc::fcntl(CONTROL_DESCRIPTOR, libc::F_SETFD, libc::FD_CLOEXEC) };
+    // The host runs its program from the workspace mount (11_shell.md, "Exec hosts"), so once
+    // that mount is gone -- a forced unmount, DiskArbitration restarting -- the next page-in of
+    // code not yet resident fails with SIGBUS. The Rust runtime's stack-overflow handler catches
+    // that SIGBUS, and its own code lies on the same unreadable pages: measured 2026-10-22, a
+    // host woken by its controller's end of stream after its mount was forced off spun in R state,
+    // nearly all of it system time, until killed. At the default disposition the fault ends it,
+    // and its supervisor names that end (`DroppedHostEnd::PageUnavailable`).
+    // SAFETY: setting a signal's disposition touches no memory; the runtime's handler only
+    // prints a stack-overflow message before the same signal ends the process.
+    if unsafe { libc::signal(libc::SIGBUS, libc::SIG_DFL) } == libc::SIG_ERR {
+        cowshed_os::eprintln!(
+            "cowshed: exec host refuses to serve: cannot restore SIGBUS's default disposition: {}",
+            io::Error::last_os_error()
+        );
+        return 71;
+    }
     let mut host = Host {
         environment: std::env::vars_os().collect(),
     };

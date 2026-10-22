@@ -36,7 +36,7 @@ use super::shell_host::{
     REPLY_HOST_FAILED, REPLY_NICE_REFUSED, REPLY_RELEASED, REPLY_SCRIPT_SYNTAX,
     REPLY_SIGNAL_FAILED, REPLY_STARTED, REQUEST_ACTIVATE, REQUEST_APPROVE, REQUEST_RELEASE,
     REQUEST_RUN, REQUEST_SCRIPT, REQUEST_SIGNAL, RawWaitStatus, SHELL_HOST_DIRECTORY,
-    ShellHostProgram, send_with_descriptors,
+    ShellHostProgram, dropped_host_end, send_with_descriptors,
 };
 use super::shell_pool::{Acquired, Activation, Activator, ShellPool, ShellPoolConfig};
 use super::shell_watch::{
@@ -743,13 +743,34 @@ pub(super) struct ExecHost {
 /// its activation's group; one holding a command ends the command's group -- SIGTERM, a grace,
 /// SIGKILL -- reaps it, and exits. The host is not signalled here: a command it holds leads a
 /// group of its own, which only the host can still prove the command's. It is reaped in the
-/// background, through its fence.
+/// background, through its fence, and any end but an idle host's exit 0 is said in this
+/// supervisor's log, since no job waits on it to say it ([`super::shell_host::DroppedHostEnd`]).
 impl Drop for ExecHost {
     fn drop(&mut self) {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let fence = Arc::clone(&self.fence);
             runtime.spawn(async move {
-                let _ = fence.wait().await;
+                let pid = fence.birth().pid();
+                match fence
+                    .wait()
+                    .await
+                    .map(|status| process_termination_from_wait(Ok(status)))
+                {
+                    Ok(Ok(exit)) => {
+                        if let Some(end) = dropped_host_end(exit) {
+                            cowshed_os::eprintln!("cowshed: dropped exec host {pid} {end}");
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        cowshed_os::eprintln!(
+                            "cowshed: dropped exec host {pid}: {}",
+                            error.message
+                        );
+                    }
+                    // Not waitable: `end` already reaped it for the job that saw it fail, or
+                    // child exits cannot be subscribed, which every job's own wait reports.
+                    Err(_) => {}
+                }
             });
         }
     }

@@ -748,10 +748,84 @@ pub fn registered() -> Option<ShellHostProgram> {
     REGISTERED.get().cloned()
 }
 
+/// How an exec host its supervisor dropped ended, when that needs saying. No job waits on a
+/// dropped host, so the supervisor's log is the only record of its end.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DroppedHostEnd {
+    /// SIGBUS: the kernel could not supply a page the host touched. The host runs its program
+    /// from the workspace mount ([`SHELL_HOST_DIRECTORY`]) and keeps SIGBUS at its default
+    /// disposition, so this is how it ends once that mount is gone from under it: the next code
+    /// it runs that is not resident cannot be paged in (11_shell.md, "Exec hosts").
+    PageUnavailable,
+    /// Any end other than the clean exit an idle host makes at its controller's end of stream.
+    Other(ExitStatus),
+}
+
+/// The end worth recording for a dropped host that ended with `exit`: `None` for exit 0.
+pub fn dropped_host_end(exit: ExitStatus) -> Option<DroppedHostEnd> {
+    match exit {
+        ExitStatus::Exited { code: 0 } => None,
+        ExitStatus::Signaled {
+            signal: libc::SIGBUS,
+            ..
+        } => Some(DroppedHostEnd::PageUnavailable),
+        other => Some(DroppedHostEnd::Other(other)),
+    }
+}
+
+impl std::fmt::Display for DroppedHostEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PageUnavailable => f.write_str(
+                "died by SIGBUS: a page it touched could not be supplied, as when the workspace \
+                 mount its program runs from is gone",
+            ),
+            Self::Other(ExitStatus::Exited { code }) => write!(f, "exited {code}"),
+            Self::Other(ExitStatus::Signaled {
+                signal,
+                core_dumped,
+            }) => write!(
+                f,
+                "died by signal {signal}{}",
+                if *core_dumped { " (core dumped)" } else { "" }
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read as _, Write as _};
+
+    use proptest::prelude::*;
+
+    fn any_exit() -> impl Strategy<Value = ExitStatus> {
+        prop_oneof![
+            (0_i32..=255).prop_map(|code| ExitStatus::Exited { code }),
+            (1_i32..=31, any::<bool>()).prop_map(|(signal, core_dumped)| ExitStatus::Signaled {
+                signal,
+                core_dumped
+            }),
+        ]
+    }
+
+    proptest! {
+        /// A dropped host's end is recorded unless it is the clean exit; SIGBUS, core flag or
+        /// not, is named as the page the host could not be given; every other end is kept exactly.
+        #[test]
+        fn a_dropped_host_s_end_is_named_unless_it_exited_cleanly(exit in any_exit()) {
+            let end = dropped_host_end(exit.clone());
+            prop_assert_eq!(end.is_none(), exit == ExitStatus::Exited { code: 0 });
+            prop_assert_eq!(
+                end == Some(DroppedHostEnd::PageUnavailable),
+                matches!(exit, ExitStatus::Signaled { signal: libc::SIGBUS, .. })
+            );
+            if let Some(DroppedHostEnd::Other(kept)) = end {
+                prop_assert_eq!(kept, exit);
+            }
+        }
+    }
 
     #[test]
     fn frames_round_trip_byte_exact_fields() {
