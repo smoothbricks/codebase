@@ -57,7 +57,8 @@ pub enum Counterpart {
 }
 
 /// One public TypeScript member: `Interface.method` of `src/types.ts`, or an export of
-/// `src/index.ts`; with `argument`, that parameter, and with `path`, the dotted property in it.
+/// `src/index.ts`; with `argument`, that parameter, and with `path`, the dotted property in it. A
+/// segment `name:kind` is property `name`'s variant tagged `kind`, which that union must declare.
 #[derive(Clone, Copy, Debug)]
 pub struct Facade {
     pub member: &'static str,
@@ -73,7 +74,7 @@ pub struct Row {
 }
 
 /// The host verbs have no N-API channel until the host operation table lands (tg#9537).
-const HOST_TABLE: &str = "the remaining host rows and launchers (tg#9537): land-turn, credential add, sccache on the installed build, and the lock/hold/subtree-root process holders";
+const HOST_TABLE: &str = "the remaining host rows and launchers (tg#9537): land-turn, sccache on the installed build, and the lock/hold/subtree-root process holders";
 
 const fn member(member: &'static str) -> Facade {
     Facade {
@@ -342,13 +343,15 @@ pub const PARITY: &[Row] = &[
     row("controller", "", Counterpart::Composed { recipe: "an embedding process starts `cowshed controller` on one end of a socketpair and passes the other to coordinatorEndpoint (07_api.md, \"cowshed-napi\")", facade: &[member("coordinatorEndpoint")] }),
     row("host", "", Counterpart::Composed { recipe: "an embedding process calls openHost, which starts `cowshed host` through the package launcher on a socketpair and connects to it (07_api.md, Host operations)", facade: &[member("openHost")] }),
 
-    gap("credential add", ""),
-    gap("credential add", "origin"),
-    gap("credential add", "path-prefix"),
-    gap("credential add", "method"),
-    gap("credential add", "secret-env"),
-    gap("credential add", "secret-command"),
-    gap("credential add", "secret-stdin"),
+    row("credential add", "", field(&[("host.credentialAdd", "")], &[member("Host.credentialAdd")])),
+    row("credential add", "origin", field(&[("host.credentialAdd", "origin")], &[argument("Host.credentialAdd", 0, "origin")])),
+    row("credential add", "path-prefix", field(&[("host.credentialAdd", "pathPrefixes")], &[argument("Host.credentialAdd", 0, "pathPrefixes")])),
+    row("credential add", "method", field(&[("host.credentialAdd", "methods")], &[argument("Host.credentialAdd", 0, "methods")])),
+    row("credential add", "secret-env", field(&[("host.credentialAdd", "secret")], &[argument("Host.credentialAdd", 0, "secret:env.name")])),
+    row("credential add", "secret-command", field(&[("host.credentialAdd", "secret")], &[argument("Host.credentialAdd", 0, "secret:command.argv"), argument("Host.credentialAdd", 0, "secret:env.command")])),
+    // The secret kind `upload` names the source; its bytes are the call's upload frame, the
+    // facade's second parameter.
+    row("credential add", "secret-stdin", field(&[("host.credentialAdd", "secret")], &[argument("Host.credentialAdd", 0, "secret:upload"), argument("Host.credentialAdd", 1, "")])),
     row("credential ls", "", field(&[("host.credentialStatus", "project")], &[argument("Host.credentialStatus", 0, "")])),
     row("credential status", "", field(&[("host.credentialStatus", "project")], &[argument("Host.credentialStatus", 0, "")])),
     row("credential rm", "", field(&[("host.credentialRemove", "project")], &[argument("Host.credentialRemove", 0, "")])),
@@ -582,7 +585,12 @@ fn typescript(spellings: BTreeMap<(&str, &str), &str>, rows: &[Row], summary: &s
                     .filter(|segment| !segment.is_empty())
                     .fold(
                         format!("NonNullable<Parameters<{base}>[{index}]>"),
-                        |inner, segment| format!("At<{inner}, '{segment}'>"),
+                        |inner, segment| match segment.split_once(':') {
+                            Some((name, kind)) => {
+                                format!("Variant<At<{inner}, '{name}'>, '{kind}'>")
+                            }
+                            None => format!("At<{inner}, '{segment}'>"),
+                        },
                     )
             })
             .collect();
@@ -605,7 +613,10 @@ fn typescript(spellings: BTreeMap<(&str, &str), &str>, rows: &[Row], summary: &s
     }
     output.push_str(
         "\n/** One property of a property path; a property the type does not declare does not compile. */\n\
-         type At<T, K extends keyof NonNullable<T>> = NonNullable<T>[K];\n\n\
+         type At<T, K extends keyof NonNullable<T>> = NonNullable<T>[K];\n\
+         /** One variant of a tagged union; a tag the union does not declare does not compile. */\n\
+         type Variant<T, K extends Tag<T>> = Extract<NonNullable<T>, { readonly kind: K }>;\n\
+         type Tag<T> = NonNullable<T> extends infer U ? (U extends { readonly kind: infer V } ? V : never) : never;\n\n\
          /** Every CLI verb and argument with a typed counterpart, as the public members that reach it. */\n\
          export interface CliParity {\n",
     );

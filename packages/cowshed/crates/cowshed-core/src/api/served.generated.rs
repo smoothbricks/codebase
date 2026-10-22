@@ -316,6 +316,40 @@ impl Serves<HostRetireDescendants> for Host {
     }
 }
 
+impl Serves<HostCredentialAdd> for Host {
+    const BOUND: &'static [&'static str] = &[];
+
+    fn request(
+        _authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<CredentialAddRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            project: PathBuf,
+            origin: String,
+            path_prefixes: Vec<String>,
+            #[serde(default)]
+            methods: Vec<String>,
+            secret: CredentialSecretSource,
+        }
+        let Caller {
+            project,
+            origin,
+            path_prefixes,
+            methods,
+            secret,
+        } = decode::<HostCredentialAdd, Caller>(arguments)?;
+        Ok(CredentialAddRequest {
+            project,
+            origin,
+            path_prefixes,
+            methods,
+            secret,
+        })
+    }
+}
+
 impl Serves<HostDiskCommand> for Host {
     const BOUND: &'static [&'static str] = &[];
 
@@ -1819,6 +1853,7 @@ pub(crate) fn each_served(
     check.served::<HostLockHolders, _>(host, &[]);
     check.served::<HostTreeHolders, _>(host, &[]);
     check.served::<HostRetireDescendants, _>(host, &[]);
+    check.served::<HostCredentialAdd, _>(host, &[]);
     check.served::<HostDiskCommand, _>(host, &[]);
     check.served::<ProjectWorkspace, _>(project, &[]);
     check.served::<ProjectWorkspaceAt, _>(project, &[]);

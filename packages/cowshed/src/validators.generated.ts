@@ -359,6 +359,13 @@ export const parseCpuWaiter = (json: string): Api.CpuWaiter => assertCpuWaiter(J
 export const assertCpuWaiterList = typia.createAssertEquals<readonly Api.CpuWaiter[]>();
 export const parseCpuWaiterList = (json: string): readonly Api.CpuWaiter[] => assertCpuWaiterList(JSON.parse(json));
 
+export const assertCredentialAddRequest = typia.createAssertEquals<Api.CredentialAddRequest>();
+export const parseCredentialAddRequest = (json: string): Api.CredentialAddRequest =>
+  assertCredentialAddRequest(JSON.parse(json));
+export const assertCredentialAddRequestList = typia.createAssertEquals<readonly Api.CredentialAddRequest[]>();
+export const parseCredentialAddRequestList = (json: string): readonly Api.CredentialAddRequest[] =>
+  assertCredentialAddRequestList(JSON.parse(json));
+
 export const assertCredentialRemoveRequest = typia.createAssertEquals<Api.CredentialRemoveRequest>();
 export const parseCredentialRemoveRequest = (json: string): Api.CredentialRemoveRequest =>
   assertCredentialRemoveRequest(JSON.parse(json));
@@ -377,6 +384,13 @@ export const parseCredentialRoute = (json: string): Api.CredentialRoute => asser
 export const assertCredentialRouteList = typia.createAssertEquals<readonly Api.CredentialRoute[]>();
 export const parseCredentialRouteList = (json: string): readonly Api.CredentialRoute[] =>
   assertCredentialRouteList(JSON.parse(json));
+
+export const assertCredentialSecretSource = typia.createAssertEquals<Api.CredentialSecretSource>();
+export const parseCredentialSecretSource = (json: string): Api.CredentialSecretSource =>
+  assertCredentialSecretSource(JSON.parse(json));
+export const assertCredentialSecretSourceList = typia.createAssertEquals<readonly Api.CredentialSecretSource[]>();
+export const parseCredentialSecretSourceList = (json: string): readonly Api.CredentialSecretSource[] =>
+  assertCredentialSecretSourceList(JSON.parse(json));
 
 export const assertDatabaseHolder = typia.createAssertEquals<Api.DatabaseHolder>();
 export const parseDatabaseHolder = (json: string): Api.DatabaseHolder => assertDatabaseHolder(JSON.parse(json));

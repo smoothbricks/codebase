@@ -427,6 +427,9 @@ operations! {
     host json "host.treeHolders" HostTreeHolders(HostPathRequest) -> Vec<TreeHolder>;
     /// Asks the job supervisor this host connection runs under to retire a retained subtree.
     host json "host.retireDescendants" HostRetireDescendants(RetireDescendantsRequest) -> JobSubtreeRetirement;
+    /// Enrols a scoped gateway registry credential for a project; `upload` secrets travel as the
+    /// upload frame.
+    host upload "host.credentialAdd" HostCredentialAdd(CredentialAddRequest) -> CredentialReport;
     /// Runs one diskutil or hdiutil argv through cowshed's disk runner, its output after its end.
     host stream "host.diskCommand" HostDiskCommand(DiskCommandRequest) -> DiskCommandEvent;
 }
@@ -979,6 +982,42 @@ pub struct DiskCommandRequest {
     pub argv: Vec<CommandArg>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdin: Option<BinaryData>,
+}
+
+/// `credential add`: one exact HTTPS origin, the registry path prefixes it may reach, the methods
+/// (absent or empty: GET and HEAD), and where the secret comes from.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CredentialAddRequest {
+    pub project: PathBuf,
+    pub origin: String,
+    pub path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+    pub secret: CredentialSecretSource,
+}
+
+/// Where `credential add`'s secret comes from: named, never carried in a request field.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum CredentialSecretSource {
+    /// `--secret-env <name> [--secret-command]`: the variable in `cowshed host`'s environment,
+    /// which is the `openHost` caller's, withheld from every child of the project from then on;
+    /// when it is unset or empty, `command` is run instead.
+    Env {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<Vec<String>>,
+    },
+    /// `--secret-command <argv>`: a helper run with no stdin, its trimmed stdout the secret.
+    Command { argv: Vec<String> },
+    /// `--secret-stdin`: the call's upload frame.
+    Upload,
 }
 
 /// `gateway stop [--purge]`.

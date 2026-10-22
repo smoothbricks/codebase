@@ -256,6 +256,13 @@
   "host.gatewayStart": {},
   "host.gatewayStop": { "purge": true },
   "host.lockHolders": { "path": "/tmp/cowshed-lock" },
+  "host.credentialAdd": {
+    "project": "/trusted/acme/widget",
+    "origin": "https://registry.example.test",
+    "pathPrefixes": ["/acme/"],
+    "methods": ["GET"],
+    "secret": { "kind": "env", "name": "REGISTRY_TOKEN", "command": ["op", "read", "op://vault/item/field"] }
+  },
   "host.diskCommand": {
     "tool": "diskutil",
     "deadlineMs": 5000,

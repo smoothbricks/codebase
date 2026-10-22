@@ -12,7 +12,8 @@ use cowshed_core::Host;
 use cowshed_core::api::call::{self, Arguments};
 use cowshed_core::api::dto::DiskCommandEvent;
 use cowshed_core::api::operations::{
-    HostBuildState, HostDiskCommand, HostLockHolders, HostRetireDescendants, HostTreeHolders,
+    HostBuildState, HostCredentialAdd, HostDiskCommand, HostLockHolders, HostRetireDescendants,
+    HostTreeHolders,
 };
 use cowshed_core::build_volume::{BUILD_LINK, BuildVolumeState};
 use cowshed_core::capabilities::BuildStatePath;
@@ -315,6 +316,62 @@ async fn a_host_disk_command_is_the_verbs_run_its_output_then_its_exit() {
     assert!(!stdout.is_empty(), "hdiutil info printed nothing");
 
     drop(events);
+    drop(host);
+    let output = child
+        .wait_with_output()
+        .await
+        .expect("wait for cowshed host");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `host.credentialAdd` carries `--secret-stdin`'s bytes as its upload frame and nothing else: a
+/// frame beside a secret named by environment is refused as usage before any project is opened,
+/// and an upload secret reaches the verb's own project discovery, which refuses a directory that
+/// is no checkout. Neither touches the platform credential store.
+#[tokio::test]
+async fn a_host_credential_upload_is_the_stdin_secret_and_nothing_else() {
+    let root =
+        temp_root::TempRoot::new_in(&temp_parent::canonical_parent(), "cowshed-host-credential");
+    let (host, child) = host_without_supervisor().await;
+    let request = |secret: serde_json::Value| {
+        let mut arguments = Arguments::new();
+        arguments.insert("project".to_owned(), serde_json::json!(root.join("absent")));
+        arguments.insert(
+            "origin".to_owned(),
+            serde_json::json!("https://registry.example.test"),
+        );
+        arguments.insert("pathPrefixes".to_owned(), serde_json::json!(["/acme/"]));
+        arguments.insert("secret".to_owned(), secret);
+        arguments
+    };
+    let stray = call::call_upload::<HostCredentialAdd, _>(
+        &host,
+        request(serde_json::json!({ "kind": "env", "name": "REGISTRY_TOKEN" })),
+        Some(bytes::Bytes::from_static(b"token")),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stray.code, cowshed_core::ErrorCode::Usage, "{stray:?}");
+    assert!(stray.message.contains("upload frame"), "{stray:?}");
+
+    let uploaded = call::call_upload::<HostCredentialAdd, _>(
+        &host,
+        request(serde_json::json!({ "kind": "upload" })),
+        Some(bytes::Bytes::from_static(b"token")),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        uploaded.code,
+        cowshed_core::ErrorCode::EnvironmentMissing,
+        "{uploaded:?}"
+    );
+
     drop(host);
     let output = child
         .wait_with_output()

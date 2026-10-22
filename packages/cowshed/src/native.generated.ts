@@ -54,6 +54,7 @@ export interface NativeHostOperations
     NativeHostLockHolders,
     NativeHostTreeHolders,
     NativeHostRetireDescendants,
+    NativeHostCredentialAdd,
     NativeHostDiskCommand {}
 
 /** The operations a `Project` serves: exactly those its authority admits. */
@@ -732,6 +733,34 @@ export async function hostClearNxStore(
   args: HostClearNxStoreArguments,
 ): Promise<Api.NxStoreClearResult> {
   return V.parseNxStoreClearResult(await handle.clearNxStore(JSON.stringify(args)));
+}
+
+/** A handle that serves `host.credentialAdd`. */
+export interface NativeHostCredentialAdd {
+  credentialAdd(argumentsJson: string, bytes?: Buffer): Promise<string>;
+}
+
+/** The request fields a `host.credentialAdd` caller names; its handle binds the rest. */
+export type HostCredentialAddArguments = Pick<
+  Api.CredentialAddRequest,
+  'project' | 'origin' | 'pathPrefixes' | 'methods' | 'secret'
+>;
+
+/**
+ * Enrols a scoped gateway registry credential for a project; `upload` secrets travel as the
+ * upload frame.
+ */
+export async function hostCredentialAdd(
+  handle: NativeHostCredentialAdd,
+  args: HostCredentialAddArguments,
+  bytes?: Uint8Array,
+): Promise<Api.CredentialReport> {
+  return V.parseCredentialReport(
+    await handle.credentialAdd(
+      JSON.stringify(args),
+      bytes === undefined ? undefined : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+    ),
+  );
 }
 
 /** A handle that serves `host.credentialRemove`. */

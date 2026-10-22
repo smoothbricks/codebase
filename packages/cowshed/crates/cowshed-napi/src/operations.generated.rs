@@ -141,6 +141,23 @@ impl Host {
         )
     }
 
+    /// Enrols a scoped gateway registry credential for a project; `upload` secrets travel as the
+    /// upload frame.
+    #[napi(js_name = "credentialAdd")]
+    pub fn credential_add(
+        &self,
+        env: Env,
+        arguments: String,
+        bytes: Option<Buffer>,
+    ) -> napi::Result<JsObject> {
+        super::upload_call::<operations::HostCredentialAdd, _>(
+            env,
+            Arc::clone(&self.inner),
+            arguments,
+            bytes,
+        )
+    }
+
     /// Runs one diskutil or hdiutil argv through cowshed's disk runner, its output after its end.
     #[napi(js_name = "diskCommand")]
     pub fn disk_command(&self, env: Env, arguments: String) -> napi::Result<JsObject> {

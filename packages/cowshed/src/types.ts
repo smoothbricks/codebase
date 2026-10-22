@@ -1,6 +1,7 @@
 import type * as Api from './api.generated.js';
 import type {
   HostAttachAllArguments,
+  HostCredentialAddArguments,
   HostDiskCommandArguments,
   HostListProjectsArguments,
   HostSkillInstallArguments,
@@ -11,6 +12,7 @@ import type {
 export type * from './api.generated.js';
 export type {
   HostAttachAllArguments,
+  HostCredentialAddArguments,
   HostDiskCommandArguments,
   HostListProjectsArguments,
   HostSkillInstallArguments,
@@ -113,6 +115,15 @@ export interface Project {
 }
 
 /**
+ * One `Host.credentialAdd` call: a secret named by `env` or `command` travels alone, and an
+ * `upload` secret travels with its bytes, so no call sends bytes beside a named source or an
+ * upload without them.
+ */
+export type CredentialAddCall =
+  | [request: HostCredentialAddArguments & { readonly secret: Exclude<Api.CredentialSecretSource, { kind: 'upload' }> }]
+  | [request: HostCredentialAddArguments & { readonly secret: { readonly kind: 'upload' } }, secret: Uint8Array];
+
+/**
  * The host's own verbs over one `cowshed host` connection, served by the binary the package
  * launcher picks (07_api.md, "Host operations"). A project-subject operation names the project by
  * a path inside its checkout, as `--project` does.
@@ -154,6 +165,12 @@ export interface Host {
     handle: Api.RetireDescendantsRequest['handle'],
     graceMs: Api.RetireDescendantsRequest['graceMs'],
   ): Promise<Api.JobSubtreeRetirement>;
+  /**
+   * Enrols a scoped gateway registry credential (`credential add`) and answers the project's
+   * routes. A secret named by `env` or `command` is resolved by `cowshed host`, whose environment
+   * is this process's; an `upload` secret is these bytes, sent as the call's upload frame.
+   */
+  credentialAdd(...call: CredentialAddCall): Promise<Api.CredentialReport>;
   /**
    * Runs one `diskutil` or `hdiutil` argv through cowshed's disk runner, as `disk-command` does:
    * under the host's disk lease, an image verb never killed. `stdin` is the tool's whole input.

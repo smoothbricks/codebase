@@ -2178,7 +2178,7 @@ const CREDENTIAL: CommandSpec = CommandSpec {
 
 /// `GET` and `HEAD` are what an intercept grant admits, so they are the default and the only
 /// methods worth spelling out; anything else is refused by the record's own validation.
-const DEFAULT_CREDENTIAL_METHODS: [&str; 2] = ["GET", "HEAD"];
+pub(crate) const DEFAULT_CREDENTIAL_METHODS: [&str; 2] = ["GET", "HEAD"];
 
 fn parse_credential(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &CREDENTIAL;

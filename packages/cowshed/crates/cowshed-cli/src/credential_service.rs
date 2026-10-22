@@ -125,8 +125,59 @@ async fn add<W: std::io::Write + Send, E: std::io::Write + Send>(
     json: bool,
     output: &mut Output<W, E>,
 ) -> Result<i32> {
+    let origin = enroll(repo_id, store_root, &args, StdinSecret::Process).await?;
+    if !json {
+        output
+            .announce(&format!(
+                "enrolled {origin} for {repo_id} with scope {}",
+                args.path_prefixes.join(", ")
+            ))
+            .map_err(write_error)?;
+        if let Some(name) = args.secret_env.as_deref() {
+            output
+                .note(&format!(
+                    "{name} is now withheld from every child of this project",
+                ))
+                .map_err(write_error)?;
+        }
+        output
+            .hint(&format!(
+                "cowshed grant <workspace> --egress {}",
+                host_of(&origin)
+            ))
+            .map_err(write_error)?;
+    }
+    report(repo_id, store_root, json, output).await
+}
+
+/// Where `--secret-stdin`'s credential comes from.
+pub enum StdinSecret<'a> {
+    /// This process's standard input: the verb's pipe.
+    Process,
+    /// A host connection's upload frame, because that process's standard input is its socket.
+    Uploaded(&'a [u8]),
+}
+
+/// `credential add` as `host.credentialAdd` answers it: the project's routes after the enrolment.
+pub async fn add_origin(
+    project_root: &Path,
+    args: &CredentialAddArgs,
+    stdin: StdinSecret<'_>,
+) -> Result<CredentialReport> {
+    let (repo_id, store_root) = project(project_root).await?;
+    enroll(&repo_id, &store_root, args, stdin).await?;
+    routes(&repo_id, &store_root).await
+}
+
+/// Enrol `args`' credential and its route, answering the canonical origin it is enrolled under.
+async fn enroll(
+    repo_id: &RepoId,
+    store_root: &Path,
+    args: &CredentialAddArgs,
+    stdin: StdinSecret<'_>,
+) -> Result<String> {
     let origin = canonical_origin(&args.origin)?;
-    let secret = resolve_secret(&args).await?;
+    let secret = resolve_secret(args, stdin).await?;
     let credential = ScopedCredential {
         repo_id: repo_id.as_str().to_owned(),
         protocol: PROTOCOL,
@@ -153,28 +204,7 @@ async fn add<W: std::io::Write + Send, E: std::io::Write + Send>(
     // after the credential exists: a route naming a credential that is not there would withhold
     // a token from every child while nothing supplied one.
     host.save(store_root).map_err(host_error)?;
-    if !json {
-        output
-            .announce(&format!(
-                "enrolled {origin} for {repo_id} with scope {}",
-                args.path_prefixes.join(", ")
-            ))
-            .map_err(write_error)?;
-        if let Some(name) = args.secret_env.as_deref() {
-            output
-                .note(&format!(
-                    "{name} is now withheld from every child of this project",
-                ))
-                .map_err(write_error)?;
-        }
-        output
-            .hint(&format!(
-                "cowshed grant <workspace> --egress {}",
-                host_of(&origin)
-            ))
-            .map_err(write_error)?;
-    }
-    report(repo_id, store_root, json, output).await
+    Ok(origin)
 }
 
 async fn remove<W: std::io::Write + Send, E: std::io::Write + Send>(
@@ -303,7 +333,10 @@ fn host_of(origin: &str) -> String {
 /// who exported the token is not asking for a vault round trip. The command form exists for a
 /// host that keeps the secret in a credential helper; its argv comes from the flag, is spawned
 /// directly with no shell, and is never assembled from anything a workspace wrote.
-async fn resolve_secret(args: &CredentialAddArgs) -> Result<Zeroizing<String>> {
+async fn resolve_secret(
+    args: &CredentialAddArgs,
+    stdin: StdinSecret<'_>,
+) -> Result<Zeroizing<String>> {
     if let Some(name) = args.secret_env.as_deref() {
         match std::env::var(name) {
             Ok(value) if !value.trim().is_empty() => {
@@ -322,7 +355,10 @@ async fn resolve_secret(args: &CredentialAddArgs) -> Result<Zeroizing<String>> {
         return run_secret_command(argv).await;
     }
     if args.secret_stdin {
-        return read_secret_stdin().await;
+        return match stdin {
+            StdinSecret::Process => read_secret_stdin().await,
+            StdinSecret::Uploaded(bytes) => uploaded_secret(bytes),
+        };
     }
     Err(CowshedError::usage(
         "no credential source was named",
@@ -386,6 +422,21 @@ async fn read_secret_stdin() -> Result<Zeroizing<String>> {
                 "pipe the credential, or pass --secret-env <NAME>",
             )
         })?;
+    stdin_credential(&value)
+}
+
+/// The upload frame as `--secret-stdin`'s bytes: UTF-8, trimmed, never empty.
+fn uploaded_secret(bytes: &[u8]) -> Result<Zeroizing<String>> {
+    let value = std::str::from_utf8(bytes).map_err(|_| {
+        CowshedError::usage(
+            "the uploaded credential is not UTF-8",
+            "upload the credential's UTF-8 bytes, or pass --secret-env <NAME>",
+        )
+    })?;
+    stdin_credential(value)
+}
+
+fn stdin_credential(value: &str) -> Result<Zeroizing<String>> {
     let trimmed = Zeroizing::new(value.trim().to_owned());
     if trimmed.is_empty() {
         return Err(CowshedError::usage(
@@ -412,4 +463,41 @@ fn host_error(error: cowshed_core::storage::host_config::HostConfigError) -> Cow
 
 fn write_error(error: std::io::Error) -> CowshedError {
     CowshedError::internal(format!("failed to write command result: {error}"))
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+
+    fn stdin_args() -> CredentialAddArgs {
+        CredentialAddArgs {
+            origin: "https://registry.example.test".to_owned(),
+            path_prefixes: vec!["/acme/".to_owned()],
+            methods: vec!["GET".to_owned()],
+            secret_env: None,
+            secret_command: None,
+            secret_stdin: true,
+        }
+    }
+
+    /// `--secret-stdin` over a host connection is the upload frame: trimmed UTF-8, refused when
+    /// empty or not UTF-8, exactly as the verb's pipe is.
+    #[tokio::test]
+    async fn the_upload_frame_is_the_stdin_secret() {
+        let secret = resolve_secret(&stdin_args(), StdinSecret::Uploaded(b"  token\n"))
+            .await
+            .unwrap();
+        assert_eq!(secret.as_str(), "token");
+        for (bytes, message) in [
+            (&b" \n"[..], "stdin carried no credential"),
+            (&b""[..], "stdin carried no credential"),
+            (&b"t\xffk"[..], "the uploaded credential is not UTF-8"),
+        ] {
+            let refused = resolve_secret(&stdin_args(), StdinSecret::Uploaded(bytes))
+                .await
+                .unwrap_err();
+            assert_eq!(refused.code, cowshed_core::ErrorCode::Usage, "{refused:?}");
+            assert_eq!(refused.message, message);
+        }
+    }
 }

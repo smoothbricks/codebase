@@ -12,7 +12,9 @@ use std::os::fd::OwnedFd;
 
 use cowshed_core::api::EmptyResult;
 use cowshed_core::api::dto::{BinaryData, CommandArg, DiskCommandTool};
-use cowshed_core::api::operations::{self, Operation, OperationRequest, encode_result};
+use cowshed_core::api::operations::{
+    self, CredentialSecretSource, Operation, OperationRequest, encode_result,
+};
 use cowshed_core::api::server::{
     ConnectionAuthority, EventSource, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
     serve_controller_connection,
@@ -78,7 +80,7 @@ fn respond<O: Operation>(result: &O::Result) -> Result<RouterResponse> {
 }
 
 async fn answer(request: RouterRequest) -> Result<RouterResponse> {
-    let (_, operation, _, _) = request.into_parts();
+    let (_, operation, upload, _) = request.into_parts();
     use OperationRequest as Op;
     match operation {
         Op::HostListProjects(request) => respond::<operations::HostListProjects>(
@@ -172,6 +174,43 @@ async fn answer(request: RouterRequest) -> Result<RouterResponse> {
             )
             .await?,
         ),
+        Op::HostCredentialAdd(request) => {
+            let (secret_env, secret_command, secret_stdin) = match request.secret {
+                CredentialSecretSource::Env { name, command } => (Some(name), command, false),
+                CredentialSecretSource::Command { argv } => (None, Some(argv), false),
+                CredentialSecretSource::Upload => (None, None, true),
+            };
+            if upload.is_some() && !secret_stdin {
+                return Err(CowshedError::usage(
+                    "host.credentialAdd carried an upload frame, but its secret is not the upload",
+                    "send the secret as the upload frame only with secret { kind: \"upload\" }",
+                ));
+            }
+            let root = crate::runtime::discover_project_root(&request.project).await?;
+            let args = crate::args::CredentialAddArgs {
+                origin: request.origin,
+                path_prefixes: request.path_prefixes,
+                methods: match request.methods.is_empty() {
+                    true => crate::args::DEFAULT_CREDENTIAL_METHODS
+                        .iter()
+                        .map(|method| (*method).to_owned())
+                        .collect(),
+                    false => request.methods,
+                },
+                secret_env,
+                secret_command,
+                secret_stdin,
+            };
+            let uploaded = upload.as_deref().unwrap_or_default();
+            respond::<operations::HostCredentialAdd>(
+                &crate::credential_service::add_origin(
+                    &root,
+                    &args,
+                    crate::credential_service::StdinSecret::Uploaded(uploaded),
+                )
+                .await?,
+            )
+        }
         Op::HostDiskCommand(request) => {
             let args = crate::args::DiskCommandArgs {
                 tool: match request.tool {

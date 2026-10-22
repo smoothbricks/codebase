@@ -762,6 +762,18 @@ export type CpuWaiter = {
 };
 
 /**
+ * `credential add`: one exact HTTPS origin, the registry path prefixes it may reach, the methods
+ * (absent or empty: GET and HEAD), and where the secret comes from.
+ */
+export type CredentialAddRequest = {
+  readonly project: string;
+  readonly origin: string;
+  readonly pathPrefixes: ReadonlyArray<string>;
+  readonly methods?: ReadonlyArray<string>;
+  readonly secret: CredentialSecretSource;
+};
+
+/**
  * `credential rm --origin`.
  */
 export type CredentialRemoveRequest = {
@@ -788,6 +800,19 @@ export type CredentialRoute = {
   readonly withheldEnvNames?: ReadonlyArray<string>;
   readonly installed: boolean;
 };
+
+/**
+ * Where `credential add`'s secret comes from: named, never carried in a request field.
+ */
+export type CredentialSecretSource =
+  | ({ readonly kind: 'env' } & {
+      readonly name: string;
+      readonly command?: ReadonlyArray<string>;
+    })
+  | ({ readonly kind: 'command' } & {
+      readonly argv: ReadonlyArray<string>;
+    })
+  | { readonly kind: 'upload' };
 
 export type DatabaseHolder = {
   readonly pid: number & tags.Type<'int32'>;

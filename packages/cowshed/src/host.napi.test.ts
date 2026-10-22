@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CowshedError, type ErrorCode, openHost } from '../dist/ts/index.js';
+import { CowshedError, type ErrorCode, type Host, openHost } from '../dist/ts/index.js';
 
 /** The taxonomy and a non-empty hint are the contract; message copy is not (see native.test.ts). */
 function requireCowshedError(error: unknown, code: ErrorCode): CowshedError {
@@ -121,6 +121,53 @@ describe('openHost', () => {
       expect(kinds[0]).toBe('stdout');
     } finally {
       await host.close();
+    }
+  });
+
+  it('types every credential source, bytes only with an upload and an upload only with bytes', () => {
+    // Compiled by typecheck-tests, never called: each line is a call shape the facade accepts or,
+    // under @ts-expect-error, refuses.
+    const shapes = (host: Host) => {
+      const scope = { project: '/p', origin: 'https://registry.example.test', pathPrefixes: ['/acme/'] };
+      const bytes = new TextEncoder().encode('token');
+      return [
+        host.credentialAdd({ ...scope, secret: { kind: 'env', name: 'TOKEN' } }),
+        host.credentialAdd({ ...scope, secret: { kind: 'env', name: 'TOKEN', command: ['op', 'read'] } }),
+        host.credentialAdd({ ...scope, secret: { kind: 'command', argv: ['op', 'read'] } }),
+        host.credentialAdd({ ...scope, secret: { kind: 'upload' } }, bytes),
+        // @ts-expect-error bytes beside a secret named by environment
+        host.credentialAdd({ ...scope, secret: { kind: 'env', name: 'TOKEN' } }, bytes),
+        // @ts-expect-error bytes beside a secret named by command
+        host.credentialAdd({ ...scope, secret: { kind: 'command', argv: ['op'] } }, bytes),
+        // @ts-expect-error an upload secret without its bytes
+        host.credentialAdd({ ...scope, secret: { kind: 'upload' } }),
+      ];
+    };
+    expect(shapes).toBeInstanceOf(Function);
+  });
+
+  it('sends an upload secret as the frame, reaching the verb own project discovery', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cowshed-host-napi-credential-'));
+    const host = await openHost();
+    try {
+      const refused = await host
+        .credentialAdd(
+          {
+            project: root,
+            origin: 'https://registry.example.test',
+            pathPrefixes: ['/acme/'],
+            secret: { kind: 'upload' },
+          },
+          new TextEncoder().encode('token'),
+        )
+        .then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+      requireCowshedError(refused, 'environment-missing');
+    } finally {
+      await host.close();
+      await rm(root, { recursive: true, force: true });
     }
   });
 

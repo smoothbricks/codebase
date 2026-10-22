@@ -19,6 +19,7 @@ import {
   type Coordinator,
   type CoordinatorEndpoint,
   CowshedError,
+  type CredentialAddCall,
   type ExecRequest,
   type Host,
   type HostAttachAllArguments,
@@ -273,6 +274,11 @@ class HostImpl implements Host {
     graceMs: Api.RetireDescendantsRequest['graceMs'],
   ): Promise<Api.JobSubtreeRetirement> {
     return callNativeAsync(() => N.hostRetireDescendants(this.#native, { handle, graceMs }));
+  }
+
+  async credentialAdd(...call: CredentialAddCall): Promise<Api.CredentialReport> {
+    const [request, secret] = call;
+    return callNativeAsync(() => N.hostCredentialAdd(this.#native, request, secret));
   }
 
   diskCommand(request: HostDiskCommandArguments): AsyncIterable<Api.DiskCommandEvent> {

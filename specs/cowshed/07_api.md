@@ -2134,8 +2134,10 @@ without a row, a row naming a word the CLI no longer parses, a wire field the re
 through the same declarations the projections are generated from, serde renames and flattening included) and an
 operation that is internal or undeclared each refuse generation by name. The facade half is
 `src/cli-parity.generated.ts`: one property per wire or composed word whose type indexes the facade member and the
-parameter property that carries it, so a facade that lacks the member or the property fails the package's typecheck. Its
-header states the counts per class.
+parameter property that carries it, so a facade that lacks the member or the property fails the package's typecheck. A
+word carried by one variant of a tagged union (`credential add --secret-env` is `secret` tagged `env`, its `name`) is
+checked through that variant, selected by a tag the union must declare, so a word is never satisfied by a sibling
+variant's field. Its header states the counts per class.
 
 The project-scoped words the facade could not reach are operations of their own: `project.list` carries an optional
 `landing` selection (`measure` measures every attached session against main's landing branch with
@@ -2187,10 +2189,16 @@ tool's output and delivers it once the tool has ended, as the verb does: the eve
 chunks of at most one inline frame, then its whole stderr the same way, then `exit` with the code the verb exits with
 (its exit code, or 128 plus its signal). A runner failure is the call's error, as the verb's wrapper codes are.
 
-`land-turn`, `credential add`, the `sccache` verbs and the process holders `lock`, `hold` and `subtree-root` are the
-parity gate's known gaps until their rows or launchers land: `land-turn` holds its turn until its child ends,
-`credential add`'s secret is the upload frame, and the `sccache` rows are served by `cowshed sccache host` so the
-launcher's installed-build selection holds.
+`host.credentialAdd` (an upload row) is `credential add`'s enrolment: the origin, the path prefixes, the methods (absent
+or empty is GET and HEAD) and one tagged secret source, so no request names two. `env` (`--secret-env`, with `command`
+as `--secret-command` when the variable is unset or empty) reads `cowshed host`'s environment, which is the `openHost`
+caller's, and withholds the variable from every child of the project; `command` (`--secret-command`) runs the helper
+with no stdin; `upload` (`--secret-stdin`) is the call's upload frame, trimmed UTF-8 as the verb's pipe is. A frame
+beside any other source is refused as usage before a project is opened. The answer is the project's routes.
+
+`land-turn`, the `sccache` verbs and the process holders `lock`, `hold` and `subtree-root` are the parity gate's known
+gaps until their rows or launchers land: `land-turn` holds its turn until its child ends, and the `sccache` rows are
+served by `cowshed sccache host` so the launcher's installed-build selection holds.
 
 One verb has no counterpart by name: `gateway run` is the process launchd execs as the daemon. A library call never
 becomes that process and no host connection runs it.
