@@ -432,15 +432,15 @@ impl Drop for TestPaths {
 /// mount; native unmount; detach — while a real detach of A, started first, waits. Under a
 /// host-wide lease B could not begin; without a per-image lease A's detach would not wait
 /// for the release. Aliases of A's file (a symlinked parent, a hard link) take other leases
-/// yet gain nothing: the inventory never maps them, so they cannot release A's device, and A's
-/// attachment holds the file exclusively against an open through either of them, so neither
-/// can take it from A — checked without spending an attach of its own. Every wait is an
-/// event; the only deadline is the hang bound, and it names the step still open.
+/// yet gain nothing: the inventory never maps them, so they cannot release A's device, and
+/// growth through either finds A's attachment by the file's device and inode, so neither can
+/// grow A's file — checked without spending an attach of its own. Every wait is an event; the
+/// only deadline is the hang bound, and it names the step still open.
 ///
-/// A's attachment is also the image-growth witness, so growth spends no attach of its own: a
-/// real attachment holds its image file exclusively (01a_apfs.md, "Images"), so growing A
-/// while attached is refused outright and nothing is written; once A is detached, the grow
-/// lands and A's capacity reports it.
+/// A's attachment is also the image-growth witness, so growth spends no attach of its own: an
+/// in-kernel attachment takes no lock on its file, so growth refuses it by the registry
+/// (01a_apfs.md, "Images"); growing A while attached is refused outright and nothing is
+/// written; once A is detached, the grow lands and A's capacity reports it.
 #[cfg(target_os = "macos")]
 #[test]
 fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
@@ -480,7 +480,7 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
         // Before A's lease is held below, since resizing takes it.
         let refused = SystemCommandRunner
             .grow_image(&image_a, capacity("2g"))
-            .expect_err("an attached image's file is held exclusively");
+            .expect_err("growth refuses an attached image");
         assert_eq!(refused.kind(), io::ErrorKind::WouldBlock, "{refused}");
         assert!(matches!(
             backend.resize_image(&image_a, capacity("2g")),
@@ -501,8 +501,8 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
 
         // Each alias takes its own lease, so these run while A's is held; none may take A's
         // file or disturb A's attachment. No alias is attached: its inventory key is its own
-        // path, so an attach would reach `diskutil image attach` and spend a host attach. The
-        // inventory shows no alias owns a device, and the exclusive open shows A holds the file.
+        // path, so an attach would reach `hdiutil attach` and spend a host attach. The
+        // inventory shows no alias owns a device, and growth finds A's attachment of the file.
         for alias in [&symlinked, &hard_link] {
             assert!(
                 backend.recovered_image_attachment(alias)?.is_none(),
@@ -511,7 +511,7 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
             );
             let refused = SystemCommandRunner
                 .grow_image(alias, capacity("2g"))
-                .expect_err("A's attachment holds the file every alias names");
+                .expect_err("A's attachment backs the file every alias names");
             assert_eq!(
                 refused.kind(),
                 io::ErrorKind::WouldBlock,
@@ -778,14 +778,14 @@ fn wait_for_exit(pid: libc::pid_t) -> io::Result<()> {
 #[cfg(target_os = "macos")]
 const FIXTURE_KILL_ROOT: &str = "COWSHED_TEST_FIXTURE_KILL_ROOT";
 
-/// A disk-image attach outlives its caller: the caller is ended the way an agent tool
-/// kills a tree — SIGTERM to every process working in its root, then SIGKILL to the
-/// caller itself — mid-attach. The detached disk-image command finishes regardless, so
-/// the next invocation (this parent, after the kill) finds the image attached and
-/// releases it cleanly: no whole device of the image remains, no image driver still holds the
-/// file, nothing keeps running in its root, and no diskimagesiod is orphaned. The host's
-/// leaked-device count is the lane's check (specs/cowshed/08_testing.md, "Host limit"), not one
-/// test's on a shared host.
+/// An in-kernel attach killed with its caller leaves nothing behind: the caller is ended the
+/// way an agent tool kills a tree — SIGTERM to every process working in its root, the
+/// attaching `hdiutil` among them, then SIGKILL to the caller itself — mid-attach. The next
+/// invocation (this parent, after the kill) releases whatever the attach left, attached or not:
+/// no whole device of the image remains, no attachment still backs the file, nothing keeps
+/// running in its root, and no diskimagesiod ever served the image. The host's departed-drive
+/// count is the lane's check (specs/cowshed/08_testing.md, "Host limit"), not one test's on a
+/// shared host.
 #[cfg(target_os = "macos")]
 #[test]
 fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
@@ -815,8 +815,8 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
     let caller = libc::pid_t::try_from(child.id()).expect("caller pid");
     let in_root = |cwd: &Path| cwd.starts_with(root.path());
     let mut lines = BufReader::new(child.stdout.take().expect("caller stdout")).lines();
-    // Each attach's diskutil is announced once it runs. Stop the caller there, so it cannot
-    // move past the attach, and strike only while that diskutil still runs: an announcement
+    // Each attach's hdiutil is announced once it runs. Stop the caller there, so it cannot
+    // move past the attach, and strike only while that hdiutil still runs: an announcement
     // read after its attach had already finished is passed over for the next one.
     let attach = loop {
         let line = lines
@@ -826,7 +826,7 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
         let Some(announced) = line.strip_prefix("inflight ") else {
             continue;
         };
-        let announced: libc::pid_t = announced.parse().expect("announced diskutil pid");
+        let announced: libc::pid_t = announced.parse().expect("announced hdiutil pid");
         let mut status = 0;
         // SAFETY: kill and waitpid only name the caller, this test's unreaped child;
         // WUNTRACED returns once the stop has taken effect.
@@ -865,18 +865,19 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
             wait_for_exit(pid).expect("watch a detached disk child's exit");
         }
     }
-    assert!(
-        !backend
-            .attached_whole_devices(&image)
-            .expect("attachment inventory")
-            .is_empty(),
-        "the killed caller's attach (diskutil {attach}) did not complete"
+    // A SIGTERM may land before or after the kernel attached the image; either is recovered.
+    let attached = !backend
+        .attached_whole_devices(&image)
+        .expect("attachment inventory")
+        .is_empty();
+    cowshed_os::eprintln!(
+        "cowshed: the killed attach (hdiutil {attach}) left the image attached: {attached}"
     );
     let image_helpers = crate::disk_image_helpers::image_helper_pids(&image)
-        .expect("join this attached image to its helper PIDs");
+        .expect("join this image to its helper PIDs");
     assert!(
-        !image_helpers.is_empty(),
-        "the fixture's attached image names no helper"
+        image_helpers.is_empty(),
+        "an in-kernel attach named diskimagesiod helpers {image_helpers:?}"
     );
     backend
         .release_image(&image, DetachIntent::Release)
@@ -888,10 +889,10 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
             .is_empty(),
         "the released image is still attached"
     );
-    // The image is free to attach again: an attachment holds its file exclusively
-    // (01a_apfs.md, "Images"), and detached growth's own nonblocking exclusive open
-    // succeeds, so no image driver still holds it — proved without another attach. The
-    // released image is then deleted, so a passing run retains no fixture.
+    // The image is free to attach again: detached growth refuses a file any registered
+    // attachment backs (01a_apfs.md, "Images") or a helper locks, and it succeeds, so no image
+    // driver still holds it — proved without another attach. The released image is then
+    // deleted, so a passing run retains no fixture.
     SystemCommandRunner
         .grow_image(&image, capacity("2g"))
         .expect("no image driver still holds the released image");
@@ -902,14 +903,6 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
         crate::scratch_apfs::processes::processes_in(in_root).expect("list the root"),
         [],
         "a process outlived the released image in its root"
-    );
-    let orphans = crate::disk_image_helpers::OrphanedHelpers::read_owned(&image_helpers)
-        .expect("read the fixture image's helpers after release");
-    assert!(
-        orphans.is_empty(),
-        "orphaned diskimagesiod helpers created for {}: {:?}",
-        image.display(),
-        orphans.pids()
     );
 }
 
@@ -927,7 +920,7 @@ fn real_apfs_disk_image_attach_outliving_a_killed_caller() {
     let backend = MacOsApfsBackend::new(SystemCommandRunner);
     let image = root.join("attach.dmg");
     crate::blank_image::blank_image(&image);
-    // Announce only the attaching diskutil while attach is in flight, so the parent kills
+    // Announce only the attaching hdiutil while attach is in flight, so the parent kills
     // mid-attach rather than during inventory reads or the exact-device release afterward.
     // Release starts only after attach returned and the attaching flag has been cleared.
     let watched = root.clone();
@@ -944,10 +937,10 @@ fn real_apfs_disk_image_attach_outliving_a_killed_caller() {
                 // SAFETY: `path` is writable for its whole length, the size passed.
                 let length =
                     unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
-                let diskutil = usize::try_from(length).is_ok_and(|length| {
-                    length > 0 && String::from_utf8_lossy(&path[..length]).ends_with("/diskutil")
+                let hdiutil = usize::try_from(length).is_ok_and(|length| {
+                    length > 0 && String::from_utf8_lossy(&path[..length]).ends_with("/hdiutil")
                 });
-                if diskutil
+                if hdiutil
                     && watching.load(std::sync::atomic::Ordering::SeqCst)
                     && announced.insert(pid)
                 {

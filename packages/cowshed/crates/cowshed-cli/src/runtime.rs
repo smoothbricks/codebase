@@ -6552,7 +6552,7 @@ mod tests {
     #[test]
     fn doctor_reports_the_attach_budget_and_says_reboot_once_the_pool_ran_out() {
         use cowshed_apfs::attach_budget::{
-            Boot, ClassCount, KernelReading, PoolRecord, REBOOT_HINT,
+            Boot, ClassCount, KernelReading, LEAKED_DEVICES_HINT, PoolRecord,
         };
         let count = |instances, registered| ClassCount {
             instances,
@@ -6597,9 +6597,7 @@ mod tests {
         let exhausted = finding(&spent, &boot.session, spent_host);
         assert_eq!(exhausted.severity, FindingSeverity::Error);
         assert!(
-            exhausted
-                .message
-                .starts_with("attach pool exhausted, reboot required"),
+            exhausted.message.starts_with("attach pool exhausted: "),
             "{exhausted:?}"
         );
         assert!(
@@ -6608,7 +6606,7 @@ mod tests {
                 .contains("66 disk images attached and 1024 leaked image devices"),
             "{exhausted:?}"
         );
-        assert_eq!(exhausted.hint, REBOOT_HINT);
+        assert_eq!(exhausted.hint, LEAKED_DEVICES_HINT);
 
         // After the reboot nothing is spent; leaked image devices warn.
         let rebooted = finding(&spent, next, rebooted_host);
@@ -6623,7 +6621,7 @@ mod tests {
         };
         let near = finding(&spent, next, near);
         assert_eq!(near.severity, FindingSeverity::Warning);
-        assert_eq!(near.hint, REBOOT_HINT);
+        assert_eq!(near.hint, LEAKED_DEVICES_HINT);
 
         let linux = std::io::Error::new(std::io::ErrorKind::Unsupported, "no pool");
         assert!(disk_image_attach_budget_finding(Err(linux)).is_none());
@@ -6635,7 +6633,8 @@ mod tests {
     #[test]
     fn doctor_reports_departed_volumes_from_the_first_one_apart_from_the_pool() {
         use cowshed_apfs::attach_budget::{
-            Boot, ClassCount, DEPARTED_ATTRIBUTION_HINT, KernelReading, PoolRecord, REBOOT_HINT,
+            Boot, ClassCount, DEPARTED_ATTRIBUTION_HINT, KernelReading, LEAKED_DEVICES_HINT,
+            PoolRecord,
         };
         let count = |instances, registered| ClassCount {
             instances,
@@ -6681,7 +6680,7 @@ mod tests {
         let spent = PoolRecord::default().exhausted(&boot, Some(spent_host.image_devices), Some(0));
         let exhausted = pool(&spent, &boot.session, spent_host);
         assert_eq!(exhausted.severity, FindingSeverity::Error);
-        assert_eq!(exhausted.hint, REBOOT_HINT);
+        assert_eq!(exhausted.hint, LEAKED_DEVICES_HINT);
 
         // The first departed instance of either class warns, and the pool does not move for it.
         for (reading, counts) in [

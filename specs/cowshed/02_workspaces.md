@@ -221,7 +221,8 @@ copies, so a commit or a fetch made after an earlier attempt refused never wedge
 
 Re-adoption copies filesystem entries, not allocated-but-free guest blocks. Space returns only after verification and
 explicit release of the old image and any snapshots sharing its blocks (01a_apfs.md, "Space reclamation"). Existing ASIF
-images are retained inputs to this transaction; ordinary runtime image enumeration and attachment use RAW only.
+images are retained inputs to this transaction, attached read-only through DiskImages2, the one reader of ASIF
+(01a_apfs.md, "Mounts"); ordinary runtime image enumeration and attachment use RAW only, attached in the kernel.
 
 ## Checkout layouts
 

@@ -36,7 +36,7 @@ use crate::device::{DISKUTIL, container_of, identifier_depth};
 /// from the kernel ([`CommandRunner::attached_disk_images`]), never from `hdiutil info`.
 pub(crate) const HDIUTIL: &str = "/usr/bin/hdiutil";
 
-/// The flags of every cowshed attach (01a_apfs.md, "Images"): `-kernel` serves the RAW image from
+/// The flags of every runtime image attach (01a_apfs.md, "Images"): `-kernel` serves the RAW image from
 /// the kernel's own file backing store (`IOHDIXHDDriveInKernel`), with no userspace image helper
 /// to stall, orphan or leave a notification undrained (01a_apfs.md, "The IOMedia
 /// match-notification ceiling"); `-nomount`, since cowshed mounts the exact verified volume itself;
@@ -59,6 +59,27 @@ fn in_kernel_attach(image: &Path, access: MountAccess) -> CommandRequest {
             .chain((access == MountAccess::ReadOnly).then(|| OsString::from("-readonly")))
             .chain(IN_KERNEL_ATTACH.map(OsString::from))
             .chain([image.as_os_str().to_owned()]),
+    )
+}
+
+/// `diskutil image attach` of a retained re-adoption input, read-only: the one cowshed attach
+/// outside the kernel. A retained input may be ASIF, which only DiskImages2 reads; the in-kernel
+/// RAW class attaches ASIF bytes as a raw device and finds no volume (01a_apfs.md, "Images"). As a
+/// DiskImages2 attach it meets the spent-boot latch ([`attach_budget::refuse_attach_into_spent_pool`]).
+fn retained_input_attach(image: &Path) -> CommandRequest {
+    CommandRequest::new(
+        DISKUTIL,
+        [
+            "image",
+            "attach",
+            "--readOnly",
+            "--nobrowse",
+            "--noMount",
+            "--plist",
+        ]
+        .map(OsString::from)
+        .into_iter()
+        .chain([image.as_os_str().to_owned()]),
     )
 }
 const FSCK_APFS: &str = "/sbin/fsck_apfs";
@@ -966,7 +987,7 @@ mod raw {
     use crate::image::ImageCapacity;
     use std::fs::{File, OpenOptions};
     use std::io;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::Path;
 
     const SECTOR_BYTES: u64 = 512;
@@ -992,14 +1013,17 @@ mod raw {
         file_capacity(&file)
     }
 
-    /// The nonblocking exclusive open refuses any attached image and keeps attachment excluded
-    /// until the larger file length is power-loss durable. Extending a file preserves its holes.
+    /// The nonblocking exclusive open refuses an image a DiskImages2 helper holds and keeps such
+    /// an attach excluded until the larger file length is power-loss durable. An in-kernel
+    /// attachment takes no lock on its file, so the registry refuses it ([`refuse_attached`]).
+    /// Extending a file preserves its holes.
     pub(super) fn grow(image: &Path, capacity: ImageCapacity) -> io::Result<()> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .custom_flags(libc::O_EXLOCK | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(image)?;
+        refuse_attached(&file, image)?;
         let current = file_capacity(&file)?;
         if !capacity.bytes().is_multiple_of(GROW_BLOCK) || capacity.bytes() <= current.bytes() {
             return Err(io::Error::new(
@@ -1011,6 +1035,35 @@ mod raw {
         }
         file.set_len(capacity.bytes())?;
         cowshed_os::fsio::Durability::PowerLoss.sync_file(&file)
+    }
+
+    /// Refuse (`WouldBlock`, as a held lock does) when any registered attachment is backed by the
+    /// file `file` opened, compared by device and inode, so an alias path is refused as well. A
+    /// backing path that no longer exists is passed over: it can name this file only if the image
+    /// was renamed while attached, which cowshed never does.
+    fn refuse_attached(file: &File, image: &Path) -> io::Result<()> {
+        let opened = file.metadata()?;
+        for attached in super::io_registry::attached_disk_images()? {
+            let crate::DiskImageSource::File(backing) = &attached.source else {
+                continue;
+            };
+            let backing_file = match std::fs::metadata(backing) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if (backing_file.dev(), backing_file.ino()) == (opened.dev(), opened.ino()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "{} is attached through {}",
+                        image.display(),
+                        backing.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1848,7 +1901,8 @@ pub enum ApfsError {
     /// for it.
     DiskImageHelperUnreachable(Box<DiskImageHelperFailure>),
     /// A disk-image command the host refused with error code 150 because its attach pool is
-    /// spent (attach_budget.rs): a host finding that only a reboot clears, not the request's
+    /// spent (attach_budget.rs): a host finding that killing a stalled helper or a reboot clears,
+    /// not the request's
     /// failure. Boxed like the helper failure.
     AttachPoolExhausted(Box<AttachPoolFailure>),
     InvalidAttachmentPlist(String),
@@ -3172,11 +3226,10 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     fn attach_without_mounting(
         &self,
         image: &Path,
-        access: MountAccess,
+        request: CommandRequest,
         cleanup: DetachIntent,
     ) -> Result<AttachedImage, ApfsError> {
         let attached_before = self.refuse_second_attach(image)?;
-        let request = in_kernel_attach(image, access);
         let output = match self.run_checked("attach image without mounting", request) {
             Ok(output) => output,
             Err(primary) => {
@@ -3200,14 +3253,14 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     fn verify_attachment(
         &self,
         image: &Path,
-        access: MountAccess,
+        request: CommandRequest,
         cleanup: DetachIntent,
     ) -> Result<AttachedImage, ApfsError> {
         let leg = apfs_step_leg(image);
         let (mut attachment, request, output, pin) = {
             let _lease = self.image_lease(image)?;
             let attachment = timed_apfs_step(leg, "attach", || {
-                self.attach_without_mounting(image, access, cleanup)
+                self.attach_without_mounting(image, request, cleanup)
             })?;
             // The same raw descriptor carries the exact-image proof from fsck through mount.
             // Losing the reported device refuses this attempt; it never authorizes another attach.
@@ -3266,8 +3319,12 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         &self,
         input: &RetainedInput<'_>,
     ) -> Result<RetainedAttachment, ApfsError> {
-        self.verify_attachment(input.path(), MountAccess::ReadOnly, DetachIntent::WhenIdle)
-            .map(RetainedAttachment)
+        self.verify_attachment(
+            input.path(),
+            retained_input_attach(input.path()),
+            DetachIntent::WhenIdle,
+        )
+        .map(RetainedAttachment)
     }
 
     #[cfg(target_os = "macos")]
@@ -3616,7 +3673,11 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
 
     fn attach_verified(&self, image: &Path) -> Result<AttachedImage, ApfsError> {
         validate_image_path(image)?;
-        self.verify_attachment(image, MountAccess::ReadWrite, DetachIntent::Release)
+        self.verify_attachment(
+            image,
+            in_kernel_attach(image, MountAccess::ReadWrite),
+            DetachIntent::Release,
+        )
     }
 
     fn attach_mounted(
@@ -3634,7 +3695,11 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
             source,
         })?;
         let attachment = timed_apfs_step(apfs_step_leg(image), "attach", || {
-            self.attach_without_mounting(image, access, DetachIntent::Release)
+            self.attach_without_mounting(
+                image,
+                in_kernel_attach(image, access),
+                DetachIntent::Release,
+            )
         })?;
         let mut mount_attempted = false;
         let mounted = (|| {
@@ -6618,18 +6683,16 @@ mod tests {
         assert_eq!(attachment.volume_device(), "/dev/disk5s1");
         assert_eq!(attachment.0.whole_device(), "/dev/disk4");
         let requests = backend.runner().requests();
+        assert_eq!(requests[0].program, Path::new(DISKUTIL));
         assert_eq!(
             argv(&requests[0]),
             [
+                "image",
                 "attach",
-                "-readonly",
-                "-kernel",
-                "-nomount",
-                "-noverify",
-                "-nobrowse",
-                "-imagekey",
-                "diskimage-class=CRawDiskImage",
-                "-plist",
+                "--readOnly",
+                "--nobrowse",
+                "--noMount",
+                "--plist",
                 input.path().to_str().unwrap(),
             ]
         );

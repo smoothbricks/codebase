@@ -80,20 +80,24 @@ This companion owns the macOS/APFS implementation.
   after sizing the copy (APFS may allocate zero blocks when extending it), `F_FULLFSYNC`s it, renames it over the image,
   syncs the directory, and verifies the result by attaching it before restoring the mount state it found. The copy runs
   at 3.1–5.4 GB/s on the store volume (8.9 GiB in 1.8–3.1 s, an 8,871-extent image back to 579). Nothing rewrites an
-  attached image: the attachment holds an exclusive lock on the file (another `O_SHLOCK` or `O_EXLOCK` open fails with
-  `EAGAIN`), and `diskutil image resize` and `diskutil image create from` refuse it as well. The copy needs, and keeps,
-  free space equal to the image's allocated bytes while earlier clones and checkpoints still share the old blocks; the
-  verb refuses before detaching when the store volume lacks it. Nothing enumerates `<image>.defrag` as an image or
-  sidecar; the next `defrag` replaces one an interrupted run left, and `doctor` names it until then. Mains are never
-  detached implicitly (the gateway keeps them mounted), so no path rewrites main on its own.
-- **Detached growth**: under the image's lease, an `O_EXLOCK | O_NONBLOCK | O_NOFOLLOW` open proves no image driver
-  holds the file and excludes attachment until the write is durable. The RAW file's length is its virtual capacity.
-  Refuse a requested length not aligned to 4 KiB or not strictly larger than the existing length; extend with
-  `ftruncate` and power-loss flush before closing. Extending creates holes, not a host allocation of the larger
-  capacity. There is no image header or allocation map to parse or rewrite. Cowshed then attaches and verifies its own
-  image, grows the container with `diskutil apfs resizeContainer`, and checks kernel capacity. A crash between file and
-  container growth leaves a larger image around the old container: equal-capacity resize is refused, while a larger
-  resize completes both steps.
+  attached image: a DiskImages2 attachment's helper holds an exclusive lock on the file (another `O_SHLOCK` or
+  `O_EXLOCK` open fails with `EAGAIN`), and `diskutil image resize` and `diskutil image create from` refuse it as well;
+  an in-kernel attachment takes no lock ("Mounts"), and the verb's own detach and the registry exclude it. The copy
+  needs, and keeps, free space equal to the image's allocated bytes while earlier clones and checkpoints still share the
+  old blocks; the verb refuses before detaching when the store volume lacks it. Nothing enumerates `<image>.defrag` as
+  an image or sidecar; the next `defrag` replaces one an interrupted run left, and `doctor` names it until then. Mains
+  are never detached implicitly (the gateway keeps them mounted), so no path rewrites main on its own.
+- **Detached growth**: under the image's lease, an `O_EXLOCK | O_NONBLOCK | O_NOFOLLOW` open refuses a file a
+  DiskImages2 helper holds and excludes such an attach until the write is durable. An in-kernel attachment takes no
+  lock, so growth then refuses (`EWOULDBLOCK`, as a held lock does) when any registered attachment's backing path names
+  the same file by device and inode, an alias path included; the lease excludes cowshed's own attach of the image until
+  the write is durable. A backing path that no longer exists is passed over, since only an image renamed while attached
+  could still name the file, and cowshed renames none. The RAW file's length is its virtual capacity. Refuse a requested
+  length not aligned to 4 KiB or not strictly larger than the existing length; extend with `ftruncate` and power-loss
+  flush before closing. Extending creates holes, not a host allocation of the larger capacity. There is no image header
+  or allocation map to parse or rewrite. Cowshed then attaches and verifies its own image, grows the container with
+  `diskutil apfs resizeContainer`, and checks kernel capacity. A crash between file and container growth leaves a larger
+  image around the old container: equal-capacity resize is refused, while a larger resize completes both steps.
 - **Volume name**: the repository name for `main`, `<repo> — <workspace>` for every other workspace. The volume name is
   a label and nothing else: Finder shows it in place of the directory name for a mounted volume's directory, so it is
   written for the person looking at it. Nothing parses it, nothing classifies a volume by it, and nothing derives
@@ -157,7 +161,9 @@ round by round.
 | Largest capacity (documented / reverse-engineered)                       | just under 4 PiB                                                                  | just under 4 PiB                                                         | 128 PB (`man hdiutil`)                                           |
 | Host dies mid-write (docs)                                               | allocation directory is versioned and switched atomically                         | allocation directory is versioned and switched atomically                | power loss during `compact` can damage the image (`man hdiutil`) |
 
-The detached-grow timings above measured Apple's content resize, before the native header-growth cutover.
+The detached-grow timings above measured Apple's content resize, before the native header-growth cutover. The "while
+attached" row measured DiskImages2 attachments; an in-kernel attachment takes no lock ("Mounts"), and growth refuses it
+by the registry ("Detached growth").
 
 ASIF's 1 MiB chunks, its capacity limit, and its versioned allocation directory come from reverse engineering
 (<https://schamper.dev/dissecting-apples-sparse-image-format-asif/>), not from Apple; SPARSE's limits and its compaction
@@ -193,13 +199,20 @@ options select workspace visibility. `-kernel` serves the RAW image from the ker
 `KDIFileBackingStore` → `KDIReadWriteDiskImage` → `KDIDiskImageNub` → `IOHDIXHDDriveInKernel` →
 `IODiskImageBlockStorageDeviceInKernel`): no userspace image helper serves its I/O, so none can stall, outlive its image
 or hold a notification ("The IOMedia match-notification ceiling"). DiskImages2 (`diskutil image attach`, served by
-`diskimagesiod`) is not used for cowshed's own images; its attachments are still read and released, since an earlier
-build or another tool may hold one. The driver choice and its measurements are in "The two drivers, measured on one 1
-GiB RAW image". Cowshed joins the reported whole device and one freshly probed APFS volume to that image in the current
-I/O Registry, opens the raw volume read-only and rechecks ownership under that pin. Absence, a conflicting device,
-multiple volumes or unreadable ownership refuses. Before the first mount, pinned `fsck_apfs -q <raw-volume>` checks the
-filesystem; any nonzero result refuses publication and releases only the new owned attachment or reports its cleanup
-refusal. The ordinary mounted path does not retry attach or verification.
+`diskimagesiod`) attaches one kind of cowshed image only: a retained re-adoption input (02_workspaces.md), read-only,
+with `diskutil image attach --readOnly --nobrowse --noMount --plist <image>`. A retained input may be ASIF, which only
+DiskImages2 reads; the in-kernel RAW class attaches ASIF bytes as a raw device and finds no volume (`NoApfsVolume`,
+measured in the real-APFS lane on 2026-10-22). That attach meets the spent-boot latch and the media gate like any other.
+DiskImages2 attachments are read and released too, since an earlier build or another tool may hold one. An in-kernel
+attachment takes no lock on its backing file: with one attached, `flock` `LOCK_EX` and `LOCK_SH` and an `O_EXLOCK` open
+were all granted (2026-10-22), so no rule reads a granted lock as proof that an image is detached ("Images", detached
+growth). A second in-kernel attach of the same file through a hard link returned the existing whole device instead of a
+second one, and a read-only second attach was refused `EBUSY`. The driver choice and its measurements are in "The two
+drivers, measured on one 1 GiB RAW image". Cowshed joins the reported whole device and one freshly probed APFS volume to
+that image in the current I/O Registry, opens the raw volume read-only and rechecks ownership under that pin. Absence, a
+conflicting device, multiple volumes or unreadable ownership refuses. Before the first mount, pinned
+`fsck_apfs -q <raw-volume>` checks the filesystem; any nonzero result refuses publication and releases only the new
+owned attachment or reports its cleanup refusal. The ordinary mounted path does not retry attach or verification.
 
 Mount is `mount_apfs -o nobrowse,owners,noatime <verified-volume-device> <mountpoint>` as the invoking user; `--browse`
 omits `nobrowse`, and read-only access adds `rdonly`. The existing root-owned event-store repair uses the same helper
@@ -509,8 +522,10 @@ whole devices, so ownership is membership in that exact image's current mapping,
 after formatting. Real fixture cleanup likewise cannot treat a missing returned attachment handle as release proof: it
 recovers and releases the exact image's current typed attachment before unlinking, then holds a nonblocking exclusive,
 no-follow descriptor of the backing file across unlink. Empty registered mapping is not proof of an unlocked file: an
-orphan helper's file lock remains a named refusal and preserves the file. Confirmed absence with an unlocked file, or an
-already-absent file, needs no release command. A failed explicit cleanup is never retried from its destructor.
+orphan helper's file lock remains a named refusal and preserves the file. The lock proves only that no DiskImages2
+helper holds the file; an in-kernel attachment takes none, so the exact image's empty registered mapping is its proof.
+Confirmed absence with an unlocked file, or an already-absent file, needs no release command. A failed explicit cleanup
+is never retried from its destructor.
 
 A namespace-only unmount, needed for adopt handoff or a sealed capture without releasing the device, holds the image
 lease and raw IOMedia pin across host namespace admission and the operation. After each admission, the owner reads the
@@ -732,7 +747,8 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    policy. The one exception is the IOMedia match-notification ceiling (below): a verb whose attach would reach it first
    detaches idle workspaces, then and for that reason, never on a timer.
 
-   The same error has a second cause, and only a reboot clears it: **leaked image devices.** Every attach creates an
+   The same error has a second cause: **leaked image devices**, which a reboot frees, and which killing the one stalled
+   helper that retains them frees without one ("The IOMedia match-notification ceiling"). Every attach creates an
    `AppleDiskImageDevice`, its `DIDeviceIOUserClient` and a `DIDeviceRequestPool`. Most leave the kernel with their
    detach; some stay alive after they have left the registry, counted among their class's instances but registered
    nowhere. `ioclasscount` reads the instances unprivileged (the registry root's `IOKitDiagnostics` class counts), the
@@ -774,15 +790,15 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    clear) replaces it. `doctor` reports `disk-image-attach-budget`: the four classes' live instances, registered entries
    and differences, the current boot's exhaustion evidence, and disk-image commands an earlier build interrupted, each a
    probable leaked device (the record keeps them until the boot ends; no current build writes one). It is an error while
-   the boot is spent ("attach pool exhausted", with "reboot required" unless orphaned helpers ran at the 150), and a
-   warning while any image device is leaked or an earlier build interrupted a command. Its hint names proven orphaned or
-   stalled helpers first when they ran at the 150, otherwise a reboot for leaked image devices, never a guessed daemon
-   restart for unrelated departed-volume references; clearing a record repairs nothing in the kernel.
+   the boot is spent ("attach pool exhausted"), and a warning while any image device is leaked or an earlier build
+   interrupted a command. Its hint names proven orphaned or stalled helpers first when they ran at the 150, then the
+   stalled helper whose kill frees retained devices, and a reboot only when none is stalled or the devices stay, never a
+   guessed daemon restart for unrelated departed-volume references; clearing a record repairs nothing in the kernel.
    `departed-volume-references` is a separate warning from the first departed APFS-volume or IOMedia instance, with
    exact counts and a root `lsmp` attribution step; it neither defines attach-pool capacity nor prescribes a daemon
    restart. Orphaned helpers are named only when two reads in a row agree and no `diskutil` or `hdiutil` ran during
    either, since a helper whose attach is under way has no device yet and killing it mid-attach is what leaks one;
-   killing orphans frees their mappings, never a leaked device.
+   killing an orphan frees its mapping; killing the stalled helper that retains departed devices frees them.
 
    **A disk-image command is detached from its caller.** A disk-image command is one that creates or releases an image
    device: any `diskutil image …`, any `hdiutil`, and `diskutil eject` (Disk Arbitration's release of an image device,

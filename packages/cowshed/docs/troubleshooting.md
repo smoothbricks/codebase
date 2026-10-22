@@ -471,11 +471,11 @@ disk-image attach pool is spent. A command that meets it fails with `AttachPoolE
 which of two causes spent it.
 
 `disk-image-attach-budget` reports leaked disk-image devices: `AppleDiskImageDevice` and `DIDeviceIOUserClient`
-instances (`ioclasscount`) that no attached image accounts for, which only a reboot frees. It also prints the
-`AppleAPFSVolume` and `IOMedia` counts, whose departed instances take no pool slot (`departed-volume-references`,
-below), and any disk-image command an earlier cowshed killed at its 15-minute hard deadline this boot, each a probable
-leaked device; cowshed no longer kills a disk-image command at all. "attach pool exhausted, reboot required" means a
-DiskImages2 attach failed with error code 150 this boot and no orphaned helper ran: reboot, or kill the one stalled
+instances (`ioclasscount`) that no attached image accounts for, which killing the one stalled `diskimagesiod` that
+retains them frees, or a reboot. It also prints the `AppleAPFSVolume` and `IOMedia` counts, whose departed instances
+take no pool slot (`departed-volume-references`, below), and any disk-image command an earlier cowshed killed at its
+15-minute hard deadline this boot, each a probable leaked device; cowshed no longer kills a disk-image command at all.
+"attach pool exhausted" means a DiskImages2 attach failed with error code 150 this boot: kill the one stalled
 `diskimagesiod` that retains the devices. Devices leak when a `diskimagesiod` helper stalls past IOKit's media
 match-notification cap (next section): its attach holds the helper's lock, its termination callback blocks on it, and
 every image device that terminates host-wide stays allocated until that helper dies. cowshed attaches its own images in
@@ -489,8 +489,9 @@ MiB into the kernel; detach does not always end it, and a helper that outlived i
 row find no attached `AppleDiskImageDevice`'s user client naming as its creator, with no `diskutil` or `hdiutil` running
 during either), the mapping they hold, and the root command that frees it, `sudo kill -9 <pids>`. `launchctl kill`
 refuses them, and no reboot is needed for them. While a disk-image tool runs, a helper may still be attaching, so no pid
-is named until a later `cowshed doctor`. Killing orphans frees their mappings, never a leaked device. Once they are
-gone, `cowshed doctor --clear-attach-budget` ends the recorded exhaustion. cowshed never signals a helper itself.
+is named until a later `cowshed doctor`. Killing orphans frees their mappings; killing a stalled helper frees the
+devices it retains. Once they are gone, `cowshed doctor --clear-attach-budget` ends the recorded exhaustion. cowshed
+never signals a helper itself.
 
 ## An attach is refused with `MediaCapReached`, or names IOKit's media match-notification queue
 

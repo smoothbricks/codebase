@@ -34,8 +34,9 @@ use serde::{Deserialize, Serialize};
 /// "Error: Disk image operation failed with error code 150".
 const POOL_EXHAUSTED: &[u8] = b"error code 150";
 /// What frees leaked image devices.
-pub const REBOOT_HINT: &str =
-    "reboot the host: only a reboot frees leaked disk-image devices (sudo shutdown -r now)";
+pub const LEAKED_DEVICES_HINT: &str = "a diskimagesiod whose attach never returned keeps every \
+     image device terminated after it: killing that one helper (sudo kill -9 <pid>) frees them; \
+     reboot (sudo shutdown -r now) when no helper is stalled or the devices stay";
 
 /// What attributes departed volumes and media to the process that holds them. It reads and
 /// changes nothing and names no restart: the holder has differed between builds, classes and
@@ -288,8 +289,8 @@ impl Budget {
     pub fn remedy(&self) -> String {
         match &self.spent {
             Some(spent) if spent.orphans_present() => ORPHANS_FIRST_HINT.to_owned(),
-            Some(_) => REBOOT_HINT.to_owned(),
-            None if self.reading.image_devices.leaked() > 0 => REBOOT_HINT.to_owned(),
+            Some(_) => LEAKED_DEVICES_HINT.to_owned(),
+            None if self.reading.image_devices.leaked() > 0 => LEAKED_DEVICES_HINT.to_owned(),
             None => "nothing to free".to_owned(),
         }
     }
@@ -318,17 +319,13 @@ impl fmt::Display for Budget {
     }
 }
 
-/// A boot's spent pool, said the way `doctor` says it: "reboot required" unless orphaned
-/// helpers ran at the 150.
+/// A boot's spent pool, said the way `doctor` says it.
 struct Spent<'a>(&'a Exhaustion);
 
 impl fmt::Display for Spent<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let exhaustion = self.0;
         f.write_str("attach pool exhausted")?;
-        if !exhaustion.orphans_present() {
-            f.write_str(", reboot required")?;
-        }
         f.write_str(
             ": a disk-image command failed with error code 150 (kIOReturnNoResources) this boot",
         )?;
@@ -379,7 +376,7 @@ pub fn spent_refusal_at(path: &Path, session: &str) -> io::Result<Option<AttachP
         remedy: if spent.orphans_present() {
             ORPHANS_FIRST_HINT
         } else {
-            REBOOT_HINT
+            LEAKED_DEVICES_HINT
         }
         .to_owned(),
     }))
@@ -433,16 +430,29 @@ pub fn record_path() -> io::Result<PathBuf> {
 
 /// The record at `path`; a missing one is empty.
 pub fn load(path: &Path) -> io::Result<PoolRecord> {
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{}: {error}", path.display()),
-            )
-        }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(PoolRecord::default()),
-        Err(error) => Err(error),
+    let invalid = |message: String| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: {message}", path.display()),
+        )
+    };
+    let record: PoolRecord = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(PoolRecord::default()),
+        Err(error) => return Err(error),
+    };
+    // A spent boot is only ever written with the exhaustion that spent it.
+    if let Some(spent) = &record.spent_session
+        && record
+            .last_exhaustion
+            .as_ref()
+            .is_none_or(|exhaustion| exhaustion.boot.session != *spent)
+    {
+        return Err(invalid(format!(
+            "boot {spent} is marked spent without its exhaustion"
+        )));
     }
+    Ok(record)
 }
 
 /// The record at `path` as [`load`] reads it, except that a record that does not parse (a hand
@@ -858,12 +868,9 @@ mod tests {
         let budget = record.budget(BOOT, rebooted_host());
         assert_eq!(budget.spent, Some(exhaustion));
         assert!(budget.is_low());
-        assert_eq!(budget.remedy(), REBOOT_HINT);
+        assert_eq!(budget.remedy(), LEAKED_DEVICES_HINT);
         let report = budget.to_string();
-        assert!(
-            report.starts_with("attach pool exhausted, reboot required"),
-            "{report}"
-        );
+        assert!(report.starts_with("attach pool exhausted: "), "{report}");
         assert!(
             report.contains("with 66 disk images attached and 1024 leaked image devices"),
             "{report}"
@@ -891,7 +898,6 @@ mod tests {
             assert_eq!(budget.remedy(), ORPHANS_FIRST_HINT);
             let report = budget.to_string();
             assert!(report.starts_with("attach pool exhausted: "), "{report}");
-            assert!(!report.contains("reboot required"), "{report}");
         }
         // The kernel unread at the 150: the boot is spent all the same.
         let unread = PoolRecord::default().exhausted(&boot(BOOT), None, None);
@@ -909,7 +915,7 @@ mod tests {
         let refused = spent_refusal_at(&path, BOOT)
             .unwrap()
             .expect("a spent boot");
-        assert_eq!(refused.remedy, REBOOT_HINT);
+        assert_eq!(refused.remedy, LEAKED_DEVICES_HINT);
         assert!(
             refused
                 .to_string()
@@ -924,6 +930,19 @@ mod tests {
         );
         clear_at(&path, BOOT).unwrap();
         assert_eq!(spent_refusal_at(&path, BOOT).unwrap(), None);
+        // A spent boot with no exhaustion, or another boot's, is corrupt: it refuses.
+        for record in [
+            format!(r#"{{"spentSession":"{BOOT}","lastExhaustion":null}}"#),
+            format!(
+                r#"{{"spentSession":"{BOOT}","lastExhaustion":{{"boot":{{"session":"{NEXT_BOOT}","bootedAt":1}},"imageDevices":null,"orphanedHelpers":null}}}}"#
+            ),
+        ] {
+            std::fs::write(&path, record).unwrap();
+            assert_eq!(
+                spent_refusal_at(&path, BOOT).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
         std::fs::remove_dir_all(&directory).unwrap();
 
         assert!(is_disk_images2_attach(&crate::CommandRequest::new(
@@ -954,7 +973,7 @@ mod tests {
         );
         let leaking = PoolRecord::default().budget(NEXT_BOOT, leaking(1));
         assert!(leaking.is_low());
-        assert_eq!(leaking.remedy(), REBOOT_HINT);
+        assert_eq!(leaking.remedy(), LEAKED_DEVICES_HINT);
     }
 
     /// Departed volumes and media take no slot in the pool: with or without them the warning
