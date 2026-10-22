@@ -6,7 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -56,6 +56,7 @@ use cowshed_gateway_types::WorkspaceToken;
 use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::fsio::AnchoredDirectory;
 
+use crate::runtime::child_fence::ChildFence;
 use crate::runtime::job_cpu::{JobCpuAdmission, JobCpuAsk, JobCpuGrant};
 use crate::runtime::job_groups::Birth;
 use crate::runtime::job_progress::{JobProgressStream, ProgressRead};
@@ -2472,7 +2473,13 @@ async fn spawn_fenced(
             }
         }
     };
+    let spawned = Instant::now();
     let fence = std::sync::Arc::new(ChildFence::new(child.id())?);
+    let process = OwnedProcess {
+        birth: fence.birth().clone(),
+        spawned,
+        host: crate::host_load::read_host_load(),
+    };
     let pipe = |error: io::Error| {
         CowshedError::internal(format!("cannot watch the spawned process's pipes: {error}"))
     };
@@ -2526,6 +2533,7 @@ async fn spawn_fenced(
     });
     Ok(Box::new(SystemRunningProcess {
         fence,
+        process,
         stdin: StdinLane::new(stdin_sender),
         nice,
         #[cfg(target_os = "linux")]
@@ -2640,203 +2648,6 @@ pub(super) fn process_termination_from_wait(
     }
 }
 
-/// A child this process spawned and alone reaps, with the fence that makes signalling its group
-/// safe. Until the child is reaped its id cannot name another process, and it is reaped only
-/// inside the critical section every signal takes, so a signal meets either the unreaped child
-/// or the record that it is gone -- never a process that reused its id. Nothing else may reap
-/// it: the child is spawned through `std`, whose handle never reaps on its own, not through a
-/// Tokio handle whose dropped children Tokio reaps by pid in the background.
-///
-/// A job's leader is observed exiting without being reaped ([`Self::exited`]) and stays held
-/// until the job concludes ([`Self::release`]): descendants that outlive it may hold the job's
-/// output open, and a kill must still reach them through the group id the held leader keeps.
-pub(super) struct ChildFence {
-    pid: i32,
-    process: OwnedProcess,
-    hold: Mutex<Hold>,
-}
-
-/// Where a fenced child is, as far as signalling its group is concerned.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Hold {
-    /// Unreaped, running or exited: its id names only it, and its group id only its group.
-    Held,
-    /// Unreaped, and wanted no longer: it is reaped as soon as it is seen exited.
-    Released,
-    /// Collected: its id may name another process, so no signal follows.
-    Reaped,
-}
-
-impl ChildFence {
-    /// The fence for `pid`, this process's own child, spawned just now and not yet reaped.
-    pub(super) fn new(pid: u32) -> Result<Self> {
-        let spawned = Instant::now();
-        let leader = i32::try_from(pid)
-            .ok()
-            .filter(|pid| *pid > 1)
-            .ok_or_else(|| {
-                CowshedError::internal("process id is not a signalable process group")
-            })?;
-        let host = crate::host_load::read_host_load();
-        Ok(Self {
-            pid: leader,
-            process: OwnedProcess {
-                birth: Birth::of(pid),
-                spawned,
-                host,
-            },
-            hold: Mutex::new(Hold::Held),
-        })
-    }
-
-    pub(super) fn birth(&self) -> &Birth {
-        &self.process.birth
-    }
-
-    pub(super) fn process(&self) -> &OwnedProcess {
-        &self.process
-    }
-
-    fn hold(&self) -> std::sync::MutexGuard<'_, Hold> {
-        self.hold.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Signal the group the child leads, while it is unreaped.
-    pub(super) fn signal(&self, signal: i32) -> Result<()> {
-        let hold = self.hold();
-        if *hold == Hold::Reaped {
-            return Err(CowshedError::conflict(
-                format!(
-                    "process {} has been reaped; processes still holding its group id cannot be \
-                     told from another group that took it, so none is signalled",
-                    self.pid
-                ),
-                format!("inspect them with `ps -g {}`", self.pid),
-            ));
-        }
-        if let Birth::Unobserved { reason, .. } = &self.process.birth {
-            return Err(CowshedError::environment_missing(
-                format!(
-                    "process group {} was never identified ({reason}); it is not signalled",
-                    self.pid
-                ),
-                format!("inspect it with `ps -g {}`", self.pid),
-            ));
-        }
-        super::job_groups::signal_unreaped_group(self.pid, signal).map_err(|error| {
-            CowshedError::environment_missing(
-                format!("failed to signal sandbox process tree: {error}"),
-                "inspect the job and retry",
-            )
-        })
-    }
-
-    /// Collect the child inside the fence if it has exited; `None` while it runs.
-    fn collect(&self, hold: &mut Hold) -> io::Result<Option<std::process::ExitStatus>> {
-        loop {
-            let mut status = 0;
-            // SAFETY: `pid` is this process's own child and `status` a valid out-pointer.
-            let waited = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
-            if waited == self.pid {
-                *hold = Hold::Reaped;
-                return Ok(Some(std::process::ExitStatus::from_raw(status)));
-            }
-            if waited == 0 {
-                return Ok(None);
-            }
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ECHILD) {
-                // Something else collected it: its id is free, so no signal may follow.
-                *hold = Hold::Reaped;
-                return Err(error);
-            }
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
-    }
-
-    /// How the child ended, if it has, read without reaping it -- unless it was released.
-    fn look(&self) -> io::Result<Option<ExitStatus>> {
-        let mut hold = self.hold();
-        if *hold == Hold::Reaped {
-            return Err(io::Error::other("the child was already reaped"));
-        }
-        let exit = match super::job_groups::exit_unreaped(self.pid) {
-            Ok(exit) => exit,
-            Err(error) => {
-                if error.raw_os_error() == Some(libc::ECHILD) {
-                    // Something else collected it: its id is free, so no signal may follow.
-                    *hold = Hold::Reaped;
-                }
-                return Err(error);
-            }
-        };
-        if exit.is_some() && *hold == Hold::Released {
-            self.collect(&mut hold)?;
-        }
-        Ok(exit)
-    }
-
-    /// Wait for the child to exit without reaping it: it stays held until [`Self::release`].
-    /// The child-exit notifications are subscribed before the first look, so none falls between
-    /// a look and the wait for the next.
-    pub(super) async fn exited(&self) -> Result<ExitStatus> {
-        let unobserved = |error: io::Error| {
-            CowshedError::integrity(
-                format!("cannot wait for the sandbox process: {error}"),
-                "cowshed doctor --json",
-            )
-        };
-        let mut exits = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
-            .map_err(unobserved)?;
-        loop {
-            if let Some(exit) = self.look().map_err(unobserved)? {
-                return Ok(exit);
-            }
-            if exits.recv().await.is_none() {
-                return Err(unobserved(io::Error::other(
-                    "child-exit notifications ended",
-                )));
-            }
-        }
-    }
-
-    /// Nothing more is wanted of the child: reap it now if it has exited, or as soon as it is
-    /// seen exiting.
-    pub(super) fn release(&self) -> io::Result<()> {
-        let mut hold = self.hold();
-        if *hold != Hold::Held {
-            return Ok(());
-        }
-        *hold = Hold::Released;
-        self.collect(&mut hold).map(drop)
-    }
-
-    /// Reap the child, inside the fence, if it has exited; `None` while it runs.
-    pub(super) fn try_reap(&self) -> io::Result<Option<std::process::ExitStatus>> {
-        let mut hold = self.hold();
-        if *hold == Hold::Reaped {
-            return Err(io::Error::other("the child was already reaped"));
-        }
-        self.collect(&mut hold)
-    }
-
-    /// Wait for the child to exit and reap it inside the fence. The child-exit notifications are
-    /// subscribed before the first look, so none falls between a look and the wait for the next.
-    pub(super) async fn wait(&self) -> io::Result<std::process::ExitStatus> {
-        let mut exits = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
-        loop {
-            if let Some(status) = self.try_reap()? {
-                return Ok(status);
-            }
-            if exits.recv().await.is_none() {
-                return Err(io::Error::other("child-exit notifications ended"));
-            }
-        }
-    }
-}
-
 pub(super) enum SystemStdin {
     Write(Bytes),
     Close,
@@ -2908,6 +2719,8 @@ impl StdinLane {
 
 struct SystemRunningProcess {
     fence: std::sync::Arc<ChildFence>,
+    /// The command as this process observed it right after spawning it.
+    process: OwnedProcess,
     stdin: StdinLane,
     /// The nice the command was observed at once placed.
     nice: i32,
@@ -2924,7 +2737,7 @@ impl RunningProcess for SystemRunningProcess {
     }
 
     fn process(&self) -> Option<&OwnedProcess> {
-        Some(self.fence.process())
+        Some(&self.process)
     }
 
     fn nice(&self) -> Option<i32> {
@@ -2958,10 +2771,12 @@ impl RunningProcess for SystemRunningProcess {
             .map_err(cgroup_error)
         }
         #[cfg(not(target_os = "linux"))]
-        self.fence.signal(match signal {
-            ProcessSignal::Term => libc::SIGTERM,
-            ProcessSignal::Kill => libc::SIGKILL,
-        })
+        self.fence
+            .signal(match signal {
+                ProcessSignal::Term => libc::SIGTERM,
+                ProcessSignal::Kill => libc::SIGKILL,
+            })
+            .map_err(crate::runtime::child_fence::NotSignalled::into_error)
     }
 }
 
@@ -10366,203 +10181,6 @@ mod process_death_tests {
                 signal: libc::SIGKILL,
                 core_dumped: false,
             }
-        );
-    }
-
-    /// A process group target must be a strictly positive pid other than init: `kill(-1, ...)`
-    /// would signal every process the daemon may signal, and `kill(0, ...)` its own group.
-    #[test]
-    fn a_pid_that_is_not_a_process_group_is_refused() {
-        for pid in [0, 1] {
-            assert!(
-                ChildFence::new(pid).is_err(),
-                "pid {pid} must not be negated into a process-group target"
-            );
-        }
-    }
-
-    /// The reaper and every signal share one fence. A group is signalled while its leader is
-    /// unreaped -- running, or exited and not yet collected -- and refused from the moment the
-    /// leader is reaped, even though a descendant still holds the id: by then a stranger's group
-    /// could take it. A signaller racing the reap sees successes and then only refusals, never a
-    /// success after the reap.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn a_group_is_signalled_only_while_its_reaper_holds_the_leader() {
-        use std::io::BufRead as _;
-        use std::os::unix::process::CommandExt as _;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        // The OwnedGroup test idiom keeps cleanup around the assertions, not after them.
-        struct OwnedGroup(std::process::Child, Option<std::process::ChildStdin>);
-        impl Drop for OwnedGroup {
-            fn drop(&mut self) {
-                let pgid = i32::try_from(self.0.id()).expect("owned child pid");
-                // SAFETY: this test created the group and keeps its descendant until cleanup.
-                if unsafe { libc::killpg(pgid, libc::SIGKILL) } != 0 {
-                    let error = io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::ESRCH) {
-                        cowshed_os::eprintln!("end owned signal-test group {pgid}: {error}");
-                    }
-                }
-                if let Err(error) = self.0.wait()
-                    && error.raw_os_error() != Some(libc::ECHILD)
-                {
-                    cowshed_os::eprintln!("reap owned signal-test leader {pgid}: {error}");
-                }
-                if let Some(mut output) = self.0.stdout.take()
-                    && let Err(error) = io::copy(&mut output, &mut io::sink())
-                {
-                    cowshed_os::eprintln!(
-                        "observe owned signal-test group {pgid} output closure: {error}"
-                    );
-                }
-                drop(self.1.take());
-            }
-        }
-        struct OwnedSignaller {
-            done: Arc<AtomicBool>,
-            thread: Option<std::thread::JoinHandle<Vec<bool>>>,
-        }
-        impl Drop for OwnedSignaller {
-            fn drop(&mut self) {
-                self.done.store(true, Ordering::SeqCst);
-                if let Some(thread) = self.thread.take()
-                    && let Err(panic) = thread.join()
-                {
-                    cowshed_os::eprintln!(
-                        "join owned signal-test signaller during cleanup: {panic:?}"
-                    );
-                }
-            }
-        }
-        let mut job = OwnedGroup(
-            std::process::Command::new("/bin/sh")
-                .args([
-                    "-c",
-                    "exec 3<&0; (trap '' TERM; echo READY; IFS= read -r release <&3) & wait",
-                ])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .process_group(0)
-                .spawn_locked()
-                .unwrap(),
-            None,
-        );
-        // Child::wait closes Child.stdin, so retain the lifetime writer in its owner instead.
-        job.1 = job.0.stdin.take();
-        assert!(
-            job.1.is_some(),
-            "the owner retains descendant stdin across wait"
-        );
-        let pgid = i32::try_from(job.0.id()).unwrap();
-        let mut ready = String::new();
-        std::io::BufReader::new(job.0.stdout.as_mut().unwrap())
-            .read_line(&mut ready)
-            .unwrap();
-        let fence = Arc::new(ChildFence::new(job.0.id()).unwrap());
-        assert!(fence.birth().leader().is_some());
-        fence
-            .signal(0)
-            .expect("a running leader's group is the job's");
-        // SIGKILL the leader only; the descendant keeps the id. Until the fence reaps it the
-        // exited leader still holds its id, so the group is still the job's.
-        // SAFETY: the unreaped test child.
-        unsafe { libc::kill(pgid, libc::SIGKILL) };
-        fence
-            .exited()
-            .await
-            .expect("the leader exited but remains unreaped");
-        fence
-            .signal(0)
-            .expect("an exited, unreaped leader's group is the job's");
-
-        let done = Arc::new(AtomicBool::new(false));
-        let (observed, observation) = oneshot::channel();
-        let mut signaller = OwnedSignaller {
-            done: Arc::clone(&done),
-            thread: Some({
-                let (fence, done) = (Arc::clone(&fence), Arc::clone(&done));
-                std::thread::spawn(move || {
-                    let initial = fence.signal(0).is_ok();
-                    let mut outcomes = vec![initial];
-                    observed
-                        .send(initial)
-                        .expect("the reaper waits for the signaller");
-                    while !done.load(Ordering::SeqCst) {
-                        outcomes.push(fence.signal(0).is_ok());
-                    }
-                    outcomes.push(fence.signal(0).is_ok());
-                    outcomes
-                })
-            }),
-        };
-        assert!(
-            observation
-                .await
-                .expect("the signaller reports before reap"),
-            "the concurrent signaller must succeed before the leader is reaped"
-        );
-        let status = fence.wait().await.unwrap();
-        // The fence, not std's handle, owns waitpid. A second reaper must find no child left.
-        assert_eq!(job.0.wait().unwrap_err().raw_os_error(), Some(libc::ECHILD));
-        done.store(true, Ordering::SeqCst);
-        let outcomes = signaller.thread.take().unwrap().join().unwrap();
-        assert_eq!(status.signal(), Some(libc::SIGKILL));
-        assert_eq!(outcomes.last(), Some(&false), "no signal after the reap");
-        assert!(
-            outcomes.windows(2).all(|pair| pair[0] || !pair[1]),
-            "a refusal is never followed by a success"
-        );
-        let refused = fence.signal(libc::SIGTERM).unwrap_err();
-        assert_eq!(refused.code, crate::error::ErrorCode::Conflict);
-        assert!(super::super::job_groups::group_has_live_members(pgid).unwrap());
-        drop(job);
-    }
-
-    /// A job's leader is observed exiting, with its exact status, while it stays unreaped: a kill
-    /// still reaches the descendants that outlive it and hold the job's output open. The leader
-    /// is reaped only once the job releases it, and nothing is signalled after that.
-    #[tokio::test]
-    async fn an_exited_leader_is_held_until_its_job_releases_it() {
-        use std::io::Read as _;
-        use std::os::unix::process::CommandExt as _;
-
-        let mut job = std::process::Command::new("/bin/sh")
-            .args(["-c", "exec 3<&0; read _ <&3 & exit 3"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .process_group(0)
-            .spawn_locked()
-            .unwrap();
-        let mut output = job.stdout.take().unwrap();
-        let pgid = i32::try_from(job.id()).unwrap();
-        let fence = ChildFence::new(job.id()).unwrap();
-        assert_eq!(
-            fence.exited().await.unwrap(),
-            ExitStatus::Exited { code: 3 }
-        );
-        // Observing the exit did not reap it: it is observed again, and the descendant is still
-        // in the group the held leader's id names.
-        assert_eq!(
-            fence.exited().await.unwrap(),
-            ExitStatus::Exited { code: 3 }
-        );
-        assert!(super::super::job_groups::group_has_live_members(pgid).unwrap());
-        fence
-            .signal(libc::SIGKILL)
-            .expect("an exited, held leader's group is the job's");
-        let mut rest = Vec::new();
-        output
-            .read_to_end(&mut rest)
-            .expect("the output ends with the descendant");
-        assert!(rest.is_empty());
-        fence.release().unwrap();
-        assert_eq!(job.wait().unwrap_err().raw_os_error(), Some(libc::ECHILD));
-        assert_eq!(
-            fence.signal(libc::SIGTERM).unwrap_err().code,
-            crate::error::ErrorCode::Conflict
         );
     }
 }

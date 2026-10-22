@@ -1224,6 +1224,94 @@ export type GrantSet = {
 };
 
 /**
+ * The leader's birth identity, observed by the holder, its parent, before anything could reap
+ * it ([`crate::runtime::job_groups::Birth`]).
+ */
+export type HeldBirth =
+  | ({ readonly kind: 'observed' } & {
+      readonly birth: DecimalU64;
+      readonly start: DecimalU64;
+    })
+  | ({ readonly kind: 'unobserved' } & {
+      readonly reason: string;
+    });
+
+/**
+ * The kernel's name of one descriptor the leader was handed, read from the holder's own copy,
+ * as `lsof -F di` prints it ([`cowshed_os::process::DescriptorName`]).
+ */
+export type HeldDescriptor =
+  | ({ readonly kind: 'device' } & {
+      readonly device: KernelAddress;
+    })
+  | ({ readonly kind: 'inode' } & {
+      readonly inode: DecimalU64;
+    })
+  | { readonly kind: 'closed' }
+  | ({ readonly kind: 'unnamed' } & {
+      readonly fdType: number & tags.Type<'uint32'>;
+    });
+
+/**
+ * The descriptors the leader was handed as its standard output and error.
+ */
+export type HeldOutput = {
+  readonly stdout: HeldDescriptor;
+  readonly stderr: HeldDescriptor;
+};
+
+/**
+ * One event a `cowshed hold` holder writes on its `--state-fd`, one JSON object per line: a
+ * reason carrying a newline stays one line. `started` is the first line of a leader that runs,
+ * and `failed` is always a last line.
+ */
+export type HoldEvent =
+  | ({ readonly kind: 'started' } & {
+      readonly pid: number & tags.Type<'int32'>;
+      readonly birth: HeldBirth;
+      readonly output: HeldOutput;
+    })
+  | ({ readonly kind: 'exited' } & {
+      readonly status: ExitStatus;
+    })
+  | ({ readonly kind: 'signalled' } & {
+      readonly signal: HoldSignal;
+    })
+  | ({ readonly kind: 'notSignalled' } & {
+      readonly signal: HoldSignal;
+      readonly reason: string;
+    })
+  | ({ readonly kind: 'failed' } & {
+      readonly reason: string;
+    })
+  | ({ readonly kind: 'commandFailed' } & {
+      readonly pid: number & tags.Type<'int32'>;
+      readonly reason: string;
+    });
+
+/**
+ * A signal a holder sends its leader's group, named as `kill -s` takes it, without `SIG`: the
+ * standard signals a caller ends, stops, continues or notifies a process group with. The wire and
+ * the control line spell it the same way.
+ */
+export type HoldSignal =
+  | 'HUP'
+  | 'INT'
+  | 'QUIT'
+  | 'ABRT'
+  | 'KILL'
+  | 'USR1'
+  | 'USR2'
+  | 'ALRM'
+  | 'TERM'
+  | 'STOP'
+  | 'CONT'
+  | 'TSTP'
+  | 'TTIN'
+  | 'TTOU'
+  | 'WINCH';
+
+/**
  * Online host cores, independent of the current process's affinity mask.
  */
 export type HostCores = number & tags.Type<'uint32'> & tags.Minimum<1> & tags.Maximum<65535>;
@@ -1674,6 +1762,14 @@ export type JobVolumeUsage = {
   readonly workspace: VolumeUsage;
   readonly build?: VolumeUsage;
 };
+
+/**
+ * A kernel address as lsof's `d` field prints it: `0x` and its lowercase hexadecimal digits,
+ * with no leading zero (`0x1c8cfdee8d6f6f3`, `0x0`), measured against lsof on Darwin 25.6.
+ * Darwin names a pipe or a socket by it; the address is the kernel's permuted one, the value
+ * every process reading that descriptor's description is shown.
+ */
+export type KernelAddress = string & tags.Pattern<'^0x(0|[1-9a-f][0-9a-f]{0,15})$'>;
 
 /**
  * One Nx task that missed the cache when a land re-ran its check in the target on the adopted

@@ -125,6 +125,38 @@ impl WorkspaceRef {
 }
 ```
 
+### Held leaders
+
+`ChildFence` (`cowshed_core::runtime::child_fence`) is the held-leader fence of 11_shell.md "Process identity and signal
+ownership", the one fence the workspace supervisor holds its job leaders and activation hosts with and `cowshed hold`
+gives a caller that is not cowshed (11_shell.md "Held leaders: `cowshed hold`"). Its decisions are the pure `Hold`
+transitions; refusals are values.
+
+```rust
+pub struct ChildFence { /* pid, birth, Mutex<{ Hold, recorded exit }> */ }
+impl ChildFence {
+    /// Spawn `command`, consumed, as the leader of a new session and group this process is outside of.
+    pub fn spawn(command: std::process::Command) -> io::Result<ChildFence>;
+    pub fn pid(&self) -> i32;
+    pub fn birth(&self) -> &Birth;
+    pub fn hold(&self) -> Hold;
+    /// `kill(-pid, signal)` only while the leader is unreaped and its birth was observed.
+    pub fn signal(&self, signal: libc::c_int) -> Result<(), NotSignalled>;
+    /// The leader's exit, observed without reaping it unless it was released; the exit the fence
+    /// recorded once it reaped it.
+    pub async fn exited(&self) -> Result<ExitStatus, CowshedError>;
+    /// Reap the leader now if it has exited, else as soon as it is seen exiting.
+    pub fn release(&self) -> io::Result<()>;
+}
+pub enum Hold { Held, Released, Reaped }
+pub enum NotSignalled { Reaped { pgid }, Unidentified { pgid, reason }, Refused { pgid, error } }
+impl NotSignalled { pub fn into_error(self) -> CowshedError; }
+```
+
+A process the caller did not spawn is held by its life instead: `job_groups::Process::of_socket_peer(&socket)` names the
+peer of a connected Unix socket by its kernel identity (a pidfd on Linux, its pid version on Darwin), and
+`Process::signal` reaches that life or nothing, answering whether it still ran.
+
 ### Exec and grants
 
 ```rust
@@ -1518,6 +1550,17 @@ supervisor that ran the job retires.
   private; `new`, `base()`, and `size()` are the public surface, and custom deserialization invokes the same validation
   so size zero, a size that is not a power of two, a base not aligned to its size, overflow, unknown fields, and
   struct-literal forgery fail.
+- `HoldEvent` (`cowshed hold --state-fd`, one per line) is
+  `{kind:"started",pid,birth:HeldBirth,output:{stdout:HeldDescriptor,stderr:HeldDescriptor}}`,
+  `{kind:"exited",status:ExitStatus}`, `{kind:"signalled",signal:HoldSignal}`,
+  `{kind:"notSignalled",signal:HoldSignal,reason}`, `{kind:"failed",reason}` (no command runs) or
+  `{kind:"commandFailed",pid,reason}` (the holder failed once its leader ran, and released it). `HoldSignal` is the
+  closed name set `HUP INT QUIT ABRT KILL USR1 USR2 ALRM TERM STOP CONT TSTP TTIN TTOU WINCH`, as `signal <SIG>` control
+  lines spell it. `HeldBirth = {kind:"observed",birth,start} | {kind:"unobserved",reason}`, the leader's rusage birth
+  clock and start time as exact decimal strings.
+  `HeldDescriptor = {kind:"device",device} | {kind:"inode",inode} | {kind:"closed"} | {kind:"unnamed",fdType}`: `device`
+  is lsof's `d` field, `0x` and lowercase hex digits with no leading zero; `inode` is lsof's `i` field as an exact
+  decimal string; `fdType` is a Darwin `PROX_FDTYPE_*` neither field names.
 - `PushReport = { sourceHead, destinationRef, previousDestinationHead? }`;
   `LandReport = { kind: "delivered", ...PushReport } | { kind: "landed", ...LandedReport }`;
   `LandedReport = { landedHead, targetBranch, previousTargetHead?, targetWasCheckedOut, retired, buildVolume }`;

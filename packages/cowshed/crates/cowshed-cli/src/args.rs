@@ -52,6 +52,7 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &RETIRE_DESCENDANTS,
     &LOCK,
     &LOCK_HOLDERS,
+    &HOLD,
     &TREE_HOLDERS,
     &GATEWAY,
     &CONTROLLER,
@@ -124,6 +125,9 @@ pub enum Command {
     Lock(LockArgs),
     /// `lock-holders <path>`: who the kernel shows holding a lock file, as one JSON object.
     LockHolders(LockHoldersArgs),
+    /// `hold --control-fd <n> --state-fd <m> -- <cmd...>`: one command held unreaped as the leader
+    /// of its own session and group, signalled only through its holder: no project, no daemon.
+    Hold(HoldArgs),
     /// `tree-holders <dir>`: every process holding something inside a directory tree, as JSON lines.
     TreeHolders(TreeHoldersArgs),
     Gateway(GatewayCommand),
@@ -188,6 +192,7 @@ impl Command {
             | Self::RetireDescendants(_)
             | Self::Lock(_)
             | Self::LockHolders(_)
+            | Self::Hold(_)
             | Self::TreeHolders(_)
             | Self::Sccache(_)
             | Self::Skill(_)
@@ -236,6 +241,15 @@ pub struct LockArgs {
     pub state_fd: Option<i32>,
     /// The pids whose lives the caller owns: captured at the start, the only lives a signal may reach.
     pub owned_pids: Vec<i32>,
+    pub argv: Vec<OsString>,
+}
+
+/// `hold --control-fd <n> --state-fd <m> -- <cmd...>`: the descriptor requests are read from, the
+/// one events are written to, and the command held.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HoldArgs {
+    pub control_fd: i32,
+    pub state_fd: i32,
     pub argv: Vec<OsString>,
 }
 
@@ -1060,6 +1074,18 @@ fn cli_command() -> ClapCommand {
                 ),
         )
         .subcommand(leaf("lock-holders").arg(positional("path", 0..=1)))
+        .subcommand(
+            leaf("hold")
+                .arg(value("control-fd"))
+                .arg(value("state-fd"))
+                .arg(
+                    Arg::new("argv")
+                        .value_parser(value_parser!(OsString))
+                        .num_args(0..)
+                        .last(true)
+                        .allow_hyphen_values(true),
+                ),
+        )
         .subcommand(leaf("tree-holders").arg(positional("path", 0..=1)))
         .subcommand(
             leaf("gateway")
@@ -1214,6 +1240,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "retire-descendants" => parse_retire_descendants(leaf, &global)?,
         "lock" => parse_lock(leaf, &global)?,
         "lock-holders" => parse_lock_holders(leaf, &global)?,
+        "hold" => parse_hold(leaf, &global)?,
         "tree-holders" => parse_tree_holders(leaf, &global)?,
         "controller" => Command::Controller,
         "gateway" => parse_gateway(leaf, &global)?,
@@ -1304,11 +1331,14 @@ fn translate_clap(error: clap::Error, args: &[OsString]) -> UsageError {
                         spec,
                     )
                 }
-                Some(spec) if spec.name == "land-turn" && !token.starts_with('-') => {
-                    UsageError::new("land-turn requires `--` before the command", spec)
-                }
-                Some(spec) if spec.name == "lock" && !token.starts_with('-') => {
-                    UsageError::new("lock requires `--` before the command", spec)
+                Some(spec)
+                    if matches!(spec.name, "land-turn" | "lock" | "hold")
+                        && !token.starts_with('-') =>
+                {
+                    UsageError::new(
+                        format!("{} requires `--` before the command", spec.name),
+                        spec,
+                    )
                 }
                 Some(spec) if token.starts_with('-') => unknown_flag(&token, spec),
                 Some(spec) => UsageError::new(
@@ -1684,20 +1714,7 @@ fn parse_land_turn(matches: &ArgMatches, global: &GlobalOptions) -> Result<Comma
                 )
             })?,
     };
-    let argv: Vec<OsString> = matches
-        .get_many::<OsString>("argv")
-        .map(|values| values.cloned().collect())
-        .unwrap_or_default();
-    if argv.is_empty() {
-        return Err(UsageError::new(
-            if matches.contains_id("argv") {
-                "land-turn requires a command after `--`"
-            } else {
-                "land-turn requires `--` before the command"
-            },
-            USAGE,
-        ));
-    }
+    let argv = command_argv(matches, USAGE)?;
     Ok(Command::LandTurn(LandTurnArgs {
         repo,
         workspace,
@@ -1746,36 +1763,8 @@ fn parse_lock(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, U
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
-    let state_fd = match os(matches, "state-fd") {
-        None => None,
-        Some(value) => Some(
-            value
-                .to_str()
-                .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
-                .and_then(|text| text.parse::<i32>().ok())
-                .filter(|descriptor| *descriptor >= 3)
-                .ok_or_else(|| {
-                    UsageError::new(
-                        "--state-fd must be an open descriptor number of 3 or above, never a standard stream",
-                        USAGE,
-                    )
-                })?,
-        ),
-    };
-    let argv: Vec<OsString> = matches
-        .get_many::<OsString>("argv")
-        .map(|values| values.cloned().collect())
-        .unwrap_or_default();
-    if argv.is_empty() {
-        return Err(UsageError::new(
-            if matches.contains_id("argv") {
-                "lock requires a command after `--`"
-            } else {
-                "lock requires `--` before the command"
-            },
-            USAGE,
-        ));
-    }
+    let state_fd = caller_descriptor(matches, "state-fd", USAGE)?;
+    let argv = command_argv(matches, USAGE)?;
     let owned_pids = appended_values(matches, "owned-pid", USAGE)?
         .into_iter()
         .map(|value| {
@@ -1796,6 +1785,99 @@ fn parse_lock(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, U
     }))
 }
 
+const HOLD: CommandSpec = CommandSpec {
+    name: "hold",
+    missing: "hold requires --control-fd and --state-fd before `--`",
+    args: "--control-fd <n> --state-fd <m>",
+    trailing: "-- <cmd...>",
+    summary: "run a command held unreaped, signalled only as its group",
+    about: &[
+        "Runs `<cmd...>` as the leader of a new session and process group that cowshed stays outside of, so a stop or kill of that group never reaches cowshed, and holds the leader unreaped until it is released: while it is held its pid cannot be given to another process and its group id names its group alone, so a signal sent through cowshed reaches that group or nothing. The command is argv, never a shell string; its arguments, environment, working directory, standard streams and every inherited descriptor but <n> and <m> are cowshed's own, byte for byte. Once the command runs cowshed keeps no copy of its standard streams, so they end with the command's group.",
+        "--control-fd <n> and --state-fd <m> are two caller-opened descriptors, 3 or above, adopted before anything else runs and never inherited by the command. cowshed reads one request per line from <n>: `signal <SIG>` sends SIG (HUP INT QUIT ABRT KILL USR1 USR2 ALRM TERM STOP CONT TSTP TTIN TTOU WINCH) to the leader's whole group while the leader is held, and `release` reaps the leader once it has exited. The end of <n> is a release, so a caller that dies releases. Any other line fails the hold.",
+        "cowshed writes one JSON HoldEvent per line to <m>: `started` with the leader's pid, its birth identity, and the kernel's names of the descriptors it was handed as stdout and stderr in the form `lsof -F di` prints (`device` 0x… for a pipe or socket on Darwin, `inode` otherwise); `exited` with its status, observed without reaping it; `signalled` or `notSignalled` with its reason, answering each signal; `failed` with its reason when no command runs, always a last line; `commandFailed` with the leader's pid and the reason once cowshed fails after the leader ran: it releases the leader as the end of <n> does, keeps answering on <m>, and ends with `exited` once the leader is reaped.",
+        "Once the leader is released and reaped, cowshed exits with its status: its code, or 128 + the signal that ended it; a failure of cowshed itself uses the wrapper codes `exec` uses. SIGINT, SIGHUP and SIGTERM that cowshed receives are sent to the group as a `signal` request is, and answered on <m>. It needs no project and asks no daemon; `--json` is refused, since its output is the command's own bytes.",
+    ],
+    options: &[],
+};
+
+fn parse_hold(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &HOLD;
+    reject_project(
+        global,
+        USAGE,
+        "--project is not valid for hold: it names no project",
+    )?;
+    if global.json {
+        return Err(UsageError::new(
+            "hold writes no JSON envelope: its output is the command's own bytes; drop --json",
+            USAGE,
+        ));
+    }
+    let (Some(control_fd), Some(state_fd)) = (
+        caller_descriptor(matches, "control-fd", USAGE)?,
+        caller_descriptor(matches, "state-fd", USAGE)?,
+    ) else {
+        return Err(UsageError::new(USAGE.missing, USAGE));
+    };
+    if control_fd == state_fd {
+        return Err(UsageError::new(
+            "--control-fd and --state-fd must be two descriptors: requests and events never share one",
+            USAGE,
+        ));
+    }
+    Ok(Command::Hold(HoldArgs {
+        control_fd,
+        state_fd,
+        argv: command_argv(matches, USAGE)?,
+    }))
+}
+
+/// The caller-opened descriptor `--<name>` numbers: 3 or above, never a standard stream.
+fn caller_descriptor(
+    matches: &ArgMatches,
+    name: &str,
+    usage: &'static CommandSpec,
+) -> Result<Option<i32>, UsageError> {
+    let Some(value) = os(matches, name) else {
+        return Ok(None);
+    };
+    value
+        .to_str()
+        .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|text| text.parse::<i32>().ok())
+        .filter(|descriptor| *descriptor >= 3)
+        .map(Some)
+        .ok_or_else(|| {
+            UsageError::new(
+                format!(
+                    "--{name} must be an open descriptor number of 3 or above, never a standard stream"
+                ),
+                usage,
+            )
+        })
+}
+
+/// The command after `--`: refused when absent, naming whether `--` or the command is missing.
+fn command_argv(
+    matches: &ArgMatches,
+    usage: &'static CommandSpec,
+) -> Result<Vec<OsString>, UsageError> {
+    let argv: Vec<OsString> = matches
+        .get_many::<OsString>("argv")
+        .map(|values| values.cloned().collect())
+        .unwrap_or_default();
+    if argv.is_empty() {
+        return Err(UsageError::new(
+            if matches.contains_id("argv") {
+                format!("{} requires a command after `--`", usage.name)
+            } else {
+                format!("{} requires `--` before the command", usage.name)
+            },
+            usage,
+        ));
+    }
+    Ok(argv)
+}
 const LOCK_HOLDERS: CommandSpec = CommandSpec {
     name: "lock-holders",
     missing: "lock-holders requires the lock file's path",
@@ -5787,6 +5869,10 @@ mod tests {
             (&["land-turn", "repo", "--", "true"], NotUsed),
             (&["lock", "/tmp/x.lock", "--", "true"], NotUsed),
             (&["lock-holders", "/tmp/x.lock"], NotUsed),
+            (
+                &["hold", "--control-fd", "3", "--state-fd", "4", "--", "true"],
+                NotUsed,
+            ),
             (&["tree-holders", "/tmp/tree"], NotUsed),
             (&["help"], NotUsed),
         ];
@@ -5818,6 +5904,64 @@ mod tests {
                     option.spelling
                 );
             }
+        }
+    }
+
+    /// `hold` takes two distinct caller descriptors, 3 or above, and a command after `--`.
+    #[test]
+    fn hold_takes_two_distinct_caller_descriptors_and_a_command() {
+        let Command::Hold(hold) = parse_args([
+            "hold",
+            "--control-fd",
+            "3",
+            "--state-fd",
+            "4",
+            "--",
+            "sh",
+            "-c",
+            "true",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("hold parses as hold");
+        };
+        assert_eq!(
+            hold,
+            HoldArgs {
+                control_fd: 3,
+                state_fd: 4,
+                argv: vec!["sh".into(), "-c".into(), "true".into()],
+            }
+        );
+        let refused: [(&[&str], &str); 5] = [
+            (
+                &["hold", "--control-fd", "3", "--state-fd", "3", "--", "true"],
+                "--control-fd and --state-fd must be two descriptors: requests and events never share one",
+            ),
+            (
+                &["hold", "--control-fd", "2", "--state-fd", "4", "--", "true"],
+                "--control-fd must be an open descriptor number of 3 or above, never a standard stream",
+            ),
+            (
+                &["hold", "--state-fd", "4", "--", "true"],
+                "hold requires --control-fd and --state-fd before `--`",
+            ),
+            (
+                &["hold", "--control-fd", "3", "--state-fd", "4"],
+                "hold requires `--` before the command",
+            ),
+            (
+                &["hold", "--control-fd", "3", "--state-fd", "4", "true"],
+                "hold requires `--` before the command",
+            ),
+        ];
+        for (arguments, message) in refused {
+            assert_eq!(
+                parse_args(arguments.iter().copied()).unwrap_err().message,
+                message,
+                "{arguments:?}"
+            );
         }
     }
 

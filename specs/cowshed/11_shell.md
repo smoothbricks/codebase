@@ -93,8 +93,9 @@ without keeping its output pipes open. A later `kill`, quota stop, or retirement
 and retained observed lives. Only after both pipes end and membership retirement succeeds does the parent release and
 reap the leader. Signals and reaping serialize on the fence, without holding a blocking lock across an await; a
 released/reaped id grants no future signal rights. Birth-observation failure never becomes a ledger claim, but the
-actual parent's unreaped child remains its own.
-
+actual parent's unreaped child remains its own. A stop is not an exit: Darwin reports a stopped child to a `waitid` that
+asked only for exits (measured on Darwin 25.6), so the exit read takes that report with a wait that cannot reap
+(`WSTOPPED | WCONTINUED`, never `WEXITED`) and reads again; a leader that stops its own group stays held and signalled.
 A warm command's signals are framed `REQUEST_SIGNAL`s to its actual parent host. The host reports the observed birth
 with `REPLY_STARTED`, and its exact typed exit with `REPLY_EXITED`, while keeping the leader unreaped. It continues
 serving signals until the supervisor concludes the job and sends `REQUEST_RELEASE`; `REPLY_RELEASED` acknowledges actual
@@ -112,6 +113,43 @@ that may fail on the closed controller socket; a refused reply retains its nativ
 attempts fallible stderr/stdout reporting without panicking or hiding the original caller error; if both channels are
 unavailable, delivery cannot be guaranteed. Consumers never clean up an old descendant PID or group ID after an exit or
 release: they close the actual parent-control capability, which still owns any held command.
+
+**Held leaders: `cowshed hold`.** The fence above is one public cowshed-core capability,
+`runtime::child_fence::ChildFence` (07_api.md "Held leaders"), and
+`cowshed hold --control-fd <n> --state-fd <m> -- <cmd…>` gives it to a caller that is not cowshed: a watchdog ending a
+step's group, for one, never signals a pid or a group id itself. `hold` spawns the command as the leader of a new
+session, and so of a new process group, that it stays outside of. A stop or kill of that group never reaches `hold`, so
+it always answers: a custodian inside the group is stopped by the very whole-group `SIGSTOP` it would have to answer.
+The command's argv, environment, working directory, standard streams and every inherited descriptor but `n` and `m` are
+the caller's, byte for byte. `n` and `m` are adopted close-on-exec before any runtime exists and are never the
+command's, and once the command runs `hold` keeps no copy of its standard streams, so they end with its group.
+
+- **State.** `m` carries one `HoldEvent` per line, as JSON, read with the generated validator of that type.
+  `started {pid, birth, output}` names the leader, its birth identity and the descriptors it was handed as 1 and 2, in
+  the form `lsof -F di` prints them: the pipe or socket address (`d`) on Darwin, the inode (`i`) otherwise, read
+  natively from `hold`'s own copies before it lets them go, so a caller names their later holders from one host-wide
+  `lsof -F pfdi` instead of a probe per step. `exited {status}` is the leader's exit, observed without reaping it, in
+  the `ExitStatus` form every job's exit has. `signalled {signal}` and `notSignalled {signal, reason}` answer each
+  signal. `failed {reason}` says no command runs and is the last line. `commandFailed {pid, reason}` says `hold` failed
+  once its leader ran -- before `started`, when it could not give up its standard streams, or after it -- and released
+  the leader as at the end of `n`; `hold` keeps `m` open, answers each signal it receives, and ends with `exited` once
+  the leader is reaped. When that release or wait fails, `hold` sends the group SIGKILL, as a job's is, and a last
+  `commandFailed` says what failed and what came of the kill; it cannot wait for a group it can no longer observe.
+- **Control.** `n` carries one request per line. `signal <SIG>` sends `kill(-pgid, SIG)` only while the leader is held,
+  and is answered `notSignalled` with the reason once the leader was reaped, when its birth was never observed, or when
+  the kernel refuses. `release` reaps the leader once it has exited; signals are still served until the reap. The end of
+  `n` is a release, so a caller that dies releases. A line that is no request is `commandFailed`.
+- **Exit.** Once the leader is reaped, `hold` exits with its status as a shell reports it: the code, or 128 plus the
+  signal. A failure of `hold` itself uses the wrapper codes `exec` uses. SIGINT, SIGHUP and SIGTERM that `hold` receives
+  are sent to the group as a `signal` request is, and answered on `m`.
+
+Under a lock it composes as `cowshed lock <lock> --state-fd 3 -- cowshed hold --control-fd 4 --state-fd 5 -- <cmd…>`:
+the waiter, the caller's direct child, keeps its `SIGUSR1` request path, and the step's group is the hold's. Each path
+has a real-boundary test: a leader that stops its whole group, ended through `hold`; an exited leader held as a zombie
+while `signal TERM` still ends a descendant holding its output; the end of `n` releasing a running leader; a signal
+after a release; the exact argv, environment, working directory and descriptors; `started.output` against `lsof` (or
+procfs) of a descendant; a malformed request; a command that cannot start; a signal `hold` receives; and `hold` under
+`lock`.
 
 **Freshness is direnv's own.** direnv records every input an evaluation depended on — the `.envrc`, its approval files,
 each `source_up`, `use devenv` and `watch_file` target — as `DIRENV_WATCHES` (base64url of zlib-deflated JSON

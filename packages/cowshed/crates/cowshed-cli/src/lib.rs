@@ -9,6 +9,7 @@ pub mod disk_command;
 pub mod forget;
 pub mod gateway_service;
 pub mod help;
+pub mod hold;
 pub mod identity_service;
 pub mod install_basis;
 pub mod land_turn;

@@ -613,7 +613,7 @@ struct TcpSockInfo {
     _tcpsi_mss: libc::c_int,
     _tcpsi_flags: u32,
     _rfu_1: u32,
-    _tcpsi_tp: u64,
+    tcpsi_tp: u64,
 }
 
 /// The `unsi_addr`/`unsi_caddr` union of `struct un_sockinfo`.
@@ -656,7 +656,7 @@ union SocketProtocolInfo {
 struct SocketInfo {
     _soi_stat: libc::vinfo_stat,
     _soi_so: u64,
-    _soi_pcb: u64,
+    soi_pcb: u64,
     _soi_type: libc::c_int,
     _soi_protocol: libc::c_int,
     _soi_family: libc::c_int,
@@ -765,6 +765,153 @@ fn socket_inode(target: &[u8]) -> Option<u64> {
     let inode = target.strip_prefix(b"socket:[")?.strip_suffix(b"]")?;
     std::str::from_utf8(inode).ok()?.parse().ok()
 }
+
+/// What `lsof -F di` names one descriptor of this process by: its `d` field, the kernel address
+/// Darwin names a pipe or a socket by, or its `i` field, the inode of anything else, and of every
+/// descriptor on Linux, where a pipe or a socket is an inode of its own filesystem. Every process
+/// that shares the descriptor's open file description shows the same name, so a caller that read
+/// it once finds every later holder of that description in one `lsof -F pfdi` listing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DescriptorName {
+    /// lsof's `d` field: the kernel's address of a pipe end, of a TCP socket's control block, or
+    /// of any other socket's protocol control block (Darwin).
+    Device(u64),
+    /// lsof's `i` field: the inode `fstat(2)` reports.
+    Inode(u64),
+    /// The descriptor is not open.
+    Closed,
+    /// Open, of a Darwin kind this reading names by neither field (a kqueue, a POSIX semaphore or
+    /// shared memory object, ...): its `PROX_FDTYPE_*` number.
+    Unnamed { fd_type: u32 },
+}
+
+/// The name `lsof -F di` gives this process's `descriptor` ([`DescriptorName`]), read from the
+/// kernel: the descriptor list and `proc_pidfdinfo` for a pipe or socket, `fstat(2)` otherwise.
+#[cfg(target_os = "macos")]
+pub fn descriptor_name(descriptor: std::os::fd::RawFd) -> io::Result<DescriptorName> {
+    // SAFETY: getpid has no failure and touches no memory.
+    let pid = unsafe { libc::getpid() };
+    let Some(listed) = descriptors(pid)?
+        .into_iter()
+        .find(|listed| listed.proc_fd == descriptor)
+    else {
+        return Ok(DescriptorName::Closed);
+    };
+    let fd_type = libc::c_int::try_from(listed.proc_fdtype).map_err(io::Error::other)?;
+    match fd_type {
+        libc::PROX_FDTYPE_PIPE => Ok(DescriptorName::Device(
+            descriptor_info::<PipeFdInfo>(pid, descriptor, PROC_PIDFDPIPEINFO)?
+                .ppi
+                .pipe_handle,
+        )),
+        libc::PROX_FDTYPE_SOCKET => {
+            let info = descriptor_info::<SocketFdInfo>(pid, descriptor, PROC_PIDFDSOCKETINFO)?.psi;
+            Ok(DescriptorName::Device(if info.soi_kind == SOCKINFO_TCP {
+                // SAFETY: the kernel fills `pri_tcp` for a socket of kind `SOCKINFO_TCP`.
+                unsafe { info.soi_proto.pri_tcp }.tcpsi_tp
+            } else {
+                info.soi_pcb
+            }))
+        }
+        libc::PROX_FDTYPE_VNODE => {
+            Ok(inode(descriptor)?.map_or(DescriptorName::Closed, DescriptorName::Inode))
+        }
+        _ => Ok(DescriptorName::Unnamed {
+            fd_type: listed.proc_fdtype,
+        }),
+    }
+}
+
+/// [`descriptor_name`] on Linux: every descriptor is named by the inode `fstat(2)` reports, a
+/// pipe's and a socket's included.
+#[cfg(target_os = "linux")]
+pub fn descriptor_name(descriptor: std::os::fd::RawFd) -> io::Result<DescriptorName> {
+    Ok(inode(descriptor)?.map_or(DescriptorName::Closed, DescriptorName::Inode))
+}
+
+/// The inode `fstat(2)` reports for `descriptor`; `None` when it is not open.
+fn inode(descriptor: std::os::fd::RawFd) -> io::Result<Option<u64>> {
+    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `status` is writable storage for one `stat`.
+    if unsafe { libc::fstat(descriptor, status.as_mut_ptr()) } == -1 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::EBADF) => Ok(None),
+            _ => Err(io::Error::new(
+                error.kind(),
+                format!("descriptor {descriptor} cannot be read: {error}"),
+            )),
+        };
+    }
+    // SAFETY: fstat succeeded, so it filled `status`.
+    Ok(Some(unsafe { status.assume_init() }.st_ino))
+}
+
+/// The record `proc_pidfdinfo` writes for `flavor` of process `pid`'s `descriptor`, whole.
+#[cfg(target_os = "macos")]
+fn descriptor_info<T: Copy>(
+    pid: libc::pid_t,
+    descriptor: std::os::fd::RawFd,
+    flavor: libc::c_int,
+) -> io::Result<T> {
+    let size = libc::c_int::try_from(std::mem::size_of::<T>()).map_err(io::Error::other)?;
+    let mut info = std::mem::MaybeUninit::<T>::zeroed();
+    // SAFETY: `info` is writable storage of exactly `size` bytes.
+    let written =
+        unsafe { libc::proc_pidfdinfo(pid, descriptor, flavor, info.as_mut_ptr().cast(), size) };
+    if written == size {
+        // SAFETY: proc_pidfdinfo filled all `size` bytes.
+        return Ok(unsafe { info.assume_init() });
+    }
+    if written > 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "proc_pidfdinfo returned {written} bytes of process {pid}'s descriptor \
+                 {descriptor}, expected {size}"
+            ),
+        ));
+    }
+    let error = io::Error::last_os_error();
+    Err(io::Error::new(
+        error.kind(),
+        format!("descriptor {descriptor} of process {pid} cannot be read: {error}"),
+    ))
+}
+
+/// `PROC_PIDFDPIPEINFO` (`<sys/proc_info.h>`), which the `libc` crate does not declare.
+#[cfg(target_os = "macos")]
+const PROC_PIDFDPIPEINFO: libc::c_int = 6;
+
+/// `struct pipe_info`.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct PipeInfo {
+    _pipe_stat: libc::vinfo_stat,
+    pipe_handle: u64,
+    _pipe_peerhandle: u64,
+    _pipe_status: libc::c_int,
+    _rfu_1: libc::c_int,
+}
+
+/// `struct pipe_fdinfo`: what `PROC_PIDFDPIPEINFO` writes.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct PipeFdInfo {
+    _pfi: ProcFileInfo,
+    ppi: PipeInfo,
+}
+
+#[cfg(target_os = "macos")]
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<PipeFdInfo>() == 184);
+    assert!(offset_of!(PipeFdInfo, ppi.pipe_handle) == 160);
+    assert!(offset_of!(SocketFdInfo, psi.soi_pcb) == 168);
+    assert!(offset_of!(TcpSockInfo, tcpsi_tp) == 112);
+};
 
 /// Adds to `ports` the local port of each row of a procfs TCP table (`net/tcp`, `net/tcp6`) in
 /// state `LISTEN` whose socket inode is one of `sockets`. Each row is `sl local rem st
@@ -1039,6 +1186,103 @@ mod tests {
                 "{refused:?}"
             );
         }
+    }
+
+    /// What `lsof -a -p <this process> -d <descriptor> -F di` prints of `descriptor`: its `d` and
+    /// `i` fields, `None` where lsof prints none.
+    #[cfg(target_os = "macos")]
+    fn lsof_name(descriptor: std::os::fd::RawFd) -> (Option<String>, Option<String>) {
+        use crate::fork_lock::Run as _;
+
+        let listed = std::process::Command::new("/usr/sbin/lsof")
+            .args(["-a", "-p", &std::process::id().to_string()])
+            .args(["-d", &descriptor.to_string(), "-F", "di"])
+            .output_locked()
+            .expect("run lsof");
+        let text = String::from_utf8(listed.stdout).expect("lsof prints ASCII");
+        let field = |tag: char| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(tag))
+                .map(str::to_owned)
+        };
+        (field('d'), field('i'))
+    }
+
+    /// A pipe end, a Unix socket, a TCP listener and a regular file are each named exactly as
+    /// lsof names them: by the kernel address in `d` for the pipe and the sockets, by the inode in
+    /// `i` for the file, and a descriptor that is not open is closed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_descriptor_is_named_as_lsof_names_it() {
+        use std::os::fd::AsRawFd as _;
+
+        let (read, write) = std::io::pipe().expect("pipe");
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let path = std::env::temp_dir().join(format!("cowshed-os-name-{}", std::process::id()));
+        let file = std::fs::File::create(&path).expect("create a file");
+        std::fs::remove_file(&path).expect("unlink the file; its descriptor keeps its inode");
+        for descriptor in [
+            read.as_raw_fd(),
+            write.as_raw_fd(),
+            socket.as_raw_fd(),
+            listener.as_raw_fd(),
+        ] {
+            let DescriptorName::Device(address) = descriptor_name(descriptor).expect("read") else {
+                panic!("descriptor {descriptor} is named by its address");
+            };
+            assert_eq!(
+                lsof_name(descriptor),
+                (Some(format!("0x{address:x}")), None),
+                "descriptor {descriptor}"
+            );
+        }
+        let DescriptorName::Inode(inode) = descriptor_name(file.as_raw_fd()).expect("read") else {
+            panic!("a regular file is named by its inode");
+        };
+        assert_eq!(lsof_name(file.as_raw_fd()).1, Some(inode.to_string()));
+        let closed = write.as_raw_fd();
+        drop(write);
+        assert_eq!(
+            descriptor_name(closed).expect("read"),
+            DescriptorName::Closed
+        );
+    }
+
+    /// A pipe end and a socket are named by the inode procfs shows for them, the field lsof
+    /// prints as `i`, and a descriptor that is not open is closed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_descriptor_is_named_by_the_inode_procfs_shows() {
+        use std::os::fd::AsRawFd as _;
+
+        let (read, write) = std::io::pipe().expect("pipe");
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        for (descriptor, kind) in [
+            (read.as_raw_fd(), "pipe"),
+            (write.as_raw_fd(), "pipe"),
+            (socket.as_raw_fd(), "socket"),
+        ] {
+            let link = std::fs::read_link(format!("/proc/self/fd/{descriptor}")).expect("link");
+            assert_eq!(
+                descriptor_name(descriptor).expect("read"),
+                DescriptorName::Inode(
+                    link.to_str()
+                        .and_then(|link| link.strip_prefix(kind))
+                        .and_then(|link| link.strip_prefix(":["))
+                        .and_then(|link| link.strip_suffix(']'))
+                        .and_then(|inode| inode.parse().ok())
+                        .expect("procfs names the inode")
+                ),
+                "descriptor {descriptor}"
+            );
+        }
+        let closed = write.as_raw_fd();
+        drop(write);
+        assert_eq!(
+            descriptor_name(closed).expect("read"),
+            DescriptorName::Closed
+        );
     }
 
     #[cfg(target_os = "macos")]

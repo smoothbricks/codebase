@@ -5,10 +5,14 @@
 //!
 //! Host-only like `land-turn`: no project, no daemon, no runtime.
 
+use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
+use std::marker::PhantomData;
 use std::os::fd::{FromRawFd as _, RawFd};
 use std::path::Path;
+
+use serde::Serialize;
 
 use cowshed_core::CowshedError;
 use cowshed_core::api::held_lock::LockWaiterEvent;
@@ -25,7 +29,7 @@ use crate::run::InterruptPolicy;
 /// standard streams belong to the command, so their EOF cannot depend on this controller's exit.
 pub(crate) async fn dispatch<W, E>(
     args: &LockArgs,
-    mut state: State,
+    mut state: State<LockWaiterEvent>,
     output: &mut Output<W, E>,
     policy: InterruptPolicy,
 ) -> i32
@@ -68,7 +72,7 @@ pub(crate) fn report<W: Write, E: Write>(output: &mut Output<W, E>, error: &Cows
 
 async fn run<W, E>(
     args: &LockArgs,
-    state: &mut State,
+    state: &mut State<LockWaiterEvent>,
     output: &mut Output<W, E>,
     policy: InterruptPolicy,
 ) -> Result<i32, CowshedError>
@@ -195,7 +199,7 @@ enum Taken {
 async fn take<W: Write, E: Write>(
     path: &Path,
     owned: &OwnedLives,
-    state: &mut State,
+    state: &mut State<LockWaiterEvent>,
     output: &mut Output<W, E>,
 ) -> Result<Taken, CowshedError> {
     let opened = Opened::open(path).map_err(|error| failure(path, "open", &error))?;
@@ -257,47 +261,53 @@ async fn take<W: Write, E: Write>(
     }
 }
 
-/// The caller's owned state channel: one [`LockWaiterEvent`] per line, as JSON. Adopted before
-/// runtime allocation, CLOEXEC throughout setup and spawn, closed after the final event.
-pub(crate) struct State(Option<File>);
+/// A caller's owned state channel: one event per line, as JSON (a [`LockWaiterEvent`] for `lock`,
+/// a `HoldEvent` for `hold`). Adopted before runtime allocation, CLOEXEC throughout setup and
+/// spawn, closed after the final event.
+pub(crate) struct State<E>(Option<File>, PhantomData<fn(&E)>);
 
-impl State {
+/// An event a state channel carries: the verb whose channel it is, and its `failed` last line.
+pub(crate) trait StateEvent: Serialize + fmt::Debug {
+    const VERB: &'static str;
+
+    fn failed(reason: String) -> Self;
+}
+
+impl StateEvent for LockWaiterEvent {
+    const VERB: &'static str = "lock";
+
+    fn failed(reason: String) -> Self {
+        Self::Failed { reason }
+    }
+}
+
+impl<E: StateEvent> State<E> {
     pub(crate) fn adopt(descriptor: Option<RawFd>) -> Result<Self, CowshedError> {
         let Some(descriptor) = descriptor else {
-            return Ok(Self(None));
+            return Ok(Self(None, PhantomData));
         };
-        // SAFETY: F_SETFD takes a plain integer; it fails on a descriptor that is not open.
-        if unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
-            return Err(CowshedError::environment_missing(
-                format!(
-                    "--state-fd {descriptor} is not an open descriptor: {}",
-                    io::Error::last_os_error()
-                ),
-                "open the descriptor in the caller before it runs cowshed lock",
-            ));
-        }
-        // SAFETY: the caller handed this process the descriptor for this channel alone, and it is
-        // open (checked above); it is owned and closed from here.
-        Ok(Self(Some(unsafe { File::from_raw_fd(descriptor) })))
+        adopt(descriptor, "--state-fd", E::VERB).map(|channel| Self(Some(channel), PhantomData))
     }
 
     fn is_open(&self) -> bool {
         self.0.is_some()
     }
 
-    fn tell(&mut self, event: &LockWaiterEvent) -> Result<(), CowshedError> {
+    pub(crate) fn tell(&mut self, event: &E) -> Result<(), CowshedError> {
         let Some(channel) = &mut self.0 else {
             return Ok(());
         };
         let mut line = serde_json::to_vec(event).map_err(|error| {
             CowshedError::internal(format!(
-                "cowshed lock cannot encode its state event {event:?}: {error}"
+                "cowshed {} cannot encode its state event {event:?}: {error}",
+                E::VERB
             ))
         })?;
         line.push(b'\n');
         channel.write_all(&line).map_err(|error| {
             CowshedError::internal(format!(
-                "cowshed lock cannot write its state event {event:?}: {error}"
+                "cowshed {} cannot write its state event {event:?}: {error}",
+                E::VERB
             ))
         })
     }
@@ -305,16 +315,32 @@ impl State {
     pub(crate) fn failed(&mut self, error: &CowshedError) {
         if self.is_open() {
             // This channel may have lost its reader; stderr still reports the original failure.
-            let _ = self.tell(&LockWaiterEvent::Failed {
-                reason: error.message.clone(),
-            });
+            let _ = self.tell(&E::failed(error.message.clone()));
             self.close();
         }
     }
 
-    fn close(&mut self) {
+    pub(crate) fn close(&mut self) {
         self.0 = None;
     }
+}
+
+/// Own `descriptor`, the one a caller handed this process for the channel `flag` names, marked
+/// close-on-exec so no command spawned meanwhile inherits it.
+pub(crate) fn adopt(descriptor: RawFd, flag: &str, verb: &str) -> Result<File, CowshedError> {
+    // SAFETY: F_SETFD takes a plain integer; it fails on a descriptor that is not open.
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+        return Err(CowshedError::environment_missing(
+            format!(
+                "{flag} {descriptor} is not an open descriptor: {}",
+                io::Error::last_os_error()
+            ),
+            format!("open the descriptor in the caller before it runs cowshed {verb}"),
+        ));
+    }
+    // SAFETY: the caller handed this process the descriptor for this channel alone, and it is
+    // open (checked above); it is owned and closed from here.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
 fn failure(path: &Path, operation: &str, error: &io::Error) -> CowshedError {

@@ -25,6 +25,7 @@ use bytes::Bytes;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, Interest};
 use tokio::sync::{mpsc, oneshot};
 
+use super::child_fence::{ChildFence, NotSignalled};
 #[cfg(target_os = "linux")]
 use super::job_cgroup::JobCgroup;
 use super::job_cpu::JobCpuAdmission;
@@ -42,8 +43,8 @@ use super::shell_watch::{
     ActivationEvidence, EvaluationClock, FsInstant, FsSeparation, Snapshot, decode_direnv_watches,
 };
 use super::supervisor::{
-    ChildFence, OwnedProcess, ProcessEvent, ProcessSignal, RunningProcess, SandboxEnvironment,
-    StdinLane, process_termination_from_wait, run_system_output, run_system_stdin,
+    OwnedProcess, ProcessEvent, ProcessSignal, RunningProcess, SandboxEnvironment, StdinLane,
+    process_termination_from_wait, run_system_output, run_system_stdin,
 };
 use crate::api::dto::{ExitStatus, JobId, Sha256Digest};
 use crate::error::{CowshedError, Result};
@@ -347,7 +348,7 @@ impl Target {
             .map_err(super::supervisor::cgroup_error);
         }
         match self {
-            Self::Host(fence) => fence.signal(signal),
+            Self::Host(fence) => fence.signal(signal).map_err(NotSignalled::into_error),
             Self::Command(host) => host.send(signal).map_err(|_| {
                 CowshedError::conflict(
                     "the job's run no longer forwards signals to its host: the host is gone",
@@ -593,7 +594,7 @@ async fn run_pooled(
             #[cfg(target_os = "macos")]
             {
                 let monitor = command.monitor.clone();
-                let pid = host.fence.process().birth.pid();
+                let pid = host.process.birth.pid();
                 if let Err(error) = tokio::task::spawn_blocking(move || {
                     monitor.gap(crate::api::process::ProcessCoverageGap::UnobservedBirth { pid })
                 })
@@ -607,7 +608,7 @@ async fn run_pooled(
             let _ = events
                 .send(ProcessEvent::Activating {
                     job_id,
-                    process: host.fence.process().clone(),
+                    process: host.process.clone(),
                 })
                 .await;
             signal_failed(
@@ -629,7 +630,7 @@ async fn run_pooled(
             let _ = events
                 .send(ProcessEvent::ActivationEnded {
                     job_id,
-                    usage: super::job_accounting::read_leader(&host.fence.process().birth),
+                    usage: super::job_accounting::read_leader(&host.process.birth),
                 })
                 .await;
             match activation {
@@ -731,6 +732,8 @@ async fn run_pooled(
 pub(super) struct ExecHost {
     /// This process is the host's parent and reaps it only inside this fence.
     fence: Arc<ChildFence>,
+    /// The host as this process observed it right after spawning it.
+    process: OwnedProcess,
     control: tokio::net::UnixStream,
     /// Set once the host closed its end of the control socket, or announced that it exits.
     closed: bool,
@@ -1239,11 +1242,18 @@ impl HostActivator {
             .map_err(ExecError::from)
             .map_err(super::supervisor::map_exec_error)?;
         drop(theirs);
+        let spawned = Instant::now();
         let fence = Arc::new(ChildFence::new(child.id())?);
+        let process = OwnedProcess {
+            birth: fence.birth().clone(),
+            spawned,
+            host: crate::host_load::read_host_load(),
+        };
         ours.set_nonblocking(true).map_err(pipe_error)?;
         let control = tokio::net::UnixStream::from_std(ours).map_err(pipe_error)?;
         Ok(ExecHost {
             fence,
+            process,
             control,
             closed: false,
         })

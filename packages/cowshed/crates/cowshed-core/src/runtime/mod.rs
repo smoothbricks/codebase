@@ -1,5 +1,6 @@
 #[cfg(target_os = "macos")]
 pub(crate) mod build_volumes;
+pub mod child_fence;
 mod command_start;
 pub mod commitment_feed;
 #[cfg(target_os = "macos")]

@@ -776,6 +776,8 @@ mod parity_tests {
             // A host-only held lock over a caller's lock file; scripts run cowshed's own verbs.
             | Command::Lock(_)
             | Command::LockHolders(_)
+            // A held command for a caller that is not cowshed; scripts run cowshed's own verb.
+            | Command::Hold(_)
             // The holder census `rm` and `detach` read, for scripts; no controller call.
             | Command::TreeHolders(_)
             | Command::Skill(_)
@@ -865,6 +867,10 @@ mod parity_tests {
         (&["land-turn", "parity", "--", "true"], None),
         (&["lock", "/tmp/parity.lock", "--", "true"], None),
         (&["lock-holders", "/tmp/parity.lock"], None),
+        (
+            &["hold", "--control-fd", "3", "--state-fd", "4", "--", "true"],
+            None,
+        ),
         (&["tree-holders", "/tmp/parity"], None),
         (&["skill", "install"], None),
         (&["mount", "main", "--repo-id", "acme/widget"], None),

@@ -54,6 +54,9 @@ const JOBS_FATE: &str = "will leave the jobs this command started running";
 /// turn, so when it cannot watch for the signal the signal ends cowshed and the turn with it.
 const FORWARDED_FATE: &str =
     "will end cowshed and give up the land turn while its command may keep running";
+/// The same clause for a held command: cowshed answers for its group, so when it cannot watch for
+/// the signal the signal ends cowshed and leaves the group running unheld.
+const HELD_FATE: &str = "will end cowshed and leave its held command running unheld";
 
 impl InterruptPolicy {
     /// The signal watch this policy calls for, for a command whose jobs a signal ends. The caller
@@ -66,6 +69,12 @@ impl InterruptPolicy {
     /// running and holds its turn until it ends.
     pub(crate) fn arm_forwarding(self) -> Interrupts {
         self.arm_with(FORWARDED_FATE)
+    }
+
+    /// The signal watch this policy calls for, for a held command: each signal is sent to its
+    /// group through the fence, and cowshed holds the leader until it is released.
+    pub(crate) fn arm_holding(self) -> Interrupts {
+        self.arm_with(HELD_FATE)
     }
 
     fn arm_with(self, fate: &'static str) -> Interrupts {
@@ -84,7 +93,13 @@ enum Prepared {
     Command(args::Cli),
     Lock {
         args: args::LockArgs,
-        state: crate::lock::State,
+        state: crate::lock::State<cowshed_core::api::held_lock::LockWaiterEvent>,
+        quiet: bool,
+    },
+    Hold {
+        args: args::HoldArgs,
+        state: crate::lock::State<cowshed_core::api::hold::HoldEvent>,
+        control: crate::hold::Control,
         quiet: bool,
     },
     GatewayGitFetch,
@@ -96,6 +111,10 @@ impl Invocation {
     pub fn fail(mut self, error: CowshedError) -> i32 {
         let quiet = match &mut self.0 {
             Prepared::Lock { state, quiet, .. } => {
+                state.failed(&error);
+                *quiet
+            }
+            Prepared::Hold { state, quiet, .. } => {
                 state.failed(&error);
                 *quiet
             }
@@ -137,6 +156,24 @@ pub fn prepare(arguments: Vec<OsString>) -> Result<Invocation, i32> {
             Ok(Invocation(Prepared::Lock {
                 args: lock,
                 state,
+                quiet: parsed.global.quiet,
+            }))
+        } else if let args::Command::Hold(hold) = parsed.command {
+            let report = |error: &CowshedError| {
+                let mut output =
+                    output::Output::new(io::stdout(), io::stderr(), parsed.global.quiet);
+                crate::lock::report(&mut output, error)
+            };
+            let mut state =
+                crate::lock::State::adopt(Some(hold.state_fd)).map_err(|error| report(&error))?;
+            let control = crate::hold::Control::adopt(hold.control_fd).map_err(|error| {
+                state.failed(&error);
+                report(&error)
+            })?;
+            Ok(Invocation(Prepared::Hold {
+                args: hold,
+                state,
+                control,
                 quiet: parsed.global.quiet,
             }))
         } else {
@@ -184,6 +221,17 @@ async fn run_with(invocation: Invocation, interrupts: InterruptPolicy) -> Ending
         Prepared::Lock { args, state, quiet } => {
             let mut output = output::Output::new(io::stdout(), io::stderr(), quiet);
             Ending::Finished(crate::lock::dispatch(&args, state, &mut output, interrupts).await)
+        }
+        Prepared::Hold {
+            args,
+            state,
+            control,
+            quiet,
+        } => {
+            let mut output = output::Output::new(io::stdout(), io::stderr(), quiet);
+            Ending::Finished(
+                crate::hold::dispatch(&args, state, control, &mut output, interrupts).await,
+            )
         }
         Prepared::WorkspaceSupervisor(arguments) => {
             Ending::Finished(crate::workspace_supervisor::run(&arguments[1..]).await)

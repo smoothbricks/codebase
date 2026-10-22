@@ -1684,6 +1684,16 @@ pub enum ExitStatus {
     Signaled { signal: i32, core_dumped: bool },
 }
 
+impl ExitStatus {
+    /// The status as a shell reports it: the exit code, or 128 plus the signal that ended it.
+    pub const fn shell_code(&self) -> i32 {
+        match self {
+            Self::Exited { code } => *code,
+            Self::Signaled { signal, .. } => 128_i32.saturating_add(*signal),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OutputLimitInfo {

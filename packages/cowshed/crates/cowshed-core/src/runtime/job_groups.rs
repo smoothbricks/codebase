@@ -1010,21 +1010,58 @@ fn read_exit(pid: i32, options: libc::c_int) -> io::Result<Option<ExitStatus>> {
         if reporter == 0 {
             return Ok(None);
         }
-        return match info.si_code {
-            libc::CLD_EXITED => Ok(Some(ExitStatus::Exited { code: status })),
-            libc::CLD_KILLED => Ok(Some(ExitStatus::Signaled {
-                signal: status,
-                core_dumped: false,
-            })),
-            libc::CLD_DUMPED => Ok(Some(ExitStatus::Signaled {
-                signal: status,
-                core_dumped: true,
-            })),
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("process {pid} reported child state {other}, not an exit"),
-            )),
+        match info.si_code {
+            libc::CLD_EXITED => return Ok(Some(ExitStatus::Exited { code: status })),
+            libc::CLD_KILLED => {
+                return Ok(Some(ExitStatus::Signaled {
+                    signal: status,
+                    core_dumped: false,
+                }));
+            }
+            libc::CLD_DUMPED => {
+                return Ok(Some(ExitStatus::Signaled {
+                    signal: status,
+                    core_dumped: true,
+                }));
+            }
+            // Darwin reports a stop (and a continue) to a wait that asked only for exits
+            // (measured on Darwin 25.6), and WNOWAIT leaves the report pending, so every later
+            // read would meet it again. A stop is not an exit: the report is taken and the exit
+            // read again.
+            libc::CLD_STOPPED | libc::CLD_CONTINUED => take_stop_report(id)?,
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("process {pid} reported child state {other}, not an exit"),
+                ));
+            }
+        }
+    }
+}
+
+/// Take child `id`'s pending stop or continue report without reaping it: the wait asks for
+/// those states alone, never `WEXITED`, so an exited child stays unreaped for its fence.
+fn take_stop_report(id: libc::id_t) -> io::Result<()> {
+    loop {
+        // SAFETY: an all-zero `siginfo_t` is valid storage for the call to fill.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `id` is the caller's own child and `info` writable storage; without WEXITED
+        // the wait cannot collect an exit.
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                id,
+                &mut info,
+                libc::WSTOPPED | libc::WCONTINUED | libc::WNOHANG,
+            )
         };
+        if waited == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 
@@ -1238,7 +1275,7 @@ impl Process {
 
     /// The process at the other end of a connected Unix socket, as the kernel recorded it when
     /// the connection was made: whatever happens to its pid later, the handle names only it.
-    pub(super) fn of_socket_peer(socket: &impl std::os::fd::AsRawFd) -> io::Result<Self> {
+    pub fn of_socket_peer(socket: &impl std::os::fd::AsRawFd) -> io::Result<Self> {
         let mut token = AuditToken { val: [0; 8] };
         let mut length = libc::socklen_t::try_from(std::mem::size_of::<AuditToken>())
             .map_err(io::Error::other)?;
@@ -1287,7 +1324,7 @@ impl Process {
     }
 
     /// Signal the process; `false` when it no longer runs.
-    pub(crate) fn signal(&self, signal: libc::c_int) -> io::Result<bool> {
+    pub fn signal(&self, signal: libc::c_int) -> io::Result<bool> {
         let mut token = AuditToken { val: [0; 8] };
         token.val[5] = self.pid.cast_unsigned();
         token.val[7] = self.version;
@@ -1782,7 +1819,7 @@ impl Process {
 
     /// The process at the other end of a connected Unix socket, as the kernel recorded it when
     /// the connection was made: whatever happens to its pid later, the handle names only it.
-    pub(super) fn of_socket_peer(socket: &impl std::os::fd::AsRawFd) -> io::Result<Self> {
+    pub fn of_socket_peer(socket: &impl std::os::fd::AsRawFd) -> io::Result<Self> {
         use std::os::fd::FromRawFd as _;
 
         let mut opened: libc::c_int = -1;
@@ -1839,7 +1876,7 @@ impl Process {
     }
 
     /// Signal the process; `false` when it no longer runs.
-    pub(crate) fn signal(&self, signal: libc::c_int) -> io::Result<bool> {
+    pub fn signal(&self, signal: libc::c_int) -> io::Result<bool> {
         use std::os::fd::AsRawFd as _;
 
         // SAFETY: pidfd_send_signal takes a live descriptor and plain integers.
@@ -2086,6 +2123,32 @@ mod tests {
             .process_group(0)
             .spawn_locked()
             .expect("spawn a job group")
+    }
+
+    /// Taking a stop report never reaps: on a child that already exited the take finds nothing
+    /// and leaves the exit pending, so the fence alone collects it, even when the child exits
+    /// between the read that met its stop and the take.
+    #[test]
+    fn taking_a_stop_report_never_reaps_an_exited_child() {
+        let mut child = OwnedGroup(
+            Command::new("/bin/sh")
+                .args(["-c", "exit 4"])
+                .stdin(Stdio::null())
+                .process_group(0)
+                .spawn_locked()
+                .expect("spawn a child"),
+        );
+        let pid = i32::try_from(child.0.id()).expect("a pid");
+        assert_eq!(
+            super::await_exit_unreaped(pid).expect("exit"),
+            crate::api::dto::ExitStatus::Exited { code: 4 }
+        );
+        super::take_stop_report(libc::id_t::try_from(pid).expect("an id")).expect("take nothing");
+        assert_eq!(
+            super::exit_unreaped(pid).expect("still unreaped"),
+            Some(crate::api::dto::ExitStatus::Exited { code: 4 })
+        );
+        assert_eq!(child.0.wait().expect("reap").code(), Some(4));
     }
 
     /// A test's group, killed and its leader reaped however the test ends.

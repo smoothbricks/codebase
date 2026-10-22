@@ -314,7 +314,7 @@ pub(crate) fn exit_code(status: ExitStatus) -> Result<i32, CowshedError> {
     }
 }
 
-fn spawn_error(program: &str, error: &io::Error) -> CowshedError {
+pub(crate) fn spawn_error(program: &str, error: &io::Error) -> CowshedError {
     let message = format!("cannot run {program}: {error}");
     match error.kind() {
         io::ErrorKind::NotFound => CowshedError::new(

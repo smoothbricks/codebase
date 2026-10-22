@@ -18,15 +18,14 @@ use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection
 use cowshed_core::api::{
     AbandonedPreservation, AbandonedWork, AdoptOptions, AttachOptions, BranchLandings, BranchName,
     CheckpointInfo, CheckpointOptions, CheckpointResult, CommandArg, Coordinator, DefragmentResult,
-    DoctorReport, EmptyResult, ExecRequest, ExitStatus, ExpectedRefHead, Finding, FindingSeverity,
-    ForkOptions, GatewayStatus, GcOptions, GcReason, GcReport, GitOid, GrantDelta, GrantSet,
-    JobInfo, JobStream, LandOptions, LandReport, LandingCommits, MountResult, OutputPublication,
-    ProjectGrantDelta, ProjectGrants, PublicationPolicy, PushOptions, PushReport,
-    RebaseBuildVolume, RebaseOptions, RebaseReport, RefLockPath, RemoveOptions,
-    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
-    ResizeVolume, RevisionTarget, RunSandboxMode, SccacheStatus, StdinSource as CoreStdinSource,
-    UnlandedPaths, UtcTimestamp, WorkspaceInfo, WorkspaceLanding, WorkspacePath, WorkspaceState,
-    validate_command_argv,
+    DoctorReport, EmptyResult, ExecRequest, ExpectedRefHead, Finding, FindingSeverity, ForkOptions,
+    GatewayStatus, GcOptions, GcReason, GcReport, GitOid, GrantDelta, GrantSet, JobInfo, JobStream,
+    LandOptions, LandReport, LandingCommits, MountResult, OutputPublication, ProjectGrantDelta,
+    ProjectGrants, PublicationPolicy, PushOptions, PushReport, RebaseBuildVolume, RebaseOptions,
+    RebaseReport, RefLockPath, RemoveOptions, RemoveProjectOptions, RemoveProjectReport,
+    RemoveReport, ReseedResult, ResizeResult, ResizeVolume, RevisionTarget, RunSandboxMode,
+    SccacheStatus, StdinSource as CoreStdinSource, UnlandedPaths, UtcTimestamp, WorkspaceInfo,
+    WorkspaceLanding, WorkspacePath, WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{
@@ -254,6 +253,7 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         | Command::RetireDescendants(_)
         | Command::Lock(_)
         | Command::LockHolders(_)
+        | Command::Hold(_)
         | Command::TreeHolders(_)
         | Command::Controller
         | Command::Credential(_)
@@ -324,6 +324,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::RetireDescendants(_)
         | Command::Lock(_)
         | Command::LockHolders(_)
+        | Command::Hold(_)
         | Command::TreeHolders(_)
         | Command::Controller
         | Command::Credential(_)
@@ -435,6 +436,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         | Command::RetireDescendants(_)
         | Command::Lock(_)
         | Command::LockHolders(_)
+        | Command::Hold(_)
         | Command::TreeHolders(_)
         | Command::Controller
         | Command::Sccache(_)
@@ -507,8 +509,10 @@ fn attach_demand(command: &Command) -> (u64, Vec<&str>) {
         Command::Push(args) => (2, named([args.workspace.as_deref()])),
         Command::Rebase(args) => (2, named([args.workspace.as_deref(), args.into.as_deref()])),
         Command::Cache(CacheCommand::Clear { workspace }) => (2, named([workspace.as_deref()])),
-        // Lock owns its descriptors; holder queries read the kernel before the runtime bridge.
-        Command::Lock(_) | Command::LockHolders(_) | Command::TreeHolders(_) => (0, Vec::new()),
+        // Lock and hold own descriptors; holder queries read the kernel before the runtime bridge.
+        Command::Lock(_) | Command::LockHolders(_) | Command::Hold(_) | Command::TreeHolders(_) => {
+            (0, Vec::new())
+        }
         Command::Remove(_)
         | Command::Forget(_)
         | Command::Detach(_)
@@ -2311,9 +2315,9 @@ where
         Command::SubtreeRoot(_) | Command::RetireDescendants(_) => Err(CowshedError::internal(
             "subtree commands use the native supervisor socket before the runtime bridge",
         )),
-        Command::Lock(_) | Command::LockHolders(_) | Command::TreeHolders(_) => {
+        Command::Lock(_) | Command::LockHolders(_) | Command::Hold(_) | Command::TreeHolders(_) => {
             Err(CowshedError::internal(
-                "lock, lock-holders and tree-holders name no project and are dispatched before the runtime bridge",
+                "lock, lock-holders, hold and tree-holders name no project and are dispatched before the runtime bridge",
             ))
         }
         Command::Controller => Err(CowshedError::internal(
@@ -4456,9 +4460,8 @@ fn emit_doctor<W: Write, E: Write>(output: &mut Output<W, E>, report: &DoctorRep
 }
 
 fn child_exit_code(info: &JobInfo) -> Result<i32> {
-    match info.exit {
-        Some(ExitStatus::Exited { code }) => Ok(code),
-        Some(ExitStatus::Signaled { signal, .. }) => Ok(128_i32.saturating_add(signal)),
+    match &info.exit {
+        Some(exit) => Ok(exit.shell_code()),
         None => Err(CowshedError::internal(format!(
             "terminal job {} has no child exit status",
             info.job_id.get()
@@ -6800,6 +6803,7 @@ mod tests {
             &["lock", "/tmp/x.lock", "--", "true"],
             &["lock-holders", "/tmp/x.lock"],
             &["tree-holders", "/tmp/tree"],
+            &["hold", "--control-fd", "3", "--state-fd", "4", "--", "true"],
         ] {
             assert_eq!(demand(nothing).0, 0, "{nothing:?}");
         }
