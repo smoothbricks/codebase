@@ -16,12 +16,12 @@ This companion owns the macOS/APFS implementation.
   GC exception is specified in [16_build_volumes.md §Garbage collection](./16_build_volumes.md#garbage-collection). Each
   store keeps one **blank template** per capacity and owner, `.blank/<capacity-bytes>-<uid>-<gid>.dmg`, and a **mint** —
   adopt's main image, a build volume's first touch — is one `clonefile` of it to the image's canonical name plus one
-  `diskutil image attach --nobrowse --noMount --plist <image>`, verified with pinned `fsck_apfs -q` before `mount_apfs`
-  mounts the exact volume at the requested root with `nobrowse,owners,noatime`. The clone takes the canonical name
-  whole, so the name only ever holds a complete, formatted volume. A template is minted lazily, the first time a store
-  mints at its capacity, in five unprivileged steps:
+  in-kernel attach ("Mounts"), verified with pinned `fsck_apfs -q` before `mount_apfs` mounts the exact volume at the
+  requested root with `nobrowse,owners,noatime`. The clone takes the canonical name whole, so the name only ever holds a
+  complete, formatted volume. A template is minted lazily, the first time a store mints at its capacity, in five
+  unprivileged steps:
   `diskutil image create blank --format RAW --size <capacity-bytes> --volumeName [cowshed] --fs None <stem>-minting-<nonce>.dmg`,
-  `diskutil image attach --nobrowse --noMount --plist <image>`,
+  `hdiutil attach -kernel -nomount -noverify -nobrowse -imagekey diskimage-class=CRawDiskImage -plist <image>`,
   `newfs_apfs -U <uid> -G <gid> -e -v [cowshed] <whole-device>`, a `fsck_apfs -q` of the new volume, and owned-registry
   `hdiutil detach -verbose <whole-device>` of that exact whole device; only then is it renamed to its name. Only minting
   takes the template's lock, and a minter that finds the template once it holds the lock returns it, so concurrent first
@@ -186,11 +186,18 @@ gives back less space.
 
 ## Mounts
 
-APFS image attach uses `diskutil image attach --nobrowse --noMount --plist <image>` exactly once, naming the exact
-backing image. Read-only attachments add `--readOnly`; attachment stays `--nobrowse`, and mount options select workspace
-visibility. Cowshed joins the reported whole device and one freshly probed APFS volume to that image in the current I/O
-Registry, opens the raw volume read-only and rechecks ownership under that pin. Absence, a conflicting device, multiple
-volumes or unreadable ownership refuses. Before the first mount, pinned `fsck_apfs -q <raw-volume>` checks the
+APFS image attach uses
+`hdiutil attach -kernel -nomount -noverify -nobrowse -imagekey diskimage-class=CRawDiskImage -plist <image>` exactly
+once, naming the exact backing image. Read-only attachments add `-readonly`; attachment stays `-nobrowse`, and mount
+options select workspace visibility. `-kernel` serves the RAW image from the kernel's own file backing store (`KDIURL` →
+`KDIFileBackingStore` → `KDIReadWriteDiskImage` → `KDIDiskImageNub` → `IOHDIXHDDriveInKernel` →
+`IODiskImageBlockStorageDeviceInKernel`): no userspace image helper serves its I/O, so none can stall, outlive its image
+or hold a notification ("The IOMedia match-notification ceiling"). DiskImages2 (`diskutil image attach`, served by
+`diskimagesiod`) is not used for cowshed's own images; its attachments are still read and released, since an earlier
+build or another tool may hold one. The driver choice and its measurements are in "The two drivers, measured on one 1
+GiB RAW image". Cowshed joins the reported whole device and one freshly probed APFS volume to that image in the current
+I/O Registry, opens the raw volume read-only and rechecks ownership under that pin. Absence, a conflicting device,
+multiple volumes or unreadable ownership refuses. Before the first mount, pinned `fsck_apfs -q <raw-volume>` checks the
 filesystem; any nonzero result refuses publication and releases only the new owned attachment or reports its cleanup
 refusal. The ordinary mounted path does not retry attach or verification.
 
@@ -413,29 +420,30 @@ general and unrecognized failures are errors, never grace or force authority. Ev
 The disk-image child policy warns at the caller's deadline and reports progress at the caller's configured cadence,
 rather than killing an in-flight `hdiutil detach`; this does not widen the release grace. The kernel's I/O Registry is
 the one host view that maps an image's path to its devices (`diskutil image info` reports none): one
-`IOServiceGetMatchingServices("AppleDiskImageDevice")` snapshot, each device's `DiskImageURL` and the IOMedia of that
-device's own subtree, reread when a concurrent attach or detach invalidates a child list. A question about one image
-names the image's file URL in the matching dictionary (`IOPropertyMatch` on `DiskImageURL`, spelled by CoreFoundation as
-the image framework spells it), so the kernel answers that image's devices alone and the read costs that image however
-many others are attached. Walking every registered IOMedia node up to its image device instead cost 7 ms per question
-with 54 images attached and 110 ms with 799, and a verb asks several. `hdiutil info -plist` is not an inventory: while
-any other image attaches or detaches it answers a truncated image list with nothing marking it (a reviewer probe that
-kept one image attached while churning another saw it missing from 11–89 of every 648–1551 polls, and from none of the
-same polls' registry reads). Reading that omission as absence once skipped a post-format release, leaving the image
-attached for `diskutil image resize` to refuse as busy, and once lost a mounted workspace's attachment on restart.
+`IOServiceGetMatchingServices` snapshot per image driver, each in-kernel drive's `KDIURLPath` (the path its attach was
+handed) and each `AppleDiskImageDevice`'s `DiskImageURL`, with the IOMedia of that device's own subtree, reread when a
+concurrent attach or detach invalidates a child list. A question about one image names the image's path, and its file
+URL as CoreFoundation spells it, in each driver's matching dictionary (`IOPropertyMatch`), so the kernel answers that
+image's devices alone and the read costs that image however many others are attached. Walking every registered IOMedia
+node up to its image device instead cost 7 ms per question with 54 images attached and 110 ms with 799, and a verb asks
+several. `hdiutil info -plist` is not an inventory: while any other image attaches or detaches it answers a truncated
+image list with nothing marking it (a reviewer probe that kept one image attached while churning another saw it missing
+from 11–89 of every 648–1551 polls, and from none of the same polls' registry reads). Reading that omission as absence
+once skipped a post-format release, leaving the image attached for `diskutil image resize` to refuse as busy, and once
+lost a mounted workspace's attachment on restart.
 
-The image driver registers an attach's media before `diskutil image attach` reports them, so creation requires the
-reported blank whole device to be the image's exact single-device mapping in one registry read before formatting.
-Absence there is a contradiction, not lag: it fails at once, as does an observed conflicting mapping, and an unreadable
-inventory is a typed refusal; each leaves both the attachment and backing file intact for diagnosis. No mutation is
-retried and no unproved device is formatted. Shared owned-image cleanup distinguishes this unformatted whole-device
-state from an APFS volume: it rechecks the exact mapping under the image's lease and releases only that owned device
-without deleting the backing file first. Every detach attempt, including a dissent retry and the final force, rechecks
-that mapping in `run_guarded` after the host storage lease wait, immediately before spawning `hdiutil`. Each volume
-unmount instead carries its proven exact image/whole-device/volume identity through the host lease wait under its raw
-pin. An earlier unpinned check is not authority after a lease wait; a recycled `diskN` cannot substitute another image.
-Confirmed image absence needs no operation; a positive conflicting mapping or unreadable inventory refuses the mutation.
-A release deduplicates whole-device views, so the same attachment is never detached twice.
+The image driver registers an attach's media before the attach reports them, so creation requires the reported blank
+whole device to be the image's exact single-device mapping in one registry read before formatting. Absence there is a
+contradiction, not lag: it fails at once, as does an observed conflicting mapping, and an unreadable inventory is a
+typed refusal; each leaves both the attachment and backing file intact for diagnosis. No mutation is retried and no
+unproved device is formatted. Shared owned-image cleanup distinguishes this unformatted whole-device state from an APFS
+volume: it rechecks the exact mapping under the image's lease and releases only that owned device without deleting the
+backing file first. Every detach attempt, including a dissent retry and the final force, rechecks that mapping in
+`run_guarded` after the host storage lease wait, immediately before spawning `hdiutil`. Each volume unmount instead
+carries its proven exact image/whole-device/volume identity through the host lease wait under its raw pin. An earlier
+unpinned check is not authority after a lease wait; a recycled `diskN` cannot substitute another image. Confirmed image
+absence needs no operation; a positive conflicting mapping or unreadable inventory refuses the mutation. A release
+deduplicates whole-device views, so the same attachment is never detached twice.
 
 ### Owned-registry release boundary
 
@@ -539,30 +547,30 @@ and source-device records; an empty mountpoint is a real inventory fault, not an
 Disk device names are reusable, not image identities. Each image has its own private per-user lease,
 `/private/tmp/cowshed-apfs-image-leases-<euid>/<sha256 of the identity>.lock`: an `flock` on a regular owner-only 0600
 single-link file, opened without following symlinks, in a 0700 directory this user owns. The identity is the absolute
-path produced by `attachment_inventory_path`, matched against the kernel's `DiskImageURL` backing-file path; the lease
-hashes that same normalized identity, never a separately resolved alias. An alias with another identity fails closed.
-Every cooperating create, attach, format, `fsck_apfs`, mount, unmount, rename, recovery and detach of one image holds
-that image's lease, so independent processes serialize on one image while operations on different images overlap. There
-is no host-wide device lock. A cooperating process acts on a device only after the inventory positively maps the
-identity to it under the lease (or while a raw pin holds it), and a device is freed only by a detach the same lease
-covers, so no same-user cowshed process recycles it inside the critical section. A contended lease is awaited on a
-helper thread that hands the locked descriptor back when the holder releases it, within the caller's admission budget;
-expiry names the lease file, the image and the holder's recorded pid, and no disk child has started. The lease does
-**not** constrain another user's disk tools or a manual eject during the two mutations that cannot run raw-pinned,
-`newfs_apfs` and `hdiutil detach`, because an open raw pin prevents releasing the device. Before `fsck_apfs` or
-`mount_apfs`, cowshed opens the reported raw volume read-only, then verifies that the attachment inventory maps **both**
-its whole container and its volume to the exact image. A verified attachment owns that raw descriptor across the
-`attach_verified` → `mount` method boundary. A mount lookup of an existing attachment likewise takes the image lease
-before reading inventory and returns a handle owning its raw pin through the kernel mount-table read and mount decision.
-It is released when an already-mounted handle is dropped, after `mount_apfs` finishes, before intentional detach, or
-before the exclusive `diskutil apfs resizeContainer` writer, which cannot run with a raw descriptor open. Independent
-device ejects during container resize after pin release are not covered. While held, the descriptor prevents even
-external `diskutil eject force` or `hdiutil detach -force` from releasing the image and recycling its device name. Every
-attach path, including detached verification and retained read-only mounting, attaches once and refuses a reported
-device lost before pinning without retrying. A conflicting or unreadable mapping fails closed, without running fsck on
-the reported device. No live-fsck option authorizes touching a foreign mounted container. Blank-image formatting keeps
-its image-to-whole-device check under the image's lease; its exclusive formatter cannot share a raw-device descriptor
-with another opener.
+path produced by `attachment_inventory_path`, matched against the kernel's `KDIURLPath` (or a DiskImages2 device's
+`DiskImageURL`) backing-file path; the lease hashes that same normalized identity, never a separately resolved alias. An
+alias with another identity fails closed. Every cooperating create, attach, format, `fsck_apfs`, mount, unmount, rename,
+recovery and detach of one image holds that image's lease, so independent processes serialize on one image while
+operations on different images overlap. There is no host-wide device lock. A cooperating process acts on a device only
+after the inventory positively maps the identity to it under the lease (or while a raw pin holds it), and a device is
+freed only by a detach the same lease covers, so no same-user cowshed process recycles it inside the critical section. A
+contended lease is awaited on a helper thread that hands the locked descriptor back when the holder releases it, within
+the caller's admission budget; expiry names the lease file, the image and the holder's recorded pid, and no disk child
+has started. The lease does **not** constrain another user's disk tools or a manual eject during the two mutations that
+cannot run raw-pinned, `newfs_apfs` and `hdiutil detach`, because an open raw pin prevents releasing the device. Before
+`fsck_apfs` or `mount_apfs`, cowshed opens the reported raw volume read-only, then verifies that the attachment
+inventory maps **both** its whole container and its volume to the exact image. A verified attachment owns that raw
+descriptor across the `attach_verified` → `mount` method boundary. A mount lookup of an existing attachment likewise
+takes the image lease before reading inventory and returns a handle owning its raw pin through the kernel mount-table
+read and mount decision. It is released when an already-mounted handle is dropped, after `mount_apfs` finishes, before
+intentional detach, or before the exclusive `diskutil apfs resizeContainer` writer, which cannot run with a raw
+descriptor open. Independent device ejects during container resize after pin release are not covered. While held, the
+descriptor prevents even external `diskutil eject force` or `hdiutil detach -force` from releasing the image and
+recycling its device name. Every attach path, including detached verification and retained read-only mounting, attaches
+once and refuses a reported device lost before pinning without retrying. A conflicting or unreadable mapping fails
+closed, without running fsck on the reported device. No live-fsck option authorizes touching a foreign mounted
+container. Blank-image formatting keeps its image-to-whole-device check under the image's lease; its exclusive formatter
+cannot share a raw-device descriptor with another opener.
 
 For every mounted attachment:
 
@@ -870,7 +878,9 @@ healthy one goes on to log its device's BSD name.
 After the stalls began, every image device that terminated stayed allocated. In that boot the 23 stalled helpers were
 exactly the ones holding two notification ports (healthy helpers hold one), and every device terminated after them, 702
 in all, was never freed, until the first error code 150 at 963 IO clients and 972 devices allocated. The trigger, the
-ceiling and the retention are measured; the kernel reference that kept those devices is not established.
+ceiling and the retention are measured, and the retain edge was reproduced live ("The retain edge, reproduced live on
+2026-10-22" below): a stalled helper's termination callback deadlocks on the lock its own attach holds and never drains
+its queue.
 
 What is established about it: each `diskimagesiod` registers an unfiltered `IOServiceTerminate` notification on
 `AppleDiskImageDevice` (static disassembly of `/usr/libexec/diskimagesiod`: `setupTerminationNotificationWithError:`,
@@ -879,10 +889,35 @@ run loop; `terminationCallback` drains its iterator until empty). The kernel kee
 notification's queue until the client drains it, and an undrained notification keeps a cleanly detached device and its
 user client alive with no userspace right to either: a controlled probe holding one undrained `AppleDiskImageDevice`
 matched or terminated notification held a detached device and client (+1/+1), and both were freed when it let go. An
-undrained IOMedia notification instead keeps only the media, never the device. What contradicts the simple reading: in
-the old boot's port census the orphaned helper 69090's notification receive queues were empty, and the sampled stalled
-helpers' main run loops were idle, not blocked. That the stalled helpers' termination notifications retained the 702
-devices is therefore the leading explanation, not a proven one.
+undrained IOMedia notification instead keeps only the media, never the device. What the old boot alone could not settle:
+in its port census the orphaned helper 69090's notification receive queues were empty, and the sampled stalled helpers'
+main run loops were idle, not blocked. The retention also outlived the threshold: after 04:45 all 420 clean shutdowns,
+at only 262 to 301 registered images, still left their devices allocated. The old boot is gone, its departed objects are
+no longer in the registry, and SIP refuses kernel tracing, so that boot alone could not name the edge.
+
+#### The retain edge, reproduced live on 2026-10-22
+
+With registered IOMedia pushed to 1,027 by throwaway in-kernel images, one attach with cowshed's DI2 argv of a throwaway
+RAW image hung, and its helper (pid 95499) logged nothing after `IOServiceWaitQuiet done`. During the next minute two
+other workspaces' images detached cleanly, and both devices stayed allocated (188 `AppleDiskImageDevice` instances
+against 185 registered, devices `0x100008c22` and `0x100008c46`). `sample 95499` shows the edge in all 175 samples:
+
+- an attach thread inside `attachToNewDeviceWithParams:` (`+0x13fe4`, within its `@synchronized` section) in
+  `tryAttachWithParams:` (`+0x13518`) waiting in `waitForDeviceWithError:` (`+0xc9e0`, the NSRunLoop spin) for the
+  IOMedia match the cap dropped;
+- the main thread inside IOKit's notification callout (`IODispatchCalloutFromCFMessage`) in `terminationCallback`
+  (`+0x109c0`, just after its `objc_sync_enter` call), blocked in `objc_sync_enter` → `__ulock_wait2` on the lock the
+  attach thread holds.
+
+The first device that terminates anywhere on the host wakes the termination notification; its callback takes the wakeup
+and then blocks before `IOIteratorNext`, forever. Its queue is never drained, so the kernel keeps every
+`AppleDiskImageDevice` (and, through it, its user client) terminated afterwards, and no receive queue shows a pending
+message: the old boot's empty queues and the 23 two-notification helpers fit exactly. A sample taken before any device
+terminates finds the main thread idle, as the old boot's samples did. Killing the attach's `diskutil` client frees
+nothing; only the helper's death releases the queue, and nothing but a root kill of that one helper can end it (SIP
+refuses the DTrace alternative). The in-kernel driver has no helper, and so neither the wait nor the callback: in the
+same session 170 in-kernel attaches took registered IOMedia from 574 to 1,084 at 0.14 to 0.27 s each, and their detaches
+above the cap left nothing allocated.
 
 #### The boot of 2026-10-21 20:12 +04, from its kernel and helper logs
 
@@ -949,6 +984,10 @@ read-only attach with `fsck_apfs` and mount all pass on it. Images were attached
 - `cowshed detach`, making room and putting a detached workspace back after a refused `rm` released the workspace image
   and left its build volume attached: before the reboot the kernel held 164 build volumes, 88 session images and 4
   mains. A land and an `rm` released both.
+
+Cowshed's own attaches no longer go through DiskImages2: every cowshed image is attached in the kernel ("Mounts"), which
+has no image helper to stall at the ceiling or retain devices after it. Whether an in-kernel attach completes with more
+than 1024 registered IOMedia is not yet measured, so until it is, cowshed still never starts an attach past the ceiling.
 
 Cowshed therefore never starts an attach past the ceiling. The system runner refuses an image attach whose media would
 reach 1024 before it spawns (`MediaCapReached`, `cowshed-apfs` `media_cap`; 02_workspaces.md, "Making room for an

@@ -89,10 +89,9 @@ not a best-effort script:
    main out of ordinary enumeration, gateway inventory, and every verb that would mount or serve it. Both path
    components come from the validated primary `repo_id` and are encoded independently as specified in 01_storage.md. The
    image is minted (01a_apfs.md "Images"): one `clonefile` of the store's formatted blank template takes the canonical
-   name whole, so the name only ever holds a complete, formatted volume. One exact-image
-   `diskutil image attach --nobrowse --noMount --plist` attaches it, pinned `fsck_apfs -q` verifies it, then
-   `mount_apfs` mounts its exact owned volume at a staging mountpoint (01a_apfs.md §Mounts). That attach is the only one
-   main gets.
+   name whole, so the name only ever holds a complete, formatted volume. One exact-image in-kernel attach (01a_apfs.md
+   §Mounts) attaches it, pinned `fsck_apfs -q` verifies it, then `mount_apfs` mounts its exact owned volume at a staging
+   mountpoint (01a_apfs.md §Mounts). That attach is the only one main gets.
 3. Copy the full tree (including `.git`), preserving metadata, in delta passes until quiescent. A bounded worker pool
    sized to available cores processes independent leaves. Each leaf first requests an APFS metadata clone and falls back
    only that leaf to `copyfile` data copy on `EXDEV`/`ENOTSUP`, so one cross-volume subtree never aborts completed
@@ -566,7 +565,7 @@ image remains live and mounted throughout capture.
 2. Open the source inode without following symlinks and descriptor-clone it to `sessions/<ws>.dmg`. RAW has no outer
    allocation map; the filesystem snapshot is crash-consistent, not an application-state transaction. Create the
    complete closed-baseline sibling sidecar before attach; allocate `portBlock` only on macOS and omit it on Linux.
-3. Attach the exact clone once without mounting (`diskutil image attach --noMount`, flags per 01a_apfs.md §Mounts),
+3. Attach the exact clone once without mounting (`hdiutil attach -kernel -nomount`, flags per 01a_apfs.md §Mounts),
    verify the freshly probed, pinned APFS volume with `fsck_apfs -q`, then use `mount_apfs` to mount that exact volume
    at `<mount-root>/<owner>/<repo>/<ws>`. The mapping is guarded again after the host lease wait; verification precedes
    the first mount, and the held mount root/source is checked before publication. No combined mountpoint attach,

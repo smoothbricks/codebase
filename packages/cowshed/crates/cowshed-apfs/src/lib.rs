@@ -31,11 +31,36 @@ use std::time::Duration;
 
 use crate::device::{DISKUTIL, container_of, identifier_depth};
 
-/// The disk-image driver's detach interface. Creation and attachment of RAW images use
-/// `diskutil image`; releasing an owned image goes directly through `hdiutil detach`. Which
-/// images are attached is read from the kernel ([`CommandRunner::attached_disk_images`]), never
-/// from `hdiutil info`.
+/// The disk-image tool. A RAW image is attached in the kernel ([`in_kernel_attach`]) and released
+/// with `hdiutil detach`; `diskutil image create` creates it. Which images are attached is read
+/// from the kernel ([`CommandRunner::attached_disk_images`]), never from `hdiutil info`.
 pub(crate) const HDIUTIL: &str = "/usr/bin/hdiutil";
+
+/// The flags of every cowshed attach (01a_apfs.md, "Images"): `-kernel` serves the RAW image from
+/// the kernel's own file backing store (`IOHDIXHDDriveInKernel`), with no userspace image helper
+/// to stall, orphan or leave a notification undrained (01a_apfs.md, "The IOMedia
+/// match-notification ceiling"); `-nomount`, since cowshed mounts the exact verified volume itself;
+/// `-noverify`, since a RAW image carries no checksum; `-nobrowse`; and the RAW image class.
+const IN_KERNEL_ATTACH: [&str; 7] = [
+    "-kernel",
+    "-nomount",
+    "-noverify",
+    "-nobrowse",
+    "-imagekey",
+    "diskimage-class=CRawDiskImage",
+    "-plist",
+];
+
+/// `hdiutil attach` of `image` in the kernel, read-only when `access` asks for it.
+fn in_kernel_attach(image: &Path, access: MountAccess) -> CommandRequest {
+    CommandRequest::new(
+        HDIUTIL,
+        std::iter::once(OsString::from("attach"))
+            .chain((access == MountAccess::ReadOnly).then(|| OsString::from("-readonly")))
+            .chain(IN_KERNEL_ATTACH.map(OsString::from))
+            .chain([image.as_os_str().to_owned()]),
+    )
+}
 const FSCK_APFS: &str = "/sbin/fsck_apfs";
 /// The kernel mount helper. Workspace volumes are mounted with it rather than `diskutil mount`
 /// because `diskutil` routes the mount through Disk Arbitration, which serialises every client
@@ -2912,17 +2937,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     ) -> Result<String, ApfsError> {
         let attached_before = self.refuse_second_attach(path)?;
 
-        let attach = CommandRequest::new(
-            DISKUTIL,
-            [
-                OsString::from("image"),
-                OsString::from("attach"),
-                OsString::from("--nobrowse"),
-                OsString::from("--noMount"),
-                OsString::from("--plist"),
-                path.as_os_str().to_owned(),
-            ],
-        );
+        let attach = in_kernel_attach(path, MountAccess::ReadWrite);
         let output = match timed_apfs_step(apfs_step_leg(path), "blank-attach", || {
             self.run_checked("attach blank RAW image", attach)
         }) {
@@ -3162,18 +3177,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         cleanup: DetachIntent,
     ) -> Result<AttachedImage, ApfsError> {
         let attached_before = self.refuse_second_attach(image)?;
-        let request = CommandRequest::new(
-            DISKUTIL,
-            [OsString::from("image"), OsString::from("attach")]
-                .into_iter()
-                .chain((access == MountAccess::ReadOnly).then(|| OsString::from("--readOnly")))
-                .chain([
-                    OsString::from("--nobrowse"),
-                    OsString::from("--noMount"),
-                    OsString::from("--plist"),
-                    image.as_os_str().to_owned(),
-                ]),
-        );
+        let request = in_kernel_attach(image, access);
         let output = match self.run_checked("attach image without mounting", request) {
             Ok(output) => output,
             Err(primary) => {
@@ -5048,9 +5052,10 @@ fn project_registered_apfs(
 /// under the registry's own consistency check — it restarts its walk whenever a concurrent attach
 /// or detach invalidates it — so the set is complete for one instant, which is exactly what
 /// `hdiutil info` and `diskutil apfs list` are not. Disk images are read from their image
-/// drivers: the snapshot holds every registered `AppleDiskImageDevice`, whose `DiskImageURL`
-/// names the backing store, or for one image only the devices whose `DiskImageURL` the kernel
-/// matched to that image's file URL; each device's media are read from its own subtree, again
+/// drivers ([`Driver`]): every registered in-kernel DI1 drive, whose `KDIURLPath` is the path its
+/// attach was handed, and every DiskImages2 `AppleDiskImageDevice`, whose `DiskImageURL` names its
+/// backing store; for one image, only the drives and devices the kernel matched to that image's
+/// path or file URL. Each device's media are read from its own subtree, again
 /// whenever a concurrent change invalidated a child list. A question about one image therefore
 /// reads that image's registry entries alone, however many other images are attached. APFS is
 /// read from a snapshot of every registered IOMedia: every container's `AppleAPFSMedia` and every
@@ -5092,7 +5097,6 @@ mod io_registry {
     /// `kIOMainPortDefault`.
     const MAIN_PORT_DEFAULT: libc::mach_port_t = 0;
     const SERVICE_PLANE: &CStr = c"IOService";
-    const IMAGE_DEVICE: &CStr = c"AppleDiskImageDevice";
     const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
     const CF_NUMBER_SINT64_TYPE: CfIndex = 4;
 
@@ -5212,11 +5216,68 @@ mod io_registry {
         }
     }
 
+    /// An image driver whose attachments the inventory reads, with the property naming each
+    /// attachment's backing store.
+    #[derive(Clone, Copy)]
+    enum Driver {
+        /// cowshed's own attach, `hdiutil attach -kernel`: `KDIURLPath` is the path it was handed.
+        InKernel,
+        /// `diskutil image attach`, an earlier build's or another tool's: `DiskImageURL` is a URL.
+        DiskImages2,
+    }
+
+    impl Driver {
+        const ALL: [Self; 2] = [Self::InKernel, Self::DiskImages2];
+
+        fn class(self) -> &'static CStr {
+            match self {
+                Self::InKernel => c"IOHDIXHDDriveInKernel",
+                Self::DiskImages2 => c"AppleDiskImageDevice",
+            }
+        }
+
+        fn source_key(self) -> &'static str {
+            match self {
+                Self::InKernel => "KDIURLPath",
+                Self::DiskImages2 => "DiskImageURL",
+            }
+        }
+
+        /// The backing store a driver's source property names.
+        fn source(self, value: &str) -> DiskImageSource {
+            match self {
+                Self::InKernel if value.starts_with('/') => {
+                    DiskImageSource::File(std::path::PathBuf::from(value))
+                }
+                Self::InKernel => DiskImageSource::Url(value.to_owned()),
+                Self::DiskImages2 => DiskImageSource::from_url(value),
+            }
+        }
+
+        /// The value this driver registers for the local file at `image`.
+        fn source_of(self, image: &std::path::Path) -> io::Result<Cf> {
+            match self {
+                Self::InKernel => key(image
+                    .to_str()
+                    .ok_or_else(|| invalid(format!("{} is not UTF-8", image.display())))?),
+                Self::DiskImages2 => file_url(image),
+            }
+        }
+
+        /// Whether `entry` is an attachment of any image driver.
+        fn any_conforms(entry: &Object) -> bool {
+            Self::ALL
+                .iter()
+                .any(|driver| conforms(entry, driver.class()))
+        }
+    }
+
     struct Keys {
         bsd_name: Cf,
         content: Cf,
         size: Cf,
-        url: Cf,
+        source: Cf,
+        driver: Driver,
     }
 
     struct ApfsKeys {
@@ -5385,35 +5446,46 @@ mod io_registry {
     }
 
     pub(super) fn attached_disk_images() -> io::Result<Vec<AttachedDiskImage>> {
-        image_devices(registered(IMAGE_DEVICE)?)
+        let mut attached = Vec::new();
+        for driver in Driver::ALL {
+            attached.extend(image_devices(registered(driver.class())?, driver)?);
+        }
+        Ok(attached)
     }
 
-    /// Every attachment the kernel holds for the local file at `image`: the image devices whose
-    /// `DiskImageURL` the kernel matched to that file's URL among image devices alone, each with
-    /// the media in its own subtree. No other image is read, however many are attached.
+    /// Every attachment the kernel holds for the local file at `image`: each driver's
+    /// attachments whose source the kernel matched to that file's path or URL, each with the
+    /// media in its own subtree. No other image is read, however many are attached.
     pub(super) fn attachments_of(image: &std::path::Path) -> io::Result<Vec<AttachedDiskImage>> {
-        let properties = mutable_dictionary()?;
-        let url_key = key("DiskImageURL")?;
-        let url = file_url(image)?;
-        // SAFETY: `properties` is a live mutable dictionary, which retains the key and value.
-        unsafe { CFDictionarySetValue(properties.0, url_key.0, url.0) };
-        let attachments = image_devices(registered_matching(IMAGE_DEVICE, Some(&properties))?)?;
-        // The kernel matched the URL's spelling; the backing path it names decides.
+        let mut attachments = Vec::new();
+        for driver in Driver::ALL {
+            let properties = mutable_dictionary()?;
+            let source_key = key(driver.source_key())?;
+            let source = driver.source_of(image)?;
+            // SAFETY: `properties` is a live mutable dictionary, which retains the key and value.
+            unsafe { CFDictionarySetValue(properties.0, source_key.0, source.0) };
+            attachments.extend(image_devices(
+                registered_matching(driver.class(), Some(&properties))?,
+                driver,
+            )?);
+        }
+        // The kernel matched a spelling; the backing path it names decides.
         Ok(attachments
             .into_iter()
             .filter(|attached| attached.is_backed_by(image))
             .collect())
     }
 
-    /// Each image device of one registry snapshot with the BSD media in its own subtree, in
-    /// registry order. A device that publishes no media yet exposes nothing and is not reported;
+    /// Each attachment of `driver` in one registry snapshot with the BSD media in its own subtree,
+    /// in registry order. One that publishes no media yet exposes nothing and is not reported;
     /// one that leaves the registry mid-read is departing and is not reported either.
-    fn image_devices(devices: Entries) -> io::Result<Vec<AttachedDiskImage>> {
+    fn image_devices(devices: Entries, driver: Driver) -> io::Result<Vec<AttachedDiskImage>> {
         let keys = Keys {
             bsd_name: key("BSD Name")?,
             content: key("Content")?,
             size: key("Size")?,
-            url: key("DiskImageURL")?,
+            source: key(driver.source_key())?,
+            driver,
         };
         let mut images: BTreeMap<u64, AttachedDiskImage> = BTreeMap::new();
         for device in devices {
@@ -5438,8 +5510,9 @@ mod io_registry {
         keys: &Keys,
     ) -> Read<()> {
         let id = entry_id(device, "read a disk image's registry id")?;
-        let Some(url) = string_property(device, &keys.url, "DiskImageURL")? else {
-            return Err(invalid("a disk image device registers no DiskImageURL").into());
+        let source_key = keys.driver.source_key();
+        let Some(source) = string_property(device, &keys.source, source_key)? else {
+            return Err(invalid(format!("a disk image device registers no {source_key}")).into());
         };
         let mut found = DeviceMedia::default();
         while !read_media(device, 0, keys, &mut found)? {
@@ -5454,7 +5527,7 @@ mod io_registry {
         images.insert(
             id,
             AttachedDiskImage {
-                source: DiskImageSource::from_url(&url),
+                source: keys.driver.source(&source),
                 capacity: found.capacity,
                 media: found.media,
             },
@@ -5476,7 +5549,7 @@ mod io_registry {
         let mut walk = children(entry)?;
         let mut consistent = true;
         for child in walk.by_ref() {
-            if conforms(&child, IMAGE_DEVICE) {
+            if Driver::any_conforms(&child) {
                 continue;
             }
             match read_child(&child, media_above, keys, found) {
@@ -6027,10 +6100,11 @@ mod io_registry {
                 bsd_name: key("BSD Name").expect("key"),
                 content: key("Content").expect("key"),
                 size: key("Size").expect("key"),
-                url: key("DiskImageURL").expect("key"),
+                source: key("KDIURLPath").expect("key"),
+                driver: Driver::InKernel,
             };
             assert!(matches!(
-                string_property(&entry, &keys.url, "DiskImageURL"),
+                string_property(&entry, &keys.source, "KDIURLPath"),
                 Err(Unread::Gone)
             ));
             assert!(matches!(
@@ -6548,12 +6622,15 @@ mod tests {
         assert_eq!(
             argv(&requests[0]),
             [
-                "image",
                 "attach",
-                "--readOnly",
-                "--nobrowse",
-                "--noMount",
-                "--plist",
+                "-readonly",
+                "-kernel",
+                "-nomount",
+                "-noverify",
+                "-nobrowse",
+                "-imagekey",
+                "diskimage-class=CRawDiskImage",
+                "-plist",
                 input.path().to_str().unwrap(),
             ]
         );
@@ -6656,8 +6733,8 @@ mod tests {
             {
                 return Ok(CommandOutput::success([]));
             }
-            if request.program == Path::new(DISKUTIL)
-                && args.starts_with(&["image".into(), "attach".into()])
+            if request.program == Path::new(HDIUTIL)
+                && args.first().is_some_and(|arg| arg == "attach")
             {
                 self.attached
                     .borrow_mut()
@@ -7527,11 +7604,14 @@ mod tests {
         assert_eq!(
             argv(steps[1].command()),
             [
-                "image",
                 "attach",
-                "--nobrowse",
-                "--noMount",
-                "--plist",
+                "-kernel",
+                "-nomount",
+                "-noverify",
+                "-nobrowse",
+                "-imagekey",
+                "diskimage-class=CRawDiskImage",
+                "-plist",
                 "/tmp/cowshed-malformed-attach.dmg",
             ]
         );
@@ -8016,7 +8096,10 @@ mod tests {
         assert_eq!(
             commands
                 .iter()
-                .filter(|request| argv(request).get(1).is_some_and(|arg| arg == "attach"))
+                .filter(|request| {
+                    request.program == Path::new(HDIUTIL)
+                        && argv(request).first().is_some_and(|arg| arg == "attach")
+                })
                 .count(),
             1,
             "one attach formats and verifies the image"
@@ -10828,18 +10911,14 @@ mod tests {
                 .attach_mounted(&image, &mount, access, browse)
                 .unwrap();
             let commands = backend.runner().requests();
-            let mut attach = vec!["image".to_owned(), "attach".to_owned()];
+            let mut attach = vec!["attach".to_owned()];
             if access == MountAccess::ReadOnly {
-                attach.push("--readOnly".to_owned());
+                attach.push("-readonly".to_owned());
             }
-            attach.extend([
-                "--nobrowse".to_owned(),
-                "--noMount".to_owned(),
-                "--plist".to_owned(),
-                image.display().to_string(),
-            ]);
+            attach.extend(IN_KERNEL_ATTACH.map(str::to_owned));
+            attach.push(image.display().to_string());
             assert_eq!(commands.len(), 3);
-            assert_eq!(commands[0].program, Path::new(DISKUTIL));
+            assert_eq!(commands[0].program, Path::new(HDIUTIL));
             assert_eq!(argv(&commands[0]), attach);
             assert_eq!(commands[1].program, Path::new(FSCK_APFS));
             assert_eq!(argv(&commands[1]), ["-q", "/dev/rdisk5s1"]);
@@ -11274,6 +11353,31 @@ mod tests {
             fs::remove_dir(mount).unwrap();
         }
     }
+    /// Every cowshed attach is the in-kernel DI1 attach of the exact image: `hdiutil attach -kernel`
+    /// with the RAW class, never mounted by the tool, read-only exactly when asked, the image last.
+    /// It is never a DiskImages2 attach, so neither the DI2 pool gate nor a `diskimagesiod` helper
+    /// is involved.
+    #[test]
+    fn every_attach_is_the_in_kernel_attach_of_the_exact_image() {
+        let image = Path::new("/private/cowshed/store/acme/widget/sessions/raven.dmg");
+        for access in [MountAccess::ReadWrite, MountAccess::ReadOnly] {
+            let request = in_kernel_attach(image, access);
+            assert_eq!(request.program, Path::new(HDIUTIL));
+            let args = argv(&request);
+            assert_eq!(args.first().map(String::as_str), Some("attach"));
+            assert_eq!(args.last().map(String::as_str), image.to_str());
+            assert_eq!(
+                args.iter().any(|arg| arg == "-readonly"),
+                access == MountAccess::ReadOnly
+            );
+            for flag in IN_KERNEL_ATTACH {
+                assert_eq!(args.iter().filter(|arg| *arg == flag).count(), 1, "{flag}");
+            }
+            assert!(is_image_attach(&request));
+            assert!(crate::attach_budget::refuse_attach_into_pool(&request).is_ok());
+        }
+    }
+
     #[test]
     fn a_reported_device_lost_before_verification_never_authorizes_a_second_attach() {
         let image = temp_path("lost-device-no-reattach", IMAGE_EXTENSION);
@@ -11289,7 +11393,7 @@ mod tests {
         let commands = backend.runner().requests();
         assert_eq!(commands.len(), 1);
         assert!(is_image_attach(&commands[0]));
-        assert!(argv(&commands[0]).iter().any(|arg| arg == "--noMount"));
+        assert!(argv(&commands[0]).iter().any(|arg| arg == "-nomount"));
     }
 
     /// What attaches, verifies or looks up one attachment still refuses a container with two

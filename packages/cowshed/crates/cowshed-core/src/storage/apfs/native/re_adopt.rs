@@ -906,9 +906,8 @@ mod tests {
 
     impl CommandRunner for RefuseFirstMount {
         fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-            assert_eq!(request.program, Path::new("/usr/sbin/diskutil"));
-            assert_eq!(request.args[0], "image");
-            assert_eq!(request.args[1], "attach");
+            assert_eq!(request.program, Path::new("/usr/bin/hdiutil"));
+            assert_eq!(request.args[0], "attach");
             assert!(
                 self.layout
                     .seed_of(&WorkspaceName::main(), &self.incarnation)

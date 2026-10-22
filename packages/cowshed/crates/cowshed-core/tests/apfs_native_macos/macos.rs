@@ -83,7 +83,9 @@ impl FakeInventory {
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect();
         let mut attached = self.0.lock().expect("fake inventory");
-        let stdout = if args.starts_with(&["image".into(), "attach".into()]) {
+        let stdout = if request.program == Path::new("/usr/bin/hdiutil")
+            && args.first().is_some_and(|argument| argument == "attach")
+        {
             attached.push(args.last().expect("attached image").clone());
             ATTACH_PLIST.as_bytes().to_vec()
         } else {
@@ -3958,9 +3960,8 @@ impl CommandRunner for EjectAfterAttach {
         if request.program == Path::new("/sbin/fsck_apfs") {
             self.fscks.fetch_add(1, Ordering::SeqCst);
         }
-        if request.program == Path::new("/usr/sbin/diskutil")
-            && request.args.first().is_some_and(|arg| arg == "image")
-            && request.args.get(1).is_some_and(|arg| arg == "attach")
+        if request.program == Path::new("/usr/bin/hdiutil")
+            && request.args.first().is_some_and(|arg| arg == "attach")
             && request
                 .args
                 .last()
