@@ -1146,7 +1146,7 @@ pub fn seatbelt_profile(
     push_line(
         &mut profile,
         &format!(
-            "(allow file-write* (subpath \"{}\") (literal \"/dev/null\") (literal \"/dev/stdout\") (literal \"/dev/stderr\"))",
+            "(allow file-write* (subpath \"{}\") (literal \"/dev/null\"))",
             sbpl_path(&config.exec_temp_dir)?
         ),
     );
@@ -1159,6 +1159,20 @@ pub fn seatbelt_profile(
         &mut profile,
         "allow file-read-metadata",
         Path::new("/dev/null"),
+    )?;
+    // A child opens its stdio by name too (usdt's proc macro runs `dtrace -h -s /dev/stdin -o
+    // /dev/stdout`). The names are links into /dev/fd, and Seatbelt matches the resolved
+    // spelling: a rule on a link name never admits an open, only its lookup, which is
+    // file-read-metadata. The open lands on /dev/fd/N, which duplicates a descriptor this
+    // process already holds and refuses an access mode wider than that descriptor's, so the
+    // subtree reaches nothing the child could not already read or write.
+    for link in ["/dev/stdin", "/dev/stdout", "/dev/stderr"] {
+        push_literal_rule(&mut profile, "allow file-read-metadata", Path::new(link))?;
+    }
+    push_subpath_rule(
+        &mut profile,
+        "allow file-read* file-write*",
+        Path::new("/dev/fd"),
     )?;
     push_readable_ancestors(&mut profile, &config.exec_temp_dir)?;
     // A contributed daemon leaf (Nx's run/nx) is shared across modes, never the surrounding
@@ -1537,6 +1551,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     use cowshed_os::fork_lock::Spawn as _;
     use std::fs;
+    #[cfg(target_os = "macos")]
+    use std::io::Write as _;
     #[cfg(target_os = "macos")]
     use std::process::Stdio;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3260,6 +3276,37 @@ mod tests {
         }
     }
 
+    /// Stdio names are links into /dev/fd and Seatbelt matches the resolved spelling: every role
+    /// resolves the links by metadata and opens through /dev/fd, and names no link in any other
+    /// rule, where it could never match an open (`host_controller_a_child_opens_its_stdio_by_name`
+    /// runs it).
+    #[test]
+    fn every_role_opens_stdio_through_the_descriptor_directory() {
+        let config = config(RunSandboxMode::ReadWrite);
+        for role in [
+            SandboxProfileRole::TrustedSupervisor,
+            SandboxProfileRole::ExecutedChild,
+            SandboxProfileRole::GitDiscovery,
+            #[cfg(target_os = "macos")]
+            SandboxProfileRole::GitDiscoveryGitOnly,
+        ] {
+            let profile = seatbelt_profile(&config, role).unwrap().into_text();
+            for link in ["/dev/stdin", "/dev/stdout", "/dev/stderr"] {
+                let lookup = format!("(allow file-read-metadata (literal \"{link}\"))");
+                assert!(profile.contains(&lookup), "{role:?} lacks {lookup}");
+                assert_eq!(
+                    profile.matches(&format!("(literal \"{link}\")")).count(),
+                    1,
+                    "{role:?} names {link} beyond its lookup"
+                );
+            }
+            assert!(
+                profile.contains("(allow file-read* file-write* (subpath \"/dev/fd\"))"),
+                "{role:?} lacks the descriptor directory"
+            );
+        }
+    }
+
     /// Every role that runs workspace commands executes `/bin/ps` outside the sandbox, after the
     /// broad exec allow, and no other program leaves it. Git's executes-only-Git role keeps it
     /// out with everything but Git (`git_only_profile_executes_only_git`).
@@ -3632,17 +3679,13 @@ mod tests {
         assert!(!hardlink_attempt.success());
     }
 
-    /// A child whose stdout is the null device can fstat it. Runtimes classify their stdio
-    /// before running a line — Node aborts in its process setup, with no message, when fstat on
-    /// fd 0-2 fails with anything but EBADF — so a denied fstat makes every `>/dev/null` and
-    /// every detached job's null stdout kill the runtime before it starts.
+    /// An executed child's profile over a fresh canonical root holding its HOME, mount and exec
+    /// temp dir. The caller removes the root.
     #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-    fn host_controller_a_child_can_fstat_the_null_device_its_stdio_points_at() {
+    fn host_child_profile(label: &str) -> (PathBuf, SandboxConfig, String) {
         let sequence = NEXT_SANDBOX_DIR.fetch_add(1, Ordering::Relaxed);
         let root_alias = std::env::temp_dir().join(format!(
-            "cowshed-null-device-test-{}-{sequence}",
+            "cowshed-{label}-test-{}-{sequence}",
             std::process::id()
         ));
         fs::create_dir_all(&root_alias).unwrap();
@@ -3658,6 +3701,80 @@ mod tests {
         let child = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild)
             .unwrap()
             .into_text();
+        (root, config, child)
+    }
+
+    /// A child opens its stdio by name, as usdt's proc macro runs `dtrace -h -s /dev/stdin -o
+    /// /dev/stdout`. The names are links into /dev/fd and Seatbelt matches the resolved
+    /// spelling, so a profile that names only the links refuses every such open.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_a_child_opens_its_stdio_by_name() {
+        let (root, config, child) = host_child_profile("stdio-names");
+
+        let mut run = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &child, "--", "/bin/sh", "-c"])
+            .arg("/bin/cat /dev/stdin > /dev/stdout && echo named > /dev/stderr")
+            .current_dir(&config.workspace_mount)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        run.stdin
+            .take()
+            .unwrap()
+            .write_all(b"through the links\n")
+            .unwrap();
+        let output = run.wait_with_output().unwrap();
+        // usdt's proc macro, verbatim: the provider arrives on stdin, the header leaves on stdout.
+        let mut dtrace = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &child, "--", "/usr/sbin/dtrace"])
+            .args(["-h", "-s", "/dev/stdin", "-o", "/dev/stdout"])
+            .current_dir(&config.workspace_mount)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        dtrace
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"provider cowshed_probe { probe ping(int); };\n")
+            .unwrap();
+        let header = dtrace.wait_with_output().unwrap();
+
+        fs::remove_dir_all(&root).unwrap();
+        assert!(
+            output.status.success(),
+            "stdio by name: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"through the links\n");
+        assert_eq!(output.stderr, b"named\n");
+        assert!(
+            header.status.success(),
+            "dtrace -h through stdio names: {}",
+            String::from_utf8_lossy(&header.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&header.stdout).contains("COWSHED_PROBE_PING"),
+            "{}",
+            String::from_utf8_lossy(&header.stdout)
+        );
+    }
+
+    /// A child whose stdout is the null device can fstat it. Runtimes classify their stdio
+    /// before running a line — Node aborts in its process setup, with no message, when fstat on
+    /// fd 0-2 fails with anything but EBADF — so a denied fstat makes every `>/dev/null` and
+    /// every detached job's null stdout kill the runtime before it starts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_a_child_can_fstat_the_null_device_its_stdio_points_at() {
+        let (root, config, child) = host_child_profile("null-device");
 
         // `Stdio::null()` opens the device write-only for stdout, as a shell's `>/dev/null`
         // does; BSD stat with no operand fstats its stdin, here that same descriptor.

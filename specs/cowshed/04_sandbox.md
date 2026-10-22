@@ -114,7 +114,7 @@ writes — but cannot add a permission absent from the enclosing execution profi
 
 ;; Writable roots outside the cowshed tree — the closed baseline.
 (allow file-write*
-  (literal "/dev/null") (literal "/dev/stdout") (literal "/dev/stderr")
+  (literal "/dev/null")
   … granted write paths …)
 ;; A child's stdio is often the null device, opened write-only by its parent (a
 ;; shell's `>/dev/null`, a detached job's streams), and runtimes fstat their
@@ -122,6 +122,18 @@ writes — but cannot add a permission absent from the enclosing execution profi
 ;; when that fails. fstat on a write-only descriptor is file-read-metadata, which
 ;; neither the write grant nor file-read-data on `/` includes:
 (allow file-read-metadata (literal "/dev/null"))
+;; A child also opens its stdio by name: usdt's proc macro runs
+;; `dtrace -h -s /dev/stdin -o /dev/stdout` while compiling. /dev/stdin,
+;; /dev/stdout and /dev/stderr are links into /dev/fd, and Seatbelt matches the
+;; resolved spelling (measured: a literal write rule on /dev/stdout never admits
+;; `echo x > /dev/stdout`; the open is refused as /dev/fd/1). A link name admits
+;; only its lookup, which is file-read-metadata; the open itself lands on
+;; /dev/fd/N. An fd-relative open duplicates a descriptor the process already
+;; holds and refuses an access mode wider than that descriptor's, so the subtree
+;; reaches nothing the child could not already read or write:
+(allow file-read-metadata
+  (literal "/dev/stdin") (literal "/dev/stdout") (literal "/dev/stderr"))
+(allow file-read* file-write* (subpath "/dev/fd"))
 
 ;; The cowshed tree: deny the volume, carve back the workspace's share.
 ;; `/private/cowshed/store` IS the store volume (01_storage.md) and everything cowshed mounts
