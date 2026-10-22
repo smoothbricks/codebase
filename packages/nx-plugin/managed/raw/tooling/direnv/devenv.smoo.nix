@@ -182,6 +182,15 @@ in {
       # `nx migrate` run with the installed CLI instead of the newest one;
       # `NX_USE_LOCAL=false nx migrate` restores that for the one command.
       NX_USE_LOCAL = "true";
+      # Nx loads every project-graph plugin in a worker process of its own by
+      # default, so each daemon keeps one resident Node process per plugin
+      # beside itself. Off, the daemon (or a daemonless client) loads them in
+      # its own process. Measured on a 56-project consumer's shed (2026-10-22,
+      # three restarts each): the same project graph and the same hash for all
+      # 443 tasks of `nx run-many -t lint`; the daemon tree went from 8
+      # processes, about 1.75 GB RSS, to 1 process, about 0.65 GB. Nx 23.2.1
+      # reads only "false" as off (project-graph/plugins/isolation/enabled.js).
+      NX_ISOLATE_PLUGINS = "false";
       TTSC_TYPESCRIPT_GO_DIR = "${typescriptGo}";
       SMOO_TYPECHECK_TSC = "${typecheckTsc}/bin/tsc";
     }

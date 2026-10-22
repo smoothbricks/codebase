@@ -958,8 +958,10 @@ then fails to create its cache, prints its `mkstemp` path, and resolves every lo
 
 Nx receives a real `nx` child directory below the short runtime alias through `NX_SOCKET_DIR`. Its `O_NOFOLLOW`
 admission rejects a symlink at the leaf, so the alias itself is not its socket directory. Nx does not use
-`XDG_RUNTIME_DIR`, and its default shared-temp directory is outside the sandbox. Its isolated plugin workers remain
-enabled; socket placement is a Cowshed runtime binding, not a per-project flag or filesystem grant.
+`XDG_RUNTIME_DIR`, and its default shared-temp directory is outside the sandbox. The managed shell turns Nx's plugin
+isolation off (`NX_ISOLATE_PLUGINS=false`, `tooling/direnv/devenv.smoo.nix`), so its daemon loads the project-graph
+plugins in its own process. Where isolation is on, as in a fixture that asks for it, socket placement is still a Cowshed
+runtime binding, not a per-project flag or filesystem grant.
 
 A TypeScript fixture running inside that job keeps its workspace outside every checkout in the job's private `TMPDIR`.
 Its short socket parent alias lies in the already-admitted runtime namespace and points to real leaves in the fixture's
@@ -1072,35 +1074,36 @@ unsandboxed daemon in its place (16_build_volumes.md). A repository shell that e
 replaces the checkout's, like any export, and splits the state again; a repository shell that sets them keeps a value
 already present (`${NX_CACHE_DIRECTORY:-.nx/cache}`) or leaves them unset.
 
-A kept daemon costs its host a resident Node process, about six plugin workers and a file watcher that recomputes the
-project graph on every change in the tree, per shed. Stock Nx stops a daemon after three hours without a request or a
-file event; the patched Nx 23.2.1 uses five minutes at the same `daemon/server/shutdown-utils.js` boundary. Every file
-event of the tree restarts that timer, so a tree that keeps changing never reaches it. The keeper therefore also ends
-the daemon. A shed is in use while its supervisor's ledger holds a job (a `--host` job and a land's gate job are the
-shed's jobs like any other) or a named session, and for the shed's idle bound after a job is admitted or ends, a session
-opens, or a daemon comes up. The bound is main's `.cowshed.toml` `[nx] daemon_idle` (06_cli.md, "Configuration"), a
-whole number of seconds, minutes or hours above zero such as `"10m"`, read where the sandbox's repository policy is
-read, at the supervisor's start; without it the bound is five minutes. A job's end restarts the interval itself, rather
-than the last probe that saw the job run, so the bound is measured from the moment the shed fell idle. The ledger is the
-only source: no probe reads the process table or waits on another process's kernel state, because a probe runs inside
-the supervisor's actor, and a blocking call there stops every hello and exec the supervisor answers. Work that runs as
-no job of the supervisor's, such as a host shell's `direnv exec <ws> nx …` on the mount, is not use, and the keeper may
-stop the daemon under it; such work runs through `cowshed exec`, which the ledger records. Untracked work that shows up
-again is a defect in whatever let it run outside the ledger, never a reason to bring back a process walk. Measured
-2026-10-21 at about 720 host processes and 10.25k vnode descriptors: the keeper's former look, one descriptor query of
-every process every 30 s per shed, made 12.2k `proc_info` calls and took 47-132 ms when nothing stalled it; one of those
-calls waited 51 s on the descriptor of a `cowshed fork` in uninterruptible sleep, and every supervisor that looked then
-stopped answering hello and exec (`did not answer within 10 seconds`; 2.6% of 3,528 hellos over 10 s, clustered on 13 of
-21 supervisors at once). Agents then ran their work around `cowshed exec`, which made exactly the work the look had been
-written to see. Once the shed has gone its idle bound with no job and no session in the ledger the keeper stops the
-daemon as `nx daemon --stop` does (a SIGTERM to the pid its record names, taken from the read that verified it live; its
-plugin workers go with it), says so on its stderr, and starts none until the shed is in use again: a job, a session, or
-a daemon someone else started, which the keeper then stops after another idle bound of disuse. A kept daemon is said on
-stderr with the job or session that keeps it, each time that changes. A supervisor retires only once its keeper holds no
-daemon (11_shell.md), so no daemon outlives the supervisor that watched it. The price is one Nx's own idle stop has: the
-first host client after a shed went idle finds no daemon and starts one of its own, outside the sandbox, until the
-keeper stops that one too. A daemon is stopped, never disabled: the next host Nx command, or the keeper once a job is
-admitted, starts one (16_build_volumes.md, "The Nx daemon stays on").
+A kept daemon costs its host a resident Node process (about 0.65 GB RSS in a 56-project consumer's shed, its plugins
+loaded in it rather than in workers) and a file watcher that recomputes the project graph on every change in the tree,
+per shed. Stock Nx stops a daemon after three hours without a request or a file event; the patched Nx 23.2.1 uses five
+minutes at the same `daemon/server/shutdown-utils.js` boundary. Every file event of the tree restarts that timer, so a
+tree that keeps changing never reaches it. The keeper therefore also ends the daemon. A shed is in use while its
+supervisor's ledger holds a job (a `--host` job and a land's gate job are the shed's jobs like any other) or a named
+session, and for the shed's idle bound after a job is admitted or ends, a session opens, or a daemon comes up. The bound
+is main's `.cowshed.toml` `[nx] daemon_idle` (06_cli.md, "Configuration"), a whole number of seconds, minutes or hours
+above zero such as `"10m"`, read where the sandbox's repository policy is read, at the supervisor's start; without it
+the bound is five minutes. A job's end restarts the interval itself, rather than the last probe that saw the job run, so
+the bound is measured from the moment the shed fell idle. The ledger is the only source: no probe reads the process
+table or waits on another process's kernel state, because a probe runs inside the supervisor's actor, and a blocking
+call there stops every hello and exec the supervisor answers. Work that runs as no job of the supervisor's, such as a
+host shell's `direnv exec <ws> nx …` on the mount, is not use, and the keeper may stop the daemon under it; such work
+runs through `cowshed exec`, which the ledger records. Untracked work that shows up again is a defect in whatever let it
+run outside the ledger, never a reason to bring back a process walk. Measured 2026-10-21 at about 720 host processes and
+10.25k vnode descriptors: the keeper's former look, one descriptor query of every process every 30 s per shed, made
+12.2k `proc_info` calls and took 47-132 ms when nothing stalled it; one of those calls waited 51 s on the descriptor of
+a `cowshed fork` in uninterruptible sleep, and every supervisor that looked then stopped answering hello and exec
+(`did not answer within 10 seconds`; 2.6% of 3,528 hellos over 10 s, clustered on 13 of 21 supervisors at once). Agents
+then ran their work around `cowshed exec`, which made exactly the work the look had been written to see. Once the shed
+has gone its idle bound with no job and no session in the ledger the keeper stops the daemon as `nx daemon --stop` does
+(a SIGTERM to the pid its record names, taken from the read that verified it live; its plugin workers go with it), says
+so on its stderr, and starts none until the shed is in use again: a job, a session, or a daemon someone else started,
+which the keeper then stops after another idle bound of disuse. A kept daemon is said on stderr with the job or session
+that keeps it, each time that changes. A supervisor retires only once its keeper holds no daemon (11_shell.md), so no
+daemon outlives the supervisor that watched it. The price is one Nx's own idle stop has: the first host client after a
+shed went idle finds no daemon and starts one of its own, outside the sandbox, until the keeper stops that one too. A
+daemon is stopped, never disabled: the next host Nx command, or the keeper once a job is admitted, starts one
+(16_build_volumes.md, "The Nx daemon stays on").
 
 Every stop of a daemon cowshed makes ends its plugin workers with it: the keeper's, a retirement's (02_workspaces.md)
 and a land's (16_build_volumes.md, Land 4). Nx forks each worker detached, leading its own session, so neither the job's

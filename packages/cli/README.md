@@ -590,7 +590,10 @@ nothing when nothing changed:
   (and `nx configure-ai-agents`, `nx init`) answers from the installed `nx` instead of installing `nx@latest` from the
   registry; `nx migrate` then also runs with the installed CLI, and `NX_USE_LOCAL=false` restores the newest one for
   that command. A daemon still asks GitHub for `nrwl/nx-ai-agents-config` when an agent has both rules and Nx's MCP
-  configured, to tell whether that configuration is outdated; a cowshed sandbox runs Nx without a daemon.
+  configured, to tell whether that configuration is outdated; a cowshed sandbox runs Nx without a daemon. The shell also
+  exports `NX_ISOLATE_PLUGINS=false`: Nx loads the project-graph plugins in the daemon's own process instead of one
+  worker process each. On a 56-project consumer's shed that left the project graph and every `lint` task hash unchanged
+  and cut the daemon's process tree from 8 processes and about 1.75 GB RSS to 1 process and about 0.65 GB.
 
 ### Linking Local Packages
 
