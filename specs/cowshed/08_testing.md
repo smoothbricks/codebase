@@ -358,6 +358,14 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   in as few cuts as the bound allows, and a release resumed after any cut plans exactly the cuts left. Its real boundary
   is a fragmented file on the host's filesystem, cut a few steps, abandoned, and finished by a second release that
   counts only what was left.
+- **A supervisor's opening finishes nothing and waits for no image lock** (07_api.md, "Authority model"): for any
+  generated workspace and probe name, a `Supervisor` opening observes what a `Workspaces` opening naming that one
+  workspace observes, replays no intent, selects no rename and has no retirement target; over generated scopes it and
+  `Inspect` are the only openings that finish nothing, and an opening that finishes nothing replays no intent. Its real
+  boundary is a directory-backed project whose main image lock and served workspace's lock other processes hold, beside
+  a corrupt sibling sidecar the store-wide pass refuses and an unrecorded earlier generation of the served workspace in
+  the trash: the supervisor opens, serves its settled mount and answers `hello` on its socket while both holders still
+  hold, and leaves the trash image, which an ordinary opening naming the workspace reclaims once the holders let go.
 - **Stateless restore recovery boundaries**: interrupt after undo-sidecar publication, each image/CA-key swap and
   rename, each canonical/undo parent fsync, pending metadata rename/fsync, staged-metadata removal, and final parent
   fsync. Restart twice from every fixture. Recovery must derive rollback/forward state only from APFS image, detached

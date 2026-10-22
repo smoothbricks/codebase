@@ -500,6 +500,7 @@ pub(in crate::storage) fn gc_candidate_failure_is_fatal(error: &ApfsStorageError
         ApfsStorageError::Apfs(_)
         | ApfsStorageError::Io { .. }
         | ApfsStorageError::BuildVolumeHeld { .. }
+        | ApfsStorageError::ImageLockHeld { .. }
         | ApfsStorageError::Host(_)
         | ApfsStorageError::MountIdentity(_)
         | ApfsStorageError::Quarantined { .. } => false,
@@ -4885,6 +4886,65 @@ where
         }
 
         self.detach_mounted(workspace, DetachIntent::Release)
+    }
+
+    fn mount_settled(
+        &self,
+        workspace: &LifecycleWorkspace,
+        mount_point: &Path,
+    ) -> Result<bool, ApfsStorageError> {
+        let Some(mount) = self
+            .mount_source
+            .mounts()?
+            .into_iter()
+            .find(|mount| mount.mount_point == mount_point)
+        else {
+            return Ok(false);
+        };
+        let canonical = layout(&self.config, workspace.repo())?
+            .canonical_image(workspace.name())?
+            .image()
+            .to_owned();
+        let Some(attachment) = self.backend.existing_attachment(&canonical)? else {
+            return Ok(false);
+        };
+        if mount.source_device != attachment.volume_device()
+            || !mount.owners_honoured()
+            || !self.mount_carries_marker(
+                mount_point,
+                workspace.repo(),
+                workspace.name(),
+                workspace.incarnation(),
+            )
+            || !matches!(
+                self.workspace_mount_state(workspace)?,
+                MountState::Mounted { .. }
+            )
+        {
+            return Ok(false);
+        }
+        let host = |error: crate::CowshedError| ApfsStorageError::Host(error.to_string());
+        let Some(target) = crate::build_volume::link::linked(mount_point).map_err(host)? else {
+            return Ok(true);
+        };
+        let layout = crate::build_volume::BuildVolumeLayout::new(
+            layout(&self.config, workspace.repo())?.project(),
+        )?;
+        let Some(id) = layout.volume_at(&target) else {
+            return Ok(false);
+        };
+        if !matches!(
+            layout.resolve_link(workspace.name(), &id).map_err(host)?,
+            crate::build_volume::LinkResolution::Keep
+        ) {
+            return Ok(false);
+        }
+        let Some(attachment) = self.backend.existing_attachment(&layout.image(&id))? else {
+            return Ok(false);
+        };
+        Ok(self
+            .mounted_at(&layout.mount(&id))?
+            .is_some_and(|device| device == attachment.volume_device()))
     }
 
     fn detach(

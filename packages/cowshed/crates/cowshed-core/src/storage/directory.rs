@@ -1702,6 +1702,46 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         Ok(())
     }
 
+    fn mount_settled(
+        &self,
+        workspace: &LifecycleWorkspace,
+        mount_point: &Path,
+    ) -> Result<bool, ApfsStorageError> {
+        let storage = layout(&self.config, workspace.repo())?;
+        let canonical = storage
+            .canonical_image(workspace.name())?
+            .image()
+            .to_owned();
+        if observed_mount(&canonical)?.as_deref() != Some(mount_point)
+            || !self.marker_names(
+                mount_point,
+                workspace.repo(),
+                workspace.name(),
+                workspace.incarnation(),
+            )
+            || !matches!(
+                self.workspace_mount_state(workspace)?,
+                MountState::Mounted { .. }
+            )
+        {
+            return Ok(false);
+        }
+        let Some(target) = crate::build_volume::link::linked(mount_point).map_err(host_error)?
+        else {
+            return Ok(true);
+        };
+        let build = crate::build_volume::BuildVolumeLayout::new(storage.project())?;
+        let Some(id) = build.volume_at(&target) else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            build
+                .resolve_link(workspace.name(), &id)
+                .map_err(host_error)?,
+            crate::build_volume::LinkResolution::Keep
+        ) && observed_mount(&build.image(&id))?.as_deref() == Some(build.mount(&id).as_path()))
+    }
+
     /// The workspace's mount, kept: the canonical payload must be mounted, through this handle,
     /// at the workspace's mountpoint. The mount id is the mount record's inode.
     fn retain_mounted(

@@ -47,11 +47,27 @@ publication recovery on a workspace request use that same scope: held canonical 
 to recover before any sidecar is read. Store-wide recovery is an explicit startup/maintenance pass, not a dependency of
 a live job's supervisor lookup.
 
-A cold `Workspaces` or `Removal` opening observes main and its explicitly selected names, filtering pending and retired
-records before reading their sidecars. It additionally observes the invocation-origin workspace only to validate its
-host-backed marker against authoritative facts; that extra observation grants no publication-recovery lock or intent
-replay. Selected identity, marker, project binding and active-versus-trash checks remain mandatory. `Store`, `Inspect`
-and explicit project enumeration retain full inventory reads and their diagnostic failures.
+A cold `Workspaces`, `Removal` or `Supervisor` opening observes main and its explicitly selected names, filtering
+pending and retired records before reading their sidecars. It additionally observes the invocation-origin workspace only
+to validate its host-backed marker against authoritative facts; that extra observation grants no publication-recovery
+lock or intent replay. Selected identity, marker, project binding and active-versus-trash checks remain mandatory.
+`Store`, `Inspect` and explicit project enumeration retain full inventory reads and their diagnostic failures.
+
+A `Supervisor` opening, the one `cowshed __workspace-supervisor` makes before it serves (11_shell.md, "Supervisor"),
+observes exactly what a `Workspaces` opening naming its one workspace observes and finishes nothing, as `Inspect` does:
+it replays no intent, `main`'s included, completes no publication or restore, reclaims no trash, finishes no identity
+change and writes no binding, so it takes no image lock. The command that asked for the supervisor has already opened
+under its own scope and finished what was its; a lock held now is a live lifecycle operation's, such as a fork's, which
+holds its source's lock, `main`'s included, through its whole clone (16_build_volumes.md, "Fork" step 1), minutes on a
+large build image. Residue left since stays for that operation, or the next ordinary command, to finish.
+
+The supervisor's start mounts its workspace without waiting either. With the workspace's image lock free it settles the
+mount under that lock as every caller does. With the lock held, a workspace already mounted from its own image, its
+owners honoured, carrying its marker, and with its build link absent or kept on a mounted volume of its own is served as
+it stands; any other refuses as a conflict naming the lock's holders by PID and command, because only that lock
+authorizes healing, mounting or relinking it. Every other caller still waits for the lock before it settles a mount.
+Measured 2026-10-22: supervisors whose openings waited for `main.dmg.lock` behind concurrent forks' clones were killed
+at the manager's start bound as supervisors that "did not serve".
 
 ## cowshed-core (Rust)
 

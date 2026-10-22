@@ -552,6 +552,18 @@ impl ApfsExecutionHost for FakeHost {
         Ok(())
     }
 
+    fn mount_settled(
+        &self,
+        workspace: &LifecycleWorkspace,
+        _: &Path,
+    ) -> Result<bool, ApfsStorageError> {
+        self.record("mount-settled");
+        Ok(matches!(
+            self.workspace_mount_state(workspace)?,
+            MountState::Mounted { .. }
+        ))
+    }
+
     fn retain_mounted(
         &self,
         workspace: &LifecycleWorkspace,

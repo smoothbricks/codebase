@@ -2,8 +2,10 @@
 //! a process of its own, serving the workspace's socket until a client retires it.
 //!
 //! Not a user verb and not in the command map: the process that owns a workspace's supervisor
-//! starts it. It opens the project exactly as any verb does, mounts the workspace if it has to,
-//! and then serves nothing but that supervisor.
+//! starts it. It reads the project as a verb naming the workspace does but finishes nothing, so it
+//! waits for no image lock ([`RecoveryScope::Supervisor`]). It mounts the workspace when it has
+//! to and the workspace's lock is free, serves one that already stands mounted while a live
+//! operation holds that lock, and then serves nothing but that supervisor.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -58,7 +60,7 @@ async fn serve(arguments: &[OsString]) -> Result<()> {
         })?;
     let runtime = ProjectRuntime::open_existing(
         PathBuf::from(project),
-        RecoveryScope::Workspaces(std::collections::BTreeSet::from([workspace.clone()])),
+        RecoveryScope::Supervisor(workspace.clone()),
         crate::gateway_service::runtime_control,
     )
     .await?;

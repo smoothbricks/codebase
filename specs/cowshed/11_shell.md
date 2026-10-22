@@ -244,6 +244,9 @@ into `OsString` for `plan_exec`; no `String`, lossy rendering, or alternate supe
   waits for the keeper to settle, never became true. Every caller in another process that stops a supervisor goes
   through this one request: `detach`, `rm`, `grant` growing the port block, `doctor --repair` moving a colliding port
   block, and re-adopting main.
+- Its start waits for no image lock (07_api.md, "Authority model"): its opening finishes nothing, and while a live
+  lifecycle operation, such as a fork of its source, `main`'s included, holds the workspace's lock, an already settled
+  mount is served as it stands and one that needs settling refuses, naming the holders, rather than wait.
 
 ## Protocol
 

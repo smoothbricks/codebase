@@ -520,6 +520,13 @@ pub enum RecoveryScope {
     /// unpublished create or fork is left for the retirement to retire rather than finished
     /// first, so nothing that stopped the clone can also stop its removal.
     Removal(WorkspaceName),
+    /// A workspace supervisor's own opening (`cowshed __workspace-supervisor`): what
+    /// [`Self::Workspaces`] of its one workspace observes, finishing nothing, as [`Self::Inspect`]
+    /// does, so it takes no image lock. The command that asked for the supervisor opened under its
+    /// own scope first and finished what was its; a lock held now is a live lifecycle operation's
+    /// (a fork holds its source's, `main`'s included, through its whole clone), and residue left
+    /// since is that operation's, or the next ordinary command's, to finish.
+    Supervisor(WorkspaceName),
     /// Inspection (`doctor` without `--repair`): the opening finishes nothing. No lifecycle intent
     /// is replayed, `main`'s included; no interrupted publication or restore is completed; no
     /// retired image is reclaimed; no identity change is finished; no healed binding is written.
@@ -553,13 +560,15 @@ impl RecoveryScope {
                 names.insert(WorkspaceName::main());
                 Some(names)
             }
-            Self::Removal(name) => Some([WorkspaceName::main(), name.clone()].into()),
+            Self::Removal(name) | Self::Supervisor(name) => {
+                Some([WorkspaceName::main(), name.clone()].into())
+            }
         }
     }
 
     fn replay(&self, workspace: &WorkspaceName) -> IntentReplay {
         match self {
-            Self::Inspect => IntentReplay::Leave,
+            Self::Inspect | Self::Supervisor(_) => IntentReplay::Leave,
             _ if workspace.is_main() => IntentReplay::Own,
             Self::Store => IntentReplay::Residue,
             Self::Workspaces(named) if named.contains(workspace) => IntentReplay::Own,
@@ -571,7 +580,7 @@ impl RecoveryScope {
     fn removal_target(&self) -> Option<&WorkspaceName> {
         match self {
             Self::Removal(target) => Some(target),
-            Self::Store | Self::Workspaces(_) | Self::Inspect => None,
+            Self::Store | Self::Workspaces(_) | Self::Supervisor(_) | Self::Inspect => None,
         }
     }
 
@@ -579,7 +588,7 @@ impl RecoveryScope {
     fn repairs(&self) -> bool {
         match self {
             Self::Store | Self::Workspaces(_) | Self::Removal(_) => true,
-            Self::Inspect => false,
+            Self::Inspect | Self::Supervisor(_) => false,
         }
     }
 }
@@ -697,6 +706,68 @@ mod recovery_scope_tests {
         assert!(unfinished_rename_claim(&rename, &name("c")).is_none());
         assert!(unfinished_rename_claim(&fork, &name("a")).is_none());
         assert!(unfinished_rename_claim(&fork, &name("b")).is_none());
+    }
+
+    /// A workspace name drawn from a small alphabet, `main` included, so that drawn names meet.
+    fn workspace_name() -> impl proptest::strategy::Strategy<Value = WorkspaceName> {
+        use proptest::strategy::Strategy as _;
+        proptest::prop_oneof![
+            proptest::strategy::Just(WorkspaceName::main()),
+            "[a-c]".prop_map(|value| name(&value)),
+        ]
+    }
+
+    fn recovery_scope() -> impl proptest::strategy::Strategy<Value = RecoveryScope> {
+        use proptest::strategy::Strategy as _;
+        proptest::prop_oneof![
+            proptest::strategy::Just(RecoveryScope::Store),
+            proptest::strategy::Just(RecoveryScope::Inspect),
+            proptest::collection::btree_set(workspace_name(), 0..4)
+                .prop_map(RecoveryScope::Workspaces),
+            workspace_name().prop_map(RecoveryScope::Removal),
+            workspace_name().prop_map(RecoveryScope::Supervisor),
+        ]
+    }
+
+    proptest::proptest! {
+        /// A supervisor's opening reads what a verb naming its one workspace reads, and finishes
+        /// nothing: no intent replayed, `main`'s included, no rename selected by its source, no
+        /// retirement target. So it takes no image lock, and never queues behind a live lifecycle
+        /// operation, as a fork cloning main holds main's.
+        #[test]
+        fn a_supervisor_observes_as_a_verb_naming_its_workspace_and_finishes_nothing(
+            served in workspace_name(),
+            other in workspace_name(),
+        ) {
+            let supervisor = RecoveryScope::Supervisor(served.clone());
+            proptest::prop_assert_eq!(
+                supervisor.observation_names(),
+                RecoveryScope::Workspaces([served].into()).observation_names()
+            );
+            proptest::prop_assert!(!supervisor.repairs());
+            proptest::prop_assert_eq!(supervisor.replay(&other), IntentReplay::Leave);
+            proptest::prop_assert_eq!(supervisor.removal_target(), None);
+            let rename = LifecycleIntent::Fork {
+                source: other,
+                destination: name("renamed"),
+                rename: true,
+            };
+            proptest::prop_assert!(!rename_selected_by_source(&supervisor, &rename));
+        }
+
+        /// Inspection and a supervisor's opening are the only openings that finish nothing, and an
+        /// opening that finishes nothing replays no intent.
+        #[test]
+        fn only_inspection_and_a_supervisor_finish_nothing(
+            scope in recovery_scope(),
+            probe in workspace_name(),
+        ) {
+            proptest::prop_assert_eq!(
+                !scope.repairs(),
+                matches!(scope, RecoveryScope::Inspect | RecoveryScope::Supervisor(_))
+            );
+            proptest::prop_assert!(scope.repairs() || scope.replay(&probe) == IntentReplay::Leave);
+        }
     }
 }
 
@@ -8260,14 +8331,25 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             current.derived.mount_state,
             crate::storage::lifecycle::MountState::Detached
         );
-        let mount = cowshed_os::timing::spanned(
-            "supervisor",
-            "ensure-mounted",
-            self.substrate
-                .ensure_mounted(&current.derived.workspace, MountIntent { browse: false }),
-        )
-        .await
-        .map_err(native_storage_error)?;
+        // A supervisor's own start waits for no image lock (11_shell.md, "Supervisor"); every
+        // other caller settles the mount under the workspace's lock.
+        let mounting = async {
+            match &self.recovery_scope {
+                RecoveryScope::Supervisor(served) if served == name => {
+                    self.substrate
+                        .mount_for_supervisor(&current.derived.workspace)
+                        .await
+                }
+                _ => {
+                    self.substrate
+                        .ensure_mounted(&current.derived.workspace, MountIntent { browse: false })
+                        .await
+                }
+            }
+        };
+        let mount = cowshed_os::timing::spanned("supervisor", "ensure-mounted", mounting)
+            .await
+            .map_err(native_storage_error)?;
         if was_detached {
             self.advance_gateway_revision(&current).await?;
             current = self.current(name).await?;
@@ -19494,6 +19576,14 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
             CowshedError::integrity(error.to_string(), format!("cowshed rekey {workspace}"))
         }
 
+        // A live lifecycle operation holds the lock: the store is healthy, and the remedy is that
+        // operation finishing, so the generic repair hint would mislead.
+        error @ crate::storage::apfs::ApfsStorageError::ImageLockHeld { .. } => {
+            CowshedError::conflict(
+                error.to_string(),
+                "retry once the operation holding the lock has finished",
+            )
+        }
         crate::storage::apfs::ApfsStorageError::MarkerMismatch(message)
         | crate::storage::apfs::ApfsStorageError::Host(message) => {
             CowshedError::integrity(message, "cowshed doctor --json")

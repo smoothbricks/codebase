@@ -134,7 +134,7 @@ impl Fixture {
     async fn open_as_supervisor(&self, workspace: &str) -> Result<ProjectRuntime> {
         ProjectRuntime::open_directory_existing_at(
             &self.checkout,
-            RecoveryScope::Workspaces([name(workspace)].into()),
+            RecoveryScope::Supervisor(name(workspace)),
             self.storage.clone(),
             refusing_gateway::connect,
         )
