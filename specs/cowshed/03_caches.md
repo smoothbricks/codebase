@@ -529,6 +529,44 @@ The package follows the repository's public-package release conventions (`npm:pu
 versions, normal build/release targets). Each consumer migration adopts the published dependency and deletes the
 superseded source in the same change.
 
+## What a land re-runs
+
+A cached task's key is every input it declares: its files, its dependencies' files, its environment, runtime and
+toolchain inputs. With a warm cache holding a valid entry for each key, a land gate runs only the tasks whose key the
+landed commits (or a changed runtime or toolchain input) changed, plus the targets that state `"cache": false`, each for
+a reason its configuration names; a re-gate of an unchanged tree runs those uncached targets alone. A cold, evicted or
+unreachable entry runs its task again, as a cache degrade does (Nx accepted-task artifact service, above). Four rules
+keep the key no wider than what a task observes, each learned from a measured miss (2026-10-22, tg#9675: twenty minutes
+of gate for a one-line change).
+
+- **A target split from a cached target states its own cache.** Nx caches a target only when its own configuration or a
+  `targetDefaults` entry for its exact name says so; `targetDefaults.test` keys the target named `test` and no other.
+  When nx-plugin's and cli's Bun suites became `test` aggregates over `test-shardN`, `test-host` and `test-shell-entry`
+  (2026-10-02), those targets stated nothing and never cached again: 0 hits in 8-9 gates each, `nx-plugin:test-shard2`
+  up to 849 s, on every land whatever it changed. Each states `"cache": true` with the inputs the unsharded `test` had,
+  and `smoo monorepo validate` refuses any target a cached `nx:noop` aggregate runs from its own project that states no
+  `cache`. It reads the aggregate's members through Nx's own `dependsOn` normalization, so `project:target`,
+  `projects: [self]` and target patterns count and `^` edges do not.
+- **Dependents key on a dependency's files without its tests.** `^default` is all of a dependency's files, its tests
+  included: one nx-plugin test file (297acb6d6) re-ran six statebus suites and tooling's, which reach nx-plugin only
+  through cli and cannot observe it. The named input `dependencyDefault` is `default` without `__tests__/`, `*.test.*`,
+  `*.spec.*` and the Bun shard manifest `test-timings.json`; build, test and cargo-test name `^dependencyDefault`. A
+  dependency's exported testing helpers (`src/testing.ts`) and runtime scripts still key its dependents.
+- **A gate's runners size their own test threads.** The gate's orchestrator holds one CPU token and its pool relays
+  every runner's ask to the host, so it exports no `RUST_TEST_THREADS`/`NEXTEST_TEST_THREADS` (05_gateway.md, "The
+  holder exports it"). While it exported 1, every Rust suite in every gate ran on one thread: `tokens=1/1` in each
+  runner from 2026-10-20, and cowshed-cli's 487 tests summed to their 1225 s wall, the tail of a 24m55s gate for a
+  three-file Rust change.
+- **A suite that outlasts the rest of the gate is sharded.** A runner's grant never grows, so one long runner finishes
+  on the tokens it started with while the host idles. cowshed-cli runs in eight hash partitions
+  (`[package.metadata.smoothbricks.test] shards = 8`), as cowshed-core does: 492 tests, the longest runner 95 s.
+
+Cargo's own reuse is not where the time goes: a TypeScript-only land compiled no Rust unit, and a cowshed-core change
+compiled exactly the seven cowshed crates downstream of it. The targets that state `"cache": false` are `cargo-fetch`
+and `cargo-test-compile` (the shared Cargo directories are no Nx output; nx-plugin README, "Cargo cache boundaries"),
+`shard-timings`, `tooling:lint-disk-commands`, the ttsc and capability-probe warmups (their caches live outside Nx
+outputs) and the packaging checks; they are what a re-gate re-runs.
+
 ## Convention table
 
 Cache classification is a built-in table keyed by well-known names — never configuration:
