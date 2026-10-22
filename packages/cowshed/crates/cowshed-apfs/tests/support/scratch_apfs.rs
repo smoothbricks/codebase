@@ -80,7 +80,17 @@ impl ScratchRoot {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&path)?;
+        match fs::create_dir(&path) {
+            Ok(()) => {}
+            // This process never made this name: its counter is its own. So the root is a dead
+            // earlier holder's of the same pid, which the sweep takes for live; release what it
+            // left through the owned cleanup, attached images included, then take the name.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                tear_down_root(&path)?;
+                fs::create_dir(&path)?;
+            }
+            Err(error) => return Err(error),
+        }
         cowshed_os::eprintln!("scratch root {}: {label}", path.display());
         Ok(Self {
             path,
