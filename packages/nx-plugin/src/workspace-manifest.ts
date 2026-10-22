@@ -181,9 +181,10 @@ export interface PackagePrivateNpmConfig {
  * shell (tooling/direnv/secret-references.ts). Absent means every workspace
  * keeps its own local cache and nothing is shared.
  *
- * The pair is emitted whole or not at all, because Nx accepts only 200 or 404
- * from a cache server: a server without a working credential fails every task
- * with 401 rather than missing quietly.
+ * The pair is emitted whole or not at all: the managed Nx patch reads a cache
+ * server that cannot answer (unreachable, a 5xx, or silent for 90 s) as a
+ * miss, but a server without a working credential fails every task with 401
+ * rather than missing quietly.
  */
 export interface PackageRemoteCacheConfig {
   /**

@@ -1217,10 +1217,11 @@ One Nx self-hosted remote cache shared by every runner and every developer shell
   reads the cache and cannot publish into it.
 
 Both generated workflows put `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` and `NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN` in
-every job env that runs Nx. The pair is emitted whole or not at all: Nx enables its cache on a nonempty server alone and
-accepts only 200 or 404 from it, so a server it cannot authenticate to fails every task on 401 instead of missing
-quietly. That is also why a declared cache puts the same-repository gate on Validate that a private dependency install
-does — a fork pull request receives no secrets, and a job with half the pair would fail everything.
+every job env that runs Nx. The pair is emitted whole or not at all: Nx enables its cache on a nonempty server alone,
+and while the managed Nx patch reads a cache that cannot answer (a refused or dropped connection, a 5xx, or no answer
+within 90 s) as a miss, a server it cannot authenticate to fails every task on 401 instead of missing quietly. That is
+also why a declared cache puts the same-repository gate on Validate that a private dependency install does — a fork pull
+request receives no secrets, and a job with half the pair would fail everything.
 
 Developer shells get the pair from the managed `tooling/direnv/secret-references.ts`, which the managed devenv
 `enterShell` runs and `eval`s: it prints the two exports when the declared token has a value, prints nothing when it has
