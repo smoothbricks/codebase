@@ -5,6 +5,12 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import fc from 'fast-check';
+import {
+  DEADLINE_PATIENCE as RAW_DEADLINE_PATIENCE,
+  TEARDOWN_PATIENCE as RAW_TEARDOWN_PATIENCE,
+  describeMembersLeft as rawDescribeMembersLeft,
+  judgeReap as rawJudgeReap,
+} from '../managed/raw/tooling/direnv/cargo-fetch-bound.js';
 import { churnFailures, startChurn } from './__tests__/churn-group.js';
 import {
   DEADLINE_PATIENCE,
@@ -101,6 +107,46 @@ describe('the decision to signal a process group again', () => {
         const rest = told.replace(command, '');
         expect(rest).not.toContain('was killed');
         expect(rest).not.toContain('still had members');
+      }),
+    );
+  });
+});
+
+describe('the managed raw copy of the decision', () => {
+  // The script cargo-fetch-run.ts runs before anything is installed and cannot import src/process-group.ts, so it keeps
+  // a copy of the decision, and the two must not drift: the same facts get the same verdict, the patiences are the same
+  // numbers, and a group a kill could not empty is described in the same words. How each says what a blocking kill
+  // leaves differs in its last clause, since the script is ending and this process waits for the kill; each has its own
+  // property.
+  it('judges any facts as src/process-group.ts does', () => {
+    // The rounds around the end of a patience, where a verdict turns from signalling to giving up, and whatever a
+    // subtraction of two counters can hand over.
+    const nearTheEnd = fc
+      .tuple(fc.integer({ min: 0, max: 600 }), fc.integer({ min: -2, max: 2 }))
+      .map(([rounds, offset]) => ({ rounds, round: rounds + offset }));
+    const anyCounters = fc.record({ round: anyReading, rounds: anyReading });
+    fc.assert(
+      fc.property(
+        fc.oneof(nearTheEnd, anyCounters),
+        anyReading,
+        fc.boolean(),
+        ({ round, rounds }, pauseMs, members) => {
+          const facts = { round, patience: { rounds, pauseMs }, members };
+          expect(rawJudgeReap(facts)).toEqual(judgeReap(facts));
+        },
+      ),
+    );
+  });
+
+  it('is as patient as src/process-group.ts, on the way out and at a deadline', () => {
+    expect(RAW_TEARDOWN_PATIENCE).toEqual(TEARDOWN_PATIENCE);
+    expect(RAW_DEADLINE_PATIENCE).toEqual(DEADLINE_PATIENCE);
+  });
+
+  it('describes a group its kill could not empty in the same words as src/process-group.ts', () => {
+    fc.assert(
+      fc.property(fc.integer({ min: 1, max: 4_194_304 }), (group) => {
+        expect(rawDescribeMembersLeft(group)).toBe(describeMembersLeft(group));
       }),
     );
   });

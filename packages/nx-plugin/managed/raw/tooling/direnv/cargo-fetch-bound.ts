@@ -225,7 +225,7 @@ export interface TeardownFacts {
  */
 export function describeTeardown({ command, group }: TeardownFacts): string {
   return [
-    `${command} was killed on the way out, but process group ${group} was still listed when the kill gave up;`,
+    `While ending ${command}, process group ${group} was still listed when the kill gave up;`,
     'whether a process in it still runs is unconfirmed, because its leader is listed until this process reaps it,',
     'which it cannot do while it is ending.',
   ].join(' ');

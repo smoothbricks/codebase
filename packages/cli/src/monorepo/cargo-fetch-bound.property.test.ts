@@ -169,6 +169,11 @@ describe('the bound on a cargo fetch', () => {
         expect(line).toContain(command);
         expect(line).toContain(`process group ${group} was still listed`);
         expect(line).toContain('unconfirmed');
+        // Nothing here establishes that the kill worked, nor that members remain: what the unreaped leader alone
+        // explains is neither.
+        const rest = line.replace(command, '');
+        expect(rest).not.toContain('was killed');
+        expect(rest).not.toContain('still had members');
       }),
     );
   });
