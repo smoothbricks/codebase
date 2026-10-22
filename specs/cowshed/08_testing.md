@@ -199,16 +199,18 @@ is not a real APFS mount or cache cutover proof.
 Inside a workspace's port block, the gateway's own port `COWSHED_PORT_BASE` stays reserved: an upstream fixture binds
 the first free odd-offset service port (`base+1`, `base+3`, …, `base+size-1`), never port 0 or a port outside the block.
 Even-offset session ports are bindable only by the holder of their adjacent service port; every allocator follows this
-same claim protocol. A block exported without its size, or the reverse, fails loudly by name. Inside a Cow test gateway,
-`free_endpoint` allocates aligned two-port sub-blocks starting at `base+2`, never the reserved real gateway `base`; each
-claimed service port is a single listener, and its claim is retained for the listener's lifetime. Outside a workspace, a
-fixture binds any free loopback port through the existing global allocator. The private actor fixture installer claims
-the adjacent service port first, then the session port in one fork-lock creation step. The service-port claim remains
-held until the installed listener is quiesced. It excludes other fixture installers across test processes throughout the
-session port's release/rebind handoff; requests and the other tests remain parallel. Both claims use the existing
-fork-lock `Fenced` value (11_shell.md): socket creation and release wait only for concurrent spawns in flight, so
-another fixture's pre-exec descriptor copy cannot outlive the release/rebind handoff. No process-local installer mutex
-is needed.
+same claim protocol. Inside the block, a fixture that needs a port where nothing listens holds a service port and hands
+out its session port, which it leaves unbound; it never hands out a port it bound and closed. Outside a block no shared
+allocator exists to claim against, and such a fixture hands out a port-0 listener's port after closing it. A block
+exported without its size, or the reverse, fails loudly by name. Inside a Cow test gateway, `free_endpoint` allocates
+aligned two-port sub-blocks starting at `base+2`, never the reserved real gateway `base`; each claimed service port is a
+single listener, and its claim is retained for the listener's lifetime. Outside a workspace, a fixture binds any free
+loopback port through the existing global allocator. The private actor fixture installer claims the adjacent service
+port first, then the session port in one fork-lock creation step. The service-port claim remains held until the
+installed listener is quiesced. It excludes other fixture installers across test processes throughout the session port's
+release/rebind handoff; requests and the other tests remain parallel. Both claims use the existing fork-lock `Fenced`
+value (11_shell.md): socket creation and release wait only for concurrent spawns in flight, so another fixture's
+pre-exec descriptor copy cannot outlive the release/rebind handoff. No process-local installer mutex is needed.
 
 An exact-count network fixture, including single-shot HTTP and TLS backends, keeps its listener owned until the test
 releases its fixture handle or its joined result, even after its accept loop finishes (including a zero-count loop). A

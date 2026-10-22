@@ -110,9 +110,11 @@ bytes is refused with an error naming it. The shell owner retains a failed socke
 foreign-workspace provider refuses before running a target and preserves its complete diagnostic. `fixtureNxEnv` gives
 each fixture its own `NX_SOCKET_DIR`; retirement stops its daemon before unlinking its verified parent alias and
 removing the fixture root. A test whose subject is two daemons names a distinct real leaf for each. A listener another
-process connects to (the counted Cargo broker, a remote-cache server) binds through `bindListener`: a port of the
-workspace's `COWSHED_PORT_BASE`/`COWSHED_PORT_BLOCK_SIZE` block, lowest first, skipping only ports in use, and port 0
-outside a block.
+process connects to (the counted Cargo broker, a remote-cache server) binds through `bindListener`: an odd-offset
+service port of the workspace's `COWSHED_PORT_BASE`/`COWSHED_PORT_BLOCK_SIZE` block, lowest first, skipping only ports
+in use, and port 0 outside a block. A client that must be refused gets `claimRefusingPort`: the even session port of a
+service port the test holds, which nothing binds (`specs/cowshed/08_testing.md`), never a port bound and closed, which
+the next allocator in the block binds.
 
 On macOS the working-directory holder census invokes `/usr/sbin/lsof` explicitly, independent of a test or devenv
 `PATH`. A missing or inaccessible census tool fails cleanup with its command error; it never means no holders. Only

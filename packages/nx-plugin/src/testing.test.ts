@@ -1,12 +1,14 @@
 import { expect, it } from 'bun:test';
 import { existsSync, lstatSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises';
-import { createConnection, createServer } from 'node:net';
+import { createConnection, createServer, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fixtureNxEnv, nxFixtureRoot, withNxFixture } from './__tests__/fixture-nx-env.js';
 import {
   awaitExit,
+  bindListener,
+  claimRefusingPort,
   fixtureSocketDirectory,
   isRunning,
   NX_LONGEST_SOCKET_NAME,
@@ -506,4 +508,50 @@ setInterval(() => {}, 1 << 30);
     await rm(suiteDirectory, { recursive: true, force: true });
     await rm(otherParent, { recursive: true, force: true });
   }
+});
+
+/** A loopback listener on `port` (0: the kernel's choice); rejects with the bind's own error. */
+function listenOn(port: number): Promise<Server> {
+  const { promise, resolve, reject } = Promise.withResolvers<Server>();
+  const server = createServer((socket) => socket.destroy());
+  server.once('error', reject);
+  server.listen(port, '127.0.0.1', () => {
+    server.off('error', reject);
+    resolve(server);
+  });
+  return promise;
+}
+
+function portOf(server: Server): number {
+  const address = server.address();
+  if (address === null || typeof address === 'string') throw new Error(`not a TCP listener: ${String(address)}`);
+  return address.port;
+}
+
+function closeServer(server: Server): Promise<void> {
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  server.close((error) => (error ? reject(error) : resolve()));
+  return promise;
+}
+
+it('hands out a refusing port that no listener takes while it is held, and that nothing holds', async () => {
+  await using refused = await claimRefusingPort();
+  // In a block, a lowest-first scan over every offset would reach the session port before most service ports.
+  const servers: Server[] = [];
+  try {
+    for (let count = 0; count < 4; count += 1) servers.push(await bindListener(listenOn));
+    expect(servers.map(portOf)).not.toContain(refused.port);
+  } finally {
+    await Promise.all(servers.map(closeServer));
+  }
+  // Nothing listens on it, so a connect is refused.
+  const { promise: refusal, resolve } = Promise.withResolvers<unknown>();
+  const client = createConnection(refused.port, '127.0.0.1');
+  client.once('connect', () => resolve('connected'));
+  client.once('error', (error) => resolve('code' in error ? error.code : error.message));
+  expect(await refusal).toBe('ECONNREFUSED');
+  client.destroy();
+  // And nothing holds it, not even a socket bound and never listening (on macOS a black hole, not a refusal): its
+  // claimant binds it itself.
+  await closeServer(await listenOn(refused.port));
 });

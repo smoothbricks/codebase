@@ -10,7 +10,7 @@ import {
   settleRemoteCacheRequest,
 } from 'nx/src/tasks-runner/remote-cache-outage.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
-import { bindListener } from './testing.js';
+import { bindListener, claimRefusingPort } from './testing.js';
 
 /**
  * Guards the remote-cache outage hunk of `patches/nx@23.2.1.patch` (`patches/README.md`, "A remote cache outage is a
@@ -214,9 +214,9 @@ function requestHeads(sockets: Set<Socket>, heads: string[]): (socket: Socket) =
 
 describe('a run against an unreachable remote cache', () => {
   it('builds when the cache port refuses connections', async () => {
-    // Bound, then closed: a port of this job's block where nothing listens.
-    const { server, origin } = await listen((socket) => socket.destroy());
-    await close(server);
+    // The session port of a service port this test holds: nothing listens on it, and no other test binds it meanwhile.
+    await using refused = await claimRefusingPort();
+    const origin = `http://127.0.0.1:${refused.port}`;
     await withNxFixture('nx-cache-refused-', async ({ workspace, socketDirectory }) => {
       await buildFixture(workspace);
       expectRanWithoutCache(await build(workspace, socketDirectory, origin), origin, 'Failed to send request');

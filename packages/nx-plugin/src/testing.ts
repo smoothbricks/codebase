@@ -31,6 +31,7 @@ import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { lstatSync, readlinkSync, realpathSync, statSync } from 'node:fs';
 import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { createServer, type Server } from 'node:net';
 import { tmpdir, userInfo } from 'node:os';
 import { dirname, isAbsolute, join, sep } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -897,7 +898,10 @@ export async function retireFixtureSocketDirectory(workspace: string): Promise<v
 type PortBlockEnvironment =
   /** Outside Cowshed, or on Linux: no block, so a listener binds port 0 as usual. */
   | { readonly kind: 'none' }
-  /** The gateway listens on `base`; service ports are `base+1 … base+size-1`. */
+  /**
+   * The gateway listens on `base`. Fixture listeners take the odd offsets `base+1, base+3, … base+size-1`, the
+   * service ports; each even offset above `base` is the session port of the service port above it (08_testing.md).
+   */
   | { readonly kind: 'block'; readonly base: number; readonly size: number }
   | { readonly kind: 'broken'; readonly reason: string };
 
@@ -949,15 +953,51 @@ function portBlockEnvironment(env: NodeJS.ProcessEnv): PortBlockEnvironment {
   return { kind: 'block', base, size };
 }
 
+/** The block's service ports from `base+first` on, lowest first: its odd offsets (08_testing.md). */
+function servicePorts(block: { readonly base: number; readonly size: number }, first: 1 | 3): number[] {
+  const ports: number[] = [];
+  for (let offset = first; offset < block.size; offset += 2) ports.push(block.base + offset);
+  return ports;
+}
+
+/**
+ * `bind` on each of `candidates` in turn, and the first that binds. Only `EADDRINUSE` (by `code`) moves on to
+ * the next; any other failure is that bind's own and surfaces as is, and so does the last candidate's, so an exhausted
+ * block reports `EADDRINUSE`, never a silent port 0.
+ */
+async function bindFirstFree<T>(
+  block: { readonly base: number; readonly size: number },
+  candidates: readonly number[],
+  bind: (port: number) => T | Promise<T>,
+): Promise<T> {
+  const last = candidates.at(-1);
+  if (last === undefined) {
+    throw new Error(`the Cowshed port block ${block.base}+${block.size} has no service port to bind`);
+  }
+  for (const port of candidates.slice(0, -1)) {
+    try {
+      return await bind(port);
+    } catch (error) {
+      if (errorCode(error) !== 'EADDRINUSE') {
+        throw error;
+      }
+    }
+  }
+  return bind(last);
+}
+
 /**
  * Bind a real listener where a Cowshed job's other processes can connect to
- * it. In a block, `bind` is called with each candidate `base+1 … base+size-1`,
- * lowest first (a long-lived test listener scans from the bottom), and the
- * first that binds is kept: only a real bind claims a port, so nothing probes
- * and closes. Only `EADDRINUSE` (by `code`) moves on to the next candidate;
- * any other failure is that bind's own and surfaces as is, and so does the
- * last candidate's, so an exhausted block reports `EADDRINUSE`, never a silent
- * port 0. Outside a block `bind` is called with 0, and the kernel picks.
+ * it. In a block, `bind` is called with each service port `base+1, base+3, …
+ * base+size-1`, lowest first (a long-lived test listener scans from the
+ * bottom), and the first that binds is kept: only a real bind claims a port, so
+ * nothing probes and closes. Even offsets are never candidates: each is the
+ * session port of the service port above it, bound by that port's holder or by
+ * nobody (08_testing.md), which is what `claimRefusingPort` relies on. Only
+ * `EADDRINUSE` (by `code`) moves on to the next candidate; any other failure
+ * is that bind's own and surfaces as is, and so does the last candidate's, so an
+ * exhausted block reports `EADDRINUSE`, never a silent port 0. Outside a block
+ * `bind` is called with 0, and the kernel picks.
  *
  * `bind` creates and binds one listener per call and returns it, and a failed
  * bind leaves nothing behind. It may throw (`Bun.serve` does) or reject (a
@@ -972,18 +1012,73 @@ export async function bindListener<T>(bind: (port: number) => T | Promise<T>): P
       return bind(0);
     case 'broken':
       throw new Error(`a listener cannot bind in a broken Cowshed port-block environment: ${block.reason}`);
+    case 'block':
+      return bindFirstFree(block, servicePorts(block, 1), bind);
+  }
+}
+
+/**
+ * A loopback port where nothing listens. In a port block it stays out of every other fixture's reach while it is held,
+ * and disposing it lets it go; outside one nothing claims it, and disposing it does nothing (`claimRefusingPort`).
+ */
+export interface RefusingPort extends AsyncDisposable {
+  readonly port: number;
+}
+
+/** A `net` server on 127.0.0.1:`port` that hangs up on whoever connects; rejects with the bind's own error. */
+function listenHangingUp(port: number): Promise<Server> {
+  return new Promise((resolve, reject) => {
+    const server = createServer((socket) => socket.destroy());
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', () => {
+      server.off('error', reject);
+      resolve(server);
+    });
+  });
+}
+
+function closeServer(server: Server): Promise<void> {
+  return new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+}
+
+/** The TCP port `server` listens on. */
+function listeningPort(server: Server): number {
+  const address = server.address();
+  if (address === null || typeof address === 'string') throw new Error(`not a TCP listener: ${String(address)}`);
+  return address.port;
+}
+
+/**
+ * A port where nothing listens, for a client that must be refused (a cache
+ * server that is down). In a block it is the session port of a service port
+ * this process holds for as long as the claim is held: no allocator binds a
+ * session port but its service port's holder (08_testing.md), so a connect to
+ * it is refused at once, and no other test's listener takes it while the client
+ * is still asking. A port bound and closed would be the next lowest-first
+ * allocator's to bind; a socket bound and never listening is no refusal either,
+ * since macOS drops the SYNs it gets and the connect times out. The service
+ * ports start at `base+3`, because the session port of `base+1` is the
+ * gateway's own `base`; a block of two ports has no session port to give.
+ *
+ * Outside a block (Linux, or no Cowshed) there is no shared allocator to claim
+ * against, so there is no claim: the port is one the kernel picked for a
+ * listener this process then closed, and another process's port-0 listener may
+ * be given it before the client connects.
+ */
+export async function claimRefusingPort(): Promise<RefusingPort> {
+  const block = portBlockEnvironment(process.env);
+  switch (block.kind) {
+    case 'none': {
+      const server = await listenHangingUp(0);
+      const port = listeningPort(server);
+      await closeServer(server);
+      return { port, [Symbol.asyncDispose]: async () => {} };
+    }
+    case 'broken':
+      throw new Error(`a refusing port cannot be claimed in a broken Cowshed port-block environment: ${block.reason}`);
     case 'block': {
-      const last = block.base + block.size - 1;
-      for (let port = block.base + 1; port < last; port += 1) {
-        try {
-          return await bind(port);
-        } catch (error) {
-          if (errorCode(error) !== 'EADDRINUSE') {
-            throw error;
-          }
-        }
-      }
-      return bind(last);
+      const service = await bindFirstFree(block, servicePorts(block, 3), listenHangingUp);
+      return { port: listeningPort(service) - 1, [Symbol.asyncDispose]: () => closeServer(service) };
     }
   }
 }
