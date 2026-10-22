@@ -509,6 +509,11 @@ describe('canonical DTO generation', () => {
       for (const name of ['cpu_budget.rs', 'status.rs']) {
         cpSync(join(project, 'crates/cowshed-gateway-types/src', name), join(gateway, name));
       }
+      // Every generation runs the CLI/N-API parity gate, which reads the CLI grammar from args.rs
+      // (specs/cowshed/07_api.md, "CLI and N-API option parity").
+      const cli = join(scratch, 'crates/cowshed-cli/src');
+      mkdirSync(cli, { recursive: true });
+      cpSync(join(project, 'crates/cowshed-cli/src/args.rs'), join(cli, 'args.rs'));
       mkdirSync(join(scratch, 'src'));
       mkdirSync(join(scratch, 'crates/cowshed-napi/src'), { recursive: true });
       // A separate project snapshots the mutant after it exists; the running test's program
