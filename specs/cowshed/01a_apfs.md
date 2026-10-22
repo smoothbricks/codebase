@@ -867,16 +867,22 @@ of the boot of 2026-10-21 20:12 +04: all 2,884 attaches that completed ran with 
 that stalled started with 334 to 352. Each stalled helper logged `IOServiceWaitQuiet done` and nothing after it, where a
 healthy one goes on to log its device's BSD name.
 
-A stalled helper also leaks every image device that terminates afterwards. Each `diskimagesiod` registers an unfiltered
-`IOServiceTerminate` notification on `AppleDiskImageDevice` (static disassembly of `/usr/libexec/diskimagesiod`,
-`terminationCallback`). The kernel keeps every matched service in the notification's queue until the client drains it. A
-notification that is never drained keeps a cleanly detached device and its user client alive with no userspace right to
-either, which a controlled probe reproduced: one undrained `AppleDiskImageDevice` matched or terminated notification
-held a detached device and client (+1/+1), and both were freed when the probe let go. In that boot the 23 stalled
-helpers were exactly the ones holding two notifications (healthy helpers hold one), and every device terminated after
-them, 702 in all, was never freed, until the first error code 150 at 963 IO clients and 972 devices allocated. Why a
-stalled helper's termination notification stops draining is not established (its main thread still runs its run loop);
-the trigger, the ceiling, and the retention are measured.
+After the stalls began, every image device that terminated stayed allocated. In that boot the 23 stalled helpers were
+exactly the ones holding two notification ports (healthy helpers hold one), and every device terminated after them, 702
+in all, was never freed, until the first error code 150 at 963 IO clients and 972 devices allocated. The trigger, the
+ceiling and the retention are measured; the kernel reference that kept those devices is not established.
+
+What is established about it: each `diskimagesiod` registers an unfiltered `IOServiceTerminate` notification on
+`AppleDiskImageDevice` (static disassembly of `/usr/libexec/diskimagesiod`: `setupTerminationNotificationWithError:`,
+called once from `tryAttachWithParams:` before `waitForDeviceWithError:`, on a port whose source is on the main thread's
+run loop; `terminationCallback` drains its iterator until empty). The kernel keeps every matched service in a
+notification's queue until the client drains it, and an undrained notification keeps a cleanly detached device and its
+user client alive with no userspace right to either: a controlled probe holding one undrained `AppleDiskImageDevice`
+matched or terminated notification held a detached device and client (+1/+1), and both were freed when it let go. An
+undrained IOMedia notification instead keeps only the media, never the device. What contradicts the simple reading: in
+the old boot's port census the orphaned helper 69090's notification receive queues were empty, and the sampled stalled
+helpers' main run loops were idle, not blocked. That the stalled helpers' termination notifications retained the 702
+devices is therefore the leading explanation, not a proven one.
 
 #### The boot of 2026-10-21 20:12 +04, from its kernel and helper logs
 
