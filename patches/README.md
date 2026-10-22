@@ -362,6 +362,60 @@ restarting daemon with the socket its clients were still writing to.
 Drop the hunk only when cowshed no longer ends a job's tree around a shared daemon, or upstream Nx has an equivalent
 setting; retain the regression.
 
+## Package-manager runs keep the daemon's graph
+
+A client a package manager runs (`bun nx`, `bun run`, `npm run` …) sends the daemon a PATH with `node_modules/.bin`
+directories in front, for the run's directory and each ancestor, and from Bun a NODE naming the `node` it found on PATH
+(or, with none there, a temporary directory whose `node` is Bun, also put first on PATH). A plain `nx` client of the
+same shell sends neither. Stock 23.2.1 counted both as project-graph identity, so every switch between the two kinds of
+client discarded the daemon's graph and computed it again: on a consumer's dev boot about 2.6 s and a fresh task hasher
+per switch, with all 47 task hashes the same under both environments.
+
+`normalizeDaemonEnvironmentForGraph` now leaves that scaffolding out, beside Yarn Berry's per-invocation bin folder.
+Where an absolute PATH entry lies is judged on its spelling and on its real path, so a link inside the workspace (its
+own `node_modules` linked to an install elsewhere) is the workspace's. A `node_modules/.bin` entry goes when it lies in
+the workspace, whose lockfile identifies the installed packages it holds (the daemon already restarts when that
+changes), or when it lies in or above the workspace and is proved absent (ENOENT or ENOTDIR), so it resolves nothing.
+NODE goes only when it is the `node` a lookup of that PATH resolves (the first PATH directory holding an executable
+`node`), so PATH already carries the choice; Bun's `bun-node-<hash>` shim directory leaves PATH with it only when its
+`node` is that one. Another checkout's `node_modules/.bin` (present or absent), an entry with `.` or `..` segments (the
+kernel resolves `..` after a link, which a runtime's realpath may collapse lexically first, so no lookup can place it;
+package managers write normal form), an existing one above the workspace, one whose lookup fails otherwise (EACCES,
+say), a relative one, any other PATH entry, the order of the rest, and a NODE that names another binary or directory
+stay identity. The filesystem is read once per env and the decision is a function of those facts. The daemon still
+applies the whole env, so workers run with the scaffolding a client sent. `hashDaemonClientEnv`, which keys a plugin's
+cache of what it inferred, hashes the same normalized env. From a directory without its own `package.json`, Bun also
+puts that package's root on PATH; that entry is no package-manager directory by these rules, so such a client still
+recomputes once.
+
+`packages/nx-plugin/src/nx-daemon-env-identity.test.ts` alternates `bun nx` and plain clients against a real fixture
+daemon and requires its log to keep the graph while naming PATH among the runtime keys it applied; a PATH directory no
+package manager added must still recompute. It also checks the installed normalization against real directories and
+`node` binaries: Bun's PATH shapes (nested runs, the shim), an alternate or off-PATH NODE, another checkout's package
+bin directory present, absent or spelled through the workspace with `..`, an unsearchable one, and the plugin digest in
+a child process. In a child whose workspace is a fixture, a bin directory reached through a workspace link and `..` must
+stay, one above the workspace must go while proved absent and stay once a lookup into it is refused (EACCES).
+
+## A refused daemon stop is a failure
+
+Stock `DaemonClient.stop` sent SIGTERM to the pid the daemon record names and, whatever the kernel answered other than
+ESRCH, printed the error, deleted the daemon's socket directory and let `nx daemon --stop` print
+`Daemon Server - Stopped` and exit 0. A cowshed job may signal only its own sandbox's processes
+(`specs/cowshed/04_sandbox.md`, `(allow signal (target same-sandbox))`), so its stop of the shed's kept daemon got
+EPERM, the daemon kept running, and the job was told it had stopped. Deleting the socket of a daemon that still runs
+hides it from the checkout's clients, and the next one starts a second daemon for the checkout's one Nx state
+(`specs/cowshed/16_build_volumes.md`, "Every checkout has exactly one Nx state"). That daemon is its keeper's to stop.
+
+The stop now throws for any refusal other than ESRCH, naming the pid and the errno, and keeps the socket directory.
+`nx daemon --stop` exits 1 through `handleErrors` without the success line; `nx reset` reports it among its errors,
+`nx add` fails, and cowshed's task-hash probe (`task_hashes.js`) fails rather than computing beside a live daemon. A
+recorded pid that has exited is still a stopped daemon.
+
+`packages/nx-plugin/src/nx-daemon-stop-host.test.ts` runs in `nx-plugin:test-host`: on macOS it starts a real fixture
+daemon and stops it from a Seatbelt profile with the job sandbox's signal rule, which `sandbox_apply` refuses inside
+another sandbox. The daemon must keep running and answering on the same record and socket. On every platform it stops a
+record naming pid 1, a live process of another user, and one naming an exited process, which still stops.
+
 ## Canonical daemon workspace roots
 
 The daemon and plugin-worker message guard compares canonical path strings. A redundant trailing separator does not make

@@ -13,6 +13,7 @@
     "src/typescript-resolution.test.ts": 43366,
     "src/executors/bounded-exec/cargo-progress-host.test.ts": 38973,
     "src/nx-cache-restore-mtime.test.ts": 33072,
+    "src/nx-daemon-env-identity.test.ts": 32670,
     "src/nx-daemon-ignore-files.test.ts": 30090,
     "src/linked-snapshots.nx.test.ts": 29735,
     "src/cargo-closure-input.test.ts": 28312,

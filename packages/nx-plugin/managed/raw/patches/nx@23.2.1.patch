@@ -384,7 +384,7 @@ index 9bd7b61bf9ad94c72a198dfe6f15fbcb68dfaac3..6b982fae848cc82a310eee9a1036be1a
      flushSyncGeneratorChangesToDisk(generators: string[]): Promise<FlushSyncGeneratorChangesResult>;
      getRegisteredSyncGenerators(): Promise<{
 diff --git a/dist/src/daemon/client/client.js b/dist/src/daemon/client/client.js
-index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..64c9d05890139ad8259e3d01ee86dd0de1f5005f 100644
+index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..bcda9e74eb18cdb919dba989eb6b334e7f8f9390 100644
 --- a/dist/src/daemon/client/client.js
 +++ b/dist/src/daemon/client/client.js
 @@ -40,7 +40,6 @@ const nx_console_1 = require("../message-types/nx-console");
@@ -576,7 +576,49 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..64c9d05890139ad8259e3d01ee86dd0d
          }
          else {
              // A permission refusal from either source wins, then the poll's errno,
-@@ -1200,6 +1250,26 @@ function isDocker() {
+@@ -1161,19 +1211,31 @@ class DaemonClient {
+             ].join('\n'));
+         }
+     }
++    /**
++     * Stops the daemon its record names: SIGTERM to that pid, then its socket
++     * directory goes. A pid no process holds any more (ESRCH) is a daemon that
++     * has already stopped. Any other refusal leaves the daemon running and
++     * serving its socket, so it is thrown, naming the pid and the errno, and
++     * the socket directory stays: deleting it would hide a live daemon from
++     * its clients, and the next one would start a second daemon for the
++     * workspace. The kernel refuses another user's daemon so, and a sandbox
++     * that may signal only its own processes (a cowshed job) refuses a daemon
++     * started outside it, which its starter (the shed's keeper) stops.
++     */
+     async stop() {
+-        try {
+-            const pid = (0, cache_1.getDaemonProcessIdSync)();
+-            if (pid) {
++        const pid = (0, cache_1.getDaemonProcessIdSync)();
++        if (pid) {
++            try {
+                 process.kill(pid, 'SIGTERM');
+             }
+-        }
+-        catch (err) {
+-            if (err.code !== 'ESRCH') {
+-                output_1.output.error({
+-                    title: err?.message ||
+-                        'Something unexpected went wrong when stopping the daemon server',
+-                });
++            catch (err) {
++                if (err?.code !== 'ESRCH') {
++                    throw new Error([
++                        `Nx Daemon not stopped: signalling its process ${pid} failed with ${err?.code ?? err}.`,
++                        'The daemon is still running and serving its socket, which is kept.',
++                        'Only a process allowed to signal it can stop it: its own user, or for a daemon started outside this sandbox, its starter (under cowshed, the shed keeper).',
++                    ].join('\n'), { cause: err });
++                }
+             }
+         }
+         (0, tmp_dir_1.removeSocketDir)();
+@@ -1200,6 +1262,26 @@ function isDocker() {
  function nxJsonIsNotPresent() {
      return !(0, nx_json_1.hasNxJson)(workspace_root_1.workspaceRoot);
  }
@@ -603,7 +645,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..64c9d05890139ad8259e3d01ee86dd0d
  /**
   * The operating system refused the connection. Most often the socket belongs to
   * another user, which is the guarantee the owner-only socket directory buys —
-@@ -1226,6 +1296,21 @@ function daemonPermissionException(socketPath, cause) {
+@@ -1226,6 +1308,21 @@ function daemonPermissionException(socketPath, cause) {
      error.daemonPermissionError = true;
      return error;
  }
@@ -625,6 +667,289 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..64c9d05890139ad8259e3d01ee86dd0d
  /**
   * Exported for testing: the `internalDaemonError` tag decides whether a daemon
   * failure degrades to a daemonless graph build or aborts the command.
+diff --git a/dist/src/daemon/client/daemon-environment.d.ts b/dist/src/daemon/client/daemon-environment.d.ts
+index 65ae9cfd686c3c676cf321cf402bbbf03fc87dab..9a68ae94318403ce70aef08f08a3af9cb5cbb6ad 100644
+--- a/dist/src/daemon/client/daemon-environment.d.ts
++++ b/dist/src/daemon/client/daemon-environment.d.ts
+@@ -3,7 +3,9 @@
+  * `getDaemonEnv` would send, minus the required settings the daemon pins
+  * itself. Skipping those yields the same digest whether the process is a
+  * daemon plugin worker (which has them set) or a daemonless one (which
+- * typically does not).
++ * typically does not). It keys a plugin's cache of what it inferred, so it is
++ * the env's graph identity (normalizeDaemonEnvironmentForGraph): a package
++ * manager's run scaffolding does not move it.
+  */
+ export declare function hashDaemonClientEnv(): string;
+ export declare function getDaemonEnv(): NodeJS.ProcessEnv & {
+@@ -63,12 +65,28 @@ export declare function getAppliedDaemonClientEnv(): {
+  */
+ export declare function applyDaemonEnvFromClient(newEnv: NodeJS.ProcessEnv): string[];
+ /**
+- * Yarn Berry creates a fresh BERRY_BIN_FOLDER for every invocation and puts it
+- * first on PATH. The wrappers inside are runtime state the daemon and workers
+- * must receive, but the folder's random name is not project-graph identity:
+- * two invocations whose environments differ only by it would compute the same
+- * graph. Strips the folder from PATH and pins the var to a sentinel so such
+- * environments compare equal. Returns a copy; never mutates runtime env.
++ * An env as project-graph identity: the env without what a package manager
++ * adds to run one command in this workspace. The daemon and its workers still
++ * receive all of it, but two clients whose envs differ only by it compute the
++ * same graph, so a switch between them keeps the cached graph:
++ * - Yarn Berry's BERRY_BIN_FOLDER, fresh for every invocation and first on
++ *   PATH: the folder leaves PATH and the var is pinned to a sentinel.
++ * - The `node_modules/.bin` directories `bun run`, `npm run`, pnpm and Yarn
++ *   put in front of PATH for the run's directory and each of its ancestors:
++ *   one that lies in the workspace, whose packages its lockfile identifies,
++ *   and one in or above it proved absent (ENOENT or ENOTDIR), which resolves
++ *   nothing. Where an entry lies is judged on its spelling and on its real
++ *   path: a link inside the workspace (its own `node_modules` linked to an
++ *   install elsewhere) is the workspace's. Another checkout's (present or
++ *   absent), an existing or unknown one above the workspace, one with `.` or
++ *   `..` segments and a relative one stay identity.
++ * - NODE, when it is the `node` PATH resolves: `bun run` sets it to the one it
++ *   found, so PATH already carries that choice. With none on PATH, Bun makes a
++ *   `bun-node-<hash>` directory whose `node` is Bun, puts it on PATH and names
++ *   it in NODE; that directory leaves PATH with NODE when its `node` is the one
++ *   PATH resolves. Any other NODE stays, and so does every other PATH entry.
++ * The order of the remaining PATH entries is kept. Returns a copy; never
++ * mutates runtime env.
+  */
+ export declare function normalizeDaemonEnvironmentForGraph(env: NodeJS.ProcessEnv, platform?: NodeJS.Platform): NodeJS.ProcessEnv;
+ export declare function getChangedEnvKeys(before: NodeJS.ProcessEnv, after: NodeJS.ProcessEnv): string[];
+diff --git a/dist/src/daemon/client/daemon-environment.js b/dist/src/daemon/client/daemon-environment.js
+index 427ced7822fb05ba966d0543c224c5760b016572..303548db369472e0f99f31c3bc66ae9b92426e15 100644
+--- a/dist/src/daemon/client/daemon-environment.js
++++ b/dist/src/daemon/client/daemon-environment.js
+@@ -8,7 +8,10 @@ exports.getAppliedDaemonClientEnv = getAppliedDaemonClientEnv;
+ exports.applyDaemonEnvFromClient = applyDaemonEnvFromClient;
+ exports.normalizeDaemonEnvironmentForGraph = normalizeDaemonEnvironmentForGraph;
+ exports.getChangedEnvKeys = getChangedEnvKeys;
++const fs_1 = require("fs");
++const path_1 = require("path");
+ const file_hasher_1 = require("../../hasher/file-hasher");
++const workspace_root_1 = require("../../utils/workspace-root");
+ const DAEMON_ENV_REQUIRED_SETTINGS = {
+     NX_PROJECT_GLOB_CACHE: 'false',
+     NX_CACHE_PROJECTS_CONFIG: 'false',
+@@ -243,7 +246,9 @@ function isExcludedEnvVar(key) {
+  * `getDaemonEnv` would send, minus the required settings the daemon pins
+  * itself. Skipping those yields the same digest whether the process is a
+  * daemon plugin worker (which has them set) or a daemonless one (which
+- * typically does not).
++ * typically does not). It keys a plugin's cache of what it inferred, so it is
++ * the env's graph identity (normalizeDaemonEnvironmentForGraph): a package
++ * manager's run scaffolding does not move it.
+  */
+ function hashDaemonClientEnv() {
+     const env = {};
+@@ -254,7 +259,7 @@ function hashDaemonClientEnv() {
+         }
+     }
+     env.NX_LOAD_DOT_ENV_FILES = normalizedLoadDotEnvFiles();
+-    return (0, file_hasher_1.hashObject)(env);
++    return (0, file_hasher_1.hashObject)(normalizeDaemonEnvironmentForGraph(env));
+ }
+ /**
+  * `NX_LOAD_DOT_ENV_FILES` as its meaning rather than its spelling. `run-command`
+@@ -379,36 +384,174 @@ function applyDaemonEnvFromClient(newEnv) {
+     return [...changedKeys];
+ }
+ const BERRY_BIN_FOLDER_GRAPH_IDENTITY = '<YARN_BERRY_BIN_FOLDER>';
++/** The directory Bun makes for one run when it finds no `node` on PATH. */
++const BUN_NODE_SHIM = /^bun-node-[0-9a-f]+$/;
++/** Errors that prove a path names nothing; any other leaves it unknown. */
++function provesAbsent(error) {
++    return error?.code === 'ENOENT' || error?.code === 'ENOTDIR';
++}
++/**
++ * Where `path` lies as the kernel resolves it, links before `..`: its real
++ * path when it exists; for a path proved absent, the real path of its nearest
++ * existing ancestor joined with the rest. `unknown` when a lookup fails
++ * otherwise. The literal path is walked, never normalized first, since `..`
++ * after a link leads out of the link's target, not back to where it was.
++ */
++function locate(path, paths) {
++    const rest = [];
++    for (let current = path;; current = paths.dirname(current)) {
++        try {
++            const real = (0, fs_1.realpathSync)(current);
++            return { status: rest.length === 0 ? 'present' : 'absent', real: paths.join(real, ...rest) };
++        }
++        catch (error) {
++            if (!provesAbsent(error)) {
++                return { status: 'unknown' };
++            }
++            if (paths.dirname(current) === current) {
++                return { status: 'absent', real: paths.join(current, ...rest) };
++            }
++            rest.unshift(paths.basename(current));
++        }
++    }
++}
++/**
++ * What the filesystem says about an env's PATH, read once so that the
++ * identity decision below stays a function of its inputs: where the
++ * workspace and each absolute entry lie ({@link locate}), and the `node` a
++ * command lookup of PATH finds, as the runner that set NODE looked it up (the
++ * first entry holding an executable `node`, `node.exe` on Windows), or
++ * `undefined` when there is none or a lookup step could not tell. An entry
++ * with `.` or `..` segments is `unknown`: the kernel resolves `..` after a
++ * link, out of the link's target, and a runtime's realpath may collapse it
++ * lexically first, so no lookup here can say where it lies. Package managers
++ * write their entries in normal form.
++ */
++function environmentFacts(entries, platform, workspaceRoot) {
++    const paths = platform === 'win32' ? path_1.win32 : path_1.posix;
++    const binary = platform === 'win32' ? 'node.exe' : 'node';
++    const located = new Map();
++    for (const entry of entries) {
++        if (entry && paths.isAbsolute(entry) && !located.has(entry)) {
++            const normal = !entry.split(/[\\/]/).some((segment) => segment === '.' || segment === '..');
++            located.set(entry, normal ? locate(entry, paths) : { status: 'unknown' });
++        }
++    }
++    let resolvedNode;
++    for (const entry of entries) {
++        const fact = located.get(entry);
++        if (fact?.status === 'absent') {
++            continue;
++        }
++        if (fact?.status !== 'present') {
++            // A relative entry depends on the client's directory, and an
++            // unknown one may hold a node: the lookup cannot tell.
++            break;
++        }
++        const candidate = paths.join(entry, binary);
++        try {
++            if ((0, fs_1.statSync)(candidate).isFile()) {
++                (0, fs_1.accessSync)(candidate, fs_1.constants.X_OK);
++                resolvedNode = candidate;
++                break;
++            }
++        }
++        catch (error) {
++            // execvp moves on past a missing or non-executable candidate; any
++            // other failure leaves the lookup unknown.
++            if (!provesAbsent(error) && error?.code !== 'EACCES') {
++                break;
++            }
++        }
++    }
++    return { workspace: locate(workspaceRoot, paths), entries: located, resolvedNode };
++}
+ /**
+- * Yarn Berry creates a fresh BERRY_BIN_FOLDER for every invocation and puts it
+- * first on PATH. The wrappers inside are runtime state the daemon and workers
+- * must receive, but the folder's random name is not project-graph identity:
+- * two invocations whose environments differ only by it would compute the same
+- * graph. Strips the folder from PATH and pins the var to a sentinel so such
+- * environments compare equal. Returns a copy; never mutates runtime env.
++ * An env as project-graph identity: the env without what a package manager
++ * adds to run one command in this workspace. The daemon and its workers still
++ * receive all of it, but two clients whose envs differ only by it compute the
++ * same graph, so a switch between them keeps the cached graph:
++ * - Yarn Berry's BERRY_BIN_FOLDER, fresh for every invocation and first on
++ *   PATH: the folder leaves PATH and the var is pinned to a sentinel.
++ * - The `node_modules/.bin` directories `bun run`, `npm run`, pnpm and Yarn
++ *   put in front of PATH for the run's directory and each of its ancestors:
++ *   one that lies in the workspace, whose packages its lockfile identifies,
++ *   and one in or above it proved absent (ENOENT or ENOTDIR), which resolves
++ *   nothing. Where an entry lies is judged on its spelling and on its real
++ *   path: a link inside the workspace (its own `node_modules` linked to an
++ *   install elsewhere) is the workspace's. Another checkout's (present or
++ *   absent), an existing or unknown one above the workspace, one with `.` or
++ *   `..` segments and a relative one stay identity.
++ * - NODE, when it is the `node` PATH resolves: `bun run` sets it to the one it
++ *   found, so PATH already carries that choice. With none on PATH, Bun makes a
++ *   `bun-node-<hash>` directory whose `node` is Bun, puts it on PATH and names
++ *   it in NODE; that directory leaves PATH with NODE when its `node` is the one
++ *   PATH resolves. Any other NODE stays, and so does every other PATH entry.
++ * The order of the remaining PATH entries is kept. Returns a copy; never
++ * mutates runtime env.
+  */
+ function normalizeDaemonEnvironmentForGraph(env, platform = process.platform) {
++    const pathKey = Object.keys(env).find((key) => key.toUpperCase() === 'PATH');
++    const entries = pathKey && env[pathKey]
++        ? env[pathKey].split(platform === 'win32' ? ';' : ':')
++        : [];
++    return graphIdentity(env, platform, workspace_root_1.workspaceRoot, pathKey, entries, environmentFacts(entries, platform, workspace_root_1.workspaceRoot));
++}
++function graphIdentity(env, platform, workspaceRoot, pathKey, entries, facts) {
+     const normalized = { ...env };
+-    const berryBinFolder = normalized.BERRY_BIN_FOLDER;
+-    if (!berryBinFolder) {
+-        return normalized;
++    const windows = platform === 'win32';
++    const paths = windows ? path_1.win32 : path_1.posix;
++    const canonicalize = (value) => windows ? value.replaceAll('/', '\\').toLowerCase() : value;
++    const scaffolding = new Set();
++    if (normalized.BERRY_BIN_FOLDER) {
++        scaffolding.add(canonicalize(normalized.BERRY_BIN_FOLDER));
++        normalized.BERRY_BIN_FOLDER = BERRY_BIN_FOLDER_GRAPH_IDENTITY;
++    }
++    if (normalized.NODE && facts.resolvedNode !== undefined) {
++        const node = canonicalize(normalized.NODE);
++        const shim = BUN_NODE_SHIM.test(paths.basename(node)) &&
++            entries.some((entry) => canonicalize(entry) === node);
++        const selected = shim
++            ? paths.join(node, windows ? 'node.exe' : 'node')
++            : node;
++        if (canonicalize(facts.resolvedNode) === selected) {
++            if (shim) {
++                scaffolding.add(node);
++            }
++            delete normalized.NODE;
++        }
+     }
+-    const pathKey = Object.keys(normalized).find((key) => key.toUpperCase() === 'PATH');
+-    if (pathKey && normalized[pathKey]) {
+-        const pathDelimiter = platform === 'win32' ? ';' : ':';
+-        const canonicalize = (value) => {
+-            const withPlatformSeparators = platform === 'win32' ? value.replaceAll('/', '\\') : value;
+-            return platform === 'win32'
+-                ? withPlatformSeparators.toLowerCase()
+-                : withPlatformSeparators;
++    if (entries.length > 0) {
++        const within = (path, directory) => path === directory ||
++            path.startsWith(directory.endsWith(paths.sep) ? directory : directory + paths.sep);
++        const roots = [paths.resolve(workspaceRoot)];
++        if (facts.workspace.status === 'present') {
++            roots.push(facts.workspace.real);
++        }
++        const workspaceRoots = roots.map(canonicalize);
++        const isRunScaffolding = (entry) => {
++            if (scaffolding.has(canonicalize(entry))) {
++                return true;
++            }
++            const fact = facts.entries.get(entry);
++            if (fact === undefined || fact.status === 'unknown') {
++                return false;
++            }
++            // A link inside the workspace (its own `node_modules` linked to an
++            // install elsewhere) is the workspace's, so an entry spelled in
++            // the workspace counts there as well as where it resolves.
++            const owners = [entry, fact.real]
++                .map(canonicalize)
++                .filter((location) => paths.basename(location) === '.bin' &&
++                paths.basename(paths.dirname(location)) === 'node_modules')
++                .map((location) => paths.dirname(paths.dirname(location)));
++            return owners.some((owner) => workspaceRoots.some((root) => within(owner, root) ||
++                (fact.status === 'absent' && within(root, owner))));
+         };
+-        const canonicalBerryBinFolder = canonicalize(berryBinFolder);
+-        normalized[pathKey] = normalized[pathKey]
+-            .split(pathDelimiter)
+-            .filter((entry) => canonicalize(entry) !== canonicalBerryBinFolder)
+-            .join(pathDelimiter);
++        normalized[pathKey] = entries
++            .filter((entry) => !isRunScaffolding(entry))
++            .join(windows ? ';' : ':');
+     }
+-    normalized.BERRY_BIN_FOLDER = BERRY_BIN_FOLDER_GRAPH_IDENTITY;
+     return normalized;
+ }
+ function getChangedEnvKeys(before, after) {
 diff --git a/dist/src/daemon/message-types/daemon-message.d.ts b/dist/src/daemon/message-types/daemon-message.d.ts
 index 9dd6123ad6d9adb20a07f7db56fc476be78cbcca..0b1ee217729d63a29806cf6c38d0fc5d4a2161a5 100644
 --- a/dist/src/daemon/message-types/daemon-message.d.ts
