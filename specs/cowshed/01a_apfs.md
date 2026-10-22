@@ -913,11 +913,13 @@ The first device that terminates anywhere on the host wakes the termination noti
 and then blocks before `IOIteratorNext`, forever. Its queue is never drained, so the kernel keeps every
 `AppleDiskImageDevice` (and, through it, its user client) terminated afterwards, and no receive queue shows a pending
 message: the old boot's empty queues and the 23 two-notification helpers fit exactly. A sample taken before any device
-terminates finds the main thread idle, as the old boot's samples did. Killing the attach's `diskutil` client frees
-nothing; only the helper's death releases the queue, and nothing but a root kill of that one helper can end it (SIP
-refuses the DTrace alternative). The in-kernel driver has no helper, and so neither the wait nor the callback: in the
-same session 170 in-kernel attaches took registered IOMedia from 574 to 1,084 at 0.14 to 0.27 s each, and their detaches
-above the cap left nothing allocated.
+terminates finds the main thread idle, as the old boot's samples did. Killing the attach's `diskutil` client freed
+nothing, and SIP refuses a DTrace-raised signal. A root `kill -9` of that one helper released the queue: the host went
+from 188 `AppleDiskImageDevice` instances against 185 registered to 184 against 184, no device retained. One stuck
+`diskimagesiod`, deadlocked on its own delegate's `@synchronized` lock, therefore retains every image device that
+terminates anywhere on the host while it lives; nothing but its death ends that. The in-kernel driver has no helper, and
+so neither the wait nor the callback: in the same session 170 in-kernel attaches took registered IOMedia from 574 to
+1,084 at 0.14 to 0.27 s each, and their detaches above the cap left nothing allocated.
 
 #### The boot of 2026-10-21 20:12 +04, from its kernel and helper logs
 
