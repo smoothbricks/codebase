@@ -2134,4 +2134,5 @@ The project-scoped words the facade could not reach are operations of their own:
 `landing::retain_fully_landed` proves fully landed). The CLI's project-scoped `ls --landed` asks for `measure` and
 applies the same filter itself, because it names every row withheld for want of an answer. `project.workspaceInSlot`
 resolves the workspace whose mount is a build slot's stable path (`path --slot`), and `coordinator.rekey` rotates one
-keyless workspace's CA identity (`rekey`), both for the CLI and the addon alike.
+keyless workspace's CA identity (`rekey`) and re-derives that workspace's gateway session from the new CA before it
+answers, both for the CLI and the addon alike: a held gateway identity never outlives its key until some later exec.

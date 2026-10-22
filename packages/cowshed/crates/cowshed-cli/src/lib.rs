@@ -19,7 +19,6 @@ pub mod mount_main;
 pub mod output;
 pub mod path_entry;
 pub mod probe;
-pub mod rekey;
 pub mod resident;
 pub mod run;
 pub mod runtime;

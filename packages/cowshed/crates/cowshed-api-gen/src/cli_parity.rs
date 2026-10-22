@@ -771,6 +771,19 @@ fn command_method(
     Ok(())
 }
 
+/// Argument settings that shape how one argument parses but add no word and no spelling.
+const ARGUMENT_SETTINGS: &[&str] = &[
+    "short",
+    "action",
+    "global",
+    "value_name",
+    "value_parser",
+    "allow_hyphen_values",
+    "num_args",
+    "required",
+    "overrides_with",
+];
+
 /// One argument's clap id and its spelling as typed.
 fn argument_word(expression: &Expr) -> Result<(String, String), String> {
     let mut base = expression;
@@ -780,7 +793,12 @@ fn argument_word(expression: &Expr) -> Result<(String, String), String> {
         match call.method.to_string().as_str() {
             "long" => long = true,
             "last" => last = true,
-            _ => {}
+            setting if ARGUMENT_SETTINGS.contains(&setting) => {}
+            other => {
+                return Err(format!(
+                    "args.rs: argument method `.{other}` is unknown to the parity reader; teach it whether `.{other}` adds a spelling or a word"
+                ));
+            }
         }
         base = &call.receiver;
     }

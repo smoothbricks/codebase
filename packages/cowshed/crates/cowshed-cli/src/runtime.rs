@@ -2065,7 +2065,7 @@ where
             Ok(success())
         }
         Command::Rekey(args) => {
-            let result = crate::rekey::rekey_report(service, &args.workspace).await?;
+            let result = service.rekey(&args.workspace).await?;
             if json {
                 output.success(result.clone()).map_err(output_error)?;
             } else {

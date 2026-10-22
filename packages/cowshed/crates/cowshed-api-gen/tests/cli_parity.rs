@@ -145,3 +145,19 @@ fn an_unknown_builder_call_is_refused_by_name() {
         "{error}"
     );
 }
+
+#[test]
+fn an_unknown_argument_builder_call_is_refused_by_name() {
+    let source = edited(
+        &grammar(),
+        r#"flag("quarantine"),"#,
+        r#"flag("quarantine").long_alias("isolate"),"#,
+    );
+    let Err(error) = read_cli(&source) else {
+        panic!("the reader skipped an argument builder call it does not know");
+    };
+    assert!(
+        error.contains("argument method `.long_alias` is unknown to the parity reader"),
+        "{error}"
+    );
+}

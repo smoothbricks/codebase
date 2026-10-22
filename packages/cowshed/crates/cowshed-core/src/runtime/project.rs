@@ -220,11 +220,7 @@ pub trait ProjectRuntimeHost: Send + 'static {
     ) -> Result<crate::api::dto::DefragmentResult>;
 
     /// Rebuild one keyless workspace's CA identity at its preserved incarnation.
-    async fn rekey(&mut self, _workspace: WorkspaceName) -> Result<crate::api::dto::RekeyResult> {
-        Err(CowshedError::internal(
-            "workspace rekey is unavailable for this runtime host",
-        ))
-    }
+    async fn rekey(&mut self, workspace: WorkspaceName) -> Result<crate::api::dto::RekeyResult>;
     async fn reseed(
         &mut self,
         workspace: WorkspaceName,
@@ -13029,8 +13025,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         })
     }
 
-    /// Rotate the workspace's CA identity from its store records. Main is rekeyed at its
-    /// checkout-aware mount and a session at its slot-aware one, both derived, never inferred.
+    /// Rotate the workspace's CA identity from its store records, then re-derive its gateway
+    /// session from the new CA. Main is rekeyed at its checkout-aware mount and a session at its
+    /// slot-aware one, both derived, never inferred.
     async fn rekey(&mut self, workspace: WorkspaceName) -> Result<crate::api::dto::RekeyResult> {
         self.validate_binding().await?;
         let mount = self.workspace_mount_path(&workspace)?;
@@ -13047,6 +13044,21 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             )
         })?
         .map_err(|error| error.into_cowshed_error())?;
+        // Sessions re-derive from the new CA before the rotation is answered: a held gateway
+        // identity must not outlive the key it was derived from until some later exec.
+        cowshed_os::timing::spanned(
+            "gateway",
+            "workspace",
+            crate::gateway_sessions::reconcile_workspace(
+                self.gateway_control.as_ref(),
+                &self.gateway_inventory,
+                &self.descriptor.repo_id,
+                &workspace,
+                &report.incarnation,
+                crate::gateway_sessions::effective_uid(),
+            ),
+        )
+        .await?;
         Ok(crate::api::dto::RekeyResult {
             workspace: report.workspace.to_string(),
             workspace_incarnation: report.incarnation.as_str().to_owned(),

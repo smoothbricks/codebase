@@ -438,6 +438,86 @@ async fn adopt(fixture: &Fixture, service: &mut ActorBridge) {
     );
 }
 
+/// The project-scoped words N-API reaches through their own controller operations answer through
+/// the real directory runtime and its store records: `path --slot` (project.workspaceInSlot),
+/// `ls --landing`/`--landed` (project.list's landing selection), `fork --markdown-only`
+/// (ForkOptions.markdownOnly) and `rekey` (coordinator.rekey, which the directory substrate's
+/// storage host refuses: it holds no image to rotate).
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_parity_operations_answer_through_the_controller() {
+    let mut fixture = Fixture::directory();
+    let mut service = serve_project(&mut fixture, &[]).await;
+
+    succeed(&mut service, ["fork", "slotted", "--slot", "2"]).await;
+    let mount = service
+        .path("slotted", true)
+        .await
+        .expect("slotted is published")
+        .mount;
+    let (stdout, _) = succeed(&mut service, ["path", "--slot", "2", "--no-attach"]).await;
+    assert_eq!(
+        String::from_utf8(stdout).expect("utf-8 path").trim_end(),
+        mount.to_str().expect("utf-8 mount"),
+        "slot 2's tenant is the workspace forked into it"
+    );
+    let (empty, _, _) = run(&mut service, ["path", "--slot", "3"]).await;
+    assert_eq!(
+        empty.expect_err("slot 3 has no tenant").code,
+        ErrorCode::NotFound
+    );
+
+    let (stdout, stderr) = succeed(&mut service, ["--json", "ls", "--landing"]).await;
+    let listing: serde_json::Value = serde_json::from_slice(&stdout).expect("ls --json");
+    let rows = listing["result"].as_array().expect("workspace rows");
+    let main = rows
+        .iter()
+        .find(|row| row["workspace"] == "main")
+        .expect("main row");
+    assert!(
+        main.get("landing").is_none(),
+        "main is the target, never measured: {main}"
+    );
+    let slotted = rows
+        .iter()
+        .find(|row| row["workspace"] == "slotted")
+        .expect("slotted row");
+    assert!(
+        slotted.get("landing").is_some(),
+        "the controller measured the session: {slotted}\n{stderr}"
+    );
+    let (stdout, stderr) = succeed(&mut service, ["ls", "--landed"]).await;
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "slotted\n",
+        "a session forked from main with no work of its own is landed\n{stderr}"
+    );
+
+    let (refused, _, _) = run(&mut service, ["fork", "notes", "--markdown-only"]).await;
+    assert_eq!(
+        refused.expect_err("a markdown-only fork is refused").code,
+        ErrorCode::Usage
+    );
+    assert!(
+        service.path("notes", true).await.is_err(),
+        "nothing was minted for it"
+    );
+
+    // rekey rotates an image's CA identity; a directory substrate's workspace is no image, so
+    // the storage host's own rotation refuses it, reached through coordinator.rekey.
+    let (rekey, _, _) = run(&mut service, ["rekey", "slotted"]).await;
+    let refusal = rekey.expect_err("a directory workspace holds no rekeyable image");
+    assert_eq!(refusal.code, ErrorCode::NotFound);
+    assert!(
+        refusal
+            .message
+            .contains("no rekeyable identity for workspace 'slotted'"),
+        "{refusal:?}"
+    );
+
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
+
 /// Persist grants across restarts before installing the gateway, then race the published port
 /// and reconcile a changed grant revision on the same adopted main.
 #[tokio::test(flavor = "multi_thread")]
