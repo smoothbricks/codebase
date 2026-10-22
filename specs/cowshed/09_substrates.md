@@ -280,20 +280,24 @@ it**:
   rather than breaks: a workspace's origin snapshot dies with it, and **a workspace with live dependents cannot be
   reclaimed** — `cowshed rm src` exits 4 naming the dependent forks; `cowshed doctor` reports fork dependencies and
   their pinned bytes so a coordinator lands or removes forks first.
-- cowshed does not use `zfs promote` to re-parent dependencies. It keeps the graph shallow — main at the center, one
-  snapshot spoke per workspace, fork spokes off sessions — and refuses reclaim while dependents exist. CI uses the
-  ordinary target/build-volume lifecycle (10_ci.md, "Keeping the host main warm"), not a dataset promotion exception.
+- cowshed does not use `zfs promote` to re-parent workspace datasets. It keeps their graph shallow — main at the center,
+  one snapshot spoke per workspace, fork spokes off sessions — and refuses reclaim while dependents exist. Build
+  datasets are the one exception: a land promotes the build dataset its target adopts, so the target's old build dataset
+  can be destroyed (01b_zfs.md, "Land swaps the build dataset"). CI uses the ordinary target/build-volume lifecycle
+  (10_ci.md, "Keeping the host main warm").
 
 ### Privileged helper (Linux)
 
 `zfs allow` delegation covers create/snapshot/clone/destroy but **not `mount(2)`**, which Linux gates on `CAP_SYS_ADMIN`
 regardless of delegation. Substrate mutations therefore go through `cowshed-helper`: a minimal root binary (installed by
 the package, auditable in one sitting) that accepts a fixed verb set
-(`create|clone|snapshot|destroy|rename|swap|mount|unmount|set-mountpoint`) — `rename` serves retire's trash namespace
-and `swap` is the narrowly-constrained clone-swap that `cowshed restore` needs — and refuses, on every verb, any dataset
-argument outside `<pool>/cowshed/`. Constrained sudoers entries are the supported alternative for hosts that forbid
-setuid helpers. Everything else — Landlock sandboxing (04_sandbox.md), gateway, secrets scanner, CLI — runs
-unprivileged.
+(`create|clone|snapshot|destroy|rename|swap|promote|mount|unmount|set-mountpoint`) — `rename` serves retire's trash
+namespace, `swap` is the narrowly-constrained clone-swap that `cowshed restore` needs, and `promote` accepts only a
+build dataset (`…/<repo>/build/<id>`), and cowshed calls it only for an adoption: at land, or when collection completes
+an adoption whose pending promote the build volume's sidecar records and the link of the target it names confirms
+(01b_zfs.md, "Retiring a build dataset") — and refuses, on every verb, any dataset argument outside `<pool>/cowshed/`.
+Constrained sudoers entries are the supported alternative for hosts that forbid setuid helpers. Everything else —
+Landlock sandboxing (04_sandbox.md), gateway, secrets scanner, CLI — runs unprivileged.
 
 ### Linux host paths
 

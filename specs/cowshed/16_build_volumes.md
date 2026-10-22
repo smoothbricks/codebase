@@ -92,8 +92,8 @@ writers at once. Content-addressed caches, whose entries are immutable and valid
   quiet (Land step 4) it grows to the target's capacity when it is smaller, before the seed is frozen from it, so the
   target and every later fork end at the larger of the two capacities. A filesystem holder that refuses that growth is a
   `landingVolumeBusy` skip, because adopting the smaller volume would shrink the target.
-- **ZFS**: a build volume is a dataset, `<pool>/cowshed/<owner>/<repo>/build/<id>`; a fork is `snapshot` + `clone`, and
-  a seed is a snapshot (09_substrates.md).
+- **ZFS**: a build volume is a dataset, `<pool>/cowshed/projects/<owner>/<repo>/build/<id>`; a fork is `snapshot` +
+  `clone`, a seed is a snapshot, and land adoption promotes the adopted dataset (01b_zfs.md, 09_substrates.md).
 - A directory is never a build volume. Copying a Rust `target/` tree file by file, even with `clonefile`-backed
   `cp -c -p -R`, takes minutes for a large workspace; cloning the image that holds it takes milliseconds. Minutes per
   land is unacceptable.
@@ -1358,6 +1358,4 @@ volumes do not require them.
 - **rust-analyzer and editors with `target` as a symlink.** Not yet verified.
 - **Daemon keeper probing.** 04_sandbox.md's workspace supervisor probes the sandboxed daemon every 5 s; an event-driven
   alternative (the daemon's exit) is preferred if Nx exposes one.
-- **ZFS mapping.** Dataset layout and `zfs promote` for adoption are specified with the ZFS substrate
-  (09_substrates.md).
 - **Fragmentation measurement** (Why two volumes, item 1).

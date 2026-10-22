@@ -4,7 +4,8 @@ cowshed derives workspace state from controller-owned filesystem facts and the k
 This spec owns repository identity, the logical store layout, shared metadata and retention policy.
 
 [APFS storage](./01a_apfs.md) owns the macOS image format, Disk Arbitration lifecycle, device custody, mount policy,
-dedicated volume provisioning and host failure mechanisms. Other substrates implement the same logical contract through
+dedicated volume provisioning and host failure mechanisms. [ZFS storage](./01b_zfs.md) owns the pool, root dataset,
+dataset lifecycle and macOS dataset properties. Both implement the same logical contract through
 [09_substrates.md](./09_substrates.md).
 
 ## Repository identity
