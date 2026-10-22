@@ -649,7 +649,7 @@ case bounds, and so do the Nx daemon proofs that apply their own Seatbelt profil
 FSEvents stream), which `sandbox_apply` refuses inside a cowshed job. The shards exclude `*-host.test.ts`; the host
 target names each owned host file.
 
-An unfinished test name is not holder attribution. During the final five seconds of an unchanged no-progress interval,
+An unfinished test name is not holder attribution. During the final ten seconds of an unchanged no-progress interval,
 the executor takes one bounded pre-signal snapshot of its runner, descendants and retained process group. Resumed
 progress discards and cancels that interval's snapshot. At expiry the executor emits the completed observation, or an
 explicit incomplete-capture result, and starts termination immediately without awaiting a probe. Diagnostic capture does
@@ -657,14 +657,16 @@ not extend the configured no-progress deadline. Capture timestamps, the offset f
 expiry-to-capture interval accompany the observation. Process rows retain PID, PPID, PGID, state, percent CPU, elapsed
 time, start identity and command. On macOS the snapshot also holds call stacks: the runner and up to four leaf processes
 of its tree (members with no live child; further leaves are named, not sampled) are each sampled for one second by
-`sudo -n sample <pid> 1 -mayDie -file /dev/stdout`, all at once and beside the open-resource probe, inside the same
-five-second window. Each sample is limited to three seconds (its second of sampling and the symbolication after it) and
-leaves the closing process census its one second; the report is kept through its call graph, without its binary-image
-list, and is written to the probe's pipe alone, never to a file in `/tmp`. A stack names the call a process waits in
-(`read`, `open`, a condition wait), which the open-resource probe cannot. A sample that sudo refuses, that fails or that
-reaches its limit is named, with its stderr, as no stack for that process: it never delays termination and does not
-change the holder outcome, which stacks do not establish. Other platforms record that no stack is sampled. The case this
-answers: GateTriageH1's deadlock was located only from `sample` stacks taken by hand while the run hung. On macOS the
+`sudo -n sample <pid> 1 -file /dev/stdout`, all at once and beside the open-resource probe, inside the same window. The
+samples set the window's length: under load averages of 27-52 on 18 cores one sample took 1.1-4.6 s, and in a
+five-second window two of eight real captures lost their sample at its limit. Each sample runs until the closing process
+census would have less than its one second left; `-mayDie` is not passed, since it reads symbols before sampling and
+measured about a second slower under load; the report is kept through its call graph, without its binary-image list, and
+is written to the probe's pipe alone, never to a file in `/tmp`. A stack names the call a process waits in (`read`,
+`open`, a condition wait), which the open-resource probe cannot. A sample that sudo refuses, that fails or that reaches
+its limit is named, with its stderr, as no stack for that process: it never delays termination and does not change the
+holder outcome, which stacks do not establish. Other platforms record that no stack is sampled. The case this answers:
+GateTriageH1's deadlock was located only from `sample` stacks taken by hand while the run hung. On macOS the
 open-resource probe invokes `/usr/sbin/lsof` through noninteractive sudo, with an explicitly limited ordinary-user
 fallback. A missing tool, denied privilege, timeout, truncated output, other probe stderr or changing process identity
 is incomplete evidence, never an empty holder set. lsof's mount-table fallback
@@ -705,10 +707,11 @@ reader assembles a complete line across chunks within an abortable readiness bou
 observed rather than treating a partial buffer as a PID.
 
 The stack-sample witness runs, under bounded-exec, a command that ignores SIGTERM and opens a FIFO the test owns and
-never opens for writing, so it waits in open(2). The clock is moved to the capture once the command says it is opening,
-and to the expiry only after the real snapshot has returned; the bound then force-kills the command and its group
-empties. On macOS the snapshot carries the command's sampled stack down to `__open`; elsewhere it records that no stack
-is sampled.
+never opens for writing, so it waits in open(2). It runs on real timers under a progress bound five seconds longer than
+the capture window, with no other deadline. Its readiness is the complete `opening` line, assembled across output
+chunks; the case requires that line seen before the capture began and the capture complete at the expiry. The bound then
+force-kills the command and its group empties. On macOS the snapshot carries the command's sampled stack down to
+`__open`; elsewhere it records that no stack is sampled.
 
 Re-executed libtest fixture roles that report a line protocol use `--nocapture --quiet`. With an inherited
 `RUST_TEST_THREADS=1`, ordinary libtest output prefixes the first report with its unfinished test-name line; a reader

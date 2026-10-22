@@ -10,18 +10,24 @@ import {
   parseLsofTable,
 } from './lock-wait.js';
 
-export const HANG_CAPTURE_MS = 5_000;
+/**
+ * The pre-expiry capture window. Stack samples set it: under load averages of 27-52 on 18 cores one `sudo -n sample`
+ * took 1.1-4.6 s, and in a five-second window two of eight real captures lost their sample at its limit.
+ */
+export const HANG_CAPTURE_MS = 10_000;
 const MAX_PROBE_BYTES = 4 * 1024 * 1024;
 const PS_FIELDS = 'pid=,ppid=,pgid=,stat=,%cpu=,etime=,lstart=,command=';
 /**
  * Stack samples: `sample` suspends a process every millisecond for one second and reports its threads' call graph. The
- * runner and at most this many leaf processes are sampled, all at once.
+ * runner and at most this many leaf processes are sampled, all at once. `-mayDie` is not passed: it reads symbols
+ * before sampling and measured about a second slower under load, and a process that exits mid-sample is a raced
+ * capture all the same.
  */
 const MAX_SAMPLED_LEAVES = 4;
 const SAMPLE_SECONDS = 1;
-/** One sample's limit: its second of sampling plus symbolication, measured at 1.3-1.7 s on an idle host. */
-const SAMPLE_LIMIT_MS = 3_000;
-/** A process census's limit; the stack samples leave the closing census this much of the window. */
+/**
+ * A process census's limit. The stack samples run until the closing census is this far from the window's end.
+ */
 const CENSUS_LIMIT_MS = 1_000;
 /**
  * lsof's mount-table fallback (darwin libproc dmnt.c, readmnt()): a mount it cannot stat(), such as one detaching under a
@@ -209,13 +215,13 @@ export function captureHangDiagnostics(
         lines.push(
           `Stack samples bounded to the runner and ${MAX_SAMPLED_LEAVES} leaf processes; not sampled: pid ${omitted.join(', ')}`,
         );
-      const limitMs = Math.min(SAMPLE_LIMIT_MS, endsAtMs - Date.now() - CENSUS_LIMIT_MS);
+      const limitMs = endsAtMs - Date.now() - CENSUS_LIMIT_MS;
       const sampled = [request.pid, ...leaves.slice(0, MAX_SAMPLED_LEAVES).map((entry) => entry.pid)];
       await Promise.all(
         sampled.map(async (pid) => {
           const name = `stack sample pid ${pid}`;
           // `-file /dev/stdout` writes the report to the probe's pipe alone, not also to a root-owned file in /tmp.
-          const args = ['-n', 'sample', String(pid), String(SAMPLE_SECONDS), '-mayDie', '-file', '/dev/stdout'];
+          const args = ['-n', 'sample', String(pid), String(SAMPLE_SECONDS), '-file', '/dev/stdout'];
           const result = await probe(name, 'sudo', args, limitMs);
           if (finished) return;
           const report = callGraph(result.stdout);

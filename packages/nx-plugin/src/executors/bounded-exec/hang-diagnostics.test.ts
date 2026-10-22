@@ -9,6 +9,7 @@ import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { processTable } from '../../testing.js';
 import {
   captureHangDiagnostics,
+  HANG_CAPTURE_MS,
   type HangCaptureRequest,
   type HangDiagnosticHost,
   type HangProbeResult,
@@ -343,8 +344,9 @@ describe('pre-expiry hang diagnostics', () => {
     const capture = await capturing;
     expect(capture.outcome, capture.text).toBe('holders');
     expect(calls.map((call) => call.file)).toEqual(['ps', 'sudo', 'sudo', 'ps']);
-    expect(samples[1]?.args).toEqual(['-n', 'sample', '303', '1', '-mayDie', '-file', '/dev/stdout']);
-    for (const sample of samples) expect(sample.timeoutMs).toBeLessThanOrEqual(3_000);
+    expect(samples[1]?.args).toEqual(['-n', 'sample', '303', '1', '-file', '/dev/stdout']);
+    // Each sample may run until the closing census has its one second left of the capture window.
+    for (const sample of samples) expect(sample.timeoutMs).toBeLessThanOrEqual(HANG_CAPTURE_MS - 1_000);
     expect(capture.text).toContain('stack sample pid 303 (1s; binary image list omitted):');
     expect(capture.text).toContain('1000 read  (in libsystem_kernel.dylib) + 8');
     expect(capture.text).not.toContain('Binary Images:');
