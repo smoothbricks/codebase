@@ -3619,15 +3619,13 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
             // source's lease through the clone: an in-kernel attachment takes no file lock
             // that the source's shared lock could exclude (01a_apfs.md, "Images").
             let _lease = match capture {
-                ImageCapture::Detached => {
-                    self.runner
-                        .image_lease(source)
-                        .map_err(|error| CloneFileError::Io {
-                            source_path: source.to_owned(),
-                            destination_path: destination.to_owned(),
-                            source: error,
-                        })?
-                }
+                ImageCapture::Detached => image_identity(source)
+                    .and_then(|identity| self.runner.image_lease(&identity))
+                    .map_err(|error| CloneFileError::Io {
+                        source_path: source.to_owned(),
+                        destination_path: destination.to_owned(),
+                        source: error,
+                    })?,
                 ImageCapture::Live => None,
             };
             let held = timed_apfs_step(leg, "hold-source", || {
@@ -4289,8 +4287,15 @@ fn retire_event_log(mount_point: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// The identity an image's lease and attachment inventory key on: its absolute path, made
+/// absolute against the working directory and never resolved through a link. The lease file
+/// hashes it verbatim ([`image_lease_path`]), so every lease of one image goes through here.
+fn image_identity(image: &Path) -> io::Result<PathBuf> {
+    std::path::absolute(image)
+}
+
 fn attachment_inventory_path(image: &Path) -> Result<PathBuf, ApfsError> {
-    std::path::absolute(image).map_err(|source| ApfsError::FileOperation {
+    image_identity(image).map_err(|source| ApfsError::FileOperation {
         operation: "resolve attachment inventory path",
         path: image.to_owned(),
         source,
@@ -9656,6 +9661,21 @@ mod tests {
             }
         ));
         fs::remove_dir(directory).unwrap();
+    }
+
+    /// A relative and an absolute spelling of one image are one identity, and so one lease file:
+    /// a capture handed a relative source excludes the attach handed its absolute path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_relative_and_an_absolute_spelling_take_one_image_lease() {
+        let relative = Path::new("lease-relative.dmg");
+        let absolute = std::env::current_dir().unwrap().join(relative);
+        assert_eq!(image_identity(relative).unwrap(), absolute);
+        assert_eq!(attachment_inventory_path(relative).unwrap(), absolute);
+        assert_eq!(
+            image_lease_path(&image_identity(relative).unwrap()).unwrap(),
+            image_lease_path(&absolute).unwrap()
+        );
     }
 
     /// One identity's lease excludes every other holder of that identity — another descriptor
