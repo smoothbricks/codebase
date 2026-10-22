@@ -30,7 +30,7 @@ import * as validators from './validators.generated.js';
 interface SeamType<T> {
   readonly assertOne: (value: unknown) => T;
   readonly parseOne: (json: string) => T;
-  /** Present only for the exports that resolve a JSON array (`listJobs`, `listWorkspaces`). */
+  /** Present only for the types an export carries as a JSON array (`listJobs`; `listWorkspaces`' two lists). */
   readonly assertMany?: (value: unknown) => readonly T[];
   readonly parseMany?: (json: string) => readonly T[];
 }
@@ -96,6 +96,19 @@ const seamTypes = {
     assertMany: validators.assertWorkspaceInfoList,
     parseMany: validators.parseWorkspaceInfoList,
     readOne: readers.readWorkspaceInfo,
+  },
+  UnprovenWorkspace: {
+    assertOne: validators.assertUnprovenWorkspace,
+    parseOne: validators.parseUnprovenWorkspace,
+    assertMany: validators.assertUnprovenWorkspaceList,
+    parseMany: validators.parseUnprovenWorkspaceList,
+    // This DTO reaches a peer inside project.list, never as a standalone result.
+    readOne: (json: string) => {
+      const listing = readers.readWorkspaceListView(JSON.stringify({ workspaces: [], unproven: [JSON.parse(json)] }));
+      return validators.assertUnprovenWorkspace(listing.unproven[0]);
+    },
+    readMany: (json: string) =>
+      readers.readWorkspaceListView(JSON.stringify({ workspaces: [], unproven: JSON.parse(json) })).unproven,
   },
   GrantSet: {
     assertOne: validators.assertGrantSet,

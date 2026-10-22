@@ -40,6 +40,7 @@ import {
   type SccacheStartArguments,
   type Session,
   type WorkspaceHandle,
+  type WorkspaceListing,
   type WorkspaceRef,
 } from './types.js';
 import { parseWorkspaceTarget } from './validators.generated.js';
@@ -165,9 +166,9 @@ class ProjectImpl implements Project {
     return workspace.info();
   }
 
-  async listWorkspaces(options?: ProjectListArguments): Promise<readonly Api.WorkspaceInfo[]> {
-    const views = await callNativeAsync(() => N.projectList(this.#native, options ?? {}));
-    return views.map((view) => view.info);
+  async listWorkspaces(options?: ProjectListArguments): Promise<WorkspaceListing> {
+    const listing = await callNativeAsync(() => N.projectList(this.#native, options ?? {}));
+    return { workspaces: listing.workspaces.map((view) => view.info), unproven: listing.unproven };
   }
 }
 

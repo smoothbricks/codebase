@@ -1294,8 +1294,8 @@ export type ProjectListArguments = Pick<Api.ListRequest, 'landing'>;
 export async function projectList(
   handle: NativeProjectList,
   args: ProjectListArguments,
-): Promise<readonly Api.WorkspaceView[]> {
-  return R.readWorkspaceViewList(await handle.list(JSON.stringify(args)));
+): Promise<Api.WorkspaceListView> {
+  return R.readWorkspaceListView(await handle.list(JSON.stringify(args)));
 }
 
 /** A handle that serves `project.workspace`. */

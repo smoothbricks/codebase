@@ -203,6 +203,72 @@ fn fixture_storage(scratch: &Path) -> ValidatedHostStorage {
     )
 }
 
+/// A workspace whose mount does not prove itself the workspace's has no row: the listing names it
+/// and still lists every other workspace, while a read of that one workspace refuses with its own
+/// refusal (01a_apfs.md, "Ownership, identity, and the volume label"; 07_api.md, "Frozen wire
+/// projections"). On 2026-10-22 one shed's unreadable marker during its own detach failed its whole
+/// project's `cowshed ls`.
+#[tokio::test]
+async fn a_listing_names_an_unproven_workspace_and_lists_every_other() {
+    let fixture = Fixture::new("unproven-listing");
+    let runtime = fixture.adopt().await;
+    fixture
+        .fork(&runtime, "main", "settled")
+        .await
+        .expect("fork settled");
+    let unsettled = fixture
+        .fork(&runtime, "main", "unsettled")
+        .await
+        .expect("fork unsettled");
+    let mount = PathBuf::from(
+        unsettled["info"]["mount"]
+            .as_str()
+            .expect("unsettled mount"),
+    );
+    fs::remove_file(mount.join(cowshed_core::storage::WORKSPACE_MARKER_PATH))
+        .expect("the unsettled marker becomes unreadable");
+
+    let listing = fixture
+        .call(&runtime, "project.list", json!({ "repoId": fixture.repo }))
+        .await
+        .expect("one unproven workspace never fails its project's listing");
+    let mut rows = listing["workspaces"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|view| view["info"]["workspace"].as_str().expect("row name"))
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    assert_eq!(rows, ["main", "settled"], "{listing}");
+    let unproven = listing["unproven"].as_array().expect("unproven");
+    assert_eq!(unproven.len(), 1, "{listing}");
+    assert_eq!(unproven[0]["workspace"], "unsettled");
+    assert_eq!(
+        unproven[0]["workspaceIncarnation"],
+        unsettled["info"]["workspaceIncarnation"]
+    );
+    assert_eq!(unproven[0]["mount"], unsettled["info"]["mount"]);
+    let reason = unproven[0]["reason"].as_str().expect("reason");
+    assert!(reason.contains("no readable"), "{reason}");
+
+    let named = fixture
+        .call(
+            &runtime,
+            "project.workspace",
+            json!({ "repoId": fixture.repo, "workspace": "unsettled" }),
+        )
+        .await
+        .expect_err("a read of the unproven workspace itself refuses");
+    assert!(
+        named
+            .message
+            .contains("carries no readable fixture/intents/unsettled marker"),
+        "{}",
+        named.message
+    );
+    runtime.shutdown().await.expect("stop runtime");
+}
+
 /// One adopted project on its own real directory store.
 struct Fixture {
     /// Owned so its drop ends this test's workers and removes its tree.
@@ -378,7 +444,7 @@ impl Fixture {
             .call(runtime, "project.list", json!({ "repoId": self.repo }))
             .await
             .expect("list workspaces");
-        let mut names = listed
+        let mut names = listed["workspaces"]
             .as_array()
             .expect("workspace array")
             .iter()
@@ -1932,7 +1998,7 @@ async fn gc_retires_the_abandoned_refs_main_holds_and_supersedes_the_rest_only_w
         .await
         .expect("list workspaces");
     let main = PathBuf::from(
-        listed
+        listed["workspaces"]
             .as_array()
             .and_then(|workspaces| {
                 workspaces

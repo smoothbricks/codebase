@@ -47,8 +47,8 @@ pub mod volume_usage;
 
 pub use nx_daemon::{NxKeeperHold, NxKeeperState};
 pub use project::{
-    ClonePurpose, JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost, RecoveryScope,
-    RuntimeLogChunk, WorkspaceSnapshot,
+    ClonePurpose, JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost,
+    ProjectSnapshots, RecoveryScope, RuntimeLogChunk, WorkspaceSnapshot,
 };
 pub use supervisor::{
     CheckpointBarrier, CommitmentDraft, CommitmentPublisher, CommitmentPublisherHandle, LogChunk,

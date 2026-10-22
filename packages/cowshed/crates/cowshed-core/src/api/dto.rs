@@ -80,9 +80,10 @@ pub const MAX_JOB_TAIL_BYTES: usize = MAX_INLINE_OUTPUT_BYTES;
 pub enum DtoError {
     #[error("job id must be in 1..={MAX_JOB_ID}, got {0}")]
     InvalidJobId(u64),
-    /// A listing row's `state` is attached or detached (07_api.md, "Frozen wire projections"),
-    /// and a workspace whose mount does not prove itself the workspace's is neither, so the row
-    /// refuses rather than claim one (01a_apfs.md, "Ownership, identity, and the volume label").
+    /// A row's `state` is attached or detached (07_api.md, "Frozen wire projections"), and a
+    /// workspace whose mount does not prove itself the workspace's is neither, so it has no row
+    /// (01a_apfs.md, "Ownership, identity, and the volume label"): a listing names it as an
+    /// [`UnprovenWorkspace`], and a read of that one workspace refuses with this.
     #[error("workspace {name} is neither attached nor detached: {0}", name = .0.workspace.name())]
     UnprovenMount(Box<MountRefusal>),
     #[error("a superseded reason is one non-empty line, got {0:?}")]
@@ -983,6 +984,35 @@ pub enum UnlandedChange {
 pub struct ProjectWorkspaces {
     pub repo_id: RepoId,
     pub workspaces: Vec<WorkspaceInfo>,
+    /// Each workspace of the project whose mount is unproven, which has no row; omitted when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unproven: Vec<UnprovenWorkspace>,
+}
+
+/// A published workspace whose mount does not prove itself the workspace's. It is neither attached
+/// nor detached, so a listing names it here instead of giving it a [`WorkspaceInfo`] row (07_api.md,
+/// "Frozen wire projections"; 01a_apfs.md, "Ownership, identity, and the volume label").
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UnprovenWorkspace {
+    pub workspace: WorkspaceName,
+    pub workspace_incarnation: WorkspaceIncarnation,
+    /// The workspace's canonical mount path, the one its row would carry.
+    pub mount: PathBuf,
+    /// The refusal that left the mount unproven, as `doctor`'s `mount-identity` finding says it.
+    pub reason: String,
+}
+
+impl UnprovenWorkspace {
+    /// The workspace `refusal` refused, whose canonical mount path is `mount`.
+    pub fn of(refusal: &MountRefusal, mount: PathBuf) -> Self {
+        Self {
+            workspace: refusal.workspace.name().clone(),
+            workspace_incarnation: refusal.workspace.incarnation().clone(),
+            mount,
+            reason: refusal.to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

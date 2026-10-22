@@ -24,8 +24,9 @@ use cowshed_core::api::{
     ProjectGrants, PublicationPolicy, PushOptions, PushReport, RebaseBuildVolume, RebaseOptions,
     RebaseReport, RefLockPath, RekeyResult, RemoveOptions, RemoveProjectOptions,
     RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult, ResizeVolume, RevisionTarget,
-    RunSandboxMode, SccacheStatus, StdinSource as CoreStdinSource, UnlandedPaths, UtcTimestamp,
-    WorkspaceInfo, WorkspacePath, WorkspaceState, validate_command_argv,
+    RunSandboxMode, SccacheStatus, StdinSource as CoreStdinSource, UnlandedPaths,
+    UnprovenWorkspace, UtcTimestamp, WorkspaceInfo, WorkspacePath, WorkspaceState,
+    validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{
@@ -118,7 +119,8 @@ pub trait CliService: Send {
     async fn checkpoint(&mut self, workspace: &str, options: CheckpointOptions) -> Result<String>;
     async fn restore(&mut self, workspace: &str, label: &str) -> Result<WorkspaceInfo>;
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceInfo>;
-    async fn list(&mut self, landing: Option<ListLanding>) -> Result<Vec<WorkspaceInfo>>;
+    /// The project's rows, and each workspace whose mount is unproven, which has none.
+    async fn list(&mut self, landing: Option<ListLanding>) -> Result<ProjectWorkspaces>;
     /// The name of the workspace that currently occupies build slot `slot`.
     async fn workspace_in_slot(&mut self, slot: u32) -> Result<String>;
     async fn list_all(&mut self) -> Result<Vec<ProjectWorkspaces>> {
@@ -966,15 +968,17 @@ impl CliService for ActorBridge {
             .await
     }
 
-    async fn list(&mut self, landing: Option<ListLanding>) -> Result<Vec<WorkspaceInfo>> {
-        Ok(self
-            .coordinator()?
-            .project()
-            .list(landing)
-            .await?
-            .into_iter()
-            .map(|workspace| workspace.into_info())
-            .collect())
+    async fn list(&mut self, landing: Option<ListLanding>) -> Result<ProjectWorkspaces> {
+        let listing = self.coordinator()?.project().list(landing).await?;
+        Ok(ProjectWorkspaces {
+            repo_id: self.repo_id()?.clone(),
+            workspaces: listing
+                .workspaces
+                .into_iter()
+                .map(|workspace| workspace.into_info())
+                .collect(),
+            unproven: listing.unproven,
+        })
     }
 
     async fn workspace_in_slot(&mut self, slot: u32) -> Result<String> {
@@ -1732,10 +1736,15 @@ where
                     emit_kept_abandon_bundles(output, &service.kept_abandon_bundles().await?)?;
                 }
             } else {
-                let mut workspaces = service.list(listing_landing(args)).await?;
+                let ProjectWorkspaces {
+                    repo_id,
+                    mut workspaces,
+                    unproven,
+                } = service.list(listing_landing(args)).await?;
                 sort_workspace_listing(&mut workspaces);
-                let empty = workspaces.is_empty();
+                let empty = workspaces.is_empty() && unproven.is_empty();
                 emit_workspace_listing(output, json, args, None, workspaces)?;
+                emit_unproven(output, &repo_id, &unproven)?;
                 if empty {
                     let others = service.other_adopted_project_count().await?;
                     let noun = if others == 1 {
@@ -3060,7 +3069,7 @@ async fn attach_scoped_sessions(
             .flat_map(|project| project.workspaces)
             .collect()
     } else {
-        service.list(None).await?
+        service.list(None).await?.workspaces
     };
     let targets: Vec<WorkspaceInfo> = candidates.into_iter().filter(is_detached_session).collect();
     if targets.is_empty() {
@@ -4074,6 +4083,29 @@ fn emit_workspace_listing<W: Write, E: Write>(
         return emit_bare_names(output, workspaces.iter());
     }
     emit_workspace_table(output, &workspaces)
+}
+
+/// Name each workspace the project listing has no row for because its mount is unproven: every
+/// other row is listed, and `doctor` says what is mounted there (`mount-identity`). `ls --all`
+/// needs none of this: the host inventory that reads each project says it (07_api.md, "Frozen
+/// wire projections").
+fn emit_unproven<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    repo_id: &RepoId,
+    unproven: &[UnprovenWorkspace],
+) -> Result<()> {
+    for held in unproven {
+        output
+            .warning(&format!(
+                "{repo_id}/{} is not listed: it is neither attached nor detached: {}",
+                held.workspace, held.reason
+            ))
+            .map_err(output_error)?;
+    }
+    if !unproven.is_empty() {
+        output.hint("cowshed doctor").map_err(output_error)?;
+    }
+    Ok(())
 }
 
 fn emit_withheld<W: Write, E: Write>(
@@ -6978,6 +7010,47 @@ mod tests {
         };
         assert_eq!(listed(true), "read\t/opt/shared\nloopback\tany\n");
         assert_eq!(listed(false), "read\t/opt/shared\n");
+    }
+
+    /// A project listing gives an unproven workspace no row and names it, its refusal and `doctor` on
+    /// stderr (06_cli.md, "`cowshed ls` unproven workspaces"), so one shed's own detach never
+    /// fails its project's `ls`.
+    #[test]
+    fn an_unproven_workspace_is_named_on_stderr_and_never_on_stdout() {
+        let repo_id = RepoId::parse("acme/widget").expect("repo identity");
+        let held = UnprovenWorkspace {
+            workspace: WorkspaceName::new("detaching").expect("workspace name"),
+            workspace_incarnation: WorkspaceIncarnation::new("f221ac9777c546caba9b48a20f9e68b4")
+                .expect("workspace incarnation"),
+            mount: PathBuf::from("/mnt/acme/widget/detaching"),
+            reason: "workspace mount identity mismatch at /mnt/acme/widget/detaching: no readable marker"
+                .to_owned(),
+        };
+        let mut output = Output::new(Vec::new(), Vec::new(), false);
+
+        emit_unproven(&mut output, &repo_id, &[held])
+            .expect("naming an unproven workspace is not a failure");
+
+        let (stdout, stderr) = output.into_inner();
+        assert!(stdout.is_empty(), "stdout carries only rows");
+        let stderr = String::from_utf8(stderr).expect("utf-8 warning");
+        assert!(
+            stderr.contains("cowshed: warning: acme/widget/detaching is not listed"),
+            "{stderr:?}"
+        );
+        assert!(stderr.contains("no readable marker"), "{stderr:?}");
+        assert!(
+            stderr.ends_with(
+                "next: cowshed doctor
+"
+            ),
+            "{stderr:?}"
+        );
+
+        let mut none = Output::new(Vec::new(), Vec::new(), false);
+        emit_unproven(&mut none, &repo_id, &[]).expect("no unproven workspace");
+        let (stdout, stderr) = none.into_inner();
+        assert!(stdout.is_empty() && stderr.is_empty());
     }
 
     /// `--json`, `--landing` and `--landed` have one precedence, and the project-scoped and

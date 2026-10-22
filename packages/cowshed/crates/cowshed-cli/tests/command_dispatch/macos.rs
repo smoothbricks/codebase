@@ -501,13 +501,18 @@ async fn directory_parity_operations_answer_through_the_controller() {
         .list(Some(cowshed_core::api::operations::ListLanding::Landed))
         .await
         .expect("the controller's landed listing");
-    let names: Vec<&str> = landed.iter().map(|info| info.workspace.as_str()).collect();
+    let names: Vec<&str> = landed
+        .workspaces
+        .iter()
+        .map(|info| info.workspace.as_str())
+        .collect();
     assert_eq!(names, ["slotted"]);
     let measured = service
         .list(Some(cowshed_core::api::operations::ListLanding::Measure))
         .await
         .expect("the controller's measured listing");
     let parked = measured
+        .workspaces
         .iter()
         .find(|info| info.workspace.as_str() == "parked")
         .expect("parked is listed");

@@ -43,7 +43,7 @@ use cowshed_core::runtime::supervisor::{
 use cowshed_core::runtime::supervisor_socket::AdmissionSource;
 use cowshed_core::runtime::{
     ClonePurpose, JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost,
-    RuntimeLogChunk, WorkspaceSnapshot,
+    ProjectSnapshots, RuntimeLogChunk, WorkspaceSnapshot,
 };
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
 
@@ -558,7 +558,7 @@ impl ProjectRuntimeHost for FakeHost {
         Ok(())
     }
 
-    async fn snapshots(&mut self) -> Result<Vec<WorkspaceSnapshot>> {
+    async fn snapshots(&mut self) -> Result<ProjectSnapshots> {
         self.events.send(Event::SnapshotBatch).ok();
         if self.refuse_snapshot_batch {
             return Err(CowshedError::integrity(
@@ -566,12 +566,15 @@ impl ProjectRuntimeHost for FakeHost {
                 "cowshed doctor --json",
             ));
         }
-        Ok(self
-            .state
-            .workspaces
-            .iter()
-            .map(|workspace| self.snapshot(workspace))
-            .collect())
+        Ok(ProjectSnapshots {
+            workspaces: self
+                .state
+                .workspaces
+                .iter()
+                .map(|workspace| self.snapshot(workspace))
+                .collect(),
+            unproven: Vec::new(),
+        })
     }
 
     async fn workspace_snapshot(&mut self, workspace: WorkspaceName) -> Result<WorkspaceSnapshot> {
@@ -5296,8 +5299,8 @@ async fn adopt_then_create_list_and_path_use_one_immutable_snapshot() {
     )
     .await
     .expect("list");
-    assert_eq!(listed.as_array().expect("array").len(), 2);
-    let listed_workspaces = listed.as_array().expect("array");
+    assert_eq!(listed["workspaces"].as_array().expect("array").len(), 2);
+    let listed_workspaces = listed["workspaces"].as_array().expect("array");
     let main = listed_workspaces
         .iter()
         .find(|workspace| workspace["info"]["workspace"] == "main")
@@ -5333,7 +5336,7 @@ async fn adopt_then_create_list_and_path_use_one_immutable_snapshot() {
         PathBuf::from(task["info"]["mount"].as_str().expect("mount")),
         root.join("store/mnt/task")
     );
-    assert_eq!(listed.as_array().expect("array").len(), 2);
+    assert_eq!(listed["workspaces"].as_array().expect("array").len(), 2);
 }
 
 #[tokio::test]
@@ -5984,7 +5987,7 @@ async fn initializer_failure_never_publishes_or_lists_workspace() {
     )
     .await
     .expect("list");
-    assert_eq!(listed.as_array().expect("array").len(), 1);
+    assert_eq!(listed["workspaces"].as_array().expect("array").len(), 1);
     let mut saw_initialize = false;
     let mut saw_publish = false;
     while let Ok(event) = events.try_recv() {
@@ -6394,7 +6397,12 @@ async fn main_restore_detaches_swaps_exact_checkout_and_then_retires() {
     )
     .await
     .expect("list after rollback");
-    assert!(listed.as_array().expect("workspaces").is_empty());
+    assert!(
+        listed["workspaces"]
+            .as_array()
+            .expect("workspaces")
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -6562,7 +6570,7 @@ async fn destroy_waits_for_physical_reclaim_before_answering() {
     .await
     .expect("list after retirement");
     assert!(
-        listed
+        listed["workspaces"]
             .as_array()
             .expect("workspaces")
             .iter()
@@ -6647,10 +6655,10 @@ async fn crash_reopen_recovers_published_and_pending_state() {
     )
     .await
     .expect("list after reopen");
-    assert_eq!(listed.as_array().expect("array").len(), 1);
+    assert_eq!(listed["workspaces"].as_array().expect("array").len(), 1);
     assert_eq!(
         PathBuf::from(
-            listed[0]["info"]["mount"]
+            listed["workspaces"][0]["info"]["mount"]
                 .as_str()
                 .expect("recovered main mount")
         ),
@@ -6850,7 +6858,10 @@ async fn removing_a_project_finishes_each_release_before_collecting_then_restore
     .await
     .expect("list after removal");
     assert!(
-        listed.as_array().expect("workspaces").is_empty(),
+        listed["workspaces"]
+            .as_array()
+            .expect("workspaces")
+            .is_empty(),
         "main was restored: {listed}"
     );
 }
@@ -6890,7 +6901,7 @@ async fn a_stale_collection_is_a_retryable_refusal_and_the_retry_finishes_the_re
     .await
     .expect("list");
     assert_eq!(
-        listed.as_array().expect("workspaces").len(),
+        listed["workspaces"].as_array().expect("workspaces").len(),
         1,
         "main is not restored yet"
     );

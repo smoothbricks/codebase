@@ -250,6 +250,7 @@ type ReaderName =
   | 'SEQ__TURN_EVENT'
   | 'SEQ__UNATTRIBUTED_CHECK'
   | 'SEQ__UNLANDED_PATH'
+  | 'SEQ__UNPROVEN_WORKSPACE'
   | 'SEQ__WORKSPACE_INFO'
   | 'SEQ__WORKSPACE_VIEW'
   | 'SIM_VERB'
@@ -292,6 +293,7 @@ type ReaderName =
   | 'UNLANDED_PATHS'
   | 'UNLANDED_PATHS__NAMED'
   | 'UNLANDED_PATHS__PREDATES_PATHS'
+  | 'UNPROVEN_WORKSPACE'
   | 'USAGE_RECONCILIATION'
   | 'VOLUME_UNAVAILABLE'
   | 'VOLUME_UNAVAILABLE__FAILED'
@@ -302,6 +304,7 @@ type ReaderName =
   | 'VOLUME_USAGE__UNAVAILABLE'
   | 'WORKSPACE_INFO'
   | 'WORKSPACE_LANDING'
+  | 'WORKSPACE_LIST_VIEW'
   | 'WORKSPACE_ROLE'
   | 'WORKSPACE_STATE'
   | 'WORKSPACE_VIEW';
@@ -1469,6 +1472,7 @@ const READERS: Readers<ReaderName> = {
     fields: [
       ['repoId', 'LEAF'],
       ['workspaces', 'SEQ__WORKSPACE_INFO'],
+      ['unproven', 'SEQ__UNPROVEN_WORKSPACE'],
     ],
   },
   PROTECTED_OUTPUT: {
@@ -1727,6 +1731,7 @@ const READERS: Readers<ReaderName> = {
   SEQ__TURN_EVENT: { kind: 'seq', element: 'TURN_EVENT' },
   SEQ__UNATTRIBUTED_CHECK: { kind: 'seq', element: 'UNATTRIBUTED_CHECK' },
   SEQ__UNLANDED_PATH: { kind: 'seq', element: 'UNLANDED_PATH' },
+  SEQ__UNPROVEN_WORKSPACE: { kind: 'seq', element: 'UNPROVEN_WORKSPACE' },
   SEQ__WORKSPACE_INFO: { kind: 'seq', element: 'WORKSPACE_INFO' },
   SEQ__WORKSPACE_VIEW: { kind: 'seq', element: 'WORKSPACE_VIEW' },
   SIM_VERB: {
@@ -1939,6 +1944,15 @@ const READERS: Readers<ReaderName> = {
   },
   UNLANDED_PATHS__NAMED: { kind: 'record', fields: [['paths', 'SEQ__UNLANDED_PATH']] },
   UNLANDED_PATHS__PREDATES_PATHS: { kind: 'record', fields: [] },
+  UNPROVEN_WORKSPACE: {
+    kind: 'record',
+    fields: [
+      ['workspace', 'LEAF'],
+      ['workspaceIncarnation', 'LEAF'],
+      ['mount', 'LEAF'],
+      ['reason', 'LEAF'],
+    ],
+  },
   USAGE_RECONCILIATION: {
     kind: 'record',
     fields: [
@@ -1993,6 +2007,13 @@ const READERS: Readers<ReaderName> = {
       ['dirtyFiles', 'LEAF'],
       ['commits', 'LANDING_COMMITS'],
       ['branches', 'BRANCH_LANDINGS'],
+    ],
+  },
+  WORKSPACE_LIST_VIEW: {
+    kind: 'record',
+    fields: [
+      ['workspaces', 'SEQ__WORKSPACE_VIEW'],
+      ['unproven', 'SEQ__UNPROVEN_WORKSPACE'],
     ],
   },
   WORKSPACE_ROLE: {
@@ -2152,5 +2173,5 @@ export const readWorkspaceInfo = (json: string): Api.WorkspaceInfo =>
 export const readWorkspaceInfoList = (json: string): readonly Api.WorkspaceInfo[] =>
   V.assertWorkspaceInfoList(project(JSON.parse(json), 'SEQ__WORKSPACE_INFO', READERS));
 
-export const readWorkspaceViewList = (json: string): readonly Api.WorkspaceView[] =>
-  V.assertWorkspaceViewList(project(JSON.parse(json), 'SEQ__WORKSPACE_VIEW', READERS));
+export const readWorkspaceListView = (json: string): Api.WorkspaceListView =>
+  V.assertWorkspaceListView(project(JSON.parse(json), 'WORKSPACE_LIST_VIEW', READERS));

@@ -3214,6 +3214,22 @@
       "workspace": "cs-seam"
     }
   },
+  "UnprovenWorkspace": {
+    "list": [
+      {
+        "mount": "/Users/fixture/.cowshed/mnt/smoothbricks/codebase/cs-detaching",
+        "reason": "workspace mount identity mismatch at /Users/fixture/.cowshed/mnt/smoothbricks/codebase/cs-detaching: the volume mounted from /dev/disk41s1 carries no readable smoothbricks/codebase/cs-detaching marker for incarnation 0123456789abcdef0123456789abcdef: No such file or directory (os error 2)",
+        "workspace": "cs-detaching",
+        "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+      }
+    ],
+    "markerUnreadable": {
+      "mount": "/Users/fixture/.cowshed/mnt/smoothbricks/codebase/cs-detaching",
+      "reason": "workspace mount identity mismatch at /Users/fixture/.cowshed/mnt/smoothbricks/codebase/cs-detaching: the volume mounted from /dev/disk41s1 carries no readable smoothbricks/codebase/cs-detaching marker for incarnation 0123456789abcdef0123456789abcdef: No such file or directory (os error 2)",
+      "workspace": "cs-detaching",
+      "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+    }
+  },
   "WorkspaceInfo": {
     "landingIndeterminate": {
       "checkpoints": [],

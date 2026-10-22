@@ -1794,6 +1794,13 @@ export const assertUnlandedPathsList = typia.createAssertEquals<readonly Api.Unl
 export const parseUnlandedPathsList = (json: string): readonly Api.UnlandedPaths[] =>
   assertUnlandedPathsList(JSON.parse(json));
 
+export const assertUnprovenWorkspace = typia.createAssertEquals<Api.UnprovenWorkspace>();
+export const parseUnprovenWorkspace = (json: string): Api.UnprovenWorkspace =>
+  assertUnprovenWorkspace(JSON.parse(json));
+export const assertUnprovenWorkspaceList = typia.createAssertEquals<readonly Api.UnprovenWorkspace[]>();
+export const parseUnprovenWorkspaceList = (json: string): readonly Api.UnprovenWorkspace[] =>
+  assertUnprovenWorkspaceList(JSON.parse(json));
+
 export const assertUsageReconciliation = typia.createAssertEquals<Api.UsageReconciliation>();
 export const parseUsageReconciliation = (json: string): Api.UsageReconciliation =>
   assertUsageReconciliation(JSON.parse(json));
@@ -1902,6 +1909,13 @@ export const parseWorkspaceLanding = (json: string): Api.WorkspaceLanding => ass
 export const assertWorkspaceLandingList = typia.createAssertEquals<readonly Api.WorkspaceLanding[]>();
 export const parseWorkspaceLandingList = (json: string): readonly Api.WorkspaceLanding[] =>
   assertWorkspaceLandingList(JSON.parse(json));
+
+export const assertWorkspaceListView = typia.createAssertEquals<Api.WorkspaceListView>();
+export const parseWorkspaceListView = (json: string): Api.WorkspaceListView =>
+  assertWorkspaceListView(JSON.parse(json));
+export const assertWorkspaceListViewList = typia.createAssertEquals<readonly Api.WorkspaceListView[]>();
+export const parseWorkspaceListViewList = (json: string): readonly Api.WorkspaceListView[] =>
+  assertWorkspaceListViewList(JSON.parse(json));
 
 export const assertWorkspaceName = typia.createAssertEquals<Api.WorkspaceName>();
 export const parseWorkspaceName = (json: string): Api.WorkspaceName => assertWorkspaceName(JSON.parse(json));

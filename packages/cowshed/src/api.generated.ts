@@ -2649,6 +2649,10 @@ export type ProjectRetirementReport = {
 export type ProjectWorkspaces = {
   readonly repoId: RepoId;
   readonly workspaces: ReadonlyArray<WorkspaceInfo>;
+  /**
+   * Each workspace of the project whose mount is unproven, which has no row; omitted when none.
+   */
+  readonly unproven?: ReadonlyArray<UnprovenWorkspace>;
 };
 
 export type ProtectedOutput =
@@ -3515,6 +3519,24 @@ export type UnlandedPaths =
   | { readonly kind: 'predatesPaths' };
 
 /**
+ * A published workspace whose mount does not prove itself the workspace's. It is neither attached
+ * nor detached, so a listing names it here instead of giving it a [`WorkspaceInfo`] row (07_api.md,
+ * "Frozen wire projections"; 01a_apfs.md, "Ownership, identity, and the volume label").
+ */
+export type UnprovenWorkspace = {
+  readonly workspace: WorkspaceName;
+  readonly workspaceIncarnation: WorkspaceIncarnation;
+  /**
+   * The workspace's canonical mount path, the one its row would carry.
+   */
+  readonly mount: string;
+  /**
+   * The refusal that left the mount unproven, as `doctor`'s `mount-identity` finding says it.
+   */
+  readonly reason: string;
+};
+
+/**
  * How a job's independent totals compare with what its observed processes counted as their
  * own: each signed difference is the total less the observed sum, never clamped, and the
  * coverage says whether the observed processes are all the job ran.
@@ -3667,6 +3689,15 @@ export type WorkspaceLanding = {
    * The workspace's other local branches, measured the way `commits` measures its head.
    */
   readonly branches: BranchLandings;
+};
+
+/**
+ * What `project.list` answers: a view of each workspace whose mount state is proven, and each
+ * unproven one by name, which has no row (07_api.md, "Frozen wire projections").
+ */
+export type WorkspaceListView = {
+  readonly workspaces: ReadonlyArray<WorkspaceView>;
+  readonly unproven: ReadonlyArray<UnprovenWorkspace>;
 };
 
 /**

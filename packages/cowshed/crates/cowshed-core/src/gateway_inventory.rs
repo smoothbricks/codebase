@@ -11,7 +11,7 @@ use thiserror::Error;
 
 #[cfg(test)]
 use crate::api::dto::WorkspaceState;
-use crate::api::dto::{ProjectWorkspaces, WorkspaceInfo};
+use crate::api::dto::{ProjectWorkspaces, UnprovenWorkspace, WorkspaceInfo};
 use crate::metadata::{
     DetachedWorkspaceMetadata, GrantSet, PortBlock, PublicationState, ReservedPortBlocks,
     WorkspaceIncarnation, WorkspaceName, sidecar_path,
@@ -1917,6 +1917,7 @@ impl NativeGatewayInventory {
             derived,
         } = self.load_derived(repo_id)?;
         let mut workspaces = Vec::with_capacity(derived.len());
+        let mut unproven = Vec::new();
         for workspace in derived {
             let volume = crate::storage::apfs::volume_key(repo_id, workspace.workspace.name());
             let mount =
@@ -1926,6 +1927,14 @@ impl NativeGatewayInventory {
                         path: layout.project().project_root.clone(),
                         message: format!("missing canonical mount path for {volume}"),
                     })?;
+            // Neither attached nor detached, so no row: named, and said by `load_derived`.
+            match &workspace.mount_state {
+                MountState::Unproven(refusal) => {
+                    unproven.push(UnprovenWorkspace::of(refusal, mount.clone()));
+                    continue;
+                }
+                MountState::Mounted { .. } | MountState::Detached => {}
+            }
             let image_paths = canonical_image_paths(&layout, &workspace.workspace)?;
             let metadata = read_current_metadata(
                 self.storage.store(),
@@ -1940,9 +1949,11 @@ impl NativeGatewayInventory {
             workspaces.push(info);
         }
         workspaces.sort_by(|left, right| left.workspace.cmp(&right.workspace));
+        unproven.sort_by(|left, right| left.workspace.cmp(&right.workspace));
         Ok(ProjectWorkspaces {
             repo_id: repo_id.clone(),
             workspaces,
+            unproven,
         })
     }
     fn load_project(&self, repo_id: &RepoId) -> Result<AttachedInventory, GatewayInventoryError> {
@@ -3405,16 +3416,35 @@ mod tests {
         let host = inventory.all_attached().await.expect("host inventory");
         assert_eq!(host.held, project.held);
 
-        // A listing row's state is attached or detached (07_api.md), so the listing that holds the
-        // unproven workspace refuses, naming it, rather than call it detached.
+        // A row's state is attached or detached (07_api.md), so the listing gives the unproven
+        // workspace no row, names it with its refusal, and still lists every other workspace.
         let listing = inventory
             .load_project_workspaces(&repo)
-            .expect_err("a listing never reports an unproven workspace detached");
-        assert!(
+            .expect("one unproven workspace never fails its project's listing");
+        assert_eq!(
             listing
-                .to_string()
-                .contains("workspace ci-fhs-tools is neither attached nor detached"),
-            "{listing}"
+                .workspaces
+                .iter()
+                .map(|info| info.workspace.as_str())
+                .collect::<Vec<_>>(),
+            ["main", "raven"]
+        );
+        let [held] = listing.unproven.as_slice() else {
+            panic!(
+                "exactly the unproven workspace is named: {:?}",
+                listing.unproven
+            );
+        };
+        assert_eq!(held.workspace.as_str(), "ci-fhs-tools");
+        assert_eq!(
+            held.workspace_incarnation.as_str(),
+            "f221ac9777c546caba9b48a20f9e68b4"
+        );
+        assert!(
+            held.reason
+                .contains("No such file or directory (os error 2)"),
+            "{}",
+            held.reason
         );
     }
 

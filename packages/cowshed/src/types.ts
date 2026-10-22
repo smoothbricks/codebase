@@ -125,9 +125,19 @@ export interface Project {
   path(name: string, options?: PathOptions): Promise<Api.WorkspaceInfo>;
   /**
    * The published workspaces. `landing: 'measure'` measures every attached session against main's
-   * landing branch; `'landed'` keeps only the sessions whose work is provably fully landed.
+   * landing branch; `'landed'` keeps only the sessions whose work is provably fully landed. A
+   * workspace whose mount is unproven has no row and is named in `unproven`.
    */
-  listWorkspaces(options?: ProjectListArguments): Promise<readonly Api.WorkspaceInfo[]>;
+  listWorkspaces(options?: ProjectListArguments): Promise<WorkspaceListing>;
+}
+
+/**
+ * A project's listing: a row for each workspace whose mount state is proven, and each workspace
+ * whose mount is unproven by name. That one is neither attached nor detached, so it has no row.
+ */
+export interface WorkspaceListing {
+  readonly workspaces: readonly Api.WorkspaceInfo[];
+  readonly unproven: readonly Api.UnprovenWorkspace[];
 }
 
 /**

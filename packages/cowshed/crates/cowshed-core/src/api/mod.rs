@@ -15,7 +15,8 @@ pub mod tree_holder;
 
 pub use capability::{
     Adopted, Coordinator, CoordinatorToken, Cowshed, EventStream, Host, JobAttachment, JobHandle,
-    JobStdin, Project, RawByteStream, SccacheHost, Session, WorkspaceHandle, WorkspaceRef,
+    JobStdin, Project, RawByteStream, SccacheHost, Session, WorkspaceHandle, WorkspaceListing,
+    WorkspaceRef,
 };
 pub use dto::*;
 pub use operations::JobStream;

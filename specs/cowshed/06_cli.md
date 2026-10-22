@@ -168,11 +168,11 @@ Every command uses a named `cowshed-core` DTO as its `result`; adapters never as
 `baseCommit`, while query/attachment paths may omit it when no marker snapshot was requested. `detach`, `rm`, job
 detach/kill, and successful policy mutations with no additional observation return the literal empty object `{}` through
 `EmptyResult` (never `null`, `true`, or a message string). `doctor` returns `DoctorReport { healthy, findings }`; each
-`Finding` has `code`, `severity`, `message`, `hint`, and optional `path`. `ls` returns `WorkspaceInfo[]`; `attach`
-returns `MountResult` for one workspace and `WorkspaceInfo[]` for several; `gc` returns `GcReport`; `identity add`
-returns `IdentityReport { repoId, added, identity, identities }`; `forget` returns
-`ProjectRetirementReport { repoId, archive, images }`. Exec and job commands return the frozen job DTOs in 07_api.md.
-Commands whose normal stdout is a scalar use a named one-field body (`CheckpointResult { label }`,
+`Finding` has `code`, `severity`, `message`, `hint`, and optional `path`. `ls` returns `WorkspaceInfo[]` and `ls --all`
+returns `ProjectWorkspaces[]` (07_api.md); `attach` returns `MountResult` for one workspace and `WorkspaceInfo[]` for
+several; `gc` returns `GcReport`; `identity add` returns `IdentityReport { repoId, added, identity, identities }`;
+`forget` returns `ProjectRetirementReport { repoId, archive, images }`. Exec and job commands return the frozen job DTOs
+in 07_api.md. Commands whose normal stdout is a scalar use a named one-field body (`CheckpointResult { label }`,
 `RevisionResult { oid }`, `SlotResult { slot }`) so JSON never changes shape when another field is added.
 
 `reseed` returns
@@ -455,6 +455,14 @@ hints `next: cowshed ls --all`.
 commit, branch, and age live in the in-image marker. So for a **detached** workspace those fields come from the snapshot
 every grants sidecar carries (01_storage.md); a sidecar without one is unreadable, not a row with empty columns. `state`
 and `name` are always accurate because they derive from readdir + getmntinfo alone.
+
+### `cowshed ls` unproven workspaces
+
+A workspace whose mount does not prove itself the workspace's (01a_apfs.md, "Ownership, identity, and the volume label")
+is neither attached nor detached, so `ls` gives it no row. `ls` lists every other workspace, names that one on stderr
+with its refusal and `next: cowshed doctor`, and exits 0. `--json` keeps `WorkspaceInfo[]` on stdout; `ls --all --json`
+carries the workspace in its project's `unproven` (07_api.md, `UnprovenWorkspace`). A shed whose marker is unreadable
+during its own detach costs its own row, never its project's listing.
 
 ### Checkpoint listing
 

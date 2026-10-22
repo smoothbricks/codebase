@@ -95,7 +95,7 @@ pub struct Project { /* repo_id, chosen remote binding, git root, cowshed dirs â
 impl Project {
     pub async fn main(&self) -> Result<WorkspaceRef, CowshedError>;
     pub async fn workspace(&self, name: &str) -> Result<WorkspaceRef, CowshedError>;
-    pub async fn list(&self) -> Result<Vec<WorkspaceRef>, CowshedError>;
+    pub async fn list(&self) -> Result<WorkspaceListing, CowshedError>; // { workspaces: Vec<WorkspaceRef>, unproven }
     /// Resolve only through authoritative metadata plus an exact active-mount containment match.
     pub async fn workspace_at(&self, path: impl AsRef<Path>) -> Result<WorkspaceRef, CowshedError>;
 }
@@ -1488,6 +1488,16 @@ supervisor that ran the job retires.
   marker snapshot omit all three marker-derived optionals but still report checkpoint facts.
   `MountResult = { workspace, mount, baseCommit? }`; lifecycle creation/restoration fills `baseCommit`, while
   attachment/query results may omit it. `EmptyResult` serializes as exactly `{}`.
+- `UnprovenWorkspace = { workspace, workspaceIncarnation, mount, reason }` names a published workspace whose mount does
+  not prove itself the workspace's (01a_apfs.md, "Ownership, identity, and the volume label"). It is neither attached
+  nor detached, so it has no `WorkspaceInfo` row; `mount` is the canonical path its row would carry and `reason` is the
+  refusal's text. A listing never fails for one: `project.list` answers
+  `WorkspaceListView = { workspaces: WorkspaceView[], unproven: UnprovenWorkspace[] }`, `Project::list` the matching
+  `WorkspaceListing`, the facade's `listWorkspaces()` `{ workspaces: WorkspaceInfo[], unproven: UnprovenWorkspace[] }`,
+  and `ProjectWorkspaces = { repoId, workspaces, unproven? }` (`ls --all --json`) omits `unproven` when it is empty. A
+  read of that one workspace still refuses with its refusal. `project.list` answered a bare `WorkspaceView[]` before;
+  the object is a breaking wire change, and a client of an older build cannot decode it. A consumer that keys on the
+  listed workspaces counts an unproven one as present: it is the project's, and only its mount is in doubt.
 - `AdoptOptions.repoId` is optional only because a trusted remote binding can supply it; local-only adoption requires
   the explicit value. `CheckpointOptions = { label?, keep }` carries pin intent without granting quota mutation
   authority. `RemoveOptions.restore` selects the reversible `main` adoption rollback; it is not an alias for forced
@@ -1764,7 +1774,9 @@ export interface Project {
   workspace(name: string): Promise<WorkspaceRef>;
   workspaceAt(path: string): Promise<WorkspaceRef>;
   workspaceInSlot(slot: number): Promise<WorkspaceRef>; // project.workspaceInSlot
-  listWorkspaces(options?: { landing?: 'measure' | 'landed' }): Promise<WorkspaceInfo[]>;
+  listWorkspaces(options?: {
+    landing?: 'measure' | 'landed';
+  }): Promise<{ workspaces: WorkspaceInfo[]; unproven: UnprovenWorkspace[] }>;
 }
 
 export interface WorkspaceRef {

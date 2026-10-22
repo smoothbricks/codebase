@@ -229,7 +229,7 @@ import { coordinatorEndpoint, openProject } from '@smoothbricks/cowshed';
 // `endpointFd` is an inherited socket from the trusted controller, never token text.
 const endpoint = coordinatorEndpoint(endpointFd);
 const project = await openProject(endpoint, '<project-root>');
-const workspaces = await project.listWorkspaces();
+const { workspaces, unproven } = await project.listWorkspaces();
 const main = await project.main();
 
 const current = await main.info();

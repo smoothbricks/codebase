@@ -722,8 +722,11 @@ static PROJECT_OPENED: Reader = Reader::Record(&[
 ]);
 static PROJECT_RETIREMENT_REPORT: Reader =
     Reader::Record(&[("repoId", &LEAF), ("archive", &LEAF), ("images", &LEAF)]);
-static PROJECT_WORKSPACES: Reader =
-    Reader::Record(&[("repoId", &LEAF), ("workspaces", &SEQ__WORKSPACE_INFO)]);
+static PROJECT_WORKSPACES: Reader = Reader::Record(&[
+    ("repoId", &LEAF),
+    ("workspaces", &SEQ__WORKSPACE_INFO),
+    ("unproven", &SEQ__UNPROVEN_WORKSPACE),
+]);
 static PROTECTED_OUTPUT: Reader = Reader::Internal {
     tag: "kind",
     arms: &[
@@ -897,7 +900,9 @@ static SEQ__TICKET: Reader = Reader::Seq(&TICKET);
 static SEQ__TURN_EVENT: Reader = Reader::Seq(&TURN_EVENT);
 static SEQ__UNATTRIBUTED_CHECK: Reader = Reader::Seq(&UNATTRIBUTED_CHECK);
 static SEQ__UNLANDED_PATH: Reader = Reader::Seq(&UNLANDED_PATH);
+static SEQ__UNPROVEN_WORKSPACE: Reader = Reader::Seq(&UNPROVEN_WORKSPACE);
 static SEQ__WORKSPACE_INFO: Reader = Reader::Seq(&WORKSPACE_INFO);
+static SEQ__WORKSPACE_VIEW: Reader = Reader::Seq(&WORKSPACE_VIEW);
 static SIM_VERB: Reader = Reader::External(&[("openurl", &LEAF), ("install", &LEAF)]);
 static SKILL_INSTALL: Reader = Reader::Record(&[
     ("harness", &LEAF),
@@ -1021,6 +1026,12 @@ static UNLANDED_PATHS: Reader = Reader::Internal {
 };
 static UNLANDED_PATHS__NAMED: Reader = Reader::Record(&[("paths", &SEQ__UNLANDED_PATH)]);
 static UNLANDED_PATHS__PREDATES_PATHS: Reader = Reader::Record(&[]);
+static UNPROVEN_WORKSPACE: Reader = Reader::Record(&[
+    ("workspace", &LEAF),
+    ("workspaceIncarnation", &LEAF),
+    ("mount", &LEAF),
+    ("reason", &LEAF),
+]);
 static USAGE_RECONCILIATION: Reader = Reader::Record(&[
     ("cpuUs", &LEAF),
     ("ioReadBytes", &LEAF),
@@ -1068,6 +1079,10 @@ static WORKSPACE_LANDING: Reader = Reader::Record(&[
     ("dirtyFiles", &LEAF),
     ("commits", &LANDING_COMMITS),
     ("branches", &BRANCH_LANDINGS),
+]);
+static WORKSPACE_LIST_VIEW: Reader = Reader::Record(&[
+    ("workspaces", &SEQ__WORKSPACE_VIEW),
+    ("unproven", &SEQ__UNPROVEN_WORKSPACE),
 ]);
 static WORKSPACE_ROLE: Reader = Reader::External(&[("main", &LEAF), ("workspace", &LEAF)]);
 static WORKSPACE_STATE: Reader = Reader::External(&[("attached", &LEAF), ("detached", &LEAF)]);
@@ -1256,6 +1271,10 @@ impl Projected for crate::api::operations::WorkerView {
 
 impl Projected for crate::api::dto::WorkspaceInfo {
     const READER: &'static Reader = &WORKSPACE_INFO;
+}
+
+impl Projected for crate::api::operations::WorkspaceListView {
+    const READER: &'static Reader = &WORKSPACE_LIST_VIEW;
 }
 
 impl Projected for crate::api::operations::WorkspaceView {

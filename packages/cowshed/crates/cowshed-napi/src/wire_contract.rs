@@ -36,9 +36,10 @@ use cowshed_core::{
         RebaseReport, RemoveReport, RepoRule, ResidentBytes, ResizeResult, ResizeVolume,
         RetiredAbandonedRefs, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind, StreamBytes,
         StreamInfo, StreamLines, SupersededReason, TraceContext, TraceId, UnlandedChange,
-        UnlandedPath, UnlandedPaths, UsageReconciliation, UtcTimestamp, VolumeUnavailable,
-        VolumeUsage, VolumeUsedBytesDelta, WallMicros, WorkspaceIncarnation, WorkspaceInfo,
-        WorkspaceLanding, WorkspaceName, WorkspacePath, WorkspaceRole, WorkspaceState,
+        UnlandedPath, UnlandedPaths, UnprovenWorkspace, UsageReconciliation, UtcTimestamp,
+        VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta, WallMicros, WorkspaceIncarnation,
+        WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath, WorkspaceRole,
+        WorkspaceState,
     },
     repository::RepoId,
 };
@@ -836,6 +837,24 @@ fn workspace_infos() -> BTreeMap<&'static str, Value> {
     ])
 }
 
+/// A workspace a listing names but gives no row: its mount does not prove itself the workspace's.
+fn unproven_workspaces() -> BTreeMap<&'static str, Value> {
+    let unreadable = UnprovenWorkspace {
+        workspace: workspace_name("cs-detaching"),
+        workspace_incarnation: incarnation(),
+        mount: PathBuf::from("/Users/fixture/.cowshed/mnt/smoothbricks/codebase/cs-detaching"),
+        reason: "workspace mount identity mismatch at /Users/fixture/.cowshed/mnt/smoothbricks/codebase/cs-detaching: the volume mounted from /dev/disk41s1 carries no readable smoothbricks/codebase/cs-detaching marker for incarnation 0123456789abcdef0123456789abcdef: No such file or directory (os error 2)".to_owned(),
+    };
+    let list = vec![unreadable.clone()];
+    BTreeMap::from([
+        (
+            "markerUnreadable",
+            document("unproven workspace", &unreadable),
+        ),
+        ("list", document("unproven workspace list", &list)),
+    ])
+}
+
 fn grant_sets() -> BTreeMap<&'static str, Value> {
     let closed = GrantSet::default();
 
@@ -1630,6 +1649,7 @@ fn corpus() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
     corpus.extend(process_observations());
     corpus.insert("JobInfo", job_infos());
     corpus.insert("WorkspaceInfo", workspace_infos());
+    corpus.insert("UnprovenWorkspace", unproven_workspaces());
     corpus.insert("GrantSet", grant_sets());
     corpus
 }

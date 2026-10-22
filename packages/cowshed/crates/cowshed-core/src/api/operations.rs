@@ -17,8 +17,8 @@ use super::dto::{
     MirrorInfo, NxStateClearResult, OutputPublication, ProjectGrantDelta, PushOptions, PushReport,
     RebaseOptions, RebaseReport, RekeyResult, RemoveOptions, RemoveProjectOptions,
     RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult, ResizeVolume, RunSandboxMode,
-    ScriptCommand, SealedJob, TraceContext, WorkspaceIncarnation, WorkspaceInfo, WorkspacePath,
-    WorkspaceTarget,
+    ScriptCommand, SealedJob, TraceContext, UnprovenWorkspace, WorkspaceIncarnation, WorkspaceInfo,
+    WorkspacePath, WorkspaceTarget,
 };
 use super::dto::{
     BinaryData, BuildStateListing, CredentialReport, DiskCommandEvent, DiskCommandTool,
@@ -282,7 +282,7 @@ operations! {
     /// Resolves the workspace an existing path belongs to.
     coordinator json "project.workspaceAt" ProjectWorkspaceAt(WorkspaceAtRequest) -> WorkspaceView;
     /// Lists every published workspace.
-    coordinator json "project.list" ProjectList(ListRequest) -> Vec<WorkspaceView>;
+    coordinator json "project.list" ProjectList(ListRequest) -> WorkspaceListView;
     /// Resolves the workspace that currently occupies one build slot.
     coordinator json "project.workspaceInSlot" ProjectWorkspaceInSlot(WorkspaceInSlotRequest) -> WorkspaceView;
     /// Refreshes one workspace's information.
@@ -550,6 +550,15 @@ impl AsMut<WorkspaceInfo> for WorkspaceView {
     fn as_mut(&mut self) -> &mut WorkspaceInfo {
         &mut self.info
     }
+}
+
+/// What `project.list` answers: a view of each workspace whose mount state is proven, and each
+/// unproven one by name, which has no row (07_api.md, "Frozen wire projections").
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceListView {
+    pub workspaces: Vec<WorkspaceView>,
+    pub unproven: Vec<UnprovenWorkspace>,
 }
 
 /// The workspace a worker capability was minted for. The wire form is the [`WorkspaceView`]; the

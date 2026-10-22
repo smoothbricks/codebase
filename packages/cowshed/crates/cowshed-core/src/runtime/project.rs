@@ -34,7 +34,7 @@ use crate::api::operations::{
     JobStream, ListLanding, ListRequest, LogsChunk, LogsRequest, Operation, OperationRequest,
     ProgressRequest, ProjectOpenRequest, ProjectOpened, ReAdoption, Scope, StdinWriteRequest,
     TailRequest, WorkerScope, WorkspaceAtRequest, WorkspaceGrantsRequest, WorkspaceInSlotRequest,
-    WorkspaceRequest, WorkspaceView, encode_result,
+    WorkspaceListView, WorkspaceRequest, WorkspaceView, encode_result,
 };
 use crate::api::process::JobProcessTree;
 use crate::api::resources::{JobResourceSample, SampleInterval};
@@ -74,6 +74,15 @@ pub struct WorkspaceSnapshot {
     pub grants: GrantSet,
     pub lifecycle_revision: u64,
     pub topology_revision: u64,
+}
+
+/// One authoritative enumeration of a project's published workspaces: a snapshot of each whose
+/// mount state is proven, and each whose mount is unproven by name, which has no snapshot because
+/// it is neither attached nor detached (01a_apfs.md, "Ownership, identity, and the volume label").
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProjectSnapshots {
+    pub workspaces: Vec<WorkspaceSnapshot>,
+    pub unproven: Vec<crate::api::dto::UnprovenWorkspace>,
 }
 
 /// Project identity fixed for the lifetime of one controller actor.
@@ -140,7 +149,8 @@ pub trait ProjectRuntimeHost: Send + 'static {
     /// serves, each once its jobs ended and its keeper's Nx daemon stopped, so nothing they ran
     /// outlives the runtime (04_sandbox.md). Supervisors another process serves are its own.
     async fn shutdown(&mut self) {}
-    async fn snapshots(&mut self) -> Result<Vec<WorkspaceSnapshot>>;
+    /// Every published workspace; one whose mount is unproven is named, never a failure of the rest.
+    async fn snapshots(&mut self) -> Result<ProjectSnapshots>;
     /// Inspect exactly one workspace; worker and job fences never enumerate sibling state.
     async fn workspace_snapshot(&mut self, workspace: WorkspaceName) -> Result<WorkspaceSnapshot>;
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceSnapshot>;
@@ -1758,13 +1768,11 @@ impl ProjectActor {
     /// can be asked for and nothing else the project serves waits on it.
     async fn project_list(&mut self, params: ListRequest) -> Result<JobAnswer<RouterResponse>> {
         self.require_repo(&params.repo_id)?;
-        let mut views: Vec<WorkspaceView> = self
-            .host
-            .snapshots()
-            .await?
-            .into_iter()
-            .map(workspace_view)
-            .collect();
+        let ProjectSnapshots {
+            workspaces,
+            unproven,
+        } = self.host.snapshots().await?;
+        let mut views: Vec<WorkspaceView> = workspaces.into_iter().map(workspace_view).collect();
         Ok(Box::pin(async move {
             if let Some(selection) = params.landing {
                 crate::landing::annotate_listing(&mut views).await;
@@ -1772,7 +1780,10 @@ impl ProjectActor {
                     crate::landing::retain_fully_landed(&mut views);
                 }
             }
-            respond::<operations::ProjectList>(&views)
+            respond::<operations::ProjectList>(&WorkspaceListView {
+                workspaces: views,
+                unproven,
+            })
         }))
     }
 
@@ -1789,10 +1800,19 @@ impl ProjectActor {
                 "choose a slot within the project's range",
             )
         })?;
-        let snapshot = self
-            .host
-            .snapshots()
-            .await?
+        let ProjectSnapshots {
+            workspaces,
+            unproven,
+        } = self.host.snapshots().await?;
+        // The slot's tenant is held, not absent: naming no workspace would send the caller to
+        // fork into a slot that is occupied.
+        if let Some(held) = unproven
+            .iter()
+            .find(|held| crate::metadata::SlotId::from_mount_path(&held.mount) == Some(wanted))
+        {
+            return Err(native_integrity_error(&held.reason));
+        }
+        let snapshot = workspaces
             .into_iter()
             .find(|snapshot| {
                 crate::metadata::SlotId::from_mount_path(&snapshot.info.mount) == Some(wanted)
@@ -2267,11 +2287,15 @@ async fn remove_project(
     host: &mut dyn ProjectRuntimeHost,
     options: RemoveProjectOptions,
 ) -> Result<RemoveProjectReport> {
-    let mut sessions: std::collections::BTreeSet<WorkspaceName> = host
-        .snapshots()
-        .await?
+    // An unproven session is still the project's: its own removal says why it cannot finish.
+    let ProjectSnapshots {
+        workspaces,
+        unproven,
+    } = host.snapshots().await?;
+    let mut sessions: std::collections::BTreeSet<WorkspaceName> = workspaces
         .into_iter()
         .map(|snapshot| snapshot.info.workspace)
+        .chain(unproven.into_iter().map(|held| held.workspace))
         .filter(|workspace| !workspace.is_main())
         .collect();
     sessions.extend(
@@ -11521,13 +11545,24 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         Ok(())
     }
 
-    async fn snapshots(&mut self) -> Result<Vec<WorkspaceSnapshot>> {
+    async fn snapshots(&mut self) -> Result<ProjectSnapshots> {
         self.validate_binding().await?;
-        self.authoritative()
-            .await?
-            .iter()
-            .map(|workspace| self.snapshot(workspace))
-            .collect()
+        let mut listing = ProjectSnapshots::default();
+        for workspace in self.authoritative().await? {
+            match &workspace.derived.mount_state {
+                crate::storage::lifecycle::MountState::Unproven(refusal) => {
+                    let mount = self.workspace_mount_path(workspace.derived.workspace.name())?;
+                    listing
+                        .unproven
+                        .push(crate::api::dto::UnprovenWorkspace::of(refusal, mount));
+                }
+                crate::storage::lifecycle::MountState::Mounted { .. }
+                | crate::storage::lifecycle::MountState::Detached => {
+                    listing.workspaces.push(self.snapshot(&workspace)?);
+                }
+            }
+        }
+        Ok(listing)
     }
 
     async fn workspace_snapshot(&mut self, workspace: WorkspaceName) -> Result<WorkspaceSnapshot> {

@@ -6,8 +6,8 @@ use super::dto::{
     JobTailLimits, LandOptions, LandReport, MirrorInfo, NxStateClearResult, ProjectGrantDelta,
     ProjectGrants, PushOptions, PushReport, RebaseOptions, RebaseReport, RekeyResult,
     RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult,
-    ResizeResult, ResizeVolume, SealedJob, StdinSource, StepReport, WorkspaceIncarnation,
-    WorkspaceInfo, WorkspaceTarget,
+    ResizeResult, ResizeVolume, SealedJob, StdinSource, StepReport, UnprovenWorkspace,
+    WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
 };
 use super::frame;
 use super::operations::{
@@ -19,7 +19,8 @@ use super::operations::{
     ReseedRequest, ResizeRequest, RestoreRequest, SessionRequest, SlotRequest,
     SourceDestinationRequest, StdinWriteRequest, StreamOperation, TailRequest, WorkerScope,
     WorkerView, WorkspaceAtRequest, WorkspaceAttachRequest, WorkspaceGrantsRequest,
-    WorkspaceInSlotRequest, WorkspaceRequest, WorkspaceView, encode_request, read_result,
+    WorkspaceInSlotRequest, WorkspaceListView, WorkspaceRequest, WorkspaceView, encode_request,
+    read_result,
 };
 use super::peer_credentials::PeerCredentialsError;
 use super::process::JobProcessTree;
@@ -1042,17 +1043,24 @@ impl Project {
     }
 
     /// The published workspaces; `landing` asks the controller to measure them against main, or
-    /// to keep only the provably fully landed ones (`crate::landing::retain_fully_landed`).
-    pub async fn list(&self, landing: Option<ListLanding>) -> Result<Vec<WorkspaceRef>> {
+    /// to keep only the provably fully landed ones (`crate::landing::retain_fully_landed`). A
+    /// workspace whose mount is unproven has no reference and is named in `unproven`.
+    pub async fn list(&self, landing: Option<ListLanding>) -> Result<WorkspaceListing> {
         let request = ListRequest {
             repo_id: self.repo_id.clone(),
             landing,
         };
-        let views = invoke::<operations::ProjectList>(&*self.runtime, &request).await?;
-        Ok(views
-            .into_iter()
-            .map(|view| WorkspaceRef::from_view(view, Arc::clone(&self.runtime)))
-            .collect())
+        let WorkspaceListView {
+            workspaces,
+            unproven,
+        } = invoke::<operations::ProjectList>(&*self.runtime, &request).await?;
+        Ok(WorkspaceListing {
+            workspaces: workspaces
+                .into_iter()
+                .map(|view| WorkspaceRef::from_view(view, Arc::clone(&self.runtime)))
+                .collect(),
+            unproven,
+        })
     }
 }
 
@@ -1074,6 +1082,14 @@ impl fmt::Debug for Project {
 pub struct Adopted {
     pub workspace: WorkspaceRef,
     pub re_adoption: Option<ReAdoption>,
+}
+
+/// What [`Project::list`] found: a reference to each workspace whose mount state is proven, and
+/// each workspace whose mount is unproven by name (07_api.md, "Frozen wire projections").
+#[derive(Clone)]
+pub struct WorkspaceListing {
+    pub workspaces: Vec<WorkspaceRef>,
+    pub unproven: Vec<UnprovenWorkspace>,
 }
 
 /// Read-only identity and detached snapshot for exactly one workspace.
