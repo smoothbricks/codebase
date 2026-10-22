@@ -9,7 +9,7 @@ use cowshed_core::api::{
 };
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::storage::recovery::{
-    IntentLease, KeptAbandonBundles, LIFECYCLE_INTENTS_FILE, LifecycleIntent,
+    IntentLease, IntentLeases, KeptAbandonBundles, LIFECYCLE_INTENTS_FILE, LifecycleIntent,
     LifecycleIntentCompletion, LifecycleIntentJournal, LifecycleIntentPhase, MintOptions,
 };
 use cowshed_os::fork_lock::{Run as _, Spawn as _};
@@ -703,6 +703,38 @@ fn recovery_leaves_a_running_removal_to_its_process_and_takes_it_over_once_that_
             .is_some(),
         "a removal whose process died is recoverable"
     );
+}
+
+#[test]
+fn letting_go_of_every_intent_lease_frees_each_for_another_holder() {
+    // A wait for image locks asks for the proof that no lease is held (01_storage.md, "Lock
+    // order"), which letting go of the set yields. It is true only if every lease in the set is let
+    // go: another descriptor takes each, as a fork in another process would.
+    let root = TestRoot::new("release-all");
+    let sessions = root.path().join("sessions");
+    let names = [workspace("first"), workspace("second")];
+    let mut leases = IntentLeases::default();
+    for name in &names {
+        assert!(
+            leases.claim(&sessions, name).expect("claim lease"),
+            "nobody else holds {name}"
+        );
+        assert!(
+            IntentLease::try_claim(&sessions, name)
+                .expect("probe lease")
+                .is_none(),
+            "the set holds {name}"
+        );
+    }
+    let _unleased = leases.release_all();
+    for name in &names {
+        assert!(
+            IntentLease::try_claim(&sessions, name)
+                .expect("probe lease")
+                .is_some(),
+            "letting go of every lease let go of {name}"
+        );
+    }
 }
 
 #[test]

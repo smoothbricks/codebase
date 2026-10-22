@@ -119,10 +119,21 @@ pub struct CowshedError {
     /// explicit removal's reason): one pointer slot in every Result, never one per cause.
     #[serde(flatten, default, deserialize_with = "known_to_this_build")]
     cold: Option<Box<ColdRefusal>>,
-    /// Boxed like `otherBuild` and `fence`: the structured CAS refusal is rare, and every
-    /// `Result` in cowshed carries this type.
+    /// What the storage layer refused with, for a caller in this process to act on; never on the
+    /// wire. Boxed like `otherBuild` and `fence`: it is rare, and every `Result` in cowshed
+    /// carries this type.
     #[serde(skip)]
-    lifecycle_conflict: Option<Box<crate::storage::lifecycle::Conflict>>,
+    storage_cause: Option<Box<StorageCause>>,
+}
+
+/// The structured storage refusal a [`CowshedError`] keeps for a caller in this process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StorageCause {
+    /// The exact stale lifecycle fact `execute_checked` found.
+    LifecycleConflict(crate::storage::lifecycle::Conflict),
+    /// The image locks an operation taking them without waiting found held (01_storage.md,
+    /// "Lock order").
+    ImageLocksHeld(Box<[std::path::PathBuf]>),
 }
 
 /// Canonical wire fields remain flat; only the private storage groups these exclusive causes.
@@ -525,7 +536,7 @@ impl CowshedError {
             admission: None,
             stdin: None,
             cold: None,
-            lifecycle_conflict: None,
+            storage_cause: None,
         }
     }
 
@@ -555,7 +566,20 @@ impl CowshedError {
             admission: None,
             stdin: None,
             cold: None,
-            lifecycle_conflict: Some(Box::new(conflict)),
+            storage_cause: Some(Box::new(StorageCause::LifecycleConflict(conflict))),
+        }
+    }
+
+    /// An operation that takes image locks without waiting found `locks` held: a `Conflict` that
+    /// keeps them, so a pass finishing another process's residue lets go of its intent lease and
+    /// waits for them alone (01_storage.md, "Lock order").
+    pub fn image_locks_held(message: impl Into<String>, locks: Box<[std::path::PathBuf]>) -> Self {
+        Self {
+            storage_cause: Some(Box::new(StorageCause::ImageLocksHeld(locks))),
+            ..Self::conflict(
+                message,
+                "retry once the operation holding the lock has finished",
+            )
         }
     }
 
@@ -582,7 +606,7 @@ impl CowshedError {
             admission: None,
             stdin: None,
             cold: None,
-            lifecycle_conflict: None,
+            storage_cause: None,
         }
     }
 
@@ -611,7 +635,7 @@ impl CowshedError {
             admission: None,
             stdin: None,
             cold: None,
-            lifecycle_conflict: None,
+            storage_cause: None,
         }
     }
 
@@ -635,7 +659,7 @@ impl CowshedError {
             admission: None,
             stdin: None,
             cold: None,
-            lifecycle_conflict: None,
+            storage_cause: None,
         }
     }
 
@@ -840,7 +864,18 @@ impl CowshedError {
 
     /// The exact stale lifecycle fact, when this error came from `execute_checked`.
     pub fn lifecycle_conflict_source(&self) -> Option<&crate::storage::lifecycle::Conflict> {
-        self.lifecycle_conflict.as_deref()
+        match self.storage_cause.as_deref()? {
+            StorageCause::LifecycleConflict(conflict) => Some(conflict),
+            StorageCause::ImageLocksHeld(_) => None,
+        }
+    }
+
+    /// The image locks found held, when this is an operation's refusal to wait for them.
+    pub fn image_locks_held_source(&self) -> Option<&[std::path::PathBuf]> {
+        match self.storage_cause.as_deref()? {
+            StorageCause::ImageLocksHeld(locks) => Some(locks),
+            StorageCause::LifecycleConflict(_) => None,
+        }
     }
 
     /// The two builds, when this is the daemon's refusal of another build's request.
@@ -908,9 +943,10 @@ impl fmt::Display for CowshedError {
 
 impl std::error::Error for CowshedError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.lifecycle_conflict
-            .as_deref()
-            .map(|conflict| conflict as &(dyn std::error::Error + 'static))
+        match self.storage_cause.as_deref()? {
+            StorageCause::LifecycleConflict(conflict) => Some(conflict),
+            StorageCause::ImageLocksHeld(_) => None,
+        }
     }
 }
 

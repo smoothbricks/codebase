@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -20,8 +20,8 @@ use cowshed_core::storage::job_artifact::{
     controller_commitment_schema, decode_controller_commitments,
 };
 use cowshed_core::storage::recovery::{
-    LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentCompletion, LifecycleIntentJournal,
-    LifecycleIntentPhase, LifecycleIntentRecord,
+    IntentLease, LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentCompletion,
+    LifecycleIntentJournal, LifecycleIntentPhase, LifecycleIntentRecord,
 };
 use cowshed_core::{CowshedError, Result};
 use cowshed_os::fork_lock::{Run as _, Spawn as _};
@@ -300,7 +300,7 @@ impl Fixture {
             _scratch: scratch,
             checkout,
             storage,
-            repo: RepoId::parse("fixture/intents").expect("repository identity"),
+            repo: fixture_repo(),
         }
     }
 
@@ -397,18 +397,7 @@ impl Fixture {
     }
 
     async fn call(&self, runtime: &ProjectRuntime, method: &str, params: Value) -> Result<Value> {
-        let response = runtime
-            .router()
-            .route(
-                ConnectionAuthority::Coordinator {
-                    repo_id: self.repo.clone(),
-                },
-                OperationRequest::decode(method, &params)?,
-                None,
-                None,
-            )
-            .await?;
-        Ok(response.into_answer()?.0)
+        route(runtime, &self.repo, method, params).await
     }
 
     async fn mint(
@@ -672,6 +661,32 @@ impl GatewayAtHello {
     async fn claimed(self) -> Vec<u16> {
         self.0.await.expect("the gateway stand-in")
     }
+}
+
+/// The repository every fixture adopts.
+fn fixture_repo() -> RepoId {
+    RepoId::parse("fixture/intents").expect("repository identity")
+}
+
+/// Answer `method` with `params` as `repo`'s coordinator asks it of `runtime`.
+async fn route(
+    runtime: &ProjectRuntime,
+    repo: &RepoId,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    let response = runtime
+        .router()
+        .route(
+            ConnectionAuthority::Coordinator {
+                repo_id: repo.clone(),
+            },
+            OperationRequest::decode(method, &params)?,
+            None,
+            None,
+        )
+        .await?;
+    Ok(response.into_answer()?.0)
 }
 
 fn name(value: &str) -> WorkspaceName {
@@ -3112,4 +3127,240 @@ async fn a_refused_existing_destination_resume_keeps_mutating_phase() {
     let record = fixture.intent("b").expect("the rename stays journaled");
     assert_eq!(record.phase, LifecycleIntentPhase::Mutating);
     assert_eq!(record.completion, None);
+}
+
+/// Names the checkout the [`gc_process`] child opens.
+const GC_CHECKOUT_ENV: &str = "COWSHED_TEST_GC_CHECKOUT";
+/// Names that child's home, the fixture's scratch root.
+const GC_HOME_ENV: &str = "COWSHED_TEST_GC_HOME";
+/// Names that child's store.
+const GC_STORE_ENV: &str = "COWSHED_TEST_GC_STORE";
+/// Names the abandonment, `<ws>/<head>`, that child supersedes.
+const GC_SUPERSEDE_ENV: &str = "COWSHED_TEST_GC_SUPERSEDE";
+/// Why that child supersedes it.
+const GC_REASON: &str = "the spike is replaced by the lock-order rewrite";
+
+/// `cowshed gc --supersede` in a process of its own: this test binary run as [`gc_process`], its
+/// stderr piped so the test reads what it says as it says it.
+struct GcProcess {
+    child: std::process::Child,
+    said: BufReader<std::process::ChildStderr>,
+    transcript: String,
+}
+
+impl GcProcess {
+    /// Start gc on `fixture`'s project beneath `scratch`, so the fixture's cleanup ends it,
+    /// superseding `supersede`.
+    fn start(fixture: &Fixture, scratch: &Path, supersede: &str) -> Self {
+        let mut child = Command::new(std::env::current_exe().expect("this test binary"))
+            .args(["--exact", "macos::gc_process", "--nocapture"])
+            .env(GC_CHECKOUT_ENV, &fixture.checkout)
+            .env(GC_HOME_ENV, fixture.storage.home())
+            .env(GC_STORE_ENV, fixture.storage.store())
+            .env(GC_SUPERSEDE_ENV, supersede)
+            .current_dir(scratch)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn_locked()
+            .expect("start gc");
+        let said = BufReader::new(child.stderr.take().expect("gc's stderr"));
+        Self {
+            child,
+            said,
+            transcript: String::new(),
+        }
+    }
+
+    /// Read what gc says until a line starts with `prefix`, and answer that line.
+    fn says(&mut self, prefix: &str) -> String {
+        loop {
+            let start = self.transcript.len();
+            let read = self
+                .said
+                .read_line(&mut self.transcript)
+                .expect("gc's stderr");
+            assert_ne!(
+                read, 0,
+                "gc ended before it said {prefix:?}; it said: {}",
+                self.transcript
+            );
+            if self.transcript[start..].starts_with(prefix) {
+                return self.transcript[start..].trim_end().to_owned();
+            }
+        }
+    }
+
+    /// Require that gc exits cleanly, and answer all it said.
+    fn finish(mut self) -> String {
+        self.said
+            .read_to_string(&mut self.transcript)
+            .expect("gc's last output");
+        let status = self.child.wait().expect("wait for gc");
+        assert!(
+            status.success(),
+            "gc failed: {status}; it said: {}",
+            self.transcript
+        );
+        self.transcript
+    }
+}
+
+/// Not a test of its own: the other process of [`GcProcess`]. Run as this binary with
+/// [`GC_CHECKOUT_ENV`] set, it opens that checkout's project as `cowshed gc` opens it, with
+/// store-wide recovery, then supersedes the abandonment [`GC_SUPERSEDE_ENV`] names. Run any other
+/// way it does nothing.
+#[tokio::test]
+async fn gc_process() {
+    let Some(checkout) = std::env::var_os(GC_CHECKOUT_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let variable = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("{name} names gc's storage"))
+    };
+    let storage = ValidatedHostStorage::new(
+        variable(GC_HOME_ENV),
+        Vec::new(),
+        CanonicalRoots::at(variable(GC_STORE_ENV)),
+    );
+    let supersede = std::env::var(GC_SUPERSEDE_ENV).expect("the abandonment gc supersedes");
+    let (workspace, head) = supersede
+        .split_once('/')
+        .expect("the abandonment is <ws>/<head>");
+    let repo = fixture_repo();
+    let gc = ProjectRuntime::open_directory_existing_at(
+        &checkout,
+        RecoveryScope::Store,
+        storage,
+        refusing_gateway::connect,
+    )
+    .await
+    .expect("gc opens the project");
+    route(
+        &gc,
+        &repo,
+        "coordinator.gc",
+        json!({
+            "repoId": repo,
+            "options": { "supersede": { "workspace": workspace, "head": head, "reason": GC_REASON } },
+        }),
+    )
+    .await
+    .expect("gc --supersede");
+    gc.shutdown().await.expect("stop gc");
+}
+
+/// `gc` finishing other processes' unfinished forks waits for `main.dmg.lock` holding no intent
+/// lease (01_storage.md, "Lock order"). Measured 2026-10-22: `gc --supersede` took the intent
+/// leases of nine unfinished forks, then sat 18 minutes in `flock` on `main.dmg.lock` behind
+/// another process's operation, and every fork of those names was refused as running elsewhere.
+/// Here another process holds main's lock while a real `gc --supersede` process replays two
+/// unfinished forks. While gc says it waits, the lease a fork of either name takes first is free;
+/// once the holder lets go, gc takes each lease again, finishes both forks from their records as it
+/// reads them then, and supersedes the abandonment it was asked to.
+#[tokio::test]
+async fn gc_waits_for_mains_image_lock_holding_no_intent_lease() {
+    let fixture = Fixture::new("gc-lock-order");
+    let runtime = fixture.adopt().await;
+    let listed = fixture
+        .call(&runtime, "project.list", json!({ "repoId": fixture.repo }))
+        .await
+        .expect("list workspaces");
+    let main = PathBuf::from(
+        listed["workspaces"]
+            .as_array()
+            .and_then(|workspaces| {
+                workspaces
+                    .iter()
+                    .find(|workspace| workspace["info"]["role"] == "main")
+            })
+            .and_then(|workspace| workspace["info"]["mount"].as_str())
+            .unwrap_or_else(|| panic!("main's mount: {listed}")),
+    );
+    let minted = fixture
+        .mint(&runtime, "spike", ForkOptions::default())
+        .await
+        .expect("mint the spike");
+    let spike_mount = PathBuf::from(minted["info"]["mount"].as_str().expect("the spike's mount"));
+    fs::write(spike_mount.join("spike"), b"spike\n").expect("the spike's change");
+    git(&spike_mount, &["add", "spike"]);
+    git(&spike_mount, &["commit", "-q", "-m", "spike"]);
+    let spike = head(&spike_mount);
+    let unfinished = ["first", "second"];
+    for workspace in unfinished {
+        fixture.plant_workspace_branch(workspace);
+        fixture
+            .mint(&runtime, workspace, worktree())
+            .await
+            .expect_err("the clone's initializer refuses main's stale workspace branch");
+        git(
+            &fixture.checkout,
+            &["branch", "-D", &format!("cowshed/{workspace}")],
+        );
+        assert_eq!(
+            fixture
+                .intent(workspace)
+                .expect("the fork stays journaled")
+                .completion,
+            None
+        );
+    }
+    runtime.shutdown().await.expect("stop the forking runtime");
+    let rm = fixture
+        .open_removing("spike")
+        .await
+        .expect("open the removal");
+    fixture
+        .call(
+            &rm,
+            "coordinator.destroy",
+            json!({
+                "repoId": fixture.repo, "workspace": "spike",
+                "options": RemoveOptions { abandon: true, force: true, ..RemoveOptions::default() },
+            }),
+        )
+        .await
+        .expect("--abandon keeps the spike's unlanded tip in main");
+    rm.shutdown().await.expect("stop the abandoning runtime");
+    let spike_ref = format!("refs/cowshed/spike/abandoned/{spike}/HEAD");
+    assert!(has_ref(&main, &spike_ref), "rm --abandon kept {spike_ref}");
+
+    let layout = fixture.layout();
+    let main_lock = layout
+        .canonical_image(&WorkspaceName::main())
+        .expect("main's image")
+        .lock()
+        .to_owned();
+    let scratch = fixture.checkout.parent().expect("the scratch root");
+    let holder = LockHolder::hold(scratch, fixture.storage.store(), &main_lock);
+    let mut gc = GcProcess::start(&fixture, scratch, &format!("spike/{spike}"));
+    let waiting = gc.says("cowshed: waiting to finish first's unfinished lifecycle work: ");
+    assert!(
+        waiting.contains(&main_lock.display().to_string())
+            && waiting.ends_with("its intent lease is free meanwhile"),
+        "gc names the lock it waits for and the lease it let go: {waiting}"
+    );
+    let sessions = &layout.project().sessions;
+    for workspace in unfinished {
+        let lease =
+            IntentLease::try_claim(sessions, &name(workspace)).expect("try the intent lease");
+        assert!(
+            lease.is_some(),
+            "gc held {workspace}'s intent lease while it waited for main's image lock"
+        );
+    }
+    holder.release();
+    let said = gc.finish();
+    for workspace in unfinished {
+        assert!(
+            completed(fixture.intent(workspace)),
+            "gc finished the fork of {workspace}: {said}"
+        );
+    }
+    assert!(
+        !has_ref(&main, &spike_ref),
+        "gc superseded {spike_ref}: {said}"
+    );
 }

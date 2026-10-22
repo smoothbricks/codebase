@@ -184,6 +184,30 @@ learn what it is. Marker-derived fields that exist only _inside_ the image remai
 `cowshed ls` reports name, image mtime, and mount state from host data, and fills `baseCommit`-class fields from a
 cached info snapshot in the same sidecar — stale-marked, refreshed on the next attach.
 
+### Lock order
+
+An intent lease is only ever tried, never waited for, so no two processes can wait on each other through one; the long
+waits are for image locks:
+
+| Lock                                                           | Taken                                                                          | Held across a wait for another lock                                                                        |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| `<image>.lock`                                                 | waited for, one sorted set per acquisition (`store_lock::acquire_image_locks`) | yes: a fork holds its source's, `main`'s included, through its whole clone, minutes on a large build image |
+| `<workspace>.intent.lock`                                      | only tried; a held one refuses the verb, or leaves the intent to its holder    | only by the verb whose target it is, from its journal write until it returns                               |
+| `lifecycle-intents.json.lock`, a blank template's minting lock | waited for                                                                     | never: each guards one bounded write                                                                       |
+
+A verb that waits for an image lock holding its own target's lease refuses only a second operation on the same name,
+which is what the lease is for. An `rm` of a rename's source tries the rename destination's lease only to settle the
+rename, and `doctor` tries an unpublished clone's only to report whether a process is creating it; each lets it go
+before it waits for anything. A pass that finishes residue other processes left, startup recovery replaying unfinished
+intents or `gc` retiring abandoned unpublished clones, runs no caller's operation, so it holds no lease across a wait.
+It takes one workspace at a time: the lease, then that workspace's work, taking image locks without waiting. An image
+lock it finds held makes it let go of the lease, say on stderr which lock and holder it waits for, and wait for that
+lock alone. Then it tries the lease again and reads the journal and the store afresh before it acts, because the
+operation's owner, or a verb run on the name meanwhile, may have finished it. The wait takes a proof that no lease is
+held (`storage::recovery::Unleased`), which only letting go of every lease yields. Measured 2026-10-22: `gc --supersede`
+took the intent leases of nine unfinished forks, then waited 18 minutes for `main.dmg.lock` behind another process, and
+every fork of those names was refused as running in another process.
+
 ### In-image marker: `.cowshed/workspace.json`
 
 Written at adopt/fork/restore, at the volume root; travels with every clone:

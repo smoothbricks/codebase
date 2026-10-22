@@ -562,6 +562,21 @@ enum IntentReplay {
     Residue,
 }
 
+/// Work a pass finishes that another process left behind
+/// ([`StorageProjectRuntimeHost::finish_residue`]).
+#[cfg(target_os = "macos")]
+enum Residue {
+    /// The workspace's unfinished lifecycle intent.
+    Intent,
+    /// An unpublished clone no unfinished intent names, retired from its own metadata, or with
+    /// `dry_run` only named.
+    AbandonedClone {
+        image: PathBuf,
+        metadata: Box<crate::metadata::DetachedWorkspaceMetadata>,
+        dry_run: bool,
+    },
+}
+
 #[cfg(target_os = "macos")]
 impl RecoveryScope {
     /// Read selection for a named opening. `None` deliberately retains full Store/Inspect
@@ -2590,7 +2605,7 @@ struct StorageProjectRuntimeHost<H: RuntimeStorageHost> {
     /// The workspaces whose lifecycle operation this process is executing in the current verb.
     /// Released when the verb returns, so an unfinished intent it leaves behind becomes an
     /// ordinary crash residue for the next open instead of staying owned by an idle process.
-    intent_leases: std::collections::BTreeMap<WorkspaceName, crate::storage::recovery::IntentLease>,
+    intent_leases: crate::storage::recovery::IntentLeases,
     /// How this host reconciles the binding's remotes, both at recovery and per verb. A host
     /// opened for the identity change skips the pairing that verb exists to supersede; every
     /// other host heals transport moves exactly like a fresh open would.
@@ -3916,7 +3931,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             telemetry_root,
             lifecycle_intents_path,
             lifecycle_intents,
-            intent_leases: std::collections::BTreeMap::new(),
+            intent_leases: crate::storage::recovery::IntentLeases::default(),
             binding_remote_validation: validation,
             recovery_scope,
             retirement_lease,
@@ -3957,19 +3972,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// Hold `workspace`'s intent lease for the rest of the current verb. `false` when another
     /// live process holds it: that process is executing a lifecycle operation on `workspace`.
     fn claim_intent_lease(&mut self, workspace: &WorkspaceName) -> Result<bool> {
-        if self.intent_leases.contains_key(workspace) {
-            return Ok(true);
-        }
-        match crate::storage::recovery::IntentLease::try_claim(
-            &self.layout.project().sessions,
-            workspace,
-        )? {
-            Some(lease) => {
-                self.intent_leases.insert(workspace.clone(), lease);
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+        self.intent_leases
+            .claim(&self.layout.project().sessions, workspace)
     }
 
     /// Journals `operation` under this process's intent lease and returns the record it
@@ -4223,14 +4227,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// process holds is no residue at all: that process is running the operation right now, and
     /// replaying it here would run it a second time beside the first. A removal never finishes its
     /// own target's unpublished clone: the `rm` retires it instead. Only intents inside this
-    /// opening's [`RecoveryScope`] are touched. Reports whether recovery mutated images or mounts,
-    /// so a caller can discard an inventory read only when necessary.
+    /// opening's [`RecoveryScope`] are touched, each under its own lease alone, which the pass never
+    /// holds while it waits for an image lock ([`Self::finish_residue`]). Reports whether recovery
+    /// mutated images or mounts, so a caller can discard an inventory read only when necessary.
     async fn recover_lifecycle_intents(&mut self) -> Result<bool> {
-        use super::supervisor::{CommitmentDraft, CommitmentSink};
-        use crate::storage::recovery::{
-            LifecycleIntent, LifecycleIntentCompletion, LifecycleIntentPhase,
-        };
-
         self.reload_lifecycle_intents().await?;
         let (unfinished, left): (Vec<_>, Vec<_>) = self
             .lifecycle_intents
@@ -4246,29 +4246,90 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 left.len()
             );
         }
-        let mut claimed = Vec::with_capacity(unfinished.len());
+        let mut mutated = false;
         for (workspace, _) in unfinished {
-            if self.claim_intent_lease(&workspace)? {
-                claimed.push(workspace);
-            } else {
+            mutated |= self.finish_residue(&workspace, &Residue::Intent).await?;
+        }
+        Ok(mutated)
+    }
+
+    /// Finishes `work`, residue another process left on `workspace`, under the lock order
+    /// (01_storage.md, "Lock order"): the pass holds `workspace`'s intent lease and no other, and
+    /// takes image locks without waiting. An image lock found held makes it let go of the lease,
+    /// wait for that lock alone, and take the lease again, and the work reads its record and the
+    /// store afresh under it: the operation's owner, or a verb run on the name meanwhile, may have
+    /// finished it. So no verb on the name is refused its lease while this pass waits. A lease
+    /// another live process holds is that process's running operation, left to it. Answers whether
+    /// the work acted.
+    async fn finish_residue(&mut self, workspace: &WorkspaceName, work: &Residue) -> Result<bool> {
+        use cowshed_apfs::store_lock::LockMode;
+        let waits = self.substrate.take_image_locks(LockMode::Try);
+        let finished = self.finish_residue_without_waiting(workspace, work).await;
+        self.substrate.take_image_locks(waits);
+        let _ = self.intent_leases.release_all();
+        finished
+    }
+
+    /// [`Self::finish_residue`]'s loop, while the substrate takes image locks without waiting.
+    async fn finish_residue_without_waiting(
+        &mut self,
+        workspace: &WorkspaceName,
+        work: &Residue,
+    ) -> Result<bool> {
+        loop {
+            if !self.claim_intent_lease(workspace)? {
                 cowshed_os::eprintln!(
                     "cowshed: leaving {workspace} to the cowshed process running its lifecycle operation"
                 );
+                return Ok(false);
             }
+            let acted = match work {
+                Residue::Intent => self.replay_unfinished_intent(workspace).await,
+                Residue::AbandonedClone {
+                    image,
+                    metadata,
+                    dry_run,
+                } => self.retire_abandoned_clone(image, metadata, *dry_run).await,
+            };
+            let held = match &acted {
+                Err(error) => error
+                    .image_locks_held_source()
+                    .map(|locks| (error.message.clone(), Box::<[PathBuf]>::from(locks))),
+                Ok(_) => None,
+            };
+            let Some((held, locks)) = held else {
+                return acted;
+            };
+            let unleased = self.intent_leases.release_all();
+            cowshed_os::eprintln!(
+                "cowshed: waiting to finish {workspace}'s unfinished lifecycle work: {held}; its intent lease is free meanwhile"
+            );
+            self.substrate
+                .wait_for_image_locks(unleased, locks)
+                .await
+                .map_err(native_storage_error)?;
         }
-        // Read again under the leases: an owner may have finished between the first read and
-        // the claim, and its result is the record to act on.
+    }
+
+    /// Replays `workspace`'s unfinished intent for [`Self::recover_lifecycle_intents`], under its
+    /// lease. The journal is read again under it: the owner may have finished the intent between the
+    /// first read and the claim, or while the pass waited for an image lock, and its result is the
+    /// record to act on. `false` when nothing is left to replay. A replay refused an image lock it
+    /// would have waited for stays an error, for [`Self::finish_residue`] to wait on alone; any
+    /// other failure of residue is reported and the record kept for a later pass.
+    async fn replay_unfinished_intent(&mut self, workspace: &WorkspaceName) -> Result<bool> {
+        use super::supervisor::{CommitmentDraft, CommitmentSink};
+        use crate::storage::recovery::{
+            LifecycleIntent, LifecycleIntentCompletion, LifecycleIntentPhase,
+        };
+
         self.reload_lifecycle_intents().await?;
-        let pending = claimed
-            .iter()
-            .filter_map(|workspace| self.lifecycle_intents.get(workspace))
+        let unfinished = self
+            .lifecycle_intents
+            .get(workspace)
             .filter(|record| record.completion.is_none())
-            .cloned()
-            .collect::<Vec<_>>();
-        if pending.is_empty() {
-            return Ok(false);
-        }
-        for record in pending {
+            .cloned();
+        if let Some(record) = unfinished {
             let workspace = record.operation.target().clone();
             let verb = record.operation.verb();
             let replay = self.intent_replay(&workspace);
@@ -4514,6 +4575,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .await;
             match replayed {
                 Ok(()) => {}
+                // Not the intent's failure: the pass waits for the lock alone and replays it again.
+                Err(error) if error.image_locks_held_source().is_some() => return Err(error),
                 Err(error) if replay == IntentReplay::Residue => cowshed_os::eprintln!(
                     "cowshed: unfinished {verb} of {workspace} could not be completed ({}: {}); it stays journaled for a later pass",
                     error.code.as_str(),
@@ -4521,8 +4584,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 ),
                 Err(error) => return Err(error),
             }
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(true)
     }
 
     /// The binding gate every verb (and recovery) runs on a live host.
@@ -7447,6 +7512,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         )
                 });
             if !still_pending {
+                self.intent_leases.release(&destination);
                 continue;
             }
             match self.current(&destination).await {
@@ -7484,6 +7550,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 cowshed_os::eprintln!(
                     "cowshed: discarded the unfinished rename of {workspace} into {destination}: it ended before changing anything, so nothing is left to finish"
                 );
+                // The rename's lease, not this removal's: the removal waits for image locks next.
+                self.intent_leases.release(&destination);
             } else {
                 return Err(CowshedError::conflict(
                     format!(
@@ -9438,8 +9506,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// neither under an intent lease nor under the image's lifecycle lock, which a create, fork or
     /// adopt of any cowshed version holds for as long as it works on the image. Such a workspace
     /// was never published, so nothing ever ran in it, and an unpublished main never touched its
-    /// checkout. Each one comes back with its intent lease held by this verb, so no other process
-    /// can take it up while it is retired.
+    /// checkout. The intent lease is only tried, and let go at once: doctor reports, and holds no
+    /// lease across the waits after it (01_storage.md, "Lock order"); `gc` retires each under its
+    /// lease, read afresh ([`Self::retire_abandoned_clone`]).
     async fn abandoned_pending_workspaces(
         &mut self,
     ) -> Result<Vec<(PathBuf, crate::metadata::DetachedWorkspaceMetadata)>> {
@@ -9451,9 +9520,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 .lifecycle_intents
                 .get(workspace)
                 .is_some_and(|record| record.completion.is_none())
-                || !self.claim_intent_lease(workspace)?
-                || image_lifecycle_lock_is_held(&image)?
             {
+                continue;
+            }
+            let leased = self.claim_intent_lease(workspace)?;
+            self.intent_leases.release(workspace);
+            if !leased || image_lifecycle_lock_is_held(&image)? {
                 continue;
             }
             abandoned.push((image, metadata));
@@ -9462,54 +9534,103 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     }
 
     /// Retire every [abandoned](Self::abandoned_pending_workspaces) workspace, or with `dry_run`
-    /// only name them. A clone is retired as the create or fork its metadata records; one whose
-    /// retirement is refused — say its history is not in main — stays, named with the refusal and
-    /// its next step, and no longer blocks the rest of `gc`. An unpublished main is retired as the
-    /// adopt it records: its image, sidecar and companion are reclaimed.
+    /// only name them, each under its own lease alone ([`Self::finish_residue`]).
     async fn retire_abandoned_pending_workspaces(&mut self, dry_run: bool) -> Result<()> {
-        for (image, metadata) in self.abandoned_pending_workspaces().await? {
+        self.reload_lifecycle_intents().await?;
+        let unrecorded = self
+            .pending_metadata()
+            .await?
+            .into_iter()
+            .filter(|(_, metadata)| {
+                self.lifecycle_intents
+                    .get(&metadata.workspace)
+                    .is_none_or(|record| record.completion.is_some())
+            })
+            .collect::<Vec<_>>();
+        for (image, metadata) in unrecorded {
             let workspace = metadata.workspace.clone();
-            let kind = if workspace.is_main() {
-                "adoption"
-            } else {
-                "clone"
+            let work = Residue::AbandonedClone {
+                image,
+                metadata: Box::new(metadata),
+                dry_run,
             };
-            if dry_run {
-                cowshed_os::eprintln!(
-                    "cowshed: would retire {workspace}, an unfinished {kind} its process \
-                 abandoned before publishing it: {}",
-                    image.display()
-                );
-                continue;
-            }
-            let retired = if workspace.is_main() {
-                self.substrate
-                    .discard_pending_adoption(&metadata.repo_id, &metadata.workspace_incarnation)
-                    .await
-                    .map_err(native_storage_error)
-            } else {
-                let origin = abandoned_clone_origin(&metadata);
-                let options = RemoveOptions {
-                    force: true,
-                    ..RemoveOptions::default()
-                };
-                self.retire_pending_workspace(&workspace, options, origin, metadata)
-                    .await
-                    .map(|_| ())
-            };
-            match retired {
-                Ok(()) => cowshed_os::eprintln!(
-                    "cowshed: retired {workspace}, an unfinished {kind} its process abandoned \
-                 before publishing it"
-                ),
-                Err(error) => cowshed_os::eprintln!(
-                    "cowshed: kept unfinished {kind} {workspace}: {}\nnext: {}",
-                    error.message,
-                    error.hint
-                ),
-            }
+            self.finish_residue(&workspace, &work).await?;
         }
         Ok(())
+    }
+
+    /// Retire the unpublished clone at `image` for [`Self::retire_abandoned_pending_workspaces`],
+    /// under its lease, if it is still abandoned: still pending as `metadata` records, named by no
+    /// unfinished intent, and its image lock held by no process creating it, all read afresh under
+    /// the lease. `false` when it no longer is, or with `dry_run`. A clone is retired as the create
+    /// or fork its metadata records; one whose retirement is refused — say its history is not in
+    /// main — stays, named with the refusal and its next step, and no longer blocks the rest of
+    /// `gc`. An unpublished main is retired as the adopt it records: its image, sidecar and
+    /// companion are reclaimed. A retirement refused an image lock it would have waited for stays an
+    /// error, for [`Self::finish_residue`] to wait on alone.
+    async fn retire_abandoned_clone(
+        &mut self,
+        image: &Path,
+        metadata: &crate::metadata::DetachedWorkspaceMetadata,
+        dry_run: bool,
+    ) -> Result<bool> {
+        self.reload_lifecycle_intents().await?;
+        let workspace = metadata.workspace.clone();
+        if self
+            .lifecycle_intents
+            .get(&workspace)
+            .is_some_and(|record| record.completion.is_none())
+            || image_lifecycle_lock_is_held(image)?
+            || !self
+                .pending_metadata()
+                .await?
+                .iter()
+                .any(|(pending, current)| pending == image && current == metadata)
+        {
+            return Ok(false);
+        }
+        let kind = if workspace.is_main() {
+            "adoption"
+        } else {
+            "clone"
+        };
+        if dry_run {
+            cowshed_os::eprintln!(
+                "cowshed: would retire {workspace}, an unfinished {kind} its process \
+             abandoned before publishing it: {}",
+                image.display()
+            );
+            return Ok(false);
+        }
+        let metadata = metadata.clone();
+        let retired = if workspace.is_main() {
+            self.substrate
+                .discard_pending_adoption(&metadata.repo_id, &metadata.workspace_incarnation)
+                .await
+                .map_err(native_storage_error)
+        } else {
+            let origin = abandoned_clone_origin(&metadata);
+            let options = RemoveOptions {
+                force: true,
+                ..RemoveOptions::default()
+            };
+            self.retire_pending_workspace(&workspace, options, origin, metadata)
+                .await
+                .map(|_| ())
+        };
+        match retired {
+            Ok(()) => cowshed_os::eprintln!(
+                "cowshed: retired {workspace}, an unfinished {kind} its process abandoned \
+                 before publishing it"
+            ),
+            Err(error) if error.image_locks_held_source().is_some() => return Err(error),
+            Err(error) => cowshed_os::eprintln!(
+                "cowshed: kept unfinished {kind} {workspace}: {}\nnext: {}",
+                error.message,
+                error.hint
+            ),
+        }
+        Ok(true)
     }
 
     /// Retire an unpublished clone without activating it, using the same physical-release
@@ -11536,7 +11657,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
     }
 
     fn release_intent_leases(&mut self) {
-        self.intent_leases.clear();
+        let _ = self.intent_leases.release_all();
     }
 
     async fn shutdown(&mut self) {
@@ -20952,6 +21073,15 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
         // tombstone is in the message, and `rekey` consumes it — point at the repair.
         ref error @ crate::storage::apfs::ApfsStorageError::Quarantined { ref workspace, .. } => {
             CowshedError::integrity(error.to_string(), format!("cowshed rekey {workspace}"))
+        }
+
+        // An operation taking image locks without waiting found one held: its caller, a pass
+        // finishing residue, keeps the locks to wait for them alone (01_storage.md, "Lock order").
+        ref error @ crate::storage::apfs::ApfsStorageError::ImageLocksHeld { ref held } => {
+            CowshedError::image_locks_held(
+                error.to_string(),
+                held.iter().map(|held| held.lock.clone()).collect(),
+            )
         }
         crate::storage::apfs::ApfsStorageError::MarkerMismatch(message)
         | crate::storage::apfs::ApfsStorageError::Host(message) => {

@@ -1285,6 +1285,50 @@ impl IntentLease {
     }
 }
 
+/// The intent leases a project host holds in its current verb, by workspace.
+///
+/// A pass finishing another process's residue never waits for an image lock while it holds a
+/// lease (01_storage.md, "Lock order"). [`Self::release_all`] is the only way to an [`Unleased`],
+/// the proof that wait asks for.
+#[derive(Debug, Default)]
+pub struct IntentLeases(BTreeMap<WorkspaceName, IntentLease>);
+
+impl IntentLeases {
+    /// Hold `workspace`'s lease, whose lock file lives in `directory`, until it is let go; `false`
+    /// while another process holds it. A lease the set already holds stays held.
+    pub fn claim(&mut self, directory: &Path, workspace: &WorkspaceName) -> CowshedResult<bool> {
+        if self.0.contains_key(workspace) {
+            return Ok(true);
+        }
+        Ok(match IntentLease::try_claim(directory, workspace)? {
+            Some(lease) => {
+                self.0.insert(workspace.clone(), lease);
+                true
+            }
+            None => false,
+        })
+    }
+
+    /// Let go of `workspace`'s lease, if the set holds it.
+    pub fn release(&mut self, workspace: &WorkspaceName) {
+        self.0.remove(workspace);
+    }
+
+    /// Let go of every lease. The answer keeps the set borrowed, so no lease is claimed again while
+    /// it lives.
+    pub fn release_all(&mut self) -> Unleased<'_> {
+        self.0.clear();
+        Unleased(std::marker::PhantomData)
+    }
+}
+
+/// Proof that an [`IntentLeases`] holds no lease for as long as this lives: only
+/// [`IntentLeases::release_all`] makes one, and it keeps the set borrowed. A wait for image locks
+/// asks for it, so a pass that would wait while it holds a lease does not compile.
+#[derive(Debug)]
+#[must_use = "a wait for image locks asks for the proof that no intent lease is held"]
+pub struct Unleased<'a>(std::marker::PhantomData<&'a mut IntentLeases>);
+
 /// Open (creating) a lock file without following a symlink planted at its name, fenced.
 fn open_lock_file(path: &Path) -> CowshedResult<Fenced<File>> {
     OpenOptions::new()

@@ -668,9 +668,12 @@ Every cowshed process that opens a project shares its intent journal. Each chang
 under an exclusive lock on `lifecycle-intents.json.lock`, so no process writes back a copy that predates another
 process's intent. The process executing a workspace's lifecycle operation holds that workspace's intent lease
 (`sessions/<name>.intent.lock`) until the verb returns; the kernel releases it when the process exits, however it exits.
-Startup recovery acts only on unfinished intents whose lease it can take. An intent whose lease another process holds is
-that process's running operation, not crash residue, and is never run a second time beside it. `cowshed doctor` runs no
-startup recovery at all: it reports every unfinished intent and leaves it journaled.
+Startup recovery acts only on unfinished intents whose lease it can take, one at a time, and never holds a lease while
+it waits for an image lock (01_storage.md, "Lock order"): a lock it finds held, `main.dmg.lock` under a fork's clone
+say, makes it let go of the lease and wait for the lock alone, so a verb re-run on that name meanwhile takes the lease
+and finishes the intent itself. An intent whose lease another process holds is that process's running operation, not
+crash residue, and is never run a second time beside it. `cowshed doctor` runs no startup recovery at all: it reports
+every unfinished intent and leaves it journaled.
 
 A `PendingFence` clone that no unfinished intent names, and that no process is creating (its intent lease and its
 image's lifecycle lock are both free), is abandoned: nothing will finish it, and because it was never published nothing

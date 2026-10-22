@@ -859,6 +859,11 @@ pub enum ApfsStorageError {
         holds: Vec<cowshed_os::process::Holder>,
         open: Vec<cowshed_os::process::Holder>,
     },
+    /// A lifecycle operation taking its image locks without waiting ([`LockMode::Try`]) found one
+    /// held: a pass finishing another process's residue never waits while it holds an intent lease
+    /// (01_storage.md, "Lock order"). `held` names each lock it asked for with who has it open.
+    #[error("image locks are held by another operation: {}", held_locks(.held))]
+    ImageLocksHeld { held: Vec<HeldImageLock> },
     #[error("lifecycle conflict: {0}")]
     Conflict(#[from] super::lifecycle::Conflict),
     #[error("derived APFS state is inconsistent: {0}")]
@@ -979,6 +984,59 @@ impl From<cowshed_apfs::template::TemplateError> for ApfsStorageError {
     }
 }
 
+/// One lock of an [`ApfsStorageError::ImageLocksHeld`], with who has it open or why they cannot be
+/// named.
+#[derive(Debug)]
+pub struct HeldImageLock {
+    pub lock: PathBuf,
+    pub holders: Result<Vec<cowshed_os::process::Holder>, String>,
+}
+
+impl ApfsStorageError {
+    /// `locks`, which an acquisition without waiting found held, each named with who has it open.
+    fn image_locks_held(locks: &[PathBuf]) -> Self {
+        Self::ImageLocksHeld {
+            held: locks
+                .iter()
+                .map(|lock| HeldImageLock {
+                    lock: lock.clone(),
+                    holders: crate::build_volume::nx::holders(lock)
+                        .map_err(|error| error.to_string()),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// [`ApfsStorageError::ImageLocksHeld`]'s locks, each with its holders.
+fn held_locks(held: &[HeldImageLock]) -> String {
+    held.iter()
+        .map(|held| match &held.holders {
+            Ok(holders) => format!("{} by {}", held.lock.display(), held_by(holders)),
+            Err(error) => format!(
+                "{} by processes that cannot be named ({error})",
+                held.lock.display()
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Take `locks` in `mode`. Under [`LockMode::Try`] a held one is
+/// [`ApfsStorageError::ImageLocksHeld`], never a wait.
+fn lock_images_in<H: ApfsExecutionHost>(
+    host: &H,
+    locks: &[PathBuf],
+    mode: LockMode,
+) -> Result<H::LockGuard, ApfsStorageError> {
+    host.lock_images(locks, mode)?.ok_or_else(|| match mode {
+        LockMode::Try => ApfsStorageError::image_locks_held(locks),
+        LockMode::Wait => {
+            ApfsStorageError::InvalidPlan("blocking image lock unexpectedly unavailable")
+        }
+    })
+}
+
 /// [`ApfsStorageError::BuildVolumeHeld`]'s holders of the hold file.
 fn held_by(holds: &[cowshed_os::process::Holder]) -> String {
     if holds.is_empty() {
@@ -1021,6 +1079,9 @@ pub struct ApfsSubstrate<H, L = TokioApfsBlockingLane> {
     lane: Arc<L>,
     config: Arc<ApfsSubstrateConfig>,
     incarnations: Arc<dyn IncarnationSource>,
+    /// How lifecycle operations take image locks: [`LockMode::Wait`], except while a pass finishing
+    /// another process's residue runs ([`Self::take_image_locks`]).
+    image_lock_mode: LockMode,
 }
 
 impl<H, L> Clone for ApfsSubstrate<H, L> {
@@ -1031,6 +1092,7 @@ impl<H, L> Clone for ApfsSubstrate<H, L> {
             lane: Arc::clone(&self.lane),
             config: Arc::clone(&self.config),
             incarnations: Arc::clone(&self.incarnations),
+            image_lock_mode: self.image_lock_mode,
         }
     }
 }
@@ -1065,11 +1127,37 @@ where
             lane: Arc::new(lane),
             config: Arc::new(config),
             incarnations: Arc::new(incarnations),
+            image_lock_mode: LockMode::Wait,
         }
     }
 
     pub fn config(&self) -> &ApfsSubstrateConfig {
         &self.config
+    }
+
+    /// Take image locks in `mode` from now on, answering the mode it replaces. Under
+    /// [`LockMode::Try`] a lifecycle operation that finds one held refuses with
+    /// [`ApfsStorageError::ImageLocksHeld`] instead of waiting: a pass finishing another process's
+    /// residue runs so, since it never waits while it holds an intent lease (01_storage.md,
+    /// "Lock order").
+    #[cfg(target_os = "macos")]
+    pub(crate) fn take_image_locks(&mut self, mode: LockMode) -> LockMode {
+        std::mem::replace(&mut self.image_lock_mode, mode)
+    }
+
+    /// Wait until no other process holds any of `locks`, then let go of them at once. Only a caller
+    /// holding no intent lease waits (`_unleased`), so a verb on a name whose residue that caller
+    /// would finish is never refused that name's lease meanwhile (01_storage.md, "Lock order").
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn wait_for_image_locks(
+        &self,
+        _unleased: super::recovery::Unleased<'_>,
+        locks: Box<[PathBuf]>,
+    ) -> Result<(), ApfsStorageError> {
+        let host = Arc::clone(&self.host);
+        self.lane
+            .dispatch(move || lock_images_in(host.as_ref(), &locks, LockMode::Wait).map(drop))
+            .await
     }
     pub fn host(&self) -> &H {
         &self.host
@@ -1224,6 +1312,7 @@ where
             config: Arc::clone(&self.config),
             incarnations: Arc::clone(&self.incarnations),
             expected: plan.expected().to_vec(),
+            image_lock_mode: self.image_lock_mode,
         };
         let mut guard = backend.acquire(plan.operation()).await?;
         let actual = backend
@@ -1373,6 +1462,7 @@ where
             config: Arc::clone(&self.config),
             incarnations: Arc::clone(&self.incarnations),
             expected: plan.expected().to_vec(),
+            image_lock_mode: self.image_lock_mode,
         };
         let mut guard = backend.acquire(plan.operation()).await?;
         let actual = backend
@@ -1523,12 +1613,11 @@ where
         let lock_path = workspace_lock_path(&self.config, workspace.repo(), workspace.name())?;
         let host = Arc::clone(&self.host);
         let config = Arc::clone(&self.config);
+        let mode = self.image_lock_mode;
         let (lock, prepared) = self
             .lane
             .dispatch(move || {
-                let lock = host.lock_images(&[lock_path], LockMode::Wait)?.ok_or(
-                    ApfsStorageError::InvalidPlan("blocking image lock unexpectedly unavailable"),
-                )?;
+                let lock = lock_images_in(host.as_ref(), &[lock_path], mode)?;
                 host.validate_pending_clone(&image, &metadata)?;
                 let prepared = mount_clone_stage(
                     host.as_ref(),
@@ -1621,6 +1710,7 @@ where
             config: Arc::clone(&self.config),
             incarnations: Arc::clone(&self.incarnations),
             expected: plan.expected().to_vec(),
+            image_lock_mode: self.image_lock_mode,
         };
         let mut guard = backend.acquire(plan.operation()).await?;
         let actual = backend
@@ -1680,6 +1770,7 @@ where
             config: Arc::clone(&self.config),
             incarnations: Arc::clone(&self.incarnations),
             expected: plan.expected().to_vec(),
+            image_lock_mode: self.image_lock_mode,
         };
         let mut guard = backend.acquire(plan.operation()).await?;
         let actual = backend
@@ -1919,6 +2010,7 @@ where
             config: Arc::clone(&self.config),
             incarnations: Arc::clone(&self.incarnations),
             expected: plan.expected().to_vec(),
+            image_lock_mode: self.image_lock_mode,
         };
         execute_checked(&backend, plan).await.map_err(Into::into)
     }
@@ -1945,11 +2037,10 @@ where
     {
         let host = Arc::clone(&self.host);
         let config = Arc::clone(&self.config);
+        let mode = self.image_lock_mode;
         self.lane
             .dispatch(move || {
-                let _guard = host.lock_images(&lock_paths, LockMode::Wait)?.ok_or(
-                    ApfsStorageError::InvalidPlan("blocking image lock unexpectedly unavailable"),
-                )?;
+                let _guard = lock_images_in(host.as_ref(), &lock_paths, mode)?;
                 if recover {
                     host.recover_pending(&config, &lock_paths)?;
                 }
@@ -2245,6 +2336,7 @@ struct CheckedApfsBackend<H, L> {
     config: Arc<ApfsSubstrateConfig>,
     incarnations: Arc<dyn IncarnationSource>,
     expected: Vec<LifecycleFact>,
+    image_lock_mode: LockMode,
 }
 
 #[async_trait]
@@ -2260,11 +2352,10 @@ where
     async fn acquire(&self, operation: &Operation) -> Result<Self::Guard, Self::Error> {
         let paths = operation_lock_paths(&self.config, &self.expected, operation)?;
         let host = Arc::clone(&self.host);
+        let mode = self.image_lock_mode;
         self.lane
             .dispatch(move || {
-                let lock = host.lock_images(&paths, LockMode::Wait)?.ok_or(
-                    ApfsStorageError::InvalidPlan("blocking image lock unexpectedly unavailable"),
-                )?;
+                let lock = lock_images_in(host.as_ref(), &paths, mode)?;
                 Ok(CheckedGuard { _lock: lock, paths })
             })
             .await
