@@ -369,7 +369,8 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   boundary is a directory-backed project whose main image lock and served workspace's lock other processes hold, beside
   a corrupt sibling sidecar the store-wide pass refuses and an unrecorded earlier generation of the served workspace in
   the trash: the supervisor opens, serves its settled mount and answers `hello` on its socket while both holders still
-  hold, and leaves the trash image, which an ordinary opening naming the workspace reclaims once the holders let go.
+  hold; neither it nor an ordinary opening naming the workspace once the holders let go deletes the trash image, a
+  recovery image retained without its record (02_workspaces.md, `rm` step 5).
 - **Stateless restore recovery boundaries**: interrupt after undo-sidecar publication, each image/CA-key swap and
   rename, each canonical/undo parent fsync, pending metadata rename/fsync, staged-metadata removal, and final parent
   fsync. Restart twice from every fixture. Recovery must derive rollback/forward state only from APFS image, detached

@@ -924,9 +924,10 @@ fn wait_for_entry(path: &Path) {
 /// supervisor that "did not serve" (measured 2026-10-22: a new supervisor spent every sample of
 /// over two minutes in `flock` on `main.dmg.lock`, under `acquire_image_locks` in the project
 /// opening). Its opening finishes nothing and runs no store-wide pass, which would refuse the
-/// corrupt sibling below; it leaves an earlier generation of its workspace in the trash, whose
-/// reclamation is that workspace's lock's to authorize, and an ordinary opening reclaims it once
-/// the holders let go. Its mount, already settled, is served as it stands under the held lock.
+/// corrupt sibling below; it leaves an unrecorded earlier generation of its workspace in the trash,
+/// and so does an ordinary opening once the holders let go: a recovery image without its record
+/// is retained, never startup garbage (02_workspaces.md, `rm` step 5). Its mount, already settled,
+/// is served as it stands under the held lock.
 #[tokio::test]
 async fn a_supervisor_serves_while_other_processes_hold_its_image_locks() {
     use cowshed_core::metadata::sidecar_path;
@@ -949,8 +950,8 @@ async fn a_supervisor_serves_while_other_processes_hold_its_image_locks() {
         .image()
         .to_owned();
     fs::write(sidecar_path(&broken), b"{ broken sibling").expect("corrupt the sibling's sidecar");
-    // An earlier generation of `served` whose retirement record is already gone: only an opening
-    // that finishes residue reclaims it, holding `served`'s lock.
+    // An earlier generation of `served` whose retirement record is already gone: a recovery image
+    // no opening deletes, since missing authority never proves its bytes disposable.
     let residue = layout
         .project()
         .sessions
@@ -1011,9 +1012,9 @@ async fn a_supervisor_serves_while_other_processes_hold_its_image_locks() {
         .open_naming("served")
         .await
         .expect("a verb naming served opens once the holders let go");
-    assert!(
-        !residue.exists(),
-        "the ordinary opening reclaims the residue the supervisor left"
+    assert_eq!(
+        fs::read(residue.join("left")).expect("the recovery image the ordinary opening retains"),
+        b"an earlier generation"
     );
     ordinary
         .shutdown()
