@@ -1534,9 +1534,9 @@ so once.
 The lease is the default for every `bounded-exec` target, every test target included, so a test's scratch lives on the
 RAM volume unless its target names `env.TMPDIR`. Reclamation never deletes the scratch of a run that did not pass: a
 lease whose task died, or whose own run failed, timed out or was signalled, is renamed whole into
-`/Volumes/smoo-ram2-<uid>/.archive/<archived at, epoch ms>-<lease>`, on the same volume, so the move is one `rename(2)`
-and copies nothing (the build-volume trash does the same, `specs/cowshed/16_build_volumes.md`, "Garbage collection").
-The task that reclaims it says where on stderr
+`/private/var/folders/cowshed/<uid>/ram3/.archive/<archived at, epoch ms>-<lease>`, on the same volume, so the move is
+one `rename(2)` and copies nothing (the build-volume trash does the same, `specs/cowshed/16_build_volumes.md`, "Garbage
+collection"). The task that reclaims it says where on stderr
 (`RAM temp volume: dead lease <lease> archived at <archive>: kept until …`). A passing run's lease is deleted. The
 volume keeps the newest two archives, the failing run under triage and the one before it, which a triage compares to
 tell a flake from a regression; that bound is a stated reason, not a measurement. It keeps none when less than half the
@@ -1564,10 +1564,12 @@ before publishing a mutation; another caller can take a lease while a dead lease
 fails after taking its lease directory gives it back, and detaches the volume if that was the last lease, as the last
 release would have.
 
-Checkouts of this plugin from before the ledger lease under the kernel lock alone and never read the claims, so the two
-protocols must never share a volume. The protocol's revision (2) names the volume, its lock and its ledger, and adds as
-many sectors to the RAM disk: the creator's stray reclaim matches user and size, so neither revision detaches the
-other's disk, mounted or still attaching. On a host running both, each revision has its own volume.
+Checkouts of this plugin from before the ledger lease under the kernel lock alone and never read the claims, and
+checkouts from before the move below the cowshed root mount the volume at `/Volumes`, so no two protocols may share a
+volume. The protocol's revision (3) names the volume, its mountpoint, its lock and its ledger, and adds as many sectors
+to the RAM disk: the creator's stray reclaim matches uid and size, so no revision detaches another's disk, mounted or
+still attaching. On a host running several, each revision has its own volume; a revision-2 volume, still under
+`/Volumes`, is detached by revision 2's own last release, never by revision 3.
 
 A creation or detach claim is void once its owner's pid is gone. A crashed owner whose pid was reused holds every caller
 waiting on the volume, and macOS gives no cheap way to tell the new process from the old without running `ps` under the
@@ -1636,16 +1638,29 @@ census is stopped in consecutive process tables, including an empty one, which r
 tree. This avoids host-wide cwd scans while stopped-table quiescence is still being established. The line is the leak
 check: a suite that prints it has a fixture to fix.
 
-The volume mounts at `/Volumes/smoo-ram2-<uid>`, where DiskArbitration puts it: asking for any other mountpoint
-escalates to an administrator dialog that blocks every `diskutil` on the host. That mount is `noowners`, and launchd
-refuses a plist from it, so a test that bootstraps a launchd job keeps the plist outside `TMPDIR`.
+The volume mounts at `/private/var/folders/cowshed/<uid>/ram3`. The parent is the per-user root `cowshed setup` makes,
+`/private/var/folders/cowshed/<uid>`, a 0700 directory of the user's; the leaf carries the protocol's revision, so two
+revisions never mount on one directory. Spotlight's `mds` admits no volume whose kernel-resolved mount path contains
+`/var/folders/`, and keeps one IOKit right for every volume it admits for as long as it runs, with no way to release it
+(`specs/cowshed/01a_apfs.md`, "Spotlight media references"). Measured 2026-10-22: a RAM volume mounted at `/Volumes` or
+`/private/tmp` left `mds` one right; the same mount under `/private/var/folders` left none. A task refuses to create the
+volume while that root is missing, is a link, or is not a 0700 directory the user owns, and its error says to run
+`cowshed setup`. The kernel mounts the volume there: `mount_apfs` needs no administrator, where
+`diskutil mount -mountPoint` escalated to an administrator dialog that blocked every `diskutil` on the host. The mount
+is `noowners`, and launchd refuses a plist from it, so a test that bootstraps a launchd job keeps the plist outside
+`TMPDIR`.
 
-The volume is created under its final name, `smoo-ram2-<uid>`, and is never renamed. It is mounted and marked at a
-private staging directory, then unmounted and placed at `/Volumes/smoo-ram2-<uid>` by DiskArbitration, so a creator that
-dies part way never leaves an unmarked volume at that mountpoint for the next one to dodge as `smoo-ram2-<uid> 1`.
-Before creating, a task detaches every RAM disk of the same user and size that is mounted nowhere but at those two
-paths: the debris of a creator that was killed or ran into its deadline. One that still carries a lease directory, or
-has something attached below it, is named in the task's error instead.
+The volume is created under its final name, `smoo-ram3-<uid>`, and is never renamed. It is mounted and marked at a
+private staging directory, `/private/var/folders/cowshed/<uid>/ram3-new`, then unmounted and mounted again at its
+mountpoint, so a creator that dies part way never leaves an unmarked volume there. No DiskArbitration call makes either
+directory, so none removes them: the task that detaches the volume, or whose provisioning step failed, removes both.
+Before creating, a task detaches every RAM disk of the same uid and size that is mounted nowhere but at those two paths:
+the debris of a creator that was killed or ran into its deadline. One that still carries a lease directory, or has
+something attached below it, is named in the task's error instead. The task finds these disks, and the one it detaches
+with the last lease, in the I/O Registry (an `IOHDIXHDDriveOutKernel` entry per RAM disk, with its size and owner uid)
+and their mounts in the mount table, never in `hdiutil info`: measured 2026-10-22, `hdiutil info` left an attached RAM
+disk out of 2 of 10 listings while other images attached and detached, and a disk left out would read as absent. A
+registry read that does not parse whole fails the task instead.
 
 Every `hdiutil` and `diskutil` execution goes through `cowshed disk-command`, including host-test inventory and cleanup.
 The cowshed is the installed one on `PATH`, which must provide this command, unless `COWSHED_EXECUTABLE` names another.

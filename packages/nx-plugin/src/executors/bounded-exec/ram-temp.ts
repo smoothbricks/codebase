@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { constants } from 'node:fs';
+import { constants, type Stats } from 'node:fs';
 import {
   type FileHandle,
   lstat,
@@ -61,11 +61,19 @@ import type { TempVolumeSpace } from './verdict.js';
  *   the APFS host degrades"; measured 2026-10-05).
  * - Attach + format + mount costs ~2 s and is DiskArbitration traffic, so the
  *   volume is created once, lazily, and every task takes a subdirectory.
- * - Only DiskArbitration's own mountpoint (`/Volumes/<volume name>`) is safe to
- *   ask for: `diskutil mount -mountPoint <dir>` was refused as not privileged
- *   (0xf8da0009), and storagekitd escalated it to an administrator dialog whose
- *   wait blocked every diskutil on the host. A default mount raised no authd
- *   request (log show, 2026-10-04).
+ * - Spotlight's mds keeps one IOKit right for every APFS volume it admits, for
+ *   the life of the mds process, and admits no volume whose kernel-resolved
+ *   mount path contains `/var/folders/` (specs/cowshed/01a_apfs.md, "Spotlight
+ *   media references"). Measured 2026-10-22: a RAM volume mounted at /Volumes
+ *   or /private/tmp left mds one right; the same mount under
+ *   /private/var/folders left none. So the volume mounts below the per-user root
+ *   `cowshed setup` makes, `/private/var/folders/cowshed/<uid>`, and a task
+ *   refuses to create it while that root is missing or not the user's 0700
+ *   directory.
+ * - The kernel mounts it there: `mount_apfs` needs no authorization, where
+ *   `diskutil mount -mountPoint <dir>` was refused as not privileged
+ *   (0xf8da0009) and storagekitd escalated it to an administrator dialog whose
+ *   wait blocked every diskutil on the host (log show, 2026-10-04).
  * - Without authorization the volume mounts only `noowners`: launchd refuses a
  *   plist from it ("Caller specified a plist with bad ownership/permissions"),
  *   so a test that bootstraps a launchd job keeps the plist outside TMPDIR.
@@ -90,16 +98,16 @@ import type { TempVolumeSpace } from './verdict.js';
  * working in it, by working directory or by `TMPDIR`, has been stopped.
  *
  * The volume is created under its final name and never renamed. It is mounted by `mount_apfs` at a
- * private staging directory and marked there; the kernel then unmounts it (`umount`) and `diskutil mount`, the
- * only call that places it at its mountpoint, so it reaches `/Volumes` already marked. A Disk
- * Arbitration rename names whatever volume holds the path it recorded, and a force-unmounted volume
- * leaves a bare directory there on the host's Data volume, so no rename is made. `noowners` lets the
- * marker be written, since a fresh volume's root is owned by root (measured 2026-10-15). A creator that
- * dies part way leaves debris at the staging directory or as an unmounted volume, never an unmarked
- * volume at the mountpoint, which DiskArbitration would make every later volume dodge as "<name> 1".
- * The host's own image list is the only record of what was
+ * private staging directory and marked there, unmounted (`umount`), and mounted by `mount_apfs` again at its
+ * mountpoint, so it reaches the mountpoint already marked. A Disk Arbitration rename names whatever volume
+ * holds the path it recorded, and a force-unmounted volume leaves a bare directory there on the host's Data
+ * volume, so no rename is made. `noowners` lets the marker be written, since a fresh volume's root is owned
+ * by root (measured 2026-10-15). A creator that dies part way leaves debris at the staging directory or as an
+ * unmounted volume, never an unmarked volume at the mountpoint. No Disk Arbitration call made either
+ * directory, so none removes it: this module removes both once the volume is gone.
+ * The I/O Registry is the only record of what was
  * attached: before creating, a task detaches every RAM disk of this user and
- * this volume's exact size that is mounted nowhere but this volume's names,
+ * this volume's exact size that is mounted nowhere but its mountpoint or staging directory,
  * because a creator killed or deadlined mid-step leaves one behind — measured
  * 2026-10-06: a deadlined `hdiutil attach` whose diskimages-helper finished the
  * attach after `hdiutil` was killed, and a volume mounted with no marker. A
@@ -142,19 +150,22 @@ const GIB = 1024 * MIB;
 /**
  * The revision of the volume's protocol. Checkouts at different revisions run on one host at
  * once, and each is safe only beside its own: revision 1 leases under the kernel lock alone,
- * revision 2 leases and detaches outside it, behind claims in a ledger revision 1 never reads.
- * So no revision shares a volume with another. It names the volume, its lock and its ledger, and
- * adds as many sectors to the RAM disk, whose size and user are what a creator's stray reclaim
- * matches: neither revision detaches the other's disk, mounted or still attaching.
+ * revision 2 leases and detaches outside it, behind claims in a ledger revision 1 never reads,
+ * and revision 3 mounts below the per-user cowshed root instead of at the `/Volumes` path
+ * DiskArbitration gave revisions 1 and 2. So no revision shares a volume with another. It names
+ * the volume, its mountpoint, its lock and its ledger, and adds as many sectors to the RAM disk,
+ * whose size and user are what a creator's stray reclaim matches: no revision detaches another's
+ * disk, mounted or still attaching. A volume of an earlier revision is detached by that
+ * revision's own last release.
  */
-const RAM_TEMP_REVISION = 2;
+const RAM_TEMP_REVISION = 3;
 /**
  * The volume's ceiling, plus the revision's sectors. Pages are allocated as they are written and
  * returned when the volume detaches, so this bounds what a runaway suite can take, not what a gate
  * costs. Measured 2026-10-04: a full parallel smoothbricks `lint test build host-controller-test`
  * gate peaked at 1.61 GiB used with 18 concurrent leases; 8 GiB is five times that. That
- * gate also staged cowshed's real-APFS fixture images on the volume, which now stay under
- * /private/tmp, so the peak is an upper bound.
+ * gate also staged cowshed's real-APFS fixture images on the volume, which now stay outside it,
+ * so the peak is an upper bound.
  */
 export const RAM_TEMP_CAPACITY_BYTES = 8 * GIB + RAM_TEMP_REVISION * SECTOR_BYTES;
 /** A failed task with less than this free on the volume is reported as having run out of space. */
@@ -338,37 +349,56 @@ export const hostLeaseProcesses: LeaseProcesses = leaseProcessesOn({
 });
 
 export interface RamTempPaths {
-  /** Where DiskArbitration mounts the volume: `/Volumes/<volumeName>`. Short for sun_path (104 bytes). */
+  /**
+   * The per-user root `cowshed setup` makes, `/private/var/folders/cowshed/<uid>`: a directory of `uid`'s with
+   * mode 0700, holding the mountpoint and the staging directory. mds admits no volume mounted below `/var/folders/`.
+   */
+  root: string;
+  /** The user that must own `root`. */
+  uid: number;
+  /**
+   * Where the kernel mounts the volume: `<root>/ram<revision>`, so no two revisions stack on one directory. Short:
+   * a socket below a lease must fit sun_path (104 bytes).
+   */
   mountpoint: string;
   lockFile: string;
-  /** APFS volume name; names the mountpoint. */
+  /** APFS volume name; its marker holds it. */
   volumeName: string;
-  /** Where the volume is mounted to be marked before Disk Arbitration places it at `mountpoint`. */
+  /** Where the volume is mounted to be marked before it is mounted at `mountpoint`. */
   staging: string;
-  /** Login name `hdiutil info` reports as the attaching user of this module's RAM disks. */
-  user: string;
 }
 
-export function ramTempPaths(user: { uid: number; username: string }): RamTempPaths {
+export function ramTempPaths(user: { uid: number }): RamTempPaths {
   const volumeName = `smoo-ram${RAM_TEMP_REVISION}-${user.uid}`;
+  const root = `/private/var/folders/cowshed/${user.uid}`;
+  const mountpoint = `${root}/ram${RAM_TEMP_REVISION}`;
   return {
-    mountpoint: join('/Volumes', volumeName),
+    root,
+    uid: user.uid,
+    mountpoint,
     lockFile: `/private/tmp/${volumeName}.lock`,
     volumeName,
-    staging: `/private/tmp/${volumeName}-new`,
-    user: user.username,
+    staging: `${mountpoint}-new`,
   };
 }
 
-/** An attached RAM disk, as `hdiutil info` lists it. */
+/** An attached RAM disk, as the I/O Registry and the mount table show it. */
 export interface RamDisk {
-  /** The whole disk (`/dev/diskN`): detaching it removes its container and volumes. */
-  physical: string;
+  /**
+   * The whole disk (`/dev/diskN`): detaching it removes its container and volumes. Null while the disk has published
+   * no media yet, part way through its attach.
+   */
+  physical: string | null;
   sectors: number;
-  /** Login name of the user that attached it. */
-  user: string;
+  /** The uid that attached it. */
+  uid: number;
   /** Where its volumes are mounted, if anywhere. */
   mountpoints: string[];
+}
+
+/** A RAM disk with its whole disk published, which a detach can name. */
+interface AttachedRamDisk extends RamDisk {
+  physical: string;
 }
 
 export interface RamTempLease {
@@ -400,7 +430,9 @@ type ProvisionFailed = { kind: 'provision-failed'; step: string; detail: string 
 export type RamTempError =
   | ProvisionFailed
   /** A failed task left the volume (nearly) full: the likely cause of its failure. */
-  | { kind: 'volume-full'; mountpoint: string; capacityBytes: number; freeBytes: number };
+  | { kind: 'volume-full'; mountpoint: string; capacityBytes: number; freeBytes: number }
+  /** The per-user root the volume mounts below is missing, or is not the user's 0700 directory. */
+  | { kind: 'root-unready'; root: string; detail: string };
 
 export type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
 
@@ -410,6 +442,8 @@ export function describeRamTempError(error: RamTempError): string {
       return `RAM temp volume: ${error.step} failed: ${error.detail}`;
     case 'volume-full':
       return `RAM temp volume ${error.mountpoint} is full: ${Math.round(error.freeBytes / MIB)} MiB free of ${Math.round(error.capacityBytes / MIB)} MiB; raise RAM_TEMP_CAPACITY_BYTES in @smoothbricks/nx-plugin`;
+    case 'root-unready':
+      return `RAM temp volume: ${error.root} ${error.detail}; run "cowshed setup", which makes it a directory of yours with mode 0700`;
   }
 }
 
@@ -1319,8 +1353,12 @@ export class RamTempVolume {
     return confirmed;
   }
 
-  /** Detach what earlier creators left, then attach and provision the volume. */
+  /** Check the root the volume mounts below, detach what earlier creators left, then attach and provision the volume. */
   private async provisionVolume(): Promise<Result<void, RamTempError>> {
+    const root = await rootReadiness(this.paths);
+    if (!root.ok) {
+      return root;
+    }
     const strays = await this.reclaimStrays(this.holdersPass());
     if (!strays.ok) {
       return strays;
@@ -1340,18 +1378,14 @@ export class RamTempVolume {
       return provisioned;
     }
     const detached = await this.commands.run('/usr/bin/hdiutil', ['detach', '-force', physical]);
-    // The detach takes every volume of the disk with it. What it leaves at the staging path is a bare
-    // directory on the host's Data volume: removed here, and already absent is done.
+    // The detach takes every volume of the disk with it. What it leaves at the staging directory and the
+    // mountpoint is a bare directory on the host's Data volume each: removed here, and already absent is done.
     const detachFailure =
       detached.status === 0
         ? null
         : `hdiutil detach -force ${physical} then failed (${commandText(detached)}), so it stays attached until the next creator reclaims it`;
-    const stagingFailure = await rmdir(this.paths.staging).then(
-      () => null,
-      (error: unknown) =>
-        errorCode(error) === 'ENOENT' ? null : `rmdir ${this.paths.staging} then failed (${errorText(error)})`,
-    );
-    const failures = [detachFailure, stagingFailure].filter((failure): failure is string => failure !== null);
+    const directoryFailures = await removeMountDirectories([this.paths.staging, this.paths.mountpoint]);
+    const failures = [...(detachFailure === null ? [] : [detachFailure]), ...directoryFailures];
     return failures.length === 0
       ? provisioned
       : failed(provisioned.error.step, [provisioned.error.detail, ...failures].join('; '));
@@ -1359,14 +1393,14 @@ export class RamTempVolume {
 
   /**
    * Create the volume under its final name, mount it with `mount_apfs` at the private staging
-   * directory, and mark it there. Then `umount` that private mount and let `diskutil mount` place
-   * the volume at the mountpoint: the only call that does, and it runs after the marker, so the
-   * volume never reaches `/Volumes` unmarked. Nothing is renamed (see the module comment). The
-   * staging mount is the kernel's, so the kernel releases it: a Disk Arbitration unmount waits in
-   * its one queue behind its own probe of the fresh RAM disk (5.1 s for the `zfs` probe alone in
-   * `log stream`; 6.5–6.7 s per unmount against 64–69 ms for `umount`, measured 2026-10-15). A
-   * crash before the final mount leaves the volume attached at the staging directory or
-   * unmounted; the next creator's reclaim detaches either.
+   * directory, and mark it there. Then `umount` that private mount and mount the volume with
+   * `mount_apfs` again at the mountpoint, after the marker, so the volume never reaches the
+   * mountpoint unmarked. Nothing is renamed (see the module comment). The staging mount is the
+   * kernel's, so the kernel releases it: a Disk Arbitration unmount waits in its one queue behind
+   * its own probe of the fresh RAM disk (5.1 s for the `zfs` probe alone in `log stream`;
+   * 6.5–6.7 s per unmount against 64–69 ms for `umount`, measured 2026-10-15). A crash before
+   * the final mount leaves the volume attached at the staging directory or unmounted; the next
+   * creator's reclaim detaches either.
    */
   private async provision(physical: string): Promise<Result<void, ProvisionFailed>> {
     const container = await this.commands.run('/usr/sbin/diskutil', ['apfs', 'createContainer', physical]);
@@ -1410,13 +1444,23 @@ export class RamTempVolume {
     if (unmounted.status !== 0) {
       return failed('umount (staging)', commandText(unmounted));
     }
-    // No -mountPoint: DiskArbitration names the mountpoint after the volume, and appends " 1" when a
-    // /Volumes entry already holds the name.
-    const placing = await this.commands.run('/usr/sbin/diskutil', ['mount', '-mountOptions', 'nobrowse', volume]);
-    if (placing.status !== 0) {
-      return failed('diskutil mount', commandText(placing));
+    // `mount_apfs` mounts at a directory of this module's choosing without authorization; `diskutil mount
+    // -mountPoint` raised an administrator dialog (see the module comment).
+    try {
+      await mkdir(this.paths.mountpoint, { recursive: true, mode: 0o700 });
+    } catch (error) {
+      return failed('mountpoint directory', errorText(error));
     }
-    const placed = await this.expectMounted(volume, this.paths.mountpoint, 'diskutil mount');
+    const placing = await this.commands.run('/sbin/mount_apfs', [
+      '-o',
+      'nobrowse,noowners',
+      `/dev/${volume}`,
+      this.paths.mountpoint,
+    ]);
+    if (placing.status !== 0) {
+      return failed('mount_apfs (mountpoint)', commandText(placing));
+    }
+    const placed = await this.expectMounted(volume, this.paths.mountpoint, 'mount_apfs (mountpoint)');
     if (!placed.ok) {
       return placed;
     }
@@ -1439,24 +1483,40 @@ export class RamTempVolume {
       : failed(step, `${volume} mounted at ${point ?? 'nowhere'}, expected ${expected}`);
   }
 
-  /** This module's RAM disks attached on the host: this user's, of this volume's exact size, mounted nowhere else. */
-  private async attached(): Promise<Result<RamDisk[], ProvisionFailed>> {
-    const info = await this.commands.run('/usr/bin/hdiutil', ['info']);
-    if (info.status !== 0) {
-      return failed('hdiutil info', commandText(info));
+  /**
+   * This module's RAM disks attached on the host: this user's, of this volume's exact size, mounted nowhere else. Read
+   * from the I/O Registry, which omits no attached disk; one still publishing its media is named, never passed over.
+   */
+  private async attached(): Promise<Result<AttachedRamDisk[], ProvisionFailed>> {
+    const registry = await this.commands.run('/usr/sbin/ioreg', ['-r', '-c', 'IOHDIXHDDriveOutKernel', '-l', '-w0']);
+    if (registry.status !== 0) {
+      return failed('ioreg (RAM disks)', commandText(registry));
     }
-    const ours = (point: string) => {
-      // DiskArbitration's " 1" suffix: a volume that found its name taken.
-      const name = point.replace(/ \d+$/, '');
-      // hdiutil lists a mount by the kernel's path; `staging` is written as that path, so it compares exactly.
-      return name === this.paths.mountpoint || name === this.paths.staging;
-    };
-    return {
-      ok: true,
-      value: ramDisksIn(info.stdout).filter(
-        (disk) => disk.user === this.paths.user && disk.sectors === this.sectors && disk.mountpoints.every(ours),
-      ),
-    };
+    const table = await this.commands.run('/sbin/mount', []);
+    if (table.status !== 0) {
+      return failed('mount (mount table)', commandText(table));
+    }
+    const disks = ramDisksIn(registry.stdout, table.stdout);
+    if (!disks.ok) {
+      return failed('ioreg (RAM disks)', disks.error);
+    }
+    // The mount table lists a mount by the kernel's path; both paths are written as that path, so they compare exactly.
+    const ours = (point: string) => point === this.paths.mountpoint || point === this.paths.staging;
+    const attached: AttachedRamDisk[] = [];
+    for (const disk of disks.value) {
+      if (disk.uid !== this.paths.uid || disk.sectors !== this.sectors || !disk.mountpoints.every(ours)) {
+        continue;
+      }
+      const { physical } = disk;
+      if (physical === null) {
+        return failed(
+          'ioreg (RAM disks)',
+          `a RAM disk of uid ${disk.uid} with ${disk.sectors} sectors has published no media yet; look again once its attach settles`,
+        );
+      }
+      attached.push({ ...disk, physical });
+    }
+    return { ok: true, value: attached };
   }
 
   /**
@@ -1526,7 +1586,7 @@ export class RamTempVolume {
     if (!disk) {
       return failed(
         'detach',
-        `hdiutil info lists no RAM disk of ${this.paths.user} with ${this.sectors} sectors mounted at ${this.paths.mountpoint}`,
+        `the I/O Registry lists no RAM disk of uid ${this.paths.uid} with ${this.sectors} sectors mounted at ${this.paths.mountpoint}`,
       );
     }
     const unchanged = await this.locked(
@@ -1556,8 +1616,9 @@ export class RamTempVolume {
     if (detached.status !== 0) {
       return failed('hdiutil detach', commandText(detached));
     }
-    // DiskArbitration removes the /Volumes directory it created when the volume goes.
-    return { ok: true, value: undefined };
+    // No Disk Arbitration call made the mountpoint, so none removes it: this module does, now its volume is gone.
+    const left = await removeMountDirectories([this.paths.mountpoint]);
+    return left.length === 0 ? { ok: true, value: undefined } : failed('detach', left.join('; '));
   }
 
   /** The host's attachments as one pass reads them: one `ioreg` run and one `mount` run. */
@@ -1609,6 +1670,49 @@ function candidatesBelow(inventory: Inventory, prefix: string): HeldCandidate[] 
       .filter((point) => point.startsWith(prefix))
       .map((point): HeldCandidate => ({ kind: 'mount', mountpoint: point, description: `${point} (mounted)` })),
   ];
+}
+
+/**
+ * Whether the per-user root is the one `cowshed setup` makes: a directory, not a link, the user's, mode 0700. A link
+ * could place the mount outside `/var/folders/`, where mds admits it, and another owner or mode exposes the volume.
+ */
+async function rootReadiness(paths: RamTempPaths): Promise<Result<void, RamTempError>> {
+  const unready = (detail: string): Result<void, RamTempError> => ({
+    ok: false,
+    error: { kind: 'root-unready', root: paths.root, detail },
+  });
+  let info: Stats;
+  try {
+    info = await lstat(paths.root);
+  } catch (error) {
+    return unready(errorCode(error) === 'ENOENT' ? 'is missing' : `cannot be read (${errorText(error)})`);
+  }
+  if (!info.isDirectory()) {
+    return unready('is not a directory');
+  }
+  if (info.uid !== paths.uid) {
+    return unready(`is owned by uid ${info.uid}, not ${paths.uid}`);
+  }
+  const mode = info.mode & 0o777;
+  return mode === 0o700 ? { ok: true, value: undefined } : unready(`has mode ${mode.toString(8)}, not 700`);
+}
+
+/**
+ * Remove directories a volume was mounted on, once it is gone. `rmdir` removes only an empty directory, follows no
+ * link and refuses one with a mount on it; already absent is done. Answers each failure.
+ */
+async function removeMountDirectories(directories: readonly string[]): Promise<string[]> {
+  const failures: string[] = [];
+  for (const directory of directories) {
+    try {
+      await rmdir(directory);
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') {
+        failures.push(`rmdir ${directory} then failed (${errorText(error)})`);
+      }
+    }
+  }
+  return failures;
 }
 
 /** The pid a lease directory is named after: whether its task is alive. */
@@ -1771,6 +1875,7 @@ function alsoFailed(primary: RamTempError, cleanup: readonly RamTempError[]): Ra
   const after = `cleanup then failed: ${cleanup.map(describeRamTempError).join('; ')}`;
   switch (primary.kind) {
     case 'provision-failed':
+    case 'root-unready':
       return { ...primary, detail: `${primary.detail}; ${after}` };
     case 'volume-full':
       return { kind: 'provision-failed', step: 'cleanup', detail: `${describeRamTempError(primary)}; ${after}` };
@@ -1870,27 +1975,59 @@ export function operationDisk(stdout: string): string | null {
 }
 
 /**
- * The RAM disks in `hdiutil info` output. Images are separated by a row of `=`; a RAM disk's
- * `image-path` is `ram://<sectors>`, and its entity rows are `<dev>\t<content hint>\t<mountpoint>`,
- * the whole disk first.
+ * The RAM disks in `ioreg -r -c IOHDIXHDDriveOutKernel -l -w0` output, with the mounts `mount` output gives them. A RAM
+ * disk is a legacy DiskImages device served by a diskimages-helper: each starts a `+-o IOHDIXHDDriveOutKernel` entry
+ * whose own properties carry `image-path` <"ram://<sectors>"> and `owner-uid`, and the `BSD Name`s below it are its
+ * whole disk first, then its APFS container and volumes. The registry is the kernel's record, and unlike `hdiutil info`,
+ * which drops images while another attaches or detaches, it leaves out no attached disk. So an entry this cannot read is
+ * an error, never a disk left out: a partial read must not stand for an absent disk.
  */
-export function ramDisksIn(info: string): RamDisk[] {
+export function ramDisksIn(registry: string, table: string): Result<RamDisk[], string> {
+  const mounted = new Map<string, string[]>();
+  for (const [, device, point] of table.matchAll(/^\/dev\/(disk\d+(?:s\d+)*) on (.+) \([^)]*\)$/gm)) {
+    if (device !== undefined && point !== undefined) {
+      mounted.set(device, [...(mounted.get(device) ?? []), point]);
+    }
+  }
   const disks: RamDisk[] = [];
-  for (const block of info.split(/^=+$/m)) {
-    const sectors = /^image-path\s*:\s*ram:\/\/(\d+)\s*$/m.exec(block)?.[1];
-    const user = /^mounting user\s*:\s*(\S+)\s*$/m.exec(block)?.[1];
-    const entities = [...block.matchAll(/^(\/dev\/disk\d+(?:s\d+)*)\t[^\t\n]*(?:\t([^\n]*))?$/gm)];
-    const physical = entities[0]?.[1];
-    if (sectors === undefined || user === undefined || physical === undefined) {
+  for (const entry of registry.split(/^(?=\+-o )/m)) {
+    if (entry.trim() === '') {
       continue;
     }
-    const mountpoints = entities.flatMap((entity) => {
-      const point = entity[2]?.trimEnd();
-      return point ? [point] : [];
+    const header = entry.slice(0, entry.indexOf('\n') === -1 ? undefined : entry.indexOf('\n'));
+    if (!header.startsWith('+-o ') || !header.includes('<class IOHDIXHDDriveOutKernel,')) {
+      return { ok: false, error: `not an IOHDIXHDDriveOutKernel entry: ${header.slice(0, 160)}` };
+    }
+    // The entry's own properties end at its first child; only they name its image and owner.
+    const firstChild = entry.indexOf('+-o ', header.length);
+    const own = entry.slice(header.length, firstChild === -1 ? undefined : firstChild);
+    const imagePath = /"image-path" = <"([^"]*)">/.exec(own)?.[1];
+    const owner = /"owner-uid" = (\d+)/.exec(own)?.[1];
+    // Every node's property list closes before the next node: a read cut short leaves one open.
+    const opened = entry.match(/^[| ]*\{\s*$/gm)?.length ?? 0;
+    const closed = entry.match(/^[| ]*\}\s*$/gm)?.length ?? 0;
+    if (opened === 0 || opened !== closed || imagePath === undefined || owner === undefined) {
+      return {
+        ok: false,
+        error: `an incomplete entry (${opened} property lists opened, ${closed} closed${imagePath === undefined ? ', no image-path' : ''}${owner === undefined ? ', no owner-uid' : ''}): ${header.slice(0, 160)}`,
+      };
+    }
+    const sectors = /^ram:\/\/(\d+)$/.exec(imagePath)?.[1];
+    if (sectors === undefined) {
+      // A file-backed legacy image, not a RAM disk.
+      continue;
+    }
+    const names = [...entry.matchAll(/"BSD Name" = "(disk\d+(?:s\d+)*)"/g)].flatMap((match) =>
+      match[1] === undefined ? [] : [match[1]],
+    );
+    disks.push({
+      physical: names[0] === undefined ? null : `/dev/${names[0]}`,
+      sectors: Number(sectors),
+      uid: Number(owner),
+      mountpoints: names.flatMap((name) => mounted.get(name) ?? []),
     });
-    disks.push({ physical, sectors: Number(sectors), user, mountpoints });
   }
-  return disks;
+  return { ok: true, value: disks };
 }
 
 /**

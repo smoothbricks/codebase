@@ -243,8 +243,8 @@ describe('bounded-exec verdicts', () => {
     const noSpace = {
       line: 'ENOSPC: no space left on device, write',
       volume: {
-        lease: '/Volumes/smoo-ram2-502/37738-AadRCN',
-        mountpoint: '/Volumes/smoo-ram2-502',
+        lease: '/private/var/folders/cowshed/502/ram3/37738-AadRCN',
+        mountpoint: '/private/var/folders/cowshed/502/ram3',
         capacityBytes: 8 * 1024 ** 3,
         freeBytes: 4096,
       },
@@ -264,7 +264,7 @@ describe('bounded-exec verdicts', () => {
     expect(judgeRun({ ...ran, exitCode: 0, report: null })).toEqual({ outcome: 'passed' });
     expect(describeVerdict(judgeRun(ran))).toBe(
       'ENOSPC (no space left on device): the command printed "ENOSPC: no space left on device, write"; its TMPDIR ' +
-        '/Volumes/smoo-ram2-502/37738-AadRCN is on the RAM temp volume /Volumes/smoo-ram2-502, which had 0.0 MiB free ' +
+        '/private/var/folders/cowshed/502/ram3/37738-AadRCN is on the RAM temp volume /private/var/folders/cowshed/502/ram3, which had 0.0 MiB free ' +
         'of 8192.0 MiB when that line arrived; the tests that then failed: lsp-differential hover',
     );
   });

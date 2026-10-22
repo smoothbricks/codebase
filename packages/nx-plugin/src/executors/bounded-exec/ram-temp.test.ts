@@ -1,7 +1,16 @@
 import { describe, expect, it } from 'bun:test';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { closeSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import {
+  closeSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -14,6 +23,7 @@ import { awaitExit, ownedSocketDirectory, pidsWorkingIn, processTable, terminate
 import {
   COWSHED_EXECUTABLE_ENV,
   createHostCommands,
+  describeRamTempError,
   diskCommand,
   hostLeaseProcesses,
   imagesBackedUnder,
@@ -21,6 +31,7 @@ import {
   mountsBelow,
   operationDisk,
   RAM_TEMP_CAPACITY_BYTES,
+  type RamTempError,
   RamTempVolume,
   ramDisksIn,
   ramTempPaths,
@@ -36,82 +47,123 @@ describe('RAM temp volume output parsing', () => {
     expect(operationDisk('Error: -69808\n')).toBeNull();
   });
 
-  it('lists the RAM disks hdiutil info reports, with their user, size and mountpoints', () => {
-    const info = [
-      'framework       : 683.160.3',
-      'driver          : 683.160.3',
-      'images          : 3',
-      '================================================',
-      'image-path      : /private/cowshed/store/x/main.dmg',
-      'mounting user   : example',
-      'framework name  : DiskImages2',
-      '/dev/disk10\t\t',
-      '/dev/disk11\tEF57347C-0000-11AA-AA11-00306543ECAC\t',
-      '/dev/disk11s1\t41504653-0000-11AA-AA11-00306543ECAC\t/Users/example/checkout',
-      '================================================',
-      'image-path      : ram://16777216',
-      'image-type      : read/write',
-      'blockcount      : 16777216',
-      'mounting user   : example',
-      'mounting mode   : <unknown>',
-      'process ID      : 91006',
-      'framework name  : DiskImages',
-      '/dev/disk138\t\t',
-      '/dev/disk139\tEF57347C-0000-11AA-AA11-00306543ECAC\t',
-      '/dev/disk139s1\t41504653-0000-11AA-AA11-00306543ECAC\t/Volumes/smoo-ram-502 1',
-      '================================================',
-      'image-path      : ram://16777216',
-      'mounting user   : root',
-      '/dev/disk159\t\t',
-      '',
+  it('lists the RAM disks the I/O Registry holds, with their owner, size and mounts', () => {
+    // Captured 2026-10-22 on macOS 26.6 with `ioreg -r -c IOHDIXHDDriveOutKernel -l -w0`: another checkout's
+    // revision-2 RAM disk, unmounted at that instant, and a 64 MiB disk whose volume mount_apfs placed below t/.
+    const table = [
+      '/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)',
+      '/dev/disk543s1 on /private/var/folders/cowshed/502/t/smoo-ram-fixture-27416 (apfs, local, nodev, nosuid, journaled, noowners, nobrowse, mounted by danny)',
     ].join('\n');
-    expect(ramDisksIn(info)).toEqual([
-      { physical: '/dev/disk138', sectors: 16777216, user: 'example', mountpoints: ['/Volumes/smoo-ram-502 1'] },
-      { physical: '/dev/disk159', sectors: 16777216, user: 'root', mountpoints: [] },
-    ]);
+    expect(ramDisksIn(capturedRegistry(), table)).toEqual({
+      ok: true,
+      value: [
+        { physical: '/dev/disk539', sectors: 16777218, uid: 502, mountpoints: [] },
+        {
+          physical: '/dev/disk540',
+          sectors: 131072,
+          uid: 502,
+          mountpoints: ['/private/var/folders/cowshed/502/t/smoo-ram-fixture-27416'],
+        },
+      ],
+    });
+    expect(ramDisksIn('', table)).toEqual({ ok: true, value: [] });
+  });
+
+  it('refuses a registry read it cannot read whole, never reporting a disk absent', () => {
+    const registry = capturedRegistry();
+    // Cut inside the second disk's own properties, then inside its APFS volume: each leaves a property list open.
+    for (const end of ['"image-path" = <"ram://131072">', '"BSD Name" = "disk543s1"']) {
+      expect(ramDisksIn(registry.slice(0, registry.indexOf(end)), '')).toMatchObject({ ok: false });
+    }
+    expect(ramDisksIn('ioreg: no such class\n', '')).toMatchObject({ ok: false });
   });
 
   it('finds only the images whose backing file is on the volume', () => {
     const registry = [
-      ...registryDevice('file:///private/tmp/smoo-ram-501/501-a1b2c3/store/main%20copy.dmg', 'disk280'),
-      ...registryDevice('file:///private/tmp/smoo-ram-5010/x.dmg', 'disk281'),
+      ...registryDevice('file:///private/var/folders/cowshed/501/ram3/501-a1b2c3/store/main%20copy.dmg', 'disk280'),
+      ...registryDevice('file:///private/var/folders/cowshed/501/ram30/x.dmg', 'disk281'),
       ...registryDevice('ram://134217728', 'disk270'),
     ].join('\n');
-    expect(imagesBackedUnder(registry, '/private/tmp/smoo-ram-501/')).toEqual([
-      '/private/tmp/smoo-ram-501/501-a1b2c3/store/main copy.dmg (/dev/disk280)',
+    expect(imagesBackedUnder(registry, '/private/var/folders/cowshed/501/ram3/')).toEqual([
+      '/private/var/folders/cowshed/501/ram3/501-a1b2c3/store/main copy.dmg (/dev/disk280)',
     ]);
   });
 
   it('finds the mounts that would make removing a lease delete through them', () => {
     const table = [
       '/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)',
-      '/dev/disk271s1 on /private/tmp/smoo-ram-501 (apfs, local, nodev, nosuid, journaled, noowners, nobrowse)',
-      '/dev/disk290s1 on /private/tmp/smoo-ram-501/501-a1b2c3/checkout (apfs, local, nobrowse, mounted by example)',
-      '/dev/disk291s1 on /private/tmp/smoo-ram-501/501-a1b2c3x/other (apfs, local)',
+      '/dev/disk271s1 on /private/var/folders/cowshed/501/ram3 (apfs, local, nodev, nosuid, journaled, noowners, nobrowse)',
+      '/dev/disk290s1 on /private/var/folders/cowshed/501/ram3/501-a1b2c3/checkout (apfs, local, nobrowse, mounted by example)',
+      '/dev/disk291s1 on /private/var/folders/cowshed/501/ram3/501-a1b2c3x/other (apfs, local)',
     ].join('\n');
-    expect(mountsBelow(table, '/private/tmp/smoo-ram-501/501-a1b2c3/')).toEqual([
-      '/private/tmp/smoo-ram-501/501-a1b2c3/checkout',
+    expect(mountsBelow(table, '/private/var/folders/cowshed/501/ram3/501-a1b2c3/')).toEqual([
+      '/private/var/folders/cowshed/501/ram3/501-a1b2c3/checkout',
     ]);
   });
 
-  it('mounts where DiskArbitration puts it, short enough to hold sockets', () => {
-    // sun_path is 104 bytes; a lease directory leaves room for nested fixture paths.
-    expect(ramTempPaths({ uid: 501, username: 'ada' })).toEqual({
-      mountpoint: '/Volumes/smoo-ram2-501',
-      lockFile: '/private/tmp/smoo-ram2-501.lock',
-      volumeName: 'smoo-ram2-501',
-      staging: '/private/tmp/smoo-ram2-501-new',
-      user: 'ada',
+  it('mounts below the per-user cowshed root, where mds keeps no right for it, short enough to hold sockets', () => {
+    // sun_path is 104 bytes; a lease directory leaves room for nested fixture paths. mds admits no
+    // volume whose mount path contains /var/folders/ (specs/cowshed/01a_apfs.md, "Spotlight media references").
+    expect(ramTempPaths({ uid: 501 })).toEqual({
+      root: '/private/var/folders/cowshed/501',
+      uid: 501,
+      mountpoint: '/private/var/folders/cowshed/501/ram3',
+      lockFile: '/private/tmp/smoo-ram3-501.lock',
+      volumeName: 'smoo-ram3-501',
+      staging: '/private/var/folders/cowshed/501/ram3-new',
     });
   });
 
-  it("never shares a volume or a RAM disk size with revision 1's checkouts", () => {
-    // Revision 1 used /Volumes/smoo-ram-<uid> and ram://16777216; a creator's stray reclaim matches
-    // user and size, so equal sizes would let either revision detach the other's attaching disk.
-    expect(RAM_TEMP_CAPACITY_BYTES / 512).toBe(16777218);
+  it('never shares a volume or a RAM disk size with the checkouts of revisions 1 and 2', () => {
+    // Revision 1 used /Volumes/smoo-ram-<uid> and ram://16777216, revision 2 /Volumes/smoo-ram2-<uid> and
+    // ram://16777218; a creator's stray reclaim matches uid and size, so equal sizes would let either
+    // revision detach the other's attaching disk.
+    expect(RAM_TEMP_CAPACITY_BYTES / 512).toBe(16777219);
   });
 });
 
+describe('the root the RAM temp volume mounts below', () => {
+  it("refuses to create the volume, naming cowshed setup, until the root is the user's 0700 directory", async () => {
+    const parent = mkdtempSync(join(realpathSync(tmpdir()), 'rt-root-'));
+    const uid = process.getuid?.() ?? 0;
+    const cases: { name: string; make: (root: string) => void; detail: string }[] = [
+      { name: 'missing', make: () => {}, detail: 'is missing' },
+      { name: 'open', make: (root) => mkdirSync(root, { mode: 0o755 }), detail: 'has mode 755, not 700' },
+      { name: 'file', make: (root) => writeFileSync(root, ''), detail: 'is not a directory' },
+    ];
+    try {
+      for (const { name, make, detail } of cases) {
+        const root = join(parent, name);
+        make(root);
+        // The volume's paths, all below this root, so no case can find the host's own volume.
+        const paths = {
+          ...ramTempPaths({ uid }),
+          root,
+          mountpoint: join(root, 'ram'),
+          staging: join(root, 'ram-new'),
+          lockFile: join(parent, `${name}.lock`),
+        };
+        const volume = new RamTempVolume(paths, 512, {
+          async run(file) {
+            throw new Error(`${file} ran before the root was checked`);
+          },
+        });
+        const error: RamTempError = { kind: 'root-unready', root, detail };
+        expect(await volume.acquire()).toEqual({ ok: false, error });
+        expect(describeRamTempError(error)).toBe(
+          `RAM temp volume: ${root} ${detail}; run "cowshed setup", which makes it a directory of yours with mode 0700`,
+        );
+      }
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+});
+
+/** A real `ioreg -r -c IOHDIXHDDriveOutKernel -l -w0` read of two RAM disks on this host, kept beside this test. */
+function capturedRegistry(): string {
+  return readFileSync(new URL('./ram-temp-registry.txt', import.meta.url), 'utf8');
+}
 /** A real facade boundary: owns a detached stand-in, kills only SAFE children, and waits for reap.
  * The control socket gates facade exit after reap; protected output stays in owned files.
  */
@@ -431,7 +483,7 @@ describe('processes a task left working in its RAM lease', () => {
     let scans = 0;
     let failure = Object.assign(new Error('spawn /usr/sbin/lsof ENOENT'), { code: 'ENOENT' });
     const volume = new RamTempVolume(
-      ramTempPaths({ uid: 0, username: 'fixture' }),
+      ramTempPaths({ uid: 0 }),
       1,
       {
         async run() {

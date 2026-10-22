@@ -45,35 +45,76 @@ const MIB = 1024 * 1024;
 
 /**
  * A volume of its own for one test: a lock beside it, and a name and a size no other test
- * process uses, since the size and the user are what identify a RAM disk as this volume's.
+ * process uses, since the size and the user are what identify a RAM disk as this volume's. It
+ * mounts in `t` below the per-user root `cowshed setup` makes, as the module's own volume mounts
+ * below that root, so mds keeps no right for it (specs/cowshed/01a_apfs.md, "Spotlight media references").
  */
 function scratchVolume(index: number): { parent: string; paths: RamTempPaths; capacity: number } {
   const parent = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'rt-'));
+  const { uid } = userInfo();
+  const root = `/private/var/folders/cowshed/${uid}`;
+  const fixtures = join(root, 't');
+  try {
+    mkdirSync(fixtures, { mode: 0o700 });
+  } catch (error) {
+    if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) {
+      throw error;
+    }
+  }
   const name = `smoo-ram-test-${process.pid}-${index}`;
   return {
     parent,
     paths: {
-      mountpoint: join('/Volumes', name),
+      root,
+      uid,
+      mountpoint: join(fixtures, name),
       lockFile: join(parent, 'v.lock'),
       volumeName: name,
-      staging: `/private/tmp/${name}-new`,
-      user: userInfo().username,
+      staging: join(fixtures, `${name}-new`),
     },
     capacity: 64 * MIB + (process.pid * 4 + index + 1) * 512,
   };
 }
 
-async function attachedDisks(paths: RamTempPaths, capacity: number): Promise<RamDisk[]> {
-  const info = await createHostCommands().run('/usr/bin/hdiutil', ['info']);
-  if (info.status !== 0) {
-    throw new Error(`inventory RAM disks: exit ${info.status}: ${info.stderr}`);
+/**
+ * Remove what a failed run left of the scratch volume's directories. Teardown must not hide the failure it follows,
+ * so a directory `rmdirSync` refuses, one still mounted on, is said on stderr instead of thrown.
+ */
+function removeScratchDirectories(paths: RamTempPaths): void {
+  for (const directory of [paths.mountpoint, paths.staging]) {
+    try {
+      rmdirSync(directory);
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) {
+        process.stderr.write(`scratch volume teardown: rmdir ${directory}: ${String(error)}\n`);
+      }
+    }
   }
-  return ramDisksIn(info.stdout).filter((disk) => disk.user === paths.user && disk.sectors === capacity / 512);
+}
+
+/** This test's RAM disks, read from the I/O Registry as the module reads them: `hdiutil info` drops attached disks. */
+async function attachedDisks(paths: RamTempPaths, capacity: number): Promise<RamDisk[]> {
+  const host = createHostCommands();
+  const registry = await host.run('/usr/sbin/ioreg', ['-r', '-c', 'IOHDIXHDDriveOutKernel', '-l', '-w0']);
+  const table = await host.run('/sbin/mount', []);
+  if (registry.status !== 0 || table.status !== 0) {
+    throw new Error(
+      `inventory RAM disks: ioreg exit ${registry.status}: ${registry.stderr}; mount exit ${table.status}: ${table.stderr}`,
+    );
+  }
+  const disks = ramDisksIn(registry.stdout, table.stdout);
+  if (!disks.ok) {
+    throw new Error(`inventory RAM disks: ${disks.error}`);
+  }
+  return disks.value.filter((disk) => disk.uid === paths.uid && disk.sectors === capacity / 512);
 }
 
 async function detachAll(paths: RamTempPaths, capacity: number): Promise<void> {
   const host = createHostCommands();
   for (const disk of await attachedDisks(paths, capacity)) {
+    if (disk.physical === null) {
+      throw new Error(`a RAM disk of ${disk.sectors} sectors has published no media to detach yet`);
+    }
     const output = await host.run('/usr/bin/hdiutil', ['detach', '-force', disk.physical]);
     if (output.status !== 0) {
       throw new Error(`hdiutil detach ${disk.physical}: exit ${output.status}: ${output.stderr}`);
@@ -85,22 +126,19 @@ async function detachAll(paths: RamTempPaths, capacity: number): Promise<void> {
 function expectSandboxed(error: RamTempError): void {
   expect(error.kind).toBe('provision-failed');
   if (error.kind === 'provision-failed') {
-    expect(['hdiutil info', 'hdiutil attach']).toContain(error.step);
+    expect(['ioreg (RAM disks)', 'hdiutil attach']).toContain(error.step);
   }
 }
 
 /**
  * The provisioning step a host call is: `mount_apfs` and `umount` of the private staging mount, or
- * the `diskutil mount` that places the volume. Null for every other call.
+ * the `mount_apfs` that places the volume at its mountpoint. Null for every other call.
  */
-function stepOf(file: string, args: readonly string[]): string | null {
+function stepOf(paths: RamTempPaths, file: string, args: readonly string[]): string | null {
   if (file === '/sbin/mount_apfs') {
-    return 'mount_apfs';
+    return args.at(-1) === paths.mountpoint ? 'mount' : 'mount_apfs';
   }
-  if (file === '/sbin/umount') {
-    return 'unmount';
-  }
-  return file === '/usr/sbin/diskutil' && args[0] === 'mount' ? 'mount' : null;
+  return file === '/sbin/umount' ? 'unmount' : null;
 }
 
 /** A readonly tree, two directories deep, with a file at each level. */
@@ -226,7 +264,7 @@ async function nativeRamVolume(): Promise<void> {
   const provisioning: string[] = [];
   const commands: HostCommands = {
     async run(file, args) {
-      const step = stepOf(file, args);
+      const step = stepOf(paths, file, args);
       if (step !== null) {
         provisioning.push(step);
       }
@@ -278,7 +316,8 @@ async function nativeRamVolume(): Promise<void> {
       operationDisk(
         await run('/usr/sbin/diskutil', ['apfs', 'addVolume', container, 'APFS', paths.volumeName, '-nomount']),
       ) ?? '';
-    await run('/usr/sbin/diskutil', ['mount', '-mountOptions', 'nobrowse', orphanVolume]);
+    mkdirSync(paths.mountpoint, { mode: 0o700 });
+    await run('/sbin/mount_apfs', ['-o', 'nobrowse,noowners', `/dev/${orphanVolume}`, paths.mountpoint]);
     await run('/usr/bin/hdiutil', ['attach', '-nomount', sectors]);
     expect((await attachedDisks(paths, capacity)).map((disk) => disk.mountpoints)).toEqual([[paths.mountpoint], []]);
 
@@ -302,11 +341,11 @@ async function nativeRamVolume(): Promise<void> {
       throw new Error(`lease over the debris failed: ${JSON.stringify(a)}`);
     }
     expect(a.value.kind).toBe('leased');
-    // Mounted and marked at its staging directory, unmounted, then placed by DiskArbitration: never renamed.
+    // Mounted and marked at its staging directory, unmounted, then mounted at its mountpoint: never renamed.
     expect(provisioning).toEqual(['mount_apfs', 'unmount', 'mount']);
     expect(a.value.lease.mountpoint).toBe(paths.mountpoint);
     expect(readFileSync(join(paths.mountpoint, '.smoo-ram'), 'utf8')).toBe(`${paths.volumeName}\n`);
-    expect(existsSync(`${paths.mountpoint} 1`)).toBe(false);
+    expect(existsSync(paths.staging)).toBe(false);
     expect((await attachedDisks(paths, capacity)).map((disk) => disk.mountpoints)).toEqual([[paths.mountpoint]]);
 
     const leaseA = a.value.lease;
@@ -477,6 +516,7 @@ async function nativeRamVolume(): Promise<void> {
     // Restore the owner write the outside directory was given, so the parent can be removed.
     chmodSync(outside, 0o755);
     await detachAll(paths, capacity);
+    removeScratchDirectories(paths);
     rmSync(parent, { recursive: true, force: true });
   }
 }
@@ -485,12 +525,12 @@ async function nativeRamVolume(): Promise<void> {
 const FAILING_STEPS = [
   { injected: 'mount_apfs', reported: 'mount_apfs (staging)' },
   { injected: 'unmount', reported: 'umount (staging)' },
-  { injected: 'mount', reported: 'diskutil mount' },
+  { injected: 'mount', reported: 'mount_apfs (mountpoint)' },
 ] as const;
 
 /**
  * A provisioning step that fails leaves nothing under the final name: the failure detaches the whole
- * disk, with the staging mount on it, and removes the staging directory the attempt made.
+ * disk, with the staging mount on it, and removes the staging directory and the mountpoint the attempt made.
  */
 async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
   const trace = useTestSpan<OpContextBinding>();
@@ -502,7 +542,7 @@ async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
     const commands: HostCommands = {
       async run(file, args, deadlineMs) {
         const record =
-          stepOf(file, args) !== null ||
+          stepOf(paths, file, args) !== null ||
           (file === '/usr/bin/hdiutil' && ['attach', 'detach'].includes(args[0] ?? '')) ||
           (file === '/usr/sbin/diskutil' && args[0] === 'apfs');
         const startedAt = Date.now();
@@ -510,7 +550,7 @@ async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
         trace.log.info(starting);
         process.stderr.write(`${starting}\n`);
         const output =
-          stepOf(file, args) === injected
+          stepOf(paths, file, args) === injected
             ? { status: 1, stdout: '', stderr: 'injected' }
             : await host.run(file, args, deadlineMs);
         if (record) {
@@ -608,9 +648,11 @@ async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
       expect(mountsBelow(table.stdout, paths.mountpoint)).toEqual([]);
       expect(mountsBelow(table.stdout, paths.staging)).toEqual([]);
       expect(existsSync(paths.staging)).toBe(false);
+      expect(existsSync(paths.mountpoint)).toBe(false);
     } finally {
       trace.log.info(JSON.stringify({ injected, phase: 'test-teardown-start' }));
       await detachAll(paths, capacity);
+      removeScratchDirectories(paths);
       rmSync(parent, { recursive: true, force: true });
       trace.log.info(JSON.stringify({ injected, phase: 'test-teardown-done' }));
     }
@@ -683,7 +725,7 @@ async function inheritedTempDirectory(): Promise<void> {
 describe('temporary-directory policy on this host', () => {
   if (process.platform === 'darwin') {
     it(
-      'reclaims what a dead creator left, shares the volume between leases, and detaches it at the last release, never mounting beside it as "<name> 1"',
+      'reclaims what a dead creator left, shares the volume between leases, and detaches it at the last release, removing its mountpoint',
       nativeRamVolume,
     );
     it(

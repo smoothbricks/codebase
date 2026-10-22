@@ -19,19 +19,19 @@ const context: HeldContext = { volumeKey: 'root 77:2:100 marker 77:9:100:200', l
 
 const workspace: Extract<HeldCandidate, { kind: 'mount' }> = {
   kind: 'mount',
-  mountpoint: '/Volumes/ram/1-abcdef/workspace',
-  description: '/Volumes/ram/1-abcdef/workspace (mounted)',
+  mountpoint: '/private/var/folders/cowshed/502/ram3/1-abcdef/workspace',
+  description: '/private/var/folders/cowshed/502/ram3/1-abcdef/workspace (mounted)',
 };
 const cache: Extract<HeldCandidate, { kind: 'mount' }> = {
   kind: 'mount',
-  mountpoint: '/Volumes/ram/1-abcdef/cache',
-  description: '/Volumes/ram/1-abcdef/cache (mounted)',
+  mountpoint: '/private/var/folders/cowshed/502/ram3/1-abcdef/cache',
+  description: '/private/var/folders/cowshed/502/ram3/1-abcdef/cache (mounted)',
 };
 const image: HeldCandidate = {
   kind: 'image',
-  imagePath: '/Volumes/ram/1-abcdef/fixture.sparseimage',
+  imagePath: '/private/var/folders/cowshed/502/ram3/1-abcdef/fixture.sparseimage',
   diskPath: '/dev/disk42',
-  description: '/Volumes/ram/1-abcdef/fixture.sparseimage (/dev/disk42)',
+  description: '/private/var/folders/cowshed/502/ram3/1-abcdef/fixture.sparseimage (/dev/disk42)',
 };
 
 type Entry = { shape: 'file' | 'directory'; dev: bigint; ino: bigint; birthtimeNs: bigint };
