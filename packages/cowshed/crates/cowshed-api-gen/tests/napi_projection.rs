@@ -31,6 +31,10 @@ impl Scratch {
         ] {
             copy_tree(&project.join(crate_source), &root.join(crate_source));
         }
+        let cli = "crates/cowshed-cli/src/args.rs";
+        fs::create_dir_all(root.join(cli).parent().expect("args.rs has a directory"))
+            .expect("scratch CLI directory");
+        fs::copy(project.join(cli), root.join(cli)).expect("copy the CLI grammar");
         Self(root)
     }
 }

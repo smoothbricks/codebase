@@ -30,10 +30,10 @@ use std::path::{Path, PathBuf};
 
 use crate::api::dto::{
     AbandonedRefs, AbandonedTip, BranchLanding, BranchLandings, GitOid, LandingCommits,
-    PreservedRef, UnlandedPaths, WorkspaceLanding,
+    PreservedRef, UnlandedPaths, WorkspaceInfo, WorkspaceLanding, WorkspaceState,
 };
 use crate::git::{ContentNotHeld, GitRepository};
-use crate::metadata::WorkspaceName;
+use crate::metadata::{WorkspaceName, WorkspaceRole};
 
 /// The branch a workspace's work has to reach, resolved live, with the object store that holds it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -447,4 +447,136 @@ async fn counted(
             paths: unheld.paths,
         },
     })
+}
+
+/// The branch `ls` measures against, which is the same constant `land` merges into and `rm` gates
+/// on. Sharing it is the point: a listing that reported against a different branch than the gate
+/// enforces would be a listing that lies about what `rm` will do.
+const LISTING_TARGET_BRANCH: &str = crate::runtime::project::DEFAULT_LANDING_BRANCH;
+
+/// Measure every session workspace of one project's listing against the project's own main.
+///
+/// Main is left unmeasured because main *is* the target: comparing it to itself answers nothing,
+/// and a zero-unlanded row for main would make it look retirable to anything reading the column.
+/// A detached session, a project without main and a measurement that never completed each carry
+/// an indeterminate landing naming why, never an absent one.
+///
+/// One task per workspace, because the measurement is process-bound rather than CPU-bound and the
+/// serial version costs the sum of every workspace's history walk — which on a project whose main
+/// has been rewritten is the slowest thing a listing could be asked to do.
+pub async fn annotate_listing<T: AsMut<WorkspaceInfo>>(rows: &mut [T]) {
+    let Some(main) = rows
+        .iter_mut()
+        .map(AsMut::as_mut)
+        .find(|workspace| workspace.role == WorkspaceRole::Main)
+        .map(|main| main.mount.clone())
+    else {
+        let reason = String::from(
+            "this project records no main workspace, so there is no branch to compare against",
+        );
+        for row in rows.iter_mut() {
+            row.as_mut().landing = Some(indeterminate(reason.clone()));
+        }
+        return;
+    };
+    // A listing reads the host's projects, so its Git runs for the host store.
+    let host_store =
+        std::sync::Arc::clone(crate::storage::bootstrap::CanonicalRoots::global().shared_store());
+    let target =
+        std::sync::Arc::new(resolve_target(&host_store, &main, LISTING_TARGET_BRANCH).await);
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, row) in rows.iter_mut().enumerate() {
+        let workspace = row.as_mut();
+        if workspace.role == WorkspaceRole::Main {
+            continue;
+        }
+        if workspace.state == WorkspaceState::Detached {
+            workspace.landing = Some(indeterminate(String::from(
+                "workspace is detached, so its repository is not mounted to be read",
+            )));
+            continue;
+        }
+        let target = std::sync::Arc::clone(&target);
+        let host_store = std::sync::Arc::clone(&host_store);
+        let mount = workspace.mount.clone();
+        let name = workspace.workspace.as_str().to_owned();
+        tasks.spawn(async move {
+            (
+                index,
+                measure(&host_store, &target, &mount, &name, "HEAD").await,
+            )
+        });
+    }
+    while let Some(finished) = tasks.join_next().await {
+        match finished {
+            Ok((index, landing)) => rows[index].as_mut().landing = Some(landing),
+            // A panicked measurement is still an unanswered question, and the row it belongs to is
+            // no longer identifiable — so every row left unmeasured says so below.
+            Err(_) => continue,
+        }
+    }
+    for row in rows.iter_mut() {
+        let workspace = row.as_mut();
+        if workspace.role != WorkspaceRole::Main && workspace.landing.is_none() {
+            workspace.landing = Some(indeterminate(String::from(
+                "the measurement did not complete",
+            )));
+        }
+    }
+}
+
+fn indeterminate(reason: String) -> WorkspaceLanding {
+    WorkspaceLanding {
+        dirty_files: None,
+        branches: BranchLandings::Indeterminate {
+            reason: reason.clone(),
+        },
+        commits: LandingCommits::Indeterminate { reason },
+    }
+}
+
+/// A listing row `retain_fully_landed` dropped because its landing could not be answered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Withheld {
+    pub workspace: WorkspaceName,
+    pub reason: String,
+}
+
+/// Keep only the workspaces a landed listing may name, and report which of the rest went
+/// unanswered.
+///
+/// A landed listing is meant to be piped into `rm`, so the bar for staying in it is the
+/// measurement `rm` gates on saying nothing is unlanded - its head and every other local branch -
+/// never an absent measurement, and never main. Rows dropped for having real unlanded work need no
+/// explanation; a row dropped because the question could not be answered does, or the silence
+/// reads as "nothing here".
+pub fn retain_fully_landed<T: AsRef<WorkspaceInfo>>(rows: &mut Vec<T>) -> Vec<Withheld> {
+    let mut withheld = Vec::new();
+    rows.retain(|row| {
+        let workspace = row.as_ref();
+        if workspace.role == WorkspaceRole::Main {
+            return false;
+        }
+        let Some(landing) = workspace.landing.as_ref() else {
+            withheld.push(Withheld {
+                workspace: workspace.workspace.clone(),
+                reason: String::from("no landing measurement was taken"),
+            });
+            return false;
+        };
+        let unanswered = match (&landing.commits, &landing.branches) {
+            (LandingCommits::Indeterminate { reason }, _)
+            | (_, BranchLandings::Indeterminate { reason }) => Some(reason),
+            _ => None,
+        };
+        if let Some(reason) = unanswered {
+            withheld.push(Withheld {
+                workspace: workspace.workspace.clone(),
+                reason: reason.clone(),
+            });
+            return false;
+        }
+        landing.fully_landed()
+    });
+    withheld
 }

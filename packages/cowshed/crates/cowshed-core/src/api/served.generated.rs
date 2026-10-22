@@ -54,13 +54,37 @@ impl Serves<ProjectList> for Project {
     fn request(
         authority: &<Self as Binder>::Fields<'_>,
         arguments: Arguments,
-    ) -> Result<RepoRequest> {
+    ) -> Result<ListRequest> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct Caller {}
-        let Caller {} = decode::<ProjectList, Caller>(arguments)?;
-        Ok(RepoRequest {
+        struct Caller {
+            #[serde(default)]
+            landing: Option<ListLanding>,
+        }
+        let Caller { landing } = decode::<ProjectList, Caller>(arguments)?;
+        Ok(ListRequest {
             repo_id: owned(authority.repo_id),
+            landing,
+        })
+    }
+}
+
+impl Serves<ProjectWorkspaceInSlot> for Project {
+    const BOUND: &'static [&'static str] = &["repoId"];
+
+    fn request(
+        authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<WorkspaceInSlotRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            slot: u32,
+        }
+        let Caller { slot } = decode::<ProjectWorkspaceInSlot, Caller>(arguments)?;
+        Ok(WorkspaceInSlotRequest {
+            repo_id: owned(authority.repo_id),
+            slot,
         })
     }
 }
@@ -478,6 +502,26 @@ impl Serves<CoordinatorDefragment> for Coordinator {
             workspace: WorkspaceName,
         }
         let Caller { workspace } = decode::<CoordinatorDefragment, Caller>(arguments)?;
+        Ok(WorkspaceRequest {
+            repo_id: owned(authority.repo_id),
+            workspace,
+        })
+    }
+}
+
+impl Serves<CoordinatorRekey> for Coordinator {
+    const BOUND: &'static [&'static str] = &["repoId"];
+
+    fn request(
+        authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<WorkspaceRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            workspace: WorkspaceName,
+        }
+        let Caller { workspace } = decode::<CoordinatorRekey, Caller>(arguments)?;
         Ok(WorkspaceRequest {
             repo_id: owned(authority.repo_id),
             workspace,
@@ -1419,6 +1463,7 @@ pub(crate) fn each_served(
     check.served::<ProjectWorkspace, _>(project, &[]);
     check.served::<ProjectWorkspaceAt, _>(project, &[]);
     check.served::<ProjectList, _>(project, &[]);
+    check.served::<ProjectWorkspaceInSlot, _>(project, &[]);
     check.served::<WorkspaceInfoRead, _>(workspace_ref, &[]);
     check.served::<WorkspaceAttach, _>(workspace_ref, &[]);
     check.served::<WorkspaceGrants, _>(workspace_ref, &["workspaceIncarnation"]);
@@ -1438,6 +1483,7 @@ pub(crate) fn each_served(
     check.served::<CoordinatorRestore, _>(coordinator, &[]);
     check.served::<CoordinatorResize, _>(coordinator, &[]);
     check.served::<CoordinatorDefragment, _>(coordinator, &[]);
+    check.served::<CoordinatorRekey, _>(coordinator, &[]);
     check.served::<CoordinatorReseed, _>(coordinator, &[]);
     check.served::<CoordinatorClearNxState, _>(coordinator, &[]);
     check.served::<CoordinatorDetach, _>(coordinator, &[]);

@@ -1019,6 +1019,11 @@ export type ForkOptions = {
    * checkpoint and restore.
    */
   readonly gitWorktree?: boolean;
+  /**
+   * The caller's edit is pure Markdown, disjoint from code edits: the fork is refused, because
+   * such an edit belongs in place in the checkout and no workspace should be minted for it.
+   */
+  readonly markdownOnly?: boolean;
 };
 
 export type ForkRequest = {
@@ -1947,6 +1952,20 @@ export type LandingCommits =
   | ({ readonly state: 'indeterminate' } & {
       readonly reason: string;
     });
+
+/**
+ * Which landing measurement a listing carries (`cowshed ls --landing`/`--landed`).
+ */
+export type ListLanding = 'measure' | 'landed';
+
+/**
+ * The project's published workspaces, measured for landing only when the caller asks to pay
+ * for it.
+ */
+export type ListRequest = {
+  readonly repoId: RepoId;
+  readonly landing?: ListLanding;
+};
 
 /**
  * What the kernel shows of one descriptor on the locked inode.
@@ -3394,6 +3413,14 @@ export type WorkspaceGrantsRequest = {
 };
 
 /**
+ * The build slot whose current tenant a caller resolves (`cowshed path --slot <n>`).
+ */
+export type WorkspaceInSlotRequest = {
+  readonly repoId: RepoId;
+  readonly slot: number & tags.Type<'uint32'>;
+};
+
+/**
  * Shared, immutable text, cloned into every request a worker handle sends.
  */
 export type WorkspaceIncarnation = string;
@@ -3411,8 +3438,8 @@ export type WorkspaceInfo = {
   readonly checkpoints: ReadonlyArray<CheckpointInfo>;
   readonly snapshotStale: boolean;
   /**
-   * Filled in only for a caller that asked to pay for the measurement; absent everywhere else,
-   * including in every controller response, so `default` is what keeps decoding those honest.
+   * Filled in only for a caller that asked to pay for the measurement (`project.list` with a
+   * landing selection); absent everywhere else, so `default` is what keeps decoding those honest.
    */
   readonly landing?: WorkspaceLanding;
 };

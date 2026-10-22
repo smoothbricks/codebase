@@ -1,8 +1,8 @@
 import type * as Api from './api.generated.js';
-import type { JobLogsArguments } from './native.generated.js';
+import type { JobLogsArguments, ProjectListArguments } from './native.generated.js';
 
 export type * from './api.generated.js';
-export type { JobLogsArguments } from './native.generated.js';
+export type { JobLogsArguments, ProjectListArguments } from './native.generated.js';
 
 export type CowshedErrorOptions = ErrorOptions &
   Pick<Api.CowshedError, 'admission' | 'cpuAdmission' | 'priority' | 'stdin'>;
@@ -88,8 +88,14 @@ export interface Project {
   main(): Promise<WorkspaceRef>;
   workspace(name: string): Promise<WorkspaceRef>;
   workspaceAt(path: string): Promise<WorkspaceRef>;
+  /** The workspace that currently occupies build slot `slot`; rejects `not-found` when none does. */
+  workspaceInSlot(slot: number): Promise<WorkspaceRef>;
   path(name: string, options?: PathOptions): Promise<Api.WorkspaceInfo>;
-  listWorkspaces(): Promise<readonly Api.WorkspaceInfo[]>;
+  /**
+   * The published workspaces. `landing: 'measure'` measures every attached session against main's
+   * landing branch; `'landed'` keeps only the sessions whose work is provably fully landed.
+   */
+  listWorkspaces(options?: ProjectListArguments): Promise<readonly Api.WorkspaceInfo[]>;
 }
 
 export interface Coordinator {
@@ -97,16 +103,30 @@ export interface Coordinator {
   fork(workspace: string, options?: Partial<Api.ForkOptions> & { source?: string }): Promise<WorkspaceRef>;
   rename(source: string, destination: string): Promise<WorkspaceRef>;
   moveCheckout(destination: string): Promise<WorkspaceRef>;
+  /** Changes the adopted project's repository identity; main is the reference it answers with. */
+  changeRepoId(newRepoId: string): Promise<WorkspaceRef>;
   grant(workspace: string, delta: Api.GrantDelta): Promise<Api.GrantSet>;
   revoke(workspace: string, delta: Api.GrantDelta): Promise<Api.GrantSet>;
+  /** The project's standing grants every workspace runs under. */
+  projectGrants(): Promise<Api.ProjectGrants>;
+  grantProject(delta: Api.ProjectGrantDelta): Promise<Api.ProjectGrants>;
+  revokeProject(delta: Api.ProjectGrantDelta): Promise<Api.ProjectGrants>;
   rebase(workspace: string, options?: RebaseOptions): Promise<Api.RebaseReport>;
   land(workspace: string, options?: LandOptions): Promise<Api.LandReport>;
   restore(workspace: string, label: string): Promise<void>;
   detach(workspace: string): Promise<void>;
   resize(workspace: string, capacity: string, volume: Api.ResizeVolume): Promise<Api.ResizeResult>;
+  /** Rewrites the workspace's image contiguously; a busy workspace refuses before its image is touched. */
+  defragment(workspace: string): Promise<Api.DefragmentResult>;
+  /** Deletes the workspace's Nx cache and task database contents on its build volume. */
+  clearNxState(workspace: string): Promise<Api.NxStateClearResult>;
+  /** Rebuilds one keyless workspace's CA identity at its preserved incarnation. */
+  rekey(workspace: string): Promise<Api.RekeyResult>;
   /** Discard live build state for an existing seed clone; never refresh a seed or alter source files. */
   reseed(workspace: string, from: string, dryRun: boolean): Promise<Api.ReseedResult>;
   remove(workspace: string, options?: Api.RemoveOptions): Promise<Api.RemoveReport>;
+  /** Removes the adopted project end to end: every session, its images and main's adoption. */
+  removeProject(options?: Api.RemoveProjectOptions): Promise<Api.RemoveProjectReport>;
   gc(options?: Api.GcOptions): Promise<Api.GcReport>;
   doctor(): Promise<Api.DoctorReport>;
   worker(workspace: string): Promise<WorkspaceHandle>;

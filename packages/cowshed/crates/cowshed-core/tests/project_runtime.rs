@@ -819,6 +819,19 @@ impl ProjectRuntimeHost for FakeHost {
         })
     }
 
+    async fn rekey(
+        &mut self,
+        workspace: WorkspaceName,
+    ) -> Result<cowshed_core::api::dto::RekeyResult> {
+        let incarnation = self.workspace(&workspace)?.incarnation.clone();
+        Ok(cowshed_core::api::dto::RekeyResult {
+            workspace: workspace.to_string(),
+            workspace_incarnation: incarnation.as_str().to_owned(),
+            revision: 2,
+            tombstone_removed: None,
+        })
+    }
+
     async fn reseed(
         &mut self,
         workspace: WorkspaceName,
@@ -5627,6 +5640,166 @@ async fn workspace_at_rejects_ambiguous_nested_active_mounts() {
     .await
     .expect_err("overlapping active mounts must be ambiguous");
     assert_eq!(error.code, ErrorCode::Conflict);
+}
+
+/// `path --slot` and `Project.workspaceInSlot` are one controller answer: the workspace whose
+/// mount is the slot's stable path, and `not-found` naming how to give an empty slot a tenant.
+#[tokio::test]
+async fn the_slot_answer_is_the_workspace_mounted_at_the_slot_path() {
+    let root = test_root();
+    let (events, _receiver) = mpsc::unbounded_channel();
+    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    let main = host.next_workspace(WorkspaceName::new("main").expect("main"));
+    let mut slotted = host.next_workspace(WorkspaceName::new("slotted").expect("slotted"));
+    slotted.mount = Some(root.join("slots").join("slot@3"));
+    host.state.workspaces = vec![main, slotted];
+    let runtime = ProjectRuntime::start(host).await.expect("runtime");
+    let router = runtime.router();
+    let repo = runtime.descriptor().repo_id.clone();
+
+    let tenant = route(
+        &router,
+        coordinator(repo.clone()),
+        "project.workspaceInSlot",
+        json!({ "repoId": repo, "slot": 3 }),
+    )
+    .await
+    .expect("slot 3 has a tenant");
+    assert_eq!(tenant["info"]["workspace"], "slotted");
+
+    let empty = route(
+        &router,
+        coordinator(repo.clone()),
+        "project.workspaceInSlot",
+        json!({ "repoId": repo, "slot": 4 }),
+    )
+    .await
+    .expect_err("slot 4 has no tenant");
+    assert_eq!(empty.code, ErrorCode::NotFound);
+    assert!(empty.hint.contains("--slot 4"), "{}", empty.hint);
+}
+
+/// A listing measures landing only when asked, measures it after the actor answers, and the
+/// landed selection keeps nothing it could not prove landed: here main is no repository, so every
+/// session is indeterminate and withheld, and main is never measured or named.
+#[tokio::test]
+async fn the_landing_selection_measures_sessions_and_withholds_what_it_cannot_prove() {
+    let root = test_root();
+    let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
+    adopt(&router, &repo).await;
+    route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.fork",
+        json!({ "repoId": repo, "workspace": "task", "options": ForkOptions::default() }),
+    )
+    .await
+    .expect("create");
+
+    let plain = route(
+        &router,
+        coordinator(repo.clone()),
+        "project.list",
+        json!({ "repoId": repo }),
+    )
+    .await
+    .expect("list");
+    assert!(
+        plain
+            .as_array()
+            .expect("rows")
+            .iter()
+            .all(|view| view["info"].get("landing").is_none()),
+        "an unmeasured listing carries no landing: {plain}"
+    );
+
+    let measured = route(
+        &router,
+        coordinator(repo.clone()),
+        "project.list",
+        json!({ "repoId": repo, "landing": "measure" }),
+    )
+    .await
+    .expect("measured list");
+    let rows = measured.as_array().expect("rows");
+    let main = rows
+        .iter()
+        .find(|view| view["info"]["workspace"] == "main")
+        .expect("main row");
+    assert!(
+        main["info"].get("landing").is_none(),
+        "main is the target, never measured: {main}"
+    );
+    let task = rows
+        .iter()
+        .find(|view| view["info"]["workspace"] == "task")
+        .expect("task row");
+    assert_eq!(
+        task["info"]["landing"]["commits"]["state"], "indeterminate",
+        "{task}"
+    );
+
+    let landed = route(
+        &router,
+        coordinator(repo.clone()),
+        "project.list",
+        json!({ "repoId": repo, "landing": "landed" }),
+    )
+    .await
+    .expect("landed list");
+    assert_eq!(landed, json!([]), "nothing unprovable is named landed");
+}
+
+/// `fork --markdown-only` is the controller's refusal, the same for the CLI and the addon, and
+/// no workspace is minted for it.
+#[tokio::test]
+async fn a_markdown_only_fork_is_refused_before_anything_is_minted() {
+    let root = test_root();
+    let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
+    adopt(&router, &repo).await;
+    let error = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.fork",
+        json!({ "repoId": repo, "workspace": "notes", "options": { "markdownOnly": true } }),
+    )
+    .await
+    .expect_err("a markdown-only fork mints nothing");
+    assert_eq!(error.code, ErrorCode::Usage);
+    let listed = route(
+        &router,
+        coordinator(repo.clone()),
+        "project.list",
+        json!({ "repoId": repo }),
+    )
+    .await
+    .expect("list");
+    assert!(
+        listed
+            .as_array()
+            .expect("rows")
+            .iter()
+            .all(|view| view["info"]["workspace"] != "notes"),
+        "{listed}"
+    );
+}
+
+/// `coordinator.rekey` is the controller operation the CLI verb and the addon both call.
+#[tokio::test]
+async fn rekey_is_a_coordinator_operation_answering_the_rotated_identity() {
+    let root = test_root();
+    let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
+    adopt(&router, &repo).await;
+    let rekeyed = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.rekey",
+        json!({ "repoId": repo, "workspace": "main" }),
+    )
+    .await
+    .expect("rekey");
+    assert_eq!(rekeyed["workspace"], "main");
+    assert_eq!(rekeyed["revision"], 2);
 }
 
 /// A coordinator reads the build volume a job of the workspace would be granted, fenced on the

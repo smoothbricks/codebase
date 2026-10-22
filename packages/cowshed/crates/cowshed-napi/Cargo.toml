@@ -24,7 +24,9 @@ napi-build.workspace = true
 # same verbs that also dragged clap into every Node process loading the addon. toml does compile
 # into this crate's build through cowshed-core, whose controller reads `.cowshed.toml` with it, but
 # the addon reaches the controller only through its descriptor, so no toml parsing code is linked
-# into the cdylib. It stays a dev-dependency because the parity tests assert that every CLI verb
-# names the capability export it corresponds to, and that assertion has to see `cowshed_cli::args`.
+# into the cdylib. It stays a dev-dependency because the parity test asserts that api-check's
+# CLI/N-API parity reader sees exactly the clap tree `cowshed_cli::args` builds.
 [dev-dependencies]
+clap.workspace = true
+cowshed-api-gen = { path = "../cowshed-api-gen" }
 cowshed-cli = { path = "../cowshed-cli" }

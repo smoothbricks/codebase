@@ -370,6 +370,8 @@ pub struct ForkArgs {
     pub slot: Option<u32>,
     pub register: bool,
     pub git_worktree: bool,
+    /// Carried to `ForkOptions::markdown_only`: the controller refuses the fork.
+    pub markdown_only: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -839,7 +841,9 @@ pub fn package_version() -> &'static str {
     VERSION.as_str()
 }
 
-fn cli_command() -> ClapCommand {
+/// The one clap definition of the CLI's grammar. Public so the N-API parity test can compare it
+/// with what api-check's parity reader reads from this source.
+pub fn cli_command() -> ClapCommand {
     ClapCommand::new("cowshed")
         .no_binary_name(true)
         .disable_help_flag(true)
@@ -2576,12 +2580,6 @@ const FORK: CommandSpec = CommandSpec {
 
 fn parse_fork(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &FORK;
-    if flagged(matches, "markdown-only") {
-        return Err(UsageError::new(
-            "pure-Markdown edit disjoint from code edits in place — no shed minted (drop --markdown-only to mint a workspace)",
-            USAGE,
-        ));
-    }
     let mut workspaces = matches
         .get_many::<OsString>("workspaces")
         .ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
@@ -2613,6 +2611,7 @@ fn parse_fork(matches: &ArgMatches) -> Result<Command, UsageError> {
         slot: parse_slot_value(matches, USAGE)?,
         register: flagged(matches, "register"),
         git_worktree: flagged(matches, "git-worktree"),
+        markdown_only: flagged(matches, "markdown-only"),
     }))
 }
 

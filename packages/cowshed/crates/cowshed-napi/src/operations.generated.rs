@@ -34,6 +34,16 @@ impl Project {
     pub fn list(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
         super::json_call::<operations::ProjectList, _>(env, Arc::clone(&self.inner), arguments)
     }
+
+    /// Resolves the workspace that currently occupies one build slot.
+    #[napi(js_name = "workspaceInSlot")]
+    pub fn workspace_in_slot(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::workspace_call::<operations::ProjectWorkspaceInSlot, _>(
+            env,
+            Arc::clone(&self.inner),
+            arguments,
+        )
+    }
 }
 
 #[napi]
@@ -209,6 +219,12 @@ impl Coordinator {
             Arc::clone(&self.inner),
             arguments,
         )
+    }
+
+    /// Rebuilds one keyless workspace's CA identity at its preserved incarnation.
+    #[napi(js_name = "rekey")]
+    pub fn rekey(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::json_call::<operations::CoordinatorRekey, _>(env, Arc::clone(&self.inner), arguments)
     }
 
     /// Replaces a workspace's build volume with a clone of an existing target seed.

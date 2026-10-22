@@ -1,4 +1,5 @@
 pub mod capabilities;
+pub mod cli_parity;
 pub mod errors;
 pub mod ir;
 pub mod napi;
@@ -280,6 +281,8 @@ pub fn generate(project: &Path) -> Result<Vec<GeneratedFile>, String> {
     )?;
     let projection = napi::emit(&operations, &api, &capabilities)?;
     let declaration_ir = ir_types("./declaration-ir.generated.js")?;
+    let cli = project.join("crates/cowshed-cli/src/args.rs");
+    let parity = cli_parity::check(&read_source(&cli)?, &operations, &api)?;
     let files = vec![
         GeneratedFile {
             path: project.join("src/api.generated.ts"),
@@ -304,6 +307,10 @@ pub fn generate(project: &Path) -> Result<Vec<GeneratedFile>, String> {
         GeneratedFile {
             path: project.join("src/declaration-ir.generated.ts"),
             contents: declaration_ir.types,
+        },
+        GeneratedFile {
+            path: project.join("src/cli-parity.generated.ts"),
+            contents: parity.typescript,
         },
     ];
     Ok(files)

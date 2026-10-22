@@ -26,6 +26,7 @@ import {
   type LandOptions,
   type PathOptions,
   type Project,
+  type ProjectListArguments,
   type RebaseOptions,
   type Session,
   type WorkspaceHandle,
@@ -118,6 +119,10 @@ class ProjectImpl implements Project {
     return new WorkspaceRefImpl(await callNativeAsync(() => N.projectWorkspaceAt(this.#native, { path })));
   }
 
+  async workspaceInSlot(slot: number): Promise<WorkspaceRef> {
+    return new WorkspaceRefImpl(await callNativeAsync(() => N.projectWorkspaceInSlot(this.#native, { slot })));
+  }
+
   async path(name: string, options?: PathOptions): Promise<Api.WorkspaceInfo> {
     const workspace = await this.workspace(name);
     if (!(options?.noAttach ?? false)) {
@@ -126,8 +131,8 @@ class ProjectImpl implements Project {
     return workspace.info();
   }
 
-  async listWorkspaces(): Promise<readonly Api.WorkspaceInfo[]> {
-    const views = await callNativeAsync(() => N.projectList(this.#native, {}));
+  async listWorkspaces(options?: ProjectListArguments): Promise<readonly Api.WorkspaceInfo[]> {
+    const views = await callNativeAsync(() => N.projectList(this.#native, options ?? {}));
     return views.map((view) => view.info);
   }
 }
@@ -212,12 +217,28 @@ class CoordinatorImpl implements Coordinator {
     return new WorkspaceRefImpl(await callNativeAsync(() => N.coordinatorMoveCheckout(this.#native, { destination })));
   }
 
+  async changeRepoId(newRepoId: string): Promise<WorkspaceRef> {
+    return new WorkspaceRefImpl(await callNativeAsync(() => N.coordinatorChangeRepoId(this.#native, { newRepoId })));
+  }
+
   async grant(workspace: string, delta: Api.GrantDelta): Promise<Api.GrantSet> {
     return callNativeAsync(() => N.coordinatorGrant(this.#native, { workspace, delta }));
   }
 
   async revoke(workspace: string, delta: Api.GrantDelta): Promise<Api.GrantSet> {
     return callNativeAsync(() => N.coordinatorRevoke(this.#native, { workspace, delta }));
+  }
+
+  async projectGrants(): Promise<Api.ProjectGrants> {
+    return callNativeAsync(() => N.coordinatorProjectGrants(this.#native, {}));
+  }
+
+  async grantProject(delta: Api.ProjectGrantDelta): Promise<Api.ProjectGrants> {
+    return callNativeAsync(() => N.coordinatorGrantProject(this.#native, { delta }));
+  }
+
+  async revokeProject(delta: Api.ProjectGrantDelta): Promise<Api.ProjectGrants> {
+    return callNativeAsync(() => N.coordinatorRevokeProject(this.#native, { delta }));
   }
 
   async rebase(workspace: string, options?: RebaseOptions): Promise<Api.RebaseReport> {
@@ -245,12 +266,28 @@ class CoordinatorImpl implements Coordinator {
     return callNativeAsync(() => N.coordinatorResize(this.#native, { workspace, capacity, volume }));
   }
 
+  async defragment(workspace: string): Promise<Api.DefragmentResult> {
+    return callNativeAsync(() => N.coordinatorDefragment(this.#native, { workspace }));
+  }
+
+  async clearNxState(workspace: string): Promise<Api.NxStateClearResult> {
+    return callNativeAsync(() => N.coordinatorClearNxState(this.#native, { workspace }));
+  }
+
+  async rekey(workspace: string): Promise<Api.RekeyResult> {
+    return callNativeAsync(() => N.coordinatorRekey(this.#native, { workspace }));
+  }
+
   async reseed(workspace: string, from: string, dryRun: boolean): Promise<Api.ReseedResult> {
     return callNativeAsync(() => N.coordinatorReseed(this.#native, { workspace, from, dryRun }));
   }
 
   async remove(workspace: string, options?: Api.RemoveOptions): Promise<Api.RemoveReport> {
     return callNativeAsync(() => N.coordinatorDestroy(this.#native, { workspace, options: options ?? {} }));
+  }
+
+  async removeProject(options?: Api.RemoveProjectOptions): Promise<Api.RemoveProjectReport> {
+    return callNativeAsync(() => N.coordinatorRemoveProject(this.#native, { options: options ?? {} }));
   }
 
   async gc(options?: Api.GcOptions): Promise<Api.GcReport> {

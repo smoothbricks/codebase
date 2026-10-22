@@ -15,9 +15,10 @@ use super::dto::{
     ExecScope, ForkOptions, GcOptions, GcReport, GrantDelta, GrantSet, JobId, JobInfo,
     JobJournalCursor, JobListeningPorts, JobTail, JobTailLimits, LandOptions, LandReport,
     MirrorInfo, NxStateClearResult, OutputPublication, ProjectGrantDelta, PushOptions, PushReport,
-    RebaseOptions, RebaseReport, RemoveOptions, RemoveProjectOptions, RemoveProjectReport,
-    RemoveReport, ReseedResult, ResizeResult, ResizeVolume, RunSandboxMode, ScriptCommand,
-    SealedJob, TraceContext, WorkspaceIncarnation, WorkspaceInfo, WorkspacePath, WorkspaceTarget,
+    RebaseOptions, RebaseReport, RekeyResult, RemoveOptions, RemoveProjectOptions,
+    RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult, ResizeVolume, RunSandboxMode,
+    ScriptCommand, SealedJob, TraceContext, WorkspaceIncarnation, WorkspaceInfo, WorkspacePath,
+    WorkspaceTarget,
 };
 use super::process::{JobProcessEvent, JobProcessTree};
 use super::resources::{JobResourceSample, SampleInterval};
@@ -254,7 +255,9 @@ operations! {
     /// Resolves the workspace an existing path belongs to.
     coordinator json "project.workspaceAt" ProjectWorkspaceAt(WorkspaceAtRequest) -> WorkspaceView;
     /// Lists every published workspace.
-    coordinator json "project.list" ProjectList(RepoRequest) -> Vec<WorkspaceView>;
+    coordinator json "project.list" ProjectList(ListRequest) -> Vec<WorkspaceView>;
+    /// Resolves the workspace that currently occupies one build slot.
+    coordinator json "project.workspaceInSlot" ProjectWorkspaceInSlot(WorkspaceInSlotRequest) -> WorkspaceView;
     /// Refreshes one workspace's information.
     coordinator json "workspace.info" WorkspaceInfoRead(WorkspaceRequest) -> WorkspaceInfo;
     /// Attaches a detached workspace.
@@ -293,6 +296,8 @@ operations! {
     coordinator json "coordinator.resize" CoordinatorResize(ResizeRequest) -> ResizeResult;
     /// Rewrites a workspace's image contiguously.
     coordinator json "coordinator.defragment" CoordinatorDefragment(WorkspaceRequest) -> DefragmentResult;
+    /// Rebuilds one keyless workspace's CA identity at its preserved incarnation.
+    coordinator json "coordinator.rekey" CoordinatorRekey(WorkspaceRequest) -> RekeyResult;
     /// Replaces a workspace's build volume with a clone of an existing target seed.
     coordinator json "coordinator.reseed" CoordinatorReseed(ReseedRequest) -> ReseedResult;
     /// Deletes a workspace's Nx cache and task database contents on its build volume.
@@ -400,6 +405,34 @@ pub struct RepoRequest {
     pub repo_id: RepoId,
 }
 
+/// Which landing measurement a listing carries (`cowshed ls --landing`/`--landed`).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ListLanding {
+    /// Measure every attached session workspace against main's landing branch.
+    Measure,
+    /// Measure, then keep only the session workspaces whose work is provably fully landed.
+    Landed,
+}
+
+/// The project's published workspaces, measured for landing only when the caller asks to pay
+/// for it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ListRequest {
+    pub repo_id: RepoId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing: Option<ListLanding>,
+}
+
+/// The build slot whose current tenant a caller resolves (`cowshed path --slot <n>`).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceInSlotRequest {
+    pub repo_id: RepoId,
+    pub slot: u32,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceRequest {
@@ -431,6 +464,18 @@ pub struct WorkspaceAtRequest {
 pub struct WorkspaceView {
     pub info: WorkspaceInfo,
     pub grants: GrantSet,
+}
+
+impl AsRef<WorkspaceInfo> for WorkspaceView {
+    fn as_ref(&self) -> &WorkspaceInfo {
+        &self.info
+    }
+}
+
+impl AsMut<WorkspaceInfo> for WorkspaceView {
+    fn as_mut(&mut self) -> &mut WorkspaceInfo {
+        &mut self.info
+    }
 }
 
 /// The workspace a worker capability was minted for. The wire form is the [`WorkspaceView`]; the

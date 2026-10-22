@@ -90,7 +90,7 @@ async fn directory_workspace_jobs_ignore_corrupt_and_missing_sibling_grants() {
         );
         if corrupt {
             assert!(
-                service.list().await.is_err(),
+                service.list(None).await.is_err(),
                 "project diagnostics still read the corrupt sibling"
             );
         }

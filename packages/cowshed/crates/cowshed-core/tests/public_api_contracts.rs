@@ -940,6 +940,7 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
             slot: Some(2),
             register: true,
             git_worktree: true,
+            markdown_only: false,
         })
         .unwrap(),
         json!({

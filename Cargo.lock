@@ -988,6 +988,8 @@ name = "cowshed-napi"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "clap",
+ "cowshed-api-gen",
  "cowshed-cli",
  "cowshed-core",
  "libc",

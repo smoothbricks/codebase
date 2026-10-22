@@ -887,12 +887,14 @@ nothing; the storage rules are 16_build_volumes.md, "Clearing a checkout's Nx st
 Canonical declarations in `cowshed-core/src/api/dto.rs`, `operations.rs` and capability authority generate the public
 protocol projections; adapters never maintain request/result field copies. Run `bun nx run cowshed:api-generate` from
 the repository root. Its declared generator writes `src/api.generated.ts`, `src/validators.generated.ts`,
-`src/native.generated.ts`, `src/declaration-ir.generated.ts`, `crates/cowshed-core/src/api/served.generated.rs` and
-`crates/cowshed-napi/src/operations.generated.rs` under `packages/cowshed`. The underlying write command is
+`src/native.generated.ts`, `src/declaration-ir.generated.ts`, `src/cli-parity.generated.ts`,
+`crates/cowshed-core/src/api/served.generated.rs` and `crates/cowshed-napi/src/operations.generated.rs` under
+`packages/cowshed`. The underlying write command is
 `packages/cowshed/.cache/api-generator/cowshed-api-gen write packages/cowshed`; the target builds that canonical
 generator first when needed. Generated files are changed only by this generator. Handwritten TypeScript capability
 facades call the generated adapters with the generated DTO types; they do not redefine protocol records. The operation
-corpus and CLI/N-API parity samples cover the same operation table, including coordinator-only reseed.
+corpus covers the same operation table, including coordinator-only reseed; CLI/N-API option parity is its own gate (see
+"CLI and N-API option parity").
 
 ### Job monitoring
 
@@ -1729,7 +1731,9 @@ export interface Project {
   // discovery + read-only
   main(): Promise<WorkspaceRef>;
   workspace(name: string): Promise<WorkspaceRef>;
-  listWorkspaces(): Promise<WorkspaceInfo[]>;
+  workspaceAt(path: string): Promise<WorkspaceRef>;
+  workspaceInSlot(slot: number): Promise<WorkspaceRef>; // project.workspaceInSlot
+  listWorkspaces(options?: { landing?: 'measure' | 'landed' }): Promise<WorkspaceInfo[]>;
 }
 
 export interface WorkspaceRef {
@@ -2095,3 +2099,39 @@ One behaviour is the CLI's alone, on purpose: a foreground `cowshed exec` holds 
 client killed by its caller's timeout leaves no orphan (05_gateway.md, "A job lives with its requester"). An API job
 outlives the connection that admitted it, because that is what lets an embedding executor reattach to it after its own
 restart; an API caller ends a job it no longer wants with `JobHandle::kill`.
+
+## CLI and N-API option parity
+
+Every word the CLI parses has a typed counterpart. "Word" means each leaf verb (`fork`, `cache clear`) and each argument
+its clap definition declares: positionals, flags, values and the trailing argv. A counterpart is one of:
+
+- **Wire**: a field of a declared, projected operation's request record (or the request itself for a verb), reached
+  through a member of the public TypeScript facade (`Coordinator`, `Project`, `WorkspaceRef`, `WorkspaceHandle`,
+  `Session`, `JobHandle`, or a package export such as `connectCoordinator`).
+- **Composed**: a composition of facade calls this specification defines and the CLI itself runs: `exec --timeout` and
+  `--background` ("CLI and API exec parity"), `revoke --all` (read the grants, revoke every item at their revision),
+  `doctor --repair` (`doctor()` then `gc({})`), `path --no-attach` (`Project.path` skips the attach), and `controller`,
+  whose peer is `coordinatorEndpoint`.
+- **CLI-only**, narrowly: pure terminal presentation (`--json`, `--quiet`, help, version) or a human step a library
+  caller cannot provide (`setup`'s administrator authorization dialog, 06_cli.md rule 3). A refusal-only flag is not
+  CLI-only: `fork --markdown-only` is `ForkOptions.markdownOnly`, which the controller refuses for every caller.
+- **Known gap**: a host verb with no N-API channel yet; the host operation table that adds its channel deletes the row.
+
+The gate is `cowshed-api-gen`'s `cli_parity` module, run by every `api-generate` and `api-check`. It reads the grammar
+from `cli_command()` in `crates/cowshed-cli/src/args.rs` without building the CLI, accepting only the builder vocabulary
+that file uses and refusing any other call by name; the addon's `parity_tests` compares that reading with the tree clap
+builds. Its `PARITY` table holds one row per word with the counterpart and, for every non-wire row, its reason. A word
+without a row, a row naming a word the CLI no longer parses, a wire field the request record does not carry (resolved
+through the same declarations the projections are generated from, serde renames and flattening included) and an
+operation that is internal or undeclared each refuse generation by name. The facade half is
+`src/cli-parity.generated.ts`: one property per wire or composed word whose type indexes the facade member and the
+parameter property that carries it, so a facade that lacks the member or the property fails the package's typecheck. Its
+header states the counts per class.
+
+The project-scoped words the facade could not reach are operations of their own: `project.list` carries an optional
+`landing` selection (`measure` measures every attached session against main's landing branch with
+`cowshed_core::landing::annotate_listing` after the actor answers; `landed` then keeps only what
+`landing::retain_fully_landed` proves fully landed). The CLI's project-scoped `ls --landed` asks for `measure` and
+applies the same filter itself, because it names every row withheld for want of an answer. `project.workspaceInSlot`
+resolves the workspace whose mount is a build slot's stable path (`path --slot`), and `coordinator.rekey` rotates one
+keyless workspace's CA identity (`rekey`), both for the CLI and the addon alike.

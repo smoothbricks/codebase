@@ -4,22 +4,22 @@ use super::dto::{
     DefragmentResult, DoctorReport, EmptyResult, ExecRequest, ForkOptions, GcOptions, GcReport,
     GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail,
     JobTailLimits, LandOptions, LandReport, MirrorInfo, NxStateClearResult, ProjectGrantDelta,
-    ProjectGrants, PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions,
-    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
-    ResizeVolume, SealedJob, StdinSource, StepReport, WorkspaceIncarnation, WorkspaceInfo,
-    WorkspaceTarget,
+    ProjectGrants, PushOptions, PushReport, RebaseOptions, RebaseReport, RekeyResult,
+    RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult,
+    ResizeResult, ResizeVolume, SealedJob, StdinSource, StepReport, WorkspaceIncarnation,
+    WorkspaceInfo, WorkspaceTarget,
 };
 use super::frame;
 use super::operations::{
     self, AdmissionKeyRequest, AdoptRequest, AdoptView, ChangeRepoIdRequest, CheckpointRequest,
     DestroyRequest, ExecParams, ExecStdin, ForkRequest, GcRequest, GrantRequest, JobRequest,
-    JobStream, LandRequest, LogsChunk, LogsRequest, MirrorRequest, MoveCheckoutRequest, Operation,
-    ProgressRequest, ProjectGrantRequest, ProjectOpenRequest, PushRequest, QuotaRequest,
-    ReAdoption, RebaseRequest, RemoveProjectRequest, RepoRequest, ReseedRequest, ResizeRequest,
-    RestoreRequest, SessionRequest, SlotRequest, SourceDestinationRequest, StdinWriteRequest,
-    StreamOperation, TailRequest, WorkerScope, WorkerView, WorkspaceAtRequest,
-    WorkspaceAttachRequest, WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, decode_result,
-    encode_request,
+    JobStream, LandRequest, ListLanding, ListRequest, LogsChunk, LogsRequest, MirrorRequest,
+    MoveCheckoutRequest, Operation, ProgressRequest, ProjectGrantRequest, ProjectOpenRequest,
+    PushRequest, QuotaRequest, ReAdoption, RebaseRequest, RemoveProjectRequest, RepoRequest,
+    ReseedRequest, ResizeRequest, RestoreRequest, SessionRequest, SlotRequest,
+    SourceDestinationRequest, StdinWriteRequest, StreamOperation, TailRequest, WorkerScope,
+    WorkerView, WorkspaceAtRequest, WorkspaceAttachRequest, WorkspaceGrantsRequest,
+    WorkspaceInSlotRequest, WorkspaceRequest, WorkspaceView, decode_result, encode_request,
 };
 use super::peer_credentials::PeerCredentialsError;
 use super::process::JobProcessTree;
@@ -1008,9 +1008,23 @@ impl Project {
         Ok(WorkspaceRef::from_view(view, Arc::clone(&self.runtime)))
     }
 
-    pub async fn list(&self) -> Result<Vec<WorkspaceRef>> {
-        let request = RepoRequest {
+    /// The workspace that currently occupies build slot `slot`, whose mount is the slot's stable
+    /// path; `not-found` when no workspace holds it.
+    pub async fn workspace_in_slot(&self, slot: u32) -> Result<WorkspaceRef> {
+        let request = WorkspaceInSlotRequest {
             repo_id: self.repo_id.clone(),
+            slot,
+        };
+        let view = invoke::<operations::ProjectWorkspaceInSlot>(&*self.runtime, &request).await?;
+        Ok(WorkspaceRef::from_view(view, Arc::clone(&self.runtime)))
+    }
+
+    /// The published workspaces; `landing` asks the controller to measure them against main, or
+    /// to keep only the provably fully landed ones (`crate::landing::retain_fully_landed`).
+    pub async fn list(&self, landing: Option<ListLanding>) -> Result<Vec<WorkspaceRef>> {
+        let request = ListRequest {
+            repo_id: self.repo_id.clone(),
+            landing,
         };
         let views = invoke::<operations::ProjectList>(&*self.runtime, &request).await?;
         Ok(views
@@ -2104,6 +2118,13 @@ impl Coordinator {
     pub async fn defragment(&self, workspace: &str) -> Result<DefragmentResult> {
         let request = self.workspace_request(workspace)?;
         invoke::<operations::CoordinatorDefragment>(&*self.runtime, &request).await
+    }
+
+    /// Rebuild one keyless workspace's CA identity at its preserved incarnation. Rotation
+    /// invalidates the certificates of jobs already running in it.
+    pub async fn rekey(&self, workspace: &str) -> Result<RekeyResult> {
+        let request = self.workspace_request(workspace)?;
+        invoke::<operations::CoordinatorRekey>(&*self.runtime, &request).await
     }
 
     /// Discard a workspace's live build state by cloning the target's latest existing seed.

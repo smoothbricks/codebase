@@ -13,7 +13,7 @@ use bytes::Bytes;
 use cowshed_apfs::SystemCommandRunner;
 use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
 pub use cowshed_core::api::ProjectWorkspaces;
-use cowshed_core::api::operations::ReAdoption;
+use cowshed_core::api::operations::{ListLanding, ReAdoption};
 use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection};
 use cowshed_core::api::{
     AbandonedPreservation, AbandonedWork, AdoptOptions, AttachOptions, BranchLandings, BranchName,
@@ -22,21 +22,20 @@ use cowshed_core::api::{
     GatewayStatus, GcOptions, GcReason, GcReport, GitOid, GrantDelta, GrantSet, JobInfo, JobStream,
     LandOptions, LandReport, LandingCommits, MountResult, OutputPublication, ProjectGrantDelta,
     ProjectGrants, PublicationPolicy, PushOptions, PushReport, RebaseBuildVolume, RebaseOptions,
-    RebaseReport, RefLockPath, RemoveOptions, RemoveProjectOptions, RemoveProjectReport,
-    RemoveReport, ReseedResult, ResizeResult, ResizeVolume, RevisionTarget, RunSandboxMode,
-    SccacheStatus, StdinSource as CoreStdinSource, UnlandedPaths, UtcTimestamp, WorkspaceInfo,
-    WorkspaceLanding, WorkspacePath, WorkspaceState, validate_command_argv,
+    RebaseReport, RefLockPath, RekeyResult, RemoveOptions, RemoveProjectOptions,
+    RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult, ResizeVolume, RevisionTarget,
+    RunSandboxMode, SccacheStatus, StdinSource as CoreStdinSource, UnlandedPaths, UtcTimestamp,
+    WorkspaceInfo, WorkspacePath, WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, SlotId, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+    DetachedWorkspaceMetadata, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
 use cowshed_core::metadata::{EgressMode, EgressRule};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::supervisor_socket::JobHold;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
-use cowshed_core::storage::apfs::rekey::RekeyReport;
 use cowshed_core::storage::apfs::{ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY};
 use cowshed_core::storage::bootstrap::{
     CachesVolume, CanonicalRoots, HostAction, HostSetupPlan, HostSetupReport, MOUNT_SERVICE_PLIST,
@@ -119,7 +118,9 @@ pub trait CliService: Send {
     async fn checkpoint(&mut self, workspace: &str, options: CheckpointOptions) -> Result<String>;
     async fn restore(&mut self, workspace: &str, label: &str) -> Result<WorkspaceInfo>;
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceInfo>;
-    async fn list(&mut self) -> Result<Vec<WorkspaceInfo>>;
+    async fn list(&mut self, landing: Option<ListLanding>) -> Result<Vec<WorkspaceInfo>>;
+    /// The name of the workspace that currently occupies build slot `slot`.
+    async fn workspace_in_slot(&mut self, slot: u32) -> Result<String>;
     async fn list_all(&mut self) -> Result<Vec<ProjectWorkspaces>> {
         Err(CowshedError::internal(
             "CLI service does not support store-wide workspace discovery",
@@ -155,13 +156,7 @@ pub trait CliService: Send {
     ) -> Result<cowshed_core::api::NxStateClearResult>;
     /// Ask the gateway to clear the project's Nx accepted-task store.
     async fn clear_nx_store(&mut self) -> Result<cowshed_core::api::NxStoreClearResult>;
-    async fn rekey(&mut self, workspace: &str) -> Result<RekeyReport> {
-        let _ = workspace;
-        Err(CowshedError::environment_missing(
-            "workspace rekey is not available from this command context",
-            "cowshed rekey <ws>",
-        ))
-    }
+    async fn rekey(&mut self, workspace: &str) -> Result<RekeyResult>;
     async fn doctor(&mut self) -> Result<DoctorReport>;
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport>;
     async fn grants(&mut self, workspace: &str) -> Result<GrantSet>;
@@ -928,15 +923,25 @@ impl CliService for ActorBridge {
             .await
     }
 
-    async fn list(&mut self) -> Result<Vec<WorkspaceInfo>> {
+    async fn list(&mut self, landing: Option<ListLanding>) -> Result<Vec<WorkspaceInfo>> {
         Ok(self
             .coordinator()?
             .project()
-            .list()
+            .list(landing)
             .await?
             .into_iter()
             .map(|workspace| workspace.into_info())
             .collect())
+    }
+
+    async fn workspace_in_slot(&mut self, slot: u32) -> Result<String> {
+        Ok(self
+            .coordinator()?
+            .project()
+            .workspace_in_slot(slot)
+            .await?
+            .name()
+            .to_string())
     }
 
     async fn list_all(&mut self) -> Result<Vec<ProjectWorkspaces>> {
@@ -1026,54 +1031,8 @@ impl CliService for ActorBridge {
             .await
     }
 
-    async fn rekey(&mut self, workspace: &str) -> Result<RekeyReport> {
-        use cowshed_core::storage::lifecycle::dispatch_blocking;
-
-        let name = WorkspaceName::new(workspace).map_err(|error| {
-            CowshedError::usage(error.to_string(), "use a valid cowshed workspace name")
-        })?;
-        let store = self.store_root()?.to_owned();
-        let repo = self.repo_id()?.clone();
-        let layout = StorageLayout::new(&store, &repo).map_err(|error| {
-            CowshedError::integrity(
-                format!("rekey cannot open project {repo}: {error}"),
-                format!("cowshed rekey {workspace}"),
-            )
-        })?;
-        // Main mounts at its checkout-aware path, resolved from store
-        // records; sessions mount under the slot-aware mount root. One rule
-        // per target, both derived — never cwd-inferred.
-        let mount = if name.is_main() {
-            crate::mount_main::resolve_main_mount(&store, &repo)
-                .map_err(|error| {
-                    CowshedError::integrity(
-                        format!(
-                            "rekey cannot resolve main mount for {repo}: {}",
-                            error.message
-                        ),
-                        "cowshed mount main --repo-id <owner/repo>",
-                    )
-                })?
-                .checkout_path
-        } else {
-            layout.workspace_mount(&name).map_err(|error| {
-                CowshedError::integrity(
-                    format!("rekey cannot resolve mount for {workspace}: {error}"),
-                    format!("cowshed rekey {workspace}"),
-                )
-            })?
-        };
-        dispatch_blocking(move || {
-            cowshed_core::storage::apfs::rekey::rekey_workspace(&layout, &name, &mount)
-        })
-        .await
-        .map_err(|error| {
-            CowshedError::integrity(
-                format!("rekey task for {workspace} failed: {error}"),
-                format!("cowshed rekey {workspace}"),
-            )
-        })?
-        .map_err(|error| error.into_cowshed_error())
+    async fn rekey(&mut self, workspace: &str) -> Result<RekeyResult> {
+        self.coordinator()?.rekey(workspace).await
     }
 
     async fn doctor(&mut self) -> Result<DoctorReport> {
@@ -1686,6 +1645,7 @@ where
                 slot: args.slot,
                 register: args.register,
                 git_worktree: args.git_worktree,
+                markdown_only: args.markdown_only,
             };
             let info = service
                 .fork(&args.destination, args.source.as_deref(), options)
@@ -1736,10 +1696,10 @@ where
                     emit_kept_abandon_bundles(output, &service.kept_abandon_bundles().await?)?;
                 }
             } else {
-                let mut workspaces = service.list().await?;
+                let mut workspaces = service.list(listing_landing(args)).await?;
                 sort_workspace_listing(&mut workspaces);
                 let empty = workspaces.is_empty();
-                emit_workspace_listing(output, json, args, None, workspaces).await?;
+                emit_workspace_listing(output, json, args, None, workspaces)?;
                 if empty {
                     let others = service.other_adopted_project_count().await?;
                     let noun = if others == 1 {
@@ -1759,7 +1719,7 @@ where
         }
         Command::Path(args) => {
             let workspace = match args.slot {
-                Some(slot) => slot_tenant(service, slot).await?,
+                Some(slot) => service.workspace_in_slot(slot).await?,
                 None => resolve_workspace(service, args.workspace, "path").await?,
             };
             let info = service.path(&workspace, args.no_attach).await?;
@@ -2499,31 +2459,6 @@ fn invocation_cwd() -> Result<PathBuf> {
     })
 }
 
-/// Which workspace currently occupies a build slot.
-///
-/// Resolved from the mount path rather than a separate index: a slot's mountpoint leaf *is* the
-/// slot, so the listing the CLI already has is authoritative and there is no second record to keep
-/// in step.
-async fn slot_tenant(service: &mut dyn CliService, slot: u32) -> Result<String> {
-    let wanted = SlotId::new(slot).map_err(|error| {
-        usage(
-            error.to_string(),
-            "choose a slot within the project's range",
-        )
-    })?;
-    let workspaces = service.list().await?;
-    workspaces
-        .into_iter()
-        .find(|info| SlotId::from_mount_path(&info.mount) == Some(wanted))
-        .map(|info| info.workspace.to_string())
-        .ok_or_else(|| {
-            CowshedError::not_found(
-                format!("no workspace occupies slot {slot}"),
-                format!("give the slot a tenant: cowshed fork <ws> --slot {slot}"),
-            )
-        })
-}
-
 fn os_utf8(value: std::ffi::OsString) -> Result<String> {
     value.into_string().map_err(|_| {
         usage(
@@ -3081,7 +3016,7 @@ async fn attach_scoped_sessions(
             .flat_map(|project| project.workspaces)
             .collect()
     } else {
-        service.list().await?
+        service.list(None).await?
     };
     let targets: Vec<WorkspaceInfo> = candidates.into_iter().filter(is_detached_session).collect();
     if targets.is_empty() {
@@ -3894,6 +3829,17 @@ const fn landing_requested(args: crate::args::ListArgs) -> bool {
     args.landing || args.landed
 }
 
+/// What a project-scoped `ls` asks the controller to measure. `--landed` asks for the measurement
+/// rather than the controller's landed filter, because the CLI names every row the filter withholds
+/// for want of an answer, and applies the same `landing::retain_fully_landed` to do so.
+const fn listing_landing(args: crate::args::ListArgs) -> Option<ListLanding> {
+    if landing_requested(args) {
+        Some(ListLanding::Measure)
+    } else {
+        None
+    }
+}
+
 fn sort_workspace_listing(workspaces: &mut [WorkspaceInfo]) {
     workspaces.sort_by(|left, right| left.workspace.cmp(&right.workspace));
 }
@@ -3913,12 +3859,12 @@ async fn emit_project_listing<W: Write, E: Write>(
 ) -> Result<()> {
     if landing_requested(args) {
         for project in &mut projects {
-            annotate_landing(&mut project.workspaces).await;
+            cowshed_core::landing::annotate_listing(&mut project.workspaces).await;
         }
     }
     if args.landed {
         for project in &mut projects {
-            let withheld = retain_fully_landed(&mut project.workspaces);
+            let withheld = cowshed_core::landing::retain_fully_landed(&mut project.workspaces);
             emit_withheld(output, Some(&project.repo_id), &withheld)?;
         }
     }
@@ -4060,18 +4006,16 @@ fn emit_kept_abandon_bundles<W: Write, E: Write>(
     Ok(())
 }
 
-async fn emit_workspace_listing<W: Write, E: Write>(
+/// One project's listing, already measured by the controller when `listing_landing` asked.
+fn emit_workspace_listing<W: Write, E: Write>(
     output: &mut Output<W, E>,
     json: bool,
     args: crate::args::ListArgs,
     repo_id: Option<&RepoId>,
     mut workspaces: Vec<WorkspaceInfo>,
 ) -> Result<()> {
-    if landing_requested(args) {
-        annotate_landing(&mut workspaces).await;
-    }
     if args.landed {
-        let withheld = retain_fully_landed(&mut workspaces);
+        let withheld = cowshed_core::landing::retain_fully_landed(&mut workspaces);
         emit_withheld(output, repo_id, &withheld)?;
     }
     if json {
@@ -4093,131 +4037,15 @@ async fn emit_workspace_listing<W: Write, E: Write>(
     emit_workspace_table(output, &workspaces)
 }
 
-/// Measure every session workspace against the project's own main workspace.
-///
-/// Main is left unmeasured because main *is* the target: comparing it to itself answers nothing, and
-/// a zero-unlanded row for main would make it look retirable to anything reading the column.
-///
-/// One task per workspace, because the measurement is process-bound rather than CPU-bound and the
-/// serial version costs the sum of every workspace's history walk — which on a project whose main
-/// has been rewritten is the slowest thing `ls` could be asked to do.
-async fn annotate_landing(workspaces: &mut [WorkspaceInfo]) {
-    let Some(main) = workspaces
-        .iter()
-        .find(|workspace| workspace.role == WorkspaceRole::Main)
-    else {
-        let reason = String::from(
-            "this project records no main workspace, so there is no branch to compare against",
-        );
-        for workspace in workspaces.iter_mut() {
-            workspace.landing = Some(indeterminate_landing(reason.clone()));
-        }
-        return;
-    };
-    // `ls` reads the host's projects, so its Git runs for the host store.
-    let host_store = std::sync::Arc::clone(
-        cowshed_core::storage::bootstrap::CanonicalRoots::global().shared_store(),
-    );
-    let target = std::sync::Arc::new(
-        cowshed_core::landing::resolve_target(&host_store, &main.mount, LANDING_TARGET_BRANCH)
-            .await,
-    );
-    let mut tasks = tokio::task::JoinSet::new();
-    for (index, workspace) in workspaces.iter().enumerate() {
-        if workspace.role == WorkspaceRole::Main {
-            continue;
-        }
-        if workspace.state == WorkspaceState::Detached {
-            continue;
-        }
-        let target = std::sync::Arc::clone(&target);
-        let host_store = std::sync::Arc::clone(&host_store);
-        let mount = workspace.mount.clone();
-        let name = workspace.workspace.as_str().to_owned();
-        tasks.spawn(async move {
-            (
-                index,
-                cowshed_core::landing::measure(&host_store, &target, &mount, &name, "HEAD").await,
-            )
-        });
-    }
-    for workspace in workspaces.iter_mut() {
-        if workspace.role != WorkspaceRole::Main && workspace.state == WorkspaceState::Detached {
-            workspace.landing = Some(indeterminate_landing(String::from(
-                "workspace is detached, so its repository is not mounted to be read",
-            )));
-        }
-    }
-    while let Some(finished) = tasks.join_next().await {
-        match finished {
-            Ok((index, landing)) => workspaces[index].landing = Some(landing),
-            // A panicked measurement is still an unanswered question, and the row it belongs to is
-            // no longer identifiable — so every row left unmeasured says so below.
-            Err(_) => continue,
-        }
-    }
-    for workspace in workspaces.iter_mut() {
-        if workspace.role != WorkspaceRole::Main && workspace.landing.is_none() {
-            workspace.landing = Some(indeterminate_landing(String::from(
-                "the measurement did not complete",
-            )));
-        }
-    }
-}
-
-fn indeterminate_landing(reason: String) -> WorkspaceLanding {
-    WorkspaceLanding {
-        dirty_files: None,
-        branches: BranchLandings::Indeterminate {
-            reason: reason.clone(),
-        },
-        commits: LandingCommits::Indeterminate { reason },
-    }
-}
-
-/// Keep only the workspaces `--landed` may name, and report which of the rest went unanswered.
-///
-/// The output of `--landed` is meant to be piped into `rm`, so the bar for staying in it is the
-/// measurement `rm` gates on saying nothing is unlanded - its head and every other local branch -
-/// never an absent measurement, and never main. Rows dropped for having real unlanded work need no
-/// explanation; a row dropped because the question could not be answered does, or the silence
-/// reads as "nothing here".
-fn retain_fully_landed(workspaces: &mut Vec<WorkspaceInfo>) -> Vec<(String, String)> {
-    let mut withheld = Vec::new();
-    workspaces.retain(|workspace| {
-        if workspace.role == WorkspaceRole::Main {
-            return false;
-        }
-        let Some(landing) = workspace.landing.as_ref() else {
-            withheld.push((
-                workspace.workspace.as_str().to_owned(),
-                String::from("no landing measurement was taken"),
-            ));
-            return false;
-        };
-        let unanswered = match (&landing.commits, &landing.branches) {
-            (LandingCommits::Indeterminate { reason }, _)
-            | (_, BranchLandings::Indeterminate { reason }) => Some(reason),
-            _ => None,
-        };
-        if let Some(reason) = unanswered {
-            withheld.push((workspace.workspace.as_str().to_owned(), reason.clone()));
-            return false;
-        }
-        landing.fully_landed()
-    });
-    withheld
-}
-
 fn emit_withheld<W: Write, E: Write>(
     output: &mut Output<W, E>,
     repo_id: Option<&RepoId>,
-    withheld: &[(String, String)],
+    withheld: &[cowshed_core::landing::Withheld],
 ) -> Result<()> {
-    for (workspace, reason) in withheld {
+    for cowshed_core::landing::Withheld { workspace, reason } in withheld {
         let scope = match repo_id {
             Some(repo_id) => format!("{}/{workspace}", repo_id.as_str()),
-            None => workspace.clone(),
+            None => workspace.to_string(),
         };
         output
             .guidance(&format!(
@@ -7106,7 +6934,6 @@ mod tests {
         async fn rendered(args: ListArgs, json: bool) -> (String, String) {
             let mut workspaces = Output::new(Vec::new(), Vec::new(), false);
             emit_workspace_listing(&mut workspaces, json, args, None, Vec::new())
-                .await
                 .expect("workspace listing");
             let mut projects = Output::new(Vec::new(), Vec::new(), false);
             emit_project_listing(&mut projects, json, args, Vec::new())

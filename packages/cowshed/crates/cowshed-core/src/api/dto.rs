@@ -735,10 +735,24 @@ pub struct WorkspaceInfo {
     pub created_at: Option<UtcTimestamp>,
     pub checkpoints: Vec<CheckpointInfo>,
     pub snapshot_stale: bool,
-    /// Filled in only for a caller that asked to pay for the measurement; absent everywhere else,
-    /// including in every controller response, so `default` is what keeps decoding those honest.
+    /// Filled in only for a caller that asked to pay for the measurement (`project.list` with a
+    /// landing selection); absent everywhere else, so `default` is what keeps decoding those honest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landing: Option<WorkspaceLanding>,
+}
+
+/// A listing row is its workspace's information; landing measurement and the landed filter
+/// (`crate::landing`) read and annotate rows through this.
+impl AsRef<Self> for WorkspaceInfo {
+    fn as_ref(&self) -> &Self {
+        self
+    }
+}
+
+impl AsMut<Self> for WorkspaceInfo {
+    fn as_mut(&mut self) -> &mut Self {
+        self
+    }
 }
 
 impl WorkspaceInfo {
@@ -3350,6 +3364,10 @@ pub struct ForkOptions {
     /// object store and one ref namespace, at the cost of requiring main mounted and giving up
     /// checkpoint and restore.
     pub git_worktree: bool,
+    /// The caller's edit is pure Markdown, disjoint from code edits: the fork is refused, because
+    /// such an edit belongs in place in the checkout and no workspace should be minted for it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub markdown_only: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

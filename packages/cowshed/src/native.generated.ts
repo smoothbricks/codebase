@@ -35,7 +35,11 @@ export interface NativeEvents {
 }
 
 /** The operations a `Project` serves: exactly those its authority admits. */
-export interface NativeProjectOperations extends NativeProjectWorkspace, NativeProjectWorkspaceAt, NativeProjectList {}
+export interface NativeProjectOperations
+  extends NativeProjectWorkspace,
+    NativeProjectWorkspaceAt,
+    NativeProjectList,
+    NativeProjectWorkspaceInSlot {}
 
 /** The operations a `WorkspaceRef` serves: exactly those its authority admits. */
 export interface NativeWorkspaceRefOperations
@@ -61,6 +65,7 @@ export interface NativeCoordinatorOperations
     NativeCoordinatorRestore,
     NativeCoordinatorResize,
     NativeCoordinatorDefragment,
+    NativeCoordinatorRekey,
     NativeCoordinatorReseed,
     NativeCoordinatorClearNxState,
     NativeCoordinatorDetach,
@@ -435,6 +440,24 @@ export async function coordinatorRebase(
   args: CoordinatorRebaseArguments,
 ): Promise<Api.RebaseReport> {
   return V.parseRebaseReport(await handle.rebase(JSON.stringify(args)));
+}
+
+/** A handle that serves `coordinator.rekey`. */
+export interface NativeCoordinatorRekey {
+  rekey(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `coordinator.rekey` caller names; its handle binds the rest. */
+export type CoordinatorRekeyArguments = Pick<Api.WorkspaceRequest, 'workspace'>;
+
+/**
+ * Rebuilds one keyless workspace's CA identity at its preserved incarnation.
+ */
+export async function coordinatorRekey(
+  handle: NativeCoordinatorRekey,
+  args: CoordinatorRekeyArguments,
+): Promise<Api.RekeyResult> {
+  return V.parseRekeyResult(await handle.rekey(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.removeProject`. */
@@ -867,7 +890,7 @@ export interface NativeProjectList {
 }
 
 /** The request fields a `project.list` caller names; its handle binds the rest. */
-export type ProjectListArguments = Readonly<Record<string, never>>;
+export type ProjectListArguments = Pick<Api.ListRequest, 'landing'>;
 
 /**
  * Lists every published workspace.
@@ -913,6 +936,24 @@ export async function projectWorkspaceAt(
   args: ProjectWorkspaceAtArguments,
 ): Promise<NativeWorkspaceRefHandle> {
   return handle.workspaceAt(JSON.stringify(args));
+}
+
+/** A handle that serves `project.workspaceInSlot`. */
+export interface NativeProjectWorkspaceInSlot {
+  workspaceInSlot(argumentsJson: string): Promise<NativeWorkspaceRefHandle>;
+}
+
+/** The request fields a `project.workspaceInSlot` caller names; its handle binds the rest. */
+export type ProjectWorkspaceInSlotArguments = Pick<Api.WorkspaceInSlotRequest, 'slot'>;
+
+/**
+ * Resolves the workspace that currently occupies one build slot.
+ */
+export async function projectWorkspaceInSlot(
+  handle: NativeProjectWorkspaceInSlot,
+  args: ProjectWorkspaceInSlotArguments,
+): Promise<NativeWorkspaceRefHandle> {
+  return handle.workspaceInSlot(JSON.stringify(args));
 }
 
 /** A handle that serves `session.close`. */

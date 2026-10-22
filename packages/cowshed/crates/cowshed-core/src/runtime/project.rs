@@ -31,10 +31,10 @@ use crate::api::dto::{BranchLandings, LandingCommits, UnlandedPaths};
 use crate::api::dto::{LandedReport, RunSandboxMode};
 use crate::api::operations::{
     self, AdoptRequest, AdoptView, BuildVolume, ExecParams, ExecStdin, GrantRequest, JobRequest,
-    JobStream, LogsChunk, LogsRequest, Operation, OperationRequest, ProgressRequest,
-    ProjectOpenRequest, ProjectOpened, ReAdoption, RepoRequest, Scope, StdinWriteRequest,
-    TailRequest, WorkerScope, WorkspaceAtRequest, WorkspaceGrantsRequest, WorkspaceRequest,
-    WorkspaceView, encode_result,
+    JobStream, ListLanding, ListRequest, LogsChunk, LogsRequest, Operation, OperationRequest,
+    ProgressRequest, ProjectOpenRequest, ProjectOpened, ReAdoption, Scope, StdinWriteRequest,
+    TailRequest, WorkerScope, WorkspaceAtRequest, WorkspaceGrantsRequest, WorkspaceInSlotRequest,
+    WorkspaceRequest, WorkspaceView, encode_result,
 };
 use crate::api::process::JobProcessTree;
 use crate::api::resources::{JobResourceSample, SampleInterval};
@@ -218,6 +218,13 @@ pub trait ProjectRuntimeHost: Send + 'static {
         &mut self,
         workspace: WorkspaceName,
     ) -> Result<crate::api::dto::DefragmentResult>;
+
+    /// Rebuild one keyless workspace's CA identity at its preserved incarnation.
+    async fn rekey(&mut self, _workspace: WorkspaceName) -> Result<crate::api::dto::RekeyResult> {
+        Err(CowshedError::internal(
+            "workspace rekey is unavailable for this runtime host",
+        ))
+    }
     async fn reseed(
         &mut self,
         workspace: WorkspaceName,
@@ -1298,8 +1305,11 @@ impl ProjectActor {
                 &self.project_workspace_at(&authority, params).await?,
             ),
             Op::ProjectList(params) => {
-                respond::<operations::ProjectList>(&self.project_list(params).await?)
+                return self.project_list(params).await.map(Routed::Later);
             }
+            Op::ProjectWorkspaceInSlot(params) => respond::<operations::ProjectWorkspaceInSlot>(
+                &self.project_workspace_in_slot(&authority, params).await?,
+            ),
             Op::WorkspaceInfoRead(params) => respond::<operations::WorkspaceInfoRead>(
                 &self.workspace_info(&authority, params).await?,
             ),
@@ -1320,6 +1330,12 @@ impl ProjectActor {
             }
             Op::CoordinatorFork(params) => {
                 self.require_repo(&params.repo_id)?;
+                if params.options.markdown_only {
+                    return Err(CowshedError::usage(
+                        "pure-Markdown edit disjoint from code edits in place — no shed minted",
+                        "edit the Markdown in the checkout itself; drop markdown-only to mint a workspace",
+                    ));
+                }
                 let snapshot = self
                     .host
                     .fork(params.source, params.workspace, params.options)
@@ -1397,6 +1413,10 @@ impl ProjectActor {
                 respond::<operations::CoordinatorDefragment>(
                     &self.host.defragment(params.workspace).await?,
                 )
+            }
+            Op::CoordinatorRekey(params) => {
+                self.require_repo(&params.repo_id)?;
+                respond::<operations::CoordinatorRekey>(&self.host.rekey(params.workspace).await?)
             }
             Op::CoordinatorReseed(params) => {
                 self.require_repo(&params.repo_id)?;
@@ -1703,15 +1723,61 @@ impl ProjectActor {
         Ok(workspace_view(snapshot))
     }
 
-    async fn project_list(&mut self, params: RepoRequest) -> Result<Vec<WorkspaceView>> {
+    /// The published workspaces, read in the actor. A landing selection is measured after the
+    /// actor answers, because one Git history walk per workspace is the slowest thing a listing
+    /// can be asked for and nothing else the project serves waits on it.
+    async fn project_list(&mut self, params: ListRequest) -> Result<JobAnswer<RouterResponse>> {
         self.require_repo(&params.repo_id)?;
-        Ok(self
+        let mut views: Vec<WorkspaceView> = self
             .host
             .snapshots()
             .await?
             .into_iter()
             .map(workspace_view)
-            .collect())
+            .collect();
+        Ok(Box::pin(async move {
+            if let Some(selection) = params.landing {
+                crate::landing::annotate_listing(&mut views).await;
+                if selection == ListLanding::Landed {
+                    crate::landing::retain_fully_landed(&mut views);
+                }
+            }
+            respond::<operations::ProjectList>(&views)
+        }))
+    }
+
+    /// The workspace whose mount is build slot `slot`'s stable path, if one occupies it.
+    async fn project_workspace_in_slot(
+        &mut self,
+        authority: &ConnectionAuthority,
+        params: WorkspaceInSlotRequest,
+    ) -> Result<WorkspaceView> {
+        self.require_repo(&params.repo_id)?;
+        let wanted = crate::metadata::SlotId::new(params.slot).map_err(|error| {
+            CowshedError::usage(
+                error.to_string(),
+                "choose a slot within the project's range",
+            )
+        })?;
+        let snapshot = self
+            .host
+            .snapshots()
+            .await?
+            .into_iter()
+            .find(|snapshot| {
+                crate::metadata::SlotId::from_mount_path(&snapshot.info.mount) == Some(wanted)
+            })
+            .ok_or_else(|| {
+                CowshedError::not_found(
+                    format!("no workspace occupies slot {}", params.slot),
+                    format!(
+                        "give the slot a tenant: cowshed fork <ws> --slot {}",
+                        params.slot
+                    ),
+                )
+            })?;
+        self.validate_worker_snapshot(authority, &snapshot)?;
+        Ok(workspace_view(snapshot))
     }
 
     async fn workspace_info(
@@ -12960,6 +13026,34 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             previous_extents: outcome.previous.get(),
             extents: outcome.extents.get(),
             bytes: outcome.bytes,
+        })
+    }
+
+    /// Rotate the workspace's CA identity from its store records. Main is rekeyed at its
+    /// checkout-aware mount and a session at its slot-aware one, both derived, never inferred.
+    async fn rekey(&mut self, workspace: WorkspaceName) -> Result<crate::api::dto::RekeyResult> {
+        self.validate_binding().await?;
+        let mount = self.workspace_mount_path(&workspace)?;
+        let layout = self.layout.clone();
+        let name = workspace.clone();
+        let report = crate::storage::lifecycle::dispatch_blocking(move || {
+            crate::storage::apfs::rekey::rekey_workspace(&layout, &name, &mount)
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::integrity(
+                format!("rekey task for {workspace} failed: {error}"),
+                format!("cowshed rekey {workspace}"),
+            )
+        })?
+        .map_err(|error| error.into_cowshed_error())?;
+        Ok(crate::api::dto::RekeyResult {
+            workspace: report.workspace.to_string(),
+            workspace_incarnation: report.incarnation.as_str().to_owned(),
+            revision: report.revision,
+            tombstone_removed: report
+                .tombstone_removed
+                .map(|path| path.display().to_string()),
         })
     }
 

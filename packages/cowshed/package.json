@@ -138,6 +138,7 @@
           "{projectRoot}/crates/cowshed-api-gen/**/*",
           "{projectRoot}/crates/cowshed-core/**/*.rs",
           "{projectRoot}/crates/cowshed-gateway-types/**/*.rs",
+          "{projectRoot}/crates/cowshed-cli/src/args.rs",
           "{projectRoot}/package.json",
           "{workspaceRoot}/biome.json",
           "cargoToolchain",
@@ -151,7 +152,8 @@
           "{projectRoot}/src/native.generated.ts",
           "{projectRoot}/src/declaration-ir.generated.ts",
           "{projectRoot}/crates/cowshed-napi/src/operations.generated.rs",
-          "{projectRoot}/crates/cowshed-core/src/api/served.generated.rs"
+          "{projectRoot}/crates/cowshed-core/src/api/served.generated.rs",
+          "{projectRoot}/src/cli-parity.generated.ts"
         ],
         "options": {
           "command": "packages/cowshed/.cache/api-generator/cowshed-api-gen write packages/cowshed",
@@ -171,6 +173,7 @@
           "{projectRoot}/crates/cowshed-api-gen/**/*",
           "{projectRoot}/crates/cowshed-core/**/*.rs",
           "{projectRoot}/crates/cowshed-gateway-types/**/*.rs",
+          "{projectRoot}/crates/cowshed-cli/src/args.rs",
           "{projectRoot}/package.json",
           "{workspaceRoot}/biome.json",
           "{projectRoot}/src/api.generated.ts",
@@ -179,6 +182,7 @@
           "{projectRoot}/src/declaration-ir.generated.ts",
           "{projectRoot}/crates/cowshed-napi/src/operations.generated.rs",
           "{projectRoot}/crates/cowshed-core/src/api/served.generated.rs",
+          "{projectRoot}/src/cli-parity.generated.ts",
           "cargoToolchain",
           {
             "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh rustc -vV"

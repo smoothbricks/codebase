@@ -722,247 +722,69 @@ mod wire_contract;
 
 #[cfg(test)]
 mod parity_tests {
+    //! Option-level CLI/N-API parity is api-check's (`cowshed_api_gen::cli_parity`, 07_api.md
+    //! "CLI and N-API option parity"): it reads the CLI grammar from `args.rs` source, so it can
+    //! run without building the CLI. This is the check that what it reads is the tree clap itself
+    //! builds, so no verb or argument reaches the parser through a shape the reader misses.
+
     use std::collections::BTreeSet;
 
-    use cowshed_cli::args::{COMMANDS, Command, parse_args};
-    use cowshed_core::api::operations::{OPERATIONS, Scope};
+    use cowshed_cli::args::{COMMANDS, cli_command};
 
-    /// The controller operations a CLI verb reaches through the addon, or `None` when the verb
-    /// has none: host management runs the packaged binary through the `cli.ts` trampoline, and
-    /// the addon deliberately does not link the CLI to offer a second in-process copy of it.
-    /// Every declared operation outside the controller's own is an addon method generated from
-    /// the operation table, so naming the operation names the export.
-    ///
-    /// Adding a `Command` variant breaks this match. Adding an arm without adding it to `SAMPLES`
-    /// breaks `every_cli_command_maps_to_its_named_operations`.
-    fn napi_operations(command: &Command) -> Option<&'static [&'static str]> {
-        match command {
-            Command::Adopt(_) => Some(&["coordinator.adopt"]),
-            Command::Fork(_) => Some(&["coordinator.fork"]),
-            Command::Move(_) => Some(&["coordinator.rename", "coordinator.moveCheckout"]),
-            Command::Checkpoint(_) => Some(&["worker.checkpoint"]),
-            Command::Restore(_) => Some(&["coordinator.restore"]),
-            Command::List(_) => Some(&["project.list"]),
-            Command::Path(_) => Some(&["project.workspace", "workspace.info"]),
-            // The verb runs as the worker's exec, or as the coordinator's when it asks for the gate class.
-            Command::Exec(_) => Some(&["worker.exec", "coordinator.exec"]),
-            Command::Grant(_) => Some(&["coordinator.grant", "workspace.grants"]),
-            Command::Revoke(_) => Some(&["coordinator.revoke", "coordinator.revokeProject"]),
-            Command::Remove(_) => Some(&["coordinator.destroy"]),
-            Command::Attach(_) => Some(&["workspace.attach"]),
-            Command::Detach(_) => Some(&["coordinator.detach"]),
-            Command::Resize(_) => Some(&["coordinator.resize"]),
-            Command::Defrag(_) => Some(&["coordinator.defragment"]),
-            Command::Reseed(_) => Some(&["coordinator.reseed"]),
-            // The store half is the gateway's control socket, which the addon does not reach.
-            Command::Cache(_) => Some(&["coordinator.clearNxState"]),
-            Command::Gc(_) => Some(&["coordinator.gc"]),
-            Command::Push(_) => Some(&["worker.push"]),
-            Command::Rebase(_) => Some(&["coordinator.rebase"]),
-            Command::Land(_) => Some(&["coordinator.land"]),
-            Command::Doctor(_) => Some(&["coordinator.doctor"]),
-            // The verb serves the endpoint `coordinatorEndpoint` wraps; the addon is its peer, not a
-            // second copy of it.
-            Command::Controller
-            | Command::Gateway(_)
-            | Command::Credential(_)
-            | Command::Identity(_)
-            | Command::Sccache(_)
-            // A host disk-tool facade for scripts; the addon's callers run cowshed's own verbs.
-            | Command::DiskCommand(_)
-            // A host-only land queue over repository files; the addon has no endpoint for it, and
-            // scripts run cowshed's own verb.
-            | Command::LandTurn(_)
-            // A host-only held lock over a caller's lock file; scripts run cowshed's own verbs.
-            | Command::Lock(_)
-            | Command::LockHolders(_)
-            // A held command for a caller that is not cowshed; scripts run cowshed's own verb.
-            | Command::Hold(_)
-            // The holder census `rm` and `detach` read, for scripts; no controller call.
-            | Command::TreeHolders(_)
-            | Command::Skill(_)
-            | Command::Setup(_)
-            | Command::Mount(_)
-            // Retires a project the controller can no longer open, from store records alone: there
-            // is no controller to call, and the addon deliberately offers no second copy of it.
-            | Command::Forget(_)
-            | Command::Rekey(_)
-            | Command::Version
-            // A read-only lint helper over the checkout's recorded volume state; no controller call.
-            | Command::BuildState
-            | Command::SubtreeRoot(_)
-            | Command::RetireDescendants(_)
-            | Command::Help(_) => None,
+    /// Every leaf verb and every argument, keyed as the parity table keys them: `*` for the
+    /// options every verb accepts, an empty argument for a leaf verb itself.
+    fn clap_words(command: &clap::Command, path: &str, words: &mut BTreeSet<(String, String)>) {
+        let scope = if path.is_empty() { "*" } else { path };
+        for argument in command.get_arguments() {
+            words.insert((scope.to_owned(), argument.get_id().to_string()));
+        }
+        let mut subcommands = command.get_subcommands().peekable();
+        if subcommands.peek().is_none() && !path.is_empty() {
+            words.insert((path.to_owned(), String::new()));
+        }
+        for subcommand in subcommands {
+            let child = if path.is_empty() {
+                subcommand.get_name().to_owned()
+            } else {
+                format!("{path} {}", subcommand.get_name())
+            };
+            clap_words(subcommand, &child, words);
         }
     }
 
-    /// One representative argv per `Command` arm, paired with the operations it must map to.
-    const SAMPLES: &[(&[&str], Option<&[&str]>)] = &[
-        (&["adopt"], Some(&["coordinator.adopt"])),
-        (&["fork", "parity"], Some(&["coordinator.fork"])),
-        (&["fork", "main", "parity"], Some(&["coordinator.fork"])),
-        (
-            &["mv", "parity", "renamed"],
-            Some(&["coordinator.rename", "coordinator.moveCheckout"]),
-        ),
-        (&["checkpoint", "parity"], Some(&["worker.checkpoint"])),
-        (
-            &["restore", "parity", "saved"],
-            Some(&["coordinator.restore"]),
-        ),
-        (&["ls"], Some(&["project.list"])),
-        (
-            &["path", "parity"],
-            Some(&["project.workspace", "workspace.info"]),
-        ),
-        (
-            &["exec", "parity", "--", "true"],
-            Some(&["worker.exec", "coordinator.exec"]),
-        ),
-        (
-            &["exec", "parity", "--class", "gate", "--", "true"],
-            Some(&["worker.exec", "coordinator.exec"]),
-        ),
-        (
-            &["exec", "parity", "--class", "gate", "--host", "--", "true"],
-            Some(&["worker.exec", "coordinator.exec"]),
-        ),
-        (
-            &["exec", "parity", "--host", "--", "true"],
-            Some(&["worker.exec", "coordinator.exec"]),
-        ),
-        (
-            &["grant", "parity"],
-            Some(&["coordinator.grant", "workspace.grants"]),
-        ),
-        (
-            &["revoke", "parity", "--egress", "api.example.test:443"],
-            Some(&["coordinator.revoke", "coordinator.revokeProject"]),
-        ),
-        (&["rm", "parity"], Some(&["coordinator.destroy"])),
-        (&["attach", "parity"], Some(&["workspace.attach"])),
-        (&["detach", "parity"], Some(&["coordinator.detach"])),
-        (&["resize", "parity", "200g"], Some(&["coordinator.resize"])),
-        (&["defrag", "parity"], Some(&["coordinator.defragment"])),
-        (&["reseed", "parity"], Some(&["coordinator.reseed"])),
-        (
-            &["reseed", "main", "--from", "parity", "--dry-run"],
-            Some(&["coordinator.reseed"]),
-        ),
-        (
-            &["cache", "clear", "parity"],
-            Some(&["coordinator.clearNxState"]),
-        ),
-        (&["gc"], Some(&["coordinator.gc"])),
-        (&["push", "parity"], Some(&["worker.push"])),
-        (&["rebase", "parity"], Some(&["coordinator.rebase"])),
-        (&["land", "parity"], Some(&["coordinator.land"])),
-        (&["doctor"], Some(&["coordinator.doctor"])),
-        (&["gateway", "status"], None),
-        (&["controller"], None),
-        (&["credential", "status"], None),
-        (&["identity", "add", "forge"], None),
-        (&["sccache", "status"], None),
-        (&["disk-command", "hdiutil", "--", "info"], None),
-        (&["land-turn", "parity", "--", "true"], None),
-        (&["lock", "/tmp/parity.lock", "--", "true"], None),
-        (&["lock-holders", "/tmp/parity.lock"], None),
-        (
-            &["hold", "--control-fd", "3", "--state-fd", "4", "--", "true"],
-            None,
-        ),
-        (&["tree-holders", "/tmp/parity"], None),
-        (&["skill", "install"], None),
-        (&["mount", "main", "--repo-id", "acme/widget"], None),
-        (&["forget", "acme/widget", "--abandon"], None),
-        (&["rekey", "parity"], None),
-        (&["help"], None),
-        (&["setup"], None),
-        (&["build-state"], None),
-        (&["subtree-root", "--handle-fd", "3", "--", "true"], None),
-        (&["retire-descendants", "--grace-ms", "0"], None),
-        (&["--version"], None),
-    ];
-
     #[test]
-    fn every_cli_command_maps_to_its_named_operations() {
-        for (argv, expected) in SAMPLES {
-            let parsed =
-                parse_args(argv.iter().copied()).expect("representative CLI command parses");
-            assert_eq!(
-                napi_operations(&parsed.command),
-                *expected,
-                "CLI command {argv:?} does not map to the operations the parity table names"
-            );
-        }
-    }
-
-    /// Every operation the table names is declared and projected onto the addon: a renamed or
-    /// controller-internal operation is red here, not a verb JavaScript silently lost.
-    #[test]
-    fn every_named_operation_is_a_projected_declaration() {
-        let projected: BTreeSet<&str> = OPERATIONS
-            .iter()
-            .filter(|operation| operation.scope != Scope::Internal)
-            .map(|operation| operation.method)
-            .collect();
-        for (argv, operations) in SAMPLES {
-            for method in operations.iter().copied().flatten() {
-                assert!(
-                    projected.contains(method),
-                    "{argv:?} names {method}, which the addon does not project"
-                );
-            }
-        }
-    }
-
-    /// Every verb the CLI dispatches must appear in the parity table.
-    ///
-    /// `COMMANDS` is the command map `cowshed --help` prints and the list the parser is generated
-    /// from, so this is red the moment a verb is added without naming the operations it
-    /// corresponds to.
-    #[test]
-    fn every_cli_verb_has_a_parity_sample() {
-        let dispatched: BTreeSet<&str> = COMMANDS.iter().map(|spec| spec.name).collect();
-        let sampled: BTreeSet<&str> = SAMPLES
-            .iter()
-            .filter_map(|(argv, _)| argv.first().copied())
-            .collect();
-
+    fn the_parity_reader_sees_exactly_the_clap_tree() {
+        let mut built = BTreeSet::new();
+        clap_words(&cli_command(), "", &mut built);
+        let read: BTreeSet<(String, String)> =
+            cowshed_api_gen::cli_parity::read_cli(include_str!("../../cowshed-cli/src/args.rs"))
+                .expect("the parity reader reads args.rs")
+                .into_iter()
+                .map(|word| (word.command, word.argument))
+                .collect();
         assert_eq!(
-            dispatched.difference(&sampled).copied().collect::<Vec<_>>(),
-            Vec::<&str>::new(),
-            "CLI verbs the parity table does not sample"
+            built.difference(&read).collect::<Vec<_>>(),
+            Vec::<&(String, String)>::new(),
+            "clap parses words the parity reader does not see"
         );
-        // `help` and `--version` resolve to a `Command` without being entries in the command map,
-        // so they are the only tokens allowed to be sampled without being dispatched verbs.
         assert_eq!(
-            sampled.difference(&dispatched).copied().collect::<Vec<_>>(),
-            vec!["--version", "help"],
-            "the parity table samples a token the CLI does not dispatch"
+            read.difference(&built).collect::<Vec<_>>(),
+            Vec::<&(String, String)>::new(),
+            "the parity reader sees words clap does not parse"
         );
     }
 
-    /// No two verbs may claim one operation: that would mean the table has stopped describing the
-    /// seam it is named after.
+    /// The command map `cowshed --help` prints is the clap tree's verbs, so a verb parity covers
+    /// is a verb the help names.
     #[test]
-    fn no_two_verbs_claim_one_operation() {
-        let pairs: BTreeSet<(&str, &str)> = SAMPLES
-            .iter()
-            .filter_map(|(argv, operations)| Some((argv, (*operations)?)))
-            .flat_map(|(argv, operations)| {
-                operations
-                    .iter()
-                    .map(move |operation| (argv[0], *operation))
-            })
+    fn the_command_map_names_every_clap_verb() {
+        let command = cli_command();
+        let verbs: BTreeSet<&str> = command
+            .get_subcommands()
+            .map(clap::Command::get_name)
             .collect();
-        let operations: BTreeSet<&str> = pairs.iter().map(|(_, operation)| *operation).collect();
-
-        assert_eq!(
-            operations.len(),
-            pairs.len(),
-            "two different verbs claim one operation; repeated samples of one verb may name it"
-        );
+        let mapped: BTreeSet<&str> = COMMANDS.iter().map(|spec| spec.name).collect();
+        assert_eq!(verbs, mapped);
     }
 }
 

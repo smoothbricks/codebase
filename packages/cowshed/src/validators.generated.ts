@@ -867,6 +867,18 @@ export const assertLandingCommitsList = typia.createAssertEquals<readonly Api.La
 export const parseLandingCommitsList = (json: string): readonly Api.LandingCommits[] =>
   assertLandingCommitsList(JSON.parse(json));
 
+export const assertListLanding = typia.createAssertEquals<Api.ListLanding>();
+export const parseListLanding = (json: string): Api.ListLanding => assertListLanding(JSON.parse(json));
+export const assertListLandingList = typia.createAssertEquals<readonly Api.ListLanding[]>();
+export const parseListLandingList = (json: string): readonly Api.ListLanding[] =>
+  assertListLandingList(JSON.parse(json));
+
+export const assertListRequest = typia.createAssertEquals<Api.ListRequest>();
+export const parseListRequest = (json: string): Api.ListRequest => assertListRequest(JSON.parse(json));
+export const assertListRequestList = typia.createAssertEquals<readonly Api.ListRequest[]>();
+export const parseListRequestList = (json: string): readonly Api.ListRequest[] =>
+  assertListRequestList(JSON.parse(json));
+
 export const assertLockCustody = typia.createAssertEquals<Api.LockCustody>();
 export const parseLockCustody = (json: string): Api.LockCustody => assertLockCustody(JSON.parse(json));
 export const assertLockCustodyList = typia.createAssertEquals<readonly Api.LockCustody[]>();
@@ -1724,6 +1736,13 @@ export const parseWorkspaceGrantsRequest = (json: string): Api.WorkspaceGrantsRe
 export const assertWorkspaceGrantsRequestList = typia.createAssertEquals<readonly Api.WorkspaceGrantsRequest[]>();
 export const parseWorkspaceGrantsRequestList = (json: string): readonly Api.WorkspaceGrantsRequest[] =>
   assertWorkspaceGrantsRequestList(JSON.parse(json));
+
+export const assertWorkspaceInSlotRequest = typia.createAssertEquals<Api.WorkspaceInSlotRequest>();
+export const parseWorkspaceInSlotRequest = (json: string): Api.WorkspaceInSlotRequest =>
+  assertWorkspaceInSlotRequest(JSON.parse(json));
+export const assertWorkspaceInSlotRequestList = typia.createAssertEquals<readonly Api.WorkspaceInSlotRequest[]>();
+export const parseWorkspaceInSlotRequestList = (json: string): readonly Api.WorkspaceInSlotRequest[] =>
+  assertWorkspaceInSlotRequestList(JSON.parse(json));
 
 export const assertWorkspaceIncarnation = typia.createAssertEquals<Api.WorkspaceIncarnation>();
 export const parseWorkspaceIncarnation = (json: string): Api.WorkspaceIncarnation =>

@@ -2,7 +2,8 @@
   "project.open": { "path": "/trusted/acme/widget" },
   "project.workspace": { "repoId": "acme/widget", "workspace": "feature" },
   "project.workspaceAt": { "repoId": "acme/widget", "path": "/trusted/acme/widget" },
-  "project.list": { "repoId": "acme/widget" },
+  "project.workspaceInSlot": { "repoId": "acme/widget", "slot": 3 },
+  "project.list": { "repoId": "acme/widget", "landing": "landed" },
   "workspace.info": { "repoId": "acme/widget", "workspace": "feature" },
   "workspace.attach": { "repoId": "acme/widget", "workspace": "feature", "options": { "browse": false } },
   "workspace.grants": {
@@ -40,6 +41,7 @@
   "coordinator.restore": { "repoId": "acme/widget", "workspace": "feature", "label": "before" },
   "coordinator.resize": { "repoId": "acme/widget", "workspace": "feature", "capacity": "64G", "volume": "build" },
   "coordinator.defragment": { "repoId": "acme/widget", "workspace": "feature" },
+  "coordinator.rekey": { "repoId": "acme/widget", "workspace": "feature" },
   "coordinator.reseed": { "repoId": "acme/widget", "workspace": "feature", "from": "main", "dryRun": false },
   "coordinator.clearNxState": { "repoId": "acme/widget", "workspace": "feature" },
   "coordinator.detach": { "repoId": "acme/widget", "workspace": "feature" },
