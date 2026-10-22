@@ -663,6 +663,14 @@ The engine is `hyper` + `rustls` + `rcgen` + `tokio`:
 - Leaves are minted in process and cached, not listeners. The leaf LRU is capped at 256 entries per workspace and 4096
   globally; entries expire after 24 hours and are usable only when hostname, workspace CA fingerprint, validity window,
   and at least 5 minutes of remaining lifetime all match. Rotation of a workspace CA drops that workspace's entries.
+  - A leaf carries the RFC 5280 end-entity profile: a subjectAltName for the host, an Authority Key Identifier equal to
+    the issuing workspace CA's Subject Key Identifier, critical keyUsage digitalSignature (the leaf key is P-256 ECDSA),
+    and extendedKeyUsage serverAuth. The workspace CA carries a Subject Key Identifier, critical basicConstraints
+    CA:TRUE, and critical keyUsage keyCertSign and cRLSign; being self-signed, it needs no Authority Key Identifier.
+    Strict X.509 verifiers accept the chain: OpenSSL with `X509_V_FLAG_X509_STRICT`, which Python 3.13+ sets in its
+    default context, refuses a leaf without the Authority Key Identifier ("Missing Authority Key Identifier"). A change
+    to the leaf profile needs no CA migration: leaves exist only in the in-process LRU, so a gateway restart mints every
+    leaf afresh under the existing CAs.
 - Limits are 32 active HTTP/opaque requests and 64 queued admissions per workspace, 256 active HTTP/opaque requests and
   512 queued admissions globally, and 8 active upstream connections per workspace+origin. Intercepted CONNECT transports
   use a separate bounded pool (32 per workspace, 256 globally), not their contained requests' slots or upstream-origin
