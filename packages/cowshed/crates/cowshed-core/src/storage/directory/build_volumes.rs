@@ -3,8 +3,11 @@
 //! file and job-admission claims as an image volume. A directory has no capacity, so nothing
 //! here reads or grows one.
 
-use std::fs;
+use std::ffi::CString;
+use std::fs::{self, File};
 use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -147,25 +150,28 @@ fn scan_clock_entries(
     }
     Ok(())
 }
-/// Commit the release of `id`'s unbound payload tree: one rename to its entry in the project's
-/// build journal, both directories synced. Nothing is deleted until
-/// [`DirectoryExecutionHost::finish_build_releases`].
-fn journal_payload_tree(
-    layout: &BuildVolumeLayout,
-    id: &BuildVolumeId,
-) -> Result<(), ApfsStorageError> {
-    let image = layout.image(id);
-    let entry = layout.released(id);
-    super::ensure_parent(&entry)?;
-    fs::rename(&image, &entry).map_err(|error| {
-        io_error(
-            "commit a build volume release to the journal",
-            &entry,
-            error,
-        )
-    })?;
-    sync_parent_path(&entry)?;
-    sync_parent_path(&image)
+/// The last component of `path` as a directory-relative name.
+fn leaf(path: &Path) -> Result<CString, ApfsStorageError> {
+    path.file_name()
+        .and_then(|name| CString::new(name.as_bytes()).ok())
+        .ok_or_else(|| ApfsStorageError::Host(format!("{} names no entry", path.display())))
+}
+
+/// The project's images directory, held by descriptor, refusing a link or a non-directory there.
+fn held_images(layout: &BuildVolumeLayout) -> Result<File, ApfsStorageError> {
+    cowshed_os::fsio::open_directory_nofollow(layout.images())
+        .map_err(|error| io_error("open the build images directory", layout.images(), error))
+}
+
+/// The project's build journal held by descriptor, `None` when it does not exist, refusing a
+/// link or a non-directory at its name.
+fn held_journal(layout: &BuildVolumeLayout) -> Result<Option<File>, ApfsStorageError> {
+    let journal = layout.releasing();
+    match cowshed_os::fsio::open_directory_nofollow(&journal) {
+        Ok(held) => Ok(Some(held)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io_error("open the build release journal", &journal, error)),
+    }
 }
 
 /// The bytes the files under `root` hold on disk, links never followed.
@@ -583,18 +589,29 @@ impl DirectoryExecutionHost {
                 });
             }
         }
-        // Nothing holds the tree (just checked), so an unforced unmount is the whole release. An
-        // image already gone has nothing to unbind: its record alone is retired, said as such.
-        if present {
+        if reclaim == Reclaim::Journaled {
+            // The journal is the store's own: reached through a link, nothing is unbound or moved.
+            self.require_store_image(&layout.released(id))?;
+        }
+        // An unforced unmount is the whole release: a deletion finds no holder (just checked),
+        // and a journal rename deletes nothing. An image already gone has nothing to unbind: a
+        // journaled retry confirms the commit an earlier attempt made, and otherwise its record
+        // alone is retired, said as such.
+        let committed = if present {
             unbind(&image, &mount, cowshed_apfs::DetachIntent::Release)?;
             match reclaim {
                 Reclaim::Now => remove_payload_tree(&image)?,
-                Reclaim::Journaled => journal_payload_tree(layout, id)?,
+                Reclaim::Journaled => self.journal_payload_tree(layout, id)?,
             }
+            true
+        } else {
+            reclaim == Reclaim::Journaled && self.confirm_journaled_tree(layout, id)?
+        };
+        if committed {
             layout.journal_release(id, recorded.as_ref(), true);
         }
         remove_if_present(&written_mark_path(&image))?;
-        if remove_if_present(&layout.record(id))? && !present {
+        if remove_if_present(&layout.record(id))? && !committed {
             layout.journal_release(id, recorded.as_ref(), false);
         }
         remove_if_present(&layout.hold_path(id))?;
@@ -613,27 +630,102 @@ impl DirectoryExecutionHost {
         Ok(None)
     }
 
-    /// Finish every release committed to the project's build journal: delete each payload tree
-    /// a [`Reclaim::Journaled`] release moved there. A tree a process still holds anything
-    /// inside is said and left for a later pass, never deleted from under its holder; anything
-    /// that is not a directory is said and left, untouched.
+    /// Commit the release of `id`'s unbound payload tree: one rename, refusing to replace
+    /// anything, from the images directory into the project's build journal, both held by
+    /// descriptor and synced. The journal is created when missing; a link or a non-directory at
+    /// either refuses, untouched; its caller has refused a journal reached through a link. Nothing
+    /// is deleted until [`Self::finish_build_releases`].
+    fn journal_payload_tree(
+        &self,
+        layout: &BuildVolumeLayout,
+        id: &BuildVolumeId,
+    ) -> Result<(), ApfsStorageError> {
+        let entry = layout.released(id);
+        let images = held_images(layout)?;
+        let (journal, _) =
+            cowshed_os::fsio::open_or_create_child_directory(&images, &leaf(&layout.releasing())?)
+                .map_err(|error| {
+                    io_error("open the build release journal", &layout.releasing(), error)
+                })?;
+        let name = leaf(&entry)?;
+        cowshed_os::fsio::rename_noreplace(images.as_raw_fd(), &name, journal.as_raw_fd(), &name)
+            .map_err(|error| {
+            io_error(
+                "commit a build volume release to the journal",
+                &entry,
+                error,
+            )
+        })?;
+        let synced = |directory: &File, path: &Path| {
+            cowshed_os::fsio::sync_held_directory(directory)
+                .map_err(|error| io_error("sync the build release journal", path, error))
+        };
+        synced(&journal, &layout.releasing())?;
+        synced(&images, layout.images())
+    }
+
+    /// Whether an earlier attempt already committed `id`'s tree to the build journal, made
+    /// durable before this answers: that attempt may have died, or failed a sync, between its
+    /// rename and the rename's syncs, and the caller removes the owner record once this answers.
+    /// A link or a non-directory at the journal or the entry refuses, untouched.
+    fn confirm_journaled_tree(
+        &self,
+        layout: &BuildVolumeLayout,
+        id: &BuildVolumeId,
+    ) -> Result<bool, ApfsStorageError> {
+        let entry = layout.released(id);
+        let images = held_images(layout)?;
+        let Some(journal) = held_journal(layout)? else {
+            return Ok(false);
+        };
+        match fs::symlink_metadata(&entry) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(ApfsStorageError::Host(format!(
+                    "{} is not a released build volume; it is left",
+                    entry.display()
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(io_error("inspect a released build volume", &entry, error));
+            }
+        }
+        let synced = |directory: &File, path: &Path| {
+            cowshed_os::fsio::sync_held_directory(directory)
+                .map_err(|error| io_error("sync the build release journal", path, error))
+        };
+        synced(&journal, &layout.releasing())?;
+        synced(&images, layout.images())?;
+        Ok(true)
+    }
+
+    /// Finish every release committed to the project's build journal: delete each `<id>.dmg`
+    /// payload tree a [`Reclaim::Journaled`] release moved there. The journal is the store's
+    /// own: one reached through a link refuses, untouched. A tree a process still holds anything
+    /// inside is said and left for a later pass, never deleted from under its holder; any other
+    /// name, or anything that is not a directory, is said and left, untouched.
     pub fn finish_build_releases(
         &self,
         layout: &BuildVolumeLayout,
     ) -> Result<Drained, ApfsStorageError> {
         let journal = layout.releasing();
-        let listing = |error| io_error("list the build release journal", &journal, error);
-        let entries = match fs::read_dir(&journal) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Drained::default()),
-            Err(error) => return Err(listing(error)),
+        self.verify_controller_path(&journal)?;
+        let Some(held) = held_journal(layout)? else {
+            return Ok(Drained::default());
         };
+        let listing = |error| io_error("list the build release journal", &journal, error);
         let mut drained = Drained::default();
-        for entry in entries {
+        for entry in fs::read_dir(&journal).map_err(listing)? {
             let entry = entry.map_err(listing)?.path();
-            let is_tree = fs::symlink_metadata(&entry)
-                .map_err(|error| io_error("inspect a released build volume", &entry, error))?
-                .is_dir();
+            let named = entry
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(crate::build_volume::is_image_name);
+            let is_tree = named
+                && fs::symlink_metadata(&entry)
+                    .map_err(|error| io_error("inspect a released build volume", &entry, error))?
+                    .is_dir();
             if !is_tree {
                 cowshed_os::eprintln!(
                     "cowshed: {} is not a released build volume; it is left",
@@ -654,6 +746,10 @@ impl DirectoryExecutionHost {
                 .map_err(|error| io_error("measure a released build volume", &entry, error))?;
             remove_payload_tree(&entry)?;
             drained.add(Drained { images: 1, bytes });
+        }
+        if drained.images > 0 {
+            cowshed_os::fsio::sync_held_directory(&held)
+                .map_err(|error| io_error("sync the build release journal", &journal, error))?;
         }
         Ok(drained)
     }
@@ -801,6 +897,112 @@ mod clock_tests {
             tree_change_clock(&root).unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
+    }
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+    use crate::repository::{ProjectPaths, RepoId};
+    use crate::storage::apfs::ApfsSubstrateConfig;
+
+    /// The build journal is the store's own. A link planted at `build/.releasing` is never
+    /// followed: a journaled release refuses with the seed, its record and the foreign tree
+    /// intact, and a finisher refuses without deleting the foreign tree's children. In a real
+    /// journal a name that is not a released volume's is left. A journaled retry that finds the
+    /// tree its earlier attempt renamed but never synced makes the rename durable (the journal
+    /// and the images directory) before the record goes, and frees none of it.
+    #[test]
+    fn the_build_journal_is_never_followed_through_a_link_and_a_retry_syncs_its_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-directory-build-journal-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let store = root.join("store");
+        let host =
+            DirectoryExecutionHost::new(ApfsSubstrateConfig::new(&store, root.join("checkout")))
+                .unwrap();
+        let project = ProjectPaths::with_mount_root(
+            &store,
+            root.join("mnt"),
+            &RepoId::parse("acme/widget").unwrap(),
+        )
+        .unwrap();
+        let layout = BuildVolumeLayout::new(&project).unwrap();
+        let id = BuildVolumeId::mint();
+        let image = layout.image(&id);
+        fs::create_dir_all(&image).unwrap();
+        fs::write(image.join("warm"), b"superseded seed\n").unwrap();
+        layout
+            .write_record(
+                &id,
+                &BuildVolumeRecord::new(
+                    None,
+                    BuildVolumeRole::Seed {
+                        target: WorkspaceName::main(),
+                        incarnation: WorkspaceIncarnation::new("1".repeat(32)).unwrap(),
+                    },
+                ),
+            )
+            .unwrap();
+        let foreign = root.join("foreign");
+        let foreign_child = foreign.join(format!("{}.dmg", BuildVolumeId::mint()));
+        fs::create_dir_all(&foreign_child).unwrap();
+        fs::write(foreign_child.join("kept"), b"not the store's").unwrap();
+        std::os::unix::fs::symlink(&foreign, layout.releasing()).unwrap();
+
+        let claim = layout.claim_release(&id).unwrap().unwrap();
+        assert!(
+            host.release_claimed(&layout, claim, Reclaim::Journaled)
+                .is_err()
+        );
+        assert_eq!(fs::read(image.join("warm")).unwrap(), b"superseded seed\n");
+        assert!(
+            layout.record(&id).exists(),
+            "the record stays for the retry"
+        );
+        assert!(host.finish_build_releases(&layout).is_err());
+        assert_eq!(
+            fs::read(foreign_child.join("kept")).unwrap(),
+            b"not the store's"
+        );
+        assert_eq!(fs::read_dir(&foreign).unwrap().count(), 1);
+
+        fs::remove_file(layout.releasing()).unwrap();
+        fs::create_dir(layout.releasing()).unwrap();
+        let stray = layout.releasing().join("stray");
+        fs::create_dir(&stray).unwrap();
+        fs::rename(&image, layout.released(&id)).unwrap();
+        cowshed_os::fsio::take_syncs();
+        assert!(host.confirm_journaled_tree(&layout, &id).unwrap());
+        assert_eq!(
+            cowshed_os::fsio::take_syncs().full,
+            2,
+            "the journal and the images directory are synced before the commit is answered"
+        );
+        let claim = layout.claim_release(&id).unwrap().unwrap();
+        assert_eq!(
+            host.release_claimed(&layout, claim, Reclaim::Journaled)
+                .unwrap(),
+            None
+        );
+        assert!(!layout.record(&id).exists());
+        assert_eq!(
+            fs::read(layout.released(&id).join("warm")).unwrap(),
+            b"superseded seed\n",
+            "the retry frees none of it"
+        );
+
+        let drained = host.finish_build_releases(&layout).unwrap();
+        assert_eq!(drained.images, 1);
+        assert!(!layout.released(&id).exists());
+        assert!(
+            stray.is_dir(),
+            "a name that is not a released volume's is left"
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 }
 

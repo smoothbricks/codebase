@@ -1243,7 +1243,7 @@ pub fn drain_store_released(store: &Path) -> Drained {
 }
 
 /// Whether `name` is a build image's file name, `<id>.dmg`.
-fn is_image_name(name: &str) -> bool {
+pub(crate) fn is_image_name(name: &str) -> bool {
     name.strip_suffix(&format!(".{IMAGE_EXTENSION}"))
         .and_then(BuildVolumeId::parse)
         .is_some()

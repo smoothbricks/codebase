@@ -1423,10 +1423,10 @@ async fn refuse_restart_while_busy(
 /// each project's `build/.releasing` and `sessions/.releasing` entries a crash cut short after
 /// their operation committed them, the superseded seeds a fork's refresh committed to
 /// `build/.releasing` without freeing them, and the `build/.trash` earlier builds renamed images
-/// into. Between starts, a project's `rm`, land and `gc` finish its journal. Each image
-/// is released in bounded steps at normal disk priority, so no free stalls the store's container,
-/// and an interrupted release resumes from the image's length. A project's next open and `cowshed
-/// gc` finish its own the same way.
+/// into. Each image is released in bounded steps at normal disk priority, so no free stalls the
+/// store's container, and an interrupted release resumes from the image's length. Between starts
+/// a project finishes its own the same way: its next lifecycle open its `sessions/.releasing`,
+/// and its next `rm` retirement, land release or `cowshed gc` its `build/.releasing`.
 fn finish_interrupted_releases(store: PathBuf) {
     let started = std::thread::Builder::new()
         .name("image-release-recovery".to_owned())
@@ -1443,7 +1443,7 @@ fn finish_interrupted_releases(store: PathBuf) {
         });
     if let Err(error) = started {
         cowshed_os::eprintln!(
-            "cowshed: interrupted image releases are not finished by this daemon ({error}); each project's next open and `cowshed gc` finish them"
+            "cowshed: committed image releases are not finished by this daemon ({error}); each project's next open finishes its sessions entries, and its next rm, land or `cowshed gc` its build entries"
         );
     }
 }

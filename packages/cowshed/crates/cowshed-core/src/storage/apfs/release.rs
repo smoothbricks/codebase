@@ -422,7 +422,7 @@ pub fn release_owned(image: &Path, entry: &Path, reclaim: Reclaim) -> io::Result
         // whoever drains the journal.
         Reclaim::Journaled => match anchors.commit()? {
             Some(_committed) => Ok(true),
-            None => anchors.entry_present(),
+            None => anchors.confirm_left(),
         },
     }
 }
@@ -491,13 +491,26 @@ impl Anchors {
         Ok(true)
     }
 
-    /// Whether an entry is under this release's name: the commit of an earlier attempt.
-    fn entry_present(&self) -> io::Result<bool> {
-        match open_entry(&self.journal, &self.entry_name)? {
-            Entry::Absent => Ok(false),
-            Entry::Image(_) => Ok(true),
-            Entry::NotImage => Err(not_image(self.entry_name.to_string_lossy())),
+    /// Make durable, without freeing it, the entry an earlier attempt committed under this
+    /// release's name: `false` when none is there. That attempt may have died, or failed a sync,
+    /// between its rename and the rename's syncs, and its caller removes the owner record once
+    /// this answers. An entry another process has locked is that process's release, which syncs
+    /// the same directories before its first cut, so it is not waited for.
+    fn confirm_left(&self) -> io::Result<bool> {
+        let file = match open_entry(&self.journal, &self.entry_name)? {
+            Entry::Absent => return Ok(false),
+            Entry::NotImage => return Err(not_image(self.entry_name.to_string_lossy())),
+            Entry::Image(file) => file,
+        };
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => return Ok(true),
+            Err(fs::TryLockError::Error(error)) => return Err(error),
         }
+        sync_held_directory(&self.journal)?;
+        sync_held_directory(&self.image_directory)?;
+        sync_held_directory(&self.journal_parent)?;
+        Ok(true)
     }
 
     /// Plan the release of the entry [`Self::commit`] renamed, from its locked descriptor.
@@ -1083,6 +1096,21 @@ mod tests {
             syncs.full, 4,
             "the journal, the image's directory and the journal's parent before the cut, the journal after: {syncs:?}"
         );
+
+        // A journaled owner's retry answers its earlier commit only once that rename is durable,
+        // and frees none of it.
+        fs::write(&image, vec![9_u8; 64 * 1024]).expect("image");
+        fs::rename(&image, &entry).expect("the journaled owner's rename, never synced");
+        take_syncs();
+        assert!(
+            release_owned(&image, &entry, Reclaim::Journaled).expect("the journaled owner's retry")
+        );
+        let syncs = take_syncs();
+        assert_eq!(
+            syncs.full, 3,
+            "the journal, the image's directory and the journal's parent: {syncs:?}"
+        );
+        assert_eq!(fs::read(&entry).expect("the entry"), vec![9_u8; 64 * 1024]);
         fs::remove_dir_all(&root).expect("cleanup");
     }
 }
