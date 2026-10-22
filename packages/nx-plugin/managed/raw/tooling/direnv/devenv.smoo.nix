@@ -634,14 +634,17 @@ in {
     # they run.
     (lib.mkBefore ''
       cd "$DEVENV_ROOT/../.."
+      # A bare assignment: export's status would hide repo-path's refusal of a
+      # cowshed workspace it could not serve, and the shell would enter with an
+      # empty PATH.
+      PATH="$("$PWD/tooling/direnv/repo-path")" || exit $?
       # Direct `devenv shell` skips .envrc. Reuse cowshed's one environment writer
       # before project hooks, rather than restating its CI/compiler-cache policy.
+      # After repo-path, which serves a workspace cowshed had not served yet, so
+      # the shell enters on the file that serve wrote.
       if [ -f .cowshed/env ]; then
         . "$PWD/.cowshed/env"
       fi
-      # A bare assignment: export's status would hide repo-path's refusal of an
-      # unserved cowshed workspace, and the shell would enter with an empty PATH.
-      PATH="$("$PWD/tooling/direnv/repo-path")" || exit $?
       export PATH="${rustToolchainBin}:$PATH"
       # devenv enters the shell with TMPDIR unset (not empty) on every platform.
       # Tools then fall back to /tmp, which on Darwin is not the per-user

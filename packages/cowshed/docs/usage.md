@@ -117,8 +117,8 @@ values directly, whether or not the repository uses direnv. Existing repository 
 
 Until its supervisor first serves a workspace, its file sets neither `TMPDIR` nor `COWSHED_RUNTIME_LINK`, and the
 checkout's build link may still name the volume of the checkout it was forked from. A fork interrupted before that start
-is left so. A hook that needs either value refuses such a checkout instead of falling back to the caller's;
-`cowshed exec <ws> -- true` serves it.
+is left so. A hook that needs either value never falls back to the caller's: the managed shell and hooks run
+`cowshed exec <ws> -- true` once to serve such a checkout, then continue, and refuse by name only if that fails.
 
 The sourced file exports workspace-local `COWSHED_*` values and is rewritten whenever cowshed rotates the workspace
 token. After a reboot or manual eject, reattach explicitly:

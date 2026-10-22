@@ -187,11 +187,17 @@ it('the environment capture pass rebuilds nothing, the entry proper still does',
 
 it('direct devenv entry sources the existing workspace policy before project hooks', () => {
   const module = readFileSync(join(import.meta.dir, 'devenv.smoo.nix'), 'utf8');
-  // Everything before the managed PATH writer runs: a bare assignment, so its refusal stops the entry.
+  // The prologue's entry, then its sourcing of the workspace file, which follows the managed PATH writer: that writer
+  // serves a workspace cowshed had not served yet, so the shell enters on the served file.
   const prologue = module.match(
-    /\(lib\.mkBefore ''\n([\s\S]*?) {6}PATH="\$\("\$PWD\/tooling\/direnv\/repo-path"\)" \|\| exit \$\?\n/,
-  )?.[1];
-  expect(prologue).toBeDefined();
+    /\(lib\.mkBefore ''\n( {6}cd "\$DEVENV_ROOT\/\.\.\/\.\."\n)[\s\S]*? {6}PATH="\$\("\$PWD\/tooling\/direnv\/repo-path"\)" \|\| exit \$\?\n(?: {6}#.*\n)*( {6}if \[ -f \.cowshed\/env \]; then\n[\s\S]*? {6}fi\n)/,
+  );
+  if (prologue === null) {
+    throw new Error(
+      'devenv.smoo.nix: no prologue entry, managed PATH writer and workspace file sourcing, in that order',
+    );
+  }
+  const policy = `${prologue[1]}${prologue[2]}`;
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'smoo-direct-entry-')));
   try {
     mkdirSync(join(root, 'tooling/direnv'), { recursive: true });
@@ -201,7 +207,7 @@ it('direct devenv entry sources the existing workspace policy before project hoo
       'if [ "${GITHUB_ACTIONS:-}" != true ]; then unset CI; fi\nexport RUSTC_WRAPPER=/store/pinned-sccache\n',
     );
     for (const marker of ['false', 'true']) {
-      const entered = spawnSync('/bin/sh', ['-c', `${prologue}printf \'%s\\n\' "\${CI-unset}" "$RUSTC_WRAPPER"`], {
+      const entered = spawnSync('/bin/sh', ['-c', `${policy}printf \'%s\\n\' "\${CI-unset}" "$RUSTC_WRAPPER"`], {
         encoding: 'utf8',
         env: { DEVENV_ROOT: join(root, 'tooling/direnv'), CI: 'true', GITHUB_ACTIONS: marker },
       });

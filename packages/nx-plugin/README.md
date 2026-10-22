@@ -1915,6 +1915,12 @@ Files with a `# smoo-local` tail or `# smoo-local-begin` / `# smoo-local-end` bl
 source symlinks are preserved; conflicting local blocks and broken or external links are reported instead of
 overwritten. The generator does not remove a repository-owned file when a capability is disabled.
 
+`tooling/direnv/repo-path` writes the `PATH` every managed shell entry and git hook uses. In a cowshed workspace whose
+`.cowshed/env` lacks `TMPDIR` or `COWSHED_RUNTIME_LINK`, a fork interrupted before its first supervisor start, it says
+so on stderr, runs `cowshed exec <ws> -- true` once through the installed cowshed, and continues on the file that start
+served. It refuses, naming the workspace and the start's exit status and error, only when that start fails or leaves the
+file unserved (cowshed `specs/cowshed/02_workspaces.md`, "Workspace environment").
+
 ### Workflow security and bounded execution
 
 Managed action references use full commit SHAs with their release tags in comments. Read-only jobs explicitly set
