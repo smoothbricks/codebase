@@ -1009,15 +1009,15 @@ pub async fn serve(
                         .map(|job| (job.job_id, job.class))
                         .collect();
                     // A second `drain` finds the first one's reckoning under way.
-                    let Some(watches) = owed.begin(&running) else {
+                    let ends = ResidentEnd {
+                        supervisor: current.clone(),
+                        report: report.clone(),
+                    };
+                    let Some(watches) = owed.begin(&running, ends) else {
                         return;
                     };
                     for watch in watches {
-                        let resident = watch.ends_resident.then(|| ResidentEnd {
-                            supervisor: current.clone(),
-                            report: report.clone(),
-                        });
-                        Arc::clone(&owed).watch(watch, resident);
+                        Arc::clone(&owed).watch(watch);
                     }
                     owed.publish(&report);
                     if let Err(error) = current.quiesce().await {
@@ -1239,6 +1239,8 @@ struct DrainReads {
 /// The processes that asked for or about one job, each held by the identity the kernel gave its
 /// connection.
 struct Asked {
+    /// The class it was admitted under: a resident ends with its requester.
+    class: ExecClass,
     /// The process whose connection admitted the job.
     requester: Option<Arc<Process>>,
     /// Every other process that held, waited on, sealed or read it.
@@ -1287,7 +1289,7 @@ fn unidentified(job: JobId, error: &io::Error) {
 
 /// A drain under way.
 struct Drain {
-    /// The jobs that ran when it was asked to drain.
+    /// The jobs that ran when it was asked to drain, and any admitted before admission closed.
     running: Vec<JobId>,
     /// Whether they have all ended, so it waits for their reads.
     reading: bool,
@@ -1296,6 +1298,8 @@ struct Drain {
     ended: Vec<RequesterGone>,
     /// The number of the next exit watch.
     next: u64,
+    /// What ends a resident whose requester exits.
+    ends: ResidentEnd,
 }
 
 impl Drain {
@@ -1327,16 +1331,7 @@ impl Drain {
                 if owed.readers.values().any(|known| same_life(known, &peer)) {
                     return None;
                 }
-                let number = self.next;
-                self.next += 1;
-                let process = Arc::new(peer);
-                owed.readers.insert(number, Arc::clone(&process));
-                Some(Watch {
-                    job,
-                    number,
-                    process,
-                    ends_resident: false,
-                })
+                Some(self.owe(job, Arc::new(peer), false))
             }
             Err(error) => {
                 if !owed.unseen {
@@ -1346,6 +1341,55 @@ impl Drain {
                 None
             }
         }
+    }
+
+    /// Owe `job`, admitted under `class` once this drain had begun, to `requester`. Admission
+    /// closes only once the drain has listed its jobs, so a job admitted meanwhile runs, and the
+    /// drain waits for it as for those it listed: the exit to watch, if any.
+    fn requester(
+        &mut self,
+        job: JobId,
+        class: ExecClass,
+        requester: io::Result<Process>,
+    ) -> Option<Watch> {
+        if !self.owed.contains_key(&job) {
+            self.running.push(job);
+        }
+        let owed = self.owed.entry(job).or_default();
+        owed.asked = true;
+        match requester {
+            Ok(requester) => Some(self.owe(job, Arc::new(requester), resident(class))),
+            Err(error) => {
+                owed.unseen = true;
+                unidentified(job, &error);
+                None
+            }
+        }
+    }
+
+    /// Owe `job` to `process`, whose exit ends the job when `ends_resident`: its watch.
+    fn owe(&mut self, job: JobId, process: Arc<Process>, ends_resident: bool) -> Watch {
+        let number = self.next;
+        self.next += 1;
+        self.owed
+            .entry(job)
+            .or_default()
+            .readers
+            .insert(number, Arc::clone(&process));
+        Watch {
+            job,
+            number,
+            process,
+            resident: ends_resident.then(|| self.ends.clone()),
+        }
+    }
+}
+
+/// Whether a job of `class` serves only its requester, and so ends with it.
+fn resident(class: ExecClass) -> bool {
+    match class {
+        ExecClass::Resident | ExecClass::InteractiveResident => true,
+        ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => false,
     }
 }
 
@@ -1387,11 +1431,12 @@ struct Watch {
     job: JobId,
     number: u64,
     process: Arc<Process>,
-    /// The process is the requester of a running resident, which ends with it.
-    ends_resident: bool,
+    /// What ends the job once the process exits: it requested a running resident.
+    resident: Option<ResidentEnd>,
 }
 
 /// What ends a resident whose requester exited: its supervisor, and the report that says so.
+#[derive(Clone)]
 struct ResidentEnd {
     supervisor: WorkspaceSupervisorHandle,
     report: DrainReport,
@@ -1482,33 +1527,49 @@ impl DrainReads {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// `job` was admitted on a connection whose peer is `requester`: owe it there should the
-    /// supervisor drain, until it ends.
+    /// `job` was admitted under `class` on a connection whose peer is `requester`: owe it there
+    /// should the supervisor drain, until it ends. Decided under the drain's lock, so a job
+    /// admitted while a drain begins is owed by that drain, never lost between the two.
     fn admitted(
         self: &Arc<Self>,
         job: JobId,
+        class: ExecClass,
         requester: io::Result<Process>,
         supervisor: &WorkspaceSupervisorHandle,
     ) {
-        let mut asked = Asked {
-            requester: None,
-            readers: Vec::new(),
-            unidentified: false,
-        };
-        match requester {
-            Ok(requester) => asked.requester = Some(Arc::new(requester)),
-            Err(error) => asked.add(job, Err(error)),
-        }
-        self.asked().insert(job, asked);
-        let reads = Arc::clone(self);
-        let supervisor = supervisor.clone();
-        tokio::spawn(async move {
-            // An ended job is owed nothing by a drain that begins later, and a drain that began
-            // took its entry already. A wait refused leaves the entry for the drain to weigh.
-            if supervisor.wait(job).await.is_ok() {
-                reads.asked().remove(&job);
+        let watch = {
+            let mut drain = self.drain();
+            match drain.as_mut() {
+                Some(drain) => drain.requester(job, class, requester),
+                None => {
+                    let mut asked = Asked {
+                        class,
+                        requester: None,
+                        readers: Vec::new(),
+                        unidentified: false,
+                    };
+                    match requester {
+                        Ok(requester) => asked.requester = Some(Arc::new(requester)),
+                        Err(error) => asked.add(job, Err(error)),
+                    }
+                    self.asked().insert(job, asked);
+                    let reads = Arc::clone(self);
+                    let supervisor = supervisor.clone();
+                    tokio::spawn(async move {
+                        // An ended job is owed nothing by a drain that begins later, and a drain
+                        // that began took its entry already. A wait refused leaves the entry for
+                        // the drain to weigh.
+                        if supervisor.wait(job).await.is_ok() {
+                            reads.asked().remove(&job);
+                        }
+                    });
+                    None
+                }
             }
-        });
+        };
+        if let Some(watch) = watch {
+            Arc::clone(self).watch(watch);
+        }
     }
 
     /// `peer` held, waited on, sealed or read `job`: one more process its end is owed to, whose
@@ -1527,69 +1588,68 @@ impl DrainReads {
             }
         };
         if let Some(watch) = watch {
-            Arc::clone(self).watch(watch, None);
+            Arc::clone(self).watch(watch);
         }
     }
 
-    /// Start owing `running`, each job to the processes that asked for or about it: the exits
+    /// Start owing `running`, and every job admitted since they were listed, each to the
+    /// processes that asked for or about it, a resident's requester through `ends`: the exits
     /// to watch, or `None` when a drain already began.
-    fn begin(&self, running: &[(JobId, ExecClass)]) -> Option<Vec<Watch>> {
+    fn begin(&self, running: &[(JobId, ExecClass)], ends: ResidentEnd) -> Option<Vec<Watch>> {
         let mut drain = self.drain();
         if drain.is_some() {
             return None;
         }
-        let mut asked = std::mem::take(&mut *self.asked());
-        let mut next = 0;
+        let mut begun = Drain {
+            running: running.iter().map(|(job, _)| *job).collect(),
+            reading: false,
+            owed: running
+                .iter()
+                .map(|(job, _)| (*job, Owed::default()))
+                .collect(),
+            ended: Vec::new(),
+            next: 0,
+            ends,
+        };
         let mut watches = Vec::new();
-        let mut owed = BTreeMap::new();
-        for &(job, class) in running {
-            let mut entry = Owed::default();
-            if let Some(Asked {
+        // An entry for a job the list did not name was admitted after it: it runs, or its end
+        // was not yet seen, so it is owed as one the drain waits for.
+        for (
+            job,
+            Asked {
+                class,
                 requester,
                 readers,
                 unidentified,
-            }) = asked.remove(&job)
-            {
-                entry.asked = true;
-                entry.unseen = unidentified;
-                let resident =
-                    matches!(class, ExecClass::Resident | ExecClass::InteractiveResident);
-                let requester = requester.map(|process| (process, resident));
-                for (process, ends_resident) in requester
-                    .into_iter()
-                    .chain(readers.into_iter().map(|process| (process, false)))
-                {
-                    entry.readers.insert(next, Arc::clone(&process));
-                    watches.push(Watch {
-                        job,
-                        number: next,
-                        process,
-                        ends_resident,
-                    });
-                    next += 1;
-                }
+            },
+        ) in std::mem::take(&mut *self.asked())
+        {
+            if !begun.owed.contains_key(&job) {
+                begun.running.push(job);
             }
-            owed.insert(job, entry);
+            let owed = begun.owed.entry(job).or_default();
+            owed.asked = true;
+            owed.unseen = unidentified;
+            if let Some(requester) = requester {
+                watches.push(begun.owe(job, requester, resident(class)));
+            }
+            for reader in readers {
+                watches.push(begun.owe(job, reader, false));
+            }
         }
-        *drain = Some(Drain {
-            running: running.iter().map(|(job, _)| *job).collect(),
-            reading: false,
-            owed,
-            ended: Vec::new(),
-            next,
-        });
+        *drain = Some(begun);
         Some(watches)
     }
 
     /// Watch `watch`'s process to its exit, registered before this returns so no exit after it
     /// is missed. The job is no longer owed to the process then, and a resident it requested is
-    /// ended through `resident` first.
-    fn watch(self: Arc<Self>, watch: Watch, resident: Option<ResidentEnd>) {
+    /// ended first.
+    fn watch(self: Arc<Self>, watch: Watch) {
         let Watch {
             job,
             number,
             process,
-            ..
+            resident,
         } = watch;
         let exit = process.exit();
         tokio::spawn(async move {
@@ -1950,7 +2010,10 @@ async fn serve_call(
     {
         owed.asked_about(*job_id, Process::of_socket_peer(&stream));
     }
-    let requester = matches!(*call, Call::Exec { .. }).then(|| Process::of_socket_peer(&stream));
+    let requester = match &*call {
+        Call::Exec { request, .. } => Some((request.class, Process::of_socket_peer(&stream))),
+        _ => None,
+    };
     if let Call::ProcessEvents { job_id, every } = *call {
         serve_process_events(stream, &caller, job_id, every).await?;
         return Ok(Retirement::Serving);
@@ -1984,8 +2047,8 @@ async fn serve_call(
             return Ok(Retirement::Serving);
         }
     };
-    if let (Some(job), Some(requester)) = (admitted, requester) {
-        owed.admitted(job, requester, &caller);
+    if let (Some(job), Some((class, requester))) = (admitted, requester) {
+        owed.admitted(job, class, requester, &caller);
     }
     if retiring {
         // The serving loop releases the listener and lease before acknowledging retirement.
@@ -3895,14 +3958,106 @@ mod drain_read_tests {
 
     const BOUND: Duration = Duration::from_secs(30 * 60);
 
+    /// What would end a resident: a supervisor handle these tests never call, and a report path.
+    fn ends() -> ResidentEnd {
+        ResidentEnd {
+            supervisor: connect(
+                PathBuf::from("/nonexistent/cowshed-drain-test.sock"),
+                WorkspaceAuthoritySnapshot {
+                    repo_id: crate::repository::RepoId::parse("acme/widget").expect("a repo"),
+                    workspace: crate::metadata::WorkspaceName::main(),
+                    workspace_incarnation: crate::metadata::WorkspaceIncarnation::new(
+                        "0".repeat(32),
+                    )
+                    .expect("an incarnation"),
+                    grant_revision: 1,
+                    lifecycle_revision: 1,
+                },
+            ),
+            report: DrainReport::beside(Path::new("/nonexistent/cowshed-drain-test.sock")),
+        }
+    }
+
+    /// A running process this test owns, held by its kernel identity, and its stdin: it exits
+    /// once that closes.
+    fn live() -> (tokio::process::Child, Process) {
+        use cowshed_os::fork_lock::Spawn as _;
+        let child = tokio::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn_locked()
+            .expect("start a process");
+        let pid = i32::try_from(child.id().expect("a running process")).expect("a pid");
+        let process = Process::observe(pid)
+            .expect("observe the process")
+            .expect("the process runs");
+        (child, process)
+    }
+
+    /// A drain lists its jobs before it closes admission, so a resident can be admitted after
+    /// the list: whether its requester is recorded before or after the drain begins, the drain
+    /// owes it to that requester, waits for it, and ends it when the requester exits. Before,
+    /// one recorded after the drain began went only to the pre-drain record, so no requester's
+    /// exit ended it and the drain waited for it forever.
+    #[tokio::test]
+    async fn a_resident_admitted_after_the_drain_listed_its_jobs_ends_with_its_requester() {
+        let ends = ends();
+        let (_before_child, before) = live();
+        let (_after_child, after) = live();
+        let owed = Arc::new(DrainReads::default());
+        // Admitted between the list and the drain's start: recorded before the drain.
+        owed.admitted(job(6), ExecClass::Resident, Ok(before), &ends.supervisor);
+        let watches = owed.begin(&[], ends).expect("the first drain");
+        assert_eq!(watches.len(), 1, "job 6's requester is watched");
+        assert!(
+            watches
+                .iter()
+                .all(|watch| watch.job == job(6) && watch.resident.is_some()),
+            "job 6 ends with its requester"
+        );
+        // Admitted before admission closed but recorded after the drain began.
+        let watch = owed
+            .drain()
+            .as_mut()
+            .expect("the drain")
+            .requester(job(5), ExecClass::InteractiveResident, Ok(after))
+            .expect("job 5's requester is watched");
+        assert_eq!(watch.job, job(5));
+        assert!(watch.resident.is_some(), "job 5 ends with its requester");
+        let drain = owed.drain();
+        let drain = drain.as_ref().expect("the drain");
+        assert_eq!(drain.running, [job(6), job(5)], "the drain waits for both");
+        assert!(drain.owed.values().all(|owed| owed.readers.len() == 1));
+    }
+
+    /// A background job recorded after the drain began is owed to its requester, never ended
+    /// with it.
+    #[tokio::test]
+    async fn a_background_job_admitted_after_the_drain_listed_its_jobs_outlives_its_requester() {
+        let (_child, requester) = live();
+        let owed = DrainReads::default();
+        owed.begin(&[], ends()).expect("the first drain");
+        let watch = owed
+            .drain()
+            .as_mut()
+            .expect("the drain")
+            .requester(job(4), ExecClass::Background, Ok(requester))
+            .expect("job 4's requester is watched");
+        assert!(
+            watch.resident.is_none(),
+            "a background job runs to its own end"
+        );
+    }
+
     /// A job is read once its end reached a client and every stream that client was reading
     /// reached EOF: the end alone leaves the tail of a relayed stream unread.
     #[tokio::test]
     async fn a_job_is_read_once_its_end_and_every_stream_being_read_reached_a_client() {
         let owed = DrainReads::default();
-        assert!(owed.begin(&background(&[1, 2])).is_some());
+        assert!(owed.begin(&background(&[1, 2]), ends()).is_some());
         assert!(
-            owed.begin(&background(&[3])).is_none(),
+            owed.begin(&background(&[3]), ends()).is_none(),
             "a second drain owes nothing new"
         );
         owed.record(job(1), |owed| owed.reading[0] = true);
@@ -3927,7 +4082,7 @@ mod drain_read_tests {
     #[tokio::test(start_paused = true)]
     async fn an_end_nobody_reads_is_given_up_after_the_idle_bound_and_named() {
         let owed = DrainReads::default();
-        owed.begin(&background(&[7]));
+        owed.begin(&background(&[7]), ends());
         let settled = owed.settle(BOUND).await;
         assert!(settled.read.is_empty());
         assert_eq!(settled.unread, [job(7)]);
@@ -3939,28 +4094,29 @@ mod drain_read_tests {
 
     /// Measured 2026-10-22: a drained supervisor whose ended job's client was gone answered the
     /// `hello` of every command of the new build it refused, and each one started its idle bound
-    /// over, so it served until it was killed. Only a read of an owed job starts the bound over.
-    #[tokio::test(start_paused = true)]
+    /// over, so it served until it was killed. Only a read of an owed job starts the bound over:
+    /// the bound's wait restarts on the `read` notification and on nothing else.
+    #[tokio::test]
     async fn only_a_read_of_an_owed_job_starts_the_idle_bound_over() {
-        for (read, owed_job) in [(job(8), false), (job(7), true)] {
-            let owed = Arc::new(DrainReads::default());
-            owed.begin(&background(&[7]));
-            let settling = tokio::spawn({
-                let owed = Arc::clone(&owed);
-                async move { owed.settle(BOUND).await }
-            });
-            tokio::time::sleep(Duration::from_secs(20 * 60)).await;
-            owed.record(read, |owed| owed.reading[0] = true);
-            tokio::time::sleep(Duration::from_secs(11 * 60)).await;
-            assert_eq!(
-                settling.is_finished(),
-                !owed_job,
-                "31 minutes in, after a read of job {} at 20",
-                read.get()
-            );
-            let settled = settling.await.expect("settle");
-            assert_eq!(settled.unread, [job(7)]);
-        }
+        let owed = DrainReads::default();
+        owed.begin(&background(&[7]), ends());
+        let restarted = |owed: &DrainReads| {
+            let mut notified = std::pin::pin!(owed.read.notified());
+            notified
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                .is_ready()
+        };
+        owed.record(job(8), |owed| owed.reading[0] = true);
+        assert!(
+            !restarted(&owed),
+            "a call about a job not owed reads nothing"
+        );
+        owed.record(job(7), |owed| owed.reading[0] = true);
+        assert!(
+            restarted(&owed),
+            "a read of an owed job starts the bound over"
+        );
     }
 
     /// A job owed to processes that have all exited is owed to nobody: the drain waits for no
@@ -3982,15 +4138,18 @@ mod drain_read_tests {
         owed.asked().insert(
             job(3),
             Asked {
+                class: ExecClass::Background,
                 requester: Some(Arc::new(process)),
                 readers: Vec::new(),
                 unidentified: false,
             },
         );
-        let watches = owed.begin(&background(&[3])).expect("the first drain");
+        let watches = owed
+            .begin(&background(&[3]), ends())
+            .expect("the first drain");
         assert_eq!(watches.len(), 1, "job 3's requester is watched");
         for watch in watches {
-            Arc::clone(&owed).watch(watch, None);
+            Arc::clone(&owed).watch(watch);
         }
         drop(reader.stdin.take());
         assert!(reader.wait().await.expect("the reader exits").success());
@@ -4011,8 +4170,8 @@ mod drain_read_tests {
     /// A draining supervisor's report says what it waits for at each step, read back by the
     /// pid serving the socket. A report another pid wrote is a killed supervisor's and says
     /// nothing, and one that does not decode says so rather than vanishing.
-    #[test]
-    fn a_drain_report_names_what_the_supervisor_serving_the_socket_waits_for() {
+    #[tokio::test]
+    async fn a_drain_report_names_what_the_supervisor_serving_the_socket_waits_for() {
         let root = std::env::temp_dir().join(format!(
             "cowshed-drain-report-{}-{}",
             std::process::id(),
@@ -4046,7 +4205,7 @@ mod drain_read_tests {
         );
 
         let owed = DrainReads::default();
-        owed.begin(&background(&[7024, 7025]));
+        owed.begin(&background(&[7024, 7025]), ends());
         owed.record(job(7025), |owed| owed.end = true);
         owed.reading(&report);
         assert_eq!(
