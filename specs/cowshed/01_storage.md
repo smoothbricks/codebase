@@ -260,7 +260,7 @@ Background reclamation handles only explicitly released build images and provabl
 | Recovery images (`sessions/.trash/…`)        | retained even when their record is missing; never deleted by startup or generic `gc`   | recover their contents deliberately; clean landed source images are unlinked by retirement, not put here |
 | Historical build trash (`build/.trash/…`)    | no new entries; build images unlink inside the operation that retires or replaces them | the daemon's start and `cowshed gc` finish old entries; gc refuses if one cannot be freed                |
 | Abandon bundles (`sessions/.trash/*.bundle`) | never reclaimed by default; their tips are also kept as refs in main's repository      | explicit `cowshed gc --abandoned`                                                                        |
-| Abandoned refs (in main's repository)        | retired by every `gc` once main holds each tip, by ancestry or content                 | `cowshed gc --supersede <ws>/<head> --reason <one line>`                                                 |
+| Abandoned refs (in main's repository)        | retired by every `gc` once main holds each tip, by ancestry, content or patch identity | `cowshed gc --supersede <ws>/<head> --reason <one line>`                                                 |
 | Dead shared-temp scratch                     | sockets/empty locks deleted; all other contents renamed to `<store>/.trash/scratch/`   | unknown/live owners kept; archived evidence kept for 24 hours before background deletion                 |
 
 - `cowshed gc` evaluates both checkpoint floors independently: it deletes only an unpinned checkpoint that is at least
@@ -299,17 +299,18 @@ Background reclamation handles only explicitly released build images and provabl
   its table. Naming them authorizes nothing; the plain sweep's own plan still never holds one.
 - Abandoned refs are retired by every `gc` once main holds them, so main's repository keeps no ref for work it already
   has. Each `refs/cowshed/<ws>/abandoned/<head>/` namespace's tips are measured as the `rm` gate measures a branch
-  (02_workspaces.md, `rm` step 1): an ancestor of main's branch, or every file its commits change already as main has
-  it, whatever history, patch identity or conflict resolution got it there. A namespace main holds every tip of is
-  deleted ref by ref (`update-ref -d <ref> <tip>`, so a ref moved since it was measured is refused, never lost) and
-  journaled as one `retire-abandoned-ref` deletion-log line naming each tip and the branch and head that hold it
-  (`{"by":"target",…}`). Every other namespace is kept: `gc` reports it, `doctor` names it as an `abandoned-refs` info
-  finding with each tip's count of commits main does not hold, and `ls --all` names it after its table. Its owner lets
-  one go with `cowshed gc --supersede <ws>/<head> --reason "<one line>"`, which retires that namespace whatever main
-  holds and journals the reason (`{"by":"superseded","reason":…}`); a blank, whitespace-only or multi-line reason, or a
-  namespace main's repository does not keep, is refused. `--dry-run` reports both and deletes nothing. When main's
-  repository cannot be measured, nothing is retired and the report says why; a supersession then refuses. A ref under an
-  `abandoned/` namespace that no abandonment writes is reported and never touched.
+  (02_workspaces.md, `rm` step 1): an ancestor of main's branch, or each of its commits held by content (every file it
+  changes already as main has it, whatever history or conflict resolution got it there) or by a patch-equivalent commit
+  of main. A namespace main holds every tip of is deleted ref by ref (`update-ref -d <ref> <tip>`, so a ref moved since
+  it was measured is refused, never lost) and journaled as one `retire-abandoned-ref` deletion-log line naming each tip
+  and the branch and head that hold it (`{"by":"target",…}`). Every other namespace is kept: `gc` reports it, `doctor`
+  names it as an `abandoned-refs` info finding with each tip's count of commits main does not hold, and `ls --all` names
+  it after its table. Its owner lets one go with `cowshed gc --supersede <ws>/<head> --reason "<one line>"`, which
+  retires that namespace whatever main holds and journals the reason (`{"by":"superseded","reason":…}`); a blank,
+  whitespace-only or multi-line reason, or a namespace main's repository does not keep, is refused. `--dry-run` reports
+  both and deletes nothing. When main's repository cannot be measured, nothing is retired and the report says why; a
+  supersession then refuses. A ref under an `abandoned/` namespace that no abandonment writes is reported and never
+  touched.
 - Explicit workspace retirement is the sole exception to live checkpoint retention: its exact trash metadata authorizes
   one workspace-scoped cleanup plan that includes pinned checkpoints and pre-restore undo generations as well as the
   trash image and empty mountpoint. Preview and execution validate the repository, workspace, incarnation, checkpoint

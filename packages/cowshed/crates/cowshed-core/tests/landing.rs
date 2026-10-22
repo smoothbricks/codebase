@@ -18,7 +18,7 @@ use std::process::Command;
 use cowshed_core::api::{
     BranchLandings, LandingCommits, UnlandedChange, UnlandedPaths, WorkspaceLanding,
 };
-use cowshed_core::landing::{measure, resolve_target};
+use cowshed_core::landing::{measure, resolve_target, unmatched_commits};
 use cowshed_os::fork_lock::Run as _;
 
 #[path = "support/temp_parent.rs"]
@@ -551,6 +551,152 @@ async fn a_pick_resolved_without_the_workspace_line_names_the_file_as_a_conflict
         "kept.txt is held; only the file whose change the target lacks is named"
     );
     assert!(!landing.commits.fully_landed());
+}
+
+/// The commits the target holds neither by content nor by patch identity, as `rm`'s refusal names
+/// them: oid and subject, oldest first.
+async fn unmatched(fixture: &Fixture, mount: &Path) -> Vec<(String, String)> {
+    let target = resolve_target(fixture.store(), &fixture.parent(), TARGET)
+        .await
+        .expect("main resolves");
+    unmatched_commits(
+        fixture.store(),
+        &fixture.parent(),
+        target.tip(),
+        mount,
+        "HEAD",
+    )
+    .await
+    .expect("the unmatched commits are named")
+    .into_iter()
+    .map(|commit| (commit.oid.to_string(), commit.subject))
+    .collect()
+}
+
+/// Pick the workspace commit `oid` into the parent cleanly.
+fn pick(fixture: &Fixture, mount: &Path, oid: &str) {
+    git(
+        fixture.parent(),
+        [
+            OsStr::new("fetch"),
+            OsStr::new("-q"),
+            mount.as_os_str(),
+            OsStr::new("HEAD"),
+        ],
+    );
+    git(fixture.parent(), ["cherry-pick", oid]);
+}
+
+/// The landing batch sheds were refused for: main took the workspace's commit by
+/// cherry-pick, then edited the very line it changed. Main's content no longer carries the
+/// workspace's line, so the content proof alone would name `gate.txt`; main holds a
+/// patch-equivalent commit, so the work is landed and `rm` needs no flag.
+#[tokio::test]
+async fn a_picked_commit_main_then_edited_past_is_landed_by_patch_identity() {
+    let fixture = Fixture::new("picked-then-edited");
+    fixture.parent_commit("gate.txt", "alpha\nbeta\ngamma\n", "gate");
+    let mount = fixture.clone_workspace("gate-coverage");
+    workspace_commit(
+        &mount,
+        "gate.txt",
+        "alpha\nbeta shed\ngamma\n",
+        "cover the gate",
+    );
+    let shed = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
+    pick(&fixture, &mount, &shed);
+    fixture.parent_commit(
+        "gate.txt",
+        "alpha\nbeta main\ngamma\n",
+        "main rewrites the line",
+    );
+
+    let landing = measured(&fixture, &mount).await;
+    assert_eq!(counts(&landing), (0, 1, 2), "{landing:?}");
+    assert!(landing.commits.fully_landed(), "{landing:?}");
+    assert_eq!(unmatched(&fixture, &mount).await, []);
+}
+
+/// One commit picked and edited past, one never taken: only the commit held by neither proof is
+/// unlanded, and the file only the picked commit changed is not named.
+#[tokio::test]
+async fn an_unpicked_commit_beside_a_picked_one_is_named_and_the_picked_file_is_not() {
+    let fixture = Fixture::new("picked-and-not");
+    fixture.parent_commit("gate.txt", "alpha\nbeta\ngamma\n", "gate");
+    let mount = fixture.clone_workspace("gate-coverage");
+    workspace_commit(
+        &mount,
+        "gate.txt",
+        "alpha\nbeta shed\ngamma\n",
+        "cover the gate",
+    );
+    let shed = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
+    workspace_commit(&mount, "notes.txt", "never picked\n", "shed notes");
+    let notes = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
+    pick(&fixture, &mount, &shed);
+    fixture.parent_commit(
+        "gate.txt",
+        "alpha\nbeta main\ngamma\n",
+        "main rewrites the line",
+    );
+
+    let landing = measured(&fixture, &mount).await;
+    assert_eq!(counts(&landing), (1, 1, 2), "{landing:?}");
+    assert_eq!(
+        unlanded_paths(&landing),
+        [("notes.txt", &UnlandedChange::Added)]
+    );
+    assert_eq!(
+        unmatched(&fixture, &mount).await,
+        [(notes, String::from("shed notes"))]
+    );
+}
+
+/// A squash of two commits matches neither one's patch, so once main edits past the squashed
+/// lines no proof holds them: both commits are unlanded and named. Patch identity admits a commit
+/// main holds verbatim, never a squash or a resolution it cannot see in any single patch.
+#[tokio::test]
+async fn a_squash_main_then_edited_past_is_held_by_neither_proof_and_names_each_commit() {
+    let fixture = Fixture::new("squashed-then-edited");
+    fixture.parent_commit("gate.txt", "alpha\nbeta\ngamma\n", "gate");
+    let mount = fixture.clone_workspace("gate-coverage");
+    workspace_commit(
+        &mount,
+        "gate.txt",
+        "alpha\nbeta shed\ngamma\n",
+        "cover beta",
+    );
+    let first = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
+    workspace_commit(
+        &mount,
+        "gate.txt",
+        "alpha\nbeta shed\ngamma shed\n",
+        "cover gamma",
+    );
+    let second = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
+    fixture.land_content_separately(
+        "gate.txt",
+        "alpha\nbeta shed\ngamma shed\n",
+        "cover the gate, squashed",
+    );
+    fixture.parent_commit(
+        "gate.txt",
+        "alpha\nbeta main\ngamma shed\n",
+        "main rewrites beta",
+    );
+
+    let landing = measured(&fixture, &mount).await;
+    assert_eq!(counts(&landing), (2, 0, 2), "{landing:?}");
+    assert_eq!(
+        unlanded_paths(&landing),
+        [("gate.txt", &UnlandedChange::Conflict)]
+    );
+    assert_eq!(
+        unmatched(&fixture, &mount).await,
+        [
+            (first, String::from("cover beta")),
+            (second, String::from("cover gamma")),
+        ]
+    );
 }
 
 /// Every way a file can differ reads as itself: an edit the target never took, a file the

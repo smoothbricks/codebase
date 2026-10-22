@@ -184,14 +184,16 @@ pub struct CommitSubject {
     pub subject: String,
 }
 
-/// What a head carries that a target does not hold, judged by content
+/// What a head carries that a target holds neither by content nor by patch identity
 /// ([`GitRepository::content_not_held`]).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ContentNotHeld {
-    /// Each file whose change the target does not hold, in path order.
+    /// Each file whose change the target does not hold, in path order: every one is changed by
+    /// one of `commits`.
     pub paths: Vec<UnlandedPath>,
-    /// Commits of `target..head` that change one of `paths`: zero exactly when `paths` is empty.
-    pub commits: u64,
+    /// The commits of `target..head`, oldest first, that change one of `paths` and have no
+    /// patch-equivalent in the target: empty exactly when `paths` is empty.
+    pub commits: Vec<CommitSubject>,
 }
 
 /// One side of a `diff-tree --raw` change: the entry's mode and object.
@@ -1762,18 +1764,28 @@ impl GitRepository {
         Ok(())
     }
 
-    /// What `head` changed since its merge base with `revision` that `revision` does not hold:
-    /// each such file with why, and how many commits of `revision..head` change one of them.
+    /// What `head` changed since its merge base with `revision` that `revision` holds neither by
+    /// content nor by patch identity: each such file with why, and the commits of
+    /// `revision..head` that change one of them and that `revision` has no patch-equivalent of.
     ///
-    /// Content, never commit identity, because the question is whether the work is in the target
-    /// (`cowshed rm`, 02_workspaces.md step 1), and work reaches a target under other commits: a
-    /// cherry-pick, a squash, a rewrite, or a pick whose conflict a lander resolved on the way in.
-    /// A file `head` changed is held when `revision` has the same entry, or when merging `head`'s
-    /// change into `revision`'s version (`git merge-file`, based at the merge base) shows the
-    /// target already holds it beside later edits of its own (`held_change`): a clean
-    /// merge that reproduces the target's version byte for byte, or conflicted regions in which
-    /// the target's lines carry every hunk the workspace made there. Every other file is named
-    /// with its [`UnlandedChange`].
+    /// The question is whether the work is in the target (`cowshed rm`, 02_workspaces.md step 1),
+    /// and work reaches a target under other commits, so a commit is held by either of two proofs:
+    ///
+    /// * **Content.** A file `head` changed is held when `revision` has the same entry, or when
+    ///   merging `head`'s change into `revision`'s version (`git merge-file`, based at the merge
+    ///   base) shows the target already holds it beside later edits of its own (`held_change`): a
+    ///   clean merge that reproduces the target's version byte for byte, or conflicted regions in
+    ///   which the target's lines carry every hunk the workspace made there. A squash, a rewrite or
+    ///   a pick whose conflict a lander resolved on the way in is held this way.
+    /// * **Patch identity.** A commit the target holds a patch-equivalent of is held, by the rules
+    ///   of [`Self::commits_not_held`] (`git cherry` over the target's commits since the merge base,
+    ///   for ordinary commits that change something, and merges that author nothing), even when
+    ///   the target has since edited the same lines, which the content proof cannot see past.
+    ///
+    /// A file the content proof does not hold is named with its [`UnlandedChange`] only while some
+    /// commit that changes it is held by neither proof; a file only patch-held commits change is
+    /// held. A squash of several commits or a conflict-resolved pick matches no commit's patch, so
+    /// it is held by content or not at all.
     ///
     /// Nothing is written: `merge-file -p` prints its result rather than storing it. Strict on
     /// both endpoints like [`Self::commits_ahead_of`]. Histories with no merge base are refused:
@@ -1786,7 +1798,6 @@ impl GitRepository {
             return Ok(ContentNotHeld::default());
         }
         let differing = self.tree_changes(revision, head).await?;
-        let mut paths = Vec::new();
         let mut unheld = Vec::new();
         for (path, (target, here)) in &differing {
             // A path only the target changed is the target's own work, not the workspace's.
@@ -1797,22 +1808,52 @@ impl GitRepository {
                 .change_not_held(base.as_ref(), here.as_ref(), target.as_ref())
                 .await?
             {
+                unheld.push((path.as_slice(), change));
+            }
+        }
+        if unheld.is_empty() {
+            return Ok(ContentNotHeld::default());
+        }
+        let held = self.held_commits(revision, head).await?;
+        let mut paths = Vec::new();
+        let mut unmatched = std::collections::BTreeSet::new();
+        for (path, change) in unheld {
+            let changing = self.commits_changing(revision, head, path).await?;
+            // Every unheld file differs from the merge base, so some commit of the range changed it.
+            // Git disagreeing with itself here must not read as "held by patch identity".
+            if changing.is_empty() {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "git reported that {revision} lacks the change to {}, yet no commit of \
+                         {revision}..{head} changes it: refusing to guess which is right",
+                        String::from_utf8_lossy(path)
+                    ),
+                    "repair the git repository",
+                ));
+            }
+            let mut unheld_by = changing
+                .into_iter()
+                .filter(|oid| !held.contains(oid))
+                .peekable();
+            if unheld_by.peek().is_some() {
+                unmatched.extend(unheld_by);
                 paths.push(UnlandedPath {
                     path: String::from_utf8_lossy(path).into_owned(),
                     change,
                 });
-                unheld.push(path.as_slice());
             }
         }
-        let commits = self.commits_changing(revision, head, &unheld).await?;
-        // Every unheld file differs from the merge base, so some commit of the range changed it.
-        // Git disagreeing with itself here must not read as "nothing unlanded".
-        if commits == 0 && !paths.is_empty() {
+        let commits = self
+            .range_subjects(revision, head, |oid| unmatched.contains(oid))
+            .await?;
+        // `unmatched` came out of the same range, so every one of its commits is listed there.
+        if commits.len() != unmatched.len() {
             return Err(CowshedError::integrity(
                 format!(
-                    "git reported {} files whose change {revision} does not hold, yet no commit \
-                     of {revision}..{head} changes them: refusing to guess which is right",
-                    paths.len()
+                    "git named {} commits of {revision}..{head} that change an unheld file, yet \
+                     lists {} of them in that range: refusing to guess which is right",
+                    unmatched.len(),
+                    commits.len()
                 ),
                 "repair the git repository",
             ));
@@ -1967,31 +2008,28 @@ impl GitRepository {
         Ok(changes)
     }
 
-    /// How many commits of `revision..head` change one of `paths`, each taken literally.
-    async fn commits_changing(&self, revision: &str, head: &str, paths: &[&[u8]]) -> Result<u64> {
-        if paths.is_empty() {
-            return Ok(0);
-        }
-        let mut args: Vec<OsString> = vec![
-            "rev-list".into(),
-            "--count".into(),
-            format!("{revision}..{head}").into(),
-            "--".into(),
-        ];
-        args.extend(
-            paths
-                .iter()
-                .map(|path| OsString::from_vec([b":(literal)".as_slice(), path].concat())),
-        );
-        let count = self
-            .read_one(args, "count commits that change unheld files")
+    /// The commits of `revision..head` that change `path`, taken literally.
+    async fn commits_changing(
+        &self,
+        revision: &str,
+        head: &str,
+        path: &[u8],
+    ) -> Result<Vec<String>> {
+        let output = self
+            .run([
+                OsString::from("rev-list"),
+                format!("{revision}..{head}").into(),
+                "--".into(),
+                OsString::from_vec([b":(literal)".as_slice(), path].concat()),
+            ])
             .await?;
-        count.parse().map_err(|_| {
-            CowshedError::integrity(
-                format!("git reported an unparseable commit count: {count}"),
-                "repair the git repository",
-            )
-        })
+        if !output.status.success() {
+            return Err(git_internal(
+                "list commits that change an unheld file",
+                &output,
+            ));
+        }
+        parse_lines(&output.stdout, "commit identity")
     }
 
     /// The commits of `revision..head` that `revision` does not hold by ancestry or patch
@@ -1999,8 +2037,8 @@ impl GitRepository {
     /// `revision` would lose, as commits.
     ///
     /// This is the install gate's identity question (05_gateway.md, "The installed cowshed"), not
-    /// `rm`'s content one ([`Self::content_not_held`]): a build that lacks a commit lacks it,
-    /// whatever its tree says.
+    /// `rm`'s, which also holds a commit by content ([`Self::content_not_held`]): a build that
+    /// lacks a commit lacks it, whatever its tree says.
     ///
     /// `git cherry` semantics for ordinary commits, and the semantics matter: equivalence is decided
     /// by patch-id, so a commit that reached `revision` by cherry-pick, a history rewrite, or a
@@ -2030,6 +2068,18 @@ impl GitRepository {
     pub async fn commits_not_held(&self, revision: &str, head: &str) -> Result<Vec<CommitSubject>> {
         self.require_commits([revision, head]).await?;
         let held = self.held_commits(revision, head).await?;
+        self.range_subjects(revision, head, |oid| !held.contains(oid))
+            .await
+    }
+
+    /// The commits of `revision..head` that `keep` admits by oid, oldest first, each with its
+    /// subject.
+    async fn range_subjects(
+        &self,
+        revision: &str,
+        head: &str,
+        keep: impl Fn(&str) -> bool,
+    ) -> Result<Vec<CommitSubject>> {
         let output = self
             .run([
                 "log",
@@ -2039,9 +2089,9 @@ impl GitRepository {
             ])
             .await?;
         if !output.status.success() {
-            return Err(git_internal("list commits not held", &output));
+            return Err(git_internal("list commit subjects", &output));
         }
-        let mut lost = Vec::new();
+        let mut kept = Vec::new();
         for line in parse_lines(&output.stdout, "commit subject")? {
             let (oid, subject) = line.split_once('\0').ok_or_else(|| {
                 CowshedError::integrity(
@@ -2049,14 +2099,14 @@ impl GitRepository {
                     "repair the git installation",
                 )
             })?;
-            if !held.contains(oid) {
-                lost.push(CommitSubject {
+            if keep(oid) {
+                kept.push(CommitSubject {
                     oid: parse_oid(oid.to_owned(), "commit subject")?,
                     subject: subject.to_owned(),
                 });
             }
         }
-        Ok(lost)
+        Ok(kept)
     }
 
     /// The commits of `revision..head` that `revision` already holds: patch-equivalent ordinary

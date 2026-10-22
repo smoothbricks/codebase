@@ -100,9 +100,11 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
    meant for the batch from the start forks from it (`cowshed fork <batch> <unit>`); the batch itself lands to main as
    an ordinary gated workspace, and its `--check` is the lane's one build.
 7. A shed whose work main already holds, or that carries none, is removed with plain `cowshed rm <ws>` and no check
-   first: rm proves containment by content against live main, over every local branch. A containment refusal names the
-   commits main lacks, and that shed is folded into the batch by step 6. Every other refusal (a workspace younger than
-   the age floor, a dirty tree, a process holding the mount, a lifecycle operation in progress) names its own remedy.
+   first: rm proves containment against live main, over every local branch: a commit is held when main's content carries
+   its change or main holds a patch-equivalent commit (`git cherry`), so a cherry-pick main later edited past still
+   counts. A containment refusal names the commits held by neither, and that shed is folded into the batch by step 6.
+   Every other refusal (a workspace younger than the age floor, a dirty tree, a process holding the mount, a lifecycle
+   operation in progress) names its own remedy.
 
 ## Enter a shed through `cowshed exec`
 

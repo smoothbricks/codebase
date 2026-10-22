@@ -618,11 +618,13 @@ the way `detach <name>` does — from the store, by its session name — and ref
 one holds it. The address is all that changes; the gate below is the same.
 
 Removing a workspace destroys its image, and the image is where its commits live — so `rm` refuses (exit 4) unless
-`main` already holds the workspace's work. Holding is judged by content: a `HEAD` main contains is landed, and otherwise
-every file the workspace changed since its merge base with main must already carry that change in main, beside whatever
-main changed since. Work main took by squash, cherry-pick, a rewrite or a conflict-resolved pick is landed. The refusal
-names main's tip, each file whose change main lacks with why (`missing`, `conflict`, `added`, `deleted`, `changed`,
-`mode`, `unmergeable`; ten, then a count), and points at `cowshed land <ws>`.
+`main` already holds the workspace's work. A `HEAD` main contains is landed; otherwise every commit main lacks must be
+held by content or by patch identity. Content: every file the workspace changed since its merge base with main already
+carries that change in main, beside whatever main changed since. Patch identity: main holds a patch-equivalent commit
+(`git cherry`), even where main has since edited the same lines. Work main took by squash, cherry-pick, a rewrite or a
+conflict-resolved pick is landed. The refusal names main's tip, each file whose change main lacks with why (`missing`,
+`conflict`, `added`, `deleted`, `changed`, `mode`, `unmergeable`; ten, then a count), the commits held by neither proof
+with their subjects (ten, then a count), and points at `cowshed land <ws>`.
 
 The project-open `cowshed: info: leaving … unfinished lifecycle operations …` line concerns other workspaces outside
 this command's recovery scope. It explicitly says those operations do not block this command; `cowshed doctor` lists
@@ -1709,9 +1711,9 @@ Deletes retired and orphaned images and stale mountpoint dirs, prunes expired ch
 Safe to run anytime; `rm`, `land`, and `restore` also run it opportunistically.
 
 Every `gc` also retires the refs `rm --abandon` kept in main, `refs/cowshed/<ws>/abandoned/<head>/`, once main holds
-every tip, by ancestry or by content: a cherry-pick, a squash or a pick whose conflict was resolved counts, as it does
-for `rm`. Each retirement is a `retire-abandoned-ref` line in the project's deletion log. `gc` keeps the rest and names
-each with how many commits main does not hold; `cowshed doctor` reports them as `abandoned-refs` findings and
+every tip, by ancestry, content or patch identity: a cherry-pick, a squash or a pick whose conflict was resolved counts,
+as it does for `rm`. Each retirement is a `retire-abandoned-ref` line in the project's deletion log. `gc` keeps the rest
+and names each with how many commits main does not hold; `cowshed doctor` reports them as `abandoned-refs` findings and
 `cowshed ls --all` after its table. When that work is no longer wanted, say why and let it go:
 
 ```sh

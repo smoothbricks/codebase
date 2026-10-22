@@ -1238,32 +1238,38 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
 ## `cowshed rm <ws>` — perceived-instant deletion
 
 1. Refuse (exit 4) unless every local branch (HEAD included) is landed in live main: the image takes every branch with
-   it. Landed is judged by content, never by commit identity, in two questions. A tip main contains (an ancestor of
-   main, or main itself) is landed, cheaply and exactly. Otherwise, for each file the branch changed since its merge
-   base with main, main must already hold that change: main has the same entry, or merging the branch's change into
-   main's version (`git merge-file`, based at the merge base) reproduces main's version, where a region both changed is
-   held when main's lines there have dropped the lines the branch replaced and carry the lines it wrote, in order. A
-   cherry-pick, a squash, a history rewrite, or a pick whose conflict a lander resolved therefore lands the work under
-   other commits; an empty commit changes no file and carries nothing. A branch other than HEAD also passes when its tip
-   equals or is an ancestor of main's repository branch of the same name or of `refs/cowshed/<ws>/heads/<branch>`, where
-   `push` preserves it. The refusal names each branch that did not pass with its tip, how many of its commits change an
-   unheld file, and each such file with why main lacks its change (`missing`, `conflict`, `added`, `deleted`, `changed`
-   where main deleted the file, `mode`, or `unmergeable` with git's reason), ten files per branch and a count of the
-   rest; `ls --landed` applies the same measurement. This is not the install gate's question (05_gateway.md, "The
-   installed cowshed"), which asks whether a build holds the installed commits themselves, by ancestry or patch
-   identity. `--force` permits loss of dirty/in-progress state, not unlanded work. An explicit `rm` (and a project
-   purge, for each session it removes) also refuses a workspace younger than ten minutes, measured from the creation
-   time its record carries, after every other gate has passed: a clean workspace at main is indistinguishable from a
-   landed one, and one its owner forked minutes ago may not have its first edit yet. The refusal names the age and the
-   floor, and its hint the remedies that keep the work; a creation time that cannot be read refuses the same way. It
-   alone carries `removal: {reason: "young", createdAt, removableAt}`: `removableAt` is the first second the floor lets
-   the workspace go, absent when the creation cannot be read, so a caller that owns the workspace waits for that second
-   instead of copying the floor. `--force` overrides it. A `land` retiring the unit it landed, and the replay of a
-   removal already authorized, are not asked. Explicit `--abandon` requires a verified recovery bundle,
-   `sessions/.trash/<ws>-<head>.bundle`, holding HEAD and every branch that did not pass as refs, before retiring
-   unlanded work. It is written beside that name and renamed into place once verified; a retried removal that finds a
-   bundle verifying for the same range keeps it instead of writing another. The verified bundle's tips are then fetched
-   into main's repository, unforced, as `refs/cowshed/<ws>/abandoned/<head>/HEAD` and
+   it. Landed is judged in two questions. A tip main contains (an ancestor of main, or main itself) is landed, cheaply
+   and exactly. Otherwise every commit of `main..<tip>` must be held by one of two proofs. **Content:** for each file
+   the branch changed since its merge base with main, main already holds that change: main has the same entry, or
+   merging the branch's change into main's version (`git merge-file`, based at the merge base) reproduces main's
+   version, where a region both changed is held when main's lines there have dropped the lines the branch replaced and
+   carry the lines it wrote, in order. **Patch identity:** main holds a patch-equivalent commit, as
+   `git cherry main <tip>` marks it `-` (git's patch-id against main's commits since the merge base), for an ordinary
+   commit that changes something; a merge that authors nothing (an empty combined diff) is held as well. A file the
+   content proof does not hold is unheld while any commit that changes it is held by neither proof. A cherry-pick, a
+   squash, a history rewrite, or a pick whose conflict a lander resolved therefore lands the work under other commits, a
+   pick main then edited past is held by patch identity, and an empty commit changes no file and carries nothing; a
+   squash of several commits or a resolved pick that main then edited past matches no commit's patch and is held by
+   neither. A branch other than HEAD also passes when its tip equals or is an ancestor of main's repository branch of
+   the same name or of `refs/cowshed/<ws>/heads/<branch>`, where `push` preserves it. The refusal names each branch that
+   did not pass with its tip, how many of its commits neither proof holds, each unheld file with why main lacks its
+   change (`missing`, `conflict`, `added`, `deleted`, `changed` where main deleted the file, `mode`, or `unmergeable`
+   with git's reason), ten files per branch and a count of the rest, and then those commits, each with its subject, ten
+   and a count of the rest; `ls --landed` applies the same measurement. This is not the install gate's question
+   (05_gateway.md, "The installed cowshed"), which asks whether a build holds the installed commits themselves, by
+   ancestry or patch identity alone. `--force` permits loss of dirty/in-progress state, not unlanded work. An explicit
+   `rm` (and a project purge, for each session it removes) also refuses a workspace younger than ten minutes, measured
+   from the creation time its record carries, after every other gate has passed: a clean workspace at main is
+   indistinguishable from a landed one, and one its owner forked minutes ago may not have its first edit yet. The
+   refusal names the age and the floor, and its hint the remedies that keep the work; a creation time that cannot be
+   read refuses the same way. It alone carries `removal: {reason: "young", createdAt, removableAt}`: `removableAt` is
+   the first second the floor lets the workspace go, absent when the creation cannot be read, so a caller that owns the
+   workspace waits for that second instead of copying the floor. `--force` overrides it. A `land` retiring the unit it
+   landed, and the replay of a removal already authorized, are not asked. Explicit `--abandon` requires a verified
+   recovery bundle, `sessions/.trash/<ws>-<head>.bundle`, holding HEAD and every branch that did not pass as refs,
+   before retiring unlanded work. It is written beside that name and renamed into place once verified; a retried removal
+   that finds a bundle verifying for the same range keeps it instead of writing another. The verified bundle's tips are
+   then fetched into main's repository, unforced, as `refs/cowshed/<ws>/abandoned/<head>/HEAD` and
    `refs/cowshed/<ws>/abandoned/<head>/heads/<branch>`, each read back against the tip the bundle advertises, before
    anything retires: the trash is emptied by `gc --abandoned`, and the refs by any `gc` once main holds every tip by
    this gate's own measurement, or by their owner's `gc --supersede` (01_storage.md, "Retention"). Keying the namespace

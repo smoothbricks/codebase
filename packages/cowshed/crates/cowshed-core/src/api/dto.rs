@@ -865,10 +865,11 @@ pub struct BranchLanding {
 /// confused by a reader or a script: there is no shape in which a count is absent but a verdict is
 /// still available, and none in which the absence of a count reads as zero.
 ///
-/// The verdict is content, not commit identity (02_workspaces.md, `rm` step 1): a head the target
-/// contains is landed, and otherwise every file the workspace changed since its merge base with the
-/// target must already carry that change in the target. A cherry-pick, a squash, or a pick whose
-/// conflict was resolved on the way in all land the content under other commits.
+/// The verdict is content or patch identity (02_workspaces.md, `rm` step 1): a head the target
+/// contains is landed, and otherwise each commit must be held by the target's content (every file
+/// the workspace changed since its merge base with the target already carries that change there)
+/// or by a patch-equivalent commit of the target. A cherry-pick, a squash, or a pick whose conflict
+/// was resolved on the way in all land the work under other commits.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum LandingCommits {
@@ -878,9 +879,10 @@ pub enum LandingCommits {
     Measured {
         target_branch: String,
         target_head: GitOid,
-        /// Commits the target does not hold: those changing a file `unlanded_paths` names, or for a
-        /// measurement recorded before files were named, those `git cherry` found unheld. Zero is
-        /// the only value that authorizes removing the workspace without `--abandon`.
+        /// Commits the target holds neither by content nor by patch identity: each changes a file
+        /// `unlanded_paths` names. For a measurement recorded before files were named, those
+        /// `git cherry` found unheld. Zero is the only value that authorizes removing the workspace
+        /// without `--abandon`.
         unlanded: u64,
         /// Commits whose every change the target already holds, however it got there: by ancestry,
         /// cherry-pick, squash-merge, a history rewrite, or a conflict-resolved pick.

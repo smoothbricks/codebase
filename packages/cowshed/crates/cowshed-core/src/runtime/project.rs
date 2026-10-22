@@ -6610,11 +6610,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// target's object store attached read-only, so its commits are visible without fetching and
     /// without writing anything anywhere.
     ///
-    /// Containment is by content, not only by ancestry. That is the correction this gate needed:
-    /// a workspace whose work reached main by squash-merge, a history rewrite, or a pick whose
-    /// conflict was resolved on the way in is not an ancestor of anything, and demanding
-    /// `--abandon` to retire it taught callers to pass a commit-destroying flag for a safe
-    /// operation.
+    /// Containment is by content or patch identity, not only by ancestry. That is the correction
+    /// this gate needed: a workspace whose work reached main by squash-merge, a cherry-pick main
+    /// then edited past, a history rewrite, or a pick whose conflict was resolved on the way in is
+    /// not an ancestor of anything, and demanding `--abandon` to retire it taught callers to pass
+    /// a commit-destroying flag for a safe operation.
     async fn landed_state(
         &self,
         workspace: &WorkspaceName,
@@ -6671,11 +6671,20 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             }
             _ => None,
         };
+        let unmatched = refused_commits(
+            self.git.store_root(),
+            &containment.mount,
+            &self.workspace_mount_path(workspace)?,
+            &fence.head,
+            &refused,
+        )
+        .await;
         Err(removal_unlanded_refusal(
             workspace,
             &fence.head,
             &refused,
             published.as_ref(),
+            &unmatched,
         ))
     }
 
@@ -10959,9 +10968,14 @@ mod rebase_recovery_tests {
                 target_behind: 1,
             })
         );
-        let message =
-            removal_unlanded_refusal(&Lane::name("shed"), &head, &refused, holding.as_ref())
-                .message;
+        let message = removal_unlanded_refusal(
+            &Lane::name("shed"),
+            &head,
+            &refused,
+            holding.as_ref(),
+            &UnmatchedCommits::new(),
+        )
+        .message;
         assert!(
             message.ends_with(&format!(
                 "(main is at {main_tip}): release.txt (added: main does not have it); \
@@ -11084,11 +11098,15 @@ mod rebase_recovery_tests {
         else {
             panic!("main never took notes.txt");
         };
+        // The held pick is not named; the commit main holds by neither proof is, with its subject.
+        let unmatched = refused_commits(store_root, &lane.main, &shed, &head, &refused).await;
         assert_eq!(
-            removal_unlanded_refusal(&Lane::name("shed"), &head, &refused, None).message,
+            removal_unlanded_refusal(&Lane::name("shed"), &head, &refused, None, &unmatched)
+                .message,
             format!(
                 "workspace shed head {head} carries 1 commit changing 1 file whose change main \
-                 does not hold (main is at {main_tip}): notes.txt (added: main does not have it)"
+                 does not hold (main is at {main_tip}): notes.txt (added: main does not have it); \
+                 main holds no patch-equivalent of {head} (shed notes)"
             )
         );
     }
@@ -16958,14 +16976,27 @@ mod removal_refusal_tests {
         vec![
             removal_in_progress_refusal(&workspace(), "rebase-merge"),
             removal_dirty_refusal(&workspace()),
-            removal_unlanded_refusal(&workspace(), &oid('4'), &measured(3, 1), None),
+            removal_unlanded_refusal(
+                &workspace(),
+                &oid('4'),
+                &measured(3, 1),
+                None,
+                &UnmatchedCommits::new(),
+            ),
             removal_unlanded_refusal(
                 &workspace(),
                 &oid('4'),
                 &measured(3, 1),
                 Some(&published(32, 34)),
+                &UnmatchedCommits::new(),
             ),
-            removal_unlanded_refusal(&workspace(), &oid('4'), &indeterminate(), None),
+            removal_unlanded_refusal(
+                &workspace(),
+                &oid('4'),
+                &indeterminate(),
+                None,
+                &UnmatchedCommits::new(),
+            ),
             removal_head_moved_refusal(&workspace(), &oid('1'), &oid('4')),
             main_removal_mode_refusal(),
             removal_young_refusal(
@@ -17161,7 +17192,13 @@ mod removal_refusal_tests {
     /// and where that branch stands.
     #[test]
     fn the_unlanded_refusal_names_the_head_the_count_the_files_the_branch_and_the_tip() {
-        let refusal = removal_unlanded_refusal(&workspace(), &oid('4'), &measured(3, 1), None);
+        let refusal = removal_unlanded_refusal(
+            &workspace(),
+            &oid('4'),
+            &measured(3, 1),
+            None,
+            &UnmatchedCommits::new(),
+        );
         assert_eq!(
             refusal.message,
             format!(
@@ -17175,14 +17212,26 @@ mod removal_refusal_tests {
 
         // One commit reads as one commit. A gate that says "1 commits" is a gate nobody trusts.
         assert!(
-            removal_unlanded_refusal(&workspace(), &oid('4'), &measured(1, 0), None)
-                .message
-                .contains("carries 1 commit changing 1 file whose change main"),
+            removal_unlanded_refusal(
+                &workspace(),
+                &oid('4'),
+                &measured(1, 0),
+                None,
+                &UnmatchedCommits::new()
+            )
+            .message
+            .contains("carries 1 commit changing 1 file whose change main"),
         );
 
         // No measurement names the unanswered question rather than printing an absence, because the
         // caller is being refused for a missing proof and not for work they can see.
-        let refusal = removal_unlanded_refusal(&workspace(), &oid('4'), &indeterminate(), None);
+        let refusal = removal_unlanded_refusal(
+            &workspace(),
+            &oid('4'),
+            &indeterminate(),
+            None,
+            &UnmatchedCommits::new(),
+        );
         assert_eq!(
             refusal.message,
             format!(
@@ -17224,24 +17273,36 @@ mod removal_refusal_tests {
             })
         };
         assert!(
-            removal_unlanded_refusal(&workspace(), &oid('4'), &with_paths(reasons), None)
-                .message
-                .ends_with(
-                    "changing 7 files whose change main does not hold (main is at \
+            removal_unlanded_refusal(
+                &workspace(),
+                &oid('4'),
+                &with_paths(reasons),
+                None,
+                &UnmatchedCommits::new()
+            )
+            .message
+            .ends_with(
+                "changing 7 files whose change main does not hold (main is at \
                      1111111111111111111111111111111111111111): a.rs (missing: main lacks this \
                      change), b.rs (conflict: main changed these lines too and lacks this \
                      change), c.rs \
                      (added: main does not have it), d.rs (deleted: main still has it), e.rs \
                      (changed: main deleted it), f.sh (mode: main's differs), g.png \
                      (unmergeable: Cannot merge binary files)"
-                ),
+            ),
         );
 
         let wide = (0..13)
             .map(|index| unheld(&format!("src/{index:02}.rs"), UnlandedChange::Missing))
             .collect();
-        let message =
-            removal_unlanded_refusal(&workspace(), &oid('4'), &with_paths(wide), None).message;
+        let message = removal_unlanded_refusal(
+            &workspace(),
+            &oid('4'),
+            &with_paths(wide),
+            None,
+            &UnmatchedCommits::new(),
+        )
+        .message;
         assert!(message.contains("changing 13 files"), "{message}");
         assert!(
             message.ends_with("src/09.rs (missing: main lacks this change), and 3 more"),
@@ -17256,12 +17317,19 @@ mod removal_refusal_tests {
     /// and the hint are the plain refusal's (02_workspaces.md, `rm` step 1).
     #[test]
     fn the_unlanded_refusal_says_when_the_published_branch_holds_every_commit() {
-        let plain = removal_unlanded_refusal(&workspace(), &oid('4'), &measured(3, 1), None);
+        let plain = removal_unlanded_refusal(
+            &workspace(),
+            &oid('4'),
+            &measured(3, 1),
+            None,
+            &UnmatchedCommits::new(),
+        );
         let refusal = removal_unlanded_refusal(
             &workspace(),
             &oid('4'),
             &measured(3, 1),
             Some(&published(32, 34)),
+            &UnmatchedCommits::new(),
         );
         assert_eq!(
             refusal.message,
@@ -17280,7 +17348,8 @@ mod removal_refusal_tests {
                 &workspace(),
                 &oid('4'),
                 &measured(1, 0),
-                Some(&published(0, 4))
+                Some(&published(0, 4)),
+                &UnmatchedCommits::new()
             )
             .message
             .ends_with(
@@ -17295,10 +17364,18 @@ mod removal_refusal_tests {
                 &workspace(),
                 &oid('4'),
                 &indeterminate(),
-                Some(&published(32, 34))
+                Some(&published(32, 34)),
+                &UnmatchedCommits::new()
             )
             .message,
-            removal_unlanded_refusal(&workspace(), &oid('4'), &indeterminate(), None).message
+            removal_unlanded_refusal(
+                &workspace(),
+                &oid('4'),
+                &indeterminate(),
+                None,
+                &UnmatchedCommits::new()
+            )
+            .message
         );
 
         // The line measured the head alone, so it speaks for the head alone. Beside an unheld
@@ -17324,8 +17401,14 @@ mod removal_refusal_tests {
             branches: branches.clone(),
             ..measured(0, 0)
         };
-        let branch_finding =
-            removal_unlanded_refusal(&workspace(), &oid('4'), &branch_only, None).message;
+        let branch_finding = removal_unlanded_refusal(
+            &workspace(),
+            &oid('4'),
+            &branch_only,
+            None,
+            &UnmatchedCommits::new(),
+        )
+        .message;
         assert_eq!(
             removal_unlanded_refusal(
                 &workspace(),
@@ -17335,6 +17418,7 @@ mod removal_refusal_tests {
                     ..measured(3, 1)
                 },
                 Some(&published(32, 34)),
+                &UnmatchedCommits::new(),
             )
             .message,
             format!("{}; {branch_finding}", refusal.message)
@@ -17344,10 +17428,75 @@ mod removal_refusal_tests {
                 &workspace(),
                 &oid('4'),
                 &branch_only,
-                Some(&published(32, 34))
+                Some(&published(32, 34)),
+                &UnmatchedCommits::new()
             )
             .message,
             branch_finding
+        );
+    }
+
+    /// After the files, a refused tip names the commits main holds neither by content nor by
+    /// patch identity, the head's in its finding and a branch's in its own; ten, then a count.
+    /// When they could not be read, the reason stands in their place.
+    #[test]
+    fn the_unlanded_refusal_names_the_unmatched_commits_or_why_it_cannot() {
+        let commit = |fill: char, subject: &str| crate::git::CommitSubject {
+            oid: oid(fill),
+            subject: subject.to_owned(),
+        };
+        let side = crate::api::dto::BranchLanding {
+            branch: String::from("side"),
+            tip: oid('5'),
+            commits: measured(1, 0).commits,
+        };
+        let landed = NativeLandedState {
+            branches: BranchLandings::Measured {
+                unlanded: vec![side],
+            },
+            ..measured(2, 0)
+        };
+        let mut unmatched = UnmatchedCommits::new();
+        unmatched.insert(
+            oid('4'),
+            Ok(vec![commit('6', "first"), commit('7', "second")]),
+        );
+        unmatched.insert(
+            oid('5'),
+            Err(String::from("main's objects could not be read")),
+        );
+        let message =
+            removal_unlanded_refusal(&workspace(), &oid('4'), &landed, None, &unmatched).message;
+        assert!(
+            message.contains(&format!(
+                "src/lib.rs (missing: main lacks this change); main holds no patch-equivalent of \
+                 {} (first), {} (second); workspace raven holds 1 other branch",
+                oid('6'),
+                oid('7')
+            )),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(&format!(
+                "side at {} (1 commit: src/lib.rs (missing: main lacks this change); its commits \
+                 could not be named: main's objects could not be read)",
+                oid('5')
+            )),
+            "{message}"
+        );
+
+        let wide = "0123456789ab"
+            .chars()
+            .map(|fill| commit(fill, "wide"))
+            .collect::<Vec<_>>();
+        let mut unmatched = UnmatchedCommits::new();
+        unmatched.insert(oid('4'), Ok(wide));
+        let message =
+            removal_unlanded_refusal(&workspace(), &oid('4'), &measured(12, 0), None, &unmatched)
+                .message;
+        assert!(
+            message.ends_with(&format!("{} (wide), and 2 more", oid('9'))),
+            "{message}"
         );
     }
 
@@ -17435,7 +17584,13 @@ mod removal_refusal_tests {
             panic!("an unheld branch must be refused");
         };
         assert_eq!(refused, unlanded);
-        let refusal = removal_unlanded_refusal(&workspace(), &oid('4'), &refused, None);
+        let refusal = removal_unlanded_refusal(
+            &workspace(),
+            &oid('4'),
+            &refused,
+            None,
+            &UnmatchedCommits::new(),
+        );
         assert_eq!(refusal.code, ErrorCode::Conflict);
         assert_eq!(
             refusal.message,
@@ -21147,9 +21302,56 @@ fn removal_landed_decision(landed: NativeLandedState, abandon: bool) -> RemovalL
     }
 }
 
+/// What a refusal names of each refused tip's commits, keyed by tip: those its target holds
+/// neither by content nor by patch identity, or the reason they could not be read
+/// ([`refused_commits`]).
+#[cfg(target_os = "macos")]
+type UnmatchedCommits =
+    std::collections::BTreeMap<GitOid, std::result::Result<Vec<crate::git::CommitSubject>, String>>;
+
+/// Each refused tip's commits that its target holds neither by content nor by patch identity
+/// (`crate::landing::unmatched_commits`): the head's, and every other branch's that did not
+/// pass. Each is measured at the target head its count was taken at, so the names explain that
+/// count. Read only once the gate has refused, to name what would be lost; it decides nothing.
+#[cfg(target_os = "macos")]
+async fn refused_commits(
+    store_root: &std::sync::Arc<Path>,
+    target_mount: &Path,
+    workspace_mount: &Path,
+    head: &GitOid,
+    refused: &NativeLandedState,
+) -> UnmatchedCommits {
+    let mut tips = Vec::new();
+    if !refused.commits.fully_landed() {
+        tips.extend(refused.commits.target_head().map(|target| (head, target)));
+    }
+    if let BranchLandings::Measured { unlanded } = &refused.branches {
+        tips.extend(unlanded.iter().filter_map(|branch| {
+            branch
+                .commits
+                .target_head()
+                .map(|target| (&branch.tip, target))
+        }));
+    }
+    let mut named = UnmatchedCommits::new();
+    for (tip, target) in tips {
+        let commits = crate::landing::unmatched_commits(
+            store_root,
+            target_mount,
+            target,
+            workspace_mount,
+            tip.as_str(),
+        )
+        .await;
+        named.insert(tip.clone(), commits);
+    }
+    named
+}
+
 /// Why the gate exists: these changes exist nowhere but the image about to be deleted. Names the
 /// head and every branch that did not pass, each with its tip, its commits and each file whose
-/// change the branch does not hold, with why.
+/// change the branch does not hold, with why, and, from `unmatched`, each commit the branch holds
+/// neither by content nor by patch identity.
 ///
 /// `published` is what the containment repository's own tracking ref of its published branch
 /// holds of the head, measured only once the decision has refused. When it holds every commit the
@@ -21163,6 +21365,7 @@ fn removal_unlanded_refusal(
     head: &GitOid,
     landed: &NativeLandedState,
     published: Option<&crate::landing::PublishedHolding>,
+    unmatched: &UnmatchedCommits,
 ) -> CowshedError {
     let branch = &landed.branch;
     let mut findings = Vec::new();
@@ -21190,6 +21393,9 @@ fn removal_unlanded_refusal(
                     if *unlanded == 1 { "" } else { "s" },
                 ),
             };
+            if let Some(named) = unmatched_commits_text(unmatched, head, branch) {
+                finding.push_str(&format!("; {named}"));
+            }
             if let Some(published) = published {
                 let drift = match (published.target_ahead, published.target_behind) {
                     (0, behind) => format!("local {branch} is {behind} behind it"),
@@ -21227,11 +21433,13 @@ fn removal_unlanded_refusal(
                         ..
                     } => match unlanded_paths {
                         UnlandedPaths::Named { paths } => format!(
-                            "{} at {} ({unlanded} commit{}: {})",
+                            "{} at {} ({unlanded} commit{}: {}{})",
                             other.branch,
                             other.tip,
                             if *unlanded == 1 { "" } else { "s" },
                             unlanded_paths_text(paths, branch),
+                            unmatched_commits_text(unmatched, &other.tip, branch)
+                                .map_or_else(String::new, |named| format!("; {named}")),
                         ),
                         UnlandedPaths::PredatesPaths => format!(
                             "{} at {} ({unlanded} commit{}; files not recorded)",
@@ -21267,10 +21475,38 @@ fn removal_unlanded_refusal(
     CowshedError::conflict(findings.join("; "), hint)
 }
 
-/// A refusal names this many files; the rest are counted, so a wide change cannot bury the
-/// sentence that matters.
+/// A refusal names this many files, and this many commits; the rest are counted, so a wide change
+/// cannot bury the sentence that matters.
 #[cfg(target_os = "macos")]
 const REFUSAL_PATH_LIMIT: usize = 10;
+
+/// The commits of `tip` that `target` holds neither by content nor by patch identity, as a
+/// refusal names them (`REFUSAL_PATH_LIMIT` of them, then a count), or why they could not be
+/// read. `None` when `tip` was not looked up, which names nothing.
+#[cfg(target_os = "macos")]
+fn unmatched_commits_text(
+    unmatched: &UnmatchedCommits,
+    tip: &GitOid,
+    target: &str,
+) -> Option<String> {
+    Some(match unmatched.get(tip)? {
+        Ok(commits) if commits.is_empty() => format!(
+            "naming its commits at the same {target} tip found none: git disagrees with itself"
+        ),
+        Ok(commits) => {
+            let mut named = commits
+                .iter()
+                .take(REFUSAL_PATH_LIMIT)
+                .map(|commit| format!("{} ({})", commit.oid, commit.subject))
+                .collect::<Vec<_>>();
+            if commits.len() > REFUSAL_PATH_LIMIT {
+                named.push(format!("and {} more", commits.len() - REFUSAL_PATH_LIMIT));
+            }
+            format!("{target} holds no patch-equivalent of {}", named.join(", "))
+        }
+        Err(reason) => format!("its commits could not be named: {reason}"),
+    })
+}
 
 /// The files a refusal names, each with why `target` does not hold its change.
 #[cfg(target_os = "macos")]

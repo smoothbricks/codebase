@@ -16,9 +16,11 @@
 //!   state of a real project — the target detached, its mount no longer a repository, no such
 //!   branch — so each one becomes [`LandingCommits::Indeterminate`] carrying the reason.
 //!   Consumers treat that exactly as they treat unlanded work.
-//! * **Landed is content, not commit identity.** Work reaches a target by cherry-pick, squash,
-//!   rewrite, or a pick whose conflict a lander resolved; the measurement names each file whose
-//!   change the target still lacks, and why, so a refusal says what would be lost.
+//! * **Landed is content or patch identity.** Work reaches a target by cherry-pick, squash,
+//!   rewrite, or a pick whose conflict a lander resolved: a commit is landed when the target's
+//!   content carries its change or the target holds a patch-equivalent of it. The measurement
+//!   names each file whose change the target still lacks, and why, and a refusal names the
+//!   commits held by neither proof, so it says what would be lost.
 //!
 //! One reading here is not a verdict: [`published_holding`] measures the target repository's own
 //! tracking ref for its published branch, the same way, so a refusal can say when that ref already
@@ -32,7 +34,7 @@ use crate::api::dto::{
     AbandonedRefs, AbandonedTip, BranchLanding, BranchLandings, GitOid, LandingCommits,
     PreservedRef, UnlandedPaths, WorkspaceInfo, WorkspaceLanding, WorkspaceState,
 };
-use crate::git::{ContentNotHeld, GitRepository};
+use crate::git::{CommitSubject, ContentNotHeld, GitRepository};
 use crate::metadata::{WorkspaceName, WorkspaceRole};
 
 /// The branch a workspace's work has to reach, resolved live, with the object store that holds it.
@@ -165,6 +167,33 @@ pub async fn published_holding(
     })
 }
 
+/// The commits `head` carries that `target_tip` holds neither by content nor by patch identity,
+/// oldest first: exactly those [`measure_commits`] counts as unlanded against that tip.
+///
+/// Read only to name them in a refusal the gate has already made, at the tip its count was taken
+/// at, so the names explain that count; it decides nothing. A failure is the reason, which the
+/// refusal states in place of the names.
+pub async fn unmatched_commits(
+    store_root: &std::sync::Arc<Path>,
+    target_mount: &Path,
+    target_tip: &GitOid,
+    workspace_mount: &Path,
+    head: &str,
+) -> std::result::Result<Vec<CommitSubject>, String> {
+    let objects = GitRepository::from_root(store_root, target_mount)
+        .object_directory()
+        .await
+        .map_err(|error| error.message)?;
+    let workspace = GitRepository::from_root(store_root, workspace_mount)
+        .with_alternate_objects(&objects)
+        .map_err(|error| error.message)?;
+    workspace
+        .content_not_held(target_tip.as_str(), head)
+        .await
+        .map(|unheld| unheld.commits)
+        .map_err(|error| error.message)
+}
+
 /// Measure one workspace tree against `target`: its head, and every other local branch.
 ///
 /// Total by construction: there is no error return, because every failure has a truthful
@@ -196,8 +225,8 @@ pub async fn measure(
 ///
 /// A branch passes when its tip equals or is an ancestor of the target repository's branch of the
 /// same name or of `refs/cowshed/<workspace>/heads/<branch>`, where `cowshed push` preserves it -
-/// destroying the workspace's copy then loses nothing - or when the target branch holds its
-/// content as it would a head's. Every other branch is named with its measurement. A tip equal to
+/// destroying the workspace's copy then loses nothing - or when the target branch holds each of
+/// its commits by content or patch identity, as it would a head's. Every other branch is named with its measurement. A tip equal to
 /// the target's same-named tip is decided without a process, which is what keeps a workspace
 /// carrying its source's branches cheap to list.
 pub async fn measure_branches(
@@ -311,7 +340,7 @@ pub async fn measure_commits(
 
 /// Every abandonment the target's repository keeps under `refs/cowshed/<ws>/abandoned/<head>/`,
 /// each tip measured against the target exactly as `rm` measures a branch: ancestry, then content
-/// (02_workspaces.md, `rm` step 1). One definition of landed serves both, so a tip that reached
+/// or patch identity (02_workspaces.md, `rm` step 1). One definition of landed serves both, so a tip that reached
 /// main by cherry-pick or a conflict-resolved pick reads as landed here as it would at `rm`.
 ///
 /// The second list names every ref under an `abandoned/` namespace that is not one an abandonment
@@ -396,9 +425,9 @@ pub async fn abandoned_refs(
 }
 
 /// The two questions of `rm` step 1 (02_workspaces.md), in order: a head the target contains is
-/// landed, cheaply and exactly; otherwise every file the head changed since its merge base with
-/// the target must carry that change in the target ([`GitRepository::content_not_held`]), however
-/// the content got there.
+/// landed, cheaply and exactly; otherwise each of its commits must be held by the target's
+/// content or by a patch-equivalent commit of the target ([`GitRepository::content_not_held`]),
+/// however the work got there.
 async fn counted(
     store_root: &std::sync::Arc<Path>,
     target: &LandingTarget,
@@ -427,20 +456,20 @@ async fn counted(
             .await
             .map_err(|error| error.message)?
     };
+    let unlanded = u64::try_from(unheld.commits.len()).expect("a commit count fits in u64");
     // The unheld commits are a subset of the same range `ahead` counts, so this cannot underflow
     // unless git's own answers disagree with each other. If they ever do, say so rather than wrap
     // into a huge `landed`.
-    let landed = ahead.checked_sub(unheld.commits).ok_or_else(|| {
+    let landed = ahead.checked_sub(unlanded).ok_or_else(|| {
         format!(
-            "git reported {} commits changing unheld files in a range of {ahead}: refusing to \
-             guess which is right",
-            unheld.commits
+            "git reported {unlanded} commits changing unheld files in a range of {ahead}: \
+             refusing to guess which is right"
         )
     })?;
     Ok(LandingCommits::Measured {
         target_branch: target.branch.clone(),
         target_head: target.tip.clone(),
-        unlanded: unheld.commits,
+        unlanded,
         landed,
         behind,
         unlanded_paths: UnlandedPaths::Named {
