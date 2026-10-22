@@ -1,6 +1,5 @@
 import { expect, it } from 'bun:test';
 import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
-import { watch as fsWatch } from 'node:fs';
 import { mkdir, readdir, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { createConnection, createServer } from 'node:net';
@@ -12,6 +11,7 @@ import { consumeMessagesFromSocket, parseMessage } from 'nx/src/utils/consume-me
 import typia from 'typia';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
+import { whenFound } from './__tests__/path-change.js';
 import { awaitExit, isRunning, type ProcessEntry, processTable, terminate, withDescendants } from './testing.js';
 
 /**
@@ -313,8 +313,8 @@ function assertNotServed(answer: Answer, what: string): void {
 }
 
 /**
- * Runs `action` once a watch on `directory` is open, then resolves with the first non-null `check`. Each pass runs
- * `check` before it waits, so a change at any point, including while `action` runs, is seen.
+ * Runs `action`, then resolves with the first non-null `check`. `check` judges the whole state once a watch on
+ * `directory` is armed and after every change there, so a change at any point, before or while `action` runs, is seen.
  */
 async function watchUntil<T>(
   directory: string,
@@ -323,19 +323,17 @@ async function watchUntil<T>(
   action?: () => Promise<void>,
 ): Promise<T> {
   await mkdir(directory, { recursive: true });
-  let notify: (() => void) | undefined;
-  const watcher = fsWatch(directory, () => notify?.());
+  const stop = new AbortController();
+  const found = whenFound(directory, check, stop.signal);
   try {
-    await action?.();
-    for (;;) {
-      const changed = Promise.withResolvers<void>();
-      notify = () => changed.resolve();
-      const found = await check();
-      if (found !== null) return found;
-      await guardEvent(changed.promise, what, () => `no change in ${directory}`);
-    }
+    const [, value] = await Promise.all([action?.(), guardEvent(found, what, () => `no change in ${directory}`)]);
+    return value;
   } finally {
-    watcher.close();
+    // Reaps the waker when `action` failed first; only the abort said here is not an outcome of the wait.
+    stop.abort();
+    await found.catch((error: unknown) => {
+      if (error !== stop.signal.reason) throw error;
+    });
   }
 }
 

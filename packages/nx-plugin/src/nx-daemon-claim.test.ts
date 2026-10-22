@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdir, readFile, rm, symlink, unlink, utimes, watch, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, symlink, unlink, utimes, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, stopFixtureNxDaemon, withNxFixture } from './__tests__/fixture-nx-env.js';
+import { whenChanged } from './__tests__/path-change.js';
 import { awaitExit, isRunning, ownedWorkspaceSocketDirectory, processTable, terminate } from './testing.js';
 
 /**
@@ -103,10 +104,9 @@ async function secondDaemonDefers(
 ): Promise<void> {
   const serving = await startedDaemon(workspace, servingEnv);
 
-  // What a second client does when its probe found no daemon: start one. The record's directory is watched from
-  // before the spawn, so no write the second daemon makes to it can be missed.
-  const recordChanges = new AbortController();
-  const changes = watch(join(workspace, '.nx/workspace-data/d'), { signal: recordChanges.signal });
+  // What a second client does when its probe found no daemon: start one. The record is judged whole once its directory
+  // is watched and after every change there, so whether the second daemon took it cannot be missed.
+  const stopWatching = new AbortController();
   let output = '';
   const second = spawn(process.execPath, [daemonStart], {
     cwd: workspace,
@@ -121,22 +121,14 @@ async function secondDaemonDefers(
   });
   const exited = new Promise<number | null>((resolve) => second.once('exit', resolve));
   // Unpatched, the second daemon never exits: it takes the record and serves. Either ends the wait.
-  let displaced = false;
-  const tookRecord = (async () => {
-    try {
-      for await (const _ of changes) {
-        if ((await daemonRecord(workspace))?.processId === second.pid) {
-          displaced = true;
-          return;
-        }
-      }
-    } catch (error) {
-      if (!(error instanceof Error && error.name === 'AbortError')) throw error;
-    }
-  })();
+  const tookRecord = whenChanged(
+    join(workspace, '.nx/workspace-data/d'),
+    async () => (await daemonRecord(workspace))?.processId === second.pid,
+    stopWatching.signal,
+  );
   try {
-    await guardEvent(
-      Promise.race([exited, tookRecord]),
+    const displaced = await guardEvent(
+      Promise.race([exited.then(() => false), tookRecord.then(() => true)]),
       'the second daemon to exit or take the record',
       () => `second daemon ${second.pid}, exit ${second.exitCode}\n${output}`,
     );
@@ -155,8 +147,10 @@ async function secondDaemonDefers(
       terminate(second.pid);
       await exited;
     }
-    recordChanges.abort();
-    await tookRecord;
+    stopWatching.abort();
+    await tookRecord.catch((error: unknown) => {
+      if (error !== stopWatching.signal.reason) throw error;
+    });
     // Stopped under the environment that started it, before the caller removes the socket directory it bound.
     await stopFixtureNxDaemon(workspace, servingEnv);
   }

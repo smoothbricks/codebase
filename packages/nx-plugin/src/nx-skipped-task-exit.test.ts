@@ -1,10 +1,11 @@
 import { expect, it, onTestFinished } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, watch } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
+import { whenChanged } from './__tests__/path-change.js';
 
 /**
  * Guards the exit-status hunk of `patches/nx@23.2.1.patch`. When a task fails, Nx skips the tasks that depend on it,
@@ -22,6 +23,8 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 const repositoryRoot = join(import.meta.dir, '../../..');
 const nxEntry = join(repositoryRoot, 'node_modules', '.bin', 'nx');
+// The fixture's failing task waits through the same waker, run by Bun from this checkout.
+const pathChange = join(import.meta.dir, '__tests__', 'path-change.ts');
 
 /** A local plugin whose `postTasksExecution` hook writes the task results it was handed. */
 const resultsHook = `
@@ -87,13 +90,11 @@ createServer().listen(0, '127.0.0.1', () => {
 `,
       );
       await writeFile(
-        join(workspace, 'fail.cjs'),
-        `const { existsSync, watch } = require('node:fs');
-const wanted = ${JSON.stringify(interrupt ? 'never-released' : 'ready')};
-const watcher = watch('.', () => {
-  if (existsSync(wanted)) { watcher.close(); process.exit(1); }
-});
-if (existsSync(wanted)) { watcher.close(); process.exit(1); }
+        join(workspace, 'fail.ts'),
+        `import { existsSync } from 'node:fs';
+import { whenChanged } from ${JSON.stringify(pathChange)};
+await whenChanged('.', () => existsSync(${JSON.stringify(interrupt ? 'never-released' : 'ready')}));
+process.exit(1);
 `,
       );
       await writeFile(
@@ -102,17 +103,15 @@ if (existsSync(wanted)) { watcher.close(); process.exit(1); }
           name: 'p',
           targets: {
             held: { executor: 'nx:run-commands', options: { command: 'node hold.cjs' } },
-            fail: { executor: 'nx:run-commands', options: { command: 'node fail.cjs' } },
+            fail: { executor: 'nx:run-commands', options: { command: 'bun fail.ts' } },
             after: { executor: 'nx:run-commands', dependsOn: ['fail'], options: { command: 'echo after' } },
           },
         }),
       );
-      const ready = Promise.withResolvers<void>();
-      const readyWatcher = interrupt
-        ? watch(workspace, () => {
-            if (existsSync(join(workspace, 'ready'))) ready.resolve();
-          })
-        : undefined;
+      const stopReady = new AbortController();
+      const ready = interrupt
+        ? whenChanged(workspace, () => existsSync(join(workspace, 'ready')), stopReady.signal)
+        : null;
       const child = spawn(
         'bun',
         [nxEntry, 'run-many', '-t', 'held,after', '-p', 'p', '--parallel=2', '--nx-bail=true', '--outputStyle=static'],
@@ -126,7 +125,6 @@ if (existsSync(wanted)) { watcher.close(); process.exit(1); }
       let output = '';
       const ended = Promise.withResolvers<number | null>();
       child.once('error', (error) => {
-        if (interrupt) ready.reject(error);
         ended.reject(error);
       });
       child.once('close', ended.resolve);
@@ -138,7 +136,10 @@ if (existsSync(wanted)) { watcher.close(); process.exit(1); }
       });
       const describe = () => `pid ${child.pid}, exit ${child.exitCode}, signal ${child.signalCode}\n${output}`;
       const retire = async () => {
-        readyWatcher?.close();
+        stopReady.abort();
+        await ready?.catch((error: unknown) => {
+          if (error !== stopReady.signal.reason) throw error;
+        });
         if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
           try {
             process.kill(process.platform === 'win32' ? child.pid : -child.pid, 'SIGKILL');
@@ -150,10 +151,10 @@ if (existsSync(wanted)) { watcher.close(); process.exit(1); }
       };
       onTestFinished(retire);
       try {
-        if (interrupt) {
+        if (ready !== null) {
           await guardEvent(
             Promise.race([
-              ready.promise,
+              ready,
               ended.promise.then((code) => {
                 throw new Error(`Nx exited ${code} before its task was ready\n${output}`);
               }),

@@ -4,7 +4,7 @@ import { writeSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { getSystemErrorName } from 'node:util';
 
-/** This module run as a program is the waker `whenChanged` spawns. */
+/** This module run as a program is the waker `whenFound` spawns. */
 const WAKER = fileURLToPath(import.meta.url);
 /** The waker's exit status when it could not arm its watch; its stderr is then one `<syscall> <errno>` line. */
 const ARM_FAILED = 3;
@@ -30,9 +30,10 @@ export class WakerArmError extends Error {
 }
 
 /**
- * Resolves once `ready` holds. `ready` is judged whole once the kernel watches `path` and again after every change it
- * reports there, so a change made before the watch exists is still seen and one made while `ready` reads still brings
- * another judgment. For a directory a change is an entry added, removed or renamed; for a file, a write to it.
+ * Resolves with the first value `find` returns other than null. `find` judges the whole state once the kernel watches
+ * `path` and again after every change it reports there, so a change made before the watch exists is still seen. Each
+ * judgment runs alone: a change reported while one runs brings another once it ends. For a directory a change is an
+ * entry added, removed or renamed; for a file, a write to it.
  *
  * The watch is a waker process holding a kqueue EVFILT_VNODE watch on darwin or an inotify watch on linux, which
  * prints one byte once armed and one after every event. Bun's fs.watch is not used: on darwin it is one FSEvents
@@ -41,44 +42,87 @@ export class WakerArmError extends Error {
  * darwin, and no tail follows a directory.
  *
  * The wait ends on a kernel event, never on a timer; one that never comes is the leg's no-progress bound to report. It
- * fails with `WakerArmError` when the watch cannot be armed, and with the waker's stderr when the waker ends first. The
- * waker is killed and its close awaited before this returns, so none outlives the wait.
+ * fails with `WakerArmError` when the watch cannot be armed, with the waker's stderr when the waker ends first, with
+ * what `find` throws, and with `signal`'s reason once it aborts. The waker is killed and its close awaited before this
+ * settles, so none outlives the wait.
  */
-export async function whenChanged(path: string, ready: () => boolean): Promise<void> {
+export async function whenFound<T>(
+  path: string,
+  find: () => T | null | Promise<T | null>,
+  signal?: AbortSignal,
+): Promise<T> {
+  signal?.throwIfAborted();
   const waker = spawn(process.execPath, [WAKER, path], { stdio: ['ignore', 'pipe', 'pipe'] });
   const closed = Promise.withResolvers<void>();
-  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  const outcome = Promise.withResolvers<T>();
+  let settled = false;
+  const resolve = (found: T): void => {
+    settled = true;
+    outcome.resolve(found);
+  };
+  const reject = (error: unknown): void => {
+    settled = true;
+    outcome.reject(error);
+  };
+  let judging = false;
+  let again = false;
+  const judge = async (): Promise<void> => {
+    if (judging) {
+      again = true;
+      return;
+    }
+    judging = true;
+    try {
+      do {
+        again = false;
+        const found = await find();
+        if (found !== null) resolve(found);
+      } while (again && !settled);
+    } catch (error) {
+      reject(error);
+    } finally {
+      judging = false;
+    }
+  };
+  const aborted = () => reject(signal?.reason);
+  signal?.addEventListener('abort', aborted, { once: true });
   let stderr = '';
   waker.stderr.setEncoding('utf8').on('data', (text: string) => {
     stderr += text;
   });
   waker.stdout.on('data', () => {
-    try {
-      if (ready()) resolve();
-    } catch (error) {
-      reject(error);
-    }
+    if (!settled) void judge();
   });
   waker.once('error', (error) => {
     closed.resolve();
     reject(error);
   });
-  waker.once('close', (code, signal) => {
+  waker.once('close', (code, exitSignal) => {
     closed.resolve();
     const unarmed = code === ARM_FAILED ? ARM_FAILURE.exec(stderr) : null;
     const syscall = ARM_SYSCALLS.find((name) => name === unarmed?.[1]);
     reject(
       syscall === undefined
-        ? new Error(`the waker on ${path} ended (${code ?? signal}) before the wait was over: ${stderr}`)
+        ? new Error(`the waker on ${path} ended (${code ?? exitSignal}) before the wait was over: ${stderr}`)
         : new WakerArmError(path, syscall, Number(unarmed?.[2])),
     );
   });
   try {
-    await promise;
+    return await outcome.promise;
   } finally {
+    signal?.removeEventListener('abort', aborted);
     waker.kill();
     await closed.promise;
   }
+}
+
+/** `whenFound` for a condition: resolves once `ready` holds. */
+export async function whenChanged(
+  path: string,
+  ready: () => boolean | Promise<boolean>,
+  signal?: AbortSignal,
+): Promise<void> {
+  await whenFound(path, async () => ((await ready()) ? true : null), signal);
 }
 
 function armFailed(syscall: ArmSyscall, errno: number): never {
@@ -86,7 +130,7 @@ function armFailed(syscall: ArmSyscall, errno: number): never {
   process.exit(ARM_FAILED);
 }
 
-/** A failure after arming: said on stderr as one line, which `whenChanged` reports with the waker's exit. */
+/** A failure after arming: said on stderr as one line, which `whenFound` reports with the waker's exit. */
 function fail(message: string): never {
   writeSync(2, `${message}\n`);
   process.exit(1);
