@@ -193,11 +193,13 @@ answer on its connection, `Coordinator::other_build()`, so the embedder learns i
 without reading the sentence. It starts `cowshed controller` again — the host's `cowshed` is the new build once the
 install has run — and sends its new work there. A job the old controller started stays reachable through it while the
 draining supervisor still serves, and that supervisor serves the job's end to the old controller before it retires: it
-retires once a client has read each of its jobs' ends, or after 30 minutes with no client call (11_shell.md "Draining a
-supervisor of another build"). A supervisor of a build from before that rule retires the moment the job ends; once a
-call of the job meets the refusal, the new controller reaches it by its number from the workspace's next supervisor —
-`WorkspaceHandle::sealed` answers its terminal record — and reads its output on from the bytes already held
-(`JobHandle::logs(stream, offset, follow)`). The old controller exits 0 when its last handle is dropped.
+retires once a client has read each of its jobs' ends, once every process that asked for or about a job has exited, or
+after 30 minutes with no read of one (11_shell.md "Draining a supervisor of another build"). A resident such as an Nx
+worker ends there once the controller that started it has exited. A supervisor of a build from before that rule retires
+the moment the job ends; once a call of the job meets the refusal, the new controller reaches it by its number from the
+workspace's next supervisor — `WorkspaceHandle::sealed` answers its terminal record — and reads its output on from the
+bytes already held (`JobHandle::logs(stream, offset, follow)`). The old controller exits 0 when its last handle is
+dropped.
 
 ## MCP authority delivery
 

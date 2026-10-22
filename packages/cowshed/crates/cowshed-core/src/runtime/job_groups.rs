@@ -1735,6 +1735,103 @@ impl ExitWatch {
     }
 }
 
+impl std::os::fd::AsRawFd for ExitWatch {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.0)
+    }
+}
+
+/// How a process's exit was seen ([`Process::exited`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ExitObserved {
+    /// The exit watch registered while it ran reported its exit.
+    Watched,
+    /// It had exited, or begun to, before a watch could name it.
+    BeforeWatch,
+}
+
+impl std::fmt::Display for ExitObserved {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Watched => "its exit watch reported its exit",
+            Self::BeforeWatch => "it had exited before it could be watched",
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Process {
+    /// Whether `other` is this very life: the same pid at the same pid version, which no later
+    /// process given the pid carries.
+    pub(crate) fn same_life(&self, other: &Self) -> io::Result<bool> {
+        Ok(self.pid == other.pid && self.version == other.version)
+    }
+
+    /// Watch for this process's exit from now; `None` once it has exited or begun to: the kernel
+    /// refuses a new watch of an exiting process (`ESRCH`), and a pid whose running process no
+    /// longer carries this version names another.
+    fn watch_running(&self) -> io::Result<Option<ExitWatch>> {
+        let queue = match exit_queue(self.pid) {
+            Ok(queue) => queue,
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(self.running()?.then_some(ExitWatch(queue)))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Process {
+    /// Whether `other` is this very life. Each names a process that held the pid when its
+    /// connection was made, and while this one has not exited the pid names no other process.
+    pub(crate) fn same_life(&self, other: &Self) -> io::Result<bool> {
+        Ok(self.pid == other.pid && !pidfd_exited(&self.handle)?)
+    }
+
+    /// Watch for this process's exit: its pidfd names it alone, exited or not.
+    fn watch_running(&self) -> io::Result<Option<ExitWatch>> {
+        self.watch_exit().map(Some)
+    }
+}
+
+impl Process {
+    /// Watch this process's exit from now, so an exit after this call is never missed.
+    pub(crate) fn exit(&self) -> io::Result<ProcessExit> {
+        Ok(self
+            .watch_running()?
+            .map_or(ProcessExit::Before, ProcessExit::Watching))
+    }
+}
+
+/// A process's exit, watched from the moment [`Process::exit`] was asked.
+pub(crate) enum ProcessExit {
+    /// Its exit watch, registered while it ran.
+    Watching(ExitWatch),
+    /// It had exited, or begun to, before a watch could name it.
+    Before,
+}
+
+impl ProcessExit {
+    /// The exit, awaited without a thread of its own: the watch's descriptor is readable once
+    /// the kernel reports the exit (`NOTE_EXIT`, a readable pidfd), never a poll of the process
+    /// table.
+    pub(crate) async fn observed(self) -> io::Result<ExitObserved> {
+        let watch = match self {
+            Self::Watching(watch) => watch,
+            Self::Before => return Ok(ExitObserved::BeforeWatch),
+        };
+        let watch = tokio::io::unix::AsyncFd::with_interest(watch, tokio::io::Interest::READABLE)?;
+        loop {
+            let mut ready = watch.readable().await?;
+            if ready.get_inner().within(Duration::ZERO)? {
+                return Ok(ExitObserved::Watched);
+            }
+            ready.clear_ready();
+        }
+    }
+}
+
 /// The pids holding the group id, in exited processes too.
 #[cfg(target_os = "macos")]
 fn group_pids(pgid: i32) -> io::Result<Vec<i32>> {

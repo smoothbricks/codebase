@@ -24,6 +24,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
+use super::job_groups::{ExitObserved, Process};
 use super::process_stream::JobProcessStream;
 use super::supervisor::{
     CheckpointBarrier, Command, LogChunk, NxDaemonRetirement, RetireWhen, SessionSnapshot,
@@ -960,8 +961,6 @@ pub async fn serve(
             }
             () = retired.notified() => return Ok(()),
         };
-        // Any call is a client still there: a draining supervisor's idle bound starts over.
-        owed.called.notify_one();
         let supervisor = supervisor.clone();
         let streams = Arc::clone(&streams);
         let retired = Arc::clone(&retired);
@@ -1004,22 +1003,27 @@ pub async fn serve(
                         Ok(jobs) => jobs,
                         Err(error) => return report.stuck("list its jobs", &error),
                     };
-                    let running: Vec<JobId> = jobs
+                    let running: Vec<(JobId, ExecClass)> = jobs
                         .iter()
                         .filter(|job| !job.state.is_terminal())
-                        .map(|job| job.job_id)
+                        .map(|job| (job.job_id, job.class))
                         .collect();
                     // A second `drain` finds the first one's reckoning under way.
-                    if !owed.begin(running.iter().copied()) {
+                    let Some(watches) = owed.begin(&running) else {
                         return;
+                    };
+                    for watch in watches {
+                        let resident = watch.ends_resident.then(|| ResidentEnd {
+                            supervisor: current.clone(),
+                            report: report.clone(),
+                        });
+                        Arc::clone(&owed).watch(watch, resident);
                     }
-                    report.publish(DrainWait::Jobs { running });
+                    owed.publish(&report);
                     if let Err(error) = current.quiesce().await {
                         return report.stuck("wait for its running jobs", &error);
                     }
-                    report.publish(DrainWait::Reads {
-                        unread: owed.unread(),
-                    });
+                    owed.reading(&report);
                     let settled = owed.settle(super::project::SUPERVISOR_IDLE).await;
                     cowshed_os::eprintln!(
                         "cowshed: workspace supervisor {} of build {} retires after draining; {settled}",
@@ -1044,6 +1048,7 @@ pub async fn serve(
 /// a command of another build it refuses can say why it still serves (11_shell.md "Draining a
 /// supervisor of another build"). Read across builds: a reader decodes what it knows, and says
 /// so when it cannot.
+#[derive(Clone)]
 struct DrainReport {
     path: PathBuf,
 }
@@ -1061,10 +1066,19 @@ struct DrainReportWire {
 #[serde(tag = "for", rename_all = "camelCase")]
 enum DrainWait {
     /// The jobs that ran when it was asked to drain, to end.
-    Jobs { running: Vec<JobId> },
-    /// A client to read these jobs' ends, or [`super::project::SUPERVISOR_IDLE`] with no client
-    /// call at all.
-    Reads { unread: Vec<JobId> },
+    Jobs {
+        running: Vec<JobId>,
+        /// The residents it ended because their requesters exited.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ended: Vec<RequesterGone>,
+    },
+    /// A process these jobs are owed to, to read their ends or exit, or
+    /// [`super::project::SUPERVISOR_IDLE`] with no read of them.
+    Reads {
+        unread: Vec<JobId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ended: Vec<RequesterGone>,
+    },
     /// A step of its retirement failed: it serves on until it is killed.
     Stuck { step: String, error: String },
 }
@@ -1077,16 +1091,37 @@ impl DrainWait {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        let ended = |ended: &[RequesterGone]| {
+            ended
+                .iter()
+                .map(|gone| format!("; it ended {gone}"))
+                .collect::<String>()
+        };
         match self {
-            Self::Jobs { running } => {
-                format!("it drains: it waits for jobs {} to end", jobs(running))
+            Self::Jobs {
+                running,
+                ended: gone,
+            } => format!(
+                "it drains: it waits for jobs {} to end{}",
+                jobs(running),
+                ended(gone)
+            ),
+            Self::Reads {
+                unread,
+                ended: gone,
+            } if unread.is_empty() => {
+                format!("it drains and is retiring{}", ended(gone))
             }
-            Self::Reads { unread } if unread.is_empty() => "it drains and is retiring".to_owned(),
-            Self::Reads { unread } => format!(
-                "it drains: its jobs ended, and it waits for a client to read the ends of jobs {}, \
-                 or {} minutes with no client call",
+            Self::Reads {
+                unread,
+                ended: gone,
+            } => format!(
+                "it drains: its jobs ended, and it waits until a client reads the ends of jobs {} \
+                 or every process they are owed to has exited, or {} minutes pass with no read \
+                 of them{}",
                 jobs(unread),
-                super::project::SUPERVISOR_IDLE.as_secs() / 60
+                super::project::SUPERVISOR_IDLE.as_secs() / 60,
+                ended(gone)
             ),
             Self::Stuck { step, error } => format!(
                 "its retirement failed to {step} ({error}), so it serves until it is killed"
@@ -1181,19 +1216,140 @@ enum Retirement {
     Draining,
 }
 
-/// What a draining supervisor still owes its clients (11_shell.md "Draining a supervisor of
-/// another build"): each job that ran when it was asked to drain, until a client has read its end
-/// and every stream it was reading to EOF. The next supervisor is another build, whose protocol
-/// the job's client cannot speak, so the end is read from this one or not at all.
+/// What a draining supervisor still owes (11_shell.md "Draining a supervisor of another build"):
+/// each job that ran when it was asked to drain, to the processes that asked for or about it,
+/// until one of them has read its end and every stream it was reading to EOF, or every one of
+/// them has exited. The next supervisor is another build, whose protocol the job's client cannot
+/// speak, so the end is read from this one or not at all; a reader that is gone reads nothing,
+/// so the drain never waits on it.
 #[derive(Default)]
 struct DrainReads {
+    /// Who asked for or about each job this socket admitted that has not ended: what the job
+    /// would be owed to if the supervisor drained now. An entry goes when its job ends, or into
+    /// the drain.
+    asked: Mutex<BTreeMap<JobId, Asked>>,
     /// `None` until the supervisor drains.
-    owed: std::sync::Mutex<Option<BTreeMap<JobId, Owed>>>,
-    /// Every call, and every read: progress to check, and the idle bound starting over.
-    called: tokio::sync::Notify,
+    drain: Mutex<Option<Drain>>,
+    /// A read of an owed job: progress, and the idle bound starting over.
+    read: tokio::sync::Notify,
+    /// A process an owed job was owed to exited: progress, the idle bound unchanged.
+    gone: tokio::sync::Notify,
 }
 
-/// One job's reads, as a client of a draining supervisor makes them.
+/// The processes that asked for or about one job, each held by the identity the kernel gave its
+/// connection.
+struct Asked {
+    /// The process whose connection admitted the job.
+    requester: Option<Arc<Process>>,
+    /// Every other process that held, waited on, sealed or read it.
+    readers: Vec<Arc<Process>>,
+    /// A process asked whose identity could not be read, the requester included: it is never
+    /// seen exiting, so what the job is owed waits for a read or the idle bound.
+    unidentified: bool,
+}
+
+impl Asked {
+    fn add(&mut self, job: JobId, peer: io::Result<Process>) {
+        match peer {
+            Ok(peer) => {
+                if !self
+                    .requester
+                    .iter()
+                    .chain(&self.readers)
+                    .any(|known| same_life(known, &peer))
+                {
+                    self.readers.push(Arc::new(peer));
+                }
+            }
+            Err(error) => {
+                if !self.unidentified {
+                    self.unidentified = true;
+                    unidentified(job, &error);
+                }
+            }
+        }
+    }
+}
+
+/// Whether `known` is `peer`'s life; a comparison the kernel cannot answer counts as another
+/// process, which costs one more exit watch and never an early retirement.
+fn same_life(known: &Process, peer: &Process) -> bool {
+    matches!(known.same_life(peer), Ok(true))
+}
+
+fn unidentified(job: JobId, error: &io::Error) {
+    cowshed_os::eprintln!(
+        "cowshed: a process asked about job {} whose identity cannot be read ({error}); if the \
+         supervisor drains, that job's end is owed until a read or the idle bound",
+        job.get()
+    );
+}
+
+/// A drain under way.
+struct Drain {
+    /// The jobs that ran when it was asked to drain.
+    running: Vec<JobId>,
+    /// Whether they have all ended, so it waits for their reads.
+    reading: bool,
+    owed: BTreeMap<JobId, Owed>,
+    /// The residents it ended because their requesters exited, in that order.
+    ended: Vec<RequesterGone>,
+    /// The number of the next exit watch.
+    next: u64,
+}
+
+impl Drain {
+    fn waits(&self) -> DrainWait {
+        if self.reading {
+            DrainWait::Reads {
+                unread: self
+                    .owed
+                    .iter()
+                    .filter(|(_, owed)| !owed.settled())
+                    .map(|(job, _)| *job)
+                    .collect(),
+                ended: self.ended.clone(),
+            }
+        } else {
+            DrainWait::Jobs {
+                running: self.running.clone(),
+                ended: self.ended.clone(),
+            }
+        }
+    }
+
+    /// Owe `job` to `peer` too, unless it is already owed to it: the exit to watch, if any.
+    fn reader(&mut self, job: JobId, peer: io::Result<Process>) -> Option<Watch> {
+        let owed = self.owed.get_mut(&job)?;
+        owed.asked = true;
+        match peer {
+            Ok(peer) => {
+                if owed.readers.values().any(|known| same_life(known, &peer)) {
+                    return None;
+                }
+                let number = self.next;
+                self.next += 1;
+                let process = Arc::new(peer);
+                owed.readers.insert(number, Arc::clone(&process));
+                Some(Watch {
+                    job,
+                    number,
+                    process,
+                    ends_resident: false,
+                })
+            }
+            Err(error) => {
+                if !owed.unseen {
+                    owed.unseen = true;
+                    unidentified(job, &error);
+                }
+                None
+            }
+        }
+    }
+}
+
+/// One job's reads, as a client of a draining supervisor makes them, and who may still make them.
 #[derive(Default)]
 struct Owed {
     /// A `wait`, `hold` or `sealed` answer carried the job's end.
@@ -1202,18 +1358,74 @@ struct Owed {
     /// A client that reads no stream owes none.
     reading: [bool; 2],
     eof: [bool; 2],
+    /// The processes it is owed to that have not been seen exiting, by exit-watch number.
+    readers: BTreeMap<u64, Arc<Process>>,
+    /// Some process asked for or about the job.
+    asked: bool,
+    /// One of them can never be seen exiting: its identity could not be read, or its exit
+    /// cannot be watched.
+    unseen: bool,
 }
 
 impl Owed {
     fn read(&self) -> bool {
         self.end && (0..2).all(|stream| !self.reading[stream] || self.eof[stream])
     }
+
+    /// Every process the job was owed to has exited, so nothing will read it.
+    fn abandoned(&self) -> bool {
+        self.asked && !self.unseen && self.readers.is_empty()
+    }
+
+    fn settled(&self) -> bool {
+        self.read() || self.abandoned()
+    }
 }
 
-/// Which jobs' ends were read before a draining supervisor retired, and which it gave up on.
+/// An exit a draining supervisor watches: of a process `job` is owed to.
+struct Watch {
+    job: JobId,
+    number: u64,
+    process: Arc<Process>,
+    /// The process is the requester of a running resident, which ends with it.
+    ends_resident: bool,
+}
+
+/// What ends a resident whose requester exited: its supervisor, and the report that says so.
+struct ResidentEnd {
+    supervisor: WorkspaceSupervisorHandle,
+    report: DrainReport,
+}
+
+/// A resident a draining supervisor ended because its requester exited (11_shell.md "Draining a
+/// supervisor of another build"): nothing else sends it requests, so it would never end.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RequesterGone {
+    job: JobId,
+    requester: i32,
+    observed: ExitObserved,
+}
+
+impl std::fmt::Display for RequesterGone {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "resident job {}, whose requester pid {} exited ({})",
+            self.job.get(),
+            self.requester,
+            self.observed
+        )
+    }
+}
+
+/// Which jobs' ends were read before a draining supervisor retired, which nobody was left to
+/// read, and which it gave up on.
 struct Settled {
     read: Vec<JobId>,
+    abandoned: Vec<JobId>,
     unread: Vec<JobId>,
+    ended: Vec<RequesterGone>,
     bound: std::time::Duration,
 }
 
@@ -1226,10 +1438,28 @@ impl std::fmt::Display for Settled {
                 .join(", ")
         };
         write!(formatter, "read by a client: [{}]", ids(&self.read))?;
+        if !self.abandoned.is_empty() {
+            write!(
+                formatter,
+                "; every process they were owed to exited: [{}]",
+                ids(&self.abandoned)
+            )?;
+        }
+        if !self.ended.is_empty() {
+            write!(
+                formatter,
+                "; ended for their requesters' exits: [{}]",
+                self.ended
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )?;
+        }
         if !self.unread.is_empty() {
             write!(
                 formatter,
-                "; unread after {} minutes with no client call: [{}]",
+                "; unread after {} minutes with no read: [{}]",
                 self.bound.as_secs() / 60,
                 ids(&self.unread)
             )?;
@@ -1239,66 +1469,276 @@ impl std::fmt::Display for Settled {
 }
 
 impl DrainReads {
-    fn owed(&self) -> std::sync::MutexGuard<'_, Option<BTreeMap<JobId, Owed>>> {
-        self.owed
+    fn asked(&self) -> std::sync::MutexGuard<'_, BTreeMap<JobId, Asked>> {
+        self.asked
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Start owing `running`; `false` when a drain already began.
-    fn begin(&self, running: impl Iterator<Item = JobId>) -> bool {
-        let mut owed = self.owed();
-        if owed.is_some() {
-            return false;
+    /// Locked before [`Self::asked`] whenever both are held.
+    fn drain(&self) -> std::sync::MutexGuard<'_, Option<Drain>> {
+        self.drain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `job` was admitted on a connection whose peer is `requester`: owe it there should the
+    /// supervisor drain, until it ends.
+    fn admitted(
+        self: &Arc<Self>,
+        job: JobId,
+        requester: io::Result<Process>,
+        supervisor: &WorkspaceSupervisorHandle,
+    ) {
+        let mut asked = Asked {
+            requester: None,
+            readers: Vec::new(),
+            unidentified: false,
+        };
+        match requester {
+            Ok(requester) => asked.requester = Some(Arc::new(requester)),
+            Err(error) => asked.add(job, Err(error)),
         }
-        *owed = Some(running.map(|job| (job, Owed::default())).collect());
-        true
-    }
-
-    /// The owed jobs whose ends no client has read yet.
-    fn unread(&self) -> Vec<JobId> {
-        self.owed()
-            .iter()
-            .flatten()
-            .filter(|(_, owed)| !owed.read())
-            .map(|(job, _)| *job)
-            .collect()
-    }
-
-    /// Record what a served call told its client about `job`, while draining.
-    fn record(&self, job: JobId, update: impl FnOnce(&mut Owed)) {
-        if let Some(entry) = self.owed().as_mut().and_then(|owed| owed.get_mut(&job)) {
-            update(entry);
-        }
-        self.called.notify_one();
-    }
-
-    /// Wait until every owed job is read, or until `bound` passes with no client call at all.
-    async fn settle(&self, bound: std::time::Duration) -> Settled {
-        loop {
-            let all_read = self
-                .owed()
-                .as_ref()
-                .is_none_or(|owed| owed.values().all(Owed::read));
-            if all_read {
-                break;
+        self.asked().insert(job, asked);
+        let reads = Arc::clone(self);
+        let supervisor = supervisor.clone();
+        tokio::spawn(async move {
+            // An ended job is owed nothing by a drain that begins later, and a drain that began
+            // took its entry already. A wait refused leaves the entry for the drain to weigh.
+            if supervisor.wait(job).await.is_ok() {
+                reads.asked().remove(&job);
             }
-            if tokio::time::timeout(bound, self.called.notified())
-                .await
-                .is_err()
+        });
+    }
+
+    /// `peer` held, waited on, sealed or read `job`: one more process its end is owed to, whose
+    /// exit is watched when the supervisor drains.
+    fn asked_about(self: &Arc<Self>, job: JobId, peer: io::Result<Process>) {
+        let watch = {
+            let mut drain = self.drain();
+            match drain.as_mut() {
+                Some(drain) => drain.reader(job, peer),
+                None => {
+                    if let Some(asked) = self.asked().get_mut(&job) {
+                        asked.add(job, peer);
+                    }
+                    None
+                }
+            }
+        };
+        if let Some(watch) = watch {
+            Arc::clone(self).watch(watch, None);
+        }
+    }
+
+    /// Start owing `running`, each job to the processes that asked for or about it: the exits
+    /// to watch, or `None` when a drain already began.
+    fn begin(&self, running: &[(JobId, ExecClass)]) -> Option<Vec<Watch>> {
+        let mut drain = self.drain();
+        if drain.is_some() {
+            return None;
+        }
+        let mut asked = std::mem::take(&mut *self.asked());
+        let mut next = 0;
+        let mut watches = Vec::new();
+        let mut owed = BTreeMap::new();
+        for &(job, class) in running {
+            let mut entry = Owed::default();
+            if let Some(Asked {
+                requester,
+                readers,
+                unidentified,
+            }) = asked.remove(&job)
             {
-                break;
+                entry.asked = true;
+                entry.unseen = unidentified;
+                let resident =
+                    matches!(class, ExecClass::Resident | ExecClass::InteractiveResident);
+                let requester = requester.map(|process| (process, resident));
+                for (process, ends_resident) in requester
+                    .into_iter()
+                    .chain(readers.into_iter().map(|process| (process, false)))
+                {
+                    entry.readers.insert(next, Arc::clone(&process));
+                    watches.push(Watch {
+                        job,
+                        number: next,
+                        process,
+                        ends_resident,
+                    });
+                    next += 1;
+                }
             }
+            owed.insert(job, entry);
         }
-        let owed = self.owed();
-        let (read, unread): (Vec<_>, Vec<_>) =
-            owed.iter().flatten().partition(|(_, owed)| owed.read());
-        Settled {
-            read: read.into_iter().map(|(job, _)| *job).collect(),
-            unread: unread.into_iter().map(|(job, _)| *job).collect(),
-            bound,
+        *drain = Some(Drain {
+            running: running.iter().map(|(job, _)| *job).collect(),
+            reading: false,
+            owed,
+            ended: Vec::new(),
+            next,
+        });
+        Some(watches)
+    }
+
+    /// Watch `watch`'s process to its exit, registered before this returns so no exit after it
+    /// is missed. The job is no longer owed to the process then, and a resident it requested is
+    /// ended through `resident` first.
+    fn watch(self: Arc<Self>, watch: Watch, resident: Option<ResidentEnd>) {
+        let Watch {
+            job,
+            number,
+            process,
+            ..
+        } = watch;
+        let exit = process.exit();
+        tokio::spawn(async move {
+            let observed = match exit {
+                Ok(exit) => exit.observed().await,
+                Err(error) => Err(error),
+            };
+            let observed = match observed {
+                Ok(observed) => observed,
+                Err(error) => {
+                    cowshed_os::eprintln!(
+                        "cowshed: a draining supervisor cannot watch pid {}, which asked about job \
+                         {}: {error}; that job's end is owed to it until a read or the idle bound",
+                        process.pid(),
+                        job.get()
+                    );
+                    self.settle_reader(job, number, true);
+                    return;
+                }
+            };
+            if let Some(ResidentEnd { supervisor, report }) = resident {
+                let gone = RequesterGone {
+                    job,
+                    requester: process.pid(),
+                    observed,
+                };
+                match end_resident(&supervisor, &gone, &report).await {
+                    Ok(true) => {
+                        let mut drain = self.drain();
+                        if let Some(drain) = drain.as_mut() {
+                            drain.ended.push(gone);
+                            report.publish(drain.waits());
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => report.stuck(&format!("end {gone}"), &error),
+                }
+            }
+            self.settle_reader(job, number, false);
+        });
+    }
+
+    /// The process watched as `number` will read nothing of `job` any more: it exited, or its
+    /// exit cannot be watched (`unseen`), so it is never seen gone.
+    fn settle_reader(&self, job: JobId, number: u64, unseen: bool) {
+        if let Some(owed) = self
+            .drain()
+            .as_mut()
+            .and_then(|drain| drain.owed.get_mut(&job))
+        {
+            owed.readers.remove(&number);
+            owed.unseen |= unseen;
+        }
+        self.gone.notify_one();
+    }
+
+    /// Say in the report what the drain waits for now.
+    fn publish(&self, report: &DrainReport) {
+        if let Some(drain) = self.drain().as_ref() {
+            report.publish(drain.waits());
         }
     }
+
+    /// Every job it waited for has ended: it waits for their reads now.
+    fn reading(&self, report: &DrainReport) {
+        let mut drain = self.drain();
+        if let Some(drain) = drain.as_mut() {
+            drain.reading = true;
+            report.publish(drain.waits());
+        }
+    }
+
+    /// Record what a served call told its client about `job`, while draining: a read of an owed
+    /// job starts the idle bound over, and nothing else does.
+    fn record(&self, job: JobId, update: impl FnOnce(&mut Owed)) {
+        let owed = match self
+            .drain()
+            .as_mut()
+            .and_then(|drain| drain.owed.get_mut(&job))
+        {
+            Some(owed) => {
+                update(owed);
+                true
+            }
+            None => false,
+        };
+        if owed {
+            self.read.notify_one();
+        }
+    }
+
+    /// Wait until every owed job is read or every process it was owed to has exited, or until
+    /// `bound` passes with no read of an owed job.
+    async fn settle(&self, bound: std::time::Duration) -> Settled {
+        let mut deadline = tokio::time::Instant::now() + bound;
+        loop {
+            let settled = self
+                .drain()
+                .as_ref()
+                .is_none_or(|drain| drain.owed.values().all(Owed::settled));
+            if settled {
+                break;
+            }
+            tokio::select! {
+                () = self.read.notified() => deadline = tokio::time::Instant::now() + bound,
+                () = self.gone.notified() => {}
+                () = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        let drain = self.drain();
+        let mut settled = Settled {
+            read: Vec::new(),
+            abandoned: Vec::new(),
+            unread: Vec::new(),
+            ended: Vec::new(),
+            bound,
+        };
+        if let Some(drain) = drain.as_ref() {
+            for (job, owed) in &drain.owed {
+                if owed.read() {
+                    settled.read.push(*job);
+                } else if owed.abandoned() {
+                    settled.abandoned.push(*job);
+                } else {
+                    settled.unread.push(*job);
+                }
+            }
+            settled.ended.clone_from(&drain.ended);
+        }
+        settled
+    }
+}
+
+/// End the resident `gone` names, whose requester exited while the supervisor drains: `false`
+/// when it had already ended.
+async fn end_resident(
+    supervisor: &WorkspaceSupervisorHandle,
+    gone: &RequesterGone,
+    report: &DrainReport,
+) -> Result<bool> {
+    if supervisor.info(gone.job).await?.state.is_terminal() {
+        return Ok(false);
+    }
+    cowshed_os::eprintln!(
+        "cowshed: a draining supervisor ({}) ends {gone}",
+        report.path.display()
+    );
+    supervisor.kill(gone.job).await?;
+    Ok(true)
 }
 
 async fn serve_endpoint_call(
@@ -1307,7 +1747,7 @@ async fn serve_endpoint_call(
     streams: &Streams,
     advances: Option<&Advances>,
     feed: Option<&super::commitment_feed::CommitmentFeed>,
-    owed: &DrainReads,
+    owed: &Arc<DrainReads>,
     membership: bool,
 ) -> Result<Retirement> {
     if membership {
@@ -1409,7 +1849,7 @@ async fn serve_call(
     streams: &Streams,
     advances: Option<&Advances>,
     feed: Option<&super::commitment_feed::CommitmentFeed>,
-    owed: &DrainReads,
+    owed: &Arc<DrainReads>,
 ) -> Result<Retirement> {
     verify_peer(&stream)?;
     let request: Request = read_json(&mut stream).await?;
@@ -1501,6 +1941,16 @@ async fn serve_call(
     };
     let payload = read_bytes(&mut stream, length).await?;
     let caller = supervisor.with_authority(authority.into());
+    // A process that asks for or about a job is one its end is owed to should the supervisor
+    // drain (11_shell.md "Draining a supervisor of another build").
+    if let Call::Hold { job_id }
+    | Call::Wait { job_id }
+    | Call::Sealed { job_id }
+    | Call::LogRead { job_id, .. } = &*call
+    {
+        owed.asked_about(*job_id, Process::of_socket_peer(&stream));
+    }
+    let requester = matches!(*call, Call::Exec { .. }).then(|| Process::of_socket_peer(&stream));
     if let Call::ProcessEvents { job_id, every } = *call {
         serve_process_events(stream, &caller, job_id, every).await?;
         return Ok(Retirement::Serving);
@@ -1523,13 +1973,20 @@ async fn serve_call(
         _ => None,
     };
     let retiring = matches!(*call, Call::Retire { .. });
-    let (value, bytes) = match answer(&caller, streams, *call, payload).await {
+    let Answer {
+        value,
+        bytes,
+        admitted,
+    } = match answer(&caller, streams, *call, payload).await {
         Ok(answer) => answer,
         Err(error) => {
             write_json(&mut stream, &Response::Err(error)).await?;
             return Ok(Retirement::Serving);
         }
     };
+    if let (Some(job), Some(requester)) = (admitted, requester) {
+        owed.admitted(job, requester, &caller);
+    }
     if retiring {
         // The serving loop releases the listener and lease before acknowledging retirement.
         return Ok(Retirement::Retired {
@@ -1745,16 +2202,24 @@ fn to_value<T: Serialize>(value: &T) -> Result<serde_json::Value> {
     serde_json::to_value(value).map_err(|error| protocol_error(format!("encoding failed: {error}")))
 }
 
+/// What a call answers, and the job it admitted when it was an `exec`.
+struct Answer {
+    value: serde_json::Value,
+    bytes: Bytes,
+    admitted: Option<JobId>,
+}
+
 async fn answer(
     supervisor: &WorkspaceSupervisorHandle,
     streams: &Streams,
     call: Call,
     payload: Bytes,
-) -> Result<(serde_json::Value, Bytes)> {
+) -> Result<Answer> {
     let session =
         |wire: SessionWire| SessionToken::remote(supervisor.snapshot(), wire.identity, wire.name);
     let unit = || to_value(&());
-    Ok(match call {
+    let mut admitted = None;
+    let (value, bytes) = match call {
         Call::OpenSession { name } => {
             let token = supervisor.open_session(name).await?;
             (to_value(&SessionWire::from(&token))?, Bytes::new())
@@ -1828,6 +2293,7 @@ async fn answer(
             if let Some(writer) = writer {
                 lock(streams).insert(job_id, writer);
             }
+            admitted = Some(job_id);
             (to_value(&job_id)?, Bytes::new())
         }
         Call::StdinWrite { job_id, offset } => {
@@ -1947,6 +2413,11 @@ async fn answer(
             supervisor.name_build_volume(build_volume).await?;
             (unit()?, Bytes::new())
         }
+    };
+    Ok(Answer {
+        value,
+        bytes,
+        admitted,
     })
 }
 
@@ -3416,28 +3887,34 @@ mod drain_read_tests {
         JobId::new(id).expect("a job id")
     }
 
+    fn background(ids: &[u64]) -> Vec<(JobId, ExecClass)> {
+        ids.iter()
+            .map(|id| (job(*id), ExecClass::Background))
+            .collect()
+    }
+
+    const BOUND: Duration = Duration::from_secs(30 * 60);
+
     /// A job is read once its end reached a client and every stream that client was reading
     /// reached EOF: the end alone leaves the tail of a relayed stream unread.
     #[tokio::test]
     async fn a_job_is_read_once_its_end_and_every_stream_being_read_reached_a_client() {
         let owed = DrainReads::default();
-        assert!(owed.begin([job(1), job(2)].into_iter()));
+        assert!(owed.begin(&background(&[1, 2])).is_some());
         assert!(
-            !owed.begin([job(3)].into_iter()),
+            owed.begin(&background(&[3])).is_none(),
             "a second drain owes nothing new"
         );
         owed.record(job(1), |owed| owed.reading[0] = true);
         owed.record(job(1), |owed| owed.end = true);
         owed.record(job(2), |owed| owed.end = true);
-        let unread = |owed: &DrainReads| {
-            owed.owed()
-                .iter()
-                .flatten()
-                .filter(|(_, owed)| !owed.read())
-                .map(|(job, _)| *job)
-                .collect::<Vec<_>>()
+        let settled = |owed: &DrainReads, id: u64| {
+            owed.drain()
+                .as_ref()
+                .is_some_and(|drain| drain.owed[&job(id)].settled())
         };
-        assert_eq!(unread(&owed), [job(1)], "job 1's stdout tail is still owed");
+        assert!(!settled(&owed, 1), "job 1's stdout tail is still owed");
+        assert!(settled(&owed, 2));
         owed.record(job(1), |owed| owed.eof[0] = true);
         let settled = owed.settle(Duration::from_secs(60 * 60)).await;
         assert_eq!(settled.read, [job(1), job(2)]);
@@ -3445,19 +3922,89 @@ mod drain_read_tests {
         assert_eq!(settled.to_string(), "read by a client: [1, 2]");
     }
 
-    /// A job nobody reads, a detached one, cannot keep a drained supervisor serving: past the
-    /// bound with no client call it retires, and says which ends went unread.
+    /// A job nobody was seen asking about cannot keep a drained supervisor serving: past the
+    /// bound with no read it retires, and says which ends went unread.
     #[tokio::test(start_paused = true)]
     async fn an_end_nobody_reads_is_given_up_after_the_idle_bound_and_named() {
         let owed = DrainReads::default();
-        owed.begin([job(7)].into_iter());
-        let bound = Duration::from_secs(30 * 60);
-        let settled = owed.settle(bound).await;
+        owed.begin(&background(&[7]));
+        let settled = owed.settle(BOUND).await;
         assert!(settled.read.is_empty());
         assert_eq!(settled.unread, [job(7)]);
         assert_eq!(
             settled.to_string(),
-            "read by a client: []; unread after 30 minutes with no client call: [7]"
+            "read by a client: []; unread after 30 minutes with no read: [7]"
+        );
+    }
+
+    /// Measured 2026-10-22: a drained supervisor whose ended job's client was gone answered the
+    /// `hello` of every command of the new build it refused, and each one started its idle bound
+    /// over, so it served until it was killed. Only a read of an owed job starts the bound over.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_read_of_an_owed_job_starts_the_idle_bound_over() {
+        for (read, owed_job) in [(job(8), false), (job(7), true)] {
+            let owed = Arc::new(DrainReads::default());
+            owed.begin(&background(&[7]));
+            let settling = tokio::spawn({
+                let owed = Arc::clone(&owed);
+                async move { owed.settle(BOUND).await }
+            });
+            tokio::time::sleep(Duration::from_secs(20 * 60)).await;
+            owed.record(read, |owed| owed.reading[0] = true);
+            tokio::time::sleep(Duration::from_secs(11 * 60)).await;
+            assert_eq!(
+                settling.is_finished(),
+                !owed_job,
+                "31 minutes in, after a read of job {} at 20",
+                read.get()
+            );
+            let settled = settling.await.expect("settle");
+            assert_eq!(settled.unread, [job(7)]);
+        }
+    }
+
+    /// A job owed to processes that have all exited is owed to nobody: the drain waits for no
+    /// reader that no longer exists, however long its idle bound.
+    #[tokio::test]
+    async fn a_job_every_process_of_which_exited_is_owed_to_nobody() {
+        use cowshed_os::fork_lock::Spawn as _;
+        let mut reader = tokio::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn_locked()
+            .expect("start a reader");
+        let pid = i32::try_from(reader.id().expect("a running reader")).expect("a pid");
+        let process = Process::observe(pid)
+            .expect("observe the reader")
+            .expect("the reader runs");
+        let owed = Arc::new(DrainReads::default());
+        owed.asked().insert(
+            job(3),
+            Asked {
+                requester: Some(Arc::new(process)),
+                readers: Vec::new(),
+                unidentified: false,
+            },
+        );
+        let watches = owed.begin(&background(&[3])).expect("the first drain");
+        assert_eq!(watches.len(), 1, "job 3's requester is watched");
+        for watch in watches {
+            Arc::clone(&owed).watch(watch, None);
+        }
+        drop(reader.stdin.take());
+        assert!(reader.wait().await.expect("the reader exits").success());
+        let settled = tokio::time::timeout(
+            Duration::from_secs(60),
+            owed.settle(Duration::from_secs(60 * 60)),
+        )
+        .await
+        .expect("it settles once every process job 3 was owed to exited, not at its bound");
+        assert_eq!(settled.abandoned, [job(3)]);
+        assert!(settled.unread.is_empty());
+        assert_eq!(
+            settled.to_string(),
+            "read by a client: []; every process they were owed to exited: [3]"
         );
     }
 
@@ -3479,10 +4026,18 @@ mod drain_read_tests {
 
         report.publish(DrainWait::Jobs {
             running: vec![job(12), job(13)],
+            ended: vec![RequesterGone {
+                job: job(12),
+                requester: 4242,
+                observed: ExitObserved::Watched,
+            }],
         });
         assert_eq!(
             DrainReport::read(&socket, ours).as_deref(),
-            Some("it drains: it waits for jobs 12, 13 to end")
+            Some(
+                "it drains: it waits for jobs 12, 13 to end; it ended resident job 12, whose \
+                 requester pid 4242 exited (its exit watch reported its exit)"
+            )
         );
         assert_eq!(
             DrainReport::read(&socket, ours + 1),
@@ -3491,16 +4046,15 @@ mod drain_read_tests {
         );
 
         let owed = DrainReads::default();
-        owed.begin([job(7024), job(7025)].into_iter());
+        owed.begin(&background(&[7024, 7025]));
         owed.record(job(7025), |owed| owed.end = true);
-        report.publish(DrainWait::Reads {
-            unread: owed.unread(),
-        });
+        owed.reading(&report);
         assert_eq!(
             DrainReport::read(&socket, ours).as_deref(),
             Some(
-                "it drains: its jobs ended, and it waits for a client to read the ends of jobs \
-                 7024, or 30 minutes with no client call"
+                "it drains: its jobs ended, and it waits until a client reads the ends of jobs \
+                 7024 or every process they are owed to has exited, or 30 minutes pass with no \
+                 read of them"
             )
         );
 

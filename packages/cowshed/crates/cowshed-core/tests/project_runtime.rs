@@ -2637,6 +2637,20 @@ fn supervisor_config(root: &Path) -> WorkspaceSupervisorConfig {
     )
 }
 
+/// The authority of the supervisor of `workspace` at `incarnation` these tests serve.
+fn authority_of(
+    workspace: WorkspaceName,
+    workspace_incarnation: WorkspaceIncarnation,
+) -> WorkspaceAuthoritySnapshot {
+    WorkspaceAuthoritySnapshot {
+        repo_id: RepoId::parse("acme/widget").expect("fixed repo id"),
+        workspace,
+        workspace_incarnation,
+        grant_revision: 1,
+        lifecycle_revision: 1,
+    }
+}
+
 /// The config of a supervisor of `workspace` at `incarnation`, at `root/workspace`.
 fn supervisor_config_of(
     root: &Path,
@@ -2645,13 +2659,7 @@ fn supervisor_config_of(
 ) -> WorkspaceSupervisorConfig {
     let workspace_root = root.join("workspace");
     std::fs::create_dir(&workspace_root).expect("workspace root");
-    let authority = WorkspaceAuthoritySnapshot {
-        repo_id: RepoId::parse("acme/widget").expect("fixed repo id"),
-        workspace,
-        workspace_incarnation,
-        grant_revision: 1,
-        lifecycle_revision: 1,
-    };
+    let authority = authority_of(workspace, workspace_incarnation);
     WorkspaceSupervisorConfig {
         owned_repo_ids: OwnedRepoIds::sole(authority.repo_id.clone()),
         authority,
@@ -2751,6 +2759,290 @@ fn system_supervisor_of(config: WorkspaceSupervisorConfig) -> WorkspaceSuperviso
     std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
         .expect("workspace token mode");
     WorkspaceSupervisor::start(config, AcceptedCommitments).expect("start supervisor")
+}
+
+/// Names the supervisor socket this test binary admits a job on when it runs as
+/// [`drain_requester_process`].
+const DRAIN_REQUESTER_SOCKET: &str = "COWSHED_TEST_DRAIN_REQUESTER_SOCKET";
+/// Whether that job is a `background` job or a `resident`.
+const DRAIN_REQUESTER_CLASS: &str = "COWSHED_TEST_DRAIN_REQUESTER_CLASS";
+
+/// A job that blocks until a line is written to the workspace's FIFO `drain-gate`.
+fn gated_request(class: ExecClass) -> ExecRequest {
+    ExecRequest {
+        command: ExecCommand::Argv(
+            [
+                "/bin/sh",
+                "-c",
+                "read _ < drain-gate; printf 'gate opened\\n'",
+            ]
+            .into_iter()
+            .map(CommandArg::from)
+            .collect(),
+        ),
+        class,
+        want: None,
+        scope: ExecScope::Workspace,
+        cwd: None,
+        mode: RunSandboxMode::ReadWrite,
+        env: std::collections::HashMap::new(),
+        trace: None,
+        stdin: StdinSource::Empty,
+        stdout_copy: None,
+        stderr_copy: None,
+        admission_key: None,
+    }
+}
+
+/// Not a test of its own: the requester process of the drain proofs. Run as this binary with
+/// [`DRAIN_REQUESTER_SOCKET`] set, it admits one gated job of [`DRAIN_REQUESTER_CLASS`] on that
+/// socket, says `job=<id>` on stdout, and exits once its stdin closes, never reading the job.
+/// Run any other way it does nothing.
+#[test]
+fn drain_requester_process() {
+    let Some(socket) = std::env::var_os(DRAIN_REQUESTER_SOCKET) else {
+        return;
+    };
+    let class = match std::env::var(DRAIN_REQUESTER_CLASS).as_deref() {
+        Ok("background") => ExecClass::Background,
+        Ok("resident") => ExecClass::InteractiveResident,
+        other => panic!("no requester class {other:?}"),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the requester's runtime");
+    let job = runtime.block_on(async {
+        cowshed_core::runtime::supervisor_socket::connect(
+            PathBuf::from(socket),
+            authority_of(WorkspaceName::new("main").expect("main"), incarnation(1)),
+        )
+        .exec(None, None, gated_request(class), AdmissionSource::Worker)
+        .await
+        .expect("admit the gated job")
+    });
+    println!("job={}", job.get());
+    std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new())
+        .expect("hold until stdin closes");
+}
+
+/// The production supervisor of main served on its socket, the way a workspace supervisor
+/// process serves it, with the FIFO its gated jobs block on.
+#[cfg(target_os = "macos")]
+struct DrainFixture {
+    root: TempRoot,
+    _sockets: scratch_apfs::ScratchRoot,
+    path: PathBuf,
+    serving: tokio::task::JoinHandle<Result<()>>,
+}
+
+#[cfg(target_os = "macos")]
+impl DrainFixture {
+    async fn start(name: &str) -> Self {
+        use cowshed_core::runtime::supervisor_socket;
+        use cowshed_os::fork_lock::Run as _;
+        let root = test_root();
+        let supervisor = system_supervisor(&root);
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .arg(root.join("workspace").join("drain-gate"))
+                .status_locked()
+                .expect("create the gate FIFO")
+                .success()
+        );
+        let sockets = scratch_apfs::ScratchRoot::new(name).expect("short socket root");
+        let path = sockets.path().join("s");
+        let socket = supervisor_socket::bind(&path)
+            .await
+            .expect("bind supervisor");
+        let serving = tokio::spawn(supervisor_socket::serve(socket, supervisor, None, None));
+        Self {
+            root,
+            _sockets: sockets,
+            path,
+            serving,
+        }
+    }
+
+    /// A requester in a process of its own that admitted a gated job of `class`.
+    async fn requester(&self, class: &str) -> (tokio::process::Child, JobId) {
+        use cowshed_os::fork_lock::Spawn as _;
+        use tokio::io::AsyncBufReadExt as _;
+        let mut child = tokio::process::Command::new(std::env::current_exe().expect("this binary"))
+            .args(["--exact", "drain_requester_process", "--nocapture"])
+            .env(DRAIN_REQUESTER_SOCKET, &self.path)
+            .env(DRAIN_REQUESTER_CLASS, class)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn_locked()
+            .expect("start the requester");
+        let mut lines =
+            tokio::io::BufReader::new(child.stdout.take().expect("the requester's stdout")).lines();
+        while let Some(line) = lines.next_line().await.expect("read the requester") {
+            if let Some((_, id)) = line.split_once("job=") {
+                let id = id.trim().parse().expect("a job id");
+                // The harness writes its result line as it exits: read on to the end, or that
+                // write meets a closed pipe and the requester fails.
+                tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+                return (child, JobId::new(id).expect("a job id"));
+            }
+        }
+        panic!(
+            "the requester ended without admitting a job: {:?}",
+            child.wait().await
+        );
+    }
+
+    /// The report the draining supervisor publishes beside its socket, once `ready` holds of it.
+    async fn report(&self, ready: impl Fn(&Value) -> bool) -> Value {
+        let path = self.path.with_extension("drain");
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    let report: Value = serde_json::from_slice(&bytes).expect("a drain report");
+                    if ready(&report) {
+                        return report;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no drain report at {} came to hold", path.display()))
+    }
+
+    /// Let the gated jobs run to their end.
+    async fn open_gate(&self) {
+        let gate = self.root.join("workspace").join("drain-gate");
+        tokio::task::spawn_blocking(move || std::fs::write(gate, b"open\n"))
+            .await
+            .expect("the gate task")
+            .expect("open the gate");
+    }
+
+    /// The supervisor's serving ends: it retired. Its idle bound is 30 minutes, so an end within
+    /// the minute is no bound passing.
+    async fn retired(self) {
+        tokio::time::timeout(Duration::from_secs(60), self.serving)
+            .await
+            .expect("the drained supervisor retires without waiting out its idle bound")
+            .expect("the serving task")
+            .expect("it retires cleanly");
+    }
+}
+
+/// Measured 2026-10-22: after a gateway restart onto a new build, a drained supervisor of the
+/// replaced build held an ended job's end for a client that no longer existed, answered every
+/// refused command's `hello`, and refused the new build's commands until it was killed. The end
+/// is owed to the processes that asked for the job; once every one has exited, the supervisor
+/// waits for nobody, whatever else connects.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_drain_owes_no_end_to_a_requester_that_exited() {
+    use cowshed_core::runtime::supervisor_socket;
+    let fixture = DrainFixture::start("drain-gone").await;
+    let (mut requester, job) = fixture.requester("background").await;
+    supervisor_socket::drain(&fixture.path)
+        .await
+        .expect("drain the supervisor");
+    let report = fixture
+        .report(|report| report["waits"]["for"] == "jobs")
+        .await;
+    assert_eq!(report["waits"]["running"], json!([job.get()]), "{report}");
+
+    // The requester goes, as the fleet's harness went with the replaced gateway.
+    drop(requester.stdin.take());
+    assert!(
+        requester
+            .wait()
+            .await
+            .expect("the requester exits")
+            .success()
+    );
+    fixture.open_gate().await;
+    // The new build's refused commands keep asking who serves: no read of the job.
+    let path = fixture.path.clone();
+    let asking = tokio::spawn(async move {
+        while supervisor_socket::hello(&path).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    fixture.retired().await;
+    asking.await.expect("the hello loop ends with the socket");
+}
+
+/// Measured 2026-10-22: a drained supervisor of the replaced build kept serving an embedder's
+/// feedback Nx worker, a resident whose controller had died with the replaced gateway, and
+/// refused the next fleet's commands for as long as it would have lived. A resident serves only
+/// its requester; once that process exits, the drain ends it and says so.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_drain_ends_a_resident_whose_requester_exited() {
+    use cowshed_core::runtime::supervisor_socket;
+    let fixture = DrainFixture::start("drain-res").await;
+    let (mut requester, job) = fixture.requester("resident").await;
+    let requester_pid = requester.id().expect("a running requester");
+    supervisor_socket::drain(&fixture.path)
+        .await
+        .expect("drain the supervisor");
+    fixture
+        .report(|report| report["waits"]["for"] == "jobs")
+        .await;
+    // This test reads the resident too, so once it ends its end is still owed, and the report
+    // that names why it ended can be read before the supervisor retires.
+    let remote = supervisor_socket::connect(
+        fixture.path.clone(),
+        authority_of(WorkspaceName::new("main").expect("main"), incarnation(1)),
+    );
+    let waiting = tokio::spawn({
+        let remote = remote.clone();
+        async move { remote.wait(job).await }
+    });
+    let first = remote
+        .log_read(job, StreamKind::Stdout, 0, false)
+        .await
+        .expect("a first read of its stdout");
+    assert!(!first.eof, "the resident runs");
+
+    drop(requester.stdin.take());
+    assert!(
+        requester
+            .wait()
+            .await
+            .expect("the requester exits")
+            .success()
+    );
+    let ended = tokio::time::timeout(Duration::from_secs(60), waiting)
+        .await
+        .expect("the resident ends with its requester")
+        .expect("the wait task")
+        .expect("its end");
+    assert_eq!(ended.state, JobState::Killed);
+    let report = fixture
+        .report(|report| report["waits"]["ended"].is_array())
+        .await;
+    assert_eq!(
+        report["waits"]["ended"],
+        json!([{ "job": job.get(), "requester": requester_pid, "observed": "watched" }]),
+        "{report}"
+    );
+
+    let mut offset = first.next_offset;
+    loop {
+        let chunk = remote
+            .log_read(job, StreamKind::Stdout, offset, true)
+            .await
+            .expect("read its stdout");
+        assert!(chunk.bytes.is_empty(), "the gate never opened");
+        offset = chunk.next_offset;
+        if chunk.eof {
+            break;
+        }
+    }
+    fixture.retired().await;
 }
 
 /// Jobs of the main workspace, reached the way an embedder reaches them: the capability client,
