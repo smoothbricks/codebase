@@ -193,6 +193,9 @@ enum Request<H> {
         epoch: u64,
         activation: Activation<H>,
     },
+    Ready {
+        reply: oneshot::Sender<bool>,
+    },
     #[cfg(test)]
     Inspect {
         reply: oneshot::Sender<PoolInspection>,
@@ -287,6 +290,17 @@ impl<A: Activator> ShellPool<A> {
                 epoch,
             }),
         })
+    }
+
+    /// Whether an acquire now would hand back a warm host: an idle one of the current
+    /// generation, or the spare. It takes and reserves nothing, so a command that acquires later
+    /// may still find none (05_gateway.md "A resident's start holds one token").
+    pub async fn ready(&self) -> Result<bool> {
+        let (reply, receive) = oneshot::channel();
+        self.requests
+            .send(Request::Ready { reply })
+            .map_err(|_| pool_stopped())?;
+        receive.await.map_err(|_| pool_stopped())
     }
 
     fn checkout(&self, slot: SlotId, host: A::Host, reusable: bool) -> Checkout<A> {
@@ -442,6 +456,10 @@ impl<A: Activator> PoolActor<A> {
                     healthy,
                 } => self.release(slot, host, healthy),
                 Request::Warmed { epoch, activation } => self.warmed(epoch, activation),
+                Request::Ready { reply } => {
+                    let ready = self.ready();
+                    let _ = reply.send(ready);
+                }
                 #[cfg(test)]
                 Request::Inspect { reply } => {
                     let _ = reply.send(PoolInspection {
@@ -541,6 +559,23 @@ impl<A: Activator> PoolActor<A> {
             };
         }
         self.ticket()
+    }
+
+    /// What [`Self::acquire`] would decide, deciding nothing: the same input checks fold into
+    /// the dirty flag, and no host is taken.
+    fn ready(&mut self) -> bool {
+        self.refresh(true);
+        let Some(current) = self.current() else {
+            return false;
+        };
+        self.sieve
+            .slots
+            .iter()
+            .any(|slot| slot.generation == Some(current) && slot.host.is_some())
+            || self
+                .spare
+                .as_ref()
+                .is_some_and(|spare| spare.generation == current)
     }
 
     fn ticket(&mut self) -> Lease<A::Host> {
@@ -791,6 +826,26 @@ mod tests {
         assert_eq!(command(&pool).await, (1, false));
         assert_eq!(command(&pool).await, (1, false));
         assert_eq!(fixture.activations.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Readiness is what the next acquire decides, and asking it takes nothing: a cold pool is
+    /// not ready, a returned host of the current generation is, and a changed input retires it.
+    #[tokio::test]
+    async fn a_pool_is_ready_exactly_when_its_next_acquire_is_warm() {
+        let (fixture, root) = fixture("ready");
+        let pool = ShellPool::start(Arc::clone(&fixture), unwarmed());
+        assert!(!pool.ready().await.unwrap(), "a cold pool activates");
+        command(&pool).await;
+        assert!(pool.ready().await.unwrap(), "host 1 waits idle");
+        assert!(pool.ready().await.unwrap(), "asking took nothing");
+        assert_eq!(command(&pool).await, (1, false));
+        std::fs::write(&fixture.inputs[0], b"edited").unwrap();
+        assert!(
+            !pool.ready().await.unwrap(),
+            "a changed input retires host 1"
+        );
+        assert_eq!(command(&pool).await, (2, true));
         std::fs::remove_dir_all(root).unwrap();
     }
 

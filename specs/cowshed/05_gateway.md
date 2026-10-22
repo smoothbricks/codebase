@@ -1186,19 +1186,32 @@ core count.
   - **A resident's start holds one token** (2026-10-20). A resident is idle between requests once it runs, but its start
     is not: under a workspace `.envrc` its shell activates first, and a cold devenv evaluation is minutes of CPU
     (measured 2026-10-20: a shed's Nx daemon keeper evaluated its shell for 197 s while holding nothing, beside other
-    work the budget had admitted, so the budget did not bound it). Before its `resident-pool` request, a resident's
-    supervisor therefore asks one background token for the resident's checkout with an activation stake,
+    work the budget had admitted, so the budget did not bound it). What a start activates is judged when the resident is
+    admitted, from its exec hosts' activation state, as one of three (2026-10-23): **bare**, the command's directory
+    selects no `.envrc`, so no shell activates, one-shot or pooled; **activated**, an exec host of that shell has
+    already activated and waits, idle or as the spare of its pool's current generation; **activates**, the shell
+    activates before the command: no activated host waits, or a one-shot child enters the shell itself (a supervisor
+    without an exec host program, or the host boundary's command). A resident whose exec host has already activated asks
+    no stake; its start costs nothing the stake bounds, and neither does a bare start: both go straight to their
+    `resident-pool` request. Measured 2026-10-23 (`b20-resource-snapshots-71706`): every resident start asked the stake,
+    so with about 17 long background `sh` jobs holding the background room, the next Start's resident (a bare one-shot
+    worktree-basis read) waited for a token none of them would return, and the Start never finished. Before the
+    `resident-pool` request of a start that activates, a resident's supervisor asks one background token for the
+    resident's checkout with an activation stake,
     `{"op":"jobserver","want":1,"checkout":"<workspace root>","command":"<command>","class":"background","pool":false}`,
     which names no job and asks for no pool: it waits as any background request does, and the gateway answers
     `tokens: 1` and a fifo nobody reads. The resident asks its pool only once the stake is held, holds the stake while
     its shell activates, and closes it when its command starts, however its spawn reports that: a warm host's command
     with the job's `Started` event once the host has activated, a one-shot command when its spawn returns its process.
-    From then on it holds no token, as above. A one-shot child that enters a workspace shell runs that activation inside
-    its own process, after the spawn has returned, so its activation is not under the stake; only a supervisor without
-    an exec host program spawns one so. A stake that is refused fails the job as a refused admission does; a job that
-    ends before its command starts returns the stake with its grant. The same stake bounds a shell pool's spare
-    (11_shell.md, "One spare and a SIEVE cache"). The ledger knows no partial return, so the stake is its own one-token
-    grant rather than a count the resident's pool would later give back.
+    From then on it holds no token, as above. The judgment reserves no host: a resident judged activated whose spawn
+    must activate after all (another command took the host, or an input changed, since its admission) asks the same
+    stake then, on the same `parentPool`, and holds it while the shell activates; a kill while it waits ends the job as
+    it would have ended the activation. A one-shot child that enters a workspace shell runs that activation inside its
+    own process, after the spawn has returned, so its activation is not under the stake; only a supervisor without an
+    exec host program spawns one so. A stake that is refused fails the job as a refused admission does; a job that ends
+    before its command starts returns the stake with its grant. The same stake bounds a shell pool's spare (11_shell.md,
+    "One spare and a SIEVE cache"). The ledger knows no partial return, so the stake is its own one-token grant rather
+    than a count the resident's pool would later give back.
   - **A kept daemon a land waits on starts as the land's gate task** (2026-10-21). A start under a holder names the
     holder's pool as the stake's `parentPool`, and the stake waits on that pool and the host ledger at once ("Work a
     holder starts draws on its grant"). The keeper's start (04_sandbox.md) has such a holder while its shed's supervisor

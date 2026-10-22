@@ -1240,6 +1240,7 @@ fn spawn_request(sandbox: &SandboxConfig, cwd: &Path, argv: Vec<OsString>) -> Pr
             pool: std::path::PathBuf::from("/nonexistent/cowshed-test-cpu-pool.sock"),
             nice: 10,
             class: cowshed_core::api::ExecClass::Background,
+            activation: cowshed_core::runtime::supervisor::ActivationCover::Held,
         },
     }
 }

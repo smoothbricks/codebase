@@ -226,6 +226,7 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
         let control = Arc::new(JobControl {
             target: Mutex::new(Target::Pending),
             requested: AtomicI32::new(0),
+            signalled: tokio::sync::Notify::new(),
             #[cfg(target_os = "linux")]
             cgroup: Arc::clone(&cgroup),
         });
@@ -250,6 +251,7 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
                 cwd: PathBuf::from("/"),
                 overlay: Vec::new(),
                 nice: 10,
+                activation: super::super::supervisor::ActivationCover::Held,
                 #[cfg(target_os = "linux")]
                 cgroup: Arc::clone(&cgroup),
                 #[cfg(target_os = "macos")]

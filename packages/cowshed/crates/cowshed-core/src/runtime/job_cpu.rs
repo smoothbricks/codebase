@@ -138,6 +138,10 @@ impl JobCpuGrant {
         self.start = Some(stake);
         self
     }
+    /// Whether a resident's start stake is held: its command has not started.
+    pub fn holds_start(&self) -> bool {
+        self.start.is_some()
+    }
     /// The job's command started: a start stake returns its token. Whether one was held.
     pub fn started(&mut self) -> bool {
         self.start.take().is_some()

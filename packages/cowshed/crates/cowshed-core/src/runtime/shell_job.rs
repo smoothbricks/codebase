@@ -23,7 +23,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, Interest};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use super::child_fence::{ChildFence, NotSignalled};
 #[cfg(target_os = "linux")]
@@ -45,8 +45,8 @@ use super::shell_watch::{
     decode_direnv_watches,
 };
 use super::supervisor::{
-    OwnedProcess, ProcessEvent, ProcessSignal, RunningProcess, SandboxEnvironment, StdinLane,
-    process_termination_from_wait, run_system_output, run_system_stdin,
+    ActivationCover, OwnedProcess, ProcessEvent, ProcessSignal, RunningProcess, SandboxEnvironment,
+    ShellStart, StdinLane, process_termination_from_wait, run_system_output, run_system_stdin,
 };
 use crate::api::dto::{ExitStatus, JobId, Sha256Digest};
 use crate::error::{CowshedError, Result};
@@ -148,6 +148,18 @@ impl WorkspaceShells {
         }
     }
 
+    /// What a command under `envrc_directory`'s shell activates if it starts now: nothing when
+    /// that shell's pool holds an activated host of its current generation, idle or the spare
+    /// (05_gateway.md "A resident's start holds one token"). The judgment reserves no host:
+    /// another command may take it, an input may change, or a changed identity may replace the
+    /// pool before this one acquires, which [`run_pooled`] covers.
+    pub(super) async fn start(&self, read_only: bool, envrc_directory: PathBuf) -> ShellStart {
+        match self.pools.get(&(read_only, Some(envrc_directory))) {
+            Some((_, pool)) if matches!(pool.ready().await, Ok(true)) => ShellStart::Activated,
+            Some(_) | None => ShellStart::Activates,
+        }
+    }
+
     pub(super) fn spawn(
         &mut self,
         spawn: PooledSpawn<'_>,
@@ -218,6 +230,7 @@ impl WorkspaceShells {
         let control = Arc::new(JobControl {
             target: Mutex::new(Target::Pending),
             requested: AtomicI32::new(0),
+            signalled: Notify::new(),
             #[cfg(target_os = "linux")]
             cgroup: Arc::clone(&spawn.cgroup),
         });
@@ -234,6 +247,7 @@ impl WorkspaceShells {
                 cwd: spawn.cwd,
                 overlay,
                 nice: spawn.cpu.nice,
+                activation: spawn.cpu.activation.clone(),
                 #[cfg(target_os = "linux")]
                 cgroup: spawn.cgroup,
                 #[cfg(target_os = "macos")]
@@ -326,6 +340,8 @@ fn null_device() -> io::Result<OwnedFd> {
 pub(super) struct JobControl {
     target: Mutex<Target>,
     requested: AtomicI32,
+    /// Woken by each request, for a run still waiting before any target exists.
+    signalled: Notify,
     #[cfg(target_os = "linux")]
     cgroup: Arc<JobCgroup>,
 }
@@ -393,8 +409,22 @@ impl JobControl {
         *self.target.lock().unwrap_or_else(PoisonError::into_inner) = Target::Finished;
     }
 
+    /// The signal requested of the job, once there is one.
+    async fn requested(&self) -> i32 {
+        loop {
+            let notified = self.signalled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.requested.load(Ordering::SeqCst) {
+                0 => notified.await,
+                signal => return signal,
+            }
+        }
+    }
+
     fn signal(&self, signal: i32) -> Result<()> {
         self.requested.store(signal, Ordering::SeqCst);
+        self.signalled.notify_waiters();
         self.target
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -472,6 +502,8 @@ struct RunCommand {
     overlay: Vec<(OsString, OsString)>,
     /// The nice the command runs at, its class's.
     nice: i32,
+    /// Whether a shell activation for this command already counts against a token of the job's.
+    activation: ActivationCover,
     #[cfg(target_os = "linux")]
     cgroup: Arc<JobCgroup>,
     #[cfg(target_os = "macos")]
@@ -589,6 +621,31 @@ async fn run_pooled(
         Acquired::Warm(checkout) => checkout,
         Acquired::Activate(ticket) => {
             let activator = ticket.activator();
+            // A resident judged to start on an activated host found none here: its shell's
+            // activation is work the budget bounds, so it asks the stake now and holds it while
+            // the shell activates (05_gateway.md "A resident's start holds one token"). A kill
+            // while it waits ends the job as the kill would have ended its activation.
+            let _stake = match (&command.activation, &activator.envrc_directory) {
+                (ActivationCover::Unheld { parent }, Some(_)) => {
+                    let asked = activator.cpu.activation(
+                        activator.workspace_mount.clone(),
+                        format!(
+                            "job {} shell activation in {}",
+                            job_id.get(),
+                            activator.home().display()
+                        ),
+                        parent.clone(),
+                    );
+                    tokio::select! {
+                        stake = asked => match stake {
+                            Ok(stake) => Some(stake),
+                            Err(error) => return Outcome::NotLaunched(error),
+                        },
+                        signal = control.requested() => return decode(signal),
+                    }
+                }
+                (ActivationCover::Unheld { .. }, None) | (ActivationCover::Held, _) => None,
+            };
             let mut host = match activator.spawn_host().await {
                 Ok(host) => host,
                 Err(error) => return Outcome::NotLaunched(error),

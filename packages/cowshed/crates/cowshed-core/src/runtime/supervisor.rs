@@ -661,6 +661,46 @@ pub struct CpuPlacement {
     /// The job's class: a gate's pool is a relay whose runners each size their own test threads
     /// to their own host grant (05_gateway.md "Gate admission").
     pub class: ExecClass,
+    /// Whether a shell activation the spawn runs is already under a token the job holds.
+    pub activation: ActivationCover,
+}
+
+/// What a command's start activates, judged when a resident is admitted (05_gateway.md "A
+/// resident's start holds one token"). Only an activation is work a resident's start does, so
+/// only [`Self::Activates`] asks the stake that bounds it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShellStart {
+    /// The command's directory selects no `.envrc`: no shell activates.
+    Bare,
+    /// An exec host of the command's shell has activated already and waits, idle or as the
+    /// spare, of its current generation.
+    Activated,
+    /// The shell activates before the command: no activated host waits, or a one-shot child
+    /// enters the shell itself.
+    Activates,
+}
+
+impl ShellStart {
+    /// Whether a resident starting so asks one background token for its start.
+    pub fn stakes(self) -> bool {
+        match self {
+            Self::Bare | Self::Activated => false,
+            Self::Activates => true,
+        }
+    }
+}
+
+/// Whether the host budget already bounds a shell activation a job's spawn runs (05_gateway.md
+/// "A resident's start holds one token").
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActivationCover {
+    /// The job holds tokens, or a resident holds its start stake: an activation counts against
+    /// them.
+    Held,
+    /// A resident that asked no stake, its start judged to activate nothing. A pooled spawn that
+    /// must activate after all -- its warm host taken, or its shell's inputs changed, since the
+    /// judgment -- asks the stake then, drawing on `parent` beside the host when it names one.
+    Unheld { parent: Option<String> },
 }
 
 /// The make flags a held grant exports to Cargo and make, ahead of its fifo's path.
@@ -726,6 +766,15 @@ impl CpuPlacement {
 mod cpu_placement_tests {
     use super::*;
 
+    /// Only a start that activates a shell asks a resident's stake: a directory with no
+    /// `.envrc` activates nothing, and a host that has activated waits ready.
+    #[test]
+    fn a_resident_stakes_only_a_start_that_activates() {
+        assert!(!ShellStart::Bare.stakes());
+        assert!(!ShellStart::Activated.stakes());
+        assert!(ShellStart::Activates.stakes());
+    }
+
     fn placement(held: Option<usize>) -> CpuPlacement {
         CpuPlacement {
             held: held.map(|tokens| super::super::job_cpu::HeldTokens {
@@ -735,6 +784,7 @@ mod cpu_placement_tests {
             pool: PathBuf::from("/pool/p.sock"),
             nice: 10,
             class: ExecClass::Background,
+            activation: ActivationCover::Held,
         }
     }
 
@@ -1148,6 +1198,19 @@ pub trait SpawnSink: Send {
         request: ProcessSpawnRequest,
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>>;
+
+    /// What a command in `mode` at `cwd`, under `policy`, would activate if it started now
+    /// (05_gateway.md "A resident's start holds one token"). A sink that keeps no exec hosts
+    /// knows of none that has activated, so by default the start activates.
+    async fn shell_start(
+        &mut self,
+        _policy: &SandboxPolicy,
+        _cwd: &Path,
+        _mode: crate::api::dto::RunSandboxMode,
+        _scope: ExecScope,
+    ) -> ShellStart {
+        ShellStart::Activates
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2361,6 +2424,45 @@ impl SpawnSink for SystemSpawnSink {
             .map(Arc::new)
             .map(Some)
             .map_err(cgroup_error)
+    }
+
+    /// A directory with no `.envrc` activates nothing, one-shot or pooled. Under an `.envrc`,
+    /// the shell's pool says whether an activated host waits; with no exec host program the
+    /// one-shot child activates the shell itself. The host boundary's command enters whatever
+    /// shell it names after its spawn, so it is judged to activate.
+    async fn shell_start(
+        &mut self,
+        policy: &SandboxPolicy,
+        cwd: &Path,
+        mode: crate::api::dto::RunSandboxMode,
+        scope: ExecScope,
+    ) -> ShellStart {
+        if scope == ExecScope::HostGate {
+            return ShellStart::Activates;
+        }
+        // A cwd or profile that cannot be resolved fails the job's spawn with this same cause;
+        // until then its start is judged to activate, which keeps its stake.
+        let Ok(cwd) = crate::exec::contained_cwd(&policy.ceiling().workspace_mount, cwd) else {
+            return ShellStart::Activates;
+        };
+        let Ok(policy) = policy.for_cwd(&cwd) else {
+            return ShellStart::Activates;
+        };
+        let (sandbox, _) = policy.child(mode);
+        let Some(directory) = shell_directory(sandbox) else {
+            return ShellStart::Bare;
+        };
+        match &self.shells {
+            Some(shells) => {
+                shells
+                    .start(
+                        sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly,
+                        directory,
+                    )
+                    .await
+            }
+            None => ShellStart::Activates,
+        }
     }
 
     async fn spawn(
@@ -4351,6 +4453,9 @@ struct PendingSpawn {
     want: std::num::NonZeroUsize,
     /// The holder's live pool a resident's start stake draws on beside the host, if any.
     parent: Option<String>,
+    /// What a resident's start activates, judged at its admission; `None` for a class that
+    /// holds tokens, which an activation counts against.
+    start: Option<ShellStart>,
     authority: WorkspaceAuthoritySnapshot,
     policy: SandboxPolicy,
     command: SpawnCommand,
@@ -6014,12 +6119,26 @@ impl SupervisorActor {
                 },
             );
         }
+        let cwd = cwd
+            .as_ref()
+            .map(WorkspacePath::as_path)
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let start = match scheduling.class() {
+            ExecClass::Resident | ExecClass::InteractiveResident => Some(
+                self.spawner
+                    .shell_start(&self.policy, &cwd, mode, scheduling.scope())
+                    .await,
+            ),
+            ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => None,
+        };
         let asking = self.ask_cpu(
             job_id,
             scheduling.class(),
             scheduling.want(),
             command_label(&info.command),
             cpu_parent.clone(),
+            start,
         );
         let job = JobStateRecord {
             info,
@@ -6063,16 +6182,13 @@ impl SupervisorActor {
                 asking,
                 want: scheduling.want(),
                 parent: cpu_parent,
+                start,
                 authority: self.authority.clone(),
                 // Rendered when this authority was taken. The request may narrow the ceiling,
                 // never widen it, and narrowing one job alters no other job.
                 policy: self.policy.clone(),
                 command: spawn_command,
-                cwd: cwd
-                    .as_ref()
-                    .map(WorkspacePath::as_path)
-                    .map(Path::to_path_buf)
-                    .unwrap_or_default(),
+                cwd,
                 env: merged_env,
                 mode,
                 scope: scheduling.scope(),
@@ -6126,7 +6242,8 @@ impl SupervisorActor {
         let PendingSpawn {
             asking: _,
             want: _,
-            parent: _,
+            parent,
+            start: _,
             authority,
             policy,
             command,
@@ -6150,6 +6267,11 @@ impl SupervisorActor {
             pool: grant.pool().to_path_buf(),
             nice: class_nice(own_nice(), job.info.class),
             class: job.info.class,
+            activation: if grant.held().is_some() || grant.holds_start() {
+                ActivationCover::Held
+            } else {
+                ActivationCover::Unheld { parent }
+            },
         };
         job.info.cpu_tokens = grant.tokens();
         job.info.state = JobState::Running;
@@ -6329,8 +6451,9 @@ impl SupervisorActor {
     /// every command while the gateway queues the request. Aborting the returned handle -- a
     /// withdrawal, or this supervisor ending -- drops the request and closes its connection,
     /// which leaves the queue. A resident holds no token for its life, but its shell's
-    /// activation is work: it first waits for one token, which it holds until its command
-    /// starts, drawing on `parent`, a holder's live pool, when it names one (05_gateway.md "A
+    /// activation is work: a resident whose `start` activates first waits for one token, which
+    /// it holds until its command starts, drawing on `parent`, a holder's live pool, when it
+    /// names one; one whose start activates nothing asks its pool at once (05_gateway.md "A
     /// resident's start holds one token").
     fn ask_cpu(
         &mut self,
@@ -6339,16 +6462,13 @@ impl SupervisorActor {
         want: std::num::NonZeroUsize,
         command: String,
         parent: Option<String>,
+        start: Option<ShellStart>,
     ) -> tokio::task::AbortHandle {
         let checkout = self.workspace_root.clone();
-        let start = match class {
-            ExecClass::Resident | ExecClass::InteractiveResident => Some(self.cpu.activation(
-                checkout.clone(),
-                command.clone(),
-                parent.clone(),
-            )),
-            ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => None,
-        };
+        let start = start.filter(|start| start.stakes()).map(|_| {
+            self.cpu
+                .activation(checkout.clone(), command.clone(), parent.clone())
+        });
         let ask = self.cpu.admit(JobCpuAsk {
             class,
             want,
@@ -6396,16 +6516,17 @@ impl SupervisorActor {
             return;
         }
         pending.asking.abort();
-        let (class, want, command) = (
+        let (class, want, command, start) = (
             job.info.class,
             pending.want,
             command_label(&job.info.command),
+            pending.start,
         );
         cowshed_os::eprintln!(
             "cowshed: the Nx daemon start job {} waited at the host as background; a gate job runs now, so its start asks again on that gate's pool {pool}",
             job_id.get()
         );
-        let asking = self.ask_cpu(job_id, class, want, command, Some(pool.clone()));
+        let asking = self.ask_cpu(job_id, class, want, command, Some(pool.clone()), start);
         if let Some(job) = self.jobs.get_mut(&job_id)
             && let CpuStanding::Queued(pending) = &mut job.cpu
         {
@@ -9053,6 +9174,7 @@ mod workspace_toolchain_tests {
                 pool: PathBuf::from("/pool/p.sock"),
                 nice: 0,
                 class: ExecClass::Background,
+                activation: ActivationCover::Held,
             },
         };
         let (events, _received) = mpsc::channel(16);
@@ -10393,6 +10515,7 @@ mod sandbox_environment_tests {
                 pool: PathBuf::from("/pool/p.sock"),
                 nice: 0,
                 class: ExecClass::Gate,
+                activation: ActivationCover::Held,
             },
             #[cfg(target_os = "linux")]
             cgroup: None,
