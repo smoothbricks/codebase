@@ -70,6 +70,23 @@ workspace policy removes static lint executors, commands, dependencies, outputs 
 override source-aware inference for every project. Project-local `nx.targets.lint` declarations retain normal Nx
 override precedence.
 
+The workspace ESLint configuration keys every lint target with the config files and exactly the workspace files they
+load, read the way ESLint loads them (`src/eslint-config-closure.ts`). Under Node, ESLint loads a TypeScript config
+through jiti and any other config with a native `import()`, and every module a config reaches loads the same way. For a
+jiti config the walk runs jiti's own transform, so an import that only types use is erased exactly as jiti erases it,
+and jiti's own resolver picks each file under the `require` or `import` conditions of the call. For a native config
+`import type` and `export type` are erased, and the `node` that runs ESLint resolves each load with
+`createRequire(module).resolve` or `import.meta.resolve(specifier, module)`, one process per walk layer. A builtin, or a
+package installed outside the workspace's own files, adds nothing: `bun.lock` and the root manifest among the check
+inputs already key what is installed. A package that resolves into the workspace (a member linked into `node_modules`)
+is keyed and walked like a relative module. Every loaded file also keys the package.json files that decide how it loads:
+the nearest one (its module format), a member's own (its entry) and that of a directory a relative specifier enters (its
+`main`). A load whose specifier the source does not spell (`require(name)`, `import(path)`, `module.require`,
+`module['require']`, `require.call`/`apply`/`bind`, an alias of `require`, `createRequire`), a specifier that is neither
+relative nor a package name, one the loader cannot resolve, and a workspace file outside Nx's index fail graph
+construction with the config, the loading module and the load: lint cannot cache a verdict its key does not cover. A
+file beside the config's modules that no config loads keys no lint target.
+
 Smoo's workspace policy also sets `"cacheDirectory": ".nx/cache"` in the root `nx.json`, and `smoo monorepo check` fails
 without it. With no `NX_*_DIRECTORY` variable set, as in a host shell, the pinned Nx otherwise moves the task cache and
 its database to a per-user `~/.nx/<id>` keyed by the repository's remote, which every checkout of the repository shares.

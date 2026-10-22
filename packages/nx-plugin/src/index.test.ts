@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'bun:test';
+import { execFileSync } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isEslintFileSet } from '@smoothbricks/nx-plugin/eslint-file-set';
 import type {
@@ -378,7 +380,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           'eslint.config.mts',
           'eslint.config.cts',
         ].flatMap((name) => [`{workspaceRoot}/${name}`, `{projectRoot}/${name}`]),
-        '{workspaceRoot}/tooling/checks/**/*',
       ]);
 
       // The guard this whole treatment lives or dies on. A declaration emit is
@@ -1170,6 +1171,199 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(programInputs).toEqual(['{workspaceRoot}/packages/example/tests/check.test.ts']);
     } finally {
       await workspace.cleanup();
+    }
+  });
+
+  it('keys exactly the workspace files jiti loads for a TypeScript ESLint config', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await writeConfigLoadFixture(workspace);
+      await workspace.write(
+        'eslint.config.ts',
+        [
+          "import { rule } from './tooling/checks/rule.js';",
+          "import dirpkg from './tooling/checks/dirpkg';",
+          "import review from '@review/rules';",
+          // Erased: a declaration-only module, and a binding used only as a type.
+          "import type { RuleName } from './tooling/checks/config-types';",
+          "import { Helper } from './tooling/checks/helper';",
+          "import { shared } from './tooling/shared';",
+          'const helper: Helper | null = null;',
+          "const lazy = await import('./tooling/checks/lazy');",
+          'export default [rule, dirpkg, review, shared, lazy, helper] as RuleName[];',
+          '',
+        ].join('\n'),
+      );
+      await workspace.write('tooling/checks/config-types.d.ts', 'export type RuleName = unknown;\n');
+      await workspace.write('tooling/checks/helper.ts', 'export interface Helper { readonly name: string }\n');
+      await workspace.write('tooling/checks/lazy.ts', 'export const lazy = 4;\n');
+      await workspace.write('tooling/shared.ts', 'export const shared = 1;\n');
+
+      const { lint } = await inferProjectTargets(workspace, 'packages/example/package.json');
+      const loaded = await loaderLoads(workspace, 'eslint.config.ts');
+      expect(loaded).toEqual([
+        'tooling/checks/dirpkg/actual.cjs',
+        'tooling/checks/lazy.ts',
+        'tooling/checks/rule.js',
+        'tooling/checks/rules/index.cjs',
+        'tooling/shared.ts',
+      ]);
+      expect(keyedTooling(lint)).toEqual(
+        [
+          ...loaded,
+          'tooling/checks/dirpkg/package.json',
+          'tooling/checks/package.json',
+          'tooling/checks/rules/package.json',
+        ].sort(),
+      );
+      expect(hashes(lint, 'eslint.config.ts')).toBe(true);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('keys exactly the workspace files Node loads for a JavaScript ESLint config', async () => {
+    const configs = {
+      'eslint.config.cjs': {
+        source: [
+          "const { rule } = require('./tooling/checks/rule.js');",
+          "const dirpkg = require('./tooling/checks/dirpkg');",
+          "const review = require('@review/rules');",
+          'module.exports = [rule, dirpkg, review];',
+          '',
+        ].join('\n'),
+        manifests: [
+          'tooling/checks/dirpkg/package.json',
+          'tooling/checks/package.json',
+          'tooling/checks/rules/package.json',
+        ],
+      },
+      'eslint.config.mjs': {
+        source: [
+          "import { rule } from './tooling/checks/rule.js';",
+          "import dirpkg from './tooling/checks/dirpkg/actual.cjs';",
+          "import review from '@review/rules';",
+          'export default [rule, dirpkg, review];',
+          '',
+        ].join('\n'),
+        manifests: [
+          'tooling/checks/dirpkg/package.json',
+          'tooling/checks/package.json',
+          'tooling/checks/rules/package.json',
+        ],
+      },
+    };
+    for (const [config, { source, manifests }] of Object.entries(configs)) {
+      const workspace = await createWorkspace();
+      try {
+        await writeConfigLoadFixture(workspace);
+        await workspace.write(config, source);
+
+        const { lint } = await inferProjectTargets(workspace, 'packages/example/package.json');
+        const loaded = await loaderLoads(workspace, config);
+        expect(loaded).toEqual([
+          'tooling/checks/dirpkg/actual.cjs',
+          'tooling/checks/rule.js',
+          'tooling/checks/rules/index.cjs',
+        ]);
+        expect(keyedTooling(lint)).toEqual([...loaded, ...manifests].sort());
+      } finally {
+        await workspace.cleanup();
+      }
+    }
+  });
+
+  it('refuses an ESLint config load it cannot key, naming the config, the module and the load', async () => {
+    const refusals = {
+      // A transitive import no file answers.
+      'eslint.config.ts': {
+        files: {
+          'eslint.config.ts': "import { rule } from './tooling/checks/rule.ts';\nexport default [rule];\n",
+          'tooling/checks/rule.ts': "export { rule } from './missing-helper';\n",
+        },
+        reason:
+          /eslint\.config\.ts loads tooling\/checks\/rule\.ts, which imports '\.\/missing-helper', which names no file jiti resolves/,
+      },
+      // A require whose specifier is computed: Node loads it, nothing names it.
+      'eslint.config.cjs': {
+        files: {
+          'eslint.config.cjs': "const name = './tooling/checks/rule.js';\nmodule.exports = require(name);\n",
+        },
+        reason: /eslint\.config\.cjs loads a module it computes at runtime \(require\(name\)\)/,
+      },
+      // A dynamic import jiti loads from a template.
+      'eslint.config.mts': {
+        files: {
+          'eslint.config.mts':
+            "const name = 'lazy';\nexport default await import('./tooling/checks/' + name + '.ts');\n",
+        },
+        reason: /eslint\.config\.mts loads a module it computes at runtime/,
+      },
+    };
+    for (const { files, reason } of Object.values(refusals)) {
+      const workspace = await createWorkspace();
+      try {
+        await writeConfigLoadFixture(workspace);
+        for (const [path, contents] of Object.entries(files)) await workspace.write(path, contents);
+
+        // Nx wraps a createNodes throw in AggregateCreateNodesError, so the reason is in the nested error.
+        const failure = await inferProjectTargets(workspace, 'packages/example/package.json').then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+        if (!(failure instanceof AggregateCreateNodesError)) {
+          throw new Error(`expected AggregateCreateNodesError, got ${String(failure)}`);
+        }
+        expect(failure.errors[0]?.[1]?.message).toMatch(reason);
+      } finally {
+        await workspace.cleanup();
+      }
+    }
+  });
+
+  it('refuses every loader form Node loads through but the source does not spell as a call', async () => {
+    // Each form loads tooling/checks/rule.js under real Node; none is a `require('…')` call.
+    const forms = {
+      dot: ["module.exports = module.require('./tooling/checks/rule.js');", '(module.require)'],
+      bracket: ["module.exports = module['require']('./tooling/checks/rule.js');", "(module['require'])"],
+      'computed bracket': [
+        "const key = 'require';\nmodule.exports = module[key]('./tooling/checks/rule.js');",
+        '(module[key])',
+      ],
+      call: ["module.exports = require.call(null, './tooling/checks/rule.js');", '(require.call)'],
+      apply: ["module.exports = require.apply(null, ['./tooling/checks/rule.js']);", '(require.apply)'],
+      bind: ["module.exports = require.bind(null)('./tooling/checks/rule.js');", '(require.bind)'],
+      destructuring: [
+        "const { require: load } = module;\nmodule.exports = load.call(module, './tooling/checks/rule.js');",
+        '(require: load)',
+      ],
+      alias: ["const load = require;\nmodule.exports = load('./tooling/checks/rule.js');", '(load = require)'],
+    };
+    for (const [form, [source, load]] of Object.entries(forms)) {
+      const workspace = await createWorkspace();
+      try {
+        await writeConfigLoadFixture(workspace);
+        await workspace.write('eslint.config.cjs', `${source}\n`);
+        expect({ form, loaded: await loaderLoads(workspace, 'eslint.config.cjs') }).toEqual({
+          form,
+          loaded: ['tooling/checks/rule.js'],
+        });
+
+        // Nx wraps a createNodes throw in AggregateCreateNodesError, so the reason is in the nested error.
+        const failure = await inferProjectTargets(workspace, 'packages/example/package.json').then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+        if (!(failure instanceof AggregateCreateNodesError)) {
+          throw new Error(`${form}: expected AggregateCreateNodesError, got ${String(failure)}`);
+        }
+        expect({ form, message: failure.errors[0]?.[1]?.message }).toEqual({
+          form,
+          message: expect.stringContaining(`eslint.config.cjs loads a module it computes at runtime ${load}`),
+        });
+      } finally {
+        await workspace.cleanup();
+      }
     }
   });
 
@@ -3318,4 +3512,84 @@ function hashes(target: TargetConfiguration | undefined, path: string): boolean 
     filesets.some((input) => !input.startsWith('!') && matches(input)) &&
     !filesets.some((input) => input.startsWith('!') && matches(input.slice(1)))
   );
+}
+
+/** This repository's ESLint, linked into config fixtures: its config loader brings the jiti it loads TypeScript with. */
+const ESLINT_DIRECTORY = dirname(createRequire(import.meta.url).resolve('eslint/package.json'));
+
+/**
+ * A project ESLint lints, and the rule-module shapes an ESLint config can
+ * reach beside files it must not key: a `.js` module with a TypeScript
+ * sibling that imports a missing file, a directory entered through its
+ * manifest's `main`, and a workspace member a package name reaches through
+ * `node_modules`. One file beside the rule modules that no config loaded
+ * re-keyed 44 lint targets of a downstream workspace in one land.
+ */
+async function writeConfigLoadFixture(workspace: WorkspaceFixture): Promise<void> {
+  const root = workspace.context.workspaceRoot;
+  await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+  await workspace.write('packages/example/src/index.ts', 'export const value = 1;\n');
+  // Decides that rule.js and lazy.ts load as CommonJS; a `type` change changes what the config gets.
+  await workspace.write('tooling/checks/package.json', '{"type":"commonjs"}\n');
+  await workspace.write('tooling/checks/rule.js', 'exports.rule = 1;\n');
+  await workspace.write('tooling/checks/rule.ts', "import './missing-unused';\nexport const rule = 0;\n");
+  await workspace.write('tooling/checks/dirpkg/package.json', '{"name":"dirpkg","main":"actual.cjs"}\n');
+  await workspace.write('tooling/checks/dirpkg/actual.cjs', 'module.exports = 2;\n');
+  await workspace.write('tooling/checks/rules/package.json', '{"name":"@review/rules","main":"index.cjs"}\n');
+  await workspace.write('tooling/checks/rules/index.cjs', 'module.exports = 3;\n');
+  await workspace.write('tooling/checks/darwin-native-archive.fixtures.ts', 'export const fixture = 1;\n');
+  await mkdir(join(root, 'node_modules/@review'), { recursive: true });
+  await symlink('../../tooling/checks/rules', join(root, 'node_modules/@review/rules'));
+  await symlink(ESLINT_DIRECTORY, join(root, 'node_modules/eslint'));
+}
+
+/**
+ * Loads `config` the way ESLint 10 does under Node (jiti for TypeScript, a
+ * native `import()` otherwise) and prints every file the loader read as a
+ * module: jiti's module cache, or Node's load hook.
+ */
+const CONFIG_LOADER_ORACLE = `import { createRequire, registerHooks } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+const config = process.argv[1];
+const loaded = new Set();
+if (/\\.[mc]?ts$/.test(config)) {
+  const require = createRequire(createRequire(config).resolve('eslint'));
+  await require('jiti').createJiti(config, { moduleCache: true, fsCache: false }).import(config);
+  for (const file of Object.keys(require.cache)) loaded.add(file);
+} else {
+  registerHooks({
+    load(url, context, nextLoad) {
+      if (url.startsWith('file:')) loaded.add(fileURLToPath(url));
+      return nextLoad(url, context);
+    },
+  });
+  await import(pathToFileURL(config).href);
+}
+console.log(JSON.stringify([...loaded]));`;
+
+/** The workspace files outside `node_modules`, the config excluded, that the real loader loads for `config`. */
+async function loaderLoads(workspace: WorkspaceFixture, config: string): Promise<string[]> {
+  const root = workspace.context.workspaceRoot;
+  const output = execFileSync('node', ['--input-type=module', '--eval', CONFIG_LOADER_ORACLE, join(root, config)], {
+    encoding: 'utf8',
+  });
+  const files: unknown = JSON.parse(output);
+  if (!Array.isArray(files)) throw new Error(`config loader oracle printed ${output}`);
+  const loaded = await Promise.all(
+    files.map(async (file) => (typeof file === 'string' ? relative(root, await realpath(file)) : String(file))),
+  );
+  return loaded
+    .filter((file) => file !== config && !file.startsWith('../') && !file.split('/').includes('node_modules'))
+    .sort();
+}
+
+/** The `tooling/` files `lint` keys by name. */
+function keyedTooling(lint: TargetConfiguration | undefined): string[] {
+  return (lint?.inputs ?? [])
+    .flatMap((input) =>
+      typeof input === 'string' && input.startsWith('{workspaceRoot}/tooling/')
+        ? [input.slice('{workspaceRoot}/'.length)]
+        : [],
+    )
+    .sort();
 }

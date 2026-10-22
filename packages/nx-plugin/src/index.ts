@@ -66,6 +66,7 @@ import {
   cargoFrozen,
   runsFrozenCargo,
 } from './cross-check-policy.js';
+import { eslintConfigClosure } from './eslint-config-closure.js';
 import type { EslintFileSet } from './eslint-file-set.js';
 import { ALL_VERDICTS_EXECUTOR } from './executors/all-verdicts/schema.js';
 import { closeRunCpuPool, serveRunCpuPool } from './executors/bounded-exec/run-cpu-pool.js';
@@ -358,9 +359,17 @@ const ESLINT_CONFIG_FILES = [
 /** Every JavaScript and TypeScript module kind ESLint is handed. */
 const ESLINT_SOURCES_GLOB = '**/*.{js,jsx,cjs,mjs,ts,tsx,cts,mts}';
 
+/** What ESLint lints in this workspace and what its configuration loads. */
+interface EslintWorkspace {
+  /** The JavaScript and TypeScript files of Nx's workspace file index. */
+  readonly sources: ReadonlySet<string>;
+  /** The workspace modules the root configs load, transitively, workspace-relative and sorted; the configs excluded. */
+  readonly configImports: readonly string[];
+}
+
 /**
- * The JavaScript and TypeScript files of Nx's workspace file index, listed once
- * per graph computation; `null` when no workspace ESLint config enables ESLint.
+ * The ESLint sources and config closure of Nx's workspace file index, listed
+ * once per graph computation; `null` when no workspace ESLint config enables ESLint.
  *
  * The ESLint file list is part of the lint target's command, metadata and
  * inputs, and Nx hashes the whole target configuration into every task that
@@ -370,10 +379,20 @@ const ESLINT_SOURCES_GLOB = '**/*.{js,jsx,cjs,mjs,ts,tsx,cts,mts}';
  * and a fresh fork's did not, which alone re-keyed 197 of 510 gate tasks.
  * Drawing the list from the index makes the plugin and the hasher agree on one
  * file set.
+ *
+ * The configs key every lint target with exactly the workspace files they
+ * load (eslint-config-closure.ts): a glob over the directory holding a
+ * config's rule modules keyed every file beside them, and one test fixture
+ * there re-keyed 44 lint targets in one land.
  */
-async function indexedEslintSources(workspaceRoot: string): Promise<ReadonlySet<string> | null> {
-  if (!ESLINT_CONFIG_FILES.some((name) => existsSync(join(workspaceRoot, name)))) return null;
-  return new Set(await globIndexedFiles(workspaceRoot, [ESLINT_SOURCES_GLOB]));
+async function eslintWorkspace(workspaceRoot: string): Promise<EslintWorkspace | null> {
+  const configs = ESLINT_CONFIG_FILES.filter((name) => existsSync(join(workspaceRoot, name)));
+  if (configs.length === 0) return null;
+  const indexed = new Set(await globIndexedFiles(workspaceRoot, [ESLINT_SOURCES_GLOB, '**/*.json']));
+  return {
+    sources: new Set([...indexed].filter((path) => !path.endsWith('.json'))),
+    configImports: eslintConfigClosure(workspaceRoot, configs, indexed),
+  };
 }
 
 /**
@@ -391,7 +410,7 @@ function readTestTsConfig(testConfig: string): ParsedCommandLine {
 function projectLintCommands(
   projectRoot: string,
   workspaceRoot: string,
-  eslintSources: ReadonlySet<string> | null,
+  eslint: EslintWorkspace | null,
 ): { commands: string[]; inputs: string[]; eslintFileSet: EslintFileSet | null } {
   const commands: string[] = [];
   const inputs: string[] = [];
@@ -401,10 +420,10 @@ function projectLintCommands(
   if (BIOME_CONFIG_FILES.some((name) => existsSync(join(workspaceRoot, name)))) {
     commands.push(`biome check --files-ignore-unknown=true ${quote(projectRoot)}`);
   }
-  if (eslintSources !== null) {
+  if (eslint !== null) {
     const sourcePrefix = projectRoot === '.' ? 'src/' : `${posix.normalize(projectRoot)}/src/`;
     const sourceFiles = new Set<string>();
-    for (const path of eslintSources) {
+    for (const path of eslint.sources) {
       if (
         path.startsWith(sourcePrefix) &&
         !path.slice(sourcePrefix.length).split('/').slice(0, -1).some(isNonSourceDirectory)
@@ -432,7 +451,7 @@ function projectLintCommands(
         }
         // Only a module Nx indexes is linted and keyed. An ignored one is build
         // output that a fresh checkout lacks; a JSON file is not ESLint's.
-        if (!eslintSources.has(path) || path.split('/').some(isNonSourceDirectory)) continue;
+        if (!eslint.sources.has(path) || path.split('/').some(isNonSourceDirectory)) continue;
         sourceFiles.add(path);
         inputs.push(`{workspaceRoot}/${path}`);
       }
@@ -1002,10 +1021,10 @@ function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandl
     const results: CreateNodesResultV2 = [];
     const errors: Array<[file: string | null, error: Error]> = [];
     let cargoWorkspaces: CargoWorkspace[];
-    let eslintSources: ReadonlySet<string> | null;
+    let eslint: EslintWorkspace | null;
     try {
       cargoWorkspaces = await resolveCargoWorkspaces(projectConfigurationFiles, context.workspaceRoot, hostPlatform);
-      eslintSources = await indexedEslintSources(context.workspaceRoot);
+      eslint = await eslintWorkspace(context.workspaceRoot);
     } catch (error) {
       throw new AggregateCreateNodesError([[null, error instanceof Error ? error : new Error(String(error))]], results);
     }
@@ -1031,7 +1050,7 @@ function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandl
               context.workspaceRoot,
               hostPlatform,
               cargoWorkspaces,
-              eslintSources,
+              eslint,
               versionless,
             ),
           ]);
@@ -1176,7 +1195,7 @@ async function createProjectTargets(
   workspaceRoot: string,
   hostPlatform: NapiPlatform | null,
   cargoWorkspaces: readonly CargoWorkspace[],
-  eslintSources: ReadonlySet<string> | null,
+  eslint: EslintWorkspace | null,
   versionless: VersionlessManifestPolicy | null,
 ) {
   const projectRoot = dirname(packageJsonPath);
@@ -1940,7 +1959,7 @@ async function createProjectTargets(
     commands: lintCommands,
     inputs: lintProgramInputs,
     eslintFileSet,
-  } = projectLintCommands(projectRoot, workspaceRoot, eslintSources);
+  } = projectLintCommands(projectRoot, workspaceRoot, eslint);
   // Every lint tool reaches its own verdict in one run: run-commands would end the
   // other tools once one fails, and their findings would surface a run later.
   if (validationTargets.length > 0 || lintCommands.length > 0) {
@@ -1959,7 +1978,7 @@ async function createProjectTargets(
           `{workspaceRoot}/${name}`,
           `{projectRoot}/${name}`,
         ]),
-        '{workspaceRoot}/tooling/checks/**/*',
+        ...(eslint?.configImports ?? []).map((path) => `{workspaceRoot}/${path}`),
       ],
       ...(lintCommands.length > 0
         ? {

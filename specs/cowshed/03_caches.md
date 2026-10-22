@@ -542,7 +542,7 @@ A cached task's key is every input it declares: its files, its dependencies' fil
 toolchain inputs. With a warm cache holding a valid entry for each key, a land gate runs only the tasks whose key the
 landed commits (or a changed runtime or toolchain input) changed, plus the targets that state `"cache": false`, each for
 a reason its configuration names; a re-gate of an unchanged tree runs those uncached targets alone. A cold, evicted or
-unreachable entry runs its task again, as a cache degrade does (Nx accepted-task artifact service, above). Five rules
+unreachable entry runs its task again, as a cache degrade does (Nx accepted-task artifact service, above). Six rules
 keep the key no wider than what a task observes, each learned from a measured miss (2026-10-22, tg#9675: twenty minutes
 of gate for a one-line change).
 
@@ -574,6 +574,12 @@ of gate for a one-line change).
 - **A suite that outlasts the rest of the gate is sharded.** A runner's grant never grows, so one long runner finishes
   on the tokens it started with while the host idles. cowshed-cli runs in eight hash partitions
   (`[package.metadata.smoothbricks.test] shards = 8`), as cowshed-core does: 492 tests, the longest runner 95 s.
+- **Lint keys the files the ESLint config loads, not their directory.** Each lint target keys the workspace ESLint
+  configs and every workspace file they load, read and resolved by the loader ESLint uses (jiti for a TypeScript config,
+  Node otherwise); `bun.lock` and the root manifest key installed packages, and a load the walk cannot key fails graph
+  construction (nx-plugin README, lint inputs). A directory glob keys every file beside those modules: under
+  `{workspaceRoot}/tooling/checks/**/*`, one fixture file (`tooling/checks/darwin-native-archive.fixtures.ts`) that no
+  config loads re-keyed 44 lint targets of a downstream workspace, 464 task-seconds, in land icm-land-10.
 
 Cargo's own reuse is not where the time goes: a TypeScript-only land compiled no Rust unit, and a cowshed-core change
 compiled exactly the seven cowshed crates downstream of it. The targets that state `"cache": false` are `cargo-fetch`
