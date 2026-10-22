@@ -2135,4 +2135,6 @@ The project-scoped words the facade could not reach are operations of their own:
 applies the same filter itself, because it names every row withheld for want of an answer. `project.workspaceInSlot`
 resolves the workspace whose mount is a build slot's stable path (`path --slot`), and `coordinator.rekey` rotates one
 keyless workspace's CA identity (`rekey`) and re-derives that workspace's gateway session from the new CA before it
-answers, both for the CLI and the addon alike: a held gateway identity never outlives its key until some later exec.
+answers, both for the CLI and the addon alike: a held gateway identity never outlives its key until some later exec. The
+rotation republishes the grants sidecar at revision + 1 whether its source was the quarantine entry or the live sidecar,
+because the gateway installs only a higher revision and never bypasses that fence.

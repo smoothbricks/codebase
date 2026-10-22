@@ -485,11 +485,38 @@ async fn directory_parity_operations_answer_through_the_controller() {
         slotted.get("landing").is_some(),
         "the controller measured the session: {slotted}\n{stderr}"
     );
+    // A detached session cannot be measured: its landing is unprovable, never "landed".
+    succeed(&mut service, ["fork", "parked"]).await;
+    succeed(&mut service, ["detach", "parked"]).await;
     let (stdout, stderr) = succeed(&mut service, ["ls", "--landed"]).await;
     assert_eq!(
         String::from_utf8_lossy(&stdout),
         "slotted\n",
         "a session forked from main with no work of its own is landed\n{stderr}"
+    );
+    assert!(stderr.contains("parked withheld"), "{stderr}");
+    // project.list's own landed selection, as N-API sends it: the controller keeps the provably
+    // landed session and drops main and the session it could not measure.
+    let landed = service
+        .list(Some(cowshed_core::api::operations::ListLanding::Landed))
+        .await
+        .expect("the controller's landed listing");
+    let names: Vec<&str> = landed.iter().map(|info| info.workspace.as_str()).collect();
+    assert_eq!(names, ["slotted"]);
+    let measured = service
+        .list(Some(cowshed_core::api::operations::ListLanding::Measure))
+        .await
+        .expect("the controller's measured listing");
+    let parked = measured
+        .iter()
+        .find(|info| info.workspace.as_str() == "parked")
+        .expect("parked is listed");
+    assert!(
+        matches!(
+            parked.landing.as_ref().map(|landing| &landing.commits),
+            Some(cowshed_core::api::dto::LandingCommits::Indeterminate { .. })
+        ),
+        "{parked:?}"
     );
 
     let (refused, _, _) = run(&mut service, ["fork", "notes", "--markdown-only"]).await;

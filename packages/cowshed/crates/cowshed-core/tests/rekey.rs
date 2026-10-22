@@ -271,17 +271,17 @@ fn rekey_converts_keyless_quarantined_workspace_to_attachable() {
 }
 
 #[test]
-fn rekey_preserves_revision_when_the_sidecar_never_left() {
+fn rekey_advances_the_revision_when_the_sidecar_never_left() {
     let fixture = live_keyless_fixture("live", "raven");
     let report = rekey_workspace(&fixture.layout, &fixture.workspace, &fixture.mount_point)
         .expect("rekey heals the live sidecar");
 
-    // Nothing was removed, so there is nothing to supersede: the revision is
-    // preserved while the CA still rotates.
-    assert_eq!(report.revision, LIVE_REVISION);
+    // The rotated CA is a new identity: a gateway session installed at the live
+    // revision is replaced only by a higher one.
+    assert_eq!(report.revision, LIVE_REVISION + 1);
     assert_eq!(report.tombstone_removed, None);
 
-    assert_attachable(&fixture, LIVE_REVISION);
+    assert_attachable(&fixture, LIVE_REVISION + 1);
 }
 
 #[test]

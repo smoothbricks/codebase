@@ -12,10 +12,11 @@
 //!    and token into that mount and a bare directory would be shadowed on
 //!    the next attach;
 //! 2. republish the grants sidecar beside the still-in-place image,
-//!    preserving workspace and incarnation and, on the quarantine path,
-//!    bumping the revision by exactly one so any gateway removal tombstone
-//!    for the old revision is superseded (the live path preserves the
-//!    revision: nothing was removed, so there is nothing to supersede);
+//!    preserving workspace and incarnation and bumping the revision by
+//!    exactly one, on the quarantine path and the live path alike: a gateway
+//!    removal tombstone for the old revision is superseded, and a gateway
+//!    session installed at the old revision is replaced, because the gateway
+//!    installs only a higher revision and the rotated CA is a new identity;
 //! 3. mint fresh credentials through [`mint_workspace_credentials`](crate::workspace_credentials::mint_workspace_credentials),
 //!    which owns the companion's `0600` + fsync + parent-fsync durability
 //!    ordering — this module never re-spells it;
@@ -25,10 +26,12 @@
 //!    gate (present, regular file, mode `0600`, valid private key).
 //!
 //! Rotation invalidates in-flight job certificates: they were signed by the
-//! lost CA generation, and the new companion anchors a new one. The revision
-//! derivation reads the quarantined copy rather than any canonical residue,
-//! so a crash between the sidecar write and the companion write retries to
-//! the same revision instead of drifting.
+//! lost CA generation, and the new companion anchors a new one. On the
+//! quarantine path the revision derivation reads the quarantined copy rather
+//! than any canonical residue, so a crash between the sidecar write and the
+//! companion write retries to the same revision instead of drifting. The live
+//! path has no other copy: such a retry publishes the next revision, which only
+//! ever moves forward and is never reused.
 //!
 //! This module is mount-agnostic on purpose: the caller supplies the mount
 //! point (a live degraded mount in production, a scratch directory carrying
@@ -61,8 +64,7 @@ pub struct RekeyReport {
     pub workspace: WorkspaceName,
     /// Preserved across the rotation: rekey never mints an incarnation.
     pub incarnation: WorkspaceIncarnation,
-    /// The republished grants revision (quarantined revision + 1, or the
-    /// unchanged live revision when the sidecar never left).
+    /// The republished grants revision: the quarantined or live revision + 1.
     pub revision: u64,
     /// The republished canonical grants sidecar.
     pub sidecar: PathBuf,
@@ -98,8 +100,8 @@ pub enum RekeyError {
     /// quarantined records disagree with each other.
     #[error("quarantine identity for workspace '{workspace}' is inconsistent: {detail}")]
     IdentityMismatch { workspace: String, detail: String },
-    /// The quarantined revision is already at `u64::MAX` and cannot bump.
-    #[error("quarantined revision {revision} for workspace '{workspace}' cannot bump")]
+    /// The source revision is already at `u64::MAX` and cannot bump.
+    #[error("revision {revision} for workspace '{workspace}' cannot bump")]
     RevisionOverflow { workspace: String, revision: u64 },
     /// A store read or write failed.
     #[error("rekey I/O for workspace '{workspace}': {detail}")]
@@ -156,7 +158,7 @@ impl RekeyError {
                 workspace,
                 revision,
             } => CowshedError::integrity(
-                format!("quarantined revision {revision} for workspace '{workspace}' cannot bump"),
+                format!("revision {revision} for workspace '{workspace}' cannot bump"),
                 format!("cowshed rekey {workspace}"),
             ),
             Self::Io { workspace, detail } => CowshedError::integrity(
@@ -237,20 +239,16 @@ pub fn rekey_workspace(
         mount_point,
     )?;
 
-    let revision = match source.origin {
-        SourceOrigin::Quarantine => {
-            source
-                .base
-                .grants
-                .revision
-                .checked_add(1)
-                .ok_or(RekeyError::RevisionOverflow {
-                    workspace: workspace.to_string(),
-                    revision: source.base.grants.revision,
-                })?
-        }
-        SourceOrigin::Live => source.base.grants.revision,
-    };
+    let revision =
+        source
+            .base
+            .grants
+            .revision
+            .checked_add(1)
+            .ok_or(RekeyError::RevisionOverflow {
+                workspace: workspace.to_string(),
+                revision: source.base.grants.revision,
+            })?;
 
     let snapshot = &source.base.info_snapshot;
     let role = WorkspaceRole::for_name(workspace);
