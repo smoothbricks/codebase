@@ -227,7 +227,8 @@ pub fn attach_demand(operation: &OperationRequest) -> AttachDemand {
         Op::CoordinatorDefragment(request)
         | Op::CoordinatorRekey(request)
         | Op::CoordinatorClearNxState(request)
-        | Op::CoordinatorWorker(request) => one(&request.workspace),
+        | Op::CoordinatorWorker(request)
+        | Op::CoordinatorRefreshBuildState(request) => one(&request.workspace),
         Op::CoordinatorExec(params) | Op::WorkerExec(params) => one(&params.workspace),
         Op::WorkerShell(request) => one(&request.workspace),
         Op::WorkerCheckpoint(request) => one(&request.workspace),
@@ -252,7 +253,6 @@ pub fn attach_demand(operation: &OperationRequest) -> AttachDemand {
         | Op::CoordinatorSetCheckpointQuota(_)
         | Op::CoordinatorDoctor(_)
         | Op::CoordinatorServeSupervisor(_)
-        | Op::CoordinatorRefreshBuildState(_)
         | Op::WorkerStdinChunk(_)
         | Op::WorkerStdinClose(_)
         | Op::WorkerListJobs(_)
@@ -979,6 +979,10 @@ mod tests {
         };
         assert_eq!(
             attach_demand(&Op::CoordinatorWorker(request())),
+            demand(0, &[session("raven")])
+        );
+        assert_eq!(
+            attach_demand(&Op::CoordinatorRefreshBuildState(request())),
             demand(0, &[session("raven")])
         );
         let attach = |aggregate| {

@@ -1478,6 +1478,7 @@ impl ProjectActor {
             }
             Op::CoordinatorRefreshBuildState(params) => {
                 self.require_repo(&params.repo_id)?;
+                self.host.make_media_room(demand).await;
                 respond::<operations::CoordinatorRefreshBuildState>(
                     &self.host.refresh_build_state(params.workspace).await?,
                 )
@@ -4882,9 +4883,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     }
 
     /// The images a verb that uses `name` attaches, as the kernel's `mounted` paths stand: its
-    /// own and its build volume's when the workspace is detached, its build volume's when only
-    /// that is, none when both are mounted. A record that cannot be read counts as detached,
-    /// which costs only a media reading.
+    /// own and its build volume's when the workspace is detached; its build volume's when only
+    /// that is, or when its checkout links none yet, since the build-state refresh every verb in
+    /// a workspace runs may mint its first (16_build_volumes.md, "One link per checkout"); none
+    /// when both are mounted. A record that cannot be read counts as detached, which costs only
+    /// a media reading.
     fn images_to_attach(
         &self,
         name: &WorkspaceName,
@@ -4902,8 +4905,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .and_then(|builds| Ok(builds.linked(&mount)?.map(|id| builds.mount(&id))));
         match build {
             Ok(Some(build)) if mounted.contains(&build) => 0,
-            Ok(None) => 0,
-            Ok(Some(_)) | Err(_) => 1,
+            Ok(Some(_) | None) | Err(_) => 1,
         }
     }
 

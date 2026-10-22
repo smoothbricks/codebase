@@ -1419,16 +1419,18 @@ past the ceiling too, never an error.
 
 An operation's demand is read from its request alone (`cowshed_core::media_room::attach_demand`). One that works in a
 workspace (attach, exec, a shell, a checkpoint, a push, a restore, a land or rebase, a grant, a defragment, a rekey, an
-Nx state clear, a worker handle) attaches it and its build volume, two images, when it is detached, and its build volume
-alone when only that is: a mounted workspace's linked build volume is read from its build link, and both mounts from the
-kernel mount table, so an operation in a mounted workspace with its build volume never reads the IOKit count. A fork or
-rename attaches its destination the same way: new, and so detached, unless a resumed one is already mounted. Adoption
-attaches main and its first build volume; a resize or reseed one build image or seed beside the workspace's own; moving
-the checkout or changing the repository identity main. Reads, job and session traffic, `rm`, `detach`, `gc`, `doctor`,
-previews (`reseed --dry-run`) and project-wide grants attach nothing. The workspaces an operation names (a fork's or
-rename's destination and source, a land's or rebase's `into`, main when it names none, a reseed's `from`) are its own
-and never detached for it. A host whose count leaves room is read once, and nothing else happens; an `exec` of a
-mounted, served workspace answers before any of this (06_cli.md, "Resident workspaces").
+Nx state clear, a worker handle, the build-state refresh `cowshed setup` runs) attaches it and its build volume, two
+images, when it is detached, and its build volume alone when only that is or when its checkout links none yet, since the
+build-state refresh may mint its first (16_build_volumes.md, "One link per checkout"): a mounted workspace's linked
+build volume is read from its build link, and both mounts from the kernel mount table, so an operation in a mounted
+workspace with its build volume never reads the IOKit count. A fork or rename attaches its destination the same way:
+new, and so detached, unless a resumed one is already mounted. Adoption attaches main and its first build volume; a
+resize or reseed one build image or seed beside the workspace's own; moving the checkout or changing the repository
+identity main. Reads, job and session traffic, `rm`, `detach`, `gc`, `doctor`, previews (`reseed --dry-run`) and
+project-wide grants attach nothing. The workspaces an operation names (a fork's or rename's destination and source, a
+land's or rebase's `into`, main when it names none, a reseed's `from`) are its own and never detached for it. A host
+whose count leaves room is read once, and nothing else happens; an `exec` of a mounted, served workspace answers before
+any of this (06_cli.md, "Resident workspaces").
 
 Three paths attach without making room. Attaching every detached session (`attach` with no name, `attach --all`) is an
 aggregate: detaching some sessions to attach others frees nothing, so each of its attaches says so in its request
