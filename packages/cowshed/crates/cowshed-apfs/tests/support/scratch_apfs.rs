@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Once};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -26,23 +26,32 @@ pub(crate) mod processes;
 
 use processes::end_processes_in;
 
-/// Every scratch root lives directly under this prefix and spells out the pid of the run that
-/// owns it. The pid is the whole ownership protocol: a later run can tell a live root from an
-/// abandoned one without any shared state of its own.
-pub(crate) const ROOT_PREFIX: &str = "/private/tmp/cowshed-itest-";
+/// Every scratch root, the user's template and the lane pools live directly under this parent
+/// ([`cowshed_os::scratch::macos_scratch_root`]), which Spotlight's `mds` never admits: a volume
+/// mounted below `/private/tmp` left `mds` one `AppleAPFSVolume` right it never releases. Each
+/// root's name starts with the pid of the run that owns it. The pid is the whole ownership
+/// protocol: a later run can tell a live root from an abandoned one without any shared state.
+pub(crate) static SCRATCH_PARENT: LazyLock<PathBuf> = LazyLock::new(|| {
+    cowshed_os::scratch::macos_scratch_root()
+        .unwrap_or_else(|error| panic!("real-APFS scratch parent: {error}"))
+});
 
 /// Held while a sweep runs. Unserialized, concurrent sweeps raced each other for the same
 /// abandoned images: every sweeper waited on the image lease another held for its detach (11.5 s
 /// measured), then found the volume already unmounted under it and failed. Its name spells no
 /// pid, so no sweep ever reclaims it. Other checkouts' sweeps share it and write their own
 /// records into it, so it records nothing of this one's.
-const SWEEP_LOCK: &str = "/private/tmp/cowshed-itest-sweep.lock";
+fn sweep_lock() -> PathBuf {
+    SCRATCH_PARENT.join("sweep.lock")
+}
 
-/// The run whose sweep last finished ([`run_id`]), written under [`SWEEP_LOCK`]: every run
+/// The run whose sweep last finished ([`run_id`]), written under [`sweep_lock`]: every run
 /// sweeps its dead predecessors once, not once per test process. Its name spells no pid either.
-const SWEEP_RECORD: &str = "/private/tmp/cowshed-itest-sweep.run";
+fn sweep_record() -> PathBuf {
+    SCRATCH_PARENT.join("sweep.run")
+}
 
-/// One test's disposable root: `/private/tmp/cowshed-itest-<pid>-<n>-<label>`.
+/// One test's disposable root: `<scratch parent>/<pid>-<n>-<label>`.
 ///
 /// Dropping it ends every process working in its tree, detaches every image attached from below
 /// it, then removes the tree. Only the root that started a predecessor sweep joins that sweep;
@@ -62,8 +71,8 @@ impl ScratchRoot {
     /// root on drop, but never starts or waits for a sweep of unrelated host runs.
     pub(crate) fn new_owned(label: &str) -> std::io::Result<Self> {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = PathBuf::from(format!(
-            "{ROOT_PREFIX}{}-{}-{label}",
+        let path = SCRATCH_PARENT.join(format!(
+            "{}-{}-{label}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -102,7 +111,7 @@ impl ScratchRoot {
 /// This does not take the host-wide sweep lock, enumerate unrelated dead roots, or rewrite the
 /// suite's sweep record. The parent's panic/kill witness uses the same cleanup as root drop.
 pub fn reclaim_dead_root(path: &Path) -> std::io::Result<()> {
-    if path.parent() != Some(Path::new("/private/tmp"))
+    if path.parent() != Some(SCRATCH_PARENT.as_path())
         || !owner_pid(&path.to_string_lossy()).is_some_and(process_is_gone)
     {
         return Err(std::io::Error::other(format!(
@@ -173,16 +182,18 @@ impl Drop for ScratchRoot {
 /// Processes go first: one working in a dead run's volume would hold that volume attached.
 fn sweep_dead_runs() {
     let run = run_id();
-    let _sweeping = match lock_exclusive(Path::new(SWEEP_LOCK)) {
+    let (lock, record) = (sweep_lock(), sweep_record());
+    let _sweeping = match lock_exclusive(&lock) {
         Ok(lock) => lock,
         Err(error) => {
             cowshed_os::eprintln!(
-                "abandoned scratch roots stay until a later run: lock {SWEEP_LOCK}: {error}"
+                "abandoned scratch roots stay until a later run: lock {}: {error}",
+                lock.display()
             );
             return;
         }
     };
-    if fs::read(SWEEP_RECORD).is_ok_and(|recorded| recorded == run.as_bytes()) {
+    if fs::read(&record).is_ok_and(|recorded| recorded == run.as_bytes()) {
         return;
     }
     let started = Instant::now();
@@ -199,7 +210,7 @@ fn sweep_dead_runs() {
             return;
         }
     };
-    let Ok(entries) = fs::read_dir("/private/tmp") else {
+    let Ok(entries) = fs::read_dir(SCRATCH_PARENT.as_path()) else {
         return;
     };
     reclaim::reclaim_dead_roots(
@@ -216,13 +227,16 @@ fn sweep_dead_runs() {
             );
         },
     );
-    if let Err(error) = fs::write(SWEEP_RECORD, run.as_bytes()) {
-        cowshed_os::eprintln!("this run sweeps again: record its sweep in {SWEEP_RECORD}: {error}");
+    if let Err(error) = fs::write(&record, run.as_bytes()) {
+        cowshed_os::eprintln!(
+            "this run sweeps again: record its sweep in {}: {error}",
+            record.display()
+        );
     }
     cowshed_os::eprintln!("scratch root: swept dead runs in {:?}", started.elapsed());
 }
 
-/// This run's identity, as [`SWEEP_RECORD`] records it: nextest gives every test process of one
+/// This run's identity, as [`sweep_record`] records it: nextest gives every test process of one
 /// run the same `NEXTEST_RUN_ID`; `cargo test` runs a binary's tests in one process, which sweeps
 /// once, so its pid and the instant it swept name its run, where a pid alone could name an
 /// earlier run that had the pid before.
@@ -258,7 +272,8 @@ pub(crate) fn lock_exclusive(path: &Path) -> std::io::Result<File> {
 
 /// The pid of the run that owns a scratch root, given the root itself or any path below it.
 fn owner_pid(path: &str) -> Option<i32> {
-    path.strip_prefix(ROOT_PREFIX)?
+    path.strip_prefix(SCRATCH_PARENT.to_str()?)?
+        .strip_prefix('/')?
         .split(['-', '/'])
         .next()?
         .parse()
@@ -342,7 +357,7 @@ fn detach_images(select: impl Fn(&Path) -> bool) -> std::io::Result<BTreeSet<Pat
 /// under its root: refuse a path a symlink redirects, then the production backend ejects each
 /// exact mounted volume through its owned root FD, then its physical whole device through hdiutil.
 pub(crate) fn release_image(image: &Path) -> std::io::Result<()> {
-    let root = Path::new("/private/tmp");
+    let root = SCRATCH_PARENT.as_path();
     if image.starts_with(root) {
         verify_no_symlinks(root, image).map_err(std::io::Error::other)?;
     }
@@ -370,7 +385,7 @@ mod sweep_ownership_tests {
         let root = ScratchRoot::new_owned("live-recovery-refusal").unwrap();
         let sentinel = root.path().join("keep");
         fs::write(&sentinel, b"live owner's bytes").unwrap();
-        for path in [root.path(), sentinel.as_path(), Path::new("/private/tmp")] {
+        for path in [root.path(), sentinel.as_path(), SCRATCH_PARENT.as_path()] {
             assert!(
                 reclaim_dead_root(path).is_err(),
                 "refuse {}",

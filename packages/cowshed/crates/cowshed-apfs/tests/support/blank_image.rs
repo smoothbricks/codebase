@@ -32,7 +32,7 @@ use std::sync::LazyLock;
 
 use cowshed_os::fork_lock::Run as _;
 
-use super::scratch_apfs::{ROOT_PREFIX, release_image};
+use super::scratch_apfs::{SCRATCH_PARENT, release_image};
 use super::{
     ApfsBackend, CommandRunner, DiskImageSource, ImageCapacity, ImageCapture, MacOsApfsBackend,
     SystemCommandRunner, blank_template,
@@ -74,7 +74,7 @@ pub fn blank_image(destination: &Path) {
 fn mint_once() -> PathBuf {
     // SAFETY: `getuid` has no preconditions and cannot fail.
     let user = unsafe { libc::getuid() };
-    let directory = PathBuf::from(format!("{ROOT_PREFIX}templates-uid{user}"));
+    let directory = SCRATCH_PARENT.join(format!("templates-uid{user}"));
     fs::create_dir_all(&directory)
         .unwrap_or_else(|error| panic!("template directory {}: {error}", directory.display()));
     blank_template(
@@ -105,7 +105,7 @@ fn pool_directory() -> PathBuf {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
         .collect();
-    PathBuf::from(format!("{ROOT_PREFIX}pool-{run}"))
+    SCRATCH_PARENT.join(format!("pool-{run}"))
 }
 
 /// A handle to one of the pool's scenario images, already attached by the pool. It hands out
@@ -299,8 +299,7 @@ fn kernel_holds(image: &Path) -> bool {
 /// pool's images live exactly one run, and a later run is what ends an earlier one. Only a
 /// pool untouched for an hour is ended, so a lane running concurrently is never touched.
 fn detach_previous_runs(current: &Path) {
-    let tmp = Path::new("/private/tmp");
-    let Ok(entries) = fs::read_dir(tmp) else {
+    let Ok(entries) = fs::read_dir(SCRATCH_PARENT.as_path()) else {
         return;
     };
     for entry in entries.flatten() {
@@ -308,7 +307,7 @@ fn detach_previous_runs(current: &Path) {
         if path == *current
             || !path
                 .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("cowshed-itest-pool-"))
+                .is_some_and(|name| name.to_string_lossy().starts_with("pool-"))
         {
             continue;
         }

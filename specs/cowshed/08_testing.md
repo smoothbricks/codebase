@@ -411,24 +411,25 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
 
 Parametrized over the substrate the host provides, and never gated off on it: a missing capability is a failure, not a
 skip. On macOS these are the `real_apfs_*` tests, compiled only for macOS: small `.dmg` images (1 GiB caps) under
-`/private/tmp/cowshed-itest-<pid>-<n>-<label>`, driven by the production host — real
-`diskutil`/`hdiutil`/`fsck_apfs`/`mount_apfs`, descriptor-native `funmount` and the live kernel mount table. A mount
-state a test needs (wrong flags, an impostor volume, a busy holder) is produced on a real volume, never by a substitute
-mount source. Every scratch root selects its backing image paths, then calls the same production owned-attachment
-cleanup used by normal removal, recovery-marker reads, reverse-order teardown, duplicate-attachment rejection, and
-staging GC. Each cleanup rereads image/whole-device/volume identity and retains each owned volume's raw pin through
-namespace admission and same-root-FD `funmount`, then runs guarded `hdiutil detach` of the exact physical device under
-the image's lease. The detach guard rechecks after storage admission; a cached device number, caller mount set or
-mountpoint never authorizes an effect. A failed release keeps the scratch tree intact for the next run, rather than
-deleting a still-attached image's backing files. Before any release, a scratch root ends every process working in its
-tree, selected by the working directory the kernel reports (`proc_pidinfo` `PROC_PIDVNODEPATHINFO`, which still names a
-deleted directory): `SIGTERM`, as `nx daemon --stop` sends it, then `SIGKILL` after a 10s grace. A stock Nx daemon a
-fixture started detaches from its starter, so a failed test's unwinding otherwise never reached it and it kept running
-in the deleted root. Successful cleanup removes the root, and every run first ends the processes working under, then
-reclaims the roots and attachments of, runs whose owner pid is gone. On Linux: a scratch ZFS pool on a loopback/file
-vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool exported on teardown; the Linux leg also exercises
-`cowshed-helper` and the Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The
-same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
+`/private/var/folders/cowshed/<uid>/t/<pid>-<n>-<label>` (`cowshed_os::scratch::macos_scratch_root`), driven by the
+production host — real `diskutil`/`hdiutil`/`fsck_apfs`/`mount_apfs`, descriptor-native `funmount` and the live kernel
+mount table. A mount state a test needs (wrong flags, an impostor volume, a busy holder) is produced on a real volume,
+never by a substitute mount source. Every scratch root selects its backing image paths, then calls the same production
+owned-attachment cleanup used by normal removal, recovery-marker reads, reverse-order teardown, duplicate-attachment
+rejection, and staging GC. Each cleanup rereads image/whole-device/volume identity and retains each owned volume's raw
+pin through namespace admission and same-root-FD `funmount`, then runs guarded `hdiutil detach` of the exact physical
+device under the image's lease. The detach guard rechecks after storage admission; a cached device number, caller mount
+set or mountpoint never authorizes an effect. A failed release keeps the scratch tree intact for the next run, rather
+than deleting a still-attached image's backing files. Before any release, a scratch root ends every process working in
+its tree, selected by the working directory the kernel reports (`proc_pidinfo` `PROC_PIDVNODEPATHINFO`, which still
+names a deleted directory): `SIGTERM`, as `nx daemon --stop` sends it, then `SIGKILL` after a 10s grace. A stock Nx
+daemon a fixture started detaches from its starter, so a failed test's unwinding otherwise never reached it and it kept
+running in the deleted root. Successful cleanup removes the root, and every run first ends the processes working under,
+then reclaims the roots and attachments of, runs whose owner pid is gone. On Linux: a scratch ZFS pool on a
+loopback/file vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool exported on teardown; the Linux leg also
+exercises `cowshed-helper` and the Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*`
+volumes/pools. The same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on
+ZFS) are tagged.
 
 The panic/kill cleanup fixture reads only its own child's stdout pipe. Before ending that child it requires two complete
 line-start image records (the mounted RAW image, then the retained RAW input) and the worker record; neither a sibling's
@@ -555,18 +556,24 @@ the selected child's complete `wait4` lifetime, not a pre-exit self-report; cach
 and retain their isolation, allocation/cache-hit and kernel-terminal empty-census negative controls.
 
 Test tasks run under `@smoothbricks/nx-plugin:bounded-exec`, which on a macOS host gives each task a `TMPDIR` lease on
-one RAM-backed volume (`packages/nx-plugin/README.md`). Scratch roots and the user's template stay under `/private/tmp`
-whatever `TMPDIR` a runner has: every run's sweep must see every dead run, not only those of one task's lease; a clone
-reaches its template by `clonefile`, which cannot cross volumes; and Darwin's socket bound must not depend on the
-runner's `TMPDIR`. The lease never detaches an image attached from below it; it keeps such a lease and names it.
+one RAM-backed volume (`packages/nx-plugin/README.md`). Real-APFS scratch roots, the user's template, the lane pools and
+the sweep's lock and record stay under `/private/var/folders/cowshed/<uid>/t` whatever `TMPDIR` a runner has: every
+run's sweep must see every dead run, not only those of one task's lease; a clone reaches its template by `clonefile`,
+which cannot cross volumes (that parent is on Data, as the template is); and Darwin's socket bound must not depend on
+the runner's `TMPDIR`. The parent is beside the workspace mount root because Spotlight's `mds` admits no volume whose
+mount path contains `/var/folders/`, and keeps one `AppleAPFSVolume` right for every volume it admits until it exits: a
+fixture volume mounted under `/private/tmp` left one each (01a_apfs.md, "Spotlight media references"). It needs the
+per-user root `cowshed setup` makes; `t` is created 0700 and refused unless the user owns it with that mode. The lease
+never detaches an image attached from below it; it keeps such a lease and names it.
 
-These canonical `/private/tmp` roots, and the canonical `/tmp` parent of the independent controller-git sandbox
-fixtures, are host-only and run in the land gate; a `cowshed exec` sandbox denies `/private/tmp`. No granted parent
-replaces them there. A fixture that runs controller Git or a supervisor under a profile of its own cannot apply that
-nested profile (`sandbox_apply` fails with `EPERM`). The sandbox's `TMPDIR` lies under the cowshed store, so controller
-Git refuses to grant it, a directory store inside it is refused, and it is too long for the sockets below a fixture
-store; the canonical runtime link, `<mount>/.cowshed/run`, is too long as well. A host shell whose `TMPDIR` is the
-workspace's exported exec temp directory would meet the same refusals, so the parent stays `/tmp`, not `TMPDIR`.
+These canonical scratch roots, the `/private/tmp` directory fixtures, and the canonical `/tmp` parent of the independent
+controller-git sandbox fixtures, are host-only and run in the land gate; a `cowshed exec` sandbox denies `/private/tmp`.
+No granted parent replaces them there. A fixture that runs controller Git or a supervisor under a profile of its own
+cannot apply that nested profile (`sandbox_apply` fails with `EPERM`). The sandbox's `TMPDIR` lies under the cowshed
+store, so controller Git refuses to grant it, a directory store inside it is refused, and it is too long for the sockets
+below a fixture store; the canonical runtime link, `<mount>/.cowshed/run`, is too long as well. A host shell whose
+`TMPDIR` is the workspace's exported exec temp directory would meet the same refusals, so the parent stays `/tmp`, not
+`TMPDIR`.
 
 On macOS, disk-image coverage runs in the dedicated root `cargo-test-group-real-apfs` target, selected from the
 `cowshed-apfs-tests` crate. Its source inputs are that crate's transitive local Cargo dependency closure:

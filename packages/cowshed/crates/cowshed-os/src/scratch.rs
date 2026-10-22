@@ -21,6 +21,40 @@ const MAX_SOCKET_ENTRIES: usize = 8;
 /// keeps its nested sockets inside `sockaddr_un.sun_path` only at this length.
 const NAMED_SUFFIX: usize = 17;
 
+/// The parent of every disk-image test fixture on macOS: `/private/var/folders/cowshed/<euid>/t`,
+/// beside the workspace mount root `mnt`. Spotlight's `mds` admits no volume whose mount path
+/// contains `/var/folders/` and keeps, until it exits, one `AppleAPFSVolume` right for every
+/// volume it admits; a volume mounted below this parent takes none (specs/cowshed/01a_apfs.md,
+/// "Spotlight media references"). The per-user root `cowshed setup` makes must exist; `t` is
+/// created 0700 and refused unless it is a directory this euid owns with that mode.
+#[cfg(target_os = "macos")]
+pub fn macos_scratch_root() -> io::Result<PathBuf> {
+    // SAFETY: `geteuid` reads this process's credentials; it takes no pointers and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let root = PathBuf::from(format!("/private/var/folders/cowshed/{euid}/t"));
+    match fs::DirBuilder::new().mode(0o700).create(&root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "create the scratch root {} (its parent is the per-user root `cowshed setup` makes): {error}",
+                    root.display()
+                ),
+            ));
+        }
+    }
+    let metadata = fs::symlink_metadata(&root)?;
+    if !metadata.is_dir() || metadata.uid() != euid || metadata.mode() & 0o777 != 0o700 {
+        return Err(io::Error::other(format!(
+            "the scratch root {} must be a 0700 directory owned by uid {euid}",
+            root.display()
+        )));
+    }
+    Ok(root)
+}
+
 /// Create a private scratch root and publish its creating pid before it holds any output.
 pub fn create(path: &Path) -> io::Result<()> {
     fs::DirBuilder::new().mode(0o700).create(path)?;
