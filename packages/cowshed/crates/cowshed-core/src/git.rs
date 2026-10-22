@@ -966,10 +966,17 @@ impl GitRepository {
         Ok(work)
     }
 
-    /// Ignored and hidden bytes are not automatically rebuildable. Only controller/volume
-    /// bookkeeping is exempt; every other untracked leaf must survive in the target checkout.
+    /// Ignored and hidden bytes are not automatically rebuildable (02_workspaces.md, `rm` step
+    /// 5). Only what cowshed itself made is exempt: its `.cowshed/` directory, the volume's own
+    /// bookkeeping, and each link of `build_state` exactly as `link::link_paths` made it — the
+    /// paths the checkout's build volume records (16_build_volumes.md, "One link per checkout").
+    /// Every other untracked leaf must survive in the target checkout.
     #[cfg(any(target_os = "macos", test))]
-    pub(crate) async fn has_unique_untracked_content(&self, checkout: &Path) -> Result<bool> {
+    pub(crate) async fn has_unique_untracked_content(
+        &self,
+        checkout: &Path,
+        build_state: Vec<crate::capabilities::BuildStatePath>,
+    ) -> Result<bool> {
         let mut args = vec![
             "ls-files".to_owned(),
             "--others".to_owned(),
@@ -990,7 +997,14 @@ impl GitRepository {
                 .stdout
                 .split(|byte| *byte == 0)
                 .filter(|path| !path.is_empty())
-                .any(|path| !held_by_checkout(&root, &checkout, Path::new(OsStr::from_bytes(path))))
+                .map(|path| Path::new(OsStr::from_bytes(path)))
+                .filter(|path| {
+                    !build_state.iter().any(|state| {
+                        state.checkout.as_path() == *path
+                            && crate::build_volume::link::is_fixed_link(&root, state)
+                    })
+                })
+                .any(|path| !held_by_checkout(&root, &checkout, path))
         })
         .await
         .map_err(|error| {
@@ -5790,17 +5804,97 @@ mod tests {
         fs::write(root.join("ignored"), b"only copy\n").unwrap();
         fs::write(root.join(".hidden"), b"hidden copy\n").unwrap();
         assert!(!git.is_dirty_by(Some(&main)).await.unwrap());
-        assert!(git.has_unique_untracked_content(&main).await.unwrap());
+        assert!(
+            git.has_unique_untracked_content(&main, Vec::new())
+                .await
+                .unwrap()
+        );
         for path in ["ignored", ".hidden"] {
             fs::copy(root.join(path), main.join(path)).unwrap();
         }
-        assert!(!git.has_unique_untracked_content(&main).await.unwrap());
+        assert!(
+            !git.has_unique_untracked_content(&main, Vec::new())
+                .await
+                .unwrap()
+        );
         fs::write(root.join("ignored"), b"different\n").unwrap();
-        assert!(git.has_unique_untracked_content(&main).await.unwrap());
+        assert!(
+            git.has_unique_untracked_content(&main, Vec::new())
+                .await
+                .unwrap()
+        );
         fs::remove_file(root.join("ignored")).unwrap();
         fs::create_dir_all(root.join(".cowshed")).unwrap();
         fs::write(root.join(".cowshed/token"), b"controller identity").unwrap();
-        assert!(!git.has_unique_untracked_content(&main).await.unwrap());
+        assert!(
+            !git.has_unique_untracked_content(&main, Vec::new())
+                .await
+                .unwrap()
+        );
+    }
+
+    /// The leaves a fleet scratch session left in `git status --ignored` when its removal kept a
+    /// recovery image (02_workspaces.md, `rm` step 5): cowshed's `.cowshed/`, the build-state
+    /// links it made into the build volume, and the volume's own bookkeeping. Main had no build
+    /// volume linked at those paths, so none of them was "held" there, yet none is the
+    /// workspace's content. The exemption comes from the build volume's record, the same paths
+    /// `link_paths` linked: a link at an unrecorded path, or a recorded path linked elsewhere,
+    /// is still content.
+    #[tokio::test]
+    async fn source_release_exempts_the_build_state_links_cowshed_made() {
+        use crate::build_volume::link;
+        use crate::capabilities::BuildStatePath;
+
+        let store = crate::temp_root::FixtureStore::new();
+        let root = repository();
+        let main = repository();
+        let volume = root.parent().unwrap().join("build-volume");
+        fs::create_dir_all(&volume).unwrap();
+        let git = GitRepository::from_root(store.shared(), &root);
+        let recorded = vec![
+            BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
+            BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap(),
+            BuildStatePath::new(".codegraph", "codegraph").unwrap(),
+        ];
+        link::point(&root, &volume).unwrap();
+        link::link_paths(&root, &volume, &recorded).unwrap();
+        fs::create_dir_all(root.join(".fseventsd")).unwrap();
+        fs::write(root.join(".fseventsd/no_log"), b"").unwrap();
+        fs::write(root.join(cowshed_apfs::SPOTLIGHT_OPT_OUT), b"").unwrap();
+        assert_eq!(
+            fs::read_link(root.join(".nx/cache")).unwrap(),
+            Path::new("../.cowshed/build/nx/cache")
+        );
+        assert!(
+            !git.has_unique_untracked_content(&main, recorded.clone())
+                .await
+                .unwrap(),
+            "cowshed's own links and bookkeeping are not the workspace's only copy"
+        );
+        assert!(
+            git.has_unique_untracked_content(&main, Vec::new())
+                .await
+                .unwrap(),
+            "with no record naming them, the links are judged like any other leaf"
+        );
+
+        symlink(".cowshed/build/turbo", root.join(".turbo")).unwrap();
+        assert!(
+            git.has_unique_untracked_content(&main, recorded.clone())
+                .await
+                .unwrap(),
+            "a link into the build volume at a path no record names is content"
+        );
+        fs::remove_file(root.join(".turbo")).unwrap();
+
+        fs::remove_file(root.join(".codegraph")).unwrap();
+        symlink("/elsewhere/codegraph", root.join(".codegraph")).unwrap();
+        assert!(
+            git.has_unique_untracked_content(&main, recorded)
+                .await
+                .unwrap(),
+            "a recorded path linked anywhere but its volume directory is content"
+        );
     }
 
     #[tokio::test]

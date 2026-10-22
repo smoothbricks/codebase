@@ -1334,10 +1334,15 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    the record the rename left imageless is reconciled, and the removal's retry finds the workspace already gone. An open
    confined to other workspaces neither reads nor waits for it.
 
-   Gitignored or hidden content is not rebuildable merely because Git calls the tree clean. Apart from the existing
-   controller/volume-bookkeeping contract, every untracked leaf must be held byte-for-byte (or by the same symlink
-   target) in the surviving target checkout before direct release. Otherwise preserve the complete image as recovery.
-   This does not weaken the ordinary dirty/unlanded refusal gates or grant a new destruction override.
+   Gitignored or hidden content is not rebuildable merely because Git calls the tree clean. What cowshed itself made in
+   the checkout is not its content: `.cowshed/`, the volume's own bookkeeping (`.fseventsd`, the Spotlight, trash,
+   temporary-items and revisions directories, and the Spotlight opt-out marker), and each build-state link exactly as
+   cowshed made it for a path the record of the build volume the checkout links names (16_build_volumes.md, "One link
+   per checkout"): a symlink, under real parent directories, whose target is that path's fixed relative target through
+   `.cowshed/build`. A link at a path the record does not name, a named path linked anywhere else, and a checkout whose
+   volume record cannot be read exempt nothing. Every other untracked leaf must be held byte-for-byte (or by the same
+   symlink target) in the surviving target checkout before direct release. Otherwise preserve the complete image as
+   recovery. This does not weaken the ordinary dirty/unlanded refusal gates or grant a new destruction override.
 
    **Recovery source:** authorized dirty/in-progress or unlanded removal, only-copy content, and rename preservation
    keep the existing atomic recovery transaction: durably link complete grants/CA companions at

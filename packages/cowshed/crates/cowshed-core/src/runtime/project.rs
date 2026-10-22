@@ -6672,8 +6672,17 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             return Ok(RetirementDisposition::Recovery);
         }
         let git = crate::git::GitRepository::from_root(self.git.store_root(), mount);
+        // The build-state links are cowshed's, named by the record of the volume they reach
+        // (16_build_volumes.md, "One link per checkout"): never the workspace's only copy.
+        let build_state = crate::build_volume::BuildVolumeState::read(
+            &mount.join(crate::build_volume::BUILD_LINK),
+        )?
+        .paths;
         Ok(
-            if git.has_unique_untracked_content(&containment.mount).await? {
+            if git
+                .has_unique_untracked_content(&containment.mount, build_state)
+                .await?
+            {
                 RetirementDisposition::Recovery
             } else {
                 RetirementDisposition::Release

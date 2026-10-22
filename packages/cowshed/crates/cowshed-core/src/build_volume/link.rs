@@ -179,10 +179,7 @@ pub fn unsettled(
                     (!state.is_declared()).then_some(Unsettled::Missing)
                 }
                 Ok(metadata) if metadata.file_type().is_symlink() => {
-                    let linked = real_parents(checkout, path)
-                        && fs::read_link(&at).is_ok_and(|target| {
-                            target == relative_target(path, state.volume.as_path())
-                        })
+                    let linked = is_fixed_link(checkout, state)
                         && fs::metadata(volume.join(state.volume.as_path()))
                             .is_ok_and(|metadata| metadata.is_dir());
                     (!linked).then_some(Unsettled::Foreign)
@@ -193,6 +190,16 @@ pub fn unsettled(
             found.map(|found| (path.to_path_buf(), found))
         })
         .collect()
+}
+
+/// Whether `state`'s path in `checkout` is exactly the fixed link [`link_paths`] makes for it: a
+/// symlink, under real parent directories, whose target is [`relative_target`]. Reads only, and
+/// asks nothing of the volume the link reaches, which may be detached or already released.
+pub fn is_fixed_link(checkout: &Path, state: &BuildStatePath) -> bool {
+    let path = state.checkout.as_path();
+    real_parents(checkout, path)
+        && fs::read_link(checkout.join(path))
+            .is_ok_and(|target| target == relative_target(path, state.volume.as_path()))
 }
 
 /// Whether every directory between `checkout` and `relative`'s parent is a real directory, as
