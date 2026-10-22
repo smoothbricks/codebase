@@ -6208,15 +6208,18 @@ async fn real_apfs_a_resumed_re_adopt_whose_retained_build_is_gone_publishes_it_
     )
     .expect("hold the publication boundary");
     let attach = cowshed_apfs::CommandRequest::new(
-        "/usr/sbin/diskutil",
+        "/usr/bin/hdiutil",
         [
-            OsString::from("image"),
             OsString::from("attach"),
-            OsString::from("--nobrowse"),
-            OsString::from("--mountOptions"),
-            OsString::from("owners"),
-            OsString::from("--mountPoint"),
+            OsString::from("-kernel"),
+            OsString::from("-noverify"),
+            OsString::from("-nobrowse"),
+            OsString::from("-owners"),
+            OsString::from("on"),
+            OsString::from("-mountpoint"),
             fixture.checkout.as_os_str().to_os_string(),
+            OsString::from("-imagekey"),
+            OsString::from("diskimage-class=CRawDiskImage"),
             main_image.as_os_str().to_os_string(),
         ],
     );

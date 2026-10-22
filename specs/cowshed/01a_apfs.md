@@ -943,8 +943,7 @@ Cowshed's attaches no longer go through DiskImages2: every image, retained re-ad
 kernel ("Mounts"), which has no image helper to stall at the ceiling or retain devices after it. Only the user's own
 `cowshed disk-command diskutil -- image attach …` still runs one. In-kernel attaches are measured to complete past the
 ceiling, up to 1,084 registered IOMedia (170 attaches at 0.14 to 0.27 s each, detaches leaving nothing allocated). 500
-sheds hold about 3,000; until in-kernel attaches are measured at that count, cowshed still never starts any attach past
-the ceiling.
+sheds hold about 3,000; in-kernel attaches are not yet measured at that count.
 
 The system runner refuses no attach on the media count: no attach cowshed runs waits on a match notification. A verb
 that may attach still makes room first when its media would reach 1024 (`cowshed-apfs` `media_cap`; 02_workspaces.md,

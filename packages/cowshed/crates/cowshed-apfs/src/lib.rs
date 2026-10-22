@@ -8354,6 +8354,43 @@ mod tests {
         }
     }
 
+    /// The created blank is still exactly the sparse file creation made: its requested length
+    /// and no allocated block, so nothing wrote, formatted or truncated it.
+    fn assert_untouched_blank(image: &Path, capacity: ImageCapacity) {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = fs::symlink_metadata(image).expect("the created image is kept");
+        assert!(metadata.is_file());
+        assert_eq!(metadata.len(), capacity.bytes());
+        assert_eq!(metadata.blocks(), 0, "nothing was written to the blank");
+    }
+
+    /// Creation never takes over a path that exists: the file keeps its bytes and no disk
+    /// command runs.
+    #[test]
+    fn blank_creation_refuses_an_existing_path_and_runs_nothing() {
+        let stem = temp_path("image-existing-staged", "stem").with_extension("");
+        let image = stem.with_extension(IMAGE_EXTENSION);
+        fs::write(&image, b"someone else's").unwrap();
+        let backend = MacOsApfsBackend::new(RecordingRunner::default());
+        let error = backend
+            .create_staged_image(&blank_request(stem))
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ApfsError::FileOperation {
+                    operation: "create sparse RAW image",
+                    path,
+                    source,
+                } if *path == image && source.kind() == io::ErrorKind::AlreadyExists
+            ),
+            "{error:?}"
+        );
+        assert_eq!(fs::read(&image).unwrap(), b"someone else's");
+        assert!(backend.runner().requests().is_empty());
+        fs::remove_file(image).unwrap();
+    }
+
     /// The detached-resize root: a blank image is released after formatting only through the
     /// kernel's own mapping. `hdiutil info` once omitted the still-attached image here, the
     /// release read that omission as "already released", and the image stayed attached until
@@ -8538,7 +8575,7 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(error, ApfsError::InvalidAttachmentInventory(_)));
-        assert!(image.exists(), "the created image is kept");
+        assert_untouched_blank(&image, capacity("5g"));
         assert!(
             backend.sleeper.waits().is_empty(),
             "conflict is not announcement lag"
@@ -8574,7 +8611,7 @@ mod tests {
             error,
             ApfsError::InvalidAttachmentInventory(message) if message.contains("not registered")
         ));
-        assert!(image.exists(), "the created image is kept");
+        assert_untouched_blank(&image, capacity("5g"));
         assert!(backend.sleeper.waits().is_empty());
         assert!(
             !backend.runner().requests().iter().any(|request| {

@@ -3620,23 +3620,14 @@ impl EjectAtFsck {
         let eject = eject?;
         if eject.succeeded() {
             self.ejected.store(1, Ordering::SeqCst);
-            let attached = system.run(&CommandRequest::new(
-                "/usr/sbin/diskutil",
-                [
-                    std::ffi::OsString::from("image"),
-                    std::ffi::OsString::from("attach"),
-                    std::ffi::OsString::from("--nobrowse"),
-                    std::ffi::OsString::from("--plist"),
-                    self.foreign.as_os_str().to_owned(),
-                ],
-            ))?;
+            let attached = system.run(&foreign_kernel_attach(&self.foreign, true))?;
             assert!(
                 attached.succeeded(),
                 "foreign image attach failed: {attached:?}"
             );
             assert!(
                 String::from_utf8_lossy(&attached.stdout)
-                    .contains(&format!("<string>{volume}</string>")),
+                    .contains(&format!("<string>/dev/{volume}</string>")),
                 "recycled volume did not reuse {volume}: {}",
                 String::from_utf8_lossy(&attached.stdout)
             );
@@ -3796,16 +3787,7 @@ fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
         .expect("external image-driver forced detach");
     if image_driver_ejected.succeeded() {
         let attached_foreign = SystemCommandRunner
-            .run(&CommandRequest::new(
-                "/usr/sbin/diskutil",
-                [
-                    "image".as_ref(),
-                    "attach".as_ref(),
-                    "--nobrowse".as_ref(),
-                    "--plist".as_ref(),
-                    foreign.as_os_str(),
-                ],
-            ))
+            .run(&foreign_kernel_attach(&foreign, true))
             .expect("external foreign attachment");
         assert!(
             attached_foreign.succeeded(),
@@ -3815,7 +3797,7 @@ fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
         cowshed_os::eprintln!(
             "foreign volume reused {volume}: {}",
             String::from_utf8_lossy(&attached_foreign.stdout)
-                .contains(&format!("<string>{volume}</string>"))
+                .contains(&format!("<string>/dev/{volume}</string>"))
         );
     }
     let refusal = ApfsError::CommandFailed {
@@ -3844,21 +3826,33 @@ fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
     assert!(!attached(&foreign), "the foreign image was never attached");
 }
 
+/// Another process's attach of `image`, outside every cowshed image lease and check: the kernel
+/// RAW attach cowshed itself runs, mounted by the tool when `mount` says so, never a DiskImages2
+/// attach.
+fn foreign_kernel_attach(image: &Path, mount: bool) -> CommandRequest {
+    let mut args: Vec<std::ffi::OsString> = vec!["attach".into(), "-kernel".into()];
+    if !mount {
+        args.push("-nomount".into());
+    }
+    args.extend(
+        [
+            "-noverify",
+            "-nobrowse",
+            "-imagekey",
+            "diskimage-class=CRawDiskImage",
+            "-plist",
+        ]
+        .map(std::ffi::OsString::from),
+    );
+    args.push(image.as_os_str().to_owned());
+    CommandRequest::new("/usr/bin/hdiutil", args)
+}
+
 /// Attach `image` the way another process does, outside every cowshed image lease and check.
 fn attach_behind_cowshed(image: &Path) {
     let attached = SystemCommandRunner
-        .run(&CommandRequest::new(
-            "/usr/sbin/diskutil",
-            [
-                "image".as_ref(),
-                "attach".as_ref(),
-                "--nobrowse".as_ref(),
-                "--noMount".as_ref(),
-                "--plist".as_ref(),
-                image.as_os_str(),
-            ],
-        ))
-        .expect("diskutil image attach");
+        .run(&foreign_kernel_attach(image, false))
+        .expect("foreign kernel attach");
     assert!(
         attached.succeeded(),
         "attach {}: {}",
@@ -4007,16 +4001,7 @@ impl CommandRunner for EjectAfterAttach {
                 ejected.succeeded(),
                 "unheld exact whole must detach: {ejected:?}"
             );
-            let attached = system.run(&CommandRequest::new(
-                "/usr/sbin/diskutil",
-                [
-                    std::ffi::OsString::from("image"),
-                    std::ffi::OsString::from("attach"),
-                    std::ffi::OsString::from("--nobrowse"),
-                    std::ffi::OsString::from("--plist"),
-                    self.foreign.as_os_str().to_owned(),
-                ],
-            ))?;
+            let attached = system.run(&foreign_kernel_attach(&self.foreign, true))?;
             assert!(attached.succeeded(), "foreign mount failed: {attached:?}");
             let replacement = cowshed_apfs::MacOsApfsBackend::new(SystemCommandRunner)
                 .existing_attachment(&self.foreign)
