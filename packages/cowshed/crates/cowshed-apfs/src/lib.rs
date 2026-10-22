@@ -1020,20 +1020,36 @@ mod raw {
         cowshed_os::fsio::Durability::PowerLoss.sync_file(&file)
     }
 
-    /// Refuse (`WouldBlock`, as a held lock does) when a registered in-kernel drive holds the
-    /// file `file` opened. The kernel names each drive's backing file by device and inode
-    /// ([`super::io_registry::in_kernel_backing_files`]), so an alias path, or a path renamed or
-    /// unlinked since the attach, is refused as well. A DiskImages2 attachment is refused by its
-    /// helper's lock, which the caller's open meets.
+    /// Refuse (`WouldBlock`, as a held lock does) when a registered in-kernel drive positively
+    /// holds the file `file` opened at `image` ([`super::io_registry::kernel_hold`]). The kernel
+    /// names each drive's backing file by device and inode, so an alias path, or a path renamed
+    /// or unlinked since the attach, is refused as well. A drive that names no file that way is
+    /// matched by the path its attach was handed alone and named in a warning; it never refuses
+    /// another image. A DiskImages2 attachment is refused by its helper's lock, which the
+    /// caller's open meets.
     pub(super) fn refuse_attached(file: &File, image: &Path) -> io::Result<()> {
+        use super::io_registry::{KernelHold, in_kernel_backings, kernel_hold};
         let opened = file.metadata()?;
-        if super::io_registry::in_kernel_backing_files()?.contains(&(opened.dev(), opened.ino())) {
-            return Err(io::Error::new(
+        match kernel_hold(&in_kernel_backings()?, (opened.dev(), opened.ino()), image) {
+            KernelHold::Held => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 format!("{} is attached in the kernel", image.display()),
-            ));
+            )),
+            KernelHold::Free { unproven } => {
+                if !unproven.is_empty() {
+                    cowshed_os::eprintln!(
+                        "cowshed: warning: {} proceeds unproven against {} in-kernel drive(s) that \
+                     name no backing file by device and inode; one is matched only by the path \
+                     its attach was handed, so it goes unseen holding this image under a renamed \
+                     or alias path, and one that names no path goes unseen holding any image (`ioreg -r -c IOHDIXHDDriveInKernel` lists them): {}",
+                        image.display(),
+                        unproven.len(),
+                        unproven.join("; ")
+                    );
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 }
 
@@ -5572,25 +5588,138 @@ mod io_registry {
         Ok(attached)
     }
 
-    /// The backing files every registered in-kernel drive holds, as `(device, inode)`: the
-    /// kernel's own `backingstore-id`, `{"writeable-components" | "readonly-components" =
-    /// ("d<dev>:i<ino>", …)}`, which names the file the drive holds open whatever path names it
-    /// now. A drive that left the registry mid-read is departing and passed over; one that names
-    /// no backing file fails the read, since its file cannot be told apart from any other.
-    pub(super) fn in_kernel_backing_files() -> io::Result<Vec<(u64, u64)>> {
-        let backing = key("backingstore-id")?;
-        let lists = [key("writeable-components")?, key("readonly-components")?];
-        let mut files = Vec::new();
-        for drive in registered(Driver::InKernel.class())? {
-            settle((|| -> Read<()> {
-                let Some(identity) = property(&drive, &backing)? else {
-                    return Err(invalid("an in-kernel drive registers no backingstore-id").into());
-                };
-                files.extend(backing_components(&identity, &lists)?);
-                Ok(())
-            })())?;
+    /// What one registered in-kernel drive names as the file it holds.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum DriveBacking {
+        /// The kernel's own `backingstore-id`, `{"writeable-components" | "readonly-components" =
+        /// ("d<dev>:i<ino>", …)}`: each file the drive holds open, as `(device, inode)`, whatever
+        /// path names it now.
+        Files(Vec<(u64, u64)>),
+        /// No `backingstore-id` names the drive's file, for the reason `why`. Its `KDIURLPath`,
+        /// the path its attach was handed, still does, but no longer once that file is renamed,
+        /// unlinked or reached through an alias.
+        Path {
+            path: std::path::PathBuf,
+            why: String,
+        },
+        /// Its `KDIURLPath` names a store that is no local file (`ram://<sectors>` for a RAM
+        /// disk), so it holds no file. The kernel registers no `backingstore-id` for such a drive.
+        Store { url: String },
+        /// Neither names the drive's file, for the reason `why`.
+        Unidentified { why: String },
+    }
+
+    impl DriveBacking {
+        /// Whether this drive positively holds the file opened as `(device, inode)` at `image`:
+        /// its `backingstore-id` names that file or, failing one, its `KDIURLPath` is `image`.
+        fn holds(&self, file: (u64, u64), image: &std::path::Path) -> bool {
+            match self {
+                Self::Files(files) => files.contains(&file),
+                Self::Path { path, .. } => path == image,
+                Self::Store { .. } | Self::Unidentified { .. } => false,
+            }
         }
-        Ok(files)
+
+        /// How this drive is known when it names no file by device and inode; `None` when it does.
+        fn unproven(&self) -> Option<String> {
+            match self {
+                Self::Files(_) | Self::Store { .. } => None,
+                Self::Path { path, why } => Some(format!(
+                    "the drive attached from {} ({why})",
+                    path.display()
+                )),
+                Self::Unidentified { why } => Some(format!("a drive that names no file ({why})")),
+            }
+        }
+    }
+
+    /// What the registered in-kernel drives say of one opened file.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum KernelHold {
+        /// A drive positively holds it.
+        Held,
+        /// No drive holds it, as far as `unproven`, each drive that names no file by device and
+        /// inode, can tell.
+        Free { unproven: Vec<String> },
+    }
+
+    /// Judge the file opened as `(device, inode)` at `image` against every drive, each by
+    /// itself: held when one drive positively holds it, free otherwise. One drive the registry
+    /// cannot identify never refuses an image it does not name.
+    pub(super) fn kernel_hold(
+        drives: &[DriveBacking],
+        file: (u64, u64),
+        image: &std::path::Path,
+    ) -> KernelHold {
+        if drives.iter().any(|drive| drive.holds(file, image)) {
+            return KernelHold::Held;
+        }
+        KernelHold::Free {
+            unproven: drives.iter().filter_map(DriveBacking::unproven).collect(),
+        }
+    }
+
+    /// The registry keys a drive's backing file is read under.
+    struct BackingKeys {
+        backing: Cf,
+        lists: [Cf; 2],
+        source: Cf,
+    }
+
+    impl BackingKeys {
+        fn new() -> io::Result<Self> {
+            Ok(Self {
+                backing: key("backingstore-id")?,
+                lists: [key("writeable-components")?, key("readonly-components")?],
+                source: key(Driver::InKernel.source_key())?,
+            })
+        }
+    }
+
+    /// What every registered in-kernel drive names as the file it holds, each read by itself
+    /// ([`drive_backing`]); a drive that left the registry mid-read is departing and passed over.
+    pub(super) fn in_kernel_backings() -> io::Result<Vec<DriveBacking>> {
+        let keys = BackingKeys::new()?;
+        Ok(registered(Driver::InKernel.class())?
+            .filter_map(|drive| drive_backing(|key| property(&drive, key), &keys))
+            .collect())
+    }
+
+    /// What one in-kernel drive names as its backing file, each property read through
+    /// `property`; `None` when the drive left the registry mid-read. A `backingstore-id` that is
+    /// absent, unreadable or malformed fails this drive alone over to its `KDIURLPath`, which is
+    /// read only then.
+    fn drive_backing(
+        property: impl Fn(&Cf) -> Read<Option<Cf>>,
+        keys: &BackingKeys,
+    ) -> Option<DriveBacking> {
+        let why = match property(&keys.backing) {
+            Ok(Some(identity)) => match backing_components(&identity, &keys.lists) {
+                Ok(files) => return Some(DriveBacking::Files(files)),
+                Err(error) => error.to_string(),
+            },
+            Ok(None) => "it registers no backingstore-id".to_owned(),
+            Err(Unread::Gone) => return None,
+            Err(Unread::Failed(error)) => format!("its backingstore-id is unreadable: {error}"),
+        };
+        let name = Driver::InKernel.source_key();
+        let unidentified = match property(&keys.source) {
+            Ok(Some(value)) => match cf_string(value.0, name) {
+                Ok(source) => {
+                    return Some(match Driver::InKernel.source(&source) {
+                        DiskImageSource::File(path) => DriveBacking::Path { path, why },
+                        DiskImageSource::Url(url) => DriveBacking::Store { url },
+                    });
+                }
+                Err(error) => error.to_string(),
+            },
+            Ok(None) => format!("it registers no {name}"),
+            Err(Unread::Gone) => return None,
+            Err(Unread::Failed(error)) => format!("its {name} is unreadable: {error}"),
+        };
+        Some(DriveBacking::Unidentified {
+            why: format!("{why}; {unidentified}"),
+        })
     }
 
     /// The `d<dev>:i<ino>` components of one drive's `backingstore-id` dictionary.
@@ -6261,6 +6390,233 @@ mod io_registry {
                     "{malformed:?}"
                 );
             }
+        }
+
+        #[link(name = "CoreFoundation", kind = "framework")]
+        unsafe extern "C" {
+            fn CFDataCreate(allocator: CfType, bytes: *const u8, length: CfIndex) -> CfType;
+            fn CFPropertyListCreateWithData(
+                allocator: CfType,
+                data: CfType,
+                options: usize,
+                format: *mut CfIndex,
+                error: *mut CfType,
+            ) -> CfType;
+        }
+
+        /// The identifying properties of a read-write in-kernel drive, as
+        /// `ioreg -a -r -c IOHDIXHDDriveInKernel -d 1` printed them on 2026-10-22, the image path
+        /// replaced by a neutral one.
+        const CLASS: &str = "<key>IOClass</key><string>IOHDIXHDDriveInKernel</string>";
+        const SOURCE_PATH: &str = "<key>KDIURLPath</key>\
+            <string>/private/cowshed/store/example/codebase/sessions/fixture.dmg</string>";
+        const BACKING_ID: &str = "<key>backingstore-id</key><dict><key>writeable-components</key>\
+            <array><string>d16777230:i120596975</string></array></dict>";
+        const IMAGE: &str = "/private/cowshed/store/example/codebase/sessions/fixture.dmg";
+        const HELD: (u64, u64) = (16_777_230, 120_596_975);
+        const OTHER_IMAGE: &str = "/private/cowshed/store/smoothbricks/sessions/other.dmg";
+
+        /// One drive judged from its registry properties, given as `ioreg -a` prints them and
+        /// parsed by CoreFoundation into the dictionary the registry answers them from.
+        fn drive(properties: &[&str]) -> DriveBacking {
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict>{}</dict></plist>",
+                properties.concat()
+            );
+            let length = CfIndex::try_from(xml.len()).expect("fixture length");
+            // SAFETY: `xml` is readable for `length` bytes, which the call copies; the answer is
+            // +1 or null.
+            let data = unsafe { CFDataCreate(ptr::null(), xml.as_ptr(), length) };
+            assert!(!data.is_null(), "copy the fixture plist");
+            let data = Cf(data);
+            // SAFETY: `data` is a live CFData, and neither the format nor an error is asked for;
+            // the answer is +1 or null.
+            let parsed = unsafe {
+                CFPropertyListCreateWithData(
+                    ptr::null(),
+                    data.0,
+                    0,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            };
+            assert!(!parsed.is_null(), "parse the fixture plist");
+            let properties = Cf(parsed);
+            // SAFETY: `properties` is a live CF object.
+            let is_dictionary = unsafe { CFGetTypeID(properties.0) == CFDictionaryGetTypeID() };
+            assert!(is_dictionary, "a drive's properties are a dictionary");
+            let keys = BackingKeys::new().expect("registry keys");
+            drive_backing(
+                |key| {
+                    // SAFETY: `properties` is a live CFDictionary and `key` a CFString; the value
+                    // is borrowed from it, or null.
+                    let value = unsafe { CFDictionaryGetValue(properties.0, key.0) };
+                    if value.is_null() {
+                        return Ok(None);
+                    }
+                    // SAFETY: `value` is live while `properties` is; retaining it makes it +1.
+                    Ok(Some(Cf(unsafe { CFRetain(value) })))
+                },
+                &keys,
+            )
+            .expect("a fixture drive never departs")
+        }
+
+        fn path(image: &str) -> &std::path::Path {
+            std::path::Path::new(image)
+        }
+
+        /// A drive that registers its backing file by device and inode holds that file whatever
+        /// path reaches it, and no other file, the path its attach was handed included.
+        #[test]
+        fn a_drive_naming_its_backing_file_holds_that_file_by_device_and_inode() {
+            let drives = [drive(&[CLASS, SOURCE_PATH, BACKING_ID])];
+            assert_eq!(drives[0], DriveBacking::Files(vec![HELD]));
+            assert_eq!(
+                kernel_hold(&drives, HELD, path(OTHER_IMAGE)),
+                KernelHold::Held
+            );
+            assert_eq!(
+                kernel_hold(&drives, (16_777_230, 1), path(IMAGE)),
+                KernelHold::Free { unproven: vec![] }
+            );
+        }
+
+        /// Audit H5: one registered drive without a `backingstore-id` failed every detached
+        /// capture and growth on the host. It is judged by itself now: it refuses the image at
+        /// the path its attach was handed, and every other image proceeds, naming it.
+        #[test]
+        fn a_drive_without_a_backing_id_refuses_only_the_image_at_its_attach_path() {
+            let drives = [
+                drive(&[CLASS, SOURCE_PATH]),
+                drive(&[
+                    CLASS,
+                    "<key>KDIURLPath</key><string>/private/cowshed/store/a.dmg</string>",
+                    "<key>backingstore-id</key><dict><key>readonly-components</key>\
+                     <array><string>d1:i2</string></array></dict>",
+                ]),
+            ];
+            assert_eq!(
+                drives[0],
+                DriveBacking::Path {
+                    path: IMAGE.into(),
+                    why: "it registers no backingstore-id".to_owned(),
+                }
+            );
+            assert_eq!(drives[1], DriveBacking::Files(vec![(1, 2)]));
+            assert_eq!(kernel_hold(&drives, (7, 8), path(IMAGE)), KernelHold::Held);
+            assert_eq!(
+                kernel_hold(&drives, (1, 2), path(OTHER_IMAGE)),
+                KernelHold::Held
+            );
+            assert_eq!(
+                kernel_hold(&drives, (7, 8), path(OTHER_IMAGE)),
+                KernelHold::Free {
+                    unproven: vec![format!(
+                        "the drive attached from {IMAGE} (it registers no backingstore-id)"
+                    )],
+                }
+            );
+        }
+
+        /// A `backingstore-id` that does not name a file fails that drive alone over to its
+        /// attach path, saying why.
+        #[test]
+        fn a_malformed_backing_id_falls_back_to_the_attach_path() {
+            for (identity, why) in [
+                (
+                    "<key>backingstore-id</key><string>d16777230:i120596975</string>",
+                    "registry property backingstore-id is not a dictionary",
+                ),
+                (
+                    "<key>backingstore-id</key><dict></dict>",
+                    "registry property backingstore-id names no backing file",
+                ),
+                (
+                    "<key>backingstore-id</key><dict><key>writeable-components</key>\
+                     <array><string>16777230:120596975</string></array></dict>",
+                    "backingstore-id component \"16777230:120596975\" is not d<dev>:i<ino>",
+                ),
+            ] {
+                assert_eq!(
+                    drive(&[CLASS, SOURCE_PATH, identity]),
+                    DriveBacking::Path {
+                        path: IMAGE.into(),
+                        why: why.to_owned(),
+                    },
+                    "{identity}"
+                );
+            }
+        }
+
+        /// A drive that names its file neither way refuses no image; it is named as unproven.
+        #[test]
+        fn a_drive_naming_no_file_refuses_nothing_and_is_named() {
+            let drives = [
+                drive(&[CLASS]),
+                drive(&[CLASS, "<key>KDIURLPath</key><integer>1</integer>"]),
+            ];
+            assert_eq!(
+                drives,
+                [
+                    DriveBacking::Unidentified {
+                        why: "it registers no backingstore-id; it registers no KDIURLPath".to_owned(),
+                    },
+                    DriveBacking::Unidentified {
+                        why: "it registers no backingstore-id; registry property KDIURLPath is not a string"
+                            .to_owned(),
+                    },
+                ]
+            );
+            assert_eq!(
+                kernel_hold(&drives, HELD, path(IMAGE)),
+                KernelHold::Free {
+                    unproven: vec![
+                        "a drive that names no file (it registers no backingstore-id; it registers no KDIURLPath)"
+                            .to_owned(),
+                        "a drive that names no file (it registers no backingstore-id; registry property \
+                         KDIURLPath is not a string)"
+                            .to_owned(),
+                    ],
+                }
+            );
+        }
+
+        /// The publish runner's failure: a RAM disk (`hdiutil attach -nomount ram://16777218`)
+        /// registers `KDIURLPath` `ram://16777218` and no `backingstore-id`, and failed every
+        /// detached growth and capture on the host. It holds no file: it refuses nothing and is
+        /// not named as unproven.
+        #[test]
+        fn a_ram_disk_holds_no_file_and_is_not_unproven() {
+            let drives = [
+                drive(&[
+                    CLASS,
+                    "<key>KDIURLPath</key><string>ram://16777218</string>",
+                ]),
+                drive(&[CLASS, SOURCE_PATH, BACKING_ID]),
+            ];
+            assert_eq!(
+                drives[0],
+                DriveBacking::Store {
+                    url: "ram://16777218".to_owned(),
+                }
+            );
+            assert_eq!(
+                kernel_hold(&drives, (7, 8), path(OTHER_IMAGE)),
+                KernelHold::Free { unproven: vec![] }
+            );
+            assert_eq!(
+                kernel_hold(&drives, HELD, path(OTHER_IMAGE)),
+                KernelHold::Held
+            );
+        }
+
+        /// A drive that leaves the registry mid-read is departing: it is passed over, neither
+        /// holding a file nor named as unproven.
+        #[test]
+        fn a_drive_departing_mid_read_is_passed_over() {
+            let keys = BackingKeys::new().expect("registry keys");
+            assert_eq!(drive_backing(|_| Err(Unread::Gone), &keys), None);
         }
 
         /// `MACH_PORT_RIGHT_DEAD_NAME`.

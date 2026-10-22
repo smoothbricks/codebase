@@ -116,13 +116,19 @@ This companion owns the macOS/APFS implementation.
   file. The kernel names each drive's backing file in its `backingstore-id` property,
   `{"writeable-components" | "readonly-components" = ("d<dev>:i<ino>")}` (read from `ioreg` for a read-write and a
   read-only attach, 2026-10-22), which still names the file after its path was renamed or unlinked, so an alias path is
-  refused too and no path is stat'd; a drive that names no backing file fails the check. The lease excludes cowshed's
-  own attach of the image until the write is durable. The RAW file's length is its virtual capacity. Refuse a requested
-  length not aligned to 4 KiB or not strictly larger than the existing length; extend with `ftruncate` and power-loss
-  flush before closing. Extending creates holes, not a host allocation of the larger capacity. There is no image header
-  or allocation map to parse or rewrite. Cowshed then attaches and verifies its own image, grows the container with
-  `diskutil apfs resizeContainer`, and checks kernel capacity. A crash between file and container growth leaves a larger
-  image around the old container: equal-capacity resize is refused, while a larger resize completes both steps.
+  refused too and no path is stat'd. Each drive is judged by itself: one whose `backingstore-id` is absent, unreadable
+  or malformed refuses only an image at its `KDIURLPath`, the path its attach was handed, and growth otherwise proceeds
+  with a warning that names it, since a rename or alias of the file it holds goes unseen; a drive that names its file
+  neither way is named in that warning too. A drive whose `KDIURLPath` names no local file (`ram://<sectors>`, a RAM
+  disk, which registers no `backingstore-id`) holds no file and is neither refused nor named. Only a positive match
+  refuses: a drive the registry cannot identify never makes growth or detached capture unavailable host-wide. The lease
+  excludes cowshed's own attach of the image until the write is durable. The RAW file's length is its virtual capacity.
+  Refuse a requested length not aligned to 4 KiB or not strictly larger than the existing length; extend with
+  `ftruncate` and power-loss flush before closing. Extending creates holes, not a host allocation of the larger
+  capacity. There is no image header or allocation map to parse or rewrite. Cowshed then attaches and verifies its own
+  image, grows the container with `diskutil apfs resizeContainer`, and checks kernel capacity. A crash between file and
+  container growth leaves a larger image around the old container: equal-capacity resize is refused, while a larger
+  resize completes both steps.
 - **Detached capture** (a blank template, an unmounted seed): the clone holds the source's image lease and a shared
   `O_SHLOCK | O_NONBLOCK | O_NOFOLLOW` descriptor through `fclonefileat`, and refuses (`SourceAttached`) a source any
   registered in-kernel drive holds, by the `backingstore-id` rule of detached growth. The lock excludes a DiskImages2
