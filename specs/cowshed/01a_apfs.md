@@ -859,11 +859,12 @@ ordinary registry enumeration (`IOServiceGetMatchingServices`, subclasses includ
 each attach already running and for each the storage phase may still admit, keeps a reserve for the host's own disks,
 adds the three this attach creates, and refuses the attach before it starts when the sum would reach the ceiling
 (02_workspaces.md, "Making room for an attach"; 05_gateway.md, "The media cap's reserve"). A CLI verb that will attach
-first makes room: it detaches the least-recently-used idle workspaces (no supervisor serving them; never main, the
-workspaces it names, or one a land or `rm` holds), which re-attach on their next use, until its images fit. If nothing
-idle frees enough it detaches nothing and refuses by name, listing ten attached workspaces with the media each holds and
-the count of the rest. Controller operations get the guard's refusal only. No path starts an attach that can only hang.
-`cowshed doctor` reports live `IOMedia` against the ceiling.
+named workspaces first makes room: it detaches the least-recently-used idle workspaces (no supervisor serving them;
+never main, the workspaces it names, or one a land or `rm` holds), which re-attach on their next use, until its images
+fit. If nothing idle frees enough it detaches nothing and refuses by name, listing ten attached workspaces with the
+media each holds and the count of the rest. Attaching every session (`cowshed attach` without a name, or `--all`) and
+controller operations get the guard's refusal only. No path starts an attach that can only hang. `cowshed doctor`
+reports live `IOMedia` against the ceiling.
 
 ### Freeing an image
 
