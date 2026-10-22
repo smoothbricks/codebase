@@ -97,6 +97,7 @@ fn runner_error(error: CommandRunError) -> CowshedError {
             message,
             "no disk tool renames a volume; create it under its final name (specs/cowshed/01a_apfs.md, \"Ownership, identity, and the volume label\")",
         ),
+        CommandRunFailure::Release(refusal) => CowshedError::conflict(message, refusal.hint()),
         CommandRunFailure::Spawn(_)
         | CommandRunFailure::Wait(_)
         | CommandRunFailure::Kill { .. }

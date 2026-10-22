@@ -117,7 +117,8 @@ fn run_disk_tool(
             | CommandRunFailure::Kill { .. }
             | CommandRunFailure::Reap { .. }
             | CommandRunFailure::Input { .. }
-            | CommandRunFailure::VolumeRename => HostError::new(format!(
+            | CommandRunFailure::VolumeRename
+            | CommandRunFailure::Release(_) => HostError::new(format!(
                 "cannot execute {:?} with argv {:?}: {error}",
                 command.program(),
                 command.args()

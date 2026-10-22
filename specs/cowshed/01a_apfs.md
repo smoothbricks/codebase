@@ -391,16 +391,24 @@ passes, and a non-administrator gets a SecurityAgent prompt that holds the reque
 `hdiutil detach`, with or without `-force`, unmounts the whole disk through `DADiskUnmount` first.
 
 The 2026-10-22 matrix on macOS 26.6.2 measured 23 cells on throwaway 64 MiB RAW images; the probe sources, per-cell
-records and the live receipt are retained outside the repository as `detach-no-auth-20261022`. Each DA request came from
-a probe whose interposed `AuthorizationCreate` refuses, so no cell reached authd. With the image attached by the user,
-whether in-kernel read-write, in-kernel `-readonly` or DiskImages2, no unmount, whole-disk unmount (forced or not) or
-eject asked for authorization. That held whatever mounted the volume (`diskutil mount` browsable,
-`diskutil mount readOnly -mountPoint`, `mount_apfs -o nobrowse` or root's `hdiutil mountvol`) and whether it was still
-mounted or already unmounted. `hdiutil detach`, `hdiutil detach -force`, `diskutil eject` and `diskutil unmount` each
-finished in 0.05–1.5 s. With the image attached by root (`sudo hdiutil attach -kernel`: `owner-uid` 0, `/dev` nodes
-root's), every whole-disk unmount, forced whole-disk unmount and eject by uid 502 needed authorization, including after
-a `diskutil mount` / `diskutil unmount` cycle. Root's own `hdiutil detach` of that image took 0.13 s. `diskutil mount`
-by uid 502 of the root-attached volume succeeded, yet launched a SecurityAgent that exited about 28 s later.
+records and the live receipt are retained outside the repository as `detach-no-auth-20261022`. Each direct DA probe ran
+with an interposed `AuthorizationCreate` that refuses, so no direct probe reached authd; the real `hdiutil` and
+`diskutil` calls are platform binaries that cannot be interposed and ran under a 15 s watch for a new SecurityAgent, and
+the one setup step noted below launched one. With the image attached by the user, whether in-kernel read-write,
+in-kernel `-readonly` or DiskImages2, no unmount, whole-disk unmount (forced or not) or eject asked for authorization.
+That held whatever mounted the volume (`diskutil mount` browsable, `diskutil mount readOnly -mountPoint`,
+`mount_apfs -o nobrowse` or root's `hdiutil mountvol`) and whether it was still mounted or already unmounted.
+`hdiutil detach`, `hdiutil detach -force`, `diskutil eject` and `diskutil unmount` each finished in 0.05–1.5 s. With the
+image attached by root (`sudo hdiutil attach -kernel`: `owner-uid` 0, `/dev` nodes root's), every whole-disk unmount,
+forced whole-disk unmount and eject by uid 502 needed authorization, including after a `diskutil mount` /
+`diskutil unmount` cycle. Root's own `hdiutil detach` of that image took 0.13 s. `diskutil mount` by uid 502 of the
+root-attached volume succeeded, yet launched a SecurityAgent that exited about 28 s later. On 2026-10-23, five more
+cells released root-attached images as uid 502 with `diskutil`, each exiting 0 and actually releasing: `unmount` of a
+volume root had mounted with `hdiutil mountvol` (0.41 s), `unmountDisk` with nothing mounted (0.15 s) and with the
+volume mounted (0.37 s), and `eject` with nothing mounted (0.11 s) and mounted (0.55 s). DiskManagement does not make
+`hdiutil`'s in-process `DADiskUnmount` call, so none waited, but the first `diskutil` request in each half-minute
+launched a SecurityAgent that lingered about 30 s. A launched SecurityAgent is itself a prompt no cowshed verb may raise
+(06_cli.md).
 
 The incident of 2026-10-22 22:48 +04 was that root-attached cell. An agent attached a recovery image with
 `sudo -n hdiutil attach -kernel -readonly -nomount …`, mounted and unmounted its volume with `diskutil`, and then
@@ -408,15 +416,31 @@ The incident of 2026-10-22 22:48 +04 was that root-attached cell. An agent attac
 `DADiskUnmountCommon → _DAAuthorize → AuthorizationCopyRights` behind a SecurityAgent prompt (expired credential, Touch
 ID locked out); its `-force` retry waited the same way. The browsable `diskutil mount` was incidental.
 
-Cowshed attaches only as the invoking user, so its own attachments never meet the prompt. The inventory reads each
-attachment's `owner-uid` with its devices, and treats an absent one as root's, as Disk Arbitration does. A release
-refuses an attachment another uid made with `ReleaseNeedsAuthorization`, naming the device, the image, the owner uid and
-the euid, before anything is unmounted. The guarded recheck before every `hdiutil detach`, the dissent retry and final
-`-force` included, refuses the same way rather than spawn a detach that would wait. Root releases any attachment. The
-refusal is a conflict whose hint names the owner: detach it as that uid (`sudo hdiutil detach <device>` for root). No
-authorization is requested, retried or waited on. In the 2026-10-22 23:47 +04 live receipt, `release_image` of a
-root-attached image as uid 502 returned `ReleaseNeedsAuthorization` in 37 ms and left the image attached for root to
-detach. The same call on a user-attached image mounted with `mount_apfs` released it in 0.61 s.
+Cowshed attaches only as the invoking user, so its own attachments never meet the prompt. One check guards every
+release, in `SystemCommandRunner` beside the rename, media-cap and attach-pool refusals: every disk child spawns there,
+cowshed's own detaches and `cowshed disk-command` alike (06_cli.md), inside the storage lease and immediately before the
+spawn (`release_authority.rs`). It covers disk-image disks only: a disk with an image drive (`IOHDIXHDDrive`,
+`AppleDiskImageDevice`) above its IOMedia. The host's own disks have none and pass untouched, including the store volume
+bootstrap remounts with an unprivileged `diskutil unmount force`. A release is `hdiutil detach` or `eject`, with any
+flags, or `diskutil eject`, `unmount`, `umount`, `unmountDisk` or `umountDisk`, in any case and optionally `force`. Its
+one operand names `/dev/diskN[sM]`, `/dev/rdiskN[sM]`, `diskN[sM]`, or an absolute path whose `statfs` source is such a
+disk. The check reads that disk's owner as Disk Arbitration does, the first `owner-uid` from its IOMedia up through its
+providers to the image drive or root when none, and refuses the release as `ReleaseNeedsAuthorization` when the owner is
+neither the euid nor the euid root. A release that names a volume name, a UUID, a path off any disk or not exactly one
+operand, or whose owner cannot be read, is refused under the same name: nothing says it is not another user's image. A
+disk the registry no longer has passes, since the tool reports its absence without asking authd. A refusal is not a
+dissent: it is never retried or forced. `release_image` also refuses another user's attachment, with the same decision
+and error, before it unmounts anything, from the `owner-uid` its inventory reads with each attachment. The refusal is a
+conflict naming the refused command, the disk, the owner uid and the euid, and its hint names the owner (run it with
+`sudo` for root). Native `funmount` does not go through Disk Arbitration and is not checked. No authorization is
+requested, retried or waited on. In the 2026-10-22 23:47 +04 live receipt, `release_image` of a root-attached image as
+uid 502 returned `ReleaseNeedsAuthorization` in 37 ms and left the image attached for root to detach. The same call on a
+user-attached image mounted with `mount_apfs` released it in 0.61 s. In the 2026-10-23 00:18 +04 facade witness, against
+a root-attached image whose volume root had mounted, `cowshed disk-command` as uid 502 refused each of `hdiutil detach`,
+`hdiutil detach -force -verbose`, `hdiutil eject`, `diskutil eject`, `diskutil unmountDisk force`, `diskutil unmount` of
+the volume, `diskutil umount` of its mountpoint and `diskutil unmount` of its bare volume name, in 0.12–0.33 s with
+wrapper exit 103. No SecurityAgent started, and the image stayed attached and mounted until root detached it. The same
+facade detached a user-attached image in 0.19 s.
 
 `WhenIdle` returns a recognized busy refusal immediately, without force. `Release` gives the first recognized busy
 refusal its existing 10 s monotonic wall-clock grace, including native/command execution and disk-lease waits between

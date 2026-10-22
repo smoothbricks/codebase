@@ -309,7 +309,9 @@ through the same `SystemCommandRunner` and disk-lifecycle lease as cowshed's own
 lease"). The option is parsed only before `--`; every later argument remains the tool's byte-exact argument, even
 `--deadline-ms`. Standard input is inherited, and terminal stdout/stderr and a normal child's exit code or
 `128 + signal` pass through unchanged. The command needs no project; `--json` is refused because its output belongs to
-the tool.
+the tool. A Disk Arbitration release of a disk-image disk another user owns, or one whose disk cannot be named, is
+refused before it spawns as a conflict (`ReleaseNeedsAuthorization`, 01a_apfs.md "Release authority"), never left
+waiting on an administrator prompt.
 
 For SAFE commands, the facade starts one monotonic total admission-and-child budget before handing work to the blocking
 runner: 120000 ms by default, or the supplied positive integer milliseconds. Exhausted admission never executes the
