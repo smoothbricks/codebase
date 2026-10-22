@@ -633,29 +633,33 @@ describe('commit-time public denylist', () => {
     });
   });
 
-  it('exempts an allowed public repository name in every casing the sibling match accepts, not another cased term', async () => {
-    await sibling('smoothbricks');
-    await sibling();
-    await installAllowlist('repository\tsmoothbricks\n');
-    await stage('smoothbricks SmoothBricks SMOOTHBRICKS\n');
-    expect((await staged()).outcome).toBe('clean');
-    await stage('SmoothBricks Secret-Consumer\n');
-    expect(await staged()).toEqual({
-      outcome: 'denied',
+  it.each([
+    {
+      kind: 'public repository name',
+      siblingName: 'smoothbricks',
+      allowlist: 'repository\tsmoothbricks\n',
+      allowed: 'smoothbricks SmoothBricks SMOOTHBRICKS\n',
+      denied: 'SmoothBricks Secret-Consumer\n',
       matches: 'staged:notes.txt:1:SmoothBricks Secret-Consumer\n',
-    });
-  });
-
-  it('exempts an allowed package scope in every casing the sibling match accepts', async () => {
-    await sibling('public-cms');
+    },
+    {
+      kind: 'package scope',
+      siblingName: 'public-cms',
+      allowlist: 'package-scope\t@public-cms\n',
+      allowed: '@Public-CMS/content-api patches/@PUBLIC-CMS%2Fcontent-api.patch\n',
+      denied: '@Public-CMS/content-api Secret-Consumer\n',
+      matches: 'staged:notes.txt:1:@Public-CMS/content-api Secret-Consumer\n',
+    },
+  ])('exempts an allowed $kind in every casing the sibling match accepts, not another cased term', async (row) => {
+    await sibling(row.siblingName);
     await sibling();
-    await installAllowlist('package-scope\t@public-cms\n');
-    await stage('@Public-CMS/content-api patches/@PUBLIC-CMS%2Fcontent-api.patch\n');
+    await installAllowlist(row.allowlist);
+    await stage(row.allowed);
     expect((await staged()).outcome).toBe('clean');
-    await stage('@Public-CMS/content-api Secret-Consumer\n');
+    await stage(row.denied);
     expect(await staged()).toEqual({
       outcome: 'denied',
-      matches: 'staged:notes.txt:1:@Public-CMS/content-api Secret-Consumer\n',
+      matches: row.matches,
     });
   });
 
