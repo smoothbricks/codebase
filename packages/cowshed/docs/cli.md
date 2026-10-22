@@ -1192,7 +1192,7 @@ refs/cowshed/raven/heads/cowshed/raven	9b2e77d4c1…
 Stdout is the preserved ref and the commit it names. Nothing preserves a workspace's work but `push` and `land`: the
 store volume that holds the images is excluded from backup (durability = git).
 
-### `cowshed rebase [<name>] [--onto <rev> | --into <lane>] [--gate]`
+### `cowshed rebase [<name>] [--onto <rev> | --into <lane> [--ungated]] [--gate]`
 
 Brings the workspace branch up to current main: cowshed points the workspace's `main` remote at main's checkout
 (`cowshed-main` in a workspace where something else already holds that name), fetches it, and runs
@@ -1222,7 +1222,11 @@ database another process holds carries nothing and names that process. The hash 
 that asks for one CPU token at background class; `--gate` asks at gate class instead, for a land's rebase, which its
 lander runs under the land lock: queued behind background work, it would hold up every land waiting for that lock.
 
-### `cowshed land <name> [--into <lane>] [--check <cmd>] [--ref-lock <file>]`
+`--ungated`, with `--into <lane>`, is the rebase before an ungated land: it fetches and replays as above and then stops,
+computing no hash and carrying nothing; `buildVolume` is `{kind:"skipped", reason:{kind:"ungated"}}`. Without `--into`,
+or with `--into main`, it is refused (exit 2, naming main), and so is `--gate` beside it: an ungated rebase runs no job.
+
+### `cowshed land <name> [--into <lane> [--ungated]] [--check <cmd>] [--ref-lock <file>]`
 
 The full close-out in one primitive: validate (`--check`) inside the sandbox, fast-forward the target's checkout to the
 workspace's branch, retire the workspace. The target is main, or with `--into <lane>` the lane base `<lane>`. A dirty
@@ -1238,6 +1242,13 @@ installs the exact head in `refs/cowshed/<name>/heads/<branch>`, without moving 
 recording a land outcome, collecting volumes or retiring the workspace, even when retirement is left at its default. Its
 text output is the preservation ref and source SHA; `--json` returns `kind: delivered` with the existing push-report
 fields. An ordinary land returns `kind: landed` with its target, build-volume and retirement report.
+
+`--ungated`, with `--into <lane>`, folds a unit into its lane base by Git alone: no check, no Nx cache initialization,
+carry, seed freeze or build-volume adoption. It fast-forwards the lane base and retires the unit, whose volume and seed
+are released with it; the lane base keeps its volume and seed. The report is `kind: landed` with seed
+`{kind:"unchanged"}` and adoption `{kind:"skipped", reason:{kind:"ungated"}}`, recorded as the land's outcome. Only a
+land into main gates, so main refuses `--ungated` (exit 2, naming main); `--check` and `--push-only` are refused with it
+(exit 2). With `--no-retire` it keeps the unit and collects nothing, since it released no volume.
 
 `--ref-lock <file>` names the lock file every other writer of the target branch holds while it moves it, as an
 operator's Markdown commit into main holds it through lockf(1). Land takes the same exclusive lock only to re-read the

@@ -229,8 +229,9 @@ will not get past it, by design; `--abandon` will, and destroys them (recoverabl
 
 ### Lanes: one change built by several workspaces
 
-When a change is too big for one workspace, give it a lane base and fork its units from that base. Each unit lands into
-the lane base instead of main, and the lane base lands into main once, when the whole change is done:
+When a change is too big for one workspace, give it a lane base and fork its units from that base. Each unit folds into
+the lane base instead of main by Git alone, and the lane base lands into main once, gated, when the whole change is
+done:
 
 ```sh
 LANE=auth-rework
@@ -239,9 +240,9 @@ cowshed fork "$LANE" --project "$PROJECT"
 cowshed fork "$LANE" "$LANE-schema" --project "$PROJECT"
 cowshed fork "$LANE" "$LANE-api" --project "$PROJECT"
 
-# each unit, when its work is done:
-cowshed rebase "$LANE-schema" --into "$LANE" --project "$PROJECT"
-cowshed land "$LANE-schema" --into "$LANE" --check 'just verify' --project "$PROJECT"
+# each unit, when its work is done: Git alone, no check, no build-volume carry
+cowshed rebase "$LANE-schema" --into "$LANE" --ungated --project "$PROJECT"
+cowshed land "$LANE-schema" --into "$LANE" --ungated --project "$PROJECT"
 
 # the lane, when every unit has landed into it:
 cowshed rebase "$LANE" --project "$PROJECT"
@@ -253,6 +254,15 @@ the lane base's checked-out branch and retires the unit once the lane base holds
 the lane: `--into` names a workspace, and your script is what knows which units belong to it. If the lane base is
 removed and recreated under the same name while units are in flight, their lands refuse it rather than land into a
 workspace they were not forked from.
+
+`--ungated` makes a unit's fold Git alone: the rebase computes no task hash and carries nothing, and the land runs no
+check, initializes or carries no Nx cache, freezes no seed and adopts no build volume. The lane base keeps its build
+volume and seed, and the unit's volume and seed are released when it retires. The lane is built once, by the lane base's
+own gated land into main, whose `--check` is the batch gate for every unit. Main refuses `--ungated` (exit 2, naming
+main): only a land into main gates. `--ungated` is also refused with `--check` or `--push-only` on land and with
+`--gate` on rebase (exit 2). With `--no-retire`, an ungated land keeps the unit and collects nothing, since it released
+no volume. Leave `--ungated` off when each unit must gate on its own, as in a stack whose units each land reviewed work:
+a gated land into the lane base adopts the unit's build volume and refreshes the lane base's seed.
 
 ## Machine-readable operation
 

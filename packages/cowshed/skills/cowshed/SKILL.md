@@ -61,8 +61,8 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 | Checkpoint or restore   | `cowshed checkpoint <ws> <label>` / `cowshed restore <ws> <label>`   | Save or roll back an image.                                                                                                                                                                                                                |
 | Rebase                  | `cowshed rebase <ws>`                                                | Rebase the workspace branch onto main.                                                                                                                                                                                                     |
 | Land with a check       | `cowshed land <ws> --target main --check '<bare command>'`           | Check, fast-forward main, and retire on success.                                                                                                                                                                                           |
-| Rebase within a lane    | `cowshed rebase <ws> --into <lane>`                                  | Rebase onto the lane base's branch, where the lane's other units land.                                                                                                                                                                     |
-| Land into a lane base   | `cowshed land <ws> --into <lane> --check '<bare command>'`           | Check, fast-forward the lane base instead of main, and retire.                                                                                                                                                                             |
+| Rebase within a lane    | `cowshed rebase <ws> --into <lane> --ungated`                        | Rebase onto the lane base's branch by Git alone: no task hashing, no carry.                                                                                                                                                                |
+| Fold into a lane base   | `cowshed land <ws> --into <lane> --ungated`                          | Fast-forward the lane base by Git alone and retire; the lane base's own land into main gates. Main refuses it.                                                                                                                             |
 | Deliver a branch        | `cowshed push <ws> --branch <name>`                                  | Put the workspace branch in main's repository for review.                                                                                                                                                                                  |
 | Retire                  | `cowshed rm <ws>`                                                    | Remove a shed whose work main holds; a containment refusal names commits to fold into the batch.                                                                                                                                           |
 | Reclaim                 | `cowshed gc --dry-run` / `cowshed gc`                                | Review, then reclaim orphaned storage.                                                                                                                                                                                                     |
@@ -93,10 +93,11 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
    adding a flag.
 6. Batch work is lane work
    ([02_workspaces.md, "Lanes"](../../../../specs/cowshed/02_workspaces.md#lanes-fork-and---into)): a repository's next
-   batch is a lane base, and a finished shed's work moves into it with `cowshed rebase <ws> --into <batch>`, then
-   `cowshed land <ws> --into <batch>`. The land fast-forwards the batch shed and retires the shed at once, so it never
-   waits for the batch to reach main. A unit meant for the batch from the start forks from it
-   (`cowshed fork <batch> <unit>`); the batch itself lands to main as an ordinary workspace.
+   batch is a lane base, and a finished shed's work moves into it with `cowshed rebase <ws> --into <batch> --ungated`,
+   then `cowshed land <ws> --into <batch> --ungated`: Git alone, no check, no build-volume carry or adoption. The land
+   fast-forwards the batch shed and retires the shed at once, so it never waits for the batch to reach main. A unit
+   meant for the batch from the start forks from it (`cowshed fork <batch> <unit>`); the batch itself lands to main as
+   an ordinary gated workspace, and its `--check` is the lane's one build.
 7. A shed whose work main already holds, or that carries none, is removed with plain `cowshed rm <ws>` and no check
    first: rm proves containment by content against live main, over every local branch. A containment refusal names the
    commits main lacks, and that shed is folded into the batch by step 6. Every other refusal (a workspace younger than

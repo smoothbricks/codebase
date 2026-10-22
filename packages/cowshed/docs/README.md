@@ -209,8 +209,9 @@ Two different mechanisms save build time, and it helps to keep them apart.
 **The clone is why a workspace starts warm.** A fork clones the target's source image and its latest immutable
 build-volume seed. Cargo target directories and Nx state live in that separate private APFS image, reached through
 `.cowshed/build` and fixed relative links; `.codegraph` is one of them, a link to `.cowshed/build/codegraph`, so the
-index is build-volume state carried like the rest. Every land freezes a seed from the landing workspace's warm volume. A
-plain Git fast-forward is detected at the next fork, including `--ref` at the target's current tree: a quiet live
+index is build-volume state carried like the rest. Every gated land freezes a seed from the landing workspace's warm
+volume; an ungated lane fold (`land --into <lane> --ungated`) moves Git alone and leaves the lane base's seed as it was.
+A plain Git fast-forward is detected at the next fork, including `--ref` at the target's current tree: a quiet live
 workspace at exactly that tree seeds the target automatically. Between lands, the fork captures newer live state only
 when it is at least as near the requested tree and has no writer. A nearer landed seed beats an older live volume. There
 is no manual seed-refresh or warm step. `doctor` reports target-only `seed-age`, `seed-tree-behind` and
