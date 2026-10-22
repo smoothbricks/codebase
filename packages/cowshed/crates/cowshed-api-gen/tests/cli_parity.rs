@@ -58,31 +58,24 @@ fn every_word_of_the_cli_has_a_counterpart() {
 }
 
 #[test]
-fn a_cli_option_without_a_counterpart_is_refused() {
-    let source = edited(
-        &grammar(),
-        "flag(\"quarantine\"),",
-        "flag(\"quarantine\"),\n            flag(\"napi-less\"),",
-    );
-    let error = refusal(&source);
-    assert!(
-        error.contains("cowshed adopt --napi-less has no N-API counterpart"),
-        "{error}"
-    );
-}
-
-#[test]
-fn a_verb_without_a_counterpart_is_refused() {
-    let source = edited(
-        &grammar(),
-        ".subcommand(leaf(\"controller\"))",
-        ".subcommand(leaf(\"controller\"))\n        .subcommand(leaf(\"napi-less\"))",
-    );
-    let error = refusal(&source);
-    assert!(
-        error.contains("cowshed napi-less has no N-API counterpart"),
-        "{error}"
-    );
+fn cli_words_without_counterparts_are_refused() {
+    let grammar = grammar();
+    for (from, to, expected) in [
+        (
+            "flag(\"quarantine\"),",
+            "flag(\"quarantine\"),\n            flag(\"napi-less\"),",
+            "cowshed adopt --napi-less has no N-API counterpart",
+        ),
+        (
+            ".subcommand(leaf(\"controller\"))",
+            ".subcommand(leaf(\"controller\"))\n        .subcommand(leaf(\"napi-less\"))",
+            "cowshed napi-less has no N-API counterpart",
+        ),
+    ] {
+        let source = edited(&grammar, from, to);
+        let error = refusal(&source);
+        assert!(error.contains(expected), "{error}");
+    }
 }
 
 #[test]
@@ -131,33 +124,26 @@ fn a_wire_field_the_request_does_not_carry_is_refused() {
 }
 
 #[test]
-fn an_unknown_builder_call_is_refused_by_name() {
-    let source = edited(
-        &grammar(),
-        ".subcommand(leaf(\"controller\"))",
-        ".subcommand(leaf(\"controller\").alias(\"ctl\"))",
-    );
-    let Err(error) = read_cli(&source) else {
-        panic!("the reader skipped a builder call it does not know");
-    };
-    assert!(
-        error.contains("command method `.alias` is unknown to the parity reader"),
-        "{error}"
-    );
-}
-
-#[test]
-fn an_unknown_argument_builder_call_is_refused_by_name() {
-    let source = edited(
-        &grammar(),
-        r#"flag("quarantine"),"#,
-        r#"flag("quarantine").long_alias("isolate"),"#,
-    );
-    let Err(error) = read_cli(&source) else {
-        panic!("the reader skipped an argument builder call it does not know");
-    };
-    assert!(
-        error.contains("argument method `.long_alias` is unknown to the parity reader"),
-        "{error}"
-    );
+fn unknown_builder_calls_are_refused_by_name() {
+    let grammar = grammar();
+    for (from, to, expected, failure) in [
+        (
+            ".subcommand(leaf(\"controller\"))",
+            ".subcommand(leaf(\"controller\").alias(\"ctl\"))",
+            "command method `.alias` is unknown to the parity reader",
+            "the reader skipped a builder call it does not know",
+        ),
+        (
+            r#"flag("quarantine"),"#,
+            r#"flag("quarantine").long_alias("isolate"),"#,
+            "argument method `.long_alias` is unknown to the parity reader",
+            "the reader skipped an argument builder call it does not know",
+        ),
+    ] {
+        let source = edited(&grammar, from, to);
+        let Err(error) = read_cli(&source) else {
+            panic!("{failure}");
+        };
+        assert!(error.contains(expected), "{error}");
+    }
 }
