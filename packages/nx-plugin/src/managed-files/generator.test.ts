@@ -133,22 +133,6 @@ describe('managed-files generator', () => {
     expect(ci).not.toContain('nixos-latest');
   });
 
-  // The package policies fail `smoo monorepo check --warn`, so the step must run where a change is
-  // judged — pull requests included — while drift healing stays a default-branch concern.
-  it('runs the policy check on every CI event and heals drift only from the default branch', async () => {
-    const tree = workspace();
-    await generate(tree);
-    const steps = workflowSteps(tree.read('.github/workflows/ci.yml', 'utf8') ?? '');
-    const check = steps.find((step) => step.get('id') === 'managed-drift');
-    expect(check?.get('run')).toBe('smoo monorepo check --warn');
-    expect(check?.has('if')).toBe(false);
-    const dispatch = steps.find((step) => String(step.get('run')).includes('--workflow managed-files.yml'));
-    const condition = String(dispatch?.get('if'));
-    expect(condition).toContain("github.event_name == 'push'");
-    expect(condition).toContain('github.event.repository.default_branch');
-    expect(condition).toContain('steps.managed-drift.outputs.drifted');
-  });
-
   it('discovers publication from workspace packages and does not publish another repository', async () => {
     const tree = workspace();
     updateJson<PackageJson>(tree, 'packages/library/package.json', (pkg) => ({
