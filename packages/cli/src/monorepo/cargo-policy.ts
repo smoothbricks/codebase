@@ -905,20 +905,20 @@ function commandsOf(options: NxTargetOptions | undefined): string {
 }
 
 /**
- * Every fileset one declared input list reaches, with nx.json's named inputs
- * expanded. The plugin's own `cargoToolchain` is defined per PROJECT and wins
- * over nx.json, so naming it counts without an entry here; a repository that
- * redefines it workspace-wide is expanded and judged on what it resolves to.
+ * Every fileset one declared input list reaches: project definitions take precedence
+ * over workspace definitions. An unresolved inference-owned `cargoToolchain` keeps
+ * its name; an explicit definition is judged on the filesets it actually reaches.
  */
 function resolveInputFilesets(
   declared: readonly string[],
   namedInputs: NonNullable<NxJson['namedInputs']>,
+  projectNamedInputs: ProjectTargets['namedInputs'],
   seen: Set<string> = new Set(),
 ): string[] {
   const filesets: string[] = [];
   for (const entry of declared) {
     const name = entry.startsWith('^') ? entry.slice(1) : entry;
-    const definition = namedInputs[name];
+    const definition = projectNamedInputs?.[name] ?? namedInputs[name];
     if (definition === undefined) {
       filesets.push(entry);
       continue;
@@ -930,6 +930,7 @@ function resolveInputFilesets(
       ...resolveInputFilesets(
         expanded.filter((value): value is string => typeof value === 'string'),
         namedInputs,
+        projectNamedInputs,
         seen,
       ),
     );
@@ -963,8 +964,12 @@ export function validateCargoToolchainInputs(root: string, projects: readonly Pr
       if (project.targetCache?.get(target) !== true) continue;
       if (!RUNS_CARGO.test(commandsOf(project.targetOptions?.get(target)))) continue;
       const declared = project.targetInputs?.get(target) ?? [];
-      if (declared.includes(CARGO_TOOLCHAIN_NAMED_INPUT)) continue;
-      if (resolveInputFilesets(declared, namedInputs).some(isCargoToolchainInput)) continue;
+      if (
+        resolveInputFilesets(declared, namedInputs, project.namedInputs).some(
+          (input) => input === CARGO_TOOLCHAIN_NAMED_INPUT || isCargoToolchainInput(input),
+        )
+      )
+        continue;
       failures += report(
         `${project.project}:${target}`,
         `cached cargo target hashes no toolchain pin, so a toolchain bump cannot invalidate it. ${CARGO_TOOLCHAIN_FIX}.`,

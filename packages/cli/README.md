@@ -440,6 +440,10 @@ exists, the sccache patches). `check --warn` reports managed-file drift as warni
 and, on a default-branch push, dispatches the managed-files workflow to heal the drift — while a policy failure still
 fails it, because nothing heals one. `diff` reports drift without writing files.
 
+The Cargo toolchain policy resolves each cached target's named inputs through its project definitions first, then
+workspace definitions. Nested aliases retain the toolchain pin; a local override that removes it is refused, including
+an override of `cargoToolchain` itself.
+
 The generated publish workflow is canonical Prettier YAML. Running the repository formatter over
 `.github/workflows/publish.yml` is byte-stable and does not create managed-file drift.
 

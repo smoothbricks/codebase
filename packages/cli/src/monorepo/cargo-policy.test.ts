@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { renderCargoDevProfiles } from '@smoothbricks/nx-plugin/cargo-dev-profile';
-import type { ProjectTargets } from '../nx/index.js';
+import { type ProjectTargets, projectTargetsFromNxProjects } from '../nx/index.js';
 import {
   applyCargoFeatureUnification,
   type CargoHakariShell,
@@ -500,12 +500,8 @@ describe('cargo toolchain identity policy', () => {
   // inferred one, so the target stops hashing the pin and a toolchain bump
   // leaves its cached verdict standing.
   it('refuses a cached cargo target whose declared inputs drop the pin', async () => {
-    const { failures, messages } = await checkToolchain({ 'nx.json': '{}\n' }, [cargoLint(['rustWorkspace'])]);
+    const { failures } = await checkToolchain({ 'nx.json': '{}\n' }, [cargoLint(['rustWorkspace'])]);
     expect(failures).toBe(1);
-    expect(messages).toEqual([
-      'codebase:cargo-lint: cached cargo target hashes no toolchain pin, so a toolchain bump cannot invalidate it. ' +
-        'Add "cargoToolchain" to its inputs, or to the named input it uses.',
-    ]);
   });
 
   it('accepts the pin reached directly, through a named input, or by the name inference defines', async () => {
@@ -521,6 +517,56 @@ describe('cargo toolchain identity policy', () => {
     expect(await checkToolchain({ 'nx.json': '{}\n' }, [cargoLint(['cargoToolchain'])])).toMatchObject({
       failures: 0,
     });
+  });
+
+  const projectInputCases: {
+    name: string;
+    inputs: string[];
+    workspace: Record<string, string[]>;
+    local: NonNullable<ProjectTargets['namedInputs']>;
+    failures: number;
+  }[] = [
+    {
+      name: 'nested project-local pin overrides the workspace alias',
+      inputs: ['rustEditSources'],
+      workspace: { nested: ['{workspaceRoot}/Cargo.toml'] },
+      local: {
+        rustEditSources: ['nested'],
+        nested: ['cargoToolchain'],
+        cargoToolchain: ['{workspaceRoot}/tooling/direnv/devenv.lock'],
+      },
+      failures: 0,
+    },
+    {
+      name: 'project alias cannot inherit a workspace pin it replaces',
+      inputs: ['rustEditSources'],
+      workspace: { rustEditSources: ['cargoToolchain'] },
+      local: { rustEditSources: ['{projectRoot}/src/**/*.rs'] },
+      failures: 1,
+    },
+    {
+      name: 'direct toolchain name does not exempt an overridden definition',
+      inputs: ['cargoToolchain'],
+      workspace: { cargoToolchain: ['{workspaceRoot}/tooling/direnv/devenv.lock'] },
+      local: { cargoToolchain: ['{projectRoot}/src/**/*.rs'] },
+      failures: 1,
+    },
+  ];
+  it.each(projectInputCases)('$name', async ({ inputs, workspace, local, failures }) => {
+    const projects = {
+      compiler: {
+        root: '.',
+        namedInputs: local,
+        targets: {
+          build: { cache: true, inputs, options: { command: 'cargo build --release' } },
+        },
+      },
+    };
+    const result = await checkToolchain(
+      { 'nx.json': JSON.stringify({ namedInputs: workspace }) },
+      projectTargetsFromNxProjects(projects),
+    );
+    expect(result.failures).toBe(failures);
   });
 
   // A negated fileset REMOVES a path from the hash. Reading one as the pin

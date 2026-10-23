@@ -31,6 +31,8 @@ export interface ProjectTargets {
   targetExecutors?: Map<string, string>;
   /** Per-target string inputs; object inputs (`runtime`, `json`, …) are dropped. */
   targetInputs?: Map<string, string[]>;
+  /** Project-local named inputs override workspace definitions. */
+  namedInputs?: NxProjectJson['namedInputs'];
   targetOptions?: Map<string, NxTargetOptions>;
   targetOutputs?: Map<string, string[]>;
   targetScripts?: Map<string, string>;
@@ -403,6 +405,7 @@ export function projectTargetsFromNxProjects(projects: NxProjects): ProjectTarge
         targetDependencies,
         localTargetDependencies: localDependenciesOf(project, metadata, graph, allTargetNames),
         targetInputs: targetInputsFromNxProjectJson(metadata),
+        namedInputs: metadata.namedInputs,
         targetExecutors: targetExecutorsFromNxProjectJson(metadata),
         targetOptions: targetOptionsFromNxProjectJson(metadata),
         targetOutputs: targetOutputsFromNxProjectJson(metadata),

@@ -1,3 +1,4 @@
+import type { ProjectConfiguration } from 'nx/src/config/workspace-json-project-json.js';
 import type typia from 'typia';
 
 /** String-keyed dependency / script / engine maps. */
@@ -360,6 +361,7 @@ export interface NxProjectJson {
   name?: string;
   root?: string;
   tags?: string[];
+  namedInputs?: ProjectConfiguration['namedInputs'];
   targets?: Record<string, NxTargetConfig>;
 }
 
