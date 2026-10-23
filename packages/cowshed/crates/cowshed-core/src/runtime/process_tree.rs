@@ -30,6 +30,21 @@ use crate::api::process::{
 #[serde(transparent)]
 pub struct BirthToken(pub u64);
 
+/// A job's processes, or a shell spare's activation, which runs for no job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TreeOwner {
+    Job(JobId),
+    Spare,
+}
+
+impl std::fmt::Display for TreeOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Job(job_id) => write!(formatter, "job {}", job_id.get()),
+            Self::Spare => formatter.write_str("the shell spare's activation"),
+        }
+    }
+}
 /// One life of one process.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

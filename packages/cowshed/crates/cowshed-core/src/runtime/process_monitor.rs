@@ -26,9 +26,9 @@ use super::job_groups::Birth;
 use super::job_spans::{JobSpanPublisher, job_span_thread};
 use super::process_events::{KqueueObserver, ObserveError};
 use super::process_spans::{ProcessSpanProjection, RetainedProcessEvent};
-use super::process_tree::ProcessIdentity;
+use super::process_tree::{ProcessIdentity, TreeOwner};
 use super::supervisor::{LeafCoverage, utc_now};
-use crate::api::dto::{JobId, JobInfo};
+use crate::api::dto::JobInfo;
 use crate::api::process::{
     JobContainment, JobProcessEvent, JobProcessRetirement, JobProcessTree, JobSubtreeAdmission,
     JobSubtreeHandle, JobSubtreeRefusal, JobSubtreeRetirement, OutlivedProcess, ProcessCoverageGap,
@@ -81,6 +81,11 @@ enum Request {
         handle: JobSubtreeHandle,
         grace: Duration,
         reply: mpsc::SyncSender<Result<JobSubtreeRetirement>>,
+    },
+    RetireRoot {
+        root: ProcessIdentity,
+        grace: Duration,
+        reply: mpsc::SyncSender<Result<JobProcessRetirement>>,
     },
     LedgerChanges(Arc<tokio::sync::Notify>),
     Trace(Box<TraceWriter>),
@@ -145,8 +150,23 @@ impl TraceWriter {
     }
 }
 
+enum SnapshotTree {
+    Job(Result<JobProcessTree>),
+    Spare,
+}
+impl SnapshotTree {
+    fn job(&self) -> Result<&JobProcessTree> {
+        match self {
+            Self::Job(tree) => tree.as_ref().map_err(Clone::clone),
+            Self::Spare => Err(CowshedError::usage(
+                "a shell spare's activation has no job process tree",
+                "read the processes of an admitted job",
+            )),
+        }
+    }
+}
 struct Snapshot {
-    tree: Result<JobProcessTree>,
+    tree: SnapshotTree,
     attribution: std::result::Result<AttributionSummary, ResourceUnitError>,
     /// Every life the fold holds with no folded exit, by its kernel unique id. Shared with the
     /// ledger's claims, so a publication never copies it.
@@ -154,7 +174,7 @@ struct Snapshot {
 }
 
 struct Driver {
-    job_id: JobId,
+    job_id: TreeOwner,
     wake: OwnedFd,
     requests: mpsc::Sender<Request>,
     snapshot: Arc<ArcSwap<Snapshot>>,
@@ -170,8 +190,8 @@ impl Driver {
             .map_err(|_| unavailable(self.job_id))?;
         control(self.wake.as_raw_fd(), 0, libc::NOTE_TRIGGER).map_err(|error| {
             CowshedError::internal(format!(
-                "cannot wake job {}'s process observer: {error}",
-                self.job_id.get()
+                "cannot wake {}'s process observer: {error}",
+                self.job_id
             ))
         })
     }
@@ -195,8 +215,8 @@ impl Drop for Driver {
             && thread.join().is_err()
         {
             cowshed_os::eprintln!(
-                "cowshed: job {}'s process observation writer panicked",
-                self.job_id.get()
+                "cowshed: {}'s process observation writer panicked",
+                self.job_id
             );
         }
     }
@@ -219,8 +239,8 @@ impl std::fmt::Debug for ProcessMonitor {
 
 impl ProcessMonitor {
     /// Prepare before the spawn. A failed source is a failed observation fence, not polling.
-    pub fn prepare(job_id: JobId) -> Result<Self> {
-        let observer = KqueueObserver::prepare(job_id).map_err(observation_error)?;
+    pub fn prepare(job_id: TreeOwner) -> Result<Self> {
+        let observer = KqueueObserver::prepare().map_err(observation_error)?;
         control(observer.as_raw_fd(), libc::EV_ADD | libc::EV_CLEAR, 0).map_err(|error| {
             CowshedError::internal(format!(
                 "cannot prepare the process observer's control event: {error}"
@@ -232,10 +252,13 @@ impl ProcessMonitor {
             ))
         })?;
         let snapshot = Arc::new(ArcSwap::from_pointee(Snapshot {
-            tree: Err(CowshedError::conflict(
-                format!("job {} has no observed process yet", job_id.get()),
-                "read its processes once the command has started",
-            )),
+            tree: match job_id {
+                TreeOwner::Job(_) => SnapshotTree::Job(Err(CowshedError::conflict(
+                    format!("{job_id} has no observed process yet"),
+                    "read its processes once the command has started",
+                ))),
+                TreeOwner::Spare => SnapshotTree::Spare,
+            },
             attribution: AttributionSummary::from_observed(std::iter::empty()),
             running: Arc::from([]),
         }));
@@ -244,7 +267,7 @@ impl ProcessMonitor {
         let attempts = Arc::new(AtomicU64::new(0));
         let completed = Arc::clone(&attempts);
         let thread = thread::Builder::new()
-            .name(format!("cowshed-process-{}", job_id.get()))
+            .name(format!("cowshed-process-{}", job_id))
             .spawn(move || Writer::new(job_id, observer, published, completed).run(receiver))
             .map_err(|error| {
                 CowshedError::internal(format!(
@@ -263,6 +286,70 @@ impl ProcessMonitor {
         })
     }
 
+    /// Spawn a root held at the in-process leader gate until this monitor watches its exact life.
+    /// The shell host uses the same native fold and subtree retirement as jobs, without watching
+    /// itself (which must stay alive to finish teardown).
+    pub fn spawn_root(
+        &self,
+        mut command: std::process::Command,
+    ) -> io::Result<(std::process::Child, ProcessIdentity)> {
+        use cowshed_os::fork_lock::Spawn as _;
+        use std::os::unix::process::CommandExt as _;
+        let (gate, held) = super::process_fence::leader_gate()?;
+        let hold = held.in_process(&gate);
+        // SAFETY: the hold only closes descriptors and calls getpid/write/read before exec.
+        unsafe {
+            command.pre_exec(move || hold.hold());
+        }
+        thread::scope(|scope| {
+            let spawning = scope.spawn(move || {
+                let child = command.spawn_locked();
+                drop(held);
+                child
+            });
+            let mut root = None;
+            let observed = gate.observe(|pid| {
+                self.watch(pid).map_err(io::Error::other)?;
+                root = self
+                    .running_lives()
+                    .iter()
+                    .copied()
+                    .find(|life| life.pid == pid);
+                assert!(root.is_some(), "the held root was just watched");
+                Ok(())
+            });
+            let spawned = spawning
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            match (observed, spawned) {
+                (Ok(Some(_)), Ok(child)) => Ok((child, root.expect("the gate watched its root"))),
+                (Ok(_), Err(error)) => Err(error),
+                (Err(observation), Err(spawn)) => Err(io::Error::other(format!(
+                    "cannot observe activation root: {observation}; held spawn failed: {spawn}"
+                ))),
+                (observed, Ok(mut child)) => {
+                    let killed = child.kill();
+                    let waited = child.wait();
+                    Err(io::Error::other(format!(
+                        "activation started without its observation fence: {observed:?}; kill: {killed:?}; reap: {waited:?}"
+                    )))
+                }
+            }
+        })
+    }
+
+    /// Retire a locally observed activation root and its retained descendants, never the host's
+    /// group. Reparenting and setsid do not change immutable ancestry in the fold.
+    pub fn retire_root(
+        &self,
+        root: ProcessIdentity,
+        grace: Duration,
+    ) -> Result<JobProcessRetirement> {
+        let (reply, answer) = mpsc::sync_channel(1);
+        self.driver
+            .send(Request::RetireRoot { root, grace, reply })?;
+        answer.recv().map_err(|_| unavailable(self.driver.job_id))?
+    }
     /// Synchronous because the held child cannot exec until this registration is acknowledged.
     pub(crate) fn watch(&self, pid: u32) -> Result<()> {
         self.driver
@@ -378,7 +465,7 @@ impl ProcessMonitor {
     }
     /// One publication load. A read neither touches the writer's fold nor samples the kernel.
     pub fn tree(&self) -> Result<JobProcessTree> {
-        self.driver.snapshot.load().tree.clone()
+        self.driver.snapshot.load().tree.job().cloned()
     }
 
     /// One publication load, answered even while a retirement occupies the writer: every life
@@ -396,7 +483,7 @@ impl ProcessMonitor {
         required: LeafCoverage,
     ) -> Result<Attribution> {
         let snapshot = self.driver.snapshot.load();
-        let tree = snapshot.tree.as_ref().map_err(Clone::clone)?;
+        let tree = snapshot.tree.job()?;
         snapshot
             .attribution
             .as_ref()
@@ -529,7 +616,7 @@ struct Writer {
     /// `finished` and no retained registration remains. Readers then see the end.
     ended: bool,
     trace: Option<Box<TraceWriter>>,
-    job_id: JobId,
+    job_id: TreeOwner,
     /// Shared with the callers; advanced once per completed retirement attempt.
     attempts: Arc<AtomicU64>,
     /// The leader and outcome of the latest retirement attempt.
@@ -542,7 +629,7 @@ struct Writer {
 
 impl Writer {
     fn new(
-        job_id: JobId,
+        job_id: TreeOwner,
         observer: KqueueObserver,
         snapshot: Arc<ArcSwap<Snapshot>>,
         attempts: Arc<AtomicU64>,
@@ -586,11 +673,19 @@ impl Writer {
         if let Some(trace) = &mut self.trace {
             trace.record(&self.journal[first..]);
         }
-        let tree = match outcome {
-            Ok(()) => utc_now().map(|at| self.observer.tree(at)),
-            Err(error) => Err(error),
+        let tree = match self.job_id {
+            TreeOwner::Job(job_id) => SnapshotTree::Job(
+                outcome
+                    .clone()
+                    .and_then(|()| utc_now().map(|at| self.observer.tree(job_id, at))),
+            ),
+            TreeOwner::Spare => SnapshotTree::Spare,
         };
-        if let Err(error) = &tree {
+        let error = match &tree {
+            SnapshotTree::Job(result) => result.as_ref().err(),
+            SnapshotTree::Spare => outcome.as_ref().err(),
+        };
+        if let Some(error) = error {
             self.journal.push(RetainedEntry {
                 event: Err(error.clone()),
                 identity: None,
@@ -699,6 +794,20 @@ impl Writer {
                         reply,
                     } => {
                         let _ = reply.send(self.retire_subtree(handle, grace));
+                    }
+                    Request::RetireRoot { root, grace, reply } => {
+                        let outcome = if self.observer.fold().holds(root) {
+                            self.retire(RetirementScope::Subtree(root), grace)
+                        } else {
+                            Err(CowshedError::conflict(
+                                format!(
+                                    "{} never observed activation root {}",
+                                    self.job_id, root.pid
+                                ),
+                                "retire only a root spawned through this observation fence",
+                            ))
+                        };
+                        let _ = reply.send(outcome);
                     }
                     Request::LedgerChanges(changed) => {
                         changed.notify_one();
@@ -812,6 +921,11 @@ impl Writer {
     }
 
     fn subtree_handle(&mut self, peer: ProcessIdentity) -> Result<JobSubtreeAdmission> {
+        let TreeOwner::Job(job_id) = self.job_id else {
+            return Ok(JobSubtreeAdmission::Refused {
+                reason: JobSubtreeRefusal::NotMember,
+            });
+        };
         if !self.owns_live(peer)? {
             // Only the observation that held the peer can say its job ended. To any other the
             // peer is no member, so the supervisor asks on until the owner answers.
@@ -848,7 +962,7 @@ impl Writer {
         }
         Ok(JobSubtreeAdmission::Admitted {
             handle: JobSubtreeHandle {
-                job_id: self.job_id,
+                job_id,
                 index: wire_index,
                 incarnation: self
                     .observer
@@ -866,7 +980,7 @@ impl Writer {
         grace: Duration,
     ) -> Result<JobSubtreeRetirement> {
         let root = usize::try_from(handle.index).ok().and_then(|index| {
-            (handle.job_id == self.job_id
+            (TreeOwner::Job(handle.job_id) == self.job_id
                 && self.observer.fold().subtree_nonce(index) == Some(handle.incarnation.as_str()))
             .then(|| self.observer.fold().node_at(index))
             .flatten()
@@ -901,8 +1015,8 @@ impl Writer {
             Some((retired, Ok(_))) => {
                 return Err(CowshedError::conflict(
                     format!(
-                        "job {}'s processes were retired under leader {}, not {}",
-                        self.job_id.get(),
+                        "{}'s processes were retired under leader {}, not {}",
+                        self.job_id,
                         retired.pid(),
                         birth.pid()
                     ),
@@ -941,8 +1055,8 @@ impl Writer {
         }
         Err(CowshedError::conflict(
             format!(
-                "job {}'s processes {:?} still run {:?} after SIGKILL",
-                self.job_id.get(),
+                "{}'s processes {:?} still run {:?} after SIGKILL",
+                self.job_id,
                 survivors.iter().map(|life| life.pid).collect::<Vec<_>>(),
                 grace.max(KILL_JOIN)
             ),
@@ -1027,9 +1141,9 @@ impl Writer {
             if Instant::now() >= deadline {
                 return Err(CowshedError::conflict(
                     format!(
-                        "job {}'s processes {:?} were still appearing {within:?} after its \
+                        "{}'s processes {:?} were still appearing {within:?} after its \
                          survivors were sent SIGSTOP: a posted stop proves no quiescence",
-                        self.job_id.get(),
+                        self.job_id,
                         fresh.iter().map(|life| life.pid).collect::<Vec<_>>(),
                     ),
                     "they stay owned and watched; retry the retirement",
@@ -1116,21 +1230,18 @@ fn observation_error(error: ObserveError) -> CowshedError {
     )
 }
 
-fn unavailable(job_id: JobId) -> CowshedError {
+fn unavailable(job_id: TreeOwner) -> CowshedError {
     CowshedError::internal(format!(
-        "job {}'s process observation writer is unavailable",
-        job_id.get()
+        "{}'s process observation writer is unavailable",
+        job_id
     ))
 }
 
 /// A retirement step the kernel refused. Nothing is presumed ended: every registration, the
 /// fold and the signal record stay for an explicit retry.
-fn refused(job_id: JobId, error: ObserveError) -> CowshedError {
+fn refused(job_id: TreeOwner, error: ObserveError) -> CowshedError {
     CowshedError::environment_missing(
-        format!(
-            "job {}'s processes cannot be retired: {error}",
-            job_id.get()
-        ),
+        format!("{}'s processes cannot be retired: {error}", job_id),
         "its processes stay owned and watched; retry the retirement once the cause is resolved",
     )
 }
@@ -1155,8 +1266,45 @@ fn control(queue: i32, flags: u16, fflags: u32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::dto::{CommandArg, UtcTimestamp};
+    use crate::api::dto::{CommandArg, JobId, UtcTimestamp};
     use crate::api::process::JobProcessSample;
+
+    #[test]
+    fn a_spare_activation_root_is_watched_and_retired_without_a_job() {
+        let monitor = ProcessMonitor::prepare(TreeOwner::Spare).unwrap();
+        let mut command = std::process::Command::new("/bin/cat");
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null());
+        let (mut child, root) = monitor.spawn_root(command).unwrap();
+        assert!(monitor.running_lives().contains(&root));
+        assert!(
+            monitor
+                .tree()
+                .unwrap_err()
+                .to_string()
+                .contains("no job process tree")
+        );
+        assert_eq!(
+            monitor.subtree_handle(root).unwrap(),
+            JobSubtreeAdmission::Refused {
+                reason: JobSubtreeRefusal::NotMember
+            }
+        );
+        let retirement = monitor.retire_root(root, Duration::ZERO).unwrap();
+        assert!(matches!(
+            retirement.containment,
+            JobContainment::Observed { .. }
+        ));
+        assert!(
+            retirement
+                .outlived
+                .iter()
+                .any(|process| process.pid == root.pid)
+        );
+        assert!(!child.wait().unwrap().success());
+        assert!(monitor.running_lives().is_empty());
+    }
     use crate::api::process::ProcessCoverage;
     use crate::runtime::process_spans::read_process_segment;
     use crate::runtime::process_tree::BirthToken;
@@ -1251,7 +1399,8 @@ for line in sys.stdin:
         os.waitpid(root, 0)
         os.write(1, b"exited\n")
 "#;
-            let monitor = ProcessMonitor::prepare(JobId::new(401).unwrap()).unwrap();
+            let monitor =
+                ProcessMonitor::prepare(TreeOwner::Job(JobId::new(401).unwrap())).unwrap();
             let (ready_read, ready_write) = std::io::pipe().unwrap();
             let (gate_read, mut gate_write) = std::io::pipe().unwrap();
             let mut command = Command::new("/bin/bash");
@@ -1493,7 +1642,7 @@ for line in sys.stdin:
             );
         }
         // A recreated monitor with the same public job id has no authority over the old nonce.
-        let replacement = ProcessMonitor::prepare(handle.job_id).unwrap();
+        let replacement = ProcessMonitor::prepare(TreeOwner::Job(handle.job_id)).unwrap();
         assert_eq!(
             replacement
                 .retire_subtree(handle.clone(), Duration::ZERO)
@@ -1502,7 +1651,7 @@ for line in sys.stdin:
                 reason: JobSubtreeRefusal::ForeignHandle
             }
         );
-        let foreign = ProcessMonitor::prepare(JobId::new(402).unwrap()).unwrap();
+        let foreign = ProcessMonitor::prepare(TreeOwner::Job(JobId::new(402).unwrap())).unwrap();
         assert_eq!(
             foreign.retire_subtree(handle, Duration::ZERO).unwrap(),
             JobSubtreeRetirement::Refused {
@@ -1605,7 +1754,7 @@ if os.fork() == 0:
 os.read(0, 1)
 os._exit(0)
 "#;
-        let monitor = ProcessMonitor::prepare(JobId::new(1).unwrap()).unwrap();
+        let monitor = ProcessMonitor::prepare(TreeOwner::Job(JobId::new(1).unwrap())).unwrap();
         let (ready_read, ready_write) = std::io::pipe().unwrap();
         let (gate_read, mut gate_write) = std::io::pipe().unwrap();
         let mut command = Command::new("/bin/bash");
@@ -1810,7 +1959,7 @@ os._exit(0)
     fn an_ended_observation_answers_job_ended_only_for_its_own_life() {
         use cowshed_os::fork_lock::Spawn as _;
 
-        let monitor = ProcessMonitor::prepare(JobId::new(1).unwrap()).unwrap();
+        let monitor = ProcessMonitor::prepare(TreeOwner::Job(JobId::new(1).unwrap())).unwrap();
         let mut child = std::process::Command::new("/bin/cat")
             .stdin(std::process::Stdio::piped())
             .spawn_locked()
@@ -1842,7 +1991,7 @@ os._exit(0)
 
     #[tokio::test]
     async fn finishing_a_live_observation_neither_invents_loss_nor_ends_its_reader() {
-        let monitor = ProcessMonitor::prepare(JobId::new(1).unwrap()).unwrap();
+        let monitor = ProcessMonitor::prepare(TreeOwner::Job(JobId::new(1).unwrap())).unwrap();
         monitor.watch(std::process::id()).unwrap();
         assert_eq!(monitor.tree().unwrap().coverage, ProcessCoverage::Complete);
         monitor.finish().unwrap();
@@ -1869,7 +2018,7 @@ os._exit(0)
     async fn a_clocked_monitor_places_the_windows_its_ticks_close_on_the_job_s_clock() {
         use crate::api::resources::WallMicros;
 
-        let monitor = ProcessMonitor::prepare(JobId::new(1).unwrap()).unwrap();
+        let monitor = ProcessMonitor::prepare(TreeOwner::Job(JobId::new(1).unwrap())).unwrap();
         monitor.watch(std::process::id()).unwrap();
         let origin = Instant::now();
         monitor.clock(origin).unwrap();

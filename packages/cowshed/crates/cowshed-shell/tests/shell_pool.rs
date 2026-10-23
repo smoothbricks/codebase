@@ -23,12 +23,14 @@ use cowshed_core::api::{
     CommandArg, ExecCommand, ExecRequest, ExecScope, ExitStatus, JobAccounting, JobFailure, JobId,
     JobInfo, JobState, RunSandboxMode, ScriptCommand, ScriptValue, StdinSource, WorkspacePath,
 };
+use cowshed_core::build_volume::nx::tree_holders;
 use cowshed_core::error::{ErrorCode, Result};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::runtime::job_cpu::{
     ActivationStake, GatewayJobCpu, HeldTokens, JobCpuAdmission, JobCpuAsk, JobCpuGrant,
 };
+use cowshed_core::runtime::job_groups::ExitWatch;
 use cowshed_core::runtime::shell_host::ShellHostProgram;
 use cowshed_core::runtime::shell_pool::ShellPoolConfig;
 use cowshed_core::runtime::supervisor::{
@@ -1676,6 +1678,155 @@ async fn host_controller_an_activation_ends_when_its_supervisor_process_does() {
     assert!(
         ended.is_ok(),
         "the activation of a supervisor that exited kept running as pid {pid}"
+    );
+}
+
+const ESCAPE_HELPER: &str = "COWSHED_SHELL_POOL_ESCAPE_HELPER";
+
+/// The controller half of the test below: a supervisor whose job's activation runs held, with a
+/// descendant that left the host's session, and that exits without running a destructor once
+/// the test watches both, exactly as a stopped supervisor's process does.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_escape_helper_exits_while_an_activation_runs() {
+    let Some(root) = std::env::var_os(ESCAPE_HELPER) else {
+        return;
+    };
+    let workspace = Workspace::from_root(PathBuf::from(root));
+    let handle = workspace.supervisor(false);
+    let _job = handle
+        .exec(None, None, sh("true"), AdmissionSource::Worker)
+        .await
+        .expect("admit");
+    let exit = workspace.sandbox.exec_temp_dir.join("helper-exit");
+    tokio::task::spawn_blocking(move || std::fs::read_to_string(exit))
+        .await
+        .expect("reader task")
+        .expect("the test releases the helper");
+    std::process::exit(0);
+}
+
+/// The parent of process pid, as the kernel records it.
+fn parent_of(pid: i32) -> i32 {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = libc::c_int::try_from(size_of::<libc::proc_bsdinfo>()).expect("size");
+    // SAFETY: info provides size writable bytes.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    assert_eq!(
+        written,
+        size,
+        "read the parent of {pid}: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: proc_pidinfo filled all size bytes.
+    i32::try_from(unsafe { info.assume_init() }.pbi_ppid).expect("a pid")
+}
+
+/// An activation whose supervisor goes away ends with every process it started, a descendant
+/// that called setsid and so left the host's process group included (11_shell.md, "Activation
+/// belongs to the job that waited on it" and "Teardown ordering"). The host ends only once that
+/// teardown is over, so its exit orders the checks: by then the escaped descendant has exited
+/// and nothing holds the workspace mount.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_an_activation_s_escaped_descendant_ends_with_its_supervisor() {
+    let workspace = Workspace::new("shell-pool-escape", 41_504);
+    let tmp = workspace.sandbox.exec_temp_dir.clone();
+    for name in [
+        "escaped-pid",
+        "escape-parent",
+        "escape-release",
+        "direnv-pid",
+        "activation-hold",
+        "helper-exit",
+    ] {
+        fifo(&tmp.join(name));
+    }
+    workspace.envrc(
+        r#"/usr/bin/perl -MPOSIX -e 'defined(my $child = fork()) or die "fork: $!"; if ($child) { open(my $p, ">", "$ENV{TMPDIR}/escape-parent") or die "parent pid: $!"; print $p $$; close $p; open(my $release, "<", "$ENV{TMPDIR}/escape-release") or die "release: $!"; <$release>; exit 0; } POSIX::setsid() > 0 or die "setsid: $!"; open(my $f, ">", "$ENV{TMPDIR}/escaped-pid") or die "open: $!"; print $f $$; close $f; exec "/bin/sleep", "600" or die "exec: $!"' &
+printf '%s' "$PPID" > "$TMPDIR/direnv-pid"
+read _ < "$TMPDIR/activation-hold"
+"#,
+    );
+    let helper = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "host_controller_escape_helper_exits_while_an_activation_runs",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(ESCAPE_HELPER, &workspace.root)
+        .spawn()
+        .expect("start the controller helper");
+    let escaped = read_pid(&tmp.join("escaped-pid")).await;
+    let parent = read_pid(&tmp.join("escape-parent")).await;
+    let host = parent_of(read_pid(&tmp.join("direnv-pid")).await);
+    // SAFETY: getpgid reads two process group ids.
+    let (escaped_group, host_group) = unsafe { (libc::getpgid(escaped), libc::getpgid(host)) };
+    assert_ne!(
+        escaped_group, host_group,
+        "the fixture's descendant {escaped} never left the host's group"
+    );
+    let watch = |pid: i32| {
+        ExitWatch::of(u32::try_from(pid).expect("a pid"))
+            .expect("watch an exit")
+            .expect("the process runs")
+    };
+    let (escaped_exit, host_exit) = (watch(escaped), watch(host));
+    let parent_exit = watch(parent);
+    release(&tmp.join("escape-release")).await;
+    assert!(
+        tokio::task::spawn_blocking(move || parent_exit.within(Duration::from_secs(60)))
+            .await
+            .expect("parent watch task")
+            .expect("watch parent"),
+        "the fixture parent must exit"
+    );
+    assert_eq!(
+        parent_of(escaped),
+        1,
+        "the escaped child must be reparented before teardown"
+    );
+    release(&tmp.join("helper-exit")).await;
+    let status = tokio::task::spawn_blocking(move || {
+        let mut helper = helper;
+        helper.wait()
+    })
+    .await
+    .expect("helper task")
+    .expect("wait for the helper");
+    assert!(status.success(), "helper: {status}");
+    let host_ended = tokio::task::spawn_blocking(move || host_exit.within(Duration::from_secs(60)))
+        .await
+        .expect("host watch task")
+        .expect("watch the host");
+    assert!(
+        host_ended,
+        "the host {host} of a supervisor that exited kept running"
+    );
+    let escaped_ended = escaped_exit
+        .within(Duration::ZERO)
+        .expect("read the escaped exit");
+    let holders = tree_holders(workspace.mount()).expect("list the mount's holders");
+    if !escaped_ended {
+        // SAFETY: a plain kill of this test's own fixture process, which still runs.
+        unsafe { libc::kill(escaped, libc::SIGKILL) };
+    }
+    assert!(
+        escaped_ended,
+        "the activation's descendant {escaped}, outside the host's group, outlived its host {host}"
+    );
+    assert!(
+        holders.is_empty(),
+        "processes hold the workspace after its host ended: {holders:?}"
     );
 }
 

@@ -1756,8 +1756,7 @@ mod tests {
             let mut pid = [0_u8; 4];
             std::io::Read::read_exact(&mut &ready_read, &mut pid).expect("child pid");
             let pid = u32::try_from(i32::from_ne_bytes(pid)).unwrap();
-            let observer =
-                KqueueObserver::watch(crate::api::dto::JobId::new(1).unwrap(), pid).expect("watch");
+            let observer = KqueueObserver::watch(pid).expect("watch");
             gate_write.write_all(b"x").unwrap();
             (observer, spawned.join().unwrap())
         });

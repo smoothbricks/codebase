@@ -34,7 +34,8 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use super::job_groups::{Birth, GroupLeader};
-use crate::api::dto::ExitStatus;
+use super::process_tree::TreeOwner;
+use crate::api::dto::{ExitStatus, JobId};
 use crate::error::PriorityFailure;
 
 /// The argument that turns the `cowshed` binary into an exec host.
@@ -54,7 +55,8 @@ pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// Approve `.envrc` in the private trust store: `[path]`, descriptors `[stdout, stderr]`.
 pub const REQUEST_APPROVE: u8 = 1;
-/// Evaluate `.envrc` once: `[directory]`, descriptors `[stderr]`.
+/// Evaluate `.envrc` once: `[owner tag, job id only for Job, directory]`, descriptors `[stderr]`.
+/// See [`FrameWriter::tree_owner`]; the boundary rejects an unknown owner tag by name.
 pub const REQUEST_ACTIVATE: u8 = 2;
 /// Fork an argv into a new process group: `[argv, cwd, overlay, child nice]`, descriptors
 /// `[stdin, stdout, stderr]`, followed on Linux by `[cgroup_placement]` and on macOS by
@@ -129,6 +131,10 @@ const EXIT_SIGNAL: u32 = 1;
 const CHILD_NICE_SUPERVISED: u32 = 0;
 const CHILD_NICE_SELF: u32 = 1;
 
+/// Activation ownership is a sum type, never a sentinel job id.
+const TREE_OWNER_JOB: u32 = 1;
+const TREE_OWNER_SPARE: u32 = 2;
+
 /// A raw `waitpid` status, decoded only where it is reported.
 pub type RawWaitStatus = i32;
 
@@ -189,6 +195,13 @@ impl FrameWriter {
         self
     }
 
+    /// An explicit owner tag followed by a u64 id only for the Job variant.
+    pub fn tree_owner(self, owner: TreeOwner) -> Self {
+        match owner {
+            TreeOwner::Job(job_id) => self.u32(TREE_OWNER_JOB).u64(job_id.get()),
+            TreeOwner::Spare => self.u32(TREE_OWNER_SPARE),
+        }
+    }
     /// A command request's last field: `[0]` when the supervisor sets the command's nice on the
     /// held child through the observation fence (macOS), `[1, nice]` when the forked child sets
     /// it itself before it runs anything ([`report_own_nice`]), because no hold exists to set it
@@ -343,6 +356,25 @@ impl<'a> FrameReader<'a> {
         }
     }
 
+    /// Decode ownership at the activation boundary; no numeric id denotes a spare.
+    pub fn tree_owner(&mut self) -> io::Result<TreeOwner> {
+        match self.u32()? {
+            TREE_OWNER_JOB => {
+                let value = self.u64()?;
+                JobId::new(value).map(TreeOwner::Job).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("malformed activation Job id {value}"),
+                    )
+                })
+            }
+            TREE_OWNER_SPARE => Ok(TreeOwner::Spare),
+            tag => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown activation tree owner tag {tag}"),
+            )),
+        }
+    }
     /// [`FrameWriter::child_nice`]: `None` when the supervisor places the held child itself.
     pub fn child_nice(&mut self) -> io::Result<Option<i32>> {
         match self.u32()? {
@@ -842,6 +874,84 @@ impl std::fmt::Display for DroppedHostEnd {
 mod tests {
     use super::*;
     use std::io::{Read as _, Write as _};
+
+    #[test]
+    fn activation_owners_are_tagged_and_only_jobs_carry_an_id() {
+        for owner in [TreeOwner::Spare, TreeOwner::Job(JobId::new(7).unwrap())] {
+            let frame = FrameWriter::new(REQUEST_ACTIVATE)
+                .tree_owner(owner)
+                .bytes(b"/ws")
+                .unwrap()
+                .finish()
+                .unwrap();
+            let (tag, mut fields) = FrameReader::new(&frame[4..]).unwrap();
+            assert_eq!(tag, REQUEST_ACTIVATE);
+            let encoded_tag = match owner {
+                TreeOwner::Job(_) => TREE_OWNER_JOB,
+                TreeOwner::Spare => TREE_OWNER_SPARE,
+            };
+            assert_eq!(&frame[5..9], &encoded_tag.to_le_bytes());
+            assert_eq!(
+                frame.len(),
+                match owner {
+                    TreeOwner::Job(_) => 24,
+                    TreeOwner::Spare => 16,
+                }
+            );
+            assert_eq!(fields.tree_owner().unwrap(), owner);
+            assert_eq!(fields.bytes().unwrap(), b"/ws");
+            fields.finish().unwrap();
+        }
+    }
+
+    #[test]
+    fn malformed_activation_owner_names_its_tag_or_job_id() {
+        for tag in [0, 3, u32::MAX] {
+            let frame = FrameWriter::new(REQUEST_ACTIVATE)
+                .u32(tag)
+                .finish()
+                .unwrap();
+            let (_, mut fields) = FrameReader::new(&frame[4..]).unwrap();
+            let error = fields.tree_owner().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                format!("unknown activation tree owner tag {tag}")
+            );
+        }
+        for id in [0, u64::MAX] {
+            let frame = FrameWriter::new(REQUEST_ACTIVATE)
+                .u32(TREE_OWNER_JOB)
+                .u64(id)
+                .finish()
+                .unwrap();
+            let (_, mut fields) = FrameReader::new(&frame[4..]).unwrap();
+            assert_eq!(
+                fields.tree_owner().unwrap_err().to_string(),
+                format!("malformed activation Job id {id}")
+            );
+        }
+        let frame = FrameWriter::new(REQUEST_ACTIVATE)
+            .u32(TREE_OWNER_JOB)
+            .finish()
+            .unwrap();
+        let (_, mut fields) = FrameReader::new(&frame[4..]).unwrap();
+        assert_eq!(
+            fields.tree_owner().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let frame = FrameWriter::new(REQUEST_ACTIVATE)
+            .tree_owner(TreeOwner::Spare)
+            .u64(0)
+            .finish()
+            .unwrap();
+        let (_, mut fields) = FrameReader::new(&frame[4..]).unwrap();
+        assert_eq!(fields.tree_owner().unwrap(), TreeOwner::Spare);
+        assert_eq!(
+            fields.finish().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 
     use proptest::prelude::*;
 

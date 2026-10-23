@@ -281,24 +281,24 @@ impl<P> AsRawFd for KqueueObserver<P> {
 
 impl KqueueObserver {
     /// Allocate the event source before any workload can be forked.
-    pub fn prepare(job_id: JobId) -> Result<Self, ObserveError> {
-        Self::prepare_with(Darwin, job_id)
+    pub fn prepare() -> Result<Self, ObserveError> {
+        Self::prepare_with(Darwin)
     }
 
-    /// Watch the held root of `job_id` before it can fork or exec.
-    pub fn watch(job_id: JobId, root: u32) -> Result<Self, ObserveError> {
-        Self::watch_with(Darwin, job_id, root)
+    /// Watch the held root before it can fork or exec.
+    pub fn watch(root: u32) -> Result<Self, ObserveError> {
+        Self::watch_with(Darwin, root)
     }
 }
 
 impl<P: ProcessReads> KqueueObserver<P> {
-    pub fn watch_with(reads: P, job_id: JobId, root: u32) -> Result<Self, ObserveError> {
-        let mut observer = Self::prepare_with(reads, job_id)?;
+    pub fn watch_with(reads: P, root: u32) -> Result<Self, ObserveError> {
+        let mut observer = Self::prepare_with(reads)?;
         observer.watch_root(root)?;
         Ok(observer)
     }
 
-    fn prepare_with(reads: P, job_id: JobId) -> Result<Self, ObserveError> {
+    fn prepare_with(reads: P) -> Result<Self, ObserveError> {
         // SAFETY: kqueue takes nothing and returns a new descriptor.
         let queue = unsafe { libc::kqueue() };
         if queue < 0 {
@@ -309,7 +309,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
         Ok(Self {
             queue,
             reads,
-            fold: JobProcessFold::new(job_id, Instant::now()),
+            fold: JobProcessFold::new(Instant::now()),
             events: Vec::new(),
             registered: HashSet::new(),
             missed: Vec::new(),
@@ -354,8 +354,9 @@ impl<P: ProcessReads> KqueueObserver<P> {
         self.fold.attribution_summary()
     }
 
-    pub fn tree(&self, at: UtcTimestamp) -> JobProcessTree {
-        self.fold.tree(at)
+    /// Job `job_id`'s tree, as last observed and read.
+    pub fn tree(&self, job_id: JobId, at: UtcTimestamp) -> JobProcessTree {
+        self.fold.tree(job_id, at)
     }
 
     pub fn drain_events(&mut self) -> std::vec::Drain<'_, JobProcessEvent> {
@@ -1073,8 +1074,7 @@ mod tests {
             let mut pid = [0_u8; 4];
             std::io::Read::read_exact(&mut &ready_read, &mut pid).expect("child pid");
             let pid = u32::try_from(i32::from_ne_bytes(pid)).expect("pid");
-            let observer =
-                KqueueObserver::watch(JobId::new(1).unwrap(), pid).expect("watch the held root");
+            let observer = KqueueObserver::watch(pid).expect("watch the held root");
             gate_write.write_all(b"x").expect("release");
             let child = spawned.join().expect("spawner");
             assert_eq!(child.id(), pid);
@@ -1952,7 +1952,7 @@ mod tests {
     impl Default for TestFold {
         fn default() -> Self {
             Self {
-                fold: JobProcessFold::new(JobId::new(1).unwrap(), Instant::now()),
+                fold: JobProcessFold::new(Instant::now()),
                 events: Vec::new(),
             }
         }

@@ -552,11 +552,8 @@ fn submit_request(
                 "script-fixture control={} phase=leader-reported pid={pid}",
                 control.as_raw_fd()
             );
-            let observer = cowshed_core::runtime::process_events::KqueueObserver::watch(
-                cowshed_core::api::JobId::new(1).expect("job id"),
-                pid,
-            )
-            .expect("attach before the script can run");
+            let observer = cowshed_core::runtime::process_events::KqueueObserver::watch(pid)
+                .expect("attach before the script can run");
             assert_eq!(observer.fold().live(pid).map(|life| life.pid), Some(pid));
             std::io::Write::write_all(&mut std::fs::File::from(go_write), b"x")
                 .expect("release the observed leader");

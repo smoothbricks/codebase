@@ -315,12 +315,23 @@ like any other: there is no spare, and the next command activates for itself.
 its own stdout and stderr, and until its command starts that host's process group is the job's: a kill reaches the
 activation, and a failed activation fails the job with the activation's status and discards the host. A warm command's
 streams carry only its own output. A spare's activation output is discarded; its failure only means there is no spare.
-An activation whose supervisor goes away — dropped the host, or its process exited — ends with its whole process group,
-since nothing can use its result. A host that cannot serve a request — it cannot run `direnv`, say — answers with the
-reason and exits; any host that breaks its protocol fails the job waiting on it as a launch that failed
-(`failure: unlaunched`), with the reason on the job's stderr, since its command never ran. The one exception is a host
-that died by a signal while it activated for the job: a kill of the job reaches its activation, and a crash is the job's
-to see, so that death is the job's status (the reason still goes to its stderr).
+An activation whose supervisor goes away — dropped the host, or its process exited — has no usable result. On macOS the
+shell host holds `direnv export` at the in-process leader gate until the same `ProcessMonitor` used by jobs observes
+that root. On control EOF it retires only that root's retained subtree with zero grace, joining native exits before
+killing its own process group. Retained ancestry includes reparented descendants and children that called `setpgid` or
+`setsid`; the host itself is not part of the observed subtree. The receipt remains `Observed { lost }`, not a
+completeness claim: Darwin's fork/adoption gaps still apply. A retirement failure is named on activation stderr.
+
+The owner is `TreeOwner::Job(JobId)` or `TreeOwner::Spare`: a spare has no fabricated job identity. `REQUEST_ACTIVATE`
+carries an explicit owner tag and an id only for the Job variant; unknown tags and invalid job ids are refused at the
+boundary by name. Linux still ends activation with the host's process group only: the reusable host is outside job
+cgroups, and no per-activation cgroup or retained ancestry source exists there yet. A descendant that changes group can
+therefore outlive Linux activation teardown; group kill is not claimed as descendant-tree containment. A host that
+cannot serve a request — it cannot run `direnv`, say — answers with the reason and exits; any host that breaks its
+protocol fails the job waiting on it as a launch that failed (`failure: unlaunched`), with the reason on the job's
+stderr, since its command never ran. The one exception is a host that died by a signal while it activated for the job: a
+kill of the job reaches its activation, and a crash is the job's to see, so that death is the job's status (the reason
+still goes to its stderr).
 
 The layer's other roles:
 

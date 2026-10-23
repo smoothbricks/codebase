@@ -681,7 +681,12 @@ async fn run_pooled(
             .await;
             let activation = match (io.stdout.try_clone(), io.stderr.try_clone()) {
                 (Ok(stdout), Ok(stderr)) => Ok(activator
-                    .activate_host(&mut host, ticket.predicted(), (stdout, stderr))
+                    .activate_host(
+                        &mut host,
+                        TreeOwner::Job(job_id),
+                        ticket.predicted(),
+                        (stdout, stderr),
+                    )
                     .await),
                 (Err(error), _) | (_, Err(error)) => Err(pipe_error(error)),
             };
@@ -1250,6 +1255,7 @@ async fn receive_frame<R: tokio::io::AsyncRead + Unpin>(
     Ok(payload)
 }
 
+use super::process_tree::TreeOwner;
 enum HostActivation {
     Ready(std::result::Result<ActivationEvidence, String>),
     Failed { status: RawWaitStatus },
@@ -1365,6 +1371,7 @@ impl HostActivator {
     async fn activate_host(
         &self,
         host: &mut ExecHost,
+        owner: TreeOwner,
         predicted: Vec<PathBuf>,
         (stdout, stderr): (OwnedFd, OwnedFd),
     ) -> HostActivation {
@@ -1447,6 +1454,7 @@ impl HostActivator {
                 Err(error) => Err(format!("the filesystem clock task failed: {error}")),
             };
         let request = FrameWriter::new(REQUEST_ACTIVATE)
+            .tree_owner(owner)
             .bytes(envrc_directory.as_os_str().as_bytes())
             .and_then(FrameWriter::finish);
         let request = match request {
@@ -1709,7 +1717,7 @@ async fn expect_status(host: &mut ExecHost, expected: u8) -> Result<RawWaitStatu
 #[async_trait]
 impl Activator for HostActivator {
     type Host = ExecHost;
-    type Output = (OwnedFd, OwnedFd);
+    type Output = (JobId, (OwnedFd, OwnedFd));
 
     /// A spare's activation output has no job to belong to and is discarded; its failure only
     /// means no spare exists, and the next command activates for itself. It runs for no job, so
@@ -1718,10 +1726,10 @@ impl Activator for HostActivator {
     async fn activate(
         &self,
         predicted: Vec<PathBuf>,
-        output: Option<(OwnedFd, OwnedFd)>,
+        output: Option<Self::Output>,
     ) -> Activation<ExecHost> {
-        let (output, _stake) = match output {
-            Some(output) => (output, None),
+        let (owner, output, _stake) = match output {
+            Some((job_id, output)) => (TreeOwner::Job(job_id), output, None),
             None => {
                 let stake = match self
                     .cpu
@@ -1736,7 +1744,7 @@ impl Activator for HostActivator {
                     Err(error) => return Activation::Broken { error },
                 };
                 match (null_device(), null_device()) {
-                    (Ok(stdout), Ok(stderr)) => ((stdout, stderr), Some(stake)),
+                    (Ok(stdout), Ok(stderr)) => (TreeOwner::Spare, (stdout, stderr), Some(stake)),
                     (Err(error), _) | (_, Err(error)) => {
                         return Activation::Broken {
                             error: pipe_error(error),
@@ -1749,7 +1757,10 @@ impl Activator for HostActivator {
             Ok(host) => host,
             Err(error) => return Activation::Broken { error },
         };
-        match self.activate_host(&mut host, predicted, output).await {
+        match self
+            .activate_host(&mut host, owner, predicted, output)
+            .await
+        {
             HostActivation::Ready(evidence) => Activation::Ready { host, evidence },
             HostActivation::Failed { status } => Activation::Failed { status },
             HostActivation::Broken(error) => Activation::Broken { error },

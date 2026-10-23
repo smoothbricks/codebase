@@ -124,7 +124,6 @@ fn live(tree: &ProcessTreeFold, readings: &Readings, process: ProcessIdentity) -
 
 #[derive(Debug)]
 pub struct JobProcessFold {
-    job_id: JobId,
     tree: ProcessTreeFold,
     readings: Readings,
     last_tick: Instant,
@@ -134,10 +133,10 @@ pub struct JobProcessFold {
 }
 
 impl JobProcessFold {
-    /// A fold for `job_id` whose sampler's clock starts at `started`.
-    pub fn new(job_id: JobId, started: Instant) -> Self {
+    /// A fold whose sampler's clock starts at `started`. It names no owner: whoever reads a
+    /// tree from it says which job the tree is.
+    pub fn new(started: Instant) -> Self {
         Self {
-            job_id,
             tree: ProcessTreeFold::default(),
             readings: Readings::default(),
             last_tick: started,
@@ -211,9 +210,9 @@ impl JobProcessFold {
         }))
     }
 
-    /// Every record, as last observed and read.
-    pub fn tree(&self, sampled_at: UtcTimestamp) -> JobProcessTree {
-        self.tree.tree(self.job_id, sampled_at, &self.readings)
+    /// Every record, as last observed and read, as job `job_id`'s tree.
+    pub fn tree(&self, job_id: JobId, sampled_at: UtcTimestamp) -> JobProcessTree {
+        self.tree.tree(job_id, sampled_at, &self.readings)
     }
 
     fn observed(
@@ -424,7 +423,7 @@ mod tests {
     impl Run {
         fn new() -> Self {
             let start = Instant::now();
-            let mut fold = JobProcessFold::new(job(), start);
+            let mut fold = JobProcessFold::new(start);
             fold.clock(start).expect("the job's clock starts once");
             Self {
                 fold,
@@ -546,7 +545,7 @@ mod tests {
         }
 
         fn assert_replay_matches(&self) {
-            assert_eq!(self.replayed(), self.fold.tree(utc(0)).processes);
+            assert_eq!(self.replayed(), self.fold.tree(job(), utc(0)).processes);
         }
     }
 
@@ -623,7 +622,7 @@ mod tests {
         );
 
         let released = change(run.blocked(shell, Some(ProcessBlockedOn::None)));
-        let mut record = run.fold.tree(utc(0)).processes[0].clone();
+        let mut record = run.fold.tree(job(), utc(0)).processes[0].clone();
         record.blocked_on = Some(lock("/ws/.git/index.lock", 4242));
         released.apply(&mut record);
         assert_eq!(
@@ -642,7 +641,7 @@ mod tests {
                 blocked_on: BlockerChange::Clear,
             }
         );
-        assert_eq!(run.fold.tree(utc(0)).processes[0].blocked_on, None);
+        assert_eq!(run.fold.tree(job(), utc(0)).processes[0].blocked_on, None);
         assert_eq!(run.blocked(shell, None), None, "absent stays absent");
         run.assert_replay_matches();
 
@@ -796,7 +795,7 @@ mod tests {
             other => panic!("expected the exit, got {other:?}"),
         }
         assert_eq!(
-            run.fold.tree(utc(3)).coverage,
+            run.fold.tree(job(), utc(3)).coverage,
             ProcessCoverage::Complete,
             "the final usage was read"
         );
@@ -848,7 +847,7 @@ mod tests {
             other => panic!("expected the exit, got {other:?}"),
         }
         assert_eq!(
-            run.fold.tree(utc(2)).coverage,
+            run.fold.tree(job(), utc(2)).coverage,
             ProcessCoverage::Gap {
                 reason: ProcessCoverageGap::UnreadFinalUsage { pid: 600 }
             }
@@ -888,7 +887,7 @@ mod tests {
         after_exit.exited = true;
         assert_eq!(run.read(child, after_exit), None);
         let shown = |run: &Run| {
-            run.fold.tree(utc(1)).processes[1]
+            run.fold.tree(job(), utc(1)).processes[1]
                 .usage
                 .map(|usage| usage.cpu_user_us.get())
         };
@@ -936,7 +935,10 @@ mod tests {
             ),
             other => panic!("expected the exit, got {other:?}"),
         }
-        assert_eq!(run.fold.tree(utc(122)).coverage, ProcessCoverage::Complete);
+        assert_eq!(
+            run.fold.tree(job(), utc(122)).coverage,
+            ProcessCoverage::Complete
+        );
         run.assert_replay_matches();
     }
 
@@ -952,7 +954,7 @@ mod tests {
             serde_json::json!([{ "kind": "gap", "reason": { "kind": "uncountedFork", "pid": 800 } }])
         );
         assert_eq!(
-            run.fold.tree(utc(0)).coverage,
+            run.fold.tree(job(), utc(0)).coverage,
             ProcessCoverage::Gap { reason }
         );
         for later in [reason, ProcessCoverageGap::EventsLost] {
@@ -962,7 +964,7 @@ mod tests {
             );
         }
         assert_eq!(
-            run.fold.tree(utc(1)).coverage,
+            run.fold.tree(job(), utc(1)).coverage,
             ProcessCoverage::Gap { reason }
         );
     }
@@ -1017,7 +1019,7 @@ mod tests {
             [JobProcessEvent::Gap { reason }]
         );
         assert_eq!(
-            unknown.fold.tree(utc(1)).coverage,
+            unknown.fold.tree(job(), utc(1)).coverage,
             ProcessCoverage::Gap { reason }
         );
     }

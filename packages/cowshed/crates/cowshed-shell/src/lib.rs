@@ -43,6 +43,11 @@ use cowshed_core::developer_links;
 #[cfg(target_os = "linux")]
 use cowshed_core::runtime::job_cgroup::Placement;
 use cowshed_core::runtime::job_groups::{self, Birth};
+#[cfg(target_os = "macos")]
+use cowshed_core::runtime::process_monitor::ProcessMonitor;
+#[cfg(target_os = "macos")]
+use cowshed_core::runtime::process_tree::ProcessIdentity;
+use cowshed_core::runtime::process_tree::TreeOwner;
 use cowshed_core::runtime::shell_host::{
     BINDING_ARRAY, BINDING_SCALAR, CONTROL_DESCRIPTOR, FrameReader, FrameWriter, Inherited,
     REPLY_ACTIVATED, REPLY_ACTIVATION_EXITED, REPLY_ACTIVATION_UNUSABLE, REPLY_ADOPTION_REFUSED,
@@ -320,10 +325,11 @@ impl Host {
                 reply(socket, FrameWriter::new(REPLY_APPROVED).i32(status))
             }
             REQUEST_ACTIVATE => {
+                let owner = fields.tree_owner()?;
                 let directory = PathBuf::from(OsStr::from_bytes(fields.bytes()?));
                 fields.finish()?;
                 let stderr = one_descriptor(&mut descriptors, "stderr")?;
-                self.activate(socket, &directory, stderr)
+                self.activate(socket, &directory, owner, stderr)
             }
             REQUEST_ADOPT => {
                 let directory = PathBuf::from(OsStr::from_bytes(fields.bytes()?));
@@ -468,20 +474,52 @@ impl Host {
         &mut self,
         socket: &UnixStream,
         directory: &Path,
+        owner: TreeOwner,
         stderr: OwnedFd,
     ) -> io::Result<()> {
         // An activation can run for minutes (a Nix evaluation, an install). If the supervisor
         // that asked for it goes away — its process exited, or it dropped this host — nothing
         // will ever use the result, so the evaluation must not keep running unobserved.
-        let _orphan_guard = OrphanGuard::watch(socket)?;
-        let mut child = self
-            .tool(directory)
+        let diagnostics = stderr.try_clone()?;
+        let mut command = self.tool(directory);
+        command
             .args(["export", "json"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::from(stderr))
-            .spawn()
+            .stderr(Stdio::from(stderr));
+        #[cfg(target_os = "macos")]
+        let monitor = ProcessMonitor::prepare(owner).map_err(io::Error::other)?;
+        #[cfg(target_os = "macos")]
+        let (mut child, root) = monitor
+            .spawn_root(command)
             .map_err(|error| self.tool_error(error))?;
+        // Linux has no retained per-activation ancestry or cgroup yet (11_shell.md). Its
+        // existing group kill remains explicit rather than claiming escaped descendants.
+        #[cfg(target_os = "linux")]
+        let mut child = {
+            let _ = owner;
+            command.spawn().map_err(|error| self.tool_error(error))?
+        };
+        let _orphan_guard = match OrphanGuard::watch(
+            socket,
+            diagnostics,
+            #[cfg(target_os = "macos")]
+            monitor.clone(),
+            #[cfg(target_os = "macos")]
+            root,
+        ) {
+            Ok(guard) => guard,
+            Err(error) => {
+                #[cfg(target_os = "macos")]
+                let retired = monitor.retire_root(root, std::time::Duration::ZERO);
+                #[cfg(target_os = "linux")]
+                let retired = child.kill();
+                let waited = child.wait();
+                return Err(io::Error::other(format!(
+                    "cannot watch activation control: {error}; retirement: {retired:?}; reap: {waited:?}"
+                )));
+            }
+        };
         let mut exported = Vec::new();
         let read = child
             .stdout
@@ -1132,8 +1170,8 @@ impl ExitWatch {
     }
 }
 
-/// Ends this host's whole process group — the host and everything its activation started —
-/// when the control socket reaches end of stream while the guard lives.
+/// On control EOF, retires the activation's observed subtree before ending this host's group.
+/// Darwin retains escaped and reparented descendants; Linux still has only group authority.
 ///
 /// A thread polls the socket and a cancel pipe. The supervisor never writes during an
 /// activation, so readable data is not expected; end of stream is recognized by a zero-byte
@@ -1144,7 +1182,12 @@ struct OrphanGuard {
 }
 
 impl OrphanGuard {
-    fn watch(socket: &UnixStream) -> io::Result<Self> {
+    fn watch(
+        socket: &UnixStream,
+        diagnostics: OwnedFd,
+        #[cfg(target_os = "macos")] monitor: ProcessMonitor,
+        #[cfg(target_os = "macos")] root: ProcessIdentity,
+    ) -> io::Result<Self> {
         let mut ends = [0; 2];
         // SAFETY: `ends` has room for the two descriptors pipe(2) writes.
         if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
@@ -1199,6 +1242,19 @@ impl OrphanGuard {
                         )
                     };
                     if peeked == 0 || watched[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                        #[cfg(target_os = "macos")]
+                        if let Err(error) = monitor.retire_root(root, std::time::Duration::ZERO)
+                            && let Err(write) = writeln!(
+                                std::fs::File::from(diagnostics),
+                                "cowshed: activation subtree retirement failed: {error}"
+                            )
+                        {
+                            cowshed_os::eprintln!(
+                                "cowshed: cannot report activation retirement: {write}; {error}"
+                            );
+                        }
+                        #[cfg(target_os = "linux")]
+                        drop(diagnostics);
                         // SAFETY: signals this host's own process group, which it leads; the
                         // commands it forked lead groups of their own and are untouched.
                         unsafe { libc::kill(0, libc::SIGKILL) };

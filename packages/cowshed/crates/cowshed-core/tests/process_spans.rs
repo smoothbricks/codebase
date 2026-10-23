@@ -294,7 +294,7 @@ impl TracedJob {
         let start = Instant::now();
         let publisher = JobSpanPublisher::start(telemetry.to_path_buf());
         let info = running_job();
-        let mut fold = JobProcessFold::new(info.job_id, start);
+        let mut fold = JobProcessFold::new(start);
         fold.clock(start).expect("the job's clock starts once");
         Self {
             fold,
@@ -845,7 +845,7 @@ async fn a_job_s_process_tree_is_three_parented_process_run_spans_over_fourteen_
     );
 
     // Rebuilt from its rows, each span ends at the fold's own final record.
-    let tree = job.fold.tree(utc(124));
+    let tree = job.fold.tree(running_job().job_id, utc(124));
     assert_eq!(
         tree.coverage,
         ProcessCoverage::Gap {

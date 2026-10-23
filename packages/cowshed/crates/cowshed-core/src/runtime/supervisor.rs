@@ -2486,7 +2486,8 @@ impl SpawnSink for SystemSpawnSink {
         if request.scope == ExecScope::HostGate {
             let command = host_gate_command(&request, &cwd)?;
             #[cfg(target_os = "macos")]
-            let monitor = ProcessMonitor::prepare(request.job_id)?;
+            let monitor =
+                ProcessMonitor::prepare(super::process_tree::TreeOwner::Job(request.job_id))?;
             return spawn_fenced(
                 command,
                 request.job_id,
@@ -2509,7 +2510,7 @@ impl SpawnSink for SystemSpawnSink {
         )
         .await?;
         #[cfg(target_os = "macos")]
-        let monitor = ProcessMonitor::prepare(request.job_id)?;
+        let monitor = ProcessMonitor::prepare(super::process_tree::TreeOwner::Job(request.job_id))?;
         let pooled = |command, environment| super::shell_job::PooledSpawn {
             job_id: request.job_id,
             command,
