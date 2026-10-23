@@ -41,17 +41,11 @@ async function main() {
   if (!taskDetails) {
     throw new Error('this Nx keeps no task database (WASM build), so it has no cache to carry into');
   }
-  // A running daemon's file map trails what the rebase just wrote until its watcher catches up,
-  // and a graph from it would hash yesterday's files. It is stopped, as `nx daemon --stop` stops
-  // it: by the pid its record names, whether or not this client would use a daemon itself. A CI
-  // runner's environment (`CI`, `GITHUB_ACTIONS`: Nx's `isCI`) turns the client off, never the
-  // daemon a host client started, which goes on trailing the rebase. The graph below is computed
-  // in this process, on the files as they are now: this probe is a job, and a job's Nx starts no
-  // daemon (NX_DAEMON_START=never, 04_sandbox.md). NX_DAEMON rather than this client alone,
-  // because every Nx loaded in this process reads it: a plugin linked from another checkout
-  // requires that checkout's Nx, whose own daemon client would otherwise go on asking for the
-  // daemon just stopped, and the plugin fails ("this client never starts a daemon").
-  await daemonClient.stop();
+  // The host controller stopped the recorded daemon before admitting this probe. This job
+  // cannot signal a daemon started outside its sandbox. Compute from the files as they are now,
+  // never a watcher's lagging map, even if the keeper restarted the daemon meanwhile.
+  // NX_DAEMON applies to every Nx loaded in this process: a plugin linked from another checkout
+  // must also compute locally rather than asking for a daemon it cannot start under the job rule.
   process.env.NX_DAEMON = 'false';
   daemonClient.reset();
   const projectGraph = await createProjectGraphAsync({ exitOnError: false, resetDaemonClient: false });

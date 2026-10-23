@@ -19833,10 +19833,12 @@ async fn nx_probe_stdout(
 /// volume of `workspace` (mounted at `mount`) holds, keyed by its `.nx` relative to the checkout,
 /// the task hashes stock Nx computes up front for the tree now checked out at that state's root
 /// and the tasks it defers ([`crate::build_volume::nx::task_hashes_script`], run there as a job
-/// of the workspace at `class`). A root whose selection cannot be computed is the carry's skip,
-/// naming it: no root is ever given a selection it did not compute, so the carry never copies an
-/// entry the tree will not look up. A failed admission (`admitted`), its supervisor unreachable
-/// included, is a probe that cannot start: the first root is skipped with it.
+/// of the workspace at `class`). The host stops the recorded daemon before admitting the probe:
+/// the sandboxed job cannot signal a host-started daemon. The probe computes locally even if the
+/// keeper restarts one. A root whose selection cannot be computed is the carry's skip, naming it:
+/// no root is ever given a selection it did not compute, so the carry never copies an entry the
+/// tree will not look up. A failed admission (`admitted`), its supervisor unreachable included,
+/// is a probe that cannot start: the first root is skipped with it.
 #[cfg(target_os = "macos")]
 async fn rebased_task_hashes(
     admitted: Result<(
@@ -19863,9 +19865,26 @@ async fn rebased_task_hashes(
             class,
         )?;
         let selection = match &admitted {
-            Ok((handle, build_volume)) => nx_probe_stdout(handle, build_volume.clone(), request)
+            Ok((handle, build_volume)) => {
+                let data = mount.join(parent).join("workspace-data");
+                let stopped = tokio::task::spawn_blocking(move || {
+                    crate::build_volume::nx::stop_recorded_daemon(&data)
+                        .map_err(|error| {
+                            format!("cannot stop the Nx daemon in {}: {error}", data.display())
+                        })?
+                        .map_err(|busy| {
+                            format!("cannot stop the Nx daemon in {}: {busy}", data.display())
+                        })
+                })
                 .await
-                .and_then(|stdout| crate::build_volume::nx::task_selection(&stdout)),
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()));
+                match stopped {
+                    Ok(_) => nx_probe_stdout(handle, build_volume.clone(), request)
+                        .await
+                        .and_then(|stdout| crate::build_volume::nx::task_selection(&stdout)),
+                    Err(reason) => Err(reason),
+                }
+            }
             Err(unavailable) => Err(format!("cannot start the probe: {unavailable}")),
         };
         match selection {

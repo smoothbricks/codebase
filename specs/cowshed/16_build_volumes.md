@@ -787,10 +787,15 @@ background class, or at gate class when the rebase names `--gate`: a land's reba
 lock, so that it is not queued behind the background work the land is served ahead of. An ungated rebase computes no
 hash and carries nothing: its report is `skipped` with `reason:{kind:"ungated"}` ("Ungated folds", below).
 
-Both volumes' shared build holds are acquired before staging and retained through commit, including while their Nx
-daemons stop. A reseed or release must not withdraw either filesystem in that interval: Nx open locks fence database
-openers, not volume capture or collection. A refused build hold fails the carry with its side and hold path; it does not
-clear cache state or retry without the hold.
+The host controller stops each root's recorded daemon before admitting its hash probe, using the native stop and exit
+watch. Stop failures name that root and fail its selection. The sandboxed probe has no authority to signal a daemon a
+host shell started. It computes the graph in-process from the rebased files, including for plugins loading another
+checkout's Nx, even if the keeper starts a replacement meanwhile. This bypass is scoped to the hash computation; normal
+runs keep their daemon, and the carry still closes both databases with host authority before committing. Both volumes'
+shared build holds are acquired before staging and retained through commit, including while their Nx daemons stop. A
+reseed or release must not withdraw either filesystem in that interval: Nx open locks fence database openers, not volume
+capture or collection. A refused build hold fails the carry with its side and hold path; it does not clear cache state
+or retry without the hold.
 
 Selection covers cacheable, non-continuous tasks in each root, with no configuration and with each declared
 configuration, using Nx's own task graph, per-task environment and hasher. CLI overrides are not guessed: an invocation
@@ -1094,7 +1099,7 @@ text or package-script indirection. It runs in the workspace's ordinary activate
 report is stdout; Nx diagnostics and failures are stderr.
 
 The standalone script ships beside the cowshed launcher. The embedded `build_volume/task_hashes.js` remains the carry
-helper: its all-target/all-configuration selection, database writes and daemon stop are deliberately different from an
+helper: its all-target/all-configuration selection and database writes, and its host-owned daemon stop, differ from an
 advisor for one next command. A new cowshed verb would add supervisor/controller/API lifecycle plumbing to a read-only
 calculation, and an advisory branch in carry would mix these incompatible authority contracts. The standalone surface
 can run from a workspace's existing read grant; it needs no new lifecycle operation or candidate write grant.
@@ -1217,7 +1222,7 @@ second build cache: no task executes and scratch is removed after success or fai
 ### The Nx daemon stays on
 
 For a normal run, cowshed never sets `NX_DAEMON=false`, and never withholds the daemon to work around state problems.
-The read-only cache-reuse advisor alone bypasses the daemon and computes in-process, without stopping, restarting or
+The read-only cache-reuse advisor bypasses the daemon and computes in-process, without stopping, restarting or
 signalling the checkout's existing daemon. A fresh walk of the rebased source tree must not use a watcher's lagging file
 map, and the probe's bookkeeping must not reach either candidate image.
 

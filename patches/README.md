@@ -408,8 +408,10 @@ hides it from the checkout's clients, and the next one starts a second daemon fo
 
 The stop now throws for any refusal other than ESRCH, naming the pid and the errno, and keeps the socket directory.
 `nx daemon --stop` exits 1 through `handleErrors` without the success line; `nx reset` reports it among its errors,
-`nx add` fails, and cowshed's task-hash probe (`task_hashes.js`) fails rather than computing beside a live daemon. A
-recorded pid that has exited is still a stopped daemon.
+`nx add` fails. Cowshed stops the recorded daemon from its host controller before admitting the task-hash probe and
+skips that root's selection if the native stop fails. The sandboxed probe computes locally and sends no signal,
+including when the keeper starts a replacement during admission. A recorded pid that has exited is still a stopped
+daemon.
 
 `packages/nx-plugin/src/nx-daemon-stop-host.test.ts` runs in `nx-plugin:test-host`: on macOS it starts a real fixture
 daemon and stops it from a Seatbelt profile with the job sandbox's signal rule, which `sandbox_apply` refuses inside

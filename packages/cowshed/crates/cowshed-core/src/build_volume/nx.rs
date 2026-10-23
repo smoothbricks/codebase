@@ -2724,12 +2724,10 @@ mod tests {
         assert_eq!(close(&stock.checkout, &state).unwrap(), Ok(()));
     }
 
-    /// The rebase-carry probe runs as a job, so under `NX_DAEMON_START=never`. It stops the
-    /// checkout's running daemon, whose file map trails the rebase, and computes the graph in its
-    /// own process: it starts no daemon and never asks for one. Asking for the stopped one is what
-    /// failed a consumer's carry, through a plugin whose Nx was another checkout's. The probe runs
-    /// under a CI runner's environment (`CI=true`), where Nx's own client uses no daemon: the
-    /// daemon a host client started still trails the rebase, and is still stopped.
+    /// The host stops the recorded daemon; the rebase-carry probe runs sandboxed under
+    /// NX_DAEMON_START=never and cannot signal host processes. It computes its graph locally,
+    /// including under CI, and starts no replacement daemon. A real host daemon is the positive
+    /// control; denying cross-process signals to the probe proves it needs no stop authority.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_task_hash_probe_computes_its_graph_without_a_daemon_under_the_job_rule() {
@@ -2746,9 +2744,19 @@ mod tests {
         .unwrap();
         stock.daemon("--start");
         let daemon = crate::runtime::nx_daemon::live_pid(&stock.record()).expect("a live daemon");
+        assert!(!cowshed_os::process::sandboxed(daemon).unwrap());
+        assert_eq!(
+            stop_recorded_daemon(&stock.workspace_data()).unwrap(),
+            Ok(Some(daemon))
+        );
 
-        let mut command = std::process::Command::new("node");
+        let mut command = std::process::Command::new("/usr/bin/sandbox-exec");
         command
+            .args([
+                "-p",
+                "(version 1) (allow default) (deny signal (target others))",
+                "node",
+            ])
             .arg("-")
             .arg(&stock.checkout)
             .current_dir(&stock.checkout);
