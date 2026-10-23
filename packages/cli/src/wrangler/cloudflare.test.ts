@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import { recordingRetryShell } from '../lib/__tests__/recording-retry-shell.js';
 import { CloudflareApiError, CloudflareRestClient, type D1DatabaseRecord, type R2Bucket } from './cloudflare.js';
 
 type CloudflareFetcher = NonNullable<ConstructorParameters<typeof CloudflareRestClient>[2]>;
@@ -489,5 +490,188 @@ describe('CloudflareRestClient R2 objects', () => {
       `GET ${V4}/accounts/account-1/r2/buckets/smoo-stage-records/objects?prefix=v1%2Fscope%2Fpr7%2F&per_page=1000`,
       `GET ${V4}/accounts/account-1/r2/buckets/smoo-stage-records/objects?prefix=v1%2Fscope%2Fpr7%2F&per_page=1000&cursor=cursor-2`,
     ]);
+  });
+});
+
+const RATE_LIMITED = 'Reduce your concurrent request rate for account level operations';
+
+/** One scripted Cloudflare answer; the last repeats once the script runs out. */
+interface ScriptedAnswer {
+  status: number;
+  errors?: Array<{ code?: number; message: string }>;
+  result?: unknown;
+  headers?: Record<string, string>;
+}
+
+function scriptedFetcher(script: ScriptedAnswer[]): { fetcher: CloudflareFetcher; calls: string[] } {
+  const calls: string[] = [];
+  return {
+    calls,
+    fetcher: async (input, init) => {
+      calls.push(`${init?.method ?? 'GET'} ${input}`);
+      const answer = script[Math.min(calls.length - 1, script.length - 1)];
+      const success = answer.status >= 200 && answer.status < 300;
+      return new Response(JSON.stringify({ success, errors: answer.errors ?? [], result: answer.result ?? null }), {
+        status: answer.status,
+        headers: { 'Content-Type': 'application/json', ...answer.headers },
+      });
+    },
+  };
+}
+
+const rateLimited = (headers?: Record<string, string>): ScriptedAnswer => ({
+  status: 429,
+  errors: [{ code: 971, message: RATE_LIMITED }],
+  headers,
+});
+
+describe('CloudflareRestClient rate limits', () => {
+  it('retries an account-level rate-limit answer and returns the payload once Cloudflare accepts the call', async () => {
+    const { fetcher, calls } = scriptedFetcher([
+      rateLimited(),
+      { status: 200, result: [{ name: 'smoo-stage-records' }] },
+    ]);
+    const { shell, sleeps, retries } = recordingRetryShell();
+    const client = new CloudflareRestClient('account-1', 'token', fetcher, undefined, shell);
+
+    await expect(client.listR2Buckets()).resolves.toEqual([{ name: 'smoo-stage-records' }]);
+
+    expect(calls).toHaveLength(2);
+    expect(sleeps).toHaveLength(1);
+    expect(retries).toHaveLength(1);
+    expect(retries[0]?.reason).toContain(RATE_LIMITED);
+  });
+
+  it('gives up after a bounded number of attempts with the existing CloudflareApiError naming the path and message', async () => {
+    const { fetcher, calls } = scriptedFetcher([rateLimited()]);
+    const { shell, sleeps } = recordingRetryShell();
+    const client = new CloudflareRestClient('account-1', 'token', fetcher, undefined, shell);
+
+    const error = await client.listR2Buckets().then(
+      () => null,
+      (failure: unknown) => failure,
+    );
+
+    if (!(error instanceof CloudflareApiError)) throw new Error('expected a CloudflareApiError');
+    expect(error.message).toContain('/accounts/account-1/r2/buckets');
+    expect(error.message).toContain(RATE_LIMITED);
+    expect(error.status).toBe(429);
+    expect(error.codes).toEqual([971]);
+    expect(calls).toHaveLength(6);
+    // Exponential backoff from two seconds, capped at thirty, never after the last attempt.
+    expect(sleeps).toEqual([2000, 4000, 8000, 16_000, 30_000]);
+  });
+
+  it('does not retry a non-rate-limit 4xx', async () => {
+    const { fetcher, calls } = scriptedFetcher([
+      { status: 403, errors: [{ code: 10000, message: 'Authentication error' }] },
+    ]);
+    const { shell, sleeps } = recordingRetryShell();
+    const client = new CloudflareRestClient('account-1', 'token', fetcher, undefined, shell);
+
+    await expect(client.listR2Buckets()).rejects.toThrow('Authentication error');
+
+    expect(calls).toHaveLength(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  it('waits at least as long as Retry-After asks', async () => {
+    const { fetcher } = scriptedFetcher([rateLimited({ 'Retry-After': '7' }), { status: 200, result: [] }]);
+    const { shell, sleeps } = recordingRetryShell();
+    const client = new CloudflareRestClient('account-1', 'token', fetcher, undefined, shell);
+
+    await client.listR2Buckets();
+
+    expect(sleeps).toEqual([7000]);
+  });
+
+  it('stops retrying when Retry-After asks for more than the retry bound allows', async () => {
+    const { fetcher, calls } = scriptedFetcher([rateLimited({ 'Retry-After': '600' }), { status: 200, result: [] }]);
+    const { shell, sleeps } = recordingRetryShell();
+    const client = new CloudflareRestClient('account-1', 'token', fetcher, undefined, shell);
+
+    await expect(client.listR2Buckets()).rejects.toBeInstanceOf(CloudflareApiError);
+
+    expect(calls).toHaveLength(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  it('retries the rate-limit message on a read whatever HTTP status carries it', async () => {
+    const { fetcher, calls } = scriptedFetcher([
+      { status: 400, errors: [{ message: RATE_LIMITED }] },
+      { status: 200, result: [] },
+    ]);
+    const { shell } = recordingRetryShell();
+    const client = new CloudflareRestClient('account-1', 'token', fetcher, undefined, shell);
+
+    await expect(client.listR2Buckets()).resolves.toEqual([]);
+
+    expect(calls).toHaveLength(2);
+  });
+
+  it('does not retry the rate-limit message when another error stands beside it', async () => {
+    const { fetcher, calls } = scriptedFetcher([
+      { status: 400, errors: [{ message: RATE_LIMITED }, { code: 7003, message: 'Invalid parameter' }] },
+    ]);
+    const { shell, sleeps } = recordingRetryShell();
+    const client = new CloudflareRestClient('account-1', 'token', fetcher, undefined, shell);
+
+    await expect(client.listR2Buckets()).rejects.toThrow('Invalid parameter');
+
+    expect(calls).toHaveLength(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  it('retries an idempotent write, a stage record put, on the rate-limit message', async () => {
+    const { fetcher, calls } = scriptedFetcher([rateLimited(), { status: 200, result: null }]);
+    const { shell } = recordingRetryShell();
+    const client = new CloudflareRestClient('account-1', 'token', fetcher, undefined, shell);
+
+    await client.putR2Object('smoo-stage-records', 'v1/key', '{}');
+
+    expect(calls).toHaveLength(2);
+  });
+
+  it('retries a create only when the answer is an HTTP 429, which refuses a call before it runs', async () => {
+    const refused = scriptedFetcher([rateLimited(), { status: 200, result: { uuid: 'db-1', name: 'site-db' } }]);
+    const refusedShell = recordingRetryShell();
+    await new CloudflareRestClient(
+      'account-1',
+      'token',
+      refused.fetcher,
+      undefined,
+      refusedShell.shell,
+    ).createD1Database('site-db');
+    expect(refused.calls).toHaveLength(2);
+
+    // The same message under another status does not say whether the create already ran: a repeat could duplicate it.
+    const ambiguous = scriptedFetcher([{ status: 400, errors: [{ message: RATE_LIMITED }] }]);
+    const ambiguousShell = recordingRetryShell();
+    await expect(
+      new CloudflareRestClient(
+        'account-1',
+        'token',
+        ambiguous.fetcher,
+        undefined,
+        ambiguousShell.shell,
+      ).createD1Database('site-db'),
+    ).rejects.toBeInstanceOf(CloudflareApiError);
+    expect(ambiguous.calls).toHaveLength(1);
+    expect(ambiguousShell.sleeps).toEqual([]);
+  });
+
+  it('does not retry a call whose transport died: only a rate-limit answer is repeated', async () => {
+    let calls = 0;
+    const fetcher: CloudflareFetcher = async () => {
+      calls += 1;
+      throw new TypeError('The socket connection was closed unexpectedly');
+    };
+    const { shell, sleeps } = recordingRetryShell();
+    const client = new CloudflareRestClient('account-1', 'token', fetcher, undefined, shell);
+
+    await expect(client.listR2Buckets()).rejects.toThrow('socket connection was closed');
+
+    expect(calls).toBe(1);
+    expect(sleeps).toEqual([]);
   });
 });

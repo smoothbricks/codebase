@@ -16,7 +16,7 @@ import {
 import { printCommandOutput, runStatus, runText } from '../lib/run.js';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 import { type DeploymentStage, isPullRequestStage, parseDeploymentStage, pullRequestStage } from '../wrangler/stage.js';
-import { ciApiContext, ciApiRequest } from './api.js';
+import { type CiCommitStatus, ciApiContext, ciApiRequest, postCiStatus } from './api.js';
 import type { NxTargetRun } from './outputs.js';
 
 export interface GithubActionsEventPayload {
@@ -660,9 +660,8 @@ export async function publishGithubDeployment(
   const sha = processEnvironment.GITHUB_SHA;
   if (!repository || !sha) throw new Error('GITHUB_REPOSITORY and GITHUB_SHA are required to publish a deployment.');
   if (ciApiContext(processEnvironment).forgejo) {
-    await ciApiRequest(
-      `/statuses/${sha}`,
-      'POST',
+    await postCiStatus(
+      sha,
       {
         state: 'success',
         context: `deployment/${environment}`,
@@ -743,7 +742,12 @@ async function updateGithubStatus(name: string, state: 'success' | 'failure' | '
   await postGithubStatus(name, state, `${name} ${suffix}`, step);
 }
 
-async function postGithubStatus(name: string, state: string, description: string, step: string): Promise<void> {
+async function postGithubStatus(
+  name: string,
+  state: CiCommitStatus['state'],
+  description: string,
+  step: string,
+): Promise<void> {
   const repository = process.env.GITHUB_REPOSITORY;
   const sha = process.env.GITHUB_SHA;
   if (!repository || !sha) {
@@ -754,7 +758,7 @@ async function postGithubStatus(name: string, state: string, description: string
     return;
   }
   const targetUrl = await getGithubStepUrl(step);
-  await ciApiRequest(`/statuses/${sha}`, 'POST', {
+  await postCiStatus(sha, {
     state,
     context: name,
     description,

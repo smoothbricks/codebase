@@ -945,6 +945,12 @@ CI status deeplinks depend on [GitHub Actions]' top-level job step anchors. The 
 comments next to each top-level step, and the `smoo github-ci nx-smart --step <number>` values for lint, test, and build
 must stay synchronized with those comments. Composite action internals do not change the top-level step numbers.
 
+Recording a commit status (`github-ci nx-smart`, `nx-deploy`, the Forgejo deployment status) repeats a 5xx answer or a
+dropped connection up to five attempts in all, waiting 1, 2, 4 and 8 s between them with jitter (never less than a
+`Retry-After` header asks; a header asking for more than 15 s ends the retrying), because a repeated status is an
+identical log entry. A 4xx is never repeated. A failure that outlasts the retries names the status that could not be
+recorded and the HTTP code, so it reads as a status-reporting failure.
+
 Only CI's Build invocation enables `NX_VERBOSE_LOGGING=true`, so Nx prints the underlying project-graph exception
 instead of only its generic title; target selection, status/step links, daemon choice and cache behavior are unchanged.
 Before cleanup, the existing trace artifact upload also retains the current workspace-data `project-graph.json` and
@@ -1025,6 +1031,14 @@ pull-request deploy needs R2 even in a repository that binds no R2: it records w
 token needs R2 write, or the deploy fails before creating anything. Cleanup reads only the zones its stage's records
 name, and lists D1 only when a D1 database was recorded. It makes every lookup before its first delete, so a token
 missing a permission the stage needs makes cleanup refuse rather than half-clean the stage.
+
+Several CI runs deploying into one Cloudflare account at once can make Cloudflare answer account-level calls with HTTP
+429 or "Reduce your concurrent request rate for account level operations". The Cloudflare client repeats such an answer
+up to six attempts in all, waiting 2 s doubling to at most 30 s with jitter (and never less than a `Retry-After` header
+asks; a header asking for more than 30 s ends the retrying). Any method repeats a 429, which refuses the call before it
+runs; the message under another status, as the answer's only error, repeats only reads and idempotent writes (GET, PUT,
+DELETE). The last answer is then thrown as the usual `CloudflareApiError`. Other failures, a 403 included, and a call
+whose connection dropped are never repeated.
 
 A wrong value type anywhere in `smoo.github` fails `smoo monorepo update` and `smoo github-ci nx-deploy` with the
 offending path, rather than silently falling back to the defaults.
