@@ -238,27 +238,30 @@ killed, and operators took to granting installs a window by hand.
 is several cowshed commands with none running between them: measured 2026-10-20, an install found the ledger empty as a
 land's first gate ended and restarted the gateway as its host gate started, and that gate's `cowshed exec` failed with
 the daemon's socket refusing the connection, failing the land. So every command a land runs — `exec --class gate`,
-`rebase` and `land` — before it asks the daemon anything, waits for an install that holds the slot ("The install slot",
-below), saying on stderr that it waits and for which file, and then holds nothing. A step that waited is still the build
-it started as, and the daemon that install left refuses another build. Measured 2026-10-21: a land's gate passed in
-1,503 s, its next step waited for an install, and the daemon refused it by build (exit 4), throwing the green gate away.
-So a step that waited and is then refused as another build goes on as the installed cowshed: it execs, in place, the
-stored copy the stable name says once the install is done, with its own arguments, keeping its pid, working directory,
-environment and descriptors, and says so on stderr. A step that did not wait, or a refusal of any other kind, is
-returned as it is. A daemon connection refused later in the step, while an install holds the slot, is that install
-restarting the daemon — a positive signal — so it waits for the install and connects once more to the daemon the install
-started; a refusal with no install holding the slot is returned as it is. An install that restarted the gateway —
-`gateway start` and `setup`'s refresh alike — holds the slot until that gateway serves: its control socket answers from
-the installed bytes, its startup pass is over and it is not draining, the wait `gateway start` reports. Releasing the
-slot at the restart is not enough: measured 2026-10-20, `setup` restarted the gateway and released the slot at once, and
-the land step that had waited on it found the daemon's socket refusing the connection, failing a land whose gate had
-passed. A land step never holds the slot for its run: it did once, and an install then waited on every land step in
-flight, between its gates as well as during them. An install refuses a gate that holds or wants tokens ("An install
-refuses while a land or a gate runs"), because a gate's CPU pool is gateway state a restart ends and is never carried
-across one. A job in flight lives in its workspace supervisor, which a gateway restart leaves running; what a restart
-breaks is a new connection to the daemon, and that is what waits. The ledger is never the guard against a restart
-between two of a land's commands, since no process of that land holds anything the gateway records there; its land turn
-is. Status reads the slot without taking it.
+`rebase` and `land` without `--preflight` — before it asks the daemon anything, waits for an install that holds the slot
+("The install slot", below), saying on stderr that it waits and for which file, and then holds nothing. A step that
+waited is still the build it started as, and the daemon that install left refuses another build. Measured 2026-10-21: a
+land's gate passed in 1,503 s, its next step waited for an install, and the daemon refused it by build (exit 4),
+throwing the green gate away. So a step that waited and is then refused as another build goes on as the installed
+cowshed: it execs, in place, the stored copy the stable name says once the install is done, with its own arguments,
+keeping its pid, working directory, environment and descriptors, and says so on stderr. A step that did not wait, or a
+refusal of any other kind, is returned as it is. A daemon connection refused later in the step, while an install holds
+the slot, is that install restarting the daemon — a positive signal — so it waits for the install and connects once more
+to the daemon the install started; a refusal with no install holding the slot is returned as it is. An install that
+restarted the gateway — `gateway start` and `setup`'s refresh alike — holds the slot until that gateway serves: its
+control socket answers from the installed bytes, its startup pass is over and it is not draining, the wait
+`gateway start` reports. Releasing the slot at the restart is not enough: measured 2026-10-20, `setup` restarted the
+gateway and released the slot at once, and the land step that had waited on it found the daemon's socket refusing the
+connection, failing a land whose gate had passed. A land step never holds the slot for its run: it did once, and an
+install then waited on every land step in flight, between its gates as well as during them. An install refuses a gate
+that holds or wants tokens ("An install refuses while a land or a gate runs"), because a gate's CPU pool is gateway
+state a restart ends and is never carried across one. A job in flight lives in its workspace supervisor, which a gateway
+restart leaves running; what a restart breaks is a new connection to the daemon, and that is what waits. The ledger is
+never the guard against a restart between two of a land's commands, since no process of that land holds anything the
+gateway records there; its land turn is. Status reads the slot without taking it.
+
+`land --preflight` only reads the pre-check fences (02_workspaces.md): it is not a land step, waits for no install,
+requires no matching daemon build and never re-execs the installed cowshed.
 
 **An install never refuses a client connection.** A restart closes every workspace listener until the next gateway's
 startup pass restores its session (5 s and more), and a stock client cannot wait for that: measured 2026-10-20, an

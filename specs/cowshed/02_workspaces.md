@@ -1184,14 +1184,18 @@ workspace than the unit, at the incarnation `--into` resolved); the source head 
 dirty tree; the target branch (a detached target checkout without `--target`), checked out in the target's checkout; and
 the target head and `--expected-target-head`. A refusal is the land's own, word for word: its code, message, hint and
 `FenceRefusal`. A pass exits 0 with `{kind: preflighted, workspaceIncarnation, sourceHead, targetBranch, targetHead}`,
-the values the land after it pins with its three expectation flags (`targetHead` in `--expected-target-head`'s form,
-`{missing: true}` for a branch not created yet), so a land refuses whatever moved in between. A preflight mutates
-nothing: it takes no land lease, so it runs while a land or an `rm` of the workspace holds one, and no ref lock; the CLI
-opens the project as an inspection, finishing no interrupted work, and the preflight heals no binding, waits for no
-build, admits no supervisor, initializes no Nx cache, synchronizes no gateway and runs no check. Reading a detached lane
-base would mean attaching it, so that target answers `environment-missing` (exit 5), never a pass or a land's refusal.
-What land decides from its lease on is outside the preflight: a lease another land or `rm` holds, a workspace with no
-checked-out branch (read after the check), the check itself, and the target head re-read under the ref lock.
+the source workspace incarnation, source head and target head that the following land can pin with
+`--expected-workspace-incarnation`, `--expected-source-head` and `--expected-target-head`. A missing target head is
+reported as `{missing: true}` and passed as `missing`. Reuse `targetBranch` as `--target` and keep the original `--into`
+and other land options. These expectations refuse changes to those three values; they do not pin the target workspace
+incarnation across independent calls. A preflight mutates nothing: it takes no land lease, so it runs while a land or an
+`rm` of the workspace holds one, and no ref lock; the CLI opens the project as an inspection, finishing no interrupted
+work. It waits for no install, checks no daemon build and never re-execs the installed cowshed; it heals no binding,
+waits for no build, admits no supervisor, initializes no Nx cache, synchronizes no gateway and runs no check. Reading a
+detached lane base would mean attaching it, so that target answers `environment-missing` (exit 5), never a pass or a
+land's refusal. What land decides from its lease on is outside the preflight: a lease another land or `rm` holds, a
+workspace with no checked-out branch (read after the check), the check itself, and the target head re-read under the ref
+lock.
 
 `--ungated`, with `--into <lane>` only, folds a unit into its lane base by Git alone (see "Lanes"): steps 1, 3 and 5
 run, and steps 2 and 4 do not. It runs no check and initializes no Nx cache, and after the fast-forward it carries

@@ -243,8 +243,8 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         | Command::Rekey(_)
         | Command::Gc(_)
         | Command::Push(_)
-        | Command::Rebase(_)
-        | Command::Land(_) => true,
+        | Command::Rebase(_) => true,
+        Command::Land(args) => !args.preflight,
         Command::List(_)
         | Command::BuildState
         | Command::Mount(_)
@@ -5727,6 +5727,24 @@ mod tests {
         }
         for argv in [
             &["doctor"][..],
+            &["land", "raven", "--preflight"],
+            &[
+                "land",
+                "raven",
+                "--preflight",
+                "--into",
+                "lane",
+                "--ungated",
+            ],
+            &[
+                "--json",
+                "land",
+                "raven",
+                "--preflight",
+                "--target",
+                "main",
+                "--push-only",
+            ],
             &["doctor", "--repair"],
             &["ls"],
             &["ls", "--all"],
@@ -5815,6 +5833,10 @@ mod tests {
         let remove = crate::args::parse_args(["rm", "raven"]).unwrap().command;
         let doctor = crate::args::parse_args(["doctor"]).unwrap().command;
         let setup = crate::args::parse_args(["setup"]).unwrap().command;
+        let preflight = crate::args::parse_args(["land", "raven", "--preflight"])
+            .unwrap()
+            .command;
+        let land = crate::args::parse_args(["land", "raven"]).unwrap().command;
 
         require_daemon_of_this_build_at(&store, &doctor)
             .await
@@ -5822,9 +5844,12 @@ mod tests {
         require_daemon_of_this_build_at(&store, &setup)
             .await
             .expect("setup ends the disagreement");
+        require_daemon_of_this_build_at(&store, &preflight)
+            .await
+            .expect("land preflight only inspects and needs no matching daemon");
         assert!(
             asked.try_recv().is_err(),
-            "a verb that diagnoses or repairs does not ask the daemon anything"
+            "a verb that diagnoses, repairs or inspects does not ask the daemon anything"
         );
 
         let error = require_daemon_of_this_build_at(&store, &remove)
@@ -5847,6 +5872,19 @@ mod tests {
             "the first thing asked is the build check: {first}"
         );
         assert!(asked.try_recv().is_err(), "and nothing after it, no ensure");
+
+        let land_error = require_daemon_of_this_build_at(&store, &land)
+            .await
+            .expect_err("ordinary land still requires the matching daemon");
+        assert_eq!(land_error, error);
+        let land_check = asked
+            .try_recv()
+            .expect("ordinary land asked the build check");
+        assert!(land_check.contains(r#""verb":"sameBuild""#), "{land_check}");
+        assert!(
+            asked.try_recv().is_err(),
+            "land asked nothing after the refusal"
+        );
 
         served.abort();
         fs::remove_dir_all(&store).ok();

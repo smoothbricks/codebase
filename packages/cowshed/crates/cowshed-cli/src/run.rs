@@ -584,12 +584,13 @@ fn runtime_dispatch(command: &args::Command) -> RuntimeDispatch {
 }
 
 /// The commands a land runs, each of which waits for an install in progress before it starts:
-/// its gates (`exec --class gate`), its rebase and its land. Ordinary work does not wait: it
-/// reaches the daemon as any command does.
+/// its gates (`exec --class gate`), its rebase and its mutating land. Read-only preflight
+/// and ordinary work do not wait for an install.
 fn is_land_step(command: &args::Command) -> bool {
     match command {
         args::Command::Exec(exec) => exec.class == cowshed_core::api::dto::ExecClass::Gate,
-        args::Command::Rebase(_) | args::Command::Land(_) => true,
+        args::Command::Rebase(_) => true,
+        args::Command::Land(args) => !args.preflight,
         _ => false,
     }
 }
@@ -664,6 +665,24 @@ mod tests {
         ]));
         assert!(step(&["rebase", "raven", "--gate"]));
         assert!(step(&["land", "raven"]));
+        assert!(!step(&["land", "raven", "--preflight"]));
+        assert!(!step(&[
+            "land",
+            "raven",
+            "--preflight",
+            "--into",
+            "lane",
+            "--ungated"
+        ]));
+        assert!(!step(&[
+            "--json",
+            "land",
+            "raven",
+            "--preflight",
+            "--target",
+            "main",
+            "--push-only"
+        ]));
         assert!(!step(&["exec", "raven", "--", "build"]));
         assert!(!step(&["exec", "raven", "--host", "--", "build"]));
         assert!(!step(&[

@@ -1292,11 +1292,14 @@ land into main gates, so main refuses `--ungated` (exit 2, naming main); `--chec
 `--preflight` runs only the fences land runs before its check, with the same arguments, and stops: the plan, the
 workspace and its incarnation, the target, the source head, the dirty tree, the target branch and the target head. When
 land would refuse, it exits with land's own refusal (exit 4 for the dirty tree, the same message and hint); otherwise it
-exits 0, and `--json` returns `kind: preflighted` with the `workspaceIncarnation`, `sourceHead`, `targetBranch` and
-`targetHead` a land can pin through its `--expected-*` flags (text output: branch, source head, target head or
-`missing`, incarnation). It takes no land lease or ref lock, attaches nothing, synchronizes no gateway and runs no
-check, so it runs while another land or `rm` of the workspace holds the lease. A detached lane base it would have to
-attach is exit 5.
+exits 0, and `--json` returns `kind: preflighted` with `workspaceIncarnation`, `sourceHead`, `targetBranch` and
+`targetHead` (text output: branch, source head, target head or `missing`, incarnation). Pass the source workspace
+incarnation, source head and target head through `--expected-workspace-incarnation`, `--expected-source-head` and
+`--expected-target-head` (`missing` for `{missing: true}`). Reuse `targetBranch` as `--target` and keep the original
+`--into` and other options. Only those three expectation values are pinned, not the target workspace incarnation across
+independent calls. It waits for no install, checks no daemon build and never re-execs the installed cowshed. It takes no
+land lease or ref lock, attaches nothing, synchronizes no gateway and runs no check, so it runs while another land or
+`rm` of the workspace holds the lease. A detached lane base it would have to attach is exit 5.
 
 `--ref-lock <file>` names the lock file every other writer of the target branch holds while it moves it, as an
 operator's Markdown commit into main holds it through lockf(1). Land takes the same exclusive lock only to re-read the
