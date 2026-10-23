@@ -1246,23 +1246,22 @@ pub(crate) fn signal_life(pid: u32, unique_id: u64, signal: libc::c_int) -> io::
     }
 }
 
-/// The BSD record and pid version of the process `pid` names now, read in one call; `None` once
-/// it has exited, reaped or not.
 #[cfg(target_os = "macos")]
 fn running_info(pid: i32) -> io::Result<Option<BsdInfoWithUniqueId>> {
-    let mut info = std::mem::MaybeUninit::<BsdInfoWithUniqueId>::zeroed();
-    let size = libc::c_int::try_from(std::mem::size_of::<BsdInfoWithUniqueId>())
-        .map_err(io::Error::other)?;
-    // SAFETY: `info` is writable storage of exactly `size` bytes.
-    let written = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            PROC_PIDT_BSDINFOWITHUNIQID,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
+    // SAFETY: flavor 18 writes exactly struct proc_bsdinfowithuniqid.
+    unsafe { pid_info(pid, PROC_PIDT_BSDINFOWITHUNIQID) }
+}
+
+/// Read one exact libproc payload; only ESRCH proves that no running life holds the pid.
+///
+/// # Safety
+/// T is the C payload structure for flavor, with no invalid initialized bit patterns.
+#[cfg(target_os = "macos")]
+unsafe fn pid_info<T>(pid: i32, flavor: libc::c_int) -> io::Result<Option<T>> {
+    let mut info = std::mem::MaybeUninit::<T>::zeroed();
+    let size = libc::c_int::try_from(std::mem::size_of::<T>()).map_err(io::Error::other)?;
+    // SAFETY: the caller supplies the exact payload type, writable for size bytes.
+    let written = unsafe { libc::proc_pidinfo(pid, flavor, 0, info.as_mut_ptr().cast(), size) };
     if written != size {
         if written <= 0 {
             let error = io::Error::last_os_error();
@@ -1273,13 +1272,14 @@ fn running_info(pid: i32) -> io::Result<Option<BsdInfoWithUniqueId>> {
         }
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("proc_pidinfo returned {written} bytes, expected {size}"),
+            format!(
+                "proc_pidinfo flavor {flavor} for process {pid} returned {written} bytes, expected {size}"
+            ),
         ));
     }
-    // SAFETY: proc_pidinfo filled all `size` bytes.
+    // SAFETY: proc_pidinfo filled the exact payload, whose initialized bits the caller admits.
     Ok(Some(unsafe { info.assume_init() }))
 }
-
 /// A running process as the kernel names it: its pid, its parent's pid, the unique ids the
 /// kernel never gives another process for both, its effective uid and its start second.
 #[cfg(target_os = "macos")]
@@ -1293,11 +1293,46 @@ pub struct ProcessRecord {
     pub started_seconds: u64,
 }
 
-/// The record of the process `pid` names now, read in one call; `None` once it has exited,
-/// reaped or not.
+/// The public metadata of one running life, fenced by its immutable unique id.
+/// BSD credentials and ppid are a snapshot of that life, not an atomic image claim or signal
+/// authority. An exec may change the pid version without changing the birth or ancestry.
 #[cfg(target_os = "macos")]
 pub(crate) fn process_record(pid: i32) -> io::Result<Option<ProcessRecord>> {
-    Ok(running_info(pid)?.map(|info| record_of(&info)))
+    const PROC_PIDUNIQIDENTIFIERINFO: libc::c_int = 17;
+    // Unlike BSDINFOWITHUNIQID, both public flavors permit a different effective uid: a
+    // legitimate setuid helper remains observable. No failed call is classified as absence.
+    // SAFETY: flavor 17 writes exactly struct proc_uniqidentifierinfo.
+    let Some(before) =
+        (unsafe { pid_info::<UniqueIdentifierInfo>(pid, PROC_PIDUNIQIDENTIFIERINFO) })?
+    else {
+        return Ok(None);
+    };
+    // SAFETY: SHORTBSDINFO writes exactly libc's struct proc_bsdshortinfo.
+    let Some(bsd) =
+        (unsafe { pid_info::<libc::proc_bsdshortinfo>(pid, libc::PROC_PIDT_SHORTBSDINFO) })?
+    else {
+        return Ok(None);
+    };
+    let Some(started) = start_time(pid)? else {
+        return Ok(None);
+    };
+    // SAFETY: the same exact flavor/type pair as the opening identity fence.
+    let Some(after) =
+        (unsafe { pid_info::<UniqueIdentifierInfo>(pid, PROC_PIDUNIQIDENTIFIERINFO) })?
+    else {
+        return Ok(None);
+    };
+    if before.unique_id != after.unique_id {
+        return Ok(None);
+    }
+    Ok(Some(ProcessRecord {
+        pid: bsd.pbsi_pid,
+        ppid: bsd.pbsi_ppid,
+        unique_id: after.unique_id,
+        parent_unique_id: after.parent_unique_id,
+        uid: bsd.pbsi_uid,
+        started_seconds: started / 1_000_000,
+    }))
 }
 
 /// The kernel's identity of the life `pid` names now: its unique id (`p_uniqueid`), which the

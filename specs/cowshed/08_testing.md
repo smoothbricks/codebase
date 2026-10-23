@@ -206,8 +206,14 @@ is not a real APFS mount or cache cutover proof.
 
 The process-custody witness retires eight native subtrees concurrently while each retained sibling forks and execs 64
 children. It joins exactly each selected root and child, observes every sibling complete its work alive, and never uses
-group expansion. Controls omit all image reads during custody and coalesced exit, preserve normal
+group expansion. Controls omit all image and final-counter reads during custody and coalesced exit, preserve normal
 EINVAL/credential-denial errors, and require unknown lineage and missing watches to refuse without signalling.
+
+The real membership endpoint proof holds a same-real-user setuid ps behind an owned output pipe while two independently
+admitted subtrees of one job retire concurrently. The public unique-id/parent-id record stays readable; the legacy
+same-effective-uid combined BSD read must retain its actual EPERM. Both detached descendants join native exit watches,
+the retained sibling completes its fork/exec work, and an unrelated process in the same checkout survives. Missing final
+counters remain UnreadFinalUsage, never zeroes, and cannot replace identity, ancestry, watch or signal proof.
 
 Port-zero fixture children report numeric ports with explicit string writes to stdout, not console inspection. They
 retain inherited color settings; the reader compares the exact undecorated decimal protocol, and never strips ANSI or

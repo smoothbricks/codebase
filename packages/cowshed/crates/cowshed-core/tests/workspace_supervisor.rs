@@ -10241,8 +10241,9 @@ async fn membership_endpoint_is_job_bound_and_never_admits_coordinator_authority
     let children_path = root.join("children.sock");
     let controls = tokio::net::UnixListener::bind(&control_path).unwrap();
     let children = tokio::net::UnixListener::bind(&children_path).unwrap();
+
     let script = r#"
-import json, os, signal, socket, struct, sys
+import json, os, signal, socket, struct, sys, threading
 endpoint = os.environ['COWSHED_SUPERVISOR_SOCKET']
 def exact(s, n):
     result = b''
@@ -10260,6 +10261,24 @@ def rpc(request):
 if sys.argv[1] == 'foreign':
     print(json.dumps(rpc({'retireDescendants': {'handle': json.loads(sys.argv[2]), 'graceMs': 20}})['ok']['value']))
     sys.exit(0)
+
+def ps_argv():
+    return ['/bin/ps', '-p', str(os.getpid()), '-ww', '-o', 'pid=' + 'h' * 131072]
+def run_ps():
+    out_read, out_write = os.pipe()
+    pid = os.fork()
+
+    if pid == 0:
+        os.close(out_read)
+        os.dup2(out_write, 1)
+        argv = ps_argv()
+        os.execv(argv[0], argv)
+    os.close(out_write)
+    with os.fdopen(out_read, 'rb') as out:
+        data = out.read()
+    _, status = os.waitpid(pid, 0)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
+    return {'pid': pid, 'code': 0, 'bytes': len(data)}
 control = socket.socket(socket.AF_UNIX)
 control.connect(sys.argv[1])
 root_read, root_write = os.pipe()
@@ -10290,24 +10309,170 @@ os.close(root_write)
 os.close(go_read)
 with os.fdopen(root_read) as inp:
     report = json.loads(inp.readline())
-control.sendall((json.dumps(report) + '\n').encode())
+sib_cmd_read, sib_cmd_write = os.pipe()
+sib_rep_read, sib_rep_write = os.pipe()
+sibling = os.fork()
+if sibling == 0:
+    control.close()
+    os.close(go_write)
+    os.close(sib_cmd_write)
+    os.close(sib_rep_read)
+    held = None
+    root2 = None
+    def reply(value):
+        os.write(sib_rep_write, (json.dumps(value) + '\n').encode())
+
+    try:
+        for raw in os.fdopen(sib_cmd_read, 'rb'):
+            command = json.loads(raw)
+            if command == 'ps_hold':
+                churn = [run_ps() for _ in range(3)]
+                out_read, out_write = os.pipe()
+                ps = os.fork()
+                if ps == 0:
+                    os.close(out_read)
+                    os.dup2(out_write, 1)
+                    argv = ps_argv()
+                    os.execv(argv[0], argv)
+                os.close(out_write)
+                stream = os.fdopen(out_read, 'rb')
+                first = stream.read(1)
+                assert first, 'ps produced no output'
+                os.kill(ps, signal.SIGSTOP)
+                stopped, status = os.waitpid(ps, os.WUNTRACED)
+                assert stopped == ps and os.WIFSTOPPED(status), status
+                held = (ps, stream, len(first))
+                reply({'ps': ps, 'first_bytes': len(first), 'churn': churn})
+            elif command == 'ps_release':
+                ps, stream, first_bytes = held
+                held = None
+                os.kill(ps, signal.SIGCONT)
+                rest = stream.read()
+                stream.close()
+                _, status = os.waitpid(ps, 0)
+                assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
+                reply({'ps_done': ps, 'code': 0, 'bytes': first_bytes + len(rest)})
+            elif command == 'ps_churn':
+                reply({'churned': [run_ps() for _ in range(4)]})
+            elif command == 'root':
+                r2_read, r2_write = os.pipe()
+                go2_read, go2_write = os.pipe()
+                root2_pid = os.fork()
+                if root2_pid == 0:
+                    os.close(r2_read)
+                    os.close(go2_write)
+                    admitted_reply = rpc('subtreeHandle')
+                    value = admitted_reply.get('ok', {}).get('value')
+                    if not value or value.get('kind') != 'admitted':
+                        with os.fdopen(r2_write, 'w') as out:
+                            out.write(json.dumps({'admission_error': admitted_reply}) + '\n')
+                        os._exit(0)
+                    child = os.fork()
+                    if child == 0:
+                        os.close(r2_write)
+                        os.close(go2_read)
+                        os.setsid()
+                        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                        peer = socket.socket(socket.AF_UNIX)
+                        peer.connect(sys.argv[2])
+                        peer.sendall(struct.pack('!IIII', os.getpid(), os.getppid(), os.getpgrp(), os.getsid(0)))
+                        peer.recv(1)
+                        os._exit(0)
+                    with os.fdopen(r2_write, 'w') as out:
+                        out.write(json.dumps({'admission': value, 'root': os.getpid(), 'child': child}) + '\n')
+                    os.read(go2_read, 1)
+                    os._exit(0)
+                os.close(r2_write)
+                os.close(go2_read)
+                with os.fdopen(r2_read) as inp:
+                    root2_report = json.loads(inp.readline())
+                if 'admission_error' in root2_report:
+                    os.waitpid(root2_pid, 0)
+                    root2 = (root2_pid, None, root2_report)
+                else:
+                    root2 = (root2_pid, go2_write, root2_report)
+                reply({'root2': root2_report})
+            elif command == 'release_root':
+                root2_pid, go2_write, root2_report = root2
+                if go2_write is not None:
+                    os.write(go2_write, b'x')
+                    os.close(go2_write)
+                    os.waitpid(root2_pid, 0)
+                reply({'released_root2': True})
+            elif command == 'exit':
+                break
+            else:
+                raise RuntimeError(command)
+    finally:
+        if held is not None:
+            ps, stream, first_bytes = held
+            held = None
+            os.kill(ps, signal.SIGCONT)
+            stream.read()
+            stream.close()
+            os.waitpid(ps, 0)
+    os._exit(0)
+os.close(sib_cmd_read)
+os.close(sib_rep_write)
+sib_commands = os.fdopen(sib_cmd_write, 'w')
+sib_replies = os.fdopen(sib_rep_read)
+def sibling_rpc(command):
+    sib_commands.write(json.dumps(command) + '\n')
+    sib_commands.flush()
+    return json.loads(sib_replies.readline())
+control.sendall((json.dumps({**report, 'sibling': sibling}) + '\n').encode())
 lines = control.makefile('rb')
+
+root2_report = None
+sibling_reaped = False
 for line in lines:
     command = json.loads(line)
     if command == 'release':
+        sibling_reply = sibling_rpc('release_root')
+        assert sibling_reply == {'released_root2': True}, sibling_reply
         os.write(go_write, b'x')
         os.close(go_write)
         os.waitpid(root, 0)
         reply = {'released': True}
+    elif command == 'ps_hold':
+        reply = sibling_rpc('ps_hold')
+    elif command == 'admit_root2':
+        reply = sibling_rpc('root')
+        root2_report = reply['root2']
+    elif command == 'ps_release':
+        reply = sibling_rpc('ps_release')
+    elif command == 'ps_churn':
+        reply = sibling_rpc('ps_churn')
+    elif command == 'retire_both':
+        handles = [('first', report['admission']['handle']), ('second', root2_report['admission']['handle'])]
+        barrier = threading.Barrier(len(handles))
+        results = {}
+        def spend(name, handle):
+            barrier.wait()
+            results[name] = rpc({'retireDescendants': {'handle': handle, 'graceMs': 20}})
+        threads = [threading.Thread(target=spend, args=(name, handle)) for name, handle in handles]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join()
+        reply = {'retire_both': [results['first'], results['second']]}
     elif command == 'privileged':
         reply = rpc('hello')
     elif command == 'retire':
         reply = rpc({'retireDescendants': {'handle': report['admission']['handle'], 'graceMs': 20}})['ok']['value']
+
     elif command == 'exit':
+        sib_commands.write(json.dumps('exit') + '\n')
+        sib_commands.flush()
+        os.waitpid(sibling, 0)
+        sibling_reaped = True
         break
     else:
         raise RuntimeError(command)
+
     control.sendall((json.dumps(reply) + '\n').encode())
+if not sibling_reaped:
+    sib_commands.write(json.dumps('exit') + '\n')
+    sib_commands.flush()
+    os.waitpid(sibling, 0)
 "#;
     let request_for = |arguments: Vec<CommandArg>| ExecRequest {
         command: ExecCommand::Argv(arguments),
@@ -10351,8 +10516,10 @@ for line in lines:
     let JobSubtreeAdmission::Admitted { handle: capability } = admitted else {
         panic!("admission refused")
     };
+
     let root_pid = u32::try_from(report["root"].as_u64().unwrap()).unwrap();
     let child_pid = u32::try_from(report["child"].as_u64().unwrap()).unwrap();
+    let sibling_pid = u32::try_from(report["sibling"].as_u64().unwrap()).unwrap();
     let (mut child_peer, _) = children.accept().await.unwrap();
     let mut child_report = [0_u8; 16];
     child_peer.read_exact(&mut child_report).await.unwrap();
@@ -10417,6 +10584,144 @@ for line in lines:
         denied["err"]["message"].as_str().unwrap().contains("hello"),
         "{denied}"
     );
+
+    writer.write_all(b"\"ps_hold\"\n").await.unwrap();
+    let ps_report: serde_json::Value =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert!(
+        ps_report["churn"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|run| run["code"] == 0),
+        "every churned ps exited successfully: {ps_report}"
+    );
+    let ps_pid = u32::try_from(ps_report["ps"].as_u64().unwrap()).unwrap();
+
+    writer.write_all(b"\"admit_root2\"\n").await.unwrap();
+    let root2_reply: serde_json::Value =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    let root2_report = &root2_reply["root2"];
+    if let Some(error) = root2_report.get("admission_error") {
+        writer.write_all(b"\"ps_release\"\n").await.unwrap();
+        let released_ps: serde_json::Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        panic!(
+            "second admission failed while setuid ps was held: {error}; held ps then released and reaped by its parent: {released_ps}"
+        );
+    }
+    let admitted2: JobSubtreeAdmission =
+        serde_json::from_value(root2_report["admission"].clone()).unwrap();
+    let JobSubtreeAdmission::Admitted {
+        handle: _capability2,
+    } = admitted2
+    else {
+        panic!("second admission refused")
+    };
+    let root2_pid = u32::try_from(root2_report["root"].as_u64().unwrap()).unwrap();
+    let child2_pid = u32::try_from(root2_report["child"].as_u64().unwrap()).unwrap();
+    let (mut child2_peer, _) = children.accept().await.unwrap();
+    let mut child2_report = [0_u8; 16];
+    child2_peer.read_exact(&mut child2_report).await.unwrap();
+    let field2 = |at| u32::from_be_bytes(child2_report[at..at + 4].try_into().unwrap());
+    assert_eq!(
+        [field2(0), field2(4), field2(8), field2(12)],
+        [child2_pid, root2_pid, child2_pid, child2_pid]
+    );
+    let sibling_life = Darwin.record(sibling_pid).unwrap().unwrap();
+    let root2_life = Darwin.record(root2_pid).unwrap().unwrap();
+    let child2_life = Darwin.record(child2_pid).unwrap().unwrap();
+    assert_eq!(root2_life.parent_unique_id, sibling_life.unique_id);
+    assert_eq!(child2_life.parent_unique_id, root2_life.unique_id);
+    let child2 = Process::observe(i32::try_from(child2_pid).unwrap())
+        .unwrap()
+        .unwrap();
+    let exit2 = child2.watch_exit().unwrap();
+
+    let mut held_failure: Option<String> = None;
+    let mut retained_observation_errors: Vec<String> = Vec::new();
+    async {
+        loop {
+            match events.next().await {
+                Some(Ok(cowshed_core::api::process::JobProcessEvent::Born { process, .. }))
+                    if process.pid == child2_pid =>
+                {
+                    break;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => retained_observation_errors.push(error.to_string()),
+                None => {
+                    if held_failure.is_none() {
+                        held_failure = Some(
+                            "process event stream ended before the second detached child was born"
+                                .to_owned(),
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    .await;
+    if !retained_observation_errors.is_empty() {
+        cowshed_os::eprintln!(
+            "process observation errors retained: {}",
+            retained_observation_errors.join("; ")
+        );
+    }
+
+    // The retained sibling's held ps is genuinely in its setuid-root interval: public
+    // identity inspection reads its exact life, while the legacy combined flavor-18
+    // read is still denied with its native EPERM preserved, never read as absence.
+    // A failure here is reported only after the sibling releases and reaps its ps.
+    let ps_record = Darwin.record(ps_pid);
+    // SAFETY: geteuid takes no pointers and only reads the caller's credential.
+    let caller_uid = unsafe { libc::geteuid() };
+    let oracle_proved = matches!(&ps_record, Ok(Some(ps_life)) if ps_life.ppid == sibling_pid
+        && ps_life.parent_unique_id == sibling_life.unique_id
+        && ps_life.uid == 0
+        && ps_life.uid != caller_uid);
+    if !oracle_proved && held_failure.is_none() {
+        held_failure = Some(format!(
+            "held setuid ps identity read did not prove its exact root life: {ps_record:?}"
+        ));
+    }
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct LegacyUniqueId {
+        _uuid: [u8; 16],
+        _unique_id: u64,
+        _parent_unique_id: u64,
+        _id_version: i32,
+        _reserved: [u8; 20],
+    }
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct LegacyBsdWithUniqueId {
+        _bsd: libc::proc_bsdinfo,
+        _unique: LegacyUniqueId,
+    }
+    let mut legacy = std::mem::MaybeUninit::<LegacyBsdWithUniqueId>::zeroed();
+    let legacy_size = libc::c_int::try_from(std::mem::size_of::<LegacyBsdWithUniqueId>()).unwrap();
+    // SAFETY: legacy is writable storage of exactly legacy_size bytes.
+    let legacy_written = unsafe {
+        libc::proc_pidinfo(
+            i32::try_from(ps_pid).unwrap(),
+            18,
+            0,
+            legacy.as_mut_ptr().cast(),
+            legacy_size,
+        )
+    };
+    let legacy_error = std::io::Error::last_os_error();
+    if !(legacy_written != legacy_size && legacy_error.raw_os_error() == Some(libc::EPERM))
+        && held_failure.is_none()
+    {
+        held_failure = Some(format!(
+            "legacy flavor-18 read of held setuid ps must preserve EPERM, got {legacy_written} bytes and {legacy_error}"
+        ));
+    }
+
     writer.write_all(b"\"release\"\n").await.unwrap();
     assert_eq!(
         lines.next_line().await.unwrap().unwrap(),
@@ -10446,37 +10751,111 @@ for line in lines:
     std::io::Read::read_exact(outsider.0.stdout.as_mut().unwrap(), &mut ready).unwrap();
     let outsider_life = Darwin.record(outsider.0.id()).unwrap().unwrap();
 
-    writer.write_all(b"\"retire\"\n").await.unwrap();
-    let retired: JobSubtreeRetirement =
+    // Two retirement requests for two admitted subtrees of this one job are in flight
+    // together (the fixture starts both endpoint calls behind one barrier) while the
+    // retained sibling's setuid ps is still held live.
+
+    writer.write_all(b"\"retire_both\"\n").await.unwrap();
+    let both: serde_json::Value =
         serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-    let JobSubtreeRetirement::Retired { retirement } = retired else {
-        panic!("retirement refused: {retired:?}")
+    let retirement_of = |reply: &serde_json::Value| -> JobSubtreeRetirement {
+        let value = reply["ok"]["value"].clone();
+        assert!(
+            !value.is_null(),
+            "simultaneous retirement request failed: {reply}"
+        );
+        serde_json::from_value(value).unwrap()
     };
+
+    // Only now may the sibling continue its own ps: it drains the blocked pipe and
+    // its exit status is asserted, then it churns more real ps children to completion.
+    // Every failure observed while the ps was held is reported after this release, so
+    // no assertion above can strand the stopped ps with its parent.
+    writer.write_all(b"\"ps_release\"\n").await.unwrap();
+    let ps_done: serde_json::Value =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(ps_done["ps_done"].as_u64().unwrap(), u64::from(ps_pid));
+    assert_eq!(ps_done["code"], 0, "held ps exited successfully: {ps_done}");
     assert!(
-        retirement
-            .outlived
-            .iter()
-            .any(|member| member.pid == child_pid && member.signal == libc::SIGKILL)
+        ps_done["bytes"].as_u64().unwrap() > 131_072,
+        "held ps header alone exceeds every pipe capacity, so it could not have exited early: {ps_done}"
     );
+    writer.write_all(b"\"ps_churn\"\n").await.unwrap();
+    let churned: serde_json::Value =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
     assert!(
-        !retirement
-            .outlived
-            .iter()
-            .any(|member| member.pid == outsider_life.pid)
+        churned["churned"]
+            .as_array()
+            .is_some_and(|runs| { runs.len() == 4 && runs.iter().all(|run| run["code"] == 0) }),
+        "retained sibling kept churning ps after both retirements: {churned}"
     );
-    assert!(Darwin.record(child_pid).unwrap().is_none());
-    assert!(!group_has_live_members(i32::try_from(child_pid).unwrap()).unwrap());
-    assert!(exit.within(Duration::from_secs(2)).unwrap());
+
+    assert!(
+        held_failure.is_none(),
+        "held setuid ps identity proof failed: {}",
+        held_failure.unwrap_or_default()
+    );
+    let first = retirement_of(&both["retire_both"][0]);
+    let second = retirement_of(&both["retire_both"][1]);
+    let JobSubtreeRetirement::Retired {
+        retirement: first_retirement,
+    } = first
+    else {
+        panic!("first simultaneous retirement refused: {first:?}")
+    };
+    let JobSubtreeRetirement::Retired {
+        retirement: second_retirement,
+    } = second
+    else {
+        panic!("second simultaneous retirement refused: {second:?}")
+    };
+
+    for (retirement, retired_child_pid, retired_exit) in [
+        (&first_retirement, child_pid, &exit),
+        (&second_retirement, child2_pid, &exit2),
+    ] {
+        assert!(
+            retirement.outlived.iter().any(|member| {
+                member.pid == retired_child_pid && member.signal == libc::SIGKILL
+            }),
+            "detached child {retired_child_pid} was killed and joined: {retirement:?}"
+        );
+        assert!(
+            !retirement
+                .outlived
+                .iter()
+                .any(|member| { [outsider_life.pid, sibling_pid, ps_pid].contains(&member.pid) }),
+            "retirement expanded beyond its subtree: {retirement:?}"
+        );
+        assert!(Darwin.record(retired_child_pid).unwrap().is_none());
+        assert!(!group_has_live_members(i32::try_from(retired_child_pid).unwrap()).unwrap());
+        assert!(retired_exit.within(Duration::from_secs(2)).unwrap());
+    }
     assert_eq!(
         Darwin.record(outsider.0.id()).unwrap().unwrap().unique_id,
         outsider_life.unique_id
     );
+    assert_eq!(
+        Darwin.record(sibling_pid).unwrap().unwrap().unique_id,
+        sibling_life.unique_id,
+        "the retained sibling survived both retirements"
+    );
+    assert!(
+        Darwin.record(ps_pid).unwrap().is_none(),
+        "the sibling reaped its released ps"
+    );
     assert_eq!(handle.info(job).await.unwrap().state, JobState::Running);
-    writer.write_all(b"\"retire\"\n").await.unwrap();
-    let spent: JobSubtreeRetirement =
+    writer.write_all(b"\"retire_both\"\n").await.unwrap();
+    let spent_both: serde_json::Value =
         serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
     assert_eq!(
-        spent,
+        retirement_of(&spent_both["retire_both"][0]),
+        JobSubtreeRetirement::Refused {
+            reason: JobSubtreeRefusal::SpentHandle
+        }
+    );
+    assert_eq!(
+        retirement_of(&spent_both["retire_both"][1]),
         JobSubtreeRetirement::Refused {
             reason: JobSubtreeRefusal::SpentHandle
         }
@@ -10484,9 +10863,15 @@ for line in lines:
     writer.write_all(b"\"exit\"\n").await.unwrap();
     drop(writer);
     let ended = handle.wait(job).await.unwrap();
-    assert!(ended.outlived.iter().any(|member| member.pid == child_pid));
+
+    assert!(
+        ended.outlived.iter().any(|member| member.pid == child_pid)
+            && ended.outlived.iter().any(|member| member.pid == child2_pid)
+    );
     assert!(ledger_leaders(&ledger).is_empty());
+
     drop(child_peer);
+    drop(child2_peer);
     drop(outsider);
     handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
     serving.abort();

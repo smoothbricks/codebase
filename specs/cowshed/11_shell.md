@@ -777,13 +777,25 @@ success. The receipt is `Observed { lost }`, never a Darwin completeness claim; 
 signalled, not survivors. Those rows also remain in the whole job's later terminal receipt. The same
 `outlivedIncomplete` vocabulary distinguishes incomplete native kill metadata from membership proof.
 
-Custody-only admission and retirement fold the same native fork and exit events without reading current argv. A queued
-exec records an explicit UnreadImage gap; an exec coalesced with its known exit omits image work in ordinary observation
-too. Image availability cannot improve retained identity or lineage, so a sibling's exec window does not refuse another
-subtree's retirement. Normal observation still returns and publishes every native image-read failure, including
-credential denial; no errno implies that a life vanished. Identity, child-list, exit-registration and signal failures
-remain retirement refusals. Adoption of a previously unobserved group root remains strict, since no retained root exists
-yet.
+Custody-only admission and retirement fold the same native fork and exit events without reading current argv or final
+counter telemetry. A queued exec records an explicit UnreadImage gap; an exec coalesced with its known exit omits image
+work in ordinary observation too. Image availability cannot improve retained identity or lineage, so a sibling's exec
+window does not refuse another subtree's retirement. Normal observation still returns and publishes every native
+image-read failure, including credential denial; no errno implies that a life vanished. Identity, child-list,
+exit-registration and signal failures remain retirement refusals. Adoption of a previously unobserved group root remains
+strict, since no retained root exists yet.
+
+Custody-only exits mark final usage unavailable and retain the ordinary UnreadFinalUsage coverage gap. Normal
+observation still samples final usage and reports every native failure. Omitting counters neither supplies membership
+nor substitutes for a watched exit: every retained scoped life must still reach its native exit before retirement
+succeeds.
+
+Darwin's observer reads public unique-identity and short-BSD metadata plus the public process start stamp, fenced by the
+same immutable unique id before and after. A legitimate setuid helper stays observable without a same-effective-uid
+precondition. The kernel's unique parent identity alone proves ancestry; ppid and effective uid describe that life's
+metadata snapshot, never confer membership or signal rights, and are not an atomic image claim. Exec may change the pid
+version without changing the birth. Signalling still reads the current unique-id/version together and uses the native
+version-bound permission check. Every native read failure, including EPERM, remains an error, never absence.
 
 Linux currently returns typed `FoldUnavailable`: whole-job cgroup membership is not retained per-command ancestry. The
 caller takes no RAM lease and reports that fact, just as on a no-supervisor runner. A cwd/TMPDIR census remains a

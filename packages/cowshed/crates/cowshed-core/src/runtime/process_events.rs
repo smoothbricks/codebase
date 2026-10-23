@@ -30,7 +30,7 @@
 //!   process's is refused ([`ObserveError::ImageNotPermitted`], keeping the `EINVAL`). Every
 //!   other failed read is [`ObserveError::Kernel`] with its call and errno, whether or not the
 //!   life still ran; a child list in particular never fails because its parent exited.
-//! - Custody-only admission and retirement fold fork/exit evidence without reading argv; an exec
+//! - Custody-only admission and retirement fold fork/exit evidence without reading argv or final usage; an exec
 //!   records UnreadImage instead. An exec coalesced with its known exit also skips that useless
 //!   read. Normal observation retains every native image failure above. Identity, lineage,
 //!   registration and signal reads remain strict in both purposes.
@@ -157,7 +157,7 @@ enum Seen {
 
 /// The kernel's per-process reads, each naming a pid alone. The observer fences every one.
 pub trait ProcessReads {
-    /// The process `pid` names now, read in one call; `None` once it has exited.
+    /// The process's public metadata fenced to one immutable life; None once it has exited.
     fn record(&self, pid: u32) -> io::Result<Option<ProcessRecord>>;
     /// The executable and byte-exact argv of the image `pid` runs now.
     fn image(&self, pid: u32) -> io::Result<ProcessImage>;
@@ -773,7 +773,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
             failures.note(self.fold_image(process, Seen::Exec, purpose));
         }
         if fflags & libc::NOTE_EXIT != 0 {
-            failures.note(self.exited(process, data));
+            failures.note(self.exited(process, data, purpose));
         }
         failures.into_result()
     }
@@ -812,22 +812,29 @@ impl<P: ProcessReads> KqueueObserver<P> {
         failures.into_result()
     }
 
-    fn exited(&mut self, process: ProcessIdentity, data: isize) -> Result<(), ObserveError> {
+    fn exited(
+        &mut self,
+        process: ProcessIdentity,
+        data: isize,
+        purpose: ObservationPurpose,
+    ) -> Result<(), ObserveError> {
         let mut failures = Failures::default();
-        match self
-            .reads
-            .usage(process, self.fold.usage_start(process), Instant::now())
-        {
-            Ok(Sampled::Read(reading)) => failures.note(
-                self.fold
-                    .apply(
-                        JobProcessObservation::Usage { process, reading },
-                        &mut self.events,
-                    )
-                    .map_err(ObserveError::from),
-            ),
-            Ok(Sampled::Gone | Sampled::Unproven) => {}
-            Err(error) => failures.note(Err(error.into())),
+        if purpose == ObservationPurpose::Metadata {
+            match self
+                .reads
+                .usage(process, self.fold.usage_start(process), Instant::now())
+            {
+                Ok(Sampled::Read(reading)) => failures.note(
+                    self.fold
+                        .apply(
+                            JobProcessObservation::Usage { process, reading },
+                            &mut self.events,
+                        )
+                        .map_err(ObserveError::from),
+                ),
+                Ok(Sampled::Gone | Sampled::Unproven) => {}
+                Err(error) => failures.note(Err(error.into())),
+            }
         }
         // An exit ends the kernel's registration with it.
         self.registered.remove(&process);
@@ -1350,6 +1357,9 @@ mod tests {
         groups: std::cell::RefCell<std::collections::VecDeque<io::Result<Vec<ProcessRecord>>>>,
         /// Every signal the observer sent, each answered as reaching its life.
         signalled: std::cell::RefCell<Vec<(ProcessIdentity, libc::c_int)>>,
+        /// A native counter denial, when scripted; custody must never ask for it.
+        usage_error: Option<i32>,
+        usage_reads: std::cell::Cell<u32>,
         /// The reader's effective uid; root unless a test sets it.
         reader: u32,
     }
@@ -1432,10 +1442,17 @@ mod tests {
 
         fn usage(
             &self,
-            _process: ProcessIdentity,
+            process: ProcessIdentity,
             _start: Option<StartStamp>,
             _at: Instant,
         ) -> Result<Sampled, SampleError> {
+            self.usage_reads.set(self.usage_reads.get() + 1);
+            if let Some(errno) = self.usage_error {
+                return Err(SampleError::Read {
+                    pid: process.pid,
+                    source: io::Error::from_raw_os_error(errno),
+                });
+            }
             // These metadata/error controls provide no native counter proof.
             Ok(Sampled::Unproven)
         }
@@ -1852,6 +1869,48 @@ mod tests {
                     reason: ProcessCoverageGap::UnreadImage { pid: 900 }
                 }
             ));
+        }
+    }
+
+    #[test]
+    fn custody_exit_joins_without_usage_while_metadata_keeps_eperm() {
+        for purpose in [ObservationPurpose::Custody, ObservationPurpose::Metadata] {
+            let current = life(900, 3);
+            let mut fold = TestFold::default();
+            fold.apply(ProcessObservation::Root {
+                process: current,
+                ppid: 1,
+                at: utc_at_second(1_700_000_000).unwrap(),
+                image: shell_image("/bin/ps"),
+            })
+            .unwrap();
+            let reads = Scripted {
+                usage_error: Some(libc::EPERM),
+                ..Scripted::default()
+            };
+            let mut observer = scripted(reads, fold, &[current]);
+            let outcome = observer.handle(&event(current, libc::NOTE_EXIT, 0), purpose);
+            if purpose == ObservationPurpose::Metadata {
+                let ObserveError::Usage(SampleError::Read { pid, source }) = outcome.unwrap_err()
+                else {
+                    panic!("the native final-usage denial was not retained")
+                };
+                assert_eq!(pid, current.pid);
+                assert_eq!(source.raw_os_error(), Some(libc::EPERM));
+                assert_eq!(observer.reads.usage_reads.get(), 1);
+            } else {
+                outcome.unwrap();
+                assert_eq!(observer.reads.usage_reads.get(), 0);
+            }
+            assert!(observer.fold().live(current.pid).is_none());
+            assert!(!observer.registered.contains(&current));
+            assert_eq!(
+                observer.fold().coverage(),
+                &ProcessCoverage::Gap {
+                    reason: ProcessCoverageGap::UnreadFinalUsage { pid: current.pid },
+                }
+            );
+            assert!(observer.reads.signalled.borrow().is_empty());
         }
     }
 
