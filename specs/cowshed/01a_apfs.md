@@ -71,7 +71,14 @@ This companion owns the macOS/APFS implementation.
   a sparse-file copy identifies guest-freed nonzero blocks.
 - **Clone cost follows extents, not size**: `clonefile` shares the source file's extent map, and the first write to
   either file copies that map. First-write cost scales with extent count; `fork` pays it in its own `first-write` step
-  before attach. When a clone or checkpoint shares an image's blocks, rewritten blocks move to new runs. Writes into a
+  before attach. `image.write_first` reads and rewrites the same 4 KiB at offset zero; that single write can materialize
+  the shared extent map. Measured 2026-10-23 on file-only clones of a 485,830-run build seed, a source-file write plus
+  fsync took 99.035 s while the clone's first write took 79.763 s. Leaving the clone unwritten moved the cost to the
+  source: 47.137 s, then 0.1 ms for the clone's write. An unrelated store-file write plus fsync reached 19.273 s in the
+  former experiment, but continued completing during most of it. These distinguish clone-family contention from
+  intermittent container-wide stalls; correlation with a live Nx freeze does not by itself identify which overlapping
+  image operation caused it. Fewer extents reduce map-copy work; yielding outside the syscall cannot split it ("Freeing
+  an image"). When a clone or checkpoint shares an image's blocks, rewritten blocks move to new runs. Writes into a
   workspace do not rewrite main's extent map. Build state lives on volumes replaced at each land rather than in main's
   image (16_build_volumes.md, "Why two volumes"). `doctor` counts each workspace source, live build source and build
   seed with one `F_LOG2PHYS_EXT` query per contiguous run, reporting `main-extents`/`source-extents`,
@@ -1040,12 +1047,63 @@ orphaned while it still owns an attached image.
 
 ### Freeing an image
 
-One `unlink` of a written image frees its whole extent tree in one container transaction, and every writer of the
-store's APFS container, the Data volume's log and fork writes included, waits behind it. A thread at background I/O
-priority (`IOPOL_THROTTLE`) makes that worse, because its own metadata reads are throttled while the container waits. So
-cowshed never throttles an image free and never frees an image in one call: it cuts the image from its end with
-`ftruncate(2)` at most 1,024 physical runs per cut, then unlinks the empty file (16_build_volumes.md, "Garbage
-collection", for the measurements and the journal).
+One `unlink` of a written image can reclaim its whole extent tree in one kernel operation. Holding an open file
+descriptor can defer reclamation until its last close, so an unlink-only timer is not an end-to-end release timer. Other
+writers on the store's APFS container, including files inside a different attached image, can wait behind this work.
+Background I/O priority (`IOPOL_THROTTLE`) can prolong that wait while the releaser's own metadata reads are throttled.
+Cowshed instead frees at normal disk priority and cuts from the end with `ftruncate(2)`, at most **1,024 physical runs
+per cut**, then unlinks the empty file. This is a bound on reclamation work, **not a wall-time bound**; the file length
+remains the restart journal (16_build_volumes.md, "Garbage collection").
+
+Measured 2026-10-23, with raw per-cut extent counts and timings under the external `release-stall-bound/` evidence
+directory:
+
+- A materialized 485,830-run seed clone made 475 cuts: 44.125 ms median, 113.158 ms p90, 217.100 ms maximum, 27.979 s in
+  the cuts. Independent store/Data/attached-image probes reached 61.668 ms. Two concurrent releases reached 1.444 s per
+  cut and 0.972 s per probe. Some probe operations overlapped three cuts in the single-release run and four across the
+  two concurrent releases; neither experiment showed starvation for the whole release.
+- The file-only followup used a **300 GiB logical, 8 GiB allocated sparse file with 524,289 counted runs** on
+  `/private/cowshed/store` (disk3s8), not an attached image. Independent 4 KiB write-plus-fsync probes ran on that
+  volume and inside an already-attached build image (disk48s1). After materializing its map, 1,024-run cuts with no
+  pause took 16.027 ms median / 1.141 s maximum; the store and attached-image probes reached 1.094 and 1.095 s. A
+  subsequent run with a 1 ms sleep between cuts took 10.051 ms median / 97.748 ms maximum, with probe maxima 21.724 and
+  14.320 ms. Both runs let other writers progress, and probe operations overlapped at most two cuts. These sequential
+  samples under changing host load do not establish that the sleep caused the improvement or guarantees a latency
+  ceiling. No scheduling delay is added on that evidence alone.
+- On a fresh clone of that sparse file, the **first cut removed just one physical run yet took 5.086 s**; a separate
+  per-step-only run measured 9.733 s. During the aligned 5.086 s call, the independent store and attached-image probes
+  completed 571 and 543 operations respectively. Thus those writers did not freeze for the entire call. The store probe
+  nevertheless reached 855.084 ms during the release; the attached-image probe reached 7.590 ms. The earlier 485,830-run
+  clone's first 454-run cut took 50.074 s. A clone-family experiment measured a first cut of 34.836 s, a source-file
+  probe of 35.899 s, and an unrelated store-file probe of 18.544 s. Reducing the reclamation step cannot bound the
+  whole-map work inside the first mutation.
+
+The first-mutation cost is inside one `ftruncate` or 4 KiB `pwrite` call, before userspace can yield. These measurements
+do not inspect APFS's internal transaction boundaries. They demonstrate an unsplittable syscall from cowshed's
+interface, not a repair of the reported 50.7 s retirement, 26.5 s first write, or twelve-minute release. Ordinary
+stepping already prevents one userspace loop from owning the container for its whole duration; it cannot promise a
+maximum duration for one kernel call.
+
+Unlinking a still-shared clone can be cheap: the followup measured 0.032 ms for unlink plus 0.005 ms for last close
+while the source retained the map. But `EF_SHARES_ALL_BLOCKS` is an observation, not custody. The same fixture observed
+that flag with reference count two, unlinked its source, then observed the flag cleared and reference count one. Its
+subsequent unlink/close was also cheap (0.672 / 0.008 ms); this is a flag-lifetime counterexample, not evidence of a
+slow sole-owner close. A plan-time flag check therefore does not justify skipping cuts. Cowshed retains the existing
+stepped path for every file.
+
+Remaining options, not additional guarantees or implemented cutovers:
+
+- Reduce fragmentation **before cloning** through the existing detached `defrag` and forkability admission. The
+  7,140-run sensitivity threshold is not a hard latency SLA, and rebuilding a seed must not first clone an arbitrarily
+  fragmented live source and only then check its new generation.
+- Avoid sharing a live fragmented source's map: copy its data without `clonefile`, under the existing consistency and
+  ownership protocol, accepting the I/O and free-space cost; or quiesce the source while paying first mutation.
+  Quiescence moves the pause to an explicit maintenance window rather than shortening the kernel work.
+- Put latency-sensitive writers on a different APFS container/device. Another image or volume in the same container is
+  not an isolation boundary. Such placement needs its own measurement; it is not proved here.
+- A shared-unlink optimization would need an enforceable lifetime/immutability hold on another map owner through final
+  close, not a second flag read. Background or serialized reclamation can move or reduce contention but does not split
+  the first mutation. A smaller step or an inter-step yield cannot do so either.
 
 ## Ownership, identity, and the volume label
 

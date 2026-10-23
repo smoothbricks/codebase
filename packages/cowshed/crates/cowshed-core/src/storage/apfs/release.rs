@@ -5,12 +5,18 @@
 //! frees extents one at a time: measured 2026-10-22 on this host's container (a clone of a 2 GiB
 //! file with a 4 KiB write every 32 KiB, 131,072 extents), one unlink ran 7.6 s to 29 s, and a
 //! trashed 300 GiB build image holds millions. So a release cuts the file from its end, at most
-//! [`STEP_EXTENTS`] extents per `ftruncate(2)`, and unlinks it only once it is empty: every
-//! step is one small free, and the writers of the container get their turn between steps.
+//! [`STEP_EXTENTS`] extents per `ftruncate(2)`, and unlinks it only once it is empty. Other
+//! writers can progress during and between cuts; this does not bound their latency.
 //!
 //! The file's length is the release's journal. A step cuts at the start of a run, so an
 //! interrupted release leaves a shorter file with whole runs before its end; opening it again
 //! walks what is left and plans the rest. Nothing else records progress.
+//!
+//! The extent limit bounds reclamation work, not syscall latency. A fresh clone may copy its
+//! whole shared extent map inside the first cut: measured 34.8 s and 50.1 s for 485,830 runs.
+//! A yield between cuts cannot split that call. A shared-map flag alone cannot justify an
+//! unbounded unlink: the other map owner can disappear after the observation. See
+//! 01a_apfs.md, "Freeing an image", for the measurements and remaining options.
 //!
 //! The plan is a pure function of the run starts ([`ReleasePlan`]); [`Release`] is the shell that
 //! walks the runs, takes the file's lock and makes the cuts.
@@ -59,6 +65,12 @@ use super::extents::for_each_run;
 /// with the step, at about 100 to 300 µs per extent. Probe writers waited 0.2 to 0.8 ms at the
 /// median with nothing freed, up to 16 ms under any free. 1,024 is the largest step whose typical
 /// free stays near a tenth of a second; a smaller one only adds steps.
+///
+/// Measured again 2026-10-23 on a materialized 485,830-run clone: 475 cuts at 44 ms p50,
+/// 113 ms p90 and 217 ms maximum; independent store/Data/attached-image probes waited at most
+/// 62 ms. Two releases at once reached 1.444 s per cut and 0.972 s per probe. These are
+/// observations under that load, not wall-time guarantees. A fresh shared-map clone took
+/// 50.074 s for its first 454-run cut; reducing reclamation work cannot bound map splitting.
 pub const STEP_EXTENTS: StepExtents = StepExtents(NonZeroU64::MIN.saturating_add(1023));
 
 /// How many extents one step frees at most: never zero, so every plan ends.
@@ -98,6 +110,10 @@ impl ReleasePlan {
         }
         planner.plan(length)
     }
+
+    /// The plan for a file whose whole extent map another file still shares: no cut, only the
+    /// unlink, which drops this file's reference and frees nothing the other file holds. A cut
+    /// would first copy the whole map in one call (the module documentation).
 
     /// The next length to cut the file to, if any cut is left.
     pub fn next(&self) -> Option<u64> {

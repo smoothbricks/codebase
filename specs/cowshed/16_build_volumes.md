@@ -986,12 +986,23 @@ delta incrementally, as an edit would.
   image from its end with `ftruncate(2)`, at most 1,024 physical runs (`F_LOG2PHYS_EXT`) per cut, and unlinks it once it
   is empty. The 1,024 is measured: over a 131,072-extent clone on the store's container a cut of 1,024 extents took 0.1
   s to 0.3 s at the median, and from there a cut's length grows with its extents; the table is `STEP_EXTENTS` in
-  `storage/apfs/release.rs`. The image's length is the release's journal: a cut ends on a run boundary, so an
-  interrupted release leaves a shorter image that the next pass walks and finishes, and nothing else records progress. A
-  release holds the image's `flock` for its whole run. It runs at normal disk priority: a thread throttled to background
-  priority (`IOPOL_THROTTLE`) holds the container's work while its own metadata reads wait, so measured the same day it
-  freed the same clone in 53 s instead of 7.6 s and the writers beside it waited 10.6 ms at the median instead of 0.2
-  ms; the installed daemon's throttled `unlink` made 1,213 throttled 4 KiB metadata reads at a 20 ms median in 21 s.
+  `storage/apfs/release.rs`. The bound is on runs reclaimed, not time inside a kernel call. On 2026-10-23 a materialized
+  485,830-run clone made 475 cuts at 44.125 ms median / 217.100 ms maximum; independent probes on the store/Data volumes
+  and inside an attached image reached 61.668 ms. Two concurrent releases reached 1.444 s per cut and 0.972 s per probe.
+  A separate 300 GiB sparse-file experiment (524,289 runs, 8 GiB allocated) measured 16.027 ms median / 1.141 s maximum
+  with no pause and 10.051 / 97.748 ms with a 1 ms inter-step sleep; these sequential observations do not prove a
+  yield-caused improvement or a latency ceiling. Crucially, a fresh clone's first cut of just **one run** took 5.086 s
+  (9.733 s in another per-step-only run); the earlier seed clone's first 454-run cut took 50.074 s. This is whole-map
+  first-mutation work inside one syscall, which a step limit or yield cannot split. An observed shared-map flag does not
+  retain its other owner, so no flag-based shortcut bypasses the cuts. See 01a_apfs.md, "Freeing an image", for probe
+  windows, last-close timing, remaining options and limitations. Raw receipts and timings: the external
+  `release-stall-bound/` evidence directory. The image's length is the release's journal: a cut ends on a run boundary,
+  so an interrupted release leaves a shorter image that the next pass walks and finishes, and nothing else records
+  progress. A release holds the image's `flock` for its whole run. It runs at normal disk priority: a thread throttled
+  to background priority (`IOPOL_THROTTLE`) holds the container's work while its own metadata reads wait, so measured
+  the same day it freed the same clone in 53 s instead of 7.6 s and the writers beside it waited 10.6 ms at the median
+  instead of 0.2 ms; the installed daemon's throttled `unlink` made 1,213 throttled 4 KiB metadata reads at a 20 ms
+  median in 21 s.
 - Historical `build/.trash/<id>.dmg` entries, renamed there by the releases of earlier builds, are committed releases
   too: the daemon's start and `cowshed gc` finish them the same way, and gc refuses when one cannot be freed. No release
   of this build moves an image there. Only `<id>.dmg` files qualify; anything else is named and left. Workspace images
