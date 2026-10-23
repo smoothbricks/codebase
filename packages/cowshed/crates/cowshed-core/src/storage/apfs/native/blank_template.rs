@@ -29,7 +29,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 &self.backend,
                 &self.config.store_root,
                 capacity,
-                &crate::held_lock::IMAGE_LOCK_TAKER,
+                &crate::held_lock::ImageLockTaker {
+                    holding: &crate::api::held_lock::LockHolding::store(
+                        crate::api::held_lock::LockOperation::MintTemplate,
+                    ),
+                },
             )?;
             timed_apfs_step(leg, "clonefile", || {
                 self.backend

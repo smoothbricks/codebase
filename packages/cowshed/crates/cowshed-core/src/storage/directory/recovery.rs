@@ -227,7 +227,12 @@ impl DirectoryExecutionHost {
                 &self.config.store_root,
                 &[lock],
                 LockMode::Try,
-                &crate::held_lock::IMAGE_LOCK_TAKER,
+                &crate::held_lock::ImageLockTaker {
+                    holding: &crate::api::held_lock::LockHolding {
+                        operation: crate::api::held_lock::LockOperation::Recover,
+                        workspace: crate::storage::image_workspace(canonical),
+                    },
+                },
             )
             .map_err(Into::into)
             .map(|guard| guard.map(Some))
@@ -243,7 +248,11 @@ impl DirectoryExecutionHost {
             &self.config.store_root,
             &[lock.to_owned()],
             LockMode::Try,
-            &crate::held_lock::IMAGE_LOCK_TAKER,
+            &crate::held_lock::ImageLockTaker {
+                holding: &crate::api::held_lock::LockHolding::store(
+                    crate::api::held_lock::LockOperation::Gc,
+                ),
+            },
         )
         .map_err(Into::into)
         .map(|guard| guard.is_some())
@@ -1481,7 +1490,11 @@ impl DirectoryExecutionHost {
             &self.config.store_root,
             plan.lock_paths(),
             LockMode::Try,
-            &crate::held_lock::IMAGE_LOCK_TAKER,
+            &crate::held_lock::ImageLockTaker {
+                holding: &crate::api::held_lock::LockHolding::store(
+                    crate::api::held_lock::LockOperation::Gc,
+                ),
+            },
         )?
         .ok_or(ApfsStorageError::GcPlanStale)?;
         let current = self.preview_gc_project(

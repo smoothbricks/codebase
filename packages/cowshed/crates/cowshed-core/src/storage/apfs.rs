@@ -10,6 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 
+use crate::api::held_lock::{LockHolding, LockOperation};
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use crate::repository::{OwnedRepoIds, RepoId};
 use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
@@ -453,10 +454,13 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     /// refused with [`ApfsStorageError::Unsupported`].
     const HAS_PHYSICAL_VOLUMES: bool = true;
     type LockGuard: Send + 'static;
+    /// Take the lifecycle locks at `images`, each recorded as held by this process for
+    /// `holding`, the request the caller names (02_workspaces.md "Held locks").
     fn lock_images(
         &self,
         images: &[PathBuf],
         mode: LockMode,
+        holding: &LockHolding,
     ) -> Result<Option<Self::LockGuard>, ApfsStorageError>;
     type Attachment: Send + 'static;
 
@@ -939,6 +943,7 @@ impl From<cowshed_apfs::store_lock::StoreLockError> for ApfsStorageError {
             StoreLockError::SymlinkComponent(path) => {
                 Self::Layout(StorageLayoutError::SymlinkComponent(path))
             }
+            replaced @ StoreLockError::Replaced { .. } => Self::Host(replaced.to_string()),
             StoreLockError::Io {
                 operation,
                 path,
@@ -1025,13 +1030,15 @@ fn lock_images_in<H: ApfsExecutionHost>(
     host: &H,
     locks: &[PathBuf],
     mode: LockMode,
+    holding: &LockHolding,
 ) -> Result<H::LockGuard, ApfsStorageError> {
-    host.lock_images(locks, mode)?.ok_or_else(|| match mode {
-        LockMode::Try => ApfsStorageError::image_locks_held(locks),
-        LockMode::Wait => {
-            ApfsStorageError::InvalidPlan("blocking image lock unexpectedly unavailable")
-        }
-    })
+    host.lock_images(locks, mode, holding)?
+        .ok_or_else(|| match mode {
+            LockMode::Try => ApfsStorageError::image_locks_held(locks),
+            LockMode::Wait => {
+                ApfsStorageError::InvalidPlan("blocking image lock unexpectedly unavailable")
+            }
+        })
 }
 
 /// [`ApfsStorageError::BuildVolumeHeld`]'s holders of the hold file.
@@ -1199,10 +1206,13 @@ where
         &self,
         _unleased: super::recovery::Unleased<'_>,
         locks: Box<[PathBuf]>,
+        holding: LockHolding,
     ) -> Result<(), ApfsStorageError> {
         let host = Arc::clone(&self.host);
         self.lane
-            .dispatch(move || lock_images_in(host.as_ref(), &locks, LockMode::Wait).map(drop))
+            .dispatch(move || {
+                lock_images_in(host.as_ref(), &locks, LockMode::Wait, &holding).map(drop)
+            })
             .await
     }
     pub fn host(&self) -> &H {
@@ -1244,7 +1254,8 @@ where
         let workspace = workspace.clone();
         let source_checkout = self.config.checkout_path.clone();
         let pre_cowshed_checkout = pre_cowshed_checkout.to_owned();
-        self.dispatch_with_locks(lock_paths, true, move |host, _| {
+        let holding = LockHolding::of(LockOperation::RestoreCheckout, workspace.name());
+        self.dispatch_with_locks(lock_paths, holding, true, move |host, _| {
             host.restore_adopted_checkout(&workspace, &source_checkout, &pre_cowshed_checkout)
         })
         .await
@@ -1271,7 +1282,8 @@ where
         )?];
         let workspace = workspace.clone();
         let handoff = handoff.clone();
-        self.dispatch_with_locks(lock_paths, true, move |host, config| {
+        let holding = LockHolding::of(LockOperation::FinishAdoption, workspace.name());
+        self.dispatch_with_locks(lock_paths, holding, true, move |host, config| {
             finish_adoption(host.as_ref(), &config, &workspace, &handoff)
         })
         .await
@@ -1296,7 +1308,8 @@ where
             workspace.repo(),
             workspace.name(),
         )?];
-        self.dispatch_with_locks(lock_paths, true, move |host, config| {
+        let holding = LockHolding::of(LockOperation::RepairUnpublished, workspace.name());
+        self.dispatch_with_locks(lock_paths, holding, true, move |host, config| {
             let image = canonical_image_path(&config, &workspace)?;
             host.validate_pending_clone(&image, &metadata)?;
             let mount = mount_point(&config, &workspace)?;
@@ -1317,7 +1330,8 @@ where
         let lock_paths = vec![workspace_lock_path(&self.config, repo, &main_name())?];
         let repo = repo.clone();
         let incarnation = incarnation.clone();
-        self.dispatch_with_locks(lock_paths, true, move |host, config| {
+        let holding = LockHolding::of(LockOperation::DiscardAdoption, &main_name());
+        self.dispatch_with_locks(lock_paths, holding, true, move |host, config| {
             match host.pending_adoption(&config, &repo)? {
                 Some(pending) if pending.incarnation == incarnation => {
                     host.discard_pending(&pending.image)
@@ -1657,13 +1671,14 @@ where
         let workspace = native::metadata_workspace_ref(&metadata)?;
         let image = canonical_image_path(&self.config, &workspace)?;
         let lock_path = workspace_lock_path(&self.config, workspace.repo(), workspace.name())?;
+        let holding = LockHolding::of(LockOperation::RetireUnpublished, workspace.name());
         let host = Arc::clone(&self.host);
         let config = Arc::clone(&self.config);
         let mode = self.image_lock_mode;
         let (lock, prepared) = self
             .lane
             .dispatch(move || {
-                let lock = lock_images_in(host.as_ref(), &[lock_path], mode)?;
+                let lock = lock_images_in(host.as_ref(), &[lock_path], mode, &holding)?;
                 host.validate_pending_clone(&image, &metadata)?;
                 let prepared = mount_clone_stage(
                     host.as_ref(),
@@ -1910,7 +1925,8 @@ where
             },
             RetirementDisposition::Release => {
                 let locks = operation_lock_paths(&self.config, plan.expected(), plan.operation())?;
-                self.dispatch_with_locks(locks, true, move |host, config| {
+                let holding = operation_holding(plan.operation());
+                self.dispatch_with_locks(locks, holding, true, move |host, config| {
                     revalidate(plan.expected(), &host.observe(plan.expected())?)?;
                     let Operation::Retire { workspace, .. } = plan.operation() else {
                         return Err(ApfsStorageError::UnexpectedResult);
@@ -1959,8 +1975,9 @@ where
             workspace.repo(),
             workspace.name(),
         )?];
+        let holding = LockHolding::of(LockOperation::RetireMain, workspace.name());
         let retired = self
-            .dispatch_with_locks(lock_paths, true, move |host, config| {
+            .dispatch_with_locks(lock_paths, holding, true, move |host, config| {
                 let volume = volume_key(workspace.repo(), workspace.name());
                 if host
                     .mounts(workspace.repo())?
@@ -2010,13 +2027,14 @@ where
         workspace: &LifecycleWorkspace,
     ) -> Result<PathBuf, ApfsStorageError> {
         let lock = workspace_lock_path(&self.config, workspace.repo(), workspace.name())?;
+        let holding = LockHolding::of(LockOperation::Mount, workspace.name());
         let workspace = workspace.clone();
         let host = Arc::clone(&self.host);
         let config = Arc::clone(&self.config);
         self.lane
             .dispatch(move || {
                 let locks = std::slice::from_ref(&lock);
-                let _guard = match host.lock_images(locks, LockMode::Try)? {
+                let _guard = match host.lock_images(locks, LockMode::Try, &holding)? {
                     Some(guard) => guard,
                     None => {
                         let mount_point = mount_point(&config, &workspace)?;
@@ -2036,7 +2054,7 @@ where
                             workspace.name(),
                             lock.display()
                         );
-                        host.lock_images(locks, LockMode::Wait)?.ok_or(
+                        host.lock_images(locks, LockMode::Wait, &holding)?.ok_or(
                             ApfsStorageError::InvalidPlan(
                                 "blocking image lock unexpectedly unavailable",
                             ),
@@ -2074,6 +2092,7 @@ where
     async fn dispatch_with_locks<T, F>(
         &self,
         lock_paths: Vec<PathBuf>,
+        holding: LockHolding,
         recover: bool,
         job: F,
     ) -> Result<T, ApfsStorageError>
@@ -2086,7 +2105,7 @@ where
         let mode = self.image_lock_mode;
         self.lane
             .dispatch(move || {
-                let _guard = lock_images_in(host.as_ref(), &lock_paths, mode)?;
+                let _guard = lock_images_in(host.as_ref(), &lock_paths, mode, &holding)?;
                 if recover {
                     host.recover_pending(&config, &lock_paths)?;
                 }
@@ -2101,13 +2120,14 @@ where
     pub(crate) async fn dispatch_with_image_lock<T, F>(
         &self,
         lock_path: PathBuf,
+        holding: LockHolding,
         job: F,
     ) -> Result<T, ApfsStorageError>
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        self.dispatch_with_locks(vec![lock_path], false, move |_, _| Ok(job()))
+        self.dispatch_with_locks(vec![lock_path], holding, false, move |_, _| Ok(job()))
             .await
     }
 
@@ -2119,14 +2139,17 @@ where
     pub(crate) async fn dispatch_on_host_with_image_lock<T, F>(
         &self,
         lock_path: PathBuf,
+        holding: LockHolding,
         job: F,
     ) -> Result<T, ApfsStorageError>
     where
         T: Send + 'static,
         F: FnOnce(&H) -> Result<T, ApfsStorageError> + Send + 'static,
     {
-        self.dispatch_with_locks(vec![lock_path], false, move |host, _| job(host.as_ref()))
-            .await
+        self.dispatch_with_locks(vec![lock_path], holding, false, move |host, _| {
+            job(host.as_ref())
+        })
+        .await
     }
 }
 
@@ -2200,7 +2223,8 @@ where
             retired.workspace().repo(),
             retired.workspace().name(),
         )?];
-        self.dispatch_with_locks(lock_paths, true, move |host, config| {
+        let holding = LockHolding::of(LockOperation::Reclaim, retired.workspace().name());
+        self.dispatch_with_locks(lock_paths, holding, true, move |host, config| {
             host.reclaim_retired(&config, &retired)
         })
         .await
@@ -2238,7 +2262,8 @@ where
             workspace.name(),
         )?];
         let workspace = workspace.clone();
-        self.dispatch_with_locks(lock_paths, true, move |host, config| {
+        let holding = LockHolding::of(LockOperation::Mount, workspace.name());
+        self.dispatch_with_locks(lock_paths, holding, true, move |host, config| {
             settle_mount(host.as_ref(), &config, &workspace, intent)
         })
         .await
@@ -2253,7 +2278,8 @@ where
         let workspace = workspace.clone();
         // The volume is the user's to be working in: an explicit unmount that cannot land is a
         // busy conflict for the caller to report, never grounds to force it out from under them.
-        self.dispatch_with_locks(lock_paths, true, move |host, _| {
+        let holding = LockHolding::of(LockOperation::Unmount, workspace.name());
+        self.dispatch_with_locks(lock_paths, holding, true, move |host, _| {
             host.detach_mounted(&workspace, DetachIntent::WhenIdle)?;
             host.detach_owned_build_volumes(&workspace)
         })
@@ -2271,7 +2297,8 @@ where
             workspace.name(),
         )?];
         let workspace = workspace.clone();
-        self.dispatch_with_locks(lock_paths, true, move |host, config| {
+        let holding = LockHolding::of(LockOperation::Resize, workspace.name());
+        self.dispatch_with_locks(lock_paths, holding, true, move |host, config| {
             let image = canonical_image_path(&config, &workspace)?;
             let mount_point = mount_point(&config, &workspace)?;
             host.resize(&workspace, &image, &mount_point, capacity)
@@ -2289,7 +2316,8 @@ where
             workspace.name(),
         )?];
         let workspace = workspace.clone();
-        self.dispatch_with_locks(lock_paths, true, move |host, config| {
+        let holding = LockHolding::of(LockOperation::Defragment, workspace.name());
+        self.dispatch_with_locks(lock_paths, holding, true, move |host, config| {
             let image = canonical_image_path(&config, &workspace)?;
             let mount_point = mount_point(&config, &workspace)?;
             host.defragment(&workspace, &image, &mount_point)
@@ -2397,11 +2425,12 @@ where
 
     async fn acquire(&self, operation: &Operation) -> Result<Self::Guard, Self::Error> {
         let paths = operation_lock_paths(&self.config, &self.expected, operation)?;
+        let holding = operation_holding(operation);
         let host = Arc::clone(&self.host);
         let mode = self.image_lock_mode;
         self.lane
             .dispatch(move || {
-                let lock = lock_images_in(host.as_ref(), &paths, mode)?;
+                let lock = lock_images_in(host.as_ref(), &paths, mode, &holding)?;
                 Ok(CheckedGuard { _lock: lock, paths })
             })
             .await
@@ -2531,6 +2560,23 @@ pub(super) fn workspace_lock_path(
         Ok(storage.main_image()?.lock().to_owned())
     } else {
         Ok(storage.session_image(workspace)?.lock().to_owned())
+    }
+}
+
+/// The request a lifecycle operation holds its image locks for: its verb, and the workspace it
+/// makes or changes (a fork's new workspace, though it holds its source's lock too).
+fn operation_holding(operation: &Operation) -> LockHolding {
+    match operation {
+        Operation::Adopt { .. } => LockHolding::of(LockOperation::Adopt, &main_name()),
+        Operation::Create { destination, .. } => {
+            LockHolding::of(LockOperation::Create, destination)
+        }
+        Operation::Fork { destination, .. } => LockHolding::of(LockOperation::Fork, destination),
+        Operation::Checkpoint { workspace, .. } => {
+            LockHolding::of(LockOperation::Checkpoint, workspace)
+        }
+        Operation::Restore { workspace, .. } => LockHolding::of(LockOperation::Restore, workspace),
+        Operation::Retire { workspace } => LockHolding::of(LockOperation::Retire, workspace),
     }
 }
 
@@ -4248,14 +4294,18 @@ mod tests {
         let first_counter = counter.clone();
         let first = tokio::spawn(async move {
             first_substrate
-                .dispatch_with_image_lock(first_lock, move || {
-                    let observed = std::fs::read_to_string(&first_counter)?
-                        .parse::<u64>()
-                        .expect("numeric revision");
-                    first_entered_tx.send(()).expect("announce first lock");
-                    release_first_rx.recv().expect("release first mutation");
-                    std::fs::write(first_counter, (observed + 1).to_string())
-                })
+                .dispatch_with_image_lock(
+                    first_lock,
+                    LockHolding::of(LockOperation::Grant, &WorkspaceName::new("raven").unwrap()),
+                    move || {
+                        let observed = std::fs::read_to_string(&first_counter)?
+                            .parse::<u64>()
+                            .expect("numeric revision");
+                        first_entered_tx.send(()).expect("announce first lock");
+                        release_first_rx.recv().expect("release first mutation");
+                        std::fs::write(first_counter, (observed + 1).to_string())
+                    },
+                )
                 .await
         });
         tokio::task::yield_now().await;
@@ -4270,13 +4320,17 @@ mod tests {
         let second = tokio::spawn(async move {
             second_attempt_tx.send(()).expect("announce second attempt");
             second_substrate
-                .dispatch_with_image_lock(lock, move || {
-                    second_entered_tx.send(()).expect("announce second lock");
-                    let observed = std::fs::read_to_string(&second_counter)?
-                        .parse::<u64>()
-                        .expect("numeric revision");
-                    std::fs::write(second_counter, (observed + 1).to_string())
-                })
+                .dispatch_with_image_lock(
+                    lock,
+                    LockHolding::of(LockOperation::Grant, &WorkspaceName::new("raven").unwrap()),
+                    move || {
+                        second_entered_tx.send(()).expect("announce second lock");
+                        let observed = std::fs::read_to_string(&second_counter)?
+                            .parse::<u64>()
+                            .expect("numeric revision");
+                        std::fs::write(second_counter, (observed + 1).to_string())
+                    },
+                )
                 .await
         });
         tokio::task::yield_now().await;

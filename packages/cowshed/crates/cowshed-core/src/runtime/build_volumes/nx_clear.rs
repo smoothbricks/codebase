@@ -39,7 +39,14 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 )
             };
             let Some(_locked) = host
-                .lock_images(std::slice::from_ref(&image_lock), LockMode::Try)
+                .lock_images(
+                    std::slice::from_ref(&image_lock),
+                    LockMode::Try,
+                    &crate::api::held_lock::LockHolding::of(
+                        crate::api::held_lock::LockOperation::ClearNxState,
+                        &workspace,
+                    ),
+                )
                 .map_err(storage)?
             else {
                 let holders = nx::holders(&image_lock)

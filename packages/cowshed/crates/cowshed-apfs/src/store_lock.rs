@@ -3,8 +3,9 @@
 //! a lock, and created race-free when several processes ask for a new one at once.
 //!
 //! An image lock is a held lock (02_workspaces.md, "Held locks"): its taker writes its holder
-//! record onto the inode once the kernel grants it and empties it before it lets go, so
-//! `lock-holders` names the process that holds it. A taker that finds a lock held and waits for
+//! record, the process and the request it holds the lock for, onto the inode once the kernel
+//! grants it and the path is proven to still name that inode, and empties it before it lets go,
+//! so `lock-holders` names who holds it and why. A taker that finds a lock held and waits for
 //! it says so as a lifecycle span before it queues, naming the lock and who holds it, and the
 //! span's end says how long it waited.
 
@@ -34,6 +35,13 @@ pub enum StoreLockError {
     Nul(PathBuf),
     /// A component below the store root is a symbolic link.
     SymlinkComponent(PathBuf),
+    /// Once granted, the lock's path no longer names the inode locked: a process removed or
+    /// replaced the lock file, which every holder keeps. `named` is what the path names now.
+    Replaced {
+        path: PathBuf,
+        locked: Inode,
+        named: Option<Inode>,
+    },
     Io {
         operation: &'static str,
         path: PathBuf,
@@ -56,6 +64,23 @@ impl fmt::Display for StoreLockError {
                 "storage path contains symbolic link component {}",
                 path.display()
             ),
+            Self::Replaced {
+                path,
+                locked,
+                named,
+            } => {
+                let named = match named {
+                    Some((dev, ino)) => format!("inode {dev} {ino}"),
+                    None => "no file".to_owned(),
+                };
+                write!(
+                    formatter,
+                    "{} names {named}, not the inode {} {} just locked: a process removed or replaced the lock file, which every holder keeps",
+                    path.display(),
+                    locked.0,
+                    locked.1
+                )
+            }
             Self::Io {
                 operation,
                 path,
@@ -118,33 +143,35 @@ fn should_retry_lock(kind: io::ErrorKind) -> bool {
     matches!(kind, io::ErrorKind::Interrupted)
 }
 
-/// Who takes an image lock: how it records itself on a lock the kernel granted it, empties that
-/// record before it lets go, and names who holds a lock it finds held. The record and the census
-/// are the held lock's (cowshed-core's `held_lock::IMAGE_LOCK_TAKER`), which this crate cannot
-/// name, so every taker passes them in.
-#[derive(Clone, Copy)]
-pub struct Taker {
-    /// Write this process's holder record onto the lock file just granted.
-    pub record: fn(&File) -> io::Result<()>,
-    /// Empty the record of the lock file at the path before its holder lets go of it; one that
-    /// cannot be emptied is said, never swallowed.
-    pub clear: fn(&File, &Path),
-    /// Who holds the lock file at the path, as the kernel shows it, in one line.
-    pub holders: fn(&Path) -> String,
+/// Who takes an image lock, and for what: it writes its holder record (the process and the
+/// request it takes the lock for) onto a lock the kernel granted it, and names who holds a lock it
+/// finds held. The record and the census are the held lock's (cowshed-core's
+/// `held_lock::ImageLockTaker`), which this crate cannot name, so every taker passes them in.
+pub trait Taker {
+    /// Write this taker's holder record onto the lock file just granted.
+    fn record(&self, file: &File) -> io::Result<()>;
+    /// Who holds the lock file at `path`, as the kernel shows it, in one line.
+    fn holders(&self, path: &Path) -> String;
 }
 
-/// The image lifecycle locks one operation holds, each recorded as this process's. Fenced: a
-/// peer's try-lock succeeds as soon as the guard is dropped, whatever this process is spawning
-/// (`fork_lock`). Dropping it empties each record before the lock goes.
+/// The image lifecycle locks one operation holds, each recorded as its taker's. Fenced: a peer's
+/// try-lock succeeds as soon as the guard is dropped, whatever this process is spawning
+/// (`fork_lock`). Dropping it empties each record, in place on its inode, before the lock goes.
 pub struct ImageLockGuard {
-    taker: Taker,
     held: Vec<(PathBuf, cowshed_os::fork_lock::Fenced<File>)>,
 }
 
 impl Drop for ImageLockGuard {
     fn drop(&mut self) {
         for (path, file) in &self.held {
-            (self.taker.clear)(file, path);
+            // One that cannot be emptied is said: its record then names this holder until the
+            // next holder rewrites it, and `lock-holders` proves no owner from a life that ended.
+            if let Err(error) = file.set_len(0) {
+                cowshed_os::eprintln!(
+                    "cowshed: cannot clear the holder record of image lock {}: {error}",
+                    path.display()
+                );
+            }
         }
     }
 }
@@ -167,14 +194,14 @@ fn flock(file: &File, operation: libc::c_int) -> io::Result<()> {
 /// Wait for the lock `file` at `path`, which another holds, inside a lifecycle span: its start
 /// names the lock, a `holders` line names who holds it as the kernel shows it when the wait
 /// begins (one look per wait), and its end says how long it waited.
-fn wait_for(file: &File, path: &Path, taker: &Taker) -> io::Result<()> {
+fn wait_for(file: &File, path: &Path, taker: &dyn Taker) -> io::Result<()> {
     let step = format!("wait {}", path.display());
     cowshed_os::timing::timed("image-lock", format_args!("{step}"), || {
         cowshed_os::timing::attribute(
             "image-lock",
             format_args!("{step}"),
             "holders",
-            (taker.holders)(path),
+            taker.holders(path),
         );
         flock(file, WAIT_LOCK_OPERATION)
     })
@@ -227,7 +254,100 @@ fn open_or_create_lock_at(
         })
 }
 
+/// The lock file at `path` below `root`, created with its directories if it does not exist yet.
 fn open_lock_file(root: &Path, path: &Path) -> Result<File, StoreLockError> {
+    match walk_to_parent(root, path, Directories::Create)? {
+        Some((directory, name)) => open_or_create_lock_at(&directory, &name, path),
+        None => Err(StoreLockError::InvalidPath(
+            "a lock directory vanished while it was created",
+        )),
+    }
+}
+
+/// A file's device and inode as the kernel's `stat` gives them.
+pub type Inode = (libc::dev_t, libc::ino_t);
+
+/// The device and inode of the open `file`.
+fn inode_of(file: &File, path: &Path) -> Result<Inode, StoreLockError> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `file` owns a live fd for the call, which fills `stat` on success.
+    if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(io_error(
+            "inspect lifecycle lock",
+            path,
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstat` succeeded, so `stat` is initialized.
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_dev, stat.st_ino))
+}
+
+/// Whether a walk to a lock's directory creates the directories it misses.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Directories {
+    Create,
+    Existing,
+}
+
+/// The inode (device, inode) the lock path names now, walked from `root` with no symlink
+/// followed and nothing created: `None` when no file is there.
+fn named_inode(root: &Path, path: &Path) -> Result<Option<Inode>, StoreLockError> {
+    let Some((directory, name)) = walk_to_parent(root, path, Directories::Existing)? else {
+        return Ok(None);
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `directory` owns a live directory fd and `name` is a `CString`, both outliving
+    // the call, which fills `stat` on success. `AT_SYMLINK_NOFOLLOW` names a symbolic link
+    // itself, never its target.
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        // SAFETY: `fstatat` succeeded, so `stat` is initialized.
+        let stat = unsafe { stat.assume_init() };
+        return Ok(Some((stat.st_dev, stat.st_ino)));
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        return Ok(None);
+    }
+    Err(io_error(
+        "inspect lifecycle lock without following symlinks",
+        path,
+        error,
+    ))
+}
+
+/// Refuse a lock just granted on `file` unless `path` still names its inode: a waiter queued
+/// on a file that was then removed or replaced holds a lock on a file no path names.
+fn require_named(root: &Path, path: &Path, file: &File) -> Result<(), StoreLockError> {
+    let locked = inode_of(file, path)?;
+    let named = named_inode(root, path)?;
+    if named == Some(locked) {
+        Ok(())
+    } else {
+        Err(StoreLockError::Replaced {
+            path: path.to_owned(),
+            locked,
+            named,
+        })
+    }
+}
+
+/// The directory that holds the lock at `path` below `root`, and the lock's own name, walked
+/// component by component with no symlink followed. `Directories::Existing` answers `None` for
+/// a directory that does not exist; `Directories::Create` creates it.
+fn walk_to_parent(
+    root: &Path,
+    path: &Path,
+    directories: Directories,
+) -> Result<Option<(File, CString)>, StoreLockError> {
     let relative = path
         .strip_prefix(root)
         .map_err(|_| StoreLockError::EscapesStoreRoot)?;
@@ -257,13 +377,20 @@ fn open_lock_file(root: &Path, path: &Path) -> Result<File, StoreLockError> {
         };
         let name = path_component(name, path)?;
         if components.peek().is_none() {
-            return open_or_create_lock_at(&directory, &name, path);
+            return Ok(Some((directory, name)));
         }
         // SAFETY: `directory` owns a live directory fd; `name` is a `CString` that
         // outlives the call. `DIRECTORY_OPEN_FLAGS` includes `O_NOFOLLOW | O_DIRECTORY`.
         let mut fd =
             unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), DIRECTORY_OPEN_FLAGS) };
-        if should_create_directory(fd, io::Error::last_os_error().kind()) {
+        let missing = io::Error::last_os_error().kind();
+        if directories == Directories::Existing
+            && fd_failed(fd)
+            && missing == io::ErrorKind::NotFound
+        {
+            return Ok(None);
+        }
+        if directories == Directories::Create && should_create_directory(fd, missing) {
             // SAFETY: `directory` owns a live directory fd; `name` is a `CString`
             // that outlives the call. Mode `0o700` is the controller-directory policy.
             let created = unsafe {
@@ -302,20 +429,21 @@ fn open_lock_file(root: &Path, path: &Path) -> Result<File, StoreLockError> {
     ))
 }
 
-/// Take the lifecycle locks at `paths` in path order, each recorded as `taker`'s once granted.
-/// A lock another holds answers busy under [`LockMode::Try`] (releasing, and emptying the record
-/// of, every lock already taken) and is waited for under [`LockMode::Wait`], said as a span.
+/// Take the lifecycle locks at `paths` in path order, each recorded as `taker`'s once granted
+/// and its path proven to still name the inode locked. A lock another holds answers busy under
+/// [`LockMode::Try`] (releasing, and emptying the record of, every lock already taken) and is
+/// waited for under [`LockMode::Wait`], said as a span. A lock whose path names another inode
+/// once granted is refused ([`StoreLockError::Replaced`]) and released unrecorded.
 pub fn acquire_image_locks(
     root: &Path,
     paths: &[PathBuf],
     mode: LockMode,
-    taker: &Taker,
+    taker: &dyn Taker,
 ) -> Result<Option<ImageLockGuard>, StoreLockError> {
     let mut paths = paths.to_vec();
     paths.sort();
     paths.dedup();
     let mut guard = ImageLockGuard {
-        taker: *taker,
         held: Vec::with_capacity(paths.len()),
     };
     for path in paths {
@@ -329,9 +457,11 @@ pub fn acquire_image_locks(
             },
             Err(error) => return Err(io_error("acquire lifecycle lock", &path, error)),
         }
+        require_named(root, &path, &file)?;
         // The guard owns the lock before a failed record is returned, so dropping it empties
         // whatever part of the record was written.
-        let failed = (taker.record)(&file)
+        let failed = taker
+            .record(&file)
             .err()
             .map(|error| io_error("record the holder of lifecycle lock", &path, error));
         guard.held.push((path, file));

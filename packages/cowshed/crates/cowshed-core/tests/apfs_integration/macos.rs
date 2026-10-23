@@ -752,7 +752,11 @@ fn real_apfs_adopt_resumes_a_fenced_image_killed_between_clone_and_attach() {
         backend,
         &world.store,
         CAPACITY,
-        &cowshed_core::held_lock::IMAGE_LOCK_TAKER,
+        &cowshed_core::held_lock::ImageLockTaker {
+            holding: &cowshed_core::api::held_lock::LockHolding::store(
+                cowshed_core::api::held_lock::LockOperation::MintTemplate,
+            ),
+        },
     )
     .expect("the seeded template");
     backend

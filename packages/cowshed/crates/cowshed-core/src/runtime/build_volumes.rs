@@ -21,6 +21,7 @@ use crate::api::dto::{
     AdoptionSkip, CarrySide, DatabaseHolder, GcCandidate, GcDeferred, GcReason, GitOid, LandSeed,
     NxCarry, RebaseBuildVolume, RebaseCarrySkip, Sha256Digest,
 };
+use crate::api::held_lock::{LockHolding, LockOperation};
 use crate::build_volume::migrate::{MintedBeside, MintedVolume};
 use crate::build_volume::{
     BuildStateRefresh, BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord,
@@ -151,6 +152,7 @@ pub(crate) struct Contended<H: RuntimeStorageHost = Host> {
     volumes: BuildVolumes<H>,
     target: Owner,
     lock: PathBuf,
+    holding: LockHolding,
 }
 
 impl<H: RuntimeStorageHost> Contended<H> {
@@ -160,10 +162,11 @@ impl<H: RuntimeStorageHost> Contended<H> {
             volumes,
             target,
             lock,
+            holding,
         } = self;
         let guard = volumes
             .blocking(move |host, _| {
-                host.lock_images(&[lock], LockMode::Wait)
+                host.lock_images(&[lock], LockMode::Wait, &holding)
                     .map_err(storage)?
                     .ok_or_else(|| {
                         CowshedError::internal("a blocking image lock answered that it was held")
@@ -752,15 +755,20 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
 
     /// `target`'s image lock at `lock`, for its land's steps that delete what a fork or reseed
     /// of `target` reads ([`TargetLock`]); [`Contended`] when another operation on `target` holds
-    /// it now, for the caller to say so before it waits.
+    /// it now, for the caller to say so before it waits. `holding` is the request it is held for.
     pub async fn try_lock_target(
         &self,
         target: Owner,
         lock: PathBuf,
+        holding: LockHolding,
     ) -> Result<std::result::Result<TargetLock<H>, Contended<H>>> {
         let path = lock.clone();
+        let asked = holding.clone();
         let guard = self
-            .blocking(move |host, _| host.lock_images(&[path], LockMode::Try).map_err(storage))
+            .blocking(move |host, _| {
+                host.lock_images(&[path], LockMode::Try, &asked)
+                    .map_err(storage)
+            })
             .await?;
         Ok(match guard {
             Some(guard) => Ok(TargetLock {
@@ -771,6 +779,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 volumes: self.clone(),
                 target,
                 lock,
+                holding,
             }),
         })
     }
@@ -1012,7 +1021,12 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         // Where the new workspace's live volume is placed: the tree its checkout starts at.
         let placed = aim.tree.clone();
         let refreshed = self
-            .refresh_seed(source.clone(), source_checkout, aim)
+            .refresh_seed(
+                source.clone(),
+                source_checkout,
+                aim,
+                LockHolding::of(LockOperation::Fork, &destination),
+            )
             .await?;
         say_refresh(&source.name, &destination, &refreshed);
         self.blocking(move |host, layout| {
@@ -1360,12 +1374,14 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// a live workspace that has it checked out ([`seed_from_landed`]); otherwise, or
     /// when none is captured, reseed from the live volume when that is nearer the tree, or as near
     /// and written since, and has no writer. The caller holds `target`'s image lock, which every
-    /// fork of `target` holds while it clones the seed.
+    /// fork of `target` holds while it clones the seed. A landed peer's image lock is taken for
+    /// `holding`, the request the refresh serves.
     pub async fn refresh_seed(
         &self,
         target: Owner,
         checkout: PathBuf,
         aim: Aim,
+        holding: LockHolding,
     ) -> Result<Refreshed> {
         let this = self.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
@@ -1382,8 +1398,14 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             // less. That is the reseed's case, whatever the session's tree.
             if target.name.is_main()
                 && age.moved_from().is_some()
-                && let Some(landed) =
-                    seed_from_landed(&*this.host, &this.layout, &target, &aim, &mut passed)?
+                && let Some(landed) = seed_from_landed(
+                    &*this.host,
+                    &this.layout,
+                    &target,
+                    &aim,
+                    &holding,
+                    &mut passed,
+                )?
             {
                 return Ok(Refreshed {
                     passed,
@@ -2774,12 +2796,13 @@ fn head_tree(checkout: &Path) -> std::result::Result<GitOid, String> {
 /// `target`'s seed the build volume of a live workspace in `aim` that has `aim`'s tree checked
 /// out, warmest first, each under its own image lock taken without waiting and its tree read
 /// again under it. `None` when none was captured; every candidate passed over is in `passed`.
-/// The caller holds `target`'s image lock.
+/// The caller holds `target`'s image lock; each candidate's is taken for `holding`.
 fn seed_from_landed(
     host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     target: &Owner,
     aim: &Aim,
+    holding: &LockHolding,
     passed: &mut Vec<(WorkspaceName, LandedSkip)>,
 ) -> Result<Option<Refresh>> {
     // The unlocked read only selects; the read under the candidate's lock decides.
@@ -2803,7 +2826,7 @@ fn seed_from_landed(
     candidates.sort_by_key(|(written, _)| *written);
     for (_, peer) in candidates {
         let Some(_held) = host
-            .lock_images(std::slice::from_ref(&peer.lock), LockMode::Try)
+            .lock_images(std::slice::from_ref(&peer.lock), LockMode::Try, holding)
             .map_err(storage)?
         else {
             passed.push((peer.name.clone(), LandedSkip::Locked));
@@ -4399,7 +4422,11 @@ mod tests {
         async fn lock(&self, target: &Owner) -> TargetLock<H> {
             match self
                 .volumes
-                .try_lock_target(target.clone(), self.image_lock(&target.name))
+                .try_lock_target(
+                    target.clone(),
+                    self.image_lock(&target.name),
+                    LockHolding::of(LockOperation::Land, &target.name),
+                )
                 .await
                 .unwrap()
             {
@@ -4864,7 +4891,11 @@ mod tests {
             .unwrap();
         let locked = scratch
             .host
-            .lock_images(&[from.image.lock().to_owned()], LockMode::Try)
+            .lock_images(
+                &[from.image.lock().to_owned()],
+                LockMode::Try,
+                &LockHolding::of(LockOperation::Fork, &from.owner.name),
+            )
             .unwrap()
             .unwrap();
         let error = scratch.volumes.execute_reseed(plan).await.unwrap_err();
@@ -6440,7 +6471,11 @@ fn main() {
         // A landed workspace whose own operation holds its image lock is passed over, named.
         let held = scratch
             .host
-            .lock_images(std::slice::from_ref(&lander.lock), LockMode::Try)
+            .lock_images(
+                std::slice::from_ref(&lander.lock),
+                LockMode::Try,
+                &LockHolding::of(LockOperation::Land, &lander.name),
+            )
             .unwrap()
             .expect("nothing else holds lander's image lock");
         let refreshed = scratch
@@ -6449,6 +6484,7 @@ fn main() {
                 main.clone(),
                 main_checkout.clone(),
                 aim(vec![lander.clone()]),
+                LockHolding::of(LockOperation::Fork, &WorkspaceName::new("fresh").unwrap()),
             )
             .await
             .unwrap();
@@ -7588,13 +7624,22 @@ fn main() {
         // The new: main's image lock, as its create takes it, then main's seed and link.
         let new_holds = scratch
             .host
-            .lock_images(&[scratch.image_lock(&main.name)], LockMode::Wait)
+            .lock_images(
+                &[scratch.image_lock(&main.name)],
+                LockMode::Wait,
+                &LockHolding::of(LockOperation::Create, &WorkspaceName::new("fresh").unwrap()),
+            )
             .unwrap()
             .expect("a blocking lock");
         assert_eq!(
             scratch
                 .volumes
-                .refresh_seed(main.clone(), main_checkout.clone(), unlanded_aim())
+                .refresh_seed(
+                    main.clone(),
+                    main_checkout.clone(),
+                    unlanded_aim(),
+                    LockHolding::of(LockOperation::Create, &WorkspaceName::new("fresh").unwrap()),
+                )
                 .await
                 .unwrap()
                 .outcome,
@@ -7610,7 +7655,11 @@ fn main() {
         // The land reaches main's seed and link here, finds main's image lock held, and waits.
         let contended = match scratch
             .volumes
-            .try_lock_target(main.clone(), scratch.image_lock(&main.name))
+            .try_lock_target(
+                main.clone(),
+                scratch.image_lock(&main.name),
+                LockHolding::of(LockOperation::Land, &WorkspaceName::new("lander").unwrap()),
+            )
             .await
             .unwrap()
         {

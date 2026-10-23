@@ -2248,6 +2248,16 @@ export type LockHolder = {
 };
 
 /**
+ * The request an image lock is held for: the operation, and the workspace it acts on (a fork's
+ * new workspace, though it holds its source's lock too); `None` for a step of the whole store or
+ * project.
+ */
+export type LockHolding = {
+  readonly operation: LockOperation;
+  readonly workspace: WorkspaceName | null;
+};
+
+/**
  * The inode a lock is on: the device and inode numbers `stat(2)` gives it.
  */
 export type LockInode = {
@@ -2280,11 +2290,50 @@ export type LockObservation = {
    */
   readonly owner: LockDescriptor | null;
   /**
+   * The request the owner's record says it holds the lock for, when the owner is proven and
+   * its record names one (every image lock's does).
+   */
+  readonly holding: LockHolding | null;
+  /**
    * Every other process with a descriptor on the inode, and what the kernel shows of it. The
    * observing process is not among them.
    */
   readonly descriptors: ReadonlyArray<LockDescriptor>;
 };
+
+/**
+ * The lifecycle step an image lock is taken for (02_workspaces.md "Held locks", "An image lock is
+ * a held lock"), as the call that takes it names it. The process's argv names the process (a
+ * `cowshed fork`, or the controller or gateway serving one); this names the request.
+ */
+export type LockOperation =
+  | 'adopt'
+  | 'finish-adoption'
+  | 'discard-adoption'
+  | 'restore-checkout'
+  | 'retire-main'
+  | 're-adopt'
+  | 'create'
+  | 'fork'
+  | 'checkpoint'
+  | 'restore'
+  | 'retire'
+  | 'retire-unpublished'
+  | 'repair-unpublished'
+  | 'reclaim'
+  | 'mount'
+  | 'unmount'
+  | 'resize'
+  | 'defragment'
+  | 'open'
+  | 'recover'
+  | 'gc'
+  | 'land'
+  | 'reseed'
+  | 'clear-nx-state'
+  | 'repair-ports'
+  | 'grant'
+  | 'mint-template';
 
 /**
  * A lock file's path, exactly as the caller named it: its bytes as tagged bytes, `utf8` when they

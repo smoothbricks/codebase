@@ -42,28 +42,25 @@ use super::{
 /// The 1 GiB test cap (08_testing.md): the template's capacity, and so every clone's.
 pub const CAPACITY: ImageCapacity = ImageCapacity::from_gibibytes(1);
 
-/// The fixture's taker of the template's lock. It records its pid on the lock and empties it
-/// before it lets go, and names a holder it waits for only as the one kind of process that takes
-/// that lock: this crate has no kernel census of a lock's holders, which the production taker
-/// (cowshed-core's `held_lock::IMAGE_LOCK_TAKER`) reads.
-const TEMPLATE_TAKER: cowshed_apfs::store_lock::Taker = cowshed_apfs::store_lock::Taker {
-    record: record_pid,
-    clear: clear_record,
-    holders: template_minter,
-};
+/// The fixture's taker of the template's lock. It records its pid and its one request, minting
+/// the template, on the lock, and names a holder it waits for only as the one kind of process that
+/// takes that lock: this crate has no kernel census of a lock's holders, which the production
+/// taker (cowshed-core's `held_lock::ImageLockTaker`) reads.
+struct TemplateTaker;
 
-fn record_pid(file: &File) -> std::io::Result<()> {
-    file.set_len(0)?;
-    file.write_all_at(format!("{{\"pid\":{}}}", std::process::id()).as_bytes(), 0)
-}
+impl cowshed_apfs::store_lock::Taker for TemplateTaker {
+    fn record(&self, file: &File) -> std::io::Result<()> {
+        file.set_len(0)?;
+        let record = format!(
+            r#"{{"pid":{},"operation":"mint-template","workspace":null}}"#,
+            std::process::id()
+        );
+        file.write_all_at(record.as_bytes(), 0)
+    }
 
-fn clear_record(file: &File, path: &Path) {
-    file.set_len(0)
-        .unwrap_or_else(|error| panic!("empty the template lock {}: {error}", path.display()));
-}
-
-fn template_minter(_: &Path) -> String {
-    "another test process minting the template".to_owned()
+    fn holders(&self, _: &Path) -> String {
+        "another test process minting the template".to_owned()
+    }
 }
 
 /// The user's template, minted by whichever test asks first.
@@ -106,7 +103,7 @@ fn mint_once() -> PathBuf {
         &MacOsApfsBackend::new(SystemCommandRunner),
         &directory,
         CAPACITY,
-        &TEMPLATE_TAKER,
+        &TemplateTaker,
     )
     .unwrap_or_else(|error| panic!("mint the user's blank template: {error}"))
 }

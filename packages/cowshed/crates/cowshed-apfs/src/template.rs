@@ -186,7 +186,7 @@ pub fn blank_template<R: CommandRunner>(
     backend: &MacOsApfsBackend<R>,
     store_root: &Path,
     capacity: ImageCapacity,
-    taker: &Taker,
+    taker: &dyn Taker,
 ) -> Result<PathBuf, TemplateError> {
     let template = blank_template_path(store_root, capacity);
     verify_no_symlinks(store_root, &template)?;

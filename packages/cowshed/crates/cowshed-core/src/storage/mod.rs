@@ -374,12 +374,21 @@ pub fn discover_session_images(
 
 /// Whether `file_name` is an image's lifecycle lock, `<stem>.dmg.lock` ([`ImagePaths::lock`]):
 /// a lock whatever its length, since its taker records itself on it and a taker that ended
-/// without unwinding leaves its record (`held_lock::IMAGE_LOCK_TAKER`).
+/// without unwinding leaves its record (`held_lock::ImageLockTaker`).
 pub fn is_image_lock(file_name: &str) -> bool {
     file_name
         .strip_suffix(".lock")
         .and_then(image_stem)
         .is_some()
+}
+
+/// The workspace a canonical image `<workspace>.dmg` belongs to (`main.dmg` is main's).
+pub fn image_workspace(image: &Path) -> Option<WorkspaceName> {
+    let stem = image
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(image_stem)?;
+    WorkspaceName::new(stem).ok()
 }
 
 /// The non-empty stem of `<stem>.dmg`.

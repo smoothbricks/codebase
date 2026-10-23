@@ -3914,7 +3914,11 @@ fn real_apfs_a_template_mint_releases_every_leftover_staging_attachment() {
         &MacOsApfsBackend::new(SystemCommandRunner),
         &store,
         capacity,
-        &cowshed_core::held_lock::IMAGE_LOCK_TAKER,
+        &cowshed_core::held_lock::ImageLockTaker {
+            holding: &cowshed_core::api::held_lock::LockHolding::store(
+                cowshed_core::api::held_lock::LockOperation::MintTemplate,
+            ),
+        },
     )
     .expect("mint over the leftovers");
 
@@ -4733,7 +4737,11 @@ fn real_apfs_gc_retires_orphaned_staging_mountpoints_and_detaches_the_ones_still
     let host = fixture.host();
     let owner = fixture.host();
     let guard = owner
-        .lock_images(std::slice::from_ref(&owned_lock), LockMode::Wait)
+        .lock_images(
+            std::slice::from_ref(&owned_lock),
+            LockMode::Wait,
+            &other_operation(),
+        )
         .expect("owner lock")
         .expect("blocking owner lock");
 
@@ -6299,7 +6307,7 @@ fn flock_child_helper() {
     );
     let host = native_host_at(Path::new(&root));
     let _guard = host
-        .lock_images(&[lock], LockMode::Wait)
+        .lock_images(&[lock], LockMode::Wait, &other_operation())
         .expect("helper lock")
         .expect("blocking helper lock");
     std::fs::write(&ready, b"ready").expect("signal ready");
@@ -6317,12 +6325,20 @@ fn independent_hosts_and_processes_serialize_and_crash_releases_the_lock() {
     let first = native_host_at(&fixture.root);
     let second = native_host_at(&fixture.root);
     let guard = first
-        .lock_images(std::slice::from_ref(&lock), LockMode::Wait)
+        .lock_images(
+            std::slice::from_ref(&lock),
+            LockMode::Wait,
+            &other_operation(),
+        )
         .expect("first lock")
         .expect("blocking first lock");
     assert!(
         second
-            .lock_images(std::slice::from_ref(&lock), LockMode::Try)
+            .lock_images(
+                std::slice::from_ref(&lock),
+                LockMode::Try,
+                &other_operation()
+            )
             .expect("second try lock")
             .is_none(),
         "independent hosts must contend through the kernel"
@@ -6330,7 +6346,11 @@ fn independent_hosts_and_processes_serialize_and_crash_releases_the_lock() {
     drop(guard);
     drop(
         second
-            .lock_images(std::slice::from_ref(&lock), LockMode::Try)
+            .lock_images(
+                std::slice::from_ref(&lock),
+                LockMode::Try,
+                &other_operation(),
+            )
             .expect("second lock after release")
             .expect("released lock must be available"),
     );
@@ -6355,7 +6375,11 @@ fn independent_hosts_and_processes_serialize_and_crash_releases_the_lock() {
         wait_for_path(&ready);
         assert!(
             first
-                .lock_images(std::slice::from_ref(&lock), LockMode::Try)
+                .lock_images(
+                    std::slice::from_ref(&lock),
+                    LockMode::Try,
+                    &other_operation()
+                )
                 .expect("parent try while child owns")
                 .is_none(),
             "another process must own the lock"
@@ -6365,7 +6389,11 @@ fn independent_hosts_and_processes_serialize_and_crash_releases_the_lock() {
         assert_eq!(status.success(), !crash);
         drop(
             first
-                .lock_images(std::slice::from_ref(&lock), LockMode::Try)
+                .lock_images(
+                    std::slice::from_ref(&lock),
+                    LockMode::Try,
+                    &other_operation(),
+                )
                 .expect("lock after child exit")
                 .expect("process exit must release flock"),
         );
@@ -6387,7 +6415,11 @@ fn gc_skips_staging_owned_by_an_active_lifecycle_lock() {
     let owner = native_host_at(&fixture.root);
     let collector = native_host_at(&fixture.root);
     let guard = owner
-        .lock_images(&[canonical.lock().to_owned()], LockMode::Wait)
+        .lock_images(
+            &[canonical.lock().to_owned()],
+            LockMode::Wait,
+            &other_operation(),
+        )
         .expect("owner lock")
         .expect("blocking owner lock");
 
@@ -6421,8 +6453,12 @@ fn lock_and_command_targets_reject_intermediate_symlink_ancestors_without_effect
     std::os::unix::fs::symlink(&attacker, fixture.root.join("acme")).expect("owner symlink");
 
     assert!(
-        host.lock_images(&[canonical.lock().to_owned()], LockMode::Try)
-            .is_err(),
+        host.lock_images(
+            &[canonical.lock().to_owned()],
+            LockMode::Try,
+            &other_operation()
+        )
+        .is_err(),
         "dirfd traversal must reject a symlinked owner"
     );
     assert!(
@@ -7607,3 +7643,11 @@ mod build_mount_races {
 
 #[path = "workspace_isolation.rs"]
 mod workspace_isolation;
+
+/// The request these tests take an image lock for when they stand in for another lifecycle
+/// operation holding it: a store's gc, which names no one workspace.
+fn other_operation() -> cowshed_core::api::held_lock::LockHolding {
+    cowshed_core::api::held_lock::LockHolding::store(
+        cowshed_core::api::held_lock::LockOperation::Gc,
+    )
+}

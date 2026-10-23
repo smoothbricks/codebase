@@ -218,6 +218,7 @@ impl ApfsExecutionHost for FakeHost {
         &self,
         paths: &[PathBuf],
         _: LockMode,
+        _: &cowshed_core::api::held_lock::LockHolding,
     ) -> Result<Option<Self::LockGuard>, ApfsStorageError> {
         self.record(format!("lock:{}", paths.len()));
         Ok(Some(()))

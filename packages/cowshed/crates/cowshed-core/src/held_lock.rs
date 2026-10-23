@@ -1,6 +1,6 @@
 //! A held lock: an exclusive `flock(2)` on a caller's lock file, and what the kernel says about who
 //! holds it (02_workspaces.md "Held locks"). `cowshed lock`, `land --ref-lock`,
-//! `land-turn --outside-lock` and every lifecycle image lock ([`IMAGE_LOCK_TAKER`]) take it;
+//! `land-turn --outside-lock` and every lifecycle image lock ([`ImageLockTaker`]) take it;
 //! `cowshed lock-holders` observes it.
 //!
 //! The lock is on the inode the path names. No holder unlinks the file: a holder that did would
@@ -37,8 +37,8 @@ use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 use crate::api::held_lock::{
-    DecimalU64, LockCustody as Custody, LockDescriptor as Descriptor, LockInode as Inode,
-    LockObservation as Observation, LockPath, LockRecord,
+    DecimalU64, LockCustody as Custody, LockDescriptor as Descriptor, LockHolding,
+    LockInode as Inode, LockObservation as Observation, LockPath, LockRecord,
 };
 use crate::lease_holder;
 use crate::runtime::job_groups;
@@ -158,19 +158,39 @@ impl Drop for HeldLock {
     }
 }
 
-/// This process as the taker of a lifecycle image lock (`main.dmg.lock`, `<ws>.dmg.lock`;
-/// 02_workspaces.md "Held locks"): it writes the held lock's record onto each lock once the
-/// kernel grants it and empties it before it lets go, so `lock-holders` names the holder, and a
-/// wait for one another holds names who holds it as `lock-holders` judges it ([`holders`]).
-pub const IMAGE_LOCK_TAKER: cowshed_apfs::store_lock::Taker = cowshed_apfs::store_lock::Taker {
-    record: record_this_process,
-    clear: lease_holder::clear,
-    holders,
-};
+/// This process as the taker of lifecycle image locks (`main.dmg.lock`, `<ws>.dmg.lock`, the
+/// store template's; 02_workspaces.md "Held locks") for `holding`, the request the call that
+/// takes them names. It writes the held lock's record with that request beside the process onto
+/// each lock once the kernel grants it (the guard empties it before it lets go), so
+/// `lock-holders` names the holder and why, and a wait for one another holds names who holds it
+/// as `lock-holders` judges it ([`holders`]).
+pub struct ImageLockTaker<'a> {
+    pub holding: &'a LockHolding,
+}
 
-/// Record this process, holding the lock `file` from now, on it.
-fn record_this_process(file: &File) -> io::Result<()> {
-    lease_holder::record(file, &lease_holder::Process::this()?)
+/// An image lock's record: the held lock's process record, and the request beside it.
+#[derive(serde::Serialize)]
+struct ImageLockRecord<'a> {
+    #[serde(flatten)]
+    process: lease_holder::Process,
+    #[serde(flatten)]
+    holding: &'a LockHolding,
+}
+
+impl cowshed_apfs::store_lock::Taker for ImageLockTaker<'_> {
+    fn record(&self, file: &File) -> io::Result<()> {
+        lease_holder::record(
+            file,
+            &ImageLockRecord {
+                process: lease_holder::Process::this()?,
+                holding: self.holding,
+            },
+        )
+    }
+
+    fn holders(&self, path: &Path) -> String {
+        holders(path)
+    }
 }
 
 /// Who holds the lock file at `path`, in one line, as the kernel shows it ([`observe`]); why
@@ -314,6 +334,13 @@ impl std::fmt::Display for Observation {
                 descriptor.command,
                 custody(descriptor.custody)
             )?;
+            let owns = self
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.pid == descriptor.pid);
+            if let (true, Some(holding)) = (owns, &self.holding) {
+                write!(formatter, " for {holding}")?;
+            }
         }
         Ok(())
     }
@@ -453,6 +480,7 @@ pub fn observe(path: &Path) -> io::Result<Observation> {
                 locked: false,
                 record: LockRecord::default(),
                 owner: None,
+                holding: None,
                 descriptors: Vec::new(),
             });
         }
@@ -465,12 +493,17 @@ pub fn observe(path: &Path) -> io::Result<Observation> {
     let own = i32::try_from(std::process::id()).map_err(io::Error::other)?;
     let (locked, seen) = kernel_view(&file, inode)?;
     let (owner, descriptors) = judge(seen, recorded.as_ref(), own);
+    // A request is believed only as far as its owner is proven.
+    let holding = owner
+        .as_ref()
+        .and_then(|_| serde_json::from_slice::<LockHolding>(&record).ok());
     Ok(Observation {
         path: LockPath::new(path.to_owned()),
         inode: Some(inode),
         locked,
         record: LockRecord::new(record),
         owner,
+        holding,
         descriptors,
     })
 }

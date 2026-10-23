@@ -469,7 +469,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             let id = build.id.clone();
             let observed_hold = layout.hold_path(&build.id);
             self.substrate
-                .dispatch_with_image_lock(lock.clone(), move || held_layout.claim_release(&id))
+                .dispatch_with_image_lock(
+                    lock.clone(),
+                    crate::api::held_lock::LockHolding::of(
+                        crate::api::held_lock::LockOperation::ReAdopt,
+                        &WorkspaceName::main(),
+                    ),
+                    move || held_layout.claim_release(&id),
+                )
                 .await
                 .map_err(native_storage_error)?
                 .map_err(|error| {
@@ -540,9 +547,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         {
             let source = source.clone();
             self.substrate
-                .dispatch_on_host_with_image_lock(lock.clone(), move |host| {
-                    host.publish_re_adopt_build(&layout, &source, build_claim.as_ref())
-                })
+                .dispatch_on_host_with_image_lock(
+                    lock.clone(),
+                    crate::api::held_lock::LockHolding::of(
+                        crate::api::held_lock::LockOperation::ReAdopt,
+                        &WorkspaceName::main(),
+                    ),
+                    move |host| host.publish_re_adopt_build(&layout, &source, build_claim.as_ref()),
+                )
                 .await
                 .map_err(native_storage_error)?;
         }
@@ -552,9 +564,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         {
             let retained = std::sync::Arc::clone(&source);
             self.substrate
-                .dispatch_on_host_with_image_lock(lock.clone(), move |host| {
-                    host.mount_re_adopt_sources(&retained)
-                })
+                .dispatch_on_host_with_image_lock(
+                    lock.clone(),
+                    crate::api::held_lock::LockHolding::of(
+                        crate::api::held_lock::LockOperation::ReAdopt,
+                        &WorkspaceName::main(),
+                    ),
+                    move |host| host.mount_re_adopt_sources(&retained),
+                )
                 .await
                 .map_err(native_storage_error)?;
         }
@@ -574,9 +591,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         {
             let source = source.clone();
             self.substrate
-                .dispatch_on_host_with_image_lock(lock, move |host| {
-                    host.release_re_adopt_sources(&source)
-                })
+                .dispatch_on_host_with_image_lock(
+                    lock,
+                    crate::api::held_lock::LockHolding::of(
+                        crate::api::held_lock::LockOperation::ReAdopt,
+                        &WorkspaceName::main(),
+                    ),
+                    move |host| host.release_re_adopt_sources(&source),
+                )
                 .await
                 .map_err(native_storage_error)?;
         }
@@ -629,11 +651,18 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         {
             let source = source.clone();
             self.substrate
-                .dispatch_on_host_with_image_lock(lock.clone(), move |host| {
-                    host.retain_re_adopt_source(&source)?;
-                    host.mount_re_adopt_sources(&source)?;
-                    host.copy_re_adopt_build(&source)
-                })
+                .dispatch_on_host_with_image_lock(
+                    lock.clone(),
+                    crate::api::held_lock::LockHolding::of(
+                        crate::api::held_lock::LockOperation::ReAdopt,
+                        &WorkspaceName::main(),
+                    ),
+                    move |host| {
+                        host.retain_re_adopt_source(&source)?;
+                        host.mount_re_adopt_sources(&source)?;
+                        host.copy_re_adopt_build(&source)
+                    },
+                )
                 .await
                 .map_err(native_storage_error)?;
         }

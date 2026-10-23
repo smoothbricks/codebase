@@ -1140,12 +1140,13 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         &self,
         images: &[PathBuf],
         mode: LockMode,
+        holding: &crate::api::held_lock::LockHolding,
     ) -> Result<Option<Self::LockGuard>, ApfsStorageError> {
         acquire_image_locks(
             &self.config.store_root,
             images,
             mode,
-            &crate::held_lock::IMAGE_LOCK_TAKER,
+            &crate::held_lock::ImageLockTaker { holding },
         )
         .map_err(Into::into)
     }

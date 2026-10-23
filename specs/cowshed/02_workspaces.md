@@ -1694,8 +1694,9 @@ it, stay. A holder that finds the path naming another inode once granted refuses
   forwarded to the command, as `land-turn` forwards them.
 - **Who holds it is the kernel's answer.** `lock-holders <path>` prints one JSON object, a `LockObservation`: the path,
   the inode, whether the kernel shows it exclusively locked, the record as written, the owner that record names once the
-  kernel proves it, and every process with a descriptor on the inode with its custody. The path and the record are their
-  exact bytes in the tagged-bytes form `CommandArg` uses (`utf8` with their text when they are UTF-8, canonical standard
+  kernel proves it, the request (`holding`) a proven owner's record names when it names one (every image lock's does,
+  below), and every process with a descriptor on the inode with its custody. The path and the record are their exact
+  bytes in the tagged-bytes form `CommandArg` uses (`utf8` with their text when they are UTF-8, canonical standard
   base64 under `base64` when not), so neither is refused, decoded lossily, or the cause of a cut object; the owner is
   judged from the record's bytes, and a record that does not parse as a holder record proves no owner. Linux exposes
   custody per descriptor: a readable `/proc/<pid>/fdinfo` carrying a granted `flock` for the exact device and inode
@@ -1707,13 +1708,21 @@ it, stay. A holder that finds the path naming another inode once granted refuses
   `unexposed`, never counted a holder. A process of another user whose descriptors this user cannot read shows none;
   `locked` still says the inode is held.
 - **An image lock is a held lock.** Every lifecycle lock a store takes through its image-lock acquisition
-  (`main.dmg.lock` and `sessions/<ws>.dmg.lock`, 01_storage.md, the store's template lock among them) carries the same
-  record: its taker writes it once the kernel grants each lock, and empties it before it lets go. So `lock-holders` on
-  one names its owner by pid and command, and the command (`cowshed fork raven`) names the operation and the workspace
-  it runs for. A taker that finds such a lock held and waits for it says so before it queues, as a lifecycle span
-  (13_telemetry.md, "Latency spans"): `cowshed: image-lock wait <path> start`, then
+  (`main.dmg.lock` and `sessions/<ws>.dmg.lock`, 01_storage.md, the store's template lock among them) carries the held
+  lock's record and, beside it, the request the lock is held for:
+  `{pid, uniqueId, since, command, operation, workspace}`. `command` is the taker's own argv, which names the process (a
+  `cowshed fork`, or the controller or gateway serving one), never the request. `operation` (`LockOperation`: `fork`,
+  `mount`, `land`, `gc`, …) and `workspace` (the workspace it makes or changes, a fork's new one though it holds its
+  source's lock too; `null` for a step of the whole store or project) are typed and passed by the call that takes the
+  lock, the controller's included, never parsed from argv. The taker writes the record once the kernel grants each lock
+  and the path is proven, by a walk from the store root that follows no symlink, to still name the inode locked; a grant
+  on a file since removed or replaced is refused, unrecorded, as a held lock refuses it. It empties the record before it
+  lets go. `lock-holders` on one names its owner by pid and command and, once the owner is proven, its `holding`
+  (`{operation, workspace}`). A taker that finds such a lock held and waits for it says so before it queues, as a
+  lifecycle span (13_telemetry.md, "Latency spans"): `cowshed: image-lock wait <path> start`, then
   `cowshed: image-lock wait <path> holders=<who>`, the one line of who holds the lock as `lock-holders` judges it when
-  the wait begins (one look per wait, as a land's ref lock wait), and once granted
+  the wait begins (one look per wait, as a land's ref lock wait), the owner's request among it
+  (`pid 4242 (cowshed controller) holds it, as its record says, for fork of raven`), and once granted
   `cowshed: image-lock wait <path> done elapsed=<waited> status=ok`. An uncontended take, and a try that finds the lock
   held, says nothing. A purge counts a recorded image lock a lock, as it counts a recorded lease. Measured 2026-10-23: a
   fork's clone waited 532.9 s on `main.dmg.lock` behind four forks and an attach while `lock-holders` answered

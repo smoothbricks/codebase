@@ -2126,7 +2126,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 &self.config.store_root,
                 &[lock],
                 LockMode::Try,
-                &crate::held_lock::IMAGE_LOCK_TAKER,
+                &crate::held_lock::ImageLockTaker {
+                    holding: &crate::api::held_lock::LockHolding {
+                        operation: crate::api::held_lock::LockOperation::Recover,
+                        workspace: crate::storage::image_workspace(canonical),
+                    },
+                },
             )
             .map(|guard| guard.map(Some))
             .map_err(Into::into)
@@ -2853,7 +2858,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             &self.config.store_root,
             &[lock.to_owned()],
             LockMode::Try,
-            &crate::held_lock::IMAGE_LOCK_TAKER,
+            &crate::held_lock::ImageLockTaker {
+                holding: &crate::api::held_lock::LockHolding::store(
+                    crate::api::held_lock::LockOperation::Gc,
+                ),
+            },
         )?
         .is_some())
     }
@@ -3533,7 +3542,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             &self.config.store_root,
             plan.lock_paths(),
             LockMode::Try,
-            &crate::held_lock::IMAGE_LOCK_TAKER,
+            &crate::held_lock::ImageLockTaker {
+                holding: &crate::api::held_lock::LockHolding::store(
+                    crate::api::held_lock::LockOperation::Gc,
+                ),
+            },
         )?
         .ok_or(ApfsStorageError::GcPlanStale)?;
         let current = self.preview_gc_project(
@@ -4251,12 +4264,13 @@ where
         &self,
         paths: &[PathBuf],
         mode: LockMode,
+        holding: &crate::api::held_lock::LockHolding,
     ) -> Result<Option<Self::LockGuard>, ApfsStorageError> {
         acquire_image_locks(
             &self.config.store_root,
             paths,
             mode,
-            &crate::held_lock::IMAGE_LOCK_TAKER,
+            &crate::held_lock::ImageLockTaker { holding },
         )
         .map_err(Into::into)
     }

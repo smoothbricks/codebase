@@ -86,7 +86,14 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             ];
             locks.sort();
             locks.dedup();
-            let Some(_locked) = host.lock_images(&locks, LockMode::Try).map_err(storage)? else {
+            let holding = crate::api::held_lock::LockHolding::of(
+                crate::api::held_lock::LockOperation::Reseed,
+                &plan.workspace.owner.name,
+            );
+            let Some(_locked) = host
+                .lock_images(&locks, LockMode::Try, &holding)
+                .map_err(storage)?
+            else {
                 let mut holders = Vec::new();
                 for lock in &locks {
                     let open = nx::holders(lock).map_err(|error| io("name reseed lock holders", lock, &error))?;

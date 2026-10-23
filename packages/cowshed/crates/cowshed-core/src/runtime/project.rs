@@ -3788,6 +3788,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                             host.lock_images(
                                 &publication_locks,
                                 cowshed_apfs::store_lock::LockMode::Wait,
+                                &crate::api::held_lock::LockHolding::store(
+                                    crate::api::held_lock::LockOperation::Open,
+                                ),
                             )
                             .map_err(native_storage_error)?
                             .ok_or_else(|| {
@@ -4330,7 +4333,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 "cowshed: waiting to finish {workspace}'s unfinished lifecycle work: {held}; its intent lease is free meanwhile"
             );
             self.substrate
-                .wait_for_image_locks(unleased, locks)
+                .wait_for_image_locks(
+                    unleased,
+                    locks,
+                    crate::api::held_lock::LockHolding::of(
+                        crate::api::held_lock::LockOperation::Recover,
+                        workspace,
+                    ),
+                )
                 .await
                 .map_err(native_storage_error)?;
         }
@@ -5587,7 +5597,17 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .map_err(native_integrity_error)?
             .lock()
             .to_owned();
-        let locked = match volumes.try_lock_target(owner, lock).await? {
+        let locked = match volumes
+            .try_lock_target(
+                owner,
+                lock,
+                crate::api::held_lock::LockHolding::of(
+                    crate::api::held_lock::LockOperation::Land,
+                    workspace,
+                ),
+            )
+            .await?
+        {
             Ok(locked) => locked,
             Err(contended) => {
                 cowshed_os::eprintln!(
@@ -8821,29 +8841,36 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .to_owned();
         let image = current.image;
         self.substrate
-            .dispatch_with_image_lock(lock_path, move || -> Result<()> {
-                let mut metadata =
-                    crate::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
-                        .map_err(native_integrity_error)?;
-                if metadata.grants.port_block != previous.port_block
-                    || metadata.grants.retained_port_blocks != previous.retained_port_blocks
-                {
-                    return Err(CowshedError::conflict(
-                        "workspace port allocation changed during its collision repair",
-                        "run cowshed doctor --repair again",
-                    ));
-                }
-                metadata.grants.port_block = repaired.port_block;
-                metadata.grants.retained_port_blocks = repaired.retained_port_blocks;
-                metadata.grants.revision = metadata
-                    .grants
-                    .revision
-                    .checked_add(1)
-                    .ok_or_else(|| CowshedError::internal("grant revision overflow"))?;
-                metadata
-                    .write_for_image(&image)
-                    .map_err(native_integrity_error)
-            })
+            .dispatch_with_image_lock(
+                lock_path,
+                crate::api::held_lock::LockHolding::of(
+                    crate::api::held_lock::LockOperation::RepairPorts,
+                    workspace,
+                ),
+                move || -> Result<()> {
+                    let mut metadata =
+                        crate::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
+                            .map_err(native_integrity_error)?;
+                    if metadata.grants.port_block != previous.port_block
+                        || metadata.grants.retained_port_blocks != previous.retained_port_blocks
+                    {
+                        return Err(CowshedError::conflict(
+                            "workspace port allocation changed during its collision repair",
+                            "run cowshed doctor --repair again",
+                        ));
+                    }
+                    metadata.grants.port_block = repaired.port_block;
+                    metadata.grants.retained_port_blocks = repaired.retained_port_blocks;
+                    metadata.grants.revision = metadata
+                        .grants
+                        .revision
+                        .checked_add(1)
+                        .ok_or_else(|| CowshedError::internal("grant revision overflow"))?;
+                    metadata
+                        .write_for_image(&image)
+                        .map_err(native_integrity_error)
+                },
+            )
             .await
             .map_err(native_storage_error)??;
         // Ownership is durable before the kernel reservations are released, and only then is
@@ -14441,90 +14468,98 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
 
         let (published, replacement_config) = self
             .substrate
-            .dispatch_with_image_lock(lock_path, move || {
-                (|| -> Result<_> {
-                    current.metadata =
-                        crate::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
-                            .map_err(native_integrity_error)?;
-                    if delta
-                        .expected_revision
-                        .is_some_and(|revision| revision != current.metadata.grants.revision)
-                    {
-                        return Err(CowshedError::conflict(
-                            "grant revision is stale",
-                            "refresh grants and retry",
-                        ));
-                    }
-                    normalize_grant_delta(&mut delta, revoke)?;
-                    let previous = current.metadata.grants.clone();
-                    if let Some(block) = replacement_block {
-                        if previous.port_block != Some(previous_block)
-                            || previous.retained_port_blocks != previous_retained_blocks
+            .dispatch_with_image_lock(
+                lock_path,
+                crate::api::held_lock::LockHolding::of(
+                    crate::api::held_lock::LockOperation::Grant,
+                    &workspace,
+                ),
+                move || {
+                    (|| -> Result<_> {
+                        current.metadata =
+                            crate::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
+                                .map_err(native_integrity_error)?;
+                        if delta
+                            .expected_revision
+                            .is_some_and(|revision| revision != current.metadata.grants.revision)
                         {
                             return Err(CowshedError::conflict(
-                                "workspace port allocation changed during capacity reservation",
-                                "refresh workspace grants and request capacity again",
+                                "grant revision is stale",
+                                "refresh grants and retry",
                             ));
                         }
-                        // Immutable profiles can outlive a completed job. A relocated block
-                        // stays owned and connectable; containing growth subsumes it instead.
-                        retain_port_authority(&mut current.metadata.grants, block);
-                    }
-                    apply_grant_delta(&mut current.metadata.grants, delta, revoke);
+                        normalize_grant_delta(&mut delta, revoke)?;
+                        let previous = current.metadata.grants.clone();
+                        if let Some(block) = replacement_block {
+                            if previous.port_block != Some(previous_block)
+                                || previous.retained_port_blocks != previous_retained_blocks
+                            {
+                                return Err(CowshedError::conflict(
+                                    "workspace port allocation changed during capacity reservation",
+                                    "refresh workspace grants and request capacity again",
+                                ));
+                            }
+                            // Immutable profiles can outlive a completed job. A relocated block
+                            // stays owned and connectable; containing growth subsumes it instead.
+                            retain_port_authority(&mut current.metadata.grants, block);
+                        }
+                        apply_grant_delta(&mut current.metadata.grants, delta, revoke);
 
-                    // Validated as the workspace will run: its own grants plus the project's.
-                    let effective = effective_workspace_grants(&layout, &current.metadata.grants)?;
-                    let config = supervisor_sandbox(
-                        &home,
-                        &program_directories,
-                        &layout,
-                        &telemetry_root,
-                        &current,
-                        &effective,
-                        mount,
-                        main_mount,
-                        None,
-                    )?;
-                    validate_grant_sandbox(&config)?;
-                    if current.metadata.grants == previous {
-                        return Ok((previous, None));
-                    }
+                        // Validated as the workspace will run: its own grants plus the project's.
+                        let effective =
+                            effective_workspace_grants(&layout, &current.metadata.grants)?;
+                        let config = supervisor_sandbox(
+                            &home,
+                            &program_directories,
+                            &layout,
+                            &telemetry_root,
+                            &current,
+                            &effective,
+                            mount,
+                            main_mount,
+                            None,
+                        )?;
+                        validate_grant_sandbox(&config)?;
+                        if current.metadata.grants == previous {
+                            return Ok((previous, None));
+                        }
 
-                    current.metadata.grants.revision = current
-                        .metadata
-                        .grants
-                        .revision
-                        .checked_add(1)
-                        .ok_or_else(|| CowshedError::internal("grant revision overflow"))?;
-                    let effective_revision = effective
-                        .revision
-                        .checked_add(1)
-                        .ok_or_else(|| CowshedError::internal("grant revision overflow"))?;
-                    let published = current.metadata.grants.clone();
-                    current
-                        .metadata
-                        .write_for_image(&image)
-                        .map_err(native_integrity_error)?;
-                    if replacement_block.is_some() {
-                        crate::workspace_credentials::publish_workspace_environment(
-                            crate::workspace_environment::EnvironmentMount::Served {
-                                workspace_mount: &config.workspace_mount,
-                                host_home: &config.home,
-                                temp_dir: &config.exec_temp_dir,
-                                capability_env: &config.capabilities.contribution,
-                            },
-                            current.metadata.platform,
-                            published.port_block,
-                        )
-                        .map_err(|error| {
-                            CowshedError::internal(format!(
-                                "publish grown workspace port environment: {error}"
-                            ))
-                        })?;
-                    }
-                    Ok((published, Some((config, effective_revision))))
-                })()
-            })
+                        current.metadata.grants.revision = current
+                            .metadata
+                            .grants
+                            .revision
+                            .checked_add(1)
+                            .ok_or_else(|| CowshedError::internal("grant revision overflow"))?;
+                        let effective_revision = effective
+                            .revision
+                            .checked_add(1)
+                            .ok_or_else(|| CowshedError::internal("grant revision overflow"))?;
+                        let published = current.metadata.grants.clone();
+                        current
+                            .metadata
+                            .write_for_image(&image)
+                            .map_err(native_integrity_error)?;
+                        if replacement_block.is_some() {
+                            crate::workspace_credentials::publish_workspace_environment(
+                                crate::workspace_environment::EnvironmentMount::Served {
+                                    workspace_mount: &config.workspace_mount,
+                                    host_home: &config.home,
+                                    temp_dir: &config.exec_temp_dir,
+                                    capability_env: &config.capabilities.contribution,
+                                },
+                                current.metadata.platform,
+                                published.port_block,
+                            )
+                            .map_err(|error| {
+                                CowshedError::internal(format!(
+                                    "publish grown workspace port environment: {error}"
+                                ))
+                            })?;
+                        }
+                        Ok((published, Some((config, effective_revision))))
+                    })()
+                },
+            )
             .await
             .map_err(native_storage_error)??;
 
@@ -26428,7 +26463,8 @@ mod terminal_project_cleanup_tests {
 
     /// A lifecycle lease's record is no retained state: the purge passes over an intent lease
     /// recorded by a holder that still has it, one whose recorded holder ended without clearing it,
-    /// a released (emptied) one, and a land lease with a record, and removes each as a lock.
+    /// a released (emptied) one, a land lease with a record, an image lock its holder has recorded
+    /// and still holds and one a holder that ended left recorded, and removes each as a lock.
     #[test]
     fn a_recorded_or_released_lifecycle_lease_never_refuses_the_purge() {
         let (root, paths) = project("recorded-lease");
@@ -26469,11 +26505,34 @@ mod terminal_project_cleanup_tests {
             !std::fs::read(&main_lease).expect("read").is_empty(),
             "the held lease records its holder"
         );
+        let held_image = paths.sessions.join("raven.dmg.lock");
+        let image_lock = cowshed_apfs::store_lock::acquire_image_locks(
+            &paths.project_root,
+            std::slice::from_ref(&held_image),
+            cowshed_apfs::store_lock::LockMode::Try,
+            &crate::held_lock::ImageLockTaker {
+                holding: &crate::api::held_lock::LockHolding::of(
+                    crate::api::held_lock::LockOperation::Fork,
+                    &raven,
+                ),
+            },
+        )
+        .expect("take raven's image lock")
+        .expect("raven's image lock is free");
+        assert!(
+            !std::fs::read(&held_image).expect("read").is_empty(),
+            "the held image lock records its holder"
+        );
+        let stale_image = paths.project_root.join("main.dmg.lock");
+        std::fs::write(&stale_image, std::fs::read(&held_image).expect("read"))
+            .expect("stale image lock record");
         require_terminal_storage(&paths.project_root)
-            .expect("a recorded lease is a lock, not a retained artifact");
+            .expect("a recorded lease or image lock is a lock, not a retained artifact");
         clean_terminal_project_storage(&paths.project_root, &paths.repository_binding)
-            .expect("the purge removes every lease as a lock");
+            .expect("the purge removes every lease and image lock as a lock");
         assert!(!stale.exists() && !main_lease.exists());
+        assert!(!held_image.exists() && !stale_image.exists());
+        drop(image_lock);
         drop(held);
         std::fs::remove_dir_all(root).expect("cleanup");
     }

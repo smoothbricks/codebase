@@ -406,7 +406,14 @@ fn directory_retirement_retry_and_held_recovery_keep_complete_authority() {
         .lock()
         .to_owned();
     let _held = host
-        .lock_images(std::slice::from_ref(&lock), LockMode::Wait)
+        .lock_images(
+            std::slice::from_ref(&lock),
+            LockMode::Wait,
+            &crate::api::held_lock::LockHolding::of(
+                crate::api::held_lock::LockOperation::Retire,
+                &victim.workspace,
+            ),
+        )
         .unwrap()
         .unwrap();
     for _ in 0..2 {
@@ -525,7 +532,14 @@ fn a_recovery_image_moves_out_of_the_store_with_its_companions_and_a_manifest() 
         .lock()
         .to_owned();
     let held = host
-        .lock_images(std::slice::from_ref(&lock), LockMode::Wait)
+        .lock_images(
+            std::slice::from_ref(&lock),
+            LockMode::Wait,
+            &crate::api::held_lock::LockHolding::of(
+                crate::api::held_lock::LockOperation::Recover,
+                &metadata.workspace,
+            ),
+        )
         .unwrap()
         .unwrap();
     assert_eq!(

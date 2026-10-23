@@ -1020,6 +1020,12 @@ export const parseLockHolder = (json: string): Api.LockHolder => assertLockHolde
 export const assertLockHolderList = typia.createAssertEquals<readonly Api.LockHolder[]>();
 export const parseLockHolderList = (json: string): readonly Api.LockHolder[] => assertLockHolderList(JSON.parse(json));
 
+export const assertLockHolding = typia.createAssertEquals<Api.LockHolding>();
+export const parseLockHolding = (json: string): Api.LockHolding => assertLockHolding(JSON.parse(json));
+export const assertLockHoldingList = typia.createAssertEquals<readonly Api.LockHolding[]>();
+export const parseLockHoldingList = (json: string): readonly Api.LockHolding[] =>
+  assertLockHoldingList(JSON.parse(json));
+
 export const assertLockInode = typia.createAssertEquals<Api.LockInode>();
 export const parseLockInode = (json: string): Api.LockInode => assertLockInode(JSON.parse(json));
 export const assertLockInodeList = typia.createAssertEquals<readonly Api.LockInode[]>();
@@ -1030,6 +1036,12 @@ export const parseLockObservation = (json: string): Api.LockObservation => asser
 export const assertLockObservationList = typia.createAssertEquals<readonly Api.LockObservation[]>();
 export const parseLockObservationList = (json: string): readonly Api.LockObservation[] =>
   assertLockObservationList(JSON.parse(json));
+
+export const assertLockOperation = typia.createAssertEquals<Api.LockOperation>();
+export const parseLockOperation = (json: string): Api.LockOperation => assertLockOperation(JSON.parse(json));
+export const assertLockOperationList = typia.createAssertEquals<readonly Api.LockOperation[]>();
+export const parseLockOperationList = (json: string): readonly Api.LockOperation[] =>
+  assertLockOperationList(JSON.parse(json));
 
 export const assertLockPath = typia.createAssertEquals<Api.LockPath>();
 export const parseLockPath = (json: string): Api.LockPath => assertLockPath(JSON.parse(json));

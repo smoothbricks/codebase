@@ -1268,6 +1268,7 @@ fn assert_raw_lock_observation(name: &std::ffi::OsStr, path_wire: Value) {
             "locked": false,
             "record": {"encoding": "utf8", "data": ""},
             "owner": null,
+            "holding": null,
             "descriptors": [],
         })
     );
@@ -1283,27 +1284,34 @@ fn assert_raw_lock_observation(name: &std::ffi::OsStr, path_wire: Value) {
             "locked": false,
             "record": {"encoding": "base64", "data": "/w=="},
             "owner": null,
+            "holding": null,
             "descriptors": [],
         })
     );
 }
 
-/// Names the image lock, and the directory store it is in, that this test binary takes when it
-/// runs as [`image_lock_taker`].
+/// Names the image lock, the directory store it is in, and the workspace whose fork it is taken
+/// for, that this test binary takes when it runs as [`image_lock_taker`].
 const IMAGE_LOCK_ENV: &str = "COWSHED_TEST_IMAGE_LOCK";
 const IMAGE_STORE_ENV: &str = "COWSHED_TEST_IMAGE_STORE";
+const IMAGE_WORKSPACE_ENV: &str = "COWSHED_TEST_IMAGE_WORKSPACE";
 
 /// Not a test of its own: another process's lifecycle operation taking one image lock, as a fork
 /// takes its source's (`main.dmg.lock`) for its whole clone. Run as this binary with
 /// [`IMAGE_LOCK_ENV`] set, it takes the lock through a directory store's execution host, the
-/// path every lifecycle operation's image lock takes, says `held` on stderr once it holds it, and
-/// holds it until its stdin closes. Run any other way it does nothing.
+/// path every lifecycle operation's image lock takes, for a fork of the workspace
+/// [`IMAGE_WORKSPACE_ENV`] names, says `held` on stderr once it holds it, and holds it until its
+/// stdin closes. A refused take panics, naming why on stderr. Run any other way it does nothing.
 #[test]
 fn image_lock_taker() {
     let Some(lock) = std::env::var_os(IMAGE_LOCK_ENV) else {
         return;
     };
     let store = PathBuf::from(std::env::var_os(IMAGE_STORE_ENV).expect("the image lock's store"));
+    let workspace = cowshed_core::metadata::WorkspaceName::new(
+        std::env::var(IMAGE_WORKSPACE_ENV).expect("the workspace the lock is taken for"),
+    )
+    .expect("a workspace name");
     let host =
         DirectoryExecutionHost::new(ApfsSubstrateConfig::new(&store, store.join("checkout")))
             .expect("open the directory store");
@@ -1311,8 +1319,12 @@ fn image_lock_taker() {
         .lock_images(
             &[PathBuf::from(lock)],
             cowshed_apfs::store_lock::LockMode::Wait,
+            &cowshed_core::api::held_lock::LockHolding::of(
+                cowshed_core::api::held_lock::LockOperation::Fork,
+                &workspace,
+            ),
         )
-        .expect("take the image lock")
+        .unwrap_or_else(|error| panic!("take the image lock: {error}"))
         .expect("a waited-for lock is taken");
     // On stderr, after every line the wait wrote there: libtest frames its own stdout.
     io::stderr()
@@ -1329,12 +1341,13 @@ struct ImageLockTaker {
 }
 
 impl ImageLockTaker {
-    fn start(store: &Path, lock: &Path) -> Self {
+    fn start(store: &Path, lock: &Path, workspace: &str) -> Self {
         let mut process = TestProcess::spawn(
             Command::new(std::env::current_exe().expect("this test binary"))
                 .args(["--exact", "image_lock_taker", "--nocapture"])
                 .env(IMAGE_LOCK_ENV, lock)
                 .env(IMAGE_STORE_ENV, store)
+                .env(IMAGE_WORKSPACE_ENV, workspace)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped()),
@@ -1358,10 +1371,7 @@ impl ImageLockTaker {
     /// nothing more: letting go of an image lock is silent.
     fn release(mut self) {
         drop(self.process.child.stdin.take());
-        let mut rest = String::new();
-        self.said
-            .read_to_string(&mut rest)
-            .expect("the taker's last output");
+        let rest = self.rest();
         assert_eq!(
             self.process.wait().expect("wait for the taker"),
             ExitStatus::Exited { code: 0 },
@@ -1369,21 +1379,44 @@ impl ImageLockTaker {
         );
         assert_eq!(rest, "", "the taker said more once released");
     }
+
+    /// Everything it writes on stderr from here until it ends.
+    fn rest(&mut self) -> String {
+        let mut rest = String::new();
+        self.said
+            .read_to_string(&mut rest)
+            .expect("the taker's last output");
+        rest
+    }
+}
+
+/// The wait span's label for `lock`, and the custody the kernel shows of a recorded holder.
+fn wait_step(lock: &Path) -> (String, &'static str) {
+    let custody = if cfg!(target_os = "linux") {
+        "holds it"
+    } else {
+        "holds it, as its record says"
+    };
+    (
+        format!("cowshed: image-lock wait {}", lock.display()),
+        custody,
+    )
 }
 
 /// An image lock is a held lock (02_workspaces.md "Held locks"): the lifecycle operation that
-/// holds one has recorded itself on it, so `lock-holders` names it the owner, and one that finds
-/// it held says, before it queues, which lock it waits for and who holds it, and once granted how
-/// long it waited. The holder lets go only after the waiter's `holders` line has been read off the
-/// waiter's pipe, so that line precedes the release by order, not by a clock. Measured
-/// 2026-10-23: a clone waited 532.9 s on `main.dmg.lock` while `lock-holders` answered
-/// `owner: null` and no line said what it waited for.
+/// holds one has recorded itself and the request it holds it for on it, so `lock-holders` names
+/// it the owner with that request, and one that finds it held says, before it queues, which lock
+/// it waits for and who holds it for what, and once granted how long it waited. The holder lets go
+/// only after the waiter's `holders` line has been read off the waiter's pipe, so that line
+/// precedes the release by order, not by a clock. Measured 2026-10-23: a clone waited 532.9 s on
+/// `main.dmg.lock` while `lock-holders` answered `owner: null` and no line said what it waited
+/// for.
 #[test]
 fn an_image_lock_names_its_holder_and_a_blocked_taker_says_whom_it_waits_for() {
     let dir = Dir::new("image-lock");
     let store = dir.path.join("store");
     let lock = store.join("acme/widget/main.dmg.lock");
-    let mut holder = ImageLockTaker::start(&store, &lock);
+    let mut holder = ImageLockTaker::start(&store, &lock, "raven");
     assert_eq!(
         holder.next(),
         "held",
@@ -1396,6 +1429,11 @@ fn an_image_lock_names_its_holder_and_a_blocked_taker_says_whom_it_waits_for() {
         holder.process.id(),
         "{observation}"
     );
+    assert_eq!(
+        observation["holding"],
+        serde_json::json!({"operation": "fork", "workspace": "raven"}),
+        "{observation}"
+    );
     let record: Value = serde_json::from_str(
         observation["record"]["data"]
             .as_str()
@@ -1403,20 +1441,17 @@ fn an_image_lock_names_its_holder_and_a_blocked_taker_says_whom_it_waits_for() {
     )
     .expect("the holder record is the held lock's");
     assert_eq!(record["pid"], holder.process.id(), "{observation}");
+    assert_eq!(record["operation"], "fork", "{observation}");
+    assert_eq!(record["workspace"], "raven", "{observation}");
 
-    let mut waiter = ImageLockTaker::start(&store, &lock);
-    let step = format!("cowshed: image-lock wait {}", lock.display());
+    let mut waiter = ImageLockTaker::start(&store, &lock, "wren");
+    let (step, custody) = wait_step(&lock);
     assert_eq!(waiter.next(), format!("{step} start"));
     let holders = waiter.next();
-    let custody = if cfg!(target_os = "linux") {
-        "holds it"
-    } else {
-        "holds it, as its record says"
-    };
     assert!(
         holders.starts_with(&format!("{step} holders=pid {} (", holder.process.id()))
-            && holders.ends_with(&format!(") {custody}")),
-        "the wait did not name its holder: {holders}"
+            && holders.ends_with(&format!(") {custody} for fork of raven")),
+        "the wait did not name its holder and its request: {holders}"
     );
 
     holder.release();
@@ -1426,13 +1461,74 @@ fn an_image_lock_names_its_holder_and_a_blocked_taker_says_whom_it_waits_for() {
         "{done}"
     );
     assert_eq!(waiter.next(), "held");
-    assert_eq!(lock_holders(&lock)["owner"]["pid"], waiter.process.id());
+    let second = lock_holders(&lock);
+    assert_eq!(second["owner"]["pid"], waiter.process.id(), "{second}");
+    assert_eq!(
+        second["holding"],
+        serde_json::json!({"operation": "fork", "workspace": "wren"}),
+        "{second}"
+    );
     waiter.release();
     let released = lock_holders(&lock);
     assert_eq!(released["locked"], false, "{released}");
+    assert_eq!(released["holding"], Value::Null, "{released}");
     assert_eq!(
         released["record"],
         serde_json::json!({"encoding": "utf8", "data": ""}),
         "the holder did not empty its record before it let go"
+    );
+}
+
+/// A taker queued on an image lock whose file is replaced at its path before the holder lets go
+/// is granted a lock on a file no path names: it refuses the grant, naming both inodes, and never
+/// records itself or says `held`. The replacement happens after the waiter's `holders` line is
+/// read off its pipe, so the waiter is queued on the old inode by order, not by a clock.
+#[test]
+fn a_taker_refuses_an_image_lock_whose_path_was_replaced_while_it_waited() {
+    let dir = Dir::new("image-lock-replaced");
+    let store = dir.path.join("store");
+    let lock = store.join("acme/widget/main.dmg.lock");
+    let mut holder = ImageLockTaker::start(&store, &lock, "raven");
+    assert_eq!(holder.next(), "held");
+    let mut waiter = ImageLockTaker::start(&store, &lock, "wren");
+    let (step, _) = wait_step(&lock);
+    assert_eq!(waiter.next(), format!("{step} start"));
+    assert!(
+        waiter.next().starts_with(&format!("{step} holders=")),
+        "the waiter did not queue"
+    );
+    let queued = fs::metadata(&lock).expect("the queued inode").ino();
+    let replacement = lock.with_file_name("replacement.lock");
+    fs::write(&replacement, b"").expect("write the replacement");
+    fs::rename(&replacement, &lock).expect("replace the lock file at its path");
+    let named = fs::metadata(&lock).expect("the replacement inode").ino();
+    assert_ne!(queued, named);
+
+    holder.release();
+    let done = waiter.next();
+    assert!(
+        done.starts_with(&format!("{step} done elapsed=")) && done.ends_with(" status=ok"),
+        "the wait itself was granted: {done}"
+    );
+    let rest = waiter.rest();
+    assert_ne!(
+        waiter.process.wait().expect("wait for the waiter"),
+        ExitStatus::Exited { code: 0 },
+        "{rest}"
+    );
+    assert!(
+        rest.contains("not the inode")
+            && rest.contains(&format!(" {queued} just locked"))
+            && rest.contains(&format!(" {named},")),
+        "the refusal did not name both inodes: {rest}"
+    );
+    assert!(
+        !rest.contains("held\n"),
+        "the waiter held a replaced lock: {rest}"
+    );
+    assert_eq!(
+        fs::read(&lock).expect("the replacement's record"),
+        b"",
+        "the refused waiter recorded itself on the file the path names"
     );
 }

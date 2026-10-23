@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::server::MAX_JSON_FRAME_BYTES;
+use crate::metadata::WorkspaceName;
 
 /// A kernel identifier (a device, an inode, a process's unique id) on the wire as its exact
 /// decimal string. A JSON number past 2^53 loses precision in JavaScript, and a reader that
@@ -118,6 +119,131 @@ pub enum LockCustody {
     Unexposed,
 }
 
+/// The lifecycle step an image lock is taken for (02_workspaces.md "Held locks", "An image lock is
+/// a held lock"), as the call that takes it names it. The process's argv names the process (a
+/// `cowshed fork`, or the controller or gateway serving one); this names the request.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LockOperation {
+    /// Adopting a checkout as main.
+    Adopt,
+    /// Finishing an adoption whose checkout handoff or mount was interrupted.
+    FinishAdoption,
+    /// Discarding an unpublished adoption nothing will finish.
+    DiscardAdoption,
+    /// Detaching main and restoring the checkout adoption retained.
+    RestoreCheckout,
+    /// Retiring adopted main once its checkout is restored.
+    RetireMain,
+    /// Re-adopting main's checkout onto a fresh image.
+    ReAdopt,
+    Create,
+    Fork,
+    Checkpoint,
+    Restore,
+    Retire,
+    /// Retiring an unfinished clone without publishing it.
+    RetireUnpublished,
+    /// Repairing an unfinished clone's extents in place.
+    RepairUnpublished,
+    /// Reclaiming a retired image.
+    Reclaim,
+    /// Settling a workspace's mount: an attach, or a supervisor's start.
+    Mount,
+    Unmount,
+    Resize,
+    Defragment,
+    /// A project opening's recovery of its selected workspaces' publications.
+    Open,
+    /// Finishing an interrupted publication of one image.
+    Recover,
+    /// Garbage collection of the project's store.
+    Gc,
+    /// A land's freeze of its target's seed and move of its build link.
+    Land,
+    Reseed,
+    /// `cowshed cache clear` of a workspace's Nx state.
+    ClearNxState,
+    /// Moving a workspace off a port block another holds.
+    RepairPorts,
+    /// Changing a workspace's grants.
+    Grant,
+    /// Minting the store's blank image template.
+    MintTemplate,
+}
+
+impl LockOperation {
+    /// Its wire spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Adopt => "adopt",
+            Self::FinishAdoption => "finish-adoption",
+            Self::DiscardAdoption => "discard-adoption",
+            Self::RestoreCheckout => "restore-checkout",
+            Self::RetireMain => "retire-main",
+            Self::ReAdopt => "re-adopt",
+            Self::Create => "create",
+            Self::Fork => "fork",
+            Self::Checkpoint => "checkpoint",
+            Self::Restore => "restore",
+            Self::Retire => "retire",
+            Self::RetireUnpublished => "retire-unpublished",
+            Self::RepairUnpublished => "repair-unpublished",
+            Self::Reclaim => "reclaim",
+            Self::Mount => "mount",
+            Self::Unmount => "unmount",
+            Self::Resize => "resize",
+            Self::Defragment => "defragment",
+            Self::Open => "open",
+            Self::Recover => "recover",
+            Self::Gc => "gc",
+            Self::Land => "land",
+            Self::Reseed => "reseed",
+            Self::ClearNxState => "clear-nx-state",
+            Self::RepairPorts => "repair-ports",
+            Self::Grant => "grant",
+            Self::MintTemplate => "mint-template",
+        }
+    }
+}
+
+/// The request an image lock is held for: the operation, and the workspace it acts on (a fork's
+/// new workspace, though it holds its source's lock too); `None` for a step of the whole store or
+/// project.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LockHolding {
+    pub operation: LockOperation,
+    pub workspace: Option<WorkspaceName>,
+}
+
+impl LockHolding {
+    pub fn of(operation: LockOperation, workspace: &WorkspaceName) -> Self {
+        Self {
+            operation,
+            workspace: Some(workspace.clone()),
+        }
+    }
+
+    /// A step of the whole store or project, for no one workspace.
+    pub const fn store(operation: LockOperation) -> Self {
+        Self {
+            operation,
+            workspace: None,
+        }
+    }
+}
+
+impl fmt::Display for LockHolding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let operation = self.operation.as_str();
+        match &self.workspace {
+            Some(workspace) => write!(formatter, "{operation} of {workspace}"),
+            None => formatter.write_str(operation),
+        }
+    }
+}
+
 /// A process with a descriptor on the locked inode.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -216,6 +342,9 @@ pub struct LockObservation {
     /// The descriptor of the holder the record names, once the kernel proves it: on Linux it holds
     /// the lock; on Darwin its unique id is the record's.
     pub owner: Option<LockDescriptor>,
+    /// The request the owner's record says it holds the lock for, when the owner is proven and
+    /// its record names one (every image lock's does).
+    pub holding: Option<LockHolding>,
     /// Every other process with a descriptor on the inode, and what the kernel shows of it. The
     /// observing process is not among them.
     pub descriptors: Vec<LockDescriptor>,
@@ -270,12 +399,13 @@ mod tests {
             locked: false,
             record: LockRecord::new(record.to_vec()),
             owner: None,
+            holding: None,
             descriptors: Vec::new(),
         };
         let wire = serde_json::to_string(&observation(b"/t/exact.lock", b"")).expect("serialize");
         assert_eq!(
             wire,
-            r#"{"path":{"encoding":"utf8","data":"/t/exact.lock"},"inode":null,"locked":false,"record":{"encoding":"utf8","data":""},"owner":null,"descriptors":[]}"#
+            r#"{"path":{"encoding":"utf8","data":"/t/exact.lock"},"inode":null,"locked":false,"record":{"encoding":"utf8","data":""},"owner":null,"holding":null,"descriptors":[]}"#
         );
         assert_eq!(
             serde_json::from_str::<LockObservation>(&wire).expect("decode"),
