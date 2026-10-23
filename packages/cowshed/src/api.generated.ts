@@ -643,6 +643,7 @@ export type CpuCheckoutStatus = {
  * One gate job's runners that hold tokens, in one checkout.
  */
 export type CpuGateJob = {
+  readonly repository: string;
   readonly checkout: string;
   /**
    * The gate job, as its admission number: the smaller is the older job.
@@ -662,6 +663,7 @@ export type CpuGateJob = {
  * One waiting gate-class request: the gate job it serves, and the request itself.
  */
 export type CpuGateWaiter = {
+  readonly repository: string;
   readonly checkout: string;
   /**
    * The gate job it serves, as that job's admission number: the smaller is the older job.

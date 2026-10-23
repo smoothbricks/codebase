@@ -1377,11 +1377,12 @@ its grants — the whole host with no gate work, half of it beside gate work (05
 held past the 30-minute hold limit, oldest first, so the first lines say who holds the host and since when (05 Gateway,
 "The hold limit"); the running gate jobs, the head — the oldest land — first; the gate queue in the order returned
 tokens go to it; then each checkout's background work. A gate job is named by its admission number (the smaller is the
-older land). Each running gate job and background stake is followed by its leases, oldest grant first: the client's pid
-(the socket's peer), its tokens of its want, the age of its grant — the lease's, not the process's; `ps -p <pid>` gives
-that — and the command it named. Every waiting request is named the same way, with how long it has waited: one gate
-job's tasks wait as one entry each, and their pids, commands and ages tell them apart. A resident
-(`exec --class resident`, a kept Nx daemon) holds no token, so it is in no line; a request it runs is.
+older land) and its repository, even when no land is running. Each running gate job and background stake is followed by
+its leases, oldest grant first: the client's pid (the socket's peer), its tokens of its want, the age of its grant — the
+lease's, not the process's; `ps -p <pid>` gives that — and the command it named. Every waiting request is named the same
+way, with how long it has waited: one gate job's tasks wait as one entry each, and their pids, commands and ages tell
+them apart. A resident (`exec --class resident`, a kept Nx daemon) holds no token, so it is in no line; a request it
+runs is.
 
 ```
 $ cowshed gateway status
@@ -1389,15 +1390,15 @@ cowshed: gateway is healthy: launchd loaded; control socket answers at /private/
 cowshed: gateway versions: cli 0.1.0; daemon 0.1.0
 cowshed: gateway cpu budget: held 18/18 tokens, background holds 2, at most 9 beside gate work
 cowshed: gateway cpu hold past 30m: /Users/me/Dev/app: pid 3977, 2/18 tokens, granted 34m07s ago: cargo --frozen test -p app
-cowshed: gateway gate head: /Users/me/Dev/app gate job 4: held 15, running 2
-cowshed: gateway gate lease: /Users/me/Dev/app gate job 4: pid 4120, 1/1 tokens, granted 12m30s ago: nx run-many -t gate
-cowshed: gateway gate lease: /Users/me/Dev/app gate job 4: pid 4388, 14/18 tokens, granted 2m05s ago: child CPU pool
-cowshed: gateway gate job behind the head: /Users/me/Dev/lib gate job 9: held 1, running 1
-cowshed: gateway gate lease: /Users/me/Dev/lib gate job 9: pid 5012, 1/1 tokens, granted 40s ago: nx run-many -t gate
+cowshed: gateway gate head: repository=owner/app /Users/me/Dev/app gate job 4: held 15, running 2
+cowshed: gateway gate lease: repository=owner/app /Users/me/Dev/app gate job 4: pid 4120, 1/1 tokens, granted 12m30s ago: nx run-many -t gate
+cowshed: gateway gate lease: repository=owner/app /Users/me/Dev/app gate job 4: pid 4388, 14/18 tokens, granted 2m05s ago: child CPU pool
+cowshed: gateway gate job behind the head: repository=owner/lib /Users/me/Dev/lib gate job 9: held 1, running 1
+cowshed: gateway gate lease: repository=owner/lib /Users/me/Dev/lib gate job 9: pid 5012, 1/1 tokens, granted 40s ago: nx run-many -t gate
 cowshed: gateway gate queue: 3 waiting, in the order returned tokens go to them
-cowshed: gateway gate queue 1: /Users/me/Dev/app gate job 4: pid 4402, want 6, waiting 1m12s: child CPU pool
-cowshed: gateway gate queue 2: /Users/me/Dev/app gate job 4: pid 4417, want 2, waiting 48s: child CPU pool
-cowshed: gateway gate queue 3: /Users/me/Dev/lib gate job 9: pid 5020, want 18, waiting 35s: child CPU pool
+cowshed: gateway gate queue 1: repository=owner/app /Users/me/Dev/app gate job 4: pid 4402, want 6, waiting 1m12s: child CPU pool
+cowshed: gateway gate queue 2: repository=owner/app /Users/me/Dev/app gate job 4: pid 4417, want 2, waiting 48s: child CPU pool
+cowshed: gateway gate queue 3: repository=owner/lib /Users/me/Dev/lib gate job 9: pid 5020, want 18, waiting 35s: child CPU pool
 cowshed: gateway background: /Users/me/Dev/app: held 2, running 1, waiting 1
 cowshed: gateway background lease: /Users/me/Dev/app: pid 3977, 2/18 tokens, granted 34m07s ago: cargo --frozen test -p app
 cowshed: gateway background queue 1: /Users/me/Dev/app: pid 3990, want 1, waiting 2m30s: bun install
@@ -1428,6 +1429,7 @@ has no `pid`:
         ],
         "gateJobs": [
           {
+            "repository": "owner/app",
             "checkout": "/Users/me/Dev/app",
             "job": 4,
             "held": 15,
@@ -1437,6 +1439,7 @@ has no `pid`:
             ]
           },
           {
+            "repository": "owner/lib",
             "checkout": "/Users/me/Dev/lib",
             "job": 9,
             "held": 1,
@@ -1445,6 +1448,7 @@ has no `pid`:
         ],
         "gateQueue": [
           {
+            "repository": "owner/app",
             "checkout": "/Users/me/Dev/app",
             "job": 4,
             "pid": 4402,
@@ -1453,6 +1457,7 @@ has no `pid`:
             "waitedMs": 72000
           },
           {
+            "repository": "owner/app",
             "checkout": "/Users/me/Dev/app",
             "job": 4,
             "pid": 4417,
@@ -1461,6 +1466,7 @@ has no `pid`:
             "waitedMs": 48000
           },
           {
+            "repository": "owner/lib",
             "checkout": "/Users/me/Dev/lib",
             "job": 9,
             "pid": 5020,

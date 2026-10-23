@@ -8,6 +8,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import typia from 'typia';
 import type {
+  CpuBudgetStatus,
   JobProcessRetirement,
   JobSubtreeAdmission,
   JobSubtreeRefusal,
@@ -160,6 +161,35 @@ const seamTypes = {
 const assertCorpus = typia.createAssert<Record<string, Record<string, unknown>>>();
 
 const corpus = assertCorpus(JSON.parse(readFileSync(new URL('./wire-fixtures.json', import.meta.url), 'utf8')));
+
+it('decodes repository-bearing gate queue status with the generated strict validator', () => {
+  const ledger: CpuBudgetStatus = {
+    total: 4,
+    held: 1,
+    checkouts: [
+      { checkout: '/w/holder', held: 1, running: 1, waiting: 0 },
+      { checkout: '/w/waiter', held: 0, running: 0, waiting: 1 },
+    ],
+    gateJobs: [
+      {
+        repository: 'owner/repo',
+        checkout: '/w/holder',
+        job: 0,
+        held: 1,
+        holders: [{ command: 'held gate', tokens: 1, want: 1, heldMs: 0 }],
+      },
+    ],
+    gateQueue: [
+      { repository: 'owner/repo', checkout: '/w/waiter', job: 1, command: 'waiting gate', want: 1, waitedMs: 0 },
+    ],
+    background: [],
+  };
+  expect(validators.parseCpuBudgetStatus(JSON.stringify(ledger))).toEqual(ledger);
+  expect(() => validators.assertCpuGateJob({ checkout: '/w/holder', job: 0, held: 1, holders: [] })).toThrow();
+  expect(() =>
+    validators.assertCpuGateWaiter({ checkout: '/w/waiter', job: 1, command: 'waiting gate', want: 1, waitedMs: 0 }),
+  ).toThrow();
+});
 
 describe('napi wire contract', () => {
   it('checks admission keys by UTF-8 bytes without allocating an encoder', () => {

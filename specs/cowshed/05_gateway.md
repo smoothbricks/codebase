@@ -1325,25 +1325,25 @@ core count.
   that admission until its connection closes. `want` 0, a missing or empty checkout, or one over 4096 bytes is refused
   as `invalid-request`. `{"op":"cpu-budget"}` is one-shot and answers the ledger as `cpuBudget`: `total`, `held`, per
   checkout `held`, `running` and `waiting` (every class together); `gateJobs`: the gate jobs whose runners hold tokens,
-  oldest job first — the first is the head of the gate queue — each with its `checkout`, its gate `job` (the job's
-  admission number; the smaller is the older job), the tokens it `held` and its `holders`; `gateQueue`: the waiting
-  gate-class requests in the order returned tokens go to them, each with its `checkout`, gate `job`, the client's `pid`,
-  the `command` it named, its `want` and `waitedMs`, the milliseconds since it asked; and `background`: each checkout's
-  background-class stake alone (`held`, `holders`, and its waiting requests as `waiters`, each with `pid`, `command`,
-  `want` and `waitedMs`), for the checkouts that have one. Every waiting entry is one request: a gate job whose tasks
-  wait is one entry per task — the job identity is the gate `job` number and each entry is a distinct connection — so
-  the queue is never collapsed per job; its pid, command and age tell the entries apart (measured 2026-10-19: fifteen
-  `batch-7 gate job 603 want 1` entries were fifteen of that gate's tasks, and read as duplicates because they named
-  nothing else). `holders` are the granted leases, one per runner holding tokens, oldest grant first, each with the
-  client's `pid` (the socket's peer; absent when the socket names none — a pool-relayed task is named by its own
-  connection to the pool), the `command` it named, the `tokens` it holds now, its `want`, and `heldMs`, the milliseconds
-  since its grant. The age is the lease's, never the process's: a lease is one connection granted once, and a process
-  that asks again holds a new lease with its own age; the ledger never scans processes, and `ps -p <pid>` gives the
-  process's age. Measured 2026-10-18: a ledger that named only `land-test-hang: held 15, running 1` read as an orphan,
-  and a live 34-minute `cargo test …` another unit was waiting on was killed by hand; its holder line would have said
-  what it was and that it was live. `cowshed gateway status` shows this ledger to the operator in the order it serves —
-  its count with what background holds and the cap in force on its grants
-  (`gateway cpu budget: held <h>/<N> tokens, background holds <b>, at most <N> with no gate work`, or
+  oldest job first — the first is the head of the gate queue — each with its `repository`, `checkout`, its gate `job`
+  (the job's admission number; the smaller is the older job), the tokens it `held` and its `holders`; `gateQueue`: the
+  waiting gate-class requests in the order returned tokens go to them, each with its `repository`, `checkout`, gate
+  `job`, the client's `pid`, the `command` it named, its `want` and `waitedMs`, the milliseconds since it asked; and
+  `background`: each checkout's background-class stake alone (`held`, `holders`, and its waiting requests as `waiters`,
+  each with `pid`, `command`, `want` and `waitedMs`), for the checkouts that have one. Every waiting entry is one
+  request: a gate job whose tasks wait is one entry per task — the job identity is the gate `job` number and each entry
+  is a distinct connection — so the queue is never collapsed per job; its pid, command and age tell the entries apart
+  (measured 2026-10-19: fifteen `batch-7 gate job 603 want 1` entries were fifteen of that gate's tasks, and read as
+  duplicates because they named nothing else). `holders` are the granted leases, one per runner holding tokens, oldest
+  grant first, each with the client's `pid` (the socket's peer; absent when the socket names none — a pool-relayed task
+  is named by its own connection to the pool), the `command` it named, the `tokens` it holds now, its `want`, and
+  `heldMs`, the milliseconds since its grant. The age is the lease's, never the process's: a lease is one connection
+  granted once, and a process that asks again holds a new lease with its own age; the ledger never scans processes, and
+  `ps -p <pid>` gives the process's age. Measured 2026-10-18: a ledger that named only
+  `land-test-hang: held 15, running 1` read as an orphan, and a live 34-minute `cargo test …` another unit was waiting
+  on was killed by hand; its holder line would have said what it was and that it was live. `cowshed gateway status`
+  shows this ledger to the operator in the order it serves — its count with what background holds and the cap in force
+  on its grants (`gateway cpu budget: held <h>/<N> tokens, background holds <b>, at most <N> with no gate work`, or
   `at most <⌊N/2⌋> beside gate work`), the head gate job, the gate jobs behind it, the gate queue, then background, each
   running gate job and background stake followed by its leases — in its human lines, and verbatim as `cpuBudget` in
   `--json` (06_cli.md; 07_api.md `GatewayStatus`), whose cap is `total` with neither `gateJobs` nor `gateQueue` and

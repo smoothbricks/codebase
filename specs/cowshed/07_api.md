@@ -1658,12 +1658,12 @@ supervisor that ran the job retires.
   field); never an empty ledger in its place, and absent when no daemon answered `status`.
   `CpuBudgetStatus = { total, held, checkouts, gateJobs, gateQueue, background }`: `checkouts` (every class) is
   `[{ checkout, held, running, waiting }]`, `background` (background class alone) is
-  `[{ checkout, held, waiting, holders }]`, `gateJobs` is `[{ checkout, job, held, holders }]` oldest job first (the
-  head of the gate queue first), and `gateQueue` is `[{ checkout, job, want }]` in the order returned tokens go to it.
-  `holders` is `[CpuHolder]`, one per granted lease, oldest grant first:
-  `CpuHolder = { pid?, command, tokens, want, heldMs }`, the client's peer pid, the command it named, the tokens it
-  holds now of its `want`, and the milliseconds since its grant — the lease's age, not its process's (05_gateway.md
-  "Host CPU budget", Wire).
+  `[{ checkout, held, waiting, holders }]`, `gateJobs` is `[{ repository, checkout, job, held, holders }]` oldest job
+  first (the head of the gate queue first), and `gateQueue` is
+  `[{ repository, checkout, job, pid?, command, want, waitedMs }]` in the order returned tokens go to it. `holders` is
+  `[CpuHolder]`, one per granted lease, oldest grant first: `CpuHolder = { pid?, command, tokens, want, heldMs }`, the
+  client's peer pid, the command it named, the tokens it holds now of its `want`, and the milliseconds since its grant —
+  the lease's age, not its process's (05_gateway.md "Host CPU budget", Wire).
   `AuditEvent = { timestamp, repoId, workspaceIncarnation, workspace, action, decision, reason?, trace }`.
 
 `JsonEnvelope<T>` has only the private-body constructors `success(T)` → `{"ok":true,"result":T}` and
