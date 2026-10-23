@@ -1,10 +1,10 @@
 # Managed by @smoothbricks/cli (smoo monorepo update) - do not edit by hand.
 #
-# Self-healing loop for smoo-managed files: ci.yml runs the authoritative
-# `smoo monorepo check --warn` on every event (devenv is already up there, so
-# the check is ~free; package policies fail the job, drift only warns) and, on
-# a default-branch push, dispatches THIS workflow only when real drift exists -
-# typically after a @smoothbricks/cli pin bump. It runs
+# Self-healing loop for smoo-managed files: ci.yml rejects managed-file drift
+# and package policy failures on pull requests. Pushes use `smoo monorepo check
+# --warn`: package policies still fail, but drift warns so a default-branch
+# push can dispatch THIS workflow to repair it. Dependency upgrades must
+# include regenerated files in the same PR. This workflow runs
 # `smoo monorepo update` and pushes the result to ONE persistent review branch
 # (chore/managed-files) with ONE PR. The PR is NEVER auto-merged: a template
 # change is upstream code that deserves a human look before it lands. Re-runs

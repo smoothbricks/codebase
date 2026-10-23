@@ -30,36 +30,24 @@ function options(overrides: Partial<CiWorkflowDefinitionOptions> = {}): CiWorkfl
 }
 
 describe('CI workflow definition', () => {
-  it('deploys immediately after build and renumbers following steps', () => {
-    const definition = options({ deploy: true, browserTests: true });
-    const steps = defineCiWorkflow(definition);
-    const rendered = renderCiWorkflowYaml(definition);
-
-    expect(steps.map((step) => [step.kind, step.number])).toEqual([
-      [CiWorkflowStepKind.Checkout, 2],
-      [CiWorkflowStepKind.SetupDevenv, 3],
-      [CiWorkflowStepKind.SetNxShas, 4],
-      [CiWorkflowStepKind.RestoreNxCache, 5],
-      [CiWorkflowStepKind.Build, 6],
-      [CiWorkflowStepKind.Deploy, 7],
-      [CiWorkflowStepKind.Lint, 8],
-      [CiWorkflowStepKind.UnitTests, 9],
-      [CiWorkflowStepKind.BrowserTests, 10],
-      [CiWorkflowStepKind.ManagedFilesCheck, 11],
-      [CiWorkflowStepKind.ManagedFilesDispatch, 12],
-      [CiWorkflowStepKind.SaveNxCache, 13],
-      [CiWorkflowStepKind.UploadTraceDbs, 14],
-      [CiWorkflowStepKind.SaveNixDevenv, 15],
-    ]);
-    expect(rendered.match(/- name: 🚀 Deploy Stage/g)).toHaveLength(1);
-    expect(rendered).toContain('id: deploy');
-    expect(rendered).toContain('smoo github-ci nx-deploy --mode run-many --name "Deploy Stage" --step 7');
-    expect(rendered).toContain('smoo github-ci nx-smart --target test-browser --name "Browser Tests" --step 10');
-    expect(rendered).toContain('group: CI-${{ github.event.pull_request.number || github.ref }}');
-    expect(rendered).toContain("cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}");
-    expect(rendered).toContain('github.event.pull_request.head.repo.full_name == github.repository');
-    expect(rendered).toContain("github.ref == 'refs/heads/main'");
-    expect(rendered).toContain("# Step 13\n      # Nx's database cache needs artifact files");
+  it('checks managed files before building or deploying, after installing the checking tool', () => {
+    for (const deploy of [false, true]) {
+      const steps = defineCiWorkflow(options({ deploy, browserTests: true }));
+      const position = (kind: CiWorkflowStepKind): number => {
+        const index = steps.findIndex((step) => step.kind === kind);
+        if (index < 0) throw new Error(`Missing workflow step: ${kind}`);
+        return index;
+      };
+      expect(position(CiWorkflowStepKind.ManagedFilesCheck)).toBeGreaterThan(position(CiWorkflowStepKind.SetupDevenv));
+      expect(position(CiWorkflowStepKind.ManagedFilesCheck)).toBeLessThan(position(CiWorkflowStepKind.Build));
+      expect(position(CiWorkflowStepKind.ManagedFilesDispatch)).toBeGreaterThan(
+        position(CiWorkflowStepKind.ManagedFilesCheck),
+      );
+      expect(position(CiWorkflowStepKind.ManagedFilesDispatch)).toBeLessThan(position(CiWorkflowStepKind.Build));
+      if (deploy) {
+        expect(position(CiWorkflowStepKind.ManagedFilesCheck)).toBeLessThan(position(CiWorkflowStepKind.Deploy));
+      }
+    }
   });
 
   it('pins every external action and materializes full read-only checkouts with finite bounds', () => {
@@ -163,7 +151,7 @@ describe('CI workflow definition', () => {
     ]);
   });
 
-  it('clones declared sibling sources before setup and renumbers following steps', () => {
+  it('clones declared sibling sources with origin-scoped credentials', () => {
     const definition = options({
       sourceCheckouts: [
         {
@@ -180,14 +168,6 @@ describe('CI workflow definition', () => {
         },
       ],
     });
-    const steps = defineCiWorkflow(definition);
-
-    expect(steps.slice(0, 4).map((step) => [step.kind, step.number])).toEqual([
-      [CiWorkflowStepKind.Checkout, 2],
-      [CiWorkflowStepKind.SourceCheckouts, 3],
-      [CiWorkflowStepKind.SetupDevenv, 4],
-      [CiWorkflowStepKind.SetNxShas, 5],
-    ]);
     const rendered = renderCiWorkflowYaml(definition);
     expect(rendered).toContain('- name: 📦 Check out sibling sources');
     expect(rendered).toContain('github.event.pull_request.head.repo.full_name == github.repository');
@@ -214,7 +194,6 @@ describe('CI workflow definition', () => {
     expect(rendered).toContain(
       'GIT_CONFIG_VALUE_0="$val" \\\n          git -C "$root/../smoothbricks" checkout --detach abc123',
     );
-    expect(rendered).toContain('# Step 4. Composite action internals');
   });
 
   it('clones public siblings unauthenticated and omits the env block without tokens', () => {

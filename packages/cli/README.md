@@ -436,9 +436,12 @@ smoo monorepo diff
 `check` fails when a managed file is missing or stale, and when a package policy fails (the devenv profile's Go against
 the Go SDK ttsc vendors, root package, Nx names and release config, public tags and metadata, test locations, workspace
 dependencies, the devenv import and release lock, the Cargo cache and toolchain policies, and, where `packages/cowshed`
-exists, the sccache patches). `check --warn` reports managed-file drift as warnings instead — CI runs it on every event
-and, on a default-branch push, dispatches the managed-files workflow to heal the drift — while a policy failure still
-fails it, because nothing heals one. `diff` reports drift without writing files.
+exists, the sccache patches). CI checks immediately after environment setup, before builds or deployments. Pull requests
+use strict `check`, so dependency upgrades must include regenerated files in the same PR. Shared workflow changes belong
+in SmoothBricks, not hand-edited generated files. Pushes use `check --warn`, which reports drift as warnings and, on a
+default-branch push, lets CI dispatch the managed-files workflow to heal it. Package policy failures still fail either
+mode. Existing fork restrictions for jobs needing private credentials remain unchanged. `diff` reports drift without
+writing files.
 
 The generated publish workflow is canonical Prettier YAML. Running the repository formatter over
 `.github/workflows/publish.yml` is byte-stable and does not create managed-file drift.
