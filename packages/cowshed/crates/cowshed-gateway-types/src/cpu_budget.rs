@@ -177,6 +177,8 @@ pub struct JobserverAnswer {
     pub error: Option<String>,
     /// The install that cut this ask off, beside [`INSTALL_RESTART_CODE`].
     pub install: Option<InstallRestart>,
+    /// The broker's queue snapshot at admission; absent when granted immediately.
+    pub queue: Option<CpuQueueWait>,
 }
 
 /// The refusal code of a CPU ask a gateway cut off because an install is restarting it
@@ -235,6 +237,75 @@ pub fn cpu_pool_directory(
     Ok(store.join("run/cpu").join(name))
 }
 
+/// A request as the host ledger knows it. Job is the admission number, not a supervisor JobId.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CpuQueueEntry {
+    pub repository: Option<String>,
+    pub class: JobserverClass,
+    pub checkout: String,
+    pub job: u64,
+    pub command: String,
+}
+
+/// The admission decision, before another ledger transition. Position is one-based among
+/// waiters in this repository's gate order or this checkout's background FIFO; holders are
+/// reported separately. Background fairness and gates in other repositories may change which
+/// queue next receives host tokens, so this is not a promised global grant order.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CpuQueueWait {
+    pub request: CpuQueueEntry,
+    pub position: usize,
+    pub holders: Vec<CpuQueueEntry>,
+    pub ahead: Vec<CpuQueueEntry>,
+}
+
+impl std::fmt::Display for CpuQueueEntry {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let class = match self.class {
+            JobserverClass::Gate => "gate",
+            JobserverClass::Background => "background",
+        };
+        write!(
+            out,
+            "repository={:?} class={class} workspace={:?} job={} command={:?}",
+            self.repository.as_deref().unwrap_or("unknown"),
+            self.checkout,
+            self.job,
+            self.command
+        )
+    }
+}
+
+impl std::fmt::Display for CpuQueueWait {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let order = match self.request.class {
+            JobserverClass::Gate => "repository-gate",
+            JobserverClass::Background => "checkout-background (host checkout-fair)",
+        };
+        write!(
+            out,
+            "queue={order} {} position={} holders=[",
+            self.request, self.position
+        )?;
+        for (index, entry) in self.holders.iter().enumerate() {
+            if index != 0 {
+                out.write_str("; ")?;
+            }
+            write!(out, "{entry}")?;
+        }
+        out.write_str("] ahead=[")?;
+        for (index, entry) in self.ahead.iter().enumerate() {
+            if index != 0 {
+                out.write_str("; ")?;
+            }
+            write!(out, "{entry}")?;
+        }
+        out.write_str("]")
+    }
+}
+
 /// The one line a client writes:
 /// `{"op":"cpu-tokens","want":8,"checkout":"/path/to/checkout","command":"…"}`.
 ///
@@ -286,6 +357,7 @@ pub struct CpuBudgetStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CpuGateJob {
+    pub repository: String,
     pub checkout: String,
     /// The gate job, as its admission number: the smaller is the older job.
     pub job: u64,
@@ -446,6 +518,7 @@ impl CpuBudgetStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CpuGateWaiter {
+    pub repository: String,
     pub checkout: String,
     /// The gate job it serves, as that job's admission number: the smaller is the older job.
     pub job: u64,

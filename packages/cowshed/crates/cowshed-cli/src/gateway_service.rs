@@ -2003,7 +2003,8 @@ fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
             "gateway gate job behind the head"
         };
         lines.push(format!(
-            "{title}: {} gate job {}: held {}, running {}",
+            "{title}: repository={} {} gate job {}: held {}, running {}",
+            job.repository,
             job.checkout,
             job.job,
             job.held,
@@ -2011,7 +2012,8 @@ fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
         ));
         lines.extend(job.holders.iter().map(|holder| {
             format!(
-                "gateway gate lease: {} gate job {}: {}",
+                "gateway gate lease: repository={} {} gate job {}: {}",
+                job.repository,
                 job.checkout,
                 job.job,
                 lease_words(holder)
@@ -2027,8 +2029,9 @@ fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
         ));
         lines.extend(ledger.gate_queue.iter().enumerate().map(|(place, waiter)| {
             format!(
-                "gateway gate queue {}: {} gate job {}: {}",
+                "gateway gate queue {}: repository={} {} gate job {}: {}",
                 place + 1,
+                waiter.repository,
                 waiter.checkout,
                 waiter.job,
                 waiter_words(waiter.pid, waiter.want, waiter.waited_ms, &waiter.command)
@@ -4651,6 +4654,7 @@ mod tests {
                     },
                 ],
                 gate_jobs: vec![CpuGateJob {
+                    repository: "owner/repo".into(),
                     checkout: "/mnt/app/land".into(),
                     job: 7,
                     held: 6,
@@ -4753,6 +4757,7 @@ mod tests {
                     },
                 ],
                 gate_jobs: vec![CpuGateJob {
+                    repository: "owner/repo".into(),
                     checkout: "/mnt/app/land".into(),
                     job: 4,
                     held: 5,

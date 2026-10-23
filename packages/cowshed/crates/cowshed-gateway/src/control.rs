@@ -664,6 +664,8 @@ struct ControlResponse {
     cpu_pool: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_budget: Option<CpuBudgetStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queue: Option<cowshed_gateway_types::cpu_budget::CpuQueueWait>,
     /// What a selected task-server unit runs under.
     #[serde(skip_serializing_if = "Option::is_none")]
     task_grant: Option<TaskGrant>,
@@ -1119,9 +1121,10 @@ async fn serve<R, W>(
             let checkout: Arc<str> = Arc::from(checkout);
             let claim = Claim::new(&command, pid);
             let rank = options.admission.rank();
-            let admission = services
-                .cpu_budget
-                .ask(Arc::clone(&checkout), want, claim, rank);
+            let admission =
+                services
+                    .cpu_budget
+                    .ask_jobserver(Arc::clone(&checkout), want, claim, rank);
             hold_jobserver(
                 reader,
                 writer,
@@ -1277,9 +1280,10 @@ async fn hold_jobserver<R, W>(
     mut reader: R,
     mut writer: W,
     want: NonZeroUsize,
-    (stake, granted): (
+    (stake, granted, queued): (
         crate::cpu_budget::Stake,
         tokio::sync::oneshot::Receiver<usize>,
+        tokio::sync::oneshot::Receiver<Option<cowshed_gateway_types::cpu_budget::CpuQueueWait>>,
     ),
     parent: Option<(PathBuf, cowshed_os::fork_lock::Fenced<UnixStream>)>,
     fifos: crate::jobserver::JobserverFifos,
@@ -1291,9 +1295,31 @@ async fn hold_jobserver<R, W>(
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    if write_response(&mut writer, &lease(LeaseState::Queued))
-        .await
-        .is_err()
+    let queue = match queued.await {
+        Ok(mut queue) => {
+            if let Some(wait) = &mut queue {
+                wait.request.repository = wait
+                    .request
+                    .repository
+                    .take()
+                    .or_else(|| options.pool_job.as_ref().map(|job| job.repo_id.to_string()));
+            }
+            queue
+        }
+        Err(_) => {
+            let _ = write_response(&mut writer, &cpu_ask_cut_off(&budget)).await;
+            return;
+        }
+    };
+    if write_response(
+        &mut writer,
+        &ControlResponse {
+            queue,
+            ..lease(LeaseState::Queued)
+        },
+    )
+    .await
+    .is_err()
     {
         return;
     }
@@ -2321,6 +2347,7 @@ fn success() -> ControlResponse {
         fifo: None,
         cpu_pool: None,
         cpu_budget: None,
+        queue: None,
         task_grant: None,
         task_queue: None,
         nx_cache_cleared: None,

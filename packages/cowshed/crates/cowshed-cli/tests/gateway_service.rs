@@ -461,6 +461,7 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
         ],
         gate_jobs: vec![
             CpuGateJob {
+                repository: "owner/repo".into(),
                 checkout: "/w/older-land".into(),
                 job: 3,
                 held: 12,
@@ -482,6 +483,7 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
                 ],
             },
             CpuGateJob {
+                repository: "owner/repo".into(),
                 checkout: "/w/younger-land".into(),
                 job: 5,
                 held: 1,
@@ -496,6 +498,7 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
         ],
         gate_queue: vec![
             CpuGateWaiter {
+                repository: "owner/repo".into(),
                 checkout: "/w/older-land".into(),
                 job: 3,
                 pid: Some(103),
@@ -504,6 +507,7 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
                 waited_ms: 187_000,
             },
             CpuGateWaiter {
+                repository: "owner/repo".into(),
                 checkout: "/w/older-land".into(),
                 job: 3,
                 pid: Some(104),
@@ -512,6 +516,7 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
                 waited_ms: 42_000,
             },
             CpuGateWaiter {
+                repository: "owner/repo".into(),
                 checkout: "/w/younger-land".into(),
                 job: 5,
                 pid: None,
@@ -568,15 +573,15 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
             "cowshed: gateway cpu budget: held 17/18 tokens, background holds 4, at most 9 beside gate work",
             "cowshed: gateway cpu hold past 30m: /w/older-land: pid 9, 1/1 tokens, granted 1h02m05s ago: bun test",
             "cowshed: gateway cpu hold past 30m: /w/younger-land: pid 71437, 3/18 tokens, granted 34m07s ago: cargo --frozen test -p app",
-            "cowshed: gateway gate head: /w/older-land gate job 3: held 12, running 2",
-            "cowshed: gateway gate lease: /w/older-land gate job 3: pid 101, 10/18 tokens, granted 2m05s ago: nx run-many -t test",
-            "cowshed: gateway gate lease: /w/older-land gate job 3: pid 102, 2/4 tokens, granted 3s ago: child CPU pool",
-            "cowshed: gateway gate job behind the head: /w/younger-land gate job 5: held 1, running 1",
-            "cowshed: gateway gate lease: /w/younger-land gate job 5: pid unknown, 1/1 tokens, granted 1m01s ago: child CPU pool",
+            "cowshed: gateway gate head: repository=owner/repo /w/older-land gate job 3: held 12, running 2",
+            "cowshed: gateway gate lease: repository=owner/repo /w/older-land gate job 3: pid 101, 10/18 tokens, granted 2m05s ago: nx run-many -t test",
+            "cowshed: gateway gate lease: repository=owner/repo /w/older-land gate job 3: pid 102, 2/4 tokens, granted 3s ago: child CPU pool",
+            "cowshed: gateway gate job behind the head: repository=owner/repo /w/younger-land gate job 5: held 1, running 1",
+            "cowshed: gateway gate lease: repository=owner/repo /w/younger-land gate job 5: pid unknown, 1/1 tokens, granted 1m01s ago: child CPU pool",
             "cowshed: gateway gate queue: 3 waiting, in the order returned tokens go to them",
-            "cowshed: gateway gate queue 1: /w/older-land gate job 3: pid 103, want 6, waiting 3m07s: cargo nextest run -p app",
-            "cowshed: gateway gate queue 2: /w/older-land gate job 3: pid 104, want 2, waiting 42s: bun test",
-            "cowshed: gateway gate queue 3: /w/younger-land gate job 5: pid unknown, want 18, waiting 9s: nx run-many -t test",
+            "cowshed: gateway gate queue 1: repository=owner/repo /w/older-land gate job 3: pid 103, want 6, waiting 3m07s: cargo nextest run -p app",
+            "cowshed: gateway gate queue 2: repository=owner/repo /w/older-land gate job 3: pid 104, want 2, waiting 42s: bun test",
+            "cowshed: gateway gate queue 3: repository=owner/repo /w/younger-land gate job 5: pid unknown, want 18, waiting 9s: nx run-many -t test",
             "cowshed: gateway background: /w/older-land: held 1, running 1, waiting 0",
             "cowshed: gateway background lease: /w/older-land: pid 9, 1/1 tokens, granted 1h02m05s ago: bun test",
             "cowshed: gateway background: /w/younger-land: held 3, running 1, waiting 0",
@@ -605,18 +610,18 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
                 {"checkout": "/w/younger-land", "held": 4, "running": 2, "waiting": 1}
             ],
             "gateJobs": [
-                {"checkout": "/w/older-land", "job": 3, "held": 12, "holders": [
+                {"repository": "owner/repo", "checkout": "/w/older-land", "job": 3, "held": 12, "holders": [
                     {"pid": 101, "command": "nx run-many -t test", "tokens": 10, "want": 18, "heldMs": 125000},
                     {"pid": 102, "command": "child CPU pool", "tokens": 2, "want": 4, "heldMs": 3400}
                 ]},
-                {"checkout": "/w/younger-land", "job": 5, "held": 1, "holders": [
+                {"repository": "owner/repo", "checkout": "/w/younger-land", "job": 5, "held": 1, "holders": [
                     {"command": "child CPU pool", "tokens": 1, "want": 1, "heldMs": 61000}
                 ]}
             ],
             "gateQueue": [
-                {"checkout": "/w/older-land", "job": 3, "pid": 103, "command": "cargo nextest run -p app", "want": 6, "waitedMs": 187000},
-                {"checkout": "/w/older-land", "job": 3, "pid": 104, "command": "bun test", "want": 2, "waitedMs": 42000},
-                {"checkout": "/w/younger-land", "job": 5, "command": "nx run-many -t test", "want": 18, "waitedMs": 9000}
+                {"repository": "owner/repo", "checkout": "/w/older-land", "job": 3, "pid": 103, "command": "cargo nextest run -p app", "want": 6, "waitedMs": 187000},
+                {"repository": "owner/repo", "checkout": "/w/older-land", "job": 3, "pid": 104, "command": "bun test", "want": 2, "waitedMs": 42000},
+                {"repository": "owner/repo", "checkout": "/w/younger-land", "job": 5, "command": "nx run-many -t test", "want": 18, "waitedMs": 9000}
             ],
             "background": [
                 {"checkout": "/w/older-land", "held": 1, "waiters": [], "holders": [
@@ -638,6 +643,7 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
 #[test]
 fn gateway_status_tells_apart_the_tasks_of_one_gate_job_waiting_for_tokens() {
     let waiter = |pid: i32, command: &str, waited_ms: u64| CpuGateWaiter {
+        repository: "owner/repo".into(),
         checkout: "/mnt/app/batch-7".into(),
         job: 603,
         pid: Some(pid),
@@ -663,6 +669,7 @@ fn gateway_status_tells_apart_the_tasks_of_one_gate_job_waiting_for_tokens() {
             },
         ],
         gate_jobs: vec![CpuGateJob {
+            repository: "owner/repo".into(),
             checkout: "/mnt/app/batch-7".into(),
             job: 603,
             held: 1,
@@ -710,9 +717,9 @@ fn gateway_status_tells_apart_the_tasks_of_one_gate_job_waiting_for_tokens() {
     assert_eq!(
         entries,
         [
-            "cowshed: gateway gate queue 1: /mnt/app/batch-7 gate job 603: pid 40118, want 1, waiting 12m03s: bun test packages/core",
-            "cowshed: gateway gate queue 2: /mnt/app/batch-7 gate job 603: pid 40127, want 1, waiting 4m01s: bun test packages/tooling",
-            "cowshed: gateway gate queue 3: /mnt/app/batch-7 gate job 603: pid 40133, want 1, waiting 7s: tsc --noEmit -p packages/core",
+            "cowshed: gateway gate queue 1: repository=owner/repo /mnt/app/batch-7 gate job 603: pid 40118, want 1, waiting 12m03s: bun test packages/core",
+            "cowshed: gateway gate queue 2: repository=owner/repo /mnt/app/batch-7 gate job 603: pid 40127, want 1, waiting 4m01s: bun test packages/tooling",
+            "cowshed: gateway gate queue 3: repository=owner/repo /mnt/app/batch-7 gate job 603: pid 40133, want 1, waiting 7s: tsc --noEmit -p packages/core",
         ],
         "{stderr}"
     );

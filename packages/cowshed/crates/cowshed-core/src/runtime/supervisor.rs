@@ -6482,16 +6482,20 @@ impl SupervisorActor {
             ),
             parent,
         });
-        self.admissions.spawn(async move {
-            let granted = match start {
-                Some(start) => match start.await {
-                    Ok(stake) => ask.await.map(|grant| grant.holding_until_started(stake)),
-                    Err(error) => Err(error),
-                },
-                None => ask.await,
-            };
-            (job_id, granted)
-        })
+        self.admissions.spawn(super::job_cpu::reporting(
+            job_id,
+            self.events.clone(),
+            async move {
+                let granted = match start {
+                    Some(start) => match start.await {
+                        Ok(stake) => ask.await.map(|grant| grant.holding_until_started(stake)),
+                        Err(error) => Err(error),
+                    },
+                    None => ask.await,
+                };
+                (job_id, granted)
+            },
+        ))
     }
 
     /// A kept daemon's start still waiting at the host, asked under no holder, draws on the

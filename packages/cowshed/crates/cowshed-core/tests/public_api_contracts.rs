@@ -1296,6 +1296,7 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
                     waiting: 1,
                 }],
                 gate_jobs: vec![cowshed_gateway_types::CpuGateJob {
+                    repository: "owner/repo".into(),
                     checkout: "/w/land".into(),
                     job: 7,
                     held: 12,
@@ -1308,6 +1309,7 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
                     }],
                 }],
                 gate_queue: vec![cowshed_gateway_types::CpuGateWaiter {
+                    repository: "owner/repo".into(),
                     checkout: "/w/land".into(),
                     job: 7,
                     pid: Some(4133),
@@ -1337,9 +1339,9 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         serde_json::to_value(&ledger).unwrap()["cpuBudget"],
         json!({"ledger":{"total":18,"held":13,
             "checkouts":[{"checkout":"/w/land","held":13,"running":2,"waiting":1}],
-            "gateJobs":[{"checkout":"/w/land","job":7,"held":12,"holders":[
+            "gateJobs":[{"repository":"owner/repo","checkout":"/w/land","job":7,"held":12,"holders":[
                 {"pid":4120,"command":"nx run-many -t gate","tokens":12,"want":18,"heldMs":125000}]}],
-            "gateQueue":[{"checkout":"/w/land","job":7,"pid":4133,"command":"child CPU pool",
+            "gateQueue":[{"repository":"owner/repo","checkout":"/w/land","job":7,"pid":4133,"command":"child CPU pool",
                 "want":6,"waitedMs":3000}],
             "background":[{"checkout":"/w/land","held":1,"waiters":[],"holders":[
                 {"command":"cargo test","tokens":1,"want":18,"heldMs":7}]}]}})

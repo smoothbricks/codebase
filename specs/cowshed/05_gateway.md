@@ -1117,6 +1117,22 @@ core count.
   held 13 of 18 tokens, killing the land for waiting in the very order the ledger serves. An unknown class is an invalid
   request, and so is a `waitMs` field: it is no longer part of the request. Running task wall/idle bounds still start at
   their grant.
+  - **Admission waits say what they wait for.** A jobserver request that remains queued after its admission transition
+    receives that transition's queue snapshot in its queued acknowledgement, before waiting for any token. The client
+    writes `cowshed: jobserver wait start` to stderr with repository (or explicitly unknown), class, workspace, its
+    one-based waiting position, all current token grantees, and the queued entries ahead, naming each workspace,
+    admission job number and command. Gate position is in its repository's gate order; background position is in its
+    checkout's FIFO on the host's checkout-fair ledger, not an invented repository FIFO or a promised global grant
+    order. Holders are separate from queued positions. The snapshot is the broker's decision, not a client-side status
+    poll. A request granted immediately prints no wait. Grant or refusal ends the phase with
+    `cowshed: jobserver wait done elapsed=<waited> status=ok|err`; transport EOF is an error, never a grant. Supervisor
+    admission forwards these lines through the job's live stderr, including before any command exists, so the waiting
+    exec hears them rather than only the daemon log. Cancellation still closes the owning connection and leaves the
+    queue. This adds no admission deadline and changes no grant order. `cowshed gateway status` reads this same ledger
+    without changing it: its existing `cpuBudget` projection shows token grantees, gate requests and background waiters,
+    and every `gateJobs` and `gateQueue` entry names its `repository`, including a repository whose land queue is empty.
+    `--json` preserves that projection in the normal success envelope; text names the repository alongside each gate
+    job, lease and queued request.
 - **The task server owns the live grant and nice.** Work enters the existing `cowshed exec` / workspace supervisor, not
   a gate-host or taskpolicy wrapper. Its typed request carries class, want and scope. Only a trusted
   coordinator/operator may request Gate or HostGate; a worker request is refused with typed class-not-permitted before

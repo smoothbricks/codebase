@@ -1581,3 +1581,149 @@ async fn a_holders_exec_on_a_full_host_with_a_busy_pool_is_granted_by_whichever_
     }
     gateway.drain().await.expect("drain");
 }
+
+/// The reader must see the waiting client's stderr while the first connection still owns its
+/// grant. No sleep or elapsed-time assertion can establish that causal boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_jobserver_client_names_holders_before_release_and_status_lists_both() {
+    use cowshed_core::api::ExecClass;
+    use cowshed_core::runtime::job_cpu::{GatewayJobCpu, JobCpuAdmission as _};
+    const SOCKET: &str = "COWSHED_QUEUE_PROOF_SOCKET";
+    const CLASS: &str = "COWSHED_QUEUE_PROOF_CLASS";
+    if let Some(socket) = std::env::var_os(SOCKET) {
+        let class = match std::env::var(CLASS).unwrap().as_str() {
+            "gate" => ExecClass::Gate,
+            "background" => ExecClass::Background,
+            other => panic!("unexpected proof class {other}"),
+        };
+        let mut ask = exec_ask(1, "/w/waiter", 2, None);
+        ask.class = class;
+        let grant = GatewayJobCpu::new(socket.into())
+            .admit(ask)
+            .await
+            .expect("waiter granted");
+        assert_eq!(grant.tokens(), NonZeroUsize::new(1));
+        drop(grant);
+        return;
+    }
+    for class in [ExecClass::Gate, ExecClass::Background] {
+        let (gateway, _root, socket) = gateway(4).await;
+        let admission = GatewayJobCpu::new(socket.clone());
+        let mut ask = exec_ask(
+            if class == ExecClass::Gate { 1 } else { 4 },
+            "/w/holder",
+            1,
+            None,
+        );
+        ask.class = class;
+        let holder = admission.admit(ask).await.expect("held grant");
+        let wire_class = if class == ExecClass::Gate {
+            "gate"
+        } else {
+            "background"
+        };
+        let mut child = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "queued_jobserver_client_names_holders_before_release_and_status_lists_both",
+                "--nocapture",
+            ])
+            .env(SOCKET, &socket)
+            .env(CLASS, wire_class)
+            .env_remove("COWSHED_TIMING")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("waiting client");
+        let mut stderr = BufReader::new(child.stderr.take().expect("client stderr pipe"));
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(
+                stderr.read_line(&mut line).await.expect("client progress"),
+                0,
+                "client closed before reporting its wait"
+            );
+            if line.starts_with("cowshed: jobserver wait start ") {
+                break;
+            }
+        }
+        assert!(line.contains(r#"repository="owner/repo""#), "{line}");
+        assert!(line.contains(&format!("class={wire_class}")), "{line}");
+        assert!(line.contains(r#"workspace="/w/waiter""#), "{line}");
+        assert!(line.contains("position=1 holders=["), "{line}");
+        assert!(
+            line.contains(r#"workspace="/w/holder" job=0 command="/w/holder job 1""#),
+            "{line}"
+        );
+        assert!(line.contains("ahead=[]"), "{line}");
+        // Status is queried only after the stderr pipe proves the second request was queued,
+        // and before this test drops the first grant. Reading it changes no admission.
+        let status = ledger(&socket).await;
+        assert_eq!(status.held, if class == ExecClass::Gate { 1 } else { 4 });
+        assert_eq!(status.checkouts.len(), 2, "{status:?}");
+        let json = one_shot(&socket, "{\"op\":\"cpu-budget\"}\n").await;
+        if class == ExecClass::Gate {
+            assert_eq!(status.gate_jobs[0].repository, "owner/repo");
+            assert_eq!(status.gate_jobs[0].checkout, "/w/holder");
+            assert_eq!(status.gate_queue[0].repository, "owner/repo");
+            assert_eq!(status.gate_queue[0].checkout, "/w/waiter");
+            assert_eq!(json["cpuBudget"]["gateJobs"][0]["repository"], "owner/repo");
+            assert_eq!(json["cpuBudget"]["gateQueue"][0]["checkout"], "/w/waiter");
+        } else {
+            assert_eq!(status.background[0].checkout, "/w/holder");
+            assert_eq!(status.background[0].holders[0].command, "/w/holder job 1");
+            assert_eq!(status.background[1].checkout, "/w/waiter");
+            assert_eq!(status.background[1].waiters[0].command, "/w/waiter job 2");
+            assert_eq!(
+                json["cpuBudget"]["background"][1]["waiters"][0]["command"],
+                "/w/waiter job 2"
+            );
+        }
+        // A third request observes the second ahead of it in the same queue. Its queued
+        // acknowledgement is the broker's own atomic admission snapshot, not a status guess.
+        let stream = UnixStream::connect(&socket).await.expect("third request");
+        let (reader, writer) = stream.into_split();
+        let mut third = Asker {
+            lines: BufReader::new(reader),
+            _writer: writer,
+        };
+        let request = serde_json::json!({"op":"jobserver", "want":1, "checkout":"/w/waiter",
+            "command":"third request", "class":wire_class, "pool":true,
+            "job":{"repoId":"owner/repo", "workspaceIncarnation":"0123456789abcdef0123456789abcdef", "jobId":3}});
+        third
+            ._writer
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        let queued = third.answer().await;
+        assert_eq!(queued["lease"], "queued");
+        assert_eq!(queued["queue"]["position"], 2);
+        assert_eq!(queued["queue"]["ahead"][0]["checkout"], "/w/waiter");
+        assert_eq!(queued["queue"]["ahead"][0]["command"], "/w/waiter job 2");
+        drop(third); // EOF cancels only this queued request, not the held grant.
+        drop(holder); // Only now may the waiting client's grant and done line arrive.
+        let mut remaining = String::new();
+        stderr
+            .read_to_string(&mut remaining)
+            .await
+            .expect("remaining stderr");
+        let output = child.wait_with_output().await.expect("client exits");
+        assert!(
+            output.status.success(),
+            "{}\n{remaining}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let done = remaining
+            .lines()
+            .find(|line| line.starts_with("cowshed: jobserver wait done elapsed="))
+            .expect("done line after grant");
+        assert!(done.contains("status=ok"), "{done}");
+        while ledger(&socket).await.held != 0 {
+            tokio::task::yield_now().await;
+        }
+        gateway.drain().await.expect("drain");
+    }
+}

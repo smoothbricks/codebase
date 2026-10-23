@@ -557,6 +557,59 @@ impl Ledger {
         })
     }
 
+    /// The wait left by this admission transition, or none when it granted immediately.
+    fn queued(&self, ticket: Ticket) -> Option<cowshed_gateway_types::cpu_budget::CpuQueueWait> {
+        use cowshed_gateway_types::cpu_budget::{CpuQueueEntry, CpuQueueWait, JobserverClass};
+        let checkout = self.tickets.get(&ticket)?;
+        let request = self
+            .checkouts
+            .get(checkout)?
+            .waiting
+            .iter()
+            .find(|waiter| waiter.ticket == ticket)?;
+        let entry = |name: &str, class: &Class, job, claim: &Claim| CpuQueueEntry {
+            repository: class.repo().map(|repo| repo.to_string()),
+            class: match class {
+                Class::Gate(_) => JobserverClass::Gate,
+                Class::Background => JobserverClass::Background,
+            },
+            checkout: name.to_owned(),
+            job,
+            command: claim.command.to_string(),
+        };
+        let mut holders = Vec::new();
+        let mut ahead = Vec::new();
+        for (name, stake) in &self.checkouts {
+            for holder in &stake.running {
+                holders.push((
+                    holder.job,
+                    holder.ticket,
+                    entry(name, &holder.class, holder.job, &holder.claim),
+                ));
+            }
+            for waiter in &stake.waiting {
+                let same_queue = match &request.class {
+                    Class::Gate(repo) => waiter.class.repo() == Some(repo),
+                    Class::Background => name == checkout && waiter.class == Class::Background,
+                };
+                if same_queue && waiter.order() < request.order() {
+                    ahead.push((
+                        waiter.order(),
+                        entry(name, &waiter.class, waiter.job, &waiter.claim),
+                    ));
+                }
+            }
+        }
+        holders.sort_unstable_by_key(|(job, ticket, _)| (*job, *ticket));
+        ahead.sort_unstable_by_key(|(order, _)| *order);
+        Some(CpuQueueWait {
+            request: entry(checkout, &request.class, request.job, &request.claim),
+            position: ahead.len() + 1,
+            holders: holders.into_iter().map(|(_, _, entry)| entry).collect(),
+            ahead: ahead.into_iter().map(|(_, entry)| entry).collect(),
+        })
+    }
+
     /// The ledger at `now`, every granted lease named with its age at that instant.
     pub(crate) fn status(&self, now: Instant) -> CpuBudgetStatus {
         let mut checkouts: Vec<CpuCheckoutStatus> = self
@@ -625,8 +678,10 @@ impl Ledger {
             gate_jobs: gate_jobs
                 .into_iter()
                 .map(|((job, name), holders)| {
+                    let repository = holders[0].class.repo().expect("gate holder").to_string();
                     let (held, holders) = leases(holders, now);
                     CpuGateJob {
+                        repository,
                         checkout: name.to_string(),
                         job,
                         held,
@@ -637,6 +692,7 @@ impl Ledger {
             gate_queue: gate_queue
                 .into_iter()
                 .map(|(waiter, name)| CpuGateWaiter {
+                    repository: waiter.class.repo().expect("gate waiter").to_string(),
                     checkout: name.to_string(),
                     job: waiter.job,
                     pid: waiter.claim.pid,
@@ -683,6 +739,7 @@ enum Message {
         /// The job whose age ranks it.
         job: Ticket,
         granted: oneshot::Sender<usize>,
+        queued: Option<oneshot::Sender<Option<cowshed_gateway_types::cpu_budget::CpuQueueWait>>>,
     },
     Leave {
         ticket: Ticket,
@@ -757,6 +814,34 @@ impl CpuBudget {
         claim: Claim,
         rank: Rank,
     ) -> (Stake, oneshot::Receiver<usize>) {
+        self.enqueue(checkout, want, claim, rank, None)
+    }
+
+    /// Jobserver admission also observes the decision made by the very same transition.
+    pub(crate) fn ask_jobserver(
+        &self,
+        checkout: Arc<str>,
+        want: NonZeroUsize,
+        claim: Claim,
+        rank: Rank,
+    ) -> (
+        Stake,
+        oneshot::Receiver<usize>,
+        oneshot::Receiver<Option<cowshed_gateway_types::cpu_budget::CpuQueueWait>>,
+    ) {
+        let (queued, decision) = oneshot::channel();
+        let (stake, granted) = self.enqueue(checkout, want, claim, rank, Some(queued));
+        (stake, granted, decision)
+    }
+
+    fn enqueue(
+        &self,
+        checkout: Arc<str>,
+        want: NonZeroUsize,
+        claim: Claim,
+        rank: Rank,
+        queued: Option<oneshot::Sender<Option<cowshed_gateway_types::cpu_budget::CpuQueueWait>>>,
+    ) -> (Stake, oneshot::Receiver<usize>) {
         let ticket = self.tickets.fetch_add(1, Ordering::Relaxed);
         let (class, job) = match rank {
             Rank::Background => (Class::Background, ticket),
@@ -775,6 +860,7 @@ impl CpuBudget {
             class,
             job,
             granted,
+            queued,
         });
         (
             Stake {
@@ -860,6 +946,7 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                 class,
                 job,
                 granted,
+                queued,
             } => {
                 // After a cut-off no ask is queued: dropping its sender refuses it at once.
                 if let Some(cut) = &mut cut {
@@ -883,6 +970,9 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                     },
                     &mut effects,
                 );
+                if let Some(queued) = queued {
+                    let _ = queued.send(ledger.queued(ticket));
+                }
             }
             Message::Leave { ticket, .. } => {
                 grants.remove(&ticket);
@@ -1137,6 +1227,7 @@ mod tests {
         assert_eq!(
             status.gate_jobs,
             [CpuGateJob {
+                repository: "land".into(),
                 checkout: "land".into(),
                 job: 2,
                 held: 1,

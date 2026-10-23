@@ -178,6 +178,37 @@ impl ActivationStake {
     }
 }
 
+tokio::task_local! {
+    /// A supervisor sends admission diagnostics down the job's existing stderr stream, not
+    /// its own daemon log. Direct gateway clients write their own stderr.
+    static PROGRESS: (JobId, tokio::sync::mpsc::Sender<super::supervisor::ProcessEvent>);
+}
+
+pub(super) async fn reporting<T>(
+    job: JobId,
+    events: tokio::sync::mpsc::Sender<super::supervisor::ProcessEvent>,
+    work: impl Future<Output = T>,
+) -> T {
+    PROGRESS.scope((job, events), work).await
+}
+
+async fn progress(line: String) {
+    match PROGRESS.try_with(|(job, events)| (*job, events.clone())) {
+        Ok((job_id, events)) => {
+            // A closed receiver means the supervisor is gone; the admission future is then
+            // cancelled with it and cannot keep either a queue place or a grant alive.
+            let _ = events
+                .send(super::supervisor::ProcessEvent::Output {
+                    job_id,
+                    stream: crate::storage::job_artifact::StreamKind::Stderr,
+                    bytes: bytes::Bytes::from(format!("{line}\n")),
+                })
+                .await;
+        }
+        Err(_) => cowshed_os::eprintln!("{line}"),
+    }
+}
+
 const MAX_ANSWER: u64 = 1024 * 1024;
 const ACK_BOUND: Duration = Duration::from_secs(2);
 
@@ -263,7 +294,28 @@ async fn exchange(socket: &Path, line: &[u8]) -> Result<(JobserverAnswer, Fenced
             detail: "expected the jobserver queued acknowledgement".to_owned(),
         }));
     }
-    let granted = answer(&mut reader).await?;
+    let wait = queued.queue.map(|queue| (std::time::Instant::now(), queue));
+    if let Some((_, queue)) = &wait {
+        progress(format!("cowshed: jobserver wait start {queue}")).await;
+    }
+    let answer = answer(&mut reader).await;
+    if let Some((started, queue)) = &wait {
+        let status = if answer
+            .as_ref()
+            .is_ok_and(|answer| answer.ok && answer.lease == Some(LeaseState::Granted))
+        {
+            "ok"
+        } else {
+            "err"
+        };
+        progress(format!(
+            "cowshed: jobserver wait done elapsed={:?} status={status} {}",
+            started.elapsed(),
+            queue.request
+        ))
+        .await;
+    }
+    let granted = answer?;
     if !granted.ok {
         return Err(refused(granted));
     }
@@ -512,6 +564,36 @@ mod tests {
     // while a real socket's readiness is still pending, so a live gateway looks dead. The real
     // clock keeps every bound unreached on success; assertions check request order, not elapsed
     // time.
+
+    #[tokio::test]
+    async fn admission_progress_reaches_job_stderr_before_any_spawn() {
+        let job = JobId::new(7).unwrap();
+        let (events, mut received) = tokio::sync::mpsc::channel(1);
+        let emit = reporting(job, events, async {
+            progress("cowshed: jobserver wait start queue=repository-gate".to_owned()).await;
+            progress("cowshed: jobserver wait done elapsed=0ns status=ok".to_owned()).await;
+        });
+        let read = async {
+            for expected in [
+                b"cowshed: jobserver wait start queue=repository-gate\n".as_slice(),
+                b"cowshed: jobserver wait done elapsed=0ns status=ok\n".as_slice(),
+            ] {
+                let super::super::supervisor::ProcessEvent::Output {
+                    job_id,
+                    stream,
+                    bytes,
+                } = received.recv().await.expect("live stderr event")
+                else {
+                    panic!("not job output")
+                };
+                assert_eq!(job_id, job);
+                assert_eq!(stream, crate::storage::job_artifact::StreamKind::Stderr);
+                assert_eq!(bytes.as_ref(), expected);
+            }
+            assert!(received.recv().await.is_none());
+        };
+        tokio::join!(emit, read);
+    }
 
     /// The workspace incarnation the test gateway's pools are scoped by.
     const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
