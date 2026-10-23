@@ -680,6 +680,9 @@ judged, since only a file both match collides. `OutputOverlapError.overlaps` nam
 validators interpolate the declarations themselves, so a declaration Nx refuses to interpolate raises
 `OutputDeclarationError` naming its target.
 
+Raw project output declarations, including collect/apply fixtures, retain the directory suffix. Already-resolved Nx
+`Task.outputs` paths are normalized paths, not declarations, and need no trailing `/`.
+
 `refuseMisdeclaredOutputKinds(graph, workspaceRoot)` holds those declarations to the built tree: a literal output
 declared a file that is a directory on disk, or declared a directory that is a file, raises `OutputKindError`, whose
 `findings` name the target, output, declared kind and on-disk kind. Call it where the outputs exist after a build; an

@@ -293,7 +293,7 @@ describe('pure core: applyWorkspaceConfig', () => {
           executor: 'nx:run-commands',
           dependsOn: ['typecheck-tests', 'cargo-lint'],
           inputs: ['default'],
-          outputs: ['dist'],
+          outputs: ['dist/'],
           options: { command: 'eslint packages/*/src' },
         },
       },

@@ -103,7 +103,7 @@ it('inspects only the requested raw-input plan without dropping producer inputs 
       const target = {
         executor: 'nx:noop',
         inputs: ['{projectRoot}/src/**/*', { dependentTasksOutputFiles: '**/*.d.ts', transitive: true }],
-        outputs: ['{options.outputPath}'],
+        outputs: ['{options.outputPath}/'],
         defaultConfiguration: 'production',
         options: { outputPath: `packages/${name}/dist-production` },
         configurations: {

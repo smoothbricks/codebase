@@ -172,7 +172,7 @@ describe('one producing target per Nx output', () => {
         },
         facts: {
           root: 'packages/facts',
-          targets: { 'tsc-js': run(['{projectRoot}/dist-types']), 'build-types': run(['{projectRoot}/dist-types/']) },
+          targets: { 'tsc-js': run(['{projectRoot}/dist-types/']), 'build-types': run(['{projectRoot}/dist-types/']) },
         },
         ttsc: { root: 'packages/ttsc', targets: { build: run(['{projectRoot}/dist/']) } },
         bun: {

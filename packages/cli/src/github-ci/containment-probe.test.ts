@@ -37,12 +37,12 @@ function cowshedShapedProject(): ProjectTargets {
     ],
     targetDependencies: new Map([['build', ['tsc-js', 'cli-arm64-macos', 'napi-arm64-macos']]]),
     targetOutputs: new Map([
-      ['tsc-js', ['{projectRoot}/dist/ts']],
-      ['cli-x64-linux', ['{projectRoot}/dist/bin/linux-x64']],
-      ['cli-arm64-linux', ['{projectRoot}/dist/bin/linux-arm64']],
-      ['cli-arm64-macos', ['{projectRoot}/dist/bin/darwin-arm64']],
-      ['napi-x64-linux', ['{projectRoot}/dist/native/linux-x64-gnu']],
-      ['napi-arm64-macos', ['{projectRoot}/dist/native/darwin-arm64']],
+      ['tsc-js', ['{projectRoot}/dist/ts/']],
+      ['cli-x64-linux', ['{projectRoot}/dist/bin/linux-x64/']],
+      ['cli-arm64-linux', ['{projectRoot}/dist/bin/linux-arm64/']],
+      ['cli-arm64-macos', ['{projectRoot}/dist/bin/darwin-arm64/']],
+      ['napi-x64-linux', ['{projectRoot}/dist/native/linux-x64-gnu/']],
+      ['napi-arm64-macos', ['{projectRoot}/dist/native/darwin-arm64/']],
     ]),
   };
 }
@@ -62,7 +62,7 @@ const DARWIN_X64_BIN = 'packages/cowshed/dist/bin/darwin-x64/cowshed';
 const TS_CLAIM: OutputClaim = {
   project: 'cowshed',
   target: 'tsc-js',
-  output: '{projectRoot}/dist/ts',
+  output: '{projectRoot}/dist/ts/',
   path: TS_ENTRY,
   size: 4,
   mode: 0o644,
@@ -140,7 +140,7 @@ describe('publish collect containment probe', () => {
         {
           project,
           target: 'tsc-js',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/ts', files: [fileFact(TS_ENTRY)] }],
+          outputs: [{ declaredOutput: '{projectRoot}/dist/ts/', files: [fileFact(TS_ENTRY)] }],
         },
       ]),
     );
@@ -149,7 +149,7 @@ describe('publish collect containment probe', () => {
         {
           project,
           target: 'cli-x64-linux',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64', files: [fileFact(LINUX_X64_BIN)] }],
+          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64/', files: [fileFact(LINUX_X64_BIN)] }],
         },
       ]),
     );
@@ -166,14 +166,14 @@ describe('publish collect containment probe', () => {
 
   it('still refuses apply when a leftover aggregate output swallows the platform binary', () => {
     const project = cowshedShapedProject();
-    project.targetOutputs?.set('build', ['{projectRoot}/dist']);
+    project.targetOutputs?.set('build', ['{projectRoot}/dist/']);
     const distFiles = [TS_ENTRY, LINUX_X64_BIN, LINUX_ARM64_BIN, DARWIN_ARM64_BIN, LINUX_X64_NAPI, DARWIN_ARM64_NAPI];
     const buildClaims = expectPlanned(
       planOutputClaims([
         {
           project,
           target: 'build',
-          outputs: [{ declaredOutput: '{projectRoot}/dist', files: distFiles.map((path) => fileFact(path)) }],
+          outputs: [{ declaredOutput: '{projectRoot}/dist/', files: distFiles.map((path) => fileFact(path)) }],
         },
       ]),
     );
@@ -182,7 +182,7 @@ describe('publish collect containment probe', () => {
         {
           project,
           target: 'cli-x64-linux',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64', files: [fileFact(LINUX_X64_BIN)] }],
+          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64/', files: [fileFact(LINUX_X64_BIN)] }],
         },
       ]),
     );
@@ -202,7 +202,7 @@ describe('publish collect containment probe', () => {
         {
           project,
           target: 'cli-x64-linux',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64', files: [fileFact(LINUX_X64_BIN)] }],
+          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64/', files: [fileFact(LINUX_X64_BIN)] }],
         },
       ]),
     ).toEqual({
@@ -211,7 +211,7 @@ describe('publish collect containment probe', () => {
         {
           project: 'cowshed',
           target: 'cli-x64-linux',
-          output: '{projectRoot}/dist/bin/linux-x64',
+          output: '{projectRoot}/dist/bin/linux-x64/',
           path: LINUX_X64_BIN,
           size: 4,
           mode: 0o644,
@@ -225,15 +225,15 @@ describe('publish collect containment probe', () => {
       ...cowshedShapedProject(),
       project: 'alpha',
       targets: ['cli-x64-linux'],
-      targetOutputs: new Map([['cli-x64-linux', ['{projectRoot}/dist/bin/linux-x64']]]),
+      targetOutputs: new Map([['cli-x64-linux', ['{projectRoot}/dist/bin/linux-x64/']]]),
     };
     const beta: ProjectTargets = {
       ...cowshedShapedProject(),
       project: 'beta',
       targets: ['other-x64-linux'],
-      targetOutputs: new Map([['other-x64-linux', ['{projectRoot}/dist/bin/linux-x64']]]),
+      targetOutputs: new Map([['other-x64-linux', ['{projectRoot}/dist/bin/linux-x64/']]]),
     };
-    const outputs = [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64', files: [fileFact(LINUX_X64_BIN)] }];
+    const outputs = [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64/', files: [fileFact(LINUX_X64_BIN)] }];
 
     expect(
       planOutputClaims([
@@ -257,18 +257,20 @@ describe('publish collect containment probe', () => {
   it('does not collide macos arm64 current against a disjoint x64 current tree', () => {
     const project = cowshedShapedProject();
     project.targets = [...project.targets, 'cli-x64-macos'];
-    project.targetOutputs?.set('cli-x64-macos', ['{projectRoot}/dist/bin/darwin-x64']);
+    project.targetOutputs?.set('cli-x64-macos', ['{projectRoot}/dist/bin/darwin-x64/']);
     const macosClaims = expectPlanned(
       planOutputClaims([
         {
           project,
           target: 'cli-arm64-macos',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/darwin-arm64', files: [fileFact(DARWIN_ARM64_BIN)] }],
+          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/darwin-arm64/', files: [fileFact(DARWIN_ARM64_BIN)] }],
         },
         {
           project,
           target: 'napi-arm64-macos',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/native/darwin-arm64', files: [fileFact(DARWIN_ARM64_NAPI)] }],
+          outputs: [
+            { declaredOutput: '{projectRoot}/dist/native/darwin-arm64/', files: [fileFact(DARWIN_ARM64_NAPI)] },
+          ],
         },
       ]),
     );
@@ -277,7 +279,7 @@ describe('publish collect containment probe', () => {
         {
           project,
           target: 'cli-x64-macos',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/darwin-x64', files: [fileFact(DARWIN_X64_BIN)] }],
+          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/darwin-x64/', files: [fileFact(DARWIN_X64_BIN)] }],
         },
       ]),
     );
@@ -305,15 +307,15 @@ describe('publish collect containment probe', () => {
   });
 
   it('refuses a declared output that matched no file', () => {
-    const outputs = [{ declaredOutput: '{projectRoot}/dist/ts', files: [] }];
+    const outputs = [{ declaredOutput: '{projectRoot}/dist/ts/', files: [] }];
     expect(planOutputClaims([{ project: cowshedShapedProject(), target: 'tsc-js', outputs }])).toEqual({
       ok: false,
-      reason: 'Declared output {projectRoot}/dist/ts for cowshed:tsc-js is missing.',
+      reason: 'Declared output {projectRoot}/dist/ts/ for cowshed:tsc-js is missing.',
     });
   });
 
   it('refuses an output file that is not a regular file', () => {
-    const outputs = [{ declaredOutput: '{projectRoot}/dist/ts', files: [fileFact(TS_ENTRY, 'symlink')] }];
+    const outputs = [{ declaredOutput: '{projectRoot}/dist/ts/', files: [fileFact(TS_ENTRY, 'symlink')] }];
     expect(planOutputClaims([{ project: cowshedShapedProject(), target: 'tsc-js', outputs }])).toEqual({
       ok: false,
       reason: `Output file must be a regular file: ${TS_ENTRY}`,
@@ -327,9 +329,9 @@ describe('publish collect containment probe', () => {
         {
           project,
           target: 'tsc-js',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/ts', files: [fileFact(TS_ENTRY)] }],
+          outputs: [{ declaredOutput: '{projectRoot}/dist/ts/', files: [fileFact(TS_ENTRY)] }],
         },
-        { project, target: 'build', outputs: [{ declaredOutput: '{projectRoot}/dist', files: [fileFact(TS_ENTRY)] }] },
+        { project, target: 'build', outputs: [{ declaredOutput: '{projectRoot}/dist/', files: [fileFact(TS_ENTRY)] }] },
       ]),
     ).toEqual({ ok: true, value: [TS_CLAIM] });
   });
@@ -469,7 +471,7 @@ describe('publish collect containment probe', () => {
  * The probe needs the REAL inferred graph but must not need the real build's
  * artifacts: `dist/bin/darwin-arm64` only exists on a macOS host, so collecting
  * from the repo made this a macOS-only test that failed on Linux with
- * "Declared output {projectRoot}/dist/bin/darwin-arm64 for cowshed:cli-arm64-macos
+ * "Declared output {projectRoot}/dist/bin/darwin-arm64/ for cowshed:cli-arm64-macos
  * is missing." Planting the declared outputs keeps the graph real, the files
  * deterministic, and the assertion identical on every runner.
  */
@@ -506,7 +508,7 @@ describe('publish collect containment probe against the resolved graph', () => {
     // The inferred aggregate declares an explicit empty output list, so a
     // cached replay of `build` can never restore bytes its children own.
     expect(cowshed?.targetOutputs?.get('build')).toEqual([]);
-    expect(cowshed?.targetOutputs?.get('tsc-js')).toEqual(['{projectRoot}/dist/ts']);
+    expect(cowshed?.targetOutputs?.get('tsc-js')).toEqual(['{projectRoot}/dist/ts/']);
 
     const buildRuns = expandNxTargetDependencyRuns(
       expandNxTargetRuns(projects, { targets: 'build', projects: 'cowshed' }).runs,

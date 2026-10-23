@@ -10,7 +10,7 @@ describe('clean-outputs executor', () => {
 
     expect(
       resolveOutputDirs({
-        outputs: ['{projectRoot}/dist/**/*.js', '{projectRoot}/dist/types', '{projectRoot}/dist-wasm-web'],
+        outputs: ['{projectRoot}/dist/**/*.js', '{projectRoot}/dist/types/', '{projectRoot}/dist-wasm-web/'],
         projectName: 'example',
         projectRoot: 'packages/example',
         workspaceRoot,
