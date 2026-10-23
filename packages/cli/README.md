@@ -1032,6 +1032,14 @@ token needs R2 write, or the deploy fails before creating anything. Cleanup read
 name, and lists D1 only when a D1 database was recorded. It makes every lookup before its first delete, so a token
 missing a permission the stage needs makes cleanup refuse rather than half-clean the stage.
 
+Several CI runs deploying into one Cloudflare account at once can make Cloudflare answer account-level calls with HTTP
+429 or "Reduce your concurrent request rate for account level operations". The Cloudflare client repeats such an answer
+up to six attempts in all, waiting 2 s doubling to at most 30 s with jitter (and never less than a `Retry-After` header
+asks; a header asking for more than 30 s ends the retrying). Any method repeats a 429, which refuses the call before it
+runs; the message under another status, as the answer's only error, repeats only reads and idempotent writes (GET, PUT,
+DELETE). The last answer is then thrown as the usual `CloudflareApiError`. Other failures, a 403 included, and a call
+whose connection dropped are never repeated.
+
 A wrong value type anywhere in `smoo.github` fails `smoo monorepo update` and `smoo github-ci nx-deploy` with the
 offending path, rather than silently falling back to the defaults.
 
