@@ -1080,9 +1080,9 @@ directory:
 
 The first-mutation cost is inside one `ftruncate` or 4 KiB `pwrite` call, before userspace can yield. These measurements
 do not inspect APFS's internal transaction boundaries. They demonstrate an unsplittable syscall from cowshed's
-interface, not a repair of the reported 50.7 s retirement, 26.5 s first write, or twelve-minute release. Ordinary
-stepping already prevents one userspace loop from owning the container for its whole duration; it cannot promise a
-maximum duration for one kernel call.
+interface, not a repair of the reported 50.7 s retirement, 26.5 s first write, or twelve-minute release. Other writers
+made progress during ordinary stepping in these experiments. That observation is neither a universal scheduling
+guarantee nor a maximum duration for one kernel call.
 
 Unlinking a still-shared clone can be cheap: the followup measured 0.032 ms for unlink plus 0.005 ms for last close
 while the source retained the map. But `EF_SHARES_ALL_BLOCKS` is an observation, not custody. The same fixture observed
@@ -1093,9 +1093,9 @@ stepped path for every file.
 
 Remaining options, not additional guarantees or implemented cutovers:
 
-- Reduce fragmentation **before cloning** through the existing detached `defrag` and forkability admission. The
-  7,140-run sensitivity threshold is not a hard latency SLA, and rebuilding a seed must not first clone an arbitrarily
-  fragmented live source and only then check its new generation.
+- Diagnose fragmentation and use detached `defrag` **before cloning** where appropriate. The existing diagnostic
+  sensitivity threshold is advisory, not a latency SLA or an extent-based admission refusal. Checking a new seed only
+  after cloning a fragmented live source cannot undo the first-mutation cost already introduced.
 - Avoid sharing a live fragmented source's map: copy its data without `clonefile`, under the existing consistency and
   ownership protocol, accepting the I/O and free-space cost; or quiesce the source while paying first mutation.
   Quiescence moves the pause to an explicit maintenance window rather than shortening the kernel work.

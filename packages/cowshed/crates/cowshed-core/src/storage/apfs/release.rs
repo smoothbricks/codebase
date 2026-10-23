@@ -111,10 +111,6 @@ impl ReleasePlan {
         planner.plan(length)
     }
 
-    /// The plan for a file whose whole extent map another file still shares: no cut, only the
-    /// unlink, which drops this file's reference and frees nothing the other file holds. A cut
-    /// would first copy the whole map in one call (the module documentation).
-
     /// The next length to cut the file to, if any cut is left.
     pub fn next(&self) -> Option<u64> {
         self.cuts.last().copied()
