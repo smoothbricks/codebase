@@ -10828,7 +10828,13 @@ mod rebase_recovery_tests {
         else {
             panic!("nothing preserves kept before the push");
         };
-        let refusal = removal_unlanded_refusal(&Lane::name("unit"), &head, &refused, None);
+        let refusal = removal_unlanded_refusal(
+            &Lane::name("unit"),
+            &head,
+            &refused,
+            None,
+            &UnmatchedCommits::new(),
+        );
         assert_eq!(
             refusal.hint,
             "preserve each branch: cowshed push unit --branch kept"
