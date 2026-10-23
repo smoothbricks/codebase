@@ -118,7 +118,9 @@ the image either way, and moving them out is the gateway vault's.
 Adoption runs no direnv evaluation, no devenv, no entry task and no approval; only the tail files run, and their output
 reaches the job that waited on the adoption as an activation's would. A miss says why on that job's stderr
 (`cowshed: evaluating the workspace shell: …`) and evaluates as before. A lost or unreadable record is a miss, never an
-error, and a record that cannot be written is reported on the supervisor's stderr and only means clones evaluate.
+error, and a record that cannot be written is reported on the supervisor's stderr and only means clones evaluate. The
+tail interpreter is an activation root of that same job or spare: on macOS it is observed before it runs and control EOF
+retires its retained subtree before the host ends, exactly as for direnv export.
 
 **Script jobs.** Besides a byte-exact argv, a job can be a script: bash-compatible shell text as a template of literal
 `parts` and `values` (`ExecCommand::Script`, 07_api.md). At admission the supervisor binds each value to a shell
@@ -323,15 +325,15 @@ killing its own process group. Retained ancestry includes reparented descendants
 completeness claim: Darwin's fork/adoption gaps still apply. A retirement failure is named on activation stderr.
 
 The owner is `TreeOwner::Job(JobId)` or `TreeOwner::Spare`: a spare has no fabricated job identity. `REQUEST_ACTIVATE`
-carries an explicit owner tag and an id only for the Job variant; unknown tags and invalid job ids are refused at the
-boundary by name. Linux still ends activation with the host's process group only: the reusable host is outside job
-cgroups, and no per-activation cgroup or retained ancestry source exists there yet. A descendant that changes group can
-therefore outlive Linux activation teardown; group kill is not claimed as descendant-tree containment. A host that
-cannot serve a request — it cannot run `direnv`, say — answers with the reason and exits; any host that breaks its
-protocol fails the job waiting on it as a launch that failed (`failure: unlaunched`), with the reason on the job's
-stderr, since its command never ran. The one exception is a host that died by a signal while it activated for the job: a
-kill of the job reaches its activation, and a crash is the job's to see, so that death is the job's status (the reason
-still goes to its stderr).
+and `REQUEST_ADOPT` carry an explicit owner tag and an id only for the Job variant; unknown tags and invalid job ids are
+refused at the boundary by name. Linux still ends activation with the host's process group only: the reusable host is
+outside job cgroups, and no per-activation cgroup or retained ancestry source exists there yet. A descendant that
+changes group can therefore outlive Linux activation teardown; group kill is not claimed as descendant-tree containment.
+A host that cannot serve a request — it cannot run `direnv`, say — answers with the reason and exits; any host that
+breaks its protocol fails the job waiting on it as a launch that failed (`failure: unlaunched`), with the reason on the
+job's stderr, since its command never ran. The one exception is a host that died by a signal while it activated for the
+job: a kill of the job reaches its activation, and a crash is the job's to see, so that death is the job's status (the
+reason still goes to its stderr).
 
 The layer's other roles:
 

@@ -332,12 +332,13 @@ impl Host {
                 self.activate(socket, &directory, owner, stderr)
             }
             REQUEST_ADOPT => {
+                let owner = fields.tree_owner()?;
                 let directory = PathBuf::from(OsStr::from_bytes(fields.bytes()?));
                 let inherited: Inherited = serde_json::from_slice(fields.bytes()?)
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                 fields.finish()?;
                 let stderr = one_descriptor(&mut descriptors, "stderr")?;
-                self.adopt(socket, &directory, inherited, stderr)
+                self.adopt(socket, &directory, owner, inherited, stderr)
             }
             REQUEST_SCRIPT => {
                 let text = fields.bytes()?;
@@ -487,39 +488,8 @@ impl Host {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr));
-        #[cfg(target_os = "macos")]
-        let monitor = ProcessMonitor::prepare(owner).map_err(io::Error::other)?;
-        #[cfg(target_os = "macos")]
-        let (mut child, root) = monitor
-            .spawn_root(command)
+        let (mut child, _orphan_guard) = OrphanGuard::spawn(socket, owner, command, diagnostics)
             .map_err(|error| self.tool_error(error))?;
-        // Linux has no retained per-activation ancestry or cgroup yet (11_shell.md). Its
-        // existing group kill remains explicit rather than claiming escaped descendants.
-        #[cfg(target_os = "linux")]
-        let mut child = {
-            let _ = owner;
-            command.spawn().map_err(|error| self.tool_error(error))?
-        };
-        let _orphan_guard = match OrphanGuard::watch(
-            socket,
-            diagnostics,
-            #[cfg(target_os = "macos")]
-            monitor.clone(),
-            #[cfg(target_os = "macos")]
-            root,
-        ) {
-            Ok(guard) => guard,
-            Err(error) => {
-                #[cfg(target_os = "macos")]
-                let retired = monitor.retire_root(root, std::time::Duration::ZERO);
-                #[cfg(target_os = "linux")]
-                let retired = child.kill();
-                let waited = child.wait();
-                return Err(io::Error::other(format!(
-                    "cannot watch activation control: {error}; retirement: {retired:?}; reap: {waited:?}"
-                )));
-            }
-        };
         let mut exported = Vec::new();
         let read = child
             .stdout
@@ -609,10 +579,10 @@ impl Host {
         &mut self,
         socket: &UnixStream,
         directory: &Path,
+        owner: TreeOwner,
         inherited: Inherited,
         stderr: OwnedFd,
     ) -> io::Result<()> {
-        let _orphan_guard = OrphanGuard::watch(socket)?;
         let refuse = |reason: String| {
             reply(
                 socket,
@@ -628,7 +598,7 @@ impl Host {
         for name in &from_tail {
             staged.remove(OsStr::new(name));
         }
-        let dump = match self.source_tail(directory, &staged, &tail, stderr) {
+        let dump = match self.source_tail(socket, directory, owner, &staged, &tail, stderr) {
             Ok(Ok(dump)) => dump,
             Ok(Err(reason)) => return refuse(reason),
             Err(error) => return refuse(error.to_string()),
@@ -661,7 +631,9 @@ impl Host {
     /// bash, its stdlib, `source_env_if_exists`, and `direnv dump json` for the result.
     fn source_tail(
         &self,
+        socket: &UnixStream,
         directory: &Path,
+        owner: TreeOwner,
         environment: &BTreeMap<OsString, OsString>,
         tail: &[PathBuf],
         stderr: OwnedFd,
@@ -687,7 +659,9 @@ impl Host {
         else {
             return Ok(Err("direnv status names no bash_path".into()));
         };
-        let output = Command::new(bash)
+        let diagnostics = stderr.try_clone()?;
+        let mut command = Command::new(bash);
+        command
             .env_clear()
             .envs(environment)
             .env("PWD", directory)
@@ -697,8 +671,10 @@ impl Host {
             .arg(&direnv)
             .args(tail)
             .stdin(Stdio::null())
-            .stderr(Stdio::from(stderr))
-            .output()?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(stderr));
+        let (child, _orphan_guard) = OrphanGuard::spawn(socket, owner, command, diagnostics)?;
+        let output = child.wait_with_output()?;
         if !output.status.success() {
             return Ok(Err(format!(
                 "sourcing this checkout's own shell files failed: {}",
@@ -1182,6 +1158,46 @@ struct OrphanGuard {
 }
 
 impl OrphanGuard {
+    fn spawn(
+        socket: &UnixStream,
+        owner: TreeOwner,
+        command: Command,
+        diagnostics: OwnedFd,
+    ) -> io::Result<(std::process::Child, Self)> {
+        #[cfg(target_os = "macos")]
+        let monitor = ProcessMonitor::prepare(owner).map_err(io::Error::other)?;
+        #[cfg(target_os = "macos")]
+        let (mut child, root) = monitor.spawn_root(command)?;
+        // Linux retains only the host's process-group authority for activation.
+        #[cfg(target_os = "linux")]
+        let mut child = {
+            let _ = owner;
+            let mut command = command;
+            command.spawn()?
+        };
+        let guard = match Self::watch(
+            socket,
+            diagnostics,
+            #[cfg(target_os = "macos")]
+            monitor.clone(),
+            #[cfg(target_os = "macos")]
+            root,
+        ) {
+            Ok(guard) => guard,
+            Err(error) => {
+                #[cfg(target_os = "macos")]
+                let retired = monitor.retire_root(root, std::time::Duration::ZERO);
+                #[cfg(target_os = "linux")]
+                let retired = child.kill();
+                let waited = child.wait();
+                return Err(io::Error::other(format!(
+                    "cannot watch activation control: {error}; retirement: {retired:?}; reap: {waited:?}"
+                )));
+            }
+        };
+        Ok((child, guard))
+    }
+
     fn watch(
         socket: &UnixStream,
         diagnostics: OwnedFd,

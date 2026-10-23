@@ -1466,7 +1466,7 @@ fn linux_refused_cgroup_placement_never_runs_the_command() {
 /// A checkout tree the adoption tests record at `origin` and adopt at `clone`, inside the host's
 /// own directory so the host's baseline (its PATH and HOME) is the same for both. The recorded
 /// export carries `LOCAL_TOKEN`; `tail_supplies_token` decides whether the checkouts' own
-/// `.envrc-local` sets it. Returns the clone and the host's reply to the adoption.
+/// `.envrc-local` sets it. Returns the clone and the adoption request.
 fn adopt_in_fixture(host: &Host, tail_supplies_token: bool) -> (PathBuf, Vec<u8>) {
     use cowshed_core::runtime::shell_host::{Inherited, SHELL_HOST_DIRECTORY};
     use cowshed_core::runtime::shell_inherit::{
@@ -1581,19 +1581,16 @@ fn adopt_in_fixture(host: &Host, tail_supplies_token: bool) -> (PathBuf, Vec<u8>
         verify(&Placement::of(&clone, &baseline), &baseline).expect("the record verifies");
     let inherited = serde_json::to_vec(&Inherited::of(&verified)).unwrap();
     let frame = FrameWriter::new(REQUEST_ADOPT)
+        .tree_owner(cowshed_core::runtime::process_tree::TreeOwner::Job(
+            cowshed_core::api::JobId::new(1).expect("job id"),
+        ))
         .bytes(clone.as_os_str().as_encoded_bytes())
         .unwrap()
         .bytes(&inherited)
         .unwrap()
         .finish()
         .unwrap();
-    let (_read, write) = pipe();
-    send_with_descriptors(host.control().as_raw_fd(), &frame, &[write.as_raw_fd()]).unwrap();
-    drop(write);
-    let (reply, _) = read_frame(host.control())
-        .unwrap()
-        .expect("an adoption reply");
-    (clone, reply)
+    (clone, frame)
 }
 
 /// An adopted shell lays the moved export over the host's environment and takes the values the
@@ -1601,7 +1598,11 @@ fn adopt_in_fixture(host: &Host, tail_supplies_token: bool) -> (PathBuf, Vec<u8>
 #[test]
 fn an_adopted_shell_takes_its_credentials_from_its_own_tail_files() {
     let mut host = Host::start("adopt");
-    let (clone, reply) = adopt_in_fixture(&host, true);
+    let (clone, request) = adopt_in_fixture(&host, true);
+    let _diagnostics = submit_adoption(&host, &request);
+    let (reply, _) = read_frame(host.control())
+        .unwrap()
+        .expect("an adoption reply");
     let (tag, _) = FrameReader::new(&reply).unwrap();
     assert_eq!(tag, REPLY_ACTIVATED, "{}", String::from_utf8_lossy(&reply));
     let ran = host.run(&text(
@@ -1623,7 +1624,11 @@ fn a_tail_that_lacks_a_withheld_value_refuses_and_changes_nothing() {
         &std::env::var_os("PATH").expect("PATH"),
         &[("LOCAL_TOKEN", "ambient")],
     );
-    let (_, reply) = adopt_in_fixture(&host, false);
+    let (_, request) = adopt_in_fixture(&host, false);
+    let _diagnostics = submit_adoption(&host, &request);
+    let (reply, _) = read_frame(host.control())
+        .unwrap()
+        .expect("an adoption reply");
     let (tag, mut fields) = FrameReader::new(&reply).unwrap();
     assert_eq!(tag, REPLY_ADOPTION_REFUSED);
     let reason = String::from_utf8_lossy(fields.bytes().unwrap()).into_owned();
@@ -1632,4 +1637,74 @@ fn a_tail_that_lacks_a_withheld_value_refuses_and_changes_nothing() {
         "printf '%s|%s' \"${AT_ROOT-unset}\" \"$LOCAL_TOKEN\"",
     ));
     assert_eq!(ran.stdout, "unset|ambient");
+}
+
+fn submit_adoption(host: &Host, request: &[u8]) -> OwnedFd {
+    let (read, write) = pipe();
+    send_with_descriptors(host.control().as_raw_fd(), request, &[write.as_raw_fd()]).unwrap();
+    drop(write);
+    read
+}
+
+/// An inherited tail has the same activation-root custody as direnv export: its escaped child
+/// must exit before the host ends after control EOF (11_shell.md, "Inherited shells").
+#[cfg(target_os = "macos")]
+#[test]
+fn an_adopted_tail_s_escaped_descendant_ends_when_control_closes() {
+    use cowshed_core::runtime::job_groups::ExitWatch;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let mut host = Host::start("adopt-orphan");
+    let (clone, request) = adopt_in_fixture(&host, true);
+    for name in ["adopt-ready", "adopt-hold"] {
+        let path = std::ffi::CString::new(host.directory.join(name).as_os_str().as_encoded_bytes())
+            .expect("FIFO path");
+        // SAFETY: a NUL-terminated path in this fixture's own directory.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+    std::fs::write(
+        clone.join(".envrc-local"),
+        r#"export LOCAL_TOKEN=from-local
+/usr/bin/perl -MPOSIX -e 'POSIX::setsid() > 0 or die "setsid: $!"; open(my $f, ">", "$ENV{HOME}/adopt-ready") or die "ready: $!"; print $f $$; close $f; exec "/bin/sleep", "600" or die "exec: $!"' &
+read _ < "$HOME/adopt-hold"
+"#,
+    )
+    .expect("write the held tail");
+    let mut diagnostics = std::fs::File::from(submit_adoption(&host, &request));
+    let escaped: u32 = std::fs::read_to_string(host.directory.join("adopt-ready"))
+        .expect("the escaped child reports readiness")
+        .parse()
+        .expect("child pid");
+    // SAFETY: getpgid reads the two live process groups.
+    assert_ne!(
+        unsafe { libc::getpgid(i32::try_from(escaped).unwrap()) },
+        unsafe { libc::getpgid(i32::try_from(host.child.id()).unwrap()) },
+        "the tail child left the host's process group"
+    );
+    let escaped_exit = ExitWatch::of(escaped)
+        .expect("watch the escaped child")
+        .expect("the child is still running");
+    let host_exit = ExitWatch::of(host.child.id())
+        .expect("watch the host")
+        .expect("the host still waits on the tail");
+    host.close_control();
+    assert!(
+        host_exit
+            .within(Duration::from_secs(60))
+            .expect("host exit"),
+        "control EOF ends the host after retiring the tail"
+    );
+    assert_eq!(
+        host.child.wait().expect("reap host").signal(),
+        Some(libc::SIGKILL)
+    );
+    assert!(
+        escaped_exit.within(Duration::ZERO).expect("escaped exit"),
+        "the escaped tail child exited before the host"
+    );
+    let mut reported = String::new();
+    diagnostics
+        .read_to_string(&mut reported)
+        .expect("diagnostic EOF");
+    assert!(!reported.contains("retirement failed"), "{reported}");
 }

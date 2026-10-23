@@ -79,7 +79,7 @@ pub const REQUEST_SIGNAL: u8 = 5;
 /// The job concluded: reap its command `[]`. Sent once, after `REPLY_EXITED`; answered by
 /// `REPLY_RELEASED`, after which the host serves its next command.
 pub const REQUEST_RELEASE: u8 = 6;
-/// Take an inherited export instead of evaluating: `[directory, inherited]`, descriptors
+/// Take an inherited export instead of evaluating: `[owner, directory, inherited]`, descriptors
 /// `[stderr]`, where `inherited` is an [`Inherited`] as JSON. Sent in place of
 /// `REQUEST_APPROVE`/`REQUEST_ACTIVATE` for a record the supervisor verified (11_shell.md,
 /// "Shell activation and process reuse"). Answered by `REPLY_ACTIVATED` (with an empty

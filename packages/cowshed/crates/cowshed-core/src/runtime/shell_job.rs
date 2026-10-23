@@ -1398,7 +1398,7 @@ impl HostActivator {
         // its producer needs, and agreeing with it certifies the records ([`Self::record`]).
         let (miss, inherited) = match verified {
             Ok(Ok(verified)) => match self
-                .adopt_host(host, envrc_directory, &verified, &stderr)
+                .adopt_host(host, owner, envrc_directory, &verified, &stderr)
                 .await
             {
                 Ok(Ok(())) => return HostActivation::Ready(Ok(verified.into_evidence())),
@@ -1620,6 +1620,7 @@ impl HostActivator {
     async fn adopt_host(
         &self,
         host: &mut ExecHost,
+        owner: TreeOwner,
         envrc_directory: &Path,
         verified: &VerifiedActivation,
         stderr: &OwnedFd,
@@ -1627,6 +1628,7 @@ impl HostActivator {
         let inherited = serde_json::to_vec(&Inherited::of(verified))
             .map_err(|error| protocol_error("request", error))?;
         let request = FrameWriter::new(REQUEST_ADOPT)
+            .tree_owner(owner)
             .bytes(envrc_directory.as_os_str().as_bytes())
             .and_then(|frame| frame.bytes(&inherited))
             .and_then(FrameWriter::finish)
