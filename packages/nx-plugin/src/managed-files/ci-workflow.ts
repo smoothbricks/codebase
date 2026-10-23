@@ -201,6 +201,8 @@ export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkfl
   }
   steps.push(
     { kind: CiWorkflowStepKind.SetupDevenv, name: '🧱 Setup Nix/devenv' },
+    { kind: CiWorkflowStepKind.ManagedFilesCheck, name: '🩺 Check monorepo policies and managed-file drift' },
+    { kind: CiWorkflowStepKind.ManagedFilesDispatch, name: '🔁 Dispatch managed-file drift healing' },
     { kind: CiWorkflowStepKind.SetNxShas, name: '🧭 Set Nx SHAs' },
     { kind: CiWorkflowStepKind.RestoreNxCache, name: '🧠 Restore Nx cache' },
     { kind: CiWorkflowStepKind.Build, name: '🔨 Build' },
@@ -233,8 +235,6 @@ export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkfl
     steps.push({ kind: CiWorkflowStepKind.BrowserTests, name: '🌐 Browser Tests' });
   }
   steps.push(
-    { kind: CiWorkflowStepKind.ManagedFilesCheck, name: '🩺 Check monorepo policies and managed-file drift' },
-    { kind: CiWorkflowStepKind.ManagedFilesDispatch, name: '🔁 Dispatch managed-file drift healing' },
     { kind: CiWorkflowStepKind.SaveNxCache, name: '💾 Save Nx cache' },
     { kind: CiWorkflowStepKind.UploadTraceDbs, name: '📎 Upload trace DBs' },
     { kind: CiWorkflowStepKind.SaveNixDevenv, name: '🧹 Cleanup and cache Nix/devenv' },
