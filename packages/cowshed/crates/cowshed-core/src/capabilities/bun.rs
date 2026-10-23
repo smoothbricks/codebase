@@ -1,5 +1,8 @@
 use super::cache::{SharedLayout, SharedToolHome};
-use super::{CapabilityContribution, CapabilityId, DetectionContext, Detector, add_bootstrap};
+use super::{
+    CapabilityContribution, CapabilityGrant, CapabilityId, DetectionContext, Detector, GrantAccess,
+    GrantScope, add_bootstrap,
+};
 use crate::Result;
 
 pub static BUN_HOME: SharedToolHome = SharedToolHome {
@@ -20,6 +23,13 @@ pub const DETECTOR: Detector = Detector {
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {
     let mut contribution = super::javascript::contribute(context, &BUN_HOME)?;
+    // A link: dependency traverses the host registration before reaching its granted provider.
+    // This permits lookup only; neither registry payloads nor the target's contents are granted.
+    contribution.grants.push(CapabilityGrant {
+        path: context.home.join(".bun/install/global/node_modules"),
+        scope: GrantScope::Subtree,
+        access: GrantAccess::ReadMetadata,
+    });
     let directories: Vec<_> = std::iter::once(context.home.join(".bun/bin"))
         .chain(context.program_directories.iter().cloned())
         .collect();

@@ -325,14 +325,21 @@ fn normalization_coalesces_grants_without_broadening_literals() {
         grants: vec![
             grant("/cache", GrantScope::Subtree, GrantAccess::ReadWrite),
             grant("/cache/child", GrantScope::Literal, GrantAccess::Read),
+            grant(
+                "/cache/child",
+                GrantScope::Literal,
+                GrantAccess::ReadMetadata,
+            ),
             grant("/cache", GrantScope::Subtree, GrantAccess::ReadWrite),
             grant("/other", GrantScope::Literal, GrantAccess::ReadWrite),
             grant("/other", GrantScope::Subtree, GrantAccess::Read),
+            grant("/other", GrantScope::Subtree, GrantAccess::ReadMetadata),
+            grant("/lookup", GrantScope::Subtree, GrantAccess::ReadMetadata),
         ],
         ..Default::default()
     };
     normalize(&mut contribution);
-    assert_eq!(contribution.grants.len(), 3);
+    assert_eq!(contribution.grants.len(), 4);
     assert!(
         contribution
             .grants

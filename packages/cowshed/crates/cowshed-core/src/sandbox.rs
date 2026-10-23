@@ -1479,6 +1479,7 @@ fn push_capability_grant(
         push_literal_rule(profile, operation, ancestor)?;
     }
     let operation = match grant.access {
+        GrantAccess::ReadMetadata => "allow file-read-metadata",
         GrantAccess::Read => "allow file-read*",
         GrantAccess::ReadWrite => "allow file-read* file-write*",
     };
@@ -1928,6 +1929,93 @@ mod tests {
         assert!(
             !sandbox.grants.read[0].join("forbidden").exists(),
             "a read grant stays unwritable"
+        );
+    }
+
+    /// Bun's global registration is only a lookup hop. The provider still needs its own grant,
+    /// and traversing that hop grants neither registry contents, listings nor provider writes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bun_registered_provider_links_require_target_grants_and_only_metadata_at_the_registry() {
+        let fixture = crate::capabilities::test_support::Fixture::new();
+        fixture.files(&["workspace/package.json", "workspace/bun.lock"]);
+        let mut sandbox = config(RunSandboxMode::ReadWrite);
+        sandbox.home = fixture.home.clone();
+        sandbox.mount_root = fixture.root.join("mounts");
+        sandbox.workspace_mount = fixture.root.join("workspace");
+        sandbox.exec_temp_dir = fixture.root.join("exec-temp");
+        sandbox.store_root = fixture.root.join("store");
+        sandbox.grants = SandboxGrants::default();
+        sandbox.allowed_unix_sockets.clear();
+        fs::create_dir_all(&sandbox.exec_temp_dir).unwrap();
+        fs::write(sandbox.workspace_mount.join("package.json"), b"{}\n").unwrap();
+        let registry = fixture.home.join(".bun/install/global/node_modules");
+        let provider = fixture.home.join("providers/granted");
+        let ungranted = fixture.home.join("providers/ungranted");
+        let modules = sandbox.workspace_mount.join("node_modules");
+        for directory in [&registry, &provider, &ungranted, &modules] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        for directory in [&provider, &ungranted, &registry] {
+            fs::write(directory.join("package.json"), b"provider\n").unwrap();
+        }
+        for (name, target) in [("granted", &provider), ("ungranted", &ungranted)] {
+            std::os::unix::fs::symlink(target, registry.join(name)).unwrap();
+            std::os::unix::fs::symlink(registry.join(name), modules.join(name)).unwrap();
+        }
+        sandbox.capabilities =
+            crate::capabilities::detect_for_workspace(&crate::capabilities::DetectionContext {
+                workspace_root: &sandbox.workspace_mount,
+                project_root: &sandbox.workspace_mount,
+                command_cwd: &sandbox.workspace_mount,
+                ..fixture.context()
+            })
+            .unwrap();
+        let paths = serde_json::to_string(&[
+            provider.join("package.json"),
+            modules.join("granted/package.json"),
+            modules.join("ungranted/package.json"),
+            registry.join("package.json"),
+            registry.clone(),
+        ])
+        .unwrap();
+        for granted in [false, true] {
+            if granted {
+                sandbox.grants.read.push(provider.clone());
+            }
+            let profile = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+            let launch =
+                crate::exec::ProfileLaunch::write(&sandbox.profile_directory(), &profile).unwrap();
+            let script = format!(
+                r#"
+const fs = require('node:fs');
+const assert = require('node:assert/strict');
+const [canonical, linked, ungranted, payload, registry] = {paths};
+for (const path of [canonical, linked]) {{
+  if ({granted}) assert.equal(fs.readFileSync(path, 'utf8'), 'provider\n');
+  else assert.throws(() => fs.readFileSync(path), {{code: 'EPERM'}});
+}}
+for (const path of [ungranted, payload]) assert.throws(() => fs.readFileSync(path), {{code: 'EPERM'}});
+assert.throws(() => fs.readdirSync(registry), {{code: 'EPERM'}});
+assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
+"#
+            );
+            let output = std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(launch.args())
+                .arg("/usr/bin/env")
+                .args(["node", "-e", &script])
+                .current_dir(&sandbox.workspace_mount)
+                .output_locked()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "granted={granted}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert_eq!(
+            fs::read(provider.join("package.json")).unwrap(),
+            b"provider\n"
         );
     }
 

@@ -80,7 +80,12 @@ rediscovery. Nx contributes `.nx/cache` and `.nx/workspace-data`. Codegraph cont
 fixed link `.codegraph -> .cowshed/build/codegraph` and is cloned and adopted with that volume, not migrated to the
 source volume (16_build_volumes.md, "Owned index links").
 
-A detected JavaScript package manager (Bun, npm or pnpm) contributes the `node_modules/.cache` of every package it
+Bun also contributes metadata-only lookup beneath the host's `~/.bun/install/global/node_modules`, where `bun link`
+registers developer packages. Resolving a workspace's package alias through that registration does not read or list the
+registry, write its links, or grant the provider's contents: the resolved provider still requires its own explicit read
+grant. This applies to ordinary jobs and Nx cache-carry probes alike. A real Seatbelt regression reads a granted
+provider through its registration while refusing ungranted providers, registry payloads/listings and provider writes. A
+detected JavaScript package manager (Bun, npm or pnpm) contributes the `node_modules/.cache` of every package it
 installed: a tracked `package.json` beside a real `node_modules` directory, below the capability's selected directory
 and not itself inside a `node_modules`. `node_modules/.cache/<tool>` of the package a tool runs in is the JavaScript
 convention for per-tree tool state (find-cache-dir: babel, webpack, ava, stryker), so the capability names the

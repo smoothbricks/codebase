@@ -152,6 +152,8 @@ pub enum GrantScope {
 }
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum GrantAccess {
+    /// Path lookup and symlink traversal, never file contents or directory enumeration.
+    ReadMetadata,
     Read,
     ReadWrite,
 }
@@ -645,12 +647,11 @@ fn normalize(contribution: &mut CapabilityContribution) {
     let mut index = 0;
     while index < contribution.grants.len() {
         let grant = &contribution.grants[index];
-        let covered = grant.access == GrantAccess::Read
-            && contribution.grants.iter().any(|other| {
-                other.access == GrantAccess::ReadWrite
-                    && ((other.scope == GrantScope::Subtree && grant.path.starts_with(&other.path))
-                        || (other.path == grant.path && grant.scope == GrantScope::Literal))
-            });
+        let covered = contribution.grants.iter().any(|other| {
+            other.access > grant.access
+                && ((other.scope == GrantScope::Subtree && grant.path.starts_with(&other.path))
+                    || (other.path == grant.path && grant.scope == GrantScope::Literal))
+        });
         if covered {
             contribution.grants.remove(index);
         } else {
