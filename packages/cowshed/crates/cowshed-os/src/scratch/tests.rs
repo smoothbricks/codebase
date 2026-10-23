@@ -245,6 +245,31 @@ fn background_deletion_is_bounded_and_does_not_follow_links() {
     assert_eq!(fs::read(outside.join("keep")).unwrap(), b"foreign");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn mount_identity_uses_the_directory_mount_and_refuses_symlinks() {
+    use std::os::fd::AsRawFd as _;
+
+    let fixture = Fixture::new();
+    let directory = fixture.0.join("directory");
+    fs::create_dir(&directory).unwrap();
+    let held = File::open(&directory).unwrap();
+    let fdinfo = fs::read_to_string(format!("/proc/self/fdinfo/{}", held.as_raw_fd())).unwrap();
+    let expected = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:"))
+        .expect("the held directory has a kernel mount ID")
+        .trim()
+        .parse::<u64>()
+        .unwrap();
+    let metadata = fs::symlink_metadata(&directory).unwrap();
+    assert_eq!(mount_identity(&directory, &metadata).unwrap(), expected);
+
+    let redirected = fixture.0.join("redirected");
+    symlink(&directory, &redirected).unwrap();
+    assert!(mount_identity(&redirected, &fs::symlink_metadata(&redirected).unwrap()).is_err());
+}
+
 #[test]
 fn a_surviving_socket_holder_keeps_a_dead_creators_directory() {
     let fixture = Fixture::new();

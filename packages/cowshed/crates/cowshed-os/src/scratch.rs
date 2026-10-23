@@ -511,25 +511,10 @@ fn mount_identity(_path: &Path, metadata: &fs::Metadata) -> io::Result<u64> {
 
 #[cfg(target_os = "linux")]
 fn mount_identity(path: &Path, _metadata: &fs::Metadata) -> io::Result<u64> {
-    use std::os::fd::AsRawFd as _;
+    use rustix::fs::{AtFlags, StatxFlags, statx};
     let directory = crate::fsio::open_directory_nofollow(path)?;
-    let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
-    // SAFETY: the held directory fd and empty path name that fd; stat is writable storage.
-    if unsafe {
-        libc::statx(
-            directory.as_raw_fd(),
-            c"".as_ptr(),
-            libc::AT_EMPTY_PATH,
-            libc::STATX_MNT_ID,
-            stat.as_mut_ptr(),
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: statx initialized the structure. Older kernels may omit the requested field.
-    let stat = unsafe { stat.assume_init() };
-    if stat.stx_mask & libc::STATX_MNT_ID == 0 {
+    let stat = statx(&directory, c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
+    if !StatxFlags::from_bits_retain(stat.stx_mask).contains(StatxFlags::MNT_ID) {
         return Err(io::Error::other(
             "cannot prove archive mount boundary: STATX_MNT_ID unavailable",
         ));
