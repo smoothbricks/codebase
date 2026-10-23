@@ -28,7 +28,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use crate::{CommandRequest, CommandRunError, CommandRunFailure, DISKUTIL, HDIUTIL};
+use crate::{CommandRequest, CommandRunError, DISKUTIL, HDIUTIL};
 
 /// What a Disk Arbitration release names.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -233,7 +233,7 @@ fn disk_of_path(path: &Path) -> Result<String, ReleaseRefusal> {
 pub(crate) fn refuse_unauthorized_release(request: &CommandRequest) -> Result<(), CommandRunError> {
     let refused = |refusal| CommandRunError {
         request: request.clone(),
-        failure: CommandRunFailure::Release(refusal),
+        failure: crate::CommandRunFailure::Release(refusal),
     };
     let Some(target) = release_target(request) else {
         return Ok(());

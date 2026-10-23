@@ -396,6 +396,9 @@ selects the effect.
 
 ### Release authority
 
+The command-target parser is shared across Unix targets. Only the macOS implementation constructs a Disk Arbitration
+release refusal; other targets compile the shared module without depending on that platform-only failure path.
+
 Disk Arbitration decides whether an unmount or eject needs authorization from one fact: the disk's owner.
 diskarbitrationd takes it from the `owner-uid` property it finds above the disk's IOMedia, which both image drivers
 (`IOHDIXHDDriveInKernel`, `AppleDiskImageDevice`) record as the attaching uid, and takes root when there is none; it
