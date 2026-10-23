@@ -1066,7 +1066,10 @@ struct RetiredCleanupArtifacts {
 }
 
 enum RetiredMountpoint {
-    Empty(PathBuf),
+    Removable {
+        path: PathBuf,
+        junk: StrayJunk,
+    },
     #[cfg(target_os = "macos")]
     RootHeld(RootHeldDirectory),
 }
@@ -1080,6 +1083,48 @@ struct RootHeldDirectory {
     identity: (libc::dev_t, libc::ino_t),
 }
 
+#[derive(Default)]
+struct StrayJunk {
+    removals: Vec<(PathBuf, bool)>,
+    directories: Vec<PathBuf>,
+}
+
+struct StrayCleanupPlan {
+    junk: StrayJunk,
+    outcome: StrayCleanup,
+}
+
+impl StrayJunk {
+    fn remove(self) -> Result<(), ApfsStorageError> {
+        for (path, is_dir) in self.removals {
+            let removed = if is_dir {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            match removed {
+                Ok(()) => cowshed_os::eprintln!(
+                    "cowshed: removed stray {} from retired mountpoint",
+                    path.display()
+                ),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error("remove stray junk", &path, error)),
+            }
+        }
+        for dir in self.directories.into_iter().rev() {
+            match fs::remove_dir(&dir) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(error) => return Err(io_error("remove empty stray directory", &dir, error)),
+            }
+        }
+        Ok(())
+    }
+}
 enum StrayCleanup {
     Empty,
     Work(Vec<PathBuf>),
@@ -2356,15 +2401,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         })
     }
 
-    /// The mountpoint a retirement is entitled to remove.
-    ///
-    /// A LIVE mount - a filesystem at that path, told apart from its parent by device - is
-    /// never touched. An unmounted directory that is not empty holds strays: files a process
-    /// wrote there after the volume left (an nx daemon's logs, a build's outputs, a generator
-    /// still running). Workspace data lives on the volume, so a stray is junk when it is
-    /// hidden (a `.` component) or gitignored by the project's own rules, and is deleted; a
-    /// visible file the rules do not ignore is someone's work landing in the wrong place and
-    /// the reclaim refuses by naming it.
+    /// Classify the mountpoint a retirement is entitled to remove, without changing it.
+    /// Mounted filesystems and unknown visible work refuse. Hidden, ignored and repository-held
+    /// bytes are planned by the same classifier reclamation uses; only reclamation removes them.
     fn retired_mount_point(
         &self,
         retired: &RetiredRef,
@@ -2373,6 +2412,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             .project()
             .mount_root
             .join(retired.workspace().name().as_str());
+        let mut junk = StrayJunk::default();
         match fs::symlink_metadata(&mount_point) {
             Ok(metadata) if metadata.file_type().is_dir() => {
                 let parent = mount_point.parent().unwrap_or(&mount_point);
@@ -2385,18 +2425,26 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                         mount_point.display()
                     )));
                 }
-                match remove_stray_junk(&mount_point, &self.config.checkout_path)? {
-                    StrayCleanup::Empty => {}
+                match plan_stray_cleanup(&mount_point, &self.config.checkout_path)? {
+                    StrayCleanupPlan {
+                        junk: planned,
+                        outcome: StrayCleanup::Empty,
+                    } => junk = planned,
                     #[cfg(target_os = "macos")]
-                    StrayCleanup::RootHeld => {
+                    StrayCleanupPlan {
+                        outcome: StrayCleanup::RootHeld,
+                        ..
+                    } => {
                         return self
                             .hold_root_held_mountpoint(&mount_point)
                             .map(RetiredMountpoint::RootHeld);
                     }
-                    StrayCleanup::Work(kept) => {
+                    StrayCleanupPlan {
+                        outcome: StrayCleanup::Work(kept),
+                        ..
+                    } => {
                         return Err(ApfsStorageError::Host(format!(
-                            "retired mountpoint {} holds files written after its volume was retired that \
-                             are neither hidden nor ignored by the project: {}; move or delete them",
+                            "retired mountpoint {} holds files written after its volume was retired that \\\n                             are neither hidden nor ignored by the project: {}; move or delete them",
                             mount_point.display(),
                             kept.iter()
                                 .map(|path| path.display().to_string())
@@ -2415,7 +2463,10 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_error("inspect retired mountpoint", &mount_point, error)),
         }
-        Ok(RetiredMountpoint::Empty(mount_point))
+        Ok(RetiredMountpoint::Removable {
+            path: mount_point,
+            junk,
+        })
     }
 
     #[cfg(target_os = "macos")]
@@ -2717,7 +2768,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             Some(RetiredMountpoint::RootHeld(held)) => {
                 Some(self.retain_root_held_mountpoint(held)?)
             }
-            Some(RetiredMountpoint::Empty(mount_point)) => {
+            Some(RetiredMountpoint::Removable {
+                path: mount_point,
+                junk,
+            }) => {
+                junk.remove()?;
                 match fs::remove_dir(&mount_point) {
                     Ok(()) => {
                         deletion_log::log_deletion(
@@ -6751,20 +6806,13 @@ fn root_owned_event_log(metadata: &libc::stat) -> bool {
         && metadata.st_mode & 0o777 == 0o700
 }
 
-/// Deletes every stray under an unmounted mountpoint that is junk - hidden, ignored by the
-/// project's gitignore rules judged from its checkout, or a regular file whose exact bytes the
-/// project's repository already holds as a blob - and returns the paths that were kept because
-/// they are none of these. One walk collects the candidates, one `check-ignore` judges them, one
-/// `hash-object` + `cat-file` pair judges what is left, and directories emptied by the deletions
-/// are removed bottom-up.
-///
-/// A file git can reproduce byte for byte is not unsaved work: the left-behind copy of a checkout
-/// (a mountpoint that was once a worktree) is exactly that, and would otherwise pin its
-/// mountpoint forever.
-fn remove_stray_junk(
+/// Classify strays without changing the mountpoint: hidden paths, project-ignored paths and
+/// regular files whose exact bytes the repository holds are junk. One walk, one check-ignore
+/// and one hash-object/cat-file pair supply both preview and execution with the same decision.
+fn plan_stray_cleanup(
     mount_point: &Path,
     checkout: &Path,
-) -> Result<StrayCleanup, ApfsStorageError> {
+) -> Result<StrayCleanupPlan, ApfsStorageError> {
     // (absolute path, relative form for check-ignore, is directory, is regular file)
     let mut strays: Vec<(PathBuf, Vec<u8>, bool, bool)> = Vec::new();
     let mut hidden: Vec<(PathBuf, bool)> = Vec::new();
@@ -6773,7 +6821,9 @@ fn remove_stray_junk(
     #[cfg(target_os = "macos")]
     let mut root_held = false;
     while let Some(dir) = stack.pop() {
-        visited.push(dir.clone());
+        if dir != mount_point {
+            visited.push(dir.clone());
+        }
         for entry in fs::read_dir(&dir)
             .map_err(|error| io_error("enumerate retired mountpoint", &dir, error))?
         {
@@ -6798,8 +6848,7 @@ fn remove_stray_junk(
                 hidden.push((path, file_type.is_dir()));
                 continue;
             }
-            // A directory pattern (`generated/`) only matches a path git knows is a directory;
-            // the path does not exist under the checkout, so the trailing slash says so.
+            // A directory pattern needs the slash because this path may not exist in checkout.
             let mut judged = relative.as_os_str().as_bytes().to_vec();
             if file_type.is_dir() {
                 judged.push(b'/');
@@ -6810,7 +6859,10 @@ fn remove_stray_junk(
         #[cfg(target_os = "macos")]
         if root_held {
             if strays.is_empty() && hidden.is_empty() {
-                return Ok(StrayCleanup::RootHeld);
+                return Ok(StrayCleanupPlan {
+                    junk: StrayJunk::default(),
+                    outcome: StrayCleanup::RootHeld,
+                });
             }
             return Err(ApfsStorageError::Host(format!(
                 "bare mountpoint {} holds a root-owned event log mixed with other entries; inspect it before removing anything",
@@ -6864,36 +6916,41 @@ fn remove_stray_junk(
             kept.push(path);
         }
     }
-    // A kept file under an ignored directory would be deleted with it: an ignored directory
-    // is junk wholesale by the project's own rule, exactly as `git clean -X` treats it.
-    for (path, is_dir) in removals {
-        let removed = if is_dir {
-            fs::remove_dir_all(&path)
-        } else {
-            fs::remove_file(&path)
-        };
-        match removed {
-            Ok(()) => cowshed_os::eprintln!(
-                "cowshed: removed stray {} from retired mountpoint",
-                path.display()
-            ),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error("remove stray junk", &path, error)),
-        }
-    }
-    kept.retain(|path| path.exists());
-    if kept.is_empty() {
-        for dir in visited.into_iter().rev() {
-            if dir != mount_point {
-                let _ = fs::remove_dir(&dir);
-            }
-        }
-    }
-    Ok(if kept.is_empty() {
+    // An ignored directory is junk wholesale, exactly as git clean -X treats it. Determine
+    // that coverage from the plan, not by deleting it and checking which kept paths vanished.
+    let removed_directories: BTreeSet<&Path> = removals
+        .iter()
+        .filter_map(|(path, is_dir)| is_dir.then_some(path.as_path()))
+        .collect();
+    kept.retain(|path| {
+        !path
+            .ancestors()
+            .any(|ancestor| removed_directories.contains(ancestor))
+            && path.exists()
+    });
+    let outcome = if kept.is_empty() {
         StrayCleanup::Empty
     } else {
+        visited.clear();
         StrayCleanup::Work(kept)
+    };
+    Ok(StrayCleanupPlan {
+        junk: StrayJunk {
+            removals,
+            directories: visited,
+        },
+        outcome,
     })
+}
+
+/// Execute the same classification used by preview, leaving visible unknown work in place.
+fn remove_stray_junk(
+    mount_point: &Path,
+    checkout: &Path,
+) -> Result<StrayCleanup, ApfsStorageError> {
+    let plan = plan_stray_cleanup(mount_point, checkout)?;
+    plan.junk.remove()?;
+    Ok(plan.outcome)
 }
 
 /// One mounted volume a job owns: the mountpoint it was found at and the filesystem id the
@@ -7441,6 +7498,146 @@ mod tests {
             kept_child(file.clone(), fs::symlink_metadata(&file), &regular),
             Some(Ok(path)) if path == file
         ));
+    }
+
+    /// Both successful and refused previews preserve bytes; execution rechecks unknown work and
+    /// only reclaims the authorized retirement, never a recovery image lacking authority.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn retired_gc_preview_preserves_strays_until_execution() {
+        use crate::storage::apfs::ApfsExecutionHost;
+        use crate::storage::recovery::re_adopt_tests::Fixture;
+        use cowshed_apfs::SystemCommandRunner;
+
+        let fixture = Fixture::new();
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        let config = ApfsSubstrateConfig::new(fixture.store(), &fixture.checkout);
+        let storage = layout(&config, &repo).expect("layout");
+        let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone()).expect("host");
+        let mut metadata = fixture.source(None).metadata;
+        metadata.workspace = WorkspaceName::session("retired").expect("workspace");
+        metadata.info_snapshot.role = crate::metadata::WorkspaceRole::Workspace;
+        metadata.info_snapshot.branch = Some("cowshed/retired".to_owned());
+        let trash = retired_image_below(
+            &storage.project().sessions,
+            &metadata.workspace,
+            &metadata.workspace_incarnation,
+        );
+        fs::create_dir_all(trash.parent().expect("trash parent")).expect("trash directory");
+        metadata
+            .write_for_image(&trash)
+            .expect("retirement authority");
+        let sidecar = sidecar_path(&trash);
+        let authority_before = fs::read(&sidecar).expect("retirement bytes");
+        // This image-shaped sentinel is recovery data, not a mounted or fabricated APFS image.
+        let recovery =
+            trash.with_file_name(format!("recovery-{}.dmg", metadata.workspace_incarnation));
+        fs::write(&recovery, b"only-copy recovery bytes").expect("recovery bytes");
+        let mount = storage
+            .workspace_mount(&metadata.workspace)
+            .expect("mountpoint");
+        fs::write(fixture.checkout.join(".gitignore"), "target/\n").expect("ignore rules");
+        let files: [(&str, &[u8]); 4] = [
+            (".nx/d/daemon.log", b"hidden daemon state"),
+            (".envrc", b"hidden environment"),
+            ("target/debug/output", b"ignored build output"),
+            ("src/README", b"re-adoption fixture\n"),
+        ];
+        for (relative, bytes) in files {
+            let path = mount.join(relative);
+            fs::create_dir_all(path.parent().expect("file parent")).expect("stray directory");
+            fs::write(path, bytes).expect("stray bytes");
+        }
+        fs::create_dir_all(mount.join("empty/nested")).expect("empty stray directories");
+        let before: Vec<_> = files
+            .iter()
+            .map(|(relative, _)| {
+                let stat = fs::symlink_metadata(mount.join(relative)).expect("stray metadata");
+                (
+                    stat.ino(),
+                    stat.mode(),
+                    stat.len(),
+                    stat.mtime(),
+                    stat.mtime_nsec(),
+                )
+            })
+            .collect();
+        let assert_untouched = || {
+            for ((relative, bytes), expected) in files.iter().zip(&before) {
+                let path = mount.join(relative);
+                assert_eq!(
+                    fs::read(&path).expect("preserved stray"),
+                    *bytes,
+                    "{relative}"
+                );
+                let stat = fs::symlink_metadata(&path).expect("preserved metadata");
+                assert_eq!(
+                    (
+                        stat.ino(),
+                        stat.mode(),
+                        stat.len(),
+                        stat.mtime(),
+                        stat.mtime_nsec()
+                    ),
+                    *expected,
+                    "{relative}"
+                );
+            }
+            assert!(
+                mount.join("empty/nested").is_dir(),
+                "preview never prunes directories"
+            );
+            assert_eq!(
+                fs::read(&sidecar).expect("preserved authority"),
+                authority_before
+            );
+            assert_eq!(
+                fs::read(&recovery).expect("preserved recovery"),
+                b"only-copy recovery bytes"
+            );
+        };
+        let plan = host
+            .preview_gc(&config, &repo, StorageGcOptions::default())
+            .expect("read-only preview");
+        assert!(plan.candidates().iter().any(|candidate| {
+            candidate.reason() == StorageGcReason::RetiredWorkspace && candidate.path() == trash
+        }));
+        assert_untouched();
+
+        let unknown = mount.join("src/unsaved.rs");
+        fs::write(&unknown, b"unique visible work").expect("unknown late work");
+        let refusal = host
+            .preview_gc(&config, &repo, StorageGcOptions::default())
+            .expect_err("unknown work refuses preview");
+        assert!(refusal.to_string().contains("src/unsaved.rs"), "{refusal}");
+        assert_untouched();
+        let refusal = host
+            .reclaim_retired_authority(&fixture.project, &repo, &trash, None)
+            .expect_err("execution rechecks unknown work");
+        assert!(refusal.to_string().contains("src/unsaved.rs"), "{refusal}");
+        assert_eq!(
+            fs::read(&unknown).expect("unknown work survives"),
+            b"unique visible work"
+        );
+        assert_untouched();
+
+        fs::remove_file(&unknown).expect("owner removes only this test's unknown work");
+        let report = host
+            .execute_gc(&config, plan)
+            .expect("execute authorized cleanup");
+        assert!(report.deferred.is_empty(), "{report:?}");
+        assert!(
+            !mount.exists(),
+            "authorized junk and empty directories are reclaimed"
+        );
+        assert!(
+            !sidecar.exists(),
+            "completed retirement releases its authority"
+        );
+        assert_eq!(
+            fs::read(&recovery).expect("recovery image retained"),
+            b"only-copy recovery bytes"
+        );
     }
 
     /// A retired mountpoint's strays: hidden and gitignored ones go, so does a copy of a file the

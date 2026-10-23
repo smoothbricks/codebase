@@ -1384,6 +1384,13 @@ retained older undo generations and choose rollback or idempotent completion. Th
 
 ## Retired mountpoint debris
 
+- Preview classifies bare retired mountpoints without unlinking files or removing directories. Hidden paths,
+  project-ignored paths and regular files whose exact bytes the repository already holds are authorized junk; visible
+  unknown work is named and refuses retirement. Preview and execution use one classifier, including ignored directory
+  coverage, and execution reclassifies before reclamation. Only execution applies the resulting removals; a preview that
+  refuses leaves authorized junk and unknown work alike untouched. Directory-only regressions exercise both the preview
+  boundary and reclamation, without allocating an image.
+
 - A logged volume's final `fseventsd` flush can land on the bare host mountpoint after unmount and leave a root-owned
   `0700` `.fseventsd`. When it is the directory's **only** entry, gc does not try to delete it: it holds the parent and
   directory without following symlinks, checks fd-relative metadata and the kernel mount table, then atomically renames
