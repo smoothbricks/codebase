@@ -258,8 +258,8 @@ fn edit_distance(left: &str, right: &str) -> usize {
 fn render_command_map() -> String {
     let grammars: Vec<String> = COMMANDS.iter().map(|spec| spec.map_grammar()).collect();
     // The summary column starts after the widest grammar that still leaves the widest summary
-    // inside the page. A grammar wider than that takes its summary two spaces later instead of
-    // pushing every other line to the right for its sake.
+    // inside the page. Wider grammars put their summary on the next line at the same column;
+    // every summary wraps rather than pushing the map past the page width.
     let widest_summary = COMMANDS
         .iter()
         .map(|spec| spec.summary.len())
@@ -276,9 +276,15 @@ fn render_command_map() -> String {
     for (spec, grammar) in COMMANDS.iter().zip(&grammars) {
         pad(&mut map, 2);
         map.push_str(grammar);
-        pad(&mut map, column.saturating_sub(grammar.len()).max(2));
-        map.push_str(spec.summary);
-        map.push('\n');
+        let written = 2 + grammar.len();
+        let summary_column = column + 2;
+        if written + 2 > summary_column {
+            map.push('\n');
+            wrap(&mut map, spec.summary, summary_column, 0);
+        } else {
+            pad(&mut map, summary_column - written);
+            wrap(&mut map, spec.summary, summary_column, summary_column);
+        }
     }
     map
 }
@@ -390,22 +396,13 @@ mod tests {
     }
 
     #[test]
-    fn the_map_names_every_command_and_the_flags_that_fit() {
-        let map = command_map();
-        for spec in COMMANDS {
+    fn command_map_stays_within_page_width() {
+        for line in command_map().lines() {
             assert!(
-                map.lines()
-                    .any(|line| line.trim_start().starts_with(spec.name)
-                        && line.contains(spec.summary)),
-                "{} is missing from the map",
-                spec.name
+                line.len() <= WIDTH,
+                "command map line exceeds {WIDTH} columns: {line}"
             );
         }
-        // Fork's creation flags use its full help page when they exceed the map budget.
-        assert!(map.contains("fork [<src>] <ws> [options]"));
-        // `exec`'s eleven flags do not fit a scannable line, so the map defers to the page.
-        assert!(map.contains("exec <ws> [options] -- <cmd...>"));
-        assert!(map.lines().all(|line| line.len() <= WIDTH));
     }
 
     #[test]

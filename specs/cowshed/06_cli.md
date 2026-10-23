@@ -592,7 +592,9 @@ a time (exit 4 if occupied).
 - Every failure's stderr includes the exact command that would resolve it
   (`cowshed: workspace not mounted — run: cowshed attach raven`), and `--json` errors carry the same in `hint`. Agents
   recover without documentation.
-- `cowshed` with no args prints a compact command map to stderr and exits 2 — safe for probing.
+- `cowshed` with no args prints a compact command map to stderr and exits 2 — safe for probing. Command summaries wrap
+  within 96 columns. A grammar that exceeds the summary column puts its summary on the next line rather than widening
+  the map.
 - Destructive operations (`rm`, `restore`) state on stderr precisely what will be destroyed and which flag confirmed it;
   there are no interactive prompts, ever (agents can't answer them). Missing confirmation flags are exit 2 with the
   completed command line in the hint.
