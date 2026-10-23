@@ -197,6 +197,22 @@ helper's exit, so startup failure reports the exited helper instead of waiting f
 and release readiness frames are newline-terminated messages; their completion does not depend on every inherited writer
 descriptor reaching EOF. Independent readiness publishers are read concurrently.
 
+Process fixtures resolve real portable tools through the selected shell's PATH, not fixed FHS executable paths. A
+version-probe fixture prepends its selected executable directory without discarding that toolchain PATH. Host API proofs
+compare both successful answers and typed refusals with their CLI verbs; JSON failure diagnostics live on stdout. The
+native disk-output proof in CLI `host.rs` belongs to its macOS-only `real_apfs_host` module and the existing
+`cargo-test-group-real-apfs-host` lane. Portable runs still prove the disk runner's rename refusal and sccache role
+isolation. Sccache's LaunchAgent status is macOS-only: Linux proves the same explicit launchctl-unavailable error
+through the CLI and host API, never a fabricated running status.
+
+An oracle on allocated bytes is judged against the same filesystem, never one filesystem's block count: a sparse-file
+proof compares the file with a fresh sparse control of the same length created and synced beside it and reads zeroes at
+its head and tail, and a drain's byte report is at least its owned leaves' synced allocation and less than a larger
+foreign tree's, whose surviving contents prove it was neither counted nor deleted. A test that names a file or directory
+with bytes that are not UTF-8 requires a temp filesystem that admits such names; a filesystem that enforces UTF-8 names
+refuses them with EILSEQ, and the failure names its exact root and the refused path so the provisioning owner can supply
+a raw-capable temp filesystem. No fixture invents a mount, a private parent directory or a skip for that refusal.
+
 The shared Rust fixture guard has one constructor, `TempRoot::new_in(parent, prefix)`. Every caller selects its
 already-granted parent explicitly. Independent controller-git sandbox fixtures use the shared canonical `/tmp` parent;
 alias-owned fixtures keep their selected runtime alias unchanged.

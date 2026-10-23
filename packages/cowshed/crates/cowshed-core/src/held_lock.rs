@@ -1056,4 +1056,49 @@ mod tests {
             "a process cowshed started kept the lock its starter let go of: {free:?}"
         );
     }
+
+    /// The handoff itself, independent of how Node or another runtime spawns its children.
+    /// Both real commands wait on our stdin pipe; only the explicitly handed descriptor keeps
+    /// the lock after the parent closes its copy, and EOF releases the child and the lock.
+    #[test]
+    fn only_a_command_handed_the_descriptor_keeps_the_lock_until_it_exits() {
+        use cowshed_os::fork_lock::Spawn as _;
+
+        let root = crate::temp_root::TempRoot::new("held-lock-handoff");
+        let path = root.join("exact.lock");
+        for handed in [false, true] {
+            let held = Opened::open(&path)
+                .expect("open the lock")
+                .try_hold()
+                .expect("take the lock")
+                .expect("a free lock");
+            let mut command = std::process::Command::new("sh");
+            command
+                .args(["-c", "read _ || :"])
+                .stdin(std::process::Stdio::piped());
+            prepare_command_environment(&mut command).expect("the held policy");
+            if handed {
+                hand_to(&mut command, vec![held.descriptor()]);
+            }
+            let mut child = command.spawn_locked().expect("spawn the reader");
+            drop(held);
+            // Collect the observation without asserting until our child has been released
+            // and reaped, so a failing oracle cannot strand it or its inherited lock.
+            let free = Opened::open(&path)
+                .and_then(Opened::try_hold)
+                .map(|grant| grant.is_ok());
+            drop(child.stdin.take());
+            let status = child.wait().expect("reap the reader");
+            assert!(status.success(), "reader exit: {status}");
+            assert_eq!(free.expect("probe the lock"), !handed, "handed: {handed}");
+            assert!(
+                Opened::open(&path)
+                    .expect("open the released lock")
+                    .try_hold()
+                    .expect("probe the released lock")
+                    .is_ok(),
+                "the exited child left the lock held (handed: {handed})"
+            );
+        }
+    }
 }

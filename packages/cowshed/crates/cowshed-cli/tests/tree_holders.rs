@@ -45,7 +45,8 @@ impl Tree {
     /// The directory `name` inside this one, created.
     fn dir(&self, name: &std::ffi::OsStr) -> PathBuf {
         let dir = self.root.join(name);
-        fs::create_dir(&dir).expect("create a directory in the tree");
+        fs::create_dir(&dir)
+            .unwrap_or_else(|error| panic!("create a directory in the tree at {dir:?}: {error}"));
         dir
     }
 }

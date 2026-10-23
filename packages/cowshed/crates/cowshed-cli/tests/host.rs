@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use cowshed_core::api::call::{self, Arguments};
-use cowshed_core::api::dto::DiskCommandEvent;
 use cowshed_core::api::operations::{
     HostBuildState, HostCredentialAdd, HostDiskCommand, HostFdHolders, HostLockHolders,
     HostRetireDescendants, HostTreeHolders, SccacheStatusRead,
@@ -345,65 +344,70 @@ async fn a_host_connection_answers_fd_holders_as_the_verb_prints_them() {
     assert!(holder.wait().unwrap().success());
 }
 
-/// `host.diskCommand` runs the verb's runner: `hdiutil info`, an image verb, given a 1 ms
-/// `deadlineMs` is neither refused nor killed, and answers its whole stdout then exit 0, as
-/// `disk-command hdiutil -- info` exits.
-#[tokio::test]
-async fn a_host_disk_command_is_the_verbs_run_its_output_then_its_exit() {
-    let verb = Command::new(cowshed())
-        .args([
-            "disk-command",
-            "hdiutil",
-            "--deadline-ms",
-            "1",
-            "--",
-            "info",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(
-        verb.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&verb.stderr)
-    );
+#[cfg(target_os = "macos")]
+mod real_apfs_host {
+    use super::*;
+    use cowshed_core::api::dto::DiskCommandEvent;
+    /// `host.diskCommand` runs the verb's runner: `hdiutil info`, an image verb, given a 1 ms
+    /// `deadlineMs` is neither refused nor killed, and answers its whole stdout then exit 0, as
+    /// `disk-command hdiutil -- info` exits.
+    #[tokio::test]
+    async fn a_host_disk_command_is_the_verbs_run_its_output_then_its_exit() {
+        let verb = Command::new(cowshed())
+            .args([
+                "disk-command",
+                "hdiutil",
+                "--deadline-ms",
+                "1",
+                "--",
+                "info",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            verb.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&verb.stderr)
+        );
 
-    let (host, child) = host_without_supervisor().await;
-    let mut arguments = Arguments::new();
-    arguments.insert("tool".to_owned(), serde_json::json!("hdiutil"));
-    arguments.insert("deadlineMs".to_owned(), serde_json::json!(1));
-    arguments.insert(
-        "argv".to_owned(),
-        serde_json::json!([{ "encoding": "utf8", "data": "info" }]),
-    );
-    let mut events = call::call_stream::<HostDiskCommand, _>(&host, arguments)
-        .await
-        .expect("host.diskCommand");
-    let mut stdout = Vec::new();
-    let mut ended = None;
-    while let Some(event) = events.next().await {
-        assert!(ended.is_none(), "an event after exit");
-        match event.expect("a disk-command event") {
-            DiskCommandEvent::Stdout { data } => stdout.extend_from_slice(data.as_bytes()),
-            DiskCommandEvent::Stderr { .. } => {}
-            DiskCommandEvent::Exit { code } => ended = Some(code),
+        let (host, child) = host_without_supervisor().await;
+        let mut arguments = Arguments::new();
+        arguments.insert("tool".to_owned(), serde_json::json!("hdiutil"));
+        arguments.insert("deadlineMs".to_owned(), serde_json::json!(1));
+        arguments.insert(
+            "argv".to_owned(),
+            serde_json::json!([{ "encoding": "utf8", "data": "info" }]),
+        );
+        let mut events = call::call_stream::<HostDiskCommand, _>(&host, arguments)
+            .await
+            .expect("host.diskCommand");
+        let mut stdout = Vec::new();
+        let mut ended = None;
+        while let Some(event) = events.next().await {
+            assert!(ended.is_none(), "an event after exit");
+            match event.expect("a disk-command event") {
+                DiskCommandEvent::Stdout { data } => stdout.extend_from_slice(data.as_bytes()),
+                DiskCommandEvent::Stderr { .. } => {}
+                DiskCommandEvent::Exit { code } => ended = Some(code),
+            }
         }
-    }
-    assert_eq!(ended, Some(0));
-    assert!(!stdout.is_empty(), "hdiutil info printed nothing");
+        assert_eq!(ended, Some(0));
+        assert!(!stdout.is_empty(), "hdiutil info printed nothing");
 
-    drop(events);
-    drop(host);
-    let output = child
-        .wait_with_output()
-        .await
-        .expect("wait for cowshed host");
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+        drop(events);
+        drop(host);
+        let output = child
+            .wait_with_output()
+            .await
+            .expect("wait for cowshed host");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 /// `host.credentialAdd` carries `--secret-stdin`'s bytes as its upload frame and nothing else: a
@@ -476,34 +480,50 @@ fn serving(verb: &[&str]) -> (OwnedFd, tokio::process::Child) {
     (OwnedFd::from(ours), child)
 }
 
-/// `cowshed sccache host` serves `sccache.status` with what `sccache status --json` prints
-/// (the daemon's installed and running state; its counters move between two reads), and each
-/// client refuses a connection of the other role at the handshake, before any call.
+/// The sccache role serves the CLI's status outcome: installed/running state on macOS,
+/// or the same typed launchctl-unavailable failure on Linux. JSON failures are on stdout.
+/// Each client refuses the other role's handshake before any call.
 #[tokio::test]
 async fn a_sccache_host_connection_serves_the_sccache_rows_and_no_other_role() {
     let verb = Command::new(cowshed())
         .args(["--json", "sccache", "status"])
         .output()
         .unwrap();
-    assert!(
-        verb.status.success(),
-        "{}",
-        String::from_utf8_lossy(&verb.stderr)
-    );
+
     let printed: serde_json::Value = serde_json::from_slice(&verb.stdout).unwrap();
 
     let (socket, child) = serving(&["sccache", "host"]);
     let sccache = SccacheHost::connect(socket)
         .await
         .expect("sccache host handshake");
-    let status = call::call::<SccacheStatusRead, _>(&sccache, Arguments::new())
-        .await
-        .expect("sccache.status");
-    let answered = serde_json::to_value(&status).unwrap();
-    for field in ["installed", "running", "socket"] {
+    let status = call::call::<SccacheStatusRead, _>(&sccache, Arguments::new()).await;
+    #[cfg(target_os = "macos")]
+    {
+        assert!(verb.status.success(), "{verb:?}");
+        let answered = serde_json::to_value(status.expect("sccache.status")).unwrap();
+        for field in ["installed", "running", "socket"] {
+            assert_eq!(
+                answered[field], printed["result"][field],
+                "{field}: {answered} {printed}"
+            );
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert_eq!(verb.status.code(), Some(1), "{verb:?}");
+        let refused = status.expect_err("the LaunchAgent service is unavailable on this platform");
         assert_eq!(
-            answered[field], printed["result"][field],
-            "{field}: {answered} {printed}"
+            refused.code,
+            cowshed_core::ErrorCode::Internal,
+            "{refused:?}"
+        );
+        assert!(
+            refused.message.contains("launchctl Print could not start"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            printed,
+            serde_json::json!({ "ok": false, "error": refused })
         );
     }
     drop(sccache);
@@ -541,4 +561,66 @@ async fn a_sccache_host_connection_serves_the_sccache_rows_and_no_other_role() {
         .wait_with_output()
         .await
         .expect("wait for cowshed host");
+}
+
+/// The host and CLI refuse the same forbidden disk operation before a native tool is needed.
+/// Successful native output and exit streaming belongs to the real_apfs_host lane above.
+#[tokio::test]
+async fn a_host_disk_command_refuses_volume_renames_as_the_verb_does() {
+    let root = temp_root::TempRoot::new_in(&temp_parent::canonical_parent(), "cowshed-host-disk");
+    let target = root.join("absent-volume");
+    let verb = Command::new(cowshed())
+        .args(["disk-command", "diskutil", "--", "renameVolume"])
+        .arg(&target)
+        .arg("renamed")
+        .output()
+        .expect("run the disk-command verb");
+    assert_eq!(verb.status.code(), Some(101), "{verb:?}");
+    assert!(verb.stdout.is_empty(), "{verb:?}");
+
+    let (host, child) = host_without_supervisor().await;
+    let mut arguments = Arguments::new();
+    arguments.insert("tool".to_owned(), serde_json::json!("diskutil"));
+    arguments.insert(
+        "argv".to_owned(),
+        serde_json::json!([
+            { "encoding": "utf8", "data": "renameVolume" },
+            { "encoding": "utf8", "data": target },
+            { "encoding": "utf8", "data": "renamed" }
+        ]),
+    );
+    let mut events = call::call_stream::<HostDiskCommand, _>(&host, arguments)
+        .await
+        .expect("open host.diskCommand");
+    let refused = events
+        .next()
+        .await
+        .expect("the operation answers")
+        .expect_err("volume renames are refused before running diskutil");
+    assert_eq!(refused.code, cowshed_core::ErrorCode::Usage, "{refused:?}");
+    assert!(refused.message.contains("refused"), "{refused:?}");
+    assert!(
+        refused.message.contains(target.to_str().unwrap()),
+        "{refused:?}"
+    );
+    assert_eq!(
+        String::from_utf8(verb.stderr).unwrap(),
+        format!("cowshed: {}\nnext: {}\n", refused.message, refused.hint)
+    );
+    assert!(
+        events.next().await.is_none(),
+        "no event follows the refusal"
+    );
+
+    drop(events);
+    drop(host);
+    let output = child
+        .wait_with_output()
+        .await
+        .expect("wait for cowshed host");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        output.stdout.is_empty(),
+        "the connection never writes stdout"
+    );
 }

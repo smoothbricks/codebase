@@ -8243,7 +8243,7 @@ mod tests {
     fn a_disk_child_reads_exactly_the_given_bytes_then_end_of_input() {
         let deadline = || CommandDeadline::new(DISK_CHILD_DEADLINE);
         let read = CommandRequest::new(
-            "/bin/sh",
+            "sh",
             [
                 "-c",
                 "if read line; then printf 'got %s' \"$line\"; else printf eof; fi; cat",
@@ -8263,7 +8263,7 @@ mod tests {
             .collect();
         let echoed = SystemCommandRunner
             .run_with_input(
-                &CommandRequest::new("/bin/cat", Vec::<OsString>::new()),
+                &CommandRequest::new("cat", Vec::<OsString>::new()),
                 deadline(),
                 large.clone(),
             )
@@ -8277,7 +8277,7 @@ mod tests {
 
         let ignored = SystemCommandRunner
             .run_with_input(
-                &CommandRequest::new("/usr/bin/true", Vec::<OsString>::new()),
+                &CommandRequest::new("true", Vec::<OsString>::new()),
                 deadline(),
                 large,
             )
@@ -8942,14 +8942,51 @@ mod tests {
         }
     }
 
-    /// The created blank is still exactly the sparse file creation made: its requested length
-    /// and no allocated block, so nothing wrote, formatted or truncated it.
+    /// The created blank is still exactly the sparse file creation made: its requested length,
+    /// no more allocated blocks than a fresh sparse file of the same length beside it, and zero
+    /// bytes at its head and tail, so nothing wrote, formatted or truncated it. Allocation is
+    /// judged against that control, never a block count only one filesystem reports: a volume
+    /// may charge a sparse file a block of its own, as the Linux CI test volume does.
     fn assert_untouched_blank(image: &Path, capacity: ImageCapacity) {
+        use std::io::{Read as _, Seek as _, SeekFrom};
         use std::os::unix::fs::MetadataExt as _;
         let metadata = fs::symlink_metadata(image).expect("the created image is kept");
         assert!(metadata.is_file());
         assert_eq!(metadata.len(), capacity.bytes());
-        assert_eq!(metadata.blocks(), 0, "nothing was written to the blank");
+
+        let mut control_name = image.as_os_str().to_owned();
+        control_name.push(".sparse-control");
+        let control = PathBuf::from(control_name);
+        let control_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&control)
+            .expect("create the sparse control");
+        control_file
+            .set_len(capacity.bytes())
+            .expect("size the sparse control");
+        control_file.sync_all().expect("sync the sparse control");
+        let control_blocks = control_file
+            .metadata()
+            .expect("stat the sparse control")
+            .blocks();
+        drop(control_file);
+        fs::remove_file(&control).expect("remove the sparse control");
+        assert!(
+            metadata.blocks() <= control_blocks,
+            "nothing was written to the blank: {} blocks, a fresh sparse file takes {control_blocks}",
+            metadata.blocks()
+        );
+
+        let mut file = File::open(image).expect("open the created image");
+        let mut head = [0_u8; 4096];
+        file.read_exact(&mut head).expect("read the blank's head");
+        assert_eq!(head, [0; 4096], "the blank's head is unwritten");
+        let mut tail = [0_u8; 4096];
+        file.seek(SeekFrom::End(-4096))
+            .expect("seek to the blank's tail");
+        file.read_exact(&mut tail).expect("read the blank's tail");
+        assert_eq!(tail, [0; 4096], "the blank's tail is unwritten");
     }
 
     /// Creation never takes over a path that exists: the file keeps its bytes and no disk

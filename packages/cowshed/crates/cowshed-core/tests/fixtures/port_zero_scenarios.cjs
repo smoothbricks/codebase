@@ -257,7 +257,7 @@ const scenarios = {
     return { passed: seen === 'EADDRINUSE', detail: seen };
   },
   // Another program's arguments and a runtime's script arguments are data the preload leaves alone.
-  echoKeepsItsArguments: async () => unchanged(await printed('/bin/echo', [inspectZero])),
+  echoKeepsItsArguments: async () => unchanged(await printed('echo', [inspectZero])),
   nodeScriptKeepsItsArguments: async () => unchanged(await printed(node, [argvScript, inspectZero])),
   bunScriptKeepsItsArguments: async () => unchanged(await printed(bun, [argvScript, inspectZero])),
   // Bun takes an option's separate operand even when it starts with a dash: here the inspector text is a preload path,

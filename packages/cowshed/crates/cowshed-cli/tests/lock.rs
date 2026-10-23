@@ -1255,7 +1255,8 @@ fn assert_raw_lock_observation(name: &std::ffi::OsStr, path_wire: Value) {
             .expect("run lock-holders with a raw path");
         assert!(
             output.status.success(),
-            "{}",
+            "lock-holders {name:?} in {:?}: {}",
+            dir.path,
             String::from_utf8_lossy(&output.stderr)
         );
         serde_json::from_slice::<Value>(&output.stdout).expect("one observation object")
@@ -1274,7 +1275,8 @@ fn assert_raw_lock_observation(name: &std::ffi::OsStr, path_wire: Value) {
     );
 
     let path = dir.path.join(name);
-    fs::write(&path, b"\xff").expect("write an arbitrary holder record");
+    fs::write(&path, b"\xff")
+        .unwrap_or_else(|error| panic!("write an arbitrary holder record at {path:?}: {error}"));
     let metadata = fs::metadata(&path).expect("read exact inode metadata");
     assert_eq!(
         observe(),

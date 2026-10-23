@@ -1120,6 +1120,17 @@ fn take_stop_report(id: libc::id_t) -> io::Result<()> {
             return Ok(());
         }
         let error = io::Error::last_os_error();
+
+        // Linux has no eligible stop/continue state once this child is a zombie, so it
+        // reports ECHILD even though WEXITED can still observe our unreaped exit. Only
+        // that positive, non-reaping observation distinguishes it from a non-child.
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            let pid = i32::try_from(id)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            if exit_unreaped(pid)?.is_some() {
+                return Ok(());
+            }
+        }
         if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
         }
@@ -2356,6 +2367,14 @@ mod tests {
             Some(crate::api::dto::ExitStatus::Exited { code: 4 })
         );
         assert_eq!(child.0.wait().expect("reap").code(), Some(4));
+    }
+
+    /// ECHILD is not success on its own: this live process is never its own child.
+    #[test]
+    fn taking_a_stop_report_refuses_a_process_that_is_not_our_child() {
+        let id = libc::id_t::try_from(std::process::id()).expect("an id");
+        let error = super::take_stop_report(id).expect_err("not our child");
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
     }
 
     /// A test's group, killed and its leader reaped however the test ends.

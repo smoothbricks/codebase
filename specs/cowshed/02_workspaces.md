@@ -1658,24 +1658,23 @@ it, stay. A holder that finds the path naming another inode once granted refuses
   be sealed (on macOS, a census of them past the seal's fixed 4096-descriptor ceiling) is refused at that stage
   (`PrepareChildDescriptors`), never started unsealed. Every held command (`lock`'s, `land-turn`'s, and the git under
   `land --ref-lock`) is spawned through one boundary that hands it the descriptor with two policies.
-  `NX_DAEMON_START=never`, the policy every job runs under, is what keeps the patched Nx (04_sandbox.md) from starting a
-  host daemon that would hold the lock (the only Nx daemon cowshed runs is the kept one); a stock Nx ignores the
-  variable and is not stopped by it. Whether an Nx child inherits the descriptor at all depends on the platform,
-  measured on Darwin 2026-10-22: Node spawns through `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`, so neither an Nx
-  daemon nor a plugin worker inherits it. [INFERENCE] On Linux, libuv's fork and exec hands it to both; the client's
-  detached plugin workers end once their host disconnects, and until then hold it as the command's descendants. The
-  Linux control requires a CI run; no local Linux result is claimed. `gc.auto=0`, `maintenance.auto=false` and
-  `core.fsmonitor=false`, as `GIT_CONFIG_COUNT` entries appended after the caller's, turn off exactly git's automatic
-  gc, automatic maintenance and fsmonitor daemon in every git the command or its hooks run. Nothing wider is promised.
-  Any other process the command starts that outlives it, an unmanaged daemon for one (a git credential helper's cache
-  daemon is a possible case, not a measured one), inherits the open file description and holds the lock, by design,
-  until it closes it or exits; cowshed never unlocks around it, and `lock-holders` names it. The policies apply to the
-  held command alone: the git and Nx a workspace runs anywhere else keep their configuration, so deferred gc and
-  maintenance run at the next git outside the lock. Each path has a real-boundary test: the seal; git's own config
-  resolution under `lock` and `land-turn`; a real Nx client (`nx show projects`) handed a held lock, beside a control
-  run without the policy; a fast-forward whose target's automatic maintenance detaches (a worktree-prune task held on a
-  FIFO gitdir), with a held and an unheld arm; and the fence's owner killed while its real git is blocked writing, with
-  a contender refused until that git ends.
+  `NX_DAEMON_START=never`, the policy every job runs under, keeps patched Nx (04_sandbox.md) from starting a host daemon
+  outside the held command's lifetime (the only Nx daemon cowshed runs is the kept one); a stock Nx ignores the variable
+  and is not stopped by it. Whether a runtime hands the descriptor to its own daemon or plugin workers is a runtime
+  implementation choice, not an OS-wide guarantee. The real Nx control requires a daemon without the policy and none
+  with it, then proves the lock becomes available after the owned processes end. A separate direct-command control
+  proves descriptor handoff: only the command handed the descriptor keeps the lock after its parent closes it, and the
+  lock becomes available when that command exits. `gc.auto=0`, `maintenance.auto=false` and `core.fsmonitor=false`, as
+  `GIT_CONFIG_COUNT` entries appended after the caller's, turn off exactly git's automatic gc, automatic maintenance and
+  fsmonitor daemon in every git the command or its hooks run. Nothing wider is promised. Any other process the command
+  hands the open file description to that outlives it, an unmanaged daemon for one (a git credential helper's cache
+  daemon is a possible case, not a measured one), holds the lock, by design, until it closes it or exits; cowshed never
+  unlocks around it, and `lock-holders` names it. The policies apply to the held command alone: the git and Nx a
+  workspace runs anywhere else keep their configuration, so deferred gc and maintenance run at the next git outside the
+  lock. Each path has a real-boundary test: the seal; git's own config resolution under `lock` and `land-turn`; a real
+  Nx client (`nx show projects`) handed a held lock, beside a control run without the policy; a fast-forward whose
+  target's automatic maintenance detaches (a worktree-prune task held on a FIFO gitdir), with a held and an unheld arm;
+  and the fence's owner killed while its real git is blocked writing, with a contender refused until that git ends.
 - **The waiter's own word.** `--state-fd <n>` gives the caller the waiter's own word: one `LockWaiterEvent` per line, as
   JSON (`{"kind":…}`), so no reason or path breaks a line, and the caller reads it with the generated validator of the
   same type. A valid state descriptor is adopted before any runtime or setup work, so every failure after that and

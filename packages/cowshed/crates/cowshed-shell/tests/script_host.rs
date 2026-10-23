@@ -1597,6 +1597,10 @@ fn adopt_in_fixture(host: &Host, tail_supplies_token: bool) -> (PathBuf, Vec<u8>
 /// record withholds from the checkout's own tail files, read through direnv's stdlib.
 #[test]
 fn an_adopted_shell_takes_its_credentials_from_its_own_tail_files() {
+    #[cfg(target_os = "linux")]
+    if delegated_case("an_adopted_shell_takes_its_credentials_from_its_own_tail_files") {
+        return;
+    }
     let mut host = Host::start("adopt");
     let (clone, request) = adopt_in_fixture(&host, true);
     let _diagnostics = submit_adoption(&host, &request);
@@ -1619,6 +1623,10 @@ fn an_adopted_shell_takes_its_credentials_from_its_own_tail_files() {
 /// of that name of its own, which must never stand in for the one the activation exported.
 #[test]
 fn a_tail_that_lacks_a_withheld_value_refuses_and_changes_nothing() {
+    #[cfg(target_os = "linux")]
+    if delegated_case("a_tail_that_lacks_a_withheld_value_refuses_and_changes_nothing") {
+        return;
+    }
     let mut host = Host::start_with(
         "adopt-refused",
         &std::env::var_os("PATH").expect("PATH"),

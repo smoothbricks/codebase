@@ -2805,11 +2805,10 @@ mod tests {
     /// its own descendants hold the lock (02_workspaces.md "Held locks"). The client is `nx show
     /// projects`, which computes the project graph through the daemon and starts one when none
     /// runs. `NX_DAEMON=true` keeps a CI host or a container from switching the daemon off, so the
-    /// boundary's policy is all that differs between the two runs. The control is the same client
-    /// handed the descriptor alone: it starts the daemon. On Linux that daemon inherits the
-    /// descriptor and keeps the lock after the client has ended, until it is stopped. Darwin's
-    /// Node spawns with `POSIX_SPAWN_CLOEXEC_DEFAULT`, so there neither the daemon nor a plugin
-    /// worker inherits it.
+    /// boundary's policy is all that differs between the two runs. Without it the same client
+    /// starts a daemon: the control fails if the environment makes both arms daemonless.
+    /// Whether Node passes the descriptor on to its daemon is a runtime implementation detail,
+    /// not a Linux/Darwin contract. Direct descriptor custody is proved at `held_lock::hand_to`.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn an_nx_client_holding_a_lock_starts_no_daemon_that_would_keep_it() {
@@ -2913,27 +2912,7 @@ mod tests {
         show(command);
         let daemon = crate::runtime::nx_daemon::live_pid(&stock.record())
             .expect("the client without the policy started its daemon");
-        let daemon_holds = holders(&held)
-            .iter()
-            .any(|(holder, _)| holder.pid == daemon);
         drop(held);
-        let kept = crate::held_lock::Opened::open(&lock)
-            .expect("open the lock")
-            .try_hold()
-            .expect("ask for the lock")
-            .is_err();
-        #[cfg(target_os = "linux")]
-        assert!(
-            daemon_holds && kept,
-            "the daemon {daemon} inherited the lock and keeps it after the client ended \
-             (holds: {daemon_holds}, kept: {kept})"
-        );
-        #[cfg(target_os = "macos")]
-        assert!(
-            !daemon_holds && !kept,
-            "Darwin's posix_spawn hands the daemon {daemon} no descriptor it was not named \
-             (holds: {daemon_holds}, kept: {kept})"
-        );
         assert_eq!(
             stop_recorded_daemon(&stock.workspace_data()).expect("stop the daemon"),
             Ok(Some(daemon))

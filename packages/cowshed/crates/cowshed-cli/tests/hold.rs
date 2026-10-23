@@ -655,7 +655,7 @@ fn fd_holders_names_a_descendant_that_left_the_group_holding_the_output() {
             os("sh"),
             os("-c"),
             os(
-                "/usr/bin/perl -MPOSIX -e '$| = 1; POSIX::setsid() > 0 or die \"setsid: $!\"; \
+                "perl -MPOSIX -e '$| = 1; POSIX::setsid() > 0 or die \"setsid: $!\"; \
                  close STDIN; print \"$$\\n\"; sleep 600' & exit 3",
             ),
         ],

@@ -4021,7 +4021,7 @@ mod drain_read_tests {
     /// once that closes.
     fn live() -> (tokio::process::Child, Process) {
         use cowshed_os::fork_lock::Spawn as _;
-        let child = tokio::process::Command::new("/bin/cat")
+        let child = tokio::process::Command::new("cat")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .kill_on_drop(true)
@@ -4233,7 +4233,7 @@ mod drain_read_tests {
     #[tokio::test]
     async fn a_job_every_process_of_which_exited_is_owed_to_nobody() {
         use cowshed_os::fork_lock::Spawn as _;
-        let mut reader = tokio::process::Command::new("/bin/cat")
+        let mut reader = tokio::process::Command::new("cat")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .kill_on_drop(true)

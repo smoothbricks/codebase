@@ -1891,7 +1891,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
   describe('a leg that runs bun', () => {
     const declaresBun = JSON.stringify({ name: 'workspace', packageManager: 'bun@1.4.3' });
-    const systemPath = ':/usr/bin:/bin';
+    const systemPath = process.env.PATH === undefined ? '' : `:${process.env.PATH}`;
 
     it('is refused before it asks for RAM or CPU when its first bun is another version, and records why', async () => {
       const workspace = await createWorkspace();
