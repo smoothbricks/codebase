@@ -41,29 +41,36 @@ runs:
     # was wasted. GitHub's hosted images ship one baked id, which is why the
     # same wiring works there.
     #
-    # Pin the id on Linux, then keep the cache on the shared mutable bind
-    # instead of shipping it through the Actions cache. One host is then one
-    # cache with one identity, which is the only arrangement Nx trusts.
+    # The runner image must carry one id for every instance, then keep the
+    # cache on the shared mutable bind instead of shipping it through the
+    # Actions cache. One host is then one cache with one identity, which is
+    # the only arrangement Nx trusts.
     # Artifacts AND metadata must move together: the DB alone is where "Nx
     # recognizes this" lives. Darwin has a stable native identity and no
-    # /etc/machine-id, so it skips the pin (and the sudo) entirely — the
-    # Linux-only gate below is on runner.os, not on host detection, because
-    # Darwin host jobs take the same host branch.
+    # /etc/machine-id, so it skips the check entirely — the Linux-only gate
+    # below is on runner.os, not on host detection, because Darwin host jobs
+    # take the same host branch.
     #
-    # /etc/machine-id is a plain writable file on the Linux hosts, not a mount
-    # point. The durable home for this is the runner image; doing it per job
-    # keeps the fix in one managed place until then.
-    - name: 🧠 Pin the machine id (Linux hosts only)
+    # The job does not write /etc/machine-id: that needs root, and the runner
+    # user has none. The durable home is the runner image, which bakes
+    # FLEET_MACHINE_ID below. This step only compares, so an image that lacks
+    # it is named in the log and the step itself never fails the job.
+    - name: 🧠 Check the machine id (Linux hosts only)
       if: steps.runner-kind.outputs.host == 'true' && runner.os == 'Linux'
       shell: bash
       env:
         # Any valid 32-char lowercase hex; only its stability across instances
         # matters. Shared fleet-wide on purpose — see the cache trust model in
-        # the CI workflow's save step.
+        # the CI workflow's save step. The runner image must carry this value.
         FLEET_MACHINE_ID: 5cbb1f9a4d2e4f0f8b6a3c7d9e150246
       run: |
-        printf '%s\n' "$FLEET_MACHINE_ID" | sudo tee /etc/machine-id >/dev/null
-        echo "machine id : $(cat /etc/machine-id)"
+        current=$(cat /etc/machine-id 2>/dev/null || true)
+        if [ "$current" = "$FLEET_MACHINE_ID" ]; then
+          echo "machine id : $current"
+        else
+          echo "::warning::the runner image does not carry the fleet machine id ($FLEET_MACHINE_ID); Nx will not trust restored cache artifacts on this runner"
+          echo "machine id : ${current:-<none>}"
+        fi
 
     # Nx cache location on the shared bind: common to every host runner.
     # Scoped per workflow, and it has to be. workspace-data is not a cache:
@@ -128,6 +135,10 @@ runs:
     # dataset failed inside the job (move_mount: ENOENT) where a container-fs
     # target does not. If the mount is refused the job goes on from the
     # checkout and pays the evaluation: this is an optimisation, never a gate.
+    # Only that random hostexecutor checkout needs the mount. The GitHub
+    # Actions runner checks out under a path that is the same every job
+    # (_work/<repo>/<repo>, one runner install path per host), so it needs
+    # neither the mount nor root.
     - name: 📂 Locate devenv state on the shared bind
       if: steps.runner-kind.outputs.host == 'true'
       shell: bash
@@ -145,14 +156,23 @@ runs:
         ln -s "$root/.devenv" tooling/direnv/.devenv
         ln -s "$root/.direnv" tooling/direnv/.direnv
         stable="/work/$DEVENV_STATE_REPO/${lane:-default}/$DEVENV_STATE_JOB/$scope"
-        if mkdir -p "$stable" && sudo mount --bind "$GITHUB_WORKSPACE" "$stable"; then
-          echo "DEVENV_WORKDIR=$stable" >> "$GITHUB_ENV"
-          echo "devenv state: $root (workspace bind-mounted at $stable)"
-        else
-          echo "DEVENV_WORKDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
-          echo "::warning::stable devenv path unavailable (bind mount refused); evaluating from the checkout"
-          echo "devenv state: $root (workspace at $GITHUB_WORKSPACE)"
-        fi
+        case "$GITHUB_WORKSPACE" in
+          */hostexecutor | */hostexecutor/*)
+            # sudo-allowed: act's host executor checks out under a random per-job directory and only a bind mount made as root keeps a stable path past this step (unprivileged user-namespace mounts die with their process); the GitHub Actions runner never takes this branch
+            if mkdir -p "$stable" && sudo -n mount --bind "$GITHUB_WORKSPACE" "$stable"; then
+              echo "DEVENV_WORKDIR=$stable" >> "$GITHUB_ENV"
+              echo "devenv state: $root (workspace bind-mounted at $stable)"
+            else
+              echo "DEVENV_WORKDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+              echo "::warning::stable devenv path unavailable (bind mount refused); evaluating from the checkout"
+              echo "devenv state: $root (workspace at $GITHUB_WORKSPACE)"
+            fi
+            ;;
+          *)
+            echo "DEVENV_WORKDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+            echo "devenv state: $root (workspace at $GITHUB_WORKSPACE is already a stable path, no mount)"
+            ;;
+        esac
 
     - name: 📂 Devenv runs in the checkout
       if: steps.runner-kind.outputs.host != 'true'
@@ -191,6 +211,7 @@ runs:
           [ "$(free_kib)" -lt "$want_kib" ] || break
           [ -n "$dir" ] && [ -d "$dir" ] || continue
           start=$SECONDS
+          # sudo-allowed: this step runs only on GitHub-hosted runners (runner.environment == 'github-hosted'), where passwordless sudo is the platform contract; self-hosted machines never reach it
           if sudo rm -rf "$dir"; then
             echo "removed $dir in $((SECONDS - start)) s"
           else
@@ -289,7 +310,8 @@ runs:
           echo "$HOME/.cache is already the runner's"
         else
           ls -ld "$HOME/.cache"
-          sudo chown "$(id -u):$(id -g)" "$HOME/.cache"
+          # sudo-allowed: cache-nix-action unpacks through sudo, so this root-owned ~/.cache only exists on runners with passwordless sudo (GitHub-hosted); the self-hosted host-nix fleet skips this step
+          sudo -n chown "$(id -u):$(id -g)" "$HOME/.cache"
           echo "gave ~/.cache to $(id -un)"
         fi
 
