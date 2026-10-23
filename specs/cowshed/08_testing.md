@@ -662,6 +662,11 @@ case bounds, and so do the Nx daemon proofs that apply their own Seatbelt profil
 FSEvents stream), which `sandbox_apply` refuses inside a cowshed job. The shards exclude `*-host.test.ts`; the host
 target names each owned host file.
 
+Drain fixtures read report publications on native directory-write events and await the serving task and resident's
+completion directly. CPU-admission holders announce readiness on stdout before blocking on their open stdin; consumers
+follow that stream rather than poll job PIDs. Missing events are hangs owned by the target's no-progress diagnosis,
+never independent test deadlines.
+
 An unfinished test name is not holder attribution. During the final ten seconds of an unchanged no-progress interval,
 the executor takes one bounded pre-signal snapshot of its runner, descendants and retained process group. Resumed
 progress discards and cancels that interval's snapshot. At expiry the executor emits the completed observation, or an

@@ -608,6 +608,8 @@ static LOCK_DESCRIPTOR: Reader = Reader::Record(&[
     ("custody", &LOCK_CUSTODY),
 ]);
 static LOCK_HOLDER: Reader = Reader::Record(&[("pid", &LEAF), ("job", &LEAF), ("program", &LEAF)]);
+static LOCK_HOLDING: Reader =
+    Reader::Record(&[("operation", &LOCK_OPERATION), ("workspace", &LEAF)]);
 static LOCK_INODE: Reader = Reader::Record(&[("dev", &LEAF), ("ino", &LEAF)]);
 static LOCK_OBSERVATION: Reader = Reader::Record(&[
     ("path", &TAGGED_BYTES_REF),
@@ -615,7 +617,37 @@ static LOCK_OBSERVATION: Reader = Reader::Record(&[
     ("locked", &LEAF),
     ("record", &TAGGED_BYTES_REF),
     ("owner", &LOCK_DESCRIPTOR),
+    ("holding", &LOCK_HOLDING),
     ("descriptors", &SEQ__LOCK_DESCRIPTOR),
+]);
+static LOCK_OPERATION: Reader = Reader::External(&[
+    ("adopt", &LEAF),
+    ("finish-adoption", &LEAF),
+    ("discard-adoption", &LEAF),
+    ("restore-checkout", &LEAF),
+    ("retire-main", &LEAF),
+    ("re-adopt", &LEAF),
+    ("create", &LEAF),
+    ("fork", &LEAF),
+    ("checkpoint", &LEAF),
+    ("restore", &LEAF),
+    ("retire", &LEAF),
+    ("retire-unpublished", &LEAF),
+    ("repair-unpublished", &LEAF),
+    ("reclaim", &LEAF),
+    ("mount", &LEAF),
+    ("unmount", &LEAF),
+    ("resize", &LEAF),
+    ("defragment", &LEAF),
+    ("open", &LEAF),
+    ("recover", &LEAF),
+    ("gc", &LEAF),
+    ("land", &LEAF),
+    ("reseed", &LEAF),
+    ("clear-nx-state", &LEAF),
+    ("repair-ports", &LEAF),
+    ("grant", &LEAF),
+    ("mint-template", &LEAF),
 ]);
 static LOGS_CHUNK: Reader = Reader::Record(&[("eof", &LEAF), ("nextOffset", &LEAF)]);
 static MIRROR_INFO: Reader = Reader::Record(&[("url", &LEAF), ("mirror", &LEAF)]);

@@ -142,8 +142,10 @@ type ReaderName =
   | 'LOCK_CUSTODY'
   | 'LOCK_DESCRIPTOR'
   | 'LOCK_HOLDER'
+  | 'LOCK_HOLDING'
   | 'LOCK_INODE'
   | 'LOCK_OBSERVATION'
+  | 'LOCK_OPERATION'
   | 'LOGS_CHUNK'
   | 'MIRROR_INFO'
   | 'MOUNT_RESULT'
@@ -1291,6 +1293,13 @@ const READERS: Readers<ReaderName> = {
       ['program', 'LEAF'],
     ],
   },
+  LOCK_HOLDING: {
+    kind: 'record',
+    fields: [
+      ['operation', 'LOCK_OPERATION'],
+      ['workspace', 'LEAF'],
+    ],
+  },
   LOCK_INODE: {
     kind: 'record',
     fields: [
@@ -1306,7 +1315,40 @@ const READERS: Readers<ReaderName> = {
       ['locked', 'LEAF'],
       ['record', 'TAGGED_BYTES_REF'],
       ['owner', 'LOCK_DESCRIPTOR'],
+      ['holding', 'LOCK_HOLDING'],
       ['descriptors', 'SEQ__LOCK_DESCRIPTOR'],
+    ],
+  },
+  LOCK_OPERATION: {
+    kind: 'external',
+    arms: [
+      ['adopt', 'LEAF'],
+      ['finish-adoption', 'LEAF'],
+      ['discard-adoption', 'LEAF'],
+      ['restore-checkout', 'LEAF'],
+      ['retire-main', 'LEAF'],
+      ['re-adopt', 'LEAF'],
+      ['create', 'LEAF'],
+      ['fork', 'LEAF'],
+      ['checkpoint', 'LEAF'],
+      ['restore', 'LEAF'],
+      ['retire', 'LEAF'],
+      ['retire-unpublished', 'LEAF'],
+      ['repair-unpublished', 'LEAF'],
+      ['reclaim', 'LEAF'],
+      ['mount', 'LEAF'],
+      ['unmount', 'LEAF'],
+      ['resize', 'LEAF'],
+      ['defragment', 'LEAF'],
+      ['open', 'LEAF'],
+      ['recover', 'LEAF'],
+      ['gc', 'LEAF'],
+      ['land', 'LEAF'],
+      ['reseed', 'LEAF'],
+      ['clear-nx-state', 'LEAF'],
+      ['repair-ports', 'LEAF'],
+      ['grant', 'LEAF'],
+      ['mint-template', 'LEAF'],
     ],
   },
   LOGS_CHUNK: {

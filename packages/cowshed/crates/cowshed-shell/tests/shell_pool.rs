@@ -1425,23 +1425,35 @@ fn holder(mode: RunSandboxMode) -> ExecRequest {
     ExecRequest {
         mode,
         stdin: StdinSource::Open,
-        ..sh("cat >/dev/null")
+        ..sh("printf 'started\\n'; cat >/dev/null")
     }
 }
 
-/// Admit `request` and wait until its command runs: its job has a pid.
+/// Admit a holder and wait for its command's stdout readiness marker, not a pid poll.
+/// A command that never starts is named by the target's no-progress bound.
 async fn started(handle: &WorkspaceSupervisorHandle, request: ExecRequest) -> JobId {
     let job = handle
         .exec(None, None, request, AdmissionSource::Worker)
         .await
         .expect("admit the job");
-    tokio::time::timeout(Duration::from_secs(60), async {
-        while handle.info(job).await.expect("job info").pid.is_none() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the command starts");
+    let mut ready = Vec::new();
+    while ready.len() < b"started\n".len() {
+        let chunk = handle
+            .log_read(
+                job,
+                StreamKind::Stdout,
+                ready.len().try_into().expect("offset"),
+                true,
+            )
+            .await
+            .expect("the holder's readiness output");
+        ready.extend_from_slice(&chunk.bytes);
+        assert!(
+            !chunk.eof,
+            "holder {job:?} ended before its stdin closed: {ready:?}"
+        );
+    }
+    assert_eq!(ready, b"started\n", "the holder announced its start");
     job
 }
 
@@ -1609,10 +1621,10 @@ async fn host_controller_a_resident_killed_while_its_spawn_stake_waits_never_act
         .expect("the resident's grant waits on the gate");
     ledger.background_reaches(workspace.mount(), 2, 1).await;
     handle.kill(job).await.expect("kill the waiting resident");
-    let ended = tokio::time::timeout(Duration::from_secs(60), handle.wait(job))
+    let ended = handle
+        .wait(job)
         .await
-        .expect("the killed resident ends")
-        .expect("its outcome");
+        .expect("the killed resident's outcome");
     assert_eq!(ended.state, JobState::Killed, "{ended:?}");
     ledger.background_reaches(workspace.mount(), 2, 0).await;
     assert_eq!(workspace.activations(), 2, "its shell never activated");
