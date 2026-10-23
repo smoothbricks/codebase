@@ -1171,7 +1171,27 @@ ordinary remedy `git rebase --onto <new-main> e9e596563`; it never replays that 
 `refs/cowshed/<ws>/heads/<branch>` preservation ref without advancing the target branch, for review-gated flows. It
 returns `LandReport::Delivered(PushReport)` before build-volume adoption, land commitments, retirement or collection,
 even with the default `retire: true`. An ordinary land returns `LandReport::Landed(LandedReport)`; its existing landed
-fields describe only an actual target advance. The canonical JSON report uses the flat `kind: delivered | landed` tag.
+fields describe only an actual target advance. A preflight returns `LandReport::Preflighted(LandPreflight)` (below). The
+canonical JSON report uses the flat `kind: delivered | landed | preflighted` tag.
+
+`--preflight` runs the fences land runs before its check and stops, so a caller learns that land would refuse before it
+spends a gate on it. It is a flag of `land`, not a verb of its own, because its whole contract is "what this land would
+refuse before its check": it takes the land's own arguments, `--into` included, and runs the land's own functions in the
+land's order, so it parses, resolves and refuses exactly as the land does, never by a second copy of a rule. The fences
+are each a read: the plan (`--ungated` into main, or with `--check` or `--push-only`, exit 2); the binding gate's reads
+(a retired project, an identity move); the workspace and `--expected-workspace-incarnation`; the target (another
+workspace than the unit, at the incarnation `--into` resolved); the source head and `--expected-source-head`; step 1's
+dirty tree; the target branch (a detached target checkout without `--target`), checked out in the target's checkout; and
+the target head and `--expected-target-head`. A refusal is the land's own, word for word: its code, message, hint and
+`FenceRefusal`. A pass exits 0 with `{kind: preflighted, workspaceIncarnation, sourceHead, targetBranch, targetHead}`,
+the values the land after it pins with its three expectation flags (`targetHead` in `--expected-target-head`'s form,
+`{missing: true}` for a branch not created yet), so a land refuses whatever moved in between. A preflight mutates
+nothing: it takes no land lease, so it runs while a land or an `rm` of the workspace holds one, and no ref lock; the CLI
+opens the project as an inspection, finishing no interrupted work, and the preflight heals no binding, waits for no
+build, admits no supervisor, initializes no Nx cache, synchronizes no gateway and runs no check. Reading a detached lane
+base would mean attaching it, so that target answers `environment-missing` (exit 5), never a pass or a land's refusal.
+What land decides from its lease on is outside the preflight: a lease another land or `rm` holds, a workspace with no
+checked-out branch (read after the check), the check itself, and the target head re-read under the ref lock.
 
 `--ungated`, with `--into <lane>` only, folds a unit into its lane base by Git alone (see "Lanes"): steps 1, 3 and 5
 run, and steps 2 and 4 do not. It runs no check and initializes no Nx cache, and after the fast-forward it carries
@@ -1463,11 +1483,11 @@ build volume is read from its build link, and both mounts from the kernel mount 
 workspace with its build volume never reads the IOKit count. A fork or rename attaches its destination the same way:
 new, and so detached, unless a resumed one is already mounted. Adoption attaches main and its first build volume; a
 resize or reseed one build image or seed beside the workspace's own; moving the checkout or changing the repository
-identity main. Reads, job and session traffic, `rm`, `detach`, `gc`, `doctor`, previews (`reseed --dry-run`) and
-project-wide grants attach nothing. The workspaces an operation names (a fork's or rename's destination and source, a
-land's or rebase's `into`, main when it names none, a reseed's `from`) are its own and never detached for it. A host
-whose count leaves room is read once, and nothing else happens; an `exec` of a mounted, served workspace answers before
-any of this (06_cli.md, "Resident workspaces").
+identity main. Reads, job and session traffic, `rm`, `detach`, `gc`, `doctor`, previews (`reseed --dry-run`,
+`land --preflight`) and project-wide grants attach nothing. The workspaces an operation names (a fork's or rename's
+destination and source, a land's or rebase's `into`, main when it names none, a reseed's `from`) are its own and never
+detached for it. A host whose count leaves room is read once, and nothing else happens; an `exec` of a mounted, served
+workspace answers before any of this (06_cli.md, "Resident workspaces").
 
 Three paths attach without making room. Attaching every detached session (`attach` with no name, `attach --all`) is an
 aggregate: detaching some sessions to attach others frees nothing, so each of its attaches says so in its request

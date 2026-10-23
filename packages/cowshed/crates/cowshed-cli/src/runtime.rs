@@ -381,7 +381,8 @@ fn binds_re_adoption_primary(command: &Command, resuming_re_adoption: bool) -> b
 /// `doctor --repair` opens the way other mutating verbs do. `reseed` inspects too: its operation
 /// must refuse unfinished create/fork/adopt work, never finish it before making that decision.
 /// `defrag` likewise opens without replay: it must be able to rewrite a pending clone whose
-/// physical-generation extent gate is the reason publication cannot finish.
+/// physical-generation extent gate is the reason publication cannot finish. `land --preflight`
+/// inspects as well: it reads land's fences and must finish nothing.
 fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
     fn named<'a>(names: impl IntoIterator<Item = Option<&'a str>>) -> RecoveryScope {
         RecoveryScope::Workspaces(
@@ -399,6 +400,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         Command::Gc(_) => RecoveryScope::Store,
         Command::Doctor(args) if !args.repair => RecoveryScope::Inspect,
         Command::Reseed(_) | Command::Defrag(_) => RecoveryScope::Inspect,
+        Command::Land(args) if args.preflight => RecoveryScope::Inspect,
         Command::Fork(args) => named([args.source.as_deref(), Some(args.destination.as_str())]),
         Command::Move(args) => match &args.destination {
             MoveDestination::Workspace(destination) => {
@@ -2145,7 +2147,8 @@ where
             Ok(success())
         }
         Command::Land(args) => {
-            let reconcile_gateway = args.retire;
+            // A preflight retires nothing, so it leaves the gateway as it is.
+            let reconcile_gateway = args.retire && !args.preflight;
             let options = LandOptions {
                 target_branch: args
                     .target
@@ -2170,6 +2173,7 @@ where
                 expected_target_head: args.expected_target_head.map(os_expected_ref).transpose()?,
                 ref_lock: args.ref_lock.map(os_ref_lock).transpose()?,
                 mode: args.mode,
+                preflight: args.preflight,
             };
             let report = service
                 .land(&args.workspace, args.into.as_deref(), options)
@@ -3644,9 +3648,33 @@ fn emit_push<W: Write, E: Write>(output: &mut Output<W, E>, report: &PushReport)
         .map_err(output_error)
 }
 
+/// A passed land preflight as the land's own pins: the target branch, the source head
+/// (`--expected-source-head`), the target head (`--expected-target-head`, `missing` for a branch
+/// that does not exist yet) and the workspace incarnation (`--expected-workspace-incarnation`).
+fn emit_land_preflight<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    report: &cowshed_core::api::dto::LandPreflight,
+) -> Result<()> {
+    let target_head = match &report.target_head {
+        cowshed_core::api::dto::ExpectedRefHead::Missing => "missing",
+        cowshed_core::api::dto::ExpectedRefHead::Oid(oid) => oid.as_str(),
+    };
+    output
+        .bare(report.target_branch.as_bytes())
+        .and_then(|()| output.bare(b"\t"))
+        .and_then(|()| output.bare(report.source_head.as_str().as_bytes()))
+        .and_then(|()| output.bare(b"\t"))
+        .and_then(|()| output.bare(target_head.as_bytes()))
+        .and_then(|()| output.bare(b"\t"))
+        .and_then(|()| output.bare(report.workspace_incarnation.as_str().as_bytes()))
+        .and_then(|()| output.bare(b"\n"))
+        .map_err(output_error)
+}
+
 fn emit_land<W: Write, E: Write>(output: &mut Output<W, E>, report: &LandReport) -> Result<()> {
     let report = match report {
         LandReport::Delivered(delivery) => return emit_push(output, delivery),
+        LandReport::Preflighted(preflight) => return emit_land_preflight(output, preflight),
         LandReport::Landed(landed) => landed,
     };
     output
@@ -7527,6 +7555,8 @@ mod tests {
             &["reseed", "raven"][..],
             &["reseed", "raven", "--from", "lane", "--dry-run"],
             &["defrag", "raven"],
+            &["land", "raven", "--preflight"],
+            &["land", "raven", "--into", "lane", "--preflight"],
         ] {
             assert_eq!(scope(argv).unwrap(), RecoveryScope::Inspect);
         }

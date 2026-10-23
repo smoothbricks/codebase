@@ -74,6 +74,7 @@ type ReaderName =
   | 'EXIT_STATUS'
   | 'EXIT_STATUS__EXITED'
   | 'EXIT_STATUS__SIGNALED'
+  | 'EXPECTED_REF_HEAD'
   | 'FAILED_CHECK'
   | 'FD_HOLDER'
   | 'FD_HOLDERS'
@@ -130,6 +131,7 @@ type ReaderName =
   | 'LANDING_COMMITS__INDETERMINATE'
   | 'LANDING_COMMITS__MEASURED'
   | 'LAND_BUILD_VOLUME'
+  | 'LAND_PREFLIGHT'
   | 'LAND_REPORT'
   | 'LAND_SEED'
   | 'LAND_SEED__FROZEN'
@@ -593,6 +595,7 @@ const READERS: Readers<ReaderName> = {
   CPU_GATE_JOB: {
     kind: 'record',
     fields: [
+      ['repository', 'LEAF'],
       ['checkout', 'LEAF'],
       ['job', 'LEAF'],
       ['held', 'LEAF'],
@@ -602,6 +605,7 @@ const READERS: Readers<ReaderName> = {
   CPU_GATE_WAITER: {
     kind: 'record',
     fields: [
+      ['repository', 'LEAF'],
       ['checkout', 'LEAF'],
       ['job', 'LEAF'],
       ['pid', 'LEAF'],
@@ -729,6 +733,13 @@ const READERS: Readers<ReaderName> = {
     fields: [
       ['signal', 'LEAF'],
       ['coreDumped', 'LEAF'],
+    ],
+  },
+  EXPECTED_REF_HEAD: {
+    kind: 'external',
+    arms: [
+      ['missing', 'LEAF'],
+      ['oid', 'LEAF'],
     ],
   },
   FAILED_CHECK: {
@@ -1215,12 +1226,22 @@ const READERS: Readers<ReaderName> = {
       ['adoption', 'ADOPTION'],
     ],
   },
+  LAND_PREFLIGHT: {
+    kind: 'record',
+    fields: [
+      ['workspaceIncarnation', 'LEAF'],
+      ['sourceHead', 'LEAF'],
+      ['targetBranch', 'LEAF'],
+      ['targetHead', 'EXPECTED_REF_HEAD'],
+    ],
+  },
   LAND_REPORT: {
     kind: 'internal',
     tag: 'kind',
     arms: [
       ['delivered', 'PUSH_REPORT'],
       ['landed', 'LANDED_REPORT'],
+      ['preflighted', 'LAND_PREFLIGHT'],
     ],
   },
   LAND_SEED: {

@@ -4622,19 +4622,26 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// enforce is exactly the one `mv … --repo-id` exists to supersede. An inspecting host checks
     /// the pairing and writes nothing; doctor reports the move.
     async fn validate_binding(&mut self) -> Result<()> {
-        crate::project_retirement::require_project_active(
-            self.descriptor.storage.store(),
-            &self.descriptor.repo_id,
-        )?;
-        if self.binding_remote_validation == BindingRemoteValidation::ForIdentityChange {
-            return Ok(());
-        }
-        if let Some(moved) = self.binding_move().await?
+        if let Some(moved) = self.observe_binding().await?
             && self.recovery_scope.repairs()
         {
             self.record_binding(moved).await?;
         }
         Ok(())
+    }
+
+    /// The binding gate's reads without its heal: refuse a retired project or an identity move,
+    /// and answer a transport move for [`Self::validate_binding`] to record. A land preflight
+    /// runs this alone, so it writes nothing under any opening.
+    async fn observe_binding(&self) -> Result<Option<RepositoryBinding>> {
+        crate::project_retirement::require_project_active(
+            self.descriptor.storage.store(),
+            &self.descriptor.repo_id,
+        )?;
+        if self.binding_remote_validation == BindingRemoteValidation::ForIdentityChange {
+            return Ok(None);
+        }
+        self.binding_move().await
     }
 
     /// The binding Git's remotes now call for when a transport move left the recorded one
@@ -5285,6 +5292,119 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             checked.capture(source_mount, check, spawned, exited)?;
         }
         Ok((checked, carry_stopped))
+    }
+
+    /// Land's fences before its check, in land's order, each a read of the source, the target or
+    /// the caller's expectations (02_workspaces.md "`cowshed land`" step 1 and `--preflight`).
+    /// A land runs them under its lease; `cowshed land --preflight` runs exactly these and stops.
+    async fn land_fences(
+        &mut self,
+        workspace: &WorkspaceName,
+        into: Option<WorkspaceTarget>,
+        options: &LandOptions,
+        detached: DetachedTarget,
+    ) -> Result<LandFenced> {
+        let store_root = &std::sync::Arc::clone(self.git.store_root());
+        let current = timed_async("land", "source", self.current(workspace)).await?;
+        if let Some(expected) = options.expected_workspace_incarnation.as_ref() {
+            Self::require_exact_incarnation(&current, expected)?;
+        }
+        // Resolved before any check runs: a lane base that was recreated under its name refuses
+        // here, not after minutes of checks.
+        let into = timed_async(
+            "land",
+            "target",
+            self.landing_into(workspace, into, detached),
+        )
+        .await?;
+        let source_mount = current_snapshot_mount(self, &current)?;
+        let source_head =
+            timed_async("land", "source-head", git_oid(store_root, &source_mount)).await?;
+        require_source_head(options.expected_source_head.as_ref(), &source_head, "land")?;
+        // The check runs in the working tree but only the head commit lands, so uncommitted work
+        // would pass validation without landing, and would then refuse the retire after main had
+        // already moved. The same reading of "work" as `rm` makes, so land refuses exactly the
+        // trees retirement would.
+        let work = timed_async(
+            "land",
+            "source-dirty",
+            crate::git::GitRepository::from_root(store_root, &source_mount)
+                .dirty_paths_by(Some(&self.substrate_config.checkout_path)),
+        )
+        .await?;
+        if !work.is_empty() {
+            return Err(CowshedError::fence_refusal(
+                crate::error::FenceRefusal::dirty(false, &work),
+                format!(
+                    "workspace {workspace} has uncommitted work, which the check would validate but land would leave behind"
+                ),
+                format!(
+                    "commit the work in the workspace or discard it, then retry: cowshed land {workspace}"
+                ),
+            ));
+        }
+        let target_branch = match options.target_branch.clone() {
+            Some(branch) => branch,
+            None => {
+                timed_async("land", "target-branch", into.checked_out_branch(store_root)).await?
+            }
+        };
+        timed_async(
+            "land",
+            "target-check",
+            require_target_checked_out(store_root, &into.root, &target_branch),
+        )
+        .await?;
+        let target_head = timed_async(
+            "land",
+            "target-head",
+            git_optional_ref_oid(
+                store_root,
+                &into.root,
+                &format!("refs/heads/{target_branch}"),
+            ),
+        )
+        .await?;
+        require_target_head(options.expected_target_head.as_ref(), target_head.as_ref())?;
+        Ok(LandFenced {
+            current,
+            into,
+            source_mount,
+            source_head,
+            target_branch,
+            target_head,
+        })
+    }
+
+    /// `cowshed land --preflight`: land's plan, its binding gate's reads and its fences before the
+    /// check, and nothing else. It takes no land lease and no ref lock, attaches nothing, waits
+    /// for no build and runs no check, so a land in flight neither blocks it nor is blocked by
+    /// it, and a refusal is the one the land would make.
+    async fn land_preflight(
+        &mut self,
+        workspace: &WorkspaceName,
+        into: Option<WorkspaceTarget>,
+        options: &LandOptions,
+    ) -> Result<LandReport> {
+        land_plan(
+            options,
+            &into
+                .as_ref()
+                .map_or_else(main_name, |into| into.workspace().clone()),
+        )?;
+        timed_async("land", "binding", self.observe_binding()).await?;
+        let fenced = self
+            .land_fences(workspace, into, options, DetachedTarget::Refuse)
+            .await?;
+        Ok(LandReport::Preflighted(crate::api::dto::LandPreflight {
+            workspace_incarnation: fenced.current.derived.workspace.incarnation().clone(),
+            source_head: fenced.source_head,
+            target_branch: fenced.target_branch,
+            target_head: fenced.target_head.map_or(
+                crate::api::dto::ExpectedRefHead::Missing,
+                crate::api::dto::ExpectedRefHead::Oid,
+            ),
+        }))
     }
 
     /// Land steps 4–7 (16_build_volumes.md, "Land"): quiesce the landing workspace, close the
@@ -6753,11 +6873,13 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
 
     /// Resolve what `unit` lands into, or rebases onto: main when `into` is `None`, otherwise the
     /// named workspace, but only at the incarnation `into` was resolved at and never `unit`
-    /// itself. A detached target is attached, since delivering into it means running Git in it.
+    /// itself. A detached target is attached, since delivering into it means running Git in it,
+    /// unless `detached` refuses it: a land preflight reads the target and attaches nothing.
     async fn landing_into(
         &mut self,
         unit: &WorkspaceName,
         into: Option<WorkspaceTarget>,
+        detached: DetachedTarget,
     ) -> Result<NativeLandingInto> {
         let main = || -> Result<NativeLandingInto> {
             Ok(NativeLandingInto {
@@ -6783,8 +6905,26 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             current.derived.mount_state,
             crate::storage::lifecycle::MountState::Detached
         ) {
-            self.attach(into.workspace().clone(), AttachOptions::default())
-                .await?;
+            match detached {
+                DetachedTarget::Attach => {
+                    self.attach(into.workspace().clone(), AttachOptions::default())
+                        .await?;
+                }
+                // Not a refusal of the land, which attaches it: the preflight cannot read a
+                // target without mounting it, so it says so instead of passing a fence unread.
+                DetachedTarget::Refuse => {
+                    return Err(CowshedError::environment_missing(
+                        format!(
+                            "lane base {} is detached, and a land preflight reads its checkout without attaching it",
+                            into.workspace()
+                        ),
+                        format!(
+                            "cowshed attach {}, then retry the preflight; the land itself attaches it",
+                            into.workspace()
+                        ),
+                    ));
+                }
+            }
         }
         let mount = self.workspace_mount_path(into.workspace())?;
         Ok(NativeLandingInto {
@@ -10435,6 +10575,27 @@ impl NativeLandingInto {
             branch,
         }
     }
+}
+
+/// What resolving a landing target does with a detached lane base: a land or a rebase attaches
+/// it to run Git in it; a land preflight, which mutates nothing, refuses it.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DetachedTarget {
+    Attach,
+    Refuse,
+}
+
+/// What land's fences before its check read: the source as the land saw it, its target, and the
+/// heads the fences held to the caller's expectations.
+#[cfg(target_os = "macos")]
+struct LandFenced {
+    current: NativeWorkspace,
+    into: NativeLandingInto,
+    source_mount: PathBuf,
+    source_head: GitOid,
+    target_branch: String,
+    target_head: Option<GitOid>,
 }
 
 #[cfg(target_os = "macos")]
@@ -14604,7 +14765,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         if let Some(expected) = options.expected_workspace_incarnation.as_ref() {
             Self::require_exact_incarnation(&current, expected)?;
         }
-        let into = self.landing_into(&workspace, into).await?;
+        let into = self
+            .landing_into(&workspace, into, DetachedTarget::Attach)
+            .await?;
         let root = current_snapshot_mount(self, &current)?;
         let source_head = git_oid(store_root, &root).await?;
         require_source_head(
@@ -14695,6 +14858,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         into: Option<WorkspaceTarget>,
         options: LandOptions,
     ) -> Result<LandReport> {
+        if options.preflight {
+            return self.land_preflight(&workspace, into, &options).await;
+        }
         self.wait_for_other_builds_as_a_land_step();
         let store_root = &std::sync::Arc::clone(self.git.store_root());
         let plan = land_plan(
@@ -14712,63 +14878,21 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             workspace.as_str(),
             super::land_lease::Holding::Land,
         )?;
-        let current = timed_async("land", "source", self.current(&workspace)).await?;
+        let LandFenced {
+            current,
+            into,
+            source_mount,
+            source_head,
+            target_branch,
+            target_head: previous,
+        } = self
+            .land_fences(&workspace, into, &options, DetachedTarget::Attach)
+            .await?;
         // Read once, here: from the fast-forward on, nothing reads the workspace back, since the
         // steps after it may unpublish it.
         let landing_incarnation = current.derived.workspace.incarnation().clone();
-        if let Some(expected) = options.expected_workspace_incarnation.as_ref() {
-            Self::require_exact_incarnation(&current, expected)?;
-        }
-        // Resolved before any check runs: a lane base that was recreated under its name refuses
-        // here, not after minutes of checks.
-        let into = timed_async("land", "target", self.landing_into(&workspace, into)).await?;
-        let source_mount = current_snapshot_mount(self, &current)?;
-        let source_repository =
-            crate::git::GitRepository::from_root(self.git.store_root(), &source_mount);
-        let source_head =
-            timed_async("land", "source-head", git_oid(store_root, &source_mount)).await?;
-        require_source_head(options.expected_source_head.as_ref(), &source_head, "land")?;
-        // The check runs in the working tree but only the head commit lands, so uncommitted work
-        // would pass validation without landing, and would then refuse the retire after main had
-        // already moved. The same reading of "work" as `rm` makes, so land refuses exactly the
-        // trees retirement would.
-        let work = timed_async(
-            "land",
-            "source-dirty",
-            source_repository.dirty_paths_by(Some(&self.substrate_config.checkout_path)),
-        )
-        .await?;
-        if !work.is_empty() {
-            return Err(CowshedError::fence_refusal(
-                crate::error::FenceRefusal::dirty(false, &work),
-                format!(
-                    "workspace {workspace} has uncommitted work, which the check would validate but land would leave behind"
-                ),
-                format!(
-                    "commit the work in the workspace or discard it, then retry: cowshed land {workspace}"
-                ),
-            ));
-        }
-        let target_branch = match options.target_branch.clone() {
-            Some(branch) => branch,
-            None => {
-                timed_async("land", "target-branch", into.checked_out_branch(store_root)).await?
-            }
-        };
-        timed_async(
-            "land",
-            "target-check",
-            require_target_checked_out(store_root, &into.root, &target_branch),
-        )
-        .await?;
+        let source_repository = crate::git::GitRepository::from_root(store_root, &source_mount);
         let target_ref = format!("refs/heads/{target_branch}");
-        let previous = timed_async(
-            "land",
-            "target-head",
-            git_optional_ref_oid(store_root, &into.root, &target_ref),
-        )
-        .await?;
-        require_target_head(options.expected_target_head.as_ref(), previous.as_ref())?;
         let retire = options.retire;
         // An ungated land initializes no Nx cache and runs no check: only a land into main gates.
         let (checked, carry_stopped) = match plan {

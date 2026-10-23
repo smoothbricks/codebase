@@ -1262,6 +1262,35 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         "a delivery cannot pretend it retired a workspace"
     );
 
+    // A passed preflight answers the land's three pins; a missing target branch is `missing`.
+    let preflighted = LandReport::Preflighted(LandPreflight {
+        workspace_incarnation: incarnation(),
+        source_head: oid('b'),
+        target_branch: "main".into(),
+        target_head: ExpectedRefHead::Missing,
+    });
+    let wire = json!({
+        "kind": "preflighted",
+        "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+        "sourceHead": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "targetBranch": "main",
+        "targetHead": {"missing": true}
+    });
+    assert_eq!(serde_json::to_value(&preflighted).unwrap(), wire);
+    assert_eq!(
+        serde_json::from_value::<LandReport>(wire).unwrap(),
+        preflighted
+    );
+    // Only a preflight names it; an ordinary land's options travel as before.
+    assert_eq!(
+        serde_json::to_value(LandOptions {
+            preflight: true,
+            ..LandOptions::default()
+        })
+        .unwrap(),
+        json!({"retire":true,"pushOnly":false,"preflight":true})
+    );
+
     let status = GatewayStatus {
         installed: true,
         running: true,

@@ -683,6 +683,7 @@ pub struct LandArgs {
     pub expected_target_head: Option<OsString>,
     pub ref_lock: Option<OsString>,
     pub mode: LandMode,
+    pub preflight: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1076,6 +1077,7 @@ pub fn cli_command() -> ClapCommand {
             value("expected-target-head"),
             value("ref-lock"),
             flag("ungated"),
+            flag("preflight"),
         ]))
         .subcommand(leaf("doctor").args([flag("repair")]))
         .subcommand(
@@ -4050,6 +4052,7 @@ const LAND: CommandSpec = CommandSpec {
         "An adopted build volume is renamed `[cowshed] <project> — build <target>` in the background. The target's previous volume is released before land returns, including with --no-retire, unless a running job's hold owns it. Release uses an unforced unmount with bounded grace, then force if needed, naming initial holders and every collection deferral. Seeds are never mounted or named: mounting one just to rename it would advance the image mtime used for seed freshness.",
         "With `--into <lane>`, the unit lands into the lane base <lane> instead of main: the lane base's checked-out branch is fast-forwarded, and the unit retires once the lane base holds its commits. The lane itself reaches main with `cowshed rebase <lane>` and `cowshed land <lane>`.",
         "With `--into <lane> --ungated`, the fold is Git alone: no check, no Nx cache initialization, carry, seed freeze or build-volume adoption. The lane base keeps its build volume and seed, and the unit's volume is released with the unit. Only a land into main gates, so main refuses `--ungated`.",
+        "With `--preflight`, land runs only the fences it runs before its check, with the same arguments, and stops: the plan, the workspace and its incarnation, the target, the source head, the dirty-tree refusal, the target branch and the target head. It exits 4 with land's own refusal when land would refuse, and 0 with what it read otherwise. It takes no land lease and no ref lock, attaches nothing, synchronizes no gateway, runs no check and finishes no interrupted work, so it runs beside a land of the same workspace; a detached lane base it cannot read without attaching is exit 5.",
     ],
     options: &[
         Opt {
@@ -4086,6 +4089,10 @@ const LAND: CommandSpec = CommandSpec {
             spelling: "--ungated",
             meaning: "fold into the lane base by Git alone: fast-forward and retire, with no check and no build-volume carry or adoption; needs --into <lane>, and conflicts with --check and --push-only",
         },
+        Opt {
+            spelling: "--preflight",
+            meaning: "run only land's fences before its check and stop, mutating nothing: exit 4 with land's own refusal, or 0 and the incarnation, source head and target head the land can pin",
+        },
     ],
 };
 
@@ -4107,6 +4114,7 @@ fn parse_land(matches: &ArgMatches) -> Result<Command, UsageError> {
         expected_target_head: os(matches, "expected-target-head"),
         ref_lock: os(matches, "ref-lock"),
         mode: land_mode(matches),
+        preflight: flagged(matches, "preflight"),
     }))
 }
 
@@ -5785,6 +5793,7 @@ mod tests {
             "cargo clippy",
             "--no-retire",
             "--push-only",
+            "--preflight",
             "--expected-workspace-incarnation",
             "0198f2c0b7e34dc795f17b238b331c80",
             "--expected-source-head",
@@ -5806,6 +5815,7 @@ mod tests {
         );
         assert!(!args.retire);
         assert!(args.push_only);
+        assert!(args.preflight);
         assert_eq!(args.ref_lock, Some(OsString::from("/tmp/ref.lock")));
         assert!(cli.global.json);
 

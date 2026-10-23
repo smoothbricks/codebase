@@ -3673,6 +3673,11 @@ pub struct LandOptions {
     /// `push_only`.
     #[serde(skip_serializing_if = "LandMode::is_gated")]
     pub mode: LandMode,
+    /// Run only land's fences before its check and stop, mutating nothing: no land lease, no
+    /// ref lock, no attach, no check (02_workspaces.md "`cowshed land`", `--preflight`). A
+    /// refusal is the land's own; a pass answers [`LandReport::Preflighted`].
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub preflight: bool,
 }
 
 impl Default for LandOptions {
@@ -3687,6 +3692,7 @@ impl Default for LandOptions {
             expected_target_head: None,
             ref_lock: None,
             mode: LandMode::Gated,
+            preflight: false,
         }
     }
 }
@@ -3799,6 +3805,19 @@ pub struct PushReport {
 pub enum LandReport {
     Delivered(PushReport),
     Landed(LandedReport),
+    Preflighted(LandPreflight),
+}
+
+/// What a land preflight read at the fences it passed: the three values the land after it pins
+/// as `expectedWorkspaceIncarnation`, `expectedSourceHead` and `expectedTargetHead`, so the
+/// land refuses if any of them moved in between.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LandPreflight {
+    pub workspace_incarnation: WorkspaceIncarnation,
+    pub source_head: GitOid,
+    pub target_branch: String,
+    pub target_head: ExpectedRefHead,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

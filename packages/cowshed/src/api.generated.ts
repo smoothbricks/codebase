@@ -2069,6 +2069,12 @@ export type LandOptions = {
    * `push_only`.
    */
   readonly mode?: LandMode;
+  /**
+   * Run only land's fences before its check and stop, mutating nothing: no land lease, no
+   * ref lock, no attach, no check (02_workspaces.md "`cowshed land`", `--preflight`). A
+   * refusal is the land's own; a pass answers [`LandReport::Preflighted`].
+   */
+  readonly preflight?: boolean;
 };
 
 /**
@@ -2089,9 +2095,24 @@ export type LandOutcomeCommitment = {
 };
 
 /**
+ * What a land preflight read at the fences it passed: the three values the land after it pins
+ * as `expectedWorkspaceIncarnation`, `expectedSourceHead` and `expectedTargetHead`, so the
+ * land refuses if any of them moved in between.
+ */
+export type LandPreflight = {
+  readonly workspaceIncarnation: WorkspaceIncarnation;
+  readonly sourceHead: GitOid;
+  readonly targetBranch: string;
+  readonly targetHead: ExpectedRefHead;
+};
+
+/**
  * Preservation-only delivery is distinct from a target that actually landed.
  */
-export type LandReport = ({ readonly kind: 'delivered' } & PushReport) | ({ readonly kind: 'landed' } & LandedReport);
+export type LandReport =
+  | ({ readonly kind: 'delivered' } & PushReport)
+  | ({ readonly kind: 'landed' } & LandedReport)
+  | ({ readonly kind: 'preflighted' } & LandPreflight);
 
 /**
  * A unit's land: the unit, what it lands into (main when absent), and its options.

@@ -10,8 +10,8 @@ use cowshed_cli::output::Output;
 use cowshed_cli::runtime::{ActorBridge, CliService, dispatch};
 use cowshed_core::api::JsonEnvelope;
 use cowshed_core::api::dto::{
-    Adoption, AdoptionSkip, CarrySide, DatabaseHolder, GcReport, LandReport, LandSeed,
-    LandedReport, RebaseBuildVolume, RebaseCarrySkip, RebaseReport,
+    Adoption, AdoptionSkip, CarrySide, DatabaseHolder, ExpectedRefHead, GcReport, GitOid,
+    LandReport, LandSeed, LandedReport, RebaseBuildVolume, RebaseCarrySkip, RebaseReport,
 };
 use cowshed_core::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx,
@@ -3068,6 +3068,9 @@ async fn land(
         LandReport::Delivered(delivery) => {
             panic!("ordinary land only preserved its head: {delivery:?}")
         }
+        LandReport::Preflighted(preflight) => {
+            panic!("ordinary land only ran its preflight: {preflight:?}")
+        }
     }
 }
 
@@ -3490,6 +3493,170 @@ async fn directory_a_land_while_an_rm_holds_the_lease_is_refused_substrate_lifec
         .shutdown()
         .await
         .expect("stop the real directory project");
+}
+
+/// A preflight refuses an untracked leaf main's checkout does not hold with the land's own
+/// refusal, code, words and fence data alike, and moves nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_land_preflight_refuses_an_unheld_untracked_leaf_as_land_does_substrate_lifecycle()
+ {
+    let mut fixture = Fixture::directory();
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let main = fixture.checkout.clone();
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("topic.txt"), b"topic\n").expect("write the workspace file");
+    git(&topic, &["add", "topic.txt"]);
+    git(&topic, &["commit", "-q", "-m", "topic"]);
+    fs::write(topic.join("scratch.txt"), b"left behind\n").expect("write an untracked leaf");
+    assert!(
+        !main.join("scratch.txt").exists(),
+        "main must not hold the leaf"
+    );
+    let main_head = git_stdout(&main, &["rev-parse", "HEAD"]);
+
+    let (preflight, _, stderr) =
+        run(&mut service, ["--json", "land", "topic", "--preflight"]).await;
+    let preflight = preflight.expect_err("a preflight passed an untracked leaf land refuses");
+    assert_eq!(
+        preflight.exit_code(),
+        4,
+        "{preflight}\n{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(
+        preflight.message.contains("has uncommitted work"),
+        "the preflight did not name the dirty tree: {preflight}"
+    );
+    let (landed, _, stderr) = run(&mut service, ["--json", "land", "topic", "--no-retire"]).await;
+    let landed = landed.expect_err("a land admitted an untracked leaf");
+    assert_eq!(
+        preflight,
+        landed,
+        "the preflight refused in other words than the land\n{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        git_stdout(&main, &["rev-parse", "HEAD"]),
+        main_head,
+        "a refused preflight and land left main where it was"
+    );
+    assert!(
+        topic.join("scratch.txt").exists(),
+        "the refusals kept the leaf"
+    );
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}
+
+/// A clean workspace passes its preflight while another process holds its land lease, which a
+/// land itself is refused for: the preflight takes no lease. Its report pins the land that runs
+/// once the lease is free.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_land_preflight_passes_while_another_process_holds_the_land_lease_substrate_lifecycle()
+ {
+    let mut fixture = Fixture::directory();
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let main = fixture.checkout.clone();
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("topic.txt"), b"topic\n").expect("write the workspace file");
+    git(&topic, &["add", "topic.txt"]);
+    git(&topic, &["commit", "-q", "-m", "topic"]);
+    let main_head = git_stdout(&main, &["rev-parse", "HEAD"]);
+    let topic_head = git_stdout(&topic, &["rev-parse", "HEAD"]);
+    let holder = OtherProcessLock::hold(&land_lease::lease_path(
+        &fixture_sessions(&fixture),
+        "topic",
+    ));
+
+    let (stdout, stderr) = succeed(&mut service, ["--json", "land", "topic", "--preflight"]).await;
+    let envelope: JsonEnvelope<LandReport> = serde_json::from_slice(&stdout)
+        .unwrap_or_else(|error| panic!("preflight printed no report ({error}): {stderr}"));
+    let LandReport::Preflighted(preflight) = envelope.result().expect("a passed preflight").clone()
+    else {
+        panic!("a preflight answered another report: {envelope:?}");
+    };
+    assert_eq!(preflight.source_head.as_str(), topic_head);
+    assert_eq!(preflight.target_branch, "main");
+    assert_eq!(
+        preflight.target_head,
+        ExpectedRefHead::Oid(GitOid::new(&main_head).expect("main's head"))
+    );
+    let (landed, _, stderr) = run(&mut service, ["--json", "land", "topic", "--no-retire"]).await;
+    let refusal = landed.expect_err("a land was admitted while another process held the lease");
+    assert!(
+        refusal.message.contains("holds its land lease"),
+        "the land did not name the held lease: {refusal}\n{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        git_stdout(&main, &["rev-parse", "HEAD"]),
+        main_head,
+        "the preflight and the refused land left main where it was"
+    );
+    holder.release();
+
+    let target_head = match &preflight.target_head {
+        ExpectedRefHead::Oid(oid) => oid.as_str().to_owned(),
+        ExpectedRefHead::Missing => panic!("main's branch exists"),
+    };
+    succeed(
+        &mut service,
+        [
+            "--json",
+            "land",
+            "topic",
+            "--no-retire",
+            "--expected-workspace-incarnation",
+            preflight.workspace_incarnation.as_str(),
+            "--expected-source-head",
+            preflight.source_head.as_str(),
+            "--expected-target-head",
+            target_head.as_str(),
+        ],
+    )
+    .await;
+    assert_eq!(
+        git_stdout(&main, &["rev-parse", "HEAD"]),
+        topic_head,
+        "the land the preflight pinned moved main"
+    );
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}
+
+/// Another process holding `path` exclusively, as lockf(1) does with the flock(2) a land lease
+/// is: it says `held` once it has the lock, and lets go when its stdin closes.
+struct OtherProcessLock(std::process::Child);
+
+impl OtherProcessLock {
+    fn hold(path: &Path) -> Self {
+        let mut child = Command::new("/usr/bin/lockf")
+            .arg("-k")
+            .arg(path)
+            .args(["/bin/sh", "-c", "echo held; exec cat"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn lockf");
+        let mut word = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().expect("the holder's stdout")),
+            &mut word,
+        )
+        .expect("read the holder's word");
+        assert_eq!(word, "held\n", "lockf did not take {}", path.display());
+        Self(child)
+    }
+
+    fn release(mut self) {
+        drop(self.0.stdin.take());
+        let status = self.0.wait().expect("wait for the lock holder");
+        assert!(status.success(), "the lock holder failed: {status}");
+    }
 }
 
 /// The fixture project's session directory, where its workspaces' land leases live.

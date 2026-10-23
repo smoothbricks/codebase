@@ -219,6 +219,7 @@ pub fn attach_demand(operation: &OperationRequest) -> AttachDemand {
             AttachDemand::of(1, [request.workspace.clone(), request.from.clone()])
         }
         Op::CoordinatorRebase(request) => into(&request.workspace, request.into.as_ref()),
+        Op::CoordinatorLand(request) if request.options.preflight => AttachDemand::default(),
         Op::CoordinatorLand(request) => into(&request.workspace, request.into.as_ref()),
         Op::WorkspaceAttach(request) if request.options.aggregate => AttachDemand::default(),
         Op::WorkspaceAttach(request) => one(&request.workspace),
@@ -904,7 +905,8 @@ mod tests {
 
     /// A controller operation's demand comes from its request alone: a fork keeps its destination
     /// and its source, main when it names none; a land keeps what it lands into, main when
-    /// it names none; a reseed attaches one image beside its own, none for a dry run; a worker
+    /// it names none, but a land preflight attaches nothing; a reseed attaches one image beside
+    /// its own, none for a dry run; a worker
     /// keeps its workspace; a detach and a read attach nothing.
     #[test]
     fn an_operations_attach_demand_follows_its_request() {
@@ -942,16 +944,19 @@ mod tests {
             fork(Some(session("crow"))),
             demand(0, &[session("raven"), session("crow")])
         );
-        let land = |into: Option<WorkspaceTarget>| {
+        let land = |into: Option<WorkspaceTarget>, preflight| {
             attach_demand(&Op::CoordinatorLand(LandRequest {
                 repo_id: repo.clone(),
                 workspace: session("raven"),
                 into,
-                options: LandOptions::default(),
+                options: LandOptions {
+                    preflight,
+                    ..LandOptions::default()
+                },
             }))
         };
         assert_eq!(
-            land(None),
+            land(None, false),
             demand(0, &[session("raven"), WorkspaceName::main()])
         );
         let lane = WorkspaceTarget::new(
@@ -959,9 +964,11 @@ mod tests {
             WorkspaceIncarnation::new("1".repeat(32)).expect("incarnation"),
         );
         assert_eq!(
-            land(Some(lane)),
+            land(Some(lane.clone()), false),
             demand(0, &[session("raven"), session("lane")])
         );
+        assert_eq!(land(None, true), AttachDemand::default());
+        assert_eq!(land(Some(lane), true), AttachDemand::default());
         let reseed = |dry_run| {
             attach_demand(&Op::CoordinatorReseed(ReseedRequest {
                 repo_id: repo.clone(),

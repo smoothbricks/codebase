@@ -1281,6 +1281,20 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                     document("land report", &LandReport::Landed(land_opening)),
                 ),
                 ("ungated", document("land report", &LandReport::Landed(land_ungated))),
+                (
+                    "preflighted",
+                    document(
+                        "land report",
+                        &LandReport::Preflighted(cowshed_core::api::LandPreflight {
+                            workspace_incarnation: incarnation(),
+                            source_head: oid("1111111111111111111111111111111111111111"),
+                            target_branch: "main".to_owned(),
+                            target_head: cowshed_core::api::ExpectedRefHead::Oid(oid(
+                                "2222222222222222222222222222222222222222",
+                            )),
+                        }),
+                    ),
+                ),
             ]),
         ),
         (

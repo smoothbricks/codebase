@@ -173,12 +173,14 @@ static CPU_CHECKOUT_STATUS: Reader = Reader::Record(&[
     ("waiting", &LEAF),
 ]);
 static CPU_GATE_JOB: Reader = Reader::Record(&[
+    ("repository", &LEAF),
     ("checkout", &LEAF),
     ("job", &LEAF),
     ("held", &LEAF),
     ("holders", &SEQ__CPU_HOLDER),
 ]);
 static CPU_GATE_WAITER: Reader = Reader::Record(&[
+    ("repository", &LEAF),
     ("checkout", &LEAF),
     ("job", &LEAF),
     ("pid", &LEAF),
@@ -248,6 +250,7 @@ static EXIT_STATUS: Reader = Reader::Internal {
 };
 static EXIT_STATUS__EXITED: Reader = Reader::Record(&[("code", &LEAF)]);
 static EXIT_STATUS__SIGNALED: Reader = Reader::Record(&[("signal", &LEAF), ("coreDumped", &LEAF)]);
+static EXPECTED_REF_HEAD: Reader = Reader::External(&[("missing", &LEAF), ("oid", &LEAF)]);
 static FAILED_CHECK: Reader =
     Reader::Record(&[("check", &LEAF), ("error", &LEAF), ("exit", &LEAF)]);
 static FD_HOLDER: Reader = Reader::Record(&[
@@ -561,9 +564,19 @@ static LANDING_COMMITS__MEASURED: Reader = Reader::Record(&[
     ("unlandedPaths", &UNLANDED_PATHS),
 ]);
 static LAND_BUILD_VOLUME: Reader = Reader::Record(&[("seed", &LAND_SEED), ("adoption", &ADOPTION)]);
+static LAND_PREFLIGHT: Reader = Reader::Record(&[
+    ("workspaceIncarnation", &LEAF),
+    ("sourceHead", &LEAF),
+    ("targetBranch", &LEAF),
+    ("targetHead", &EXPECTED_REF_HEAD),
+]);
 static LAND_REPORT: Reader = Reader::Internal {
     tag: "kind",
-    arms: &[("delivered", &PUSH_REPORT), ("landed", &LANDED_REPORT)],
+    arms: &[
+        ("delivered", &PUSH_REPORT),
+        ("landed", &LANDED_REPORT),
+        ("preflighted", &LAND_PREFLIGHT),
+    ],
 };
 static LAND_SEED: Reader = Reader::Internal {
     tag: "kind",

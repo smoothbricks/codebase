@@ -2983,6 +2983,15 @@
       "targetBranch": "main",
       "targetWasCheckedOut": false
     },
+    "preflighted": {
+      "kind": "preflighted",
+      "sourceHead": "1111111111111111111111111111111111111111",
+      "targetBranch": "main",
+      "targetHead": {
+        "oid": "2222222222222222222222222222222222222222"
+      },
+      "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+    },
     "retired": {
       "buildVolume": {
         "adoption": {

@@ -322,6 +322,7 @@ pub const PARITY: &[Row] = &[
     row("land", "ref-lock", field(&[("coordinator.land", "options.refLock")], &[argument("Coordinator.land", 1, "refLock")])),
     
     row("land", "ungated", field(&[("coordinator.land", "options.mode")], &[argument("Coordinator.land", 1, "mode")])),
+    row("land", "preflight", field(&[("coordinator.land", "options.preflight")], &[argument("Coordinator.land", 1, "preflight")])),
 
     row("doctor", "", field(&[("coordinator.doctor", "")], &[member("Coordinator.doctor")])),
     row("doctor", "repair", Counterpart::Composed { recipe: "doctor() then gc({}): the one sweep the CLI's repair runs (06_cli.md, \"Onboarding and repair\")", facade: &[member("Coordinator.doctor"), member("Coordinator.gc")] }),

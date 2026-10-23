@@ -1289,6 +1289,15 @@ are released with it; the lane base keeps its volume and seed. The report is `ki
 land into main gates, so main refuses `--ungated` (exit 2, naming main); `--check` and `--push-only` are refused with it
 (exit 2). With `--no-retire` it keeps the unit and collects nothing, since it released no volume.
 
+`--preflight` runs only the fences land runs before its check, with the same arguments, and stops: the plan, the
+workspace and its incarnation, the target, the source head, the dirty tree, the target branch and the target head. When
+land would refuse, it exits with land's own refusal (exit 4 for the dirty tree, the same message and hint); otherwise it
+exits 0, and `--json` returns `kind: preflighted` with the `workspaceIncarnation`, `sourceHead`, `targetBranch` and
+`targetHead` a land can pin through its `--expected-*` flags (text output: branch, source head, target head or
+`missing`, incarnation). It takes no land lease or ref lock, attaches nothing, synchronizes no gateway and runs no
+check, so it runs while another land or `rm` of the workspace holds the lease. A detached lane base it would have to
+attach is exit 5.
+
 `--ref-lock <file>` names the lock file every other writer of the target branch holds while it moves it, as an
 operator's Markdown commit into main holds it through lockf(1). Land takes the same exclusive lock only to re-read the
 target head, check it against `--expected-target-head`, fetch and fast-forward; the checks, Nx cache initialization,

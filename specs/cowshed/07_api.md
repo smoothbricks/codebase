@@ -572,6 +572,7 @@ pub struct LandOptions {
     pub expected_target_head: Option<ExpectedRefHead>,
     pub ref_lock: Option<RefLockPath>,   // absolute; held only for the head fence and fast-forward (02, land step 3)
     pub mode: LandMode,                  // Ungated: a lane fold by Git alone; refused into main (02, "Lanes")
+    pub preflight: bool,                 // land's fences before its check only, mutating nothing; absent when false (02)
 }
 
 #[serde(rename_all = "camelCase")]
@@ -584,6 +585,14 @@ pub enum LandMode {                      // default Gated, absent on the wire; `
 pub enum LandReport {
     Delivered(PushReport),
     Landed(LandedReport),
+    Preflighted(LandPreflight),          // the fences a preflight passed read these; the land pins them (02)
+}
+
+pub struct LandPreflight {
+    pub workspace_incarnation: WorkspaceIncarnation,
+    pub source_head: GitOid,
+    pub target_branch: String,
+    pub target_head: ExpectedRefHead,
 }
 
 pub struct LandedReport {
@@ -1641,7 +1650,8 @@ supervisor that ran the job retires.
   is lsof's `d` field, `0x` and lowercase hex digits with no leading zero; `inode` is lsof's `i` field as an exact
   decimal string; `fdType` is a Darwin `PROX_FDTYPE_*` neither field names.
 - `PushReport = { sourceHead, destinationRef, previousDestinationHead? }`;
-  `LandReport = { kind: "delivered", ...PushReport } | { kind: "landed", ...LandedReport }`;
+  `LandReport = { kind: "delivered", ...PushReport } | { kind: "landed", ...LandedReport } | { kind: "preflighted", ...LandPreflight }`;
+  `LandPreflight = { workspaceIncarnation, sourceHead, targetBranch, targetHead: ExpectedRefHead }`;
   `LandedReport = { landedHead, targetBranch, previousTargetHead?, targetWasCheckedOut, retired, buildVolume }`;
   preservation-only delivery has no landed, build-volume or retirement fields; `MirrorInfo = { url, mirror }`;
   `CheckpointQuota = { maxCount, maxBytes }`.
