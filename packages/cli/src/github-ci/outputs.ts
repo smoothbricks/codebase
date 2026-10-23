@@ -576,7 +576,8 @@ export function resolveDeclaredOutput(declaredOutput: string, project: ProjectTa
   if (hasUnsupportedOutputBraces(substituted)) {
     throw new Error(`Unsupported Nx output placeholder in ${project.project}:${declaredOutput}`);
   }
-  return validateWorkspaceRelativePattern(substituted, `output for ${project.project}`);
+  // A trailing `/` declares a directory output (nx-plugin build-state-output-policy); the path it names has none.
+  return validateWorkspaceRelativePattern(substituted.replace(/\/+$/, ''), `output for ${project.project}`);
 }
 
 function hasUnsupportedOutputBraces(value: string): boolean {

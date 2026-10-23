@@ -158,9 +158,11 @@ function targetOutputs(
             kind: declaredKind(output),
           }))
           .filter(({ output }) => output && !/{(projectRoot|workspaceRoot|(options.*))}/.test(output))
-      : getOutputsForTargetAndConfiguration({ project, target, configuration }, {}, node).map((output) => ({
+      : // A target declaring no outputs takes Nx's fallback: its options' outputPath, or for build and prepare the
+        // legacy dist, build and public directories. Each names a directory, and no declaration states otherwise.
+        getOutputsForTargetAndConfiguration({ project, target, configuration }, {}, node).map((output) => ({
           output,
-          kind: declaredKind(output),
+          kind: 'directory' as const,
         }));
   } catch (error) {
     // Nx tests a template against a module-level global regex before it throws, leaving that regex's lastIndex past
@@ -233,14 +235,18 @@ interface GlobClaim {
 
 type OutputClaim = PathClaim | GlobClaim;
 
-/** Each target's declared outputs once per distinct path across its configurations; a negation claims nothing. */
+/**
+ * Each target's declared outputs once per distinct path and declared kind across its configurations; a negation claims
+ * nothing. The kind is part of the identity, so a path a target declares as both a file and a directory is two claims,
+ * and each is judged.
+ */
 function outputClaims(declared: readonly DeclaredOutput[], root: string): OutputClaim[] {
   const seen = new Set<string>();
   const claims: OutputClaim[] = [];
   for (const output of declared) {
     if (output.output.startsWith('!')) continue;
     const absolute = posix.resolve(root, output.output);
-    const key = JSON.stringify([output.project, output.target, absolute]);
+    const key = JSON.stringify([output.project, output.target, absolute, output.kind]);
     if (seen.has(key)) continue;
     seen.add(key);
     const relative = posix.relative(root, absolute);
@@ -263,7 +269,8 @@ function outputClaims(declared: readonly DeclaredOutput[], root: string): Output
  * A pattern conflicts with a path at or above its static prefix, a path it matches, or a directory it can reach inside.
  * Reaching is minimatch's partial match: it expands braces before it splits segments, so an alternative that crosses a
  * slash is walked whole, and a directory whose every segment matches the pattern's leading segments is one the pattern
- * can write under. A file the pattern does not match is not written by it, whatever the pattern writes beside it.
+ * can write under. A file the pattern does not match below its prefix is not written by it, whatever the pattern writes
+ * beside it; a file at or above the prefix collides by kind, since the pattern needs a directory there to write into.
  */
 function patternMeetsPath(pattern: GlobClaim, path: PathClaim): boolean {
   return (

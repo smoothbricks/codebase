@@ -185,7 +185,7 @@ describe('GitHub CI Nx target expansion', () => {
         ['compile-js', ['package-js', '^build']],
       ]),
       targetOutputs: new Map([
-        ['build', ['{projectRoot}/dist']],
+        ['build', ['{projectRoot}/dist/']],
         ['compile-js', ['{projectRoot}/dist/**/*.bin']],
         ['package-js', ['{projectRoot}/dist/**/*.tar']],
       ]),
@@ -299,7 +299,7 @@ describe('collected Nx outputs', () => {
   it('accepts only workspace outputs that still match their collected artifacts', async () => {
     await withOutputFixture(async ({ root, artifact, outputProject }) => {
       outputProject.targets = ['build'];
-      outputProject.targetOutputs = new Map([['build', ['{projectRoot}/dist']]]);
+      outputProject.targetOutputs = new Map([['build', ['{projectRoot}/dist/']]]);
       await mkdir(join(root, 'packages/app/dist'), { recursive: true });
       const outputPath = join(root, 'packages/app/dist/index.js');
       await writeFile(outputPath, 'verified output');
@@ -372,7 +372,7 @@ describe('collected Nx outputs', () => {
         ['compile-js', ['package-js']],
       ]);
       outputProject.targetOutputs = new Map([
-        ['build', ['{projectRoot}/dist']],
+        ['build', ['{projectRoot}/dist/']],
         ['compile-js', ['{projectRoot}/dist/**/*.bin']],
         ['package-js', ['{projectRoot}/dist/package/**/*.tar']],
       ]);
@@ -396,8 +396,8 @@ describe('collected Nx outputs', () => {
       outputProject.targetDependencies = new Map([['build', ['cli-x64-linux', 'napi-arm64-macos']]]);
       outputProject.targetOutputs = new Map([
         ['build', ['{projectRoot}/dist/ts/**/*.js']],
-        ['cli-x64-linux', ['{projectRoot}/dist/bin/linux-x64-gnu']],
-        ['napi-arm64-macos', ['{projectRoot}/dist/native/darwin-arm64']],
+        ['cli-x64-linux', ['{projectRoot}/dist/bin/linux-x64-gnu/']],
+        ['napi-arm64-macos', ['{projectRoot}/dist/native/darwin-arm64/']],
       ]);
       await mkdir(join(root, 'packages/app/dist/bin/linux-x64-gnu'), { recursive: true });
       await mkdir(join(root, 'packages/app/dist/native/darwin-arm64'), { recursive: true });
@@ -479,8 +479,8 @@ describe('collected Nx outputs', () => {
     await withOutputFixture(async ({ root, artifact, outputProject, temp }) => {
       outputProject.targets = ['aggregate-linux', 'binary-linux'];
       outputProject.targetOutputs = new Map([
-        ['aggregate-linux', ['{projectRoot}/dist']],
-        ['binary-linux', ['{projectRoot}/dist/bin']],
+        ['aggregate-linux', ['{projectRoot}/dist/']],
+        ['binary-linux', ['{projectRoot}/dist/bin/']],
       ]);
       await mkdir(join(root, 'packages/app/dist/bin'), { recursive: true });
       await writeFile(join(root, 'packages/app/dist/bin/app'), 'one binary, two claimants');
@@ -578,8 +578,8 @@ describe('collected Nx outputs', () => {
     await withOutputFixture(async ({ root, artifact, outputProject, temp }) => {
       outputProject.targets = ['build', 'build-macos'];
       outputProject.targetOutputs = new Map([
-        ['build', ['{projectRoot}/dist']],
-        ['build-macos', ['{projectRoot}/dist/native/darwin-arm64']],
+        ['build', ['{projectRoot}/dist/']],
+        ['build-macos', ['{projectRoot}/dist/native/darwin-arm64/']],
       ]);
 
       const darwinDir = join(root, 'packages/app/dist/native/darwin-arm64');

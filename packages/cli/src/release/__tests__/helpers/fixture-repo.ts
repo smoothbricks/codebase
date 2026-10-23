@@ -154,7 +154,7 @@ export async function writeWorkspace(root: string): Promise<void> {
   await writeFile(
     join(root, 'nx.json'),
     `${JSON.stringify(
-      { cacheDirectory: '.nx/cache', targetDefaults: { build: { cache: true, outputs: ['{projectRoot}/dist'] } } },
+      { cacheDirectory: '.nx/cache', targetDefaults: { build: { cache: true, outputs: ['{projectRoot}/dist/'] } } },
       null,
       2,
     )}\n`,

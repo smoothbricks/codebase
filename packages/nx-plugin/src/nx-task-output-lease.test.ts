@@ -105,7 +105,7 @@ it('leases a target across clients through producer completion, cache capture an
             executor: 'nx:run-commands',
             cache: true,
             inputs: ['{workspaceRoot}/produce.ts', { env: 'OUTPUT_LABEL' }],
-            outputs: ['{projectRoot}/dist'],
+            outputs: ['{projectRoot}/dist/'],
             options: { command: 'bun produce.ts' },
           },
           hash: {
@@ -396,7 +396,7 @@ it('refuses an ancestor-owned target before waiting for its output lease', async
           loop: {
             executor: 'nx:run-commands',
             cache: false,
-            outputs: ['{projectRoot}/dist'],
+            outputs: ['{projectRoot}/dist/'],
             options: { command: `bun ${JSON.stringify(nx)} run app:loop --outputStyle=static` },
           },
         },
@@ -468,7 +468,7 @@ it('shares one continuous producer between simultaneous cold clients without wai
             executor: 'nx:run-commands',
             continuous: true,
             cache: false,
-            outputs: ['{projectRoot}/dist'],
+            outputs: ['{projectRoot}/dist/'],
             options: { command: 'bun serve.ts' },
           },
         },

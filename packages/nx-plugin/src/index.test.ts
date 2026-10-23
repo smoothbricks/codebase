@@ -49,7 +49,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       executor: 'nx:run-commands',
       cache: true,
       inputs: ['{projectRoot}/source.txt', '{workspaceRoot}/toolchain.txt'],
-      outputs: ['{projectRoot}/dist'],
+      outputs: ['{projectRoot}/dist/'],
       options: { command: 'mkdir -p dist && cat source.txt ../../toolchain.txt > dist/app.js', cwd: '{projectRoot}' },
     };
     const declared = { 'emit-js': emit };

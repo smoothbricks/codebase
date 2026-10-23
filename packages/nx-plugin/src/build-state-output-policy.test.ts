@@ -265,6 +265,25 @@ describe('one producing target per Nx output', () => {
     ).toEqual([]);
   });
 
+  it("reads Nx's fallback outputs of a target that declares none as directories", () => {
+    // A pattern above the legacy build fallback's dist can write inside it only because that dist is a directory.
+    expect(
+      overlaps({
+        app: {
+          root: 'packages/app',
+          targets: {
+            build: { executor: 'nx:run-commands', options: { command: 'true' } },
+            types: run(['{projectRoot}/**/*.d.ts']),
+          },
+        },
+      }),
+    ).toEqual([
+      'app:build packages/app/dist <> app:types packages/app/**/*.d.ts',
+      'app:build packages/app/build <> app:types packages/app/**/*.d.ts',
+      'app:build packages/app/public <> app:types packages/app/**/*.d.ts',
+    ]);
+  });
+
   it('names the target whose output Nx refuses to interpolate, and reads the next graph whole', () => {
     // Nx's own error names only the output.
     let refusal: unknown;
@@ -322,6 +341,23 @@ describe('each literal output declares the kind the built tree holds', () => {
       expect(refusal.message).toContain(
         'app:compile: "packages/app/dist" is declared a file but is a directory on disk',
       );
+      // One target declaring a path as both kinds has each declaration judged, in either order.
+      for (const outputs of [
+        ['{projectRoot}/dist/', '{projectRoot}/dist'],
+        ['{projectRoot}/dist', '{projectRoot}/dist/'],
+      ]) {
+        let both: unknown;
+        try {
+          refuseMisdeclaredOutputKinds(
+            projects({ app: { root: 'packages/app', targets: { compile: run(outputs) } } }),
+            root,
+          );
+        } catch (error) {
+          both = error;
+        }
+        if (!(both instanceof OutputKindError)) throw new Error(`${outputs.join(', ')}: expected an OutputKindError`);
+        expect(both.findings.map(({ output, kind }) => [output, kind])).toEqual([['packages/app/dist', 'file']]);
+      }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

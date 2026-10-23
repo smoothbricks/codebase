@@ -201,7 +201,7 @@ describe('pure core: checkWorkspaceConfig', () => {
       plugins: validPlugins(),
       targetDefaults: {
         ...validTargetDefaults(),
-        build: { cache: true, outputs: ['{projectRoot}/dist'] },
+        build: { cache: true, outputs: ['{projectRoot}/dist/'] },
       },
       namedInputs: validNamedInputs(),
     });
@@ -338,7 +338,7 @@ describe('pure core: applyWorkspaceConfig', () => {
       ...validNxJson(),
       targetDefaults: {
         ...validTargetDefaults(),
-        build: { cache: true, outputs: ['{projectRoot}/dist', '{projectRoot}/dist-node'] },
+        build: { cache: true, outputs: ['{projectRoot}/dist/', '{projectRoot}/dist-node/'] },
       },
     };
     expect(applyWorkspaceConfig(nxJson)).toBe(true);
@@ -685,7 +685,7 @@ describe('Tree: applyWorkspaceConfigTree', () => {
     const tree = createTreeWithEmptyWorkspace();
     writeJson(tree, 'nx.json', {
       plugins: validPlugins(),
-      targetDefaults: { build: { cache: false, outputs: ['{projectRoot}/dist'] } },
+      targetDefaults: { build: { cache: false, outputs: ['{projectRoot}/dist/'] } },
       namedInputs: validNamedInputs(),
     });
 

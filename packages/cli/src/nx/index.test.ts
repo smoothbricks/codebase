@@ -97,7 +97,7 @@ describe('Nx helper output formatting', () => {
             inputs: ['default', { runtime: 'echo version' }],
             options: { command: 'bun test', timeoutMs: 120_000 },
           },
-          build: { outputs: ['{projectRoot}/dist'] },
+          build: { outputs: ['{projectRoot}/dist/'] },
         },
       },
       cli: { root: 'packages/cli', targets: { lint: {} } },
@@ -133,7 +133,7 @@ describe('Nx helper output formatting', () => {
         // strings survive the projection.
         targetInputs: new Map([['test', ['default']]]),
         targetOptions: new Map([['test', { command: 'bun test', timeoutMs: 120_000 }]]),
-        targetOutputs: new Map([['build', ['{projectRoot}/dist']]]),
+        targetOutputs: new Map([['build', ['{projectRoot}/dist/']]]),
         targetScripts: new Map(),
       },
     ]);

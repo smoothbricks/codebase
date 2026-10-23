@@ -134,7 +134,7 @@ async function writeProvider(workspace: string): Promise<string> {
           executor: 'nx:run-commands',
           cache: true,
           inputs: ['{projectRoot}/src/**/*'],
-          outputs: ['{projectRoot}/dist'],
+          outputs: ['{projectRoot}/dist/'],
           options: { command: 'mkdir -p dist && cp src/index.js dist/index.js', cwd: '{projectRoot}' },
         },
       },

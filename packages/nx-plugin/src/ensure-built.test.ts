@@ -764,7 +764,7 @@ async function writeTwoProjectWorkspace(workspace: string, builds: string, publi
           executor: 'nx:run-commands',
           cache: true,
           inputs: ['{projectRoot}/source.txt'],
-          outputs: ['{projectRoot}/dist'],
+          outputs: ['{projectRoot}/dist/'],
           options: {
             command: `mkdir -p dist && cp source.txt dist/lib.txt && cat dist/lib.txt >> ${builds}`,
             cwd: '{projectRoot}',
@@ -783,7 +783,7 @@ async function writeTwoProjectWorkspace(workspace: string, builds: string, publi
           executor: 'nx:run-commands',
           cache: true,
           inputs: ['{projectRoot}/source.txt', { dependentTasksOutputFiles: '**/*' }],
-          outputs: ['{projectRoot}/dist'],
+          outputs: ['{projectRoot}/dist/'],
           dependsOn: ['^build'],
           options: {
             command: 'mkdir -p dist && cat source.txt ../lib/dist/lib.txt > dist/marker.txt',

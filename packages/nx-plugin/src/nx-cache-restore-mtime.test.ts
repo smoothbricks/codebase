@@ -61,7 +61,7 @@ async function restoreFixture(workspace: string, env: Record<string, string>) {
           cache: true,
           inputs: ['{projectRoot}/source.txt'],
           // A file output and a directory output: the restore walks into the directory.
-          outputs: ['{projectRoot}/result.txt', '{projectRoot}/dist'],
+          outputs: ['{projectRoot}/result.txt', '{projectRoot}/dist/'],
           options: {
             cwd: 'app',
             command: 'cp source.txt result.txt && mkdir -p dist/nested && cp source.txt dist/nested/copy.txt',

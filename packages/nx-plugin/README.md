@@ -673,11 +673,12 @@ refuses any target whose output is at, under or above another target's output, i
 directory output as one tree, so a second target writing inside it leaves the first target's tree unlike its cache
 artifact after every build, and the two restore over each other without either ever being a cache hit. Each declaration
 states its kind: one ending in `/` names a directory, any other a file (`{projectRoot}/dist/`, `{options.out}/`). A
-pattern conflicts with a path at or above its static prefix, a path it matches, or a directory it can reach inside under
-Nx's own minimatch, which expands brace alternatives before splitting segments; a file the pattern does not match is not
-written by it. Two patterns are not judged, since only a file both match collides. `OutputOverlapError.overlaps` names
-both targets and outputs. Both validators interpolate the declarations themselves, so a declaration Nx refuses to
-interpolate raises `OutputDeclarationError` naming its target.
+pattern conflicts with a path at or above its static prefix (it writes beneath that path, so a file there collides by
+kind), a path it matches, or a directory it can reach inside under Nx's own minimatch, which expands brace alternatives
+before splitting segments; a file below its prefix that it does not match is not written by it. Two patterns are not
+judged, since only a file both match collides. `OutputOverlapError.overlaps` names both targets and outputs. Both
+validators interpolate the declarations themselves, so a declaration Nx refuses to interpolate raises
+`OutputDeclarationError` naming its target.
 
 `refuseMisdeclaredOutputKinds(graph, workspaceRoot)` holds those declarations to the built tree: a literal output
 declared a file that is a directory on disk, or declared a directory that is a file, raises `OutputKindError`, whose

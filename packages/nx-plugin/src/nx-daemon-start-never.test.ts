@@ -134,7 +134,7 @@ const taskOutput = (project: string) => `${project}/dist/${project}.txt`;
  */
 async function twoTaskWorkspace(workspace: string, first: string): Promise<void> {
   await fixtureWorkspace(workspace);
-  const build = (command: string) => ({ command, outputs: ['{projectRoot}/dist'], cache: true });
+  const build = (command: string) => ({ command, outputs: ['{projectRoot}/dist/'], cache: true });
   await writeFile(
     join(workspace, 'p', 'project.json'),
     JSON.stringify({
