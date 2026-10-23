@@ -218,6 +218,12 @@ pub fn recover(
         &project.store_root,
         std::slice::from_ref(&lock),
         LockMode::Try,
+        &crate::held_lock::ImageLockTaker {
+            holding: &crate::api::held_lock::LockHolding::of(
+                crate::api::held_lock::LockOperation::Recover,
+                &workspace,
+            ),
+        },
     )
     .map_err(|error| {
         CowshedError::environment_missing(
