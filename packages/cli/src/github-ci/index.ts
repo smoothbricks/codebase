@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { PERMANENT_DEPLOY_TAG, STAGING_DEPLOY_TAG, stageDeploysProject } from '@smoothbricks/nx-plugin/deploy-policy';
 import { runtimeInputFailureReports } from '@smoothbricks/nx-plugin/runtime-input-policy';
 import { PLATFORM_TARGET_GLOBS, RELEASE_CONFIGURATION } from '@smoothbricks/nx-plugin/workspace-config-policy';
@@ -762,7 +763,11 @@ async function postGithubStatus(name: string, state: string, description: string
   });
 }
 
-interface GithubWorkflowJob {
+const GITHUB_JOBS_PAGE_SIZE = 100;
+const GITHUB_STEP_LINK_ATTEMPTS = 5;
+const GITHUB_STEP_LINK_RETRY_MS = 2000;
+
+export interface GithubWorkflowJob {
   name: string;
   status: string;
   runner_name: string | null;
@@ -791,18 +796,52 @@ async function getGithubStepUrl(step: string): Promise<string | null> {
   const runnerName = process.env.RUNNER_NAME;
   if (!runnerName) throw new Error('Cannot link GitHub Actions logs without RUNNER_NAME.');
   const attempt = process.env.GITHUB_RUN_ATTEMPT ?? '1';
-  for (let page = 1; ; page++) {
-    const response = await ciApiRequest(
-      `/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=100&page=${page}`,
-      'GET',
-    );
-    const { jobs } = typia.json.assertParse<{ jobs: GithubWorkflowJob[] }>(await response.text());
-    const url = githubStepUrlForJobs(jobs, runnerName, step);
-    if (url) return url;
-    if (jobs.length < 100) {
-      throw new Error(`Cannot find the running GitHub Actions job for runner "${runnerName}" in run ${runId}.`);
+  return resolveGithubStepUrl({
+    runnerName,
+    step,
+    fallbackUrl: `${htmlBase}/${repository}/actions/runs/${runId}/attempts/${attempt}`,
+    attempts: GITHUB_STEP_LINK_ATTEMPTS,
+    retryDelayMs: GITHUB_STEP_LINK_RETRY_MS,
+    listJobs: async (page) => {
+      const response = await ciApiRequest(
+        `/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=${GITHUB_JOBS_PAGE_SIZE}&page=${page}`,
+        'GET',
+      );
+      return typia.json.assertParse<{ jobs: GithubWorkflowJob[] }>(await response.text()).jobs;
+    },
+    sleep: delay,
+  });
+}
+
+interface GithubStepLinkLookup {
+  runnerName: string;
+  step: string;
+  /** Linked when the running job is absent from every listing: the status is cosmetic and must not fail the build. */
+  fallbackUrl: string;
+  attempts: number;
+  retryDelayMs: number;
+  listJobs: (page: number) => Promise<readonly GithubWorkflowJob[]>;
+  sleep: (milliseconds: number) => Promise<void>;
+}
+
+/**
+ * The jobs listing is eventually consistent for a just-started job, so an absent job is retried; a listing that
+ * fails outright still throws, since that is a real API fault rather than lag.
+ */
+export async function resolveGithubStepUrl(lookup: GithubStepLinkLookup): Promise<string> {
+  for (let attempt = 1; attempt <= lookup.attempts; attempt++) {
+    for (let page = 1; ; page++) {
+      const jobs = await lookup.listJobs(page);
+      const url = githubStepUrlForJobs(jobs, lookup.runnerName, lookup.step);
+      if (url) return url;
+      if (jobs.length < GITHUB_JOBS_PAGE_SIZE) break;
     }
+    if (attempt < lookup.attempts) await lookup.sleep(lookup.retryDelayMs);
   }
+  console.warn(
+    `Cannot find the running GitHub Actions job for runner "${lookup.runnerName}" after ${lookup.attempts} attempts; linking the run attempt instead.`,
+  );
+  return lookup.fallbackUrl;
 }
 
 export function githubCommitStatusesWritable(
