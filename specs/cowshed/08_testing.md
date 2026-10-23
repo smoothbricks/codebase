@@ -190,7 +190,12 @@ such as a test `HOME`, takes the granted `TMPDIR`. An invalid requested alias fa
 global or temp directory.
 
 A fixture's child directory is a real, non-symlink directory owned by the test process UID with mode 0700. Drop cleans
-every path the fixture created. No fixture adds a grant, a host cache path, a script wrapper, or a sandbox disable.
+every path the fixture created. No fixture adds a grant, a host cache path, a script wrapper, or a sandbox disable. FIFO
+readiness reads are nonblocking asynchronous reads: dropping a failed or cancelled wait closes its descriptor, never
+leaves a blocking open behind during runtime shutdown. A fixture awaiting a helper's readiness also watches that
+helper's exit, so startup failure reports the exited helper instead of waiting for a writer that no longer exists. PID
+and release readiness frames are newline-terminated messages; their completion does not depend on every inherited writer
+descriptor reaching EOF. Independent readiness publishers are read concurrently.
 
 The shared Rust fixture guard has one constructor, `TempRoot::new_in(parent, prefix)`. Every caller selects its
 already-granted parent explicitly. Independent controller-git sandbox fixtures use the shared canonical `/tmp` parent;

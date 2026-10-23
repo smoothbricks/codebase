@@ -396,7 +396,8 @@ impl Workspace {
     }
 
     fn new(label: &str, port_base: u16) -> Self {
-        let alias = std::env::temp_dir().join(format!(
+        let parent = std::fs::canonicalize("/tmp").expect("canonical controller fixture parent");
+        let alias = parent.join(format!(
             "cowshed-{label}-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
@@ -1689,21 +1690,45 @@ const ESCAPE_HELPER: &str = "COWSHED_SHELL_POOL_ESCAPE_HELPER";
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_escape_helper_exits_while_an_activation_runs() {
+    use std::io::Write as _;
+    use tokio::io::AsyncBufReadExt as _;
+
     let Some(root) = std::env::var_os(ESCAPE_HELPER) else {
         return;
     };
     let workspace = Workspace::from_root(PathBuf::from(root));
     let handle = workspace.supervisor(false);
-    let _job = handle
+    let job = handle
         .exec(None, None, sh("true"), AdmissionSource::Worker)
         .await
         .expect("admit");
     let exit = workspace.sandbox.exec_temp_dir.join("helper-exit");
-    tokio::task::spawn_blocking(move || std::fs::read_to_string(exit))
-        .await
-        .expect("reader task")
-        .expect("the test releases the helper");
-    std::process::exit(0);
+    let release = tokio::net::unix::pipe::OpenOptions::new()
+        .open_receiver(&exit)
+        .expect("open the helper release FIFO");
+    let mut release = tokio::io::BufReader::new(release);
+    let mut released = String::new();
+    let mut offset = 0;
+    let mut stderr_open = true;
+    loop {
+        tokio::select! {
+            read = release.read_line(&mut released) => {
+                read.expect("the test releases the helper");
+                std::process::exit(0);
+            }
+            ended = handle.wait(job) => {
+                let info = ended.expect("activation job outcome");
+                let stderr = read_stream(&handle, &info, StreamKind::Stderr).await;
+                panic!("activation ended before the test released its helper: {info:?}; stderr: {}", String::from_utf8_lossy(&stderr));
+            }
+            chunk = handle.log_read(job, StreamKind::Stderr, offset, true), if stderr_open => {
+                let chunk = chunk.expect("follow activation stderr");
+                std::io::stderr().write_all(&chunk.bytes).expect("report activation stderr");
+                offset += u64::try_from(chunk.bytes.len()).expect("stream offset");
+                stderr_open = !chunk.eof;
+            }
+        }
+    }
 }
 
 /// The parent of process pid, as the kernel records it.
@@ -1751,12 +1776,12 @@ async fn host_controller_an_activation_s_escaped_descendant_ends_with_its_superv
         fifo(&tmp.join(name));
     }
     workspace.envrc(
-        r#"/usr/bin/perl -MPOSIX -e 'defined(my $child = fork()) or die "fork: $!"; if ($child) { open(my $p, ">", "$ENV{TMPDIR}/escape-parent") or die "parent pid: $!"; print $p $$; close $p; open(my $release, "<", "$ENV{TMPDIR}/escape-release") or die "release: $!"; <$release>; exit 0; } POSIX::setsid() > 0 or die "setsid: $!"; open(my $f, ">", "$ENV{TMPDIR}/escaped-pid") or die "open: $!"; print $f $$; close $f; exec "/bin/sleep", "600" or die "exec: $!"' &
-printf '%s' "$PPID" > "$TMPDIR/direnv-pid"
+        r#"/usr/bin/perl -MPOSIX -e 'defined(my $child = fork()) or die "fork: $!"; if ($child) { open(my $p, ">", "$ENV{TMPDIR}/escape-parent") or die "parent pid: $!"; print $p "$$\n"; close $p; open(my $release, "<", "$ENV{TMPDIR}/escape-release") or die "release: $!"; <$release>; exit 0; } POSIX::setsid() > 0 or die "setsid: $!"; open(my $f, ">", "$ENV{TMPDIR}/escaped-pid") or die "open: $!"; print $f "$$\n"; close $f; exec "/bin/sleep", "600" or die "exec: $!"' &
+printf '%s\n' "$PPID" > "$TMPDIR/direnv-pid"
 read _ < "$TMPDIR/activation-hold"
 "#,
     );
-    let helper = std::process::Command::new(std::env::current_exe().expect("test binary"))
+    let mut helper = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
         .args([
             "--exact",
             "host_controller_escape_helper_exits_while_an_activation_runs",
@@ -1764,11 +1789,20 @@ read _ < "$TMPDIR/activation-hold"
             "--nocapture",
         ])
         .env(ESCAPE_HELPER, &workspace.root)
+        .kill_on_drop(true)
         .spawn()
         .expect("start the controller helper");
-    let escaped = read_pid(&tmp.join("escaped-pid")).await;
-    let parent = read_pid(&tmp.join("escape-parent")).await;
-    let host = parent_of(read_pid(&tmp.join("direnv-pid")).await);
+    let ready = async {
+        let escaped = tmp.join("escaped-pid");
+        let parent = tmp.join("escape-parent");
+        let direnv = tmp.join("direnv-pid");
+        tokio::join!(read_pid(&escaped), read_pid(&parent), read_pid(&direnv))
+    };
+    let (escaped, parent, direnv) = tokio::select! {
+        ready = ready => ready,
+        status = helper.wait() => panic!("activation helper exited before publishing its pids: {status:?}"),
+    };
+    let host = parent_of(direnv);
     // SAFETY: getpgid reads two process group ids.
     let (escaped_group, host_group) = unsafe { (libc::getpgid(escaped), libc::getpgid(host)) };
     assert_ne!(
@@ -1796,13 +1830,7 @@ read _ < "$TMPDIR/activation-hold"
         "the escaped child must be reparented before teardown"
     );
     release(&tmp.join("helper-exit")).await;
-    let status = tokio::task::spawn_blocking(move || {
-        let mut helper = helper;
-        helper.wait()
-    })
-    .await
-    .expect("helper task")
-    .expect("wait for the helper");
+    let status = helper.wait().await.expect("wait for the helper");
     assert!(status.success(), "helper: {status}");
     let host_ended = tokio::task::spawn_blocking(move || host_exit.within(Duration::from_secs(60)))
         .await
@@ -2095,18 +2123,52 @@ fn fifo(path: &Path) {
     );
 }
 
-/// The pid a job's process wrote into the FIFO at `path`, once it wrote it.
+/// The newline-terminated pid a job's process wrote into the FIFO at `path`, without a
+/// blocking thread left behind if readiness fails or the controlling helper exits.
 async fn read_pid(path: &Path) -> i32 {
-    let path = path.to_path_buf();
-    let text = tokio::time::timeout(
-        Duration::from_secs(60),
-        tokio::task::spawn_blocking(move || std::fs::read_to_string(path)),
-    )
-    .await
-    .expect("the job writes its pid")
-    .expect("reader task")
-    .expect("read the pid");
-    text.trim().parse().expect("a pid")
+    use tokio::io::AsyncBufReadExt as _;
+
+    let receiver = tokio::net::unix::pipe::OpenOptions::new()
+        .open_receiver(path)
+        .unwrap_or_else(|error| panic!("open pid FIFO {}: {error}", path.display()));
+    let mut receiver = tokio::io::BufReader::new(receiver);
+    let mut text = String::new();
+    let read = tokio::time::timeout(Duration::from_secs(60), receiver.read_line(&mut text)).await;
+    match read {
+        Ok(Ok(_)) => text
+            .trim()
+            .parse()
+            .unwrap_or_else(|error| panic!("pid FIFO {} held {text:?}: {error}", path.display())),
+        Ok(Err(error)) => panic!(
+            "read pid FIFO {}: {error}; received {text:?}",
+            path.display()
+        ),
+        Err(error) => panic!(
+            "wait for pid FIFO {}: {error}; received {text:?}",
+            path.display()
+        ),
+    }
+}
+
+/// Dropping a pending FIFO wait must not leave spawn_blocking(open) behind for Runtime::drop
+/// to join forever. The biased select polls the real reader once before cancelling it.
+#[tokio::test]
+async fn a_cancelled_pid_fifo_wait_leaves_no_blocking_reader() {
+    let root = LedgerRoot(std::env::temp_dir().join(format!(
+        "cowshed-pid-reader-{}",
+        uuid::Uuid::new_v4().simple()
+    )));
+    std::fs::create_dir(&root.0).expect("private FIFO fixture");
+    let path = root.0.join("pid");
+    fifo(&path);
+    {
+        let mut reader = std::pin::pin!(read_pid(&path));
+        tokio::select! {
+            biased;
+            _ = &mut reader => panic!("a FIFO without a writer cannot publish a pid"),
+            _ = std::future::ready(()) => {}
+        }
+    }
 }
 
 /// Release the job's process blocked reading the FIFO at `path`.
