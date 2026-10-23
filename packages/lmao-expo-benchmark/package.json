@@ -101,7 +101,7 @@
           "^build"
         ],
         "outputs": [
-          "{projectRoot}/dist/web"
+          "{projectRoot}/dist/web/"
         ],
         "options": {
           "command": "bun run prepare:web-wasm && bun expo export --platform web --output-dir dist/web --clear --max-workers 1",
@@ -155,7 +155,7 @@
           "^build"
         ],
         "outputs": [
-          "{projectRoot}/dist/headless"
+          "{projectRoot}/dist/headless/"
         ],
         "options": {
           "command": "bun expo export:embed --entry-file headless-bootstrap.js --platform android --dev false --minify true --bytecode --reset-cache --max-workers 1 --bundle-output dist/headless/lmao-benchmark.hbc --sourcemap-output dist/headless/lmao-benchmark.hbc.map --assets-dest dist/headless",

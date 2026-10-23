@@ -54,7 +54,7 @@
           "^dependencyDefault"
         ],
         "outputs": [
-          "{projectRoot}/dist"
+          "{projectRoot}/dist/"
         ],
         "cache": true
       }

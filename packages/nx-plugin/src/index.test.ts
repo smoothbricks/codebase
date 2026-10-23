@@ -1500,7 +1500,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           'wasm-bindgen --target web --out-dir packages/wasm/dist-wasm/web target/wasm32-unknown-unknown/release/runtime_wasm.wasm',
         ].join(' && '),
       });
-      expect(wasm['cargo-wasm']?.outputs).toEqual(['{projectRoot}/dist-wasm']);
+      expect(wasm['cargo-wasm']?.outputs).toEqual(['{projectRoot}/dist-wasm/']);
       expect(wasm['cargo-wasm']?.dependsOn).toEqual([rootFetch, '^build']);
       expect(wasm.build?.dependsOn).toContainEqual(rootCompile);
       expect(wasm.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
@@ -1978,7 +1978,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         cache: true,
         dependsOn: ['cargo-fetch', '^build'],
         inputs: expect.arrayContaining(['{projectRoot}/**/*.rs', '{projectRoot}/**/Cargo.toml']),
-        outputs: ['{projectRoot}/generated/wasm'],
+        outputs: ['{projectRoot}/generated/wasm/'],
         options: {
           command: [
             'cargo --frozen build --target wasm32-unknown-unknown --manifest-path crates/git-do/Cargo.toml',
@@ -2059,7 +2059,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const targets = await inferProjectTargets(workspace, 'packages/cowshed/package.json');
 
       expect(targets['cargo-wasm']).toBeUndefined();
-      expect(targets['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/ts']);
+      expect(targets['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/ts/']);
       // This fixture declares all four supported triples, so on EVERY supported
       // runner the host's own triple is present and native: the host provider is
       // that platform target and `cargo-napi` is never inferred. Tying the native
@@ -2087,7 +2087,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         // The dedicated host build consumes only its dependencies' outputs; it is
         // not ordered behind the test compile.
         dependsOn: ['^build'],
-        outputs: ['{projectRoot}/dist/native/host'],
+        outputs: ['{projectRoot}/dist/native/host/'],
         options: {
           cwd: 'packages/cowshed',
           command:
@@ -2101,7 +2101,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         },
       });
       expect(unservedHostTargets.build?.dependsOn).toEqual(['^build', 'cargo-test-compile', 'cargo-napi', 'tsc-js']);
-      expect(targets['napi-arm64-macos']?.outputs).toEqual(['{projectRoot}/dist/native/darwin-arm64']);
+      expect(targets['napi-arm64-macos']?.outputs).toEqual(['{projectRoot}/dist/native/darwin-arm64/']);
       // Every local build compiles dev; only the release configuration ships.
       const darwinArm64Build = (release: string): string =>
         `napi build${release} --platform --no-js --dts cowshed.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/darwin-arm64 && node ../../node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-build-inputs.js --manifest-path crates/cowshed-napi/Cargo.toml --dep-info aarch64-apple-darwin/${release === '' ? 'debug' : 'release'}/libcowshed_napi.d --output dist/native/darwin-arm64`;
@@ -2132,7 +2132,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(darwinArm64Targets['napi-x64-linux']).toMatchObject({
         executor: '@smoothbricks/nx-plugin:cargo-zigbuild',
         cache: true,
-        outputs: ['{projectRoot}/dist/native/linux-x64-gnu'],
+        outputs: ['{projectRoot}/dist/native/linux-x64-gnu/'],
         options: {
           target: 'x86_64-unknown-linux-gnu.2.17',
           manifestPath: 'packages/cowshed/crates/cowshed-napi/Cargo.toml',
@@ -2202,7 +2202,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         executor: 'nx:run-commands',
         cache: true,
         dependsOn: ['^build'],
-        outputs: ['{projectRoot}/.cache/native-debug'],
+        outputs: ['{projectRoot}/.cache/native-debug/'],
         options: {
           cwd: 'packages/cowshed',
           command:

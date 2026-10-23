@@ -671,11 +671,19 @@ configuration, output, and contributed path. Keep cacheable artifacts under sour
 `refuseOverlappingOutputs(graph, workspaceRoot)` from the same module gives each output path one producing target. It
 refuses any target whose output is at, under or above another target's output, in any configuration: Nx restores a
 directory output as one tree, so a second target writing inside it leaves the first target's tree unlike its cache
-artifact after every build, and the two restore over each other without either ever being a cache hit. A pattern
-conflicts with a path at or above its static prefix, or a path it matches or can reach inside under Nx's own minimatch,
-which expands brace alternatives before splitting segments; two patterns are not judged, since only a file both match
-collides. `OutputOverlapError.overlaps` names both targets and outputs. Both validators interpolate the declarations
-themselves, so a declaration Nx refuses to interpolate raises `OutputDeclarationError` naming its target.
+artifact after every build, and the two restore over each other without either ever being a cache hit. Each declaration
+states its kind: one ending in `/` names a directory, any other a file (`{projectRoot}/dist/`, `{options.out}/`). A
+pattern conflicts with a path at or above its static prefix, a path it matches, or a directory it can reach inside under
+Nx's own minimatch, which expands brace alternatives before splitting segments; a file the pattern does not match is not
+written by it. Two patterns are not judged, since only a file both match collides. `OutputOverlapError.overlaps` names
+both targets and outputs. Both validators interpolate the declarations themselves, so a declaration Nx refuses to
+interpolate raises `OutputDeclarationError` naming its target.
+
+`refuseMisdeclaredOutputKinds(graph, workspaceRoot)` holds those declarations to the built tree: a literal output
+declared a file that is a directory on disk, or declared a directory that is a file, raises `OutputKindError`, whose
+`findings` name the target, output, declared kind and on-disk kind. Call it where the outputs exist after a build; an
+output absent on disk is not judged, and patterns state no kind. The overlap policy reads only the declarations, so its
+verdict is the same in every checkout.
 
 ## Test Walk Policy
 

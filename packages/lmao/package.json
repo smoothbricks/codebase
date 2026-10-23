@@ -201,7 +201,7 @@
           "{projectRoot}/scripts/build-rust-dist.mjs"
         ],
         "outputs": [
-          "{projectRoot}/dist/rust"
+          "{projectRoot}/dist/rust/"
         ],
         "options": {
           "command": "bun scripts/build-rust-dist.mjs",
@@ -329,7 +329,7 @@
           "cargoToolchain"
         ],
         "outputs": [
-          "{workspaceRoot}/.cache/lmao-thread-ffi"
+          "{workspaceRoot}/.cache/lmao-thread-ffi/"
         ],
         "options": {
           "command": "cargo build -p lmao-ffi-dylib -Z unstable-options --artifact-dir ../../.cache/lmao-thread-ffi",

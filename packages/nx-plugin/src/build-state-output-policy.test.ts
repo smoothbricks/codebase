@@ -1,11 +1,16 @@
 import { describe, expect, it } from 'bun:test';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { ProjectGraph } from 'nx/src/config/project-graph';
 import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
 import {
   BuildStateOutputError,
   type DeclaredOutput,
   OutputDeclarationError,
+  OutputKindError,
   OutputOverlapError,
+  refuseMisdeclaredOutputKinds,
   refuseOutputsUnderBuildState,
   refuseOverlappingOutputs,
 } from './build-state-output-policy.js';
@@ -91,6 +96,7 @@ describe('build-state Nx output policy', () => {
           target: 'archive',
           configuration: 'unsafe',
           output: 'packages/nested/out/cargo/archive',
+          kind: 'file',
           buildStatePath: 'packages/nested/out/cargo',
         },
       ]);
@@ -160,7 +166,7 @@ describe('one producing target per Nx output', () => {
         llm: {
           root: 'packages/llm',
           targets: {
-            'tsc-js': run(['{projectRoot}/dist']),
+            'tsc-js': run(['{projectRoot}/dist/']),
             'nx-worker-bundle': run(['{projectRoot}/dist/nx/worker-entry.js']),
           },
         },
@@ -168,7 +174,7 @@ describe('one producing target per Nx output', () => {
           root: 'packages/facts',
           targets: { 'tsc-js': run(['{projectRoot}/dist-types']), 'build-types': run(['{projectRoot}/dist-types/']) },
         },
-        ttsc: { root: 'packages/ttsc', targets: { build: run(['{projectRoot}/dist']) } },
+        ttsc: { root: 'packages/ttsc', targets: { build: run(['{projectRoot}/dist/']) } },
         bun: {
           root: 'packages/bun',
           targets: {
@@ -180,7 +186,7 @@ describe('one producing target per Nx output', () => {
         app: {
           root: 'packages/app',
           targets: {
-            build: run(['{projectRoot}/dist']),
+            build: run(['{projectRoot}/dist/']),
             bundle: run(['{options.out}'], {
               options: { command: 'true', out: 'packages/app/bundle' },
               configurations: { production: { out: 'packages/app/dist/bundle.js' } },
@@ -190,7 +196,7 @@ describe('one producing target per Nx output', () => {
         rt: {
           root: 'packages/rt',
           targets: {
-            native: run(['{projectRoot}/dist/native']),
+            native: run(['{projectRoot}/dist/native/']),
             darwin: run(['{projectRoot}/dist/native/darwin/**']),
             types: run(['{projectRoot}/**/*.d.ts']),
             wasm: run(['{projectRoot}/out/*.wasm']),
@@ -199,7 +205,7 @@ describe('one producing target per Nx output', () => {
         },
         mix: {
           root: 'packages/mix',
-          targets: { b: run(['{projectRoot}/b']), split: run(['{projectRoot}/{b/c,d}/**']) },
+          targets: { b: run(['{projectRoot}/b/']), split: run(['{projectRoot}/{b/c,d}/**']) },
         },
       }),
     ).toEqual([
@@ -209,19 +215,18 @@ describe('one producing target per Nx output', () => {
       'app:build packages/app/dist <> app:bundle:production packages/app/dist/bundle.js',
       'rt:native packages/rt/dist/native <> rt:darwin packages/rt/dist/native/darwin/**',
       'rt:native packages/rt/dist/native <> rt:types packages/rt/**/*.d.ts',
-      'rt:types packages/rt/**/*.d.ts <> rt:engine packages/rt/out/engine.wasm',
       'rt:wasm packages/rt/out/*.wasm <> rt:engine packages/rt/out/engine.wasm',
       'mix:b packages/mix/b <> mix:split packages/mix/{b/c,d}/**',
     ]);
   });
 
-  it('passes disjoint outputs, two patterns, a negation and a pattern that cannot reach inside a path', () => {
+  it('passes disjoint outputs, two patterns, a negation, and a pattern beside a file it does not match', () => {
     expect(
       overlaps({
         llm: {
           root: 'packages/llm',
           targets: {
-            'tsc-js': run(['{projectRoot}/dist']),
+            'tsc-js': run(['{projectRoot}/dist/']),
             'nx-worker-bundle': run(['{projectRoot}/dist-nx-bundle/worker-entry.js']),
             'script-prelude': run([
               '{projectRoot}/dist-prelude/script-prelude.json',
@@ -239,6 +244,22 @@ describe('one producing target per Nx output', () => {
             wasm: run(['{projectRoot}/*/wasm/*.wasm']),
             docs: run(['{projectRoot}/{doc/api,doc/guide}/*.md']),
           },
+        },
+        // A compiler's pattern and the files another target writes beside it: the pattern matches neither file, and
+        // a file holds nothing the pattern could write, so each has one producer.
+        prelude: {
+          root: 'packages/prelude',
+          targets: {
+            'tsc-js': run(['{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}']),
+            'script-prelude': run([
+              '{projectRoot}/dist/script-prelude.json',
+              '{projectRoot}/dist/shell-prelude-fixture.json',
+            ]),
+          },
+        },
+        mix: {
+          root: 'packages/mix',
+          targets: { b: run(['{projectRoot}/b']), split: run(['{projectRoot}/{b/c,d}/**']) },
         },
       }),
     ).toEqual([]);
@@ -260,9 +281,49 @@ describe('one producing target per Nx output', () => {
       overlaps({
         app: {
           root: 'packages/app',
-          targets: { build: run(['{projectRoot}/dist']), bundle: run(['{projectRoot}/dist/a.js']) },
+          targets: { build: run(['{projectRoot}/dist/']), bundle: run(['{projectRoot}/dist/a.js']) },
         },
       }),
     ).toEqual(['app:build packages/app/dist <> app:bundle packages/app/dist/a.js']);
+  });
+});
+
+describe('each literal output declares the kind the built tree holds', () => {
+  it('refuses a directory declared as a file and a file declared as a directory, and judges nothing absent', () => {
+    const root = mkdtempSync(join(tmpdir(), 'output-kind-'));
+    try {
+      mkdirSync(join(root, 'packages/app/dist'), { recursive: true });
+      mkdirSync(join(root, 'packages/app/types'), { recursive: true });
+      writeFileSync(join(root, 'packages/app/bundle.js'), '');
+      writeFileSync(join(root, 'packages/app/index.js'), '');
+      const app = projects({
+        app: {
+          root: 'packages/app',
+          targets: {
+            compile: run(['{projectRoot}/dist']),
+            bundle: run(['{projectRoot}/bundle.js/']),
+            types: run(['{projectRoot}/types/', '{projectRoot}/index.js', '{projectRoot}/**/*.map']),
+            // Not built yet, and a path under a file: neither is on disk to judge.
+            later: run(['{projectRoot}/later/', '{projectRoot}/bundle.js/inner']),
+          },
+        },
+      });
+      let refusal: unknown;
+      try {
+        refuseMisdeclaredOutputKinds(app, root);
+      } catch (error) {
+        refusal = error;
+      }
+      if (!(refusal instanceof OutputKindError)) throw new Error(`expected an OutputKindError, got ${String(refusal)}`);
+      expect(refusal.findings.map(({ target, output, kind, onDisk }) => [target, output, kind, onDisk])).toEqual([
+        ['compile', 'packages/app/dist', 'file', 'directory'],
+        ['bundle', 'packages/app/bundle.js', 'directory', 'file'],
+      ]);
+      expect(refusal.message).toContain(
+        'app:compile: "packages/app/dist" is declared a file but is a directory on disk',
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

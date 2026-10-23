@@ -1,3 +1,4 @@
+import { statSync } from 'node:fs';
 import { posix } from 'node:path';
 import { Minimatch } from 'minimatch';
 import type { ProjectGraph, ProjectGraphProjectNode } from 'nx/src/config/project-graph';
@@ -10,12 +11,19 @@ export interface BuildStatePath {
   readonly volume: string;
 }
 
+/**
+ * What an output names, as its declaration states it: a declaration ending in `/` names a directory, any other a file.
+ * Nx records no kind and its interpolation drops a trailing `/`, so the kind is read from the declaration as written.
+ */
+export type OutputKind = 'file' | 'directory';
+
 /** One output a target declares under one configuration (`undefined`: its default options), as Nx interpolates it. */
 export interface DeclaredOutput {
   readonly project: string;
   readonly target: string;
   readonly configuration: string | undefined;
   readonly output: string;
+  readonly kind: OutputKind;
 }
 
 export interface BuildStateOutputFinding extends DeclaredOutput {
@@ -23,7 +31,11 @@ export interface BuildStateOutputFinding extends DeclaredOutput {
 }
 
 /** `project:target[:configuration]`, as Nx names the task. */
-function taskName({ project, target, configuration }: Omit<DeclaredOutput, 'output'>): string {
+function taskName({
+  project,
+  target,
+  configuration,
+}: Pick<DeclaredOutput, 'project' | 'target' | 'configuration'>): string {
   return `${project}:${target}${configuration ? `:${configuration}` : ''}`;
 }
 
@@ -77,6 +89,28 @@ export class OutputOverlapError extends Error {
   }
 }
 
+/** What a path is on disk: absent, or the kind a restore of it would write. */
+export type OutputOnDisk = OutputKind | 'absent';
+
+/** A literal output whose declared kind the built tree contradicts. */
+export interface OutputKindFinding extends DeclaredOutput {
+  readonly onDisk: OutputKind;
+}
+
+export class OutputKindError extends Error {
+  constructor(readonly findings: readonly OutputKindFinding[]) {
+    super(
+      `Each Nx output declaration states its kind: a directory output ends in \`/\`, a file output does not. These contradict the built tree:\n${findings
+        .map(
+          (finding) =>
+            `  ${taskName(finding)}: ${JSON.stringify(finding.output)} is declared a ${finding.kind} but is a ${finding.onDisk} on disk`,
+        )
+        .join('\n')}`,
+    );
+    this.name = 'OutputKindError';
+  }
+}
+
 /** A path segment holding glob syntax, read conservatively: any character that may start a pattern. */
 const GLOB_PART = /[*?[\]{}()!]/;
 
@@ -109,21 +143,25 @@ function targetOutputs(
   configuration: string | undefined,
   node: ProjectGraphProjectNode,
   root: string,
-): string[] {
+): Pick<DeclaredOutput, 'output' | 'kind'>[] {
   try {
     return options.outputs
       ? options.outputs
-          .map((output) =>
-            interpolate(output, {
+          .map((output) => ({
+            output: interpolate(output, {
               workspaceRoot: root,
               projectRoot: node.data.root,
               projectName: node.name,
               project: { ...node.data, name: node.name },
               options: { ...options.options, ...(configuration ? options.configurations?.[configuration] : {}) },
             }),
-          )
-          .filter((output) => output && !/{(projectRoot|workspaceRoot|(options.*))}/.test(output))
-      : getOutputsForTargetAndConfiguration({ project, target, configuration }, {}, node);
+            kind: declaredKind(output),
+          }))
+          .filter(({ output }) => output && !/{(projectRoot|workspaceRoot|(options.*))}/.test(output))
+      : getOutputsForTargetAndConfiguration({ project, target, configuration }, {}, node).map((output) => ({
+          output,
+          kind: declaredKind(output),
+        }));
   } catch (error) {
     // Nx tests a template against a module-level global regex before it throws, leaving that regex's lastIndex past
     // the first placeholder; the next interpolation in this process would then skip its placeholders and drop its
@@ -133,6 +171,10 @@ function targetOutputs(
   }
 }
 
+function declaredKind(declaration: string): OutputKind {
+  return declaration.endsWith('/') ? 'directory' : 'file';
+}
+
 /** Every output of every target in the resolved graph (project overrides included), for each configuration. */
 function declaredOutputs(graph: ProjectGraph, root: string): DeclaredOutput[] {
   const declared: DeclaredOutput[] = [];
@@ -140,7 +182,7 @@ function declaredOutputs(graph: ProjectGraph, root: string): DeclaredOutput[] {
     for (const [target, options] of Object.entries(node.data.targets ?? {})) {
       for (const configuration of [undefined, ...Object.keys(options.configurations ?? {})]) {
         for (const output of targetOutputs(project, target, options, configuration, node, root)) {
-          declared.push({ project, target, configuration, output });
+          declared.push({ project, target, configuration, ...output });
         }
       }
     }
@@ -175,7 +217,7 @@ export function refuseOutputsUnderBuildState(
 
 /** One path a target's output names, absolute, and workspace-relative for matching. */
 interface PathClaim {
-  readonly kind: 'path';
+  readonly form: 'path';
   readonly declared: DeclaredOutput;
   readonly absolute: string;
   readonly relative: string;
@@ -183,7 +225,7 @@ interface PathClaim {
 
 /** One pattern a target's output names: the directory it cannot write outside of, and the pattern compiled once. */
 interface GlobClaim {
-  readonly kind: 'glob';
+  readonly form: 'glob';
   readonly declared: DeclaredOutput;
   readonly prefix: string;
   readonly matcher: Minimatch;
@@ -205,26 +247,30 @@ function outputClaims(declared: readonly DeclaredOutput[], root: string): Output
     claims.push(
       GLOB_PART.test(relative)
         ? {
-            kind: 'glob',
+            form: 'glob',
             declared: output,
             prefix: posix.resolve(root, staticPrefix(relative)),
             // Nx's own matcher, as Nx pins it. Dotfiles match: a restore writes them like any other file.
             matcher: new Minimatch(relative, { dot: true }),
           }
-        : { kind: 'path', declared: output, absolute, relative },
+        : { form: 'path', declared: output, absolute, relative },
     );
   }
   return claims;
 }
 
 /**
- * A pattern conflicts with a path at or above its static prefix, a path it matches, or a path it can reach inside. The
- * last two are one partial match: minimatch expands braces before it splits segments, so an alternative that crosses a
- * slash is walked whole, and a path whose every segment matches the pattern's leading segments is one the pattern can
- * write at or under.
+ * A pattern conflicts with a path at or above its static prefix, a path it matches, or a directory it can reach inside.
+ * Reaching is minimatch's partial match: it expands braces before it splits segments, so an alternative that crosses a
+ * slash is walked whole, and a directory whose every segment matches the pattern's leading segments is one the pattern
+ * can write under. A file the pattern does not match is not written by it, whatever the pattern writes beside it.
  */
 function patternMeetsPath(pattern: GlobClaim, path: PathClaim): boolean {
-  return contains(path.absolute, pattern.prefix) || pattern.matcher.match(path.relative, true);
+  return (
+    contains(path.absolute, pattern.prefix) ||
+    pattern.matcher.match(path.relative) ||
+    (path.declared.kind === 'directory' && pattern.matcher.match(path.relative, true))
+  );
 }
 
 /**
@@ -232,12 +278,12 @@ function patternMeetsPath(pattern: GlobClaim, path: PathClaim): boolean {
  * so only a file both match collides, and a pattern pair cannot name one without the tree.
  */
 function conflicts(left: OutputClaim, right: OutputClaim): boolean {
-  if (left.kind === 'path') {
-    return right.kind === 'path'
+  if (left.form === 'path') {
+    return right.form === 'path'
       ? contains(left.absolute, right.absolute) || contains(right.absolute, left.absolute)
       : patternMeetsPath(right, left);
   }
-  return right.kind === 'path' && patternMeetsPath(left, right);
+  return right.form === 'path' && patternMeetsPath(left, right);
 }
 
 /**
@@ -258,4 +304,32 @@ export function refuseOverlappingOutputs(graph: ProjectGraph, workspaceRoot: str
     }
   }
   if (overlaps.length) throw new OutputOverlapError(overlaps);
+}
+
+/** The kind of `path` on disk, following links as a restore's reader does; a path under a file is absent. */
+export function outputOnDisk(path: string): OutputOnDisk {
+  try {
+    const stats = statSync(path, { throwIfNoEntry: false });
+    return stats === undefined ? 'absent' : stats.isDirectory() ? 'directory' : 'file';
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOTDIR') return 'absent';
+    throw error;
+  }
+}
+
+/**
+ * Hold every literal output's declared kind to the built tree under `workspaceRoot`: a directory output must be a
+ * directory and a file output a file. Run where the outputs exist after a build; an output absent on disk is not judged,
+ * and a pattern names its files by matching, so it states no kind to hold. The overlap policy reads the declared kind
+ * alone; this keeps that declaration honest.
+ */
+export function refuseMisdeclaredOutputKinds(graph: ProjectGraph, workspaceRoot: string): void {
+  const root = absoluteRoot(workspaceRoot);
+  const findings: OutputKindFinding[] = [];
+  for (const claim of outputClaims(declaredOutputs(graph, root), root)) {
+    if (claim.form !== 'path') continue;
+    const onDisk = outputOnDisk(claim.absolute);
+    if (onDisk !== 'absent' && onDisk !== claim.declared.kind) findings.push({ ...claim.declared, onDisk });
+  }
+  if (findings.length) throw new OutputKindError(findings);
 }

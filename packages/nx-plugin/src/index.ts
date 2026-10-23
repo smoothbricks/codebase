@@ -705,7 +705,7 @@ function createCargoWasmTarget(
     inputs: repoRooted
       ? [CARGO_CLOSURE_INPUT, '{workspaceRoot}/scripts/*.sh', '{projectRoot}/scripts/*.sh']
       : CARGO_OUTPUT_INPUTS,
-    outputs: [`{projectRoot}/${config.outputDirectory}`],
+    outputs: [`{projectRoot}/${config.outputDirectory}/`],
     options: {
       command: buildCommand('dev'),
       cwd: repoRooted ? '.' : projectRoot,
@@ -2188,7 +2188,7 @@ function inferTypescriptOutputs(tsconfigPath: string, packageJsonPath: string): 
   if (normalized === '.' || normalized === '..' || normalized.startsWith('../') || normalized.startsWith('/')) {
     throw new Error(`${packageJsonPath}: tsconfig.lib.json compilerOptions.outDir must stay inside the project`);
   }
-  return [`{projectRoot}/${normalized}`];
+  return [`{projectRoot}/${normalized}/`];
 }
 
 function resolveNapiConfig(
@@ -2287,7 +2287,7 @@ function createNapiTargets(
     cache: true,
     dependsOn: ['^build'],
     inputs: cargoInputs,
-    outputs: ['{projectRoot}/.cache/native-debug'],
+    outputs: ['{projectRoot}/.cache/native-debug/'],
     options: {
       cwd: cargoCwd,
       command: `${napiCommand} build --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputPath('.cache/native-debug')}`,
@@ -2308,7 +2308,7 @@ function createNapiTargets(
       cache: true,
       dependsOn: ['^build'],
       inputs: cargoInputs,
-      outputs: ['{projectRoot}/dist/native/host'],
+      outputs: ['{projectRoot}/dist/native/host/'],
       options: {
         cwd: cargoCwd,
         command: hostBuild('dev'),
@@ -2333,7 +2333,7 @@ function createNapiTargets(
         executor: '@smoothbricks/nx-plugin:cargo-zigbuild',
         cache: true,
         inputs: napiInputs(projectRoot, repoRooted, []),
-        outputs: [`{projectRoot}/${outputDirectory}`],
+        outputs: [`{projectRoot}/${outputDirectory}/`],
         options: {
           target: `${triple}.${LINUX_GLIBC_FLOOR}`,
           manifestPath: posix.join(cargoCwd, config.manifestPath),
@@ -2352,7 +2352,7 @@ function createNapiTargets(
       executor: 'nx:run-commands',
       cache: true,
       inputs: cargoInputs,
-      outputs: [`{projectRoot}/${outputDirectory}`],
+      outputs: [`{projectRoot}/${outputDirectory}/`],
       options: {
         cwd: cargoCwd,
         command: platformBuild('dev'),

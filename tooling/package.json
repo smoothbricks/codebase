@@ -28,7 +28,7 @@
           }
         ],
         "outputs": [
-          "{workspaceRoot}/.cache/nx-daemon-idle-proof"
+          "{workspaceRoot}/.cache/nx-daemon-idle-proof/"
         ],
         "options": {
           "command": "ttsc -p tooling/tsconfig.nx-daemon-idle-proof.json --emit",
