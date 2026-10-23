@@ -945,6 +945,12 @@ CI status deeplinks depend on [GitHub Actions]' top-level job step anchors. The 
 comments next to each top-level step, and the `smoo github-ci nx-smart --step <number>` values for lint, test, and build
 must stay synchronized with those comments. Composite action internals do not change the top-level step numbers.
 
+Recording a commit status (`github-ci nx-smart`, `nx-deploy`, the Forgejo deployment status) repeats a 5xx answer or a
+dropped connection up to five attempts in all, waiting 1, 2, 4 and 8 s between them with jitter (never less than a
+`Retry-After` header asks; a header asking for more than 15 s ends the retrying), because a repeated status is an
+identical log entry. A 4xx is never repeated. A failure that outlasts the retries names the status that could not be
+recorded and the HTTP code, so it reads as a status-reporting failure.
+
 Only CI's Build invocation enables `NX_VERBOSE_LOGGING=true`, so Nx prints the underlying project-graph exception
 instead of only its generic title; target selection, status/step links, daemon choice and cache behavior are unchanged.
 Before cleanup, the existing trace artifact upload also retains the current workspace-data `project-graph.json` and
