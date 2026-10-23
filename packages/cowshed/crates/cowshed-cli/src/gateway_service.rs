@@ -4729,7 +4729,7 @@ mod tests {
             assert!(hold_lines(&lines).is_empty(), "{lines:#?}");
             assert_eq!(
                 lines[1],
-                "gateway gate head: /mnt/app/land gate job 7: held 6, running 1"
+                "gateway gate head: repository=owner/repo /mnt/app/land gate job 7: held 6, running 1"
             );
         }
 
