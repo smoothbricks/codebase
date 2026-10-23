@@ -30,6 +30,10 @@
 //!   process's is refused ([`ObserveError::ImageNotPermitted`], keeping the `EINVAL`). Every
 //!   other failed read is [`ObserveError::Kernel`] with its call and errno, whether or not the
 //!   life still ran; a child list in particular never fails because its parent exited.
+//! - Custody-only admission and retirement fold fork/exit evidence without reading argv; an exec
+//!   records UnreadImage instead. An exec coalesced with its known exit also skips that useless
+//!   read. Normal observation retains every native image failure above. Identity, lineage,
+//!   registration and signal reads remain strict in both purposes.
 //! - A child is adopted only when its parent's unique id is the member's.
 //! - The kernel hands over a batch of events at once and keeps none of them. Every event of a
 //!   batch, and every bit of each event, is folded even after another failed, so a failed image
@@ -56,6 +60,12 @@ use crate::runtime::process_usage::{SampleError, Sampled, StartStamp};
 use crate::runtime::supervisor::{process_termination_from_wait, utc_at_second, utc_now};
 use cowshed_os::process::process_arguments;
 
+/// Custody depends on lives and exit watches, not their current argv.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ObservationPurpose {
+    Metadata,
+    Custody,
+}
 const WATCHED: u32 = libc::NOTE_FORK | libc::NOTE_EXEC | libc::NOTE_EXIT | libc::NOTE_EXITSTATUS;
 
 /// Why observing a job's processes failed.
@@ -463,8 +473,17 @@ impl<P: ProcessReads> KqueueObserver<P> {
     /// Fold every event already queued, without waiting. An `Err` names what could not be
     /// observed; every event was folded all the same, and the observer stays usable.
     pub fn drain(&mut self) -> Result<(), ObserveError> {
+        self.drain_for(ObservationPurpose::Metadata)
+    }
+
+    /// Fold custody evidence without asking for an image that cannot improve ownership.
+    pub(crate) fn drain_custody(&mut self) -> Result<(), ObserveError> {
+        self.drain_for(ObservationPurpose::Custody)
+    }
+
+    fn drain_for(&mut self, purpose: ObservationPurpose) -> Result<(), ObserveError> {
         let mut failures = Failures::default();
-        self.drain_into(&mut failures);
+        self.drain_into(&mut failures, purpose);
         failures.into_result()
     }
 
@@ -477,16 +496,28 @@ impl<P: ProcessReads> KqueueObserver<P> {
     /// [`KqueueObserver::wait`], returning with nothing folded once `within` passes with no
     /// event. The kernel's own wait bounds it; no timer runs beside it.
     pub fn wait_within(&mut self, within: Option<Duration>) -> Result<(), ObserveError> {
+        self.wait_for(within, ObservationPurpose::Metadata)
+    }
+
+    pub(crate) fn wait_custody(&mut self, within: Duration) -> Result<(), ObserveError> {
+        self.wait_for(Some(within), ObservationPurpose::Custody)
+    }
+
+    fn wait_for(
+        &mut self,
+        within: Option<Duration>,
+        purpose: ObservationPurpose,
+    ) -> Result<(), ObserveError> {
         let mut failures = Failures::default();
         let timeout = within.map(|within| libc::timespec {
             tv_sec: libc::time_t::try_from(within.as_secs()).unwrap_or(libc::time_t::MAX),
             tv_nsec: libc::c_long::from(within.subsec_nanos()),
         });
         if self
-            .collect(timeout.as_ref(), &mut failures)
+            .collect(timeout.as_ref(), &mut failures, purpose)
             .is_some_and(|ready| ready > 0)
         {
-            self.drain_into(&mut failures);
+            self.drain_into(&mut failures, purpose);
         }
         failures.into_result()
     }
@@ -559,7 +590,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
             .live(member.ppid)
             .filter(|parent| parent.birth.0 == member.parent_unique_id)
         {
-            return self.adopt(parent, member.pid);
+            return self.adopt(parent, member.pid, ObservationPurpose::Custody);
         }
         let Some(record) = self.attach(member)? else {
             // It exited: the group no longer holds it.
@@ -585,7 +616,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
             at: utc_at_second(record.started_seconds)?,
             image,
         })?;
-        self.adopt_children(process)
+        self.adopt_children(process, ObservationPurpose::Custody)
     }
 
     /// Adopt every child a retained parent has now. Retirement calls this after posting STOP;
@@ -596,7 +627,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
         parent: ProcessIdentity,
     ) -> Result<Result<(), ObserveError>, ObserveError> {
         Ok(match self.children(parent)? {
-            Some(children) => self.adopt_each(parent, children),
+            Some(children) => self.adopt_each(parent, children, ObservationPurpose::Custody),
             // Its life ended; its exit is joined from its own registration.
             None => Ok(()),
         })
@@ -622,13 +653,13 @@ impl<P: ProcessReads> KqueueObserver<P> {
         &self.missed
     }
 
-    fn drain_into(&mut self, failures: &mut Failures) {
+    fn drain_into(&mut self, failures: &mut Failures, purpose: ObservationPurpose) {
         let zero = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
         };
         while self
-            .collect(Some(&zero), failures)
+            .collect(Some(&zero), failures, purpose)
             .is_some_and(|ready| ready > 0)
         {}
     }
@@ -638,6 +669,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
         &mut self,
         timeout: Option<&libc::timespec>,
         failures: &mut Failures,
+        purpose: ObservationPurpose,
     ) -> Option<usize> {
         // SAFETY: an all-zero kevent is a valid value of the plain C struct.
         let mut events: [libc::kevent; 64] = unsafe { std::mem::zeroed() };
@@ -665,21 +697,29 @@ impl<P: ProcessReads> KqueueObserver<P> {
                 }
             }
         };
-        failures.note(self.fold_batch(&events[..ready]));
+        failures.note(self.fold_batch(&events[..ready], purpose));
         Some(ready)
     }
 
     /// Fold every event of one batch the kernel handed over, each one even after another
     /// failed: the kernel keeps none of them. The batch's failures are returned together.
-    fn fold_batch(&mut self, events: &[libc::kevent]) -> Result<(), ObserveError> {
+    fn fold_batch(
+        &mut self,
+        events: &[libc::kevent],
+        purpose: ObservationPurpose,
+    ) -> Result<(), ObserveError> {
         let mut failures = Failures::default();
         for event in events {
-            failures.note(self.handle(event));
+            failures.note(self.handle(event, purpose));
         }
         failures.into_result()
     }
 
-    fn handle(&mut self, event: &libc::kevent) -> Result<(), ObserveError> {
+    fn handle(
+        &mut self,
+        event: &libc::kevent,
+        purpose: ObservationPurpose,
+    ) -> Result<(), ObserveError> {
         if event.filter != libc::EVFILT_PROC {
             return Ok(());
         }
@@ -722,10 +762,15 @@ impl<P: ProcessReads> KqueueObserver<P> {
         // earlier one failed.
         let mut failures = Failures::default();
         if fflags & libc::NOTE_FORK != 0 {
-            failures.note(self.forked(process));
+            failures.note(self.forked(process, purpose));
         }
         if fflags & libc::NOTE_EXEC != 0 {
-            failures.note(self.exec(process));
+            let purpose = if fflags & libc::NOTE_EXIT != 0 {
+                ObservationPurpose::Custody
+            } else {
+                purpose
+            };
+            failures.note(self.fold_image(process, Seen::Exec, purpose));
         }
         if fflags & libc::NOTE_EXIT != 0 {
             failures.note(self.exited(process, data));
@@ -733,16 +778,20 @@ impl<P: ProcessReads> KqueueObserver<P> {
         failures.into_result()
     }
 
-    fn exec(&mut self, process: ProcessIdentity) -> Result<(), ObserveError> {
-        self.fold_image(process, Seen::Exec)
-    }
-
     /// Fold the image `process` runs now. After a `NOTE_EXEC` it is that exec's image; read
     /// at adoption, it is an exec only when it differs from the parent's image the child
     /// started with. An image that could not be read is the `UnreadImage` gap, and a read
     /// that failed is returned beside it with its call and errno.
-    fn fold_image(&mut self, process: ProcessIdentity, seen: Seen) -> Result<(), ObserveError> {
+    fn fold_image(
+        &mut self,
+        process: ProcessIdentity,
+        seen: Seen,
+        purpose: ObservationPurpose,
+    ) -> Result<(), ObserveError> {
         let unread = ProcessObservation::ImageUnread { process };
+        if purpose == ObservationPurpose::Custody {
+            return self.observe(unread);
+        }
         let mut failures = Failures::default();
         let observation = match self.image(process) {
             Ok(Some(image))
@@ -804,12 +853,16 @@ impl<P: ProcessReads> KqueueObserver<P> {
     /// `parent` forked an uncounted number of children: adopt every one it has now. Children
     /// that could not be listed -- the parent's life ended first, or the read failed -- were
     /// forked and may run on unwatched: a missed adoption.
-    fn forked(&mut self, parent: ProcessIdentity) -> Result<(), ObserveError> {
+    fn forked(
+        &mut self,
+        parent: ProcessIdentity,
+        purpose: ObservationPurpose,
+    ) -> Result<(), ObserveError> {
         self.observe(ProcessObservation::Lost(
             ProcessCoverageGap::UncountedFork { pid: parent.pid },
         ))?;
         match self.children(parent) {
-            Ok(Some(children)) => self.adopt_each(parent, children),
+            Ok(Some(children)) => self.adopt_each(parent, children, purpose),
             unlisted => {
                 self.missed
                     .push(ProcessCoverageGap::UncountedFork { pid: parent.pid });
@@ -820,12 +873,16 @@ impl<P: ProcessReads> KqueueObserver<P> {
 
     /// Adopt every child `parent` has now that the tree does not hold, each one even after
     /// another failed.
-    fn adopt_children(&mut self, parent: ProcessIdentity) -> Result<(), ObserveError> {
+    fn adopt_children(
+        &mut self,
+        parent: ProcessIdentity,
+        purpose: ObservationPurpose,
+    ) -> Result<(), ObserveError> {
         let Some(children) = self.children(parent)? else {
             // It exited; its children went to another parent. The fork gap covers them.
             return Ok(());
         };
-        self.adopt_each(parent, children)
+        self.adopt_each(parent, children, purpose)
     }
 
     /// Adopt each listed child, each one even after another failed. A child whose adoption
@@ -834,10 +891,11 @@ impl<P: ProcessReads> KqueueObserver<P> {
         &mut self,
         parent: ProcessIdentity,
         children: Vec<u32>,
+        purpose: ObservationPurpose,
     ) -> Result<(), ObserveError> {
         let mut failures = Failures::default();
         for child in children {
-            let adopted = self.adopt(parent, child);
+            let adopted = self.adopt(parent, child, purpose);
             if adopted.is_err() && self.fold.lives().live(child).is_none() {
                 self.missed
                     .push(ProcessCoverageGap::UnobservedBirth { pid: child });
@@ -847,7 +905,12 @@ impl<P: ProcessReads> KqueueObserver<P> {
         failures.into_result()
     }
 
-    fn adopt(&mut self, parent: ProcessIdentity, child: u32) -> Result<(), ObserveError> {
+    fn adopt(
+        &mut self,
+        parent: ProcessIdentity,
+        child: u32,
+        purpose: ObservationPurpose,
+    ) -> Result<(), ObserveError> {
         let Some(before) = self.record(child)? else {
             // Exited before it could be watched: the fork gap covers it.
             return Ok(());
@@ -867,8 +930,8 @@ impl<P: ProcessReads> KqueueObserver<P> {
         })?;
         // It may have exec'd, and forked, before it was watched.
         let mut failures = Failures::default();
-        failures.note(self.fold_image(process, Seen::Adopted));
-        failures.note(self.adopt_children(process));
+        failures.note(self.fold_image(process, Seen::Adopted, purpose));
+        failures.note(self.adopt_children(process, purpose));
         failures.into_result()
     }
 
@@ -1483,8 +1546,18 @@ mod tests {
         // When the old life's exec is handled, the pid names the new life.
         let reads = Scripted::default().record(900, &[Some(record(900, 3, 1))]);
         let mut observer = scripted(reads, fold, &[root, old, new]);
-        observer.handle(&event(old, libc::NOTE_EXEC, 0)).unwrap();
-        observer.handle(&event(old, libc::NOTE_EXIT, 0)).unwrap();
+        observer
+            .handle(
+                &event(old, libc::NOTE_EXEC, 0),
+                ObservationPurpose::Metadata,
+            )
+            .unwrap();
+        observer
+            .handle(
+                &event(old, libc::NOTE_EXIT, 0),
+                ObservationPurpose::Metadata,
+            )
+            .unwrap();
 
         assert_eq!(observer.fold().live(900), Some(new));
         let nodes: Vec<_> = observer.fold().nodes().collect();
@@ -1513,7 +1586,10 @@ mod tests {
         let mut observer = scripted(Scripted::default(), fold, &[root, old, new]);
         let stranger = life(900, 77);
         observer
-            .handle(&event(stranger, libc::NOTE_EXIT | libc::NOTE_FORK, 0))
+            .handle(
+                &event(stranger, libc::NOTE_EXIT | libc::NOTE_FORK, 0),
+                ObservationPurpose::Metadata,
+            )
             .unwrap();
         assert_eq!(observer.fold().live(900), Some(new));
         assert_eq!(observer.fold().nodes().count(), 3);
@@ -1688,7 +1764,10 @@ mod tests {
         let reads = Scripted::default().record(800, &[None]);
         let mut observer = scripted(reads, fold, &[root]);
         observer
-            .handle(&event(root, libc::NOTE_FORK, 0))
+            .handle(
+                &event(root, libc::NOTE_FORK, 0),
+                ObservationPurpose::Metadata,
+            )
             .expect("a parent gone before its list is no read failure");
         assert_eq!(
             observer.missed(),
@@ -1703,7 +1782,10 @@ mod tests {
             .record_failure(901, libc::EIO);
         let mut observer = scripted(reads, fold, &[root]);
         let error = observer
-            .handle(&event(root, libc::NOTE_FORK, 0))
+            .handle(
+                &event(root, libc::NOTE_FORK, 0),
+                ObservationPurpose::Metadata,
+            )
             .expect_err("the child's record read failed");
         assert_eq!(failed(&error), ("proc_pidinfo", 901, Some(libc::EIO)));
         assert_eq!(
@@ -1736,6 +1818,62 @@ mod tests {
             Some(shell_image("/bin/cat"))
         );
         assert_eq!(observer.children(process).unwrap(), None, "changed life");
+    }
+
+    #[test]
+    fn custody_exec_and_coalesced_exit_never_read_an_image() {
+        for (purpose, flags) in [
+            (ObservationPurpose::Custody, libc::NOTE_EXEC),
+            (
+                ObservationPurpose::Metadata,
+                libc::NOTE_EXEC | libc::NOTE_EXIT,
+            ),
+        ] {
+            let current = life(900, 3);
+            let mut fold = TestFold::default();
+            fold.apply(ProcessObservation::Root {
+                process: current,
+                ppid: 1,
+                at: utc_at_second(1_700_000_000).unwrap(),
+                image: shell_image("/bin/bash"),
+            })
+            .unwrap();
+            // No image or record read is scripted: either would panic.
+            let mut observer = scripted(Scripted::default(), fold, &[current]);
+            observer.handle(&event(current, flags, 0), purpose).unwrap();
+            assert_eq!(observer.fold().image(current), None);
+            assert_eq!(
+                observer.fold().live(current.pid).is_none(),
+                flags & libc::NOTE_EXIT != 0
+            );
+            assert!(matches!(
+                observer.fold().coverage(),
+                ProcessCoverage::Gap {
+                    reason: ProcessCoverageGap::UnreadImage { pid: 900 }
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn custody_folding_still_refuses_unknown_lineage_and_missing_exit_watches() {
+        let (fold, root, old, current) = reused_pid_fold();
+        let reads = Scripted::default().record_failure(root.pid, libc::EPERM);
+        let mut observer = scripted(reads, fold, &[root, old, current]);
+        let error = observer
+            .handle(
+                &event(root, libc::NOTE_FORK, 0),
+                ObservationPurpose::Custody,
+            )
+            .unwrap_err();
+        assert_eq!(
+            failed(&error),
+            ("proc_pidinfo", root.pid, Some(libc::EPERM))
+        );
+        observer.registered.remove(&current);
+        let error = observer.subtree(root).unwrap_err();
+        assert_eq!(failed(&error), ("kevent(EVFILT_PROC)", current.pid, None));
+        assert!(observer.reads.signalled.borrow().is_empty());
     }
 
     fn failed(error: &ObserveError) -> (&'static str, u32, Option<i32>) {
@@ -1851,7 +1989,7 @@ mod tests {
         assert_eq!(failed(&error), ("KERN_PROCARGS2", 930, Some(libc::EIO)));
     }
 
-    /// Failed reads in a batch drop nothing: the exit coalesced with a failed exec, and every
+    /// Failed reads in a batch drop nothing: an exit following a failed exec, and every
     /// later event, are folded, and every failure of the batch is returned.
     #[test]
     fn a_failed_read_never_drops_the_rest_of_its_batch() {
@@ -1881,11 +2019,15 @@ mod tests {
             .image(901, enomem());
         let mut observer = scripted(reads, fold, &[root, first, second]);
         let error = observer
-            .fold_batch(&[
-                event(first, libc::NOTE_EXEC | libc::NOTE_EXIT, 0),
-                event(second, libc::NOTE_EXEC, 0),
-                event(root, libc::NOTE_EXIT, 0),
-            ])
+            .fold_batch(
+                &[
+                    event(first, libc::NOTE_EXEC, 0),
+                    event(first, libc::NOTE_EXIT, 0),
+                    event(second, libc::NOTE_EXEC, 0),
+                    event(root, libc::NOTE_EXIT, 0),
+                ],
+                ObservationPurpose::Metadata,
+            )
             .expect_err("two reads failed");
         let ObserveError::Several { first: one, rest } = error else {
             panic!("{error}");

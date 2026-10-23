@@ -901,7 +901,7 @@ impl Writer {
     }
 
     fn owns_live(&mut self, peer: ProcessIdentity) -> Result<bool> {
-        let drained = self.observer.drain();
+        let drained = self.observer.drain_custody();
         self.observed(drained)?;
         if !self.observer.fold().holds(peer) {
             // The peer may have connected before its parent's fork event was dequeued. Use
@@ -914,7 +914,7 @@ impl Writer {
                     .map_err(|error| refused(self.job_id, error))?;
                 self.observed(adopted)?;
             }
-            let drained = self.observer.drain();
+            let drained = self.observer.drain_custody();
             self.observed(drained)?;
         }
         self.observer.retained_live(peer).map_err(observation_error)
@@ -1039,7 +1039,7 @@ impl Writer {
     ) -> Result<JobProcessRetirement> {
         // Fold every queued observation first: a life whose exit is already queued is joined,
         // never signalled.
-        let drained = self.observer.drain();
+        let drained = self.observer.drain_custody();
         self.observed(drained)?;
         for process in self.owned(scope)? {
             self.signal(process, libc::SIGTERM)?;
@@ -1117,7 +1117,7 @@ impl Writer {
             if owned.is_empty() || left.is_zero() {
                 return Ok(owned);
             }
-            let waited = self.observer.wait_within(Some(left));
+            let waited = self.observer.wait_custody(left);
             self.observed(waited)?;
         }
     }
@@ -1152,7 +1152,7 @@ impl Writer {
             for &process in &fresh {
                 self.signal(process, libc::SIGSTOP)?;
             }
-            let drained = self.observer.drain();
+            let drained = self.observer.drain_custody();
             self.observed(drained)?;
             for process in fresh {
                 let adopted = self
@@ -1203,7 +1203,7 @@ impl Writer {
     }
 
     /// Publish what an observer step folded, and its failure. The events were folded either
-    /// way; a failure refuses the retirement, since a read it lacks may be a life it missed.
+    /// way; custody-only steps still refuse every failed identity, child-list, watch or signal read.
     fn observed(&mut self, result: std::result::Result<(), ObserveError>) -> Result<()> {
         let result = result.map_err(|error| refused(self.job_id, error));
         if result.is_err() || self.observer.has_events() {
@@ -1362,6 +1362,10 @@ mod tests {
 
     impl SubtreeFixture {
         fn start() -> Self {
+            Self::start_with_churn(false)
+        }
+
+        fn start_with_churn(churn: bool) -> Self {
             use cowshed_os::fork_lock::Spawn as _;
             use std::io::{BufRead as _, Write as _};
             use std::os::unix::process::CommandExt as _;
@@ -1386,14 +1390,29 @@ if root == 0:
         os.write(child_write, b"x")
         os.waitpid(child, 0)
     os._exit(0)
+churn_read, churn_write = os.pipe()
 sibling = os.fork()
 if sibling == 0:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     os.write(1, b"sibling %d\n" % os.getpid())
+    if os.environ["COWSHED_TEST_SUBTREE_CHURN"] == "1":
+        os.read(churn_read, 1)
+        for _ in range(64):
+            child = os.fork()
+            if child == 0:
+                os.execv("/usr/bin/true", ["true"])
+            _, status = os.waitpid(child, 0)
+            if status != 0:
+                os._exit(2)
+        os.write(1, b"churned 64\n")
     while True:
         signal.pause()
 for line in sys.stdin:
     command = line.strip().encode()
+    if command == b"c":
+        os.write(1, b"churning\n")
+        os.write(churn_write, b"x")
+        continue
     os.write(root_write, command)
     if command in (b"x", b"n"):
         os.waitpid(root, 0)
@@ -1406,6 +1425,7 @@ for line in sys.stdin:
             let mut command = Command::new("/bin/bash");
             command
                 .args(["-c", "exec python3 -c \"$1\"", "subtree-fixture", script])
+                .env("COWSHED_TEST_SUBTREE_CHURN", if churn { "1" } else { "0" })
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .process_group(0);
@@ -1529,6 +1549,52 @@ for line in sys.stdin:
             assert!(self.monitor.owns_live(native_life(leader)).unwrap());
             assert!(self.monitor.owns_live(self.sibling).unwrap());
         }
+    }
+
+    #[test]
+    fn concurrent_subtree_retirements_preserve_siblings_while_they_fork_and_exec() {
+        let fixtures: Vec<_> = (0..8)
+            .map(|_| SubtreeFixture::start_with_churn(true))
+            .collect();
+        let ready = std::sync::Barrier::new(8);
+        thread::scope(|scope| {
+            let witnesses: Vec<_> = fixtures
+                .into_iter()
+                .map(|mut fixture| {
+                    let ready = &ready;
+                    scope.spawn(move || {
+                        let handle = fixture.handle(fixture.root);
+                        ready.wait();
+                        fixture.command("c", "churning");
+                        let receipt = fixture.retired(handle);
+                        let mut actual: Vec<_> =
+                            receipt.outlived.iter().map(|row| row.pid).collect();
+                        actual.sort_unstable();
+                        let mut expected = vec![fixture.root.pid, fixture.child.pid];
+                        expected.sort_unstable();
+                        assert_eq!(actual, expected, "{receipt:?}");
+                        assert!(
+                            receipt
+                                .outlived
+                                .iter()
+                                .all(|row| row.signal == libc::SIGKILL)
+                        );
+                        assert!(!receipt.outlived_incomplete);
+                        for life in [fixture.root, fixture.child] {
+                            assert!(
+                                !fixture.monitor.running_lives().contains(&life),
+                                "exit not joined"
+                            );
+                        }
+                        assert_eq!(fixture.lines.next().unwrap().unwrap(), "churned 64");
+                        fixture.assert_siblings_live();
+                    })
+                })
+                .collect();
+            for witness in witnesses {
+                witness.join().unwrap();
+            }
+        });
     }
 
     #[test]

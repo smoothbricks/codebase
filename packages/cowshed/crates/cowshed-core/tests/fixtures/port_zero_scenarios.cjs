@@ -108,7 +108,7 @@ writeFileSync(
   listenScript,
   `const s = require('node:net').createServer();
 s.on('error', (error) => console.log(error.code));
-s.listen(0, '127.0.0.1', () => { console.log(s.address().port); s.close(); });
+s.listen(0, '127.0.0.1', () => { process.stdout.write(String(s.address().port) + '\\n'); s.close(); });
 `,
 );
 // Spawns a Node child whose inspector follows a bare `--require`, which the preload must not map and must name.

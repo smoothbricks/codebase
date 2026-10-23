@@ -201,7 +201,7 @@ mod tests {
         std::fs::write(
             &script,
             "const s = require('node:net').createServer();\n\
-             s.listen(0, '127.0.0.1', () => { console.log(s.address().port); s.close(); });\n",
+             s.listen(0, '127.0.0.1', () => { process.stdout.write(String(s.address().port) + '\\n'); s.close(); });\n",
         )
         .expect("write the listener");
         for runtime in ["node", "bun"] {

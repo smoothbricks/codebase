@@ -204,6 +204,15 @@ alias-owned fixtures keep their selected runtime alias unchanged.
 A pure regression fixture runs inside an ordinary exec and covers both the HTTP and Unix-socket authentication cases. It
 is not a real APFS mount or cache cutover proof.
 
+The process-custody witness retires eight native subtrees concurrently while each retained sibling forks and execs 64
+children. It joins exactly each selected root and child, observes every sibling complete its work alive, and never uses
+group expansion. Controls omit all image reads during custody and coalesced exit, preserve normal
+EINVAL/credential-denial errors, and require unknown lineage and missing watches to refuse without signalling.
+
+Port-zero fixture children report numeric ports with explicit string writes to stdout, not console inspection. They
+retain inherited color settings; the reader compares the exact undecorated decimal protocol, and never strips ANSI or
+disables color to make an oracle pass.
+
 Inside a workspace's port block, the gateway's own port `COWSHED_PORT_BASE` stays reserved: an upstream fixture binds
 the first free odd-offset service port (`base+1`, `base+3`, …, `base+size-1`), never port 0 or a port outside the block.
 Even-offset session ports are bindable only by the holder of their adjacent service port; every allocator follows this

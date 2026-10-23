@@ -777,6 +777,14 @@ success. The receipt is `Observed { lost }`, never a Darwin completeness claim; 
 signalled, not survivors. Those rows also remain in the whole job's later terminal receipt. The same
 `outlivedIncomplete` vocabulary distinguishes incomplete native kill metadata from membership proof.
 
+Custody-only admission and retirement fold the same native fork and exit events without reading current argv. A queued
+exec records an explicit UnreadImage gap; an exec coalesced with its known exit omits image work in ordinary observation
+too. Image availability cannot improve retained identity or lineage, so a sibling's exec window does not refuse another
+subtree's retirement. Normal observation still returns and publishes every native image-read failure, including
+credential denial; no errno implies that a life vanished. Identity, child-list, exit-registration and signal failures
+remain retirement refusals. Adoption of a previously unobserved group root remains strict, since no retained root exists
+yet.
+
 Linux currently returns typed `FoldUnavailable`: whole-job cgroup membership is not retained per-command ancestry. The
 caller takes no RAM lease and reports that fact, just as on a no-supervisor runner. A cwd/TMPDIR census remains a
 failure-only diagnostic; it cannot signal processes, refuse a gate, or become a fallback ownership authority.
