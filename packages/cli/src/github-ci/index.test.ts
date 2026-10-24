@@ -20,6 +20,7 @@ import {
   publishGithubDeployment,
   readGitHeadSha,
   resolveDeploymentStage,
+  resolveGithubStepUrl,
   selectStageDeployProjects,
 } from './index.js';
 import {
@@ -87,6 +88,78 @@ describe('GitHub Actions step links', () => {
         '8',
       ),
     ).toBeNull();
+  });
+});
+
+describe('GitHub Actions step link resolution', () => {
+  const runUrl = 'https://github.com/smoothbricks/codebase/actions/runs/34967722056';
+  const runner = 'bread-main-s6wltmlyvjgk';
+  const jobUrl = `${runUrl}/job/104376095985`;
+  const runningJob = { name: 'Validate', runner_name: runner, status: 'in_progress', html_url: jobUrl };
+  const queuedJob = { name: 'Validate', runner_name: null, status: 'queued', html_url: jobUrl };
+  const fallbackUrl = `${runUrl}/attempts/2`;
+
+  function lookupOver(listings: readonly (readonly (typeof runningJob | typeof queuedJob)[])[]) {
+    const pages: number[] = [];
+    const sleeps: number[] = [];
+    return {
+      pages,
+      sleeps,
+      lookup: {
+        runnerName: runner,
+        step: '6',
+        fallbackUrl,
+        attempts: 3,
+        retryDelayMs: 2000,
+        listJobs: async (page: number) => {
+          pages.push(page);
+          return listings[Math.min(pages.length, listings.length) - 1] ?? [];
+        },
+        sleep: async (milliseconds: number) => {
+          sleeps.push(milliseconds);
+        },
+      },
+    };
+  }
+
+  it('waits for a just-started job that the jobs listing does not show yet', async () => {
+    const { lookup, pages, sleeps } = lookupOver([[queuedJob], [queuedJob], [runningJob]]);
+
+    await expect(resolveGithubStepUrl(lookup)).resolves.toBe(`${jobUrl}#step:6:1`);
+    expect(pages).toEqual([1, 1, 1]);
+    expect(sleeps).toEqual([2000, 2000]);
+  });
+
+  it('links the run attempt instead of failing when the running job never appears', async () => {
+    const { lookup, pages, sleeps } = lookupOver([[queuedJob]]);
+
+    await expect(resolveGithubStepUrl(lookup)).resolves.toBe(fallbackUrl);
+    expect(pages).toEqual([1, 1, 1]);
+    expect(sleeps).toEqual([2000, 2000]);
+  });
+
+  it('reads the next page before it concludes the job is absent', async () => {
+    const fullPage = Array.from({ length: 100 }, () => ({
+      name: 'Other',
+      runner_name: 'another-runner',
+      status: 'in_progress',
+      html_url: `${runUrl}/job/1`,
+    }));
+    const { lookup, pages, sleeps } = lookupOver([fullPage, [runningJob]]);
+
+    await expect(resolveGithubStepUrl(lookup)).resolves.toBe(`${jobUrl}#step:6:1`);
+    expect(pages).toEqual([1, 2]);
+    expect(sleeps).toEqual([]);
+  });
+
+  it('does not hide a failing jobs listing behind the fallback link', async () => {
+    const { lookup } = lookupOver([]);
+    const failure = new Error('CI API GET /actions/runs/1/attempts/2/jobs failed with HTTP 403.');
+    lookup.listJobs = async () => {
+      throw failure;
+    };
+
+    await expect(resolveGithubStepUrl(lookup)).rejects.toBe(failure);
   });
 });
 
