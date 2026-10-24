@@ -35,8 +35,8 @@ use columine_types::types::{
 
 use crate::meta::SlotMetaView;
 use crate::vm::{
-    body_op_len, decode_struct_map_upsert_operands, decode_struct_map2_tuple_operands,
-    decode_struct_map2_upsert_operands,
+    body_op_len, decode_struct_map_guarded_upsert_operands, decode_struct_map_upsert_operands,
+    decode_struct_map2_tuple_operands, decode_struct_map2_upsert_operands,
 };
 
 /// How the reduce section reads a column operand.
@@ -361,6 +361,26 @@ fn walk_op(
         }
         Opcode::BatchStructMap2UpsertLast => {
             struct_map2_reads(&decode_struct_map2_upsert_operands(code, pc + 1)?, visit);
+        }
+        Opcode::BatchStructMapRemove => {
+            ops.index()?;
+            reads(ops, 1, visit)?;
+        }
+        Opcode::BatchStructMapGuardedUpsertLast => {
+            let operands = decode_struct_map_guarded_upsert_operands(code, pc + 1)?;
+            cell(visit, operands.row.key_col, ColumnUse::Read);
+            cell(visit, operands.guard_key_col, ColumnUse::Read);
+            for &col in operands.row.vals.cols() {
+                cell(visit, col, ColumnUse::Read);
+            }
+            for array in operands.row.array_fields() {
+                visit(ColumnOperand::Csr {
+                    slot: operands.row.slot,
+                    field_idx: array.field_idx,
+                    offsets_col: array.offsets_col,
+                    values_col: array.values_col,
+                });
+            }
         }
         Opcode::BatchStructMap2UpsertMaxI64x2 | Opcode::BatchStructMap2UpsertMinI64x2 => {
             let operands = decode_struct_map2_tuple_operands(code, pc + 1, op)?;

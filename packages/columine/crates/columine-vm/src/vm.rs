@@ -1032,6 +1032,10 @@ pub struct Vm {
     /// operand arrays: an element decodes into these instead of building
     /// (zeroing and copying) the arrays per row.
     element_struct_map: StructMapUpsertOperands,
+    element_struct_map_guarded: StructMapGuardedUpsertOperands,
+    /// The last reduce section whose companion pairing validated; a new
+    /// program revalidates before its first batch folds.
+    guard_validated: Vec<u8>,
     element_struct_map2: StructMap2UpsertOperands,
     element_struct_map2_tuple: StructMap2TupleOperands,
     element_list_vals: ScalarOperands,
@@ -1062,6 +1066,8 @@ impl Vm {
             declarations: state_init::Declarations::default(),
             element_plan: BodyPlan::default(),
             element_struct_map: StructMapUpsertOperands::EMPTY,
+            element_struct_map_guarded: StructMapGuardedUpsertOperands::EMPTY,
+            guard_validated: Vec::new(),
             element_struct_map2: StructMap2UpsertOperands::EMPTY,
             element_struct_map2_tuple: StructMap2TupleOperands::EMPTY,
             element_list_vals: ScalarOperands::EMPTY,
@@ -1975,6 +1981,18 @@ impl StructMapUpsertOperands {
         self.num_arrays = 0;
         self.slot = operands.index()?;
         self.key_col = operands.index()?;
+        self.decode_tail_from(operands, op)
+    }
+
+    /// The shared value/array tail after slot and key column: num_vals:u8,
+    /// (val_col, field_idx) × num_vals, num_arrays:u8, (offsets_col,
+    /// values_col, field_idx) × num_arrays [, comparison_field_idx:u8].
+    fn decode_tail_from<'a, R: OperandRead<'a>>(
+        &mut self,
+        operands: &mut R,
+        op: Opcode,
+    ) -> Option<()> {
+        self.num_arrays = 0;
         let num_vals = usize::from(operands.byte()?);
         self.vals.decode_into(operands, num_vals, 0)?;
         let num_arrays = usize::from(operands.byte()?);
@@ -2019,6 +2037,51 @@ pub(crate) fn decode_struct_map_upsert_operands(
 ) -> Option<StructMapUpsertOperands> {
     let mut operands = StructMapUpsertOperands::EMPTY;
     operands.decode_from(&mut Operands::at(code, start), op)?;
+    Some(operands)
+}
+
+/// The 0x8d guarded upsert operands: a 0x80 row whose write is gated on the
+/// companion struct map holding the row key with an exact guard-key cell.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StructMapGuardedUpsertOperands {
+    pub(crate) row: StructMapUpsertOperands,
+    pub(crate) companion_slot: u32,
+    pub(crate) guard_key_col: u32,
+    pub(crate) guard_field_idx: u8,
+    pub(crate) end: usize,
+}
+
+impl StructMapGuardedUpsertOperands {
+    const EMPTY: Self = Self {
+        row: StructMapUpsertOperands::EMPTY,
+        companion_slot: 0,
+        guard_key_col: 0,
+        guard_field_idx: 0,
+        end: 0,
+    };
+
+    /// slot, companion_slot, key_col, guard_key_col, guard_field_idx:u8,
+    /// then the shared upsert tail.
+    fn decode_from<'a, R: OperandRead<'a>>(&mut self, operands: &mut R) -> Option<()> {
+        self.row = StructMapUpsertOperands::EMPTY;
+        self.row.slot = operands.index()?;
+        self.companion_slot = operands.index()?;
+        self.row.key_col = operands.index()?;
+        self.guard_key_col = operands.index()?;
+        self.guard_field_idx = operands.byte()?;
+        self.row
+            .decode_tail_from(operands, Opcode::BatchStructMapUpsertLast)?;
+        self.end = self.row.end;
+        Some(())
+    }
+}
+
+pub(crate) fn decode_struct_map_guarded_upsert_operands(
+    code: &[u8],
+    start: usize,
+) -> Option<StructMapGuardedUpsertOperands> {
+    let mut operands = StructMapGuardedUpsertOperands::EMPTY;
+    operands.decode_from(&mut Operands::at(code, start))?;
     Some(operands)
 }
 
@@ -2716,6 +2779,296 @@ fn single_struct_map2_remove(
     state[(slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS) as usize] |= ChangeFlag::REMOVED;
     undo.finish_capture(delta_mode, state, capture);
     ErrorCode::Ok
+}
+
+/// Remove one struct-map row by key, journaled exactly like the two-key
+/// remove. Sentinel and absent keys are no-ops: the instruction composes
+/// unconditionally after a write keyed by the same column (a companion
+/// clear), including rows whose key cell is the absent sentinel.
+fn single_struct_map_remove(
+    undo: &mut UndoState,
+    delta_mode: bool,
+    state: &mut [u8],
+    slot: u32,
+    key: u32,
+) -> ErrorCode {
+    if key == EMPTY_KEY || key == TOMBSTONE {
+        return ErrorCode::Ok;
+    }
+    let smap = match state_init::bind_struct_map(state, slot) {
+        Ok(map) => map,
+        Err(error) => return error,
+    };
+    let Some(pos) = smap.find(state, key) else {
+        return ErrorCode::Ok;
+    };
+    let row = smap.row_off(pos);
+    let ranges = || {
+        [
+            (smap.size_off, 4),
+            (slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS, 1),
+            (smap.keys_off + pos * 4, 4),
+            (row, smap.bitset_bytes),
+        ]
+    };
+    let capture = match undo.begin_capture(state, ranges) {
+        Ok(capture) => capture,
+        Err(error) => return error,
+    };
+    smap.set_key_at(state, pos, TOMBSTONE);
+    smap.set_size(state, smap.size(state) - 1);
+    smap.clear_bitset(state, row);
+    state[(slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS) as usize] |= ChangeFlag::REMOVED;
+    undo.finish_capture(delta_mode, state, capture);
+    ErrorCode::Ok
+}
+
+/// The companion field a companion guard compares must exist and hold one
+/// interned STRING or UINT32 cell: the only layouts whose 4-byte cell the
+/// guard compares against the terminal key column.
+fn validate_guard_companion(
+    state: &[u8],
+    companion: &StructMapSlot,
+    guard_field_idx: u8,
+) -> Result<(), ErrorCode> {
+    if guard_field_idx >= companion.num_fields {
+        return Err(ErrorCode::InvalidProgram);
+    }
+    match companion.field_type(state, guard_field_idx) {
+        StructFieldType::String | StructFieldType::UInt32 => Ok(()),
+        _ => Err(ErrorCode::InvalidProgram),
+    }
+}
+
+/// Whether the companion currently holds the key with the exact guard-key
+/// cell: the revision guard. Anything else — no companion row, the field
+/// unset, a different key cell — admits nothing.
+fn guard_admits(
+    state: &[u8],
+    companion: &StructMapSlot,
+    guard_field_idx: u8,
+    key: u32,
+    guard_key: u32,
+) -> bool {
+    let Some(pos) = companion.find(state, key) else {
+        return false;
+    };
+    let row = companion.row_off(pos);
+    StructMapSlot::is_field_set(state, row, guard_field_idx)
+        && bytes::read_u32(state, row + companion.field_offset(state, guard_field_idx)) == guard_key
+}
+
+/// One companion-guarded row: write through the ordinary upsert-last path only
+/// while the companion admits the key, then remove the companion row that
+/// admitted it. The remove runs only after a successful write, and a growth
+/// refusal leaves both slots as the batch found them for its retry.
+#[allow(clippy::too_many_arguments)]
+fn single_struct_map_guarded_upsert_last(
+    undo: &mut UndoState,
+    delta_mode: bool,
+    state: &mut [u8],
+    operands: &StructMapGuardedUpsertOperands,
+    smap: &StructMapSlot,
+    companion: &StructMapSlot,
+    key: u32,
+    guard_key: u32,
+    cols: &[&[u8]],
+    element_idx: u32,
+) -> u32 {
+    // The destination row must still be absent: any write since the
+    // companion row was seeded — guarded or not — supersedes the claim, so
+    // a rewrite the producer forgot to pair with a companion clear still
+    // cannot be overwritten by the later guarded write.
+    if smap.find(state, key).is_some() {
+        return OK;
+    }
+    if !guard_admits(state, companion, operands.guard_field_idx, key, guard_key) {
+        return OK;
+    }
+    let result = upsert_struct_map_row(
+        undo,
+        delta_mode,
+        state,
+        smap,
+        operands.row.slot,
+        key,
+        operands.row.vals.cols(),
+        operands.row.vals.fields(),
+        operands.row.array_fields(),
+        cols,
+        element_idx,
+    );
+    if result != OK {
+        return result;
+    }
+    single_struct_map_remove(undo, delta_mode, state, operands.companion_slot, key) as u32
+}
+
+/// One instruction of a sequence, as the pairing validation reads it.
+#[derive(Clone, Copy)]
+enum GuardInst {
+    /// A write or delete of a struct-map row (slot, key column).
+    Write {
+        slot: u32,
+        key_col: u32,
+    },
+    /// A struct-map remove (slot, key column): the pairing clear itself.
+    Remove {
+        slot: u32,
+        key_col: u32,
+    },
+    /// The guarded upsert (destination, companion).
+    Guarded {
+        dest: u32,
+        companion: u32,
+    },
+    Other,
+}
+
+/// The body slice and total length of the container instruction at pc.
+fn guard_envelope(code: &[u8], pc: usize, op: Opcode) -> Option<(&[u8], usize)> {
+    let mut r = Operands::at(code, pc.checked_add(1)?);
+    if op == Opcode::ForEach {
+        r.index()?;
+        let count = usize::try_from(r.index()?).ok()?;
+        r.bytes(count.checked_mul(4)?)?;
+    } else {
+        r.index()?;
+        r.index()?;
+    }
+    let len = usize::from(r.u16()?);
+    let body = r.bytes(len)?;
+    Some((body, r.pos().checked_sub(pc)?))
+}
+
+fn guard_inst(code: &[u8], pc: usize, op: Opcode) -> Option<GuardInst> {
+    let at = pc.checked_add(1)?;
+    Some(match op {
+        Opcode::BatchStructMapUpsertLast
+        | Opcode::BatchStructMapUpsertFirst
+        | Opcode::BatchStructMapUpsertMax => {
+            let operands = decode_struct_map_upsert_operands(code, at, op)?;
+            GuardInst::Write {
+                slot: operands.slot,
+                key_col: operands.key_col,
+            }
+        }
+        Opcode::BatchStructMapRemove | Opcode::BatchMapRemove | Opcode::BatchMapRemoveIf => {
+            let mut r = Operands::at(code, at);
+            GuardInst::Remove {
+                slot: r.index()?,
+                key_col: r.index()?,
+            }
+        }
+        Opcode::BatchStructMapGuardedUpsertLast => {
+            let operands = decode_struct_map_guarded_upsert_operands(code, at)?;
+            GuardInst::Guarded {
+                dest: operands.row.slot,
+                companion: operands.companion_slot,
+            }
+        }
+        Opcode::BatchStructMapProbe => {
+            let mut r = Operands::at(code, at);
+            r.index()?;
+            r.index()?;
+            r.byte()?;
+            let out_slot = r.index()?;
+            let fields = usize::from(r.byte()?);
+            r.bytes(fields.checked_mul(2)?)?;
+            GuardInst::Write {
+                slot: out_slot,
+                key_col: r.index()?,
+            }
+        }
+        Opcode::BatchStructMapCountsFold => {
+            let mut r = Operands::at(code, at);
+            GuardInst::Write {
+                slot: r.index()?,
+                key_col: r.index()?,
+            }
+        }
+        _ => GuardInst::Other,
+    })
+}
+
+/// Collect one sequence's instructions, recursing into containers, and the
+/// guarded (destination, companion) pairs of the whole program.
+fn collect_guard_insts(
+    code: &[u8],
+    pairs: &mut Vec<(u32, u32)>,
+    sequences: &mut Vec<Vec<GuardInst>>,
+) -> Option<()> {
+    let mut sequence = Vec::new();
+    let mut pc = 0usize;
+    while pc < code.len() {
+        let op = Opcode::from_u8(code[pc])?;
+        if op == Opcode::Halt {
+            break;
+        }
+        match op {
+            Opcode::ForEach | Opcode::FlatMap => {
+                let (body, len) = guard_envelope(code, pc, op)?;
+                collect_guard_insts(body, pairs, sequences)?;
+                pc = pc.checked_add(len)?;
+            }
+            _ => {
+                let inst = guard_inst(code, pc, op)?;
+                if let GuardInst::Guarded { dest, companion } = inst {
+                    if dest == companion {
+                        return None;
+                    }
+                    if !pairs.contains(&(dest, companion)) {
+                        pairs.push((dest, companion));
+                    }
+                }
+                sequence.push(inst);
+                pc = pc.checked_add(body_op_len(code, pc)?)?;
+            }
+        }
+    }
+    sequences.push(sequence);
+    Some(())
+}
+
+/// The pairing invariant of the companion-guarded upsert, over the whole
+/// reduce section: every write or delete of a guarded destination row —
+/// other than the guarded upsert itself — is immediately followed, in the
+/// same instruction sequence, by a struct-map remove of the companion row
+/// under the same key column. Without it a producer could rewrite or delete
+/// the destination row and leave a live companion claim whose later guarded
+/// write resurrects it; execution's absent-destination guard already stops
+/// the overwrite, and this refusal stops the delete case at the door.
+/// Scatter writes are covered only by the absent-destination guard: their
+/// destination is chosen per element by a route table, so no key column
+/// names the row a clear would have to use.
+fn validate_guard_pairing(code: &[u8]) -> Option<()> {
+    let mut pairs: Vec<(u32, u32)> = Vec::new();
+    let mut sequences: Vec<Vec<GuardInst>> = Vec::new();
+    collect_guard_insts(code, &mut pairs, &mut sequences)?;
+    if pairs.is_empty() {
+        return Some(());
+    }
+    for sequence in &sequences {
+        for (index, inst) in sequence.iter().enumerate() {
+            let (slot, key_col) = match *inst {
+                GuardInst::Write { slot, key_col } | GuardInst::Remove { slot, key_col } => {
+                    (slot, key_col)
+                }
+                _ => continue,
+            };
+            let Some(&(_, companion)) = pairs.iter().find(|&&(dest, _)| dest == slot) else {
+                continue;
+            };
+            match sequence.get(index + 1) {
+                Some(GuardInst::Remove {
+                    slot: cleared,
+                    key_col: cleared_key,
+                }) if *cleared == companion && *cleared_key == key_col => {}
+                _ => return None,
+            }
+        }
+    }
+    Some(())
 }
 
 //#region reduce-typed-state.probe-upsert
@@ -3615,6 +3968,26 @@ impl Vm {
         if self.element_plan.reserve_for(sections.reduce_code).is_err() {
             return OUT_OF_MEMORY;
         }
+        // Companion pairing is a whole-program invariant checked once per
+        // program, before any batch of it folds: see validate_guard_pairing.
+        if sections
+            .reduce_code
+            .contains(&(Opcode::BatchStructMapGuardedUpsertLast as u8))
+            && self.guard_validated != sections.reduce_code
+        {
+            if validate_guard_pairing(sections.reduce_code).is_none() {
+                return INVALID_PROGRAM;
+            }
+            if self
+                .guard_validated
+                .try_reserve(sections.reduce_code.len())
+                .is_err()
+            {
+                return OUT_OF_MEMORY;
+            }
+            self.guard_validated.clear();
+            self.guard_validated.extend_from_slice(sections.reduce_code);
+        }
         match self
             .declarations
             .matches(sections.init_code, sections.header.num_slots, state)
@@ -4332,6 +4705,71 @@ impl Vm {
                         );
                         if result != ErrorCode::Ok {
                             return result as u32;
+                        }
+                    }
+                }
+
+                Opcode::BatchStructMapRemove => {
+                    let (slot, key_col) = (operand!(r.index()), operand!(r.index()));
+                    pc = r.pos();
+                    let keys = batch_col!(col_u32_exact(col_at(cols, key_col as usize), batch_len));
+                    for &key in keys {
+                        let result =
+                            single_struct_map_remove(&mut self.undo, delta_mode, state, slot, key);
+                        if result != ErrorCode::Ok {
+                            return result as u32;
+                        }
+                    }
+                }
+
+                Opcode::BatchStructMapGuardedUpsertLast => {
+                    let Some(operands) = decode_struct_map_guarded_upsert_operands(code, pc) else {
+                        return INVALID_PROGRAM;
+                    };
+                    pc = operands.end;
+                    let smap = match state_init::bind_struct_map(state, operands.row.slot) {
+                        Ok(map) => map,
+                        Err(error) => return error as u32,
+                    };
+                    if let Err(error) = validate_struct_map_operands(state, &smap, &operands.row) {
+                        return error as u32;
+                    }
+                    if operands.companion_slot == operands.row.slot {
+                        return INVALID_PROGRAM;
+                    }
+                    let companion =
+                        match state_init::bind_struct_map(state, operands.companion_slot) {
+                            Ok(map) => map,
+                            Err(error) => return error as u32,
+                        };
+                    if let Err(error) =
+                        validate_guard_companion(state, &companion, operands.guard_field_idx)
+                    {
+                        return error as u32;
+                    }
+                    let keys = batch_col!(col_u32_exact(
+                        col_at(cols, operands.row.key_col as usize),
+                        batch_len
+                    ));
+                    let guard_keys = batch_col!(col_u32_exact(
+                        col_at(cols, operands.guard_key_col as usize),
+                        batch_len
+                    ));
+                    for i in 0..batch_len {
+                        let result = single_struct_map_guarded_upsert_last(
+                            &mut self.undo,
+                            delta_mode,
+                            state,
+                            &operands,
+                            &smap,
+                            &companion,
+                            keys[i as usize],
+                            guard_keys[i as usize],
+                            cols,
+                            i,
+                        );
+                        if result != OK {
+                            return self.growth_of(operands.row.slot, result);
                         }
                     }
                 }
@@ -5215,6 +5653,64 @@ impl Vm {
                     );
                     if result != ErrorCode::Ok {
                         return result as u32;
+                    }
+                }
+
+                Opcode::BatchStructMapRemove => {
+                    let (slot, key_col) = (operand!(r.index()), operand!(r.index()));
+                    bpc = r.pos();
+                    let result = single_struct_map_remove(
+                        &mut self.undo,
+                        delta_mode,
+                        state,
+                        slot,
+                        cell_u32(cols, key_col, child_idx),
+                    );
+                    if result != ErrorCode::Ok {
+                        return result as u32;
+                    }
+                }
+                Opcode::BatchStructMapGuardedUpsertLast => {
+                    let operands = &mut self.element_struct_map_guarded;
+                    if operands.decode_from(&mut r).is_none() {
+                        return INVALID_PROGRAM;
+                    }
+                    bpc = operands.end;
+                    let smap = match state_init::bind_struct_map(state, operands.row.slot) {
+                        Ok(map) => map,
+                        Err(error) => return error as u32,
+                    };
+                    if let Err(error) = validate_struct_map_operands(state, &smap, &operands.row) {
+                        return error as u32;
+                    }
+                    if operands.companion_slot == operands.row.slot {
+                        return INVALID_PROGRAM;
+                    }
+                    let companion =
+                        match state_init::bind_struct_map(state, operands.companion_slot) {
+                            Ok(map) => map,
+                            Err(error) => return error as u32,
+                        };
+                    if let Err(error) =
+                        validate_guard_companion(state, &companion, operands.guard_field_idx)
+                    {
+                        return error as u32;
+                    }
+                    let result = single_struct_map_guarded_upsert_last(
+                        &mut self.undo,
+                        delta_mode,
+                        state,
+                        operands,
+                        &smap,
+                        &companion,
+                        cell_u32(cols, operands.row.key_col, child_idx),
+                        cell_u32(cols, operands.guard_key_col, child_idx),
+                        cols,
+                        child_idx,
+                    );
+                    if result != OK {
+                        let slot = operands.row.slot;
+                        return self.growth_of(slot, result);
                     }
                 }
 

@@ -296,6 +296,22 @@ fn effects(op: Opcode, o: &[u32], out: &mut impl FnMut(Effect)) -> Option<()> {
         // Init frames charged for absent rows and clear fields alike.
         Opcode::BatchStructMapCountsFold => out(Effect::Opaque { slot: at(0)? }),
         Opcode::StructMapSweep => out(Effect::Sweep { slot: at(0)? }),
+        // A remove only shrinks its slot; it reserves no capacity.
+        Opcode::BatchStructMapRemove => {}
+        Opcode::BatchStructMapGuardedUpsertLast => {
+            // slot, companion, key, guard_key, guard_field, num_vals,
+            // (col, field) × num_vals, num_arrays, ... The companion only
+            // shrinks; admission charges the destination like an upsert, an
+            // upper bound the guard can only lower.
+            let (slot, col) = (at(0)?, at(2)?);
+            let num_vals = usize::try_from(at(5)?).ok()?;
+            let num_arrays = at(6 + 2 * num_vals)?;
+            if num_arrays == 0 {
+                out(Effect::Key { slot, col });
+            } else {
+                out(Effect::Arena { slot, col });
+            }
+        }
         Opcode::BatchStructMap2UpsertLast
         | Opcode::BatchStructMap2UpsertMaxI64x2
         | Opcode::BatchStructMap2UpsertMinI64x2 => {

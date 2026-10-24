@@ -369,6 +369,26 @@ pub(crate) fn walk_operands<S: OperandSink>(
         Opcode::ListAppend => &[I, I],
         Opcode::StructMapSweep => &[I, I],
         Opcode::BatchStructMap2Remove => &[I, I, I],
+        Opcode::BatchStructMapRemove => &[I, I],
+        Opcode::BatchStructMapGuardedUpsertLast => {
+            // slot, companion_slot, key_col, guard_key_col, guard_field_idx,
+            // then the 0x80 value/array tail.
+            for _ in 0..4 {
+                index(r, sink)?;
+            }
+            byte(r, sink)?;
+            pairs(r, sink, MAX_STRUCT_SCALAR_OPERANDS)?;
+            let num_arrays = count(r, sink)?;
+            if num_arrays > MAX_STRUCT_ARRAY_OPERANDS {
+                return None;
+            }
+            for _ in 0..num_arrays {
+                index(r, sink)?;
+                index(r, sink)?;
+                byte(r, sink)?;
+            }
+            &[]
+        }
         Opcode::ListAppendStruct => {
             // slot, then the value pairs.
             index(r, sink)?;

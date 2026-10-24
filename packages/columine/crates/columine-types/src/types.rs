@@ -767,6 +767,31 @@ pub enum Opcode {
     BatchStructMap2UpsertMinI64x2 = 0x89,
     /// slot:index, predicate_col:index; top-level stored unary-map row sweep.
     StructMapSweep = 0x8a,
+    /// slot:index, key_col:index — remove the struct-map row of each key.
+    /// A sentinel key (EMPTY_KEY/TOMBSTONE) is a no-op, as is an absent key,
+    /// so the instruction composes unconditionally after a write to another
+    /// slot keyed by the same column.
+    BatchStructMapRemove = 0x8c,
+    /// Companion-guarded upsert: BatchStructMapUpsertLast into slot,
+    /// admitted per row only while the destination row is still absent and
+    /// the companion struct map holds the row's
+    /// key with its guard_field_idx cell (an interned STRING or UINT32
+    /// cell) equal to the row's guard_key_col cell. An admitted write
+    /// removes the companion row in the same instruction, so a write whose
+    /// key is not current — the row was deleted, rewritten (which removes
+    /// the companion row with BatchStructMapRemove) or re-registered under a
+    /// fresh key — writes nothing and never resurrects the row. A growth
+    /// retry is sound from either basis: replaying from the partially applied
+    /// image finds admitted rows already written and their companion rows
+    /// already removed, so it skips them.
+    /// The companion must differ from the destination. Program validation
+    /// also refuses a write or delete of the destination (other than this
+    /// instruction) that is not immediately followed by a companion remove
+    /// on the same key column, so no admitted program can strand a claim.
+    /// slot:index, companion_slot:index, key_col:index, guard_key_col:index,
+    /// guard_field_idx:u8, num_vals:u8, [val_col:index, field_idx:u8] ×
+    /// num_vals, num_arrays:u8, [(offsets_col, values_col, field_idx) × num_arrays]
+    BatchStructMapGuardedUpsertLast = 0x8d,
     /// slot:index, val_col:index (body opcode inside FOR_EACH/FLAT_MAP blocks)
     ListAppend = 0x84,
     /// slot:index, num_vals:u8, \[(val_col:index, field_idx:u8) × N\]
@@ -861,6 +886,8 @@ impl Opcode {
             0x89 => Self::BatchStructMap2UpsertMinI64x2,
             0x8a => Self::StructMapSweep,
             0x8b => Self::BatchStructMapUpsertFirstSinceReset,
+            0x8c => Self::BatchStructMapRemove,
+            0x8d => Self::BatchStructMapGuardedUpsertLast,
             0x90 => Self::NestedSetInsert,
             0x92 => Self::NestedMapUpsertLast,
             0x95 => Self::NestedAggUpdate,

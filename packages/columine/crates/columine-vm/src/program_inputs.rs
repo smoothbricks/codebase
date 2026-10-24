@@ -30,7 +30,9 @@ use columine_types::vo::{VoAdmission, VoFrameProof, VoProgramMetadata, VoRefusal
 use crate::column_uses::{ColumnOperand, reduce_column_roles};
 use crate::counts_fold::CountsFoldOp;
 use crate::program_admission::ProgramAdmissionError;
-use crate::vm::{body_op_len, decode_struct_map_upsert_operands};
+use crate::vm::{
+    body_op_len, decode_struct_map_guarded_upsert_operands, decode_struct_map_upsert_operands,
+};
 
 /// Container nesting a program may reach. Bounds compile recursion, and the
 /// runtime FLAT_MAP walk keeps one offset floor per level.
@@ -290,6 +292,15 @@ impl Builder<'_> {
                     // input; the others are ordinary arena fields.
                     for array in operands.array_fields() {
                         if let Some(link) = self.link(operands.slot, array.field_idx) {
+                            self.add(link, array.offsets_col, array.values_col, scope)?;
+                        }
+                    }
+                }
+                Opcode::BatchStructMapGuardedUpsertLast => {
+                    let operands = decode_struct_map_guarded_upsert_operands(code, pc + 1)
+                        .ok_or(invalid.clone())?;
+                    for array in operands.row.array_fields() {
+                        if let Some(link) = self.link(operands.row.slot, array.field_idx) {
                             self.add(link, array.offsets_col, array.values_col, scope)?;
                         }
                     }
