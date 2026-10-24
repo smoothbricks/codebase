@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { chmod, cp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { chmod, cp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { edit, HEALTHY, repository, withManagedRepository } from './__tests__/helpers/shell-entry.js';
 
@@ -65,10 +65,15 @@ describe('what shell entry syncs for a uv project', () => {
       );
       expect(readFileSync(join(cloneSite, '_virtualenv.pth'), 'utf8')).toBe('import _virtualenv\n');
 
-      // A stamped environment under a valid config whose launcher still names the environment absolutely, beside an
-      // absolute .pth line. The stamp cannot witness either, so the entry removes the environment and creates it
-      // again, relocatable, before the sync, instead of syncing over the escape and stamping it.
+      // A stamped environment under a valid config whose launcher, interpreter link and .pth line still name this
+      // environment or an old checkout absolutely. The stamp cannot witness any of them, so the entry removes the
+      // environment and creates it again, relocatable, before the sync, instead of syncing over the escape and
+      // stamping it.
       const site = join(venv, 'lib', 'python3.14', 'site-packages');
+      const profile = join(dirname(root), 'old-checkout', '.devenv', 'profile', 'bin', 'python');
+      await mkdir(dirname(profile), { recursive: true });
+      await writeFile(profile, '');
+      await symlink(profile, join(venv, 'bin', 'python'));
       await writeFile(join(venv, 'bin', 'pytest'), `#!${join(venv, 'bin', 'python')}\n`);
       await writeFile(join(site, 'tool.pth'), `${join(root, 'python/tool/src')}\n`);
       expect(await enter(uv)).toEqual(HEALTHY);
@@ -76,6 +81,7 @@ describe('what shell entry syncs for a uv project', () => {
       expect(uvRuns()).toEqual(replaced);
       expect(readFileSync(join(venv, 'pyvenv.cfg'), 'utf8')).toContain('relocatable = true');
       expect(existsSync(join(venv, 'bin', 'pytest'))).toBe(false);
+      expect(lstatSync(join(venv, 'bin', 'python'), { throwIfNoEntry: false })).toBeUndefined();
       expect(resolve(site, readFileSync(join(site, 'tool.pth'), 'utf8').trim())).toBe(join(root, 'python/tool/src'));
       expect(await enter(uv)).toEqual(HEALTHY);
       expect(uvRuns()).toEqual(replaced);
