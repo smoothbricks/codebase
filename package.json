@@ -204,14 +204,6 @@
             "target": "cargo-test-archive"
           }
         ]
-      },
-      "cargo-test-compile": {
-        "inputs": [
-          "rustWorkspace",
-          {
-            "env": "LMAO_GIT_REVISION"
-          }
-        ]
       }
     },
     "name": "@smoothbricks/codebase"

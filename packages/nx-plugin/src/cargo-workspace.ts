@@ -624,9 +624,6 @@ function readTestShards(cratePackage: Record<string, unknown>, crateTomlPath: st
  */
 export const CARGO_TEST_TARGET = 'cargo-test';
 
-/** Prerequisite that compiles the workspace; not a per-crate runner. */
-export const CARGO_TEST_COMPILE_TARGET = 'cargo-test-compile';
-
 /**
  * The one workspace-wide `cargo nextest archive` every per-crate runner
  * executes from. Named here beside the other cargo target names so the policy
@@ -774,7 +771,6 @@ export function cargoTestGroupTargetName(group: string): string {
 export function packageNameFromCargoTestTarget(targetName: string): string | null {
   if (
     !targetName.startsWith('cargo-test-') ||
-    targetName === CARGO_TEST_COMPILE_TARGET ||
     targetName === CARGO_TEST_ARCHIVE_TARGET ||
     targetName.startsWith(CARGO_TEST_GROUP_PREFIX)
   ) {

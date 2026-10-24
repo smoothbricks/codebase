@@ -173,17 +173,19 @@ export const CARGO_DENY_WARNINGS = `--config 'build.warnings="deny"'`;
 export const CARGO_CROSS_LINT_COMMAND = `${CARGO_CROSS_LINT_GUARD}; ${CARGO_ZIGBUILD_CLIPPY_FROZEN_PREFIX}--workspace --all-targets --target ${CARGO_LINUX_TRIPLE} --target-dir target/cargo-lint-cross ${CARGO_DENY_WARNINGS}`;
 
 /**
- * No `--target-dir`: clippy writes the workspace's own `target/`, beside every
- * dev build. Check units carry their mode in the unit hash, so they never
- * collide with build units, and the host units a dev build already compiled —
- * build scripts and their host-only dependencies — are reused rather than
- * compiled a second time in a directory of their own. A dependency that both
- * a proc-macro and ordinary code use stays a distinct unit: a dev build
- * compiles it once at the target profile, while a check build needs a separate
- * host copy. Distinct hashes coexist, so neither command dirties the other.
- * A plain `cargo clippy --workspace --all-targets` checks exactly these units.
+ * `target/cargo-lint`: clippy writes a directory of its own, as the cross lint
+ * does. Cargo flocks one build directory per invocation, and a workspace-wide
+ * check is the longest Cargo invocation in a gate: sharing the dev build's
+ * `target/`, it held that lock about 257 s while the test archive (0 crates to
+ * compile) waited about 236 s and the Wasm build about 264 s. The price is that
+ * clippy compiles its own host units (build scripts, proc-macros) once per
+ * directory, and cargo retention does not reclaim nested target directories.
+ * A plain `cargo clippy --workspace --all-targets` checks exactly these units,
+ * in `target/`.
  */
-export const CARGO_LINT_CLIPPY_COMMAND = cargoFrozen(`clippy --workspace --all-targets ${CARGO_DENY_WARNINGS}`);
+export const CARGO_LINT_CLIPPY_COMMAND = cargoFrozen(
+  `clippy --workspace --all-targets --target-dir target/cargo-lint ${CARGO_DENY_WARNINGS}`,
+);
 
 /** Root `package.json` script name, in the repo's `verb:qualifier` style. */
 export const CROSS_CHECK_SCRIPT_NAME = 'check:linux';

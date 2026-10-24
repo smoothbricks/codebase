@@ -592,9 +592,9 @@ of gate for a one-line change).
 
 Cargo's own reuse is not where the time goes: a TypeScript-only land compiled no Rust unit, and a cowshed-core change
 compiled exactly the seven cowshed crates downstream of it. The targets that state `"cache": false` are `cargo-fetch`
-and `cargo-test-compile` (the shared Cargo directories are no Nx output; nx-plugin README, "Cargo cache boundaries"),
-`shard-timings`, `tooling:lint-disk-commands`, the ttsc and capability-probe warmups (their caches live outside Nx
-outputs) and the packaging checks; they are what a re-gate re-runs.
+(the registry lives outside Nx outputs; nx-plugin README, "Cargo cache boundaries"), `shard-timings`,
+`tooling:lint-disk-commands`, the ttsc and capability-probe warmups (their caches live outside Nx outputs) and the
+packaging checks; they are what a re-gate re-runs.
 
 ## Convention table
 

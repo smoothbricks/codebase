@@ -198,15 +198,9 @@ describe('bounded test target policy', () => {
     const project = resolvedAggregateProject();
     const resolvedProject: ResolvedProjectTargets = {
       ...project,
-      targets: new Set([
-        ...project.targets,
-        'typecheck-tests',
-        'cargo-test-compile',
-        'cargo-test-archive',
-        'test-shards',
-      ]),
+      targets: new Set([...project.targets, 'typecheck-tests', 'cargo-test-archive', 'test-shards']),
       targetDependencies: new Map([
-        ['test', ['^build', 'build', 'typecheck-tests', 'cargo-test-compile', 'cargo-test-archive', 'test-shards']],
+        ['test', ['^build', 'build', 'typecheck-tests', 'cargo-test-archive', 'test-shards']],
         ['test-shards', dependencies],
       ]),
     };
@@ -747,20 +741,20 @@ describe('cargo-test reachability policy', () => {
       // this. Hoisted so the runner fixture below extends a total map instead
       // of spreading an optional one.
       const compileOnlyOptions = new Map<string, Record<string, unknown>>([
-        ['cargo-test-compile', { command: 'cargo --frozen test --workspace --no-run' }],
+        ['cargo-build-tests', { command: 'cargo --frozen test --workspace --no-run' }],
         ['cargo-wasm', { command: 'just wasm' }],
       ]);
       const compileOnly: ResolvedProjectTargets = {
         root: 'packages/rusty',
-        targets: new Set(['test', 'cargo-test', 'cargo-test-compile', 'cargo-wasm']),
+        targets: new Set(['test', 'cargo-test', 'cargo-build-tests', 'cargo-wasm']),
         targetDependencies: new Map([
           ['test', ['cargo-test']],
-          ['cargo-test', ['cargo-test-compile', 'cargo-wasm']],
+          ['cargo-test', ['cargo-build-tests', 'cargo-wasm']],
         ]),
         targetExecutors: new Map([
           ['test', 'nx:noop'],
           ['cargo-test', 'nx:noop'],
-          ['cargo-test-compile', 'nx:run-commands'],
+          ['cargo-build-tests', 'nx:run-commands'],
           ['cargo-wasm', 'nx:run-commands'],
         ]),
         targetOptions: compileOnlyOptions,
@@ -778,7 +772,7 @@ describe('cargo-test reachability policy', () => {
         targetDependencies: new Map([
           ['test', ['cargo-test']],
           ['cargo-test', ['cargo-test-rusty-core']],
-          ['cargo-test-rusty-core', ['cargo-test-compile']],
+          ['cargo-test-rusty-core', ['cargo-build-tests']],
         ]),
         targetOptions: new Map([
           ...compileOnlyOptions,
@@ -902,22 +896,28 @@ describe('cargo-test reachability policy', () => {
       await writeFile(join(root, 'packages/rusty/crates/cli/Cargo.toml'), '[package]\nname = "rusty-cli"\n');
 
       const runnerOptions = new Map<string, Record<string, unknown>>([
-        ['cargo-test-compile', { command: 'cargo --frozen test --workspace --no-run' }],
+        [
+          'cargo-test-archive',
+          {
+            command:
+              'mkdir -p .cache/nextest && cargo --frozen nextest archive --workspace --archive-file .cache/nextest/archive.tar.zst',
+          },
+        ],
         ['cargo-test-rusty-core', { command: 'cargo --frozen nextest run --package rusty-core' }],
         ['cargo-test-rusty-cli', { command: 'cargo --frozen nextest run --package rusty-cli' }],
       ]);
       const missingChild: ResolvedProjectTargets = {
         root: 'packages/rusty',
-        targets: new Set(['test', 'cargo-test', 'cargo-test-compile', 'cargo-test-rusty-core']),
+        targets: new Set(['test', 'cargo-test', 'cargo-test-archive', 'cargo-test-rusty-core']),
         targetDependencies: new Map([
           ['test', ['cargo-test']],
           ['cargo-test', ['cargo-test-rusty-core']],
-          ['cargo-test-rusty-core', ['cargo-test-compile']],
+          ['cargo-test-rusty-core', ['cargo-test-archive']],
         ]),
         targetExecutors: new Map([
           ['test', 'nx:noop'],
           ['cargo-test', 'nx:noop'],
-          ['cargo-test-compile', 'nx:run-commands'],
+          ['cargo-test-archive', 'nx:run-commands'],
           ['cargo-test-rusty-core', BOUNDED_TEST_EXECUTOR],
         ]),
         targetOptions: runnerOptions,
@@ -934,7 +934,7 @@ describe('cargo-test reachability policy', () => {
         targetDependencies: new Map([
           ['test', ['cargo-test']],
           ['cargo-test', ['cargo-test-rusty-core', 'cargo-test-rusty-cli']],
-          ['cargo-test-rusty-core', ['cargo-test-compile']],
+          ['cargo-test-rusty-core', ['cargo-test-archive']],
           ['cargo-test-rusty-cli', ['cargo-test-rusty-core']],
         ]),
         targetExecutors: new Map([
@@ -976,25 +976,31 @@ describe('cargo-test reachability policy', () => {
         targets: new Set([
           'test',
           'cargo-test',
-          'cargo-test-compile',
+          'cargo-test-archive',
           'cargo-test-rusty-core-shard1',
           'cargo-test-rusty-core-shard2',
         ]),
         targetDependencies: new Map([
           ['test', ['cargo-test']],
           ['cargo-test', ['cargo-test-rusty-core-shard1', 'cargo-test-rusty-core-shard2']],
-          ['cargo-test-rusty-core-shard1', ['cargo-test-compile']],
+          ['cargo-test-rusty-core-shard1', ['cargo-test-archive']],
           ['cargo-test-rusty-core-shard2', ['cargo-test-rusty-core-shard1']],
         ]),
         targetExecutors: new Map([
           ['test', 'nx:noop'],
           ['cargo-test', 'nx:noop'],
-          ['cargo-test-compile', 'nx:run-commands'],
+          ['cargo-test-archive', 'nx:run-commands'],
           ['cargo-test-rusty-core-shard1', BOUNDED_TEST_EXECUTOR],
           ['cargo-test-rusty-core-shard2', BOUNDED_TEST_EXECUTOR],
         ]),
         targetOptions: new Map<string, Record<string, unknown>>([
-          ['cargo-test-compile', { command: 'cargo --frozen test --workspace --no-run' }],
+          [
+            'cargo-test-archive',
+            {
+              command:
+                'mkdir -p .cache/nextest && cargo --frozen nextest archive --workspace --archive-file .cache/nextest/archive.tar.zst',
+            },
+          ],
           [
             'cargo-test-rusty-core-shard1',
             { command: "cargo --frozen nextest run --workspace -E 'package(rusty-core)' --partition hash:1/2" },

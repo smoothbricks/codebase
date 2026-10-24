@@ -51,7 +51,7 @@ Land order for `cowshed-core` is `cs-coreapi` first — its type changes are wha
    s by the global `slow-timeout = { period = "30s", terminate-after = 1 }` in `packages/nx-plugin/nextest.toml`, while
    its 82 sibling tests each finish under 0.11 s. The bound must come from a measurement taken on an OTHERWISE IDLE
    machine; any number taken while a fleet is compiling is CPU-starved and must not be encoded. See handbook §19.9 for
-   why this test cannot be hoisted into `cargo-test-compile`.
+   why this test cannot be hoisted into `cargo-test-archive`.
 5. **Darwin linker/SDK selection is per-cargo-workspace, and only `packages/cowshed` makes it.** cowshed's own layer
    manages `DEVELOPER_DIR` and nothing else: `developer_directory()` in
    `packages/cowshed/crates/cowshed-core/src/runtime/supervisor.rs` exports it into every sandboxed child, accepting a

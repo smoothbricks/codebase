@@ -167,37 +167,40 @@ last 60 lines before fixture retirement removes them. The record-change and rest
 
 The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
 
-- **Workspace owner:** the project beside a workspace `Cargo.toml` owns one `cargo-fetch`, `cargo-test-compile`,
-  `cargo-test-archive`, `cargo-lint`, cross-check, mutation, bench, and `cargo-retention` target. Its `cargo-lint` and
-  `cargo-test` aggregates reach all workspace crates, including a root `[package]`; `cargo-test` is the ordinary suite,
-  and the project's `test` also reaches the serial test groups (below).
+- **Workspace owner:** the project beside a workspace `Cargo.toml` owns one `cargo-fetch`, `cargo-test-archive`,
+  `cargo-lint`, cross-check, mutation, bench, and `cargo-retention` target. Its `cargo-lint` and `cargo-test` aggregates
+  reach all workspace crates, including a root `[package]`; `cargo-test` is the ordinary suite, and the project's `test`
+  also reaches the serial test groups (below).
 - **Crate owner:** the deepest Nx project directory containing a crate owns `cargo-test-<crate>` targets. Its
   `cargo-lint` delegates to the workspace owner's one verdict, and `lint` never depends on the workspace test suite.
   Projects can own multiple crates. A nested independent workspace has its own prerequisites and does not inherit those
   of an outer workspace.
 - **Commands:** validation runs from the governing Cargo workspace directory. One `cargo fmt --all --check` and one
-  `cargo --frozen clippy --workspace --all-targets --config 'build.warnings="deny"'` cover every member. Clippy of a
-  crate is a check build of its whole closure, so a target directory per crate rebuilt every shared dependency once per
-  crate — 49 closures and 11 GiB on one repository — and no per-crate cache hit repaid it. Clippy writes the workspace's
-  own `target/`, like every dev build: its check units carry their mode in the unit hash and never collide with build
-  units, and the host units a dev build compiled (build scripts and their host-only dependencies) are reused instead of
-  compiled a second time. Warnings are denied by Cargo's `build.warnings`, not `-- -D warnings`: arguments after `--`
-  are clippy-driver's `CLIPPY_ARGS`, which enter every member's fingerprint, so the gate and a plain
-  `cargo clippy --workspace --all-targets` would re-check each other's units. `build.warnings` also fails on warnings
-  replayed from Fresh units, so the two share one unit set and the gate still fails. Cargo's own lock serializes the
-  invocations that share the directory. `cargo-lint-cross` keeps `target/cargo-lint-cross`: a foreign triple's units are
-  distinct anyway, and its own lock keeps the cross check from queueing behind host builds.
+  `cargo --frozen clippy --workspace --all-targets --target-dir target/cargo-lint --config 'build.warnings="deny"'`
+  cover every member. Clippy of a crate is a check build of its whole closure, so a target directory per crate rebuilt
+  every shared dependency once per crate — 49 closures and 11 GiB on one repository — and no per-crate cache hit repaid
+  it. Clippy writes its own `target/cargo-lint`, so the archive, the Wasm and N-API builds and every other dev build no
+  longer queue behind a workspace-wide check on its lock. Measured in a land gate, clippy held `target/debug`'s build
+  lock for about 257 s while `cargo-test-archive` waited about 236 s with 0 crates to compile and `columine:cargo-wasm`
+  about 264 s. The price is that clippy compiles its own host units (build scripts, proc-macros) once per directory.
+  `cargo-lint-cross` keeps `target/cargo-lint-cross` for the same lock reason: a foreign triple's units are distinct
+  anyway, and its own lock keeps the cross check from queueing behind host builds. Warnings are denied by Cargo's
+  `build.warnings`, not `-- -D warnings`: arguments after `--` are clippy-driver's `CLIPPY_ARGS`, which enter every
+  member's fingerprint, so a `-- -D warnings` gate would fingerprint every member differently from a plain
+  `cargo clippy --workspace --all-targets`. `build.warnings` also fails on warnings replayed from Fresh units, so the
+  gate still fails when a warning replays instead of recompiling. Cargo's own lock serializes the invocations that share
+  a directory.
 - **Retention:** Cargo never deletes a unit generation a later build superseded, so a busy checkout's target directory
   only grows. After each Nx run that executed a Cargo producer (an inferred target that builds, checks or tests into the
-  target directory, marked by its `cargoProducer` metadata: `cargo-test-compile`, `cargo-test-archive`, `cargo-test`,
-  `cargo-lint`, `cargo-lint-cross`, mutation, bench, and the napi and wasm builds), the plugin's `postTasksExecution`
-  checks whether each Cargo workspace is due for maintenance. Automatic passes run at most once per 24 hours after a
-  successful completed pass; its existing receipt records completion time and configuration/workspace/target identity. A
-  not-due hook reports that scheduling decision without locks, a fingerprint scan, cleanup or receipt replacement. It
-  does not claim newer outputs were inspected or the graph is unchanged. Busy, refused, invalid, foreign or
-  backward-clock receipt evidence never postpones the next attempt. The first executed producer after the interval runs
-  a current pass; cache replays, fetch and noop tasks start none. Manual preview and apply always run fresh. Due passes
-  reclaim superseded generations under `<profile>/build/<package>/<META>/`. They keep the newest generation of each unit
+  target directory, marked by its `cargoProducer` metadata: `cargo-test-archive`, `cargo-test`, `cargo-lint`,
+  `cargo-lint-cross`, mutation, bench, and the napi and wasm builds), the plugin's `postTasksExecution` checks whether
+  each Cargo workspace is due for maintenance. Automatic passes run at most once per 24 hours after a successful
+  completed pass; its existing receipt records completion time and configuration/workspace/target identity. A not-due
+  hook reports that scheduling decision without locks, a fingerprint scan, cleanup or receipt replacement. It does not
+  claim newer outputs were inspected or the graph is unchanged. Busy, refused, invalid, foreign or backward-clock
+  receipt evidence never postpones the next attempt. The first executed producer after the interval runs a current pass;
+  cache replays, fetch and noop tasks start none. Manual preview and apply always run fresh. Due passes reclaim
+  superseded generations under `<profile>/build/<package>/<META>/`. They keep the newest generation of each unit
   identity of a workspace member (identity is every fingerprint field but its edges and source state, integers read
   exactly), every unit used in the last 24 hours (`-Zmtime-on-use` stamps each use), and the transitive dependency
   closure of those across every profile, host and cross alike. A pass holds every profile's Cargo locks without waiting:
@@ -211,11 +214,12 @@ The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
   scan reuses directory-entry types and reads its small metadata files synchronously, avoiding duplicate stats and one
   asynchronous dispatch per tiny file; it does not walk retained artifact contents or reuse an earlier graph that could
   miss in-place recompiles. `cargo-retention` previews the same selection without changing anything. `incremental/`,
-  nested target directories (`cargo-lint-cross`) and the split-debuginfo objects rustc keeps inside current generations
-  (rust-lang/rust#161824) are not reclaimed, so the target directory is not bounded. Empty fingerprint hashes are kept
-  as unfinished compilations. The preservation proof covers Cargo's current unit and dependency records, not every debug
-  reference in copied binaries or other checkouts. In particular, a binary copied up before a failed link can outlive
-  the generation its debug map names; this pass does not establish that machine-wide debug closure.
+  nested target directories (`cargo-lint`, `cargo-lint-cross`) and the split-debuginfo objects rustc keeps inside
+  current generations (rust-lang/rust#161824) are not reclaimed, so the target directory is not bounded. Empty
+  fingerprint hashes are kept as unfinished compilations. The preservation proof covers Cargo's current unit and
+  dependency records, not every debug reference in copied binaries or other checkouts. In particular, a binary copied up
+  before a failed link can outlive the generation its debug map names; this pass does not establish that machine-wide
+  debug closure.
 - **Scheduling:** inference never throttles Nx. It sets no `parallelism: false` or `parallel: false`, no cap, and no
   edge whose only purpose is keeping two cargo writers off one `target/`: Cargo owns that lock, and a second process
   waits inside cargo. An edge states a real consumer — fetch before frozen cargo, the archive before the runners,
@@ -233,9 +237,10 @@ patterns and member patterns that match no directory fail graph construction ins
 
 ### Cargo profiles
 
-The default configuration of every cargo target compiles cargo's `dev` profile: every local build and test, gates, CI
-validation and `nx build` share one `target/` and one set of units, so cargo recompiles only what changed. The
-`production` configuration adds `--release` to the targets that build shipped artifacts (`cargo-napi`,
+The default configuration of every cargo target compiles cargo's `dev` profile: every local build and test, CI
+validation and `nx build` share one `target/` and one set of units, so cargo recompiles only what changed. The clippy
+gate and the cross check keep their own `target/cargo-lint` and `target/cargo-lint-cross` (see Cargo Workspace Layouts).
+The `production` configuration adds `--release` to the targets that build shipped artifacts (`cargo-napi`,
 `napi-<arch>-<os>`, `cargo-wasm`) and is selected only where an artifact ships: the generated publish workflow's build
 and platform-leg steps, the `smoo release` commands it runs, and the build and deploy runs of a production
 `smoo github-ci nx-deploy`. Test targets have no `production` configuration, so a release build never compiles release
@@ -253,10 +258,11 @@ workspace's cached nextest archive hashes that variable too, because it contains
 
 ### Cargo cache boundaries
 
-`cargo-fetch` is uncached because the registry lives outside Nx outputs. `cargo-test-compile` is also uncached: it warms
-Cargo's shared mutable build directory before the bounded runner, even if that directory was deleted after an earlier
-successful run. Cargo's own incremental cache avoids recompiling unchanged code. Nx never restores or collects shared
-Cargo build directories; lint and test **results**, and dedicated Wasm/N-API **outputs**, remain cacheable.
+`cargo-fetch` is uncached because the registry lives outside Nx outputs. `cargo-test-archive` is the one cached cargo
+build, and it is the step that compiles the test binaries ahead of the bounded runners; there is no separate uncached
+`cargo test --no-run` warm-up, since it compiled the same units the archive does. Cargo's own incremental cache avoids
+recompiling unchanged code. Nx never restores or collects shared Cargo build directories; lint and test **results**, and
+dedicated Wasm/N-API **outputs**, remain cacheable.
 
 Validation inputs include the crate's files, every file its sources compile in through a literal `include_str!` or
 `include_bytes!` path outside the crate's directory (a shipped skill or a shared corpus beside the crates), local
@@ -835,8 +841,9 @@ Concrete targets come from concrete files:
 - `typecheck-tests:watch` is inferred from `tsconfig.test.json` and runs the same typecheck in watch mode.
 - `test-watch` is inferred when the package already defines an explicit Bun or Vitest `test` command. The plugin derives
   the corresponding watch command and makes it depend on `typecheck-tests`.
-- A workspace-root `Cargo.toml` provides `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`.
-  `cargo-test-compile` warms one workspace `cargo test --no-run`. `cargo-test-archive` runs one
+- A workspace-root `Cargo.toml` provides `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`. A project's
+  `build` depends on its cargo workspace's `cargo-test-archive` (for a nested package, the workspace root project's), so
+  `nx build` leaves the test binaries compiled. `cargo-test-archive` runs one
   `cargo --frozen nextest archive --workspace` into `.cache/nextest/archive.tar.zst` and is the only cached cargo BUILD:
   it produces a file outside the build-volume links rather than a mutable build tree. Nx cache restoration must never
   replace Cargo's `target` link. Its inputs, like every cargo-derived fileset, are anchored at `{workspaceRoot}`: Nx

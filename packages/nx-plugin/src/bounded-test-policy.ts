@@ -3,7 +3,6 @@ import { dirname, join } from 'node:path';
 import { expandWildcardTargetConfiguration } from 'nx/src/tasks-runner/utils.js';
 import {
   CARGO_TEST_ARCHIVE_TARGET,
-  CARGO_TEST_COMPILE_TARGET,
   CARGO_TEST_TARGET,
   listCargoWorkspacePackages,
   packageNameFromCargoTestTarget,
@@ -162,7 +161,7 @@ export function checkWorkspaceBoundedTestTargetPolicy(
  *    package-local `nx.targets['cargo-test'].dependsOn` that omits the inferred
  *    runner leg leaves a target that still "reaches" its dependencies while no
  *    test binary is ever run. Reachability alone cannot see this, because
- *    `cargo-test-compile` is `--no-run`. (Inference itself no longer skips a
+ *    `cargo-test-archive` only compiles. (Inference itself no longer skips a
  *    declared cargo key, so the executor and options survive the declaration —
  *    see `index.ts`.)
  *
@@ -220,12 +219,11 @@ export function checkWorkspaceCargoTestReachabilityPolicy(
 
 /**
  * True when `target`, or something in its dependency closure, invokes cargo in a
- * mode that executes tests. The two workspace-wide preparation targets are
- * deliberately excluded: `cargo-test-compile` is `cargo test --no-run` and
- * `cargo-test-archive` is `cargo nextest archive`. Both prove the binaries
- * build and nothing about them running, and both say "test"/"nextest" in their
- * command — a closure holding only these is the silent green this check exists
- * to catch.
+ * mode that executes tests. Compile-only steps are deliberately excluded:
+ * `cargo-test-archive` is `cargo nextest archive` and a `--no-run` build is
+ * `cargo test --no-run`. Both prove the binaries build and nothing about them
+ * running, and both say "test"/"nextest" in their command — a closure holding
+ * only these is the silent green this check exists to catch.
  */
 function resolvedTargetRunsTests(project: ResolvedProjectTargets, target: string): boolean {
   const targetNames = [...project.targets];
@@ -253,7 +251,7 @@ function resolvedTargetRunsTests(project: ResolvedProjectTargets, target: string
 }
 
 /**
- * Per-crate nextest targets that `cargo-test` actually reaches. `cargo-test-compile`
+ * Per-crate nextest targets that `cargo-test` actually reaches. `cargo-test-archive`
  * is excluded: it is not a runner. Members come from the same Cargo.toml walk
  * inference uses; the child list is the graph, not a hand-written crate list.
  */
@@ -453,11 +451,7 @@ function bunTestHasNoDeadline(command: string): boolean {
 }
 
 function isTestLegTargetName(name: string): boolean {
-  return (
-    name !== CARGO_TEST_COMPILE_TARGET &&
-    name !== CARGO_TEST_ARCHIVE_TARGET &&
-    (isTestRunnerTargetName(name) || name.endsWith('-test'))
-  );
+  return name !== CARGO_TEST_ARCHIVE_TARGET && (isTestRunnerTargetName(name) || name.endsWith('-test'));
 }
 
 function resolvedAggregateTestIsBounded(project: ResolvedProjectTargets | undefined): boolean {

@@ -90,10 +90,10 @@ No mounts, no root, no network — pure functions with table-driven cases:
   routing, and served-handle decoding tests consume that same corpus. Process-tree and process-event reply goldens cover
   omitted observations, observed exits, sparse changes, and coverage gaps through core serialization and the generated
   public validators. `cowshed:wire-fixtures` regenerates those goldens before the workspace's `cargo-test-archive`
-  compiles them with `include_str!`; the archive hashes the produced JSON. Its later `cargo-test-compile` join cannot
-  establish that predecessor. Generated JSON is never edited by hand. The target renders and formats the corpus in a
-  git-ignored staging directory and publishes it with one rename, so a reader running beside it (`cowshed:lint`) sees
-  the old corpus or the new one, never a truncated or unformatted file; `cowshed:wire-fixtures-test` witnesses that.
+  compiles them with `include_str!`; the archive hashes the produced JSON. Generated JSON is never edited by hand. The
+  target renders and formats the corpus in a git-ignored staging directory and publishes it with one rename, so a reader
+  running beside it (`cowshed:lint`) sees the old corpus or the new one, never a truncated or unformatted file;
+  `cowshed:wire-fixtures-test` witnesses that.
 - **Public declaration IR:** `cowshed:declaration-model-test` admits the actual owner model through its generated Typia
   Equals guards in one setup, pins `get`/`as-str`/`display` projection metadata, and refuses missing, unknown and extra
   metadata through both assertion and JSON parsing. It consumes the prebuilt owner generator, without an N-API wire

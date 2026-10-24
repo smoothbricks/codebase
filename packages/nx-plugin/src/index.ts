@@ -41,7 +41,6 @@ import {
   attributeCargoWorkspacePackages,
   CARGO_TEST_ARCHIVE_FILE,
   CARGO_TEST_ARCHIVE_TARGET,
-  CARGO_TEST_COMPILE_TARGET,
   CARGO_TEST_EXCEPTIONS_SUFFIX,
   CARGO_TEST_TARGET,
   type CargoCrossTestTarget,
@@ -99,8 +98,6 @@ import {
   RELEASE_CONFIGURATION,
 } from './workspace-config-policy.js';
 import { globIndexedFiles } from './workspace-index.js';
-
-export { CARGO_TEST_COMPILE_TARGET };
 
 /** Makes a version live and proves it answers; never cached. */
 export const DEPLOY_TARGET = 'deploy';
@@ -721,47 +718,6 @@ function createCargoWasmTarget(
 }
 
 /**
- * Compilation is excluded from the bounded test window: a cold Cargo
- * workspace can take many minutes to compile while still making progress,
- * which is not a property of the tests. `cargo test --no-run` pays that cost
- * in its own unbounded target. Cargo reuses incremental compilation locally;
- * Nx cannot cache this warming action without restoring shared mutable state.
- *
- * Cargo flocks one `target/` per invocation and owns that lock: a second cargo
- * process on the same directory waits inside cargo ("Blocking waiting for file
- * lock"). Inference adds no edge to keep writers apart — an edge says one
- * target consumes another's output, and none of these do. These are unbounded
- * `nx:run-commands` targets, so a wait is not charged against a test budget.
- *
- * Clippy runs ONCE over the whole workspace, in that same `target/`, rather
- * than once per crate. Clippy of a crate is a check build of its whole
- * closure, so 49 crates meant 49 closure rebuilds and 11 GiB of target
- * directories on one repository, and no per-crate cache hit ever repaid that.
- * Sharing the build's directory costs nothing: cargo's own lock serializes
- * the invocations that use it, and the host units a dev build compiled are
- * reused instead of compiled again.
- *
- * Tests compile the dev profile only, so no test target carries a
- * RELEASE_CONFIGURATION: Nx forwards a run's configuration down every
- * `dependsOn` edge to each target that has it, and a release `build` must
- * warm the dev test binaries the test run will use, not release ones nobody
- * runs.
- */
-function createCargoTestCompileTarget(projectRoot: string): TargetConfiguration {
-  return {
-    executor: 'nx:run-commands',
-    metadata: CARGO_PRODUCER_METADATA,
-    cache: false,
-    inputs: CARGO_INPUTS,
-    outputs: [],
-    options: {
-      command: cargoFrozen('test --workspace --no-run'),
-      cwd: projectRoot,
-    },
-  };
-}
-
-/**
  * The workspace's test binaries, compiled once and packed into one file the
  * per-crate runners execute from.
  *
@@ -773,9 +729,22 @@ function createCargoTestCompileTarget(projectRoot: string): TargetConfiguration 
  * entirely — the runners execute one extraction of it and never write cargo's
  * `target/` build tree — which is what lets the runners fan out.
  *
- * Cached, unlike `cargo-test-compile`, because it produces a VALUE: one file,
- * not a mutable build tree Nx would have to restore. `--workspace` matches the
- * clippy selection exactly, so both gates unify features the same way.
+ * It is also the step that keeps compilation out of the bounded test window: a
+ * cold workspace can take many minutes to compile while still making progress,
+ * which is not a property of the tests, and the runners start after it. A
+ * project's `build` depends on it, so `nx build` leaves the test binaries
+ * compiled. There is no separate uncached `cargo test --no-run` warm-up: it
+ * compiled the same dev units a second time, queued on the same `target/` lock.
+ *
+ * Cached because it produces a VALUE: one file, not a mutable build tree Nx
+ * would have to restore. `--workspace` matches the clippy selection exactly, so
+ * both gates unify features the same way.
+ *
+ * Tests compile the dev profile only, so no test target carries a
+ * RELEASE_CONFIGURATION: Nx forwards a run's configuration down every
+ * `dependsOn` edge to each target that has it, and a release `build` must
+ * reach the dev test binaries the test run will use, not release ones nobody
+ * runs.
  *
  * The directory and the archive are ONE command: nextest does not create the
  * archive's parent, so the archive step consumes what the `mkdir` produced.
@@ -904,7 +873,7 @@ function createCargoTestTarget(projectRoot: string): TargetConfiguration {
     metadata: CARGO_PRODUCER_METADATA,
     cache: true,
     inputs: CARGO_INPUTS,
-    dependsOn: [CARGO_TEST_COMPILE_TARGET],
+    dependsOn: [CARGO_TEST_ARCHIVE_TARGET],
     options: {
       command: cargoFrozen('test --workspace'),
       cwd: projectRoot,
@@ -1420,7 +1389,7 @@ async function createProjectTargets(
   // `dependsOn` REPLACES rather than unions. These lists state what each target
   // consumes — the fetched registry, the archive, the debug addon — and a
   // package that must re-route one (build its artifact ahead of the test run,
-  // or drop `cargo-test-compile` because it compiles differently) can only say
+  // or drop `cargo-test-archive` because it compiles differently) can only say
   // so by replacing the list; a union would make every inferred edge
   // unremovable and a corrected order unrepresentable.
   // Additive intent already has a spelling (`"..."` above), so a plugin-local
@@ -1435,7 +1404,6 @@ async function createProjectTargets(
   const ownsCargoWorkspaceTargets = isCargoWorkspaceRoot;
   if (ownsCargoWorkspaceTargets && cargoWorkspace) {
     const cargoWorkspaceRoot = cargoWorkspace.projectRoot;
-    targets[CARGO_TEST_COMPILE_TARGET] = createCargoTestCompileTarget(cargoWorkspaceRoot);
     const workspaceInputs = [
       ...new Set(
         (
@@ -1464,7 +1432,6 @@ async function createProjectTargets(
       ...(workspaceInputs.length > 0 ? workspaceInputs : CARGO_INPUTS),
       { dependentTasksOutputFiles: '**/*', transitive: false },
     ];
-    targets[CARGO_TEST_COMPILE_TARGET].inputs = workspaceCargoInputs;
     targets[CARGO_TEST_ARCHIVE_TARGET] = createCargoTestArchiveTarget(
       cargoWorkspaceRoot,
       nextestToolConfigArg(cargoWorkspaceRoot),
@@ -1511,13 +1478,15 @@ async function createProjectTargets(
       aggregateDependencies.length > 0
         ? { executor: 'nx:noop', cache: true, outputs: [], dependsOn: aggregateDependencies }
         : createCargoTestTarget(cargoWorkspaceRoot);
-    // One clippy over the whole workspace, in the build's target dir. Clippy
-    // of a crate is a check build of its closure; a target dir per crate
-    // compiled every shared dependency once per crate (49 closures, 11 GiB on
-    // one repository) and no per-crate cache hit ever repaid that. The
-    // workspace inputs are exactly the union of every crate's, so the verdict
-    // caches on the same key set the compile does. Non-root packages depend on
-    // this target.
+    // One clippy over the whole workspace. Clippy of a crate is a check build
+    // of its closure; a target dir per crate compiled every shared dependency
+    // once per crate (49 closures, 11 GiB on one repository) and no per-crate
+    // cache hit ever repaid that. The workspace inputs are exactly the union of
+    // every crate's, so the verdict caches on the same key set the archive
+    // does. Non-root packages depend on this target. Its target dir is its own
+    // (CARGO_LINT_CLIPPY_COMMAND, ./cross-check-policy.ts): Cargo flocks one
+    // directory per invocation, and a workspace clippy holding the dev build's
+    // `target/` queued the archive and every dev build behind it.
     targets['cargo-lint'] = {
       executor: 'nx:run-commands',
       metadata: CARGO_PRODUCER_METADATA,
@@ -1753,14 +1722,14 @@ async function createProjectTargets(
     ];
   }
 
-  // `build` warms the test executables' compile; in a nested package that names
-  // the root workspace's one compile.
-  const cargoTestCompileDependency: CargoTargetDependency | null = targets[CARGO_TEST_COMPILE_TARGET]
-    ? CARGO_TEST_COMPILE_TARGET
+  // `build` compiles the test executables through the workspace's one
+  // archive; in a nested package that names the root workspace's archive.
+  const cargoTestArchiveDependency: CargoTargetDependency | null = targets[CARGO_TEST_ARCHIVE_TARGET]
+    ? CARGO_TEST_ARCHIVE_TARGET
     : isCargoProject && cargoWorkspace
       ? cargoTargetDependency(projectName, {
           projectName: cargoWorkspace.rootProjectName,
-          targetName: CARGO_TEST_COMPILE_TARGET,
+          targetName: CARGO_TEST_ARCHIVE_TARGET,
         })
       : null;
   const napiDebug = targets['napi-debug'];
@@ -1782,15 +1751,6 @@ async function createProjectTargets(
       }
     }
   } else if (napiDebug) {
-    for (const [name, target] of Object.entries(targets)) {
-      if (!name.startsWith('cargo-test-') || name === CARGO_TEST_COMPILE_TARGET) {
-        continue;
-      }
-      const dependsOn = target.dependsOn ?? [];
-      if (dependsOn.includes(CARGO_TEST_COMPILE_TARGET) && !dependsOn.includes('napi-debug')) {
-        target.dependsOn = [...dependsOn, 'napi-debug'];
-      }
-    }
     const cargoTest = targets[CARGO_TEST_TARGET];
     if (
       cargoTest?.options &&
@@ -1896,8 +1856,8 @@ async function createProjectTargets(
         ...new Set([
           '^build',
           // Compiling the test executables is unbounded preparation. Cargo
-          // reuses its incremental state; Nx never restores that shared state.
-          ...(cargoTestCompileDependency ? [cargoTestCompileDependency] : []),
+          // reuses its incremental state; Nx restores only the archive file.
+          ...(cargoTestArchiveDependency ? [cargoTestArchiveDependency] : []),
           ...buildOutputTargetNames([...Object.keys(declaredTargets), ...Object.keys(targets)]),
           ...hostPlatformBinaries,
         ]),
