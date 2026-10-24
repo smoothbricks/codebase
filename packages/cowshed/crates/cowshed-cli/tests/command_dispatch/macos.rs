@@ -6866,9 +6866,10 @@ struct LandDaemonRecord {
 /// never signalled. A daemon started detached from the job, as stock Nx does, skips adoption as
 /// `LandingDaemonStayed` and is still running after the land.
 #[tokio::test(flavor = "multi_thread")]
-async fn real_apfs_land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption() {
+async fn directory_land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption_substrate_lifecycle()
+ {
     let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with(Project::Build {
+    let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
         rust: None,
     });
@@ -6986,9 +6987,10 @@ async fn real_apfs_land_leaves_a_stock_detached_landing_daemon_running_and_skips
 /// A default land cannot turn Land 4's unproven nominee into signal authority at retirement.
 /// A live socket makes the record-nominated close capable of signalling the foreign process.
 #[tokio::test(flavor = "multi_thread")]
-async fn real_apfs_default_land_never_signals_a_foreign_nominee_during_retirement() {
+async fn directory_default_land_never_signals_a_foreign_nominee_during_retirement_substrate_lifecycle()
+ {
     let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with(Project::Build {
+    let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
         rust: None,
     });
@@ -7085,26 +7087,34 @@ async fn real_apfs_default_land_never_signals_a_foreign_nominee_during_retiremen
 /// its socket to the exited daemon, which under load is not at once, so the test waits for the
 /// daemon and every worker it had to exit, and a stand-in host process holds the mount in their
 /// place. Once nothing holds it the landed workspace retires.
+///
+/// Both unverifiable shapes, a malformed record and one that cannot be read, run on one served
+/// project, each in a workspace of its own: the setup is the same, and the second land starts
+/// from the main the first one moved, which an unverifiable record's skip never reads.
 #[tokio::test(flavor = "multi_thread")]
-async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
+async fn directory_land_skips_an_unverifiable_daemon_record_before_quiesce_substrate_lifecycle() {
     let (nx, node) = repository_nx();
-    for unreadable in [false, true] {
-        let mut fixture = Fixture::with(Project::Build {
-            nx: Some((&nx, &node)),
-            rust: None,
-        });
-        write_emit_project(&fixture.checkout, &node, false);
-        git(&fixture.checkout, &["add", "b"]);
-        git(
-            &fixture.checkout,
-            &["commit", "-q", "-m", "add emit producer"],
-        );
-        let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-        let mut service = serve_project(&mut fixture, &nx_reads).await;
-        let topic = new_workspace(&mut service, "outputs").await;
-        fs::write(topic.join("a/src.txt"), "changed\n").unwrap();
+    let mut fixture = Fixture::with_directory(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
+    write_emit_project(&fixture.checkout, &node, false);
+    git(&fixture.checkout, &["add", "b"]);
+    git(
+        &fixture.checkout,
+        &["commit", "-q", "-m", "add emit producer"],
+    );
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
+    for (landed, (workspace, unreadable)) in
+        [("malformed-record", false), ("unreadable-record", true)]
+            .into_iter()
+            .enumerate()
+    {
+        let topic = new_workspace(&mut service, workspace).await;
+        fs::write(topic.join("a/src.txt"), format!("{workspace}\n")).unwrap();
         git(&topic, &["commit", "-q", "-am", "change output input"]);
-        sh(&mut service, "outputs", &nx_run_many(&node, "build")).await;
+        sh(&mut service, workspace, &nx_run_many(&node, "build")).await;
         let record = topic.join(".nx/workspace-data/d/server-process.json");
         // The run put the shed in use at its admission, and the keeper started its daemon alongside
         // it; a supervisor's own start is no use (04_sandbox.md, the kept daemon), so the record
@@ -7134,20 +7144,21 @@ async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
         await_exits(&plugin_workers);
         let mut workers = HostProcesses(Vec::new());
         let worker = workers.start(&topic, None);
-        let (kept, _, stderr) = run(&mut service, ["--json", "land", "outputs"]).await;
+        let (kept, _, stderr) = run(&mut service, ["--json", "land", workspace]).await;
         let kept = kept.expect_err(&format!(
             "a process cowshed does not run holds the mount; {}",
             String::from_utf8_lossy(&stderr)
         ));
         assert_eq!(kept.code, ErrorCode::Conflict, "{kept}");
         assert!(
-            kept.message.contains("but workspace outputs was kept")
+            kept.message
+                .contains(&format!("but workspace {workspace} was kept"))
                 && kept.message.contains("cowshed does not run")
                 && kept.message.contains(&format!("pid {worker} (")),
             "{}",
             kept.message
         );
-        let skips = controller_commitments(fixture.storage.telemetry())
+        let outcomes = controller_commitments(fixture.storage.telemetry())
             .into_iter()
             .filter_map(|value| match value {
                 cowshed_core::api::dto::ControllerCommitment::LandOutcome(value) => {
@@ -7156,33 +7167,41 @@ async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        match skips.as_slice() {
-            [
-                (
-                    Some(AdoptionSkip::LandingDaemonUnverifiable {
-                        record: skipped_record,
-                        reason,
-                    }),
-                    seeded,
-                ),
-            ] => {
-                assert_eq!(skipped_record, &record);
+        assert_eq!(
+            outcomes.len(),
+            landed + 1,
+            "one outcome per land: {outcomes:?}"
+        );
+        let this_land = outcomes
+            .iter()
+            .filter(|(skip, _)| {
+                matches!(
+                    skip,
+                    Some(AdoptionSkip::LandingDaemonUnverifiable { record: skipped, .. })
+                        if skipped == &record
+                )
+            })
+            .collect::<Vec<_>>();
+        match this_land.as_slice() {
+            [(Some(AdoptionSkip::LandingDaemonUnverifiable { reason, .. }), seeded)] => {
                 assert!(!reason.is_empty());
                 assert!(!seeded, "an unverifiable record freezes no seed");
             }
-            other => panic!("an unverifiable daemon record skips adoption: {other:?}"),
+            other => {
+                panic!("an unverifiable daemon record skips adoption: {other:?} of {outcomes:?}")
+            }
         }
         workers.end();
-        let (retired, _, stderr) = run(&mut service, ["rm", "--force", "outputs"]).await;
+        let (retired, _, stderr) = run(&mut service, ["rm", "--force", workspace]).await;
         retired.unwrap_or_else(|error| {
             panic!(
                 "retire once nothing holds it: {error}; {}",
                 String::from_utf8_lossy(&stderr)
             )
         });
-        drop(service);
-        fixture.stop_gateway().await;
     }
+    drop(service);
+    fixture.stop_gateway().await;
 }
 
 /// The managed `bun` is the Bun the workspace declares (15_capabilities.md, "Bootstrap
@@ -7330,7 +7349,8 @@ async fn directory_managed_bun_runs_the_declared_bun_and_refuses_another_naming_
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans_absolute_bypass() {
+async fn directory_managed_install_restores_developer_links_before_nx_and_cleans_absolute_bypass_substrate_lifecycle()
+ {
     cowshed_core::runtime::shell_host::register(
         cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
             cowshed(),
@@ -7338,7 +7358,7 @@ async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans
         ),
     );
     let (repository, node) = repository_nx();
-    let mut fixture = Fixture::with(Project::Build {
+    let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&repository, &node)),
         rust: None,
     });
@@ -7570,7 +7590,8 @@ async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans
 /// stays alive in, killed through the public job API before it finishes: terminal cleanup must
 /// restore the links it removed, because the wrapper recorded the install, and leave no marker.
 #[tokio::test(flavor = "multi_thread")]
-async fn real_apfs_killed_covered_install_restores_links_its_postinstall_removed() {
+async fn directory_killed_covered_install_restores_links_its_postinstall_removed_substrate_lifecycle()
+ {
     cowshed_core::runtime::shell_host::register(
         cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
             cowshed(),
@@ -7578,7 +7599,7 @@ async fn real_apfs_killed_covered_install_restores_links_its_postinstall_removed
         ),
     );
     let (repository, node) = repository_nx();
-    let mut fixture = Fixture::with(Project::Build {
+    let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&repository, &node)),
         rust: None,
     });
@@ -7668,7 +7689,7 @@ async fn real_apfs_killed_covered_install_restores_links_its_postinstall_removed
         .await
         .expect("stop the CLI bridge so the job's runtime is the only controller");
 
-    let runtime = cowshed_core::runtime::ProjectRuntime::open_existing_at(
+    let runtime = cowshed_core::runtime::ProjectRuntime::open_directory_existing_at(
         &fixture.checkout,
         cowshed_core::runtime::RecoveryScope::Workspaces(std::collections::BTreeSet::from([
             WorkspaceName::new("links").expect("workspace name"),

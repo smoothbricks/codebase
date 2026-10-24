@@ -978,7 +978,9 @@ teardown guards run on assertion failure as well as success; no test installs or
 `apfs_native_macos/macos.rs` synthesize `hdiutil` responses to test command-runner handling. They are not real
 host/substrate evidence and do not count toward the `real_apfs_*` acceptance set. The real APFS cases added beside them
 use `ScratchRoot`, `SystemCommandRunner`, and the kernel's attachment table; the command-runner fixtures remain a
-separate, explicitly owned migration boundary rather than being presented as real dispatch tests.
+separate, explicitly owned migration boundary rather than being presented as real dispatch tests. They attach no image,
+so they run in cowshed-core's ordinary parallel shards: the host group's cowshed-core filter selects `real_apfs_*` names
+only, not the whole `apfs_native_macos` binary.
 
 Covered flows:
 
