@@ -675,59 +675,6 @@ async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
   }
 }
 
-/**
- * A lease whose volume goes while its task holds it is said lost, by the space an ENOSPC line reads and by the
- * release, never measured on the host's Data volume or released as though it were there. From a land gate: the
- * volume was detached under running shards, a write through `TMPDIR` made a lease directory again on the bare
- * mountpoint, and the shard's ENOSPC verdict read the Data volume's 2778060.4 MiB free "of 8192.0 MiB".
- */
-async function aLeaseLostUnderItsTask(): Promise<void> {
-  const fixture = scratchVolume(3);
-  const { parent, paths, capacity, owned, gatewaySocket } = fixture;
-  expectFixtureVolume(paths, capacity);
-  const stopGateway = await startFixtureGateway(fixture);
-  const volume = new RamTempVolume(paths, capacity, createHostCommands(undefined, gatewaySocket));
-  try {
-    const acquired = await volume.acquire(provisionOnly);
-    if (!acquired.ok) {
-      expectSandboxed(acquired.error);
-      return;
-    }
-    if (acquired.value.kind !== 'leased') {
-      throw new Error(`no lease: ${JSON.stringify(acquired)}`);
-    }
-    const lease = acquired.value.lease;
-    const measured = await volume.space(lease);
-    expect(measured).toMatchObject({ kind: 'measured', lease: lease.directory, mountpoint: paths.mountpoint });
-    expect(measured.kind === 'measured' && measured.capacityBytes <= capacity).toBe(true);
-
-    // Another owner detaches the volume, and a write through TMPDIR makes the lease directory again below the bare
-    // mountpoint, on the Data volume.
-    await detachOwned(owned, paths.uid, gatewaySocket);
-    mkdirSync(join(lease.directory, 'node-compile-cache'), { recursive: true });
-    const detail = `no marked volume is mounted at ${paths.mountpoint} any more: it was detached while the task held its lease`;
-    expect(await volume.space(lease)).toEqual({
-      kind: 'lost',
-      lease: lease.directory,
-      mountpoint: paths.mountpoint,
-      detail,
-    });
-    expect(await volume.release(lease, true, provisionOnly)).toEqual({
-      ok: false,
-      error: { kind: 'lease-lost', lease: lease.directory, mountpoint: paths.mountpoint, detail },
-    });
-  } finally {
-    try {
-      await detachOwned(owned, paths.uid, gatewaySocket);
-    } finally {
-      await stopGateway();
-    }
-    // Only once nothing is mounted there: the bare mountpoint, with the lease directory the write made again.
-    rmSync(paths.mountpoint, { recursive: true, force: true });
-    removeScratchDirectories(paths);
-    rmSync(parent, { recursive: true, force: true });
-  }
-}
 /** The non-Darwin executor owns no RAM disk: inherited and target-supplied temp directories stay with their owner. */
 async function inheritedTempDirectory(): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), 'rt-policy-'));
@@ -800,10 +747,6 @@ describe('temporary-directory policy on this host', () => {
     it(
       'leaves no volume under its final name, and no staging directory, when any provisioning step fails',
       aFailedStepLeavesNoNamedVolume,
-    );
-    it(
-      'says a lease lost when its volume is detached under its task, never measuring the host disk in its place',
-      aLeaseLostUnderItsTask,
     );
   } else {
     it(

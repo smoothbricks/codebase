@@ -36,20 +36,13 @@ export type BoundedExecVerdict =
   | ({ readonly outcome: 'no-space'; readonly exitCode: number; readonly tests: readonly string[] } & NoSpaceSighting)
   | { readonly outcome: 'failed'; readonly exitCode: number; readonly tests: readonly string[] };
 
-/**
- * The task's RAM temp volume, read when a line saying ENOSPC arrived: the writer's own lease and the space left on the
- * volume it was taken on (`measured`), or why there was none to measure: the lease was no longer on that volume
- * (`lost`), or the volume could not be read (`unread`).
- */
-export type TempVolumeSpace =
-  | {
-      readonly kind: 'measured';
-      readonly lease: string;
-      readonly mountpoint: string;
-      readonly capacityBytes: number;
-      readonly freeBytes: number;
-    }
-  | { readonly kind: 'lost' | 'unread'; readonly lease: string; readonly mountpoint: string; readonly detail: string };
+/** The task's RAM temp volume, read when a line saying ENOSPC arrived: the writer's own lease, and the space left. */
+export interface TempVolumeSpace {
+  readonly lease: string;
+  readonly mountpoint: string;
+  readonly capacityBytes: number;
+  readonly freeBytes: number;
+}
 
 /** The first output line that said a write found no space, and the task's RAM temp volume then; `null` without one. */
 export interface NoSpaceSighting {
@@ -457,22 +450,15 @@ function parseTempVolumeSpace(value: unknown): { value: TempVolumeSpace | null }
   if (value === null) {
     return { value: null };
   }
-  if (!isObject(value) || typeof value.lease !== 'string' || typeof value.mountpoint !== 'string') {
-    return undefined;
-  }
-  const { lease, mountpoint } = value;
-  // A record written before the kinds were named measured whatever filesystem held the mountpoint then.
   if (
-    (value.kind === 'measured' || value.kind === undefined) &&
+    isObject(value) &&
+    typeof value.lease === 'string' &&
+    typeof value.mountpoint === 'string' &&
     typeof value.capacityBytes === 'number' &&
     typeof value.freeBytes === 'number'
   ) {
-    return {
-      value: { kind: 'measured', lease, mountpoint, capacityBytes: value.capacityBytes, freeBytes: value.freeBytes },
-    };
-  }
-  if ((value.kind === 'lost' || value.kind === 'unread') && typeof value.detail === 'string') {
-    return { value: { kind: value.kind, lease, mountpoint, detail: value.detail } };
+    const { lease, mountpoint, capacityBytes, freeBytes } = value;
+    return { value: { lease, mountpoint, capacityBytes, freeBytes } };
   }
   return undefined;
 }
@@ -562,14 +548,6 @@ export function describeNoSpace(sighting: NoSpaceSighting): string {
   if (volume === null) {
     return `${said}; it held no RAM temp volume, so the full disk is the one that line's writer wrote to`;
   }
-  switch (volume.kind) {
-    case 'measured': {
-      const mib = (bytes: number) => (bytes / (1024 * 1024)).toFixed(1);
-      return `${said}; its TMPDIR ${volume.lease} is on the RAM temp volume ${volume.mountpoint}, which had ${mib(volume.freeBytes)} MiB free of ${mib(volume.capacityBytes)} MiB when that line arrived`;
-    }
-    case 'lost':
-      return `${said}; its TMPDIR ${volume.lease} was no longer on the RAM temp volume at ${volume.mountpoint} when that line arrived, so no free space of that volume was read: ${volume.detail}`;
-    case 'unread':
-      return `${said}; its TMPDIR ${volume.lease} is on the RAM temp volume ${volume.mountpoint}, whose space could not be read when that line arrived: ${volume.detail}`;
-  }
+  const mib = (bytes: number) => (bytes / (1024 * 1024)).toFixed(1);
+  return `${said}; its TMPDIR ${volume.lease} is on the RAM temp volume ${volume.mountpoint}, which had ${mib(volume.freeBytes)} MiB free of ${mib(volume.capacityBytes)} MiB when that line arrived`;
 }
