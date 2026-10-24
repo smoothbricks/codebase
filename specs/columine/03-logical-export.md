@@ -27,9 +27,11 @@ aggregate from its prefix); on struct kinds the byte counts fields and is not a 
 Import writes into a freshly initialized image the caller owns exclusively, with the same unjournaled raw writers
 init_state and grow_state use. It never runs on an image inside a speculation window: there is no undo log for these
 writes because the imported image is a new snapshot, not a mutation of a live one. The target slot must be empty
-(aggregates and scalars are overwritten whole), duplicate and sentinel keys refuse, and when rows, a bitmap image, a
-struct arena, or an eviction index outgrow the target slot the image grows through grow_state, so unchanged regions copy
-exactly the way growth copies them. Change flags stay clear.
+(aggregates and scalars are overwritten whole), duplicate and sentinel keys refuse, a row whose comparison timestamp the
+target cannot store (or that lacks one the target stores) refuses rather than inventing or dropping it, an aggregate
+whose stated subtype differs from the target's (including a nested slot's inner aggregate) refuses, and when rows, a
+bitmap image, a struct arena, or an eviction index outgrow the target slot the image grows through grow_state, so
+unchanged regions copy exactly the way growth copies them. Change flags stay clear.
 
 A condition-tree import writes derived-facts cells at their exported positions, tombstones included, so probe chains
 survive; importing into a table of another capacity leaves rehashing to the owner of the derived-facts table, as after
@@ -63,4 +65,5 @@ Tests prove, per slot kind, that export of import is the identity including time
 interned text; that generated latest-wins map states continue identically after import under a larger layout (a lost
 comparison lane lets a stale row win and fails); that an eager rewrite region-copies a geometry-identical slot whole and
 applies Copy, Expr, and Project fields to a reshaped one; and that refusals (truncated image, kind mismatch, duplicate
-key, unknown interned id) are typed with operation, slot, and cause.
+key, unknown interned id, comparison-lane mismatch, aggregate subtype mismatch) are typed with operation, slot, and
+cause.

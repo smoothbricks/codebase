@@ -903,8 +903,16 @@ fn refusals_are_typed() {
     // Duplicate keys refuse.
     let mut dup = base_slot(0, SlotType::HashMap);
     dup.rows = vec![
-        row(LogicalValue::U32(1), vec![Some(LogicalValue::U32(1))], None),
-        row(LogicalValue::U32(1), vec![Some(LogicalValue::U32(2))], None),
+        row(
+            LogicalValue::U32(1),
+            vec![Some(LogicalValue::U32(1))],
+            Some(1.0),
+        ),
+        row(
+            LogicalValue::U32(1),
+            vec![Some(LogicalValue::U32(2))],
+            Some(1.0),
+        ),
     ];
     let error = import_slot(
         &mut image,
@@ -924,7 +932,7 @@ fn refusals_are_typed() {
     one.rows = vec![row(
         LogicalValue::Text("k".into()),
         vec![Some(LogicalValue::U32(1))],
-        None,
+        Some(1.0),
     )];
     let mut interner = TestInterner::default();
     let mut image = fresh_image(&prog);
@@ -932,4 +940,84 @@ fn refusals_are_typed() {
     let error = export_slot(&image, 0, &enc, &TestInterner::default())
         .expect_err("unknown intern id refuses");
     assert_eq!(error.cause, LogicalExportCause::UnknownInternId(0));
+}
+
+#[test]
+fn cmp_lane_mismatch_and_nested_subtype_refuse() {
+    // A row with no timestamp into a map that stores one refuses: the
+    // alternative is inventing a value that loses every comparison.
+    let ts_prog = program(1, &halt(slot_def(0, SlotType::HashMap as u8, 8)));
+    let mut no_ts = base_slot(0, SlotType::HashMap);
+    no_ts.rows = vec![row(
+        LogicalValue::U32(1),
+        vec![Some(LogicalValue::U32(1))],
+        None,
+    )];
+    let mut image = fresh_image(&ts_prog);
+    let error = import_slot(
+        &mut image,
+        &no_ts,
+        &SlotEncoding::RAW,
+        &mut TestInterner::default(),
+    )
+    .expect_err("missing comparison timestamp refuses");
+    assert!(matches!(error.cause, LogicalExportCause::InvalidRow(_)));
+
+    // And the mirror image: a timestamp aimed at a map with no lane
+    // (the 0x40 no-timestamps flag) is never silently dropped.
+    let bare_prog = program(1, &halt(slot_def(0, SlotType::HashMap as u8 | 0x40, 8)));
+    let mut with_ts = base_slot(0, SlotType::HashMap);
+    with_ts.rows = vec![row(
+        LogicalValue::U32(1),
+        vec![Some(LogicalValue::U32(1))],
+        Some(2.0),
+    )];
+    let mut image = fresh_image(&bare_prog);
+    let error = import_slot(
+        &mut image,
+        &with_ts,
+        &SlotEncoding::RAW,
+        &mut TestInterner::default(),
+    )
+    .expect_err("unstorable comparison timestamp refuses");
+    assert!(matches!(error.cause, LogicalExportCause::InvalidRow(_)));
+    // The same rows without the timestamp round-trip through the
+    // no-lane layout, so the refusal is about the lane, not the map.
+    let mut interner = TestInterner::default();
+    round_trip(&bare_prog, &no_ts, &SlotEncoding::RAW, &mut interner);
+
+    // A nested Sum does not import into a nested Min: both store an
+    // f64 value and a count, so only the subtype check separates them.
+    let mut init = vec![Opcode::SlotNested as u8, 0, SlotType::Nested as u8];
+    init.extend(8u16.to_le_bytes());
+    init.push(SlotType::Aggregate as u8);
+    init.extend(16u16.to_le_bytes());
+    init.push(AggType::Min as u8);
+    let min_prog = program(1, &halt(init));
+    let mut nested = base_slot(0, SlotType::Nested);
+    nested.agg_type = AggType::Min as u8;
+    nested.nested = vec![LogicalNestedEntry {
+        outer_key: LogicalValue::U32(5),
+        inner: LogicalInner {
+            kind: SlotType::Aggregate,
+            agg_type: AggType::Sum as u8,
+            rows: Vec::new(),
+            aggregate: Some(LogicalAggregate {
+                value: LogicalValue::F64(17.5),
+                count: 4,
+            }),
+        },
+    }];
+    let mut image = fresh_image(&min_prog);
+    let error = import_slot(
+        &mut image,
+        &nested,
+        &SlotEncoding::RAW,
+        &mut TestInterner::default(),
+    )
+    .expect_err("nested subtype mismatch refuses");
+    assert!(matches!(
+        error.cause,
+        LogicalExportCause::InvalidRow("nested aggregate subtype mismatch")
+    ));
 }

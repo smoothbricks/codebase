@@ -232,7 +232,7 @@ impl Eq for LogicalEvictionEntry {}
 /// occupied derived-facts cell (live and tombstone identities alike, so
 /// probe chains survive). Cells carry their stored position; importing
 /// into a table of another capacity writes positions as exported and the
-/// RETE layer that owns the table rehashes, as it does after grow_state.
+/// owner of the derived-facts table rehashes, as it does after grow_state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogicalCondition {
     pub lifecycle_generation: u32,
@@ -1118,6 +1118,27 @@ fn require_empty(image: &[u8], meta: &SlotMetaView) -> CauseResult<()> {
     Ok(())
 }
 
+/// The comparison timestamp a target with a timestamp lane must store
+/// for this row. A missing one refuses: inventing a value would make
+/// the row lose every latest-wins comparison after import.
+fn required_cmp_ts(row: &LogicalRow) -> CauseResult<f64> {
+    row.cmp_ts.ok_or(LogicalExportCause::InvalidRow(
+        "row is missing the comparison timestamp the target slot stores",
+    ))
+}
+
+/// Refuse a comparison timestamp a target with no lane cannot store.
+/// Dropping one is the caller's explicit choice on the logical slot,
+/// never a silent loss inside import.
+fn no_cmp_ts(row: &LogicalRow) -> CauseResult<()> {
+    if row.cmp_ts.is_some() {
+        return Err(LogicalExportCause::InvalidRow(
+            "row carries a comparison timestamp the target slot cannot store",
+        ));
+    }
+    Ok(())
+}
+
 fn single_field(row: &LogicalRow) -> CauseResult<&LogicalValue> {
     if row.fields.len() != 1 {
         return Err(LogicalExportCause::FieldShape {
@@ -1456,11 +1477,9 @@ fn import_slot_inner(
                 let size = table.size(image);
                 table.set_size(image, size + 1);
                 if has_ts {
-                    bytes::write_f64(
-                        image,
-                        timestamps + probe.pos * 8,
-                        row.cmp_ts.unwrap_or(f64::NEG_INFINITY),
-                    );
+                    bytes::write_f64(image, timestamps + probe.pos * 8, required_cmp_ts(row)?);
+                } else {
+                    no_cmp_ts(row)?;
                 }
             }
             let meta = bind_target(image, logical)?;
@@ -1481,6 +1500,7 @@ fn import_slot_inner(
                 ENTRY_NONE,
             );
             for row in &logical.rows {
+                no_cmp_ts(row)?;
                 no_fields(row)?;
                 if row.key2.is_some() {
                     return Err(LogicalExportCause::InvalidRow(
@@ -1583,11 +1603,7 @@ fn import_slot_inner(
                     return Err(LogicalExportCause::DuplicateKey);
                 }
                 bytes::write_u32(image, meta.offset + pos * 4, value);
-                bytes::write_f64(
-                    image,
-                    timestamps + pos * 8,
-                    row.cmp_ts.unwrap_or(f64::NEG_INFINITY),
-                );
+                bytes::write_f64(image, timestamps + pos * 8, required_cmp_ts(row)?);
                 live += 1;
             }
             meta.set_size(image, live);
@@ -1595,6 +1611,7 @@ fn import_slot_inner(
         SlotType::Bitmap => {
             let mut members: Vec<u32> = Vec::with_capacity(logical.rows.len());
             for row in &logical.rows {
+                no_cmp_ts(row)?;
                 no_fields(row)?;
                 members.push(encode_u32(&row.key, enc.value, interner)?);
             }
@@ -1692,11 +1709,9 @@ fn import_slot_inner(
                     interner,
                 )?;
                 if has_ts {
-                    bytes::write_f64(
-                        image,
-                        timestamps + upsert.pos * 8,
-                        row.cmp_ts.unwrap_or(f64::NEG_INFINITY),
-                    );
+                    bytes::write_f64(image, timestamps + upsert.pos * 8, required_cmp_ts(row)?);
+                } else {
+                    no_cmp_ts(row)?;
                 }
             }
         }
@@ -1726,6 +1741,7 @@ fn import_slot_inner(
                 None
             };
             for row in &logical.rows {
+                no_cmp_ts(row)?;
                 let key1 = key_u32(&row.key, enc.key, interner)?;
                 let key2 = match &row.key2 {
                     Some(value) => encode_u32(value, enc.key2, interner)?,
@@ -1769,6 +1785,7 @@ fn import_slot_inner(
                 require_descriptor(logical, &descriptor)?;
                 let rows_base = meta.offset + align8(descriptor.len() as u32);
                 for (index, row) in logical.rows.iter().enumerate() {
+                    no_cmp_ts(row)?;
                     let row_off = rows_base + index as u32 * row_size;
                     bytes::zero(image, row_off, row_size);
                     write_row_fields(
@@ -1792,6 +1809,7 @@ fn import_slot_inner(
                 }
                 let row_size = struct_field_size(elem);
                 for (index, row) in logical.rows.iter().enumerate() {
+                    no_cmp_ts(row)?;
                     let at = meta.offset + index as u32 * row_size;
                     write_scalar_cell(image, at, elem, single_field(row)?, interner)?;
                 }
@@ -1921,6 +1939,17 @@ fn import_nested(
                 found: entry.inner.kind,
             });
         }
+        // Like the top-level aggregate guard: a stated inner subtype
+        // must match the target's, or a Sum would import as a Min
+        // (both store an f64 value and count).
+        if entry.inner.kind == SlotType::Aggregate
+            && entry.inner.agg_type != 0
+            && entry.inner.agg_type != prefix.inner_agg_type_byte
+        {
+            return Err(LogicalExportCause::InvalidRow(
+                "nested aggregate subtype mismatch",
+            ));
+        }
     }
     let arena_needed: u64 = logical
         .nested
@@ -1967,6 +1996,7 @@ fn import_nested(
             SlotType::HashMap => {
                 let table = FlatTable::init(image, pointer, cap, ENTRY_U32);
                 for row in &entry.inner.rows {
+                    no_cmp_ts(row)?;
                     let key = key_u32(&row.key, enc.inner_key, interner)?;
                     let value = encode_u32(single_field(row)?, enc.inner_value, interner)?;
                     match table.upsert_u32(image, key, value) {
@@ -1984,6 +2014,7 @@ fn import_nested(
             SlotType::HashSet => {
                 let table = FlatTable::init(image, pointer, cap, ENTRY_NONE);
                 for row in &entry.inner.rows {
+                    no_cmp_ts(row)?;
                     no_fields(row)?;
                     let key = key_u32(&row.key, enc.inner_key, interner)?;
                     match table.insert_key(image, key) {
