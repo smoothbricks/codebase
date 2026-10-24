@@ -27,6 +27,8 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 const repositoryRoot = join(import.meta.dir, '../../..');
 const nxEntry = join(repositoryRoot, 'node_modules', '.bin', 'nx');
 const DEAD_STREAM = '(version 1)(allow default)(deny mach-lookup (global-name "com.apple.FSEvents"))';
+const RENAME_CASE = 'rebuilds a target whose input was replaced by rename, through the one stream';
+const DOT_HIDDEN_CASE = 'proves its watcher current where .nxignore hides every dot path';
 
 /**
  * The fixture's `node_modules` links the repository's. With `hidesDotPaths` the fixture ignores every dot path in its
@@ -75,23 +77,38 @@ async function copy(workspace: string, env: Record<string, string>): Promise<{ o
 }
 
 describe('the daemon answers from the files as they are when a request arrives', () => {
-  it('rebuilds a target whose input was replaced by rename, through the one stream', async () => {
-    await withNxFixture('nx-watch-stream-', async ({ workspace, socketDirectory }) => {
-      await fixtureWorkspace(workspace);
+  it('rebuilds a target whose input was replaced by rename, through the one stream, and proves its watcher current where .nxignore hides every dot path', async () => {
+    // One healthy daemon walks both cases over the dot-hidden layout. Its probe must come back from node_modules:
+    // a probe in .nx or .git would never come back there, and the healthy daemon would stop.
+    // A rename needs only the stream.
+    await withNxFixture('nx-dot-hidden-', async ({ workspace, socketDirectory }) => {
+      await fixtureWorkspace(workspace, true);
       const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true', NX_TUI: 'false' };
       const started = nx(workspace, env, [], 'daemon', '--start');
-      expect(started.status, started.output).toBe(0);
-      expect((await copy(workspace, env)).out).toBe('one\n');
-      // An editor's or icm's publication: write beside, rename over.
-      await writeFile(join(workspace, 'p', '.src.txt.tmp'), 'two\n');
-      await rename(join(workspace, 'p', '.src.txt.tmp'), join(workspace, 'p', 'src.txt'));
+      expect(started.status, `${RENAME_CASE}, and ${DOT_HIDDEN_CASE}: the daemon starts\n${started.output}`).toBe(0);
+      expect((await copy(workspace, env)).out, `${DOT_HIDDEN_CASE}: the first copy`).toBe('one\n');
+      await writeFile(join(workspace, 'p', 'src.txt'), 'two\n');
       const second = await copy(workspace, env);
-      expect(second.output).not.toContain('existing outputs match the cache');
-      expect(second.out).toBe('two\n');
+      expect(second.output, `${DOT_HIDDEN_CASE}: no stopped stream`).not.toContain('watcher stream stopped');
+      expect(second.output, `${DOT_HIDDEN_CASE}: no stale cache hit`).not.toContain('existing outputs match the cache');
+      expect(second.out, `${DOT_HIDDEN_CASE}: the rewritten input`).toBe('two\n');
+      // An editor's or icm's publication: write beside, rename over.
+      await writeFile(join(workspace, 'p', '.src.txt.tmp'), 'three\n');
+      await rename(join(workspace, 'p', '.src.txt.tmp'), join(workspace, 'p', 'src.txt'));
+      const renamed = await copy(workspace, env);
+      expect(renamed.output, `${RENAME_CASE}: no stale cache hit`).not.toContain('existing outputs match the cache');
+      expect(renamed.out, `${RENAME_CASE}: the renamed input`).toBe('three\n');
+      if (process.platform === 'darwin') {
+        const log = await readFile(join(workspace, '.nx/workspace-data/d/daemon.log'), 'utf8');
+        expect(log, `${DOT_HIDDEN_CASE}: the probe came back`).toContain('watcher current: probe came back');
+        expect(log, `${DOT_HIDDEN_CASE}: no refused probe`).not.toContain('cannot be proven current');
+      }
     });
   });
 
   if (process.platform === 'darwin') {
+    // Each dead-stream case is its own daemon lifetime: its first request stops that daemon, and the layout decides
+    // whether the watcher has a probe directory, which decides the message the stream gives.
     it('stops a daemon whose FSEvents stream delivers nothing, rather than hash from stale files', async () => {
       await withNxFixture('nx-dead-stream-', async ({ workspace, socketDirectory }) => {
         await fixtureWorkspace(workspace);
@@ -128,25 +145,6 @@ describe('the daemon answers from the files as they are when a request arrives',
         const second = await copy(workspace, env);
         expect(second.output).not.toContain('existing outputs match the cache');
         expect(second.out).toBe('two\n');
-      });
-    });
-
-    it('proves its watcher current where .nxignore hides every dot path', async () => {
-      await withNxFixture('nx-dot-hidden-', async ({ workspace, socketDirectory }) => {
-        await fixtureWorkspace(workspace, true);
-        const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true', NX_TUI: 'false' };
-        const started = nx(workspace, env, [], 'daemon', '--start');
-        expect(started.status, started.output).toBe(0);
-        expect((await copy(workspace, env)).out).toBe('one\n');
-        await writeFile(join(workspace, 'p', 'src.txt'), 'two\n');
-        const second = await copy(workspace, env);
-        expect(second.output).not.toContain('watcher stream stopped');
-        expect(second.output).not.toContain('existing outputs match the cache');
-        expect(second.out).toBe('two\n');
-        // A probe in .nx or .git would never come back, and the healthy daemon would stop.
-        const log = await readFile(join(workspace, '.nx/workspace-data/d/daemon.log'), 'utf8');
-        expect(log).toContain('watcher current: probe came back');
-        expect(log).not.toContain('cannot be proven current');
       });
     });
   }
