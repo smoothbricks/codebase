@@ -291,10 +291,11 @@ pub(crate) fn walk_operands<S: OperandSink>(
         Opcode::BatchAggSumI64 | Opcode::BatchAggMinI64 | Opcode::BatchAggMaxI64 => &[I, I],
         Opcode::BatchStructMapUpsertLast
         | Opcode::BatchStructMapUpsertFirst
-        | Opcode::BatchStructMapUpsertMax => {
+        | Opcode::BatchStructMapUpsertMax
+        | Opcode::BatchStructMapUpsertFirstSinceReset => {
             // slot, key_col, num_vals, (val_col, field_idx) × num_vals,
             // num_arrays, (offsets_col, values_col, field_idx) × num_arrays,
-            // and 0x82's comparison field ordinal.
+            // and 0x82's comparison or 0x8b's reset field ordinal.
             index(r, sink)?;
             index(r, sink)?;
             pairs(r, sink, MAX_STRUCT_SCALAR_OPERANDS)?;
@@ -307,7 +308,10 @@ pub(crate) fn walk_operands<S: OperandSink>(
                 index(r, sink)?;
                 byte(r, sink)?;
             }
-            if op == Opcode::BatchStructMapUpsertMax {
+            if matches!(
+                op,
+                Opcode::BatchStructMapUpsertMax | Opcode::BatchStructMapUpsertFirstSinceReset
+            ) {
                 byte(r, sink)?;
             }
             &[]

@@ -324,9 +324,9 @@ fn walk_op(
         }
         Opcode::BatchStructMapUpsertLast
         | Opcode::BatchStructMapUpsertFirst
-        | Opcode::BatchStructMapUpsertMax => {
-            let operands =
-                decode_struct_map_upsert_operands(code, pc + 1, op == Opcode::BatchStructMapUpsertMax)?;
+        | Opcode::BatchStructMapUpsertMax
+        | Opcode::BatchStructMapUpsertFirstSinceReset => {
+            let operands = decode_struct_map_upsert_operands(code, pc + 1, op)?;
             cell(visit, operands.key_col, ColumnUse::Read);
             for &col in operands.vals.cols() {
                 cell(visit, col, ColumnUse::Read);

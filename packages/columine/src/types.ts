@@ -481,6 +481,7 @@ export enum Opcode {
   BATCH_STRUCT_MAP_UPSERT_LAST = 0x80, // slot, key_col, num_vals, [val_col, field_idx] × num_vals, num_array_vals, [(offsets_col, values_col, field_idx) × num_array_vals]
   BATCH_STRUCT_MAP_UPSERT_FIRST = 0x81, // same operands; existing persisted keys are left untouched
   BATCH_STRUCT_MAP_UPSERT_MAX = 0x82, // same row operands followed by comparison field_idx; replaces only when incoming comparison is strictly greater
+  BATCH_STRUCT_MAP_UPSERT_FIRST_SINCE_RESET = 0x8b, // same row operands followed by reset field_idx (mapped BOOL); replaces when the key is absent, the stored reset is true, or the incoming reset is true
   SLOT_STRUCT_MAP2 = 0x1b, // same slot operands as SLOT_STRUCT_MAP; type flag low nibble = 10
   BATCH_STRUCT_MAP2_UPSERT_LAST = 0x83, // slot,key1_col,key2_col,num_vals,[val_col,field_idx] × N
   BATCH_STRUCT_MAP2_REMOVE = 0x86, // slot,key1_col,key2_col

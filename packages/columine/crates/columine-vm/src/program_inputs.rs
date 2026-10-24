@@ -2,7 +2,7 @@
 //! per batch.
 //!
 //! [`InputPlan::compile`] links each struct-map CSR pair the program reads for
-//! a value-object field (the `0x80`–`0x82` array fields and the `0x88` counts
+//! a value-object field (the `0x80`–`0x82` and `0x8b` array fields and the `0x88` counts
 //! init pair) to that field's schema, and records the scope the pair is read
 //! under: the batch rows, filtered by a top-level `FOR_EACH`, expanded through
 //! each enclosing `FLAT_MAP`. It then classifies every operand of the reduce
@@ -282,13 +282,10 @@ impl Builder<'_> {
                 Opcode::Halt | Opcode::ForEach | Opcode::FlatMap => return Err(invalid),
                 Opcode::BatchStructMapUpsertLast
                 | Opcode::BatchStructMapUpsertFirst
-                | Opcode::BatchStructMapUpsertMax => {
-                    let operands = decode_struct_map_upsert_operands(
-                        code,
-                        pc + 1,
-                        op == Opcode::BatchStructMapUpsertMax,
-                    )
-                    .ok_or(invalid.clone())?;
+                | Opcode::BatchStructMapUpsertMax
+                | Opcode::BatchStructMapUpsertFirstSinceReset => {
+                    let operands = decode_struct_map_upsert_operands(code, pc + 1, op)
+                        .ok_or(invalid.clone())?;
                     // Only an array field linked to a schema is a value-object
                     // input; the others are ordinary arena fields.
                     for array in operands.array_fields() {

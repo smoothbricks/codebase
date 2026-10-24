@@ -281,7 +281,8 @@ fn effects(op: Opcode, o: &[u32], out: &mut impl FnMut(Effect)) -> Option<()> {
         }),
         Opcode::BatchStructMapUpsertLast
         | Opcode::BatchStructMapUpsertFirst
-        | Opcode::BatchStructMapUpsertMax => {
+        | Opcode::BatchStructMapUpsertMax
+        | Opcode::BatchStructMapUpsertFirstSinceReset => {
             // slot, key, num_vals, (col, field) × num_vals, num_arrays, ...
             let (slot, col) = (at(0)?, at(1)?);
             let num_vals = usize::try_from(at(2)?).ok()?;

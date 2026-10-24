@@ -1932,8 +1932,23 @@ pub(crate) struct StructMapUpsertOperands {
     pub(crate) vals: ScalarOperands,
     arrays: [ArrayField; MAX_STRUCT_ARRAY_OPERANDS],
     num_arrays: usize,
-    pub(crate) comparison_field_idx: Option<u8>,
+    pub(crate) pick: StructMapPick,
     pub(crate) end: usize,
+}
+
+/// Which row a unary struct-map upsert keeps per key, as its opcode and
+/// trailing field ordinal encode it. Every pick folds rows in input order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StructMapPick {
+    /// 0x80: every row replaces.
+    Last,
+    /// 0x81: a row writes only when its key is absent.
+    First,
+    /// 0x82: a row replaces when its comparison field is strictly greater.
+    Max { comparison_field_idx: u8 },
+    /// 0x8b: a row replaces when its key is absent, the stored reset field is
+    /// true, or its own reset field is true.
+    FirstSinceReset { reset_field_idx: u8 },
 }
 
 impl StructMapUpsertOperands {
@@ -1947,7 +1962,7 @@ impl StructMapUpsertOperands {
             field_idx: 0,
         }; MAX_STRUCT_ARRAY_OPERANDS],
         num_arrays: 0,
-        comparison_field_idx: None,
+        pick: StructMapPick::Last,
         end: 0,
     };
 
@@ -1956,11 +1971,7 @@ impl StructMapUpsertOperands {
     }
 
     /// Decode over this value, writing only what the instruction carries.
-    fn decode_from<'a, R: OperandRead<'a>>(
-        &mut self,
-        operands: &mut R,
-        has_comparison: bool,
-    ) -> Option<()> {
+    fn decode_from<'a, R: OperandRead<'a>>(&mut self, operands: &mut R, op: Opcode) -> Option<()> {
         self.num_arrays = 0;
         self.slot = operands.index()?;
         self.key_col = operands.index()?;
@@ -1978,29 +1989,36 @@ impl StructMapUpsertOperands {
             };
         }
         self.num_arrays = num_arrays;
-        self.comparison_field_idx = if has_comparison {
-            Some(operands.byte()?)
-        } else {
-            None
+        self.pick = match op {
+            Opcode::BatchStructMapUpsertLast => StructMapPick::Last,
+            Opcode::BatchStructMapUpsertFirst => StructMapPick::First,
+            Opcode::BatchStructMapUpsertMax => StructMapPick::Max {
+                comparison_field_idx: operands.byte()?,
+            },
+            Opcode::BatchStructMapUpsertFirstSinceReset => StructMapPick::FirstSinceReset {
+                reset_field_idx: operands.byte()?,
+            },
+            _ => return None,
         };
         self.end = operands.pos();
         Some(())
     }
 }
 
-/// Decode the shared 0x80/0x81 row operands and 0x82's trailing comparison
-/// ordinal without mutating state: `slot:index, key_col:index, num_vals:u8,
-/// (val_col:index, field_idx:u8) × num_vals, num_arrays:u8, (offsets_col:index,
-/// values_col:index, field_idx:u8) × num_arrays [, comparison_field_idx:u8]`.
+/// Decode the shared 0x80/0x81 row operands and the trailing field ordinal of
+/// 0x82 (comparison) or 0x8b (reset) without mutating state: `slot:index,
+/// key_col:index, num_vals:u8, (val_col:index, field_idx:u8) × num_vals,
+/// num_arrays:u8, (offsets_col:index, values_col:index, field_idx:u8) ×
+/// num_arrays [, pick_field_idx:u8]`. Any other opcode decodes to `None`.
 /// Fixed operand arrays in both dispatch paths make their encoded maxima part
 /// of the accepted-program contract.
 pub(crate) fn decode_struct_map_upsert_operands(
     code: &[u8],
     start: usize,
-    has_comparison: bool,
+    op: Opcode,
 ) -> Option<StructMapUpsertOperands> {
     let mut operands = StructMapUpsertOperands::EMPTY;
-    operands.decode_from(&mut Operands::at(code, start), has_comparison)?;
+    operands.decode_from(&mut Operands::at(code, start), op)?;
     Some(operands)
 }
 
@@ -2221,8 +2239,116 @@ fn resolve_struct_map_max_comparison(
     })
 }
 
+/// A struct-map pick with its field lane bound to the instruction's mapped
+/// column, resolved once before any row is decided.
+#[derive(Clone, Copy)]
+enum ResolvedStructMapPick {
+    Last,
+    First,
+    Max(StructMapMaxComparison),
+    FirstSinceReset(StructMapResetLane),
+}
+
+/// 0x8b's reset lane: a mapped BOOL field and the column that carries it.
+#[derive(Clone, Copy)]
+struct StructMapResetLane {
+    field_idx: u8,
+    col: u32,
+}
+
+/// Bind the instruction's pick to its mapped field lane. A comparison or reset
+/// ordinal that names no mapped field of the admitted kind is `None`.
+fn resolve_struct_map_pick(
+    state: &[u8],
+    smap: &StructMapSlot,
+    operands: &StructMapUpsertOperands,
+) -> Option<ResolvedStructMapPick> {
+    Some(match operands.pick {
+        StructMapPick::Last => ResolvedStructMapPick::Last,
+        StructMapPick::First => ResolvedStructMapPick::First,
+        StructMapPick::Max {
+            comparison_field_idx,
+        } => ResolvedStructMapPick::Max(resolve_struct_map_max_comparison(
+            state,
+            smap,
+            &operands.vals,
+            comparison_field_idx,
+        )?),
+        StructMapPick::FirstSinceReset { reset_field_idx } => {
+            if reset_field_idx >= smap.num_fields
+                || smap.field_type(state, reset_field_idx) != StructFieldType::Bool
+            {
+                return None;
+            }
+            let at = operands
+                .vals
+                .fields()
+                .iter()
+                .position(|&field| field == reset_field_idx)?;
+            ResolvedStructMapPick::FirstSinceReset(StructMapResetLane {
+                field_idx: reset_field_idx,
+                col: operands.vals.cols()[at],
+            })
+        }
+    })
+}
+
+/// Decide whether row `element_idx` writes its key, before bitset clearing,
+/// journaling, row or array writes, or change flags: a skipped row mutates
+/// nothing.
+fn should_write_struct_map_row(
+    state: &[u8],
+    smap: &StructMapSlot,
+    key: u32,
+    pick: ResolvedStructMapPick,
+    cols: &[&[u8]],
+    element_idx: u32,
+) -> Result<bool, ErrorCode> {
+    match pick {
+        ResolvedStructMapPick::Last => Ok(true),
+        ResolvedStructMapPick::First => Ok(smap.find(state, key).is_none()),
+        ResolvedStructMapPick::Max(comparison) => {
+            should_upsert_struct_map_max(state, smap, key, comparison, cols, element_idx)
+        }
+        ResolvedStructMapPick::FirstSinceReset(lane) => {
+            should_upsert_struct_map_since_reset(state, smap, key, lane, cols, element_idx)
+        }
+    }
+}
+
+/// 0x8b: an incoming reset, an absent key or a stored reset accepts. An absent
+/// stored reset field is false. A BOOL cell travels as a u32 lane.
+fn should_upsert_struct_map_since_reset(
+    state: &[u8],
+    smap: &StructMapSlot,
+    key: u32,
+    lane: StructMapResetLane,
+    cols: &[&[u8]],
+    element_idx: u32,
+) -> Result<bool, ErrorCode> {
+    let start = (element_idx as usize)
+        .checked_mul(4)
+        .ok_or(ErrorCode::ColumnUnderrun)?;
+    let end = start.checked_add(4).ok_or(ErrorCode::ColumnUnderrun)?;
+    let cell = cols
+        .get(lane.col as usize)
+        .and_then(|col| col.get(start..end))
+        .ok_or(ErrorCode::ColumnUnderrun)?;
+    if bytes::read_u32(cell, 0) != 0 {
+        return Ok(true);
+    }
+    let Some(position) = smap.find(state, key) else {
+        return Ok(true);
+    };
+    let row = smap.row_off(position);
+    Ok(StructMapSlot::is_field_set(state, row, lane.field_idx)
+        && state[(row + smap.field_offset(state, lane.field_idx)) as usize] != 0)
+}
+
 /// Operand kinds are a program property, admitted before FIRST/MAX can skip
-/// a row. Skipping execution must not make an invalid mapping valid.
+/// a row. Skipping execution must not make an invalid mapping valid. Each
+/// field is mapped at most once: a comparison or reset lane binds one column,
+/// and that column must be the one the row writer stores.
 fn validate_struct_map_operands(
     state: &[u8],
     map: &StructMapSlot,
@@ -2242,6 +2368,15 @@ fn validate_struct_map_operands(
         {
             return Err(ErrorCode::InvalidProgram);
         }
+    }
+    let mut mapped = [0u64; 4];
+    let fields = operands.vals.fields().iter().copied();
+    for field in fields.chain(operands.array_fields().iter().map(|array| array.field_idx)) {
+        let (word, bit) = (usize::from(field / 64), 1u64 << (field % 64));
+        if mapped[word] & bit != 0 {
+            return Err(ErrorCode::InvalidProgram);
+        }
+        mapped[word] |= bit;
     }
     Ok(())
 }
@@ -4037,11 +4172,9 @@ impl Vm {
 
                 Opcode::BatchStructMapUpsertLast
                 | Opcode::BatchStructMapUpsertFirst
-                | Opcode::BatchStructMapUpsertMax => {
-                    let has_comparison = op == Opcode::BatchStructMapUpsertMax;
-                    let Some(operands) =
-                        decode_struct_map_upsert_operands(code, pc, has_comparison)
-                    else {
+                | Opcode::BatchStructMapUpsertMax
+                | Opcode::BatchStructMapUpsertFirstSinceReset => {
+                    let Some(operands) = decode_struct_map_upsert_operands(code, pc, op) else {
                         return INVALID_PROGRAM;
                     };
                     pc = operands.end;
@@ -4053,19 +4186,8 @@ impl Vm {
                     if let Err(error) = validate_struct_map_operands(state, &smap, &operands) {
                         return error as u32;
                     }
-                    let comparison = match operands.comparison_field_idx {
-                        Some(field_idx) => {
-                            let Some(comparison) = resolve_struct_map_max_comparison(
-                                state,
-                                &smap,
-                                &operands.vals,
-                                field_idx,
-                            ) else {
-                                return INVALID_PROGRAM;
-                            };
-                            Some(comparison)
-                        }
-                        None => None,
+                    let Some(pick) = resolve_struct_map_pick(state, &smap, &operands) else {
+                        return INVALID_PROGRAM;
                     };
 
                     let keys = batch_col!(col_u32_exact(
@@ -4074,23 +4196,10 @@ impl Vm {
                     ));
                     for i in 0..batch_len {
                         let key = keys[i as usize];
-                        let should_write = match op {
-                            Opcode::BatchStructMapUpsertFirst => smap.find(state, key).is_none(),
-                            Opcode::BatchStructMapUpsertMax => {
-                                let Some(comparison) = comparison else {
-                                    return INVALID_PROGRAM;
-                                };
-                                match should_upsert_struct_map_max(
-                                    state, &smap, key, comparison, cols, i,
-                                ) {
-                                    Ok(should_write) => should_write,
-                                    Err(error) => return error as u32,
-                                }
-                            }
-                            _ => true,
-                        };
-                        if !should_write {
-                            continue;
+                        match should_write_struct_map_row(state, &smap, key, pick, cols, i) {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(error) => return error as u32,
                         }
 
                         let result = upsert_struct_map_row(
@@ -4972,15 +5081,13 @@ impl Vm {
                     }
                 }
 
-                // STRUCT_MAP_UPSERT_LAST/FIRST/MAX (0x80/0x81/0x82)
+                // STRUCT_MAP_UPSERT_LAST/FIRST/MAX/FIRST_SINCE_RESET (0x80/0x81/0x82/0x8b)
                 Opcode::BatchStructMapUpsertLast
                 | Opcode::BatchStructMapUpsertFirst
-                | Opcode::BatchStructMapUpsertMax => {
+                | Opcode::BatchStructMapUpsertMax
+                | Opcode::BatchStructMapUpsertFirstSinceReset => {
                     let operands = &mut self.element_struct_map;
-                    if operands
-                        .decode_from(&mut r, op == Opcode::BatchStructMapUpsertMax)
-                        .is_none()
-                    {
+                    if operands.decode_from(&mut r, op).is_none() {
                         return INVALID_PROGRAM;
                     }
                     bpc = operands.end;
@@ -4992,36 +5099,16 @@ impl Vm {
                     if let Err(error) = validate_struct_map_operands(state, &smap, operands) {
                         return error as u32;
                     }
-                    let comparison = match operands.comparison_field_idx {
-                        Some(field_idx) => {
-                            let Some(comparison) = resolve_struct_map_max_comparison(
-                                state,
-                                &smap,
-                                &operands.vals,
-                                field_idx,
-                            ) else {
-                                return INVALID_PROGRAM;
-                            };
-                            Some(comparison)
-                        }
-                        None => None,
+                    let Some(pick) = resolve_struct_map_pick(state, &smap, operands) else {
+                        return INVALID_PROGRAM;
                     };
                     let key = cell_u32(cols, operands.key_col, child_idx);
-                    let should_write = match op {
-                        Opcode::BatchStructMapUpsertFirst => smap.find(state, key).is_none(),
-                        Opcode::BatchStructMapUpsertMax => {
-                            let Some(comparison) = comparison else {
-                                return INVALID_PROGRAM;
-                            };
-                            match should_upsert_struct_map_max(
-                                state, &smap, key, comparison, cols, child_idx,
-                            ) {
-                                Ok(should_write) => should_write,
-                                Err(error) => return error as u32,
-                            }
-                        }
-                        _ => true,
-                    };
+                    let should_write =
+                        match should_write_struct_map_row(state, &smap, key, pick, cols, child_idx)
+                        {
+                            Ok(should_write) => should_write,
+                            Err(error) => return error as u32,
+                        };
                     if should_write {
                         let result = upsert_struct_map_row(
                             &mut self.undo,

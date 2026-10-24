@@ -745,6 +745,11 @@ pub enum Opcode {
     /// Same row operands as 0x80 followed by comparison_field_idx:u8; replaces
     /// only when the incoming scalar comparison is strictly greater.
     BatchStructMapUpsertMax = 0x82,
+    /// Same row operands as 0x80 followed by reset_field_idx:u8, which names a
+    /// mapped BOOL field. Replaces when the key is absent, the stored row's
+    /// reset field is true, or the incoming row's reset field is true: each key
+    /// keeps the first row since its last reset. An absent stored field is false.
+    BatchStructMapUpsertFirstSinceReset = 0x8b,
     /// slot:index, key1_col:index, key2_col:index, num_vals:u8,
     /// [val_col:index, field_idx:u8] × num_vals
     BatchStructMap2UpsertLast = 0x83,
@@ -855,6 +860,7 @@ impl Opcode {
             0x88 => Self::BatchStructMapCountsFold,
             0x89 => Self::BatchStructMap2UpsertMinI64x2,
             0x8a => Self::StructMapSweep,
+            0x8b => Self::BatchStructMapUpsertFirstSinceReset,
             0x90 => Self::NestedSetInsert,
             0x92 => Self::NestedMapUpsertLast,
             0x95 => Self::NestedAggUpdate,
