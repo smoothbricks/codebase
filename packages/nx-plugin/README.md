@@ -1633,6 +1633,13 @@ and lease, and the volume's free space read when that line arrived, and records 
 usually removes what it half-wrote before it exits, so the volume no longer looks full by then. A failed task that
 printed no such line but left the volume nearly full names the volume.
 
+A lease names the attach of the volume it was taken on, and its space is read only while the mountpoint still holds that
+attach and the lease is still on it. Once the attach is gone the mountpoint is a bare directory on the host's Data
+volume, where a write through `TMPDIR` can make the lease path again, and that free space is not the lease's: the ENOSPC
+line then says the lease was lost and why, or that the volume could not be read. Its release says it the same way
+(`RAM temp volume: lease <lease> was lost while its task held it: …`) and is never taken as a release of a lease that
+was there.
+
 What a command leaves running is ended by its owner, never chosen by where it works (`specs/cowshed/11_shell.md`,
 "Process identity and signal ownership"; `specs/cowshed/07_api.md`, `JobSubtreeHandle`). When the job's supervisor
 serves `COWSHED_SUPERVISOR_SOCKET`, the command runs as `cowshed subtree-root --handle-fd 4 -- /bin/sh -c <command>`:
@@ -1909,7 +1916,8 @@ task id and the hash it ran at:
   `lockWaits` is always empty. An incomplete or raced capture records none.
 - `no-space`: the command failed after its output said a write found no space (`ENOSPC` or `No space left on device`).
   Its tests failed on the disk, not on their own, whatever bound or hang followed: it records that line and, when the
-  task held a RAM lease, the lease, the volume and its free bytes when the line arrived. A passing run that printed such
+  task held a RAM lease, the lease, the volume and its free bytes when the line arrived, or why none were read: the
+  lease was no longer on its volume (`lost`) or the volume could not be read (`unread`). A passing run that printed such
   a line passed.
 - `failed`: a test failed on its own, or the command exited non-zero with no report naming a timeout.
 - `passed`.

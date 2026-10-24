@@ -243,12 +243,13 @@ describe('bounded-exec verdicts', () => {
     const noSpace = {
       line: 'ENOSPC: no space left on device, write',
       volume: {
+        kind: 'measured',
         lease: '/private/var/folders/cowshed/502/ram3/37738-AadRCN',
         mountpoint: '/private/var/folders/cowshed/502/ram3',
         capacityBytes: 8 * 1024 ** 3,
         freeBytes: 4096,
       },
-    };
+    } as const;
     const report = { timedOut: [], cancelled: [], failed: ['lsp-differential hover'] };
     const ran = { exitCode: 1, elapsedMs: 11_580, expiry: null, report, noSpace, lockWaits: [] };
     expect(judgeRun(ran)).toEqual({ outcome: 'no-space', exitCode: 1, tests: ['lsp-differential hover'], ...noSpace });
@@ -267,6 +268,44 @@ describe('bounded-exec verdicts', () => {
         '/private/var/folders/cowshed/502/ram3/37738-AadRCN is on the RAM temp volume /private/var/folders/cowshed/502/ram3, which had 0.0 MiB free ' +
         'of 8192.0 MiB when that line arrived; the tests that then failed: lsp-differential hover',
     );
+  });
+
+  it('says the lease was lost from its volume when the ENOSPC line arrived, and reads each recorded kind back', async () => {
+    // From a land gate: the RAM volume was detached under a running shard, a write through TMPDIR made the lease
+    // directory again on the host's Data volume, and its statfs read 2778060.4 MiB free of the 8192.0 MiB volume.
+    const line = 'ENOSPC: no space left on device, write';
+    const lost = {
+      kind: 'lost',
+      lease: '/private/var/folders/cowshed/502/ram3/33054-jdLjKN',
+      mountpoint: '/private/var/folders/cowshed/502/ram3',
+      detail: 'no marked volume is mounted at /private/var/folders/cowshed/502/ram3 any more',
+    } as const;
+    const verdict = { outcome: 'no-space', exitCode: 1, tests: [], line, volume: lost } as const;
+    expect(describeVerdict(verdict)).toBe(
+      `ENOSPC (no space left on device): the command printed "${line}"; its TMPDIR ${lost.lease} was no longer on ` +
+        `the RAM temp volume at ${lost.mountpoint} when that line arrived, so no free space of that volume was read: ` +
+        lost.detail,
+    );
+
+    const { root } = await workspace();
+    const directory = join(root, 'record');
+    await mkdir(directory, { recursive: true });
+    const write = (volume: unknown) =>
+      writeFile(
+        join(directory, VERDICT_FILE),
+        JSON.stringify({ task: 'app:test', hash: '42', verdict: { ...verdict, volume } }),
+      );
+    await write(lost);
+    expect((await readRecord(directory))?.verdict).toEqual(verdict);
+    const unread = { ...lost, kind: 'unread', detail: 'EIO' } as const;
+    await write(unread);
+    expect((await readRecord(directory))?.verdict).toEqual({ ...verdict, volume: unread });
+    // A record written before the kinds were named reads as the measurement it recorded.
+    const measured = { lease: lost.lease, mountpoint: lost.mountpoint, capacityBytes: 8 * 1024 ** 3, freeBytes: 4096 };
+    await write(measured);
+    expect((await readRecord(directory))?.verdict).toEqual({ ...verdict, volume: { kind: 'measured', ...measured } });
+    await write({ kind: 'lost', lease: lost.lease, mountpoint: lost.mountpoint });
+    await expect(readRecord(directory)).rejects.toThrow('not a bounded-exec verdict');
   });
 
   it('records a failing command with no report as a failure, and a passing one as passed', async () => {

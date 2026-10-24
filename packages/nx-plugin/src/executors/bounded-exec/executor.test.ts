@@ -1505,7 +1505,13 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const directory = join(workspace.root, 'lease');
     await mkdir(directory);
     const lease = leaseAt(directory);
-    const space = { lease: directory, mountpoint: workspace.root, capacityBytes: lease.capacityBytes, freeBytes: 4096 };
+    const space = {
+      kind: 'measured',
+      lease: directory,
+      mountpoint: workspace.root,
+      capacityBytes: 1024 * 1024 * 1024,
+      freeBytes: 4096,
+    } as const;
     const volume = scriptedVolume(
       { ok: true, value: { kind: 'leased', lease, held: [], reaped: [], gaps: [], retained: [] } },
       null,
@@ -1513,6 +1519,12 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     );
     const record = { task: { id: 'compiler:test-10', hash: 'h' }, directory: join(workspace.root, 'record') };
     const line = 'ENOSPC: no space left on device, write';
+    // The command's ENOSPC line is this test's fixture. On the suite's own output the bounded leg that runs the suite
+    // reads it as its own disk filling: a land gate recorded nx-plugin:test-shard1 as no-space from this line.
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    process.stdout.write = captureWrite(stdout);
+    process.stderr.write = captureWrite(stderr);
 
     const result = await runBoundedExec(
       { command: `node -e "console.error('${line}'); process.exit(1)"`, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
@@ -1533,6 +1545,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         'line arrived\n',
     );
     expect(result.terminalOutput).not.toContain('is full:');
+    expect([...stdout, ...stderr].join('')).toContain(line);
     expect(await readRecord(record.directory)).toEqual({
       task: record.task.id,
       hash: 'h',
@@ -2529,7 +2542,7 @@ async function createWorkspace(parent: string = tmpdir()): Promise<WorkspaceFixt
 }
 
 function leaseAt(directory: string): RamTempLease {
-  return { directory, mountpoint: dirname(directory), capacityBytes: 1024 * 1024 * 1024 };
+  return { directory, mountpoint: dirname(directory), volumeKey: 'scripted attach' };
 }
 
 /**
@@ -2557,8 +2570,11 @@ function scriptedVolume(
       return Promise.resolve({ ok: true, value: keep ? [`${lease.directory} archived by the scripted volume`] : [] });
     },
     fullness: () => Promise.resolve(full),
-    space() {
+    space(lease) {
       order.push('space');
+      if (space === null) {
+        throw new Error(`the scripted volume holding ${lease.directory} was built without a space reading to answer`);
+      }
       return Promise.resolve(space);
     },
   };

@@ -319,7 +319,11 @@ export interface RamTempLease {
   /** The task's TMPDIR: a directory on the volume that only this task uses. */
   directory: string;
   mountpoint: string;
-  capacityBytes: number;
+  /**
+   * The attach of the volume the lease was taken on ({@link MountedVolume.key}). A read of the mountpoint that finds
+   * another attach, or none, is not this lease's volume: its free space is some other filesystem's.
+   */
+  volumeKey: string;
 }
 
 export interface RamUnavailable {
@@ -362,6 +366,8 @@ export type RamTempError =
   | ProvisionFailed
   /** A failed task left the volume (nearly) full: the likely cause of its failure. */
   | { kind: 'volume-full'; mountpoint: string; capacityBytes: number; freeBytes: number }
+  /** The lease went while its task held it: its volume was detached or replaced, or its directory removed. */
+  | { kind: 'lease-lost'; lease: string; mountpoint: string; detail: string }
   /** The per-user root the volume mounts below is missing, or is not the user's 0700 directory. */
   | { kind: 'root-unready'; root: string; detail: string };
 
@@ -375,6 +381,8 @@ export function describeRamTempError(error: RamTempError): string {
       return `RAM temp volume: ${error.step} failed: ${error.detail}`;
     case 'volume-full':
       return `RAM temp volume ${error.mountpoint} is full: ${Math.round(error.freeBytes / MIB)} MiB free of ${Math.round(error.capacityBytes / MIB)} MiB; raise RAM_TEMP_CAPACITY_BYTES in @smoothbricks/nx-plugin`;
+    case 'lease-lost':
+      return `RAM temp volume: lease ${error.lease} was lost while its task held it: ${error.detail}; what the task wrote to its TMPDIR went with it`;
     case 'root-unready':
       return `RAM temp volume: ${error.root} ${error.detail}; run "cowshed setup", which makes it a directory of yours with mode 0700`;
   }
@@ -445,7 +453,6 @@ const EMPTY_LEDGER: Ledger = { lifecycle: null, claims: [], held: [] };
 /** The volume as one locked step finds it mounted. */
 interface MountedVolume {
   readonly registryEntry: string;
-  readonly capacity: number;
   /** This attach of the volume: its root's and its marker's identity, never times that change while it is in use. */
   readonly key: string;
   readonly device: number;
@@ -541,7 +548,7 @@ type Taken =
     };
 
 type Releasing =
-  | { readonly kind: 'unmounted' }
+  | { readonly kind: 'lost'; readonly detail: string }
   | { readonly kind: 'wait'; readonly claim: LifecycleClaim }
   | {
       readonly kind: 'claimed';
@@ -561,7 +568,7 @@ export class RamTempVolume {
 
   constructor(
     private readonly paths: RamTempPaths,
-    private readonly capacityBytes: number,
+    capacityBytes: number,
     private readonly commands: HostCommands,
     private readonly pid: number = process.pid,
     private readonly isAlive: (pid: number) => boolean = processIsAlive,
@@ -733,7 +740,7 @@ export class RamTempVolume {
               lease: {
                 directory: value.directory,
                 mountpoint: this.paths.mountpoint,
-                capacityBytes: value.volume.capacity,
+                volumeKey: value.volume.key,
               },
               held: [...value.held, ...settled.value.held].map((lease) => lease.text),
               reaped: [...settled.value.reaped],
@@ -755,7 +762,7 @@ export class RamTempVolume {
     const placed = await this.locked(
       op,
       'lease',
-      async (ledger, volume): Promise<Step<Result<string, RamTempError>>> => {
+      async (ledger, volume): Promise<Step<Result<RamTempLease, RamTempError>>> => {
         const next = withoutClaimsOf(ledger, op.owner);
         if (ledger.lifecycle?.owner.token !== op.owner.token) {
           return {
@@ -772,7 +779,11 @@ export class RamTempVolume {
             value: failed('create', `${this.paths.mountpoint} is not the marked volume once provisioned`),
           };
         }
-        return { ledger: next, value: { ok: true, value: await this.make(op) } };
+        const directory = await this.make(op);
+        return {
+          ledger: next,
+          value: { ok: true, value: { directory, mountpoint: this.paths.mountpoint, volumeKey: volume.key } },
+        };
       },
     );
     if (!placed.ok) {
@@ -785,7 +796,7 @@ export class RamTempVolume {
       ok: true,
       value: {
         kind: 'leased',
-        lease: { directory: placed.value.value, mountpoint: this.paths.mountpoint, capacityBytes: this.capacityBytes },
+        lease: placed.value.value,
         held: [],
         reaped: [],
         retained: [],
@@ -817,7 +828,7 @@ export class RamTempVolume {
     const op: Operation = { owner: { pid: this.pid, token: randomUUID() }, subtrees, claimed: false, made: null };
     let result: Result<string[], LockedError>;
     try {
-      result = await this.releaseLease(op, basename(lease.directory), keep);
+      result = await this.releaseLease(op, lease, keep);
     } catch (error) {
       result = failed('release', errorText(error));
     }
@@ -832,20 +843,27 @@ export class RamTempVolume {
     return { ok: false, error: alsoFailed(primary, ended.ok ? [] : [ended.error]) };
   }
 
-  private async releaseLease(op: Operation, own: string, keep: boolean): Promise<Result<string[], LockedError>> {
+  private async releaseLease(
+    op: Operation,
+    lease: RamTempLease,
+    keep: boolean,
+  ): Promise<Result<string[], LockedError>> {
+    const own = basename(lease.directory);
     let waited: ClaimWait | null = null;
     for (;;) {
       const taken = await this.locked(op, 'release', async (ledger, volume): Promise<Step<Releasing>> => {
-        if (volume === null) {
-          return { ledger, value: { kind: 'unmounted' } };
+        // A lease that went while its task held it is said, never released as though it were there.
+        const held = leaseOn(lease, volume);
+        if ('lost' in held) {
+          return { ledger, value: { kind: 'lost', detail: held.lost } };
         }
         if (ledger.lifecycle !== null) {
           return { ledger, value: { kind: 'wait', claim: ledger.lifecycle } };
         }
-        const claimed = await this.claim(ledger, volume, op.owner, own, keep);
+        const claimed = await this.claim(ledger, held.on, op.owner, own, keep);
         return {
           ledger: claimed.ledger,
-          value: { kind: 'claimed', volume, held: claimed.held, candidates: claimed.candidates },
+          value: { kind: 'claimed', volume: held.on, held: claimed.held, candidates: claimed.candidates },
         };
       });
       if (!taken.ok) {
@@ -853,8 +871,11 @@ export class RamTempVolume {
       }
       const value = taken.value;
       switch (value.kind) {
-        case 'unmounted':
-          return { ok: true, value: [] };
+        case 'lost':
+          return {
+            ok: false,
+            error: { kind: 'lease-lost', lease: lease.directory, mountpoint: lease.mountpoint, detail: value.detail },
+          };
         case 'wait': {
           const yielded = await this.yieldTo(op, value.claim, waited);
           if (!yielded.ok) return yielded;
@@ -924,28 +945,45 @@ export class RamTempVolume {
     return { ...wait, notices: Math.max(wait.notices, due) };
   }
 
-  /** After a failed task: whether the volume ran out of space, which is then the error to report. */
+  /**
+   * After a failed task: whether the volume ran out of space, which is then the error to report. A lease no longer on
+   * its volume is said by its release, and a volume that cannot be read has no space to report.
+   */
   async fullness(lease: RamTempLease): Promise<RamTempError | null> {
     const space = await this.space(lease);
-    if (space === null || space.freeBytes >= FULL_FREE_BYTES) {
+    if (space.kind !== 'measured' || space.freeBytes >= FULL_FREE_BYTES) {
       return null;
     }
     const { mountpoint, capacityBytes, freeBytes } = space;
     return { kind: 'volume-full', mountpoint, capacityBytes, freeBytes };
   }
 
-  /** The lease's volume and the space left on it now; `null` when the volume cannot be read. */
-  async space(lease: RamTempLease): Promise<TempVolumeSpace | null> {
+  /**
+   * The lease's volume and the space left on it now, measured only while the mountpoint holds the attach the lease was
+   * taken on and the lease is still on it: a bare mountpoint's statfs reads the host's Data volume, whose free space is
+   * not the lease's. A lease that went with its volume, or from it, is `lost`; a read that failed is `unread`.
+   */
+  async space(lease: RamTempLease): Promise<TempVolumeSpace> {
+    const { directory, mountpoint } = lease;
     try {
-      const fs = await statfs(lease.mountpoint);
+      const observed = await this.observe();
+      if (!observed.ok) {
+        return { kind: 'unread', lease: directory, mountpoint, detail: describeRamTempError(observed.error) };
+      }
+      const held = leaseOn(lease, observed.value);
+      if ('lost' in held) {
+        return { kind: 'lost', lease: directory, mountpoint, detail: held.lost };
+      }
+      const fs = await statfs(mountpoint);
       return {
-        lease: lease.directory,
-        mountpoint: lease.mountpoint,
-        capacityBytes: lease.capacityBytes,
+        kind: 'measured',
+        lease: directory,
+        mountpoint,
+        capacityBytes: fs.blocks * fs.bsize,
         freeBytes: fs.bavail * fs.bsize,
       };
-    } catch {
-      return null;
+    } catch (error) {
+      return { kind: 'unread', lease: directory, mountpoint, detail: errorText(error) };
     }
   }
 
@@ -1260,11 +1298,10 @@ export class RamTempVolume {
     ]);
     if (root.dev === parent.dev || !mark.isFile())
       return failed('provenance', 'gateway marker is not on a separately mounted RAM volume');
-    const [fs, names] = await Promise.all([statfs(this.paths.mountpoint), readdir(this.paths.mountpoint)]);
+    const names = await readdir(this.paths.mountpoint);
     return {
       ok: true,
       value: {
-        capacity: fs.blocks * fs.bsize,
         registryEntry: marker.registryEntry,
         key: [
           `root ${root.dev}:${root.ino}:${root.birthtimeNs}`,
@@ -1979,6 +2016,30 @@ async function removeMountDirectories(directories: readonly string[]): Promise<s
   return failures;
 }
 
+/**
+ * The volume one read found at the lease's mountpoint, while the lease is still on that attach of it; else why it is
+ * not. Every lease's `TMPDIR` is a directory on one attach: once that attach is gone, the path is a bare directory on
+ * the host's Data volume, or on a later attach, which a write through `TMPDIR` can make again.
+ */
+function leaseOn(
+  lease: RamTempLease,
+  volume: MountedVolume | null,
+): { readonly on: MountedVolume } | { readonly lost: string } {
+  if (volume === null) {
+    return {
+      lost: `no marked volume is mounted at ${lease.mountpoint} any more: it was detached while the task held its lease`,
+    };
+  }
+  if (volume.key !== lease.volumeKey) {
+    return {
+      lost: `${lease.mountpoint} holds another attach of the volume than the one the lease was taken on: it was detached and made again while the task held its lease`,
+    };
+  }
+  return volume.leases.includes(basename(lease.directory))
+    ? { on: volume }
+    : { lost: `${lease.directory} is gone from the volume while the task held it` };
+}
+
 /** The pid a lease directory is named after: whether its task is alive. */
 function leasePid(name: string): number {
   return Number(LEASE_NAME.exec(name)?.[1]);
@@ -2174,6 +2235,7 @@ function alsoFailed(primary: RamTempError, cleanup: readonly RamTempError[]): Ra
     case 'root-unready':
       return { ...primary, detail: `${primary.detail}; ${after}` };
     case 'volume-full':
+    case 'lease-lost':
       return { kind: 'provision-failed', step: 'cleanup', detail: `${describeRamTempError(primary)}; ${after}` };
   }
 }
