@@ -86,6 +86,7 @@
     "src/executors/bounded-exec/ram-temp-held.test.ts": 65,
     "src/producer-receipts.test.ts": 59,
     "src/executors/bounded-exec/disk-lease.test.ts": 57,
+    "src/managed-files/managed-templates-no-sudo.test.ts": 50,
     "src/managed-files/trace-db-artifact.test.ts": 45,
     "src/managed-files/managed-content.test.ts": 44,
     "src/managed-files/tree.test.ts": 44,
