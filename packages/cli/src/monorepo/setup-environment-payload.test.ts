@@ -7,7 +7,6 @@ import { dirname, join, relative, resolve } from 'node:path';
 import {
   edit,
   finished,
-  HEALTHY,
   type Repository,
   type RepositoryOptions,
   type ShellProcess,
@@ -16,18 +15,26 @@ import {
 
 /**
  * What an explicit missing-payload repair does, measured against the real
- * "setup-environment.ts --repair-missing-payload" mode.
+ * "setup-environment.ts --repair-missing-payload" mode, and what shell entry
+ * relinks in Bun's store.
  *
- * Every case owns a private HTTP registry serving a real published tar: real
- * bytes, real sha512 integrity, a real "bun install" resolving it into
- * bun.lock under a private BUN_INSTALL_CACHE_DIR. Each then breaks one
+ * Every install owns a private HTTP registry serving a real published tar:
+ * real bytes, real sha512 integrity, a real "bun install" resolving it into
+ * bun.lock under a private BUN_INSTALL_CACHE_DIR. A repair case breaks one
  * installed file physically and requests the repair through the checkout's
- * installed alias. Nothing here stubs the repair: the fetch, the locked
- * integrity comparison, the filesystem and the whole-directory exchange are
- * the real ones, and the atomic-failure case reaches its cause through real
- * file permissions rather than any fault flag. A successful repair reports its
- * stdout JSON protocol; the filesystem digests around each run are the proof
- * that the report is true.
+ * installed alias; the relink case removes an install-cache entry and runs
+ * shell entry's "--links". Nothing here stubs the repair: the fetch, the
+ * locked integrity comparison, the filesystem and the whole-directory exchange
+ * are the real ones, and the atomic-failure case reaches its cause through
+ * real file permissions rather than any fault flag. A successful repair
+ * reports its stdout JSON protocol; the filesystem digests around each run are
+ * the proof that the report is true.
+ *
+ * An install is the expensive part, so the cases that can share one do. Each
+ * adds its single cause to it, asserts, and withdraws the cause before the
+ * next, so no refusal is explained by what an earlier case left behind; a
+ * failure names the case that broke. The permission case revokes write access
+ * to the package's parent and keeps an install of its own.
  */
 
 interface PublishedRegistry {
@@ -148,6 +155,18 @@ function protocol(stdout: string): Record<string, unknown> {
   return Object.fromEntries(Object.entries(report ?? {}));
 }
 
+/**
+ * One named step of a sequence that shares an install. A failure says which
+ * step broke, because the runner's source frames are unreliable.
+ */
+async function step(name: string, run: () => Promise<void>): Promise<void> {
+  try {
+    await run();
+  } catch (cause) {
+    throw new Error(`${name}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+  }
+}
+
 /** One run of the real script, with the private Bun install cache this fixture owns. */
 function setupRun(root: string, cargoHome: string, args: readonly string[]): ShellProcess {
   const scratch = dirname(cargoHome);
@@ -172,7 +191,7 @@ function setupRun(root: string, cargoHome: string, args: readonly string[]): She
   });
 }
 
-describe('explicit missing-payload repair', () => {
+describe('a published payload installed in a checkout', () => {
   const alias = join('node_modules', '@acme', 'payload');
   const missing = join(alias, 'lib', 'middle.js');
 
@@ -219,114 +238,117 @@ describe('explicit missing-payload repair', () => {
     );
   }
 
-  it('restores a physically missing published file to its locked published bytes', async () => {
+  /**
+   * What a repair is judged against on disk: the package's bytes and links, the
+   * lock, and the witness (null while there is none).
+   */
+  function evidence(root: string): { payload: Record<string, string>; lock: string; witness: string | null } {
+    const receipt = join(root, 'node_modules', '.smoo-install');
+    return {
+      payload: packageState(join(root, alias)),
+      lock: readFileSync(join(root, 'bun.lock'), 'utf8'),
+      witness: existsSync(receipt) ? readFileSync(receipt, 'utf8') : null,
+    };
+  }
+
+  it('refuses unsafe repairs unchanged, repairs under a stale witness, and relinks a dangling store link', async () => {
     const registry = await publishedRegistry();
     try {
       await withInstalledPayload(registry, {}, async ({ root, cargoHome }) => {
         const installed = join(root, missing);
-        await rm(installed);
-        const broken = packageState(join(root, alias));
-        expect(Object.hasOwn(broken, 'lib/middle.js')).toBe(false);
         const receipt = join(root, 'node_modules', '.smoo-install');
-        const stamped = readFileSync(receipt, 'utf8');
-        const locked = readFileSync(join(root, 'bun.lock'), 'utf8');
-        const repaired = await setupResult(setupRun(root, cargoHome, ['--repair-missing-payload', installed]));
-        expect(repaired.exitCode).toBe(0);
-        // Missing-only: exactly the named file returns, at its locked published
-        // bytes, and every other byte and link of the package is untouched.
-        expect(packageState(join(root, alias))).toEqual({
-          ...broken,
-          'lib/middle.js': PUBLISHED_MIDDLE,
+        const repair = () => setupResult(setupRun(root, cargoHome, ['--repair-missing-payload', installed]));
+
+        await step(
+          'reinstalls when a store link the installed tree reaches dangles, and never for one nothing reaches',
+          async () => {
+            const check = async () => (await finished(setupRun(root, cargoHome, ['--links', '--check']))).exitCode;
+            const store = join(root, 'node_modules', '.bun');
+            const entry = join(store, '@acme+payload@1.0.0');
+            const cached = readlinkSync(entry);
+            expect(cached.startsWith(`${join(root, '.bun-install-cache')}/`)).toBe(true);
+            expect(await check()).toBe(0);
+
+            // A superseded variant of the same package and version, its cache entry gone: nothing installed reaches
+            // it and no install changes it, so it is not out of date.
+            symlinkSync(`${cached}-superseded`, join(store, '@acme+payload@1.0.0+superseded'));
+            expect(await check()).toBe(0);
+
+            // The cache entry the installed tree reaches is gone: the install is out of date.
+            await rm(cached, { recursive: true });
+            expect(await check()).toBe(1);
+            const repaired = await finished(setupRun(root, cargoHome, ['--links']));
+            expect(repaired.exitCode, repaired.stderr).toBe(0);
+            expect(repaired.stderr).toContain(
+              `! ${entry} -> ${cached}: that Bun install-cache entry no longer exists; reinstalling`,
+            );
+            expect(JSON.parse(readFileSync(join(root, alias, 'package.json'), 'utf8'))).toEqual(
+              JSON.parse(PUBLISHED_PACKAGE),
+            );
+            expect(await check()).toBe(0);
+          },
+        );
+
+        // Every step below adds its single cause to this install, asserts, and withdraws the cause, so each
+        // refusal is for its own reason. The named file stays missing until the repair that restores it.
+        await rm(installed);
+
+        await step('refuses a tar whose bytes fail the locked integrity and changes nothing', async () => {
+          const before = evidence(root);
+          registry.tamper(true);
+          const refused = await repair();
+          registry.tamper(false);
+          expect(refused.exitCode).not.toBe(0);
+          expect(refused.stderr).toContain('integrity');
+          expect(evidence(root)).toEqual(before);
         });
-        expect(readFileSync(join(root, 'bun.lock'), 'utf8')).toBe(locked);
-        expect(readFileSync(receipt, 'utf8')).toBe(stamped);
-        const report = protocol(repaired.stdout);
-        expect(report['operation']).toBe('repair-missing-payload');
-        expect(report['package']).toBe('@acme/payload@1.0.0');
-        expect(report['requestedPath']).toBe(installed);
-        expect(report['publishedComplete']).toBe(true);
-        expect(report['lockedHashesUnchanged']).toBe(true);
-        expect(report['restoredFiles']).toBe(1);
-        expect(report['publishedFiles']).toBe(4);
+
+        await step('refuses an existing published-payload mismatch and changes nothing', async () => {
+          const index = join(root, alias, 'index.js');
+          await edit(index, "module.exports = 'local edit';\n");
+          const before = evidence(root);
+          const refused = await repair();
+          expect(refused.exitCode).not.toBe(0);
+          expect(refused.stderr).toContain('index.js');
+          // The mismatch is refused, never silently repaired: package, stamp and
+          // locks are all unchanged, and the named file stays missing.
+          expect(evidence(root)).toEqual(before);
+          // Withdrawn, so the next step meets no cause but its own.
+          await writeFile(index, PUBLISHED_INDEX);
+        });
+
+        await step('preserves a stale witness and its stale inputs exactly', async () => {
+          // The install inputs drift after the witness was recorded. The repair is
+          // not an install: the stale inputs and the witness's recorded digests
+          // stay exactly as they are, while the missing file is restored.
+          await edit(join(root, 'package.json'), `${readFileSync(join(root, 'package.json'), 'utf8')}\n`);
+          const witness = readFileSync(receipt, 'utf8');
+          const stale = readFileSync(join(root, 'package.json'), 'utf8');
+          const repaired = await repair();
+          expect(repaired.exitCode).toBe(0);
+          expect(readFileSync(installed, 'utf8')).toBe(PUBLISHED_MIDDLE);
+          expect(readFileSync(receipt, 'utf8')).toBe(witness);
+          expect(readFileSync(join(root, 'package.json'), 'utf8')).toBe(stale);
+        });
+
+        await step('refuses a repair with no prior success witness and mints no fresh proof', async () => {
+          await rm(receipt);
+          await rm(installed);
+          const before = evidence(root);
+          const refused = await repair();
+          expect(refused.exitCode).not.toBe(0);
+          // Refused rather than minting fresh full-install proof: no witness
+          // appears, and the package stays exactly as it was asked.
+          expect(existsSync(receipt)).toBe(false);
+          expect(evidence(root)).toEqual(before);
+        });
       });
     } finally {
       registry.close();
     }
   });
 
-  it('refuses an existing published-payload mismatch and changes nothing', async () => {
-    const registry = await publishedRegistry();
-    try {
-      await withInstalledPayload(registry, {}, async ({ root, cargoHome }) => {
-        const installed = join(root, missing);
-        await rm(installed);
-        await edit(join(root, alias, 'index.js'), "module.exports = 'local edit';\n");
-        const broken = packageState(join(root, alias));
-        const receipt = join(root, 'node_modules', '.smoo-install');
-        const stamped = readFileSync(receipt, 'utf8');
-        const locked = readFileSync(join(root, 'bun.lock'), 'utf8');
-        const refused = await setupResult(setupRun(root, cargoHome, ['--repair-missing-payload', installed]));
-        expect(refused.exitCode).not.toBe(0);
-        expect(refused.stderr).toContain('index.js');
-        // The mismatch is refused, never silently repaired: package, stamp and
-        // locks are all unchanged, and the named file stays missing.
-        expect(packageState(join(root, alias))).toEqual(broken);
-        expect(readFileSync(join(root, 'bun.lock'), 'utf8')).toBe(locked);
-        expect(readFileSync(receipt, 'utf8')).toBe(stamped);
-      });
-    } finally {
-      registry.close();
-    }
-  });
-
-  it('refuses a tar whose bytes fail the locked integrity and changes nothing', async () => {
-    const registry = await publishedRegistry();
-    try {
-      await withInstalledPayload(registry, {}, async ({ root, cargoHome }) => {
-        const installed = join(root, missing);
-        await rm(installed);
-        const broken = packageState(join(root, alias));
-        const receipt = join(root, 'node_modules', '.smoo-install');
-        const stamped = readFileSync(receipt, 'utf8');
-        const locked = readFileSync(join(root, 'bun.lock'), 'utf8');
-        registry.tamper(true);
-        const refused = await setupResult(setupRun(root, cargoHome, ['--repair-missing-payload', installed]));
-        expect(refused.exitCode).not.toBe(0);
-        expect(refused.stderr).toContain('integrity');
-        expect(packageState(join(root, alias))).toEqual(broken);
-        expect(readFileSync(join(root, 'bun.lock'), 'utf8')).toBe(locked);
-        expect(readFileSync(receipt, 'utf8')).toBe(stamped);
-      });
-    } finally {
-      registry.close();
-    }
-  });
-
-  it('repeats a healthy request idempotently, installing nothing', async () => {
-    const registry = await publishedRegistry();
-    try {
-      await withInstalledPayload(registry, {}, async ({ root, cargoHome, count }) => {
-        const installed = join(root, missing);
-        await rm(installed);
-        const repaired = await setupResult(setupRun(root, cargoHome, ['--repair-missing-payload', installed]));
-        expect(repaired.exitCode).toBe(0);
-        const whole = packageState(join(root, alias));
-        const receipt = join(root, 'node_modules', '.smoo-install');
-        const stamped = readFileSync(receipt, 'utf8');
-        const installs = count('install');
-        const again = await setupResult(setupRun(root, cargoHome, ['--repair-missing-payload', installed]));
-        expect(again.exitCode).toBe(0);
-        expect(protocol(again.stdout)['operation']).toBe('repair-missing-payload');
-        expect(packageState(join(root, alias))).toEqual(whole);
-        expect(readFileSync(receipt, 'utf8')).toBe(stamped);
-        expect(count('install')).toBe(installs);
-      });
-    } finally {
-      registry.close();
-    }
-  });
-
-  it('retains alias links, package metadata and developer links across a repair', async () => {
+  it('restores a missing file keeping links and metadata, and a repeated request installs nothing', async () => {
     const registry = await publishedRegistry();
     try {
       await withInstalledPayload(
@@ -340,9 +362,11 @@ describe('explicit missing-payload repair', () => {
           },
           developerLinks: { '@acme/notes': '../notes-target' },
         },
-        async ({ root, cargoHome }) => {
+        async ({ root, cargoHome, count }) => {
+          const installed = join(root, missing);
           const aliasPath = join(root, alias);
           const notes = join(root, 'node_modules', '@acme', 'notes');
+          const repair = () => setupResult(setupRun(root, cargoHome, ['--repair-missing-payload', installed]));
           // Each oracle names itself in its failure, because the runner's
           // source frames are unreliable.
           expect(lstatSync(aliasPath).isSymbolicLink() ? 'alias-link' : 'alias-not-a-link').toBe('alias-link');
@@ -350,15 +374,46 @@ describe('explicit missing-payload repair', () => {
           const beforeNotes = linkTarget(notes);
           expect(existsSync(notes) ? 'notes-link' : 'notes-absent').toBe('notes-link');
           const metadata = readFileSync(join(aliasPath, 'package.json'), 'utf8');
-          await rm(join(root, missing));
-          const repaired = await setupResult(
-            setupRun(root, cargoHome, ['--repair-missing-payload', join(root, missing)]),
-          );
-          expect(repaired.exitCode).toBe(0);
-          expect(lstatSync(aliasPath).isSymbolicLink() ? 'alias-link' : 'alias-not-a-link').toBe('alias-link');
-          expect(linkTarget(aliasPath)).toBe(beforeAlias);
-          expect(linkTarget(notes)).toBe(beforeNotes);
-          expect(readFileSync(join(aliasPath, 'package.json'), 'utf8')).toBe(metadata);
+          await rm(installed);
+          const broken = evidence(root);
+          expect(Object.hasOwn(broken.payload, 'lib/middle.js')).toBe(false);
+          const repaired = await repair();
+
+          await step('restores a physically missing published file to its locked published bytes', async () => {
+            expect(repaired.exitCode).toBe(0);
+            // Missing-only: exactly the named file returns, at its locked published
+            // bytes, and every other byte and link of the package, the lock and the
+            // witness are untouched.
+            expect(evidence(root)).toEqual({
+              ...broken,
+              payload: { ...broken.payload, 'lib/middle.js': PUBLISHED_MIDDLE },
+            });
+            const report = protocol(repaired.stdout);
+            expect(report['operation']).toBe('repair-missing-payload');
+            expect(report['package']).toBe('@acme/payload@1.0.0');
+            expect(report['requestedPath']).toBe(installed);
+            expect(report['publishedComplete']).toBe(true);
+            expect(report['lockedHashesUnchanged']).toBe(true);
+            expect(report['restoredFiles']).toBe(1);
+            expect(report['publishedFiles']).toBe(4);
+          });
+
+          await step('retains alias links, package metadata and developer links across a repair', async () => {
+            expect(lstatSync(aliasPath).isSymbolicLink() ? 'alias-link' : 'alias-not-a-link').toBe('alias-link');
+            expect(linkTarget(aliasPath)).toBe(beforeAlias);
+            expect(linkTarget(notes)).toBe(beforeNotes);
+            expect(readFileSync(join(aliasPath, 'package.json'), 'utf8')).toBe(metadata);
+          });
+
+          await step('repeats a healthy request idempotently, installing nothing', async () => {
+            const whole = evidence(root);
+            const installs = count('install');
+            const again = await repair();
+            expect(again.exitCode).toBe(0);
+            expect(protocol(again.stdout)['operation']).toBe('repair-missing-payload');
+            expect(evidence(root)).toEqual(whole);
+            expect(count('install')).toBe(installs);
+          });
         },
         async ({ root }) => {
           const target = join(dirname(root), 'notes-target');
@@ -369,53 +424,6 @@ describe('explicit missing-payload repair', () => {
           await writeFile(join(target, 'README.md'), 'developer notes\n');
         },
       );
-    } finally {
-      registry.close();
-    }
-  });
-
-  it('refuses a repair with no prior success witness and mints no fresh proof', async () => {
-    const registry = await publishedRegistry();
-    try {
-      await withInstalledPayload(registry, {}, async ({ root, cargoHome }) => {
-        const installed = join(root, missing);
-        const receipt = join(root, 'node_modules', '.smoo-install');
-        await rm(receipt);
-        await rm(installed);
-        const broken = packageState(join(root, alias));
-        const locked = readFileSync(join(root, 'bun.lock'), 'utf8');
-        const refused = await setupResult(setupRun(root, cargoHome, ['--repair-missing-payload', installed]));
-        expect(refused.exitCode).not.toBe(0);
-        // Refused rather than minting fresh full-install proof: no witness
-        // appears, and the package stays exactly as it was asked.
-        expect(existsSync(receipt)).toBe(false);
-        expect(packageState(join(root, alias))).toEqual(broken);
-        expect(readFileSync(join(root, 'bun.lock'), 'utf8')).toBe(locked);
-      });
-    } finally {
-      registry.close();
-    }
-  });
-
-  it('preserves a stale witness and its stale inputs exactly', async () => {
-    const registry = await publishedRegistry();
-    try {
-      await withInstalledPayload(registry, {}, async ({ root, cargoHome }) => {
-        const installed = join(root, missing);
-        const receipt = join(root, 'node_modules', '.smoo-install');
-        // The install inputs drift after the witness was recorded. The repair is
-        // not an install: the stale inputs and the witness's recorded digests
-        // stay exactly as they are, while the missing file is restored.
-        await edit(join(root, 'package.json'), `${readFileSync(join(root, 'package.json'), 'utf8')}\n`);
-        const witness = readFileSync(receipt, 'utf8');
-        const stale = readFileSync(join(root, 'package.json'), 'utf8');
-        await rm(installed);
-        const repaired = await setupResult(setupRun(root, cargoHome, ['--repair-missing-payload', installed]));
-        expect(repaired.exitCode).toBe(0);
-        expect(readFileSync(installed, 'utf8')).toBe(PUBLISHED_MIDDLE);
-        expect(readFileSync(receipt, 'utf8')).toBe(witness);
-        expect(readFileSync(join(root, 'package.json'), 'utf8')).toBe(stale);
-      });
     } finally {
       registry.close();
     }
@@ -465,54 +473,6 @@ describe('explicit missing-payload repair', () => {
           await chmod(parent, 0o755);
         }
       });
-    } finally {
-      registry.close();
-    }
-  });
-});
-
-describe("what shell entry relinks in Bun's store", () => {
-  it('reinstalls when a store link the installed tree reaches dangles, and never for one nothing reaches', async () => {
-    const registry = await publishedRegistry();
-    try {
-      await withManagedRepository(
-        {
-          dependencies: { '@acme/payload': '1.0.0' },
-          files: {
-            '.npmrc': `@acme:registry=${registry.origin}\n`,
-            // The repository's own install declaration: node_modules/.bun/<entry> links into the private install
-            // cache setupRun names.
-            'bunfig.toml': '[install]\nlinker = "isolated"\nglobalStore = true\n',
-          },
-        },
-        async ({ root, cargoHome }) => {
-          expect(await finished(setupRun(root, cargoHome, []))).toEqual(HEALTHY);
-          const check = async () => (await finished(setupRun(root, cargoHome, ['--links', '--check']))).exitCode;
-          const store = join(root, 'node_modules', '.bun');
-          const entry = join(store, '@acme+payload@1.0.0');
-          const cached = readlinkSync(entry);
-          expect(cached.startsWith(`${join(root, '.bun-install-cache')}/`)).toBe(true);
-          expect(await check()).toBe(0);
-
-          // A superseded variant of the same package and version, its cache entry gone: nothing installed reaches
-          // it and no install changes it, so it is not out of date.
-          symlinkSync(`${cached}-superseded`, join(store, '@acme+payload@1.0.0+superseded'));
-          expect(await check()).toBe(0);
-
-          // The cache entry the installed tree reaches is gone: the install is out of date.
-          await rm(cached, { recursive: true });
-          expect(await check()).toBe(1);
-          const repaired = await finished(setupRun(root, cargoHome, ['--links']));
-          expect(repaired.exitCode, repaired.stderr).toBe(0);
-          expect(repaired.stderr).toContain(
-            `! ${entry} -> ${cached}: that Bun install-cache entry no longer exists; reinstalling`,
-          );
-          expect(
-            JSON.parse(readFileSync(join(root, 'node_modules', '@acme', 'payload', 'package.json'), 'utf8')),
-          ).toEqual(JSON.parse(PUBLISHED_PACKAGE));
-          expect(await check()).toBe(0);
-        },
-      );
     } finally {
       registry.close();
     }
