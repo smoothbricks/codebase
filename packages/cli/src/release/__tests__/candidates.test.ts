@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { $ } from 'bun';
 import type { PackageJson } from '../../lib/json.js';
 import { parsePackageJsonText } from '../../lib/json.js';
+import { packageInfo } from '../../lib/workspace.js';
+import { releaseCandidateShell } from '../candidate-shell.js';
 import {
   type AutoReleaseCandidateShell,
   autoReleaseCandidatePackages,
@@ -11,7 +12,7 @@ import {
   releaseCandidatePackages,
 } from '../candidates.js';
 import type { ReleasePackageInfo } from '../core.js';
-import { git, tag, withFixtureRepo, writePackage } from './helpers/fixture-repo.js';
+import { git, tag, withFixtureRepo, writePackage, writeWorkspace } from './helpers/fixture-repo.js';
 
 const a: ReleasePackageInfo = { name: '@scope/a', projectName: 'a', path: 'packages/a', version: '1.0.0' };
 const b: ReleasePackageInfo = { name: '@scope/b', projectName: 'b', path: 'packages/b', version: '1.0.0' };
@@ -131,17 +132,19 @@ describe('auto release candidate filtering', () => {
     await expect(autoReleaseCandidatePackages(repo, [next])).resolves.toEqual([]);
   });
 
-  // The one case that runs the test-local git shell end to end; every other case reads the in-memory repository.
+  // The one real-git case: the production shell reads a real repository and a real Nx workspace.
   it('selects a prerelease package when releasable changes exist since the last stable tag', async () => {
     await withFixtureRepo(async (root) => {
-      await writePackage(root, next.name, next.path, '1.0.0');
-      await git(root, ['add', '.']);
+      await writeWorkspace(root);
+      await writeNxPackage(root, next, '1.0.0');
+      await writePackage(root, c.name, c.path, c.version);
+      await git(root, ['add', 'package.json', 'nx.json', 'packages']);
       await git(root, ['commit', '-m', 'chore(release): publish']);
       await tag(root, 'next@1.0.0', '2025-01-01T00:00:00Z');
 
       // Simulate the post-release prerelease bump
-      await writePackage(root, next.name, next.path, next.version);
-      await git(root, ['add', '.']);
+      await writeNxPackage(root, next, next.version);
+      await git(root, ['add', 'packages']);
       await git(root, ['commit', '-m', 'chore(release): prepare next prerelease']);
 
       // A real fix lands on the prerelease version
@@ -150,8 +153,26 @@ describe('auto release candidate filtering', () => {
       await git(root, ['add', join(next.path, 'src/index.ts')]);
       await git(root, ['commit', '-m', 'fix(next): repair something']);
 
-      await expect(autoReleaseCandidatePackages(gitCandidateShell(root), [next])).resolves.toEqual([next]);
+      const shell = await releaseCandidateShell(root);
+      await expect(autoReleaseCandidatePackages(shell, [next])).resolves.toEqual([next]);
+      // c is untagged but has history, so it is a candidate; d has neither a package nor history.
+      await expect(autoReleaseCandidatePackages(shell, [c, d])).resolves.toEqual([c]);
     });
+  });
+
+  it('treats a manifest that cannot be read at the tag or at HEAD as a release change', async () => {
+    const unreadableAtTag = new MemoryRepository();
+    unreadableAtTag.commit({ [join(a.path, 'package.json')]: '{ "name": ' });
+    unreadableAtTag.tag('a@1.0.0');
+    unreadableAtTag.commit(packageManifest(a));
+
+    const unreadableAtHead = new MemoryRepository();
+    unreadableAtHead.commit(packageManifest(a));
+    unreadableAtHead.tag('a@1.0.0');
+    unreadableAtHead.commit({ [join(a.path, 'package.json')]: '[]' });
+
+    await expect(autoReleaseCandidatePackages(unreadableAtTag, [a])).resolves.toEqual([a]);
+    await expect(autoReleaseCandidatePackages(unreadableAtHead, [a])).resolves.toEqual([a]);
   });
 
   it('does not select a prerelease package when no releasable changes exist since the last stable tag', async () => {
@@ -345,7 +366,9 @@ class MemoryRepository implements AutoReleaseCandidateShell {
   }
 
   async currentPackageJson(packagePath: string): Promise<PackageJson | null> {
-    return manifestIn(this.#head(), packagePath);
+    // readPackageJson: a manifest without a name and a version is no workspace package.
+    const manifest = manifestIn(this.#head(), packagePath);
+    return manifest !== null && packageInfo(join(packagePath, 'package.json'), manifest) !== null ? manifest : null;
   }
 
   async packageBuildInputPatterns(): Promise<string[]> {
@@ -379,9 +402,15 @@ function changedPaths(before: Tree, after: Tree): string[] {
   return [...paths].filter((path) => before.get(path) !== after.get(path)).sort();
 }
 
+/** A manifest as candidate-shell.ts reads it: null when absent, not JSON, or not a manifest shape. */
 function manifestIn(tree: Tree, packagePath: string): PackageJson | null {
   const text = tree.get(join(packagePath, 'package.json'));
-  return text === undefined ? null : parseJsonObject(text);
+  if (text === undefined) return null;
+  try {
+    return parsePackageJsonText(text);
+  } catch {
+    return null;
+  }
 }
 
 /** Orders dotted stable versions numerically, the order git tag --sort=-v:refname gives them. */
@@ -395,66 +424,25 @@ function compareStableVersions(left: string, right: string): number {
   return 0;
 }
 
-/** The test-local git adapter; only the one real-git case reads through it. */
-function gitCandidateShell(root: string): AutoReleaseCandidateShell {
-  return {
-    gitRefExists: async (ref) => {
-      const result = await $`git rev-parse --verify ${ref}`.cwd(root).quiet().nothrow();
-      return result.exitCode === 0;
-    },
-    latestStableReleaseRef: async (projectName) => {
-      const pattern = `${projectName}@*`;
-      const result = await $`git tag --list ${pattern} --sort=-v:refname`.cwd(root).quiet().nothrow();
-      if (result.exitCode !== 0) {
-        return null;
-      }
-      const prefix = `${projectName}@`;
-      for (const line of new TextDecoder().decode(result.stdout).split('\n')) {
-        const tagName = line.trim();
-        const version = tagName.slice(prefix.length);
-        if (version && !version.includes('-')) {
-          return `refs/tags/${tagName}`;
-        }
-      }
-      return null;
-    },
-    packageChangedFilesSince: async (ref, packagePath) => {
-      const result = await $`git diff --name-only ${`${ref}..HEAD`} -- ${packagePath}`.cwd(root).quiet().nothrow();
-      if (result.exitCode === 0) {
-        const packagePrefix = `${packagePath}/`;
-        return new TextDecoder()
-          .decode(result.stdout)
-          .split('\n')
-          .map((path) => path.trim())
-          .filter(Boolean)
-          .map((path) => (path.startsWith(packagePrefix) ? path.slice(packagePrefix.length) : path));
-      }
-      throw new Error(`Unable to inspect package changes under ${packagePath}.`);
-    },
-    packageJsonAtRef: async (ref, packagePath) => {
-      const result = await $`git show ${`${ref}:${packagePath}/package.json`}`.cwd(root).quiet().nothrow();
-      if (result.exitCode !== 0) {
-        return null;
-      }
-      return parseJsonObject(new TextDecoder().decode(result.stdout));
-    },
-    currentPackageJson: async (packagePath) =>
-      parseJsonObject(await readFile(join(root, packagePath, 'package.json'), 'utf8')),
-    packageBuildInputPatterns: async () => ['**/*'],
-    packageHasHistory: async (packagePath) => {
-      const result = await $`git log --format=%H -- ${packagePath}`.cwd(root).quiet().nothrow();
-      if (result.exitCode !== 0) {
-        throw new Error(`Unable to inspect package history under ${packagePath}.`);
-      }
-      return new TextDecoder().decode(result.stdout).trim().length > 0;
+/**
+ * A workspace package that Nx names by its project name, with a build target whose inputs are the package's own
+ * files: the target `nx show project` reports and the production shell derives its build inputs from.
+ */
+async function writeNxPackage(root: string, pkg: ReleasePackageInfo, version: string): Promise<void> {
+  await mkdir(join(root, pkg.path), { recursive: true });
+  const manifest = {
+    name: pkg.name,
+    version,
+    nx: {
+      name: pkg.projectName,
+      targets: {
+        build: {
+          executor: 'nx:run-commands',
+          inputs: ['{projectRoot}/**/*'],
+          options: { command: "mkdir -p dist && echo '{}' > dist/index.js", cwd: pkg.path },
+        },
+      },
     },
   };
-}
-
-function parseJsonObject(text: string): PackageJson {
-  const parsed = parsePackageJsonText(text);
-  if (!parsed) {
-    throw new Error('expected JSON object');
-  }
-  return parsed;
+  await writeFile(join(root, pkg.path, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 }
