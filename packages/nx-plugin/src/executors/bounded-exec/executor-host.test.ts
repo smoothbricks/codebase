@@ -735,6 +735,7 @@ async function proveForegroundExitReleases(
 ): Promise<void> {
   const root = await createRoot();
   const barrier = await startBarrier();
+  let foreground: ChildRun | undefined;
   try {
     await expect(
       withChurn(root, pool.environment, async () => {
@@ -749,6 +750,7 @@ async function proveForegroundExitReleases(
           join(root, name),
           childEnv(pool.environment),
         );
+        foreground = run;
         releaseOnSiblingExit(barrier, [{ name, run }]);
         await barrier.until((events) => events.some((event) => event.kind === 'end' && event.name === name));
       }),
@@ -761,6 +763,10 @@ async function proveForegroundExitReleases(
     }
   } finally {
     await barrier.close();
+  }
+  // The runner releases its RAM lease, and the last lease detaches the volume, before the runner exits.
+  if (foreground !== undefined) {
+    expect(typeof (await foreground.exited)).toBe('number');
   }
 }
 
