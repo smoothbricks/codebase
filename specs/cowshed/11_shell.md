@@ -807,6 +807,13 @@ image-read failure, including credential denial; no errno implies that a life va
 exit-registration and signal failures remain retirement refusals. Adoption of a previously unobserved group root remains
 strict, since no retained root exists yet.
 
+Darwin grants `NOTE_EXITSTATUS` only for a child or a process the supervisor may SIGKILL, and refuses it with `EACCES`
+for any other: a root command a member runs through `sudo -n`, as bounded-exec's hang probe does. Such a refusal is not
+an exit-registration failure. The one registration path registers that life for `NOTE_FORK`/`NOTE_EXEC`/`NOTE_EXIT`
+without the status, which the kernel grants for every process, so the life stays in custody and a retirement still joins
+its native exit; its exit records no status and the `UnreadExitStatus` coverage gap names it. Signalling it remains the
+kernel's refusal, so a retirement that must signal a still-running root life refuses rather than claim it.
+
 Custody-only exits mark final usage unavailable and retain the ordinary UnreadFinalUsage coverage gap. Normal
 observation still samples final usage and reports every native failure. Omitting counters neither supplies membership
 nor substitutes for a watched exit: every retained scoped life must still reach its native exit before retirement

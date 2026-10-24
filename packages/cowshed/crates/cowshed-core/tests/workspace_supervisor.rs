@@ -8145,6 +8145,7 @@ fn stated_unattributed(accounting: &cowshed_core::api::JobAccounting) -> Option<
             ProcessCoverageGap::UncountedFork { pid } => ("uncountedFork", Some(pid)),
             ProcessCoverageGap::UnreadImage { pid } => ("unreadImage", Some(pid)),
             ProcessCoverageGap::UnreadFinalUsage { pid } => ("unreadFinalUsage", Some(pid)),
+            ProcessCoverageGap::UnreadExitStatus { pid } => ("unreadExitStatus", Some(pid)),
         },
     };
     let cells = Unattributed {

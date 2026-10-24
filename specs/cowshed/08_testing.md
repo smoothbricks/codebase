@@ -238,6 +238,14 @@ same-effective-uid combined BSD read must retain its actual EPERM. Both detached
 the retained sibling completes its fork/exec work, and an unrelated process in the same checkout survives. Missing final
 counters remain UnreadFinalUsage, never zeroes, and cannot replace identity, ancestry, watch or signal proof.
 
+The exit-watch fallback is proven on the real kernel in the ordinary lane: registering launchd (pid 1, which no user may
+SIGKILL) yields the withheld watch and the observer's own child the status watch. A scripted withheld exit folds no
+status and the `UnreadExitStatus` gap. The host-controller lane's
+`host_controller_a_root_command_run_through_sudo_stays_in_custody_with_its_status_withheld` runs `sudo -n lsof` under a
+watched shell, which every cow sandbox denies: custody adopts the root lsof under its withheld watch without a refusal,
+sudo relays SIGTERM, and both exits are joined with sudo's status read and lsof's withheld. It needs the host's
+passwordless sudo grant for `/usr/sbin/lsof` and fails naming sudo's refusal without it.
+
 Port-zero fixture children report numeric ports with explicit string writes to stdout, not console inspection. They
 retain inherited color settings; the reader compares the exact undecorated decimal protocol, and never strips ANSI or
 disables color to make an oracle pass.

@@ -811,6 +811,11 @@ async fn every_coverage_gap_reaches_the_span_as_its_own_kind_with_its_evidence()
             "unreadFinalUsage",
             Some(15),
         ),
+        (
+            ProcessCoverageGap::UnreadExitStatus { pid: 16 },
+            "unreadExitStatus",
+            Some(16),
+        ),
     ];
     let jobs = gaps
         .iter()

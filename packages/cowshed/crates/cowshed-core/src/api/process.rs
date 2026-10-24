@@ -186,11 +186,14 @@ impl JobProcessDelta {
     }
 }
 
-/// How and when a process ended: the two are observed together, so neither exists alone.
+/// When a process ended, and how when the kernel said: both come from its one exit event.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProcessExit {
-    pub status: ExitStatus,
+    /// Absent when the kernel withheld it from the observer
+    /// ([`ProcessCoverageGap::UnreadExitStatus`]); never a status in its place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ExitStatus>,
     pub exited_at: UtcTimestamp,
 }
 
@@ -316,6 +319,10 @@ pub enum ProcessCoverageGap {
     /// A member exited with no read of its counters after its exit: its usage is the last one
     /// observed, not its final usage.
     UnreadFinalUsage { pid: u32 },
+    /// A member's exit was observed but the kernel withheld its status: macOS grants
+    /// `NOTE_EXITSTATUS` only for a process the observer may signal, so a root command run
+    /// through sudo exits without one.
+    UnreadExitStatus { pid: u32 },
 }
 
 /// What held a job's process membership while its retirement proved the membership empty, which

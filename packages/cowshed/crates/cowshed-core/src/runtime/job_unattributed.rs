@@ -58,6 +58,7 @@ trace_enum! {
         UncountedFork = "uncountedFork",
         UnreadImage = "unreadImage",
         UnreadFinalUsage = "unreadFinalUsage",
+        UnreadExitStatus = "unreadExitStatus",
     }
 }
 
@@ -73,6 +74,7 @@ impl CoverageKind {
                 ProcessCoverageGap::UncountedFork { pid } => (Self::UncountedFork, Some(pid)),
                 ProcessCoverageGap::UnreadImage { pid } => (Self::UnreadImage, Some(pid)),
                 ProcessCoverageGap::UnreadFinalUsage { pid } => (Self::UnreadFinalUsage, Some(pid)),
+                ProcessCoverageGap::UnreadExitStatus { pid } => (Self::UnreadExitStatus, Some(pid)),
             },
         }
     }
@@ -117,13 +119,14 @@ mod tests {
     };
     use crate::storage::trace_columns::TraceEnum as _;
 
-    const GAPS: [ProcessCoverageGap; 6] = [
+    const GAPS: [ProcessCoverageGap; 7] = [
         ProcessCoverageGap::EventsLost,
         ProcessCoverageGap::UnobservedBirth { pid: 11 },
         ProcessCoverageGap::UnobservedExit { pid: 12 },
         ProcessCoverageGap::UncountedFork { pid: 13 },
         ProcessCoverageGap::UnreadImage { pid: 14 },
         ProcessCoverageGap::UnreadFinalUsage { pid: 15 },
+        ProcessCoverageGap::UnreadExitStatus { pid: 16 },
     ];
 
     fn totals() -> CpuTotals {
@@ -257,6 +260,7 @@ mod tests {
                 (CoverageKind::UncountedFork, Some(13)),
                 (CoverageKind::UnreadImage, Some(14)),
                 (CoverageKind::UnreadFinalUsage, Some(15)),
+                (CoverageKind::UnreadExitStatus, Some(16)),
             ]
         );
     }

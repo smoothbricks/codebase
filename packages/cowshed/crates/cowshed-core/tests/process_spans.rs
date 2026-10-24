@@ -613,7 +613,7 @@ async fn a_job_s_process_tree_is_three_parented_process_run_spans_over_fourteen_
         121_000,
         ProcessObservation::Exited {
             process: first,
-            status: ExitStatus::Exited { code: 0 },
+            status: Some(ExitStatus::Exited { code: 0 }),
             at: utc(121),
         },
     );
@@ -621,10 +621,10 @@ async fn a_job_s_process_tree_is_three_parented_process_run_spans_over_fourteen_
         122_000,
         ProcessObservation::Exited {
             process: second,
-            status: ExitStatus::Signaled {
+            status: Some(ExitStatus::Signaled {
                 signal: libc::SIGTERM,
                 core_dumped: false,
-            },
+            }),
             at: utc(122),
         },
     );
@@ -635,7 +635,7 @@ async fn a_job_s_process_tree_is_three_parented_process_run_spans_over_fourteen_
         123_000,
         ProcessObservation::Exited {
             process: shell,
-            status: ExitStatus::Exited { code: 1 },
+            status: Some(ExitStatus::Exited { code: 1 }),
             at: utc(123),
         },
     );
@@ -1006,7 +1006,7 @@ async fn a_job_s_charged_memory_and_its_process_s_resident_memory_are_recorded_a
             1_000,
             ProcessObservation::Exited {
                 process: shell,
-                status: ExitStatus::Exited { code: 0 },
+                status: Some(ExitStatus::Exited { code: 0 }),
                 at: utc(1),
             },
         );

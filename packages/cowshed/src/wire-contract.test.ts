@@ -630,6 +630,7 @@ describe('process events', () => {
       { kind: 'uncountedFork', pid: 7 },
       { kind: 'unreadImage', pid: 7 },
       { kind: 'unreadFinalUsage', pid: 7 },
+      { kind: 'unreadExitStatus', pid: 7 },
     ]) {
       const event = { kind: 'gap', reason };
       expect<unknown>(validators.assertJobProcessEvent(event)).toEqual(event);

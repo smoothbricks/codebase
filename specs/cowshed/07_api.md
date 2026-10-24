@@ -1150,11 +1150,14 @@ with `ENOTSUP` (xnu
 [`filt_procevent`](https://github.com/apple-oss-distributions/xnu/blob/ac9718fb1af618d5ce8678d0dc6e8a58f252216f/bsd/kern/kern_event.c#L1210-L1212),
 and the `NOTE_FORK` comment in `bsd/sys/event.h`). The supervisor therefore answers each `NOTE_FORK` by reading the
 member's children with `proc_listchildpids` and watches each new one for `NOTE_FORK`/`NOTE_EXEC`/`NOTE_EXIT`
-(`NOTE_EXITSTATUS` is accepted for any process the supervisor may signal, grandchildren included). A child that forks,
-execs and is reaped before that read is missed, and a coalesced `NOTE_FORK` cannot prove how many children it stood for,
-so a macOS tree in which a member forked never claims `Complete`. The leader/children rusage source (below) still counts
-the missed children's CPU once each parent up to the leader has reaped them, and reconciliation states it as
-unattributed usage. An Endpoint Security observer is not used: it needs an Apple entitlement.
+(`NOTE_EXITSTATUS` is accepted for any process the supervisor may signal, grandchildren included). A life it refuses
+`NOTE_EXITSTATUS` with `EACCES` -- one the supervisor may not signal, such as a root command a member ran through `sudo`
+-- is watched through the same one registration path for `NOTE_FORK`/`NOTE_EXEC`/`NOTE_EXIT` alone, which xnu grants for
+every process: its exit is joined, and only its status is withheld (`UnreadExitStatus`), never guessed. A child that
+forks, execs and is reaped before that read is missed, and a coalesced `NOTE_FORK` cannot prove how many children it
+stood for, so a macOS tree in which a member forked never claims `Complete`. The leader/children rusage source (below)
+still counts the missed children's CPU once each parent up to the leader has reaped them, and reconciliation states it
+as unattributed usage. An Endpoint Security observer is not used: it needs an Apple entitlement.
 
 The canonical records are:
 
@@ -1181,7 +1184,7 @@ pub struct JobProcessSample {
     pub blocked_on: Option<ProcessBlockedOn>, // absent when not observed, not fabricated `none`
     pub exit: Option<ProcessExit>,
 }
-pub struct ProcessExit { pub status: ExitStatus, pub exited_at: UtcTimestamp }
+pub struct ProcessExit { pub status: Option<ExitStatus>, pub exited_at: UtcTimestamp } // status absent only when withheld
 pub const BUSY_CPU_PERMILLE: u32 = 10;     // busy: own CPU over the last sample window ≥ 1 % of one core
 pub struct ProcessUsage {                  // the process's own counters, as last read
     pub cpu_user_us: CpuMicros,
@@ -1228,6 +1231,7 @@ pub enum ProcessCoverageGap {      // the first observation the tree is known to
     UncountedFork { pid: u32 },     // a member forked without the kernel naming or counting its children
     UnreadImage { pid: u32 },       // a member exec'd and its new image was not read (exited first, or the read failed)
     UnreadFinalUsage { pid: u32 },  // a member exited with no read of its counters after its exit
+    UnreadExitStatus { pid: u32 },  // a member's exit was observed but the kernel withheld its status
 }
 pub struct CpuTotals { pub user_us: CpuMicros, pub sys_us: CpuMicros }
 pub struct StorageIoTotals { pub read_bytes: StorageIoBytes, pub write_bytes: StorageIoBytes }
@@ -1256,15 +1260,16 @@ reconcile against the retained process counters; they are not a live-members-onl
 milliseconds once, after aggregation. Storage I/O byte counters follow the kernel source's semantics and never convert
 operation counts into invented byte totals or stand in for volume-allocation deltas. An exit's status and time are one
 `ProcessExit`, present only after exit; the existing `ExitStatus` union prevents an empty or ambiguous code/signal
-result. A gap is absorbing and names the first missed observation. `UncountedFork.pid` is the observed forking member,
-not an invented child PID or a missing-child count; `UnreadImage.pid` is the member whose new image was not read,
-whether it exited before the read or the read failed, not an invented program or argv. A failed read is also returned as
-an observation error with its call and errno; the gap keeps the tree from claiming Complete, and does not replace the
-error. Both gaps retain their evidence through the generated controller and N-API records. Blocker detail fields are
-valid only for their observed blocker kind; an unobserved blocker is absence or an observation error, never an assertion
-that the process is unblocked. A lock observation identifies its path and, when kernel evidence resolves it, the holder
-PID and that holder's job. Its optional `program` is present only after an identity-fenced image read; no program-name
-guess supplies it.
+result. Its status is absent only when the kernel withheld it, and `UnreadExitStatus.pid` names that member; no code
+stands in for it. A gap is absorbing and names the first missed observation. `UncountedFork.pid` is the observed forking
+member, not an invented child PID or a missing-child count; `UnreadImage.pid` is the member whose new image was not
+read, whether it exited before the read or the read failed, not an invented program or argv. A failed read is also
+returned as an observation error with its call and errno; the gap keeps the tree from claiming Complete, and does not
+replace the error. Both gaps retain their evidence through the generated controller and N-API records. Blocker detail
+fields are valid only for their observed blocker kind; an unobserved blocker is absence or an observation error, never
+an assertion that the process is unblocked. A lock observation identifies its path and, when kernel evidence resolves
+it, the holder PID and that holder's job. Its optional `program` is present only after an identity-fenced image read; no
+program-name guess supplies it.
 
 `usage` is a process's own counters as last read. It is absent, never zero, for a process whose counters were never
 read: one reaped before the sampler reached it, or on macOS one that exited before its first read could be proven its

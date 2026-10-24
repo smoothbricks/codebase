@@ -174,6 +174,7 @@ type ReaderName =
   | 'PROCESS_COVERAGE_GAP__UNCOUNTED_FORK'
   | 'PROCESS_COVERAGE_GAP__UNOBSERVED_BIRTH'
   | 'PROCESS_COVERAGE_GAP__UNOBSERVED_EXIT'
+  | 'PROCESS_COVERAGE_GAP__UNREAD_EXIT_STATUS'
   | 'PROCESS_COVERAGE_GAP__UNREAD_FINAL_USAGE'
   | 'PROCESS_COVERAGE_GAP__UNREAD_IMAGE'
   | 'PROCESS_COVERAGE__COMPLETE'
@@ -1497,12 +1498,14 @@ const READERS: Readers<ReaderName> = {
       ['uncountedFork', 'PROCESS_COVERAGE_GAP__UNCOUNTED_FORK'],
       ['unreadImage', 'PROCESS_COVERAGE_GAP__UNREAD_IMAGE'],
       ['unreadFinalUsage', 'PROCESS_COVERAGE_GAP__UNREAD_FINAL_USAGE'],
+      ['unreadExitStatus', 'PROCESS_COVERAGE_GAP__UNREAD_EXIT_STATUS'],
     ],
   },
   PROCESS_COVERAGE_GAP__EVENTS_LOST: { kind: 'record', fields: [] },
   PROCESS_COVERAGE_GAP__UNCOUNTED_FORK: { kind: 'record', fields: [['pid', 'LEAF']] },
   PROCESS_COVERAGE_GAP__UNOBSERVED_BIRTH: { kind: 'record', fields: [['pid', 'LEAF']] },
   PROCESS_COVERAGE_GAP__UNOBSERVED_EXIT: { kind: 'record', fields: [['pid', 'LEAF']] },
+  PROCESS_COVERAGE_GAP__UNREAD_EXIT_STATUS: { kind: 'record', fields: [['pid', 'LEAF']] },
   PROCESS_COVERAGE_GAP__UNREAD_FINAL_USAGE: { kind: 'record', fields: [['pid', 'LEAF']] },
   PROCESS_COVERAGE_GAP__UNREAD_IMAGE: { kind: 'record', fields: [['pid', 'LEAF']] },
   PROCESS_COVERAGE__COMPLETE: { kind: 'record', fields: [] },

@@ -638,8 +638,10 @@ impl ProcessSpanProjection {
             .as_ref()
             .ok_or(ProcessSpanError::ExitWithoutStatus { index })?;
         let mut columns = ProcessColumns::default();
+        // A withheld status proves no clean exit: the span ends span-err, both exit columns null.
         let outcome = match exit.status {
-            ExitStatus::Exited { code } => {
+            None => SpanOutcome::Err,
+            Some(ExitStatus::Exited { code }) => {
                 columns.exit_code = Some(code);
                 if code == 0 {
                     SpanOutcome::Ok
@@ -647,7 +649,7 @@ impl ProcessSpanProjection {
                     SpanOutcome::Err
                 }
             }
-            ExitStatus::Signaled { signal, .. } => {
+            Some(ExitStatus::Signaled { signal, .. }) => {
                 columns.exit_signal = Some(
                     ExitSignal::from_raw(signal)
                         .ok_or(ProcessSpanError::UnknownSignal { signal })?,
@@ -1536,7 +1538,7 @@ mod tests {
         let mut ended = sample(5, 1, "/bin/sleep", &["/bin/sleep", "1"]);
         ended.usage = Some(usage(50, false, 0));
         ended.exit = Some(ProcessExit {
-            status: ExitStatus::Exited { code: 0 },
+            status: Some(ExitStatus::Exited { code: 0 }),
             exited_at: UtcTimestamp::new("2026-10-12T00:01:00Z").unwrap(),
         });
         let terminal = project(
@@ -1590,10 +1592,10 @@ mod tests {
         );
         let mut unnamed = sample(6, 1, "/bin/cat", &["/bin/cat"]);
         unnamed.exit = Some(ProcessExit {
-            status: ExitStatus::Signaled {
+            status: Some(ExitStatus::Signaled {
                 signal: 999,
                 core_dumped: false,
-            },
+            }),
             exited_at: UtcTimestamp::new("2026-10-12T00:00:01Z").unwrap(),
         });
         let refused = projection.project(

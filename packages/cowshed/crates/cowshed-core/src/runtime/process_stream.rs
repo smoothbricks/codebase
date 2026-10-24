@@ -511,7 +511,7 @@ mod tests {
         fn exit(&mut self, process: ProcessIdentity, second: u32) -> Option<JobProcessEvent> {
             self.apply(JobProcessObservation::Tree(ProcessObservation::Exited {
                 process,
-                status: ExitStatus::Exited { code: 0 },
+                status: Some(ExitStatus::Exited { code: 0 }),
                 at: utc(second),
             }))
         }
@@ -819,7 +819,7 @@ mod tests {
         assert_eq!(
             run.refused(JobProcessObservation::Tree(ProcessObservation::Exited {
                 process: child,
-                status: ExitStatus::Exited { code: 0 },
+                status: Some(ExitStatus::Exited { code: 0 }),
                 at: utc(4),
             })),
             JobProcessFoldError::Tree(ProcessFoldError::AfterExit { pid: 501 })
@@ -995,7 +995,7 @@ mod tests {
         unread.root(root);
         let events = unread.emit(JobProcessObservation::Tree(ProcessObservation::Exited {
             process: root,
-            status: ExitStatus::Exited { code: 0 },
+            status: Some(ExitStatus::Exited { code: 0 }),
             at: utc(1),
         }));
         assert!(matches!(

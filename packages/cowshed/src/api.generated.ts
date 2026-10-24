@@ -2617,6 +2617,9 @@ export type ProcessCoverageGap =
     })
   | ({ readonly kind: 'unreadFinalUsage' } & {
       readonly pid: number & tags.Type<'uint32'>;
+    })
+  | ({ readonly kind: 'unreadExitStatus' } & {
+      readonly pid: number & tags.Type<'uint32'>;
     });
 
 /**
@@ -2648,10 +2651,14 @@ export type ProcessCpuWindow = {
 };
 
 /**
- * How and when a process ended: the two are observed together, so neither exists alone.
+ * When a process ended, and how when the kernel said: both come from its one exit event.
  */
 export type ProcessExit = {
-  readonly status: ExitStatus;
+  /**
+   * Absent when the kernel withheld it from the observer
+   * ([`ProcessCoverageGap::UnreadExitStatus`]); never a status in its place.
+   */
+  readonly status?: ExitStatus;
   readonly exitedAt: UtcTimestamp;
 };
 

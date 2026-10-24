@@ -4093,9 +4093,9 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
         assert_eq!(exits.len(), 1, "{history:?}");
         assert_eq!(
             exits[0].exit.as_ref().unwrap().status,
-            ExitStatus::Exited {
+            Some(ExitStatus::Exited {
                 code: [29, 23, 0][usize::try_from(index).unwrap()]
-            }
+            })
         );
         assert!(exits[0].usage.is_some());
         let ended_at = history

@@ -123,9 +123,10 @@ pub enum ProcessObservation {
     },
     /// This retained life exec'd, but its current image could not be read.
     ImageUnread { process: ProcessIdentity },
+    /// `status` is `None` when the kernel withheld it: the exit is a fact, its status a gap.
     Exited {
         process: ProcessIdentity,
-        status: ExitStatus,
+        status: Option<ExitStatus>,
         at: UtcTimestamp,
     },
     /// The event source itself reported that it missed something.
@@ -286,10 +287,14 @@ impl ProcessTreeFold {
                 let Some(life) = self.running_life(process)? else {
                     return Ok(());
                 };
+                let withheld = status.is_none();
                 life.exit = Some(ProcessExit {
                     status,
                     exited_at: at,
                 });
+                if withheld {
+                    self.gap(ProcessCoverageGap::UnreadExitStatus { pid: process.pid });
+                }
                 // A late exit of a pid's earlier life must not end the life now holding it.
                 let index = self.by_identity[&process];
                 if self.running.get(&process.pid) == Some(&index) {
@@ -559,7 +564,7 @@ mod tests {
     fn exit(fold: &mut ProcessTreeFold, process: ProcessIdentity, code: i32, second: u32) {
         fold.apply(ProcessObservation::Exited {
             process,
-            status: ExitStatus::Exited { code },
+            status: Some(ExitStatus::Exited { code }),
             at: at(second),
         })
         .unwrap();
@@ -626,7 +631,7 @@ mod tests {
         assert_eq!(
             child.exit,
             Some(ProcessExit {
-                status: ExitStatus::Exited { code: 3 },
+                status: Some(ExitStatus::Exited { code: 3 }),
                 exited_at: at(2),
             })
         );
@@ -810,13 +815,13 @@ mod tests {
         );
         assert_eq!(
             lives[0].exit.as_ref().unwrap().status,
-            ExitStatus::Exited { code: 0 }
+            Some(ExitStatus::Exited { code: 0 })
         );
         assert_eq!(lives[0].exit.as_ref().unwrap().exited_at, at(2));
         assert_eq!(lives[1].program, "/usr/bin/ld");
         assert_eq!(
             lives[1].exit.as_ref().unwrap().status,
-            ExitStatus::Exited { code: 7 }
+            Some(ExitStatus::Exited { code: 7 })
         );
         assert_eq!(lives[1].exit.as_ref().unwrap().exited_at, at(4));
     }
@@ -893,7 +898,7 @@ mod tests {
         assert_eq!(tree.processes[1].exit.as_ref().unwrap().exited_at, at(3));
         assert_eq!(
             tree.processes[2].exit.as_ref().unwrap().status,
-            ExitStatus::Exited { code: 4 }
+            Some(ExitStatus::Exited { code: 4 })
         );
     }
 
@@ -915,7 +920,7 @@ mod tests {
         assert_eq!(
             fold.apply(ProcessObservation::Exited {
                 process: shell,
-                status: ExitStatus::Exited { code: 1 },
+                status: Some(ExitStatus::Exited { code: 1 }),
                 at: at(3),
             }),
             Err(ProcessFoldError::AfterExit { pid: 100 })
@@ -939,10 +944,10 @@ mod tests {
         fork(&mut fold, id(101, 2), shell, 1);
         fold.apply(ProcessObservation::Exited {
             process: id(101, 2),
-            status: ExitStatus::Signaled {
+            status: Some(ExitStatus::Signaled {
                 signal: 9,
                 core_dumped: false,
-            },
+            }),
             at: at(2),
         })
         .unwrap();

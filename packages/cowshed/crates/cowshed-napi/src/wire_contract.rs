@@ -1464,7 +1464,7 @@ fn process_observations() -> BTreeMap<&'static str, BTreeMap<&'static str, Value
             ..usage
         }),
         exit: Some(ProcessExit {
-            status: ExitStatus::Exited { code: 0 },
+            status: Some(ExitStatus::Exited { code: 0 }),
             exited_at: timestamp(),
         }),
         ..unread.clone()
@@ -1497,6 +1497,25 @@ fn process_observations() -> BTreeMap<&'static str, BTreeMap<&'static str, Value
                 },
             ),
         ),
+        (
+            "exitStatusWithheld",
+            document(
+                "job processes",
+                &JobProcessTree {
+                    processes: vec![JobProcessSample {
+                        exit: Some(ProcessExit {
+                            status: None,
+                            exited_at: timestamp(),
+                        }),
+                        ..ended.clone()
+                    }],
+                    coverage: ProcessCoverage::Gap {
+                        reason: ProcessCoverageGap::UnreadExitStatus { pid: 4242 },
+                    },
+                    ..tree.clone()
+                },
+            ),
+        ),
     ]);
     for (name, reason) in [
         ("ioNotPermitted", ProcessIoUnavailable::NotPermitted),
@@ -1509,10 +1528,10 @@ fn process_observations() -> BTreeMap<&'static str, BTreeMap<&'static str, Value
                 ..ended.usage.expect("exited fixture usage")
             }),
             exit: Some(ProcessExit {
-                status: ExitStatus::Signaled {
+                status: Some(ExitStatus::Signaled {
                     signal: 9,
                     core_dumped: false,
-                },
+                }),
                 exited_at: timestamp(),
             }),
             ..ended.clone()
@@ -1638,6 +1657,10 @@ fn process_observations() -> BTreeMap<&'static str, BTreeMap<&'static str, Value
         (
             "unreadFinalUsage",
             ProcessCoverageGap::UnreadFinalUsage { pid: 4242 },
+        ),
+        (
+            "unreadExitStatus",
+            ProcessCoverageGap::UnreadExitStatus { pid: 4242 },
         ),
     ] {
         trees.insert(

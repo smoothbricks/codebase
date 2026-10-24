@@ -221,12 +221,13 @@ the store disk and on a build-volume image alike). Each seal keeps its durabilit
 process dies are lost, as the gateway's one-batch audit window is ("Batched audit flush accepted"). An event the
 projection cannot place is counted in the trace health and adds no row. A row's kind is its lmao entry type and a fixed
 message: `span-start` and `span-ok`/`span-err` named `process.run` at the observed birth and exit (`span-ok` only for a
-clean exit with status 0), and `info` rows `process.exec`, `process.busy`, `process.idle`, `process.usage` (a first read
-or an RSS step), `process.heartbeat`, `process.blocked` and `process.blocker-cleared`. A `process.blocked` row is a SET
-that states `blocked_on`, `blocked_path` and `blocked_holder_pid` whole, so a null path or holder there is absent, never
-unchanged; `process.blocker-cleared` is a CLEAR. A span starts idle and only busy/idle rows change that; a flip with no
-counter moved is a row with every column null. The end row states every counter of the final usage. `exit_signal` names
-the signal from one dictionary on every host: the macOS and Linux signal names, then Linux's real-time signals by kernel
+clean exit with status 0; an exit whose status the kernel withheld ends `span-err` with both exit columns null), and
+`info` rows `process.exec`, `process.busy`, `process.idle`, `process.usage` (a first read or an RSS step),
+`process.heartbeat`, `process.blocked` and `process.blocker-cleared`. A `process.blocked` row is a SET that states
+`blocked_on`, `blocked_path` and `blocked_holder_pid` whole, so a null path or holder there is absent, never unchanged;
+`process.blocker-cleared` is a CLEAR. A span starts idle and only busy/idle rows change that; a flip with no counter
+moved is a row with every column null. The end row states every counter of the final usage. `exit_signal` names the
+signal from one dictionary on every host: the macOS and Linux signal names, then Linux's real-time signals by kernel
 number as `SIG32`…`SIG64`. The argv display writes an argument of only `[A-Za-z0-9_@%+=:,./-]` bare and any other in
 `$'…'` quotes, with `\\`, `\'`, and `\xHH` for each byte of a control character or of an invalid UTF-8 sequence. The
 enum columns (`exit_signal`, `blocked_on`) are dictionaries of every declared name keyed by `u16`, as lmao encodes
@@ -253,14 +254,14 @@ span: an `info` row of that message, sealed just before the job's `span-ok`/`spa
 terminal reconciliation (07_api.md, `UsageReconciliation`) whole in six fixed columns, which every other row of the span
 leaves null.
 
-| Column                        | Type     | Meaning                                                                                                                                                                   |
-| ----------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `unattributed_cpu_us`         | `i64`    | The independent CPU total less the CPU the observed processes counted as their own, in microseconds; negative where the processes counted more.                           |
-| `unattributed_io_read_bytes`  | `i64`    | The same difference in storage bytes read; null where the source or the observed processes have no bytes to compare.                                                      |
-| `unattributed_io_write_bytes` | `i64`    | The same difference in storage bytes written; null where nothing could be compared.                                                                                       |
-| `unattributed_source`         | `S.enum` | The independent source that counted the totals, by its wire kind: `linuxCgroupV2` or `macOsRusageChildren`.                                                               |
-| `unattributed_coverage`       | `S.enum` | How completely the observed processes covered the job: `complete`, `eventsLost`, `unobservedBirth`, `unobservedExit`, `uncountedFork`, `unreadImage`, `unreadFinalUsage`. |
-| `unattributed_gap_pid`        | `u32`    | The observed process a gap's evidence names; null for a complete tree and for lost events.                                                                                |
+| Column                        | Type     | Meaning                                                                                                                                                                                       |
+| ----------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `unattributed_cpu_us`         | `i64`    | The independent CPU total less the CPU the observed processes counted as their own, in microseconds; negative where the processes counted more.                                               |
+| `unattributed_io_read_bytes`  | `i64`    | The same difference in storage bytes read; null where the source or the observed processes have no bytes to compare.                                                                          |
+| `unattributed_io_write_bytes` | `i64`    | The same difference in storage bytes written; null where nothing could be compared.                                                                                                           |
+| `unattributed_source`         | `S.enum` | The independent source that counted the totals, by its wire kind: `linuxCgroupV2` or `macOsRusageChildren`.                                                                                   |
+| `unattributed_coverage`       | `S.enum` | How completely the observed processes covered the job: `complete`, `eventsLost`, `unobservedBirth`, `unobservedExit`, `uncountedFork`, `unreadImage`, `unreadFinalUsage`, `unreadExitStatus`. |
+| `unattributed_gap_pid`        | `u32`    | The observed process a gap's evidence names; null for a complete tree and for lost events.                                                                                                    |
 
 Differences are signed checked units and are never clamped: observation can see work its source has not counted yet, and
 the two are read at different instants, so a negative difference is a fact. A comparison no source could make -- macOS

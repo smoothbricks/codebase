@@ -2444,6 +2444,13 @@
         "pid": 4243
       }
     },
+    "unreadExitStatus": {
+      "kind": "gap",
+      "reason": {
+        "kind": "unreadExitStatus",
+        "pid": 4242
+      }
+    },
     "unreadFinalUsage": {
       "kind": "gap",
       "reason": {
@@ -2502,6 +2509,52 @@
           "ppid": 4200,
           "program": "cargo",
           "truncated": false
+        }
+      ],
+      "sampledAt": "2026-01-02T03:04:05Z"
+    },
+    "exitStatusWithheld": {
+      "coverage": {
+        "kind": "gap",
+        "reason": {
+          "kind": "unreadExitStatus",
+          "pid": 4242
+        }
+      },
+      "jobId": 7,
+      "processes": [
+        {
+          "argv": [
+            {
+              "data": "cargo",
+              "encoding": "utf8"
+            }
+          ],
+          "bornAt": "2026-01-02T03:04:05Z",
+          "exit": {
+            "exitedAt": "2026-01-02T03:04:05Z"
+          },
+          "pid": 4242,
+          "ppid": 4200,
+          "program": "cargo",
+          "truncated": false,
+          "usage": {
+            "busy": false,
+            "cpuSysUs": 678,
+            "cpuUserUs": 12345,
+            "cpuWindow": {
+              "closedUs": 2500000,
+              "cpuPermille": 4,
+              "openedUs": 2000000
+            },
+            "io": {
+              "kind": "read",
+              "readBytes": 123,
+              "writeBytes": 456
+            },
+            "rssBytes": 0,
+            "rssPeakBytes": 8192
+          }
         }
       ],
       "sampledAt": "2026-01-02T03:04:05Z"
@@ -2767,6 +2820,32 @@
     "unread": {
       "coverage": {
         "kind": "complete"
+      },
+      "jobId": 7,
+      "processes": [
+        {
+          "argv": [
+            {
+              "data": "cargo",
+              "encoding": "utf8"
+            }
+          ],
+          "bornAt": "2026-01-02T03:04:05Z",
+          "pid": 4242,
+          "ppid": 4200,
+          "program": "cargo",
+          "truncated": false
+        }
+      ],
+      "sampledAt": "2026-01-02T03:04:05Z"
+    },
+    "unreadExitStatus": {
+      "coverage": {
+        "kind": "gap",
+        "reason": {
+          "kind": "unreadExitStatus",
+          "pid": 4242
+        }
       },
       "jobId": 7,
       "processes": [

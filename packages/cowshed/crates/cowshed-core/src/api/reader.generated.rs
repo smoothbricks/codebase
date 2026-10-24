@@ -731,12 +731,17 @@ static PROCESS_COVERAGE_GAP: Reader = Reader::Internal {
             "unreadFinalUsage",
             &PROCESS_COVERAGE_GAP__UNREAD_FINAL_USAGE,
         ),
+        (
+            "unreadExitStatus",
+            &PROCESS_COVERAGE_GAP__UNREAD_EXIT_STATUS,
+        ),
     ],
 };
 static PROCESS_COVERAGE_GAP__EVENTS_LOST: Reader = Reader::Record(&[]);
 static PROCESS_COVERAGE_GAP__UNCOUNTED_FORK: Reader = Reader::Record(&[("pid", &LEAF)]);
 static PROCESS_COVERAGE_GAP__UNOBSERVED_BIRTH: Reader = Reader::Record(&[("pid", &LEAF)]);
 static PROCESS_COVERAGE_GAP__UNOBSERVED_EXIT: Reader = Reader::Record(&[("pid", &LEAF)]);
+static PROCESS_COVERAGE_GAP__UNREAD_EXIT_STATUS: Reader = Reader::Record(&[("pid", &LEAF)]);
 static PROCESS_COVERAGE_GAP__UNREAD_FINAL_USAGE: Reader = Reader::Record(&[("pid", &LEAF)]);
 static PROCESS_COVERAGE_GAP__UNREAD_IMAGE: Reader = Reader::Record(&[("pid", &LEAF)]);
 static PROCESS_COVERAGE__COMPLETE: Reader = Reader::Record(&[]);

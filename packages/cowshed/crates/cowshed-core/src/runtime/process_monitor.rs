@@ -1535,7 +1535,7 @@ for line in sys.stdin:
                 .find(|process| process.pid == life.pid)
                 .unwrap();
             assert_eq!(
-                process.exit.as_ref().map(|exit| &exit.status),
+                process.exit.as_ref().and_then(|exit| exit.status.as_ref()),
                 Some(&ExitStatus::Signaled {
                     signal,
                     core_dumped: false
@@ -1922,7 +1922,10 @@ os._exit(0)
         );
         assert!(monitor.running_lives().is_empty());
         assert_eq!(
-            tree.processes[index].exit.as_ref().map(|exit| &exit.status),
+            tree.processes[index]
+                .exit
+                .as_ref()
+                .and_then(|exit| exit.status.as_ref()),
             Some(&ExitStatus::Signaled {
                 signal,
                 core_dumped: false
