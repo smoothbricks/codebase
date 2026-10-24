@@ -485,13 +485,8 @@ test('full staging admission refuses 403 and cancellation releases its reservati
       headers: { authorization: 'Bearer process-write' },
     });
     expect(refused.status).toBe(403);
-    changed = changes.next();
     socket.destroy();
-    for (;;) {
-      await changed;
-      if ((await readdir(staging)).length === 0) break;
-      changed = changes.next();
-    }
+    await running.stderr.until('ev=staging.released key=held ');
     const stored = await fetch(`${running.origin}/v1/cache/after-cancel`, {
       method: 'PUT',
       body: 'x',
