@@ -200,12 +200,23 @@ fn positioned_intersection(a: &Bitmosaic, b: &Bitmosaic) -> Vec<(u32, u64, u64)>
 /// so these are independent implementations of the same set operation.
 #[test]
 fn every_lazy_range_matches_its_materialising_operation() {
-    let all = shapes();
+    // Each shape's four witnesses are built once; the cross product only reads them.
+    let all: Vec<_> = shapes()
+        .into_iter()
+        .map(|(name, values)| {
+            let set: BTreeSet<u32> = values.iter().copied().collect();
+            let roaring: RoaringBitmap = values.iter().copied().collect();
+            (
+                name,
+                Bitmosaic::from_sorted(values.iter().copied()),
+                set,
+                roaring,
+            )
+        })
+        .collect();
     let mut census = (0usize, 0usize, 0usize, 0usize, 0usize);
     let mut pairs = 0usize;
-    for (na, va) in &all {
-        let a = Bitmosaic::from_sorted(va.iter().copied());
-        let sa: BTreeSet<u32> = va.iter().copied().collect();
+    for (na, a, sa, ra) in &all {
         let c = a.container_census();
         census = (
             census.0 + c.0,
@@ -214,42 +225,38 @@ fn every_lazy_range_matches_its_materialising_operation() {
             census.3 + c.3,
             census.4 + c.4,
         );
-        let ra: RoaringBitmap = va.iter().copied().collect();
-        for (nb, vb) in &all {
-            let b = Bitmosaic::from_sorted(vb.iter().copied());
-            let sb: BTreeSet<u32> = vb.iter().copied().collect();
-            let rb: RoaringBitmap = vb.iter().copied().collect();
+        for (nb, b, sb, rb) in &all {
             pairs += 1;
             let cell = format!("{na} vs {nb}");
 
             for (op, lazy, materialised, std_ref, roaring_ref) in [
                 (
                     "and",
-                    a.and_range(&b).collect::<Vec<u32>>(),
-                    a.and(&b).iter().collect::<Vec<u32>>(),
-                    sa.intersection(&sb).copied().collect::<Vec<u32>>(),
-                    (&ra & &rb).into_iter().collect::<Vec<u32>>(),
+                    a.and_range(b).collect::<Vec<u32>>(),
+                    a.and(b).iter().collect::<Vec<u32>>(),
+                    sa.intersection(sb).copied().collect::<Vec<u32>>(),
+                    (ra & rb).into_iter().collect::<Vec<u32>>(),
                 ),
                 (
                     "or",
-                    a.or_range(&b).collect(),
-                    a.or(&b).iter().collect(),
-                    sa.union(&sb).copied().collect(),
-                    (&ra | &rb).into_iter().collect(),
+                    a.or_range(b).collect(),
+                    a.or(b).iter().collect(),
+                    sa.union(sb).copied().collect(),
+                    (ra | rb).into_iter().collect(),
                 ),
                 (
                     "xor",
-                    a.xor_range(&b).collect(),
-                    a.xor(&b).iter().collect(),
-                    sa.symmetric_difference(&sb).copied().collect(),
-                    (&ra ^ &rb).into_iter().collect(),
+                    a.xor_range(b).collect(),
+                    a.xor(b).iter().collect(),
+                    sa.symmetric_difference(sb).copied().collect(),
+                    (ra ^ rb).into_iter().collect(),
                 ),
                 (
                     "andnot",
-                    a.andnot_range(&b).collect(),
-                    a.andnot(&b).iter().collect(),
-                    sa.difference(&sb).copied().collect(),
-                    (&ra - &rb).into_iter().collect(),
+                    a.andnot_range(b).collect(),
+                    a.andnot(b).iter().collect(),
+                    sa.difference(sb).copied().collect(),
+                    (ra - rb).into_iter().collect(),
                 ),
             ] {
                 assert_eq!(lazy, materialised, "{cell}: {op}_range vs Bitmosaic::{op}");
@@ -260,13 +267,13 @@ fn every_lazy_range_matches_its_materialising_operation() {
             // The merge has already proved where every shared value sits in
             // both inputs. Retain both positions from the source cursors and
             // verify them through the independent rank directory.
-            let positioned = positioned_intersection(&a, &b);
+            let positioned = positioned_intersection(a, b);
             assert_eq!(
                 positioned
                     .iter()
                     .map(|&(value, _, _)| value)
                     .collect::<Vec<_>>(),
-                sa.intersection(&sb).copied().collect::<Vec<_>>(),
+                sa.intersection(sb).copied().collect::<Vec<_>>(),
                 "{cell}: positioned intersection values"
             );
             for &(value, left_ordinal, right_ordinal) in &positioned {
@@ -286,8 +293,8 @@ fn every_lazy_range_matches_its_materialising_operation() {
             // the range's own count, which is the claim that lets a caller
             // pick either.
             assert_eq!(
-                a.and_range(&b).count() as u64,
-                a.and_len(&b),
+                a.and_range(b).count() as u64,
+                a.and_len(b),
                 "{cell}: and_range().count() vs and_len()"
             );
         }
