@@ -1,10 +1,17 @@
-/* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Shell fixture scripts are literal shell text. */
 import { describe, expect, it } from 'bun:test';
-import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
-import { chmod, cp, mkdir, symlink, writeFile } from 'node:fs/promises';
-import { dirname, join, relative, resolve } from 'node:path';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { chmod, cp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { edit, HEALTHY, repository, withManagedRepository } from './__tests__/helpers/shell-entry.js';
 
+/**
+ * What shell entry does for a uv project, through the real script with a recording `uv` on PATH, and with the real
+ * `uv`. Which environments the witness admits and how each `.pth` line is rewritten is measured on the filesystem
+ * alone in uv-relocation.test.ts; what is measured here is the installer's wiring of them: a shell that enables uv
+ * creates the relocatable environment devenv names and syncs it once per changed input, a shell that does not syncs
+ * nothing, a copy of the checkout enters installed, and an environment the witness refuses is removed and created again
+ * before the sync.
+ */
 describe('what shell entry syncs for a uv project', () => {
   const PYTHON = '/nix/store/python3-env/bin/python3';
   const UV_PROJECT = {
@@ -14,347 +21,80 @@ describe('what shell entry syncs for a uv project', () => {
     'uv.lock': 'version = 1\n',
   };
 
-  it('creates a relocatable environment where devenv names it and syncs it once per input change', async () => {
-    await withManagedRepository({ files: UV_PROJECT }, async ({ root, state, enterShell: enter, uvRuns }) => {
+  it('creates a relocatable environment, syncs it once per input change, syncs nothing without uv, enters a copy installed and replaces an environment that is not relocatable', async () => {
+    await withManagedRepository({ files: UV_PROJECT }, async (original) => {
+      const { root, state, enterShell: enter, uvRuns } = original;
       const venv = join(state, 'venv');
       const uv = { uvProjectEnvironment: venv, python: PYTHON };
-      expect(await enter(uv)).toEqual(HEALTHY);
-      expect(await enter(uv)).toEqual(HEALTHY);
+      const create = ['venv', '--relocatable', '--python', PYTHON, venv];
       const sync = ['sync', '--python', PYTHON, '--all-packages', '--all-groups'];
-      expect(uvRuns()).toEqual([['venv', '--relocatable', '--python', PYTHON, venv], sync]);
 
+      // Entered from another repository's uv shell, whose variable is inherited: this shell's module passed no
+      // interpreter, so nothing syncs.
+      expect(await enter({ uvProjectEnvironment: join(state, 'outer-venv') })).toEqual(HEALTHY);
+      expect(uvRuns()).toEqual([]);
+
+      // The environment is created relocatable where devenv names it, and synced once.
+      expect(await enter(uv)).toEqual(HEALTHY);
+      expect(await enter(uv)).toEqual(HEALTHY);
+      expect(original.count('install')).toBe(1);
+      expect(uvRuns()).toEqual([create, sync]);
+
+      // Then once per changed input, a member's manifest and the lockfile, and not for an entry that changes neither.
       await edit(join(root, 'python/tool/pyproject.toml'), '[project]\nname = "tool"\ndependencies = ["attrs"]\n');
       expect(await enter(uv)).toEqual(HEALTHY);
       await edit(join(root, 'uv.lock'), 'version = 1\nrevision = 2\n');
       expect(await enter(uv)).toEqual(HEALTHY);
       expect(await enter(uv)).toEqual(HEALTHY);
-      expect(uvRuns().slice(2)).toEqual([sync, sync]);
-    });
-  });
+      const settled = [create, sync, sync, sync];
+      expect(uvRuns()).toEqual(settled);
 
-  it('syncs nothing for a shell that does not enable uv, even under an outer shell’s environment', async () => {
-    await withManagedRepository({ files: UV_PROJECT }, async ({ state, enterShell: enter, uvRuns }) => {
-      // Entered from another repository's uv shell: its variable is inherited,
-      // but this shell's module passed no interpreter.
-      expect(await enter({ uvProjectEnvironment: join(state, 'outer-venv') })).toEqual(HEALTHY);
-      expect(uvRuns()).toEqual([]);
-    });
-  });
-
-  it('enters a copied checkout installed, its workspace members importing from the copy', async () => {
-    await withManagedRepository({ files: UV_PROJECT }, async (original) => {
-      expect(await original.enterShell({ uvProjectEnvironment: join(original.state, 'venv'), python: PYTHON })).toEqual(
-        HEALTHY,
-      );
-      expect(original.count('install')).toBe(1);
-      expect(original.uvRuns()).toHaveLength(2);
-
-      // A copy-on-write clone: every byte, ignored state included, at another path.
-      const clone = join(dirname(original.root), 'clone');
-      await cp(original.root, clone, { recursive: true, verbatimSymlinks: true });
-      const venv = join(clone, 'tooling', 'direnv', '.devenv', 'state', 'venv');
-      const copied = repository(clone, join(dirname(original.root), 'ledgers'), join(dirname(original.root), 'bin'));
-
-      expect(await copied.enterShell({ uvProjectEnvironment: venv, python: PYTHON })).toEqual(HEALTHY);
-      expect(copied.uvRuns()).toHaveLength(2);
+      // A copy-on-write clone: every byte, ignored state included, at another path. Its entry installs and syncs
+      // nothing, and the member's .pth line resolves to the copy.
+      const clone = join(dirname(root), 'clone');
+      await cp(root, clone, { recursive: true, verbatimSymlinks: true });
+      const cloneVenv = join(clone, 'tooling', 'direnv', '.devenv', 'state', 'venv');
+      const copied = repository(clone, original.ledgers, join(dirname(root), 'bin'));
+      expect(await copied.enterShell({ uvProjectEnvironment: cloneVenv, python: PYTHON })).toEqual(HEALTHY);
+      expect(copied.uvRuns()).toEqual(settled);
       expect(copied.count('install')).toBe(1);
       // Python's site resolves a relative .pth line against site-packages.
-      const site = join(venv, 'lib', 'python3.14', 'site-packages');
-      expect(resolve(site, readFileSync(join(site, 'tool.pth'), 'utf8').trim())).toBe(join(clone, 'python/tool/src'));
-      expect(readFileSync(join(site, '_virtualenv.pth'), 'utf8')).toBe('import _virtualenv\n');
-    });
-  });
+      const cloneSite = join(cloneVenv, 'lib', 'python3.14', 'site-packages');
+      expect(resolve(cloneSite, readFileSync(join(cloneSite, 'tool.pth'), 'utf8').trim())).toBe(
+        join(clone, 'python/tool/src'),
+      );
+      expect(readFileSync(join(cloneSite, '_virtualenv.pth'), 'utf8')).toBe('import _virtualenv\n');
 
-  it('replaces an environment that is not relocatable', async () => {
-    await withManagedRepository({ files: UV_PROJECT }, async ({ state, enterShell: enter, uvRuns }) => {
-      const venv = join(state, 'venv');
+      // A stamped environment under a valid config whose launcher still names the environment absolutely, beside an
+      // absolute .pth line. The stamp cannot witness either, so the entry removes the environment and creates it
+      // again, relocatable, before the sync, instead of syncing over the escape and stamping it.
+      const site = join(venv, 'lib', 'python3.14', 'site-packages');
+      await writeFile(join(venv, 'bin', 'pytest'), `#!${join(venv, 'bin', 'python')}\n`);
+      await writeFile(join(site, 'tool.pth'), `${join(root, 'python/tool/src')}\n`);
+      expect(await enter(uv)).toEqual(HEALTHY);
+      const replaced = [...settled, create, sync];
+      expect(uvRuns()).toEqual(replaced);
+      expect(readFileSync(join(venv, 'pyvenv.cfg'), 'utf8')).toContain('relocatable = true');
+      expect(existsSync(join(venv, 'bin', 'pytest'))).toBe(false);
+      expect(resolve(site, readFileSync(join(site, 'tool.pth'), 'utf8').trim())).toBe(join(root, 'python/tool/src'));
+      expect(await enter(uv)).toEqual(HEALTHY);
+      expect(uvRuns()).toEqual(replaced);
+
+      // An environment an older shell built: no stamp, and a config that does not say relocatable.
+      await rm(venv, { recursive: true });
       await mkdir(venv, { recursive: true });
       await writeFile(join(venv, 'pyvenv.cfg'), 'home = /nix/store/python/bin\n');
       await writeFile(join(venv, 'built-by-an-older-shell'), '');
-      expect(await enter({ uvProjectEnvironment: venv, python: PYTHON })).toEqual(HEALTHY);
+      expect(await enter(uv)).toEqual(HEALTHY);
+      const replacedAgain = [...replaced, create, sync];
+      expect(uvRuns()).toEqual(replacedAgain);
       expect(existsSync(join(venv, 'built-by-an-older-shell'))).toBe(false);
       expect(readFileSync(join(venv, 'pyvenv.cfg'), 'utf8')).toContain('relocatable = true');
-      expect(uvRuns().map(([verb]) => verb)).toEqual(['venv', 'sync']);
+      expect(await enter(uv)).toEqual(HEALTHY);
+      expect(uvRuns()).toEqual(replacedAgain);
     });
   });
 
-  it('replaces a stamped environment whose launcher and .pth still name the old absolute home', async () => {
-    await withManagedRepository({ files: UV_PROJECT }, async ({ root, state, enterShell: enter, uvRuns }) => {
-      const venv = join(state, 'venv');
-      const uv = { uvProjectEnvironment: venv, python: PYTHON };
-      expect(await enter(uv)).toEqual(HEALTHY);
-      expect(await enter(uv)).toEqual(HEALTHY);
-      expect(uvRuns()).toHaveLength(2);
-
-      // A copied legacy environment under a matching stamp: relocatable nowhere, its launcher
-      // naming the old absolute home, and an absolute .pth line the sync already relativized.
-      await writeFile(join(venv, 'pyvenv.cfg'), 'home = /nix/store/python/bin\n');
-      await mkdir(join(venv, 'bin'), { recursive: true });
-      await writeFile(join(venv, 'bin', 'pytest'), `#!${venv}/bin/python\n`);
-      const site = join(venv, 'lib', 'python3.14', 'site-packages');
-      await writeFile(join(site, 'tool.pth'), `${join(root, 'python/tool/src')}\n`);
-
-      expect(await enter(uv)).toEqual(HEALTHY);
-      expect(uvRuns().map(([verb]) => verb)).toEqual(['venv', 'sync', 'venv', 'sync']);
-      expect(readFileSync(join(venv, 'pyvenv.cfg'), 'utf8')).toContain('relocatable = true');
-      expect(existsSync(join(venv, 'bin', 'pytest'))).toBe(false);
-      expect(readFileSync(join(site, 'tool.pth'), 'utf8')).not.toContain(root);
-
-      expect(await enter(uv)).toEqual(HEALTHY);
-      expect(uvRuns()).toHaveLength(4);
-    });
-  });
-
-  it('repairs each stamped escape independently, with a valid config throughout', async () => {
-    const cases: ReadonlyArray<{
-      name: string;
-      tamper: (root: string, venv: string, site: string) => Promise<void>;
-      repaired: (root: string, venv: string, site: string) => void;
-    }> = [
-      {
-        name: 'a launcher naming a foreign old root',
-        tamper: async (root, venv) => {
-          const foreign = join(dirname(root), 'foreign-venv');
-          await mkdir(join(foreign, 'bin'), { recursive: true });
-          await writeFile(join(foreign, 'pyvenv.cfg'), 'home = /nix/store/python/bin\n');
-          await writeFile(join(foreign, 'bin', 'python'), '');
-          await mkdir(join(venv, 'bin'), { recursive: true });
-          await writeFile(join(venv, 'bin', 'pytest'), `#!${join(foreign, 'bin', 'python')}\n`);
-        },
-        repaired: (_root, venv) => expect(existsSync(join(venv, 'bin', 'pytest'))).toBe(false),
-      },
-      {
-        name: 'a launcher naming this environment absolutely',
-        tamper: async (_root, venv) => {
-          await mkdir(join(venv, 'bin'), { recursive: true });
-          await writeFile(join(venv, 'bin', 'pytest'), `#!${join(venv, 'bin', 'python')}\n`);
-        },
-        repaired: (_root, venv) => expect(existsSync(join(venv, 'bin', 'pytest'))).toBe(false),
-      },
-      {
-        name: 'an absolute .pth line',
-        tamper: async (root, _venv, site) => {
-          await writeFile(join(site, 'tool.pth'), `${join(root, 'python/tool/src')}\n`);
-        },
-        repaired: (root, _venv, site) => expect(readFileSync(join(site, 'tool.pth'), 'utf8')).not.toContain(root),
-      },
-    ];
-    for (const testCase of cases) {
-      await withManagedRepository({ files: UV_PROJECT }, async ({ root, state, enterShell: enter, uvRuns }) => {
-        const venv = join(state, 'venv');
-        const uv = { uvProjectEnvironment: venv, python: PYTHON };
-        expect(await enter(uv), testCase.name).toEqual(HEALTHY);
-        const site = join(venv, 'lib', 'python3.14', 'site-packages');
-        await testCase.tamper(root, venv, site);
-        expect(await enter(uv), testCase.name).toEqual(HEALTHY);
-        // A replacement, not a repeated sync over the escape: the venv verb runs again.
-        expect(
-          uvRuns().map(([verb]) => verb),
-          testCase.name,
-        ).toEqual(['venv', 'sync', 'venv', 'sync']);
-        expect(readFileSync(join(venv, 'pyvenv.cfg'), 'utf8'), testCase.name).toContain('relocatable = true');
-        testCase.repaired(root, venv, site);
-        expect(await enter(uv), testCase.name).toEqual(HEALTHY);
-        expect(uvRuns(), testCase.name).toHaveLength(4);
-      });
-    }
-  });
-
-  it('repairs checkout-naming launchers independently, with a valid config throughout', async () => {
-    const cases: ReadonlyArray<{
-      name: string;
-      tamper: (root: string, venv: string, site: string) => Promise<void>;
-      repaired: (root: string, venv: string, site: string) => void;
-    }> = [
-      {
-        name: 'a launcher naming an old checkout devenv profile interpreter',
-        tamper: async (root, venv) => {
-          const profile = join(dirname(root), 'old-checkout', '.devenv', 'profile', 'bin');
-          await mkdir(profile, { recursive: true });
-          await writeFile(join(profile, 'python'), '');
-          await mkdir(join(venv, 'bin'), { recursive: true });
-          await writeFile(join(venv, 'bin', 'pytest'), `#!${join(profile, 'python')}\n`);
-        },
-        repaired: (_root, venv) => expect(existsSync(join(venv, 'bin', 'pytest'))).toBe(false),
-      },
-      {
-        name: 'a shell wrapper execing an old venv',
-        tamper: async (root, venv) => {
-          const foreign = join(dirname(root), 'foreign-venv');
-          await mkdir(join(foreign, 'bin'), { recursive: true });
-          await writeFile(join(foreign, 'pyvenv.cfg'), 'home = /nix/store/python/bin\n');
-          await writeFile(join(foreign, 'bin', 'python'), '');
-          await mkdir(join(venv, 'bin'), { recursive: true });
-          await writeFile(join(venv, 'bin', 'pytest'), `#!/bin/sh\nexec "${join(foreign, 'bin', 'python')}" "$@"\n`);
-        },
-        repaired: (_root, venv) => expect(existsSync(join(venv, 'bin', 'pytest'))).toBe(false),
-      },
-      {
-        name: 'a whitespace-shebang launcher naming an old venv',
-        tamper: async (root, venv) => {
-          const foreign = join(dirname(root), 'foreign-venv');
-          await mkdir(join(foreign, 'bin'), { recursive: true });
-          await writeFile(join(foreign, 'pyvenv.cfg'), 'home = /nix/store/python/bin\n');
-          await writeFile(join(foreign, 'bin', 'python'), '');
-          await mkdir(join(venv, 'bin'), { recursive: true });
-          await writeFile(join(venv, 'bin', 'pytest'), `#! ${join(foreign, 'bin', 'python')}\n`);
-        },
-        repaired: (_root, venv) => expect(existsSync(join(venv, 'bin', 'pytest'))).toBe(false),
-      },
-    ];
-    for (const testCase of cases) {
-      await withManagedRepository({ files: UV_PROJECT }, async ({ root, state, enterShell: enter, uvRuns }) => {
-        const venv = join(state, 'venv');
-        const uv = { uvProjectEnvironment: venv, python: PYTHON };
-        expect(await enter(uv), testCase.name).toEqual(HEALTHY);
-        const site = join(venv, 'lib', 'python3.14', 'site-packages');
-        await testCase.tamper(root, venv, site);
-        expect(await enter(uv), testCase.name).toEqual(HEALTHY);
-        expect(
-          uvRuns().map(([verb]) => verb),
-          testCase.name,
-        ).toEqual(['venv', 'sync', 'venv', 'sync']);
-        expect(readFileSync(join(venv, 'pyvenv.cfg'), 'utf8'), testCase.name).toContain('relocatable = true');
-        testCase.repaired(root, venv, site);
-        expect(await enter(uv), testCase.name).toEqual(HEALTHY);
-        expect(uvRuns(), testCase.name).toHaveLength(4);
-      });
-    }
-  });
-
-  it('repairs spaced-path and interpreter-symlink escapes independently, with a valid config throughout', async () => {
-    const cases: ReadonlyArray<{
-      name: string;
-      tamper: (root: string, venv: string, site: string) => Promise<void>;
-      repaired: (root: string, venv: string, site: string) => void;
-    }> = [
-      {
-        name: 'a shell wrapper execing a spaced old venv path, and an env -S launcher naming it',
-        tamper: async (root, venv) => {
-          const foreign = join(dirname(root), 'old checkout', 'foreign venv');
-          await mkdir(join(foreign, 'bin'), { recursive: true });
-          await writeFile(join(foreign, 'pyvenv.cfg'), 'home = /nix/store/python/bin\n');
-          await writeFile(join(foreign, 'bin', 'python'), '');
-          await mkdir(join(venv, 'bin'), { recursive: true });
-          await writeFile(join(venv, 'bin', 'pytest'), `#!/bin/sh\nexec "${join(foreign, 'bin', 'python')}" "$@"\n`);
-        },
-        repaired: (_root, venv) => expect(existsSync(join(venv, 'bin', 'pytest'))).toBe(false),
-      },
-      {
-        name: 'an env -S launcher naming a spaced old venv path',
-        tamper: async (root, venv) => {
-          const foreign = join(dirname(root), 'old checkout', 'foreign venv');
-          await mkdir(join(foreign, 'bin'), { recursive: true });
-          await writeFile(join(foreign, 'pyvenv.cfg'), 'home = /nix/store/python/bin\n');
-          await writeFile(join(foreign, 'bin', 'python'), '');
-          await mkdir(join(venv, 'bin'), { recursive: true });
-          await writeFile(join(venv, 'bin', 'pytest'), `#!/usr/bin/env -S "${join(foreign, 'bin', 'python')}"\n`);
-        },
-        repaired: (_root, venv) => expect(existsSync(join(venv, 'bin', 'pytest'))).toBe(false),
-      },
-    ];
-    for (const testCase of cases) {
-      await withManagedRepository({ files: UV_PROJECT }, async ({ root, state, enterShell: enter, uvRuns }) => {
-        const venv = join(state, 'venv');
-        const uv = { uvProjectEnvironment: venv, python: PYTHON };
-        expect(await enter(uv), testCase.name).toEqual(HEALTHY);
-        const site = join(venv, 'lib', 'python3.14', 'site-packages');
-        await testCase.tamper(root, venv, site);
-        expect(await enter(uv), testCase.name).toEqual(HEALTHY);
-        expect(
-          uvRuns().map(([verb]) => verb),
-          testCase.name,
-        ).toEqual(['venv', 'sync', 'venv', 'sync']);
-        expect(readFileSync(join(venv, 'pyvenv.cfg'), 'utf8'), testCase.name).toContain('relocatable = true');
-        testCase.repaired(root, venv, site);
-        expect(await enter(uv), testCase.name).toEqual(HEALTHY);
-        expect(uvRuns(), testCase.name).toHaveLength(4);
-      });
-    }
-  });
-
-  it('repairs polyglot and interpreter-symlink escapes independently, with a valid config throughout', async () => {
-    const cases: ReadonlyArray<{
-      name: string;
-      tamper: (root: string, venv: string, site: string) => Promise<void>;
-      repaired: (root: string, venv: string, site: string) => void;
-    }> = [
-      {
-        name: 'a relative interpreter alias resolving into an old checkout profile',
-        tamper: async (root, venv) => {
-          const profile = join(dirname(root), 'old-checkout', '.devenv', 'profile', 'bin');
-          await mkdir(profile, { recursive: true });
-          await writeFile(join(profile, 'python'), '');
-          await symlink(relative(join(venv, 'bin'), join(profile, 'python')), join(venv, 'bin', 'python'));
-        },
-        repaired: (_root, venv) =>
-          expect(lstatSync(join(venv, 'bin', 'python'), { throwIfNoEntry: false })).toBeUndefined(),
-      },
-      {
-        name: 'a polyglot wrapper execing a spaced old venv path',
-        tamper: async (root, venv) => {
-          const foreign = join(dirname(root), 'old checkout', 'foreign venv');
-          await mkdir(join(foreign, 'bin'), { recursive: true });
-          await writeFile(join(foreign, 'pyvenv.cfg'), 'home = /nix/store/python/bin\n');
-          await writeFile(join(foreign, 'bin', 'python'), '');
-          await mkdir(join(venv, 'bin'), { recursive: true });
-          await writeFile(
-            join(venv, 'bin', 'pytest'),
-            `#!/bin/sh\n'''exec' "${join(foreign, 'bin', 'python')}" "$0" "$@"\n' '''\n`,
-          );
-        },
-        repaired: (_root, venv) => expect(existsSync(join(venv, 'bin', 'pytest'))).toBe(false),
-      },
-      {
-        name: 'the environment interpreter is a symlink into an old checkout profile',
-        tamper: async (root, venv) => {
-          const profile = join(dirname(root), 'old-checkout', '.devenv', 'profile', 'bin');
-          await mkdir(profile, { recursive: true });
-          await writeFile(join(profile, 'python'), '');
-          await symlink(join(profile, 'python'), join(venv, 'bin', 'python'));
-        },
-        repaired: (_root, venv) =>
-          expect(lstatSync(join(venv, 'bin', 'python'), { throwIfNoEntry: false })).toBeUndefined(),
-      },
-    ];
-    for (const testCase of cases) {
-      await withManagedRepository({ files: UV_PROJECT }, async ({ root, state, enterShell: enter, uvRuns }) => {
-        const venv = join(state, 'venv');
-        const uv = { uvProjectEnvironment: venv, python: PYTHON };
-        expect(await enter(uv), testCase.name).toEqual(HEALTHY);
-        const site = join(venv, 'lib', 'python3.14', 'site-packages');
-        await testCase.tamper(root, venv, site);
-        expect(await enter(uv), testCase.name).toEqual(HEALTHY);
-        expect(
-          uvRuns().map(([verb]) => verb),
-          testCase.name,
-        ).toEqual(['venv', 'sync', 'venv', 'sync']);
-        expect(readFileSync(join(venv, 'pyvenv.cfg'), 'utf8'), testCase.name).toContain('relocatable = true');
-        testCase.repaired(root, venv, site);
-        expect(await enter(uv), testCase.name).toEqual(HEALTHY);
-        expect(uvRuns(), testCase.name).toHaveLength(4);
-      });
-    }
-  });
-
-  it('admits a constructed relocatable layout — relative interpreter aliases, a store interpreter, a self-locating wrapper — without another sync', async () => {
-    await withManagedRepository({ files: UV_PROJECT }, async ({ root, state, enterShell: enter, uvRuns }) => {
-      const venv = join(state, 'venv');
-      const uv = { uvProjectEnvironment: venv, python: PYTHON };
-      expect(await enter(uv)).toEqual(HEALTHY);
-
-      expect(uvRuns()).toHaveLength(2);
-      const store = join(dirname(root), 'store', 'bin');
-      await mkdir(store, { recursive: true });
-      await writeFile(join(store, 'python'), '');
-      await symlink(join(store, 'python'), join(venv, 'bin', 'python'));
-      await symlink('python', join(venv, 'bin', 'python3'));
-      await symlink('python', join(venv, 'bin', 'python3.14'));
-      await writeFile(join(venv, 'bin', 'pytest'), '#!/bin/sh\nexec "$(dirname "$0")/python" "$@"\n');
-      expect(await enter(uv)).toEqual(HEALTHY);
-      expect(uvRuns()).toHaveLength(2);
-    });
-  });
   it('enters a real uv environment and its clone installed, the member importing from the clone', async () => {
     const realUv = Bun.which('uv');
     const pythonWhich = Bun.which('python3');
