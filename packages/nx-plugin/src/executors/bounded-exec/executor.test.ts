@@ -946,15 +946,16 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const ready = join(workspace.root, 'straggler-ready.fifo');
     expect(spawnSync('mkfifo', [fifo, ready]).status).toBe(0);
     // The leader exits on SIGTERM. The subshell beside it ignores SIGTERM, a disposition its
-    // `tail` inherits, and announces itself only once that disposition is installed. Every
-    // script descendant inherits the lifetime FIFO, so EOF proves all of them ended, not
+    // `tail` inherits. The reader echoes the subshell's line before it announces readiness, so the
+    // signal, which waits for that announcement, never ends the run before its output is written.
+    // Every script descendant inherits the lifetime FIFO, so EOF proves all of them ended, not
     // just the ignoring child. A fork during signal delivery inherits that witness too.
     await workspace.write(
       'straggle.sh',
       [
         'exec 3>"$1"',
-        '( trap "" TERM; echo ready; echo armed >"$2"; exec tail -f /dev/null ) | {',
-        '  read -r line; echo "$line"; exec tail -f /dev/null',
+        '( trap "" TERM; echo ready; exec tail -f /dev/null ) | {',
+        '  read -r line; echo "$line"; echo armed >"$2"; exec tail -f /dev/null',
         '}',
         '',
       ].join('\n'),
@@ -965,8 +966,10 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       expect(await readToEnd(ready), `straggler readiness pgid=${pid} must follow trap and FIFO open`).toBe('armed\n');
     });
 
+    // Nothing ends the command on its own: its subshell and `tail` never exit, so the bound is the event that ends
+    // the run, and the killer holds its signal until the announcement above. A short bound races no output.
     const result = await runBoundedExec(
-      { command: `sh straggle.sh ${fifo} ${ready}`, timeoutMs: 5_000, killAfterMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+      { command: `sh straggle.sh ${fifo} ${ready}`, timeoutMs: 200, killAfterMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
       workspace.context,
       termination.killer,
       null,
