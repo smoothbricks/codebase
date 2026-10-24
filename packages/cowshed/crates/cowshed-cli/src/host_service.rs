@@ -213,6 +213,19 @@ async fn answer(request: RouterRequest) -> Result<RouterResponse> {
             )
         }
         Op::HostDiskCommand(request) => {
+            if let Some(path) = request
+                .gateway_socket
+                .as_ref()
+                .filter(|path| !path.is_absolute())
+            {
+                return Err(CowshedError::usage(
+                    format!(
+                        "host.diskCommand gatewaySocket must be absolute: {}",
+                        path.display()
+                    ),
+                    "supply an absolute gateway control socket path or omit gatewaySocket",
+                ));
+            }
             let args = crate::args::DiskCommandArgs {
                 tool: match request.tool {
                     DiskCommandTool::Diskutil => cowshed_apfs::DiskTool::Diskutil,
@@ -229,7 +242,7 @@ async fn answer(request: RouterRequest) -> Result<RouterResponse> {
                     .map(CommandArg::into_os_string)
                     .collect(),
                 registry_entry: request.registry_entry,
-                gateway_socket: None,
+                gateway_socket: request.gateway_socket,
             };
             if args.registry_entry.is_some() {
                 crate::args::bound_detach(args.tool, &args.args).map_err(|refusal| {

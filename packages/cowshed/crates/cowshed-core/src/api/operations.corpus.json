@@ -277,6 +277,7 @@
   "host.diskCommand": {
     "tool": "diskutil",
     "deadlineMs": 5000,
+    "gatewaySocket": "/tmp/private-gateway/control.sock",
     "argv": [{ "encoding": "utf8", "data": "list" }],
     "stdin": { "encoding": "utf8", "data": "" }
   },

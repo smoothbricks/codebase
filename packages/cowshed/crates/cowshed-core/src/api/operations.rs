@@ -1031,6 +1031,10 @@ pub struct DiskCommandRequest {
     /// detach runs only while that entry still names the device, read inside the disk admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry_entry: Option<u64>,
+    /// `--gateway-socket`: the absolute control socket of the authenticated gateway that owns
+    /// disk admission; absent selects the host gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_socket: Option<PathBuf>,
 }
 
 /// `credential add`: one exact HTTPS origin, the registry path prefixes it may reach, the methods

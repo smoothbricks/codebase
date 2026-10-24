@@ -67,6 +67,7 @@ describe('openHost', () => {
     const root = await mkdtemp(join(tmpdir(), 'cowshed-host-napi-bare-'));
     const host = await openHost();
     try {
+      await mkdir(join(root, '.git'));
       const refused = await host.buildState(root).then(
         () => undefined,
         (error: unknown) => error,
@@ -132,6 +133,26 @@ describe('openHost', () => {
     }
   });
 
+  it('rejects a relative disk gateway before running the host command', async () => {
+    const host = await openHost();
+    try {
+      const refused = await host
+        .diskCommand({
+          tool: 'hdiutil',
+          argv: [{ encoding: 'utf8', data: 'info' }],
+          gatewaySocket: 'relative.sock',
+        })
+        [Symbol.asyncIterator]()
+        .next()
+        .then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+      requireCowshedError(refused, 'usage');
+    } finally {
+      await host.close();
+    }
+  });
   it('types every credential source, bytes only with an upload and an upload only with bytes', () => {
     // Compiled by typecheck-tests, never called: each line is a call shape the facade accepts or,
     // under @ts-expect-error, refuses.

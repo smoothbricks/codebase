@@ -829,7 +829,7 @@ export interface NativeHostDiskCommand {
 /** The request fields a `host.diskCommand` caller names; its handle binds the rest. */
 export type HostDiskCommandArguments = Pick<
   Api.DiskCommandRequest,
-  'tool' | 'deadlineMs' | 'argv' | 'stdin' | 'registryEntry'
+  'tool' | 'deadlineMs' | 'argv' | 'stdin' | 'registryEntry' | 'gatewaySocket'
 >;
 
 /**

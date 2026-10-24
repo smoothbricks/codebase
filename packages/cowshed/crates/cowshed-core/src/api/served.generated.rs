@@ -373,6 +373,8 @@ impl Serves<HostDiskCommand> for Host {
             stdin: Option<BinaryData>,
             #[serde(default)]
             registry_entry: Option<u64>,
+            #[serde(default)]
+            gateway_socket: Option<PathBuf>,
         }
         let Caller {
             tool,
@@ -380,6 +382,7 @@ impl Serves<HostDiskCommand> for Host {
             argv,
             stdin,
             registry_entry,
+            gateway_socket,
         } = decode::<HostDiskCommand, Caller>(arguments)?;
         Ok(DiskCommandRequest {
             tool,
@@ -387,6 +390,7 @@ impl Serves<HostDiskCommand> for Host {
             argv,
             stdin,
             registry_entry,
+            gateway_socket,
         })
     }
 }

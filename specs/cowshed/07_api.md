@@ -2273,12 +2273,14 @@ tool's output and delivers it once the tool has ended, as the verb does: the eve
 chunks of at most one inline frame, then its whole stderr the same way, then `exit` with the code the verb exits with
 (its exit code, or 128 plus its signal). A runner failure is the call's error, as the verb's wrapper codes are.
 
-`host.credentialAdd` (an upload row) is `credential add`'s enrolment: the origin, the path prefixes, the methods (absent
-or empty is GET and HEAD) and one tagged secret source, so no request names two. `env` (`--secret-env`, with `command`
-as `--secret-command` when the variable is unset or empty) reads `cowshed host`'s environment, which is the `openHost`
-caller's, and withholds the variable from every child of the project; `command` (`--secret-command`) runs the helper
-with no stdin; `upload` (`--secret-stdin`) is the call's upload frame, trimmed UTF-8 as the verb's pipe is. A frame
-beside any other source is refused as usage before a project is opened. The answer is the project's routes.
+`gatewaySocket` selects the authenticated disk-admission endpoint exactly as `--gateway-socket` does. It is an absolute
+control-socket path; a relative path is a usage error. Omitting it selects the host gateway. `host.credentialAdd` (an
+upload row) is `credential add`'s enrolment: the origin, the path prefixes, the methods (absent or empty is GET and
+HEAD) and one tagged secret source, so no request names two. `env` (`--secret-env`, with `command` as `--secret-command`
+when the variable is unset or empty) reads `cowshed host`'s environment, which is the `openHost` caller's, and withholds
+the variable from every child of the project; `command` (`--secret-command`) runs the helper with no stdin; `upload`
+(`--secret-stdin`) is the call's upload frame, trimmed UTF-8 as the verb's pipe is. A frame beside any other source is
+refused as usage before a project is opened. The answer is the project's routes.
 
 The `sccache` verbs are rows of their own scope, `sccache`: `sccache.start` (`capacity` as `--capacity` spells it),
 `sccache.stop` and `sccache.status`. They are served only by a `cowshed sccache host` connection, which the package

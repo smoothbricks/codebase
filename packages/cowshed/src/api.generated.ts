@@ -897,6 +897,11 @@ export type DiskCommandRequest = {
    * detach runs only while that entry still names the device, read inside the disk admission.
    */
   readonly registryEntry?: number & tags.Type<'uint64'>;
+  /**
+   * `--gateway-socket`: the absolute control socket of the authenticated gateway that owns
+   * disk admission; absent selects the host gateway.
+   */
+  readonly gatewaySocket?: string;
 };
 
 /**
