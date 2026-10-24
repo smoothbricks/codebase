@@ -1,6 +1,6 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are asserted literally. */
 import { describe, expect, it, spyOn } from 'bun:test';
-import { chmod, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -203,17 +203,13 @@ describe('managed devenv release lock', () => {
     }
   };
 
-  it('accepts a commit that a release tag from v2.0.4 on names, whatever devenv.yaml declared', async () => {
-    await withDevenvRemote(async ({ url, v204, v210 }) => {
+  it('checks a locked devenv commit against the release tags of its remote', async () => {
+    await withDevenvRemote(async ({ root, url, v203, v204, between, v210, head }) => {
       // An annotated tag, matched through the commit it peels to.
       expect(await checkLock(lockWithDevenv({ type: 'git', url, rev: v204 }))).toEqual({ failures: 0, reason: '' });
       // As text, v2.10 would sort before v2.0.4.
       expect(await checkLock(lockWithDevenv({ type: 'git', url, rev: v210 }))).toEqual({ failures: 0, reason: '' });
-    });
-  });
 
-  it('asks the remote of a github input at https://github.com/<owner>/<repo>', async () => {
-    await withDevenvRemote(async ({ url, v204 }) => {
       // git's own URL rewriting sends the derived GitHub URL to the stand-in, so no test reaches the network.
       const rewrite: Record<string, string> = {
         GIT_CONFIG_COUNT: '1',
@@ -231,12 +227,9 @@ describe('managed devenv release lock', () => {
           else process.env[key] = value;
         }
       }
-    });
-  });
 
-  it('refuses a commit no release tag from v2.0.4 on names, even an ancestor of one, and says why', async () => {
-    await withDevenvRemote(async ({ url, v203, between, head }) => {
-      // `between` is part of v2.10's history, which is not enough: the cache keeps the tag's build, not its history's.
+      // `between` is part of v2.10's history, which is not enough: the cache keeps the tag's build,
+      // not its history's.
       for (const rev of [between, head, 'f'.repeat(40)]) {
         const { failures, reason } = await checkLock(lockWithDevenv({ type: 'git', url, rev }));
         expect(failures).toBe(1);
@@ -246,6 +239,12 @@ describe('managed devenv release lock', () => {
       const old = await checkLock(lockWithDevenv({ type: 'git', url, rev: v203 }));
       expect(old.failures).toBe(1);
       expect(old.reason).toContain('which only v2.0.3 names, not a release from v2.0.4 on');
+
+      // A remote whose tags cannot be listed is refused, not passed.
+      const unreachable = pathToFileURL(join(root, 'unreachable')).href;
+      const unlisted = await checkLock(lockWithDevenv({ type: 'git', url: unreachable, rev: v204 }));
+      expect(unlisted.failures).toBe(1);
+      expect(unlisted.reason).toContain(`cannot list the release tags of ${unreachable}`);
     });
   });
 
@@ -263,15 +262,6 @@ describe('managed devenv release lock', () => {
       expect(failures).toBe(1);
       expect(reason).toContain(`tooling/direnv/devenv.lock locks devenv ${why}`);
     }
-  });
-
-  it('refuses, rather than passes, when it cannot list the tags of the remote', async () => {
-    await withDevenvRemote(async ({ root, v204 }) => {
-      const url = pathToFileURL(join(root, 'unreachable')).href;
-      const { failures, reason } = await checkLock(lockWithDevenv({ type: 'git', url, rev: v204 }));
-      expect(failures).toBe(1);
-      expect(reason).toContain(`cannot list the release tags of ${url}`);
-    });
   });
 
   it('has nothing to check without a lock or a devenv node, and reports a lock it cannot read', async () => {
@@ -464,6 +454,14 @@ describe('managed raw files', () => {
     const temp = await mkdtemp(join(tmpdir(), 'smoo-github-bootstrap-'));
     const bin = join(temp, 'bin');
     await mkdir(bin);
+    // The workspace the emulated shell enters: a checkout of its own with ttsc-env.sh copied in, so the cache
+    // that ttsc-env.sh computes lands under temp rather than in the checkout the suite runs from.
+    const checkout = join(temp, 'checkout');
+    await mkdir(join(checkout, 'tooling', 'direnv'), { recursive: true });
+    await copyFile(
+      join(REPO_ROOT, 'tooling', 'direnv', 'ttsc-env.sh'),
+      join(checkout, 'tooling', 'direnv', 'ttsc-env.sh'),
+    );
     const devenv = join(bin, 'devenv');
     // Emulates `devenv shell [flags] -- cmd...` the way devenv.smoo.nix's
     // enterShell behaves: cd to the workspace root, source ttsc-env.sh, which
@@ -479,7 +477,7 @@ describe('managed raw files', () => {
         '[ "${1:-}" = tasks ] && exit 0',
         'while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done',
         'shift',
-        'cd ../..',
+        `cd '${checkout}'`,
         '. tooling/direnv/ttsc-env.sh',
         'exec "$@"',
         '',
@@ -489,9 +487,9 @@ describe('managed raw files', () => {
 
     try {
       const cases = [
-        // No host value: the shell computes the repo-local default and the
+        // No host value: the shell computes the checkout's default and the
         // capture persists it for the workflow steps that follow.
-        { input: '', expected: `TTSC_CACHE_DIR=${join(REPO_ROOT, '.cache', 'ttsc')}\n` },
+        { input: '', expected: `TTSC_CACHE_DIR=${join(checkout, '.cache', 'ttsc')}\n` },
         // Host-provided value: the shell keeps it, so nothing changed and
         // nothing is rewritten — the override stays live in the step env.
         { input: join(temp, 'host-ttsc'), expected: undefined },
@@ -508,7 +506,10 @@ describe('managed raw files', () => {
               GITHUB_ENV: githubEnv,
               GITHUB_PATH: githubPath,
               PATH: `${bin}:${Bun.env.PATH ?? ''}`,
+              // The inherited environment may name the real checkout's cache: every ttsc path points at this fixture.
+              NX_WORKSPACE_ROOT_PATH: checkout,
               TTSC_CACHE_DIR: cache.input,
+              TTSC_GO_CACHE_DIR: '',
             },
             stderr: 'inherit',
             stdout: 'inherit',
