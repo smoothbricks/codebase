@@ -339,7 +339,10 @@ export async function nxDaemonProcesses(workspace: string): Promise<ProcessEntry
  * tree the job's supervisor observes, which ends it with the test command's
  * subtree (bounded-exec), so here the census only names it. A missing record
  * can mean startup has not published it yet: the daemon-stop command is
- * skipped, and the census still reports.
+ * skipped, and the census still reports. Nx opens the daemon's log,
+ * `d/daemon.log`, before it spawns any daemon, so a workspace without one
+ * never started a daemon and has nothing of one to name: the census, a host
+ * process scan, is skipped for it.
  */
 export async function stopNxDaemon(workspace: string, stop: () => Promise<void>): Promise<void> {
   const [daemon, ...before] = await nxDaemonProcesses(workspace);
@@ -352,6 +355,10 @@ export async function stopNxDaemon(workspace: string, stop: () => Promise<void>)
       terminate(entry.pid);
     }
     await awaitExit([daemon, ...spawned], `Nx daemon of ${workspace}`);
+  } else if (
+    lstatSync(join(workspace, '.nx', 'workspace-data', 'd', 'daemon.log'), { throwIfNoEntry: false }) === undefined
+  ) {
+    return;
   }
   const left = await censusDiagnostic(workspace);
   if (left !== null) {

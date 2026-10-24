@@ -2032,8 +2032,10 @@ tests) owns those roots:
   the workspace's path alone, so a deleted workspace retires too. A colliding non-symlink or retargeted alias refuses
   instead of removing another owner's entry; removing the fixture root reclaims its physical socket directories.
 - `stopNxDaemon(workspace, stop)` runs the caller's `nx daemon --stop` and waits until the daemon recorded in
-  `<workspace>/.nx/workspace-data/d/server-process.json`, and its descendants, has exited, then ends every process still
-  working in the workspace. That final census also catches editor probes reparented when the daemon exits.
+  `<workspace>/.nx/workspace-data/d/server-process.json`, and its descendants, has exited, then names on stderr every
+  process the host census still finds working in the workspace. That final census also catches editor probes reparented
+  when the daemon exits. It runs only where a daemon was started: Nx opens `d/daemon.log` before it spawns one, so a
+  workspace without that log, such as a daemonless fixture's, skips the host process scan.
 
 A fixture retires on every exit path, a throwing body included: stop its daemon, unlink its socket alias, then delete
 its root. A daemon that outlives the stop keeps the alias and the root, so the next run's sweep still finds both.
