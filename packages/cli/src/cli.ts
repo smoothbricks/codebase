@@ -2,26 +2,10 @@ import { appendFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { Command, CommanderError, InvalidArgumentError, Option } from 'commander';
 import { variants } from './generate/index.js';
-import { dispatchCiWorkflow, ensureCiPullRequest } from './github-ci/api.js';
 import { cliPackageVersion } from './lib/cli-package.js';
 import { decode, findRepoRoot, printCommandOutput } from './lib/run.js';
-import { checkPublicCommitDenylist, checkPublicDenylist } from './monorepo/public-denylist.js';
-import { ensureChromium, runWithChromium } from './playwright/index.js';
-import { resolvePrConflicts } from './pr/index.js';
 import { RELEASE_BUMPS } from './release/core.js';
-import { secretsSet, secretsStatus, secretsSync } from './secrets/commands.js';
-import { secretsRun } from './secrets/run.js';
-import {
-  cleanupPullRequest,
-  deployStage,
-  describeCleanup,
-  describeInventory,
-  inventoryPullRequest,
-} from './wrangler/deploy-stage.js';
-import { deployedVersion } from './wrangler/deployed-version.js';
-import { scaffold } from './wrangler/scaffold.js';
 import { type DeploymentStage, parseDeploymentStage, parsePullRequestNumber } from './wrangler/stage.js';
-import { describeSweep, sweepNeedsAttention, sweepRepositoryStages } from './wrangler/stage-sweep.js';
 
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   // Every Nx smoo loads in-process or starts answers from the installed Nx: a daemon otherwise installs `nx@latest` to
@@ -82,6 +66,8 @@ function capturedStream(error: Error, key: 'stdout' | 'stderr'): string {
   return value instanceof Uint8Array ? decode(value) : '';
 }
 
+// Building the program loads only what option parsing needs; every action imports its own modules, so a git hook's
+// `smoo` call pays for its one command and never for the other commands' dependency graphs.
 function buildProgram(): Command {
   const program = new Command();
   program
@@ -116,19 +102,31 @@ function buildProgram(): Command {
       'comma-separated Nx project names to build and pack-validate (a release selection); default: every project',
     )
     .action(
-      async (options: {
+      async ({
+        onlyIfNewWorkspacePackage,
+        projects,
+        ...options
+      }: {
         fix?: boolean;
         failFast?: boolean;
         onlyIfNewWorkspacePackage?: boolean;
         verbose?: boolean;
         projects?: string;
       }) => {
+        const root = await findRepoRoot();
+        // The pre-commit hook asks on every commit; only a staged new package pays for the validator's Nx graph.
+        if (onlyIfNewWorkspacePackage) {
+          const { hasNewWorkspacePackage } = await import('./monorepo/new-workspace-package.js');
+          if (!(await hasNewWorkspacePackage(root))) return;
+        }
         const { validateMonorepo } = await import('./monorepo/index.js');
-        const projects = options.projects
-          ?.split(',')
-          .map((name) => name.trim())
-          .filter((name) => name.length > 0);
-        await validateMonorepo(await findRepoRoot(), { ...options, projects });
+        await validateMonorepo(root, {
+          ...options,
+          projects: projects
+            ?.split(',')
+            .map((name) => name.trim())
+            .filter((name) => name.length > 0),
+        });
       },
     );
   monorepo.command('update').action(async () => {
@@ -175,6 +173,7 @@ function buildProgram(): Command {
       ]),
     )
     .action(async (revisions: string[], options: { remote?: string; staged?: boolean; commitMessage?: string }) => {
+      const { checkPublicCommitDenylist, checkPublicDenylist } = await import('./monorepo/public-denylist.js');
       const root = await findRepoRoot();
       if (options.staged || options.commitMessage !== undefined) {
         if (revisions.length > 0) {
@@ -476,6 +475,7 @@ function buildProgram(): Command {
     .requiredOption('--workflow <workflow>')
     .requiredOption('--ref <ref>')
     .action(async (options: { workflow: string; ref: string }) => {
+      const { dispatchCiWorkflow } = await import('./github-ci/api.js');
       await dispatchCiWorkflow(options.workflow, options.ref);
     });
   githubCi
@@ -484,7 +484,10 @@ function buildProgram(): Command {
     .requiredOption('--base <branch>')
     .requiredOption('--title <title>')
     .requiredOption('--body <body>')
-    .action(ensureCiPullRequest);
+    .action(async (options: { head: string; base: string; title: string; body: string }) => {
+      const { ensureCiPullRequest } = await import('./github-ci/api.js');
+      await ensureCiPullRequest(options);
+    });
   githubCi
     .command('nx-smart')
     .requiredOption('--target <target>')
@@ -563,6 +566,7 @@ function buildProgram(): Command {
     .option('--remote <name>', 'git remote hosting the PR branch (auto-inferred when omitted)')
     .option('--abort', 'discard an in-progress resolution and return to the original branch')
     .action(async (prArg: string | undefined, options: { remote?: string; abort?: boolean }) => {
+      const { resolvePrConflicts } = await import('./pr/index.js');
       const exitCode = await resolvePrConflicts(await findRepoRoot(), prArg, options);
       if (exitCode !== 0) {
         process.exitCode = exitCode;
@@ -575,6 +579,7 @@ function buildProgram(): Command {
     .command('chromium')
     .description('Ensure Chromium is available for browser tests')
     .action(async () => {
+      const { ensureChromium } = await import('./playwright/index.js');
       await ensureChromium();
     });
   playwright
@@ -582,6 +587,7 @@ function buildProgram(): Command {
     .description('Run a command with Chromium prepared and its browser path in the child environment')
     .passThroughOptions()
     .action(async (command: string, args: string[]) => {
+      const { runWithChromium } = await import('./playwright/index.js');
       await runWithChromium(command, args);
     });
 
@@ -602,6 +608,7 @@ function buildProgram(): Command {
     // @acme/x`, not lose `-d` to this command's own parser.
     .passThroughOptions()
     .action(async (group: string | undefined, command: string[]) => {
+      const { secretsRun } = await import('./secrets/run.js');
       process.exitCode = await secretsRun(await findRepoRoot(), group, command);
     });
   secrets
@@ -625,6 +632,7 @@ function buildProgram(): Command {
         'unchanged, so a status that refuses still refuses',
     )
     .action(async (options: { repo?: string; env?: string; json?: boolean }) => {
+      const { secretsStatus } = await import('./secrets/commands.js');
       process.exitCode = await secretsStatus(await findRepoRoot(), options);
     });
   secrets
@@ -639,6 +647,7 @@ function buildProgram(): Command {
       "write into this GitHub Environment; its value takes precedence over the repository's for a job bound to it",
     )
     .action(async (name: string | undefined, options: { repo?: string; env?: string }) => {
+      const { secretsSet } = await import('./secrets/commands.js');
       process.exitCode = await secretsSet(await findRepoRoot(), name, options);
     });
   secrets
@@ -653,6 +662,7 @@ function buildProgram(): Command {
       "write into this GitHub Environment; its value takes precedence over the repository's for a job bound to it",
     )
     .action(async (options: { repo?: string; env?: string }) => {
+      const { secretsSync } = await import('./secrets/commands.js');
       process.exitCode = await secretsSync(await findRepoRoot(), options);
     });
 
@@ -662,6 +672,7 @@ function buildProgram(): Command {
     .description('Write a starter scripts/prepare-env.ts (manifest-driven) and wire its nx target')
     .option('--force', 'overwrite an existing scripts/prepare-env.ts')
     .action(async (project: string, options: { force?: boolean }) => {
+      const { scaffold } = await import('./wrangler/scaffold.js');
       scaffold(await findRepoRoot(), project, { force: options.force });
     });
   wrangler
@@ -670,6 +681,7 @@ function buildProgram(): Command {
     .option('--config <path>', "deploy a build-generated flat wrangler.json instead of the project's own config")
     .option('--version-endpoint <url>', 'URL served by this worker whose trimmed body is the running version tag')
     .action(async (options: { stage: DeploymentStage; config?: string; versionEndpoint?: string }) => {
+      const { deployStage } = await import('./wrangler/deploy-stage.js');
       await deployStage(process.cwd(), {
         stage: options.stage,
         repositoryRoot: await findRepoRoot(),
@@ -684,6 +696,7 @@ function buildProgram(): Command {
     .option('--config <path>', 'resolve the worker name from a build-generated flat wrangler.json')
     .option('--refresh', 'ask Cloudflare even when a fresh cached answer exists')
     .action(async (options: { stage: DeploymentStage; config?: string; refresh?: boolean }) => {
+      const { deployedVersion } = await import('./wrangler/deployed-version.js');
       const report = await deployedVersion(process.cwd(), {
         stage: options.stage,
         ...(options.config ? { config: resolve(options.config) } : {}),
@@ -700,6 +713,9 @@ function buildProgram(): Command {
     .option('--dry-run', 'list what cleanup would delete and delete nothing')
     .option('--json', 'write the result as JSON instead of a sentence')
     .action(async (options: { pr: number; dryRun?: boolean; json?: boolean }) => {
+      const { cleanupPullRequest, describeCleanup, describeInventory, inventoryPullRequest } = await import(
+        './wrangler/deploy-stage.js'
+      );
       const root = await findRepoRoot();
       const { pr } = options;
       const json = options.json === true;
@@ -723,6 +739,7 @@ function buildProgram(): Command {
     )
     .option('--json', 'write the result as JSON instead of a report')
     .action(async (options: { pr?: number; json?: boolean }) => {
+      const { describeSweep, sweepNeedsAttention, sweepRepositoryStages } = await import('./wrangler/stage-sweep.js');
       const result = await sweepRepositoryStages(
         await findRepoRoot(),
         options.pr === undefined ? {} : { only: options.pr },
