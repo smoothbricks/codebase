@@ -30,11 +30,12 @@ import {
  * reports its stdout JSON protocol; the filesystem digests around each run are
  * the proof that the report is true.
  *
- * An install is the expensive part, so the cases that can share one do. Each
- * adds its single cause to it, asserts, and withdraws the cause before the
- * next, so no refusal is explained by what an earlier case left behind; a
- * failure names the case that broke. The permission case revokes write access
- * to the package's parent and keeps an install of its own.
+ * An install is the expensive part, so the cases that can share one do. A
+ * refusal meets the install with its own single cause and withdraws it before
+ * the next case, so none is explained by another's leftover; the case that
+ * removes the witness cannot withdraw it and goes last. A failure names the
+ * case that broke. The permission case revokes write access to the package's
+ * parent and keeps an install of its own.
  */
 
 interface PublishedRegistry {
@@ -289,8 +290,9 @@ describe('a published payload installed in a checkout', () => {
           },
         );
 
-        // Every step below adds its single cause to this install, asserts, and withdraws the cause, so each
-        // refusal is for its own reason. The named file stays missing until the repair that restores it.
+        // A refusal meets this install with its own single cause and withdraws it before the next case, so none is
+        // explained by another's leftover; removing the witness cannot be withdrawn, so it goes last. The named file
+        // stays missing until the repair that restores it.
         await rm(installed);
 
         await step('refuses a tar whose bytes fail the locked integrity and changes nothing', async () => {
@@ -332,6 +334,7 @@ describe('a published payload installed in a checkout', () => {
         });
 
         await step('refuses a repair with no prior success witness and mints no fresh proof', async () => {
+          // The repair above restored the named file: it goes again, with the witness.
           await rm(receipt);
           await rm(installed);
           const before = evidence(root);
