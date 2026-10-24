@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -14,6 +14,7 @@ import { resolveCowshedExecutable } from './executor.js';
 import { SUPERVISOR_SOCKET_ENV } from './owned-subtree.js';
 import { COWSHED_EXECUTABLE_ENV } from './ram-temp.js';
 import {
+  attachedDisks,
   detachOwned,
   removeScratchDirectories,
   type ScratchVolume,
@@ -137,6 +138,11 @@ interface Barrier {
    */
   until(ready: (events: readonly SiblingEvent[]) => boolean): Promise<void>;
   go(name: string): void;
+  /**
+   * A foreground sibling process exited. End already recorded means the ack was sent, so this zero exit is the
+   * expected order and is not a failure. Any other exit fails the barrier and rejects every pending `until`.
+   */
+  lost(name: string, code: number | null): void;
   close(): Promise<void>;
 }
 
@@ -286,8 +292,9 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
         // the two-token peak below is still the pool's own count.
         const churn = await withChurn(root, pool.environment, async () => {
           const siblings = await Promise.all(
-            ['a', 'b', 'c'].map((name) =>
-              startRunner(
+            ['a', 'b', 'c'].map(async (name) => ({
+              name,
+              run: await startRunner(
                 root,
                 name,
                 {
@@ -298,8 +305,10 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
                 join(root, name),
                 childEnv(pool.environment),
               ),
-            ),
+            })),
           );
+          // Exit without a recorded end rejects this wait. A zero exit after the end ack does not.
+          releaseOnSiblingExit(barrier, siblings);
 
           // Two siblings are admitted together and the third waits for a release. Which two is not fixed, so the proof
           // releases whichever started first, then every other started sibling in turn.
@@ -315,7 +324,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
             }
           }
           await barrier.until((events) => namesOf(events, 'end').length >= 3);
-          return siblings;
+          return siblings.map(({ run }) => run);
         });
         for (const sibling of churn.value) {
           expect(await sibling.exited).toBe(0);
@@ -342,6 +351,32 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
       } finally {
         await barrier.close();
       }
+    });
+  });
+
+  it('stops owned churn when a foreground sibling exits before start or end', async () => {
+    await withPool(2, async (pool) => {
+      await proveForegroundExitReleases(pool, 'early', () => 'node -e "process.exit(1)"', /sibling early exited/);
+      await proveForegroundExitReleases(
+        pool,
+        'late',
+        (port) => siblingDropCommand(port, 'late'),
+        /sibling late (?:closed before end|exited)/,
+      );
+      if (ramVolume !== undefined) {
+        expect(await attachedDisks(ramVolume.paths, ramVolume.capacity, ramVolume.gatewaySocket)).toEqual([]);
+        expect((await stat(ramVolume.gatewaySocket)).isSocket()).toBe(true);
+      }
+      const root = await createRoot();
+      const run = await startRunner(
+        root,
+        'still',
+        { command: 'true', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, parallelism: 1 },
+        join(root, 'still'),
+        childEnv(pool.environment),
+      );
+      expect(await run.exited, run.stderr()).toBe(0);
+      expect(run.stderr()).not.toContain('RAM temp volume not leased');
     });
   });
 
@@ -651,17 +686,82 @@ function attribution(child: ChildRun, stage: string): string {
 
 /**
  * The sibling's command: report `start NAME TOKENS` to the barrier, wait for `go`, then report `end NAME TOKENS`.
- * It is plain `node`, so it needs no preload.
+ * It is plain `node`, so it needs no preload. It does not exit until the barrier acks `end`, and that ack is written
+ * only after the end event is recorded, so a zero exit cannot overtake bytes still queued on the socket.
  */
 function siblingCommand(port: number, name: string): string {
   const tokens = `process.env.${CPU_TOKENS_ENV}`;
   const script = [
     `const s = require('node:net').connect(${port}, '127.0.0.1', () =>`,
     `s.write('start ${name} ' + ${tokens} + '\\n'));`,
-    `let got = ''; s.on('data', (d) => { got += d;`,
-    `if (got.includes('go\\n')) s.end('end ${name} ' + ${tokens} + '\\n'); });`,
+    `let got = '', sent = false; s.on('data', (d) => { got += d;`,
+    `if (!sent && got.includes('go\\n')) { sent = true; s.write('end ${name} ' + ${tokens} + '\\n'); }`,
+    `if (got.includes('ack\\n')) s.end(); });`,
   ].join(' ');
   return `node -e ${JSON.stringify(script)}`;
+}
+
+/** A real sibling that reports start and then FINs without end: failure before finish, after the start bytes. */
+function siblingDropCommand(port: number, name: string): string {
+  const tokens = `process.env.${CPU_TOKENS_ENV}`;
+  const script = [
+    `const s = require('node:net').connect(${port}, '127.0.0.1', () => {`,
+    `s.write('start ${name} ' + ${tokens} + '\\n', () => s.end()); });`,
+  ].join(' ');
+  return `node -e ${JSON.stringify(script)}`;
+}
+
+/**
+ * Foreground exit fails the barrier unless that sibling's end is already recorded. The command waits for the end ack,
+ * so a legitimate zero exit is observed only after the barrier has the event. No sleep and no read of the socket buffer.
+ */
+function releaseOnSiblingExit(
+  barrier: Barrier,
+  siblings: readonly { readonly name: string; readonly run: ChildRun }[],
+): void {
+  for (const sibling of siblings) {
+    void sibling.run.exited.then((code) => {
+      barrier.lost(sibling.name, code);
+    });
+  }
+}
+
+/** One real foreground failure beside real churn. Rejection must stop those workers; the fixture gateway stays up. */
+async function proveForegroundExitReleases(
+  pool: CpuPool,
+  name: string,
+  command: (port: number) => string,
+  failure: RegExp,
+): Promise<void> {
+  const root = await createRoot();
+  const barrier = await startBarrier();
+  try {
+    await expect(
+      withChurn(root, pool.environment, async () => {
+        const run = await startRunner(
+          root,
+          name,
+          {
+            command: command(barrier.port),
+            timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+            parallelism: 1,
+          },
+          join(root, name),
+          childEnv(pool.environment),
+        );
+        releaseOnSiblingExit(barrier, [{ name, run }]);
+        await barrier.until((events) => events.some((event) => event.kind === 'end' && event.name === name));
+      }),
+    ).rejects.toThrow(failure);
+    expect(await readFile(join(root, CHURN_STOP), 'utf8')).toBe('');
+    const workers = [...children].filter((child) => child.label === 'churna.mjs' || child.label === 'churnb.mjs');
+    expect(workers.length).toBeGreaterThanOrEqual(2);
+    for (const worker of workers) {
+      expect(await worker.exited, worker.stderr()).toBe(0);
+    }
+  } finally {
+    await barrier.close();
+  }
 }
 
 /**
@@ -780,7 +880,8 @@ function namesOf(events: readonly SiblingEvent[], kind: SiblingEvent['kind']): s
 /**
  * A TCP barrier the sibling proof drives. It stamps each sibling event in the order it hears it, so the proof never
  * needs a clock: a sibling's `start` and `end` are the only ordering it trusts. A connection error, a server error, or
- * a malformed line fails the barrier, and every pending `until` rejects with that failure.
+ * a malformed line, a socket EOF before `end`, or a sibling exit before that end was recorded fails the barrier,
+ * and every pending `until` rejects with that failure.
  */
 function startBarrier(): Promise<Barrier> {
   const events: SiblingEvent[] = [];
@@ -811,6 +912,7 @@ function startBarrier(): Promise<Barrier> {
       sockets.set(name, connection);
     }
     events.push({ kind: kind === 'start' ? 'start' : 'end', name, tokens: Number(tokens) });
+    if (kind === 'end') connection.write('ack\n');
     wake();
   };
 
@@ -818,6 +920,22 @@ function startBarrier(): Promise<Barrier> {
     connections.add(connection);
     connection.on('close', () => {
       connections.delete(connection);
+    });
+    connection.on('end', () => {
+      if (pending !== '') {
+        const line = pending;
+        pending = '';
+        fail(new Error(`sibling connection closed with a partial line: ${JSON.stringify(line)}`));
+        return;
+      }
+      const name = [...sockets.entries()].find(([, socket]) => socket === connection)?.[0];
+      if (name === undefined) {
+        fail(new Error('sibling connection closed before start'));
+        return;
+      }
+      if (!events.some((event) => event.kind === 'end' && event.name === name)) {
+        fail(new Error(`sibling ${name} closed before end`));
+      }
     });
     connection.on('error', (error) => {
       fail(new Error(`barrier connection failed: ${error.message}`));
@@ -869,6 +987,10 @@ function startBarrier(): Promise<Barrier> {
             throw new Error(`sibling ${JSON.stringify(name)} has not reported its start`);
           }
           socket.write('go\n');
+        },
+        lost(name, code) {
+          if (events.some((event) => event.kind === 'end' && event.name === name)) return;
+          fail(new Error(`sibling ${name} exited ${code} before the barrier recorded its end`));
         },
         close() {
           barriers.delete(barrier);
