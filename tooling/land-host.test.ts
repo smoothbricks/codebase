@@ -44,7 +44,7 @@ function failedRun(message: string, exit = 1): Call {
     args: GATE,
     exit,
     output: [
-      '> nx run ' + TASK,
+      `> nx run ${TASK}`,
       '',
       message,
       '',
@@ -54,8 +54,8 @@ function failedRun(message: string, exit = 1): Call {
       '',
       'Failed tasks:',
       '',
-      '- ' + TASK,
-      '- ' + TASK,
+      `- ${TASK}`,
+      `- ${TASK}`,
       '',
     ].join('\n'),
   };
@@ -151,7 +151,7 @@ function git(directory: string, ...args: string[]): string {
   });
   if (run.status !== 0) {
     throw new Error(
-      `git ${args.join(' ')} in ${directory}: ${run.error?.message ?? (run.stderr || 'terminated by ' + run.signal)}`,
+      `git ${args.join(' ')} in ${directory}: ${run.error?.message ?? (run.stderr || `terminated by ${run.signal}`)}`,
     );
   }
   return run.stdout.trim();
@@ -197,6 +197,8 @@ function fixture(replayFails = false): Land {
   }
   symlinkSync(join(repo, 'node_modules'), join(main, 'node_modules'));
   writeFileSync(join(main, 'nx.json'), '{}\n');
+  // The land cross-lints the gated tree for Linux after the gate; the fixture's check passes.
+  writeFileSync(join(main, 'package.json'), '{"scripts":{"check:linux":"echo linux cross check passed"}}\n');
   writeFileSync(join(main, '.envrc'), '# approved\n');
   writeFileSync(join(main, '.gitignore'), 'node_modules\n.nx\n');
   git(main, 'init', '-q', '-b', 'main');
@@ -265,8 +267,8 @@ describe('land-host.sh', () => {
     expect(PRE_REWRITE_MAIN).toBe('e9e596563bfaa8b337893bb7df9937f9f65d06ea');
     expect(judgeHistory(land.ws, newMain, oldMain)).toEqual({
       kind: 'refused',
-      why: 'source ancestry contains pre-rewrite main ' + oldMain,
-      remedy: 'git rebase --onto ' + newMain + ' ' + oldMain.slice(0, 9),
+      why: `source ancestry contains pre-rewrite main ${oldMain}`,
+      remedy: `git rebase --onto ${newMain} ${oldMain.slice(0, 9)}`,
     });
     expect(git(land.ws, 'rev-parse', 'HEAD')).toBe(sourceBefore);
     git(land.ws, 'fetch', '-q', land.main, newMain);
@@ -318,7 +320,7 @@ describe('land-host.sh', () => {
       { ...failed, requireFileOutput: true, output: `${failed.output}\n${'x'.repeat(70_000)}\ncapture-suffix` },
     ]);
     expect(run.status, run.log).toBe(7);
-    expect(run.log).toContain('failed ' + TASK + '\n' + message);
+    expect(run.log).toContain(`failed ${TASK}\n${message}`);
     expect(run.nx).toEqual(['daemon --stop', GATE.join(' ')]);
     expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
   });
@@ -341,13 +343,13 @@ describe('land-host.sh', () => {
     'bounded-exec: outlived its 120000ms bound',
     'bounded-exec: wedged, no test finished for 180000ms',
   ]) {
-    it('stops immediately on ' + message.split('\n')[0] + ', without rerunning or committing a ledger', () => {
+    it(`stops immediately on ${message.split('\n')[0]}, without rerunning or committing a ledger`, () => {
       const land = fixture();
       const before = git(land.main, 'rev-parse', 'HEAD');
       const gated = git(land.ws, 'rev-parse', 'HEAD');
       const run = land.land([DAEMON_STOP, failedRun(message, 7)]);
       expect(run.status, run.log).toBe(7);
-      expect(run.log).toContain('failed ' + TASK + '\n' + message);
+      expect(run.log).toContain(`failed ${TASK}\n${message}`);
       expect(run.log.split(message)).toHaveLength(2);
       expect(run.log).toContain('gate exited 7; the land stops');
       expect(run.nx).toEqual(['daemon --stop', GATE.join(' ')]);
