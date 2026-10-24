@@ -15,6 +15,7 @@ import { testFileInstallation } from './__tests__/owned-installation.js';
 const RECEIPT_ENV = 'COWSHED_NX_TASK_RECEIPT_ID';
 const RECEIPT = '0123456789abcdef0123456789abcdef';
 const CHANGED_RECEIPT = 'fedcba9876543210fedcba9876543210';
+const FAILED_RECEIPT = '00112233445566778899aabbccddeeff';
 /** The Nx CLI of a fixture workspace's own installation. */
 const nxEntry = (workspace: string) => join(workspace, 'node_modules', '.bin', 'nx');
 const HINTS = join('.nx', 'cache', '.cowshed-task-results');
@@ -134,22 +135,12 @@ it('records a task hint only under a controller receipt, and never on an ordinar
         run: { argv: [process.execPath, await realpath(nxEntry(workspace)), ...changed.argv.slice(2)] },
         tasks: [{ task: { id: 'app:build', hash: expect.stringMatching(/^\d+$/) }, status: 'success', code: 0 }],
       });
-    },
-    '.',
-  );
-});
-
-it('records a failed task as a failure under a receipt, never as a success', async () => {
-  await withNxFixture(
-    'task-results-failure',
-    async ({ workspace, socketDirectory }) => {
-      await writeWorkspace(workspace);
-      const { [RECEIPT_ENV]: _inherited, ...ordinary } = fixtureNxEnv(workspace, socketDirectory);
-
-      const failed = await nx(workspace, { ...ordinary, [RECEIPT_ENV]: RECEIPT }, 'app:fail');
-      expect(failed.exitCode).not.toBe(0);
-      expect(await readHint(join(workspace, HINTS, RECEIPT))).toMatchObject({
-        requestId: RECEIPT,
+      // A failed task is recorded as a failure under its own receipt: a namespace holds one hint.
+      const failureCase = 'records a failed task as a failure under a receipt, never as a success';
+      const failed = await nx(workspace, { ...ordinary, [RECEIPT_ENV]: FAILED_RECEIPT }, 'app:fail');
+      expect(failed.exitCode, `${failureCase}\n${failed.log}`).not.toBe(0);
+      expect(await readHint(join(hints, FAILED_RECEIPT)), failureCase).toMatchObject({
+        requestId: FAILED_RECEIPT,
         tasks: [{ task: { id: 'app:fail' }, status: 'failure', code: 1 }],
       });
     },
