@@ -89,6 +89,16 @@ export function recordedStamp(stats: StampFields, start: bigint): string {
     : nodeStamp(stats);
 }
 
+/**
+ * What a census read of one node, and when it started reading: a reader that records the node in the same capture
+ * takes this instead of reading it a second time. `entries` is a directory's sorted listing.
+ */
+export interface CensusRead {
+  readonly stats: BigIntStats;
+  readonly start: bigint;
+  readonly entries?: readonly string[];
+}
+
 export interface NodeWitness {
   readonly path: string;
   readonly stamp: string;
@@ -383,7 +393,8 @@ export function provenInstallationCensus(
  * whose stamp `previous` lacks, and one `previous` recorded unproven are read again; `previous` need not be proven.
  * The key is the stamp, not a cheaper generation (a resolution, a manifest, an install marker): a rebuild of a
  * developer-linked package, this plugin's own `dist`, rewrites its files in place and moves none of those, so a census
- * keyed on them would describe a tree that is no longer there.
+ * keyed on them would describe a tree that is no longer there. `reads`, when given, receives what this census read of
+ * each node ({@link CensusRead}).
  */
 export function graphInstallationCensus(
   workspaceRoot: string,
@@ -393,6 +404,7 @@ export function graphInstallationCensus(
   localInputs: GraphInputContractProof | null,
   onUnproved?: (detail: string) => void,
   previous?: GraphInstallationCensus,
+  reads?: Map<string, CensusRead>,
 ): GraphInstallationCensus | null {
   const plugins = (nxJson.plugins ?? []).map((plugin) => (typeof plugin === 'string' ? plugin : plugin.plugin));
   const unproved = plugins.filter(
@@ -420,6 +432,7 @@ export function graphInstallationCensus(
     const stats = lstatSync(path, { bigint: true });
     const stamp = nodeStamp(stats);
     nodes.push({ path, stamp });
+    reads?.set(path, { stats, start });
     if (stats.isSymbolicLink()) {
       const physical = realpathSync(path);
       if (lstatSync(physical).isDirectory() && !declaredDirectoryLinks.has(path)) {
@@ -428,7 +441,9 @@ export function graphInstallationCensus(
       walk(physical);
     } else if (stats.isDirectory()) {
       const visible = expandedRoots.has(path) ? undefined : selected;
-      for (const name of readdirSync(path).sort()) {
+      const entries = readdirSync(path).sort();
+      reads?.set(path, { stats, start, entries });
+      for (const name of entries) {
         const child = join(path, name);
         if (
           name !== 'node_modules' &&

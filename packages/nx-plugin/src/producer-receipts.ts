@@ -37,6 +37,7 @@ import {
   receiptNode,
 } from './ensure-built-receipt.js';
 import {
+  type CensusRead,
   censusFileHashes,
   censusStart,
   graphInstallationCensus,
@@ -187,8 +188,9 @@ function targetGraph(root: string, target: string, projectGraph: ProjectGraph): 
 /**
  * The installed closure of Nx, this plugin, TypeScript and the local graph plugins as one producer tool: every node of
  * the installation census, and the module namespace each of its resolutions searched. The census is not proved by a
- * stat pass of its own: each of its nodes is stat-ed again as a tool node, a file whose stamp moved since the census
- * read it is read again, and the capture's stability check refuses a tool node that moves before publication.
+ * stat pass of its own, and is not read twice: a tool node takes the stat, listing and hash the census read of it
+ * ({@link CensusRead}), and the stability check after execution reads every tool node again and refuses one that moved
+ * at any point from this capture to the run's completion.
  *
  * Its value is a function of the closure's node stamps (device, inode, mode, size, mtime and ctime), not of the moment
  * it is taken. So every node is stat-ed on every call, and that is what makes reuse safe: a file whose stamp is the one
@@ -208,6 +210,7 @@ export function installedClosureTool(
   census: { readonly start: bigint; readonly observed: NodeWitness[] },
 ): ReceiptEvidence<EnsureBuiltProducerTool> {
   let installationMiss = 'unproved installed module/resolution closure';
+  const reads = new Map<string, CensusRead>();
   performance.mark('producerReceipts:census:start');
   const installation = graphInstallationCensus(
     root,
@@ -219,6 +222,7 @@ export function installedClosureTool(
       installationMiss = detail;
     },
     readInstallationCensus(record),
+    reads,
   );
   performance.measure('producerReceipts:census', 'producerReceipts:census:start');
   if (installation === null)
@@ -252,7 +256,7 @@ export function installedClosureTool(
     }
   }
   const recorded = censusFileHashes(installation);
-  const nodes = [...paths].sort().map((path) => receiptNode(path, path, census, recorded));
+  const nodes = [...paths].sort().map((path) => receiptNode(path, path, census, recorded, reads.get(path)));
   return {
     ok: true,
     value: {
@@ -337,9 +341,6 @@ function toolsFor(
         sha256: sha(entries),
       });
     }
-    const capture = movedNodes(observed, recordedTool(tools));
-    if (capture !== null)
-      return { ok: false, detail: `Producer tool/module namespace moved during capture: ${capture}` };
     if (!missing(module.missing))
       return { ok: false, detail: 'Producer tool/module namespace moved during capture: a missing candidate appeared' };
     return { ok: true, value: { tools, nodes: observed } };
@@ -504,7 +505,7 @@ export async function postTasksExecution(
     let detail: string | undefined;
     const execution = movedNodes(frame.value.toolNodes, recordedTool(frame.value.tools));
     if (execution !== null) {
-      refuse(`Producer tool/module nodes changed across actual execution: ${execution}`);
+      refuse(`Producer tool/module nodes changed between capture and the end of execution: ${execution}`);
       continue;
     }
     const load = createWorkspaceNxRequire(context.workspaceRoot);

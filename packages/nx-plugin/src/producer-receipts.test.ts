@@ -10,7 +10,13 @@ import type { TaskResults } from 'nx/src/tasks-runner/life-cycle';
 import { readModulePackageJson } from 'nx/src/utils/package-json';
 import { pastTick } from './__tests__/past-tick.js';
 import type { EnsureBuiltProducerReceipt } from './ensure-built.js';
-import { censusStart, type GraphInstallationCensus, readInstallationCensus } from './ensure-built-witness.js';
+import {
+  censusStart,
+  type GraphInstallationCensus,
+  movedNodes,
+  type NodeWitness,
+  readInstallationCensus,
+} from './ensure-built-witness.js';
 import {
   completedProducerTasks,
   installedClosureTool,
@@ -215,7 +221,7 @@ async function developerLinkedWorkspace(): Promise<{ readonly root: string; read
 describe("the producer hook's installed-closure census", () => {
   const sentinel = '0'.repeat(64);
   /** One census of `root`'s closure, taking hashes from the census recorded at `record`. */
-  function closure(root: string, record: string) {
+  function closure(root: string, record: string, observed: NodeWitness[] = []) {
     const tool = installedClosureTool(
       root,
       { plugins: ['@smoothbricks/nx-plugin'] },
@@ -223,7 +229,7 @@ describe("the producer hook's installed-closure census", () => {
       record,
       readModulePackageJson,
       expandOutputs,
-      { start: censusStart(), observed: [] },
+      { start: censusStart(), observed },
     );
     if (!tool.ok) throw new Error(tool.detail);
     return tool.value;
@@ -265,10 +271,13 @@ describe("the producer hook's installed-closure census", () => {
     try {
       const record = join(root, 'census.json');
       await pastTick();
-      closure(root, record);
+      // What the capture recorded is what the stability check after execution re-reads.
+      const captured: NodeWitness[] = [];
+      closure(root, record, captured);
       await recordSentinels(record);
       const rebuilt = 'export const value = 2;\n';
       await writeFile(dist, rebuilt);
+      expect(movedNodes(captured)).toContain(dist);
       const nodes = closure(root, record).nodes;
       expect(nodes.find(({ path }) => path === dist)).toMatchObject({
         type: 'file',
