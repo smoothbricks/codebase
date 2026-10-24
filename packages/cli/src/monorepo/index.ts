@@ -159,7 +159,11 @@ export async function checkManagedFiles(root: string, options: { warn?: boolean 
   }
   const packageFailures = await checkPolicyFailures(root, await readProjectTargets(root));
   if (drifted) {
-    throw new Error('Managed monorepo files or package conventions are out of date. Run: smoo monorepo update');
+    throw new Error(
+      'Managed monorepo files are out of date. Run: smoo monorepo update\n' +
+        'Commit the regenerated files in the same PR as the SmoothBricks upgrade. ' +
+        'Intentional changes to shared workflows belong upstream in SmoothBricks first; then upgrade and regenerate.',
+    );
   }
   if (packageFailures > 0) {
     throw new Error(`${packageFailures} monorepo package convention check(s) failed; fix the findings above.`);

@@ -201,6 +201,8 @@ export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkfl
   }
   steps.push(
     { kind: CiWorkflowStepKind.SetupDevenv, name: '🧱 Setup Nix/devenv' },
+    { kind: CiWorkflowStepKind.ManagedFilesCheck, name: '🩺 Check monorepo policies and managed-file drift' },
+    { kind: CiWorkflowStepKind.ManagedFilesDispatch, name: '🔁 Dispatch managed-file drift healing' },
     { kind: CiWorkflowStepKind.SetNxShas, name: '🧭 Set Nx SHAs' },
     { kind: CiWorkflowStepKind.RestoreNxCache, name: '🧠 Restore Nx cache' },
     { kind: CiWorkflowStepKind.Build, name: '🔨 Build' },
@@ -233,8 +235,6 @@ export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkfl
     steps.push({ kind: CiWorkflowStepKind.BrowserTests, name: '🌐 Browser Tests' });
   }
   steps.push(
-    { kind: CiWorkflowStepKind.ManagedFilesCheck, name: '🩺 Check monorepo policies and managed-file drift' },
-    { kind: CiWorkflowStepKind.ManagedFilesDispatch, name: '🔁 Dispatch managed-file drift healing' },
     { kind: CiWorkflowStepKind.SaveNxCache, name: '💾 Save Nx cache' },
     { kind: CiWorkflowStepKind.UploadTraceDbs, name: '📎 Upload trace DBs' },
     { kind: CiWorkflowStepKind.SaveNixDevenv, name: '🧹 Cleanup and cache Nix/devenv' },
@@ -509,11 +509,17 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         `        run: smoo github-ci nx-run-many --targets "${darwinCrossTestTargetNames(options).join(',')}"`,
       ];
     case CiWorkflowStepKind.ManagedFilesCheck:
-      // Runs on every event, pull requests included: the package policies fail the job, since
-      // nothing heals them, while --warn keeps managed-file drift non-blocking and publishes the
-      // step output `drifted=<count>` for the dispatch step below. The check is nearly free here
-      // (devenv is already up).
-      return [`      - name: ${step.name}`, '        id: managed-drift', '        run: smoo monorepo check --warn'];
+      // Reject drift before merge; pushes retain the warning output needed by default-branch healing.
+      return [
+        `      - name: ${step.name}`,
+        '        id: managed-drift',
+        '        run: |',
+        '          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then',
+        '            smoo monorepo check',
+        '          else',
+        '            smoo monorepo check --warn',
+        '          fi',
+      ];
     case CiWorkflowStepKind.ManagedFilesDispatch:
       // Dispatches the managed-files workflow, which maintains the persistent
       // review PR, from the default branch only. workflow_dispatch is exempt from

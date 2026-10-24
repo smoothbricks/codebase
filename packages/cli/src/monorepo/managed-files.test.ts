@@ -681,6 +681,64 @@ const context = (overrides: Partial<ManagedFileContext>): ManagedFileContext => 
   ...overrides,
 });
 
+describe('managed CI workflow drift and regeneration', () => {
+  it.each(['consumer edit', 'changed generator context'] as const)(
+    'reports %s without writing, then regeneration restores a clean check',
+    async (cause) => {
+      const root = await mkdtemp(join(tmpdir(), 'smoo-managed-ci-drift-'));
+      try {
+        const manifest = `${JSON.stringify({
+          name: '@acme/workflow-consumer',
+          private: true,
+          workspaces: ['packages/*'],
+        })}\n`;
+        await writeFile(join(root, 'package.json'), manifest);
+        const originalContext = context({ hasReleasePackages: false });
+        await applyManagedFilesForContext(root, 'update', originalContext);
+        const workflow = '.github/workflows/ci.yml';
+        const destination = join(root, workflow);
+        const original = await readFile(destination, 'utf8');
+        expect(
+          (await applyManagedFilesForContext(root, 'check', originalContext)).filter(
+            (result) => result.action === 'drifted',
+          ),
+        ).toEqual([]);
+
+        const desiredContext =
+          cause === 'consumer edit' ? originalContext : { ...originalContext, ciRunsOn: 'ubuntu-24.04' };
+        const drifted =
+          cause === 'consumer edit' ? `# Consumer modification to managed workflow\n${original}` : original;
+        await writeFile(destination, drifted);
+
+        // This is the real generator/filesystem boundary used by both strict and warn checks.
+        // It deliberately does not substitute a fake Nx graph or bypass package policy checks.
+        const findings = await applyManagedFilesForContext(root, 'check', desiredContext);
+        expect(findings.filter((result) => result.action === 'drifted').map((result) => result.target)).toContain(
+          workflow,
+        );
+        expect(await readFile(destination, 'utf8')).toBe(drifted);
+
+        const regenerated = await applyManagedFilesForContext(root, 'update', desiredContext);
+        expect(regenerated).toContainEqual({ target: workflow, action: 'updated' });
+        const repaired = await readFile(destination, 'utf8');
+        expect(repaired).not.toBe(drifted);
+        if (cause === 'consumer edit') {
+          expect(repaired).toBe(original);
+        }
+        expect(
+          (await applyManagedFilesForContext(root, 'check', desiredContext)).filter(
+            (result) => result.action === 'drifted',
+          ),
+        ).toEqual([]);
+        expect(await readFile(destination, 'utf8')).toBe(repaired);
+        expect(await readFile(join(root, 'package.json'), 'utf8')).toBe(manifest);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
 describe('publish workflow rendering by repo shape', () => {
   it('drops the release half for a repo that deploys production but owns no packages', () => {
     const rendered = renderManagedWorkflowForTest(
