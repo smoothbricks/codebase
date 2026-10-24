@@ -1582,6 +1582,60 @@ async fn directory_detach_and_rm_refuse_a_host_process_holding_the_mount() {
     fixture.stop_gateway().await;
 }
 
+/// Removing a detached workspace's gateway session unbinds its block's base until its next attach,
+/// and every fixture store and test gateway on the host shares the fixture partition: the store
+/// claims the block's first service port before the removal, so no claimant that binds it before
+/// a base takes the block (the making-room test lost 45184 so), and the workspace's own session
+/// install on its next `exec` lets the claim go.
+#[tokio::test(flavor = "multi_thread")]
+async fn real_apfs_a_detached_workspace_keeps_its_port_block_until_it_attaches_again() {
+    use std::io::Read as _;
+
+    let mut fixture = Fixture::with(Project::Plain);
+    let mut service = fixture.open().await;
+    adopt(&fixture, &mut service).await;
+    fixture.start_gateway().await;
+    service
+        .reconcile_gateway()
+        .await
+        .expect("serve the project");
+    new_workspace(&mut service, "parked").await;
+    service
+        .reconcile_gateway()
+        .await
+        .expect("serve the parked session");
+    let block = service
+        .grants("parked")
+        .await
+        .expect("parked's grants")
+        .port_block
+        .expect("a macOS port block");
+    let claim = block.base() + 1;
+
+    succeed(&mut service, ["detach", "parked"]).await;
+    service
+        .reconcile_gateway()
+        .await
+        .expect("remove the detached session");
+    let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, claim))
+        .expect_err("the store claims the detached block");
+    assert_eq!(taken.kind(), std::io::ErrorKind::AddrInUse);
+
+    let mut queued = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, claim))
+        .expect("connect to the store's claim");
+    succeed(&mut service, ["exec", "parked", "--", "/usr/bin/true"]).await;
+    let reset = queued
+        .read(&mut [0])
+        .expect_err("a connection queued on a released claim is reset");
+    assert_eq!(
+        reset.kind(),
+        std::io::ErrorKind::ConnectionReset,
+        "the session's install lets the store's claim go"
+    );
+    service.shutdown().await.expect("shutdown runtime");
+    fixture.stop_gateway().await;
+}
+
 /// Making room under IOKit's media match-notification ceiling on the real kernel
 /// (02_workspaces.md, "Making room for an attach"), with a small cap as the decision input rather
 /// than a fake registry: every count is the host's own, read by `make_room` itself.

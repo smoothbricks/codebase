@@ -867,7 +867,6 @@ impl NativeGatewayInventory {
         self.storage.port_allocation()
     }
 
-    #[cfg(target_os = "macos")]
     pub(crate) fn fixture_port_claims(
         &self,
     ) -> Option<&crate::storage::bootstrap::FixturePortClaims> {

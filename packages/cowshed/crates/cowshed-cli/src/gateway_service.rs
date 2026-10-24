@@ -4908,6 +4908,11 @@ mod tests {
 
         #[async_trait]
         impl SessionInventory for UnreadInventory {
+            fn fixture_port_claims(
+                &self,
+            ) -> Option<&cowshed_core::storage::bootstrap::FixturePortClaims> {
+                None
+            }
             async fn all_sessions(
                 &self,
             ) -> Result<cowshed_core::gateway_sessions::InventorySessions> {

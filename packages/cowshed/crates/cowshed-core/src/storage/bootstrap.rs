@@ -1042,7 +1042,7 @@ impl CanonicalRoots {
     }
 
     /// A test fixture store; its ports never come from the host allocation partition, and it
-    /// holds the claims on its blocks for as long as any handle to it lives.
+    /// holds the claims on its detached blocks for as long as any handle to it lives.
     pub fn at(store: PathBuf) -> Self {
         Self::new(store, PortPartition::Fixture(Arc::default()))
     }
@@ -1104,31 +1104,58 @@ impl PartialEq for PortPartition {
 
 impl Eq for PortPartition {}
 
-/// The kernel claims on a fixture store's port blocks (08_testing.md): a listener on the first
-/// service port of every initial-size cell of each block the store reserved, the port every test
-/// allocator on the host binds before it takes a block. Every fixture store and test gateway
-/// shares the fixture partition, and a block's gateway listener is unbound while its workspace
-/// is detached or not yet served, so the reservation hands its claims to the store and they close
-/// with the store's last handle: no other claimant takes the block in between.
+/// The kernel claims of a fixture store's detached port blocks (08_testing.md): a listener on a
+/// block's first service port, the port every test allocator on the host binds before it takes a
+/// block's base. Every fixture store and test gateway shares the fixture partition, and removing
+/// a detached workspace's gateway session unbinds its base until the next attach installs it
+/// again, so the store claims the block before the removal and lets the claim go once the
+/// session holds the base again, or hands it to a reservation of the block. A claim closes with
+/// the store's last handle at the latest.
 #[derive(Debug, Default)]
 pub struct FixturePortClaims {
-    #[cfg(target_os = "macos")]
-    held: std::sync::Mutex<BTreeMap<u16, std::net::TcpListener>>,
+    held: std::sync::Mutex<BTreeMap<u16, cowshed_os::fork_lock::Fenced<std::net::TcpListener>>>,
 }
 
-#[cfg(target_os = "macos")]
 impl FixturePortClaims {
-    /// Whether the store already holds `port`'s claim.
-    pub(crate) fn holds(&self, port: u16) -> bool {
-        self.held().contains_key(&port)
+    /// Claim `port` for the store, unless it already holds it.
+    pub fn claim(&self, port: u16) -> std::io::Result<()> {
+        let mut held = self.held();
+        if let std::collections::btree_map::Entry::Vacant(entry) = held.entry(port) {
+            entry.insert(cowshed_os::fork_lock::Fenced::create(|| {
+                std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            })?);
+        }
+        Ok(())
     }
 
-    /// Keep `listener`, bound on its claim `port`, for the store's life.
+    /// Let `port`'s claim go, if the store holds it.
+    pub fn release(&self, port: u16) {
+        self.held().remove(&port);
+    }
+
+    /// Hold `listener`, already bound on `port`, as the store's claim: a test's way to claim a
+    /// port it never lets go of.
+    #[cfg(test)]
     pub(crate) fn hold(&self, port: u16, listener: std::net::TcpListener) {
-        self.held().insert(port, listener);
+        self.held()
+            .insert(port, cowshed_os::fork_lock::Fenced::new(listener));
     }
 
-    fn held(&self) -> std::sync::MutexGuard<'_, BTreeMap<u16, std::net::TcpListener>> {
+    /// `port`'s claim, handed over without an unbound interval to a reservation of its block.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn take(
+        &self,
+        port: u16,
+    ) -> Option<cowshed_os::fork_lock::Fenced<std::net::TcpListener>> {
+        self.held().remove(&port)
+    }
+
+    fn held(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        BTreeMap<u16, cowshed_os::fork_lock::Fenced<std::net::TcpListener>>,
+    > {
         // Every entry is one whole insert, so a holder that panicked left the map consistent.
         self.held
             .lock()

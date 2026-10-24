@@ -32,7 +32,7 @@ use crate::metadata::{
     EgressMode as CoreEgressMode, GrantSet, WorkspaceIncarnation, WorkspaceName,
 };
 use crate::repository::RepoId;
-use crate::storage::bootstrap::ValidatedHostStorage;
+use crate::storage::bootstrap::{FixturePortClaims, ValidatedHostStorage};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReconcileReport {
@@ -144,6 +144,8 @@ pub trait SessionInventory {
         repo_id: &RepoId,
         workspace: &WorkspaceName,
     ) -> Result<Option<WorkspaceSessionSnapshot>>;
+    /// The kernel claims of the store's detached blocks: a fixture store's, never the host's.
+    fn fixture_port_claims(&self) -> Option<&FixturePortClaims>;
 }
 
 pub struct NativeSessionInventory {
@@ -201,6 +203,9 @@ impl NativeSessionInventory {
 
 #[async_trait]
 impl SessionInventory for NativeSessionInventory {
+    fn fixture_port_claims(&self) -> Option<&FixturePortClaims> {
+        self.inventory.fixture_port_claims()
+    }
     async fn all_sessions(&self) -> Result<InventorySessions> {
         let (served, _, held) = self.served(None).await?;
         Ok(InventorySessions {
@@ -317,6 +322,38 @@ where
         }
     }
     Ok(report)
+}
+
+/// Removing a fixture workspace's session unbinds its block's base until the next attach installs
+/// it again, so the store claims the block first (08_testing.md): no claimant on the host that
+/// binds a block's first service port before its base takes this one meanwhile. A Unix endpoint
+/// has no block, and only a fixture store holds claims.
+fn claim_block_before_removal<I: SessionInventory + ?Sized>(inventory: &I, endpoint: &str) {
+    let Some(claims) = inventory.fixture_port_claims() else {
+        return;
+    };
+    let Some(port) = endpoint
+        .parse::<SocketAddr>()
+        .ok()
+        .and_then(|address| address.port().checked_add(1))
+    else {
+        return;
+    };
+    if let Err(error) = claims.claim(port) {
+        cowshed_os::eprintln!(
+            "cowshed: cannot claim port {port} of the fixture block at {endpoint} before removing its session: {error}; another claimant can take the block before its workspace attaches again"
+        );
+    }
+}
+
+/// The workspace's own session holds its block's base again: the store's claim goes.
+fn release_block_claim<I: SessionInventory + ?Sized>(inventory: &I, endpoint: &WorkspaceEndpoint) {
+    if let (Some(claims), WorkspaceEndpoint::Tcp { address, .. }) =
+        (inventory.fixture_port_claims(), endpoint)
+        && let Some(port) = address.port().checked_add(1)
+    {
+        claims.release(port);
+    }
 }
 
 pub fn project_session_prefix(repo_id: &RepoId) -> String {
@@ -679,6 +716,7 @@ where
         if !desired_ids.contains(installed.workspace_id.as_str())
             && !held_session(&held, &installed.workspace_id)
         {
+            claim_block_before_removal(host, &installed.endpoint);
             match control
                 .remove(&installed.workspace_id, installed.revision)
                 .await
@@ -756,6 +794,7 @@ where
             .get(identity.as_str())
             .is_some_and(|installed| installed.revision == session.revision);
         if unchanged {
+            release_block_claim(host, &session.endpoint);
             continue;
         }
         let mut replacement: Option<WorkspaceSession> = None;
@@ -764,6 +803,7 @@ where
             let attempted = replacement.as_ref().unwrap_or(session);
             match control.install(attempted).await {
                 Ok(()) => {
+                    release_block_claim(host, &attempted.endpoint);
                     report.installed += 1;
                     break;
                 }

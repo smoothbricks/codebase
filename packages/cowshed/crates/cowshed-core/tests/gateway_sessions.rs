@@ -211,6 +211,9 @@ struct SelectedInventory {
 
 #[async_trait]
 impl SessionInventory for SelectedInventory {
+    fn fixture_port_claims(&self) -> Option<&cowshed_core::storage::bootstrap::FixturePortClaims> {
+        None
+    }
     async fn all_sessions(&self) -> Result<InventorySessions> {
         Err(CowshedError::integrity(
             "unrelated removed or malformed session grants must not be read",
@@ -1005,6 +1008,9 @@ struct AttachingInventory {
 
 #[async_trait]
 impl SessionInventory for AttachingInventory {
+    fn fixture_port_claims(&self) -> Option<&cowshed_core::storage::bootstrap::FixturePortClaims> {
+        None
+    }
     async fn all_sessions(&self) -> Result<InventorySessions> {
         Err(CowshedError::internal("host inventory not expected"))
     }
@@ -1190,6 +1196,9 @@ struct FakeInventory {
 
 #[async_trait]
 impl SessionInventory for FakeInventory {
+    fn fixture_port_claims(&self) -> Option<&cowshed_core::storage::bootstrap::FixturePortClaims> {
+        None
+    }
     async fn all_sessions(&self) -> Result<InventorySessions> {
         self.all
             .lock()
