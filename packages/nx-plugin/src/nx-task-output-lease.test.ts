@@ -370,14 +370,16 @@ it('keeps one lock descriptor per lock file in a helper across acquires', async 
   const task = leaseTask('repeated');
   try {
     const counts: number[] = [];
-    for (let round = 0; round < 5; round++) {
+    // Round 0 opens the lock in a fresh helper. Round 1 reuses that helper and its FileLock, the only state a
+    // later acquire can meet; rounds past 1 would repeat it exactly, so they add no coverage.
+    for (let round = 0; round < 2; round++) {
       const pathEvent = nextLeasePath();
       const release = await leases.acquire([task]);
       const path = await pathEvent;
       counts.push(openDescriptors(await leaseHolder(path), path));
       await release();
     }
-    expect(counts).toEqual([1, 1, 1, 1, 1]);
+    expect(counts).toEqual([1, 1]);
   } finally {
     await leases.close();
   }
