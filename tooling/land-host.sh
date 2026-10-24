@@ -14,6 +14,8 @@
 #    A failure summary keeps unique tasks and exact diagnostics; the complete failed output is retained.
 #    The gate runs as a cowshed gate job (`cowshed exec --class gate --host`): the jobserver serves every task it
 #    starts ahead of other execs, at nice 0 where they run at +10 (05_gateway.md, "Host CPU budget").
+#    After the gate passes, `bun run check:linux` cross-lints the same tree for Linux: the pre-push hook refuses a
+#    tree whose Linux cross check is not cached, so a land that skipped it would leave main unpushable.
 # 4. `cowshed land` fast-forwards main to exactly the gated commit and retires the workspace. If main moved
 #    meanwhile, rebase and gate the new tree; this is a source fence, never a retry of a red gate.
 set -eu
@@ -111,6 +113,14 @@ gate_workspace() {
     exit "$gate_status"
   fi
   replay_gate_output "$output"
+  rm "$output"
+  say "cross-linting $head for Linux"
+  cowshed exec "$workspace" --class gate --host -- direnv exec "$checkout" bun run check:linux </dev/null >"$output" 2>&1 || {
+    linux_status=$?
+    replay_gate_output "$output"
+    say "Linux cross check exited $linux_status; the land stops; complete output: $output"
+    exit "$linux_status"
+  }
   rm "$output"
 }
 
