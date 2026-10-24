@@ -130,9 +130,7 @@ function moduleLoads(root: string, config: string, module: string, jiti: typeof 
   const source = readFileSync(from, 'utf8');
   const instance = jiti === null ? null : jiti.createJiti(from, JITI_OPTIONS);
   const sites =
-    instance === null
-      ? loadSites(source, from)
-      : loadSites(instance.transform({ source, filename: from, ts: /\.[mc]?tsx?$/u.test(from) }), `${from}.cjs`);
+    instance === null ? loadSites(source, from) : loadSites(jitiTransform(instance, source, from), `${from}.cjs`);
   const importer = module === config ? config : `${config} loads ${module}, which`;
   return sites.flatMap((site): PendingLoad[] => {
     if (site.kind === 'computed') {
@@ -149,6 +147,31 @@ function moduleLoads(root: string, config: string, module: string, jiti: typeof 
     }
     return [{ importer, from, kind: site.kind, specifier: site.specifier, bare, jiti: instance }];
   });
+}
+
+/**
+ * `source` as jiti compiles it, leaving the process's stack-trace globals as
+ * they were.
+ *
+ * jiti compiles with Babel, whose first transform replaces
+ * `Error.prepareStackTrace` with a frame-hiding wrapper around the one it found
+ * and raises `Error.stackTraceLimit` to 50, for the life of the process. This
+ * walk runs inside whichever process builds the Nx graph (the Nx CLI, its
+ * daemon, smoo), so the wrapper would outlive it there. Under Bun the wrapped
+ * default is Bun's native `Error.prepareStackTrace`, which throws "First
+ * argument must be an Error object" for the non-Error targets
+ * `Error.captureStackTrace` accepts (oven-sh/bun#46393): every later stack
+ * capture onto such an object then fails in that process, as follow-redirects'
+ * error types do when axios loads. The walk only reads the transform's output.
+ */
+function jitiTransform(instance: Jiti.Jiti, source: string, filename: string): string {
+  const { prepareStackTrace, stackTraceLimit } = Error;
+  try {
+    return instance.transform({ source, filename, ts: /\.[mc]?tsx?$/u.test(filename) });
+  } finally {
+    Error.prepareStackTrace = prepareStackTrace;
+    Error.stackTraceLimit = stackTraceLimit;
+  }
 }
 
 /**

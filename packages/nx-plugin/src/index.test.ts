@@ -1222,6 +1222,32 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('hands the process back its stack-trace globals after jiti compiles a TypeScript ESLint config', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await writeConfigLoadFixture(workspace);
+      await workspace.write(
+        'eslint.config.ts',
+        "import { shared } from './tooling/shared';\nexport default [shared];\n",
+      );
+      await workspace.write('tooling/shared.ts', 'export const shared = 1;\n');
+      const { prepareStackTrace, stackTraceLimit } = Error;
+
+      const { lint } = await inferProjectTargets(workspace, 'packages/example/package.json');
+
+      expect(keyedTooling(lint)).toEqual(['tooling/shared.ts']);
+      expect(Error.prepareStackTrace).toBe(prepareStackTrace);
+      expect(Error.stackTraceLimit).toBe(stackTraceLimit);
+      // follow-redirects' error types capture onto objects that are not Errors;
+      // under Bun a Babel wrapper left installed makes this capture throw.
+      const target: { stack?: string } = {};
+      Error.captureStackTrace(target);
+      expect(typeof target.stack).toBe('string');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('keys exactly the workspace files Node loads for a JavaScript ESLint config', async () => {
     const configs = {
       'eslint.config.cjs': {
