@@ -138,6 +138,11 @@ const managedFiles: ManagedFileDescriptor[] = [
   },
   {
     kind: 'raw',
+    source: 'tooling/direnv/installed-bun-links.ts',
+    target: 'tooling/direnv/installed-bun-links.ts',
+  },
+  {
+    kind: 'raw',
     source: 'tooling/direnv/linked-snapshots.ts',
     target: 'tooling/direnv/linked-snapshots.ts',
   },
@@ -145,6 +150,11 @@ const managedFiles: ManagedFileDescriptor[] = [
     kind: 'raw',
     source: 'tooling/direnv/secret-references.ts',
     target: 'tooling/direnv/secret-references.ts',
+  },
+  {
+    kind: 'raw',
+    source: 'tooling/direnv/uv-relocation.ts',
+    target: 'tooling/direnv/uv-relocation.ts',
   },
   {
     kind: 'raw',

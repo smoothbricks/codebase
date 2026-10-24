@@ -518,8 +518,10 @@ in {
         "../../tooling/workspace.gitconfig"
         "setup-environment.ts"
         "developer-links.ts"
+        "installed-bun-links.ts"
         "linked-snapshots.ts"
         "secret-references.ts"
+        "uv-relocation.ts"
         "../../node_modules/.smoo-install"
         "../../node_modules/@typescript/native/bin/tsc"
       ];

@@ -638,8 +638,10 @@ describe('snapshot declarations', () => {
       'cargo-fetch-bound.ts',
       'cargo-fetch-run.ts',
       'developer-links.ts',
+      'installed-bun-links.ts',
       'linked-snapshots.ts',
       'secret-references.ts',
+      'uv-relocation.ts',
     ]) {
       write(
         join(checkout.consumer, 'tooling/direnv', file),
