@@ -824,173 +824,6 @@ describe('smoo-nx-exec with a fresh daemon', () => {
     return owner.stdout;
   };
 
-  // These integration controls run real Nx because their subject is the daemon:
-  // the daemon a probe starts holds no output records, so every output must be
-  // vouched for by comparing the working tree with Nx's cache artifact. The
-  // daemon it starts is also the one whose socket is in question, so the same
-  // lifetime answers where a root entered from another workspace's shell binds.
-  it('reuses authoritative graphs without assuming an unstable generation republishes its witness', async () => {
-    await withNxFixture(
-      'ensure-built-graph-witness-',
-      async ({ root, workspace, socketDirectory }) => {
-        const builds = join(root, 'lib-builds.log');
-        await writeTwoProjectWorkspace(workspace, builds);
-        // The workspace takes its own copy of TypeScript, which the census resolves from the workspace root, so the
-        // installation the script below writes into is the fixture's, not the copy this file's fixtures share.
-        const shared = await realpath(join(workspace, 'node_modules'));
-        await rm(join(workspace, 'node_modules'));
-        await mkdir(join(workspace, 'node_modules'));
-        for (const entry of await readdir(shared)) {
-          if (entry !== 'typescript') await symlink(join(shared, entry), join(workspace, 'node_modules', entry));
-        }
-        await cp(await realpath(join(shared, 'typescript')), join(workspace, 'node_modules', 'typescript'), {
-          recursive: true,
-        });
-        const built = await run(
-          'node',
-          nxEntry(workspace),
-          workspace,
-          ['run-many', '-t', 'build', '-p', 'app', '--outputStyle=static-failures-only'],
-          // Its plugin workers bind sockets too: Nx's default root is not admitted in a sandbox.
-          { NX_DAEMON: 'false', NX_WORKSPACE_ROOT_PATH: workspace, NX_SOCKET_DIR: socketDirectory },
-        );
-        expect(built.code, built.stdout + built.stderr).toBe(0);
-        const reuseEntry = join(root, 'graph-reuse.ts');
-        const resultsPath = join(root, 'graph-checks.json');
-        await writeFile(
-          reuseEntry,
-          `
-import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { chmod, readFile, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
-const requireNx = createRequire(process.cwd() + '/package.json');
-const { daemonClient } = requireNx('nx/src/daemon/client/client');
-const { workspaceDataDirectoryForWorkspace } = requireNx('nx/src/utils/cache-directory');
-const witness = join(workspaceDataDirectoryForWorkspace(process.cwd()), 'ensure-built-graph.json');
-const savedWitness = ${JSON.stringify(join(root, 'authoritative-graph.json'))};
-const source = join(process.cwd(), 'packages/lib/source.txt');
-const text = await readFile(source, 'utf8');
-const request = daemonClient.getProjectGraphAndSourceMaps.bind(daemonClient);
-let requests = 0;
-let invalidateGeneration = false;
-daemonClient.getProjectGraphAndSourceMaps = async () => {
-  requests += 1;
-  const response = await request();
-  if (invalidateGeneration) {
-    invalidateGeneration = false;
-    await writeFile(source, 'transient graph input');
-    await writeFile(source, text);
-  }
-  return response;
-};
-const results = [];
-async function check(label) {
-  const before = requests;
-  const result = await ensureBuilt({ target: 'app:build', cwd: process.cwd() });
-  results.push({ label, requests: requests - before, disposition: result.disposition, witnessExists: existsSync(witness) });
-}
-await check('establish');
-await check('reuse');
-const added = join(process.cwd(), 'new-graph-input.txt');
-await writeFile(added, 'new');
-await check('created');
-await rm(added);
-await check('deleted');
-const project = join(process.cwd(), 'packages/app/project.json');
-const original = await readFile(project, 'utf8');
-const config = JSON.parse(original);
-config.implicitDependencies = [];
-await writeFile(project, JSON.stringify(config));
-await check('dependency');
-await writeFile(project, original);
-await check('dependency-restored');
-// Every call censuses the installation again, taking the hashes of files whose stamps have not moved from the
-// witness. A same-size rewrite that keeps its file's mtime moves its ctime: the next call reads it and sees the
-// changed installation, and the call after that reuses the graph the changed installation was proved with.
-const installed = join(process.cwd(), 'node_modules/typescript/README.md');
-const readme = await readFile(installed);
-const { atime, mtime } = await stat(installed);
-readme[0] ^= 1;
-await writeFile(installed, readme);
-await utimes(installed, atime, mtime);
-await check('installation');
-await check('installation-reuse');
-// Save only evidence the real daemon generation actually authorized, outside
-// the workspace: the later missing-witness RPC is not obliged to replace it.
-const authoritativeWitness = await readFile(witness, 'utf8');
-const witnessMode = (await stat(witness)).mode & 0o7777;
-await rename(witness, savedWitness);
-// Equal pre/post bytes do not authorize publication after a write/revert.
-// Count and return the actual RPC response, including the required successor.
-invalidateGeneration = true;
-await check('missing-witness');
-assert.equal(invalidateGeneration, false);
-assert.equal(existsSync(witness), false);
-// Restore that same genuine witness, not synthesized evidence or a retry of
-// the unstable generation, so the unreadable control always runs.
-await rename(savedWitness, witness);
-assert.equal(await readFile(witness, 'utf8'), authoritativeWitness);
-await chmod(witness, 0);
-try {
-  await assert.rejects(readFile(witness), { code: 'EACCES' });
-  await check('unreadable-witness');
-} finally {
-  await chmod(witness, witnessMode);
-}
-await writeFile(${JSON.stringify(resultsPath)}, JSON.stringify(results));
-`,
-        );
-        const reused = await run('bun', reuseEntry, workspace, [], {
-          NX_DAEMON: 'true',
-          NX_USE_LOCAL: 'true',
-          NX_WORKSPACE_ROOT_PATH: workspace,
-          NX_SOCKET_DIR: socketDirectory,
-        });
-        expect(reused.code, reused.stdout + reused.stderr).toBe(0);
-        // A changed dependency configuration may legitimately run app:build;
-        // its streamed logs are not the graph-observation protocol.
-        const graphChecks = typia.json.assertParse<
-          { label: string; requests: number; disposition: string; witnessExists: boolean }[]
-        >(await readFile(resultsPath, 'utf8'));
-        expect(graphChecks.find(({ label }) => label === 'reuse')).toEqual({
-          label: 'reuse',
-          requests: 0,
-          disposition: 'hit',
-          witnessExists: true,
-        });
-        for (const label of [
-          'created',
-          'deleted',
-          'dependency',
-          'dependency-restored',
-          'installation',
-          'unreadable-witness',
-        ]) {
-          expect(graphChecks.find((check) => check.label === label)?.requests, label).toBeGreaterThan(0);
-        }
-        expect(graphChecks.find(({ label }) => label === 'missing-witness')).toEqual({
-          label: 'missing-witness',
-          requests: 2,
-          disposition: 'hit',
-          witnessExists: false,
-        });
-        expect(graphChecks.find(({ label }) => label === 'installation-reuse')).toEqual({
-          label: 'installation-reuse',
-          requests: 0,
-          disposition: 'hit',
-          witnessExists: true,
-        });
-        expect(graphChecks.find(({ label }) => label === 'unreadable-witness')?.disposition).toBe('hit');
-        expect(await readFile(builds, 'utf8')).toBe('lib\n');
-        expect(await readFile(join(workspace, 'packages/app/dist/marker.txt'), 'utf8')).toBe('built\nlib\n');
-      },
-      'workspace',
-    );
-  });
-
   // Publication is opt-in only for the receipt case. Graph/exec probes below
   // keep ordinary plugin hooks but have no producer source/tool prepass.
   it('publishes real completion receipts and reuses their original basis for the same tree', async () => {
@@ -1001,6 +834,41 @@ await writeFile(${JSON.stringify(resultsPath)}, JSON.stringify(results));
         async ({ root, workspace, socketDirectory }) => {
           const builds = join(root, 'lib-builds.log');
           await writeTwoProjectWorkspace(workspace, builds, true);
+          // A sandboxed consumer is granted its provider read-only, and starting a daemon writes the provider's workspace
+          // data (`.nx/workspace-data/d`): the read-only probe connects to a serving daemon or reports that none serves.
+          // It runs before any daemon starts and before any receipt is published, the state that case began in.
+          const noDaemonLabel =
+            'reports no-daemon and writes nothing when no daemon serves a provider without a receipt';
+          const listing = async () =>
+            (await readdir(workspace, { recursive: true })).filter((entry) => !entry.startsWith('node_modules')).sort();
+          const listingBefore = await listing();
+          const noDaemonEntry = join(root, 'probe-no-daemon.ts');
+          await writeFile(
+            noDaemonEntry,
+            `
+import { probeBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
+const result = await probeBuilt({ target: 'app:build', cwd: ${JSON.stringify(workspace)} });
+await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify(result) + "\\n", error => error ? reject(error) : resolve()));
+`,
+          );
+          // Run from the fixture root, outside the provider workspace, as a consumer calls it.
+          const noDaemon = await run('bun', noDaemonEntry, root, [], {
+            NX_DAEMON: 'true',
+            NX_SOCKET_DIR: socketDirectory,
+          });
+          expect(noDaemon.code, noDaemon.stdout + noDaemon.stderr).toBe(0);
+          const noDaemonResult = typia.json.assertParse<EnsureBuiltProbeResult>(noDaemon.stdout);
+          expect(noDaemonResult, noDaemonLabel).toMatchObject({
+            disposition: 'failed',
+            reason: { kind: 'provider-proof', taskId: 'app:build' },
+          });
+          if (noDaemonResult.disposition !== 'failed' || noDaemonResult.reason.kind !== 'provider-proof') {
+            throw new Error(`the probe must refuse with its provider proof, not ${noDaemon.stdout}`);
+          }
+          expect(noDaemonResult.reason.detail, noDaemonLabel).toEndWith(
+            `authoritative graph unavailable: ${describeMiss({ kind: 'no-daemon', taskId: 'app:build' })}`,
+          );
+          expect(await listing(), noDaemonLabel).toEqual(listingBefore);
           providerSockets = providerSocketDirectory(workspace);
           const ownEnv: Record<string, string> = providerSockets === null ? {} : { NX_SOCKET_DIR: providerSockets };
           const built = await run(
@@ -1228,50 +1096,12 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
     }
   });
 
-  // A sandboxed consumer is granted its provider read-only, and starting a daemon writes the provider's workspace
-  // data (`.nx/workspace-data/d`): the read-only probe connects to a serving daemon or reports that none serves.
-  it('reports no-daemon and writes nothing when no daemon serves a provider without a receipt', async () => {
-    await withNxFixture(
-      'ensure-built-probe-no-daemon-',
-      async ({ root, workspace, socketDirectory }) => {
-        await writeTwoProjectWorkspace(workspace, join(root, 'lib-builds.log'), true);
-        const listing = async () =>
-          (await readdir(workspace, { recursive: true })).filter((entry) => !entry.startsWith('node_modules')).sort();
-        const before = await listing();
-        const probeEntry = join(root, 'probe-no-daemon.ts');
-        await writeFile(
-          probeEntry,
-          `
-import { probeBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
-const result = await probeBuilt({ target: 'app:build', cwd: ${JSON.stringify(workspace)} });
-await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify(result) + "\\n", error => error ? reject(error) : resolve()));
-`,
-        );
-        // Run from the fixture root, outside the provider workspace, as a consumer calls it.
-        const probed = await run('bun', probeEntry, root, [], { NX_DAEMON: 'true', NX_SOCKET_DIR: socketDirectory });
-        expect(probed.code, probed.stdout + probed.stderr).toBe(0);
-        const result = typia.json.assertParse<EnsureBuiltProbeResult>(probed.stdout);
-        expect(result).toMatchObject({
-          disposition: 'failed',
-          reason: { kind: 'provider-proof', taskId: 'app:build' },
-        });
-        if (result.disposition !== 'failed' || result.reason.kind !== 'provider-proof') {
-          throw new Error(`the probe must refuse with its provider proof, not ${probed.stdout}`);
-        }
-        expect(result.reason.detail).toEndWith(
-          `authoritative graph unavailable: ${describeMiss({ kind: 'no-daemon', taskId: 'app:build' })}`,
-        );
-        expect(await listing()).toEqual(before);
-      },
-      'workspace',
-    );
-  });
-
-  // The graph/exec case runs real Nx because its subject is the daemon:
+  // The graph, replay and refresh steps run real Nx because their subject is the daemon:
   // the daemon a probe starts holds no output records, so every output must be
   // vouched for by comparing the working tree with Nx's cache artifact. The
   // daemon it starts is also the one whose socket is in question, so the same
   // lifetime answers where a root entered from another workspace's shell binds.
+  // They share one fixture and one daemon, so every daemon step passes the directory the provider binds.
   it('replays current outputs and refreshes stale snapshots without running unrelated edits', async () => {
     // A socket path has a 95 character budget and macOS's temp directory spends most of it, so the
     // socket directory is made in the short socket namespace the sandbox admits.
@@ -1287,6 +1117,17 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
           const { workspace } = fixture;
           const builds = join(root, 'lib-builds.log');
           await writeTwoProjectWorkspace(workspace, builds);
+          // The workspace takes its own copy of TypeScript, which the census resolves from the workspace root, so the
+          // installation the graph-witness steps write into is the fixture's, not the copy this file's fixtures share.
+          const shared = await realpath(join(workspace, 'node_modules'));
+          await rm(join(workspace, 'node_modules'));
+          await mkdir(join(workspace, 'node_modules'));
+          for (const entry of await readdir(shared)) {
+            if (entry !== 'typescript') await symlink(join(shared, entry), join(workspace, 'node_modules', entry));
+          }
+          await cp(await realpath(join(shared, 'typescript')), join(workspace, 'node_modules', 'typescript'), {
+            recursive: true,
+          });
           // What the provider binds for this workspace when the call is entered from another one's shell.
           const providerSockets = providerSocketDirectory(workspace);
           if (providerSockets !== null) providerDirectories.push(providerSockets);
@@ -1294,6 +1135,7 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
 
           // Built by daemonless Nx, as CI or a restarted daemon leaves a tree:
           // cached and on disk, recorded by no daemon.
+          // Its plugin workers bind sockets too: Nx's default root is not admitted in a sandbox.
           const built = await run(
             'node',
             nxEntry(workspace),
@@ -1389,6 +1231,139 @@ console.log(JSON.stringify({ result, requests }));
           expect(generations.requests).toBeGreaterThanOrEqual(2);
           expect(generationRace.stderr).toBe('');
           expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+          // Graph witness steps of the case that reuses authoritative graphs without assuming an unstable generation
+          // republishes its witness. They run on this walk's daemon, through the directory the provider binds.
+          const reuseEntry = join(root, 'graph-reuse.ts');
+          const resultsPath = join(root, 'graph-checks.json');
+          await writeFile(
+            reuseEntry,
+            `
+import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { chmod, readFile, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
+const requireNx = createRequire(process.cwd() + '/package.json');
+const { daemonClient } = requireNx('nx/src/daemon/client/client');
+const { workspaceDataDirectoryForWorkspace } = requireNx('nx/src/utils/cache-directory');
+const witness = join(workspaceDataDirectoryForWorkspace(process.cwd()), 'ensure-built-graph.json');
+const savedWitness = ${JSON.stringify(join(root, 'authoritative-graph.json'))};
+const source = join(process.cwd(), 'packages/lib/source.txt');
+const text = await readFile(source, 'utf8');
+const request = daemonClient.getProjectGraphAndSourceMaps.bind(daemonClient);
+let requests = 0;
+let invalidateGeneration = false;
+daemonClient.getProjectGraphAndSourceMaps = async () => {
+  requests += 1;
+  const response = await request();
+  if (invalidateGeneration) {
+    invalidateGeneration = false;
+    await writeFile(source, 'transient graph input');
+    await writeFile(source, text);
+  }
+  return response;
+};
+const results = [];
+async function check(label) {
+  const before = requests;
+  const result = await ensureBuilt({ target: 'app:build', cwd: process.cwd() });
+  results.push({ label, requests: requests - before, disposition: result.disposition, witnessExists: existsSync(witness) });
+}
+await check('establish');
+await check('reuse');
+const added = join(process.cwd(), 'new-graph-input.txt');
+await writeFile(added, 'new');
+await check('created');
+await rm(added);
+await check('deleted');
+const project = join(process.cwd(), 'packages/app/project.json');
+const original = await readFile(project, 'utf8');
+const config = JSON.parse(original);
+config.implicitDependencies = [];
+await writeFile(project, JSON.stringify(config));
+await check('dependency');
+await writeFile(project, original);
+await check('dependency-restored');
+// Every call censuses the installation again, taking the hashes of files whose stamps have not moved from the
+// witness. A same-size rewrite that keeps its file's mtime moves its ctime: the next call reads it and sees the
+// changed installation, and the call after that reuses the graph the changed installation was proved with.
+const installed = join(process.cwd(), 'node_modules/typescript/README.md');
+const readme = await readFile(installed);
+const { atime, mtime } = await stat(installed);
+readme[0] ^= 1;
+await writeFile(installed, readme);
+await utimes(installed, atime, mtime);
+await check('installation');
+await check('installation-reuse');
+// Save only evidence the real daemon generation actually authorized, outside
+// the workspace: the later missing-witness RPC is not obliged to replace it.
+const authoritativeWitness = await readFile(witness, 'utf8');
+const witnessMode = (await stat(witness)).mode & 0o7777;
+await rename(witness, savedWitness);
+// Equal pre/post bytes do not authorize publication after a write/revert.
+// Count and return the actual RPC response, including the required successor.
+invalidateGeneration = true;
+await check('missing-witness');
+assert.equal(invalidateGeneration, false);
+assert.equal(existsSync(witness), false);
+// Restore that same genuine witness, not synthesized evidence or a retry of
+// the unstable generation, so the unreadable control always runs.
+await rename(savedWitness, witness);
+assert.equal(await readFile(witness, 'utf8'), authoritativeWitness);
+await chmod(witness, 0);
+try {
+  await assert.rejects(readFile(witness), { code: 'EACCES' });
+  await check('unreadable-witness');
+} finally {
+  await chmod(witness, witnessMode);
+}
+await writeFile(${JSON.stringify(resultsPath)}, JSON.stringify(results));
+`,
+          );
+          const reused = await run('bun', reuseEntry, workspace, [], {
+            NX_DAEMON: 'true',
+            NX_USE_LOCAL: 'true',
+            NX_WORKSPACE_ROOT_PATH: workspace,
+            ...ownEnv,
+          });
+          expect(reused.code, reused.stdout + reused.stderr).toBe(0);
+          // A changed dependency configuration may legitimately run app:build;
+          // its streamed logs are not the graph-observation protocol.
+          const graphChecks = typia.json.assertParse<
+            { label: string; requests: number; disposition: string; witnessExists: boolean }[]
+          >(await readFile(resultsPath, 'utf8'));
+          expect(graphChecks.find(({ label }) => label === 'reuse')).toEqual({
+            label: 'reuse',
+            requests: 0,
+            disposition: 'hit',
+            witnessExists: true,
+          });
+          for (const label of [
+            'created',
+            'deleted',
+            'dependency',
+            'dependency-restored',
+            'installation',
+            'unreadable-witness',
+          ]) {
+            expect(graphChecks.find((check) => check.label === label)?.requests, label).toBeGreaterThan(0);
+          }
+          expect(graphChecks.find(({ label }) => label === 'missing-witness')).toEqual({
+            label: 'missing-witness',
+            requests: 2,
+            disposition: 'hit',
+            witnessExists: false,
+          });
+          expect(graphChecks.find(({ label }) => label === 'installation-reuse')).toEqual({
+            label: 'installation-reuse',
+            requests: 0,
+            disposition: 'hit',
+            witnessExists: true,
+          });
+          expect(graphChecks.find(({ label }) => label === 'unreadable-witness')?.disposition).toBe('hit');
+          expect(await readFile(builds, 'utf8')).toBe('lib\n');
+          expect(await readFile(join(workspace, 'packages/app/dist/marker.txt'), 'utf8')).toBe('built\nlib\n');
           // Coordinate a real write after the real daemon returned its file
           // table. The response is not substituted: this makes the
           // graph→snapshot race deterministic without relying on FSEvents.
