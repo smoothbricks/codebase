@@ -3,7 +3,6 @@ import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import fc from 'fast-check';
 import { WorkspaceContext } from 'nx/src/native/index.js';
 import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import { byFile, closureFixture, closureOf, graphComputation } from './__tests__/cargo-closure-fixture.js';
@@ -22,7 +21,7 @@ import { isRecord } from './type-guards.js';
  * and reads under that key. A consumer's code generator, run by the gate, rewrites ignored,
  * content-named chunk files and the generated `.rs` sources that `include_str!` them. When the
  * Cargo closure named those files, the generator's own output moved the input list, so every
- * first push of a gated tree was refused (1f5c3a58e). The properties below hold the key to a
+ * first push of a gated tree was refused (1f5c3a58e). The cases below hold the key to a
  * function of Nx's file index: no history of producer runs moves it, and the real Nx hook run
  * reads exactly the hash the real gate run wrote.
  */
@@ -53,12 +52,6 @@ interface ProducerRun {
   readonly clean: boolean;
   readonly nested: boolean;
 }
-
-const producerRun: fc.Arbitrary<ProducerRun> = fc.record({
-  chunks: fc.uniqueArray(fc.string({ minLength: 1, maxLength: 12 }), { minLength: 1, maxLength: 3 }),
-  clean: fc.boolean(),
-  nested: fc.boolean(),
-});
 
 /** A content-named chunk, as a bundler names it: the name moves whenever the content does. */
 const chunkName = (content: string) => `chunk-${Bun.hash(content).toString(36)}.js`;
@@ -110,6 +103,52 @@ async function closureKey(workspace: string): Promise<string> {
   return JSON.stringify({ inputs, files: context.hashFilesMatchingGlob(positive, negative), runtime });
 }
 
+/**
+ * Fixed producer histories covering every transition `producerRun` can make. A run writes over the state the
+ * previous run left: `clean` wipes the ignored directory first, or keeps it so the previous run's chunk files stay
+ * behind; `nested` writes under `shared/`. A kept layout leaves each previous chunk stale, rewritten or both. A
+ * flipped layout never rewrites a previous file, since its path differs. A wipe leaves only the next run's files.
+ * Each row is four runs, so it walks three transitions; each row ends in the property's assertion.
+ */
+const PRODUCER_HISTORIES: readonly { readonly name: string; readonly history: readonly ProducerRun[] }[] = [
+  {
+    name: 'flat layout, kept: same names, grown names, shrunk names',
+    history: [
+      { chunks: ['alpha', 'beta'], clean: false, nested: false },
+      { chunks: ['beta', 'alpha'], clean: false, nested: false },
+      { chunks: ['beta', 'alpha', 'gamma'], clean: false, nested: false },
+      { chunks: ['gamma'], clean: false, nested: false },
+    ],
+  },
+  {
+    name: 'nested layout, kept: same names, grown names, shrunk names',
+    history: [
+      { chunks: ['one', 'two'], clean: false, nested: true },
+      { chunks: ['one', 'two'], clean: false, nested: true },
+      { chunks: ['two', 'one', 'three'], clean: false, nested: true },
+      { chunks: ['three'], clean: false, nested: true },
+    ],
+  },
+  {
+    name: 'flat kept with mixed names, flipped to nested, nested kept with mixed names',
+    history: [
+      { chunks: ['red', 'green'], clean: false, nested: false },
+      { chunks: ['green', 'blue'], clean: false, nested: false },
+      { chunks: ['green', 'purple'], clean: false, nested: true },
+      { chunks: ['yellow', 'purple'], clean: false, nested: true },
+    ],
+  },
+  {
+    name: 'nested run, wipe from nested, flat kept after nested, wipe from flat',
+    history: [
+      { chunks: ['sun'], clean: false, nested: true },
+      { chunks: ['moon', 'star'], clean: true, nested: true },
+      { chunks: ['moon'], clean: false, nested: false },
+      { chunks: ['dusk', 'dawn', 'noon'], clean: true, nested: false },
+    ],
+  },
+];
+
 it('no history of producer runs over ignored compiled-in files moves the Cargo closure key', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-key-')));
   try {
@@ -119,16 +158,13 @@ it('no history of producer runs over ignored compiled-in files moves the Cargo c
     expect(gate).toContain('{workspaceRoot}/skills/SKILL.md');
     expect(gate).not.toContain('generated/');
 
-    await fc.assert(
-      fc.asyncProperty(fc.array(producerRun, { minLength: 1, maxLength: 4 }), async (history) => {
-        await rm(join(workspace, GENERATED), { recursive: true, force: true });
-        for (const run of history) await produce(workspace, run);
-        expect(await closureKey(workspace)).toBe(gate);
-      }),
-      { numRuns: 15 },
-    );
+    for (const { name, history } of PRODUCER_HISTORIES) {
+      await rm(join(workspace, GENERATED), { recursive: true, force: true });
+      for (const run of history) await produce(workspace, run);
+      expect(await closureKey(workspace), name).toBe(gate);
+    }
 
-    // And an edit Nx's index sees still moves it: the property is not a key that never moves.
+    // And an edit Nx's index sees still moves it: the rows are not a key that never moves.
     await edit('workspace/skills/SKILL.md', 'skill-two');
     expect(await closureKey(workspace)).not.toBe(gate);
   } finally {
