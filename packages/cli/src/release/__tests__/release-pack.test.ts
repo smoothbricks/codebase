@@ -1,7 +1,7 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Workflow expressions in packed fixtures are literal. */
 import { describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { RELEASE_CONFIGURATION } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import {
@@ -18,87 +18,86 @@ import {
   releasePack,
   verifyReleasePackManifest,
 } from '../pack.js';
-import { gitOutput } from './helpers/fixture-repo.js';
-import { packedManifestJson, withPackWorkspace } from './helpers/pack-workspace.js';
+import { git, gitOutput } from './helpers/fixture-repo.js';
+import { type PackWorkspacePackage, packedManifestJson, withPackWorkspace } from './helpers/pack-workspace.js';
 import { withPrivateNpmFixture } from './helpers/private-registry.js';
 
-/**
- * Selection is the boundary that keeps private artifacts off npmjs. Release and
- * packing operate on both publishable classes; bootstrap and trust-publisher
- * talk to npmjs and must keep reading the public-only list. A private package
- * appearing in the public list would create a public npmjs package named after
- * it, and a package owned by another repository must not be released from here
- * at all.
- */
-describe('publishable closure classification', () => {
-  it('separates the npmjs-only public list from the publishable release list', async () => {
+describe('release pack', () => {
+  /**
+   * Selection is the boundary that keeps private artifacts off npmjs. Release and
+   * packing operate on both publishable classes; bootstrap and trust-publisher
+   * talk to npmjs and must keep reading the public-only list. A private package
+   * appearing in the public list would create a public npmjs package named after
+   * it, and a package owned by another repository must not be released from here
+   * at all. One workspace holds every shape the classification must tell apart,
+   * so each selection is checked against all of them at once.
+   */
+  it('selects only owned, singly tagged, non-private packages and refuses closures it cannot pack', async () => {
     await withPackWorkspace(
       async (root) => {
-        expect(listPublicPackages(root).map((pkg) => pkg.name)).toEqual(['@priv.test/public-face']);
-        expect(listPublishablePackages(root).map((pkg) => pkg.name)).toEqual([
-          '@priv.test/alpha',
-          '@priv.test/beta',
-          '@priv.test/public-face',
-        ]);
-        expect(listReleasePackages(root).map((pkg) => pkg.name)).toEqual([
-          '@priv.test/alpha',
-          '@priv.test/beta',
-          '@priv.test/public-face',
-        ]);
-      },
-      { publicFace: true },
-    );
-  });
+        const names = (packages: readonly PackageInfo[]): string[] => packages.map((pkg) => pkg.name);
+        const npmjsOnly = names(listPublicPackages(root));
+        const publishable = names(listPublishablePackages(root));
+        const releasable = names(listReleasePackages(root));
 
-  it('never selects a private:true package for publication', async () => {
-    await withPackWorkspace(async (root) => {
-      for (const selected of [listPublishablePackages(root), listReleasePackages(root), listPublicPackages(root)]) {
-        expect(selected.map((pkg) => pkg.name)).not.toContain('@priv.test/internal');
-      }
-      expect(listPublishablePackages(root).map((pkg) => pkg.name)).toEqual(['@priv.test/alpha', '@priv.test/beta']);
-      expect(listPublicPackages(root)).toEqual([]);
-    });
-  });
-
-  it('excludes a publishable package owned by another repository from the release list', async () => {
-    await withPackWorkspace(
-      async (root) => {
+        // npmjs bootstrap and trust-publisher consume the public list: no private-tagged package may be on it.
+        expect(npmjsOnly).toEqual(['@priv.test/public-face']);
         // Ownership is what makes a release ours to cut; the tag alone is not.
-        expect(listPublishablePackages(root).map((pkg) => pkg.name)).toContain('@priv.test/vendored');
-        expect(listReleasePackages(root).map((pkg) => pkg.name)).toEqual(['@priv.test/alpha', '@priv.test/beta']);
-      },
-      { foreignPackage: true },
-    );
-  });
-
-  it('never selects an ambiguously tagged package for any publishable list', async () => {
-    await withPackWorkspace(
-      async (root) => {
-        // The public list is what npmjs bootstrap and trust-publisher consume;
-        // a package with both tags, or private:true plus a tag, must be absent
-        // from every publishable selection so it can never reach a registry.
-        for (const selected of [listPublicPackages(root), listPublishablePackages(root), listReleasePackages(root)]) {
-          expect(selected.map((pkg) => pkg.name)).not.toContain('@priv.test/tagged-both');
-          expect(selected.map((pkg) => pkg.name)).not.toContain('@priv.test/private-true');
+        expect(publishable).toEqual([
+          '@priv.test/alpha',
+          '@priv.test/beta',
+          '@priv.test/public-face',
+          '@priv.test/uses-internal',
+          '@priv.test/vendored',
+        ]);
+        expect(releasable).toEqual([
+          '@priv.test/alpha',
+          '@priv.test/beta',
+          '@priv.test/public-face',
+          '@priv.test/uses-internal',
+        ]);
+        // A package with both tags, or private:true with or without a tag, must be absent
+        // from every selection so it can never reach a registry.
+        for (const selected of [npmjsOnly, publishable, releasable]) {
+          expect(selected).not.toContain('@priv.test/internal');
+          expect(selected).not.toContain('@priv.test/tagged-both');
+          expect(selected).not.toContain('@priv.test/private-true');
         }
+
+        const output = artifactsDir(root, 'refused');
+        // A runtime edge on a package that can never be published.
+        await expect(releasePack(root, { projects: 'uses-internal', output }, fixtureNx())).rejects.toThrow(
+          /@priv\.test\/internal/,
+        );
+        // A public package depending on a private one.
+        await expect(releasePack(root, { projects: 'public-face', output }, fixtureNx())).rejects.toThrow(
+          /@priv\.test\/alpha/,
+        );
+        // A foreign-owned package, even when named directly.
+        await expect(releasePack(root, { projects: 'vendored', output }, fixtureNx())).rejects.toThrow(/vendored/);
       },
-      { ambiguousTagPackages: true },
+      {
+        publicFace: true,
+        foreignPackage: true,
+        ambiguousTagPackages: true,
+        packages: [
+          privatePackage('uses-internal', '0.7.0', { dependencies: { '@priv.test/internal': 'workspace:*' } }),
+        ],
+      },
     );
   });
-});
 
-/**
- * `release pack` is the artifact half of private distribution: it must produce
- * installable tarballs and a verifiable manifest while touching no registry and
- * no Git ref. Both non-effects are load-bearing — a pack that quietly queried
- * registry status would need credentials wherever artifacts are built, and one
- * that moved a ref would turn artifact production into a release.
- */
-describe('release pack artifacts', () => {
-  it('packs the runtime closure into a verifiable manifest without contacting a registry or moving a ref', async () => {
+  /**
+   * `release pack` is the artifact half of private distribution: it must produce
+   * installable tarballs and a verifiable manifest while touching no registry and
+   * no Git ref. Both non-effects are load-bearing — a pack that quietly queried
+   * registry status would need credentials wherever artifacts are built, and one
+   * that moved a ref would turn artifact production into a release.
+   */
+  it('writes a verifiable artifact directory and refuses to mix, trust or rebind one', async () => {
     await withPrivateNpmFixture(async (fixture) => {
       await withPackWorkspace(async (root) => {
-        const output = join(root, 'artifacts');
+        const output = artifactsDir(root, 'closure');
         const headBefore = await gitOutput(root, ['rev-parse', 'HEAD']);
         const tagsBefore = await gitOutput(root, ['tag', '--list']);
         const statusBefore = await gitOutput(root, ['status', '--porcelain', '--untracked-files=no']);
@@ -138,267 +137,164 @@ describe('release pack artifacts', () => {
         expect(await gitOutput(root, ['rev-parse', 'HEAD'])).toBe(headBefore);
         expect(await gitOutput(root, ['tag', '--list'])).toBe(tagsBefore);
         expect(await gitOutput(root, ['status', '--porcelain', '--untracked-files=no'])).toBe(statusBefore);
+
+        // A nonempty output directory is refused instead of mixing releases.
+        const stale = artifactsDir(root, 'stale');
+        await mkdir(stale, { recursive: true });
+        await writeFile(join(stale, 'stale.tgz'), 'previous release');
+
+        await expect(releasePack(root, { projects: 'alpha', output: stale }, fixtureNx())).rejects.toThrow();
+
+        expect(await readdir(stale)).toEqual(['stale.tgz']);
+
+        // Each refusal below damages its own copy of one verified artifact directory.
+        const pristine = artifactsDir(root, 'beta');
+        await releasePack(root, { projects: 'beta', output: pristine }, fixtureNx());
+
+        const tampered = artifactsDir(root, 'tampered');
+        await cp(pristine, tampered, { recursive: true });
+        const verified = await verifyReleasePackManifest(tampered);
+        expect(verified.packages.map((entry) => entry.name)).toEqual(['@priv.test/beta']);
+
+        // The digest is the only thing standing between a consumer and a swapped
+        // tarball, so verification must actually re-hash the bytes on disk.
+        const tarball = join(tampered, verified.packages[0]?.tarball ?? '');
+        const tarballBytes = await readFile(tarball);
+        tarballBytes[tarballBytes.length - 1] ^= 0xff;
+        await writeFile(tarball, tarballBytes);
+
+        await expect(verifyReleasePackManifest(tampered)).rejects.toThrow(/beta/);
+
+        const unbound = artifactsDir(root, 'unbound');
+        await cp(pristine, unbound, { recursive: true });
+        // `release pack` writes into an empty directory, so an extra tarball is a
+        // mixed or tampered release, not an artifact this manifest describes.
+        await writeFile(join(unbound, 'priv.test-beta-9.9.9.tgz'), 'unbound artifact');
+
+        await expect(verifyReleasePackManifest(unbound)).rejects.toThrow(/priv\.test-beta-9\.9\.9\.tgz/);
+
+        const rebound = artifactsDir(root, 'rebound');
+        await cp(pristine, rebound, { recursive: true });
+        const first = (await readManifest(rebound)).packages[0];
+        if (!first) {
+          throw new Error('pack produced no manifest entries');
+        }
+
+        // The manifest is the name/version map a consumer pins against: two
+        // entries for one name make the pinned version ambiguous.
+        await writeFile(
+          join(rebound, 'manifest.json'),
+          `${JSON.stringify({ schemaVersion: 1, packages: [first, { ...first, version: '9.9.9' }] }, null, 2)}\n`,
+        );
+        await expect(verifyReleasePackManifest(rebound)).rejects.toThrow(/appears twice/);
+
+        // A path is validated before it is opened, so no read can escape the
+        // artifact directory.
+        await writeFile(
+          join(rebound, 'manifest.json'),
+          `${JSON.stringify({ schemaVersion: 1, packages: [{ ...first, tarball: `../${first.tarball}` }] }, null, 2)}\n`,
+        );
+        await expect(verifyReleasePackManifest(rebound)).rejects.toThrow(/bare file name/);
       });
     });
   });
 
-  it('refuses a nonempty output directory instead of mixing releases', async () => {
-    await withPackWorkspace(async (root) => {
-      const output = join(root, 'artifacts');
-      await mkdir(output, { recursive: true });
-      await writeFile(join(output, 'stale.tgz'), 'previous release');
-
-      await expect(releasePack(root, { projects: 'alpha', output }, fixtureNx())).rejects.toThrow();
-
-      expect(await readdir(output)).toEqual(['stale.tgz']);
-    });
-  });
-
-  it('refuses a runtime edge on a package that can never be published', async () => {
+  /**
+   * One packer makes every tarball `release pack` and `release publish` ship: workspace
+   * pins become exact versions, no lifecycle script runs, every declared asset must be
+   * inside, and the workspace's own bytes are back as they were afterwards.
+   */
+  it('packs tarballs with exact pins, declared assets and a resolved registry, and restores the workspace', async () => {
+    const wasmExports = { '.': './dist/index.js', './reducer.wasm': './dist/reducer.wasm' };
     await withPackWorkspace(
       async (root) => {
+        // The private publish path carries the destination inside the tarball: the
+        // resolved literal registry goes into publishConfig for the pack and the
+        // workspace bytes come back afterwards. An unresolved placeholder shipping in
+        // a published package.json would send every consumer's install to a
+        // nonexistent host, so it must fail before bytes leave.
+        const registry = 'https://forge.example.test/api/packages/priv-owner/npm/';
+        const betaManifestPath = join(root, 'packages/beta/package.json');
+        const betaManifestBefore = await readFile(betaManifestPath, 'utf8');
+
+        await withPackedTarball(root, 'beta', { publishConfigRegistry: registry }, async ({ tarball }) => {
+          const manifest = await packedManifestJson(tarball);
+          expect(manifest).toContain(`"registry": "${registry}"`);
+          expect(manifest).not.toContain('${');
+        });
+        expect(await readFile(betaManifestPath, 'utf8')).toBe(betaManifestBefore);
+
+        await withPackedTarball(
+          root,
+          'beta',
+          { publishConfigRegistry: '${PRIV_NPM_REGISTRY}' },
+          async ({ tarball, pkg }) => {
+            await expect(assertPackedArtifact(root, tarball, pkg)).rejects.toThrow(/environment placeholder/);
+          },
+        );
+
+        // A missing exported Wasm asset is refused and leaves no partial artifact behind.
+        const wasmMissingOutput = artifactsDir(root, 'wasm-missing');
         await expect(
-          releasePack(root, { projects: 'alpha', output: join(root, 'artifacts') }, fixtureNx()),
-        ).rejects.toThrow(/@priv\.test\/internal/);
-      },
-      { alphaDependencies: { '@priv.test/internal': 'workspace:*' } },
-    );
-  });
+          releasePack(root, { projects: 'wasm-missing', output: wasmMissingOutput }, fixtureNx()),
+        ).rejects.toThrow(/reducer\.wasm/);
+        expect(await readdir(wasmMissingOutput)).toEqual([]);
 
-  it('refuses a public package depending on a private one', async () => {
-    await withPackWorkspace(
-      async (root) => {
-        await expect(
-          releasePack(root, { projects: 'public-face', output: join(root, 'artifacts') }, fixtureNx()),
-        ).rejects.toThrow(/@priv\.test\/alpha/);
-      },
-      { publicFace: true },
-    );
-  });
-
-  it('refuses to pack a foreign-owned package even when named directly', async () => {
-    await withPackWorkspace(
-      async (root) => {
-        await expect(
-          releasePack(root, { projects: 'vendored', output: join(root, 'artifacts') }, fixtureNx()),
-        ).rejects.toThrow(/vendored/);
-      },
-      { foreignPackage: true },
-    );
-  });
-
-  it('refuses a missing exported Wasm asset and leaves no partial artifact behind', async () => {
-    await withPackWorkspace(
-      async (root) => {
-        const output = join(root, 'artifacts');
-        await expect(releasePack(root, { projects: 'alpha', output }, fixtureNx())).rejects.toThrow(/reducer\.wasm/);
-        expect(await readdir(output)).toEqual([]);
-      },
-      {
-        alphaExports: { '.': './dist/index.js', './reducer.wasm': './dist/reducer.wasm' },
-      },
-    );
-  });
-
-  it('ships a declared Wasm export that is present in the files allowlist', async () => {
-    await withPackWorkspace(
-      async (root) => {
-        const packed = await packReleaseTarball(root, packagedProject(root, 'alpha'), {}, fixtureNx());
-        try {
-          const extraction = await Bun.$`tar -xzOf ${packed.tarball} package/dist/reducer.wasm`.quiet();
+        // A declared Wasm export that is present in the files allowlist ships.
+        await withPackedTarball(root, 'wasm-shipped', {}, async ({ tarball }) => {
+          const extraction = await Bun.$`tar -xzOf ${tarball} package/dist/reducer.wasm`.quiet();
           expect(extraction.stdout.toString()).toBe('wasm-bytes');
-        } finally {
-          await packed.cleanup();
-        }
-      },
-      {
-        alphaExports: { '.': './dist/index.js', './reducer.wasm': './dist/reducer.wasm' },
-        alphaFiles: { 'dist/reducer.wasm': 'wasm-bytes' },
-      },
-    );
-  });
+        });
 
-  it('refuses when the declared types entry is missing from the packed tarball', async () => {
-    await withPackWorkspace(
-      async (root) => {
-        const pkg = packagedProject(root, 'alpha');
-        const packed = await packReleaseTarball(root, pkg, {}, fixtureNx());
-        try {
-          await expect(assertPackedArtifact(root, packed.tarball, pkg)).rejects.toThrow(/index\.d\.ts/);
-        } finally {
-          await packed.cleanup();
-        }
-      },
-      { alphaTypes: 'dist/index.d.ts' },
-    );
-  });
+        // A declared types entry missing from the packed tarball is refused.
+        await withPackedTarball(root, 'types-missing', {}, async ({ tarball, pkg }) => {
+          await expect(assertPackedArtifact(root, tarball, pkg)).rejects.toThrow(/index\.d\.ts/);
+        });
 
-  it('rejects a tampered artifact when the manifest is verified', async () => {
-    await withPackWorkspace(async (root) => {
-      const output = join(root, 'artifacts');
-      await releasePack(root, { projects: 'beta', output }, fixtureNx());
-
-      const manifest = await verifyReleasePackManifest(output);
-      expect(manifest.packages.map((entry) => entry.name)).toEqual(['@priv.test/beta']);
-
-      // The digest is the only thing standing between a consumer and a swapped
-      // tarball, so verification must actually re-hash the bytes on disk.
-      const tarball = join(output, manifest.packages[0]?.tarball ?? '');
-      const bytes = await readFile(tarball);
-      bytes[bytes.length - 1] ^= 0xff;
-      await writeFile(tarball, bytes);
-
-      await expect(verifyReleasePackManifest(output)).rejects.toThrow(/beta/);
-    });
-  });
-
-  it('refuses an artifact directory holding a tarball the manifest does not bind', async () => {
-    await withPackWorkspace(async (root) => {
-      const output = join(root, 'artifacts');
-      await releasePack(root, { projects: 'beta', output }, fixtureNx());
-
-      // `release pack` writes into an empty directory, so an extra tarball is a
-      // mixed or tampered release, not an artifact this manifest describes.
-      await writeFile(join(output, 'priv.test-beta-9.9.9.tgz'), 'unbound artifact');
-
-      await expect(verifyReleasePackManifest(output)).rejects.toThrow(/priv\.test-beta-9\.9\.9\.tgz/);
-    });
-  });
-
-  it('refuses a manifest that binds one package name twice or escapes the directory', async () => {
-    await withPackWorkspace(async (root) => {
-      const output = join(root, 'artifacts');
-      await releasePack(root, { projects: 'beta', output }, fixtureNx());
-      const manifest = await readManifest(output);
-      const entry = manifest.packages[0];
-      if (!entry) {
-        throw new Error('pack produced no manifest entries');
-      }
-
-      // The manifest is the name/version map a consumer pins against: two
-      // entries for one name make the pinned version ambiguous.
-      await writeFile(
-        join(output, 'manifest.json'),
-        `${JSON.stringify({ schemaVersion: 1, packages: [entry, { ...entry, version: '9.9.9' }] }, null, 2)}\n`,
-      );
-      await expect(verifyReleasePackManifest(output)).rejects.toThrow(/appears twice/);
-
-      // A path is validated before it is opened, so no read can escape the
-      // artifact directory.
-      await writeFile(
-        join(output, 'manifest.json'),
-        `${JSON.stringify({ schemaVersion: 1, packages: [{ ...entry, tarball: `../${entry.tarball}` }] }, null, 2)}\n`,
-      );
-      await expect(verifyReleasePackManifest(output)).rejects.toThrow(/bare file name/);
-    });
-  });
-});
-
-/**
- * The private publish path carries the destination inside the tarball: the
- * resolved literal registry goes into publishConfig for the pack and the
- * workspace bytes come back afterwards. An unresolved placeholder shipping in
- * a published package.json would send every consumer's install to a
- * nonexistent host, so it must fail before bytes leave.
- */
-describe('private publish manifest transform', () => {
-  const registry = 'https://forge.example.test/api/packages/priv-owner/npm/';
-
-  it('packs the resolved literal registry and restores the workspace manifest', async () => {
-    await withPackWorkspace(async (root) => {
-      const manifestPath = join(root, 'packages/beta/package.json');
-      const before = await readFile(manifestPath, 'utf8');
-
-      const packed = await packReleaseTarball(
-        root,
-        packagedProject(root, 'beta'),
-        { publishConfigRegistry: registry },
-        fixtureNx(),
-      );
-      try {
-        const manifest = await packedManifestJson(packed.tarball);
-        expect(manifest).toContain(`"registry": "${registry}"`);
-        expect(manifest).not.toContain('${');
-      } finally {
-        await packed.cleanup();
-      }
-
-      expect(await readFile(manifestPath, 'utf8')).toBe(before);
-    });
-  });
-
-  it('refuses a packed artifact whose registry is still an environment placeholder', async () => {
-    await withPackWorkspace(async (root) => {
-      const pkg = packagedProject(root, 'beta');
-      const packed = await packReleaseTarball(
-        root,
-        pkg,
-        { publishConfigRegistry: '${PRIV_NPM_REGISTRY}' },
-        fixtureNx(),
-      );
-      try {
-        await expect(assertPackedArtifact(root, packed.tarball, pkg)).rejects.toThrow(/environment placeholder/);
-      } finally {
-        await packed.cleanup();
-      }
-    });
-  });
-});
-
-describe('release pack tarball production', () => {
-  it('normalizes workspace protocol dependencies to exact versions', async () => {
-    await withPackWorkspace(async (root) => {
-      const packed = await packReleaseTarball(root, packagedProject(root, 'alpha'), {}, fixtureNx());
-      try {
-        const manifest = await packedManifestJson(packed.tarball);
-        expect(manifest).toContain('"@priv.test/beta": "0.2.0"');
-        expect(manifest).not.toContain('workspace:');
-      } finally {
-        await packed.cleanup();
-      }
-    });
-  });
-
-  it('does not run package lifecycle scripts while packing', async () => {
-    await withPackWorkspace(
-      async (root) => {
-        const packed = await packReleaseTarball(root, packagedProject(root, 'alpha'), {}, fixtureNx());
-        try {
+        // Packing normalizes workspace protocol dependencies to exact versions and runs no lifecycle script.
+        await withPackedTarball(root, 'scripted', {}, async ({ tarball }) => {
+          const manifest = await packedManifestJson(tarball);
+          expect(manifest).toContain('"@priv.test/beta": "0.2.0"');
+          expect(manifest).not.toContain('workspace:');
           // The script would create this file; packing must not execute it.
-          await expect(readFile(join(root, 'packages/alpha/prepack-ran'), 'utf8')).rejects.toThrow();
-        } finally {
-          await packed.cleanup();
-        }
-      },
-      { alphaScripts: { prepack: 'touch prepack-ran' } },
-    );
-  });
+          await expect(readFile(join(root, 'packages/scripted/prepack-ran'), 'utf8')).rejects.toThrow();
+        });
 
-  it('restores bun.lock and package.json byte-exactly around publish-mode packing', async () => {
-    await withPackWorkspace(
-      async (root) => {
+        // next-dep is an unpublished prerelease whose last stable release is tagged 0.2.0.
+        await git(root, ['tag', 'next-dep@0.2.0']);
         const lockPath = join(root, 'bun.lock');
         const lockBefore = await readFile(lockPath);
-        const manifestPath = join(root, 'packages/alpha/package.json');
-        const manifestBefore = await readFile(manifestPath);
+        const consumerManifestPath = join(root, 'packages/next-consumer/package.json');
+        const consumerManifestBefore = await readFile(consumerManifestPath);
 
-        const packed = await packReleaseTarball(root, packagedProject(root, 'alpha'), {}, fixtureNx());
-        try {
+        await withPackedTarball(root, 'next-consumer', {}, async ({ tarball }) => {
           // publish-mode sync rewrote the -next lock entry to the stable tag
           // mid-flight; the packed dependency must embed the stable version...
-          expect(await packedManifestJson(packed.tarball)).toContain('"@priv.test/beta": "0.2.0"');
+          expect(await packedManifestJson(tarball)).toContain('"@priv.test/next-dep": "0.2.0"');
           // ...and both workspace files must be back to their original bytes
           // after packing, including the manifest the export prune rewrote.
           expect(await readFile(lockPath)).toEqual(lockBefore);
-          expect(await readFile(manifestPath)).toEqual(manifestBefore);
-        } finally {
-          await packed.cleanup();
-        }
+          expect(await readFile(consumerManifestPath)).toEqual(consumerManifestBefore);
+        });
       },
       {
-        betaVersion: '0.2.1-next.0',
-        stableTags: ['beta@0.2.0'],
-        alphaExports: { '.': { development: './src/index.ts', default: './dist/index.js' } },
+        packages: [
+          privatePackage('wasm-missing', '0.8.0', { exports: wasmExports }),
+          privatePackage('wasm-shipped', '0.9.0', {
+            exports: wasmExports,
+            files: { 'dist/reducer.wasm': 'wasm-bytes' },
+          }),
+          privatePackage('types-missing', '1.0.0', { types: 'dist/index.d.ts' }),
+          privatePackage('scripted', '1.1.0', {
+            dependencies: { '@priv.test/beta': 'workspace:*' },
+            scripts: { prepack: 'touch prepack-ran' },
+          }),
+          privatePackage('next-consumer', '1.2.0', {
+            dependencies: { '@priv.test/next-dep': 'workspace:*' },
+            exports: { '.': { development: './src/index.ts', default: './dist/index.js' } },
+          }),
+          privatePackage('next-dep', '0.2.1-next.0'),
+        ],
       },
     );
   });
@@ -425,6 +321,46 @@ function packagedProject(root: string, projectName: string): PackageInfo {
     throw new Error(`fixture workspace has no publishable project ${projectName}`);
   }
   return pkg;
+}
+
+/**
+ * Packs the named project the way both release commands do, hands the tarball to
+ * `body`, and removes it again whether `body` passes or throws.
+ */
+async function withPackedTarball(
+  root: string,
+  projectName: string,
+  options: { publishConfigRegistry?: string },
+  body: (packed: { tarball: string; pkg: PackageInfo }) => Promise<void>,
+): Promise<void> {
+  const pkg = packagedProject(root, projectName);
+  const packed = await packReleaseTarball(root, pkg, options, fixtureNx());
+  try {
+    await body({ tarball: packed.tarball, pkg });
+  } finally {
+    await packed.cleanup();
+  }
+}
+
+/** A private-tagged package of the fixture's repository, built like the fixture's own packages. */
+function privatePackage(
+  projectName: string,
+  version: string,
+  rest: Omit<PackWorkspacePackage, 'name' | 'projectName' | 'path' | 'version' | 'tags'> = {},
+): PackWorkspacePackage {
+  return {
+    name: `@priv.test/${projectName}`,
+    projectName,
+    path: `packages/${projectName}`,
+    version,
+    tags: ['npm:private'],
+    ...rest,
+  };
+}
+
+/** The fixture's .gitignore already excludes `artifacts`, so no scenario's output shows as a working-tree change. */
+function artifactsDir(root: string, scenario: string): string {
+  return join(root, 'artifacts', scenario);
 }
 
 /**

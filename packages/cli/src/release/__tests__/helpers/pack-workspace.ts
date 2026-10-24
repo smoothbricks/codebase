@@ -7,18 +7,11 @@ import { bunBinary } from './private-registry.js';
 export const PACK_FIXTURE_REPOSITORY = 'https://github.com/example/private-closure.git';
 
 export interface PackWorkspaceOptions {
-  /** Extra runtime edges on the packed entry package. */
-  alphaDependencies?: Record<string, string>;
-  alphaScripts?: Record<string, string>;
-  /** Extra files written under packages/alpha, relative to the package root. */
-  alphaFiles?: Record<string, string>;
-  /** Overrides alpha's `types` / `exports` manifest fields. */
-  alphaTypes?: string;
-  alphaExports?: Record<string, unknown>;
-  /** Overrides beta's version (e.g. an unpublished prerelease the publish-mode lock sync rewrites). */
-  betaVersion?: string;
-  /** Lightweight git tags created after the fixture commit (e.g. `beta@0.2.0` stable tags). */
-  stableTags?: string[];
+  /**
+   * Further packages written beside alpha, beta and internal before the one lockfile install, so a single workspace
+   * can hold every variant a set of cases needs.
+   */
+  packages?: readonly PackWorkspacePackage[];
   /** Adds packages whose tags/private flags are ambiguous under the publish policy. */
   ambiguousTagPackages?: boolean;
   /** Add a public package with a runtime edge onto the private closure. */
@@ -32,7 +25,9 @@ export interface PackWorkspaceOptions {
  * two publishable private packages, one internal `private: true` package that
  * may never be published, and optionally a public package reaching into the
  * private closure. The repo starts clean and committed so any working-tree or
- * ref change a command makes is directly observable.
+ * ref change a command makes is directly observable. Any further shape joins
+ * through `packages`, so one workspace and one lockfile install can serve every
+ * case that needs it.
  */
 export async function withPackWorkspace(
   fn: (root: string) => Promise<void>,
@@ -57,22 +52,14 @@ export async function withPackWorkspace(
       projectName: 'alpha',
       path: 'packages/alpha',
       version: '0.1.0',
-      dependencies: { '@priv.test/beta': 'workspace:*', ...(options.alphaDependencies ?? {}) },
+      dependencies: { '@priv.test/beta': 'workspace:*' },
       tags: ['npm:private'],
-      ...(options.alphaScripts ? { scripts: options.alphaScripts } : {}),
-      ...(options.alphaTypes ? { types: options.alphaTypes } : {}),
-      ...(options.alphaExports ? { exports: options.alphaExports } : {}),
     });
-    for (const [relativePath, content] of Object.entries(options.alphaFiles ?? {})) {
-      const filePath = join(root, 'packages/alpha', relativePath);
-      await mkdir(dirname(filePath), { recursive: true });
-      await writeFile(filePath, content);
-    }
     await writePackWorkspacePackage(root, {
       name: '@priv.test/beta',
       projectName: 'beta',
       path: 'packages/beta',
-      version: options.betaVersion ?? '0.2.0',
+      version: '0.2.0',
       tags: ['npm:private'],
     });
     await writePackWorkspacePackage(root, {
@@ -120,6 +107,9 @@ export async function withPackWorkspace(
         private: true,
       });
     }
+    for (const pkg of options.packages ?? []) {
+      await writePackWorkspacePackage(root, pkg);
+    }
     // `bun pm pack` resolves `workspace:*` from bun.lock and refuses to pack
     // without one ("Failed to resolve workspace version"), so the fixture needs
     // a real lockfile. `--lockfile-only` writes it from the local workspace
@@ -127,9 +117,6 @@ export async function withPackWorkspace(
     await writeLockfile(root);
     await git(root, ['add', '-A']);
     await git(root, ['commit', '-m', 'fixture closure']);
-    for (const tag of options.stableTags ?? []) {
-      await git(root, ['tag', tag]);
-    }
     await fn(root);
   });
 }
@@ -148,6 +135,8 @@ export interface PackWorkspacePackage {
   /** Written verbatim into the package manifest. */
   types?: string;
   exports?: Record<string, unknown>;
+  /** Extra files under the package root, by path relative to it. */
+  files?: Record<string, string>;
 }
 
 /**
@@ -174,6 +163,11 @@ export async function writePackWorkspacePackage(root: string, pkg: PackWorkspace
       nx: { name: pkg.projectName, tags: pkg.tags },
     }),
   );
+  for (const [relativePath, content] of Object.entries(pkg.files ?? {})) {
+    const filePath = join(root, pkg.path, relativePath);
+    await mkdir(dirname(filePath), { recursive: true });
+    await writeFile(filePath, content);
+  }
 }
 
 function manifestText(value: object): string {
