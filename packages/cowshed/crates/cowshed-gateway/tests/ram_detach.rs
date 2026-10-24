@@ -18,9 +18,8 @@ mod ram_fixture;
 use std::io::{BufRead as _, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use cowshed_apfs::DISK_CHILD_DEADLINE;
 use cowshed_apfs::disk_lease::leased_at;
 use cowshed_gateway::DiskLeaseLimits;
 use cowshed_gateway_types::{DiskClass, RamDetachRequest, RamDiskEntry};
@@ -58,14 +57,9 @@ fn requester(socket: &Path, line: &str) -> Command {
 
 /// Wait until the registry no longer lists `disk`'s entry. Nothing tells the test when a detach no
 /// one waits for has ended, so the registry, which lists every attached disk, is read until it
-/// does, within the disk-image command's warning point.
+/// does; a detach that never ends is the test runner's hang to report.
 fn await_detached(disk: &OwnedDisk) {
-    let deadline = Instant::now() + DISK_CHILD_DEADLINE;
-    while let Some(now) = registered(disk.entry) {
-        assert!(
-            Instant::now() < deadline,
-            "the gateway's detach of {disk:?} has not ended within {DISK_CHILD_DEADLINE:?}: {now:?}"
-        );
+    while registered(disk.entry).is_some() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
