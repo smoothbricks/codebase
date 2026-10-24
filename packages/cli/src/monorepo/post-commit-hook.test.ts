@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -57,16 +57,20 @@ function blobs(repo: string, file: string): { head: string; index: string; workt
   };
 }
 
+function initRepository(repo: string): void {
+  git(repo, 'init', '-q', '--initial-branch=main');
+  git(repo, 'config', 'user.email', 'hooks@example.test');
+  git(repo, 'config', 'user.name', 'Hook Test');
+  mkdirSync(join(repo, 'tooling', 'git-hooks'), { recursive: true });
+  copyFileSync(hookScript, join(repo, 'tooling', 'git-hooks', 'post-commit.sh'));
+  writeFileSync(join(repo, '.git', 'hooks', 'pre-commit'), FORMATTER, { mode: 0o755 });
+  writeFileSync(join(repo, '.git', 'hooks', 'post-commit'), DISPATCHER, { mode: 0o755 });
+}
+
 function withRepository(run: (repo: string) => void): void {
   const repo = mkdtempSync(join(tmpdir(), 'smoo-post-commit-'));
   try {
-    git(repo, 'init', '-q', '--initial-branch=main');
-    git(repo, 'config', 'user.email', 'hooks@example.test');
-    git(repo, 'config', 'user.name', 'Hook Test');
-    mkdirSync(join(repo, 'tooling', 'git-hooks'), { recursive: true });
-    copyFileSync(hookScript, join(repo, 'tooling', 'git-hooks', 'post-commit.sh'));
-    writeFileSync(join(repo, '.git', 'hooks', 'pre-commit'), FORMATTER, { mode: 0o755 });
-    writeFileSync(join(repo, '.git', 'hooks', 'post-commit'), DISPATCHER, { mode: 0o755 });
+    initRepository(repo);
     run(repo);
   } finally {
     rmSync(repo, { recursive: true, force: true });
@@ -74,8 +78,34 @@ function withRepository(run: (repo: string) => void): void {
 }
 
 describe('post-commit hook', () => {
-  it('leaves the index equal to the partial commit the formatter rewrote', () => {
+  it('repairs the first commit in a repository, which has no parent to diff against', () => {
     withRepository((repo) => {
+      writeFileSync(join(repo, 'first.txt'), 'first needs format   \n');
+      git(repo, 'add', 'first.txt');
+      git(repo, 'commit', '-m', 'initial', '--only', '--', 'first.txt');
+
+      expect(git(repo, 'cat-file', '-p', 'HEAD:first.txt')).toBe('first needs format\n');
+      const { head, index } = blobs(repo, 'first.txt');
+      expect(index).toBe(head);
+    });
+  });
+
+  // The three cases below share one repository and run in declaration order; each starts from the index the one
+  // before it left. The plain commit runs first because the partial commit leaves peer.txt staged and dropped.txt
+  // unstaged, which the plain case would otherwise commit.
+  describe('commits in one repository with history', () => {
+    let repo = '';
+
+    beforeAll(() => {
+      repo = mkdtempSync(join(tmpdir(), 'smoo-post-commit-'));
+      initRepository(repo);
+    });
+
+    afterAll(() => {
+      rmSync(repo, { recursive: true, force: true });
+    });
+
+    it('leaves the index equal to the partial commit the formatter rewrote', () => {
       writeFileSync(join(repo, 'mine.txt'), 'base\n');
       git(repo, 'add', 'mine.txt');
       git(repo, 'commit', '-qm', 'base', '--no-verify');
@@ -92,22 +122,23 @@ describe('post-commit hook', () => {
       expect(worktree).toBe(head);
       expect(git(repo, 'diff', '--cached', '--name-only', 'HEAD')).toBe('');
     });
-  });
 
-  it('repairs the first commit in a repository, which has no parent to diff against', () => {
-    withRepository((repo) => {
-      writeFileSync(join(repo, 'first.txt'), 'first needs format   \n');
-      git(repo, 'add', 'first.txt');
-      git(repo, 'commit', '-m', 'initial', '--only', '--', 'first.txt');
+    it('keeps a plain index-built commit consistent', () => {
+      writeFileSync(join(repo, 'plain.txt'), 'base\n');
+      git(repo, 'add', 'plain.txt');
+      git(repo, 'commit', '-qm', 'base', '--no-verify');
 
-      expect(git(repo, 'cat-file', '-p', 'HEAD:first.txt')).toBe('first needs format\n');
-      const { head, index } = blobs(repo, 'first.txt');
+      writeFileSync(join(repo, 'plain.txt'), 'plain needs format   \n');
+      git(repo, 'add', 'plain.txt');
+      git(repo, 'commit', '-m', 'plain');
+
+      expect(git(repo, 'cat-file', '-p', 'HEAD:plain.txt')).toBe('plain needs format\n');
+      const { head, index, worktree } = blobs(repo, 'plain.txt');
       expect(index).toBe(head);
+      expect(worktree).toBe(head);
     });
-  });
 
-  it('leaves staged work on paths outside the commit alone', () => {
-    withRepository((repo) => {
+    it('leaves staged work on paths outside the commit alone', () => {
       writeFileSync(join(repo, 'mine.txt'), 'base\n');
       writeFileSync(join(repo, 'peer.txt'), 'base\n');
       writeFileSync(join(repo, 'dropped.txt'), 'base\n');
@@ -127,23 +158,6 @@ describe('post-commit hook', () => {
       expect(peer.index).toBe(peer.worktree);
       expect(peer.index).not.toBe(peer.head);
       expect(git(repo, 'ls-files', '--', 'dropped.txt')).toBe('');
-    });
-  });
-
-  it('keeps a plain index-built commit consistent', () => {
-    withRepository((repo) => {
-      writeFileSync(join(repo, 'plain.txt'), 'base\n');
-      git(repo, 'add', 'plain.txt');
-      git(repo, 'commit', '-qm', 'base', '--no-verify');
-
-      writeFileSync(join(repo, 'plain.txt'), 'plain needs format   \n');
-      git(repo, 'add', 'plain.txt');
-      git(repo, 'commit', '-m', 'plain');
-
-      expect(git(repo, 'cat-file', '-p', 'HEAD:plain.txt')).toBe('plain needs format\n');
-      const { head, index, worktree } = blobs(repo, 'plain.txt');
-      expect(index).toBe(head);
-      expect(worktree).toBe(head);
     });
   });
 });

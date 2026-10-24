@@ -1184,28 +1184,77 @@ describe('workspace package script policy', () => {
     }
   });
 
-  it('creates no-emit test typecheck config for packages that use bun test', async () => {
+  // The reconcile family shares one workspace and one reconcile pass. The validators count failures across the whole
+  // workspace, so the pre-repair total is the sum of what each package counted alone (bun-tests 2, vitest 2, nx-bun 2,
+  // app 7, external-app 3). The drift package joins after that total is taken, since its own pre-repair count was never
+  // asserted.
+  it('creates and repairs test typecheck configs for every test-runner shape in one workspace', async () => {
     const root = await createWorkspace({
       rootName: '@smoothbricks/codebase',
-      packages: [{ dir: 'app', name: '@smoothbricks/app', scripts: { test: 'bun test --pass-with-no-tests' } }],
+      packages: [
+        { dir: 'lib', name: '@smoothbricks/lib', nx: { name: 'lib' } },
+        { dir: 'bun-tests', name: '@smoothbricks/bun-tests', scripts: { test: 'bun test --pass-with-no-tests' } },
+        { dir: 'vitest', name: '@smoothbricks/vitest', scripts: { test: 'vitest run' } },
+        {
+          dir: 'nx-bun',
+          name: '@smoothbricks/nx-bun',
+          nx: {
+            name: 'nx-bun',
+            targets: {
+              test: { executor: 'nx:run-commands', options: { command: 'bun test', cwd: '{projectRoot}' } },
+            },
+          },
+        },
+        {
+          dir: 'app',
+          name: '@smoothbricks/app',
+          dependencies: { '@smoothbricks/lib': '^0.0.0' },
+          scripts: {
+            dev: 'astro dev',
+            serve: 'vite dev --host 0.0.0.0',
+            test: 'bun test --pass-with-no-tests',
+            build: 'wrangler build --outdir dist',
+            deploy: 'wrangler deploy',
+            astro: 'astro',
+          },
+          nx: { name: 'app' },
+        },
+        {
+          dir: 'external-app',
+          name: '@external/app',
+          dependencies: { '@smoothbricks/lib': 'workspace:*' },
+          scripts: { test: 'bun test --pass-with-no-tests' },
+          nx: { targets: {} },
+        },
+      ],
     });
     try {
-      await writeJson(join(root, 'packages/app/tsconfig.json'), {
+      await writeJson(join(root, 'packages/bun-tests/tsconfig.json'), {
         files: [],
         include: [],
         references: [{ path: './tsconfig.lib.json' }, { path: './tsconfig.test.json' }],
       });
-      await writeJson(join(root, 'packages/app/tsconfig.lib.json'), {
+      await writeJson(join(root, 'packages/bun-tests/tsconfig.lib.json'), {
         extends: '../../tsconfig.base.json',
         compilerOptions: { baseUrl: '.', rootDir: 'src', types: ['node'], outDir: 'dist' },
       });
+      await writeJson(join(root, 'packages/vitest/tsconfig.lib.json'), {
+        extends: '../../tsconfig.base.json',
+        compilerOptions: { baseUrl: '.', rootDir: 'src', outDir: 'dist' },
+      });
+      expect(validateWorkspaceDependencies(root)).toBe(2 + 2 + 2 + 7 + 3);
 
-      expect(validateWorkspaceDependencies(root)).toBe(2);
+      await writeWorkspacePackage(root, { dir: 'drift', name: '@smoothbricks/drift', scripts: { test: 'bun test' } });
+      await writeJson(join(root, 'packages/drift/tsconfig.lib.json'), {
+        extends: '../../tsconfig.base.json',
+        compilerOptions: { rootDir: 'src' },
+      });
 
       await reconcileManagedFiles(root);
       applyWorkspaceDependencyDefaults(root);
+      expect(validateWorkspaceDependencies(root)).toBe(0);
 
-      const testTsconfig = await readJson(join(root, 'packages/app/tsconfig.test.json'));
+      const testTsconfig = await readJson(join(root, 'packages/bun-tests/tsconfig.test.json'));
       expect(testTsconfig).toEqual({
         extends: '../../tsconfig.base.json',
         compilerOptions: {
@@ -1226,174 +1275,18 @@ describe('workspace package script policy', () => {
         ],
         references: [{ path: './tsconfig.lib.json' }],
       });
-      const projectTsconfig = await readJson(join(root, 'packages/app/tsconfig.json'));
+      const projectTsconfig = await readJson(join(root, 'packages/bun-tests/tsconfig.json'));
       expect(projectTsconfig.references).toEqual([{ path: './tsconfig.lib.json' }]);
-      expect(validateWorkspaceDependencies(root)).toBe(0);
-      const firstPackage = await readFile(join(root, 'packages/app/package.json'), 'utf8');
-      const firstProjectConfig = await readFile(join(root, 'packages/app/tsconfig.json'), 'utf8');
-      const firstTestConfig = await readFile(join(root, 'packages/app/tsconfig.test.json'), 'utf8');
-      await reconcileManagedFiles(root);
-      applyWorkspaceDependencyDefaults(root);
-      expect(await readFile(join(root, 'packages/app/package.json'), 'utf8')).toBe(firstPackage);
-      expect(await readFile(join(root, 'packages/app/tsconfig.json'), 'utf8')).toBe(firstProjectConfig);
-      expect(await readFile(join(root, 'packages/app/tsconfig.test.json'), 'utf8')).toBe(firstTestConfig);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
+      const firstPackage = await readFile(join(root, 'packages/bun-tests/package.json'), 'utf8');
+      const firstProjectConfig = await readFile(join(root, 'packages/bun-tests/tsconfig.json'), 'utf8');
+      const firstTestConfig = await readFile(join(root, 'packages/bun-tests/tsconfig.test.json'), 'utf8');
 
-  it('detects canonical test-config drift before monorepo update repairs it', async () => {
-    const root = await createWorkspace({
-      rootName: '@smoothbricks/codebase',
-      packages: [{ dir: 'app', name: '@smoothbricks/app', scripts: { test: 'bun test' } }],
-    });
-    try {
-      await writeJson(join(root, 'packages/app/tsconfig.lib.json'), {
-        extends: '../../tsconfig.base.json',
-        compilerOptions: { rootDir: 'src' },
-      });
-      await reconcileManagedFiles(root);
-      applyWorkspaceDependencyDefaults(root);
-      expect(validateWorkspaceDependencies(root)).toBe(0);
+      const vitestTestConfig = await readJson(join(root, 'packages/vitest/tsconfig.test.json'));
+      expect(vitestTestConfig).toMatchObject({ compilerOptions: { noEmit: true } });
+      expect(vitestTestConfig).not.toMatchObject({ compilerOptions: { types: expect.anything() } });
 
-      await writeJson(join(root, 'packages/app/tsconfig.lib.json'), {
-        extends: '../../tsconfig.base.json',
-        compilerOptions: { rootDir: 'src', lib: ['es2024'] },
-      });
-      expect(validateWorkspaceDependencies(root)).toBe(1);
-
-      await reconcileManagedFiles(root);
-      applyWorkspaceDependencyDefaults(root);
-      const repaired = await readJson(join(root, 'packages/app/tsconfig.test.json'));
-      expect(repaired).toMatchObject({ compilerOptions: { lib: ['es2024'] } });
-      expect(validateWorkspaceDependencies(root)).toBe(0);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('creates no-emit test typecheck config for packages that use vitest', async () => {
-    const root = await createWorkspace({
-      rootName: '@smoothbricks/codebase',
-      packages: [{ dir: 'app', name: '@smoothbricks/app', scripts: { test: 'vitest run' } }],
-    });
-    try {
-      await writeJson(join(root, 'packages/app/tsconfig.lib.json'), {
-        extends: '../../tsconfig.base.json',
-        compilerOptions: { baseUrl: '.', rootDir: 'src', outDir: 'dist' },
-      });
-
-      expect(validateWorkspaceDependencies(root)).toBe(2);
-
-      await reconcileManagedFiles(root);
-      applyWorkspaceDependencyDefaults(root);
-
-      const testTsconfig = await readJson(join(root, 'packages/app/tsconfig.test.json'));
-      expect(testTsconfig).toMatchObject({ compilerOptions: { noEmit: true } });
-      expect(testTsconfig).not.toMatchObject({ compilerOptions: { types: expect.anything() } });
-      expect(validateWorkspaceDependencies(root)).toBe(0);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('does not require tsconfig.test.json for other test runners but still requires bounded execution', async () => {
-    const root = await createWorkspace({
-      rootName: '@smoothbricks/codebase',
-      packages: [{ dir: 'app', name: '@smoothbricks/app', scripts: { test: 'node --test' } }],
-    });
-    try {
-      expect(validateWorkspaceDependencies(root)).toBe(1);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('detects bun test commands configured directly in Nx targets', async () => {
-    const root = await createWorkspace({
-      rootName: '@smoothbricks/codebase',
-      packages: [
-        {
-          dir: 'app',
-          name: '@smoothbricks/app',
-          nx: {
-            name: 'app',
-            targets: {
-              test: { executor: 'nx:run-commands', options: { command: 'bun test', cwd: '{projectRoot}' } },
-            },
-          },
-        },
-      ],
-    });
-    try {
-      expect(validateWorkspaceDependencies(root)).toBe(2);
-
-      await reconcileManagedFiles(root);
-      applyWorkspaceDependencyDefaults(root);
-
-      const testTsconfig = await readJson(join(root, 'packages/app/tsconfig.test.json'));
-      expect(testTsconfig.compilerOptions).toMatchObject({ noEmit: true, types: ['bun'] });
-      expect(validateWorkspaceDependencies(root)).toBe(0);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('accepts a noEmit test tsconfig', async () => {
-    const root = await createWorkspace({
-      rootName: '@smoothbricks/codebase',
-      packages: [{ dir: 'native', name: '@smoothbricks/native', nx: { name: 'native', targets: { lint: {} } } }],
-    });
-    try {
-      await writeJson(join(root, 'packages/native/tsconfig.test.json'), { compilerOptions: { noEmit: true } });
-
-      expect(validateWorkspaceDependencies(root)).toBe(0);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('requires a test script or target when test files exist', async () => {
-    const root = await createWorkspace({
-      rootName: '@smoothbricks/codebase',
-      packages: [{ dir: 'app', name: '@smoothbricks/app' }],
-    });
-    try {
-      await mkdir(join(root, 'packages/app/src'), { recursive: true });
-      await writeFile(join(root, 'packages/app/src/example.test.ts'), 'export const testValue = true;\n');
-
-      expect(validateWorkspaceDependencies(root)).toBe(1);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('rewrites safe scripts that use workspace dependencies into Nx aliases', async () => {
-    const root = await createWorkspace({
-      rootName: '@smoothbricks/codebase',
-      packages: [
-        { dir: 'lib', name: '@smoothbricks/lib', nx: { name: 'lib' } },
-        {
-          dir: 'app',
-          name: '@smoothbricks/app',
-          dependencies: { '@smoothbricks/lib': '^0.0.0' },
-          scripts: {
-            dev: 'astro dev',
-            serve: 'vite dev --host 0.0.0.0',
-            test: 'bun test --pass-with-no-tests',
-            build: 'wrangler build --outdir dist',
-            deploy: 'wrangler deploy',
-            astro: 'astro',
-          },
-          nx: { name: 'app' },
-        },
-      ],
-    });
-    try {
-      expect(validateWorkspaceDependencies(root)).toBe(7);
-
-      await reconcileManagedFiles(root);
-      applyWorkspaceDependencyDefaults(root);
+      const nxBunTestConfig = await readJson(join(root, 'packages/nx-bun/tsconfig.test.json'));
+      expect(nxBunTestConfig.compilerOptions).toMatchObject({ noEmit: true, types: ['bun'] });
 
       const app = await readJson(join(root, 'packages/app/package.json'));
       expect(app.dependencies).toEqual({ '@smoothbricks/lib': 'workspace:*' });
@@ -1436,7 +1329,79 @@ describe('workspace package script policy', () => {
           },
         },
       });
+
+      const externalApp = await readJson(join(root, 'packages/external-app/package.json'));
+      expect(externalApp.scripts).toEqual({ test: 'nx run @external/app:test --outputStyle=stream' });
+      expect(externalApp.nx).toEqual({
+        name: '@external/app',
+        targets: {
+          test: {
+            executor: BOUNDED_TEST_EXECUTOR,
+            options: {
+              command: `bun test ${TIMEOUT_FLAG} --pass-with-no-tests`,
+              cwd: '{projectRoot}',
+              idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+              killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
+            },
+          },
+        },
+      });
+
+      await writeJson(join(root, 'packages/drift/tsconfig.lib.json'), {
+        extends: '../../tsconfig.base.json',
+        compilerOptions: { rootDir: 'src', lib: ['es2024'] },
+      });
+      expect(validateWorkspaceDependencies(root)).toBe(1);
+
+      await reconcileManagedFiles(root);
+      applyWorkspaceDependencyDefaults(root);
+      expect(await readFile(join(root, 'packages/bun-tests/package.json'), 'utf8')).toBe(firstPackage);
+      expect(await readFile(join(root, 'packages/bun-tests/tsconfig.json'), 'utf8')).toBe(firstProjectConfig);
+      expect(await readFile(join(root, 'packages/bun-tests/tsconfig.test.json'), 'utf8')).toBe(firstTestConfig);
+      const repaired = await readJson(join(root, 'packages/drift/tsconfig.test.json'));
+      expect(repaired).toMatchObject({ compilerOptions: { lib: ['es2024'] } });
       expect(validateWorkspaceDependencies(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not require tsconfig.test.json for other test runners but still requires bounded execution', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [{ dir: 'app', name: '@smoothbricks/app', scripts: { test: 'node --test' } }],
+    });
+    try {
+      expect(validateWorkspaceDependencies(root)).toBe(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts a noEmit test tsconfig', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [{ dir: 'native', name: '@smoothbricks/native', nx: { name: 'native', targets: { lint: {} } } }],
+    });
+    try {
+      await writeJson(join(root, 'packages/native/tsconfig.test.json'), { compilerOptions: { noEmit: true } });
+
+      expect(validateWorkspaceDependencies(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('requires a test script or target when test files exist', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [{ dir: 'app', name: '@smoothbricks/app' }],
+    });
+    try {
+      await mkdir(join(root, 'packages/app/src'), { recursive: true });
+      await writeFile(join(root, 'packages/app/src/example.test.ts'), 'export const testValue = true;\n');
+
+      expect(validateWorkspaceDependencies(root)).toBe(1);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1541,47 +1506,6 @@ describe('workspace package script policy', () => {
     }
   });
 
-  it('materializes nx.name when rewriting scripts for packages with existing nx config', async () => {
-    const root = await createWorkspace({
-      rootName: '@smoothbricks/codebase',
-      packages: [
-        { dir: 'lib', name: '@smoothbricks/lib', nx: { name: 'lib' } },
-        {
-          dir: 'app',
-          name: '@external/app',
-          dependencies: { '@smoothbricks/lib': 'workspace:*' },
-          scripts: { test: 'bun test --pass-with-no-tests' },
-          nx: { targets: {} },
-        },
-      ],
-    });
-    try {
-      expect(validateWorkspaceDependencies(root)).toBe(3);
-
-      await reconcileManagedFiles(root);
-      applyWorkspaceDependencyDefaults(root);
-
-      const app = await readJson(join(root, 'packages/app/package.json'));
-      expect(app.scripts).toEqual({ test: 'nx run @external/app:test --outputStyle=stream' });
-      expect(app.nx).toEqual({
-        name: '@external/app',
-        targets: {
-          test: {
-            executor: BOUNDED_TEST_EXECUTOR,
-            options: {
-              command: `bun test ${TIMEOUT_FLAG} --pass-with-no-tests`,
-              cwd: '{projectRoot}',
-              idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
-              killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
-            },
-          },
-        },
-      });
-      expect(validateWorkspaceDependencies(root)).toBe(0);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
   it('validates generic CI skip tags against resolved project targets', async () => {
     const root = await createWorkspace({
       rootName: '@fixture/root',
@@ -1771,18 +1695,20 @@ describe('workspace package script policy', () => {
   });
 });
 
+type WorkspacePackage = {
+  dir: string;
+  name: string;
+  private?: boolean;
+  version?: string | null;
+  dependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
+  scripts?: Record<string, string>;
+  nx?: Record<string, unknown>;
+};
+
 async function createWorkspace(input: {
   rootName: string;
-  packages: Array<{
-    dir: string;
-    name: string;
-    private?: boolean;
-    version?: string | null;
-    dependencies?: Record<string, string>;
-    devDependencies?: Record<string, string>;
-    scripts?: Record<string, string>;
-    nx?: Record<string, unknown>;
-  }>;
+  packages: WorkspacePackage[];
   files?: Record<string, string>;
 }): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
@@ -1795,21 +1721,7 @@ async function createWorkspace(input: {
     workspaces: ['packages/*'],
   });
   for (const pkg of input.packages) {
-    await writeJson(join(root, `packages/${pkg.dir}/package.json`), {
-      name: pkg.name,
-      ...(pkg.version === null ? {} : { version: pkg.version ?? '0.0.0' }),
-      ...(pkg.private === undefined ? {} : { private: pkg.private }),
-      ...(pkg.dependencies ? { dependencies: pkg.dependencies } : {}),
-      ...(pkg.devDependencies ? { devDependencies: pkg.devDependencies } : {}),
-      ...(pkg.scripts ? { scripts: pkg.scripts } : {}),
-      ...(pkg.nx ? { nx: pkg.nx } : {}),
-    });
-    // A package that runs a test runner has a suite: the typecheck-test policy refuses a
-    // test program that selects no file, so a fixture without one is not a realistic package.
-    if (/\b(?:bun test|vitest)\b/.test(JSON.stringify({ scripts: pkg.scripts, nx: pkg.nx }))) {
-      await mkdir(join(root, `packages/${pkg.dir}/src`), { recursive: true });
-      await writeFile(join(root, `packages/${pkg.dir}/src/index.test.ts`), 'export {};\n');
-    }
+    await writeWorkspacePackage(root, pkg);
   }
   for (const [relativePath, content] of Object.entries(input.files ?? {})) {
     const absolutePath = join(root, relativePath);
@@ -1817,6 +1729,25 @@ async function createWorkspace(input: {
     await writeFile(absolutePath, content);
   }
   return root;
+}
+
+// Writes one package into an existing workspace root, so a fixture can grow between reconciles.
+async function writeWorkspacePackage(root: string, pkg: WorkspacePackage): Promise<void> {
+  await writeJson(join(root, `packages/${pkg.dir}/package.json`), {
+    name: pkg.name,
+    ...(pkg.version === null ? {} : { version: pkg.version ?? '0.0.0' }),
+    ...(pkg.private === undefined ? {} : { private: pkg.private }),
+    ...(pkg.dependencies ? { dependencies: pkg.dependencies } : {}),
+    ...(pkg.devDependencies ? { devDependencies: pkg.devDependencies } : {}),
+    ...(pkg.scripts ? { scripts: pkg.scripts } : {}),
+    ...(pkg.nx ? { nx: pkg.nx } : {}),
+  });
+  // A package that runs a test runner has a suite: the typecheck-test policy refuses a
+  // test program that selects no file, so a fixture without one is not a realistic package.
+  if (/\b(?:bun test|vitest)\b/.test(JSON.stringify({ scripts: pkg.scripts, nx: pkg.nx }))) {
+    await mkdir(join(root, `packages/${pkg.dir}/src`), { recursive: true });
+    await writeFile(join(root, `packages/${pkg.dir}/src/index.test.ts`), 'export {};\n');
+  }
 }
 
 async function readJson(path: string): Promise<Record<string, unknown>> {
