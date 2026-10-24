@@ -6,9 +6,14 @@ import { dirname, join } from 'node:path';
 import { edit, finished, git, HEALTHY, repository, withManagedRepository } from './__tests__/helpers/shell-entry.js';
 
 describe('the workspace git config', () => {
-  it('resolves in a copy of the checkout at another path that cannot read the original', async () => {
+  it('is written by the first shell entry only, and resolves in a copy of the checkout at another path that cannot read the original', async () => {
     await withManagedRepository({}, async (original) => {
       expect(await original.enterShell()).toEqual(HEALTHY);
+      // An entry that finds the config already correct does not write it.
+      const written = original.gitConfigWrites().length;
+      expect(written).toBeGreaterThan(0);
+      expect(await original.enterShell()).toEqual(HEALTHY);
+      expect(original.gitConfigWrites()).toHaveLength(written);
 
       // A copy-on-write clone carries .git/config verbatim. In a sandbox the
       // checkout it was copied from is unreadable, and git refuses to run at
@@ -102,16 +107,6 @@ describe('the workspace git config', () => {
     });
   });
 
-  it('is not written by a shell entry that finds it already correct', async () => {
-    await withManagedRepository({}, async ({ enterShell: enter, gitConfigWrites }) => {
-      expect(await enter()).toEqual(HEALTHY);
-      const first = gitConfigWrites().length;
-      expect(first).toBeGreaterThan(0);
-      expect(await enter()).toEqual(HEALTHY);
-      expect(gitConfigWrites()).toHaveLength(first);
-    });
-  });
-
   it('loads the shell when its hooks cannot be written, naming the path and errno, and links them once they can', async () => {
     // A sandboxed job may not write .git/hooks: a cowshed workspace denies it. A hooks
     // directory without write permission is the same refusal outside a sandbox.
@@ -145,25 +140,27 @@ describe('the workspace git config', () => {
 describe('a shell direnv keeps loaded', () => {
   const MEMBER = 'packages/member/package.json';
   // Stands in for `use devenv` and the managed prologue: devenv's two
-  // variables, then the script the prologue runs.
+  // variables, the script the prologue runs, then the directory devenv's hook
+  // last changed to, where the export it replays leaves the shell.
   const USE_DEVENV = [
     'export DEVENV_ROOT="$PWD"',
     'export DEVENV_STATE="$PWD/.devenv/state"',
     'bun "$DEVENV_ROOT/setup-environment.ts" >&2',
+    'cd /',
   ].join('\n');
 
   /**
    * direnv in `root` with a private home, so no host direnv config or approval leaks in, and a
-   * `devenv` on PATH whose `direnvrc` defines `use_devenv` as `useDevenv`: the managed .envrc
+   * `devenv` on PATH whose `direnvrc` defines `use_devenv` as `USE_DEVENV`: the managed .envrc
    * drives devenv through exactly that pair.
    */
-  async function isolatedDirenv(root: string, useDevenv: string) {
+  async function isolatedDirenv(root: string) {
     const home = join(dirname(root), 'home');
     const devenvBin = join(dirname(root), 'devenv-bin');
     await mkdir(devenvBin, { recursive: true });
     await writeFile(
       join(devenvBin, 'devenv'),
-      ['#!/bin/sh', '[ "$1" = direnvrc ] || exit 64', "cat <<'RC'", 'use_devenv() {', useDevenv, '}', 'RC', ''].join(
+      ['#!/bin/sh', '[ "$1" = direnvrc ] || exit 64', "cat <<'RC'", 'use_devenv() {', USE_DEVENV, '}', 'RC', ''].join(
         '\n',
       ),
     );
@@ -190,24 +187,38 @@ describe('a shell direnv keeps loaded', () => {
     return { base, direnv };
   }
 
-  it('re-enters when a lockfile changes, and not for any other edit', async () => {
+  it('is built from the checkout alone, in order, and re-enters when a lockfile changes, and not for any other edit', async () => {
     await withManagedRepository(
       {
         workspaces: ['packages/*'],
         files: {
           [MEMBER]: JSON.stringify({ name: 'member', version: '0.0.0' }),
           'README.md': 'fixture\n',
+          '.cowshed/env': 'export SMOO_LOADED="cowshed"\n',
+          '.envrc-local': 'export SMOO_LOADED="$SMOO_LOADED local"\n',
         },
       },
       async ({ root }) => {
-        const { base, direnv } = await isolatedDirenv(root, USE_DEVENV);
+        const { base, direnv } = await isolatedDirenv(root);
+        // An approved .envrc one directory up, as a checkout under a projects folder has.
+        const parent = join(dirname(root), '.envrc');
+        await writeFile(parent, 'export SMOO_PARENT_ENVRC=loaded\n');
+        await direnv(['allow', parent], base);
         await direnv(['allow', root], base);
+
         // The load a shell pool keeps: every variable the export sets.
-        const loaded: Record<string, string> = { ...base };
         const exported: unknown = JSON.parse(await direnv(['export', 'json'], base));
-        for (const [name, value] of Object.entries(exported ?? {})) {
+        const variables = new Map(Object.entries(exported ?? {}));
+        const loaded: Record<string, string> = { ...base };
+        for (const [name, value] of variables) {
           if (typeof value === 'string') loaded[name] = value;
         }
+
+        // It is built from the checkout alone, never from a parent directory's .envrc, and loads the workspace
+        // environment, then .envrc-local, from the checkout root after devenv.
+        expect(variables.get('DEVENV_ROOT')).toBe(join(root, 'tooling', 'direnv'));
+        expect(variables.has('SMOO_PARENT_ENVRC')).toBe(false);
+        expect(variables.get('SMOO_LOADED')).toBe('cowshed local');
 
         expect(await direnv(['export', 'json'], loaded)).toBe('');
         await edit(join(root, 'README.md'), 'edited\n');
@@ -215,41 +226,6 @@ describe('a shell direnv keeps loaded', () => {
         expect(await direnv(['export', 'json'], loaded)).toBe('');
         await edit(join(root, 'Cargo.lock'), 'version = 4\n');
         expect(await direnv(['export', 'json'], loaded)).not.toBe('');
-      },
-    );
-  });
-
-  it("is built from the checkout alone, never from a parent directory's .envrc", async () => {
-    await withManagedRepository({}, async ({ root }) => {
-      const { base, direnv } = await isolatedDirenv(root, 'export DEVENV_ROOT="$PWD"');
-      // An approved .envrc one directory up, as a checkout under a projects folder has.
-      const parent = join(dirname(root), '.envrc');
-      await writeFile(parent, 'export SMOO_PARENT_ENVRC=loaded\n');
-      await direnv(['allow', parent], base);
-      await direnv(['allow', root], base);
-
-      const exported: unknown = JSON.parse(await direnv(['export', 'json'], base));
-      const variables = new Map(Object.entries(exported ?? {}));
-      expect(variables.get('DEVENV_ROOT')).toBe(join(root, 'tooling', 'direnv'));
-      expect(variables.has('SMOO_PARENT_ENVRC')).toBe(false);
-    });
-  });
-
-  it('loads the workspace environment, then .envrc-local, from the checkout root after devenv', async () => {
-    await withManagedRepository(
-      {
-        files: {
-          '.cowshed/env': 'export SMOO_LOADED="cowshed"\n',
-          '.envrc-local': 'export SMOO_LOADED="$SMOO_LOADED local"\n',
-        },
-      },
-      async ({ root }) => {
-        // The export devenv replays leaves the shell where its hook last changed directory.
-        const { base, direnv } = await isolatedDirenv(root, 'export DEVENV_ROOT="$PWD"\ncd /');
-        await direnv(['allow', root], base);
-
-        const exported: unknown = JSON.parse(await direnv(['export', 'json'], base));
-        expect(new Map(Object.entries(exported ?? {})).get('SMOO_LOADED')).toBe('cowshed local');
       },
     );
   });
