@@ -19,6 +19,35 @@ import {
 } from './package-target-policy.js';
 
 describe('package target policy', () => {
+  it('reads the object form of workspaces, catalogs beside it, as it reads the array', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoothbricks-pkg-target-'));
+    try {
+      await writeJson(join(root, 'packages/app/package.json'), {
+        name: '@scope/app',
+        nx: {
+          name: 'app',
+          targets: {
+            'build:ts': {
+              executor: 'nx:run-commands',
+              options: { command: 'tsc --build tsconfig.lib.json', cwd: '{projectRoot}' },
+            },
+          },
+        },
+      });
+      await writeJson(join(root, 'package.json'), { name: '@scope/root', private: true, workspaces: ['packages/*'] });
+      const arrayIssues = checkPackageTargetPolicy(root);
+      await writeJson(join(root, 'package.json'), {
+        name: '@scope/root',
+        private: true,
+        workspaces: { packages: ['packages/*'], catalog: { typescript: '^6.0.3' } },
+      });
+
+      expect(arrayIssues.length).toBeGreaterThan(0);
+      expect(checkPackageTargetPolicy(root)).toEqual(arrayIssues);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   it('rejects colon-style package Nx targets', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoothbricks-pkg-target-'));
     try {

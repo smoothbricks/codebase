@@ -14,6 +14,7 @@ import {
   MACOS_PLATFORM_TARGET_GLOBS,
   type NxPolicyIssue,
 } from './workspace-config-policy.js';
+import { workspacePackagePatterns } from './workspace-manifest.js';
 
 export { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 export type { NxPolicyIssue };
@@ -97,9 +98,7 @@ function listWorkspacePackageJsonPaths(root: string): string[] {
   if (!rootPackage) {
     return [];
   }
-  const workspacePatterns = Array.isArray(rootPackage.workspaces)
-    ? rootPackage.workspaces.filter((entry): entry is string => typeof entry === 'string')
-    : [];
+  const workspacePatterns = workspacePackagePatterns(rootPackage.workspaces) ?? [];
   const paths: string[] = [];
   for (const pattern of workspacePatterns) {
     if (!pattern.endsWith('/*')) {

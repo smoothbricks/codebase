@@ -16,6 +16,7 @@ import {
 } from './test-program.js';
 import { isRecord } from './type-guards.js';
 import type { NxPolicyIssue } from './workspace-config-policy.js';
+import { workspacePackagePatterns } from './workspace-manifest.js';
 
 export type TestRunner = 'bun' | 'vitest';
 
@@ -643,9 +644,7 @@ function listWorkspacePackageJsonPaths(root: string): string[] {
   if (!rootPackage) {
     return [];
   }
-  const workspacePatterns = Array.isArray(rootPackage.workspaces)
-    ? rootPackage.workspaces.filter((entry): entry is string => typeof entry === 'string')
-    : [];
+  const workspacePatterns = workspacePackagePatterns(rootPackage.workspaces) ?? [];
   const paths: string[] = [];
   for (const pattern of workspacePatterns) {
     if (!pattern.includes('*')) {

@@ -457,6 +457,29 @@ describe('bounded test target policy', () => {
     expect(ensureBunTestTimeoutFlag('bun run test')).toBe('bun run test');
   });
 
+  it('reads the object form of workspaces, catalogs beside it, as it reads the array', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoothbricks-bounded-policy-'));
+    try {
+      await writeJson(join(root, 'packages/app/package.json'), {
+        name: '@scope/app',
+        scripts: { test: 'bun test --pass-with-no-tests' },
+        nx: { name: 'app' },
+      });
+      await writeJson(join(root, 'package.json'), { name: '@scope/root', private: true, workspaces: ['packages/*'] });
+      const arrayIssues = checkWorkspaceBoundedTestTargetPolicy(root);
+      await writeJson(join(root, 'package.json'), {
+        name: '@scope/root',
+        private: true,
+        workspaces: { packages: ['packages/*'], catalog: { typescript: '^6.0.3' } },
+      });
+
+      expect(arrayIssues.length).toBeGreaterThan(0);
+      expect(checkWorkspaceBoundedTestTargetPolicy(root)).toEqual(arrayIssues);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('checks and fixes workspace package test targets', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoothbricks-bounded-policy-'));
     try {

@@ -12,6 +12,7 @@ import { writeJsonFile } from './managed-files/managed-format.js';
 import type { PackageTargetPolicyOptions, ResolvedProjectTargets } from './package-target-policy.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './test-backstop.js';
 import { isTestRunnerTargetName } from './workspace-config-policy.js';
+import { workspacePackagePatterns } from './workspace-manifest.js';
 
 export { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './test-backstop.js';
 export const BOUNDED_TEST_EXECUTOR = '@smoothbricks/nx-plugin:bounded-exec';
@@ -624,9 +625,7 @@ function listWorkspacePackageJsonPaths(root: string): string[] {
     return [];
   }
   const rootPackage = readPackageJson(rootPackagePath);
-  const workspacePatterns = Array.isArray(rootPackage.workspaces)
-    ? rootPackage.workspaces.filter((entry): entry is string => typeof entry === 'string')
-    : [];
+  const workspacePatterns = workspacePackagePatterns(rootPackage.workspaces) ?? [];
   const paths: string[] = [];
   for (const pattern of workspacePatterns) {
     if (!pattern.endsWith('/*')) {

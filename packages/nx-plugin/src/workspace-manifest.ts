@@ -290,7 +290,17 @@ export interface PackageSmooConfig {
   developerLinks?: Record<string, DeveloperLinkDirectory | DeveloperLinkSnapshotDeclaration>;
 }
 
-export interface PackageWorkspacesObject {
+/**
+ * Bun catalogs: one version per dependency for every member that writes `catalog:` (the default catalog,
+ * also `catalog:default`) or `catalog:<name>` (a named one) instead of a version.
+ */
+export interface PackageCatalogs {
+  catalog?: StringMap;
+  catalogs?: Record<string, StringMap>;
+}
+
+/** The object form of `workspaces`: the member patterns, and the catalogs Bun then reads from here. */
+export interface PackageWorkspacesObject extends PackageCatalogs {
   packages?: string[];
 }
 
@@ -298,7 +308,7 @@ export interface PackageWorkspacesObject {
  * package.json shape used by smoo. Optional fields stay optional so partial
  * manifests parse; mutation helpers create nested objects on demand.
  */
-export interface PackageJson {
+export interface PackageJson extends PackageCatalogs {
   name?: string;
   version?: string;
   private?: boolean;
@@ -371,4 +381,69 @@ export interface NxJson {
 
 export function ciPushBranches(github: PackageSmooGithub | undefined): NonEmptyArray<string> {
   return github?.pushBranches ?? ['main'];
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The member patterns a root manifest's `workspaces` declares, in either shape Bun reads: the array itself, or the
+ * object whose `packages` holds it beside the catalogs. `undefined` when the value is neither.
+ */
+export function workspacePackagePatterns(workspaces: unknown): string[] | undefined {
+  const patterns = isObject(workspaces) ? workspaces.packages : workspaces;
+  return Array.isArray(patterns) ? patterns.filter((entry): entry is string => typeof entry === 'string') : undefined;
+}
+
+/** The default catalog's name: `catalog:` and `catalog:default` both resolve to it. */
+export const DEFAULT_CATALOG = 'default';
+const CATALOG_PROTOCOL = 'catalog:';
+
+/**
+ * The catalog a dependency value names: {@link DEFAULT_CATALOG} for `catalog:` and `catalog:default`, the name for
+ * `catalog:<name>`, `null` for a value that is no catalog reference.
+ */
+export function catalogName(value: string): string | null {
+  return value.startsWith(CATALOG_PROTOCOL) ? value.slice(CATALOG_PROTOCOL.length) || DEFAULT_CATALOG : null;
+}
+
+/**
+ * Where Bun reads a root manifest's catalogs: from the object form of `workspaces` once it holds `catalog` or
+ * `catalogs`, and then from nowhere else; otherwise from the manifest's own top-level `catalog` and `catalogs`.
+ * Measured with `bun install` 1.4.3: beside a `workspaces.catalog`, a top-level `catalog` entry is not in the catalog
+ * and a top-level `catalogs` name is "no catalog named"; beside a `workspaces` object without either, the top level
+ * resolves.
+ */
+function catalogHolder(root: PackageJson): { holder: PackageCatalogs; path: string } {
+  const workspaces = root.workspaces;
+  if (isObject(workspaces) && (workspaces.catalog !== undefined || workspaces.catalogs !== undefined)) {
+    return { holder: workspaces, path: 'workspaces.' };
+  }
+  return { holder: root, path: '' };
+}
+
+/** The catalog `name` resolves to in a root manifest, or `undefined` when the root defines none by that name. */
+export function rootCatalog(root: PackageJson, name: string): StringMap | undefined {
+  const { holder } = catalogHolder(root);
+  return name === DEFAULT_CATALOG ? holder.catalog : holder.catalogs?.[name];
+}
+
+/** The catalog `name` resolves to, created empty where Bun reads it when the root defines none by that name. */
+export function ensureRootCatalog(root: PackageJson, name: string): StringMap {
+  const { holder } = catalogHolder(root);
+  if (name === DEFAULT_CATALOG) {
+    holder.catalog ??= {};
+    return holder.catalog;
+  }
+  holder.catalogs ??= {};
+  const catalog = holder.catalogs[name] ?? {};
+  holder.catalogs[name] = catalog;
+  return catalog;
+}
+
+/** JSON path of the catalog `name` resolves to, for messages: `workspaces.catalog`, `catalogs.<name>`, ... */
+export function rootCatalogPath(root: PackageJson, name: string): string {
+  const { path } = catalogHolder(root);
+  return name === DEFAULT_CATALOG ? `${path}catalog` : `${path}catalogs.${name}`;
 }

@@ -792,6 +792,23 @@ describe('typecheck test policy', () => {
     });
   });
 
+  it('reads the object form of workspaces, catalogs beside it, as it reads the array', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-typecheck-test-policy-'));
+    try {
+      await writeJsonFs(join(root, 'packages/app/package.json'), { name: '@scope/app', scripts: { test: 'bun test' } });
+      await writeJsonFs(join(root, 'package.json'), { workspaces: ['packages/*'] });
+      const arrayIssues = checkTypecheckTestPolicy(root);
+      await writeJsonFs(join(root, 'package.json'), {
+        workspaces: { packages: ['packages/*'], catalog: { typescript: '^6.0.3' } },
+      });
+
+      expect(arrayIssues.length).toBeGreaterThan(0);
+      expect(checkTypecheckTestPolicy(root)).toEqual(arrayIssues);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('creates tsconfig.test.json for bun test package', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-typecheck-test-policy-'));
     try {
