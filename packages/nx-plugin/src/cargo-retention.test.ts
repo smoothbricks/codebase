@@ -441,6 +441,41 @@ async function inFixture(run: (root: string) => Promise<void>): Promise<void> {
   }
 }
 
+/** Labels each assertion of a walk step with the case it proves, so a failing check names that case. */
+function labelled(label: string) {
+  return <T>(actual: T, detail?: string) => expect(actual, detail === undefined ? label : `${label}: ${detail}`);
+}
+
+async function clearReceipt(target: string): Promise<void> {
+  const receipt = join(target, RETENTION_RECEIPT);
+  if (await exists(receipt)) await rm(receipt);
+}
+
+async function clearLock(target: string): Promise<void> {
+  const lock = join(target, RETENTION_LOCK);
+  if (await exists(lock)) await rm(lock);
+}
+
+async function midAndApp(target: string): Promise<string[]> {
+  return [...(await metasOf(target, 'ret-mid')), ...(await metasOf(target, 'ret-app'))].sort();
+}
+
+/**
+ * The walk's next churn: flip the leaf feature mid depends on and build. Returns the mid and app
+ * generations that build supersedes, the set the following retention pass must reclaim.
+ */
+async function toggleFeature(fx: Churn): Promise<string[]> {
+  const extra = (await readFile(join(fx.ws, 'crates/mid/Cargo.toml'), 'utf8')).includes('features = ["extra"]');
+  const superseded = await midAndApp(fx.target);
+  if (superseded.length === 0) throw new Error('the walk left no mid or app generation to supersede');
+  await writeMid(fx.ws, !extra, '0.1');
+  relock(fx.ws);
+  await build(fx.ws);
+  const created = (await metasOf(fx.target, 'ret-mid')).filter((path) => !superseded.includes(path));
+  if (created.length === 0) throw new Error('the feature toggle made no new ret-mid generation');
+  return superseded;
+}
+
 interface ScanWork {
   readonly report: RetentionReport;
   readonly reads: readonly string[];
@@ -449,269 +484,723 @@ interface ScanWork {
   readonly children: readonly string[];
 }
 const validateScanWork = typia.createValidateEquals<ScanWork>();
-describe('cargo retention against real Cargo target layouts', () => {
-  it('a no-op pass reads current fingerprints once without async dispatch or duplicate type stats', async () => {
-    await inFixture(async (root) => {
-      const fx = await churnFixture(root, false);
-      await scopedTo(fx.target, async () => {
-        await churnGenerations(fx);
-        planned(await retain(fx.ws, { apply: true, now: future() }));
-        const module = join(import.meta.dir, '..', 'dist', 'cargo-retention.js');
-        const source = lines(
-          'import fs from "node:fs";',
-          'import promises from "node:fs/promises";',
-          'import cp from "node:child_process";',
-          'import { syncBuiltinESMExports } from "node:module";',
-          `const target = ${JSON.stringify(fx.target)};`,
-          'const reads = [], stats = [], asyncFingerprintCalls = [], children = [];',
-          'const spawn = cp.spawn; cp.spawn = function(command, ...args) { children.push(command); return spawn.call(this, command, ...args); };',
-          'for (const [name, rows] of [["readFileSync", reads], ["lstatSync", stats]]) {',
-          '  const original = fs[name];',
-          '  fs[name] = function(path, ...args) {',
-          '    if (String(path).startsWith(target + "/") && String(path).includes("/fingerprint")) rows.push(String(path));',
-          '    return original.call(this, path, ...args);',
-          '  };',
-          '}',
-          'for (const name of ["readFile", "lstat", "readdir"]) {',
-          '  const original = promises[name];',
-          '  promises[name] = function(path, ...args) {',
-          '    if (String(path).startsWith(target + "/") && String(path).includes("/fingerprint")) asyncFingerprintCalls.push(String(path));',
-          '    return original.call(this, path, ...args);',
-          // Load the product only after installing forwarding I/O counters; static imports run before them.
-          '  };',
-          '}',
-          'syncBuiltinESMExports();',
-          `const { retainCargoWorkspace } = await import(${JSON.stringify(module)});`,
-          `const result = await retainCargoWorkspace(${JSON.stringify(fx.ws)}, { apply: process.argv[1] === 'automatic', automatic: process.argv[1] === 'automatic', now: new Date(${future().getTime()}) });`,
-          'if (!result.ok) throw new Error(JSON.stringify(result.error));',
-          'console.log(JSON.stringify({ report: result.value, reads, stats, asyncFingerprintCalls, children }));',
-        );
-        const child = spawnSync('node', ['--input-type=module', '-e', source], {
-          cwd: fx.ws,
-          env: { ...process.env },
-          encoding: 'utf8',
-        });
-        expect(child.status, child.stderr).toBe(0);
-        const checked = validateScanWork(JSON.parse(child.stdout));
-        if (!checked.success) throw new Error(JSON.stringify(checked.errors));
-        const { report, reads, stats, asyncFingerprintCalls } = checked.data;
-        expect(planned(report).reclaim).toEqual([]);
-        expect(reads.length).toBeGreaterThan(0);
-        expect(new Set(reads).size).toBe(reads.length);
-        expect(new Set(stats).size).toBe(stats.length);
-        expect(asyncFingerprintCalls).toEqual([]);
-        expect(reads.filter((path) => !path.includes('/fingerprint/'))).toEqual([]);
-        expect(stats.filter((path) => path.endsWith('.json'))).toEqual([]);
-        const jsonCount = reads.filter((path) => path.endsWith('.json')).length;
-        expect(reads.length).toBe(2 * jsonCount);
-        const hashPaths = reads.filter((path) => !path.endsWith('.json'));
-        for (const path of hashPaths) expect(stats.filter((stat) => stat === path)).toHaveLength(1);
-        const automatic = spawnSync('node', ['--input-type=module', '-e', source, 'automatic'], {
-          cwd: fx.ws,
-          env: { ...process.env },
-          encoding: 'utf8',
-        });
-        expect(automatic.status, automatic.stderr).toBe(0);
-        const notDue = validateScanWork(JSON.parse(automatic.stdout));
-        if (!notDue.success) throw new Error(JSON.stringify(notDue.errors));
-        expect(notDue.data.report.outcome.kind).toBe('not-due');
-        expect(notDue.data.reads).toEqual([]);
-        expect(notDue.data.stats).toEqual([]);
-        expect(notDue.data.asyncFingerprintCalls).toEqual([]);
-        expect(notDue.data.children).not.toContain('perl');
-        await expectFresh(fx.ws);
-      });
-    });
+/** Title of the reclaim case for one mtime-on-use setting; the walk's first pass and the mtime-on-use case share it. */
+const RECLAIM_TITLE = (mtimeOnUse: boolean): string =>
+  `reclaims exactly the superseded generations and keeps the next build Fresh (mtime-on-use ${String(mtimeOnUse)})`;
+
+/** Case: the u64 fingerprint digits parse and identify exactly. Pure values, so no fixture. */
+function keepsExactDigitsInTheParser(): void {
+  const check = labelled('keeps exact u64 fingerprint digits distinct, parser and end-to-end');
+  const base = '{"rustc":8522741132697106019,"target":17066949999414752808,"deps":[],"local":[]}';
+  const shifted = '{"rustc":8522741132697106019,"target":17066949999414752809,"deps":[],"local":[]}';
+  const a = readCargoFingerprint(base);
+  const b = readCargoFingerprint(shifted);
+  if (!a.ok || !b.ok) throw new Error('fingerprints unreadable');
+  check(fingerprintIdentity('ret-leaf', 'lib-ret_leaf', a.value), 'neighbouring exact digits').not.toBe(
+    fingerprintIdentity('ret-leaf', 'lib-ret_leaf', b.value),
+  );
+  check(readCargoFingerprint('{').ok, 'a truncated fingerprint').toBe(false);
+  check(readCargoFingerprint('{"rustc":1.5,"deps":[]}').ok, 'a fractional integer field').toBe(false);
+}
+
+/** Case: refuses the whole pass over one unreadable fingerprint and changes nothing. */
+async function refusesOverUnreadableFingerprint(fx: Churn): Promise<void> {
+  const check = labelled('refuses the whole pass over one unreadable fingerprint and changes nothing');
+  const meta = only((await metasOf(fx.target, 'ret-mid')).slice(0, 1), 'a ret-mid generation to corrupt');
+  const fingerprints = join(meta, 'fingerprint');
+  const jsonName = (await readdir(fingerprints)).find((name) => name.endsWith('.json'));
+  if (jsonName === undefined) throw new Error(`no fingerprint json under ${fingerprints}`);
+  const jsonPath = join(fingerprints, jsonName);
+  const original = await readFile(jsonPath, 'utf8');
+  await writeFile(jsonPath, '{');
+  const buildDir = join(fx.target, 'debug', 'build');
+  const before = await snapshot(buildDir);
+  const report = await retain(fx.ws, { apply: true, now: future() });
+  check(refused(report).reason).toContain('fingerprint');
+  check(await snapshot(buildDir)).toEqual(before);
+  await writeFile(jsonPath, original);
+}
+
+/** Case: deletes nothing when the flock helper (perl) is unavailable. */
+async function refusesWithoutPerl(fx: Churn): Promise<void> {
+  const check = labelled('deletes nothing when the flock helper (perl) is unavailable');
+  const bin = join(fx.root, 'bin');
+  await mkdir(bin);
+  for (const tool of ['cargo', 'rustc']) {
+    const real = Bun.which(tool);
+    if (real === null) throw new Error(`${tool} is not on PATH`);
+    await symlink(real, join(bin, tool));
+  }
+  const buildDir = join(fx.target, 'debug', 'build');
+  const before = await snapshot(buildDir);
+  await withEnv({ PATH: bin }, async () => {
+    for (const apply of [false, true]) {
+      const result = await retainCargoWorkspace(fx.ws, { apply, now: future() });
+      if (result.ok) throw new Error(`retention ran without perl: ${JSON.stringify(result.value)}`);
+      check(result.error.kind, `apply ${apply}`).toBe('lock-helper');
+    }
   });
-  it('automatic cadence uses only successful matching receipts and due/manual runs read the current graph', async () => {
+  check(await snapshot(buildDir)).toEqual(before);
+}
+
+/** Case: refuses a legacy-layout profile instead of reporting a clean zero. */
+async function refusesLegacyLayout(fx: Churn): Promise<void> {
+  const check = labelled('refuses a legacy-layout profile instead of reporting a clean zero');
+  const leaf = only((await metasOf(fx.target, 'ret-leaf')).slice(0, 1), 'a ret-leaf generation');
+  const fingerprints = join(leaf, 'fingerprint');
+  const jsonName = (await readdir(fingerprints)).find((name) => name.endsWith('.json'));
+  if (jsonName === undefined) throw new Error(`no fingerprint json under ${fingerprints}`);
+  const legacy = join(fx.target, 'debug', '.fingerprint');
+  await mkdir(legacy, { recursive: true });
+  await cp(join(fingerprints, jsonName), join(legacy, jsonName));
+  const buildDir = join(fx.target, 'debug', 'build');
+  const before = await snapshot(buildDir);
+  const report = await retain(fx.ws, { apply: true, now: future() });
+  check(refused(report).reason).toContain('legacy');
+  check(await snapshot(buildDir)).toEqual(before);
+  await rm(legacy, { recursive: true });
+}
+
+/** Case: refuses a profile with Cargo locks but no build directory (split build-dir shape). */
+async function refusesSplitBuildDir(fx: Churn): Promise<void> {
+  const check = labelled('refuses a profile with Cargo locks but no build directory (split build-dir shape)');
+  const split = join(fx.target, 'split-profile');
+  await put(join(split, '.cargo-lock'), '');
+  await put(join(split, '.cargo-build-lock'), '');
+  const buildDir = join(fx.target, 'debug', 'build');
+  const before = await snapshot(buildDir);
+  const report = await retain(fx.ws, { apply: false, now: future() });
+  check(refused(report).reason).toBe('no build directory');
+  check(await snapshot(buildDir)).toEqual(before);
+  await rm(split, { recursive: true });
+}
+
+/** Case: never follows a symlinked fingerprint file; a link inside a real generation refuses the pass. */
+async function refusesSymlinkedFingerprint(fx: Churn): Promise<void> {
+  const check = labelled('never follows a symlinked generation directory or a symlinked fingerprint file');
+  const meta = only((await metasOf(fx.target, 'ret-leaf')).slice(0, 1), 'a ret-leaf generation');
+  const fingerprints = join(meta, 'fingerprint');
+  const kind = (await readdir(fingerprints)).find((name) => name.endsWith('.json'))?.slice(0, -'.json'.length);
+  if (kind === undefined) throw new Error(`no fingerprint kind under ${fingerprints}`);
+  const hashPath = join(fingerprints, kind);
+  const stash = join(fx.root, 'hash-stash');
+  await rename(hashPath, stash);
+  await symlink(stash, hashPath, 'file');
+  const buildDir = join(fx.target, 'debug', 'build');
+  const before = await snapshot(buildDir);
+  const report = await retain(fx.ws, { apply: true, now: future() });
+  check(refused(report).reason).toContain('fingerprint');
+  check(await snapshot(buildDir)).toEqual(before);
+  check(await readFile(stash, 'utf8')).toMatch(/^[0-9a-f]{16}$/);
+  await rm(hashPath);
+  await rename(stash, hashPath);
+}
+
+/** Case: the plan writes nothing and names exactly the superseded generations; at real now they stay recent. */
+async function plansAndKeepsRecent(fx: Churn, gen: Generations, label: string): Promise<PlannedOutcome> {
+  const check = labelled(label);
+  await clearReceipt(fx.target);
+  await clearLock(fx.target);
+  const beforePlan = await snapshot(fx.target);
+  const planReport = await retain(fx.ws, { apply: false, now: future() });
+  const plan = planned(planReport);
+  check(plan.kind).toBe('planned');
+  check(planReport.targetDir).toBe(await realpath(fx.target));
+  check(await snapshot(fx.target)).toEqual(beforePlan);
+  check(await exists(join(fx.target, RETENTION_RECEIPT)), 'plan writes no receipt').toBe(false);
+  check(await exists(join(fx.target, RETENTION_LOCK)), 'plan takes no lock').toBe(false);
+  check(reclaimPaths(plan)).toEqual(gen.superseded);
+  check(plan.reclaimedBytes).toBeGreaterThan(0);
+  check(keepReason(plan, gen.leafOld)).toBe('newest-of-identity');
+  check(keepReason(plan, gen.extMeta)).toBe('dependency-of-kept');
+  // At real now the same generations are inside the recent window: nothing goes.
+  const recent = planned(await retain(fx.ws, { apply: true }));
+  check(recent.reclaim).toEqual([]);
+  check(recent.reclaimedBytes).toBe(0);
+  for (const path of gen.superseded) check(await exists(path), path).toBe(true);
+  await expectFresh(fx.ws);
+  return plan;
+}
+
+/** Case: apply reclaims exactly the superseded generations and keeps the next build Fresh; a repeat is a no-op. */
+async function reclaimsSupersededAndRepeats(
+  fx: Churn,
+  gen: Generations,
+  plan: PlannedOutcome,
+  label: string,
+): Promise<void> {
+  const check = labelled(label);
+  const incremental = join(fx.target, 'debug', 'incremental');
+  const incrementalBefore = await snapshot(incremental);
+  const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
+  check(applied.kind).toBe('reclaimed');
+  check(reclaimPaths(applied)).toEqual(gen.superseded);
+  check(applied.reclaimedBytes).toBeGreaterThanOrEqual(plan.reclaimedBytes);
+  check(applied.reclaimedBytes).toBeGreaterThan(0);
+  for (const path of gen.superseded) check(await exists(path), path).toBe(false);
+  check(await exists(gen.leafOld)).toBe(true);
+  check(await exists(gen.extMeta)).toBe(true);
+  check(await snapshot(incremental)).toEqual(incrementalBefore);
+  await expectFresh(fx.ws);
+  check(execFileSync(join(fx.target, 'debug', 'ret-app'), { encoding: 'utf8' })).toBe('13\n');
+  // A repeated pass is a no-op.
+  const settled = await snapshot(fx.target, new Set([RETENTION_RECEIPT]));
+  const second = planned(await retain(fx.ws, { apply: true, now: future() }));
+  check(second.reclaim).toEqual([]);
+  check(second.reclaimedBytes).toBe(0);
+  check(await snapshot(fx.target, new Set([RETENTION_RECEIPT]))).toEqual(settled);
+}
+
+/** Case: a no-op pass reads current fingerprints once without async dispatch or duplicate type stats. */
+async function noOpPassReadsFingerprintsOnce(fx: Churn): Promise<void> {
+  const check = labelled('a no-op pass reads current fingerprints once without async dispatch or duplicate type stats');
+  await clearReceipt(fx.target);
+  planned(await retain(fx.ws, { apply: true, now: future() }));
+  const module = join(import.meta.dir, '..', 'dist', 'cargo-retention.js');
+  const source = lines(
+    'import fs from "node:fs";',
+    'import promises from "node:fs/promises";',
+    'import cp from "node:child_process";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    `const target = ${JSON.stringify(fx.target)};`,
+    'const reads = [], stats = [], asyncFingerprintCalls = [], children = [];',
+    'const spawn = cp.spawn; cp.spawn = function(command, ...args) { children.push(command); return spawn.call(this, command, ...args); };',
+    'for (const [name, rows] of [["readFileSync", reads], ["lstatSync", stats]]) {',
+    '  const original = fs[name];',
+    '  fs[name] = function(path, ...args) {',
+    '    if (String(path).startsWith(target + "/") && String(path).includes("/fingerprint")) rows.push(String(path));',
+    '    return original.call(this, path, ...args);',
+    '  };',
+    '}',
+    'for (const name of ["readFile", "lstat", "readdir"]) {',
+    '  const original = promises[name];',
+    '  promises[name] = function(path, ...args) {',
+    '    if (String(path).startsWith(target + "/") && String(path).includes("/fingerprint")) asyncFingerprintCalls.push(String(path));',
+    '    return original.call(this, path, ...args);',
+    // Load the product only after installing forwarding I/O counters; static imports run before them.
+    '  };',
+    '}',
+    'syncBuiltinESMExports();',
+    `const { retainCargoWorkspace } = await import(${JSON.stringify(module)});`,
+    `const result = await retainCargoWorkspace(${JSON.stringify(fx.ws)}, { apply: process.argv[1] === 'automatic', automatic: process.argv[1] === 'automatic', now: new Date(${future().getTime()}) });`,
+    'if (!result.ok) throw new Error(JSON.stringify(result.error));',
+    'console.log(JSON.stringify({ report: result.value, reads, stats, asyncFingerprintCalls, children }));',
+  );
+  const child = spawnSync('node', ['--input-type=module', '-e', source], {
+    cwd: fx.ws,
+    env: { ...process.env },
+    encoding: 'utf8',
+  });
+  check(child.status, child.stderr).toBe(0);
+  const checked = validateScanWork(JSON.parse(child.stdout));
+  if (!checked.success) throw new Error(JSON.stringify(checked.errors));
+  const { report, reads, stats, asyncFingerprintCalls } = checked.data;
+  check(planned(report).reclaim).toEqual([]);
+  check(reads.length).toBeGreaterThan(0);
+  check(new Set(reads).size).toBe(reads.length);
+  check(new Set(stats).size).toBe(stats.length);
+  check(asyncFingerprintCalls).toEqual([]);
+  check(reads.filter((path) => !path.includes('/fingerprint/'))).toEqual([]);
+  check(stats.filter((path) => path.endsWith('.json'))).toEqual([]);
+  const jsonCount = reads.filter((path) => path.endsWith('.json')).length;
+  check(reads.length).toBe(2 * jsonCount);
+  const hashPaths = reads.filter((path) => !path.endsWith('.json'));
+  for (const path of hashPaths)
+    check(
+      stats.filter((stat) => stat === path),
+      path,
+    ).toHaveLength(1);
+  const automatic = spawnSync('node', ['--input-type=module', '-e', source, 'automatic'], {
+    cwd: fx.ws,
+    env: { ...process.env },
+    encoding: 'utf8',
+  });
+  check(automatic.status, automatic.stderr).toBe(0);
+  const notDue = validateScanWork(JSON.parse(automatic.stdout));
+  if (!notDue.success) throw new Error(JSON.stringify(notDue.errors));
+  check(notDue.data.report.outcome.kind).toBe('not-due');
+  check(notDue.data.reads).toEqual([]);
+  check(notDue.data.stats).toEqual([]);
+  check(notDue.data.asyncFingerprintCalls).toEqual([]);
+  check(notDue.data.children).not.toContain('perl');
+  await expectFresh(fx.ws);
+}
+
+/** Case: retains foreign entries and fingerprint-less directories while reclaiming around them. */
+async function keepsForeignEntries(fx: Churn, superseded: readonly string[]): Promise<void> {
+  const check = labelled('retains foreign entries and fingerprint-less directories while reclaiming around them');
+  const loose = join(fx.target, 'debug', 'build', 'loose.txt');
+  const notHex = join(fx.target, 'debug', 'build', 'ret-mid', 'not-hex');
+  const emptyHex = join(fx.target, 'debug', 'build', 'ret-leaf', '0123456789abcdef');
+  await put(loose, 'loose\n');
+  await put(join(notHex, 'junk.txt'), 'junk\n');
+  await mkdir(emptyHex, { recursive: true });
+  await put(join(fx.target, 'keep.txt'), 'keep\n');
+  const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
+  check(reclaimPaths(applied)).toEqual(superseded);
+  check(keepReason(applied, loose)).toBe('not-a-unit');
+  check(keepReason(applied, notHex)).toBe('not-a-unit');
+  check(keepReason(applied, emptyHex)).toBe('no-fingerprint');
+  check(await readFile(loose, 'utf8')).toBe('loose\n');
+  check(await readFile(join(notHex, 'junk.txt'), 'utf8')).toBe('junk\n');
+  check(await readFile(join(fx.target, 'keep.txt'), 'utf8')).toBe('keep\n');
+  await expectFresh(fx.ws);
+  // The foreign entries have served their assertions; removing them keeps the walk's generation listings exact.
+  await rm(loose);
+  await rm(notHex, { recursive: true });
+  await rm(emptyHex, { recursive: true });
+  await rm(join(fx.target, 'keep.txt'));
+}
+
+/** Case: never follows a symlinked generation directory; the link is retained and its target untouched. */
+async function keepsSymlinkedGeneration(fx: Churn, superseded: readonly string[]): Promise<void> {
+  const check = labelled('never follows a symlinked generation directory or a symlinked fingerprint file');
+  const outside = join(fx.root, 'outside');
+  await put(join(outside, 'sentinel.txt'), 'sentinel\n');
+  const link = join(fx.target, 'debug', 'build', 'ret-mid', 'fedcba9876543210');
+  await symlink(outside, link, 'dir');
+  const outsideBefore = await snapshot(outside);
+  const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
+  check(reclaimPaths(applied)).toEqual(superseded);
+  const retainedLink = applied.retained.find((entry) => entry.path === link);
+  check(retainedLink?.reason).toBe('not-a-unit');
+  check(retainedLink?.detail).toBe('symbolic link');
+  check((await lstat(link)).isSymbolicLink()).toBe(true);
+  check(await snapshot(outside)).toEqual(outsideBefore);
+  await expectFresh(fx.ws);
+  await rm(link);
+}
+
+/** Case: deletes only proven trash from an interrupted pass and retains the unproven. */
+async function reclaimsOnlyProvenTrash(fx: Churn, superseded: readonly string[]): Promise<void> {
+  const check = labelled('deletes only proven trash from an interrupted pass and retains the unproven');
+  const provenVictim = superseded[0];
+  const mismatchedVictim = superseded[1];
+  if (provenVictim === undefined || mismatchedVictim === undefined) {
+    throw new Error('the churn left fewer than two superseded generations');
+  }
+  const trash = join(fx.target, 'debug', TRASH);
+  const passId = randomUUID();
+  const passDir = join(trash, passId);
+  await mkdir(passDir, { recursive: true });
+  const entryOf = async (from: string, inoDelta: bigint) => {
+    const stats = await lstat(from, { bigint: true });
+    return { from, dev: stats.dev.toString(), ino: (stats.ino + inoDelta).toString() };
+  };
+  const manifest = {
+    version: 1,
+    entries: [await entryOf(provenVictim, 0n), await entryOf(mismatchedVictim, 9n)],
+  };
+  await writeFile(join(trash, `${passId}.json`), JSON.stringify(manifest));
+  await rename(provenVictim, join(passDir, '0'));
+  await rename(mismatchedVictim, join(passDir, '1'));
+  await put(join(passDir, '2', 'sentinel.txt'), 'unlisted\n');
+  await put(join(trash, 'stray.txt'), 'stray\n');
+  const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
+  check(reclaimPaths(applied)).toContain(provenVictim);
+  check(await exists(join(passDir, '0'))).toBe(false);
+  check(keepReason(applied, join(passDir, '1'))).toBe('unproven-trash-entry');
+  check(keepReason(applied, join(passDir, '2'))).toBe('unproven-trash-entry');
+  check(keepReason(applied, join(trash, 'stray.txt'))).toBe('unproven-trash-entry');
+  check(await exists(join(passDir, '1'))).toBe(true);
+  check(await readFile(join(passDir, '2', 'sentinel.txt'), 'utf8')).toBe('unlisted\n');
+  check(await readFile(join(trash, 'stray.txt'), 'utf8')).toBe('stray\n');
+  await expectFresh(fx.ws);
+  await rm(trash, { recursive: true });
+}
+
+/** Case: leaves a nested target directory byte-identical and reports it as a nested root. */
+async function nestedRootStaysByteIdentical(fx: Churn, superseded: readonly string[]): Promise<void> {
+  const check = labelled('leaves a nested target directory byte-identical and reports it as a nested root');
+  const nestedWs = join(fx.root, 'nested');
+  await put(
+    join(nestedWs, 'Cargo.toml'),
+    lines('[package]', 'name = "ret-nested"', 'version = "0.1.0"', 'edition = "2021"', '', '[workspace]'),
+  );
+  await put(join(nestedWs, 'src/lib.rs'), lines('pub fn nested() -> u8 { 7 }'));
+  relock(nestedWs);
+  const nestedTarget = join(fx.target, 'nested-root');
+  await scopedTo(nestedTarget, async () => {
+    await build(nestedWs);
+  });
+  const nestedBefore = await snapshot(nestedTarget);
+  const report = await retain(fx.ws, { apply: true, now: future() });
+  const applied = planned(report);
+  check(report.nestedRoots, JSON.stringify(await readdir(nestedTarget))).toEqual([
+    join(report.targetDir, 'nested-root'),
+  ]);
+  check(reclaimPaths(applied)).toEqual(superseded);
+  check(await snapshot(nestedTarget)).toEqual(nestedBefore);
+  await scopedTo(nestedTarget, async () => {
+    await expectFresh(nestedWs);
+  });
+  await expectFresh(fx.ws);
+  await rm(nestedTarget, { recursive: true });
+}
+
+/** Case: the CLI plans read-only, applies with a receipt, and exits 3 on a refused pass. */
+async function cliPlansReadOnlyAndApplies(fx: Churn, superseded: readonly string[]): Promise<void> {
+  const check = labelled('the CLI plans read-only, applies with a receipt, and exits 3 on a refused pass');
+  await clearReceipt(fx.target);
+  const bin = join(import.meta.dir, '..', 'dist', 'bin', 'smoo-nx-cargo-retain.js');
+  const cli = async (args: string[]): Promise<CargoRun> => {
+    const child = Bun.spawn(['node', bin, ...args], { cwd: fx.ws, env: cargoEnv(), stdout: 'pipe', stderr: 'pipe' });
+    const [code, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    return { code, stdout, stderr };
+  };
+  const before = await snapshot(fx.target);
+  const planRun = await cli([fx.ws]);
+  check(planRun.code, planRun.stderr).toBe(0);
+  const planReport = parseReport(planRun.stdout);
+  check(planned(planReport).kind).toBe('planned');
+  check(await snapshot(fx.target)).toEqual(before);
+  check(await exists(join(fx.target, RETENTION_RECEIPT))).toBe(false);
+  await backdate([...superseded]);
+  const applyRun = await cli(['--apply', fx.ws]);
+  check(applyRun.code, applyRun.stderr).toBe(0);
+  const applyReport = parseReport(applyRun.stdout);
+  check(reclaimPaths(planned(applyReport))).toEqual(superseded);
+  const receipt = parseReport(await readFile(join(fx.target, RETENTION_RECEIPT), 'utf8'));
+  check(receipt).toEqual(applyReport);
+  for (const path of superseded) check(await exists(path), path).toBe(false);
+  await expectFresh(fx.ws);
+  const legacy = join(fx.target, 'debug', '.fingerprint');
+  await mkdir(legacy, { recursive: true });
+  const refusedRun = await cli([fx.ws]);
+  check(refusedRun.code, refusedRun.stderr).toBe(3);
+  check(refused(parseReport(refusedRun.stdout)).reason).toContain('legacy');
+  await rm(legacy, { recursive: true });
+}
+
+/** Case: retains an incomplete (empty-hash) superseded generation while reclaiming complete ones. */
+async function keepsIncompleteGeneration(fx: Churn, superseded: readonly string[]): Promise<void> {
+  const check = labelled('retains an incomplete (empty-hash) superseded generation while reclaiming complete ones');
+  const midMetas = await metasOf(fx.target, 'ret-mid');
+  const husk = superseded.find((path) => midMetas.includes(path));
+  if (husk === undefined) throw new Error('no superseded ret-mid generation to leave incomplete');
+  await emptyHash(husk);
+  await backdate([husk]);
+  const rest = superseded.filter((path) => path !== husk);
+  const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
+  check(reclaimPaths(applied)).toEqual(rest);
+  check(keepReason(applied, husk)).toBe('incomplete-fingerprint');
+  check(await exists(husk)).toBe(true);
+  await expectFresh(fx.ws);
+  await rm(husk, { recursive: true });
+}
+
+/** Case: a half-written current generation nothing kept depends on stays the root and its older generation is reclaimed. */
+async function keepsHalfWrittenCurrentRoot(fx: Churn, superseded: readonly string[]): Promise<void> {
+  const check = labelled(
+    'a half-written current generation nothing kept depends on stays the root and its older generation is reclaimed',
+  );
+  let currentBin: string | undefined;
+  for (const meta of await metasOf(fx.target, 'ret-app')) {
+    if (superseded.includes(meta)) continue;
+    const names = await readdir(join(meta, 'fingerprint'));
+    if (names.some((name) => name.startsWith('bin-') && name.endsWith('.json'))) currentBin = meta;
+  }
+  if (currentBin === undefined) throw new Error('no current bin generation for ret-app');
+  await emptyHash(currentBin);
+  const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
+  check(keepReason(applied, currentBin)).toBe('newest-of-identity');
+  check(reclaimPaths(applied)).toEqual(superseded);
+  check(await exists(currentBin)).toBe(true);
+  const rebuilt = await buildJson(fx.ws);
+  const compiled = rebuilt.filter((artifact) => !artifact.fresh);
+  check(compiled.length).toBeGreaterThan(0);
+  check(compiled.filter((artifact) => !artifact.packageId.includes('ret-app'))).toEqual([]);
+  await expectFresh(fx.ws);
+}
+
+/** Case: a copied bin generation whose exact target digit differs is its own identity: kept, not collapsed. */
+async function keepsCopyWithExactDigits(fx: Churn): Promise<void> {
+  const check = labelled('keeps exact u64 fingerprint digits distinct, parser and end-to-end');
+  let binMeta: string | undefined;
+  let binJson = '';
+  for (const meta of await metasOf(fx.target, 'ret-app')) {
+    const names = await readdir(join(meta, 'fingerprint'));
+    const found = names.find((name) => name.startsWith('bin-') && name.endsWith('.json'));
+    if (found !== undefined) {
+      binMeta = meta;
+      binJson = found;
+    }
+  }
+  if (binMeta === undefined) throw new Error('no bin generation for ret-app');
+  const name = binMeta.slice(binMeta.lastIndexOf('/') + 1);
+  const flipped = (name.startsWith('0') ? '1' : '0') + name.slice(1);
+  const copy = join(dirname(binMeta), flipped);
+  await cp(binMeta, copy, { recursive: true });
+  const copyJson = join(copy, 'fingerprint', binJson);
+  const text = await readFile(copyJson, 'utf8');
+  const match = /"target":(\d+)/.exec(text);
+  if (match === null || match[1] === undefined) throw new Error(`no target digits in ${text}`);
+  const digits = BigInt(match[1]);
+  const neighbor = Number(digits) === Number(digits + 1n) ? digits + 1n : digits - 1n;
+  await writeFile(copyJson, text.replace(`"target":${match[1]}`, `"target":${neighbor.toString()}`));
+  await backdate([copy]);
+  const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
+  check(keepReason(applied, copy)).toBe('newest-of-identity');
+  check(keepReason(applied, binMeta)).toBe('newest-of-identity');
+  check(await exists(copy)).toBe(true);
+  await expectFresh(fx.ws);
+  await rm(copy, { recursive: true });
+}
+
+/** Case: invents no churn for source edits, reverts, or whole cold profiles. */
+async function sourceEditsInventNoChurn(fx: Churn): Promise<void> {
+  const check = labelled('invents no churn for source edits, reverts, or whole cold profiles');
+  await build(fx.ws);
+  await build(fx.ws, ['--release']);
+  const leafSource = join(fx.ws, 'crates/leaf/src/lib.rs');
+  // A source edit rehashes fingerprints inside the same generations.
+  await put(
+    leafSource,
+    lines('pub fn base() -> u8 { 5 }', '', '#[cfg(feature = "extra")]', 'pub fn extra() -> u8 { 2 }'),
+  );
+  await build(fx.ws);
+  const afterEdit = planned(await retain(fx.ws, { apply: true, now: future() }));
+  check(afterEdit.reclaim).toEqual([]);
+  await expectFresh(fx.ws);
+  // Reverting to the exact earlier content reuses the same generations again.
+  await put(
+    leafSource,
+    lines('pub fn base() -> u8 { 1 }', '', '#[cfg(feature = "extra")]', 'pub fn extra() -> u8 { 2 }'),
+  );
+  await build(fx.ws);
+  // Cargo also sees the source revert in release; establish its fresh baseline before retention.
+  await build(fx.ws, ['--release']);
+  const afterRevert = planned(await retain(fx.ws, { apply: true, now: future() }));
+  check(afterRevert.reclaim).toEqual([]);
+  await expectFresh(fx.ws);
+  await expectFresh(fx.ws, ['--release']);
+  // The release profile has served its assertions; removing it returns the target to the debug walk's layout.
+  await rm(join(fx.target, 'release'), { recursive: true });
+}
+
+/** Case: a half-written library keeps dangling generations and adds no recompilation to Cargo recovery. */
+async function halfWrittenLibraryRecovers(fx: Churn, superseded: readonly string[]): Promise<void> {
+  const title = 'a half-written library keeps dangling generations and adds no recompilation to Cargo recovery';
+  const midMetas = await metasOf(fx.target, 'ret-mid');
+  const older = superseded.find((path) => midMetas.includes(path));
+  if (older === undefined) throw new Error('no superseded ret-mid generation');
+  const current = only(
+    midMetas.filter((path) => !superseded.includes(path)),
+    'current ret-mid generation',
+  );
+  const recoveries: string[][][] = [];
+  for (const apply of [false, true]) {
+    const check = labelled(`${title} (${apply ? 'retained' : 'control'})`);
+    await emptyHash(current);
+    if (apply) {
+      const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
+      check(keepReason(applied, current)).toBe('newest-of-identity');
+      check(keepReason(applied, older)).toBe('dangling-dependency');
+      check(reclaimPaths(applied)).toEqual(superseded.filter((path) => path !== older));
+      check(await exists(older)).toBe(true);
+    }
+    // Cargo discovers the incomplete library first, then its binary's changed
+    // dependency. Compare both builds with an untouched control, not a warm-up.
+    const first = (await buildJson(fx.ws)).filter((artifact) => !artifact.fresh);
+    const second = (await buildJson(fx.ws)).filter((artifact) => !artifact.fresh);
+    check(first.some((artifact) => artifact.name === 'ret_mid')).toBe(true);
+    check([...first, ...second].filter((artifact) => ['ret_leaf', 'ret_ext'].includes(artifact.name))).toEqual([]);
+    recoveries.push([first, second].map((artifacts) => artifacts.map((artifact) => artifact.name).sort()));
+    await expectFresh(fx.ws);
+  }
+  labelled(title)(recoveries[1]).toEqual(recoveries[0]);
+  await rm(older, { recursive: true });
+}
+
+/** Case: automatic cadence uses only successful matching receipts; due and manual runs read the current graph. */
+async function automaticCadence(fx: Churn, superseded: readonly string[]): Promise<void> {
+  const check = labelled(
+    'automatic cadence uses only successful matching receipts and due/manual runs read the current graph',
+  );
+  await clearReceipt(fx.target);
+  const now = new Date();
+  const first = await retain(fx.ws, { apply: true, automatic: true, now });
+  check(planned(first).reclaim).toEqual([]);
+  if (first.completed === undefined) throw new Error('first successful apply has no completion');
+  const receiptPath = join(fx.target, RETENTION_RECEIPT);
+  const before = await readFile(receiptPath, 'utf8');
+  const json = join(superseded[0] ?? '', 'fingerprint');
+  const name = (await readdir(json)).find((entry) => entry.endsWith('.json'));
+  if (name === undefined) throw new Error('fixture has no fingerprint JSON');
+  const path = join(json, name);
+  const original = await readFile(path, 'utf8');
+  await writeFile(path, '{');
+  const within = new Date(now.getTime() + 1);
+  check((await retain(fx.ws, { apply: true, automatic: true, now: within })).outcome.kind).toBe('not-due');
+  check(await readFile(receiptPath, 'utf8')).toBe(before);
+  check(refused(await retain(fx.ws, { apply: false, now: within })).reason).toContain('fingerprint');
+  const forced = await retain(fx.ws, { apply: true, now: within });
+  check(forced.outcome.kind).toBe('refused');
+  check(forced.completed).toBeUndefined();
+  const invalidClock = await retainCargoWorkspace(fx.ws, { apply: true, automatic: true, now: new Date(Number.NaN) });
+  check(invalidClock.ok).toBe(false);
+  const due = new Date(now.getTime() + AUTOMATIC_INTERVAL_MS);
+  const failed = await retain(fx.ws, { apply: true, automatic: true, now: due });
+  check(failed.outcome.kind).toBe('refused');
+  check(failed.completed).toBeUndefined();
+  await writeFile(path, original);
+  const recovered = await retain(fx.ws, { apply: true, automatic: true, now: due });
+  check(reclaimPaths(planned(recovered))).toEqual(superseded);
+  check(recovered.completed?.at).toBe(due.getTime());
+  // Invalid/foreign/backward/busy evidence cannot suppress a real current pass.
+  const invalidReceipts = [
+    '{',
+    JSON.stringify({ ...first, workspaceRoot: fx.root }),
+    JSON.stringify({ ...first, targetDir: fx.root }),
+    JSON.stringify({ ...first, completed: { ...first.completed, at: now.getTime() + 1 } }),
+    JSON.stringify({ ...first, completed: { ...first.completed, configuration: 'foreign' } }),
+    JSON.stringify({ ...first, outcome: { kind: 'busy', lock: 'held' } }),
+    JSON.stringify({ ...first, outcome: { kind: 'refused', profile: 'debug', reason: 'unreadable' } }),
+  ];
+  for (const [index, invalid] of invalidReceipts.entries()) {
+    await writeFile(receiptPath, invalid);
+    check((await retain(fx.ws, { apply: true, automatic: true, now })).outcome.kind, `invalid receipt ${index}`).toBe(
+      'reclaimed',
+    );
+  }
+  await writeFile(receiptPath, before);
+  await put(join(fx.ws, '.cargo/config.toml'), fixtureConfig(true));
+  check((await retain(fx.ws, { apply: true, automatic: true, now })).outcome.kind).toBe('reclaimed');
+  await expectFresh(fx.ws);
+}
+
+/** Case: reclaims an old dependency version no kept unit reaches, and keeps the reached one. */
+async function reclaimsUnreachedDependencyVersion(fx: Churn): Promise<void> {
+  const check = labelled('reclaims an old dependency version no kept unit reaches, and keeps the reached one');
+  await build(fx.ws);
+  const extOld = only(await metasOf(fx.target, 'ret-ext'), 'ret-ext 0.1 generation');
+  await put(join(fx.ext, 'Cargo.toml'), extManifest('0.2.0'));
+  await writeMid(fx.ws, false, '0.2');
+  relock(fx.ws);
+  await build(fx.ws);
+  const extAll = await metasOf(fx.target, 'ret-ext');
+  const extNew = only(
+    extAll.filter((path) => path !== extOld),
+    'ret-ext 0.2 generation',
+  );
+  const plan = planned(await retain(fx.ws, { apply: false, now: future() }));
+  check(reclaimPaths(plan)).toContain(extOld);
+  check(keepReason(plan, extNew)).toBe('dependency-of-kept');
+  planned(await retain(fx.ws, { apply: true, now: future() }));
+  check(await exists(extOld)).toBe(false);
+  check(await exists(extNew)).toBe(true);
+  await expectFresh(fx.ws);
+}
+
+/** Case: keeps an older generation still referenced by a kept unit while reclaiming its unreferenced successor. */
+async function keepsReferencedOlderDependency(fx: Churn): Promise<void> {
+  const check = labelled(
+    'keeps an older generation still referenced by a kept unit while reclaiming its unreferenced successor',
+  );
+  const extA = only(await metasOf(fx.target, 'ret-ext'), 'first ret-ext generation');
+  // ret-ext gains a dependency; built alone it makes a newer generation of the same
+  // identity, while the workspace's newest units still reference the first one.
+  const ext2 = join(fx.root, 'ext2');
+  await put(
+    join(ext2, 'Cargo.toml'),
+    lines('[package]', 'name = "ret-ext2"', 'version = "0.1.0"', 'edition = "2021"', '', '[workspace]'),
+  );
+  await put(join(ext2, 'src/lib.rs'), lines('pub fn value() -> u8 { 100 }'));
+  await put(
+    join(fx.ext, 'Cargo.toml'),
+    lines(
+      '[package]',
+      'name = "ret-ext"',
+      'version = "0.2.0"',
+      'edition = "2021"',
+      '',
+      '[dependencies]',
+      'ret-ext2 = { path = "../ext2" }',
+      '',
+      '[workspace]',
+    ),
+  );
+  await put(join(fx.ext, 'src/lib.rs'), lines('pub fn value() -> u8 { ret_ext2::value() + 10 }'));
+  relock(fx.ws);
+  relock(fx.ext);
+  await cargoOk(fx.ext, ['build', '--locked', '--offline']);
+  const extB = only(
+    (await metasOf(fx.target, 'ret-ext')).filter((path) => path !== extA),
+    'second ret-ext generation',
+  );
+  const ext2Meta = only(await metasOf(fx.target, 'ret-ext2'), 'ret-ext2 generation');
+  const plan = planned(await retain(fx.ws, { apply: false, now: future() }));
+  check(keepReason(plan, extA)).toBe('dependency-of-kept');
+  check(reclaimPaths(plan)).toContain(extB);
+  check(reclaimPaths(plan)).toContain(ext2Meta);
+  planned(await retain(fx.ws, { apply: true, now: future() }));
+  check(await exists(extA)).toBe(true);
+  check(await exists(extB)).toBe(false);
+  // Cargo's own dirtiness from the manifest change rebuilds the ext chain and its
+  // workspace dependents, but the cleaner cost the build nothing else: leaf stays Fresh.
+  const rebuilt = await buildJson(fx.ws);
+  check(rebuilt.filter((a) => a.packageId.includes('ret-leaf') && !a.fresh)).toEqual([]);
+  check(rebuilt.filter((a) => a.packageId.includes('ret-ext') && !a.fresh).length).toBeGreaterThan(0);
+  await expectFresh(fx.ws);
+}
+
+describe('cargo retention against real Cargo target layouts', () => {
+  it('walks the retention cases over one churned Cargo target, asserting after every step (mtime-on-use false)', async () => {
+    keepsExactDigitsInTheParser();
     await inFixture(async (root) => {
       const fx = await churnFixture(root, false);
       await scopedTo(fx.target, async () => {
         const gen = await churnGenerations(fx);
-        const now = new Date();
-        const first = await retain(fx.ws, { apply: true, automatic: true, now });
-        expect(planned(first).reclaim).toEqual([]);
-        if (first.completed === undefined) throw new Error('first successful apply has no completion');
-        const receiptPath = join(fx.target, RETENTION_RECEIPT);
-        const before = await readFile(receiptPath, 'utf8');
-        const json = join(gen.superseded[0] ?? '', 'fingerprint');
-        const name = (await readdir(json)).find((name) => name.endsWith('.json'));
-        if (name === undefined) throw new Error('fixture has no fingerprint JSON');
-        const path = join(json, name);
-        const original = await readFile(path, 'utf8');
-        await writeFile(path, '{');
-        const within = new Date(now.getTime() + 1);
-        expect((await retain(fx.ws, { apply: true, automatic: true, now: within })).outcome.kind).toBe('not-due');
-        expect(await readFile(receiptPath, 'utf8')).toBe(before);
-        expect(refused(await retain(fx.ws, { apply: false, now: within })).reason).toContain('fingerprint');
-        const forced = await retain(fx.ws, { apply: true, now: within });
-        expect(forced.outcome.kind).toBe('refused');
-        expect(forced.completed).toBeUndefined();
-        const invalidClock = await retainCargoWorkspace(fx.ws, {
-          apply: true,
-          automatic: true,
-          now: new Date(Number.NaN),
-        });
-        expect(invalidClock.ok).toBe(false);
-        const due = new Date(now.getTime() + AUTOMATIC_INTERVAL_MS);
-        const failed = await retain(fx.ws, { apply: true, automatic: true, now: due });
-        expect(failed.outcome.kind).toBe('refused');
-        expect(failed.completed).toBeUndefined();
-        await writeFile(path, original);
-        const recovered = await retain(fx.ws, { apply: true, automatic: true, now: due });
-        expect(reclaimPaths(planned(recovered))).toEqual(gen.superseded);
-        expect(recovered.completed?.at).toBe(due.getTime());
-        // Invalid/foreign/backward/busy evidence cannot suppress a real current pass.
-        for (const invalid of [
-          '{',
-          JSON.stringify({ ...first, workspaceRoot: root }),
-          JSON.stringify({ ...first, targetDir: root }),
-          JSON.stringify({ ...first, completed: { ...first.completed, at: now.getTime() + 1 } }),
-          JSON.stringify({ ...first, completed: { ...first.completed, configuration: 'foreign' } }),
-          JSON.stringify({ ...first, outcome: { kind: 'busy', lock: 'held' } }),
-          JSON.stringify({ ...first, outcome: { kind: 'refused', profile: 'debug', reason: 'unreadable' } }),
-        ]) {
-          await writeFile(receiptPath, invalid);
-          expect((await retain(fx.ws, { apply: true, automatic: true, now })).outcome.kind).toBe('reclaimed');
-        }
-        await writeFile(receiptPath, before);
-        await put(join(fx.ws, '.cargo/config.toml'), fixtureConfig(true));
-        expect((await retain(fx.ws, { apply: true, automatic: true, now })).outcome.kind).toBe('reclaimed');
-        await expectFresh(fx.ws);
-      });
-    });
-  });
-  for (const mtimeOnUse of [false, true]) {
-    it(
-      'reclaims exactly the superseded generations and keeps the next build Fresh (mtime-on-use ' +
-        String(mtimeOnUse) +
-        ')',
-      async () => {
-        await inFixture(async (root) => {
-          const fx = await churnFixture(root, mtimeOnUse);
-          await scopedTo(fx.target, async () => {
-            const gen = await churnGenerations(fx);
-            const incremental = join(fx.target, 'debug', 'incremental');
-            // A plan creates nothing and names exactly the superseded generations.
-            const beforePlan = await snapshot(fx.target);
-            const planReport = await retain(fx.ws, { apply: false, now: future() });
-            const plan = planned(planReport);
-            expect(plan.kind).toBe('planned');
-            expect(planReport.targetDir).toBe(await realpath(fx.target));
-            expect(await snapshot(fx.target)).toEqual(beforePlan);
-            expect(await exists(join(fx.target, RETENTION_RECEIPT))).toBe(false);
-            expect(await exists(join(fx.target, RETENTION_LOCK))).toBe(false);
-            expect(reclaimPaths(plan)).toEqual(gen.superseded);
-            expect(plan.reclaimedBytes).toBeGreaterThan(0);
-            expect(keepReason(plan, gen.leafOld)).toBe('newest-of-identity');
-            expect(keepReason(plan, gen.extMeta)).toBe('dependency-of-kept');
-            // At real now the same generations are inside the recent window: nothing goes.
-            const recent = planned(await retain(fx.ws, { apply: true }));
-            expect(recent.reclaim).toEqual([]);
-            expect(recent.reclaimedBytes).toBe(0);
-            for (const path of gen.superseded) expect(await exists(path)).toBe(true);
-            await expectFresh(fx.ws);
-            // Outside the window, applying the plan leaves the current build warm.
-            const incrementalBefore = await snapshot(incremental);
-            const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
-            expect(applied.kind).toBe('reclaimed');
-            expect(reclaimPaths(applied)).toEqual(gen.superseded);
-            expect(applied.reclaimedBytes).toBeGreaterThanOrEqual(plan.reclaimedBytes);
-            expect(applied.reclaimedBytes).toBeGreaterThan(0);
-            for (const path of gen.superseded) expect(await exists(path)).toBe(false);
-            expect(await exists(gen.leafOld)).toBe(true);
-            expect(await exists(gen.extMeta)).toBe(true);
-            expect(await snapshot(incremental)).toEqual(incrementalBefore);
-            await expectFresh(fx.ws);
-            expect(execFileSync(join(fx.target, 'debug', 'ret-app'), { encoding: 'utf8' })).toBe('13\n');
-            // A repeated pass is a no-op.
-            const settled = await snapshot(fx.target, new Set([RETENTION_RECEIPT]));
-            const second = planned(await retain(fx.ws, { apply: true, now: future() }));
-            expect(second.reclaim).toEqual([]);
-            expect(second.reclaimedBytes).toBe(0);
-            expect(await snapshot(fx.target, new Set([RETENTION_RECEIPT]))).toEqual(settled);
-          });
-        });
-      },
-    );
-  }
-
-  it('reclaims an old dependency version no kept unit reaches, and keeps the reached one', async () => {
-    await inFixture(async (root) => {
-      const fx = await churnFixture(root, false);
-      await scopedTo(fx.target, async () => {
-        await build(fx.ws);
-        const extOld = only(await metasOf(fx.target, 'ret-ext'), 'ret-ext 0.1 generation');
-        await put(join(fx.ext, 'Cargo.toml'), extManifest('0.2.0'));
-        await writeMid(fx.ws, false, '0.2');
-        relock(fx.ws);
-        await build(fx.ws);
-        const extAll = await metasOf(fx.target, 'ret-ext');
-        const extNew = only(
-          extAll.filter((path) => path !== extOld),
-          'ret-ext 0.2 generation',
-        );
-        const plan = planned(await retain(fx.ws, { apply: false, now: future() }));
-        expect(reclaimPaths(plan)).toContain(extOld);
-        expect(keepReason(plan, extNew)).toBe('dependency-of-kept');
-        planned(await retain(fx.ws, { apply: true, now: future() }));
-        expect(await exists(extOld)).toBe(false);
-        expect(await exists(extNew)).toBe(true);
-        await expectFresh(fx.ws);
+        // Refusals first: each asserts its refusal and puts back the bytes it touched.
+        await refusesOverUnreadableFingerprint(fx);
+        await refusesWithoutPerl(fx);
+        await refusesLegacyLayout(fx);
+        await refusesSplitBuildDir(fx);
+        await refusesSymlinkedFingerprint(fx);
+        // The first plan and reclaim use the generations churnGenerations made.
+        const plan = await plansAndKeepsRecent(fx, gen, RECLAIM_TITLE(false));
+        await reclaimsSupersededAndRepeats(fx, gen, plan, RECLAIM_TITLE(false));
+        // Each later step flips the feature first, so the generations it supersedes are exactly the ones that flip made stale.
+        await toggleFeature(fx);
+        await noOpPassReadsFingerprintsOnce(fx);
+        await keepsForeignEntries(fx, await toggleFeature(fx));
+        await keepsSymlinkedGeneration(fx, await toggleFeature(fx));
+        await reclaimsOnlyProvenTrash(fx, await toggleFeature(fx));
+        await nestedRootStaysByteIdentical(fx, await toggleFeature(fx));
+        await cliPlansReadOnlyAndApplies(fx, await toggleFeature(fx));
+        await keepsIncompleteGeneration(fx, await toggleFeature(fx));
+        await keepsHalfWrittenCurrentRoot(fx, await toggleFeature(fx));
+        // These need no superseded generation: the step above left the target clean.
+        await keepsCopyWithExactDigits(fx);
+        await sourceEditsInventNoChurn(fx);
+        await halfWrittenLibraryRecovers(fx, await toggleFeature(fx));
+        // Last, because its mtime-on-use config change persists to the end of the walk.
+        await automaticCadence(fx, await toggleFeature(fx));
       });
     });
   });
 
-  it('keeps an older generation still referenced by a kept unit while reclaiming its unreferenced successor', async () => {
+  it(RECLAIM_TITLE(true), async () => {
+    await inFixture(async (root) => {
+      const fx = await churnFixture(root, true);
+      await scopedTo(fx.target, async () => {
+        const gen = await churnGenerations(fx);
+        const plan = await plansAndKeepsRecent(fx, gen, RECLAIM_TITLE(true));
+        await reclaimsSupersededAndRepeats(fx, gen, plan, RECLAIM_TITLE(true));
+      });
+    });
+  });
+
+  it('reclaims an old dependency version no kept unit reaches, and keeps an older generation still referenced by a kept unit', async () => {
     await inFixture(async (root) => {
       const fx = await churnFixture(root, false);
       await scopedTo(fx.target, async () => {
-        await build(fx.ws);
-        const extA = only(await metasOf(fx.target, 'ret-ext'), 'first ret-ext generation');
-        // ret-ext gains a dependency; built alone it makes a newer generation of the same
-        // identity, while the workspace's newest units still reference the first one.
-        const ext2 = join(root, 'ext2');
-        await put(
-          join(ext2, 'Cargo.toml'),
-          lines('[package]', 'name = "ret-ext2"', 'version = "0.1.0"', 'edition = "2021"', '', '[workspace]'),
-        );
-        await put(join(ext2, 'src/lib.rs'), lines('pub fn value() -> u8 { 100 }'));
-        await put(
-          join(fx.ext, 'Cargo.toml'),
-          lines(
-            '[package]',
-            'name = "ret-ext"',
-            'version = "0.1.0"',
-            'edition = "2021"',
-            '',
-            '[dependencies]',
-            'ret-ext2 = { path = "../ext2" }',
-            '',
-            '[workspace]',
-          ),
-        );
-        await put(join(fx.ext, 'src/lib.rs'), lines('pub fn value() -> u8 { ret_ext2::value() + 10 }'));
-        relock(fx.ws);
-        relock(fx.ext);
-        await cargoOk(fx.ext, ['build', '--locked', '--offline']);
-        const extB = only(
-          (await metasOf(fx.target, 'ret-ext')).filter((path) => path !== extA),
-          'second ret-ext generation',
-        );
-        const ext2Meta = only(await metasOf(fx.target, 'ret-ext2'), 'ret-ext2 generation');
-        const plan = planned(await retain(fx.ws, { apply: false, now: future() }));
-        expect(keepReason(plan, extA)).toBe('dependency-of-kept');
-        expect(reclaimPaths(plan)).toContain(extB);
-        expect(reclaimPaths(plan)).toContain(ext2Meta);
-        planned(await retain(fx.ws, { apply: true, now: future() }));
-        expect(await exists(extA)).toBe(true);
-        expect(await exists(extB)).toBe(false);
-        // Cargo's own dirtiness from the manifest change rebuilds the ext chain and its
-        // workspace dependents, but the cleaner cost the build nothing else: leaf stays Fresh.
-        const rebuilt = await buildJson(fx.ws);
-        expect(rebuilt.filter((a) => a.packageId.includes('ret-leaf') && !a.fresh)).toEqual([]);
-        expect(rebuilt.filter((a) => a.packageId.includes('ret-ext') && !a.fresh).length).toBeGreaterThan(0);
-        await expectFresh(fx.ws);
+        await reclaimsUnreachedDependencyVersion(fx);
+        await keepsReferencedOlderDependency(fx);
       });
     });
   });
@@ -863,303 +1352,6 @@ describe('cargo retention against real Cargo target layouts', () => {
     });
   });
 
-  it('refuses the whole pass over one unreadable fingerprint and changes nothing', async () => {
-    await inFixture(async (root) => {
-      const fx = await churnFixture(root, false);
-      await scopedTo(fx.target, async () => {
-        await churnGenerations(fx);
-        const meta = only((await metasOf(fx.target, 'ret-mid')).slice(0, 1), 'a ret-mid generation to corrupt');
-        const fingerprints = join(meta, 'fingerprint');
-        const jsonName = (await readdir(fingerprints)).find((name) => name.endsWith('.json'));
-        if (jsonName === undefined) throw new Error(`no fingerprint json under ${fingerprints}`);
-        await writeFile(join(fingerprints, jsonName), '{');
-        const buildDir = join(fx.target, 'debug', 'build');
-        const before = await snapshot(buildDir);
-        const report = await retain(fx.ws, { apply: true, now: future() });
-        expect(refused(report).reason).toContain('fingerprint');
-        expect(await snapshot(buildDir)).toEqual(before);
-      });
-    });
-  });
-
-  it('retains foreign entries and fingerprint-less directories while reclaiming around them', async () => {
-    await inFixture(async (root) => {
-      const fx = await churnFixture(root, false);
-      await scopedTo(fx.target, async () => {
-        const gen = await churnGenerations(fx);
-        const loose = join(fx.target, 'debug', 'build', 'loose.txt');
-        const notHex = join(fx.target, 'debug', 'build', 'ret-mid', 'not-hex');
-        const emptyHex = join(fx.target, 'debug', 'build', 'ret-leaf', '0123456789abcdef');
-        await put(loose, 'loose\n');
-        await put(join(notHex, 'junk.txt'), 'junk\n');
-        await mkdir(emptyHex, { recursive: true });
-        await put(join(fx.target, 'keep.txt'), 'keep\n');
-        const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
-        expect(reclaimPaths(applied)).toEqual(gen.superseded);
-        expect(keepReason(applied, loose)).toBe('not-a-unit');
-        expect(keepReason(applied, notHex)).toBe('not-a-unit');
-        expect(keepReason(applied, emptyHex)).toBe('no-fingerprint');
-        expect(await readFile(loose, 'utf8')).toBe('loose\n');
-        expect(await readFile(join(notHex, 'junk.txt'), 'utf8')).toBe('junk\n');
-        expect(await readFile(join(fx.target, 'keep.txt'), 'utf8')).toBe('keep\n');
-        await expectFresh(fx.ws);
-      });
-    });
-  });
-
-  it('never follows a symlinked generation directory or a symlinked fingerprint file', async () => {
-    await inFixture(async (root) => {
-      const fx = await churnFixture(root, false);
-      await scopedTo(fx.target, async () => {
-        const gen = await churnGenerations(fx);
-        const outside = join(root, 'outside');
-        await put(join(outside, 'sentinel.txt'), 'sentinel\n');
-        const link = join(fx.target, 'debug', 'build', 'ret-mid', 'fedcba9876543210');
-        await symlink(outside, link, 'dir');
-        const outsideBefore = await snapshot(outside);
-        const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
-        expect(reclaimPaths(applied)).toEqual(gen.superseded);
-        const retainedLink = applied.retained.find((entry) => entry.path === link);
-        expect(retainedLink?.reason).toBe('not-a-unit');
-        expect(retainedLink?.detail).toBe('symbolic link');
-        expect((await lstat(link)).isSymbolicLink()).toBe(true);
-        expect(await snapshot(outside)).toEqual(outsideBefore);
-        await expectFresh(fx.ws);
-        // A symlinked fingerprint hash file inside a real generation refuses the pass.
-        const meta = only((await metasOf(fx.target, 'ret-leaf')).slice(0, 1), 'a ret-leaf generation');
-        const fingerprints = join(meta, 'fingerprint');
-        const kind = (await readdir(fingerprints)).find((name) => name.endsWith('.json'))?.slice(0, -'.json'.length);
-        if (kind === undefined) throw new Error(`no fingerprint kind under ${fingerprints}`);
-        const hashPath = join(fingerprints, kind);
-        const stash = join(root, 'hash-stash');
-        await rename(hashPath, stash);
-        await symlink(stash, hashPath, 'file');
-        const before = await snapshot(join(fx.target, 'debug', 'build'));
-        const report = await retain(fx.ws, { apply: true, now: future() });
-        expect(refused(report).reason).toContain('fingerprint');
-        expect(await snapshot(join(fx.target, 'debug', 'build'))).toEqual(before);
-        expect(await readFile(stash, 'utf8')).toMatch(/^[0-9a-f]{16}$/);
-      });
-    });
-  });
-
-  it('refuses a legacy-layout profile instead of reporting a clean zero', async () => {
-    await inFixture(async (root) => {
-      const fx = await churnFixture(root, false);
-      await scopedTo(fx.target, async () => {
-        await build(fx.ws);
-        const meta = only(await metasOf(fx.target, 'ret-leaf'), 'ret-leaf generation');
-        const fingerprints = join(meta, 'fingerprint');
-        const jsonName = (await readdir(fingerprints)).find((name) => name.endsWith('.json'));
-        if (jsonName === undefined) throw new Error(`no fingerprint json under ${fingerprints}`);
-        const legacy = join(fx.target, 'debug', '.fingerprint');
-        await mkdir(legacy, { recursive: true });
-        await cp(join(fingerprints, jsonName), join(legacy, jsonName));
-        const before = await snapshot(join(fx.target, 'debug', 'build'));
-        const report = await retain(fx.ws, { apply: true, now: future() });
-        expect(refused(report).reason).toContain('legacy');
-        expect(await snapshot(join(fx.target, 'debug', 'build'))).toEqual(before);
-      });
-    });
-  });
-
-  it('refuses a profile with Cargo locks but no build directory (split build-dir shape)', async () => {
-    await inFixture(async (root) => {
-      const fx = await churnFixture(root, false);
-      await scopedTo(fx.target, async () => {
-        await build(fx.ws);
-        const split = join(fx.target, 'split-profile');
-        await put(join(split, '.cargo-lock'), '');
-        await put(join(split, '.cargo-build-lock'), '');
-        const before = await snapshot(join(fx.target, 'debug', 'build'));
-        const report = await retain(fx.ws, { apply: false, now: future() });
-        expect(refused(report).reason).toBe('no build directory');
-        expect(await snapshot(join(fx.target, 'debug', 'build'))).toEqual(before);
-      });
-    });
-  });
-
-  it('leaves a nested target directory byte-identical and reports it as a nested root', async () => {
-    await inFixture(async (root) => {
-      const fx = await churnFixture(root, false);
-      const nestedWs = join(root, 'nested');
-      await put(
-        join(nestedWs, 'Cargo.toml'),
-        lines('[package]', 'name = "ret-nested"', 'version = "0.1.0"', 'edition = "2021"', '', '[workspace]'),
-      );
-      await put(join(nestedWs, 'src/lib.rs'), lines('pub fn nested() -> u8 { 7 }'));
-      relock(nestedWs);
-      await scopedTo(fx.target, async () => {
-        const gen = await churnGenerations(fx);
-        const nestedTarget = join(fx.target, 'nested-root');
-        await scopedTo(nestedTarget, async () => {
-          await build(nestedWs);
-        });
-        const nestedBefore = await snapshot(nestedTarget);
-        const report = await retain(fx.ws, { apply: true, now: future() });
-        const applied = planned(report);
-        expect(report.nestedRoots, JSON.stringify(await readdir(nestedTarget))).toEqual([
-          join(report.targetDir, 'nested-root'),
-        ]);
-        expect(reclaimPaths(applied)).toEqual(gen.superseded);
-        expect(await snapshot(nestedTarget)).toEqual(nestedBefore);
-        await scopedTo(nestedTarget, async () => {
-          await expectFresh(nestedWs);
-        });
-        await expectFresh(fx.ws);
-      });
-    });
-  });
-
-  it('deletes only proven trash from an interrupted pass and retains the unproven', async () => {
-    await inFixture(async (root) => {
-      const fx = await churnFixture(root, false);
-      await scopedTo(fx.target, async () => {
-        const gen = await churnGenerations(fx);
-        const provenVictim = gen.superseded[0];
-        const mismatchedVictim = gen.superseded[1];
-        if (provenVictim === undefined || mismatchedVictim === undefined) {
-          throw new Error('the churn left fewer than two superseded generations');
-        }
-        const profile = join(fx.target, 'debug');
-        const trash = join(profile, TRASH);
-        const passId = randomUUID();
-        const passDir = join(trash, passId);
-        await mkdir(passDir, { recursive: true });
-        const entryOf = async (from: string, inoDelta: bigint) => {
-          const stats = await lstat(from, { bigint: true });
-          return { from, dev: stats.dev.toString(), ino: (stats.ino + inoDelta).toString() };
-        };
-        const manifest = {
-          version: 1,
-          entries: [await entryOf(provenVictim, 0n), await entryOf(mismatchedVictim, 9n)],
-        };
-        await writeFile(join(trash, `${passId}.json`), JSON.stringify(manifest));
-        await rename(provenVictim, join(passDir, '0'));
-        await rename(mismatchedVictim, join(passDir, '1'));
-        await put(join(passDir, '2', 'sentinel.txt'), 'unlisted\n');
-        await put(join(trash, 'stray.txt'), 'stray\n');
-        const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
-        expect(reclaimPaths(applied)).toContain(provenVictim);
-        expect(await exists(join(passDir, '0'))).toBe(false);
-        expect(keepReason(applied, join(passDir, '1'))).toBe('unproven-trash-entry');
-        expect(keepReason(applied, join(passDir, '2'))).toBe('unproven-trash-entry');
-        expect(keepReason(applied, join(trash, 'stray.txt'))).toBe('unproven-trash-entry');
-        expect(await exists(join(passDir, '1'))).toBe(true);
-        expect(await readFile(join(passDir, '2', 'sentinel.txt'), 'utf8')).toBe('unlisted\n');
-        expect(await readFile(join(trash, 'stray.txt'), 'utf8')).toBe('stray\n');
-        await expectFresh(fx.ws);
-      });
-    });
-  });
-
-  it('deletes nothing when the flock helper (perl) is unavailable', async () => {
-    await inFixture(async (root) => {
-      const fx = await churnFixture(root, false);
-      await scopedTo(fx.target, async () => {
-        await build(fx.ws);
-        const bin = join(root, 'bin');
-        await mkdir(bin);
-        for (const tool of ['cargo', 'rustc']) {
-          const real = Bun.which(tool);
-          if (real === null) throw new Error(`${tool} is not on PATH`);
-          await symlink(real, join(bin, tool));
-        }
-        const before = await snapshot(join(fx.target, 'debug', 'build'));
-        await withEnv({ PATH: bin }, async () => {
-          for (const apply of [false, true]) {
-            const result = await retainCargoWorkspace(fx.ws, { apply, now: future() });
-            if (result.ok) throw new Error(`retention ran without perl: ${JSON.stringify(result.value)}`);
-            expect(result.error.kind).toBe('lock-helper');
-          }
-        });
-        expect(await snapshot(join(fx.target, 'debug', 'build'))).toEqual(before);
-      });
-    });
-  });
-
-  it('keeps exact u64 fingerprint digits distinct, parser and end-to-end', async () => {
-    const base = '{"rustc":8522741132697106019,"target":17066949999414752808,"deps":[],"local":[]}';
-    const shifted = '{"rustc":8522741132697106019,"target":17066949999414752809,"deps":[],"local":[]}';
-    expect(Number(17066949999414752808n)).toBe(Number(17066949999414752809n));
-    const a = readCargoFingerprint(base);
-    const b = readCargoFingerprint(shifted);
-    if (!a.ok || !b.ok) throw new Error('fingerprints unreadable');
-    expect(fingerprintIdentity('ret-leaf', 'lib-ret_leaf', a.value)).not.toBe(
-      fingerprintIdentity('ret-leaf', 'lib-ret_leaf', b.value),
-    );
-    expect(readCargoFingerprint('{').ok).toBe(false);
-    expect(readCargoFingerprint('{"rustc":1.5,"deps":[]}').ok).toBe(false);
-    await inFixture(async (root) => {
-      const fx = await churnFixture(root, false);
-      await scopedTo(fx.target, async () => {
-        await build(fx.ws);
-        const appMetas = await metasOf(fx.target, 'ret-app');
-        let binMeta: string | undefined;
-        let binJson = '';
-        for (const meta of appMetas) {
-          const names = await readdir(join(meta, 'fingerprint'));
-          const found = names.find((name) => name.startsWith('bin-') && name.endsWith('.json'));
-          if (found !== undefined) {
-            binMeta = meta;
-            binJson = found;
-          }
-        }
-        if (binMeta === undefined) throw new Error('no bin generation for ret-app');
-        const name = binMeta.slice(binMeta.lastIndexOf('/') + 1);
-        const flipped = (name.startsWith('0') ? '1' : '0') + name.slice(1);
-        const copy = join(dirname(binMeta), flipped);
-        await cp(binMeta, copy, { recursive: true });
-        const copyJson = join(copy, 'fingerprint', binJson);
-        const text = await readFile(copyJson, 'utf8');
-        const match = /"target":(\d+)/.exec(text);
-        if (match === null || match[1] === undefined) throw new Error(`no target digits in ${text}`);
-        const digits = BigInt(match[1]);
-        const neighbor = Number(digits) === Number(digits + 1n) ? digits + 1n : digits - 1n;
-        expect(Number(neighbor)).toBe(Number(digits));
-        await writeFile(copyJson, text.replace(`"target":${match[1]}`, `"target":${neighbor.toString()}`));
-        await backdate([copy]);
-        const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
-        expect(keepReason(applied, copy)).toBe('newest-of-identity');
-        expect(keepReason(applied, binMeta)).toBe('newest-of-identity');
-        expect(await exists(copy)).toBe(true);
-        await expectFresh(fx.ws);
-      });
-    });
-  });
-
-  it('invents no churn for source edits, reverts, or whole cold profiles', async () => {
-    await inFixture(async (root) => {
-      const fx = await churnFixture(root, false);
-      await scopedTo(fx.target, async () => {
-        await build(fx.ws);
-        await build(fx.ws, ['--release']);
-        const leafSource = join(fx.ws, 'crates/leaf/src/lib.rs');
-        // A source edit rehashes fingerprints inside the same generations.
-        await put(
-          leafSource,
-          lines('pub fn base() -> u8 { 5 }', '', '#[cfg(feature = "extra")]', 'pub fn extra() -> u8 { 2 }'),
-        );
-        await build(fx.ws);
-        const afterEdit = planned(await retain(fx.ws, { apply: true, now: future() }));
-        expect(afterEdit.reclaim).toEqual([]);
-        await expectFresh(fx.ws);
-        // Reverting to the exact earlier content reuses the same generations again.
-        await put(
-          leafSource,
-          lines('pub fn base() -> u8 { 1 }', '', '#[cfg(feature = "extra")]', 'pub fn extra() -> u8 { 2 }'),
-        );
-        await build(fx.ws);
-        // Cargo also sees the source revert in release; establish its fresh baseline before retention.
-        await build(fx.ws, ['--release']);
-        const afterRevert = planned(await retain(fx.ws, { apply: true, now: future() }));
-        expect(afterRevert.reclaim).toEqual([]);
-        await expectFresh(fx.ws);
-        await expectFresh(fx.ws, ['--release']);
-      });
-    });
-  });
-
   it('accepts a real pre-created Cargo target without a backup tag, but refuses a foreign root or forged tag', async () => {
     await inFixture(async (root) => {
       const empty = await retainCargoWorkspace(root, { apply: false });
@@ -1180,51 +1372,6 @@ describe('cargo retention against real Cargo target layouts', () => {
         const forged = await retainCargoWorkspace(fx.ws, { apply: false, now: future() });
         if (forged.ok) throw new Error('a forged CACHEDIR.TAG produced a report');
         expect(forged.error.kind).toBe('target-not-cargo');
-      });
-    });
-  });
-
-  it('the CLI plans read-only, applies with a receipt, and exits 3 on a refused pass', async () => {
-    await inFixture(async (root) => {
-      const fx = await churnFixture(root, false);
-      await scopedTo(fx.target, async () => {
-        const gen = await churnGenerations(fx);
-        const bin = join(import.meta.dir, '..', 'dist', 'bin', 'smoo-nx-cargo-retain.js');
-        const cli = async (args: string[]): Promise<CargoRun> => {
-          const child = Bun.spawn(['node', bin, ...args], {
-            cwd: fx.ws,
-            env: cargoEnv(),
-            stdout: 'pipe',
-            stderr: 'pipe',
-          });
-          const [code, stdout, stderr] = await Promise.all([
-            child.exited,
-            new Response(child.stdout).text(),
-            new Response(child.stderr).text(),
-          ]);
-          return { code, stdout, stderr };
-        };
-        const before = await snapshot(fx.target);
-        const planRun = await cli([fx.ws]);
-        expect(planRun.code, planRun.stderr).toBe(0);
-        const planReport = parseReport(planRun.stdout);
-        expect(planned(planReport).kind).toBe('planned');
-        expect(await snapshot(fx.target)).toEqual(before);
-        expect(await exists(join(fx.target, RETENTION_RECEIPT))).toBe(false);
-        await backdate(gen.superseded);
-        const applyRun = await cli(['--apply', fx.ws]);
-        expect(applyRun.code, applyRun.stderr).toBe(0);
-        const applyReport = parseReport(applyRun.stdout);
-        expect(reclaimPaths(planned(applyReport))).toEqual(gen.superseded);
-        const receipt = parseReport(await readFile(join(fx.target, RETENTION_RECEIPT), 'utf8'));
-        expect(receipt).toEqual(applyReport);
-        for (const path of gen.superseded) expect(await exists(path)).toBe(false);
-        await expectFresh(fx.ws);
-        const legacy = join(fx.target, 'debug', '.fingerprint');
-        await mkdir(legacy, { recursive: true });
-        const refusedRun = await cli([fx.ws]);
-        expect(refusedRun.code, refusedRun.stderr).toBe(3);
-        expect(refused(parseReport(refusedRun.stdout)).reason).toContain('legacy');
       });
     });
   });
@@ -1341,90 +1488,6 @@ describe('cargo retention against real Cargo target layouts', () => {
           await expectFresh(fx.ws);
         },
       );
-    });
-  });
-
-  it('retains an incomplete (empty-hash) superseded generation while reclaiming complete ones', async () => {
-    await inFixture(async (root) => {
-      const fx = await churnFixture(root, false);
-      await scopedTo(fx.target, async () => {
-        const gen = await churnGenerations(fx);
-        const midMetas = await metasOf(fx.target, 'ret-mid');
-        const husk = gen.superseded.find((path) => midMetas.includes(path));
-        if (husk === undefined) throw new Error('no superseded ret-mid generation to leave incomplete');
-        await emptyHash(husk);
-        await backdate([husk]);
-        const rest = gen.superseded.filter((path) => path !== husk);
-        const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
-        expect(reclaimPaths(applied)).toEqual(rest);
-        expect(keepReason(applied, husk)).toBe('incomplete-fingerprint');
-        expect(await exists(husk)).toBe(true);
-        await expectFresh(fx.ws);
-      });
-    });
-  });
-
-  it('a half-written current generation nothing kept depends on stays the root and its older generation is reclaimed', async () => {
-    await inFixture(async (root) => {
-      const fx = await churnFixture(root, false);
-      await scopedTo(fx.target, async () => {
-        const gen = await churnGenerations(fx);
-        let currentBin: string | undefined;
-        for (const meta of await metasOf(fx.target, 'ret-app')) {
-          if (gen.superseded.includes(meta)) continue;
-          const names = await readdir(join(meta, 'fingerprint'));
-          if (names.some((name) => name.startsWith('bin-') && name.endsWith('.json'))) currentBin = meta;
-        }
-        if (currentBin === undefined) throw new Error('no current bin generation for ret-app');
-        await emptyHash(currentBin);
-        const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
-        expect(keepReason(applied, currentBin)).toBe('newest-of-identity');
-        expect(reclaimPaths(applied)).toEqual(gen.superseded);
-        expect(await exists(currentBin)).toBe(true);
-        const rebuilt = await buildJson(fx.ws);
-        const compiled = rebuilt.filter((a) => !a.fresh);
-        expect(compiled.length).toBeGreaterThan(0);
-        expect(compiled.filter((a) => !a.packageId.includes('ret-app'))).toEqual([]);
-        await expectFresh(fx.ws);
-      });
-    });
-  });
-
-  it('a half-written library keeps dangling generations and adds no recompilation to Cargo recovery', async () => {
-    await inFixture(async (root) => {
-      const recoveries: string[][][] = [];
-      for (const apply of [false, true]) {
-        const fx = await churnFixture(join(root, apply ? 'retained' : 'control'), false);
-        await scopedTo(fx.target, async () => {
-          const gen = await churnGenerations(fx);
-          const midMetas = await metasOf(fx.target, 'ret-mid');
-          const older = gen.superseded.find((path) => midMetas.includes(path));
-          const current = only(
-            midMetas.filter((path) => !gen.superseded.includes(path)),
-            'current ret-mid generation',
-          );
-          if (older === undefined) throw new Error('no superseded ret-mid generation');
-          await emptyHash(current);
-          if (apply) {
-            const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
-            expect(keepReason(applied, current)).toBe('newest-of-identity');
-            expect(keepReason(applied, older)).toBe('dangling-dependency');
-            expect(reclaimPaths(applied)).toEqual(gen.superseded.filter((path) => path !== older));
-            expect(await exists(older)).toBe(true);
-          }
-          // Cargo discovers the incomplete library first, then its binary's changed
-          // dependency. Compare both builds with an untouched control, not a warm-up.
-          const first = (await buildJson(fx.ws)).filter((artifact) => !artifact.fresh);
-          const second = (await buildJson(fx.ws)).filter((artifact) => !artifact.fresh);
-          expect(first.some((artifact) => artifact.name === 'ret_mid')).toBe(true);
-          expect([...first, ...second].filter((artifact) => ['ret_leaf', 'ret_ext'].includes(artifact.name))).toEqual(
-            [],
-          );
-          recoveries.push([first, second].map((artifacts) => artifacts.map((artifact) => artifact.name).sort()));
-          await expectFresh(fx.ws);
-        });
-      }
-      expect(recoveries[1]).toEqual(recoveries[0]);
     });
   });
 
