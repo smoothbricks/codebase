@@ -20,7 +20,7 @@ import {
 } from '../pack.js';
 import { git, gitOutput } from './helpers/fixture-repo.js';
 import { type PackWorkspacePackage, packedManifestJson, withPackWorkspace } from './helpers/pack-workspace.js';
-import { withPrivateNpmFixture } from './helpers/private-registry.js';
+import { FIXTURE_SCOPE, withPrivateNpmFixture } from './helpers/private-registry.js';
 
 describe('release pack', () => {
   /**
@@ -97,6 +97,18 @@ describe('release pack', () => {
   it('writes a verifiable artifact directory and refuses to mix, trust or rebind one', async () => {
     await withPrivateNpmFixture(async (fixture) => {
       await withPackWorkspace(async (root) => {
+        // The pack must reach no registry. npm reads .npmrc and bun reads bunfig.toml, so both name the loopback
+        // stand-ins (the private scope its own endpoint): a request to either is recorded below instead of
+        // leaving the machine.
+        await writeFile(
+          join(root, '.npmrc'),
+          `registry=${fixture.publicRegistry.registry}\n${FIXTURE_SCOPE}:registry=${fixture.privateRegistry.registry}\n`,
+        );
+        await writeFile(
+          join(root, 'bunfig.toml'),
+          `[install]\nregistry = ${JSON.stringify(fixture.publicRegistry.registry)}\n`,
+        );
+
         const output = artifactsDir(root, 'closure');
         const headBefore = await gitOutput(root, ['rev-parse', 'HEAD']);
         const tagsBefore = await gitOutput(root, ['tag', '--list']);
