@@ -2569,4 +2569,4 @@ impl DirectoryExecutionHost {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

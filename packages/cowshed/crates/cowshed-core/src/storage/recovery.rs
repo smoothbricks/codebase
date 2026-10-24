@@ -813,13 +813,16 @@ impl LifecycleIntentRecord {
     }
 }
 
-/// One bounded record per logical workspace. A later lifecycle supersedes the prior record for the
-/// same name, so retry evidence cannot grow without bound.
+/// Lifecycle entries are bounded to one record per logical workspace. Recovery exports retain
+/// per-source custody through completion; terminal project unbinding releases this controller journal.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LifecycleIntentJournal {
     version: u32,
     entries: BTreeMap<WorkspaceName, LifecycleIntentRecord>,
+    /// Recovery-export proofs remain controller metadata until terminal project unbinding.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    recovery_exports: BTreeMap<PathBuf, super::recovery_image::custody::RecoveryExport>,
 }
 
 impl Default for LifecycleIntentJournal {
@@ -827,6 +830,7 @@ impl Default for LifecycleIntentJournal {
         Self {
             version: LIFECYCLE_INTENT_VERSION,
             entries: BTreeMap::new(),
+            recovery_exports: BTreeMap::new(),
         }
     }
 }
@@ -907,6 +911,33 @@ impl LifecycleIntentJournal {
         })
     }
 
+    pub(crate) fn recovery_export(
+        &self,
+        source: &Path,
+    ) -> Option<&super::recovery_image::custody::RecoveryExport> {
+        self.recovery_exports.get(source)
+    }
+
+    pub(crate) fn record_recovery_export(
+        &mut self,
+        source: &Path,
+        previous: Option<&super::recovery_image::custody::RecoveryExport>,
+        next: &super::recovery_image::custody::RecoveryExport,
+    ) -> CowshedResult<()> {
+        if self.recovery_exports.get(source) != previous {
+            return Err(CowshedError::integrity(
+                format!(
+                    "source-held recovery authority for {} changed",
+                    source.display()
+                ),
+                "retain both copies and retry through the existing recovery operation",
+            ));
+        }
+        next.validate(source)?;
+        self.recovery_exports
+            .insert(source.to_owned(), next.clone());
+        Ok(())
+    }
     pub fn get(&self, workspace: &WorkspaceName) -> Option<&LifecycleIntentRecord> {
         self.entries.get(workspace)
     }
@@ -1152,6 +1183,9 @@ impl LifecycleIntentJournal {
                 ),
                 "upgrade cowshed or repair the lifecycle intent journal",
             ));
+        }
+        for (source, export) in &self.recovery_exports {
+            export.validate(source)?;
         }
         for (workspace, record) in &self.entries {
             if record.operation.target() != workspace {

@@ -2184,6 +2184,12 @@ pub(super) async fn sandbox_environment(
     own("HOME", private_home.as_os_str());
     own("XDG_CONFIG_HOME", private_config.as_os_str());
     own("XDG_CACHE_HOME", private_cache.as_os_str());
+    own(
+        crate::workspace_environment::NODE_COMPILE_CACHE_ENV,
+        private_cache
+            .join(crate::workspace_environment::NODE_COMPILE_CACHE_DIRECTORY)
+            .as_os_str(),
+    );
     own("XDG_DATA_HOME", private_data.as_os_str());
     own("XDG_STATE_HOME", private_state.as_os_str());
     own(
@@ -9073,6 +9079,20 @@ mod workspace_toolchain_tests {
             child.remove(OsStr::new("BUN_OPTIONS")),
             Some(OsString::from(format!("--preload={}", preload.display())))
         );
+        // Core hygiene like TMPDIR, not capability wiring: any child can run Node or
+        // Bun, so the compile cache is owned unconditionally and fenced from
+        // capabilities. Every other NODE_* name below remains capability wiring.
+        assert_eq!(
+            child.remove(OsStr::new(
+                crate::workspace_environment::NODE_COMPILE_CACHE_ENV
+            )),
+            Some(
+                mount
+                    .join(".cowshed/cache")
+                    .join(crate::workspace_environment::NODE_COMPILE_CACHE_DIRECTORY)
+                    .into_os_string()
+            )
+        );
         assert_eq!(
             std::fs::read(&preload).expect("port-0 preload"),
             crate::port_zero::PRELOAD
@@ -9878,6 +9898,230 @@ mod workspace_toolchain_tests {
             "fixture must remove its runtime alias {}",
             runtime_link.display()
         );
+    }
+
+    /// Both JS runtimes compile a sandbox child's modules into the workspace's private XDG
+    /// cache — the image's .cowshed/cache read-write, the exec-temp carve-back read-only —
+    /// through the owned NODE_COMPILE_CACHE the real environment builder hands it. The
+    /// caller's cache is never inherited, no loose node-compile-cache appears under TMPDIR
+    /// (the residue that refused a retired workspace's restore), and every compile-cache
+    /// file a read-only child leaves in its temp dir is inside the owned cache subtree the
+    /// temp dir's own retirement reclaims (storage::directory::tests::
+    /// a_retired_workspaces_read_only_compile_cache_is_reclaimed_with_its_temp_dir).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandbox_children_compile_into_the_private_cache_not_the_temp_dir() {
+        fn files_under(root: &Path) -> Vec<PathBuf> {
+            let mut files = Vec::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(directory) = pending.pop() {
+                let entries = match std::fs::read_dir(&directory) {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => panic!("read {}: {error}", directory.display()),
+                };
+                for entry in entries {
+                    let entry = entry.unwrap_or_else(|error| panic!("read entry: {error}"));
+                    if entry.file_type().expect("entry type").is_dir() {
+                        pending.push(entry.path());
+                    } else {
+                        files.push(entry.path());
+                    }
+                }
+            }
+            files.sort();
+            files
+        }
+
+        fn host_program(name: &str) -> PathBuf {
+            let path = std::env::var_os("PATH").expect("the gate PATH names the host toolchain");
+            std::env::split_paths(&path)
+                .map(|directory| directory.join(name))
+                .find(|candidate| candidate.is_file())
+                .unwrap_or_else(|| panic!("host {name} is required for this proof"))
+        }
+
+        // The producer's actual call, then a real module load whose bytecode the runtime
+        // flushes into the resolved cache before it exits.
+        const COMPILE: &str = r#"const m = require("node:module");
+m.enableCompileCache();
+const dir = m.getCompileCacheDir();
+if (!dir) { console.error("compile cache is not enabled"); process.exit(3); }
+console.log(dir);
+import("./compile-cache-lib.mjs").then((lib) => {
+  if (lib.answer() !== 42) { process.exit(4); }
+  if (m.flushCompileCache) { m.flushCompileCache(); }
+});
+"#;
+
+        let root = scratch("compile-cache");
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(mount.join(".cowshed")).expect("private root");
+        std::fs::create_dir_all(root.join("home")).expect("home");
+        let token = cowshed_gateway_types::WorkspaceToken::from_bytes([7; 32]);
+        std::fs::write(
+            mount.join(crate::workspace_credentials::WORKSPACE_TOKEN_PATH),
+            token.encode(),
+        )
+        .expect("workspace token");
+        std::fs::write(
+            mount.join(crate::workspace_credentials::CA_CERTIFICATE_PATH),
+            b"-----BEGIN CERTIFICATE-----\nWORKSPACE\n-----END CERTIFICATE-----\n",
+        )
+        .expect("workspace CA");
+        std::fs::write(mount.join("package.json"), "{}\n").expect("project manifest");
+        std::fs::write(mount.join("bun.lock"), "").expect("project convention");
+        std::fs::write(
+            mount.join("compile-cache-lib.mjs"),
+            "export function answer() { return 42; }\n",
+        )
+        .expect("compiled module");
+        let script = mount.join("compile.cjs");
+        std::fs::write(&script, COMPILE).expect("compile script");
+        let caller_cache = root.join("caller-cache");
+        std::fs::create_dir_all(&caller_cache).expect("caller cache");
+        let caller_sentinel = caller_cache.join("sentinel");
+        std::fs::write(&caller_sentinel, b"the caller's own").expect("caller sentinel");
+        let caller = BTreeMap::from([
+            (
+                crate::workspace_environment::NODE_COMPILE_CACHE_ENV.to_owned(),
+                caller_cache
+                    .to_str()
+                    .expect("utf-8 caller cache")
+                    .to_owned(),
+            ),
+            (
+                "XDG_CACHE_HOME".to_owned(),
+                caller_cache
+                    .to_str()
+                    .expect("utf-8 caller cache")
+                    .to_owned(),
+            ),
+        ]);
+        let runtimes = [host_program("node"), host_program("bun")];
+        let sandbox = sandbox_at(&mount);
+        for (mode, label) in [
+            (RunSandboxMode::ReadWrite, "read-write"),
+            (RunSandboxMode::ReadOnly, "read-only"),
+        ] {
+            let mut configured = sandbox.clone();
+            configured.mode = mode;
+            configured
+                .configure_capabilities()
+                .expect("detect capabilities");
+            let environment = sandbox_environment(&configured, &caller)
+                .await
+                .expect("environment");
+            let child = environment.child(&caller);
+            let value = |name: &str| -> PathBuf {
+                child
+                    .get(OsStr::new(name))
+                    .unwrap_or_else(|| panic!("{label}: child has no {name}"))
+                    .clone()
+                    .into()
+            };
+            let owned = value(crate::workspace_environment::NODE_COMPILE_CACHE_ENV);
+            assert_eq!(
+                owned,
+                value("XDG_CACHE_HOME")
+                    .join(crate::workspace_environment::NODE_COMPILE_CACHE_DIRECTORY),
+                "{label}: the compile cache is the private XDG cache's own directory"
+            );
+            // A foreign file sharing the owned cache's parent is not the child's to move.
+            std::fs::create_dir_all(value("XDG_CACHE_HOME")).expect("private cache");
+            let keep = value("XDG_CACHE_HOME").join("keep");
+            std::fs::write(&keep, b"not compile cache").expect("foreign cache neighbour");
+            for program in &runtimes {
+                let mut command = std::process::Command::new(program);
+                command.arg(&script).current_dir(&mount).env_clear();
+                for (name, entry) in &child {
+                    command.env(name, entry);
+                }
+                let output = command.output_locked().expect("run child runtime");
+                assert!(
+                    output.status.success(),
+                    "{label} {}: {output:?}",
+                    program.display()
+                );
+                let stdout = String::from_utf8(output.stdout).expect("runtime output");
+                let reported = PathBuf::from(stdout.lines().next().expect("cache dir"));
+                assert!(
+                    reported.starts_with(&owned),
+                    "{label}: compiled into {}, not {}",
+                    reported.display(),
+                    owned.display()
+                );
+                assert!(
+                    files_under(&reported)
+                        .iter()
+                        .any(|file| std::fs::metadata(file).expect("cache file").len() > 0),
+                    "{label}: no bytecode under {}",
+                    reported.display()
+                );
+            }
+            // The whole private-environment inventory the temp dir's retirement must
+            // outlive or remove: the trust bundle and port-0 preload at the environment
+            // root, bootstrap tools and the XDG subtrees. In read-only mode all of it is
+            // inside the temp dir, so a cleanup that removed only the compile cache
+            // would still strand the retired workspace.
+            let environment_root = match configured.mode {
+                RunSandboxMode::ReadWrite => mount.join(".cowshed"),
+                RunSandboxMode::ReadOnly => configured.exec_temp_dir.clone(),
+            };
+            for published in [
+                crate::workspace_clients::TRUST_BUNDLE_NAME
+                    .to_str()
+                    .expect("the bundle name is ASCII"),
+                crate::port_zero::PRELOAD_NAME
+                    .to_str()
+                    .expect("the preload name is ASCII"),
+            ] {
+                assert!(
+                    environment_root.join(published).is_file(),
+                    "{label}: no published {published} under {}",
+                    environment_root.display()
+                );
+            }
+            for subtree in ["home", "config", "cache", "data", "state", "run", "tools"] {
+                assert!(
+                    environment_root.join(subtree).is_dir(),
+                    "{label}: no private {subtree} under {}",
+                    environment_root.display()
+                );
+            }
+            assert!(
+                !configured
+                    .exec_temp_dir
+                    .join(crate::workspace_environment::NODE_COMPILE_CACHE_DIRECTORY)
+                    .exists(),
+                "{label}: a loose compile cache under TMPDIR"
+            );
+            // Every compile-cache byte in the temp dir is inside the owned cache subtree
+            // (read-write leaves none there at all).
+            for file in files_under(&configured.exec_temp_dir) {
+                if file.components().any(|component| {
+                    component.as_os_str()
+                        == OsStr::new(crate::workspace_environment::NODE_COMPILE_CACHE_DIRECTORY)
+                }) {
+                    assert!(
+                        file.starts_with(&owned),
+                        "{label}: {} escaped {}",
+                        file.display(),
+                        owned.display()
+                    );
+                }
+            }
+            assert_eq!(std::fs::read(&keep).expect("kept"), b"not compile cache");
+            assert_eq!(
+                files_under(&caller_cache),
+                std::slice::from_ref(&caller_sentinel)
+            );
+            assert_eq!(
+                std::fs::read(&caller_sentinel).expect("kept"),
+                b"the caller's own"
+            );
+        }
+        std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
     }
 }
 

@@ -50,19 +50,31 @@ each of them.
 
 ### What lives where
 
-| State                                                                                                                                                       | Volume                            | Shared how                                                |
-| ----------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- | --------------------------------------------------------- |
-| Git tree and `.git`, installed dependencies (`node_modules`), every Nx task's declared outputs                                                              | Source volume                     | Cloned with the workspace image                           |
-| Cargo target directories; Nx `.nx/cache` and `.nx/workspace-data` (task database, project graph); each installed JavaScript package's `node_modules/.cache` | Build volume                      | Cloned at fork; adopted by main at land                   |
-| Codegraph's per-tree `.codegraph/` index                                                                                                                    | Build volume                      | Cloned at fork; adopted by main at land                   |
-| Declared build state (`.cowshed.toml` `[build] state`), under the volume's `declared/`                                                                      | Build volume                      | Cloned at fork; adopted by main at land                   |
-| Nx daemon record and sockets (`.nx/workspace-data/d`, the socket directory)                                                                                 | Per checkout, never travels       | Deleted from a build volume before main adopts it (below) |
-| Content-addressed tool caches (Cargo registry/git, Go `GOMODCACHE`/`GOCACHE`, zig, bun, uv, sccache)                                                        | Shared cache paths (03_caches.md) | Written once, read by every checkout; never in any image  |
+| State                                                                                                                                                       | Volume                                       | Shared how                                                                             |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- | -------------------------------------------------------------------------------------- |
+| Git tree and `.git`, installed dependencies (`node_modules`), every Nx task's declared outputs                                                              | Source volume                                | Cloned with the workspace image                                                        |
+| Cargo target directories; Nx `.nx/cache` and `.nx/workspace-data` (task database, project graph); each installed JavaScript package's `node_modules/.cache` | Build volume                                 | Cloned at fork; adopted by main at land                                                |
+| Codegraph's per-tree `.codegraph/` index                                                                                                                    | Build volume                                 | Cloned at fork; adopted by main at land                                                |
+| Node/Bun module compile cache (`NODE_COMPILE_CACHE`)                                                                                                        | Workspace's private XDG cache (03_caches.md) | Read-write/host cache cloned with source; read-only cache retired with owned exec-temp |
+| Declared build state (`.cowshed.toml` `[build] state`), under the volume's `declared/`                                                                      | Build volume                                 | Cloned at fork; adopted by main at land                                                |
+| Nx daemon record and sockets (`.nx/workspace-data/d`, the socket directory)                                                                                 | Per checkout, never travels                  | Deleted from a build volume before main adopts it (below)                              |
+| Content-addressed tool caches (Cargo registry/git, Go `GOMODCACHE`/`GOCACHE`, zig, bun, uv, sccache)                                                        | Shared cache paths (03_caches.md)            | Written once, read by every checkout; never in any image                               |
 
 The build volume holds exactly the state a build tool keeps **for one tree and keys by its own fingerprints**: state
 that is correct to reuse for any tree the tool checks against, but costly to rebuild and useless to share between two
 writers at once. Content-addressed caches, whose entries are immutable and valid for every checkout, stay shared
 (03_caches.md). Declared task outputs stay on the source volume (rule "Nx outputs never live in the build volume").
+
+Module compilation uses the already-owned private environment cache, not a new build-state volume or a loose directory
+under `TMPDIR`. Its runtime-versioned bytes remain reconstructible and retain that cache root's clone and retirement
+rules. Source-read-only jobs write only their existing exec-temp cache. Clean retirement reclaims that environment
+through the owned scratch lifetime. A retained recovery image keeps its authority until deliberate export: after
+transfer preflight, under the name's lifecycle lock, the storage owner reclaims its exec-temp environment before any
+image or companion moves (02_workspaces.md, Recovering a recovery image). A live or newer namesake retains its own
+environment. A mount at exec-temp itself or beneath it refuses cleanup before any entry is removed, including a Linux
+bind mount on the same backing device; the recovery image and sidecar stay in place. Checkpoint payloads remain
+separately owned, never disposable merely because module compilation is. Restoration's refusal of unexplained project
+contents is unchanged: no blanket temporary-tree sweep or restore exception stands in for producer ownership.
 
 ### Substrate
 

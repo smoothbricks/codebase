@@ -102,13 +102,15 @@ const TOKEN_PREFIXES: [&str; 5] = ["ghp_", "xoxb-", "sk-", "AKIA", "-----BEGIN"]
 
 fn workspace_owned(name: &str) -> bool {
     use crate::workspace_environment::{
-        NX_REMOTE_SERVER_ENV, PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, RUNTIME_LINK_ENV, TEMP_DIR_ENV,
+        NODE_COMPILE_CACHE_ENV, NX_REMOTE_SERVER_ENV, PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV,
+        RUNTIME_LINK_ENV, TEMP_DIR_ENV,
     };
     [
         PORT_BASE_ENV,
         PORT_BLOCK_SIZE_ENV,
         NX_REMOTE_SERVER_ENV,
         TEMP_DIR_ENV,
+        NODE_COMPILE_CACHE_ENV,
         RUNTIME_LINK_ENV,
         "NX_MAX_CACHE_SIZE",
         "CI",
@@ -1406,6 +1408,50 @@ mod tests {
         );
     }
 
+    /// The directory a runtime compiles into is the workspace's own private cache, so the
+    /// record carries it no more than it carries the workspace's temp dir: the clone's
+    /// adopted export has none, its own published-environment tail is what must supply it,
+    /// and no origin path is ever written into the record a clone inherits.
+    #[test]
+    fn a_clone_never_adopts_the_origins_compile_cache() {
+        let compile_cache: Extra = |site| {
+            vec![(
+                crate::workspace_environment::NODE_COMPILE_CACHE_ENV,
+                Some(format!(
+                    "{}/.cowshed/cache/{}",
+                    site.root.display(),
+                    crate::workspace_environment::NODE_COMPILE_CACHE_DIRECTORY
+                )),
+            )]
+        };
+        let sites = sites("compile-cache");
+        assert_eq!(
+            lineage(&sites, compile_cache),
+            Certification::Certified {
+                origin: Origin::Updated
+            }
+        );
+        let written = std::fs::read_to_string(record_path(&sites.clone.root)).unwrap();
+        assert!(
+            !written.contains(crate::workspace_environment::NODE_COMPILE_CACHE_DIRECTORY),
+            "the origin's compile-cache path is written into the record"
+        );
+        let verified = verify_at(&sites.clone).unwrap();
+        assert!(
+            !verified
+                .environment()
+                .contains_key(crate::workspace_environment::NODE_COMPILE_CACHE_ENV),
+            "an adopted export carries the origin's compile cache"
+        );
+        assert!(
+            verified
+                .from_tail()
+                .iter()
+                .any(|name| name.as_str() == crate::workspace_environment::NODE_COMPILE_CACHE_ENV),
+            "the clone's own published environment must supply its compile cache, tail names {:?}",
+            verified.from_tail()
+        );
+    }
     /// The root every move starts from is part of the record's type: a record without one is
     /// not one this cowshed writes, never a move from the empty path.
     #[test]

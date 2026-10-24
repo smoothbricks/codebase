@@ -325,22 +325,28 @@ with main retired nothing links one, so main's linked volume and its seed go wit
 (16_build_volumes.md, "Garbage collection"), and a volume that stays (a job holds it, its release failed) refuses the
 unbinding while the project is still bound, naming it and why, for the same command to retry. Unbinding then removes
 terminal storage (`.staging/`, `sessions/`, `checkpoints/`, `tmp/` and `build/`, which by then may hold only empty
-directories and zero-length locks and holds; anything else refuses, named, before one entry is removed), the
-controller's own state (lifecycle journal, deletion log, slot bindings) and the mount trees (`<owner>/<repo>` and
-`.build/<owner>/<repo>` under the host mount root, and each owner directory they leave empty), then the binding, then
-the checkout record, so a process that dies at any point leaves either a bound project that command reopens or none.
-What the user wrote stays: `policy.json`, `waivers.json` and `quarantine/` keep the store directory. Once the project is
-unbound, the identity's project lease `.retirements/<owner>/<repo>.lease` goes too, and with it an owner directory it
-leaves empty, but only under the lease itself: the unbinding's own shared hold must upgrade to exclusive without
-waiting, and no `<repo>.json` retirement record may stand beside it. Another holder (the gateway, a command still open
-on the project) or a record keeps it, said on stderr, and the unbinding keeps its shared hold. Because every holder
-rechecks the lease's inode after locking (`forget`, below), removing it cannot split them. The restore checks terminal
-storage before it retires main, exempting what main's retirement and this release remove (main's own checkpoints and
-temp dir, every build volume's image and record), so its refusal leaves main in place. The binding's absence is the
-completion: a run that finds the project already unbound — its own open-time recovery may have finished the pending
-restore — writes nothing and removes only a lease an earlier run left. A death between the binding's removal and the
-checkout record's leaves an unbound store directory holding only `checkout-root.json`; nothing bound reads it, and a
-later adoption's main image outranks it.
+directories and zero-length locks and holds; anything else refuses, named, before one entry is removed) and the empty
+mount trees (`<owner>/<repo>` and `.build/<owner>/<repo>` under the host mount root). It then unlinks the validated
+binding and syncs its held parent directory. Only this durable unbinding authorizes removal of the controller's
+lifecycle journal, recovery-export proofs, deletion log and slot bindings; the checkout-root record goes afterward. An
+unlink failure or interruption before the sync keeps that authority. A retry finding the binding absent still performs
+the directory durability barrier before releasing controller metadata. What the user wrote stays: `policy.json`,
+`waivers.json` and `quarantine/` keep the store directory. Once the project is unbound, the identity's project lease
+`.retirements/<owner>/<repo>.lease` goes too, and with it an owner directory it leaves empty, but only under the lease
+itself: the unbinding's own shared hold must upgrade to exclusive without waiting, and no `<repo>.json` retirement
+record may stand beside it. Another holder (the gateway, a command still open on the project) or a record keeps it, said
+on stderr, and the unbinding keeps its shared hold. Because every holder rechecks the lease's inode after locking
+(`forget`, below), removing it cannot split them. The restore checks terminal storage before it retires main, exempting
+what main's retirement and this release remove (main's own checkpoints and temp dir, every build volume's image and
+record), so its refusal leaves main in place. Binding removal becomes completion only after its parent sync; a retry
+finishes controller cleanup before removing the lease, without recreating project directories. A fresh controller can
+discover an interrupted unbinding from the exact canonical checkout-root record and a typed, unfinished
+`Mutating Retire(main, restore=true)` in the source journal, even for a checkout with no remote. This is read-only
+recovery admission, never active inventory or registration. Live bindings retain precedence; ambiguous matching
+continuation records refuse rather than choosing one. The lifecycle journal is released after the other controller
+records, so failures in their removal retain the continuation. A death after releasing the journal but before deleting
+the checkout record can leave only that unbound bookkeeping record; it holds no recovery authority, and a later
+adoption's main image outranks it.
 
 ## `cowshed forget <owner/repo> --abandon` — retire from store authority
 
@@ -1383,24 +1389,87 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    preserves source/recovery authority and is reported.
 
    **Recovering a recovery image:** `cowshed gc --recover <image> --to <dir>` (`coordinator.recoverImage`, 07_api.md) is
-   that deliberate recovery, and the only way a recovery image leaves the store. It moves, never copies or deletes. Both
-   paths are absolute. Before anything moves it refuses a path that is not one of this project's
-   `sessions/.trash/<ws>-<incarnation>.dmg` (an abandon bundle is `gc --abandoned`'s), a grants sidecar that records
-   another project, workspace or incarnation, a `<dir>` inside the store or on another filesystem than the trash, and a
-   `<dir>/<ws>-<incarnation>` that is anything but a real directory holding this image's own manifest. It holds the
-   workspace name's lifecycle lock, the one collection and every lifecycle operation on the name take, for the whole
-   move, and refuses (`conflict`) while another operation holds it. It creates that directory, syncs its parent, and
-   durably writes `recovery.json` into it first: the project, workspace, incarnation, trash path, the files that move,
-   whether the grants sidecar was there, and why the retirement kept the image, as its `retire-workspace` line records
-   it (`unrecorded` when no line does). The files are the image's grants sidecar, CA companion and any checkpoint or
-   restore-recovery fact, then the image, as derived from the image's own path; a manifest listing anything else, or
-   these out of that order, is not this move's; nor is one that omits such a file existing on either side, or whose
-   grants flag disagrees with its list (`integrity`, nothing moves). They move in that order by no-clobber renames
-   relative to both directories, held open, syncing both after each and again before answering, so a rename an
-   interrupted run made is durable before a retry reports it: an image whose companions left first is still a retained
-   recovery image, never a reclaimable record. Each moved file appends a `recover-retired-image` line naming where it
-   went. A retry after an interruption finds the manifest and finishes the same move. What moved is no longer the
-   store's: terminal store removal no longer counts it.
+   that deliberate recovery, and the only way a recovery image leaves the store. Both paths are absolute. Before any
+   source transfers it refuses a path that is not this project's `sessions/.trash/<ws>-<incarnation>.dmg` (an abandon
+   bundle is `gc --abandoned`'s), a grants sidecar recording another project, workspace or incarnation, a destination
+   inside the store, and an occupied or symlinked `<dir>/<ws>-<incarnation>` without this image's admitted manifest. It
+   holds the workspace lifecycle lock for the whole operation and refuses `conflict` while another operation holds it.
+   No filesystem alias bypasses the outside-store fence. Same-filesystem recovery keeps the no-clobber rename path,
+   including directory-backed test images. Across filesystems only regular images and regular companions are supported:
+   directories, symlinks and other nonregular artifacts refuse before creating the recovered directory or changing
+   source custody. There is no recursive directory-copy fallback.
+
+   The destination directory and `recovery.json` become durable before any source transfer. The manifest records the
+   project, workspace, incarnation, trash path, ordered file names, grants presence, recovery time and retirement reason
+   (`unrecorded` when the deletion log has none). Files are derived from the image path: grants sidecar, CA companion,
+   checkpoint fact, restore-recovery fact, then the image. A foreign name, duplicate, wrong order, omitted companion
+   present on either side, or inconsistent grants flag refuses. Every component of the canonical directory chain opens
+   without following a symlink; held directory descriptors anchor file operations.
+
+   After this admission and before transferring source bytes, the backend may reclaim the whole owned exec-temp
+   environment under the same name lock. Only validated retired authority authorizes that ephemeral cleanup; a missing
+   grants sidecar authorizes no inferred-name deletion. A live canonical or newer retired incarnation keeps the name's
+   environment foreign and untouched. A mounted subtree refuses before source transfer. This cleanup deletes neither the
+   image nor checkpoints. Independently owned checkpoint data can still block terminal restore.
+
+   A version-1 same-filesystem manifest resumes the original ordered renames: companions first, image last, no
+   replacement, both directories synced after each rename and before answering. Cross-filesystem recovery uses the
+   existing source-side `lifecycle-intents.json` journal's typed `recoveryExports` records, keyed by canonical source
+   image. The existing journal lock covers only a read/change/durable-write transaction, never image copying. Each
+   record binds the exact admitted destination, both directory identities, source witnesses, copy progress, retirement
+   progress and completion. A destination cannot authorize its own recovery: without the matching source-held record, an
+   existing version-2 destination refuses even if it claims every artifact is published and supplies plausible inode
+   identities or digests. Altered destination fields never replace source-held progress.
+
+   Source admission is journaled before publishing the destination's version-2 `recovery.json`. An interruption between
+   those steps resumes only that exact record and directory identity. This admission document is immutable: its
+   `copy.artifacts` retain the original device, inode, length, mode, mtime and ctime witnesses with `pending` states.
+   Every destination document is exclusively created and published by no-clobber rename; recovery never replaces an
+   existing document. A swapped foreign manifest or proof is retained and refused, not overwritten. The mutable states
+   below live only in the source journal:
+
+   - `pending`: no copied bytes are admitted.
+   - `copying`: an exclusively created `.<file>.recovery-<uuid>.partial` and its inode are recorded before writing. An
+     interrupted attempt is unverified evidence, not a completed copy. A retry retains it and starts a fresh UUID
+     attempt; it never overwrites unknown partial data. Unrecorded partials likewise remain untrusted and untouched.
+   - `copied`: sparse copying and file sync completed, the source still matches admission, and the staged file's
+     complete mutation witness is journaled. Publication is a descriptor-relative no-clobber rename. After a crash
+     immediately following that rename, only the recorded staged inode at the final name can resume, and it still owes
+     verification. An altered stage or foreign final name refuses without retiring a source.
+   - `published`: final file and directory are durable, bytes and copied metadata were compared, sparse allocation was
+     checked, and the SHA-256 digest plus exact final mutation witness are durable in the source journal. Normal
+     publication verifies once. An unchanged journal-owned witness reuses that proof without recopying or rehashing.
+
+   Metadata fidelity includes numeric owner/group, mode, timestamps, extended attributes and ACLs. Linux transfers the
+   exact descriptor-owned xattr set, including its POSIX ACL representation, removing inherited target-only attributes
+   before applying final times. macOS keeps native copyfile metadata transfer and verifies ordinary xattrs, resource
+   forks and canonical extended ACLs. Filesystem-private compression representation is not copied metadata. Unsupported
+   or forbidden metadata operations refuse; they are not silently dropped. Sparse verification enforces the existing
+   allocation contract, not identical physical extent topology on different filesystems.
+
+   **No source artifact leaves the trash until every destination artifact is published, durable and verified.** The
+   complete journal-owned destination proof is also published create-new as `recovery-copy.json`, with the same manifest
+   shape and all copy states `published`. Its identity is then journaled. Only after both immutable documents, all
+   source/target witnesses and directory bindings agree can source retirement begin.
+
+   Retirement first creates a private held directory beneath the trash, named
+   `.<image-file-name>.recovery-retire-<uuid>.partial`, and journals its name and directory identity. For each artifact,
+   companions first and image last, the journal advances `original` → `staging` before a no-clobber rename from the
+   original name into that private directory. The moved inode is checked against the admitted source before its exact
+   new witness is journaled as `staged`. A substituted foreign entry is never unlinked: recovery attempts a no-clobber
+   restore to the original name, otherwise retains it in private custody and reports where it remains. Only a validated
+   entry in the operation-owned directory is unlinked. The directory is synced before marking that artifact `retired`. A
+   crash after the rename resumes the recorded stage; a crash after unlink but before recording `retired` is recognized
+   only from the already journaled staged identity and complete destination proof. A missing original name alone never
+   proves retirement. An occupied original or mismatched stage refuses without deleting foreign content.
+
+   After all sources retire, recovery removes only the empty owned staging directory and records completion. Completed
+   records remain in the existing controller lifecycle journal to make repeats idempotent; their release condition is
+   terminal project unbinding, whose existing controller-state removal deletes that journal. No additional root artifact
+   or surviving successful-retirement staging directory blocks terminal restore. Unfinished stages retain their source
+   bytes and remain a terminal-storage refusal. Unverified destination partials remain outside-store evidence, never
+   generic-GC input. Each retired source logs `recover-retired-image`; errors name the operation, source/destination and
+   cause, including expected and observed identities. Plain GC gains no new deletion authority.
 
 The in-progress Git gate follows operation state (`MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `rebase-merge`, or
 `rebase-apply`), not a leftover `.git/AUTO_MERGE` tree: Git can retain that tree after an operation finishes. A stale

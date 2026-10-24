@@ -157,7 +157,8 @@ pub fn mint_workspace_ca(common_name: String) -> Result<WorkspaceCa, WorkspaceCr
 }
 
 /// Derives `.cowshed/env` from the image's published token, the workspace's recorded platform
-/// and port block, and, at a served mount, the trusted host install PATH, sandbox `TMPDIR` and runtime link. This is the
+/// and port block, and, at a served mount, the trusted host install PATH, sandbox `TMPDIR`,
+/// runtime link and private Node compile cache. This is the
 /// file's one writer: adopt, clone and restore publish it as they mint, and every supervisor
 /// start publishes it again served, so a live workspace's file follows its metadata — a
 /// workspace minted before a variable existed gains it on its next start.
@@ -548,8 +549,9 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use crate::workspace_environment::{
-        DEV_CI_POLICY, NX_REMOTE_SERVER_ENV, NX_REMOTE_TOKEN_ENV, PORT_BASE_ENV,
-        PORT_BLOCK_SIZE_ENV, RUNTIME_LINK_ENV, TEMP_DIR_ENV, WORKSPACE_TOKEN_ENV,
+        NODE_COMPILE_CACHE_DIRECTORY, NODE_COMPILE_CACHE_ENV, NX_REMOTE_SERVER_ENV,
+        NX_REMOTE_TOKEN_ENV, PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, RUNTIME_LINK_ENV, TEMP_DIR_ENV,
+        WORKSPACE_TOKEN_ENV,
     };
 
     use super::*;
@@ -596,8 +598,43 @@ mod tests {
         root
     }
 
-    /// The token reaches `.cowshed/env` only as the Nx cache route's bearer, so an Nx checkout's
-    /// environment is the one a rotation rewrites; the bare `COWSHED_WORKSPACE_TOKEN` is never in it.
+    /// Source the generated file with a controlled PATH and explicit inherited values;
+    /// return child-observable stdout, never the file's wording.
+    fn run_sourced(file: &Path, inherited: &[(&str, &str)], tail: &str) -> String {
+        use cowshed_os::fork_lock::Run as _;
+        let mut command = std::process::Command::new("sh");
+        command
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").expect("gate PATH"))
+            .args(["-c", &format!(". \"$1\"; {tail}"), "sourced"])
+            .arg(file);
+        for (name, value) in inherited {
+            command.env(name, value);
+        }
+        let output = command.output_locked().expect("source environment");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).expect("shell output")
+    }
+
+    /// The values the names hold after sourcing the file, in order. A name the file leaves
+    /// unset reads as the literal unset; a name it set empty would read empty.
+    fn sourced(file: &Path, inherited: &[(&str, &str)], names: &[&str]) -> Vec<String> {
+        let print = names
+            .iter()
+            .map(|name| format!("printf '%s\\0' \"${{{name}-unset}}\""))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let stdout = run_sourced(file, inherited, &print);
+        let mut values: Vec<String> = stdout.split('\0').map(str::to_owned).collect();
+        assert_eq!(values.pop(), Some(String::new()), "trailing separator");
+        assert_eq!(values.len(), names.len(), "sourced {names:?}");
+        values
+    }
+
+    /// The token reaches a sourced environment only as the Nx cache route's bearer,
+    /// so an Nx checkout's environment is the one a rotation rewrites; the bare
+    /// workspace token name stays unset there, and a minted file hands a child neither
+    /// a sibling's runtime link nor its compile cache.
     #[test]
     fn token_rotation_rewrites_the_in_image_environment() {
         let root = test_root("environment-rotation");
@@ -607,6 +644,46 @@ mod tests {
         let key_path = root.join("raven.ca.key");
         let workspace = workspace("00112233445566778899aabbccddeeff");
         let port_block = crate::metadata::PortBlock::new(40_960, 16).expect("port block");
+        let environment_file = image_mount.join(".cowshed/env");
+        let inherited = [
+            (RUNTIME_LINK_ENV, "/tmp/stale-sibling"),
+            (NODE_COMPILE_CACHE_ENV, "/foreign/cache"),
+            ("XDG_CACHE_HOME", "/foreign/cache"),
+        ];
+        let assert_environment = |token: &str| {
+            let [
+                port_base,
+                block_size,
+                nx_server,
+                nx_token,
+                bare_token,
+                runtime_link,
+                compile_cache,
+            ]: [String; 7] = sourced(
+                &environment_file,
+                &inherited,
+                &[
+                    PORT_BASE_ENV,
+                    PORT_BLOCK_SIZE_ENV,
+                    NX_REMOTE_SERVER_ENV,
+                    NX_REMOTE_TOKEN_ENV,
+                    WORKSPACE_TOKEN_ENV,
+                    RUNTIME_LINK_ENV,
+                    NODE_COMPILE_CACHE_ENV,
+                ],
+            )
+            .try_into()
+            .expect("sourced names");
+            assert_eq!(port_base, "40960");
+            assert_eq!(block_size, "16");
+            assert_eq!(nx_server, "http://127.0.0.1:40960/nx");
+            assert_eq!(nx_token, token);
+            assert_eq!(
+                [bare_token, runtime_link, compile_cache],
+                ["unset", "unset", "unset"],
+                "a child of a shell that sourced the minted file"
+            );
+        };
 
         mint_workspace_credentials(
             &workspace,
@@ -618,14 +695,7 @@ mod tests {
         .expect("first mint");
         let first_token =
             fs::read_to_string(image_mount.join(WORKSPACE_TOKEN_PATH)).expect("token");
-        let first_environment =
-            fs::read_to_string(image_mount.join(".cowshed/env")).expect("environment");
-        assert_eq!(
-            first_environment,
-            format!(
-                "{DEV_CI_POLICY}export {PORT_BASE_ENV}=40960\nexport {PORT_BLOCK_SIZE_ENV}=16\nexport {NX_REMOTE_SERVER_ENV}=http://127.0.0.1:40960/nx\nexport {NX_REMOTE_TOKEN_ENV}={first_token}\nunset {RUNTIME_LINK_ENV}\n"
-            )
-        );
+        assert_environment(&first_token);
 
         mint_workspace_credentials(
             &workspace,
@@ -637,22 +707,21 @@ mod tests {
         .expect("rotated mint");
         let second_token =
             fs::read_to_string(image_mount.join(WORKSPACE_TOKEN_PATH)).expect("rotated token");
-        let second_environment =
-            fs::read_to_string(image_mount.join(".cowshed/env")).expect("rotated environment");
         assert_ne!(second_token, first_token);
-        assert_ne!(second_environment, first_environment);
+        assert_environment(&second_token);
         assert!(
-            second_environment.contains(&format!("export {NX_REMOTE_TOKEN_ENV}={second_token}\n"))
+            !run_sourced(&environment_file, &inherited, "env").contains(&first_token),
+            "the rotated-out token survives in a sourced environment"
         );
-        assert!(!second_environment.contains(&first_token));
-        assert!(!second_environment.contains(WORKSPACE_TOKEN_ENV));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
 
     /// A live workspace minted before its environment exported the block size keeps its token
     /// and block; publishing the environment again — as every supervisor start does — derives the
-    /// file from them, so the workspace gains the size without a new token or a new block.
+    /// file from them, so the workspace gains the size without a new token or a new block. Read
+    /// as a host shell reads it, the republished file also drops the stale file's bare token
+    /// export and binds every served value to this workspace, compile cache included.
     #[test]
     fn republishing_brings_a_minted_environment_up_to_its_metadata() {
         let root = test_root("environment-refresh");
@@ -688,15 +757,65 @@ mod tests {
             Some(port_block),
         )
         .expect("republish");
+        let [
+            port_base,
+            block_size,
+            tmpdir,
+            runtime_link,
+            path,
+            bare_token,
+            compile_cache,
+            nx_server,
+            nx_token,
+        ]: [String; 9] = sourced(
+            &image_mount.join(".cowshed/env"),
+            &[
+                (RUNTIME_LINK_ENV, "/tmp/stale-sibling"),
+                (NODE_COMPILE_CACHE_ENV, "/foreign/cache"),
+                ("XDG_CACHE_HOME", "/foreign/cache"),
+            ],
+            &[
+                PORT_BASE_ENV,
+                PORT_BLOCK_SIZE_ENV,
+                TEMP_DIR_ENV,
+                RUNTIME_LINK_ENV,
+                "PATH",
+                WORKSPACE_TOKEN_ENV,
+                NODE_COMPILE_CACHE_ENV,
+                NX_REMOTE_SERVER_ENV,
+                NX_REMOTE_TOKEN_ENV,
+            ],
+        )
+        .try_into()
+        .expect("sourced names");
+        assert_eq!(port_base, "40976");
+        assert_eq!(block_size, "16", "the size the stale file predates");
+        assert_eq!(tmpdir, temp_dir.display().to_string());
         assert_eq!(
-            fs::read_to_string(image_mount.join(".cowshed/env")).expect("environment"),
-            format!(
-                "{DEV_CI_POLICY}export {PORT_BASE_ENV}=40976\nexport {PORT_BLOCK_SIZE_ENV}=16\nexport {TEMP_DIR_ENV}='{}'\nexport {RUNTIME_LINK_ENV}={}\nexport PATH='{}'\"${{PATH:+:}}${{PATH-}}\"\n",
-                temp_dir.display(),
-                crate::sandbox::workspace_runtime_link(&image_mount).display(),
-                crate::host_dirs::installed_binary_directory(&root).display()
-            )
+            runtime_link,
+            crate::sandbox::workspace_runtime_link(&image_mount)
+                .display()
+                .to_string()
         );
+        assert_eq!(
+            path,
+            format!(
+                "{}:{}",
+                crate::host_dirs::installed_binary_directory(&root).display(),
+                std::env::var("PATH").expect("gate PATH")
+            ),
+            "sourcing prepends the receiving workspace's installed directory without discarding the inherited PATH"
+        );
+        assert_eq!(bare_token, "unset", "the stale bare token export is gone");
+        assert_eq!(
+            compile_cache,
+            image_mount
+                .join(".cowshed/cache")
+                .join(NODE_COMPILE_CACHE_DIRECTORY)
+                .display()
+                .to_string()
+        );
+        assert_eq!([nx_server, nx_token], ["unset", "unset"], "no Nx checkout");
         assert_eq!(
             fs::read_to_string(image_mount.join(WORKSPACE_TOKEN_PATH)).expect("token"),
             token
@@ -719,16 +838,32 @@ mod tests {
             &key_path,
         )
         .expect("mint Linux credentials");
-        let environment =
-            fs::read_to_string(image_mount.join(".cowshed/env")).expect("environment");
+        let environment_file = image_mount.join(".cowshed/env");
         let token = fs::read_to_string(image_mount.join(WORKSPACE_TOKEN_PATH)).expect("token");
-        assert_eq!(
-            environment,
-            format!("{DEV_CI_POLICY}unset {RUNTIME_LINK_ENV}\n")
+        let inherited = [
+            (RUNTIME_LINK_ENV, "/tmp/stale-sibling"),
+            (NODE_COMPILE_CACHE_ENV, "/foreign/cache"),
+        ];
+        let values = sourced(
+            &environment_file,
+            &inherited,
+            &[
+                PORT_BASE_ENV,
+                PORT_BLOCK_SIZE_ENV,
+                WORKSPACE_TOKEN_ENV,
+                RUNTIME_LINK_ENV,
+                NODE_COMPILE_CACHE_ENV,
+            ],
         );
-        assert!(!environment.contains(&token));
-        assert!(!environment.contains("COWSHED_PORT_BASE"));
-        assert!(!environment.contains("COWSHED_PORT_BLOCK_SIZE"));
+        assert_eq!(
+            values,
+            ["unset", "unset", "unset", "unset", "unset"],
+            "a Linux minted file exports no ports and unsets the names it withholds"
+        );
+        assert!(
+            !run_sourced(&environment_file, &inherited, "env").contains(&token),
+            "the token reaches a sourced environment"
+        );
 
         fs::remove_dir_all(root).expect("cleanup");
     }

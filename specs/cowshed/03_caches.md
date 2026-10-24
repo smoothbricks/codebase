@@ -352,10 +352,19 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     client environment below, and Nx's `NX_MAX_CACHE_SIZE` default; explicit caller cache-size overrides are preserved.
     Linux exports no port values: services use private loopback and package/proxy wiring uses `http://127.0.0.1:7644`.
     No workspace-identity variable is exported; anything that needs identity derives it from cwd via
-    `.cowshed/workspace.json` or asks the CLI.
+    `.cowshed/workspace.json` or asks the CLI. A served mount binds `NODE_COMPILE_CACHE` to
+    `<workspace>/.cowshed/cache/node-compile-cache`, replacing any caller or parent value rather than borrowing the
+    host's `XDG_CACHE_HOME`. When sourced by a read-only job whose `XDG_CACHE_HOME` is exactly this workspace's
+    `<exec-temp>/cache`, it instead binds the cache below that directory; activation never redirects that job's writes
+    into source. A minted environment unsets the variable until its supervisor publishes the served paths, so a staging
+    clone never inherits another workspace's cache.
   - The supervisor sets, for every job it spawns (`runtime/supervisor.rs` `sandbox_environment`):
     - the private environment: `HOME`, `XDG_{CONFIG,CACHE,DATA,STATE}_HOME`, `DIRENV_CONFIG`, `TMPDIR` (the workspace's
-      temp dir in the project store, 04_sandbox.md) and `XDG_RUNTIME_DIR`;
+      temp dir in the project store, 04_sandbox.md) and `XDG_RUNTIME_DIR`; - Node and compatible runtimes' module
+      compile cache: `NODE_COMPILE_CACHE=$XDG_CACHE_HOME/node-compile-cache`, owned by the supervisor, never a caller
+      override or a capability's replacement. This uses the existing private cache root in either mode, not the
+      runtime's default loose `TMPDIR/node-compile-cache` directory. Caching stays enabled; no new write grant, shared
+      host cache or independent cleanup root is introduced;
     - git isolation: `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_NOSYSTEM`, `GIT_ATTR_NOSYSTEM`, and the fetch-route include as
       `GIT_CONFIG_COUNT`/`KEY`/`VALUE` (02_workspaces.md);
     - each detected capability's contribution (15_capabilities.md): for an Nx project `NX_SOCKET_DIR`,
@@ -671,10 +680,10 @@ full copy of the cache (measured: a 5.5 GB copy inherited by every clone of one 
 
 **Environment variables as the wiring rejected.** Environment survives only processes cowshed spawns; files and host
 paths survive everything. So identity is the marker file, the gateway URL lives in the config files that consume it, and
-cache locations are the tools' own default directories — none of them an export. What is exported is what no file can
-carry (the list above): Go's env file path, the token and port pair a dev server or proxy client needs, the sccache
-endpoint for compile paths with no config file, and the per-job private environment and trust anchors only the
-supervisor can set.
+shared package cache locations are the tools' own default directories — none of them an export. What is exported is what
+no file can carry (the list above): Go's env file path, the token and port pair a dev server or proxy client needs, the
+sccache endpoint for compile paths with no config file, `NODE_COMPILE_CACHE` for workspace-owned module compilation, and
+the per-job private environment and trust anchors only the supervisor can set.
 
 **Gateway-proxied sccache rejected.** Routing sccache through cowshed-gateway would mean translating sccache's own
 client-server protocol for zero policy gain — the gateway mediates _egress_, and the sccache daemon never leaves the

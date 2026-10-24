@@ -26,7 +26,9 @@ mod native;
 /// operations on a backend without kernel volumes must return an explicit unsupported error,
 /// never a successful disk result. The capability flag keeps optional cosmetic labels and job
 /// volume sampling out of those backends; their resource samples report unconfigured volumes.
-pub(crate) trait RuntimeStorageHost: ApfsExecutionHost<LockGuard: Sync> {
+pub(crate) trait RuntimeStorageHost:
+    ApfsExecutionHost<LockGuard: Sync> + crate::storage::recovery_image::RecoveryEnvironment
+{
     fn canonical_metadata(
         &self,
         repo: &RepoId,

@@ -2322,8 +2322,9 @@ impl Coordinator {
 
     /// Move one recovery image, `sessions/.trash/<ws>-<incarnation>.dmg`, with its grants sidecar,
     /// CA companion and a manifest, out of the store into `<to>/<ws>-<incarnation>/`
-    /// (`cowshed gc --recover`). It moves and never deletes; the project's terminal removal no
-    /// longer counts what it moved.
+    /// (`cowshed gc --recover`). Same-filesystem transfers rename; cross-filesystem transfers
+    /// retain the source until every regular artifact is durably copied and verified. Terminal
+    /// project removal no longer counts the exported image.
     pub async fn recover_image(
         &self,
         image: &std::path::Path,

@@ -511,15 +511,8 @@ fn mount_identity(_path: &Path, metadata: &fs::Metadata) -> io::Result<u64> {
 
 #[cfg(target_os = "linux")]
 fn mount_identity(path: &Path, _metadata: &fs::Metadata) -> io::Result<u64> {
-    use rustix::fs::{AtFlags, StatxFlags, statx};
     let directory = crate::fsio::open_directory_nofollow(path)?;
-    let stat = statx(&directory, c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
-    if !StatxFlags::from_bits_retain(stat.stx_mask).contains(StatxFlags::MNT_ID) {
-        return Err(io::Error::other(
-            "cannot prove archive mount boundary: STATX_MNT_ID unavailable",
-        ));
-    }
-    Ok(stat.stx_mnt_id)
+    crate::fsio::mount_id(&directory)
 }
 
 /// One archived tree's background removal, at most 256 directory entries per step. A mounted

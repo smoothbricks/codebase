@@ -3284,38 +3284,162 @@ fn clean_terminal_project_storage(project_root: &Path, binding: &Path) -> Result
     remove_planned_terminal_storage(plan)
 }
 
-/// Everything the controller keeps for a project it is unbinding. Nothing reopens an unbound
-/// project, so its lifecycle journal, deletion log and slot bindings go, and with them its mount
-/// tree, its build volumes' mount tree (`<host mount root>/.build/<owner>/<repo>`) and each owner
-/// directory they leave empty; the store directory goes once the binding and the checkout root
-/// record after it do. What the user put in the store — `policy.json`, `waivers.json`,
-/// `quarantine/` — stays, and keeps the store directory with it. The project lease under
-/// `.retirements/` is not here: it goes only once the binding has, under the lease itself
-/// (`StorageProjectRuntimeHost::remove_unbound_lease`).
 #[cfg(target_os = "macos")]
-fn remove_unbound_project_state(paths: &crate::repository::ProjectPaths) -> Result<()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UnbindCheckpoint {
+    BeforeBindingRemoval,
+    BindingRemoved,
+    BindingDurable,
+}
+
+/// Created only after this transaction has synced the binding's absence.
+#[cfg(target_os = "macos")]
+struct DurablyUnboundProject<'a> {
+    paths: &'a crate::repository::ProjectPaths,
+}
+
+#[cfg(target_os = "macos")]
+fn remove_project_mount_trees(paths: &crate::repository::ProjectPaths) -> Result<()> {
     let build =
         crate::build_volume::BuildVolumeLayout::new(paths).map_err(native_integrity_error)?;
+    for tree in [paths.mount_root.as_path(), build.mounts()] {
+        remove_empty_mount_tree(tree)?;
+        if let Some(owner) = tree.parent() {
+            remove_directory_if_empty(owner)?;
+        }
+    }
+    Ok(())
+}
+
+/// The real restore finisher, also used when a retry finds the binding already absent.
+#[cfg(target_os = "macos")]
+pub(crate) fn finish_restored_project_unbinding(
+    paths: &crate::repository::ProjectPaths,
+    expected: &RepositoryBinding,
+    observe: &mut impl FnMut(UnbindCheckpoint) -> Result<()>,
+) -> Result<()> {
+    let path = &paths.repository_binding;
+    let bound = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "repository binding is not a regular file: {}",
+                        path.display()
+                    ),
+                    "move the collision aside and retry",
+                ));
+            }
+            let actual = crate::metadata::read_json::<RepositoryBinding>(path)
+                .map_err(native_integrity_error)?;
+            if actual != *expected {
+                return Err(CowshedError::integrity(
+                    "repository binding changed during restoration",
+                    "restore the exact binding and retry",
+                ));
+            }
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(CowshedError::environment_missing(
+                format!(
+                    "cannot inspect repository binding {}: {error}",
+                    path.display()
+                ),
+                "check controller storage permissions and retry",
+            ));
+        }
+    };
+    let directory = match cowshed_os::fsio::open_directory_nofollow(&paths.project_root) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !bound => {
+            remove_project_mount_trees(paths)?;
+            if let Some(owner) = paths.project_root.parent() {
+                remove_store_owner_if_projectless(owner)?;
+            }
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(CowshedError::environment_missing(
+                format!(
+                    "cannot open binding directory {}: {error}",
+                    paths.project_root.display()
+                ),
+                "check controller storage permissions and retry",
+            ));
+        }
+    };
+    // Failure-prone storage and mount cleanup happens while controller authority still exists.
+    clean_terminal_project_storage(&paths.project_root, path)?;
+    remove_project_mount_trees(paths)?;
+    if bound {
+        observe(UnbindCheckpoint::BeforeBindingRemoval)?;
+        std::fs::remove_file(path).map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot remove repository binding {}: {error}",
+                    path.display()
+                ),
+                "check controller storage permissions and retry",
+            )
+        })?;
+        observe(UnbindCheckpoint::BindingRemoved)?;
+    }
+    // An absent-binding retry may be resuming an unlink whose directory sync failed.
+    cowshed_os::fsio::sync_held_directory(&directory).map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot sync repository binding directory {}: {error}",
+                paths.project_root.display()
+            ),
+            "check controller storage permissions and retry",
+        )
+    })?;
+    observe(UnbindCheckpoint::BindingDurable)?;
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(CowshedError::integrity(
+                "repository binding reappeared during unbinding",
+                "retain controller state and inspect the new binding before retrying",
+            ));
+        }
+        Err(error) => {
+            return Err(CowshedError::environment_missing(
+                format!("cannot confirm removed binding {}: {error}", path.display()),
+                "check controller storage permissions and retry",
+            ));
+        }
+    }
+    remove_unbound_project_state(&DurablyUnboundProject { paths })?;
+    remove_unbound_file(&paths.checkout_root)?;
+    remove_directory_if_empty(&paths.project_root)?;
+    match paths.project_root.parent() {
+        Some(owner) => remove_store_owner_if_projectless(owner),
+        None => Ok(()),
+    }
+}
+
+/// Release controller metadata only through the durable-unbinding proof. The checkout-root
+/// record remains until this succeeds so a failed cleanup still identifies its continuation.
+#[cfg(target_os = "macos")]
+fn remove_unbound_project_state(unbound: &DurablyUnboundProject<'_>) -> Result<()> {
+    let paths = unbound.paths;
     for file in [
-        paths
-            .project_root
-            .join(crate::storage::recovery::LIFECYCLE_INTENTS_FILE),
         paths
             .project_root
             .join(crate::storage::deletion_log::DELETION_LOG_FILE),
         paths.slot_bindings.clone(),
+        paths
+            .project_root
+            .join(crate::storage::recovery::LIFECYCLE_INTENTS_FILE),
     ] {
         remove_unbound_file(&file)?;
     }
     remove_directory_if_empty(&paths.project_root)?;
     if let Some(owner) = paths.project_root.parent() {
         remove_store_owner_if_projectless(owner)?;
-    }
-    for tree in [paths.mount_root.as_path(), build.mounts()] {
-        remove_empty_mount_tree(tree)?;
-        if let Some(owner) = tree.parent() {
-            remove_directory_if_empty(owner)?;
-        }
     }
     Ok(())
 }
@@ -7915,13 +8039,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             // so it is tried before the pending-intent completion below, which would answer the
             // retry with success while the binding still stands.
             Err(error) if options.restore && error.code == ErrorCode::NotFound => {
-                // The binding's absence is the restore's completion. Recovery at open replays a
-                // pending restore, so this very process may already have finished it and removed
-                // the project directory with the binding; there is nothing left to record or
-                // journal, and writing either would recreate that directory. Only the project
-                // lease may remain, from a run that died after the binding went.
+                // An earlier run may have unlinked the binding but failed before its sync or
+                // controller cleanup. Finish that same transaction without recreating state.
                 if !self.project_is_bound().await? {
-                    self.remove_unbound_lease()?;
+                    self.unbind_restored_project().await?;
                     return Ok(RemoveReport::default());
                 }
                 let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
@@ -8424,15 +8545,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         ))
     }
 
-    /// Unbinds a project whose main was restored: its build volumes are released, then the
-    /// terminal storage (`build/` included), the controller's own state (lifecycle journal
-    /// included) and both mount trees go, and the binding last, so a process that dies part way
-    /// leaves a project still bound and a retry that finishes the job. The binding's absence is
-    /// the removal's completion. The checkout root record goes right after it — it is what
-    /// reopens a still-bound project whose main image is gone — and the store directory and
-    /// emptied owner directories after that, and once the project is unbound the identity's
-    /// project lease. What the user wrote (`policy.json`, `waivers.json`, `quarantine/`) stays,
-    /// and with it the store directory.
+    /// Release terminal artifacts while bound, durably remove the binding, then release
+    /// controller authority. An absent-binding retry finishes cleanup without provisioning.
     async fn unbind_restored_project(&self) -> Result<()> {
         if self.project_is_bound().await? {
             self.release_build_volumes_for_unbinding().await?;
@@ -8440,67 +8554,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let paths = self.layout.project().clone();
         let expected = self.descriptor.binding.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
-            let path = &paths.repository_binding;
-            let bound = match std::fs::symlink_metadata(path) {
-                Ok(metadata) => Some(metadata),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    return Err(CowshedError::environment_missing(
-                        format!(
-                            "cannot inspect repository binding {}: {error}",
-                            path.display()
-                        ),
-                        "check controller storage permissions and retry",
-                    ));
-                }
-            };
-            if let Some(metadata) = bound {
-                if !metadata.file_type().is_file() {
-                    return Err(CowshedError::integrity(
-                        format!(
-                            "repository binding is not a regular file: {}",
-                            path.display()
-                        ),
-                        "move the collision aside and retry",
-                    ));
-                }
-                let actual = crate::metadata::read_json::<RepositoryBinding>(path)
-                    .map_err(native_integrity_error)?;
-                if &actual != expected.as_ref() {
-                    return Err(CowshedError::integrity(
-                        "repository binding changed during adoption rollback",
-                        "restore the exact binding and retry",
-                    ));
-                }
-                clean_terminal_project_storage(&paths.project_root, path)?;
-                remove_unbound_project_state(&paths)?;
-                std::fs::remove_file(path).map_err(|error| {
-                    CowshedError::environment_missing(
-                        format!(
-                            "cannot remove repository binding {}: {error}",
-                            path.display()
-                        ),
-                        "check controller storage permissions and retry",
-                    )
-                })?;
-                std::fs::File::open(&paths.project_root)
-                    .and_then(|directory| directory.sync_all())
-                    .map_err(|error| {
-                        CowshedError::environment_missing(
-                            format!(
-                                "cannot sync repository binding directory {}: {error}",
-                                paths.project_root.display()
-                            ),
-                            "check controller storage permissions and retry",
-                        )
-                    })?;
-            }
-            remove_unbound_file(&paths.checkout_root)?;
-            remove_directory_if_empty(&paths.project_root)?;
-            match paths.project_root.parent() {
-                Some(owner) => remove_store_owner_if_projectless(owner),
-                None => Ok(()),
-            }
+            finish_restored_project_unbinding(&paths, expected.as_ref(), &mut |_| Ok(()))
         })
         .await
         .map_err(|error| {
@@ -14050,8 +14104,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         self.validate_binding().await?;
         let layout = self.layout.clone();
         let repo = self.descriptor.repo_id.clone();
+        let owner = self.substrate.shared_host();
         crate::storage::lifecycle::dispatch_blocking(move || {
-            crate::storage::recovery_image::recover(&layout, &repo, &image, &to)
+            crate::storage::recovery_image::recover(&layout, &repo, &image, &to, owner.as_ref())
         })
         .await
         .map_err(|error| CowshedError::internal(format!("recovery image task failed: {error}")))?
@@ -26269,9 +26324,10 @@ mod port_reservation_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod terminal_project_cleanup_tests {
     use super::{
-        clean_terminal_project_storage, remove_unbound_project_state, require_terminal_storage,
+        UnbindCheckpoint, clean_terminal_project_storage, finish_restored_project_unbinding,
+        require_terminal_storage,
     };
-    use crate::repository::{ProjectPaths, RepoId};
+    use crate::repository::{BoundIdentity, ProjectPaths, RepoId, RepositoryBinding};
 
     fn root(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -26322,6 +26378,19 @@ mod terminal_project_cleanup_tests {
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
+    fn test_binding() -> RepositoryBinding {
+        RepositoryBinding::new(vec![BoundIdentity {
+            repo_id: RepoId::parse("example-org/example-app").unwrap(),
+            remote_name: None,
+            remote_url: None,
+            primary: true,
+        }])
+        .unwrap()
+    }
+
+    fn finish_unbinding(paths: &ProjectPaths) -> crate::Result<()> {
+        finish_restored_project_unbinding(paths, &test_binding(), &mut |_| Ok(()))
+    }
     /// A store root and a mount root side by side under one scratch directory, the way the
     /// host lays them out, holding one project each.
     fn project(label: &str) -> (std::path::PathBuf, ProjectPaths) {
@@ -26350,7 +26419,7 @@ mod terminal_project_cleanup_tests {
     fn an_unbound_project_leaves_no_store_or_mount_directory() {
         let (root, paths) = project("unbound");
 
-        remove_unbound_project_state(&paths).expect("unbound state removal");
+        finish_unbinding(&paths).expect("unbound state removal");
         assert!(!paths.project_root.exists(), "store directory remains");
         assert!(!paths.mount_root.exists(), "mount tree remains");
         assert!(
@@ -26378,7 +26447,7 @@ mod terminal_project_cleanup_tests {
             .join("other-app");
         std::fs::create_dir_all(&sibling).expect("sibling project");
 
-        remove_unbound_project_state(&paths).expect("unbound state removal");
+        finish_unbinding(&paths).expect("unbound state removal");
         assert_eq!(std::fs::read(&paths.policy).expect("policy"), b"policy");
         assert_eq!(std::fs::read(&paths.waivers).expect("waivers"), b"waivers");
         assert_eq!(
@@ -26397,46 +26466,70 @@ mod terminal_project_cleanup_tests {
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
-    /// The unbinding removes this state while the binding still stands; a process that dies right
-    /// after must leave the project reopenable from its checkout, and main's image is already gone.
+    /// Each interruption executes the real transaction up to its actual filesystem boundary.
     #[test]
     fn unbound_state_removal_keeps_what_reopens_a_still_bound_project() {
-        let (root, paths) = project("still-bound");
-        std::fs::write(&paths.repository_binding, b"binding").expect("binding");
-        std::fs::write(&paths.checkout_root, b"checkout root").expect("checkout root");
-
-        remove_unbound_project_state(&paths).expect("unbound state removal");
-        assert!(paths.repository_binding.is_file(), "binding went");
-        assert_eq!(
-            std::fs::read(&paths.checkout_root).expect("checkout root record"),
-            b"checkout root"
-        );
-        std::fs::remove_dir_all(root).expect("cleanup");
+        for stop in [
+            UnbindCheckpoint::BeforeBindingRemoval,
+            UnbindCheckpoint::BindingRemoved,
+            UnbindCheckpoint::BindingDurable,
+        ] {
+            let (root, paths) = project("unbinding-interruption");
+            let binding = test_binding();
+            crate::metadata::write_json(&paths.repository_binding, &binding).unwrap();
+            std::fs::write(&paths.checkout_root, b"checkout root").unwrap();
+            let journal = paths.project_root.join("lifecycle-intents.json");
+            let before = std::fs::read(&journal).unwrap();
+            let result = finish_restored_project_unbinding(&paths, &binding, &mut |step| {
+                if step == stop {
+                    return Err(crate::CowshedError::internal("interrupted unbinding"));
+                }
+                Ok(())
+            });
+            assert!(result.is_err(), "{stop:?}");
+            assert_eq!(
+                std::fs::read(&journal).unwrap(),
+                before,
+                "authority lost at {stop:?}"
+            );
+            assert_eq!(
+                paths.repository_binding.exists(),
+                stop == UnbindCheckpoint::BeforeBindingRemoval
+            );
+            assert!(paths.checkout_root.is_file());
+            let mut observed_durable = false;
+            finish_restored_project_unbinding(&paths, &binding, &mut |step| {
+                if step == UnbindCheckpoint::BindingDurable {
+                    observed_durable = true;
+                    assert!(!paths.repository_binding.exists());
+                    assert_eq!(std::fs::read(&journal).unwrap(), before);
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert!(observed_durable);
+            assert!(!paths.project_root.exists());
+            finish_unbinding(&paths).unwrap();
+            assert!(
+                !paths.project_root.exists(),
+                "completed retry recreated the project"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
     fn an_unbound_mount_tree_holding_a_file_is_reported_and_kept_whole() {
         let (root, paths) = project("mount-file");
         let stray = paths.mount_root.join("raven/notes.txt");
-        std::fs::write(&stray, b"left in a mountpoint").expect("stray file");
-
-        let error = remove_unbound_project_state(&paths)
-            .expect_err("a file under the mount tree is not an empty mountpoint");
+        std::fs::write(&stray, b"left in a mountpoint").unwrap();
+        let error = finish_unbinding(&paths).expect_err("a file is not an empty mountpoint");
         assert_eq!(error.code.as_str(), "integrity");
-        assert!(error.message.contains("notes.txt"), "{}", error.message);
-        assert_eq!(
-            std::fs::read(&stray).expect("stray kept"),
-            b"left in a mountpoint"
-        );
-        assert!(
-            paths.mount_root.join(".staging/main-orphan").is_dir(),
-            "the refused tree was partly removed"
-        );
-        assert!(
-            !paths.project_root.exists(),
-            "the store side must go before the mount tree is refused"
-        );
-        std::fs::remove_dir_all(root).expect("cleanup");
+        assert!(error.message.contains("notes.txt"));
+        assert_eq!(std::fs::read(&stray).unwrap(), b"left in a mountpoint");
+        assert!(paths.mount_root.join(".staging/main-orphan").is_dir());
+        assert!(paths.project_root.join("lifecycle-intents.json").is_file());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -26627,13 +26720,43 @@ mod terminal_project_cleanup_tests {
         let mounts = root.join("mnt/.build/example-org/example-app");
         std::fs::create_dir_all(mounts.join(VOLUME)).expect("released volume's mountpoint");
 
-        remove_unbound_project_state(&paths).expect("unbound state removal");
+        finish_unbinding(&paths).expect("unbound state removal");
         assert!(!mounts.exists(), "build mount tree remains");
         assert!(
             !mounts.parent().expect("owner").exists(),
             "empty owner directory remains under .build"
         );
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_real_binding_unlink_failure_preserves_recovery_authority() {
+        let (root, paths) = project("binding-unlink-refusal");
+        let binding = test_binding();
+        crate::metadata::write_json(&paths.repository_binding, &binding).unwrap();
+        let journal = paths.project_root.join("lifecycle-intents.json");
+        let before = std::fs::read(&journal).unwrap();
+        let retained = paths.project_root.join("binding-before-refusal");
+        let result = finish_restored_project_unbinding(&paths, &binding, &mut |step| {
+            if step == UnbindCheckpoint::BeforeBindingRemoval {
+                std::fs::rename(&paths.repository_binding, &retained).unwrap();
+                std::fs::create_dir(&paths.repository_binding).unwrap();
+            }
+            Ok(())
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("cannot remove repository binding")
+        );
+        assert_eq!(std::fs::read(&journal).unwrap(), before);
+        assert!(paths.repository_binding.is_dir());
+        std::fs::remove_dir(&paths.repository_binding).unwrap();
+        std::fs::rename(&retained, &paths.repository_binding).unwrap();
+        finish_unbinding(&paths).unwrap();
+        assert!(!paths.project_root.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -26682,6 +26805,291 @@ mod terminal_project_cleanup_tests {
             );
             std::fs::remove_dir_all(root).expect("cleanup");
         }
+    }
+
+    /// One store through the whole recovery custody chain, with the bytes a real
+    /// read-only job leaves: the environment builder publishes its trust bundle, port-0
+    /// preload, tools and XDG subtrees into the workspace's temp dir and Node and Bun
+    /// compile into its owned cache there. Retired as a recovery retention, the image
+    /// stands in the trash and the terminal guard refuses main's restore, removing
+    /// nothing. The actual recovery export then runs its scoped ephemeral cleanup
+    /// under the held name lock before any transfer: the whole temp dir goes, the
+    /// image and its companions arrive at the destination byte for byte, and the same
+    /// guard admits the restore. (An independently retained checkpoint would still
+    /// block it; this fixture's workspace has none, as the cleanup's scope states.)
+    #[tokio::test]
+    async fn mains_restore_admits_the_state_a_recovered_workspaces_export_leaves() {
+        use crate::sandbox::{RunSandboxMode, SandboxConfig, SandboxGrants};
+        use crate::storage::apfs::ApfsExecutionHost as _;
+        use crate::storage::directory::tests::{
+            Scratch, published_directory, published_directory_layout, published_directory_paths,
+            published_directory_trash,
+        };
+        use crate::storage::recovery_image::recover;
+        use cowshed_os::fork_lock::Run as _;
+        use std::ffi::OsStr;
+
+        fn files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+            let mut files = Vec::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(directory) = pending.pop() {
+                let entries = match std::fs::read_dir(&directory) {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => panic!("read {}: {error}", directory.display()),
+                };
+                for entry in entries {
+                    let entry = entry.unwrap_or_else(|error| panic!("read entry: {error}"));
+                    if entry.file_type().expect("entry type").is_dir() {
+                        pending.push(entry.path());
+                    } else {
+                        files.push(entry.path());
+                    }
+                }
+            }
+            files.sort();
+            files
+        }
+
+        fn tree_bytes(
+            root: &std::path::Path,
+        ) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+            files_under(root)
+                .into_iter()
+                .map(|file| {
+                    let relative = file
+                        .strip_prefix(root)
+                        .expect("a listed file is under its root")
+                        .to_path_buf();
+                    let bytes = std::fs::read(&file)
+                        .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
+                    (relative, bytes)
+                })
+                .collect()
+        }
+
+        fn host_program(name: &str) -> std::path::PathBuf {
+            let path = std::env::var_os("PATH").expect("the gate PATH names the host toolchain");
+            std::env::split_paths(&path)
+                .map(|directory| directory.join(name))
+                .find(|candidate| candidate.is_file())
+                .unwrap_or_else(|| panic!("host {name} is required for this proof"))
+        }
+
+        // The producer's actual call, then a real module load whose bytecode the runtime
+        // flushes into the resolved cache before it exits.
+        const COMPILE: &str = r#"const m = require("node:module");
+m.enableCompileCache();
+const dir = m.getCompileCacheDir();
+if (!dir) { console.error("compile cache is not enabled"); process.exit(3); }
+console.log(dir);
+import("./compile-cache-lib.mjs").then((lib) => {
+  if (lib.answer() !== 42) { process.exit(4); }
+  if (m.flushCompileCache) { m.flushCompileCache(); }
+});
+"#;
+
+        let scratch = Scratch::new("recover-restore");
+        let (host, image, metadata) = published_directory(&scratch, "selected", 1);
+        let layout = published_directory_layout(&host, &metadata);
+        let (project_root, exec_temp) = published_directory_paths(&host, &metadata);
+        let caller_cache = scratch.path().join("caller-cache");
+        std::fs::create_dir_all(&caller_cache).expect("caller cache");
+        let caller_sentinel = caller_cache.join("sentinel");
+        std::fs::write(&caller_sentinel, b"the caller's own").expect("caller sentinel");
+        // Another workspace's temp dir, foreign to every act below.
+        let sibling = exec_temp
+            .parent()
+            .expect("temp root")
+            .join("sibling")
+            .join("keep");
+        std::fs::create_dir_all(sibling.parent().expect("sibling temp")).expect("sibling temp");
+        std::fs::write(&sibling, b"a sibling's own").expect("sibling sentinel");
+
+        std::fs::write(image.join("package.json"), "{}\n").expect("project manifest");
+        std::fs::write(image.join("bun.lock"), "").expect("project convention");
+        std::fs::write(
+            image.join("compile-cache-lib.mjs"),
+            "export function answer() { return 42; }\n",
+        )
+        .expect("compiled module");
+        let script = image.join("compile.cjs");
+        std::fs::write(&script, COMPILE).expect("compile script");
+
+        // A real read-only job's environment, built by the production builder against
+        // this store's own layout: its temp dir is the one the terminal guard reads.
+        let home = scratch.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let mut sandbox = SandboxConfig {
+            program_directories: crate::capabilities::host_program_directories(&home),
+            home,
+            mount_root: scratch.path().join("mounts"),
+            workspace_mount: image.clone(),
+            exec_temp_dir: exec_temp.clone(),
+            store_root: scratch.path().join("store"),
+            port_block: metadata
+                .grants
+                .port_block
+                .expect("the fixture grants a port block"),
+            retained_port_blocks: Vec::new(),
+            mode: RunSandboxMode::ReadOnly,
+            grants: SandboxGrants::default(),
+            allowed_unix_sockets: Vec::new(),
+            cpu_pool_directory: None,
+            additional_denies: Vec::new(),
+            shed_links: Vec::new(),
+            git_worktree_repository: None,
+            build_volume_mount: None,
+            repository_caches: Vec::new(),
+            capabilities: Default::default(),
+        };
+        sandbox
+            .configure_capabilities()
+            .expect("detect capabilities");
+        let caller = std::collections::BTreeMap::from([(
+            crate::workspace_environment::NODE_COMPILE_CACHE_ENV.to_owned(),
+            caller_cache
+                .to_str()
+                .expect("utf-8 caller cache")
+                .to_owned(),
+        )]);
+        let environment = super::super::supervisor::sandbox_environment(&sandbox, &caller)
+            .await
+            .expect("environment");
+        let mut child = environment.base();
+        child.extend(environment.overlay(&caller));
+        let owned = exec_temp
+            .join("cache")
+            .join(crate::workspace_environment::NODE_COMPILE_CACHE_DIRECTORY);
+        assert_eq!(
+            child.get(OsStr::new(
+                crate::workspace_environment::NODE_COMPILE_CACHE_ENV
+            )),
+            Some(&owned.clone().into_os_string()),
+            "the read-only child compiles into its exec-temp cache"
+        );
+        for program in [host_program("node"), host_program("bun")] {
+            let mut command = std::process::Command::new(&program);
+            command.arg(&script).current_dir(&image).env_clear();
+            for (name, entry) in &child {
+                command.env(name, entry);
+            }
+            let output = command.output_locked().expect("run child runtime");
+            assert!(output.status.success(), "{}: {output:?}", program.display());
+            let stdout = String::from_utf8(output.stdout).expect("runtime output");
+            let reported = std::path::PathBuf::from(stdout.lines().next().expect("cache dir"));
+            assert!(
+                reported.starts_with(&owned),
+                "compiled into {}, not {}",
+                reported.display(),
+                owned.display()
+            );
+            assert!(
+                files_under(&reported)
+                    .iter()
+                    .any(|file| std::fs::metadata(file).expect("cache file").len() > 0),
+                "no bytecode under {}",
+                reported.display()
+            );
+        }
+        std::fs::remove_file(crate::sandbox::workspace_runtime_link(&image)).ok();
+        // The whole inventory the cleanup owes: published wiring at the temp root and
+        // job state under it, far beyond the compile cache alone.
+        for published in [
+            crate::workspace_clients::TRUST_BUNDLE_NAME
+                .to_str()
+                .expect("the bundle name is ASCII"),
+            crate::port_zero::PRELOAD_NAME
+                .to_str()
+                .expect("the preload name is ASCII"),
+        ] {
+            assert!(
+                exec_temp.join(published).is_file(),
+                "no published {published} under {}",
+                exec_temp.display()
+            );
+        }
+        assert!(
+            !exec_temp
+                .join(crate::workspace_environment::NODE_COMPILE_CACHE_DIRECTORY)
+                .exists(),
+            "a loose compile cache beside the owned read-only cache"
+        );
+        let inventory = files_under(&exec_temp);
+        assert!(
+            inventory.iter().any(|file| !file.starts_with(&owned)),
+            "the inventory is only the compile cache; the whole-tree claim would be empty"
+        );
+
+        // Retire as a recovery retention does, then snapshot the exact bytes custody owes.
+        let trash = published_directory_trash(&host, &metadata);
+        std::fs::create_dir_all(trash.parent().expect("trash")).expect("trash");
+        std::fs::hard_link(
+            crate::metadata::sidecar_path(&image),
+            crate::metadata::sidecar_path(&trash),
+        )
+        .expect("stage sidecar");
+        std::fs::hard_link(
+            crate::storage::apfs::companion_path(&image),
+            crate::storage::apfs::companion_path(&trash),
+        )
+        .expect("stage companion");
+        host.retire_image(&image, &trash).expect("retire to trash");
+        let payload = tree_bytes(&trash);
+        assert!(!payload.is_empty(), "the oracle snapshot is empty");
+        let sidecar = std::fs::read(crate::metadata::sidecar_path(&trash)).expect("sidecar");
+        let companion =
+            std::fs::read(crate::storage::apfs::companion_path(&trash)).expect("companion");
+
+        // While it stands, the restore refuses and removes nothing.
+        let error = require_terminal_storage(&project_root)
+            .expect_err("a retained recovery workspace must refuse the restore");
+        assert_eq!(error.code.as_str(), "conflict");
+        assert_eq!(
+            files_under(&exec_temp),
+            inventory,
+            "the refusal removed bytes"
+        );
+        assert_eq!(
+            tree_bytes(&trash),
+            payload,
+            "the refusal touched the payload"
+        );
+
+        // The actual export: scoped cleanup under the held name lock, then transfer.
+        let to = scratch.path().join("recovered");
+        let recovered = recover(&layout, &metadata.repo_id, &trash, &to, &host).expect("recover");
+        let moved = recovered
+            .directory
+            .join(trash.file_name().expect("trash name"));
+        assert_eq!(
+            tree_bytes(&moved),
+            payload,
+            "the export changed payload bytes"
+        );
+        assert_eq!(
+            std::fs::read(crate::metadata::sidecar_path(&moved)).expect("moved sidecar"),
+            sidecar
+        );
+        assert_eq!(
+            std::fs::read(crate::storage::apfs::companion_path(&moved)).expect("moved companion"),
+            companion
+        );
+        assert!(!trash.exists(), "the payload did not leave the trash");
+        assert!(
+            !exec_temp.exists(),
+            "the recovered workspace's temp dir outlived its export"
+        );
+        assert_eq!(std::fs::read(&sibling).expect("kept"), b"a sibling's own");
+        assert_eq!(
+            std::fs::read(&caller_sentinel).expect("kept"),
+            b"the caller's own"
+        );
+        // The sibling is another workspace: its own retirement, not this export, ends
+        // its temp dir. The fixture ends it here to reach the terminal state.
+        std::fs::remove_dir_all(sibling.parent().expect("sibling temp")).expect("end sibling");
+        require_terminal_storage(&project_root)
+            .expect("the export leaves terminal storage the restore admits");
     }
 }
 

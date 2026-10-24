@@ -4,20 +4,16 @@
 //! A removal that cannot prove every source byte held elsewhere keeps the complete image as
 //! `sessions/.trash/<ws>-<incarnation>.dmg` with its companions (02, "Recovery source"). Nothing in
 //! the store deletes one, and terminal project removal refuses while one remains, so its contents
-//! leave the store only deliberately, through this move. It renames and never copies or deletes:
-//! the image and every companion go to `<to>/<ws>-<incarnation>/`, beside a manifest naming the
-//! project, the workspace, its incarnation and why it was kept.
-//!
-//! The renames are ordered so that every point a crash can stop at leaves the bytes retained: the
-//! manifest first, then the companions, the image last. An image whose grants sidecar has left is
-//! a recovery image without its record, which nothing reclaims; a sidecar whose image had left
-//! would read as a retired record and be collected, so the image never goes first. The same
-//! command finds the manifest and finishes the move.
+//! leave the store only deliberately, through this transfer. Same-filesystem transfers rename
+//! companions before the image. Cross-filesystem transfers sparsely copy regular files; the
+//! existing source-side lifecycle journal alone owns progress and verified proofs. Destination
+//! documents are immutable reports, never retirement authority. After complete verification,
+//! sources move into journal-bound private custody and only validated staged inodes are freed.
 
 use std::ffi::{CString, OsStr, OsString};
 use std::fs;
-use std::io;
-use std::os::fd::AsRawFd as _;
+use std::io::{self, Write as _};
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
@@ -25,6 +21,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 use crate::api::dto::{RecoveredImage, RecoveryRetention};
+use crate::copy::{CopyFileIdentity, copy_held_file, verify_held_file};
 use crate::error::{CowshedError, Result};
 use crate::metadata::{
     DetachedWorkspaceMetadata, WorkspaceIncarnation, WorkspaceName, sidecar_path,
@@ -37,10 +34,94 @@ use crate::storage::deletion_log::{self, DeletionKind};
 use crate::storage::recovery::{ABANDON_BUNDLE_EXTENSION, TRASH_NAMESPACE};
 use cowshed_apfs::image::IMAGE_EXTENSION;
 use cowshed_apfs::store_lock::{LockMode, acquire_image_locks};
+/// Backend-owned ephemeral cleanup under recovery's held workspace lifecycle lock.
+pub trait RecoveryEnvironment {
+    fn reclaim_recovery_environment(
+        &self,
+        repo: &RepoId,
+        image: &Path,
+    ) -> std::result::Result<(), crate::storage::apfs::ApfsStorageError>;
+}
 
 /// The manifest's name in the directory a recovery image moves to.
 pub const MANIFEST_FILE: &str = "recovery.json";
+/// Immutable complete-destination evidence; source retirement authority stays in the store.
+pub const COPY_PROOF_FILE: &str = "recovery-copy.json";
+
+pub(crate) mod custody;
+use custody::RecoveryExport;
 const MANIFEST_VERSION: u32 = 1;
+const COPY_MANIFEST_VERSION: u32 = 2;
+
+/// The admitted destination namespace, shared by planning, publication and its manifest.
+struct RecoveryDestination<'a> {
+    parent: &'a Path,
+    directory: &'a Path,
+    manifest: &'a Path,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl DirectoryIdentity {
+    fn read(directory: &fs::File) -> io::Result<Self> {
+        let metadata = directory.metadata()?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CopyTransfer {
+    source_directory: DirectoryIdentity,
+    destination_directory: DirectoryIdentity,
+    artifacts: Vec<CopyArtifact>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CopyArtifact {
+    source: CopyFileIdentity,
+    state: CopyState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "phase", rename_all = "camelCase", deny_unknown_fields)]
+enum CopyState {
+    Pending,
+    Copying {
+        stage: String,
+        target: CopyFileIdentity,
+    },
+    Copied {
+        stage: String,
+        target: CopyFileIdentity,
+    },
+    Published {
+        target: CopyFileIdentity,
+        digest: crate::api::Sha256Digest,
+    },
+}
+
+/// Transaction boundaries observed by the ordinary-file behavioral controls.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CopyCheckpoint {
+    ManifestDurable,
+    CopyCreated,
+    Staged,
+    Published,
+    BeforeRetire,
+    BeforeSourceRetire,
+    RetirementStaged,
+    Retired,
+}
 
 /// Why a path is not a recovery image of this project.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -121,6 +202,8 @@ struct Manifest {
     grants: bool,
     retained: RecoveryRetention,
     recovered_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    copy: Option<CopyTransfer>,
 }
 
 impl Manifest {
@@ -131,7 +214,20 @@ impl Manifest {
         incarnation: &WorkspaceIncarnation,
         source: &Path,
     ) -> bool {
-        self.version == MANIFEST_VERSION
+        ((self.version == MANIFEST_VERSION && self.copy.is_none())
+            || (self.version == COPY_MANIFEST_VERSION
+                && self.copy.as_ref().is_some_and(|copy| {
+                    copy.artifacts.len() == self.files.len()
+                        && copy
+                            .artifacts
+                            .iter()
+                            .zip(&self.files)
+                            .all(|(artifact, name)| match &artifact.state {
+                                CopyState::Copying { stage, .. }
+                                | CopyState::Copied { stage, .. } => valid_stage(name, stage),
+                                CopyState::Pending | CopyState::Published { .. } => true,
+                            })
+                })))
             && self.repo_id == *repo
             && self.workspace == *workspace
             && self.incarnation == *incarnation
@@ -167,17 +263,27 @@ fn in_moving_order(files: &[String], image: &Path) -> bool {
             .all(|file| candidates.any(|name| name.as_os_str() == OsStr::new(file)))
 }
 
-/// Move the recovery image `image` of the project `layout` names, bound to `repo`, out of the store
-/// into `<to>/<workspace>-<incarnation>/`, beside its manifest. `image` and `to` must be absolute.
-/// Refuses before anything moves a path that is not one of this project's recovery images, a
-/// destination inside the store, on another filesystem or already occupied, and a workspace whose
-/// lifecycle lock another operation holds; a retry after an interruption finishes the move its
-/// manifest describes.
+/// Transfer one recovery image outside the store while holding its lifecycle lock.
+/// Rename on the same filesystem; on another filesystem accept only regular artifacts and
+/// retain every source until the complete destination is durable and verified.
 pub fn recover(
     layout: &StorageLayout,
     repo: &RepoId,
     image: &Path,
     to: &Path,
+    owner: &impl RecoveryEnvironment,
+) -> Result<RecoveredImage> {
+    recover_with(layout, repo, image, to, owner, false, &mut |_, _| Ok(()))
+}
+
+fn recover_with(
+    layout: &StorageLayout,
+    repo: &RepoId,
+    image: &Path,
+    to: &Path,
+    owner: &impl RecoveryEnvironment,
+    force_copy: bool,
+    observe: &mut impl FnMut(CopyCheckpoint, &Path) -> Result<()>,
 ) -> Result<RecoveredImage> {
     for (role, path) in [("recovery image", image), ("--to directory", to)] {
         if !path.is_absolute() {
@@ -239,42 +345,80 @@ pub fn recover(
     })?;
     let to = destination(&project.store_root, to)?;
     let (trash_device, to_device) = (device(&trash)?, device(&to)?);
-    if trash_device != to_device {
-        return Err(CowshedError::usage(
-            format!(
-                "{} is on another filesystem than the store's trash {}; a recovery image moves by rename, never by copy",
-                to.display(),
-                trash.display()
-            ),
-            "choose a directory outside the store on the store's own filesystem",
-        ));
-    }
+    let cross_device = force_copy || trash_device != to_device;
+    let held_trash = open_directory(&trash)?;
     let directory = to.join(format!("{}-{}", workspace.as_str(), incarnation.as_str()));
     let manifest_path = directory.join(MANIFEST_FILE);
-    // Only a real directory holding this image's own manifest is a move to finish: a symlink there
-    // could aim a retry anywhere, back into the store included.
-    let manifest = match fs::symlink_metadata(&directory) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => plan(
-            project.project_root.as_path(),
-            repo,
-            (&workspace, &incarnation),
-            &image,
-            &to,
-            &directory,
-        )?,
-        Ok(metadata) if metadata.file_type().is_dir() => match read_manifest(&manifest_path)? {
-            Some(manifest) if manifest.describes(repo, &workspace, &incarnation, &image) => {
-                manifest
-            }
-            Some(_) | None => return Err(occupied(&directory)),
-        },
-        Ok(_) => return Err(occupied(&directory)),
-        Err(error) => return Err(io_failure("inspect", &directory, &error)),
+    let destination = RecoveryDestination {
+        parent: &to,
+        directory: &directory,
+        manifest: &manifest_path,
+    };
+    let journal_path = custody::journal_path(&project.project_root);
+    let mut export = custody::load_export(&journal_path, &image)?;
+    let manifest = if let Some(record) = &export {
+        if record.directory != directory
+            || !record
+                .admission
+                .describes(repo, &workspace, &incarnation, &image)
+        {
+            return Err(transfer_failure(
+                "admit source-held recovery",
+                &image,
+                &directory,
+                "the source journal admits a different destination or image identity",
+            ));
+        }
+        record.admission.clone()
+    } else {
+        match fs::symlink_metadata(&directory) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => plan(
+                project.project_root.as_path(),
+                repo,
+                (&workspace, &incarnation),
+                &image,
+                &destination,
+                cross_device,
+                &held_trash,
+            )?,
+            Ok(metadata) if metadata.file_type().is_dir() => match read_manifest(&manifest_path)? {
+                Some(manifest)
+                    if manifest.copy.is_none()
+                        && manifest.describes(repo, &workspace, &incarnation, &image) =>
+                {
+                    manifest
+                }
+                Some(_) | None => return Err(occupied(&directory)),
+            },
+            Ok(_) => return Err(occupied(&directory)),
+            Err(error) => return Err(io_failure("inspect", &directory, &error)),
+        }
     };
     // Both directories are held by descriptor from here on: every rename is relative to them, so
     // a link planted at either path afterwards cannot redirect a move.
-    let held_trash = open_directory(&trash)?;
     let held_directory = open_directory(&directory)?;
+    if manifest.copy.is_some() {
+        if export.is_none() {
+            export = custody::load_export(&journal_path, &image)?;
+        }
+        let record = export.as_mut().ok_or_else(|| {
+            transfer_failure(
+                "admit copy authority",
+                &image,
+                &directory,
+                "no source-held recovery record",
+            )
+        })?;
+        custody::ensure_admission(record, &held_directory, &journal_path)?;
+    } else if read_manifest_at(&held_directory, &manifest_path)?.as_ref() != Some(&manifest) {
+        return Err(occupied(&directory));
+    }
+    if cross_device && manifest.copy.is_none() {
+        return Err(CowshedError::integrity(
+            "a rename manifest cannot authorize a cross-filesystem copy",
+            "resume this recovery on its original filesystem; preserve both directories",
+        ));
+    }
     // An ordered list can still be short: every file derived for this image that exists on either
     // side must be one the manifest moves, or the image would leave without its companions.
     for path in movable(&image) {
@@ -302,6 +446,53 @@ pub fn recover(
             ),
             "move the destination directory aside, then retry: the recovery moved nothing",
         ));
+    }
+    if let Some(record) = &export {
+        custody::admit_export(record, &held_trash, &held_directory, &trash)?;
+    } else {
+        admit_transfer(
+            &manifest,
+            &held_trash,
+            &held_directory,
+            &trash,
+            &directory,
+            &manifest_path,
+        )?;
+    }
+    owner
+        .reclaim_recovery_environment(repo, &image)
+        .map_err(|error| {
+            transfer_failure(
+                "reclaim scoped recovery environment",
+                &image,
+                &directory,
+                error,
+            )
+        })?;
+    if let Some(record) = export.as_mut() {
+        copy_recovery(
+            record,
+            &held_trash,
+            &held_directory,
+            &trash,
+            &destination,
+            &project.project_root,
+            observe,
+        )?;
+        return Ok(RecoveredImage {
+            workspace,
+            incarnation,
+            source: image,
+            moved: manifest
+                .files
+                .iter()
+                .map(|name| directory.join(name))
+                .collect(),
+            directory,
+            manifest: manifest_path,
+            grants: manifest.grants,
+            retained: manifest.retained,
+        });
     }
     let mut moved = Vec::with_capacity(manifest.files.len());
     for name in &manifest.files {
@@ -372,16 +563,17 @@ pub fn recover(
     })
 }
 
-/// Read the image's own record, name everything that moves, make the destination directory and
-/// write the manifest into it, durably, before the first rename.
 fn plan(
     project_root: &Path,
     repo: &RepoId,
     (workspace, incarnation): (&WorkspaceName, &WorkspaceIncarnation),
     image: &Path,
-    to: &Path,
-    directory: &Path,
+    destination: &RecoveryDestination<'_>,
+    cross_device: bool,
+    held_trash: &fs::File,
 ) -> Result<Manifest> {
+    let to = destination.parent;
+    let directory = destination.directory;
     match fs::symlink_metadata(image) {
         Ok(metadata) if !metadata.file_type().is_symlink() => {}
         Ok(_) => {
@@ -393,7 +585,7 @@ fn plan(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(CowshedError::not_found(
                 format!("no recovery image at {}", image.display()),
-                "cowshed doctor names the recovery images the project's trash keeps",
+                "cowshed doctor names retained recovery images",
             ));
         }
         Err(error) => return Err(io_failure("inspect", image, &error)),
@@ -424,13 +616,65 @@ fn plan(
         }
     }
     let mut files = Vec::new();
+    let mut artifacts = Vec::new();
     for path in movable(image) {
-        if present(&path)? {
-            files.push(file_name(&path)?);
+        let name = file_name(&path)?;
+        let entry = held_name(&name, directory)?;
+        if present_in(held_trash, &entry, &path)? {
+            if cross_device {
+                let source = open_regular_at(held_trash, &entry)
+                    .and_then(|file| CopyFileIdentity::read(&file))
+                    .map_err(|error| {
+                        transfer_failure(
+                            "admit regular source",
+                            &path,
+                            &directory.join(&name),
+                            error,
+                        )
+                    })?;
+                artifacts.push(CopyArtifact {
+                    source,
+                    state: CopyState::Pending,
+                });
+            }
+            files.push(name);
         }
     }
+    if !in_moving_order(&files, image) {
+        return Err(transfer_failure(
+            "admit source set",
+            image,
+            directory,
+            "the recovery image disappeared while its companions were inspected",
+        ));
+    }
+    let held_to = open_directory(to)?;
+    let leaf = held_name(&file_name(directory)?, directory)?;
+    let (held_directory, created) =
+        cowshed_os::fsio::open_or_create_child_directory(&held_to, &leaf)
+            .map_err(|error| io_failure("create", directory, &error))?;
+    if !created {
+        return Err(occupied(directory));
+    }
+    cowshed_os::fsio::sync_held_directory(&held_to)
+        .map_err(|error| io_failure("sync", to, &error))?;
+    let copy = if cross_device {
+        Some(CopyTransfer {
+            source_directory: DirectoryIdentity::read(held_trash)
+                .map_err(|error| io_failure("identify", image, &error))?,
+            destination_directory: DirectoryIdentity::read(&held_directory)
+                .map_err(|error| io_failure("identify", directory, &error))?,
+            artifacts,
+        })
+    } else {
+        None
+    };
     let manifest = Manifest {
-        version: MANIFEST_VERSION,
+        version: if cross_device {
+            COPY_MANIFEST_VERSION
+        } else {
+            MANIFEST_VERSION
+        },
         repo_id: repo.clone(),
         workspace: workspace.clone(),
         incarnation: incarnation.clone(),
@@ -439,42 +683,24 @@ fn plan(
         grants,
         retained: deletion_log::recovery_retention(project_root, image),
         recovered_at: deletion_log::rfc3339_utc(SystemTime::now()),
+        copy,
     };
-    match fs::create_dir(directory) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(occupied(directory));
-        }
-        Err(error) => return Err(io_failure("create", directory, &error)),
+    if manifest.copy.is_some() {
+        let mut record = RecoveryExport::new(manifest.clone(), directory.to_owned());
+        let journal_path = custody::journal_path(project_root);
+        custody::save_export(&journal_path, None, &record)?;
+        custody::ensure_admission(&mut record, &held_directory, &journal_path)?;
+    } else {
+        save_manifest(&held_directory, &directory.join(MANIFEST_FILE), &manifest)?;
     }
-    // The directory's own entry is durable before the manifest in it claims the move.
-    sync_directory(to)?;
-    let manifest_path = directory.join(MANIFEST_FILE);
-    crate::metadata::write_json(&manifest_path, &manifest).map_err(|error| {
-        CowshedError::environment_missing(
-            format!("cannot write {}: {error}", manifest_path.display()),
-            "make the destination writable, remove the directory the recovery made, then retry",
-        )
-    })?;
     Ok(manifest)
 }
 
 fn read_manifest(path: &Path) -> Result<Option<Manifest>> {
-    match crate::metadata::read_json::<Manifest>(path) {
-        Ok(manifest) => Ok(Some(manifest)),
-        Err(crate::metadata::MetadataError::Io { source, .. })
-            if source.kind() == io::ErrorKind::NotFound =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(CowshedError::integrity(
-            format!(
-                "cannot read the recovery manifest {}: {error}",
-                path.display()
-            ),
-            "move the destination directory aside, or choose another --to",
-        )),
-    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| CowshedError::internal("manifest has no directory"))?;
+    read_manifest_at(&open_directory(parent)?, path)
 }
 
 /// The path `create_dir_all(to)` makes, resolved through its longest existing prefix, created
@@ -516,7 +742,7 @@ fn destination(store: &Path, to: &Path) -> Result<PathBuf> {
                 resolved.display(),
                 store.display()
             ),
-            "choose a directory outside the store, on the store's own filesystem",
+            "choose a directory outside the store",
         ));
     }
     fs::create_dir_all(&resolved).map_err(|error| io_failure("create", &resolved, &error))?;
@@ -578,13 +804,41 @@ fn both_exist(from: &Path, into: &Path) -> CowshedError {
     )
 }
 
-/// `directory`, opened without following a link at its last component.
 fn open_directory(directory: &Path) -> Result<fs::File> {
-    fs::OpenOptions::new()
+    let mut held = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(directory)
-        .map_err(|error| io_failure("open", directory, &error))
+        .open("/")
+        .map_err(|error| io_failure("open root for", directory, &error))?;
+    for component in directory.components() {
+        match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => {
+                use std::os::unix::ffi::OsStrExt as _;
+                let name = CString::new(name.as_bytes())
+                    .map_err(|_| CowshedError::internal("directory contains NUL"))?;
+                // SAFETY: the held descriptor and leaf are live; each component refuses links.
+                let fd = unsafe {
+                    libc::openat(
+                        held.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(io_failure("open", directory, &io::Error::last_os_error()));
+                }
+                // SAFETY: openat returned a fresh descriptor owned by this iteration.
+                held = unsafe { fs::File::from_raw_fd(fd) };
+            }
+            _ => {
+                return Err(CowshedError::internal(
+                    "recovery directory is not canonical",
+                ));
+            }
+        }
+    }
+    Ok(held)
 }
 
 /// Whether `entry` exists in the held `directory`, without following it; `path` names it in
@@ -758,4 +1012,489 @@ mod tests {
             );
         }
     }
+}
+
+#[cfg(test)]
+mod copy_tests;
+
+#[cfg(test)]
+pub(crate) fn recover_by_copy(
+    layout: &StorageLayout,
+    repo: &RepoId,
+    image: &Path,
+    to: &Path,
+    observe: &mut impl FnMut(CopyCheckpoint, &Path) -> Result<()>,
+) -> Result<RecoveredImage> {
+    struct CopyOnly;
+    impl RecoveryEnvironment for CopyOnly {
+        fn reclaim_recovery_environment(
+            &self,
+            _: &RepoId,
+            _: &Path,
+        ) -> std::result::Result<(), crate::storage::apfs::ApfsStorageError> {
+            Ok(())
+        }
+    }
+    recover_with(layout, repo, image, to, &CopyOnly, true, observe)
+}
+
+fn valid_stage(name: &str, stage: &str) -> bool {
+    stage
+        .strip_prefix(&format!(".{name}.recovery-"))
+        .and_then(|suffix| suffix.strip_suffix(".partial"))
+        .is_some_and(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn open_regular_at(directory: &fs::File, name: &CString) -> io::Result<fs::File> {
+    // SAFETY: the directory and name outlive openat. NONBLOCK prevents a planted FIFO hanging admission.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a newly owned descriptor.
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    CopyFileIdentity::read(&file)?;
+    Ok(file)
+}
+
+fn read_manifest_at(directory: &fs::File, path: &Path) -> Result<Option<Manifest>> {
+    let name = held_name(&file_name(path)?, path)?;
+    match open_regular_at(directory, &name) {
+        Ok(file) => serde_json::from_reader(file).map(Some).map_err(|error| {
+            CowshedError::integrity(
+                format!("cannot read recovery manifest {}: {error}", path.display()),
+                "preserve the destination; choose another --to or inspect its manifest",
+            )
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io_failure("open recovery manifest", path, &error)),
+    }
+}
+
+fn save_manifest(directory: &fs::File, path: &Path, manifest: &Manifest) -> Result<()> {
+    let name = held_name(&file_name(path)?, path)?;
+    let temporary = held_name(
+        &format!(
+            ".{}.tmp.{}",
+            file_name(path)?,
+            uuid::Uuid::new_v4().simple()
+        ),
+        path,
+    )?;
+    let mut file = cowshed_os::fsio::create_private_file_at(directory, &temporary)
+        .map_err(|error| io_failure("create manifest staging file for", path, &error))?;
+    serde_json::to_writer_pretty(&mut file, manifest).map_err(|error| {
+        CowshedError::internal(format!("serialize {}: {error}", path.display()))
+    })?;
+    file.write_all(b"\n")
+        .map_err(|error| io_failure("write", path, &error))?;
+    file.sync_all()
+        .map_err(|error| io_failure("sync", path, &error))?;
+    cowshed_os::fsio::rename_noreplace(
+        directory.as_raw_fd(),
+        &temporary,
+        directory.as_raw_fd(),
+        &name,
+    )
+    .map_err(|error| io_failure("publish immutable manifest", path, &error))?;
+    cowshed_os::fsio::sync_held_directory(directory)
+        .map_err(|error| io_failure("sync manifest directory", path, &error))
+}
+
+fn transfer_failure(
+    operation: &str,
+    source: &Path,
+    destination: &Path,
+    cause: impl std::fmt::Display,
+) -> CowshedError {
+    CowshedError::integrity(
+        format!(
+            "cannot {operation} recovery artifact {} -> {}: {cause}",
+            source.display(),
+            destination.display()
+        ),
+        "retain the source, destination and manifest; resolve the named cause and retry the same recovery",
+    )
+}
+
+fn require_identity(
+    file: &fs::File,
+    expected: &CopyFileIdentity,
+    source: &Path,
+    destination: &Path,
+    role: &str,
+) -> Result<()> {
+    let actual = CopyFileIdentity::read(file)
+        .map_err(|error| transfer_failure("inspect identity", source, destination, error))?;
+    if actual != *expected {
+        return Err(transfer_failure(
+            "validate identity",
+            source,
+            destination,
+            format!("{role} changed: expected {expected:?}, observed {actual:?}"),
+        ));
+    }
+    Ok(())
+}
+
+fn set_copy_state(
+    record: &mut RecoveryExport,
+    index: usize,
+    state: CopyState,
+    journal_path: &Path,
+) -> Result<()> {
+    let previous = record.clone();
+    let copy = record
+        .progress
+        .copy
+        .as_mut()
+        .ok_or_else(|| CowshedError::internal("copy state without copy manifest"))?;
+    copy.artifacts[index].state = state;
+    custody::save_export(journal_path, Some(&previous), record)
+}
+
+fn admit_transfer(
+    manifest: &Manifest,
+    held_trash: &fs::File,
+    held_directory: &fs::File,
+    trash: &Path,
+    directory: &Path,
+    manifest_path: &Path,
+) -> Result<()> {
+    let Some(copy) = &manifest.copy else {
+        for name in &manifest.files {
+            let from = trash.join(name);
+            let into = directory.join(name);
+            let entry = held_name(name, manifest_path)?;
+            match (
+                present_in(held_trash, &entry, &from)?,
+                present_in(held_directory, &entry, &into)?,
+            ) {
+                (true, true) => return Err(both_exist(&from, &into)),
+                (false, false) => {
+                    return Err(transfer_failure(
+                        "admit rename",
+                        &from,
+                        &into,
+                        "both entries are missing",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        return Ok(());
+    };
+    require_copy_directories(copy, held_trash, held_directory, trash, directory)?;
+    let published = copy
+        .artifacts
+        .iter()
+        .all(|artifact| matches!(artifact.state, CopyState::Published { .. }));
+    for (name, artifact) in manifest.files.iter().zip(&copy.artifacts) {
+        let from = trash.join(name);
+        let into = directory.join(name);
+        let entry = held_name(name, manifest_path)?;
+        if !published || present_in(held_trash, &entry, &from)? {
+            let source = open_regular_at(held_trash, &entry)
+                .map_err(|error| transfer_failure("admit source", &from, &into, error))?;
+            require_identity(&source, &artifact.source, &from, &into, "source")?;
+        }
+        match &artifact.state {
+            CopyState::Published { target, .. } => {
+                let destination = open_regular_at(held_directory, &entry)
+                    .map_err(|error| transfer_failure("admit destination", &from, &into, error))?;
+                require_identity(&destination, target, &from, &into, "destination")?;
+            }
+            CopyState::Copied { stage, target } => {
+                let stage_name = held_name(stage, manifest_path)?;
+                if present_in(held_directory, &stage_name, &directory.join(stage))? {
+                    if present_in(held_directory, &entry, &into)? {
+                        return Err(both_exist(&from, &into));
+                    }
+                    let staged = open_regular_at(held_directory, &stage_name).map_err(|error| {
+                        transfer_failure("admit staged copy", &from, &into, error)
+                    })?;
+                    require_identity(&staged, target, &from, &into, "staged copy")?;
+                } else {
+                    let destination = open_regular_at(held_directory, &entry).map_err(|error| {
+                        transfer_failure("admit interrupted publication", &from, &into, error)
+                    })?;
+                    let actual = CopyFileIdentity::read(&destination).map_err(|error| {
+                        transfer_failure("identify interrupted publication", &from, &into, error)
+                    })?;
+                    if !target.after_rename(&actual) {
+                        return Err(transfer_failure(
+                            "admit interrupted publication",
+                            &from,
+                            &into,
+                            format!("expected {target:?}, observed {actual:?}"),
+                        ));
+                    }
+                }
+            }
+            CopyState::Pending | CopyState::Copying { .. } => {
+                if present_in(held_directory, &entry, &into)? {
+                    return Err(both_exist(&from, &into));
+                }
+                if let CopyState::Copying { stage, target } = &artifact.state {
+                    let stage_name = held_name(stage, manifest_path)?;
+                    if present_in(held_directory, &stage_name, &directory.join(stage))? {
+                        let staged =
+                            open_regular_at(held_directory, &stage_name).map_err(|error| {
+                                transfer_failure("admit interrupted copy", &from, &into, error)
+                            })?;
+                        let actual = CopyFileIdentity::read(&staged).map_err(|error| {
+                            transfer_failure("identify interrupted copy", &from, &into, error)
+                        })?;
+                        if !target.same_inode(&actual) {
+                            return Err(transfer_failure(
+                                "admit interrupted copy",
+                                &from,
+                                &into,
+                                format!("expected {target:?}, observed {actual:?}"),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_copy_directories(
+    copy: &CopyTransfer,
+    held_trash: &fs::File,
+    held_directory: &fs::File,
+    trash: &Path,
+    directory: &Path,
+) -> Result<()> {
+    for (path, held, expected) in [
+        (trash, held_trash, &copy.source_directory),
+        (directory, held_directory, &copy.destination_directory),
+    ] {
+        for file in [held, &open_directory(path)?] {
+            let actual = DirectoryIdentity::read(file)
+                .map_err(|error| io_failure("identify", path, &error))?;
+            if actual != *expected {
+                return Err(transfer_failure(
+                    "admit directory identity",
+                    trash,
+                    directory,
+                    format!(
+                        "{}: expected {expected:?}, observed {actual:?}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copy_recovery(
+    record: &mut RecoveryExport,
+    held_trash: &fs::File,
+    held_directory: &fs::File,
+    trash: &Path,
+    destination: &RecoveryDestination<'_>,
+    project_root: &Path,
+    observe: &mut impl FnMut(CopyCheckpoint, &Path) -> Result<()>,
+) -> Result<()> {
+    let directory = destination.directory;
+    let manifest_path = destination.manifest;
+    let journal_path = custody::journal_path(project_root);
+    custody::admit_export(record, held_trash, held_directory, trash)?;
+    observe(CopyCheckpoint::ManifestDurable, &record.progress.source)?;
+    for index in 0..record.progress.files.len() {
+        let name = record.progress.files[index].clone();
+        let from = trash.join(&name);
+        let into = directory.join(&name);
+        let entry = held_name(&name, manifest_path)?;
+        let artifact = record
+            .progress
+            .copy
+            .as_ref()
+            .ok_or_else(|| CowshedError::internal("missing copy manifest"))?
+            .artifacts[index]
+            .clone();
+        if let CopyState::Published { target, .. } = &artifact.state {
+            let copied = open_regular_at(held_directory, &entry).map_err(|error| {
+                transfer_failure("open published destination", &from, &into, error)
+            })?;
+            require_identity(&copied, target, &from, &into, "destination")?;
+            continue;
+        }
+        let source = open_regular_at(held_trash, &entry)
+            .map_err(|error| transfer_failure("open source", &from, &into, error))?;
+        require_identity(&source, &artifact.source, &from, &into, "source")?;
+        let (stage, staged_identity) = match artifact.state.clone() {
+            CopyState::Copied { stage, target } => (stage, target),
+            CopyState::Pending | CopyState::Copying { .. } => {
+                if present_in(held_directory, &entry, &into)? {
+                    return Err(both_exist(&from, &into));
+                }
+                if let CopyState::Copying { stage, target } = &artifact.state {
+                    let partial_name = held_name(stage, manifest_path)?;
+                    if present_in(held_directory, &partial_name, &directory.join(stage))? {
+                        let partial =
+                            open_regular_at(held_directory, &partial_name).map_err(|error| {
+                                transfer_failure(
+                                    "inspect partial copy",
+                                    &from,
+                                    &directory.join(stage),
+                                    error,
+                                )
+                            })?;
+                        let actual = CopyFileIdentity::read(&partial).map_err(|error| {
+                            transfer_failure(
+                                "identify partial copy",
+                                &from,
+                                &directory.join(stage),
+                                error,
+                            )
+                        })?;
+                        if !target.same_inode(&actual) {
+                            return Err(transfer_failure(
+                                "admit partial copy",
+                                &from,
+                                &directory.join(stage),
+                                format!(
+                                    "partial changed: expected {target:?}, observed {actual:?}"
+                                ),
+                            ));
+                        }
+                    }
+                }
+                let stage = format!(".{name}.recovery-{}.partial", uuid::Uuid::new_v4().simple());
+                let stage_name = held_name(&stage, manifest_path)?;
+                let output = cowshed_os::fsio::create_private_file_at(held_directory, &stage_name)
+                    .map_err(|error| {
+                        transfer_failure(
+                            "create partial copy",
+                            &from,
+                            &directory.join(&stage),
+                            error,
+                        )
+                    })?;
+                output.sync_all().map_err(|error| {
+                    transfer_failure("sync partial identity", &from, &into, error)
+                })?;
+                cowshed_os::fsio::sync_held_directory(held_directory)
+                    .map_err(|error| transfer_failure("sync partial entry", &from, &into, error))?;
+                let target = CopyFileIdentity::read(&output)
+                    .map_err(|error| transfer_failure("identify partial", &from, &into, error))?;
+                set_copy_state(
+                    record,
+                    index,
+                    CopyState::Copying {
+                        stage: stage.clone(),
+                        target,
+                    },
+                    &journal_path,
+                )?;
+                observe(CopyCheckpoint::CopyCreated, &from)?;
+                require_identity(&source, &artifact.source, &from, &into, "source")?;
+                copy_held_file(&source, &output).map_err(|error| {
+                    transfer_failure("copy sparse bytes", &from, &directory.join(&stage), error)
+                })?;
+                require_identity(&source, &artifact.source, &from, &into, "source")?;
+                output
+                    .sync_all()
+                    .map_err(|error| transfer_failure("sync copied bytes", &from, &into, error))?;
+                let target = CopyFileIdentity::read(&output).map_err(|error| {
+                    transfer_failure("identify copied bytes", &from, &into, error)
+                })?;
+                set_copy_state(
+                    record,
+                    index,
+                    CopyState::Copied {
+                        stage: stage.clone(),
+                        target: target.clone(),
+                    },
+                    &journal_path,
+                )?;
+                observe(CopyCheckpoint::Staged, &from)?;
+                (stage, target)
+            }
+            CopyState::Published { .. } => unreachable!("published handled above"),
+        };
+        let stage_name = held_name(&stage, manifest_path)?;
+        if present_in(held_directory, &stage_name, &directory.join(&stage))? {
+            if present_in(held_directory, &entry, &into)? {
+                return Err(both_exist(&from, &into));
+            }
+            let staged = open_regular_at(held_directory, &stage_name).map_err(|error| {
+                transfer_failure("open staged copy", &from, &directory.join(&stage), error)
+            })?;
+            require_identity(
+                &staged,
+                &staged_identity,
+                &from,
+                &directory.join(&stage),
+                "staged copy",
+            )?;
+            require_identity(&source, &artifact.source, &from, &into, "source")?;
+            cowshed_os::fsio::rename_noreplace(
+                held_directory.as_raw_fd(),
+                &stage_name,
+                held_directory.as_raw_fd(),
+                &entry,
+            )
+            .map_err(|error| transfer_failure("publish copied artifact", &from, &into, error))?;
+        }
+        let copied = open_regular_at(held_directory, &entry)
+            .map_err(|error| transfer_failure("open copied destination", &from, &into, error))?;
+        let actual = CopyFileIdentity::read(&copied)
+            .map_err(|error| transfer_failure("identify destination", &from, &into, error))?;
+        if !staged_identity.after_rename(&actual) {
+            return Err(transfer_failure(
+                "admit published inode",
+                &from,
+                &into,
+                format!("expected staged {staged_identity:?}, observed {actual:?}"),
+            ));
+        }
+        copied
+            .sync_all()
+            .map_err(|error| transfer_failure("sync destination", &from, &into, error))?;
+        cowshed_os::fsio::sync_held_directory(held_directory)
+            .map_err(|error| transfer_failure("sync publication", &from, &into, error))?;
+        require_identity(&source, &artifact.source, &from, &into, "source")?;
+        let digest = verify_held_file(&source, &copied)
+            .map_err(|error| transfer_failure("verify copied bytes", &from, &into, error))?;
+        require_identity(&source, &artifact.source, &from, &into, "source")?;
+        require_identity(&copied, &actual, &from, &into, "verified destination")?;
+        set_copy_state(
+            record,
+            index,
+            CopyState::Published {
+                target: actual,
+                digest,
+            },
+            &journal_path,
+        )?;
+        observe(CopyCheckpoint::Published, &from)?;
+    }
+    custody::ensure_copy_proof(record, held_directory, &journal_path)?;
+    observe(CopyCheckpoint::BeforeRetire, &record.progress.source)?;
+    custody::admit_export(record, held_trash, held_directory, trash)?;
+    custody::retire_sources(
+        record,
+        held_trash,
+        held_directory,
+        trash,
+        project_root,
+        observe,
+    )?;
+    cowshed_os::fsio::sync_held_directory(held_trash)
+        .map_err(|error| io_failure("sync", trash, &error))?;
+    cowshed_os::fsio::sync_held_directory(held_directory)
+        .map_err(|error| io_failure("sync", directory, &error))?;
+    Ok(())
 }

@@ -10,11 +10,15 @@ use super::{
 
 const SOURCE: &[u8] = b"pub fn answer() -> u8 { 42 }\n";
 
-struct Scratch(PathBuf);
+pub(crate) struct Scratch(PathBuf);
 
 impl Scratch {
-    fn new(label: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
+    pub(crate) fn new(label: &str) -> Self {
+        Self::new_in(&std::env::temp_dir(), label)
+    }
+
+    pub(crate) fn new_in(parent: &Path, label: &str) -> Self {
+        let root = parent.join(format!(
             "cowshed-directory-{label}-{}",
             uuid::Uuid::new_v4().simple()
         ));
@@ -24,7 +28,7 @@ impl Scratch {
         Self(fs::canonicalize(root).unwrap())
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.0
     }
 
@@ -151,7 +155,7 @@ fn tree_usage_counts_hard_links_once_and_never_follows_links() {
     assert!(usage.allocated < 1 << 20, "the linked tree is not counted");
 }
 
-fn published_directory(
+pub(crate) fn published_directory(
     scratch: &Scratch,
     name: &str,
     incarnation: u128,
@@ -323,6 +327,443 @@ fn directory_source_release_keeps_canonical_authority_on_cleanup_refusal() {
     assert!(!storage.project().sessions.join(".trash").exists());
 }
 
+/// The store paths a published fixture's release and a project's terminal-storage guard
+/// both name: its project root, and the per-workspace temp dir below it. Shared so a test
+/// outside this module composes the actual release with that guard on one store.
+pub(crate) fn published_directory_paths(
+    host: &super::DirectoryExecutionHost,
+    metadata: &crate::metadata::DetachedWorkspaceMetadata,
+) -> (PathBuf, PathBuf) {
+    use super::*;
+    let storage = layout(&host.config, &metadata.repo_id).unwrap();
+    (
+        storage.project().project_root.clone(),
+        storage.exec_temp_dir(&metadata.workspace).unwrap(),
+    )
+}
+
+/// Release a published fixture through the same RetiredRef authority its retiring image
+/// carries in production.
+pub(crate) fn release_published_directory(
+    host: &super::DirectoryExecutionHost,
+    metadata: &crate::metadata::DetachedWorkspaceMetadata,
+) {
+    use super::*;
+    let workspace = metadata_workspace_ref(metadata).unwrap();
+    let retired = RetiredRef::new(workspace, Revision::new(1));
+    host.release_workspace(&host.config, &retired).unwrap();
+}
+
+/// The published fixture's storage layout, for tests outside this module composing the
+/// fixture with store-level operations a layout names (recovery export above all).
+pub(crate) fn published_directory_layout(
+    host: &super::DirectoryExecutionHost,
+    metadata: &crate::metadata::DetachedWorkspaceMetadata,
+) -> crate::storage::StorageLayout {
+    use super::*;
+    layout(&host.config, &metadata.repo_id).unwrap()
+}
+
+/// Where a published fixture's payload retires to: the trash image a recovery retention
+/// keeps, named after the workspace and its incarnation.
+pub(crate) fn published_directory_trash(
+    host: &super::DirectoryExecutionHost,
+    metadata: &crate::metadata::DetachedWorkspaceMetadata,
+) -> PathBuf {
+    use super::*;
+    layout(&host.config, &metadata.repo_id)
+        .unwrap()
+        .project()
+        .sessions
+        .join(format!(
+            ".trash/{}-{}.dmg",
+            metadata.workspace.as_str(),
+            metadata.workspace_incarnation
+        ))
+}
+
+/// Reclaim a published fixture's retained trash image through its exact RetiredRef, the
+/// authority gc's collection of a retirement carries: image disposal included, unlike
+/// the recovery export, which must preserve the image.
+pub(crate) fn reclaim_retired_published_directory(
+    host: &super::DirectoryExecutionHost,
+    metadata: &crate::metadata::DetachedWorkspaceMetadata,
+) {
+    use super::*;
+    let workspace = metadata_workspace_ref(metadata).unwrap();
+    let revision = Revision::new(workspace.revision().get().saturating_add(1));
+    let retired = RetiredRef::new(workspace, revision);
+    host.reclaim_retired(&host.config, &retired).unwrap();
+}
+#[test]
+fn a_retired_workspaces_read_only_compile_cache_is_reclaimed_with_its_temp_dir() {
+    use super::*;
+    use crate::capabilities::CapabilityContribution;
+    use crate::workspace_environment::{
+        EnvironmentMount, NODE_COMPILE_CACHE_DIRECTORY, NODE_COMPILE_CACHE_ENV,
+        WORKSPACE_ENVIRONMENT_PATH, write_workspace_environment,
+    };
+    use cowshed_os::fork_lock::Run as _;
+
+    fn files_under(root: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let entries = match fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("read {}: {error}", directory.display()),
+            };
+            for entry in entries {
+                let entry = entry.unwrap_or_else(|error| panic!("read entry: {error}"));
+                if entry.file_type().expect("entry type").is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    files.push(entry.path());
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    fn host_program(name: &str) -> PathBuf {
+        let path = std::env::var_os("PATH").expect("the gate PATH names the host toolchain");
+        std::env::split_paths(&path)
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| panic!("host {name} is required for this proof"))
+    }
+
+    // The producer's actual call, then a real module load whose bytecode the runtime
+    // flushes into the resolved cache before it exits.
+    const COMPILE: &str = r#"const m = require("node:module");
+m.enableCompileCache();
+const dir = m.getCompileCacheDir();
+if (!dir) { console.error("compile cache is not enabled"); process.exit(3); }
+console.log(dir);
+import("./compile-cache-lib.mjs").then((lib) => {
+  if (lib.answer() !== 42) { process.exit(4); }
+  if (m.flushCompileCache) { m.flushCompileCache(); }
+});
+"#;
+
+    let scratch = Scratch::new("compile-cache-retire");
+    let (host, image, metadata) = published_directory(&scratch, "selected", 1);
+    let storage = layout(&host.config, &metadata.repo_id).unwrap();
+    let (_, exec_temp) = published_directory_paths(&host, &metadata);
+    fs::create_dir_all(&exec_temp).unwrap();
+    // Another workspace's temp dir and the caller's own cache are foreign to this release.
+    let sibling = storage
+        .exec_temp_dir(&WorkspaceName::session("sibling").unwrap())
+        .unwrap()
+        .join("keep");
+    fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+    fs::write(&sibling, b"a sibling's own").unwrap();
+    let caller_sentinel = scratch.path().join("caller-cache/sentinel");
+    fs::create_dir_all(caller_sentinel.parent().unwrap()).unwrap();
+    fs::write(&caller_sentinel, b"the caller's own").unwrap();
+
+    // Serve the fixture's image the way a supervisor start does, then let an activated
+    // read-only shell (its XDG_CACHE_HOME is the exec-temp cache) compile into it.
+    write_workspace_environment(
+        EnvironmentMount::Served {
+            workspace_mount: &image,
+            host_home: scratch.path(),
+            temp_dir: &exec_temp,
+            capability_env: &CapabilityContribution::default(),
+        },
+        &zeroize::Zeroizing::new("token".to_owned()),
+        metadata.platform,
+        metadata.grants.port_block,
+    )
+    .unwrap();
+    let work = scratch.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    fs::write(
+        work.join("compile-cache-lib.mjs"),
+        "export function answer() { return 42; }\n",
+    )
+    .unwrap();
+    let script = work.join("compile.cjs");
+    fs::write(&script, COMPILE).unwrap();
+    let owned = exec_temp.join("cache").join(NODE_COMPILE_CACHE_DIRECTORY);
+    for program in [host_program("node"), host_program("bun")] {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .env_clear()
+            .args(["-c", ". \"$1\"; exec \"$2\" \"$3\"", "read-only-shell"])
+            .arg(image.join(WORKSPACE_ENVIRONMENT_PATH))
+            .arg(&program)
+            .arg(&script)
+            .current_dir(&work)
+            .env("HOME", scratch.path())
+            .env("XDG_CACHE_HOME", exec_temp.join("cache"))
+            .env(NODE_COMPILE_CACHE_ENV, scratch.path().join("caller-cache"));
+        let output = command.output_locked().unwrap();
+        assert!(output.status.success(), "{}: {output:?}", program.display());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let reported = PathBuf::from(stdout.lines().next().expect("cache dir"));
+        assert!(
+            reported.starts_with(&owned),
+            "compiled into {}, not {}",
+            reported.display(),
+            owned.display()
+        );
+        assert!(
+            files_under(&reported)
+                .iter()
+                .any(|file| fs::metadata(file).expect("cache file").len() > 0),
+            "no bytecode under {}",
+            reported.display()
+        );
+    }
+    assert!(
+        !exec_temp.join(NODE_COMPILE_CACHE_DIRECTORY).exists(),
+        "a loose compile cache beside the owned read-only cache"
+    );
+
+    // The supported release reclaims the whole per-workspace temp dir, compile cache
+    // included, and nothing foreign with it.
+    release_published_directory(&host, &metadata);
+    assert!(
+        !exec_temp.exists(),
+        "the retired workspace's temp dir, compile cache included, is reclaimed"
+    );
+    assert!(!image.exists());
+    assert_eq!(fs::read(&sibling).unwrap(), b"a sibling's own");
+    assert_eq!(fs::read(&caller_sentinel).unwrap(), b"the caller's own");
+}
+
+/// Backend scope proof only — not the recovery acceptance, which must preserve the
+/// exported image: reclaiming a retained trash image through its RetiredRef disposes of
+/// the image and removes the workspace's whole exec-temp tree, the read-only compile
+/// cache a real Bun child wrote into it included, and nothing of a sibling's.
+#[test]
+fn reclaiming_a_retained_image_removes_the_whole_exec_temp_tree() {
+    use super::*;
+    use crate::capabilities::CapabilityContribution;
+    use crate::workspace_environment::{
+        EnvironmentMount, NODE_COMPILE_CACHE_DIRECTORY, NODE_COMPILE_CACHE_ENV,
+        WORKSPACE_ENVIRONMENT_PATH, write_workspace_environment,
+    };
+    use cowshed_os::fork_lock::Run as _;
+
+    const COMPILE: &str = r#"const m = require("node:module");
+m.enableCompileCache();
+const dir = m.getCompileCacheDir();
+if (!dir) { console.error("compile cache is not enabled"); process.exit(3); }
+console.log(dir);
+import("./compile-cache-lib.mjs").then((lib) => {
+  if (lib.answer() !== 42) { process.exit(4); }
+  if (m.flushCompileCache) { m.flushCompileCache(); }
+});
+"#;
+
+    let scratch = Scratch::new("compile-cache-reclaim");
+    let (host, image, metadata) = published_directory(&scratch, "selected", 1);
+    let storage = layout(&host.config, &metadata.repo_id).unwrap();
+    let (_, exec_temp) = published_directory_paths(&host, &metadata);
+    fs::create_dir_all(&exec_temp).unwrap();
+    let sibling = storage
+        .exec_temp_dir(&WorkspaceName::session("sibling").unwrap())
+        .unwrap()
+        .join("keep");
+    fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+    fs::write(&sibling, b"a sibling's own").unwrap();
+
+    write_workspace_environment(
+        EnvironmentMount::Served {
+            workspace_mount: &image,
+            host_home: scratch.path(),
+            temp_dir: &exec_temp,
+            capability_env: &CapabilityContribution::default(),
+        },
+        &zeroize::Zeroizing::new("token".to_owned()),
+        metadata.platform,
+        metadata.grants.port_block,
+    )
+    .unwrap();
+    let work = scratch.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    fs::write(
+        work.join("compile-cache-lib.mjs"),
+        "export function answer() { return 42; }\n",
+    )
+    .unwrap();
+    let script = work.join("compile.cjs");
+    fs::write(&script, COMPILE).unwrap();
+    let path = std::env::var_os("PATH").expect("the gate PATH names the host toolchain");
+    let bun = std::env::split_paths(&path)
+        .map(|directory| directory.join("bun"))
+        .find(|candidate| candidate.is_file())
+        .expect("host bun is required for this proof");
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .env_clear()
+        .args(["-c", ". \"$1\"; exec \"$2\" \"$3\"", "read-only-shell"])
+        .arg(image.join(WORKSPACE_ENVIRONMENT_PATH))
+        .arg(&bun)
+        .arg(&script)
+        .current_dir(&work)
+        .env("HOME", scratch.path())
+        .env("XDG_CACHE_HOME", exec_temp.join("cache"))
+        .env(NODE_COMPILE_CACHE_ENV, scratch.path().join("caller-cache"));
+    let output = command.output_locked().unwrap();
+    assert!(output.status.success(), "bun: {output:?}");
+    let owned = exec_temp.join("cache").join(NODE_COMPILE_CACHE_DIRECTORY);
+    assert!(owned.is_dir(), "no read-only compile cache was written");
+
+    // Retire as a recovery retention does: payload, sidecar and companion move to the
+    // trash and the temp dir stands, until a reclaim is authorized for the exact ref.
+    let trash = published_directory_trash(&host, &metadata);
+    fs::create_dir_all(trash.parent().unwrap()).unwrap();
+    fs::hard_link(sidecar_path(&image), sidecar_path(&trash)).unwrap();
+    fs::hard_link(companion_path(&image), companion_path(&trash)).unwrap();
+    host.retire_image(&image, &trash).unwrap();
+    assert!(trash.is_dir(), "the retained payload left the trash");
+    assert!(
+        exec_temp.is_dir(),
+        "retirement alone reclaimed the temp dir"
+    );
+
+    reclaim_retired_published_directory(&host, &metadata);
+    assert!(!trash.exists(), "the retained payload outlived its reclaim");
+    assert!(
+        !sidecar_path(&trash).exists(),
+        "the retained record outlived its reclaim"
+    );
+    assert!(
+        !exec_temp.exists(),
+        "the reclaimed workspace's temp dir remains"
+    );
+    assert_eq!(fs::read(&sibling).unwrap(), b"a sibling's own");
+}
+
+/// The name is the scope: when a newer incarnation already owns the name, reclaiming
+/// the old incarnation's retained image disposes of that image alone and keeps the
+/// name-scoped temp dir the new owner's jobs write into, until the new owner's own
+/// release removes it whole.
+#[test]
+fn reclaiming_an_old_incarnation_keeps_the_names_new_owners_temp_dir() {
+    use super::*;
+    let scratch = Scratch::new("compile-cache-foreign");
+    let (host, image, metadata) = published_directory(&scratch, "selected", 1);
+    let (_, exec_temp) = published_directory_paths(&host, &metadata);
+    fs::create_dir_all(&exec_temp).unwrap();
+    fs::write(exec_temp.join("old-scratch"), b"the old incarnation's").unwrap();
+    let trash = published_directory_trash(&host, &metadata);
+    fs::create_dir_all(trash.parent().unwrap()).unwrap();
+    fs::hard_link(sidecar_path(&image), sidecar_path(&trash)).unwrap();
+    fs::hard_link(companion_path(&image), companion_path(&trash)).unwrap();
+    host.retire_image(&image, &trash).unwrap();
+
+    // The name again, a new incarnation with its own canonical image and temp dir.
+    let (host, image, current) = published_directory(&scratch, "selected", 2);
+    let (_, current_temp) = published_directory_paths(&host, &current);
+    assert_eq!(current_temp, exec_temp, "the temp dir is keyed on the name");
+    fs::write(exec_temp.join("new-scratch"), b"the new owner's").unwrap();
+
+    reclaim_retired_published_directory(&host, &metadata);
+    assert!(!trash.exists(), "the old payload outlived its reclaim");
+    assert!(image.is_dir(), "the new owner's image was reclaimed");
+    assert_eq!(
+        fs::read(exec_temp.join("new-scratch")).unwrap(),
+        b"the new owner's",
+        "the old reclaim touched the new owner's temp dir"
+    );
+
+    release_published_directory(&host, &current);
+    assert!(
+        !exec_temp.exists(),
+        "the new owner's release left its temp dir"
+    );
+}
+
+/// The recovery export under a reused name: the old incarnation's image leaves with
+/// its bytes exact, the pre-export ephemeral cleanup computes the name Foreign and
+/// does not touch the temp dir the new incarnation's jobs write into, and the new
+/// canonical image stands. The new owner's own release still removes the temp dir
+/// whole.
+#[test]
+fn recovering_an_old_incarnation_keeps_the_names_new_owners_temp_dir() {
+    use super::*;
+    use crate::storage::recovery_image::recover;
+
+    fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(&directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    files.push(entry.path());
+                }
+            }
+        }
+        files.sort();
+        files
+            .into_iter()
+            .map(|file| {
+                let relative = file
+                    .strip_prefix(root)
+                    .expect("a listed file is under its root")
+                    .to_path_buf();
+                let bytes = fs::read(&file)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
+                (relative, bytes)
+            })
+            .collect()
+    }
+
+    let scratch = Scratch::new("recover-foreign");
+    let (host, image, metadata) = published_directory(&scratch, "selected", 1);
+    let storage = published_directory_layout(&host, &metadata);
+    let (_, exec_temp) = published_directory_paths(&host, &metadata);
+    fs::create_dir_all(&exec_temp).unwrap();
+    fs::write(exec_temp.join("old-scratch"), b"the old incarnation's").unwrap();
+    let trash = published_directory_trash(&host, &metadata);
+    fs::create_dir_all(trash.parent().unwrap()).unwrap();
+    fs::hard_link(sidecar_path(&image), sidecar_path(&trash)).unwrap();
+    fs::hard_link(companion_path(&image), companion_path(&trash)).unwrap();
+    host.retire_image(&image, &trash).unwrap();
+
+    let (host, image, current) = published_directory(&scratch, "selected", 2);
+    fs::write(exec_temp.join("new-scratch"), b"the new owner's").unwrap();
+    let payload = tree_bytes(&trash);
+    assert!(!payload.is_empty(), "the oracle snapshot is empty");
+    let sidecar = fs::read(sidecar_path(&trash)).unwrap();
+    let companion = fs::read(companion_path(&trash)).unwrap();
+
+    let to = scratch.path().join("recovered");
+    let recovered = recover(&storage, &metadata.repo_id, &trash, &to, &host).unwrap();
+    let moved = recovered.directory.join(trash.file_name().unwrap());
+    assert_eq!(
+        tree_bytes(&moved),
+        payload,
+        "the export changed payload bytes"
+    );
+    assert_eq!(fs::read(sidecar_path(&moved)).unwrap(), sidecar);
+    assert_eq!(fs::read(companion_path(&moved)).unwrap(), companion);
+    assert!(image.is_dir(), "the new owner's image went with the export");
+    assert_eq!(
+        fs::read(exec_temp.join("new-scratch")).unwrap(),
+        b"the new owner's"
+    );
+    assert_eq!(
+        fs::read(exec_temp.join("old-scratch")).unwrap(),
+        b"the old incarnation's",
+        "Foreign cleanup touched the shared name-scoped temp dir"
+    );
+
+    release_published_directory(&host, &current);
+    assert!(
+        !exec_temp.exists(),
+        "the new owner's release left its temp dir"
+    );
+}
 #[test]
 fn directory_retirement_retry_and_held_recovery_keep_complete_authority() {
     use super::*;
@@ -446,10 +887,17 @@ fn a_recovery_image_moves_out_of_the_store_with_its_companions_and_a_manifest() 
     use crate::api::dto::{RecoveryCause, RecoveryRetention};
     use crate::error::ErrorCode;
     use crate::storage::deletion_log::{self, Caller, KeptRecovery, RetiredBy};
-    use crate::storage::recovery_image::{MANIFEST_FILE, recover};
+    use crate::storage::recovery_image::MANIFEST_FILE;
 
     let scratch = Scratch::new("recover-image");
     let (host, image, metadata) = published_directory(&scratch, "selected", 1);
+    // Every recovery below names the fixture host as its backend environment owner.
+    let recover = |storage: &crate::storage::StorageLayout,
+                   repo: &crate::repository::RepoId,
+                   image: &Path,
+                   to: &Path| {
+        crate::storage::recovery_image::recover(storage, repo, image, to, &host)
+    };
     let storage = layout(&host.config, &metadata.repo_id).unwrap();
     let project = storage.project();
     let repo = &metadata.repo_id;
@@ -652,4 +1100,269 @@ fn a_recovery_image_moves_out_of_the_store_with_its_companions_and_a_manifest() 
         ErrorCode::Conflict
     );
     assert!(trash.join(WORKSPACE_MARKER_PATH).exists());
+}
+
+/// The pre-export cleanup's refusal, with a real mounted filesystem inside the temp
+/// dir (host lane: attaching one is host-controller authority): the recovery refuses
+/// before any source transfer, the trash image and its companions keep their exact
+/// bytes and authority, the mounted payload is untouched, and detaching the mount
+/// lets the same recovery finish — exported bytes exact, temp dir gone whole.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+fn host_controller_recovery_refuses_a_mounted_temp_subtree_and_keeps_the_image() {
+    use super::*;
+    use crate::error::ErrorCode;
+    use crate::storage::recovery_image::{MANIFEST_FILE, recover};
+    use cowshed_apfs::{ApfsBackend, MacOsApfsBackend, MountAccess, SystemCommandRunner};
+
+    fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(&directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    files.push(entry.path());
+                }
+            }
+        }
+        files.sort();
+        files
+            .into_iter()
+            .map(|file| {
+                let relative = file
+                    .strip_prefix(root)
+                    .expect("a listed file is under its root")
+                    .to_path_buf();
+                let bytes = fs::read(&file)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
+                (relative, bytes)
+            })
+            .collect()
+    }
+
+    let scratch = Scratch::new("recover-mounted");
+    let (host, image, metadata) = published_directory(&scratch, "selected", 1);
+    let storage = published_directory_layout(&host, &metadata);
+    let (_, exec_temp) = published_directory_paths(&host, &metadata);
+    fs::create_dir_all(&exec_temp).unwrap();
+    fs::write(exec_temp.join("job-scratch"), b"a job's own").unwrap();
+
+    // A real blank image mounted inside the temp dir: removing the tree would empty
+    // it through its mountpoint, which is exactly what the cleanup must refuse.
+    let mount_image = scratch
+        .path()
+        .join("mounted")
+        .with_extension(cowshed_apfs::image::IMAGE_EXTENSION);
+    crate::blank_image::blank_image(&mount_image);
+    let mount = exec_temp.join("mounted");
+    fs::create_dir_all(&mount).unwrap();
+    let backend = MacOsApfsBackend::new(SystemCommandRunner);
+    let attachment = backend
+        .attach_mounted(&mount_image, &mount, MountAccess::ReadWrite, false)
+        .unwrap();
+    assert_ne!(
+        fs::metadata(&exec_temp).unwrap().dev(),
+        fs::metadata(&mount).unwrap().dev(),
+        "the mounted subtree is not on another device"
+    );
+    fs::write(mount.join("payload"), b"mounted bytes").unwrap();
+
+    let trash = published_directory_trash(&host, &metadata);
+    fs::create_dir_all(trash.parent().unwrap()).unwrap();
+    fs::hard_link(sidecar_path(&image), sidecar_path(&trash)).unwrap();
+    fs::hard_link(companion_path(&image), companion_path(&trash)).unwrap();
+    host.retire_image(&image, &trash).unwrap();
+    let payload = tree_bytes(&trash);
+    assert!(!payload.is_empty(), "the oracle snapshot is empty");
+    let sidecar = fs::read(sidecar_path(&trash)).unwrap();
+    let companion = fs::read(companion_path(&trash)).unwrap();
+
+    let to = scratch.path().join("recovered");
+    let error = recover(&storage, &metadata.repo_id, &trash, &to, &host).unwrap_err();
+    assert_eq!(error.code, ErrorCode::Integrity);
+    assert!(
+        error.message.contains("mounted filesystem"),
+        "{}",
+        error.message
+    );
+    // Original authority retained: nothing of the source moved or changed, and the
+    // mounted payload was not emptied through its mountpoint.
+    assert_eq!(
+        tree_bytes(&trash),
+        payload,
+        "the refusal moved source payload bytes"
+    );
+    assert_eq!(fs::read(sidecar_path(&trash)).unwrap(), sidecar);
+    assert_eq!(fs::read(companion_path(&trash)).unwrap(), companion);
+    assert_eq!(fs::read(mount.join("payload")).unwrap(), b"mounted bytes");
+    assert!(exec_temp.is_dir(), "the refusal removed the temp dir");
+    // Destination bookkeeping from the preflight may stand; no source file may.
+    let directory = to.join(format!("selected-{}", metadata.workspace_incarnation));
+    if directory.exists() {
+        assert_eq!(
+            tree_bytes(&directory)
+                .keys()
+                .map(|path| path.as_path())
+                .collect::<Vec<_>>(),
+            [Path::new(MANIFEST_FILE)],
+            "the refusal moved source files into the destination"
+        );
+    }
+
+    // Detached, the same recovery finishes the move its manifest describes: the
+    // cleanup now removes the temp dir whole and the payload arrives exact.
+    backend
+        .unmount_verified(&attachment, cowshed_apfs::DetachIntent::WhenIdle)
+        .unwrap();
+    backend
+        .detach(&attachment, cowshed_apfs::DetachIntent::WhenIdle)
+        .unwrap();
+    let recovered = recover(&storage, &metadata.repo_id, &trash, &to, &host).unwrap();
+    let moved = recovered.directory.join(trash.file_name().unwrap());
+    assert_eq!(
+        tree_bytes(&moved),
+        payload,
+        "the export changed payload bytes"
+    );
+    assert_eq!(fs::read(sidecar_path(&moved)).unwrap(), sidecar);
+    assert_eq!(fs::read(companion_path(&moved)).unwrap(), companion);
+    assert!(!trash.exists(), "the payload did not leave the trash");
+    assert!(
+        !exec_temp.exists(),
+        "the recovered workspace's temp dir outlived its export"
+    );
+}
+
+/// The mounted-root boundary of the same refusal (host lane): the temp dir itself is
+/// the mountpoint, so a device walk that only compares children against the root
+/// would see one device and start deleting. Admission by mount identity refuses
+/// before any entry is removed — image, sidecar and companion keep their bytes and
+/// authority, the mounted payload is untouched — and detaching lets the same
+/// recovery finish with the temp dir gone whole.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+fn host_controller_recovery_refuses_a_mounted_temp_root_and_keeps_the_image() {
+    use super::*;
+    use crate::error::ErrorCode;
+    use crate::storage::recovery_image::{MANIFEST_FILE, recover};
+    use cowshed_apfs::{ApfsBackend, MacOsApfsBackend, MountAccess, SystemCommandRunner};
+
+    fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(&directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    files.push(entry.path());
+                }
+            }
+        }
+        files.sort();
+        files
+            .into_iter()
+            .map(|file| {
+                let relative = file
+                    .strip_prefix(root)
+                    .expect("a listed file is under its root")
+                    .to_path_buf();
+                let bytes = fs::read(&file)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
+                (relative, bytes)
+            })
+            .collect()
+    }
+
+    let scratch = Scratch::new("recover-mounted-root");
+    let (host, image, metadata) = published_directory(&scratch, "selected", 1);
+    let storage = published_directory_layout(&host, &metadata);
+    let (_, exec_temp) = published_directory_paths(&host, &metadata);
+    fs::create_dir_all(&exec_temp).unwrap();
+
+    // The temp dir itself mounted: every entry inside shares its device, so only
+    // mount identity against the parent outside it can refuse this.
+    let mount_image = scratch
+        .path()
+        .join("root-volume")
+        .with_extension(cowshed_apfs::image::IMAGE_EXTENSION);
+    crate::blank_image::blank_image(&mount_image);
+    let backend = MacOsApfsBackend::new(SystemCommandRunner);
+    let attachment = backend
+        .attach_mounted(&mount_image, &exec_temp, MountAccess::ReadWrite, false)
+        .unwrap();
+    assert_ne!(
+        fs::metadata(exec_temp.parent().unwrap()).unwrap().dev(),
+        fs::metadata(&exec_temp).unwrap().dev(),
+        "the temp root is not itself a mounted filesystem"
+    );
+    fs::write(exec_temp.join("payload"), b"mounted bytes").unwrap();
+
+    let trash = published_directory_trash(&host, &metadata);
+    fs::create_dir_all(trash.parent().unwrap()).unwrap();
+    fs::hard_link(sidecar_path(&image), sidecar_path(&trash)).unwrap();
+    fs::hard_link(companion_path(&image), companion_path(&trash)).unwrap();
+    host.retire_image(&image, &trash).unwrap();
+    let payload = tree_bytes(&trash);
+    assert!(!payload.is_empty(), "the oracle snapshot is empty");
+    let sidecar = fs::read(sidecar_path(&trash)).unwrap();
+    let companion = fs::read(companion_path(&trash)).unwrap();
+
+    let to = scratch.path().join("recovered");
+    let error = recover(&storage, &metadata.repo_id, &trash, &to, &host).unwrap_err();
+    assert_eq!(error.code, ErrorCode::Integrity);
+    assert!(
+        error.message.contains("mounted filesystem"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        tree_bytes(&trash),
+        payload,
+        "the refusal moved source payload bytes"
+    );
+    assert_eq!(fs::read(sidecar_path(&trash)).unwrap(), sidecar);
+    assert_eq!(fs::read(companion_path(&trash)).unwrap(), companion);
+    assert_eq!(
+        fs::read(exec_temp.join("payload")).unwrap(),
+        b"mounted bytes"
+    );
+    let directory = to.join(format!("selected-{}", metadata.workspace_incarnation));
+    if directory.exists() {
+        assert_eq!(
+            tree_bytes(&directory)
+                .keys()
+                .map(|path| path.as_path())
+                .collect::<Vec<_>>(),
+            [Path::new(MANIFEST_FILE)],
+            "the refusal moved source files into the destination"
+        );
+    }
+
+    backend
+        .unmount_verified(&attachment, cowshed_apfs::DetachIntent::WhenIdle)
+        .unwrap();
+    backend
+        .detach(&attachment, cowshed_apfs::DetachIntent::WhenIdle)
+        .unwrap();
+    let recovered = recover(&storage, &metadata.repo_id, &trash, &to, &host).unwrap();
+    let moved = recovered.directory.join(trash.file_name().unwrap());
+    assert_eq!(
+        tree_bytes(&moved),
+        payload,
+        "the export changed payload bytes"
+    );
+    assert_eq!(fs::read(sidecar_path(&moved)).unwrap(), sidecar);
+    assert_eq!(fs::read(companion_path(&moved)).unwrap(), companion);
+    assert!(!trash.exists(), "the payload did not leave the trash");
+    assert!(
+        !exec_temp.exists(),
+        "the recovered workspace's temp dir outlived its export"
+    );
 }

@@ -193,24 +193,52 @@ fn checked_increment(count: &mut usize) -> Result<(), ApfsStorageError> {
     Ok(())
 }
 
-/// Whether any directory under `root` sits on another device: a filesystem mounted inside the
-/// tree, which removing the tree would empty through its mountpoint.
+/// Whether the root or a descendant is mounted independently of the root's parent.
+/// Mount identities, not backing-device numbers, detect a root mount and Linux bind mounts.
 fn tree_crosses_device(root: &Path) -> io::Result<Option<PathBuf>> {
-    let device = fs::symlink_metadata(root)?.dev();
-    let mut pending = vec![root.to_owned()];
-    while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(&directory)? {
-            let path = entry?.path();
-            let metadata = fs::symlink_metadata(&path)?;
-            if metadata.dev() != device {
-                return Ok(Some(path));
+    #[cfg(target_os = "macos")]
+    {
+        let root = fs::canonicalize(root)?;
+        Ok(cowshed_apfs::mounts::kernel_mounts()?
+            .into_iter()
+            .find(|mount| mount.mount_point.starts_with(&root))
+            .map(|mount| mount.mount_point))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use cowshed_os::fsio::{mount_id, open_directory_nofollow};
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let parent = root.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "owned tree has no parent mount",
+            )
+        })?;
+        let expected = mount_id(&open_directory_nofollow(parent)?)?;
+        let mut pending = vec![root.to_owned()];
+        while let Some(directory) = pending.pop() {
+            let held = open_directory_nofollow(&directory)?;
+            if mount_id(&held)? != expected {
+                return Ok(Some(directory));
             }
-            if metadata.is_dir() {
-                pending.push(path);
+            for entry in fs::read_dir(&directory)? {
+                let path = entry?.path();
+                // O_PATH pins directory, file and symlink entries without reading or following
+                // their contents. A bind-mounted file must refuse before its siblings disappear.
+                let entry = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&path)?;
+                if mount_id(&entry)? != expected {
+                    return Ok(Some(path));
+                }
+                if entry.metadata()?.is_dir() {
+                    pending.push(path);
+                }
             }
         }
+        Ok(None)
     }
-    Ok(None)
 }
 
 impl DirectoryExecutionHost {
@@ -1102,6 +1130,48 @@ impl DirectoryExecutionHost {
         self.reclaim_workspace_artifacts(&project, retired, &canonical, NameScope::Owned)
     }
 
+    /// Disposable environment only; the caller has already proved this retirement owns
+    /// the name. Source payloads, checkpoints and their records remain separate custody.
+    fn reclaim_exec_temp(
+        project: &Path,
+        authority: &RetiredRef,
+        trash_image: &Path,
+    ) -> Result<(), ApfsStorageError> {
+        let name = authority.workspace().name().as_str();
+        let exec_temp = project.join(EXEC_TEMP_DIRECTORY).join(name);
+        match fs::symlink_metadata(&exec_temp) {
+            Ok(metadata) => {
+                let removed = if metadata.is_dir() {
+                    if let Some(mounted) = tree_crosses_device(&exec_temp).map_err(|error| {
+                        io_error("inspect retired exec temp dir", &exec_temp, error)
+                    })? {
+                        return Err(ApfsStorageError::Host(format!(
+                            "retired exec temp dir {} carries a mounted filesystem at {}; detach it, then retry the retirement or recovery export",
+                            exec_temp.display(),
+                            mounted.display()
+                        )));
+                    }
+                    cowshed_os::fsio::remove_owned_tree(&exec_temp)
+                } else {
+                    fs::remove_file(&exec_temp)
+                };
+                removed
+                    .map_err(|error| io_error("remove retired exec temp dir", &exec_temp, error))?;
+                deletion_log::log_deletion(
+                    project,
+                    DeletionOp::ReclaimRetiredArtifact,
+                    DeletionKind::Other,
+                    name,
+                    Some(trash_image),
+                    &exec_temp,
+                );
+                sync_parent_path(&exec_temp)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_error("inspect retired exec temp dir", &exec_temp, error)),
+        }
+    }
+
     fn reclaim_workspace_artifacts(
         &self,
         project: &Path,
@@ -1140,34 +1210,7 @@ impl DirectoryExecutionHost {
                     ));
                 }
             }
-            let exec_temp = project.join(EXEC_TEMP_DIRECTORY).join(name);
-            match fs::symlink_metadata(&exec_temp) {
-                Ok(metadata) => {
-                    let removed = if metadata.is_dir() {
-                        if let Some(mounted) = tree_crosses_device(&exec_temp).map_err(|error| {
-                            io_error("inspect retired exec temp dir", &exec_temp, error)
-                        })? {
-                            return Err(ApfsStorageError::Host(format!(
-                                "retired exec temp dir {} carries a mounted filesystem at {}; detach it, then `cowshed gc` finishes the retirement",
-                                exec_temp.display(),
-                                mounted.display()
-                            )));
-                        }
-                        cowshed_os::fsio::remove_owned_tree(&exec_temp)
-                    } else {
-                        fs::remove_file(&exec_temp)
-                    };
-                    removed.map_err(|error| {
-                        io_error("remove retired exec temp dir", &exec_temp, error)
-                    })?;
-                    log(&exec_temp);
-                    sync_parent_path(&exec_temp)?;
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(io_error("inspect retired exec temp dir", &exec_temp, error));
-                }
-            }
+            Self::reclaim_exec_temp(project, authority, trash_image)?;
         }
         if let Some(mount_point) = cleanup.mount_point {
             let removed = match mount_point_state(&mount_point)? {
@@ -1620,5 +1663,27 @@ fn names_mount(image: &Path, mount_point: &Path) -> Result<bool, ApfsStorageErro
         Ok(_) => Ok(false),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(io_error("inspect payload", image, error)),
+    }
+}
+
+impl crate::storage::recovery_image::RecoveryEnvironment for DirectoryExecutionHost {
+    fn reclaim_recovery_environment(
+        &self,
+        repo: &RepoId,
+        image: &Path,
+    ) -> Result<(), ApfsStorageError> {
+        let project = layout(&self.config, repo)?.project().project_root.clone();
+        let Some(authority) = self.retired_authority(&project, repo, image)? else {
+            // Successful-export retries and images without grants authorize no name cleanup.
+            return Ok(());
+        };
+        let trash = project.join(SESSIONS_DIRECTORY).join(TRASH_NAMESPACE);
+        let owners = retired_name_owners(&Self::retired_trash_images(&trash)?);
+        if self.retired_name_scope(&authority, owners.get(authority.workspace().name()))?
+            == NameScope::Owned
+        {
+            Self::reclaim_exec_temp(&project, &authority, image)?;
+        }
+        Ok(())
     }
 }

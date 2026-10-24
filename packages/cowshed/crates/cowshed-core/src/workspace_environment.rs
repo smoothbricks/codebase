@@ -21,6 +21,10 @@ pub const NX_REMOTE_TOKEN_ENV: &str = "NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN"
 /// neither shares the machine's: Bun reads every ancestor directory of its working directory
 /// whole, and a user temp directory every concurrent gate fills holds each start for seconds.
 pub const TEMP_DIR_ENV: &str = "TMPDIR";
+/// Node and compatible runtimes keep module compilation in the workspace's private cache,
+/// never the runtime's default loose directory under TMPDIR.
+pub const NODE_COMPILE_CACHE_ENV: &str = "NODE_COMPILE_CACHE";
+pub(crate) const NODE_COMPILE_CACHE_DIRECTORY: &str = "node-compile-cache";
 /// The short link to the workspace's runtime dir, [`crate::sandbox::workspace_runtime_link`],
 /// exported so a host shell names the link its jobs use without re-deriving it: the Nx socket
 /// dir host shells and jobs share is `nx` below it, by that literal path.
@@ -43,6 +47,10 @@ pub enum WorkspaceEnvironmentError {
     UnexportableTempDir(std::path::PathBuf),
     #[error("workspace capability variable {0} cannot be exported as UTF-8 shell text")]
     UnexportableCapability(&'static str),
+    #[error(
+        "workspace Node compile cache {0:?} cannot be exported as an absolute UTF-8 shell path"
+    )]
+    UnexportableNodeCompileCache(std::path::PathBuf),
     #[error("installed cowshed directory {0:?} cannot be exported as UTF-8 shell text")]
     UnexportableInstalledDirectory(std::path::PathBuf),
     #[error(transparent)]
@@ -53,7 +61,7 @@ pub enum WorkspaceEnvironmentError {
 #[derive(Clone, Copy, Debug)]
 pub enum EnvironmentMount<'a> {
     /// A mint's mount, possibly a staging path: no sandbox serves it yet, so the file names
-    /// neither a TMPDIR nor a runtime link. The supervisor start that serves it adds both.
+    /// neither a TMPDIR, a runtime link nor a compile cache. The supervisor start adds them.
     Minted(&'a Path),
     /// The workspace mount its supervisor serves, with that sandbox's `TMPDIR`. The runtime
     /// link is named after this mount.
@@ -81,7 +89,7 @@ impl<'a> EnvironmentMount<'a> {
 /// Atomically publish the source-able, workspace-local build environment inside an image. Its
 /// one caller is `workspace_credentials::publish_workspace_environment`, which reads the token
 /// the image publishes. A served mount also exports its `TMPDIR`, single-quoted, and its
-/// runtime link.
+/// runtime link, and binds module compilation to the receiving workspace's private cache.
 pub(crate) fn write_workspace_environment(
     mount: EnvironmentMount<'_>,
     token: &Zeroizing<String>,
@@ -124,6 +132,22 @@ pub(crate) fn write_workspace_environment(
             ))
         }
     };
+    let node_compile_cache = served.as_ref().map(|_| {
+        mount
+            .root()
+            .join(".cowshed/cache")
+            .join(NODE_COMPILE_CACHE_DIRECTORY)
+    });
+    let node_compile_cache_text = node_compile_cache
+        .as_ref()
+        .map(|path| {
+            path.to_str()
+                .filter(|text| path.is_absolute() && !text.contains(['\0', '\n', '\r']))
+                .ok_or_else(|| {
+                    WorkspaceEnvironmentError::UnexportableNodeCompileCache(path.clone())
+                })
+        })
+        .transpose()?;
     let installed_directory = match mount {
         EnvironmentMount::Served { host_home, .. } => {
             Some(crate::host_dirs::installed_binary_directory(host_home))
@@ -166,7 +190,10 @@ pub(crate) fn write_workspace_environment(
             + DEV_CI_POLICY.len()
             + capability_bytes
             + installed_directory_text.map_or(0, |path| path.len() * 4 + 96)
-            + served.as_ref().map_or(0, |(temp_dir, _)| temp_dir.len()),
+            + node_compile_cache_text.map_or(0, |path| path.len() * 4 + 256)
+            + served
+                .as_ref()
+                .map_or(0, |(temp_dir, _)| temp_dir.len() * 5),
     ));
     contents.push_str(DEV_CI_POLICY);
     // No bare `COWSHED_WORKSPACE_TOKEN`: every shell that sources this file would hand it to every
@@ -187,7 +214,9 @@ pub(crate) fn write_workspace_environment(
             "export {NX_REMOTE_SERVER_ENV}=http://127.0.0.1:{port}/nx\nexport {NX_REMOTE_TOKEN_ENV}={}", token.as_str())
             .expect("writing to a String cannot fail");
     }
-    if let Some((temp_dir, runtime_link)) = served {
+    if let (Some((temp_dir, runtime_link)), Some(node_compile_cache)) =
+        (served, node_compile_cache_text)
+    {
         // The link is `/tmp/cs-` and hex digits: shell-safe, so it is written unquoted.
         writeln!(
             &mut *contents,
@@ -195,6 +224,20 @@ pub(crate) fn write_workspace_environment(
             runtime_link.display()
         )
         .expect("writing to a String cannot fail");
+        // Host shells use this workspace's cache, not the caller's XDG cache. An activated
+        // read-only job keeps its already-authorized exec-temp cache instead of writing source.
+        contents.push_str("if [ \"${XDG_CACHE_HOME-}\" = ");
+        write_shell_quoted(&mut contents, temp_dir);
+        contents.push_str("/cache ]; then\n");
+        writeln!(
+            &mut *contents,
+            "export {NODE_COMPILE_CACHE_ENV}=\"${{XDG_CACHE_HOME}}/{NODE_COMPILE_CACHE_DIRECTORY}\"\nelse"
+        )
+        .expect("writing to a String cannot fail");
+        write!(&mut *contents, "export {NODE_COMPILE_CACHE_ENV}=")
+            .expect("writing to a String cannot fail");
+        write_shell_quoted(&mut contents, node_compile_cache);
+        contents.push_str("\nfi\n");
     }
     if let Some(directory) = installed_directory_text {
         contents.push_str("export PATH=");
@@ -203,8 +246,11 @@ pub(crate) fn write_workspace_environment(
     } else {
         // A newly minted image has no served runtime identity yet. Do not
         // let a host shell borrow an inherited sibling's served marker.
-        writeln!(&mut *contents, "unset {RUNTIME_LINK_ENV}")
-            .expect("writing to a String cannot fail");
+        writeln!(
+            &mut *contents,
+            "unset {RUNTIME_LINK_ENV} {NODE_COMPILE_CACHE_ENV}"
+        )
+        .expect("writing to a String cannot fail");
     }
     if let EnvironmentMount::Served { capability_env, .. } = mount {
         for name in crate::capabilities::sccache::HOST_ENVIRONMENT
@@ -269,6 +315,7 @@ mod tests {
     #[test]
     fn workspace_env_var_names_are_the_sandbox_contract() {
         assert_eq!(WORKSPACE_TOKEN_ENV, "COWSHED_WORKSPACE_TOKEN");
+        assert_eq!(NODE_COMPILE_CACHE_ENV, "NODE_COMPILE_CACHE");
         assert_eq!(PORT_BASE_ENV, "COWSHED_PORT_BASE");
         assert_eq!(PORT_BLOCK_SIZE_ENV, "COWSHED_PORT_BLOCK_SIZE");
         assert_eq!(TEMP_DIR_ENV, "TMPDIR");
@@ -504,5 +551,221 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Node and Bun compile modules into the receiving workspace's private cache when a host
+    /// shell sources its published environment: enableCompileCache() with no argument — the
+    /// call whose TMPDIR default stranded a retired workspace's loose node-compile-cache —
+    /// resolves through the published NODE_COMPILE_CACHE, so the bytecode lands under
+    /// .cowshed/cache, never under the served TMPDIR or the caller's own cache. A read-only
+    /// job's activated shell (its XDG_CACHE_HOME is already the exec-temp cache) keeps that
+    /// authorized cache instead of writing the image, and a minted file enables no inherited
+    /// cache at all. Foreign files in every cache the run could have touched survive.
+    #[test]
+    fn host_shells_compile_into_the_receiving_workspaces_private_cache() {
+        use cowshed_os::fork_lock::Run as _;
+
+        /// Removes the fixture root however the test ends, a failed assertion included.
+        struct Root(std::path::PathBuf);
+        impl Drop for Root {
+            fn drop(&mut self) {
+                if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                    cowshed_os::eprintln!("remove {}: {error}", self.0.display());
+                }
+            }
+        }
+
+        fn files_under(root: &Path) -> Vec<std::path::PathBuf> {
+            let mut files = Vec::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(directory) = pending.pop() {
+                let entries = match std::fs::read_dir(&directory) {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => panic!("read {}: {error}", directory.display()),
+                };
+                for entry in entries {
+                    let entry = entry.unwrap_or_else(|error| panic!("read entry: {error}"));
+                    if entry.file_type().expect("entry type").is_dir() {
+                        pending.push(entry.path());
+                    } else {
+                        files.push(entry.path());
+                    }
+                }
+            }
+            files.sort();
+            files
+        }
+
+        fn host_program(name: &str) -> std::path::PathBuf {
+            let path = std::env::var_os("PATH").expect("the gate PATH names the host toolchain");
+            std::env::split_paths(&path)
+                .map(|directory| directory.join(name))
+                .find(|candidate| candidate.is_file())
+                .unwrap_or_else(|| panic!("host {name} is required for this proof"))
+        }
+
+        // The producer's actual call, then a real module load whose bytecode the runtime
+        // flushes into the resolved cache before it exits.
+        const COMPILE: &str = r#"const m = require("node:module");
+    m.enableCompileCache();
+    const dir = m.getCompileCacheDir();
+    if (!dir) { console.error("compile cache is not enabled"); process.exit(3); }
+    console.log(dir);
+    import("./compile-cache-lib.mjs").then((lib) => {
+      if (lib.answer() !== 42) { process.exit(4); }
+      if (m.flushCompileCache) { m.flushCompileCache(); }
+    });
+    "#;
+        const DISABLED: &str = r#"const m = require("node:module");
+    if (m.getCompileCacheDir() !== undefined) { console.error(m.getCompileCacheDir()); process.exit(5); }
+    "#;
+
+        let root = Root(
+            std::env::temp_dir().join(format!("cowshed-compile-cache-{}", uuid::Uuid::new_v4())),
+        );
+        let root = &root.0;
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(mount.join(".cowshed")).unwrap();
+        // A space in the served temp dir, so the published quoting is what the shell runs.
+        let temp_dir = root.join("exec temp");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let caller_cache = root.join("caller cache");
+        std::fs::create_dir_all(&caller_cache).unwrap();
+        let caller_sentinel = caller_cache.join("sentinel");
+        std::fs::write(&caller_sentinel, b"the caller's own").unwrap();
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(
+            work.join("compile-cache-lib.mjs"),
+            "export function answer() { return 42; }\n",
+        )
+        .unwrap();
+        let compile = work.join("compile.cjs");
+        std::fs::write(&compile, COMPILE).unwrap();
+        let disabled = work.join("disabled.cjs");
+        std::fs::write(&disabled, DISABLED).unwrap();
+        let runtimes = [host_program("node"), host_program("bun")];
+
+        write_workspace_environment(
+            EnvironmentMount::Served {
+                workspace_mount: &mount,
+                host_home: root,
+                temp_dir: &temp_dir,
+                capability_env: &CapabilityContribution::default(),
+            },
+            &Zeroizing::new("token".to_owned()),
+            Platform::Linux,
+            None,
+        )
+        .unwrap();
+
+        // Source the published file in a real shell, as a host activation does, with the
+        // caller's own cache and machine temp already in the environment to be overridden.
+        let run = |xdg_cache_home: &Path, program: &Path, entry: &Path| {
+            let mut command = std::process::Command::new("sh");
+            command
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").expect("gate PATH"))
+                .args(["-c", ". \"$1\"; exec \"$2\" \"$3\"", "host-shell"])
+                .arg(mount.join(WORKSPACE_ENVIRONMENT_PATH))
+                .arg(program)
+                .arg(entry)
+                .current_dir(&work)
+                .env("HOME", root)
+                .env("TMPDIR", root.join("machine tmp"))
+                .env("XDG_CACHE_HOME", xdg_cache_home)
+                .env(NODE_COMPILE_CACHE_ENV, &caller_cache);
+            let output = command.output_locked().unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}: {output:?}",
+                program.display(),
+                entry.display()
+            );
+            output
+        };
+        let compiled_into = |output: &std::process::Output, expected: &Path| {
+            let stdout = std::str::from_utf8(&output.stdout).unwrap();
+            let reported = std::path::PathBuf::from(stdout.lines().next().expect("cache dir"));
+            assert!(
+                reported.starts_with(expected),
+                "compiled into {}, not {}",
+                reported.display(),
+                expected.display()
+            );
+            assert!(
+                files_under(&reported)
+                    .iter()
+                    .any(|file| std::fs::metadata(file).expect("cache file").len() > 0),
+                "no bytecode under {}",
+                reported.display()
+            );
+        };
+
+        // An ordinary host shell: the bytecode is the receiving workspace's, under its
+        // private cache, for both runtimes.
+        let image_cache = mount
+            .join(".cowshed/cache")
+            .join(NODE_COMPILE_CACHE_DIRECTORY);
+        for program in &runtimes {
+            let output = run(&caller_cache, program, &compile);
+            compiled_into(&output, &image_cache);
+        }
+        let image_files = files_under(&image_cache);
+        assert!(!image_files.is_empty());
+        assert!(
+            !temp_dir.join(NODE_COMPILE_CACHE_DIRECTORY).exists(),
+            "a loose compile cache under the served TMPDIR"
+        );
+        assert!(
+            !root
+                .join("machine tmp")
+                .join(NODE_COMPILE_CACHE_DIRECTORY)
+                .exists(),
+            "a loose compile cache under the caller's TMPDIR"
+        );
+
+        // A read-only job's activated shell keeps its already-authorized exec-temp cache
+        // and writes nothing more into the image.
+        let exec_cache = temp_dir.join("cache");
+        let exec_compile_cache = exec_cache.join(NODE_COMPILE_CACHE_DIRECTORY);
+        for program in &runtimes {
+            let output = run(&exec_cache, program, &compile);
+            compiled_into(&output, &exec_compile_cache);
+        }
+        assert_eq!(
+            files_under(&image_cache),
+            image_files,
+            "a read-only shell wrote the image's cache"
+        );
+        assert!(
+            !temp_dir.join(NODE_COMPILE_CACHE_DIRECTORY).exists(),
+            "a loose compile cache beside the read-only cache"
+        );
+
+        // The caller's cache is untouched, file for file and byte for byte.
+        assert_eq!(
+            files_under(&caller_cache),
+            std::slice::from_ref(&caller_sentinel)
+        );
+        assert_eq!(
+            std::fs::read(&caller_sentinel).unwrap(),
+            b"the caller's own"
+        );
+
+        // A minted image publishes no cache identity: an inherited sibling value is unset,
+        // so neither runtime starts with a compile cache enabled into it.
+        write_workspace_environment(
+            EnvironmentMount::Minted(&mount),
+            &Zeroizing::new("token".to_owned()),
+            Platform::Linux,
+            None,
+        )
+        .unwrap();
+        for program in &runtimes {
+            run(&caller_cache, program, &disabled);
+        }
+        assert_eq!(files_under(&caller_cache), [caller_sentinel]);
     }
 }

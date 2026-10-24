@@ -767,6 +767,20 @@ pub fn is_temp_artifact(file_name: &OsStr) -> bool {
     name.starts_with('.') && name.contains(".tmp.")
 }
 
+/// The Linux mount identity of an already-held inode, not its backing device number.
+/// A bind mount has a distinct identity even when both paths share the same filesystem.
+#[cfg(target_os = "linux")]
+pub fn mount_id(held: &File) -> io::Result<u64> {
+    use rustix::fs::{AtFlags, StatxFlags, statx};
+    let stat = statx(held, c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
+    if !StatxFlags::from_bits_retain(stat.stx_mask).contains(StatxFlags::MNT_ID) {
+        return Err(io::Error::other(
+            "cannot prove mount boundary: STATX_MNT_ID unavailable",
+        ));
+    }
+    Ok(stat.stx_mnt_id)
+}
+
 /// Remove a directory tree a sandboxed process wrote, read-only directories included.
 ///
 /// Tools seal what they write: Go's module cache extracts every directory 0555, and

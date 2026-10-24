@@ -680,6 +680,7 @@ fn reserved(name: &str) -> bool {
             | "TMPDIR"
             | "XDG_CONFIG_HOME"
             | "XDG_CACHE_HOME"
+            | crate::workspace_environment::NODE_COMPILE_CACHE_ENV
             | "XDG_DATA_HOME"
             | "XDG_STATE_HOME"
             | "XDG_RUNTIME_DIR"

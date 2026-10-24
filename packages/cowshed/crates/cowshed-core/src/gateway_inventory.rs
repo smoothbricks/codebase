@@ -1431,7 +1431,10 @@ impl NativeGatewayInventory {
                 ));
             }
         }
-        Ok(matched)
+        if matched.is_some() {
+            return Ok(matched);
+        }
+        pending_restore_for_checkout(self.storage.store(), &expected)
     }
 
     fn re_adoption_primary_for_checkout_blocking(
@@ -2092,6 +2095,77 @@ pub(crate) fn discover_repositories(
         .into_iter()
         .map(|owned| owned.current().clone())
         .collect())
+}
+
+/// Read-only recovery admission, not active inventory or repository identity ownership.
+/// A pending mutating main restore and its exact recorded checkout jointly authorize discovery.
+fn pending_restore_for_checkout(
+    store_root: &Path,
+    checkout: &Path,
+) -> Result<Option<RepoId>, GatewayInventoryError> {
+    use crate::storage::recovery::{
+        LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentJournal, LifecycleIntentPhase,
+    };
+    let mut matched = None;
+    for owner in crate::storage::bootstrap::project_owner_directories(store_root)? {
+        let Some(owner_name) = owner.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        for project in read_directory(&owner, "enumerating restore continuations")? {
+            let Some(project_name) = project.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if crate::storage::bootstrap::is_reserved_store_namespace(project_name)
+                || !is_directory(&project)?
+            {
+                continue;
+            }
+            let Ok(repo) = RepoId::parse(&format!("{owner_name}/{project_name}")) else {
+                continue;
+            };
+            let layout = StorageLayout::new(store_root, &repo).map_err(|error| {
+                GatewayInventoryError::InvalidMetadata {
+                    path: project.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+            if layout.project().project_root != project
+                || binding_path_exists(&layout.project().repository_binding)?
+            {
+                continue;
+            }
+            let recorded = layout.recorded_checkout_root().map_err(|error| {
+                GatewayInventoryError::InvalidMetadata {
+                    path: layout.project().checkout_root.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+            if !recorded
+                .and_then(|root| fs::canonicalize(root).ok())
+                .is_some_and(|root| root == checkout)
+            {
+                continue;
+            }
+            let journal_path = project.join(LIFECYCLE_INTENTS_FILE);
+            let journal = LifecycleIntentJournal::load(&journal_path).map_err(|error| {
+                GatewayInventoryError::InvalidMetadata {
+                    path: journal_path.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+            let pending_restore = journal.get(&WorkspaceName::main()).is_some_and(|record| {
+                record.phase == LifecycleIntentPhase::Mutating && record.completion.is_none()
+                    && matches!(&record.operation, LifecycleIntent::Retire { workspace, options, .. }
+                        if workspace.is_main() && options.restore)
+            });
+            if pending_restore && matched.replace(repo).is_some() {
+                return Err(GatewayInventoryError::AmbiguousProjectRoot(
+                    checkout.to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(matched)
 }
 
 /// The same scan, keeping every identity each live project owns rather than only its current one.
@@ -4526,6 +4600,190 @@ mod tests {
                 .expect("resolve a project with no main image"),
             Some(repo)
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn interrupted_restore(fixture: &Fixture, repo: &RepoId, checkout: &Path) -> StorageLayout {
+        use crate::storage::recovery::{
+            LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentJournal,
+        };
+        fixture.bind(repo);
+        let layout = StorageLayout::new(fixture.storage.store(), repo).unwrap();
+        layout.record_checkout_root(checkout).unwrap();
+        LifecycleIntentJournal::update(
+            &layout.project().project_root.join(LIFECYCLE_INTENTS_FILE),
+            |journal| {
+                journal.begin(LifecycleIntent::Retire {
+                    workspace: WorkspaceName::main(),
+                    options: crate::api::dto::RemoveOptions {
+                        restore: true,
+                        ..Default::default()
+                    },
+                    origin: None,
+                });
+                journal.mark_mutating(&WorkspaceName::main())
+            },
+        )
+        .unwrap();
+        let binding: RepositoryBinding =
+            crate::metadata::read_json(&layout.project().repository_binding).unwrap();
+        let error = crate::runtime::project::finish_restored_project_unbinding(
+            layout.project(),
+            &binding,
+            &mut |step| {
+                if step == crate::runtime::project::UnbindCheckpoint::BindingRemoved {
+                    return Err(crate::CowshedError::internal(
+                        "interrupted after binding unlink",
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.message.contains("interrupted after binding unlink"));
+        assert!(!layout.project().repository_binding.exists());
+        layout
+    }
+
+    /// A new inventory instance follows the exact lookup used by the original restore command.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_fresh_controller_finds_an_interrupted_unbinding_without_rebinding_it() {
+        use crate::storage::recovery::LIFECYCLE_INTENTS_FILE;
+        let fixture = Fixture::new("unbinding-discovery");
+        let repo = RepoId::parse("acme/widget").unwrap();
+        let checkout = fixture.root.join("plain-checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        let layout = interrupted_restore(&fixture, &repo, &checkout);
+        let journal = layout.project().project_root.join(LIFECYCLE_INTENTS_FILE);
+        let before = fs::read(&journal).unwrap();
+        let inventory = NativeGatewayInventory::new(fixture.storage.clone());
+        assert_eq!(
+            inventory
+                .repository_for_project_root(&checkout)
+                .await
+                .unwrap(),
+            Some(repo.clone())
+        );
+        assert!(
+            discover_repositories(fixture.storage.store())
+                .unwrap()
+                .is_empty(),
+            "cleanup admission became active inventory"
+        );
+        assert!(
+            !layout.project().repository_binding.exists(),
+            "lookup recreated registration"
+        );
+        assert_eq!(
+            fs::read(&journal).unwrap(),
+            before,
+            "lookup rewrote controller authority"
+        );
+        let other = fixture.root.join("other-checkout");
+        fs::create_dir_all(&other).unwrap();
+        assert_eq!(
+            inventory.repository_for_project_root(&other).await.unwrap(),
+            None
+        );
+        let binding = RepositoryBinding::new(vec![BoundIdentity {
+            repo_id: repo,
+            remote_name: None,
+            remote_url: None,
+            primary: true,
+        }])
+        .unwrap();
+        crate::runtime::project::finish_restored_project_unbinding(
+            layout.project(),
+            &binding,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert!(!layout.project().project_root.exists());
+        assert_eq!(
+            NativeGatewayInventory::new(fixture.storage.clone())
+                .repository_for_project_root(&checkout)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            !layout.project().project_root.exists(),
+            "completed lookup recreated directories"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn unbinding_discovery_requires_mutating_restore_authority_and_refuses_ambiguity() {
+        use crate::storage::recovery::{
+            LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentJournal,
+        };
+        let fixture = Fixture::new("unbinding-authority");
+        let checkout = fixture.root.join("plain-checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        let first = RepoId::parse("acme/first").unwrap();
+        let layout = interrupted_restore(&fixture, &first, &checkout);
+        let path = layout.project().project_root.join(LIFECYCLE_INTENTS_FILE);
+        let inventory = NativeGatewayInventory::new(fixture.storage.clone());
+        for (workspace, restore, mutating) in [
+            (WorkspaceName::main(), true, false),
+            (WorkspaceName::main(), false, true),
+            (WorkspaceName::new("topic").unwrap(), true, true),
+        ] {
+            LifecycleIntentJournal::update(&path, |journal| {
+                journal.clear(&WorkspaceName::main());
+                journal.begin(LifecycleIntent::Retire {
+                    workspace: workspace.clone(),
+                    options: crate::api::dto::RemoveOptions {
+                        restore,
+                        ..Default::default()
+                    },
+                    origin: None,
+                });
+                if mutating {
+                    journal.mark_mutating(&workspace)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(
+                inventory
+                    .repository_for_project_root(&checkout)
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+        LifecycleIntentJournal::update(&path, |journal| {
+            journal.begin(LifecycleIntent::Retire {
+                workspace: WorkspaceName::main(),
+                options: crate::api::dto::RemoveOptions {
+                    restore: true,
+                    ..Default::default()
+                },
+                origin: None,
+            });
+            journal.mark_mutating(&WorkspaceName::main())
+        })
+        .unwrap();
+        let second = RepoId::parse("acme/second").unwrap();
+        let second_layout = interrupted_restore(&fixture, &second, &checkout);
+        assert!(matches!(
+            inventory.repository_for_project_root(&checkout).await,
+            Err(GatewayInventoryError::AmbiguousProjectRoot(_))
+        ));
+        fixture.bind(&second);
+        second_layout.record_checkout_root(&checkout).unwrap();
+        assert_eq!(
+            inventory
+                .repository_for_project_root(&checkout)
+                .await
+                .unwrap(),
+            Some(second),
+            "pending cleanup must not override a live binding"
+        );
+        assert!(!layout.project().repository_binding.exists());
     }
 
     #[tokio::test]

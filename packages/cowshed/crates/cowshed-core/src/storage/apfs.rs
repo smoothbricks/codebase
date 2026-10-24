@@ -3843,7 +3843,7 @@ fn active_expected(
 /// The suffix of the CA private key that rides beside a workspace image.
 pub(crate) const COMPANION_SUFFIX: &str = ".ca.key";
 
-pub(super) fn companion_path(image: &Path) -> PathBuf {
+pub(crate) fn companion_path(image: &Path) -> PathBuf {
     crate::metadata::append_suffix(image, COMPANION_SUFFIX)
 }
 

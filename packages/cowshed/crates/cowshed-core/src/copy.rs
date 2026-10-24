@@ -233,6 +233,154 @@ pub(crate) struct CopyVerification {
     pub copied_allocated_bytes: u64,
 }
 
+/// A regular file's identity and mutation witness. Allocation changes alone are not mutations.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CopyFileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    mode: u32,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl CopyFileIdentity {
+    pub(crate) fn read(file: &fs::File) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cross-filesystem recovery requires a regular file",
+            ));
+        }
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            mode: metadata.mode(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+
+    pub(crate) fn same_inode(&self, other: &Self) -> bool {
+        self.device == other.device && self.inode == other.inode
+    }
+
+    /// A rename may change ctime; byte verification is still required after this comparison.
+    pub(crate) fn after_rename(&self, other: &Self) -> bool {
+        self.same_inode(other)
+            && self.size == other.size
+            && self.mode == other.mode
+            && self.mtime == other.mtime
+    }
+}
+
+/// Copy only into a newly created, held regular file. The caller owns publication and durability.
+pub(crate) fn copy_held_file(source: &fs::File, destination: &fs::File) -> io::Result<()> {
+    CopyFileIdentity::read(source)?;
+    CopyFileIdentity::read(destination)?;
+    native::copy_regular(source, destination)
+}
+
+/// Compare held bytes, ownership and applicable ACL/xattrs; retain exact mutation witnesses.
+pub(crate) fn verify_held_file(
+    source: &fs::File,
+    destination: &fs::File,
+) -> io::Result<crate::api::Sha256Digest> {
+    use std::io::{Seek as _, SeekFrom};
+    use std::os::unix::fs::MetadataExt as _;
+    let before = CopyFileIdentity::read(source)?;
+    let copied = CopyFileIdentity::read(destination)?;
+    if before.size != copied.size || before.mode != copied.mode || before.mtime != copied.mtime {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "copied file metadata differs",
+        ));
+    }
+    let original_metadata = source.metadata()?;
+    let copied_metadata = destination.metadata()?;
+    if original_metadata.uid() != copied_metadata.uid()
+        || original_metadata.gid() != copied_metadata.gid()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "copied ownership differs: source uid {} gid {}, destination uid {} gid {}",
+                original_metadata.uid(),
+                original_metadata.gid(),
+                copied_metadata.uid(),
+                copied_metadata.gid(),
+            ),
+        ));
+    }
+    native::verify_metadata(source, destination)?;
+    if copied_metadata.blocks().saturating_mul(512)
+        > original_metadata
+            .blocks()
+            .saturating_mul(512)
+            .saturating_add(65536)
+        && original_metadata.blocks().saturating_mul(512) < before.size
+        && native::has_holes(source, before.size)?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sparse holes were materialized",
+        ));
+    }
+    let mut source = source;
+    let mut destination = destination;
+    source.seek(SeekFrom::Start(0))?;
+    destination.seek(SeekFrom::Start(0))?;
+    let digest = compare_file_bytes(source, destination, before.size)?;
+    if CopyFileIdentity::read(source)? != before || CopyFileIdentity::read(destination)? != copied {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source or destination changed during verification",
+        ));
+    }
+    Ok(digest)
+}
+
+fn compare_file_bytes(
+    mut source: &fs::File,
+    mut destination: &fs::File,
+    length: u64,
+) -> io::Result<crate::api::Sha256Digest> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+    let mut digest = Sha256::new();
+    let mut source_bytes = [0_u8; 65536];
+    let mut destination_bytes = [0_u8; 65536];
+    let mut remaining = length;
+    while remaining != 0 {
+        let count = usize::try_from(remaining.min(65536))
+            .map_err(|_| io::Error::other("read length exceeds usize"))?;
+        source.read_exact(&mut source_bytes[..count])?;
+        destination.read_exact(&mut destination_bytes[..count])?;
+        if source_bytes[..count] != destination_bytes[..count] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file content differs",
+            ));
+        }
+        digest.update(&source_bytes[..count]);
+        remaining -=
+            u64::try_from(count).map_err(|_| io::Error::other("read length exceeds u64"))?;
+    }
+    let mut extra = [0];
+    if source.read(&mut extra)? != 0 || destination.read(&mut extra)? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file grew during verification",
+        ));
+    }
+    Ok(crate::api::Sha256Digest::from_bytes(
+        digest.finalize().into(),
+    ))
+}
 /// One hard-linked inode already byte-compared in this walk: the destination inode it was
 /// compared against, and the digest of its payload, reused for every other name of that inode.
 struct VerifiedAlias {
@@ -334,7 +482,6 @@ fn verify_with_snapshot(
     observe: impl Fn(&Path) -> Result<Snapshot>,
 ) -> Result<CopyVerification> {
     use sha2::{Digest, Sha256};
-    use std::io::Read;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -356,8 +503,6 @@ fn verify_with_snapshot(
     let mut source_allocated_bytes = 0_u64;
     let mut copied_allocated_bytes = 0_u64;
     let mut aliases: BTreeMap<(u64, u64), VerifiedAlias> = BTreeMap::new();
-    let mut source_bytes = [0_u8; 65536];
-    let mut destination_bytes = [0_u8; 65536];
     for (relative, original) in &before {
         let copy = copied
             .get(relative)
@@ -426,7 +571,7 @@ fn verify_with_snapshot(
                         .map_err(|error| read_error(path, &error))
                 };
                 let source_file = open(&source_path)?;
-                let mut destination_file = open(&destination_path)?;
+                let destination_file = open(&destination_path)?;
                 if copy.allocated_bytes > original.allocated_bytes.saturating_add(65536)
                     && original.allocated_bytes < original.size
                     && native::has_holes(&source_file, original.size)
@@ -434,44 +579,9 @@ fn verify_with_snapshot(
                 {
                     return Err(mismatch(relative, "sparse holes were materialized"));
                 }
-                let mut payload_digest = Sha256::new();
-                let mut reader = source_file.take(original.size);
-                let mut read_bytes = 0_u64;
-                loop {
-                    let count = reader
-                        .read(&mut source_bytes)
-                        .map_err(|error| read_error(&source_path, &error))?;
-                    if count == 0 {
-                        break;
-                    }
-                    destination_file
-                        .read_exact(&mut destination_bytes[..count])
-                        .map_err(|error| read_error(&destination_path, &error))?;
-                    if source_bytes[..count] != destination_bytes[..count] {
-                        return Err(mismatch(relative, "file content"));
-                    }
-                    payload_digest.update(&source_bytes[..count]);
-                    read_bytes += u64::try_from(count)
-                        .map_err(|_| CowshedError::internal("read count exceeds u64"))?;
-                }
-                if read_bytes != original.size {
-                    return Err(mismatch(relative, "source shortened during verification"));
-                }
-                let mut extra = [0];
-                if reader
-                    .into_inner()
-                    .read(&mut extra)
-                    .map_err(|error| read_error(&source_path, &error))?
-                    != 0
-                    || destination_file
-                        .read(&mut extra)
-                        .map_err(|error| read_error(&destination_path, &error))?
-                        != 0
-                {
-                    return Err(mismatch(relative, "file grew during verification"));
-                }
                 let payload_digest =
-                    crate::api::Sha256Digest::from_bytes(payload_digest.finalize().into());
+                    compare_file_bytes(&source_file, &destination_file, original.size)
+                        .map_err(|error| mismatch(relative, &error.to_string()))?;
                 digest.update(payload_digest.as_bytes());
                 if original.is_hard_linked() {
                     aliases.insert(
@@ -1965,3 +2075,6 @@ mod tests {
             .unwrap();
     }
 }
+
+#[cfg(test)]
+mod metadata_tests;

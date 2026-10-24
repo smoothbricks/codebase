@@ -933,9 +933,16 @@ refusals are 02_workspaces.md, `rm` step 5, "Recovering a recovery image".
 the grants sidecar travelled with it) and `retained`: `RecoveryRetention` is `recorded`, with the retirement's `at` and
 `because`, its `RecoveryCause` list (`inProgress` with `operation`, `dirty`, `abandoned`, `onlyCopy` with `path`,
 `main`), or `unrecorded`. A relative path, a path that is not one of the project's recovery images, and a destination
-inside the store or on another filesystem are `usage`; a missing image or trash is `notFound`; an occupied or symlinked
-destination, a lifecycle lock another operation holds, or a file present on both sides is `conflict`; a sidecar
-recording another identity is `integrity`.
+inside the store are `usage`; a missing image or trash is `notFound`. An occupied or symlinked destination, a lifecycle
+lock another operation holds, or an unadmitted file present on both sides is `conflict`. A sidecar recording another
+identity, nonregular cross-filesystem artifact, changed copy witness or failed copy verification is `integrity`.
+Cross-filesystem regular files use durable sparse copy and complete-set verification before source retirement;
+same-filesystem recovery still renames. Both transports return the same `RecoveredImage` shape.
+
+`manifest` names the immutable admission document `recovery.json`. Cross-filesystem recovery additionally writes
+immutable `recovery-copy.json` only after complete destination verification. Mutable progress and retirement authority
+remain in the source project's existing lifecycle journal, not in either destination document; forged or replaced
+destination evidence cannot promote progress. Completed source-side receipts remain until terminal project unbinding.
 
 ### Generated surfaces
 

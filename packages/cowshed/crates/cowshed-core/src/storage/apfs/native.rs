@@ -2675,6 +2675,55 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         self.reclaim_workspace_artifacts(project, &authority, trash_image, scope)
     }
 
+    /// The name owner alone may remove its disposable environment. Recovery export and
+    /// complete retirement share this operation; it never releases source or checkpoints.
+    fn reclaim_exec_temp(
+        &self,
+        project: &Path,
+        authority: &RetiredRef,
+        trash_image: &Path,
+    ) -> Result<(), ApfsStorageError> {
+        let exec_temp = project
+            .join(EXEC_TEMP_DIRECTORY)
+            .join(authority.workspace().name().as_str());
+        match fs::symlink_metadata(&exec_temp) {
+            Ok(metadata) => {
+                let removed = if metadata.is_dir() {
+                    if let Some(mounted) = self
+                        .mount_source
+                        .mounts()?
+                        .into_iter()
+                        .find(|mount| mount.mount_point.starts_with(&exec_temp))
+                    {
+                        return Err(ApfsStorageError::Host(format!(
+                            "retired exec temp dir {} carries a mounted filesystem: {} at {}; detach it, then retry the retirement or recovery export",
+                            exec_temp.display(),
+                            mounted.source_device,
+                            mounted.mount_point.display()
+                        )));
+                    }
+                    cowshed_os::fsio::remove_owned_tree(&exec_temp)
+                } else {
+                    // A replaced root link belongs to this name, not its target.
+                    fs::remove_file(&exec_temp)
+                };
+                removed
+                    .map_err(|error| io_error("remove retired exec temp dir", &exec_temp, error))?;
+                deletion_log::log_deletion(
+                    project,
+                    DeletionOp::ReclaimRetiredArtifact,
+                    DeletionKind::Other,
+                    authority.workspace().name().as_str(),
+                    Some(trash_image),
+                    &exec_temp,
+                );
+                sync_parent_path(&exec_temp)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_error("inspect retired exec temp dir", &exec_temp, error)),
+        }
+    }
+
     fn reclaim_workspace_artifacts(
         &self,
         project: &Path,
@@ -2714,54 +2763,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     ));
                 }
             }
-            // The workspace's TMPDIR, named like its checkpoints, so the name's owner reclaims it.
-            // A sandboxed process may have replaced it with a link: that is unlinked, never
-            // followed. What its tools sealed read-only inside is made writable to remove it.
-            // A volume mounted beneath it is not part of it: removing the tree would empty that
-            // volume through its mountpoint and then stop at the busy directory. The mount is a
-            // path a sandboxed child chose, so it is named and never detached, and the retirement
-            // stays to authorise the pass that runs once it is gone.
-            let exec_temp = project
-                .join(EXEC_TEMP_DIRECTORY)
-                .join(authority.workspace().name().as_str());
-            match fs::symlink_metadata(&exec_temp) {
-                Ok(metadata) => {
-                    let removed = if metadata.is_dir() {
-                        if let Some(mounted) = self
-                            .mount_source
-                            .mounts()?
-                            .into_iter()
-                            .find(|mount| mount.mount_point.starts_with(&exec_temp))
-                        {
-                            return Err(ApfsStorageError::Host(format!(
-                                "retired exec temp dir {} carries a mounted filesystem: {} at {}; detach it, then `cowshed gc` finishes the retirement",
-                                exec_temp.display(),
-                                mounted.source_device,
-                                mounted.mount_point.display()
-                            )));
-                        }
-                        cowshed_os::fsio::remove_owned_tree(&exec_temp)
-                    } else {
-                        fs::remove_file(&exec_temp)
-                    };
-                    removed.map_err(|error| {
-                        io_error("remove retired exec temp dir", &exec_temp, error)
-                    })?;
-                    deletion_log::log_deletion(
-                        project,
-                        DeletionOp::ReclaimRetiredArtifact,
-                        DeletionKind::Other,
-                        authority.workspace().name().as_str(),
-                        Some(trash_image),
-                        &exec_temp,
-                    );
-                    sync_parent_path(&exec_temp)?
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(io_error("inspect retired exec temp dir", &exec_temp, error));
-                }
-            }
+            self.reclaim_exec_temp(project, authority, trash_image)?;
         }
         let retained = match cleanup.mount_point {
             #[cfg(target_os = "macos")]
@@ -4306,6 +4308,36 @@ where
                 })
             }
         }
+    }
+}
+
+impl<R> crate::storage::recovery_image::RecoveryEnvironment for MacOsApfsExecutionHost<R>
+where
+    R: CommandRunner + Send + Sync + 'static,
+{
+    fn reclaim_recovery_environment(
+        &self,
+        repo: &RepoId,
+        image: &Path,
+    ) -> Result<(), ApfsStorageError> {
+        let project = layout(&self.config, repo)?.project().project_root.clone();
+        let Some(authority) = self.retired_authority(&project, repo, image)? else {
+            // An already-exported image, or a legacy image missing its grants, carries no
+            // authority to delete a name's environment. Its filename cannot replace that proof.
+            return Ok(());
+        };
+        let trash = project
+            .join(SESSIONS_DIRECTORY)
+            .join(super::TRASH_NAMESPACE);
+        let owners = retired_name_owners(&self.retired_trash_images(&trash)?);
+        if self.retired_name_scope(
+            authority.workspace(),
+            owners.get(authority.workspace().name()),
+        )? == NameScope::Owned
+        {
+            self.reclaim_exec_temp(&project, &authority, image)?;
+        }
+        Ok(())
     }
 }
 
