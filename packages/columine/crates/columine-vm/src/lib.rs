@@ -45,6 +45,7 @@ pub mod hash_table;
 pub mod hashmap_ops;
 pub mod hashset_ops;
 pub mod hooks;
+pub mod logical_export;
 pub mod meta;
 pub mod nested;
 pub mod program_admission;
