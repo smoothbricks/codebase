@@ -15,16 +15,17 @@ import {
   utimes,
   writeFile,
 } from 'node:fs/promises';
-import { homedir, tmpdir } from 'node:os';
+import { homedir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
+import { outsideTreesTmpdir } from './__tests__/outside-trees.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { CARGO_ANCESTOR_INPUTS, compiledInFiles, hashCargoPathInputs, readCargoResolve } from './cargo-source-hash.js';
 
 useFixtureCargoHome();
 
 it.each(['app', '.'])('invalidates transitive and inherited Cargo inputs with Nx rooted at %s', async (nxDirectory) => {
-  const root = await mkdtemp(join(tmpdir(), 'cargo-hash-'));
+  const root = await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-'));
   const app = join(root, 'app');
   const manifest = join(app, 'Cargo.toml');
   const nxRoot = join(root, nxDirectory);
@@ -69,7 +70,7 @@ it.each(['app', '.'])('invalidates transitive and inherited Cargo inputs with Nx
 });
 
 it('identical external inputs hash equally at different checkout depths, with bytes and file names still significant', async () => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-hash-portable-')));
+  const root = await realpath(await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-portable-')));
   const shared = join(root, 'shared');
   const roots: readonly [string, string] = [join(root, 'main'), join(root, 'sheds/deep/unit')];
   try {
@@ -78,8 +79,8 @@ it('identical external inputs hash equally at different checkout depths, with by
       join(shared, 'Cargo.toml'),
       '[package]\nname="shared"\nversion="0.1.0"\nedition="2021"\n[workspace]\n',
     );
-    const include = 'const DATA: &str = include_str!(' + JSON.stringify(join(root, 'data.txt')) + ');\n';
-    await writeFile(join(shared, 'src/lib.rs'), 'pub fn value() -> u8 { 7 }\n' + include);
+    const include = `const DATA: &str = include_str!(${JSON.stringify(join(root, 'data.txt'))});\n`;
+    await writeFile(join(shared, 'src/lib.rs'), `pub fn value() -> u8 { 7 }\n${include}`);
     await writeFile(join(shared, 'src/extra.rs'), 'pub const EXTRA: u8 = 9;\n');
     await writeFile(join(root, 'data.txt'), 'shared-data-one');
     const manifest =
@@ -89,7 +90,7 @@ it('identical external inputs hash equally at different checkout depths, with by
     for (const workspace of roots) {
       await mkdir(join(workspace, 'src'), { recursive: true });
       await writeFile(join(workspace, 'Cargo.toml'), manifest);
-      await writeFile(join(workspace, 'src/lib.rs'), 'pub fn value() -> u8 { shared::value() }\n' + include);
+      await writeFile(join(workspace, 'src/lib.rs'), `pub fn value() -> u8 { shared::value() }\n${include}`);
       await symlink(join(shared, 'src'), join(workspace, 'linked-src'), 'dir');
       execFileSync('cargo', ['generate-lockfile', '--offline', '--manifest-path', join(workspace, 'Cargo.toml')], {
         stdio: 'pipe',
@@ -133,7 +134,7 @@ it('the runtime input is byte-identical under cargo lock contention: nothing on 
   // distinct task env, so the bin runs many times at once at the start of a
   // run. Cargo reports package-cache lock contention on stderr; a private
   // CARGO_HOME makes that contention real here.
-  const root = await mkdtemp(join(tmpdir(), 'cargo-hash-'));
+  const root = await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-'));
   const manifest = join(root, 'Cargo.toml');
   try {
     await mkdir(join(root, 'src'), { recursive: true });
@@ -175,7 +176,7 @@ it('the runtime input is byte-identical under cargo lock contention: nothing on 
 });
 
 it('failed runtime inputs have the same key at different checkout paths and still name the cause', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'cargo-hash-refusal-'));
+  const root = await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-refusal-'));
   try {
     const bin = join(import.meta.dir, '../dist/bin/smoo-nx-cargo-hash.js');
     for (const directory of ['first', 'second']) {
@@ -249,7 +250,7 @@ async function workspaceCargoFixture(root: string) {
 }
 
 it('include-workspace hashes in-workspace transitive source edits without changing the external-only contract', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'cargo-hash-workspace-'));
+  const root = await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-workspace-'));
   try {
     const { workspace, manifest, leafSource } = await workspaceCargoFixture(root);
     const external = await hashCargoPathInputs(manifest, workspace);
@@ -273,7 +274,7 @@ it('include-workspace hashes in-workspace transitive source edits without changi
 it.each(['external', 'workspace/node_modules/external'])(
   'follows same-size same-mtime dependency edits in %s and hashes the newly reached source bytes',
   async (externalDirectory) => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-hash-boundary-')));
+    const root = await realpath(await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-boundary-')));
     const workspace = join(root, 'workspace');
     const manifest = join(workspace, 'Cargo.toml');
     const external = join(root, externalDirectory);
@@ -346,7 +347,7 @@ it.each(['external', 'workspace/node_modules/external'])(
 );
 
 it('include-workspace CLI accepts an optional manifest and refuses unsupported arguments', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'cargo-hash-cli-'));
+  const root = await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-cli-'));
   try {
     const { workspace, leafSource } = await workspaceCargoFixture(root);
     const bin = join(import.meta.dir, '../dist/bin/smoo-nx-cargo-hash.js');
@@ -408,7 +409,7 @@ it('include-workspace CLI accepts an optional manifest and refuses unsupported a
 });
 
 it('closure hashes the dependency closure of one directory and ignores unrelated workspace members', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'cargo-hash-closure-'));
+  const root = await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-closure-'));
   try {
     const { workspace, manifest, leafSource } = await workspaceCargoFixture(root);
     const app = { includeWorkspace: true, closure: join(workspace, 'packages/app') };
@@ -447,7 +448,7 @@ it('closure hashes the dependency closure of one directory and ignores unrelated
 });
 
 it('leaves gitignored sources beneath a package out of the digest but keeps an ignored package root', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'cargo-hash-ignored-'));
+  const root = await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-ignored-'));
   try {
     const { workspace, manifest } = await workspaceCargoFixture(root);
     execFileSync('git', ['init', '--quiet', workspace], { stdio: 'pipe' });
@@ -475,7 +476,7 @@ it('leaves gitignored sources beneath a package out of the digest but keeps an i
 it('hashes a Cargo workspace that lives inside a directory its enclosing repository ignores', async () => {
   // A sandbox's TMPDIR, or a checkout under another repository's ignored scratch directory: every
   // package sits beneath one ignored ancestor, where `git ls-files` refuses the pathspec outright.
-  const repository = await mkdtemp(join(tmpdir(), 'cargo-hash-enclosed-'));
+  const repository = await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-enclosed-'));
   try {
     execFileSync('git', ['init', '--quiet', repository], { stdio: 'pipe' });
     await writeFile(join(repository, '.gitignore'), 'scratch/\n');
@@ -494,7 +495,7 @@ it('the runtime input reads no git configuration from the operator home', async 
   // (cowshed 04_sandbox.md). Git must not read that home: the sandbox denies its global
   // configuration, and git dies on any error but a missing file; its global ignore file would
   // decide which sources the key covers.
-  const root = await mkdtemp(join(tmpdir(), 'cargo-hash-operator-git-'));
+  const root = await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-operator-git-'));
   try {
     const { workspace } = await workspaceCargoFixture(root);
     execFileSync('git', ['init', '--quiet', workspace], { stdio: 'pipe' });
@@ -551,7 +552,7 @@ it('the runtime input reads no git configuration from the operator home', async 
 it.each(['helper', 'cli'])(
   'include-workspace gives a custom Nx cached Cargo consumer a runtime input that follows transitive edits via %s',
   async (mode) => {
-    const root = await mkdtemp(join(tmpdir(), 'cargo-hash-consumer-'));
+    const root = await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-consumer-'));
     const dist = join(import.meta.dir, '../dist');
     try {
       const { workspace, manifest, leafSource } = await workspaceCargoFixture(root);
@@ -580,7 +581,7 @@ it.each(['helper', 'cli'])(
 );
 
 it('keeps the v2 transcript across forward source includes and an ignored source included through an alias', async () => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-hash-fused-')));
+  const root = await realpath(await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-fused-')));
   const manifest = join(root, 'Cargo.toml');
   const contents = new Map([
     ['Cargo.toml', '[workspace]\nmembers=["a","z"]\nresolver="2"\n'],
@@ -629,7 +630,7 @@ it('keeps the v2 transcript across forward source includes and an ignored source
       for (const name of CARGO_ANCESTOR_INPUTS) {
         const file = join(ancestor, name);
         if (statSync(file, { throwIfNoEntry: false })?.isFile()) {
-          inputs.push({ file, key: JSON.stringify(['a', '0.1.0', 'ancestor', depth + '/' + name]) });
+          inputs.push({ file, key: JSON.stringify(['a', '0.1.0', 'ancestor', `${depth}/${name}`]) });
         }
       }
       if (dirname(ancestor) === ancestor) break;
@@ -643,7 +644,7 @@ it('keeps the v2 transcript across forward source includes and an ignored source
     )) {
       const bytes = await readFile(file);
       expected.update(key);
-      expected.update('\0' + bytes.length + '\0');
+      expected.update(`\0${bytes.length}\0`);
       expected.update(bytes);
     }
     const before = await hashCargoPathInputs(manifest, root, { includeWorkspace: true });
@@ -656,7 +657,7 @@ it('keeps the v2 transcript across forward source includes and an ignored source
 });
 
 it('keeps literal discovery exact and refuses unreadable sources', async () => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-hash-literals-')));
+  const root = await realpath(await mkdtemp(join(outsideTreesTmpdir(), 'cargo-hash-literals-')));
   const source = join(root, 'src/lib.rs');
   const unicode = 'spelling-e\u0301-\u{10000}-payload';
   try {

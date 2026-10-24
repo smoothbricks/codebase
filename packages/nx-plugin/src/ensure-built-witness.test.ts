@@ -14,7 +14,6 @@ import {
   utimes,
   writeFile,
 } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import fc from 'fast-check';
 import type { ProjectGraph } from 'nx/src/config/project-graph';
@@ -22,6 +21,7 @@ import { expandOutputs, WorkspaceContext } from 'nx/src/native';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory';
 import type { readModulePackageJsonWithoutFallbacks } from 'nx/src/utils/package-json';
 import typia from 'typia';
+import { outsideTreesTmpdir } from './__tests__/outside-trees.js';
 import { pastTick } from './__tests__/past-tick.js';
 import {
   censusStart,
@@ -57,7 +57,7 @@ const snapshot = (previous?: GraphWitness['snapshot']) =>
   workspaceSnapshot(root, new WorkspaceContext(root, data()), previous);
 
 beforeEach(async () => {
-  root = await realpath(await mkdtemp(join(tmpdir(), 'ensure-built-witness-')));
+  root = await realpath(await mkdtemp(join(outsideTreesTmpdir(), 'ensure-built-witness-')));
   await mkdir(data(), { recursive: true });
   await mkdir(join(root, 'packages', 'app'), { recursive: true });
   await writeFile(join(root, '.gitignore'), '.nx/\n');
@@ -90,7 +90,7 @@ describe('authoritative graph witness', () => {
     expect(reusableGraph(previous, root, 'env-changed', 'installed', previous.snapshot)).toBeNull();
     expect(reusableGraph(previous, root, 'env', 'provider-changed', previous.snapshot)).toBeNull();
     expect(reusableGraph(previous, root, 'env', null, previous.snapshot)).toBeNull();
-    expect(reusableGraph(previous, root + '/other', 'env', 'installed', previous.snapshot)).toBeNull();
+    expect(reusableGraph(previous, `${root}/other`, 'env', 'installed', previous.snapshot)).toBeNull();
     expect(reusableGraph(null, root, 'env', 'installed', previous.snapshot)).toBeNull();
     expect(reusableGraph(previous, root, 'env', 'installed', { ...previous.snapshot, stable: false })).toBeNull();
   });
@@ -129,9 +129,9 @@ describe('authoritative graph witness', () => {
     const path = join(root, 'packages', 'app', 'source.txt');
     const { stat } = await import('node:fs/promises');
     const before = await stat(path);
-    await writeFile(path + '.replacement', 'AFTER!');
-    await utimes(path + '.replacement', before.atime, before.mtime);
-    await rename(path + '.replacement', path);
+    await writeFile(`${path}.replacement`, 'AFTER!');
+    await utimes(`${path}.replacement`, before.atime, before.mtime);
+    await rename(`${path}.replacement`, path);
     expect(reusableGraph(previous, root, 'env', 'installed', snapshot(previous.snapshot))).toBeNull();
   });
 

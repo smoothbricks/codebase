@@ -17,7 +17,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { Socket } from 'node:net';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { DEADLINE_PATIENCE, describeMembersLeft, killProcessGroup } from '../../process-group.js';
 import { isRecord } from '../../type-guards.js';
@@ -570,6 +570,13 @@ export class RamTempVolume {
   private readonly sectors: number;
   /** The claims and held verdicts the lock admits changes to, beside the lock file. */
   private readonly ledgerPath: string;
+  /**
+   * Where optional RAM's ordinary fallback makes its owned scratch: the lock's own directory, which an unavailable answer
+   * has just written. For the user's volume that is `/private/tmp`, outside every checkout, so no Git or Cargo walk from
+   * the command's temp files finds the workspace it builds; the workspace's runtime alias resolves into
+   * `<mount>/.cowshed/run`, inside the checkout, and the inherited TMPDIR may be RAM.
+   */
+  readonly ordinaryParent: string;
 
   constructor(
     private readonly paths: RamTempPaths,
@@ -581,6 +588,7 @@ export class RamTempVolume {
   ) {
     this.sectors = Math.ceil(capacityBytes / SECTOR_BYTES);
     this.ledgerPath = `${paths.lockFile}.ledger`;
+    this.ordinaryParent = dirname(paths.lockFile);
   }
 
   /**

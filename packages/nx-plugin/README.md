@@ -1609,10 +1609,12 @@ target's own `env.TMPDIR` wins over the lease. Inside a cowshed sandbox, which c
 the task keeps its inherited `TMPDIR` and says so once.
 
 Every owned `bounded-exec` target attempts the lease, test targets included. Explicit RAM unavailability uses a unique
-owned ordinary directory under the granted runtime alias, or `/private/tmp` on macOS when no alias is configured. It
-never reuses inherited RAM as its fallback. The report names the actual medium/path and typed reason once; an explicit
-target `env.TMPDIR` wins, is labelled target-provided, and is never cleaned by the executor. Successful ordinary scratch
-is removed only after subtree retirement; failed or unretired scratch remains at its reported path. Reclamation never
+owned ordinary directory beside the RAM lock that answer was taken under, in the system temp directory `/private/tmp`.
+It lies outside every checkout, so no Git or Cargo walk from the command's temp files finds the workspace it builds; the
+workspace's runtime alias is not, since it resolves into `<mount>/.cowshed/run` inside the checkout. It never reuses
+inherited RAM as its fallback. The report names the actual medium/path and typed reason once; an explicit target
+`env.TMPDIR` wins, is labelled target-provided, and is never cleaned by the executor. Successful ordinary scratch is
+removed only after subtree retirement; failed or unretired scratch remains at its reported path. Reclamation never
 deletes the scratch of a run that did not pass: a lease whose task died, or whose own run failed, timed out or was
 signalled, is renamed whole into `/private/var/folders/cowshed/<uid>/ram3/.archive/<archived at, epoch ms>-<lease>`, on
 the same volume, so the move is one `rename(2)` and copies nothing (the build-volume trash does the same,

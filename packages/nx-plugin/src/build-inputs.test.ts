@@ -2,8 +2,8 @@ import { describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { outsideTreesTmpdir } from './__tests__/outside-trees.js';
 import {
   type BuildInputRecord,
   buildInputRecord,
@@ -26,7 +26,7 @@ function sha256(bytes: string | Uint8Array): string {
 
 /** Runs `body` in a new directory under the physical temp directory, removed however `body` ends. */
 async function inTemporaryDirectory(body: (directory: string) => unknown): Promise<void> {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), 'smoo-build-inputs-')));
+  const directory = await realpath(await mkdtemp(join(outsideTreesTmpdir(), 'smoo-build-inputs-')));
   try {
     await body(directory);
   } finally {

@@ -1,8 +1,8 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import { accessSync, constants } from 'node:fs';
-import { mkdtemp, realpath, rm } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { availableParallelism, userInfo } from 'node:os';
-import { delimiter, isAbsolute, join, relative, resolve as resolvePath } from 'node:path';
+import { delimiter, isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Duplex, Readable } from 'node:stream';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
@@ -146,7 +146,10 @@ export interface ProcessTreeKiller {
 }
 
 /** Where the command's TMPDIR comes from; `null` leaves the inherited one. */
-export type TempVolume = Pick<RamTempVolume, 'acquire' | 'release' | 'fullness' | 'space' | 'record'>;
+export type TempVolume = Pick<
+  RamTempVolume,
+  'acquire' | 'release' | 'fullness' | 'space' | 'record' | 'ordinaryParent'
+>;
 
 /** Workspace-provided cowshed launchers, in the order a workspace that provides one names them. */
 const WORKSPACE_COWSHED_LAUNCHERS = [
@@ -449,21 +452,11 @@ export async function runBoundedExec(
       if (options.env?.TMPDIR !== undefined) {
         appendStderr(`${unavailable}; using target-provided TMPDIR ${options.env.TMPDIR} (medium not inferred)\n`);
       } else {
-        // The granted runtime namespace is on the workspace's backing filesystem, not its inherited RAM TMPDIR.
-        const configuredParent =
-          process.env.COWSHED_RUNTIME_LINK ?? (process.platform === 'darwin' ? '/private/tmp' : '/tmp');
         try {
-          const parent = await realpath(configuredParent);
-          if (/^ram\d+(?:-new)?(?:\/|$)/.test(relative(ramTempPaths(userInfo()).root, parent))) {
-            appendStderr(
-              `${unavailable}; refusing ordinary scratch inside the shared RAM namespace: ${configuredParent} resolves to ${parent}\n`,
-            );
-            return { success: false, terminalOutput: outputChunks.join('') };
-          }
-          ordinaryTemp = await mkdtemp(join(parent, `smoo-bounded-exec-${process.pid}-`));
+          ordinaryTemp = await mkdtemp(join(tempVolume.ordinaryParent, `smoo-bounded-exec-${process.pid}-`));
         } catch (error) {
           appendStderr(
-            `${unavailable}; could not create ordinary scratch under ${configuredParent}: ${error instanceof Error ? error.message : String(error)}\n`,
+            `${unavailable}; could not create ordinary scratch under ${tempVolume.ordinaryParent}: ${error instanceof Error ? error.message : String(error)}\n`,
           );
           return { success: false, terminalOutput: outputChunks.join('') };
         }

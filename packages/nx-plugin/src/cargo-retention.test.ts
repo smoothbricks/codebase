@@ -16,11 +16,11 @@ import {
   utimes,
   writeFile,
 } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import typia from 'typia';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
+import { outsideTreesTmpdir } from './__tests__/outside-trees.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 import {
   AUTOMATIC_INTERVAL_MS,
@@ -433,7 +433,7 @@ async function churnGenerations(fx: Churn): Promise<Generations> {
 }
 
 async function inFixture(run: (root: string) => Promise<void>): Promise<void> {
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-retention-')));
+  const root = await realpath(await mkdtemp(join(outsideTreesTmpdir(), 'cargo-retention-')));
   try {
     await run(root);
   } finally {
