@@ -15,7 +15,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { statfs } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { OpContextBinding } from '@smoothbricks/lmao';
@@ -34,9 +34,11 @@ import {
   type HostCommands,
   mountsBelow,
   operationDisk,
+  RAM_TEMP_CAPACITY_BYTES,
   type RamTempError,
   type RamTempPaths,
   RamTempVolume,
+  ramTempPaths,
 } from './ram-temp.js';
 import {
   attachedDisks,
@@ -519,159 +521,283 @@ async function nativeRamVolume(): Promise<void> {
   }
 }
 
-/** The provisioning steps a test fails in turn, each with the step name its failure must report. */
-const FAILING_STEPS = [
-  { injected: 'mount_apfs', reported: 'mount_apfs (staging)' },
-  { injected: 'unmount', reported: 'umount (staging)' },
-  { injected: 'mount', reported: 'mount_apfs (mountpoint)' },
+/**
+ * The failing step the one real APFS cycle runs. The staging volume is still mounted, with its marker, when the
+ * rollback detaches it: the kernel unwinds a mounted volume, and only a real disk shows what it leaves.
+ */
+const REAL_FAILING_STEP = { injected: 'unmount', reported: 'umount (staging)' } as const;
+
+/**
+ * The failing steps the recording stand-in runs. Each stops provisioning where it fails, so only the steps it lists
+ * run, and the rollback has the module's own state to undo.
+ */
+const STAND_IN_FAILING_STEPS = [
+  { injected: 'mount_apfs', reported: 'mount_apfs (staging)', steps: ['mount_apfs'] },
+  { injected: 'mount', reported: 'mount_apfs (mountpoint)', steps: ['mount_apfs', 'unmount', 'mount'] },
 ] as const;
+
+/** The registry entry the stand-in gives its attached RAM disk: the identity the rollback detach must name. */
+const STAND_IN_REGISTRY_ENTRY = '0x1000b0ab1';
 
 /**
  * A provisioning step that fails leaves nothing under the final name: the failure detaches the whole
  * disk, with the staging mount on it, and removes the staging directory and the mountpoint the attempt made.
+ * This is the real disk's observation of that rule, for the one step REAL_FAILING_STEP names.
  */
 async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
   const trace = useTestSpan<OpContextBinding>();
   process.stderr.write(`RAM provisioning case started in ${process.pid}\n`);
-  for (const { injected, reported } of FAILING_STEPS) {
-    const fixture = scratchVolume(2);
-    const { parent, paths, capacity, owned, gatewaySocket } = fixture;
-    expectFixtureVolume(paths, capacity);
-    const host = createHostCommands(undefined, gatewaySocket);
-    const calls: { file: string; args: readonly string[]; output: CommandOutput }[] = [];
-    const commands: HostCommands = {
-      ownsRamDisk: (disk) => ownsRecordedDisk(owned, disk),
-      async detachRam(device, entry, deadlineMs) {
-        const output = await host.detachRam(device, entry, deadlineMs);
-        calls.push({ file: '/usr/bin/hdiutil', args: ['detach', device], output });
-        return output;
-      },
-      async run(file, args, deadlineMs, binding) {
-        const record =
-          stepOf(paths, file, args) !== null ||
-          (file === '/usr/bin/hdiutil' && ['attach', 'detach'].includes(args[0] ?? '')) ||
-          (file === '/usr/sbin/diskutil' && args[0] === 'apfs');
-        const startedAt = Date.now();
-        const starting = JSON.stringify({ injected, phase: 'command-start', file, args });
-        trace.log.info(starting);
-        process.stderr.write(`${starting}\n`);
-        const output =
-          stepOf(paths, file, args) === injected
-            ? { status: 1, stdout: '', stderr: 'injected' }
-            : await host.run(file, args, deadlineMs, binding);
-        if (record) {
-          calls.push({ file, args, output });
-        }
-        const finished = JSON.stringify({
-          injected,
-          phase: 'command-end',
-          file,
-          args,
-          output: record
-            ? output
-            : { status: output.status, stderr: output.stderr, stdoutBytes: Buffer.byteLength(output.stdout) },
-          elapsedMs: Date.now() - startedAt,
-        });
-        trace.log.info(finished);
-        process.stderr.write(`${finished}\n`);
-        return output;
-      },
-      // Through `run`, so the injection and the record see the attach as every other step.
-      attachRam: recordedRamAttach(
-        host.attachRam,
-        (file, args, deadlineMs, binding) => commands.run(file, args, deadlineMs, binding),
-        owned,
-      ),
-    };
-    const stopGateway = await startFixtureGateway(fixture);
-    try {
-      const refused = await new RamTempVolume(paths, capacity, commands).acquire(provisionOnly);
-      const refusal = JSON.stringify({ injected, refused }, null, 2);
-      trace.log.info(refusal);
-      process.stderr.write(`${refusal}\n`);
-      const failedDetach = calls.find(
-        (call) => call.file === '/usr/bin/hdiutil' && call.args[0] === 'detach' && call.output.status !== 0,
+  const { injected, reported } = REAL_FAILING_STEP;
+  const fixture = scratchVolume(2);
+  const { parent, paths, capacity, owned, gatewaySocket } = fixture;
+  expectFixtureVolume(paths, capacity);
+  const host = createHostCommands(undefined, gatewaySocket);
+  const calls: { file: string; args: readonly string[]; output: CommandOutput }[] = [];
+  const commands: HostCommands = {
+    ownsRamDisk: (disk) => ownsRecordedDisk(owned, disk),
+    async detachRam(device, entry, deadlineMs) {
+      const output = await host.detachRam(device, entry, deadlineMs);
+      calls.push({ file: '/usr/bin/hdiutil', args: ['detach', device], output });
+      return output;
+    },
+    async run(file, args, deadlineMs, binding) {
+      const record =
+        stepOf(paths, file, args) !== null ||
+        (file === '/usr/bin/hdiutil' && ['attach', 'detach'].includes(args[0] ?? '')) ||
+        (file === '/usr/sbin/diskutil' && args[0] === 'apfs');
+      const startedAt = Date.now();
+      const starting = JSON.stringify({ injected, phase: 'command-start', file, args });
+      trace.log.info(starting);
+      process.stderr.write(`${starting}\n`);
+      const output =
+        stepOf(paths, file, args) === injected
+          ? { status: 1, stdout: '', stderr: 'injected' }
+          : await host.run(file, args, deadlineMs, binding);
+      if (record) {
+        calls.push({ file, args, output });
+      }
+      const finished = JSON.stringify({
+        injected,
+        phase: 'command-end',
+        file,
+        args,
+        output: record
+          ? output
+          : { status: output.status, stderr: output.stderr, stdoutBytes: Buffer.byteLength(output.stdout) },
+        elapsedMs: Date.now() - startedAt,
+      });
+      trace.log.info(finished);
+      process.stderr.write(`${finished}\n`);
+      return output;
+    },
+    // Through `run`, so the injection and the record see the attach as every other step.
+    attachRam: recordedRamAttach(
+      host.attachRam,
+      (file, args, deadlineMs, binding) => commands.run(file, args, deadlineMs, binding),
+      owned,
+    ),
+  };
+  const stopGateway = await startFixtureGateway(fixture);
+  try {
+    const refused = await new RamTempVolume(paths, capacity, commands).acquire(provisionOnly);
+    const refusal = JSON.stringify({ injected, refused }, null, 2);
+    trace.log.info(refusal);
+    process.stderr.write(`${refusal}\n`);
+    const failedDetach = calls.find(
+      (call) => call.file === '/usr/bin/hdiutil' && call.args[0] === 'detach' && call.output.status !== 0,
+    );
+    if (failedDetach !== undefined) {
+      // Diagnostic probes explain a failed detach: each waits for the host to answer, bounded by the leg backstop.
+      const mountTable = await host.run('/sbin/mount', [], BOUNDED_TEST_IDLE_TIMEOUT_MS);
+      const filesystemHolders = await host.run(
+        '/usr/bin/sudo',
+        ['-n', '/usr/sbin/lsof', '-nP', '+f', '--', paths.staging],
+        BOUNDED_TEST_IDLE_TIMEOUT_MS,
       );
-      if (failedDetach !== undefined) {
-        // Diagnostic probes explain a failed detach: each waits for the host to answer, bounded by the leg backstop.
-        const mountTable = await host.run('/sbin/mount', [], BOUNDED_TEST_IDLE_TIMEOUT_MS);
-        const filesystemHolders = await host.run(
-          '/usr/bin/sudo',
-          ['-n', '/usr/sbin/lsof', '-nP', '+f', '--', paths.staging],
-          BOUNDED_TEST_IDLE_TIMEOUT_MS,
-        );
-        const added = calls.find(
-          (call) => call.file === '/usr/sbin/diskutil' && call.args[0] === 'apfs' && call.args[1] === 'addVolume',
-        );
-        const volume = added === undefined ? null : operationDisk(added.output.stdout);
-        const devices = failedDetach.args.filter((argument) => argument.startsWith('/dev/disk'));
-        if (volume !== null) devices.push(`/dev/${volume}`);
-        if (devices.length === 0) throw new Error('rollback detach recorded no device for its diagnostic probe');
-        const devicePaths: string[] = [];
-        for (const device of devices) devicePaths.push(device, device.replace('/dev/', '/dev/r'));
-        const deviceHolders = await host.run(
-          '/usr/bin/sudo',
-          ['-n', '/usr/sbin/lsof', '-nP', '--', ...devicePaths],
-          BOUNDED_TEST_IDLE_TIMEOUT_MS,
-        );
-        const observations = JSON.stringify(
-          {
-            injected,
-            phase: 'rollback-refused-observations',
-            mountTable: {
-              status: mountTable.status,
-              stderr: mountTable.stderr,
-              matching: mountTable.stdout.split('\n').filter((line) => line.includes(paths.staging)),
-            },
-            filesystemHolders,
-            devicePaths,
-            deviceHolders,
+      const added = calls.find(
+        (call) => call.file === '/usr/sbin/diskutil' && call.args[0] === 'apfs' && call.args[1] === 'addVolume',
+      );
+      const volume = added === undefined ? null : operationDisk(added.output.stdout);
+      const devices = failedDetach.args.filter((argument) => argument.startsWith('/dev/disk'));
+      if (volume !== null) devices.push(`/dev/${volume}`);
+      if (devices.length === 0) throw new Error('rollback detach recorded no device for its diagnostic probe');
+      const devicePaths: string[] = [];
+      for (const device of devices) devicePaths.push(device, device.replace('/dev/', '/dev/r'));
+      const deviceHolders = await host.run(
+        '/usr/bin/sudo',
+        ['-n', '/usr/sbin/lsof', '-nP', '--', ...devicePaths],
+        BOUNDED_TEST_IDLE_TIMEOUT_MS,
+      );
+      const observations = JSON.stringify(
+        {
+          injected,
+          phase: 'rollback-refused-observations',
+          mountTable: {
+            status: mountTable.status,
+            stderr: mountTable.stderr,
+            matching: mountTable.stdout.split('\n').filter((line) => line.includes(paths.staging)),
           },
-          null,
-          2,
-        );
-        trace.log.info(observations);
-        process.stderr.write(`${observations}\n`);
+          filesystemHolders,
+          devicePaths,
+          deviceHolders,
+        },
+        null,
+        2,
+      );
+      trace.log.info(observations);
+      process.stderr.write(`${observations}\n`);
+    }
+    // A cowshed sandbox cannot attach images, so provisioning stops before the injected step.
+    if (!refused.ok && refused.error.kind === 'provision-failed' && refused.error.step !== reported) {
+      expectSandboxed(refused.error);
+      return;
+    }
+    const detail = JSON.stringify({ injected, refused, calls }, null, 2);
+    expect(refused, detail).toEqual({
+      ok: false,
+      error: { kind: 'provision-failed', step: reported, detail: 'exit 1: injected' },
+    });
+    expect(
+      calls
+        .filter((call) => call.file === '/usr/bin/hdiutil' && call.args[0] === 'detach')
+        .map((call) => call.output.status),
+      detail,
+    ).toEqual([0]);
+    const listed = await host.run('/usr/sbin/diskutil', ['list']);
+    const remaining = listed.stdout.split('\n').filter((line) => line.includes(paths.volumeName));
+    const inventory = JSON.stringify({ injected, inventory: { status: listed.status, remaining } }, null, 2);
+    trace.log.info(inventory);
+    process.stderr.write(`${inventory}\n`);
+    expect(listed.status).toBe(0);
+    expect(remaining, detail).toEqual([]);
+    const table = await host.run('/sbin/mount', []);
+    expect(table.status).toBe(0);
+    expect(mountsBelow(table.stdout, paths.mountpoint)).toEqual([]);
+    expect(mountsBelow(table.stdout, paths.staging)).toEqual([]);
+    expect(existsSync(paths.staging)).toBe(false);
+    expect(existsSync(paths.mountpoint)).toBe(false);
+  } finally {
+    trace.log.info(JSON.stringify({ injected, phase: 'test-teardown-start' }));
+    try {
+      await detachOwned(owned, paths.uid, gatewaySocket);
+    } finally {
+      await stopGateway();
+    }
+    removeScratchDirectories(paths);
+    rmSync(parent, { recursive: true, force: true });
+    trace.log.info(JSON.stringify({ injected, phase: 'test-teardown-done' }));
+  }
+}
+
+/** One RAM disk as ioreg -r -c IOHDIXHDDriveOutKernel -l -w0 lists it: its whole disk and its image. */
+function ramDiskRecord(name: string, sectors: number, uid: number): string {
+  return [
+    `+-o IOHDIXHDDriveOutKernel <class IOHDIXHDDriveOutKernel, id ${STAND_IN_REGISTRY_ENTRY}, registered, matched, active, busy 0, retain 1>`,
+    '{',
+    `  "image-path" = <"ram://${sectors}">`,
+    `  "owner-uid" = ${uid}`,
+    `  "BSD Name" = "${name}"`,
+    '}',
+    '',
+  ].join('\n');
+}
+
+/**
+ * A recording HostCommands stand-in for one provisioning run. It attaches one RAM disk and answers ioreg, mount,
+ * diskutil, mount_apfs and umount from the disk and the mounts it holds, so provisioning's own checks run unchanged.
+ * It fails the step named injected, and records every step and every detach. It answers nothing else.
+ */
+function provisioningStandIn(paths: RamTempPaths, injected: string) {
+  const calls: { file: string; args: readonly string[] }[] = [];
+  const steps: string[] = [];
+  const detaches: { device: string; registryEntry: string }[] = [];
+  const kernel: { disk: { name: string; sectors: number } | null; mounts: Map<string, string> } = {
+    disk: null,
+    mounts: new Map(),
+  };
+  const commands: HostCommands = {
+    async run(file, args) {
+      calls.push({ file, args });
+      const step = stepOf(paths, file, args);
+      if (step !== null) steps.push(step);
+      if (step === injected) return { status: 1, stdout: '', stderr: 'injected' };
+      if (file === '/usr/sbin/ioreg') {
+        const disk = args.includes('IOHDIXHDDriveOutKernel') ? kernel.disk : null;
+        return {
+          status: 0,
+          stdout: disk === null ? '' : ramDiskRecord(disk.name, disk.sectors, paths.uid),
+          stderr: '',
+        };
       }
-      // A cowshed sandbox cannot attach images, so provisioning stops before the injected step.
-      if (!refused.ok && refused.error.kind === 'provision-failed' && refused.error.step !== reported) {
-        expectSandboxed(refused.error);
-        continue;
+      if (file === '/sbin/mount') {
+        const table = [...kernel.mounts].map(([point, volume]) => `/dev/${volume} on ${point} (apfs, local, nobrowse)`);
+        return { status: 0, stdout: table.join('\n'), stderr: '' };
       }
-      const detail = JSON.stringify({ injected, refused, calls }, null, 2);
+      if (file === '/usr/sbin/diskutil' && args[1] === 'createContainer') {
+        return { status: 0, stdout: 'Disk from APFS operation: disk902\n', stderr: '' };
+      }
+      if (file === '/usr/sbin/diskutil' && args[1] === 'addVolume') {
+        return { status: 0, stdout: 'Disk from APFS operation: disk902s1\n', stderr: '' };
+      }
+      if (file === '/sbin/mount_apfs') {
+        const [, , device = '', point = ''] = args;
+        kernel.mounts.set(point, device.slice('/dev/'.length));
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      if (file === '/sbin/umount') {
+        const [point = ''] = args;
+        if (!kernel.mounts.delete(point)) return { status: 1, stdout: '', stderr: `${point} is not mounted` };
+        // The volume's marker leaves the directory with the volume, so the unmounted directory is bare again.
+        rmSync(join(point, '.smoo-ram'), { force: true });
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      throw new Error(`${file} ${args.join(' ')} is not answered by the provisioning stand-in`);
+    },
+    async attachRam(sectors) {
+      kernel.disk = { name: 'disk901', sectors };
+      return { ok: true, value: '/dev/disk901' };
+    },
+    async detachRam(device, registryEntry) {
+      detaches.push({ device, registryEntry });
+      kernel.disk = null;
+      kernel.mounts.clear();
+      return { status: 0, stdout: '', stderr: '' };
+    },
+  };
+  return { commands, calls, steps, detaches };
+}
+
+/**
+ * Each failing step the stand-in answers: the module names the step that failed, stops provisioning there, detaches
+ * exactly the disk it attached by the registry entry it read for it, and removes the directories it made. Whether the
+ * kernel unmounted or detached anything is not asked of a stand-in: the real cycle observes that.
+ */
+async function aFailedStepRollsBackOnAStandIn(): Promise<void> {
+  for (const { injected, reported, steps } of STAND_IN_FAILING_STEPS) {
+    const parent = mkdtempSync(join(tmpdir(), 'rt-stand-in-'));
+    try {
+      const root = join(parent, 'root');
+      mkdirSync(root, { mode: 0o700 });
+      const paths: RamTempPaths = {
+        ...ramTempPaths(userInfo()),
+        root,
+        mountpoint: join(root, 'ram'),
+        staging: join(root, 'ram-new'),
+        lockFile: join(parent, 'v.lock'),
+      };
+      const standIn = provisioningStandIn(paths, injected);
+      const refused = await new RamTempVolume(paths, RAM_TEMP_CAPACITY_BYTES, standIn.commands).acquire(provisionOnly);
+      const detail = JSON.stringify({ injected, refused, calls: standIn.calls }, null, 2);
       expect(refused, detail).toEqual({
         ok: false,
         error: { kind: 'provision-failed', step: reported, detail: 'exit 1: injected' },
       });
-      expect(
-        calls
-          .filter((call) => call.file === '/usr/bin/hdiutil' && call.args[0] === 'detach')
-          .map((call) => call.output.status),
-        detail,
-      ).toEqual([0]);
-      const listed = await host.run('/usr/sbin/diskutil', ['list']);
-      const remaining = listed.stdout.split('\n').filter((line) => line.includes(paths.volumeName));
-      const inventory = JSON.stringify({ injected, inventory: { status: listed.status, remaining } }, null, 2);
-      trace.log.info(inventory);
-      process.stderr.write(`${inventory}\n`);
-      expect(listed.status).toBe(0);
-      expect(remaining, detail).toEqual([]);
-      const table = await host.run('/sbin/mount', []);
-      expect(table.status).toBe(0);
-      expect(mountsBelow(table.stdout, paths.mountpoint)).toEqual([]);
-      expect(mountsBelow(table.stdout, paths.staging)).toEqual([]);
-      expect(existsSync(paths.staging)).toBe(false);
-      expect(existsSync(paths.mountpoint)).toBe(false);
+      expect(standIn.steps, detail).toEqual(steps);
+      expect(standIn.detaches, detail).toEqual([{ device: '/dev/disk901', registryEntry: STAND_IN_REGISTRY_ENTRY }]);
+      expect(existsSync(paths.staging), detail).toBe(false);
+      expect(existsSync(paths.mountpoint), detail).toBe(false);
     } finally {
-      trace.log.info(JSON.stringify({ injected, phase: 'test-teardown-start' }));
-      try {
-        await detachOwned(owned, paths.uid, gatewaySocket);
-      } finally {
-        await stopGateway();
-      }
-      removeScratchDirectories(paths);
       rmSync(parent, { recursive: true, force: true });
-      trace.log.info(JSON.stringify({ injected, phase: 'test-teardown-done' }));
     }
   }
 }
@@ -800,12 +926,16 @@ describe('temporary-directory policy on this host', () => {
       nativeRamVolume,
     );
     it(
-      'leaves no volume under its final name, and no staging directory, when any provisioning step fails',
+      'leaves no volume under its final name, and no staging directory, when the staging umount fails on a real disk',
       aFailedStepLeavesNoNamedVolume,
     );
     it(
       'says a lease lost when its volume is detached under its task, never measuring the host disk in its place',
       aLeaseLostUnderItsTask,
+    );
+    it(
+      'names the failed step, detaches exactly the disk it attached and removes its directories, when mount_apfs or the mountpoint mount fails',
+      aFailedStepRollsBackOnAStandIn,
     );
   } else {
     it(
