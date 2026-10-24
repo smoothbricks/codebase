@@ -13,6 +13,7 @@ import {
   cargoPackageTestInputs,
   listCargoWorkspacePackages,
   NEXTEST_REPO_CONFIG_PATH,
+  packageNameFromCargoTestTarget,
   SERIAL_TEST_GROUP_PLATFORM,
   serialTestGroups,
 } from './cargo-workspace.js';
@@ -26,6 +27,9 @@ const DEVICE_GROUP = 'cargo-test-group-real-apfs';
 const HOST_GROUP = 'cargo-test-group-real-apfs-host';
 /** cowshed's build, which leaves the host's own CLI where the package's launcher finds it. */
 const CHECKOUT_COWSHED_BUILD = { projects: ['cowshed'], target: 'build' };
+/** The target that provisions the per-user mount root the real-image fixtures keep their scratch trees below. */
+const APFS_TEST_ROOT = { projects: ['cowshed'], target: 'apfs-test-root' };
+const APFS_TEST_ROOT_TASK = 'cowshed:apfs-test-root';
 
 describe('the real-APFS serial groups of this repository', () => {
   it('are exactly the device group and the host group, each scoped to the packages it holds', () => {
@@ -87,7 +91,7 @@ describe('the real-APFS serial groups of this repository', () => {
     const nx = await readRecord('nx.json', JSON.parse);
     const host = child(child(nx, 'targetDefaults'), HOST_GROUP);
     // `...` keeps the inferred archive and fetch edges ahead of the explicit ones.
-    expect(host.dependsOn).toEqual(['...', CHECKOUT_COWSHED_BUILD, DEVICE_GROUP]);
+    expect(host.dependsOn).toEqual(['...', CHECKOUT_COWSHED_BUILD, APFS_TEST_ROOT, DEVICE_GROUP]);
   });
 
   it("run this checkout's cowshed, built first, for every disk command the code under test makes", async () => {
@@ -109,7 +113,7 @@ describe('the real-APFS serial groups of this repository', () => {
   });
 
   it('reaches host groups only through the explicit host and land gates, preserving the old land task set', async () => {
-    const graph = await repositoryProjectGraph();
+    const graph = await projectGraph();
     const projects = Object.keys(graph.nodes);
     const targets = [...new Set(projects.flatMap((name) => Object.keys(graph.nodes[name]?.data.targets ?? {})))];
     const tasks = createTaskGraph(graph, {}, projects, targets, undefined, {});
@@ -220,6 +224,50 @@ describe('the real-APFS serial groups of this repository', () => {
   });
 });
 
+describe('the per-user mount root the real-image fixtures keep their scratch trees below', () => {
+  it('is provisioned by a target that runs every time, because its directories are host state, not an Nx output', async () => {
+    const graph = await projectGraph();
+    const setup = graph.nodes.cowshed?.data.targets?.[APFS_TEST_ROOT.target];
+    expect(setup?.executor).toBe('nx:run-commands');
+    expect(setup?.options?.command).toBe('bun scripts/apfs-test-root.ts');
+    // A cached skip on a fresh runner would leave the directories missing.
+    expect(setup?.cache).toBe(false);
+  });
+
+  it('is provisioned before every test that makes a scratch root there, in a shard, a group or a host proof', async () => {
+    const graph = await projectGraph();
+    // The crates whose Rust sources make scratch roots: by the function that does, or the support module that calls it.
+    const makers = new Set<string>();
+    for (const source of await rustSources(listCargoWorkspacePackages(REPOSITORY))) {
+      if (/\bmacos_scratch_root\b|\bscratch_apfs\b/.test(source.text)) makers.add(source.owner);
+    }
+    const consumers = [
+      { project: 'cowshed', target: 'host-controller-test' },
+      { project: 'cowshed', target: 'integration-apfs' },
+      { project: ROOT_PROJECT, target: DEVICE_GROUP },
+      { project: ROOT_PROJECT, target: HOST_GROUP },
+    ];
+    for (const [project, node] of Object.entries(graph.nodes)) {
+      for (const target of Object.keys(node.data.targets ?? {})) {
+        const crate = packageNameFromCargoTestTarget(target);
+        if (crate !== null && makers.has(crate)) consumers.push({ project, target });
+      }
+    }
+    // Not vacuous: the three crates that hold the real_apfs_ tests are among those whose shards are checked.
+    const crates = new Set(consumers.map(({ target }) => packageNameFromCargoTestTarget(target)));
+    for (const crate of ['cowshed-apfs-tests', 'cowshed-cli', 'cowshed-core'])
+      expect(crates.has(crate), crate).toBe(true);
+
+    const projects = [...new Set(consumers.map(({ project }) => project))];
+    const targets = [...new Set(consumers.map(({ target }) => target))];
+    const tasks = createTaskGraph(graph, {}, projects, targets, undefined, {});
+    for (const { project, target } of consumers) {
+      const id = `${project}:${target}`;
+      expect(tasks.dependencies[id], id).toContain(APFS_TEST_ROOT_TASK);
+    }
+  });
+});
+
 /** `path` of the repository, parsed by `parse`, which must be an object. */
 async function readRecord(path: string, parse: (text: string) => unknown): Promise<Record<string, unknown>> {
   const parsed = parse(await readFile(join(REPOSITORY, path), 'utf8'));
@@ -274,6 +322,14 @@ async function repositoryProjectGraph(): Promise<ProjectGraph> {
   } finally {
     await rm(data, { recursive: true, force: true });
   }
+}
+
+let projectGraphOnce: Promise<ProjectGraph> | undefined;
+
+/** `repositoryProjectGraph`, computed once for the file: each call costs a child process. */
+function projectGraph(): Promise<ProjectGraph> {
+  projectGraphOnce ??= repositoryProjectGraph();
+  return projectGraphOnce;
 }
 
 interface RustSource {

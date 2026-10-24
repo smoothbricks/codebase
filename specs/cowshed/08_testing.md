@@ -503,8 +503,8 @@ skip. On macOS these are the `real_apfs_*` tests, compiled only for macOS: small
 `sun_path`) (`cowshed_os::scratch::macos_scratch_root`), driven by the production host — real
 `diskutil`/`hdiutil`/`fsck_apfs`/`mount_apfs`, descriptor-native `funmount` and the live kernel mount table. The
 per-user scratch parent is host state `cowshed setup` provisions, never fixture state: a fixture creates only `t` inside
-it and refuses a missing or foreign root, so the one CI leg that runs these tests on a setup-less host provisions
-setup's same mount-root directories first (.github/workflows/publish.yml). A mount state a test needs (wrong flags, an
+it and refuses a missing or foreign root, so a host lacking setup gets setup's same directories from the Nx target
+`cowshed:apfs-test-root`, which every such test target depends on (below). A mount state a test needs (wrong flags, an
 impostor volume, a busy holder) is produced on a real volume, never by a substitute mount source. Every scratch root
 selects its backing image paths, then calls the same production owned-attachment cleanup used by normal removal,
 recovery-marker reads, reverse-order teardown, duplicate-attachment rejection, and staging GC. Each cleanup rereads
@@ -521,6 +521,16 @@ of, runs whose owner pid is gone. On Linux: a scratch ZFS pool on a loopback/fil
 datasets destroyed and the pool exported on teardown; the Linux leg also exercises `cowshed-helper` and the
 Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The same flow table runs on
 both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
+
+The Nx target `cowshed:apfs-test-root` (`packages/cowshed/scripts/apfs-test-root.ts`) gives a host `cowshed setup` has
+not run on, such as a CI runner that cannot answer setup's interactive authorization prompt, setup's own three
+directories: `/private/var/folders/cowshed` (root:wheel 0755), the user's `<uid>` directory below it and `mnt` below
+that (the user's, 0700). Every target that runs a test creating a scratch root depends on it: the cargo test shards of
+the `cowshed-*` crates, both real-APFS groups, `host-controller-test` and `integration-apfs`. It creates only what is
+missing, by `sudo -n` for the prefix and the per-user root and as the user for `mnt`, refuses a link, a non-directory or
+a foreign owner rather than writing through it, and with a directory missing and `sudo -n` refused fails naming the
+exact commands to run. It never looks at `t`: the fixtures make it, and a `cowshed exec` sandbox, where the shards run
+too, denies it. On a host setup has been through it checks and changes nothing.
 
 The panic/kill cleanup fixture reads only its own child's stdout pipe. Before ending that child it requires two complete
 line-start image records (the mounted RAW image, then the retained RAW input) and the worker record; neither a sibling's

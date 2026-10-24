@@ -630,16 +630,50 @@
           "launcher-test",
           "cache-advisor-test",
           "wire-fixtures-test",
+          "apfs-test-root-test",
           "wire-test",
           "declaration-model-test",
           "verify-packaging"
         ]
+      },
+      "apfs-test-root": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "comment": "Makes sure the per-user mount root that real-image fixtures keep their scratch trees below exists, as cowshed setup makes it: /private/var/folders/cowshed, its <uid> directory, and mnt inside that (specs/cowshed/08_testing.md, Integration tests). The fixtures make t themselves, and a cowshed exec sandbox denies it, so it is never touched here. On a host setup has been through it only checks, and changes nothing. cache:false is load-bearing: the directories are host state, not an Nx output, so a cached skip on a fresh runner would leave them missing. It does nothing off macOS.",
+          "command": "bun scripts/apfs-test-root.ts",
+          "cwd": "{projectRoot}"
+        }
+      },
+      "apfs-test-root-test": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "{projectRoot}/scripts/apfs-test-root.ts",
+          "{projectRoot}/scripts/apfs-test-root.test.ts",
+          "{projectRoot}/crates/cowshed-core/src/storage/host_config.rs",
+          "{projectRoot}/crates/cowshed-core/src/storage/bootstrap/native/macos.rs",
+          "{projectRoot}/crates/cowshed-os/src/scratch.rs",
+          "bunToolchain",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh uname -s"
+          }
+        ],
+        "outputs": [],
+        "options": {
+          "comment": "Unit tests of apfs-test-root.ts: every decision against an in-memory host, the real lstat and install against a temporary directory, and pins of its paths and modes to the Rust code that makes and refuses them. Runs from the project root on an explicit path, with an empty Bun config: the package bunfig.toml preloads LMAO's compiler and trace hooks, which a script test has no use for and which would make it wait on lmao's build. The host OS is an input because a darwin-only case skips elsewhere, and a result cached there must not replay here.",
+          "command": "bun test --config=/dev/null --timeout=0 ./scripts/apfs-test-root.test.ts",
+          "cwd": "{projectRoot}",
+          "idleTimeoutMs": 180000,
+          "killAfterMs": 10000
+        }
       },
       "host-controller-test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": false,
         "dependsOn": [
           "build",
+          "apfs-test-root",
           {
             "target": "cargo-test-archive",
             "projects": [
@@ -672,6 +706,9 @@
       "integration-apfs": {
         "executor": "nx:run-commands",
         "cache": false,
+        "dependsOn": [
+          "apfs-test-root"
+        ],
         "options": {
           "cwd": "packages/cowshed",
           "command": "cargo test -p cowshed-core --test apfs_integration -- --nocapture"

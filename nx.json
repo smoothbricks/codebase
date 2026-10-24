@@ -71,12 +71,24 @@
       "executor": "@smoothbricks/nx-plugin:clean-outputs",
       "cache": false
     },
+    "cargo-test-cowshed-*": {
+      "dependsOn": ["...", { "projects": ["cowshed"], "target": "apfs-test-root" }]
+    },
     "cargo-test-group-real-apfs": {
-      "dependsOn": ["...", { "projects": ["cowshed"], "target": "build" }],
+      "dependsOn": [
+        "...",
+        { "projects": ["cowshed"], "target": "build" },
+        { "projects": ["cowshed"], "target": "apfs-test-root" }
+      ],
       "options": { "env": { "COWSHED_EXECUTABLE": "{workspaceRoot}/packages/cowshed/bin/cowshed" } }
     },
     "cargo-test-group-real-apfs-host": {
-      "dependsOn": ["...", { "projects": ["cowshed"], "target": "build" }, "cargo-test-group-real-apfs"],
+      "dependsOn": [
+        "...",
+        { "projects": ["cowshed"], "target": "build" },
+        { "projects": ["cowshed"], "target": "apfs-test-root" },
+        "cargo-test-group-real-apfs"
+      ],
       "options": { "env": { "COWSHED_EXECUTABLE": "{workspaceRoot}/packages/cowshed/bin/cowshed" } }
     }
   },
