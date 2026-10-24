@@ -433,6 +433,38 @@ async function restarted(
 }
 
 /**
+ * Runs `action` as a lockfile change with a connection opened before it held across the change: a request sent on
+ * that connection after the change must not be served by the old daemon.
+ */
+async function restartedHeld(
+  workspace: string,
+  daemon: Daemon,
+  what: string,
+  action: () => Promise<void>,
+): Promise<Daemon> {
+  const held = await openClient(daemon.record.socketPath);
+  try {
+    expect(
+      await held.request(ping(workspace), `the first PING on the held connection before ${what}`),
+      `does not serve a request sent on a connection opened before a lockfile change: the first PING before ${what}`,
+    ).toEqual({ answered: true, message: true });
+    return await restarted(workspace, daemon, what, async () => {
+      await action();
+      assertNotServed(
+        await held.request(
+          { type: 'REQUEST_PROJECT_GRAPH', workspaceRoot: workspace },
+          `the graph request sent right after ${what}`,
+        ),
+        `does not serve a request sent on a connection opened before a lockfile change: a graph request on a connection opened before ${what}`,
+      );
+      held.close();
+    });
+  } finally {
+    held.close();
+  }
+}
+
+/**
  * A file-watcher client of the workspace's daemon, read one event at a time. The fixture environment turns NX_DAEMON
  * off, so this client turns it back on: its watcher must reach the daemon under test, not an in-process Nx.
  */
@@ -651,7 +683,12 @@ it('restarts the daemon on each root lockfile create, change, replace, and delet
         const lock = join(workspace, lockfile);
         const [one, two, three] = await lockContents(lockfile, root);
         daemon = await restarted(workspace, daemon, `creating ${lockfile}`, () => writeFile(lock, one));
-        daemon = await restarted(workspace, daemon, `changing ${lockfile}`, () => writeFile(lock, two));
+        // The yarn.lock change also holds a connection opened before it across the change.
+        const change = () => writeFile(lock, two);
+        daemon =
+          lockfile === 'yarn.lock'
+            ? await restartedHeld(workspace, daemon, `changing ${lockfile}`, change)
+            : await restarted(workspace, daemon, `changing ${lockfile}`, change);
         daemon = await restarted(workspace, daemon, `replacing ${lockfile} by rename`, async () => {
           await writeFile(`${lock}.next`, three);
           await rename(`${lock}.next`, lock);
@@ -670,43 +707,6 @@ it('restarts the daemon on each root lockfile create, change, replace, and delet
         ]);
         daemon = await restarted(workspace, daemon, `deleting ${lockfile}`, () => rm(lock));
       }
-    },
-    FIXTURE_WORKSPACE,
-  );
-});
-
-it('does not serve a request sent on a connection opened before a lockfile change', async () => {
-  await withNxFixture(
-    'nx-daemon-validity-held-',
-    async ({ socketDirectory, workspace }) => {
-      await fixtureWorkspace(workspace);
-      const lock = join(workspace, 'yarn.lock');
-      await writeFile(lock, 'lock one\n');
-      const env = fixtureNxEnv(workspace, socketDirectory);
-      const daemon = await startDaemon(workspace, env);
-      const held = await openClient(daemon.record.socketPath);
-      try {
-        expect(await held.request(ping(workspace), 'the first PING on the held connection')).toEqual({
-          answered: true,
-          message: true,
-        });
-        await writeFile(lock, 'lock two\n');
-        assertNotServed(
-          await held.request(
-            { type: 'REQUEST_PROJECT_GRAPH', workspaceRoot: workspace },
-            'the graph request sent right after the lockfile change',
-          ),
-          'a graph request on a connection opened before the lockfile change',
-        );
-      } finally {
-        held.close();
-      }
-      await awaitExit([daemon.entry], `daemon ${daemon.record.processId} after the held lockfile change`);
-      await replacementAfter({
-        workspace,
-        previous: daemon.record.processId,
-        what: 'the daemon to restart after the held lockfile change',
-      });
     },
     FIXTURE_WORKSPACE,
   );
@@ -763,7 +763,14 @@ it('stops a kept daemon on a lockfile change instead of spawning a successor its
   );
 });
 
-it('stops a daemon at the next request after an ignored lockfile changes, then its successor within its safety poll with no request', async () => {
+it('stops each daemon as its state changes: an ignored lockfile, a replaced or removed socket, a taken record, and emptied workspace files', async () => {
+  // Each step's messages keep the title of the original case it came from.
+  const ignored =
+    'stops a daemon at the next request after an ignored lockfile changes, then its successor within its safety poll with no request';
+  const replaced = "leaves a replacement socket in place when the daemon's own socket path is replaced";
+  const removed = 'stops a daemon whose own socket path is removed with nothing taking its place';
+  const taken = 'leaves a successor record and socket in place when another process takes the record';
+  const emptied = 'stops a daemon whose workspace files are all deleted before it reads the emptied workspace';
   await withNxFixture(
     'nx-daemon-validity-ignored-',
     async ({ socketDirectory, workspace }) => {
@@ -777,89 +784,159 @@ it('stops a daemon at the next request after an ignored lockfile changes, then i
       await writeFile(lock, 'lock two\n');
       assertNotServed(
         await requestOnce(daemon.record.socketPath, ping(workspace), 'a PING sent after the ignored lockfile changed'),
-        'a PING sent after the ignored lockfile changed',
+        `${ignored}: a PING sent after the ignored lockfile changed`,
       );
       await awaitExit(
         [daemon.entry],
-        `daemon ${daemon.record.processId} after the ignored lockfile changed and a PING followed`,
+        `${ignored}: daemon ${daemon.record.processId} after the ignored lockfile changed and a PING followed`,
       );
       const record = await replacementAfter({
         workspace,
         previous: daemon.record.processId,
-        what: 'the daemon to restart after the ignored lockfile changed and a PING followed',
+        what: `${ignored}: the daemon to restart after the ignored lockfile changed and a PING followed`,
       });
       // The successor booted with 'lock two' on disk, so that is its baseline; a daemon answers a PING only when its
       // check finds the lock unchanged, and nothing requests this one afterwards.
       const successor = await readyDaemon(workspace, record);
       expect(
         await recordedPid(workspace),
-        'the successor was replaced before the lockfile changed again, so no replacement could show the safety poll',
+        `${ignored}: the successor was replaced before the lockfile changed again, so no replacement could show the safety poll`,
       ).toBe(successor.record.processId);
       // Nothing requests the successor after this write and its watcher ignores the file, so only the 5 s safety
       // poll can judge 'lock three'.
-      await replacementAfter({
+      const polled = await replacementAfter({
         workspace,
         previous: successor.record.processId,
         action: () => writeFile(lock, 'lock three\n'),
-        what: 'a replacement of the successor within the 5 s safety poll after an ignored lockfile change',
+        what: `${ignored}: a replacement of the successor within the 5 s safety poll after an ignored lockfile change`,
       });
       await awaitExit(
         [successor.entry],
-        `successor ${successor.record.processId} after the ignored lockfile changed with no request`,
+        `${ignored}: successor ${successor.record.processId} after the ignored lockfile changed with no request`,
+      );
+      // The socket path is replaced under the daemon: it stops, and the replacement stays in place.
+      let current = await readyDaemon(workspace, polled);
+      await unlink(current.record.socketPath);
+      const closeReplacement = await listenInProcess(current.record.socketPath);
+      try {
+        await awaitExit(
+          [current.entry],
+          `${replaced}: daemon ${current.record.processId} whose socket path was replaced`,
+        );
+        expect(
+          await acceptsConnections(current.record.socketPath),
+          `${replaced}: the replacement socket after the daemon exited`,
+        ).toBe(true);
+      } finally {
+        await closeReplacement();
+      }
+      // The socket path is removed with nothing taking its place: the daemon stops, and nothing listens there.
+      current = await startDaemon(workspace, env);
+      await unlink(current.record.socketPath);
+      await awaitExit(
+        [current.entry],
+        `${removed}: daemon ${current.record.processId} after its socket path was removed`,
+      );
+      expect(
+        await acceptsConnections(current.record.socketPath),
+        `${removed}: the socket path after the daemon exited`,
+      ).toBe(false);
+      // Another process takes the record and its socket: the daemon exits and leaves both in place.
+      current = await startDaemon(workspace, env);
+      const successorSocket = join(socketDirectory, 'successor.sock');
+      const taker = await listeningChild(successorSocket);
+      try {
+        const takenRecord = {
+          processId: taker.pid,
+          socketPath: successorSocket,
+          nxVersion: (await installedManifest()).version,
+          workspaceRoot: workspace,
+        };
+        await writeFile(recordPath(workspace), `${JSON.stringify(takenRecord)}\n`);
+        await awaitExit(
+          [current.entry],
+          `${taken}: daemon ${current.record.processId} whose record now names ${taker.pid}`,
+        );
+        expect(await daemonRecord(workspace), `${taken}: the record after the displaced daemon exited`).toMatchObject({
+          processId: taker.pid,
+          socketPath: successorSocket,
+        });
+        expect(
+          await acceptsConnections(successorSocket),
+          `${taken}: the successor socket after the displaced daemon exited`,
+        ).toBe(true);
+      } finally {
+        await taker.stop();
+      }
+      // Last, as it leaves no workspace to walk: every tracked file goes.
+      current = await startDaemon(workspace, env);
+      expect(
+        JSON.parse(nx(workspace, { ...env, NX_DAEMON: 'true' }, 'show', 'projects', '--json')),
+        `${emptied}: the projects before the workspace was emptied`,
+      ).toEqual(['p']);
+      // Every tracked file goes, as when a checkout is removed or unmounted under its daemon; the daemon's own record
+      // under .nx stays, so only the workspace check can stop it. Reading the emptied file map instead would block
+      // the daemon's only thread for good, where no SIGTERM handler runs.
+      await rm(join(workspace, 'p'), { recursive: true });
+      await unlink(join(workspace, 'package.json'));
+      await unlink(join(workspace, 'nx.json'));
+      await awaitExit(
+        [current.entry],
+        `${emptied}: daemon ${current.record.processId} after every workspace file was deleted`,
+      );
+      const log = await readFile(join(workspace, '.nx', 'workspace-data', 'd', 'daemon.log'), 'utf8');
+      expect(log, `${emptied}: the daemon log`).toMatch(
+        /Server stopped because: "its workspace \S+ has no nx\.json any more"/,
       );
     },
     FIXTURE_WORKSPACE,
   );
 });
 
-it('stops a daemon, refusing its next request, once the installed nx version changes in place', async () => {
+it('stops a daemon once the workspace nx link points at a different version, and once the installed nx version changes in place', async () => {
+  const linkTitle = 'stops a daemon once the workspace nx link points at a different version';
+  const versionTitle = 'stops a daemon, refusing its next request, once the installed nx version changes in place';
   await withNxFixture(
     'nx-daemon-validity-version-',
     async ({ root, socketDirectory, workspace }) => {
       const installed = join(root, 'installed-nx');
+      const replacement = join(root, 'replacement-nx');
       const manifest = await installedManifest();
       await nxPackageCopy(installed, manifest.version);
+      await nxPackageCopy(replacement, `${manifest.version}-replacement`);
       await fixtureWorkspace(workspace, installed);
       const env = fixtureNxEnv(workspace, socketDirectory);
-      const daemon = await startDaemon(workspace, env);
+      const nxLink = join(workspace, 'node_modules', 'nx');
+      // Each step stops its daemon with no successor. A daemon started on a workspace whose nx is not the version the
+      // repository's nx runs does not come up, so the link goes back to the installed copy before the next daemon
+      // starts, as the lockfile walk deletes each lockfile so the next starts clean.
+      const linked = await startDaemon(workspace, env);
+      await unlink(nxLink);
+      await symlink(replacement, nxLink, 'dir');
+      assertNotServed(
+        await requestOnce(linked.record.socketPath, ping(workspace), 'a PING sent after the nx link changed'),
+        `${linkTitle}: a PING sent after the nx link changed`,
+      );
+      await awaitExit([linked.entry], `${linkTitle}: daemon ${linked.record.processId} after the nx link changed`);
+      await unlink(nxLink);
+      await symlink(installed, nxLink, 'dir');
+      const versioned = await startDaemon(workspace, env);
       await writeFile(
         join(installed, 'package.json'),
         JSON.stringify({ ...manifest, version: `${manifest.version}-validity` }),
       );
       assertNotServed(
         await requestOnce(
-          daemon.record.socketPath,
+          versioned.record.socketPath,
           ping(workspace),
           'a PING sent after the installed nx version changed',
         ),
-        'a PING sent after the installed nx version changed',
+        `${versionTitle}: a PING sent after the installed nx version changed`,
       );
-      await awaitExit([daemon.entry], `daemon ${daemon.record.processId} after the installed nx version changed`);
-    },
-    FIXTURE_WORKSPACE,
-  );
-});
-
-it('stops a daemon once the workspace nx link points at a different version', async () => {
-  await withNxFixture(
-    'nx-daemon-validity-link-',
-    async ({ root, socketDirectory, workspace }) => {
-      const first = join(root, 'installed-nx');
-      const second = join(root, 'replacement-nx');
-      const manifest = await installedManifest();
-      await nxPackageCopy(first, manifest.version);
-      await nxPackageCopy(second, `${manifest.version}-validity`);
-      await fixtureWorkspace(workspace, first);
-      const env = fixtureNxEnv(workspace, socketDirectory);
-      const daemon = await startDaemon(workspace, env);
-      const link = join(workspace, 'node_modules', 'nx');
-      await unlink(link);
-      await symlink(second, link, 'dir');
-      assertNotServed(
-        await requestOnce(daemon.record.socketPath, ping(workspace), 'a PING sent after the nx link changed'),
-        'a PING sent after the nx link changed',
+      await awaitExit(
+        [versioned.entry],
+        `${versionTitle}: daemon ${versioned.record.processId} after the installed nx version changed`,
       );
-      await awaitExit([daemon.entry], `daemon ${daemon.record.processId} after the nx link changed`);
     },
     FIXTURE_WORKSPACE,
   );
@@ -925,100 +1002,6 @@ it('restarts a daemon once a plugin linked from outside the workspace changes it
       // The checkout's lockfile selects the plugin's dependencies, so its change restarts the daemon as well.
       await writeFile(first.lock, 'checkout lock two\n');
       await replaced(daemon, "the linked plugin checkout's lockfile changing");
-    },
-    FIXTURE_WORKSPACE,
-  );
-});
-
-it('leaves a successor record and socket in place when another process takes the record', async () => {
-  await withNxFixture(
-    'nx-daemon-validity-successor-',
-    async ({ socketDirectory, workspace }) => {
-      await fixtureWorkspace(workspace);
-      const env = fixtureNxEnv(workspace, socketDirectory);
-      const old = await startDaemon(workspace, env);
-      const successorSocket = join(socketDirectory, 'successor.sock');
-      const successor = await listeningChild(successorSocket);
-      try {
-        const record = {
-          processId: successor.pid,
-          socketPath: successorSocket,
-          nxVersion: (await installedManifest()).version,
-          workspaceRoot: workspace,
-        };
-        await writeFile(recordPath(workspace), `${JSON.stringify(record)}\n`);
-        await awaitExit([old.entry], `daemon ${old.record.processId} whose record now names ${successor.pid}`);
-        expect(await daemonRecord(workspace), 'the record after the displaced daemon exited').toMatchObject({
-          processId: successor.pid,
-          socketPath: successorSocket,
-        });
-        expect(
-          await acceptsConnections(successorSocket),
-          'the successor socket after the displaced daemon exited',
-        ).toBe(true);
-      } finally {
-        await successor.stop();
-      }
-    },
-    FIXTURE_WORKSPACE,
-  );
-});
-
-it("leaves a replacement socket in place when the daemon's own socket path is replaced", async () => {
-  await withNxFixture(
-    'nx-daemon-validity-socket-',
-    async ({ socketDirectory, workspace }) => {
-      await fixtureWorkspace(workspace);
-      const env = fixtureNxEnv(workspace, socketDirectory);
-      const daemon = await startDaemon(workspace, env);
-      await unlink(daemon.record.socketPath);
-      const closeReplacement = await listenInProcess(daemon.record.socketPath);
-      try {
-        await awaitExit([daemon.entry], `daemon ${daemon.record.processId} whose socket path was replaced`);
-        expect(
-          await acceptsConnections(daemon.record.socketPath),
-          'the replacement socket after the daemon exited',
-        ).toBe(true);
-      } finally {
-        await closeReplacement();
-      }
-    },
-    FIXTURE_WORKSPACE,
-  );
-});
-
-it('stops a daemon whose own socket path is removed with nothing taking its place', async () => {
-  await withNxFixture(
-    'nx-daemon-validity-unlinked-',
-    async ({ socketDirectory, workspace }) => {
-      await fixtureWorkspace(workspace);
-      const env = fixtureNxEnv(workspace, socketDirectory);
-      const daemon = await startDaemon(workspace, env);
-      await unlink(daemon.record.socketPath);
-      await awaitExit([daemon.entry], `daemon ${daemon.record.processId} after its socket path was removed`);
-      expect(await acceptsConnections(daemon.record.socketPath), 'the socket path after the daemon exited').toBe(false);
-    },
-    FIXTURE_WORKSPACE,
-  );
-});
-
-it('stops a daemon whose workspace files are all deleted before it reads the emptied workspace', async () => {
-  await withNxFixture(
-    'nx-daemon-validity-emptied-',
-    async ({ socketDirectory, workspace }) => {
-      await fixtureWorkspace(workspace);
-      const env = fixtureNxEnv(workspace, socketDirectory);
-      const daemon = await startDaemon(workspace, env);
-      expect(JSON.parse(nx(workspace, { ...env, NX_DAEMON: 'true' }, 'show', 'projects', '--json'))).toEqual(['p']);
-      // Every tracked file goes, as when a checkout is removed or unmounted under its daemon; the daemon's own record
-      // under .nx stays, so only the workspace check can stop it. Reading the emptied file map instead would block
-      // the daemon's only thread for good, where no SIGTERM handler runs.
-      await rm(join(workspace, 'p'), { recursive: true });
-      await unlink(join(workspace, 'package.json'));
-      await unlink(join(workspace, 'nx.json'));
-      await awaitExit([daemon.entry], `daemon ${daemon.record.processId} after every workspace file was deleted`);
-      const log = await readFile(join(workspace, '.nx', 'workspace-data', 'd', 'daemon.log'), 'utf8');
-      expect(log).toMatch(/Server stopped because: "its workspace \S+ has no nx\.json any more"/);
     },
     FIXTURE_WORKSPACE,
   );
