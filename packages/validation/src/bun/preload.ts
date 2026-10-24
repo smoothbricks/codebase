@@ -24,6 +24,12 @@
  * a generation reusable, and Bun on macOS charges seconds for every `fs.watch`
  * registration after the first. `Bun.build` callers still pass the adapter in
  * `plugins` and get its own cache, so they keep ttsc's `fs.watch` fallback.
+ *
+ * Every process used to compile every project it touched from scratch: ttsc
+ * keeps a generation for one process only. A proven generation is now stored
+ * beside the managed shell's ttsc cache and served to later processes while
+ * every input it was derived from is unchanged; `transform-store.ts` says what
+ * that proof covers.
  */
 
 import { existsSync } from 'node:fs';
@@ -42,6 +48,16 @@ import type { BunLoader } from '@ttsc/unplugin/bun';
 import { plugin } from 'bun';
 import ts from 'typescript';
 import { pollingDirectoryWatch } from './directory-watch.js';
+import {
+  createRecording,
+  loadGeneration,
+  projectWalk,
+  recordingHooks,
+  recordModule,
+  type StoredGeneration,
+  sha256,
+  storeGeneration,
+} from './transform-store.js';
 
 /** Transformed source, in the shape Bun's runtime loader requires. */
 interface LoadedSource {
@@ -85,6 +101,8 @@ const cache = createTtscTransformCache({ watch: pollingDirectoryWatch(WATCH_POLL
 const optionsByProject = new Map([['', resolveOptions({ project: undefined })]]);
 interface ProjectRoots {
   readonly snapshot: ReturnType<typeof readTsconfigSourceSnapshot>;
+  /** The config's root files, spelled as TypeScript lists them. */
+  readonly fileNames: readonly string[];
   readonly files: ReadonlySet<string>;
   readonly queriedFiles: Set<string>;
 }
@@ -96,6 +114,25 @@ const configHost: ts.ParseConfigFileHost = {
   },
 };
 const canonicalPath = ts.sys.useCaseSensitiveFileNames ? (path: string) => path : (path: string) => path.toLowerCase();
+/**
+ * Where proven project generations persist across processes. Only beside the
+ * managed shell's ttsc cache, the build state a checkout declares for ttsc
+ * (specs/cowshed/03_caches.md, "Retiring the caches volume"): without it there
+ * is no agreed place, and each process compiles as it always did.
+ */
+const STORE = process.env.TTSC_CACHE_DIR === undefined ? undefined : join(process.env.TTSC_CACHE_DIR, 'bun-preload');
+/** One project's store state in this process, reopened when its config chain changes. */
+interface ProjectSession {
+  readonly snapshot: ProjectRoots['snapshot'];
+  /** Whether the stored generation was read, and proven or refused, yet. */
+  loaded: boolean;
+  /** The stored generation proven current in this process. */
+  generation: StoredGeneration | undefined;
+  /** The project walk taken before this process first compiled the project. */
+  walk: Readonly<Record<string, string>> | undefined;
+  queue: Promise<void> | undefined;
+}
+const sessions = new Map<string, ProjectSession>();
 
 plugin({
   name: 'ttsc-project-router',
@@ -118,8 +155,109 @@ async function loadThroughOwningProject(path: string): Promise<LoadedSource> {
   const candidates = candidateProjects(path);
   const project =
     candidates.find((candidate) => candidate !== undefined && isConfiguredRoot(candidate, path)) ?? candidates[0];
-  const result = await transformTtsc(path, source, optionsFor(project), undefined, cache, TRANSFORM_HOOKS);
-  return { contents: result?.code ?? source, loader };
+  const roots = project === undefined ? undefined : rootsByProject.get(project);
+  if (STORE === undefined || project === undefined || roots === undefined) {
+    const result = await transformTtsc(path, source, optionsFor(project), undefined, cache, TRANSFORM_HOOKS);
+    return { contents: result?.code ?? source, loader };
+  }
+  return { contents: await deliverThroughStore(STORE, project, roots, path, source), loader };
+}
+
+/**
+ * Serialize one project's deliveries, so concurrent first imports wait for the
+ * single compile that stores them all instead of each starting its own.
+ */
+function deliverThroughStore(
+  store: string,
+  project: string,
+  roots: ProjectRoots,
+  path: string,
+  source: string,
+): Promise<string> {
+  let session = sessions.get(project);
+  if (session === undefined || !sameConfigSnapshot(session.snapshot, roots.snapshot)) {
+    session = { snapshot: roots.snapshot, loaded: false, generation: undefined, walk: undefined, queue: undefined };
+    sessions.set(project, session);
+  }
+  const current = session;
+  const delivery = (current.queue ?? Promise.resolve()).then(() =>
+    deliver(store, project, current, roots, path, source),
+  );
+  // The chain only orders deliveries; each caller still receives its own rejection.
+  current.queue = delivery.then(
+    () => undefined,
+    () => undefined,
+  );
+  return delivery;
+}
+
+async function deliver(
+  store: string,
+  project: string,
+  session: ProjectSession,
+  roots: ProjectRoots,
+  path: string,
+  source: string,
+): Promise<string> {
+  const options = optionsFor(project);
+  if (!session.loaded) {
+    session.loaded = true;
+    try {
+      session.generation = loadGeneration(store, project, options.compilerOptions);
+    } catch (error) {
+      reportStoreFailure(project, 'reading', error);
+    }
+  }
+  const stored = session.generation?.modules[path];
+  if (stored !== undefined && stored.sourceSha256 === sha256(source)) return stored.code ?? source;
+
+  session.walk ??= projectWalk(project, options.compilerOptions);
+  if (session.walk === undefined) {
+    const result = await transformTtsc(path, source, options, undefined, cache, TRANSFORM_HOOKS);
+    return result?.code ?? source;
+  }
+  const recording = createRecording(project, session.walk);
+  const hooks = recordingHooks(recording);
+  const result = await transformTtsc(path, source, options, undefined, cache, hooks);
+  recordModule(recording, path, source, result?.code);
+  try {
+    // The compile already produced every root's output; delivering them now
+    // costs milliseconds each and lets every later process hit, whichever
+    // modules it happens to import.
+    for (const root of roots.fileNames) {
+      if (recording.modules.has(root) || session.generation?.modules[root] !== undefined) continue;
+      if (!SOURCE_FILE_PATTERN.test(root) || !isTransformTarget(root)) continue;
+      const rootSource = await readFile(root, 'utf8');
+      const rootResult = await transformTtsc(root, rootSource, options, undefined, cache, hooks);
+      recordModule(recording, root, rootSource, rootResult?.code);
+    }
+    const outcome = storeGeneration(store, recording, session.generation, options.compilerOptions);
+    if (outcome.kind === 'stored') {
+      session.generation = outcome.generation;
+    } else {
+      session.generation = undefined;
+      session.walk = undefined;
+      process.stderr.write(`@smoothbricks/validation: not storing ttsc output for ${project}: ${outcome.reason}\n`);
+    }
+  } catch (error) {
+    session.generation = undefined;
+    session.walk = undefined;
+    reportStoreFailure(project, 'storing', error);
+  }
+  return result?.code ?? source;
+}
+
+/** The store is an accelerator: failing it falls back to compiling, out loud. */
+function reportStoreFailure(project: string, action: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`@smoothbricks/validation: ${action} stored ttsc output for ${project} failed: ${message}\n`);
+}
+
+function sameConfigSnapshot(left: ProjectRoots['snapshot'], right: ProjectRoots['snapshot']): boolean {
+  return (
+    left.length === right.length &&
+    left.every((entry, index) => entry.path === right[index]?.path && entry.contents === right[index]?.contents)
+  );
 }
 
 /** Config-chain edits invalidate root selection independently of native output. */
@@ -129,10 +267,7 @@ function isConfiguredRoot(project: string, file: string): boolean {
   const existing = rootsByProject.get(project);
   if (
     existing !== undefined &&
-    existing.snapshot.length === snapshot.length &&
-    existing.snapshot.every(
-      (entry, index) => entry.path === snapshot[index]?.path && entry.contents === snapshot[index]?.contents,
-    ) &&
+    sameConfigSnapshot(existing.snapshot, snapshot) &&
     (existing.files.has(key) || existing.queriedFiles.has(key))
   ) {
     return existing.files.has(key);
@@ -140,9 +275,11 @@ function isConfiguredRoot(project: string, file: string): boolean {
   // A newly requested path can have appeared beneath an unchanged include glob.
   // Reparse its directory membership rather than retaining a negative answer.
   const parsed = ts.getParsedCommandLineOfConfigFile(project, undefined, configHost);
+  const fileNames = parsed?.fileNames ?? [];
   const roots: ProjectRoots = {
     snapshot,
-    files: new Set(parsed?.fileNames.map(canonicalPath)),
+    fileNames,
+    files: new Set(fileNames.map(canonicalPath)),
     queriedFiles: new Set([key]),
   };
   rootsByProject.set(project, roots);
