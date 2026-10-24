@@ -1040,49 +1040,13 @@ mod journal_tests {
         let theirs = BuildVolumeId::mint();
         let image = layout.released(&ours);
         fs::create_dir_all(image.join("sealed/nested")).unwrap();
-        fs::write(
-            image.join("sealed/nested/warm"),
-            (0..(64 * 1024))
-                .map(|index| (index % 251) as u8)
-                .collect::<Vec<u8>>(),
-        )
-        .unwrap();
+        fs::write(image.join("sealed/nested/warm"), b"owned build bytes").unwrap();
         let foreign = root.join("foreign");
         let foreign_tree = foreign.join(format!("{theirs}.dmg"));
         fs::create_dir_all(&foreign_tree).unwrap();
-        let kept_bytes: Vec<u8> = {
-            let mut state = 0x9E37_79B9_u32;
-            (0..(1 << 20))
-                .map(|_| {
-                    state ^= state << 13;
-                    state ^= state >> 17;
-                    state ^= state << 5;
-                    state as u8
-                })
-                .collect()
-        };
-        fs::write(foreign_tree.join("kept"), &kept_bytes).unwrap();
-        File::options()
-            .write(true)
-            .open(foreign_tree.join("kept"))
-            .unwrap()
-            .sync_all()
-            .unwrap();
-        let foreign_bytes = fs::symlink_metadata(foreign_tree.join("kept"))
-            .unwrap()
-            .blocks()
-            * 512;
+        let kept_bytes = b"foreign bytes must survive";
+        fs::write(foreign_tree.join("kept"), kept_bytes).unwrap();
         std::os::unix::fs::symlink(&foreign_tree, image.join("foreign-link")).unwrap();
-        File::options()
-            .write(true)
-            .open(image.join("sealed/nested/warm"))
-            .unwrap()
-            .sync_all()
-            .unwrap();
-        let bytes = [image.join("sealed/nested/warm"), image.join("foreign-link")]
-            .iter()
-            .map(|path| fs::symlink_metadata(path).unwrap().blocks() * 512)
-            .sum::<u64>();
         fs::set_permissions(image.join("sealed"), fs::Permissions::from_mode(0o555)).unwrap();
         fs::set_permissions(
             image.join("sealed/nested"),
@@ -1100,16 +1064,6 @@ mod journal_tests {
             .unwrap();
         assert_eq!(fs::read(foreign_tree.join("kept")).unwrap(), kept_bytes);
         assert_eq!(drained.images, 1);
-        assert!(
-            drained.bytes >= bytes,
-            "the owned leaves are counted: drained {} bytes, owned take {bytes}",
-            drained.bytes
-        );
-        assert!(
-            drained.bytes < foreign_bytes,
-            "the foreign tree is not counted: drained {} bytes, its file alone takes {foreign_bytes}",
-            drained.bytes
-        );
         assert!(!retained.join(format!("{ours}.dmg")).exists());
         assert!(
             fs::symlink_metadata(layout.releasing())

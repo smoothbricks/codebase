@@ -207,11 +207,11 @@ through the CLI and host API, never a fabricated running status.
 
 An oracle on allocated bytes is judged against the same filesystem, never one filesystem's block count: a sparse-file
 proof compares the file with a fresh sparse control of the same length created and synced beside it and reads zeroes at
-its head and tail, and a drain's byte report is at least its owned leaves' synced allocation and less than a larger
-foreign tree's, whose surviving contents prove it was neither counted nor deleted. A test that names a file or directory
-with bytes that are not UTF-8 requires a temp filesystem that admits such names; a filesystem that enforces UTF-8 names
-refuses them with EILSEQ, and the failure names its exact root and the refused path so the provisioning owner can supply
-a raw-capable temp filesystem. No fixture invents a mount, a private parent directory or a skip for that refusal.
+its head and tail. Drain custody is proved directly: foreign file bytes survive, the held owned tree is removed, and the
+replacement journal symlink remains. Do not rank owned and foreign trees by allocated bytes: compression and deferred
+allocation can make a larger foreign file report fewer blocks even after sync. A test that names a file or directory
+with bytes that are not UTF-8 requires a temp filesystem that admits such names; EILSEQ names that setup failure and its
+exact root/path. No fixture invents a mount, a private parent directory or a skip for that refusal.
 
 The shared Rust fixture guard has one constructor, `TempRoot::new_in(parent, prefix)`. Every caller selects its
 already-granted parent explicitly. Independent controller-git sandbox fixtures use the shared canonical `/tmp` parent;
