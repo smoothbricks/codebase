@@ -34,8 +34,9 @@ const NODE_MODULES_CACHE_KEY = "${{ hashFiles('.npmrc', 'bun.lock', 'package.jso
 const CACHE_ACTIONS = [
   { name: 'setup-devenv', osKeyLines: 2 },
   { name: 'cache-nix-devenv', osKeyLines: 3 },
+  { name: 'save-nix-devenv', osKeyLines: 0 },
   { name: 'cache-node-modules', osKeyLines: 2 },
-  { name: 'cache-ttsc-plugins', osKeyLines: 1 },
+  { name: 'cache-ttsc-plugins', osKeyLines: 2 },
   { name: 'cache-nx', osKeyLines: 2 },
 ] as const;
 

@@ -983,9 +983,10 @@ Managed CI setup is split across local composite actions:
   `devenv.lock`'s rev, restores `node_modules` and the ttsc plugins, and builds the shell. A host-nix runner
   (`NIX_REMOTE=daemon` with `/var/cache/ci`) skips the install and every store cache: it already has the store and keeps
   its caches on the shared bind.
-- `save-nix-devenv` runs under `always()` and saves the `.devenv`/`.direnv` eval-cache segment when setup missed it and
-  the shell produced `nix-eval-cache.db`. The store cache saves itself in `setup-devenv`'s post phase, which collects
-  garbage down to the live closure before uploading.
+- `save-nix-devenv` runs under `always()`. It saves the `.devenv`/`.direnv` eval-cache segment when setup missed it and
+  the shell produced `nix-eval-cache.db`, and the ttsc plugins the job used when setup's restore of them was not an
+  exact hit. The store cache saves itself in `setup-devenv`'s post phase, which collects garbage down to the live
+  closure before uploading.
 - `cache-nix-devenv` is the shared restore/save primitive for the `.devenv`/`.direnv` segment.
 - `cache-node-modules` restores `node_modules` together with `~/.bun/install/cache/links`. Bun's isolated-store aliases
   name those global targets by absolute path, so archiving the aliases alone is incomplete. Both paths share one cache
@@ -994,6 +995,17 @@ Managed CI setup is split across local composite actions:
   archive, and the stamp is the input devenv's `smoo:install` watches, so a restored stamp beside a restored `.devenv`
   task state would skip the install that recreates those links. A `!node_modules/.smoo-install` cache path cannot do
   this, because actions/cache archives a listed directory whole and ignores excludes inside it.
+- `cache-ttsc-plugins` restores the compiled ttsc plugin binaries (`.cache/ttsc/plugins`) in `setup-devenv` and saves
+  them when `save-nix-devenv` runs at the end of the job. ttsc names each entry by a hash of what it was compiled from
+  and runs only an entry whose name it computes for the checkout, so the restore falls back to the newest cache of the
+  runner's OS and architecture: a release commit rewrites `bun.lock` and moves the exact key without changing a plugin
+  input. A composite action has no post step, so the save is a second call of the action. It runs after a red job too,
+  only when the restore was not an exact hit, and under the key that restore looked up, because the release steps can
+  have rewritten `bun.lock` by then. First it drops the entries the job did not use, judged by the `.last-used` stamp
+  ttsc writes on every hit and build: ttsc evicts only from a cache it owns, not one named by `TTSC_CACHE_DIR`, so every
+  earlier generation would otherwise ride along into each new key. A job that used no entry saves nothing, so an emptied
+  cache is never pinned to the exact key. A workflow that runs `setup-devenv` without `save-nix-devenv` restores the
+  plugins and never saves them.
 
 The cache split is intentional. The store segment is large. Its key hashes the pins (`devenv.lock`, `devenv.yaml`), then
 the files that choose and override packages on top of them (`devenv.nix`, `devenv.smoo.nix`, `nixpkgs-overlay/`), and a

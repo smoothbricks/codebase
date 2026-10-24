@@ -38,10 +38,16 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-devenv
+      - id: setup
+        uses: ./.github/actions/setup-devenv
       - name: Verify frozen dependencies
         run: bun install --frozen-lockfile
       - name: Lint and typecheck browser contracts
         run: nx run statebus-navigation-browser:lint
       - name: Browser primitive and real React-StateBus integration
         run: nx run statebus-navigation-browser:test-browser --output-style=static
+      - name: Cleanup and cache Nix/devenv
+        if: always()
+        uses: ./.github/actions/save-nix-devenv
+        with:
+          devenv-cache-hit: ${{ steps.setup.outputs.devenv-cache-hit }}
