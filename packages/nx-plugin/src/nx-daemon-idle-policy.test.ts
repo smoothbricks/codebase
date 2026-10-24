@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
+import { compileFunction } from 'node:vm';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { whenChanged } from './__tests__/path-change.js';
 import { nxDaemonProcesses } from './testing.js';
@@ -135,6 +136,22 @@ ${log}`);
   });
 });
 
+// Node wraps every CommonJS file in this function, so its body is where a `return` or a `require` is legal.
+const COMMONJS_PARAMETERS = ['exports', 'require', 'module', '__filename', '__dirname'];
+
+/** The syntax error `source` has as a CommonJS module body, or `undefined` when it compiles. Runs nothing. */
+function commonJsSyntaxError(source: string, filename: string): string | undefined {
+  // Node accepts a leading hashbang line as a comment; Bun's compileFunction does not, so the same line is read as one.
+  const body = source.replace(/^#!/, '//');
+  try {
+    compileFunction(body, COMMONJS_PARAMETERS, { filename });
+    return undefined;
+  } catch (error) {
+    if (error instanceof Error) return error.message;
+    throw error;
+  }
+}
+
 it('syntax-checks every JavaScript file patched in the actual installed Nx product', () => {
   const installedNxRoot = dirname(createRequire(import.meta.url).resolve('nx/package.json'));
   const patch = readFileSync(new URL('../../../patches/nx@23.2.1.patch', import.meta.url), 'utf8');
@@ -143,10 +160,10 @@ it('syntax-checks every JavaScript file patched in the actual installed Nx produ
     .filter((line) => line.startsWith('+++ b/') && line.endsWith('.js'))
     .map((line) => line.slice('+++ b/'.length));
   expect(patchedJavaScript.length).toBeGreaterThan(0);
+  // Every patched file is CommonJS (Nx is `type: commonjs`, none is ESM), so none needs a module check.
   for (const relative of patchedJavaScript) {
-    const checked = spawnSync('node', ['--check', join(installedNxRoot, relative)], {
-      encoding: 'utf8',
-    });
-    expect(checked.status, `${relative}\n${checked.stdout}${checked.stderr}`).toBe(0);
+    const file = join(installedNxRoot, relative);
+    const failure = commonJsSyntaxError(readFileSync(file, 'utf8'), file);
+    expect(failure, `${relative} does not compile as a CommonJS module body`).toBeUndefined();
   }
 });
