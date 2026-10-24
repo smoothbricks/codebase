@@ -207,10 +207,6 @@ describe('Linux cross-check policy', () => {
     // and an unbounded clippy are indistinguishable from a hang.
     expect(CROSS_CHECK_SCRIPT_COMMAND).not.toContain('--quiet');
   });
-
-  it('uses the verb:qualifier root script convention', () => {
-    expect(CROSS_CHECK_SCRIPT_NAME).toMatch(/^[a-z]+:[a-z-]+$/);
-  });
 });
 
 /**

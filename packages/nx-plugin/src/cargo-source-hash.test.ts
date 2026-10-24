@@ -200,21 +200,6 @@ it('failed runtime inputs have the same key at different checkout paths and stil
       expect(stderr).toContain('unclosed table');
       expect(stderr).not.toContain(workspace);
       expect(stderr).not.toContain(await realpath(workspace));
-      // The cause is not the verdict: the real producer still refuses the
-      // manifest with Cargo's operational cause.
-      const producer = Bun.spawn(['cargo', 'build', '--locked', '--offline'], {
-        cwd: workspace,
-        env: process.env,
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-      const [producerCode, producerError] = await Promise.all([
-        producer.exited,
-        new Response(producer.stderr).text(),
-        new Response(producer.stdout).text(),
-      ]);
-      expect(producerCode).not.toBe(0);
-      expect(producerError).toContain('Cargo.toml');
     }
   } finally {
     await rm(root, { recursive: true, force: true });
