@@ -1,7 +1,7 @@
 /**
- * The bound on `cargo fetch --locked`, as decisions over facts. Pure: no clock, no process, no environment and no file
- * of its own. cargo-fetch-run.ts is the shell that measures time, spawns, signals and reads the environment, and asks
- * here what to do; setup-environment.ts reports what comes back.
+ * The bound on `cargo fetch --locked`, as decisions over facts, and the choice of where its stamp lives. Pure: no
+ * clock, no process, no environment and no file of its own. cargo-fetch-run.ts is the shell that measures time,
+ * spawns, signals and reads the environment, and asks here what to do; setup-environment.ts reports what comes back.
  *
  * While `cargo fetch` runs it holds Cargo's global package-cache lock, `$CARGO_HOME/.package-cache`, and every other
  * cargo that shares the CARGO_HOME waits behind it. Git has no low-speed limit unless one is configured, so the fetch of
@@ -15,8 +15,9 @@
  *   group still has members (`judgeReap`), which bounds whatever the first does not reach.
  *
  * This file is a managed raw script like secret-references.ts: shell entry loads it before anything is installed, so
- * it imports nothing.
+ * it imports only the runtime's path functions.
  */
+import { isAbsolute, join } from 'node:path';
 
 /**
  * The longest one `cargo fetch --locked` may run. It is the bound the Nx plugin puts on each Cargo child of project-graph
@@ -84,6 +85,18 @@ export function boundedFetchEnv(env: Readonly<Record<string, string | undefined>
     GIT_HTTP_LOW_SPEED_LIMIT: String(GIT_HTTP_LOW_SPEED_LIMIT),
     GIT_HTTP_LOW_SPEED_TIME: String(GIT_HTTP_LOW_SPEED_TIME_S),
   };
+}
+
+/**
+ * Smoo's directory in the user cache, below which a fetch keeps its stamp. The stamp cannot live in CARGO_HOME: a
+ * sandboxed shell may write only Cargo's own paths there, and the user cache is the shell's own. It is
+ * `$XDG_CACHE_HOME/smoo`, or `<home>/.cache/smoo` when the variable is unset, empty or not an absolute path, as the XDG
+ * base directory rule has it: a relative value is invalid and is ignored. The shell reads both facts, the variable's
+ * value (`xdgCacheHome`) and the user's home directory (`home`).
+ */
+export function smooCacheDirectory(xdgCacheHome: string | undefined, home: string): string {
+  const cacheHome = xdgCacheHome !== undefined && isAbsolute(xdgCacheHome) ? xdgCacheHome : join(home, '.cache');
+  return join(cacheHome, 'smoo');
 }
 
 /** What the shell knows about the command when it asks for a verdict. */

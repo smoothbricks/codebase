@@ -24,7 +24,13 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { getSystemErrorName, parseArgs } from 'node:util';
 import { $ } from 'bun';
-import { boundedFetchEnv, CARGO_FETCH_DEADLINE_ENV, describeDeadline, fetchDeadline } from './cargo-fetch-bound.ts';
+import {
+  boundedFetchEnv,
+  CARGO_FETCH_DEADLINE_ENV,
+  describeDeadline,
+  fetchDeadline,
+  smooCacheDirectory,
+} from './cargo-fetch-bound.ts';
 import { type BoundedOutcome, runBounded } from './cargo-fetch-run.ts';
 import {
   applyDeclaredLinks,
@@ -1081,9 +1087,10 @@ function uvInstaller(inputs: readonly string[], options: { locked: boolean }): I
  * `registry` and `git` caches), so a stamp directory fails the entry with
  * EPERM. It lives in smoo's user cache instead — `$XDG_CACHE_HOME/smoo`, or
  * `~/.cache/smoo` when the variable is unset, empty or not absolute, as the XDG
- * base directory rule has it; a cowshed sandbox owns XDG_CACHE_HOME — named by
- * the digest of the Cargo binary, the CARGO_HOME path, and the workspace's
- * Cargo.lock, manifest and Cargo configuration.
+ * base directory rule has it (smooCacheDirectory, cargo-fetch-bound.ts); a
+ * cowshed sandbox owns XDG_CACHE_HOME — named by the digest of the Cargo
+ * binary, the CARGO_HOME path, and the workspace's Cargo.lock, manifest and
+ * Cargo configuration.
  *
  * A stamp outside CARGO_HOME no longer dies with it, and a stamp that outlived
  * its packages would promise ones that are gone. So it also records which
@@ -1108,13 +1115,7 @@ function cargoFetcher(workspace: string): Installer {
   const cargoHome = path.resolve(process.env.CARGO_HOME ?? path.join(homedir(), '.cargo'));
   const identity = ['cargo fetch --locked', cargo === null ? 'cargo not on PATH' : realpathSync(cargo), cargoHome];
   const digest = inputsDigest(identity, cargoWorkspaceInputs(workspace));
-  const cacheHome = process.env.XDG_CACHE_HOME;
-  const stampPath = path.join(
-    cacheHome !== undefined && path.isAbsolute(cacheHome) ? cacheHome : path.join(homedir(), '.cache'),
-    'smoo',
-    'cargo-fetched',
-    digest,
-  );
+  const stampPath = path.join(smooCacheDirectory(process.env.XDG_CACHE_HOME, homedir()), 'cargo-fetched', digest);
   // What a stamp promises: these inputs were fetched into the directory CARGO_HOME names now.
   // A CARGO_HOME with nothing at it is an identity of its own.
   const fetched = () => {
