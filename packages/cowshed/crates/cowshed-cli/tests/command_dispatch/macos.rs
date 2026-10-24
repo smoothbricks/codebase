@@ -3184,21 +3184,39 @@ fn seeds_of_main(layout: &BuildVolumeLayout) -> Vec<(BuildVolumeId, BuildVolumeR
         .collect()
 }
 
-/// Review-gated delivery validates and preserves the head, but is not a land, even with
-/// retirement left at its default. The control then takes the ordinary landing path.
+/// Review-gated delivery, then a land beside a stock detached Nx daemon, on one served build-nx
+/// project: the scenarios share their setup (08_testing.md, "Host limit"). Delivery runs first:
+/// it compares main's seeds, every build volume and the land commitments before and after, which
+/// only a project with no earlier land still reclaiming volumes behind it can promise. The daemon
+/// scenario ends the project.
 #[tokio::test(flavor = "multi_thread")]
-async fn directory_push_only_preserves_the_validated_head_without_landing_or_retiring_substrate_lifecycle()
- {
+async fn directory_a_push_only_delivery_then_a_land_beside_a_stock_daemon_substrate_lifecycle() {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
         rust: None,
     });
-    let reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-    let mut service = serve_project(&mut fixture, &reads).await;
-    let layout = build_volumes(&fixture);
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
+    push_only_preserves_the_validated_head_without_landing_or_retiring(&fixture, &mut service)
+        .await;
+    land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption(
+        &mut fixture,
+        service,
+        &nx,
+        &node,
+    )
+    .await;
+}
+/// Review-gated delivery validates and preserves the head, but is not a land, even with
+/// retirement left at its default. The control then takes the ordinary landing path.
+async fn push_only_preserves_the_validated_head_without_landing_or_retiring(
+    fixture: &Fixture,
+    service: &mut ActorBridge,
+) {
+    let layout = build_volumes(fixture);
     let main = fixture.checkout.clone();
-    let topic = new_workspace(&mut service, "topic").await;
+    let topic = new_workspace(service, "topic").await;
     fs::write(topic.join("a/src.txt"), b"reviewed source\\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "prepare reviewed source"]);
     let source_head = git_stdout(&topic, &["rev-parse", "HEAD"]);
@@ -3227,7 +3245,7 @@ async fn directory_push_only_preserves_the_validated_head_without_landing_or_ret
     };
     let commitments = land_commitments();
     let (stdout, _) = succeed(
-        &mut service,
+        service,
         [
             "--json",
             "land",
@@ -3278,7 +3296,7 @@ async fn directory_push_only_preserves_the_validated_head_without_landing_or_ret
         topic.exists(),
         "the default retire=true must not retire a delivery"
     );
-    let (text, diagnostics) = succeed(&mut service, ["land", "topic", "--push-only"]).await;
+    let (text, diagnostics) = succeed(service, ["land", "topic", "--push-only"]).await;
     assert_eq!(
         text,
         format!("{preservation_ref}\t{source_head}\n").into_bytes()
@@ -3287,7 +3305,7 @@ async fn directory_push_only_preserves_the_validated_head_without_landing_or_ret
         !diagnostics.contains("build volume"),
         "delivery has no adoption report: {diagnostics}"
     );
-    let landed = land(&mut service, "topic", true, &[]).await;
+    let landed = land(service, "topic", true, &[]).await;
     assert_eq!(landed.landed_head.as_str(), source_head);
     assert_eq!(git_stdout(&main, &["rev-parse", "HEAD"]), source_head);
     assert!(landed.retired, "ordinary land still retires by default");
@@ -3295,10 +3313,6 @@ async fn directory_push_only_preserves_the_validated_head_without_landing_or_ret
     eventually(|| !topic.exists()).await;
     assert!(!topic.exists());
     assert_land_outcome(fixture.storage.telemetry(), &landed);
-    service
-        .shutdown()
-        .await
-        .expect("stop the real directory project");
 }
 
 /// A land fences the target's head under the caller's ref lock (02_workspaces.md "`cowshed
@@ -3917,17 +3931,13 @@ async fn nx_statuses(
     }
 }
 
-/// The retiring land first proves ownership, frozen-seed identity and tree, immediate reclamation
-/// of the old volume, its new label and the exact linked mounts (16_build_volumes.md, steps 5–7).
-/// What main runs after a land reaches main's seed (16_build_volumes.md, "Targets and seeds"):
-/// main changes `a` and runs it on the adopted volume, so its seed, frozen from the landing
-/// volume at the same tree, is behind; doctor says so, and the next `fork` reseeds main
-/// from its volume before it clones the seed and hits main's run. No command does it by hand.
-/// A keeper-held workspace takes the separate busy-skip path:
-/// [`directory_a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed_substrate_lifecycle`].
+/// What main runs after a land reaches its seed, then a fork of a keeper-held workspace, on one
+/// served build-nx project: the scenarios share their setup (08_testing.md, "Host limit"). The
+/// reseed runs first: it asserts main keeps exactly one seed and that the land reclaimed the volume
+/// main linked before it. The keeper-held fork shuts the runtime down to prove its kept daemons
+/// stop, so it ends the project.
 #[tokio::test(flavor = "multi_thread")]
-async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it_substrate_lifecycle()
- {
+async fn directory_main_reseeds_after_a_land_then_a_keeper_held_fork_substrate_lifecycle() {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
@@ -3935,18 +3945,35 @@ async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
     });
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
     let mut service = serve_project(&mut fixture, &nx_reads).await;
-    let layout = build_volumes(&fixture);
+    what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it(&fixture, &mut service, &node)
+        .await;
+    a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed(&mut fixture, service, &node).await;
+}
+/// The retiring land first proves ownership, frozen-seed identity and tree, immediate reclamation
+/// of the old volume, its new label and the exact linked mounts (16_build_volumes.md, steps 5–7).
+/// What main runs after a land reaches main's seed (16_build_volumes.md, "Targets and seeds"):
+/// main changes `a` and runs it on the adopted volume, so its seed, frozen from the landing
+/// volume at the same tree, is behind; doctor says so, and the next `fork` reseeds main
+/// from its volume before it clones the seed and hits main's run. No command does it by hand.
+/// A keeper-held workspace takes the separate busy-skip path:
+/// [`a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed`], which follows it on its project.
+async fn what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it(
+    fixture: &Fixture,
+    service: &mut ActorBridge,
+    node: &Path,
+) {
+    let layout = build_volumes(fixture);
     let previous = linked_volume(&layout, &fixture.checkout);
-    let nx_check = nx_run_many(&node, "build test");
+    let nx_check = nx_run_many(node, "build test");
     let main = fixture.checkout.clone();
 
-    let topic = new_workspace(&mut service, "topic").await;
+    let topic = new_workspace(service, "topic").await;
     fs::write(topic.join("a/src.txt"), b"src, landed\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "land a"]);
     let landing = linked_volume(&layout, &topic);
     assert_ne!(landing, previous);
     let landed_tree = git_stdout(&topic, &["rev-parse", "HEAD^{tree}"]);
-    let report = land(&mut service, "topic", true, &[&nx_check]).await;
+    let report = land(service, "topic", true, &[&nx_check]).await;
     assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
     assert!(report.retired, "{report:?}");
     assert_eq!(report.build_volume.seed, LandSeed::Frozen, "{report:?}");
@@ -3998,8 +4025,8 @@ async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
             .expect("the landed Nx output is available without running a check"),
         b"generated\n"
     );
-    let warm = new_workspace(&mut service, "warm").await;
-    let restored = nx_statuses(&mut service, "warm", &warm, &nx_check).await;
+    let warm = new_workspace(service, "warm").await;
+    let restored = nx_statuses(service, "warm", &warm, &nx_check).await;
     assert_eq!(restored.len(), 2, "{restored:?}");
     assert!(
         restored
@@ -4013,7 +4040,7 @@ async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
     // Main's own work on the adopted volume, after the seed was frozen: a miss in main.
     fs::write(main.join("a/src.txt"), b"src, changed in main\n").unwrap();
     git(&main, &["commit", "-q", "-am", "change a in main"]);
-    let ran = nx_statuses(&mut service, "main", &main, &nx_check).await;
+    let ran = nx_statuses(service, "main", &main, &nx_check).await;
     assert!(
         ran.iter()
             .all(|(_, status)| *status == nx::CacheStatus::Miss),
@@ -4021,7 +4048,7 @@ async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
     );
 
     // Doctor exits 5 on any error finding the scratch host has; only its report matters here.
-    let (_, stdout, _) = run(&mut service, ["--json", "doctor"]).await;
+    let (_, stdout, _) = run(service, ["--json", "doctor"]).await;
     let doctor: serde_json::Value = serde_json::from_slice(&stdout).expect("doctor --json");
     let behind = doctor["result"]["findings"]
         .as_array()
@@ -4038,7 +4065,7 @@ async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
         "doctor reports main's seed behind its volume: {behind:?}"
     );
 
-    let w1 = new_workspace(&mut service, "w1").await;
+    let w1 = new_workspace(service, "reseeded").await;
     let [(seed, record)] = seeds_of_main(&layout).try_into().expect("one seed of main");
     assert_ne!(seed, landed_seed, "the fork reseeded main first");
     assert_eq!(
@@ -4046,15 +4073,13 @@ async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
         Some(landed_tree.as_str()),
         "the seed records the tree its volume was adopted at"
     );
-    let hits = nx_statuses(&mut service, "w1", &w1, &nx_check).await;
+    let hits = nx_statuses(service, "reseeded", &w1, &nx_check).await;
     assert_eq!(hits.len(), 2, "{hits:?}");
     assert!(
         hits.iter()
             .all(|(_, status)| *status == nx::CacheStatus::LocalHit),
         "a fork hits what main ran after the land: {hits:?}"
     );
-    service.shutdown().await.expect("stop the runtime");
-    fixture.stop_gateway().await;
 }
 
 /// A foreground keeper holds `w1`'s volume, so `cowshed fork` cannot refresh its seed.
@@ -4062,16 +4087,12 @@ async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
 /// both tasks again. The no-keeper main case above retains the warm-fork `LocalHit` oracle.
 /// Before either fork, doctor diagnoses main's displaced workspace-data link and an exec restores
 /// it, so the forks never inherit a real directory in place of the build-volume link.
-#[tokio::test(flavor = "multi_thread")]
-async fn directory_a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed_substrate_lifecycle() {
-    let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with_directory(Project::Build {
-        nx: Some((&nx, &node)),
-        rust: None,
-    });
-    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-    let mut service = serve_project(&mut fixture, &nx_reads).await;
-    let layout = build_volumes(&fixture);
+async fn a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed(
+    fixture: &mut Fixture,
+    mut service: ActorBridge,
+    node: &Path,
+) {
+    let layout = build_volumes(fixture);
     assert_eq!(build_link_findings(&mut service).await, [""; 0]);
 
     let data = fixture.checkout.join(".nx/workspace-data");
@@ -4096,7 +4117,7 @@ async fn directory_a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed_sub
     assert_eq!(relinked.expect("the exec's refresh relinked it"), link);
     assert_eq!(after, [""; 0]);
 
-    let nx_check = nx_run_many(&node, "build test");
+    let nx_check = nx_run_many(node, "build test");
 
     let w1 = new_workspace(&mut service, "w1").await;
     fs::write(w1.join("a/src.txt"), b"src, changed in w1\n").unwrap();
@@ -4271,14 +4292,13 @@ async fn build_link_findings(service: &mut ActorBridge) -> Vec<String> {
         .collect()
 }
 
-/// A land carries main's Nx cache entries into the volume main adopts (16_build_volumes.md,
-/// "Carry"): `a` lands and warms `a:build` and `a:test` in main; `b`, forked before that land
-/// and changing nothing `a` hashes, lands next without running them. `b` catches up with plain
-/// git, since `cowshed rebase` would carry `a`'s entries into its volume first. Main then adopts
-/// `b`'s volume, which never held `a`'s entries, and a fork of main still hits both.
+/// An ungated lane fold, then a land carry, on one served build-nx project: the two scenarios
+/// share their setup, so the second pays no adopt, grant, gateway or serve of its own
+/// (08_testing.md, "Host limit"). The fold runs first: it compares every build-volume record but
+/// its unit's before and after, which only a project with no earlier land still reclaiming
+/// volumes behind it can promise.
 #[tokio::test(flavor = "multi_thread")]
-async fn directory_a_land_carries_mains_nx_entries_into_the_volume_main_adopts_substrate_lifecycle()
-{
+async fn directory_a_lane_fold_then_a_land_carry_on_one_project_substrate_lifecycle() {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
@@ -4286,17 +4306,34 @@ async fn directory_a_land_carries_mains_nx_entries_into_the_volume_main_adopts_s
     });
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
     let mut service = serve_project(&mut fixture, &nx_reads).await;
-    let nx_check = nx_run_many(&node, "build test");
+    an_ungated_fold_into_a_lane_base_is_git_alone(&fixture, &mut service).await;
+    a_land_carries_mains_nx_entries_into_the_volume_main_adopts(&fixture, &mut service, &node)
+        .await;
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
 
-    let b = new_workspace(&mut service, "b").await;
+/// A land carries main's Nx cache entries into the volume main adopts (16_build_volumes.md,
+/// "Carry"): `a` lands and warms `a:build` and `a:test` in main; `b`, forked before that land
+/// and changing nothing `a` hashes, lands next without running them. `b` catches up with plain
+/// git, since `cowshed rebase` would carry `a`'s entries into its volume first. Main then adopts
+/// `b`'s volume, which never held `a`'s entries, and a fork of main still hits both.
+async fn a_land_carries_mains_nx_entries_into_the_volume_main_adopts(
+    fixture: &Fixture,
+    service: &mut ActorBridge,
+    node: &Path,
+) {
+    let nx_check = nx_run_many(node, "build test");
+
+    let b = new_workspace(service, "b").await;
     fs::write(b.join("unrelated.txt"), b"nothing a hashes\n").unwrap();
     git(&b, &["add", "unrelated.txt"]);
     git(&b, &["commit", "-q", "-m", "add an unrelated file"]);
 
-    let a = new_workspace(&mut service, "a").await;
+    let a = new_workspace(service, "a").await;
     fs::write(a.join("a/src.txt"), b"src, landed by a\n").unwrap();
     git(&a, &["commit", "-q", "-am", "change a"]);
-    let report = land(&mut service, "a", true, &[&nx_check]).await;
+    let report = land(service, "a", true, &[&nx_check]).await;
     assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
 
     git(
@@ -4304,7 +4341,7 @@ async fn directory_a_land_carries_mains_nx_entries_into_the_volume_main_adopts_s
         &["fetch", "-q", &fixture.checkout.to_string_lossy(), "HEAD"],
     );
     git(&b, &["rebase", "-q", "FETCH_HEAD"]);
-    let report = land(&mut service, "b", true, &[]).await;
+    let report = land(service, "b", true, &[]).await;
     match &report.build_volume.adoption {
         Adoption::Adopted { carried, .. } => {
             assert_eq!(carried.stopped, None, "{report:?}");
@@ -4316,10 +4353,8 @@ async fn directory_a_land_carries_mains_nx_entries_into_the_volume_main_adopts_s
         Adoption::Skipped { reason } => panic!("the adoption was skipped: {reason:?}"),
     }
 
-    let fork = new_workspace(&mut service, "fork").await;
-    let hits = nx_statuses(&mut service, "fork", &fork, &nx_check).await;
-    service.shutdown().await.expect("stop the runtime");
-    fixture.stop_gateway().await;
+    let fork = new_workspace(service, "fork").await;
+    let hits = nx_statuses(service, "fork", &fork, &nx_check).await;
     assert_eq!(hits.len(), 2, "{hits:?}");
     assert!(
         hits.iter()
@@ -4334,19 +4369,14 @@ async fn directory_a_land_carries_mains_nx_entries_into_the_volume_main_adopts_s
 /// retires the unit, with no check, carry, seed freeze or adoption: every build volume record but
 /// the unit's is byte-for-byte what it was, so the lane base keeps its volume and seed, and the
 /// unit's volume is released with the unit.
-#[tokio::test(flavor = "multi_thread")]
-async fn directory_an_ungated_fold_into_a_lane_base_is_git_alone_substrate_lifecycle() {
-    let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with_directory(Project::Build {
-        nx: Some((&nx, &node)),
-        rust: None,
-    });
-    let reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-    let mut service = serve_project(&mut fixture, &reads).await;
-    let layout = build_volumes(&fixture);
+async fn an_ungated_fold_into_a_lane_base_is_git_alone(
+    fixture: &Fixture,
+    service: &mut ActorBridge,
+) {
+    let layout = build_volumes(fixture);
     let main = fixture.checkout.clone();
-    let lane = new_workspace(&mut service, "lane").await;
-    succeed(&mut service, ["fork", "lane", "unit"]).await;
+    let lane = new_workspace(service, "lane").await;
+    succeed(service, ["fork", "lane", "unit"]).await;
     let unit = service
         .path("unit", false)
         .await
@@ -4396,7 +4426,7 @@ async fn directory_an_ungated_fold_into_a_lane_base_is_git_alone_substrate_lifec
         &["land", "unit", "--into", "main", "--ungated"],
         &["rebase", "unit", "--ungated"],
     ] {
-        let (result, _, _) = run(&mut service, args.iter().copied()).await;
+        let (result, _, _) = run(service, args.iter().copied()).await;
         let refused = result.expect_err("main refuses an ungated fold");
         assert_eq!(refused.code, ErrorCode::Usage, "{args:?}: {refused:?}");
         assert!(
@@ -4407,7 +4437,7 @@ async fn directory_an_ungated_fold_into_a_lane_base_is_git_alone_substrate_lifec
     }
 
     let (stdout, _) = succeed(
-        &mut service,
+        service,
         ["--json", "rebase", "unit", "--into", "lane", "--ungated"],
     )
     .await;
@@ -4423,7 +4453,7 @@ async fn directory_an_ungated_fold_into_a_lane_base_is_git_alone_substrate_lifec
     assert_eq!(rebased.oid.as_str(), unit_head);
 
     let (stdout, _) = succeed(
-        &mut service,
+        service,
         ["--json", "land", "unit", "--into", "lane", "--ungated"],
     )
     .await;
@@ -4464,13 +4494,24 @@ async fn directory_an_ungated_fold_into_a_lane_base_is_git_alone_substrate_lifec
         "no seed freeze, adoption or new volume: only the unit's volume and seed are gone"
     );
     assert_land_outcome(fixture.storage.telemetry(), &landed);
-    service
-        .shutdown()
-        .await
-        .expect("stop the real directory project");
-    fixture.stop_gateway().await;
 }
 
+/// A rebase carry, then a rebase whose supervisor does not answer, on one served build-nx project:
+/// the scenarios share their setup (08_testing.md, "Host limit"). The unanswered rebase stops the
+/// runtime and reopens it, so it ends the project; its workspace takes a name of its own, since the
+/// carry keeps `b`.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_rebase_carry_then_an_unanswered_rebase_substrate_lifecycle() {
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::with_directory(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
+    a_rebase_carries_mains_nx_entries_into_the_rebased_workspace(&mut service, &node).await;
+    a_rebase_whose_supervisor_does_not_answer_skips_the_carry(&mut fixture, service, &node).await;
+}
 /// A rebase carries main's Nx cache entries into the rebased workspace's volume
 /// (16_build_volumes.md, "Rebase carry"), and only those the rebased tree looks up: `b`, forked
 /// before main runs the check at the original tree and before `a` lands and warms `a:build` and
@@ -4481,33 +4522,27 @@ async fn directory_an_ungated_fold_into_a_lane_base_is_git_alone_substrate_lifec
 // Admitted to the 60 s lifecycle class below its 3× rule: its one low-load sample (34.983 s) ran
 // with the daemon off, and its daemon-on samples are load-dependent (08_testing.md, Integration
 // tests).
-#[tokio::test(flavor = "multi_thread")]
-async fn directory_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_substrate_lifecycle()
- {
-    let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with_directory(Project::Build {
-        nx: Some((&nx, &node)),
-        rust: None,
-    });
-    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-    let mut service = serve_project(&mut fixture, &nx_reads).await;
-    let nx_check = nx_run_many(&node, "build test");
+async fn a_rebase_carries_mains_nx_entries_into_the_rebased_workspace(
+    service: &mut ActorBridge,
+    node: &Path,
+) {
+    let nx_check = nx_run_many(node, "build test");
 
-    let b = new_workspace(&mut service, "b").await;
+    let b = new_workspace(service, "b").await;
     fs::write(b.join("unrelated.txt"), b"nothing a hashes\n").unwrap();
     git(&b, &["add", "unrelated.txt"]);
     git(&b, &["commit", "-q", "-m", "add an unrelated file"]);
     // Entries no tree after the land looks up: what a rebase that carried main's whole cache
     // copied, entry for entry.
-    sh(&mut service, "main", &nx_check).await;
+    sh(service, "main", &nx_check).await;
 
-    let a = new_workspace(&mut service, "a").await;
+    let a = new_workspace(service, "a").await;
     fs::write(a.join("a/src.txt"), b"src, landed by a\n").unwrap();
     git(&a, &["commit", "-q", "-am", "change a"]);
-    let report = land(&mut service, "a", true, &[&nx_check]).await;
+    let report = land(service, "a", true, &[&nx_check]).await;
     assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
 
-    let rebased = rebase(&mut service, "b").await;
+    let rebased = rebase(service, "b").await;
     assert_eq!(rebased.oid.as_str(), git_stdout(&b, &["rev-parse", "HEAD"]));
     match &rebased.build_volume {
         RebaseBuildVolume::Carried { carried, deferred } => {
@@ -4523,7 +4558,7 @@ async fn directory_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_
         }
         RebaseBuildVolume::Skipped { reason } => panic!("the carry was skipped: {reason}"),
     }
-    let hits = nx_statuses(&mut service, "b", &b, &nx_check).await;
+    let hits = nx_statuses(service, "b", &b, &nx_check).await;
 
     let data = b.join(".nx/workspace-data");
     let databases: Vec<PathBuf> = fs::read_dir(&data)
@@ -4550,10 +4585,8 @@ async fn directory_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_
             .any(|holder| holder.pid == pid)
     })
     .await;
-    let held = rebase(&mut service, "b").await;
+    let held = rebase(service, "b").await;
     drop(holder);
-    service.shutdown().await.expect("stop the runtime");
-    fixture.stop_gateway().await;
 
     assert_eq!(hits.len(), 2, "{hits:?}");
     assert!(
@@ -4591,20 +4624,16 @@ async fn directory_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_
 /// the socket lease and never accepts: it holds the socket and answers nothing, as a supervisor
 /// stalled in a blocking call does. A fresh runtime then rebases `b`, and the rebase names the
 /// root and the unanswered hello instead of failing after the tree has moved.
-#[tokio::test(flavor = "multi_thread")]
-async fn directory_a_rebase_whose_supervisor_does_not_answer_skips_the_carry_substrate_lifecycle() {
-    let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with_directory(Project::Build {
-        nx: Some((&nx, &node)),
-        rust: None,
-    });
-    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-    let mut service = serve_project(&mut fixture, &nx_reads).await;
-    let nx_check = nx_run_many(&node, "build test");
+async fn a_rebase_whose_supervisor_does_not_answer_skips_the_carry(
+    fixture: &mut Fixture,
+    mut service: ActorBridge,
+    node: &Path,
+) {
+    let nx_check = nx_run_many(node, "build test");
 
-    let b = new_workspace(&mut service, "b").await;
+    let b = new_workspace(&mut service, "unanswered").await;
     // b's own run leaves its Nx state on its volume.
-    sh(&mut service, "b", &nx_check).await;
+    sh(&mut service, "unanswered", &nx_check).await;
     service
         .shutdown()
         .await
@@ -4612,13 +4641,13 @@ async fn directory_a_rebase_whose_supervisor_does_not_answer_skips_the_carry_sub
     let socket = cowshed_core::runtime::supervisor_socket::socket_path(
         fixture.storage.store(),
         &RepoId::parse("fixture/dispatch").expect("repository identity"),
-        &WorkspaceName::new("b").expect("workspace name"),
+        &WorkspaceName::new("unanswered").expect("workspace name"),
     );
     let stalled = cowshed_core::runtime::supervisor_socket::bind(&socket)
         .await
         .expect("the stand-in holds b's supervisor socket");
     let mut service = fixture.reopen().await;
-    let rebased = rebase(&mut service, "b").await;
+    let rebased = rebase(&mut service, "unanswered").await;
     drop(stalled);
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
@@ -6865,20 +6894,16 @@ struct LandDaemonRecord {
 /// Land 4 (16_build_volumes.md): a landing daemon the job ledger does not prove the job's own is
 /// never signalled. A daemon started detached from the job, as stock Nx does, skips adoption as
 /// `LandingDaemonStayed` and is still running after the land.
-#[tokio::test(flavor = "multi_thread")]
-async fn directory_land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption_substrate_lifecycle()
- {
-    let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with_directory(Project::Build {
-        nx: Some((&nx, &node)),
-        rust: None,
-    });
-    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-    let mut service = serve_project(&mut fixture, &nx_reads).await;
+async fn land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption(
+    fixture: &mut Fixture,
+    mut service: ActorBridge,
+    nx: &Path,
+    node: &Path,
+) {
     let topic = new_workspace(&mut service, "outputs").await;
     fs::write(topic.join("a/src.txt"), "changed\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "change output input"]);
-    sh(&mut service, "outputs", &nx_run_many(&node, "build")).await;
+    sh(&mut service, "outputs", &nx_run_many(node, "build")).await;
     // The keeper started the shed's daemon at the run's admission, behind the run's tokens
     // (04_sandbox.md, the kept daemon), so its record may follow the run's end. The patched Nx
     // daemon claims the record when it starts and replaces one of another workspace root as
@@ -6890,7 +6915,7 @@ async fn directory_land_leaves_a_stock_detached_landing_daemon_running_and_skips
     let foreign = fixture._scratch.path().join("foreign-daemon-checkout");
     clone_tree(
         &checkout_template(Project::Build {
-            nx: Some((&nx, &node)),
+            nx: Some((nx, node)),
             rust: None,
         }),
         &foreign,
@@ -6899,7 +6924,7 @@ async fn directory_land_leaves_a_stock_detached_landing_daemon_running_and_skips
     let data = state.join("workspace-data");
     let socket = cowshed_core::sandbox::workspace_runtime_link(&foreign).join("nx");
     fs::create_dir_all(&socket).unwrap();
-    let mut command = Command::new(&node);
+    let mut command = Command::new(node);
     command
         .args(["node_modules/nx/dist/bin/nx.js", "daemon", "--start"])
         .current_dir(&foreign);
@@ -6959,7 +6984,7 @@ async fn directory_land_leaves_a_stock_detached_landing_daemon_running_and_skips
         .expect("the real foreign daemon socket survives");
 
     // Cleanup belongs to the daemon's standalone owner, only after the survival proof.
-    let mut stop = Command::new(&node);
+    let mut stop = Command::new(node);
     stop.args(["node_modules/nx/dist/bin/nx.js", "daemon", "--stop"])
         .current_dir(&foreign);
     for (key, value) in command.get_envs() {
@@ -6986,26 +7011,15 @@ async fn directory_land_leaves_a_stock_detached_landing_daemon_running_and_skips
 
 /// A default land cannot turn Land 4's unproven nominee into signal authority at retirement.
 /// A live socket makes the record-nominated close capable of signalling the foreign process.
-#[tokio::test(flavor = "multi_thread")]
-async fn directory_default_land_never_signals_a_foreign_nominee_during_retirement_substrate_lifecycle()
- {
-    let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with_directory(Project::Build {
-        nx: Some((&nx, &node)),
-        rust: None,
-    });
-    write_emit_project(&fixture.checkout, &node, false);
-    git(&fixture.checkout, &["add", "b"]);
-    git(
-        &fixture.checkout,
-        &["commit", "-q", "-m", "add emit producer"],
-    );
-    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-    let mut service = serve_project(&mut fixture, &nx_reads).await;
+async fn default_land_never_signals_a_foreign_nominee_during_retirement(
+    fixture: &mut Fixture,
+    mut service: ActorBridge,
+    node: &Path,
+) {
     let topic = new_workspace(&mut service, "outputs").await;
     fs::write(topic.join("a/src.txt"), "changed\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "change output input"]);
-    sh(&mut service, "outputs", &nx_run_many(&node, "build")).await;
+    sh(&mut service, "outputs", &nx_run_many(node, "build")).await;
     // The run put the shed in use at its admission, and the keeper started its daemon alongside
     // it, behind the run's tokens (04_sandbox.md, the kept daemon), so its record may follow the
     // run's end. The patched Nx daemon claims the record when it starts and replaces one that
@@ -7073,6 +7087,28 @@ async fn directory_default_land_never_signals_a_foreign_nominee_during_retiremen
     fixture.stop_gateway().await;
 }
 
+/// Unverifiable daemon records, then a forged nominee, at land on one served project with the emit
+/// producer: the scenarios share their setup (08_testing.md, "Host limit"). The unverifiable
+/// records run first, since they count every land outcome the project has recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_unverifiable_then_forged_landing_daemon_records_substrate_lifecycle() {
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::with_directory(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
+    write_emit_project(&fixture.checkout, &node, false);
+    git(&fixture.checkout, &["add", "b"]);
+    git(
+        &fixture.checkout,
+        &["commit", "-q", "-m", "add emit producer"],
+    );
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
+    land_skips_an_unverifiable_daemon_record_before_quiesce(&fixture, &mut service, &node).await;
+    default_land_never_signals_a_foreign_nominee_during_retirement(&mut fixture, service, &node)
+        .await;
+}
 /// An unreadable or malformed landing daemon record cannot authorize retirement or adoption.
 ///
 /// The run started a host Nx daemon on the checkout, then its record was made unverifiable. Stock
@@ -7091,30 +7127,20 @@ async fn directory_default_land_never_signals_a_foreign_nominee_during_retiremen
 /// Both unverifiable shapes, a malformed record and one that cannot be read, run on one served
 /// project, each in a workspace of its own: the setup is the same, and the second land starts
 /// from the main the first one moved, which an unverifiable record's skip never reads.
-#[tokio::test(flavor = "multi_thread")]
-async fn directory_land_skips_an_unverifiable_daemon_record_before_quiesce_substrate_lifecycle() {
-    let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with_directory(Project::Build {
-        nx: Some((&nx, &node)),
-        rust: None,
-    });
-    write_emit_project(&fixture.checkout, &node, false);
-    git(&fixture.checkout, &["add", "b"]);
-    git(
-        &fixture.checkout,
-        &["commit", "-q", "-m", "add emit producer"],
-    );
-    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-    let mut service = serve_project(&mut fixture, &nx_reads).await;
+async fn land_skips_an_unverifiable_daemon_record_before_quiesce(
+    fixture: &Fixture,
+    service: &mut ActorBridge,
+    node: &Path,
+) {
     for (landed, (workspace, unreadable)) in
         [("malformed-record", false), ("unreadable-record", true)]
             .into_iter()
             .enumerate()
     {
-        let topic = new_workspace(&mut service, workspace).await;
+        let topic = new_workspace(service, workspace).await;
         fs::write(topic.join("a/src.txt"), format!("{workspace}\n")).unwrap();
         git(&topic, &["commit", "-q", "-am", "change output input"]);
-        sh(&mut service, workspace, &nx_run_many(&node, "build")).await;
+        sh(service, workspace, &nx_run_many(node, "build")).await;
         let record = topic.join(".nx/workspace-data/d/server-process.json");
         // The run put the shed in use at its admission, and the keeper started its daemon alongside
         // it; a supervisor's own start is no use (04_sandbox.md, the kept daemon), so the record
@@ -7144,7 +7170,7 @@ async fn directory_land_skips_an_unverifiable_daemon_record_before_quiesce_subst
         await_exits(&plugin_workers);
         let mut workers = HostProcesses(Vec::new());
         let worker = workers.start(&topic, None);
-        let (kept, _, stderr) = run(&mut service, ["--json", "land", workspace]).await;
+        let (kept, _, stderr) = run(service, ["--json", "land", workspace]).await;
         let kept = kept.expect_err(&format!(
             "a process cowshed does not run holds the mount; {}",
             String::from_utf8_lossy(&stderr)
@@ -7192,7 +7218,7 @@ async fn directory_land_skips_an_unverifiable_daemon_record_before_quiesce_subst
             }
         }
         workers.end();
-        let (retired, _, stderr) = run(&mut service, ["rm", "--force", workspace]).await;
+        let (retired, _, stderr) = run(service, ["rm", "--force", workspace]).await;
         retired.unwrap_or_else(|error| {
             panic!(
                 "retire once nothing holds it: {error}; {}",
@@ -7200,8 +7226,6 @@ async fn directory_land_skips_an_unverifiable_daemon_record_before_quiesce_subst
             )
         });
     }
-    drop(service);
-    fixture.stop_gateway().await;
 }
 
 /// The managed `bun` is the Bun the workspace declares (15_capabilities.md, "Bootstrap
