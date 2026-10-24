@@ -792,7 +792,7 @@ async function aFailedStepRollsBackOnAStandIn(): Promise<void> {
         ok: false,
         error: { kind: 'provision-failed', step: reported, detail: 'exit 1: injected' },
       });
-      expect(standIn.steps, detail).toEqual(steps);
+      expect(standIn.steps, detail).toEqual([...steps]);
       expect(standIn.detaches, detail).toEqual([{ device: '/dev/disk901', registryEntry: STAND_IN_REGISTRY_ENTRY }]);
       expect(existsSync(paths.staging), detail).toBe(false);
       expect(existsSync(paths.mountpoint), detail).toBe(false);

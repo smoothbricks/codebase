@@ -737,7 +737,7 @@ async function keepsForeignEntries(fx: Churn, superseded: readonly string[]): Pr
   await mkdir(emptyHex, { recursive: true });
   await put(join(fx.target, 'keep.txt'), 'keep\n');
   const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
-  check(reclaimPaths(applied)).toEqual(superseded);
+  check(reclaimPaths(applied)).toEqual([...superseded]);
   check(keepReason(applied, loose)).toBe('not-a-unit');
   check(keepReason(applied, notHex)).toBe('not-a-unit');
   check(keepReason(applied, emptyHex)).toBe('no-fingerprint');
@@ -761,7 +761,7 @@ async function keepsSymlinkedGeneration(fx: Churn, superseded: readonly string[]
   await symlink(outside, link, 'dir');
   const outsideBefore = await snapshot(outside);
   const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
-  check(reclaimPaths(applied)).toEqual(superseded);
+  check(reclaimPaths(applied)).toEqual([...superseded]);
   const retainedLink = applied.retained.find((entry) => entry.path === link);
   check(retainedLink?.reason).toBe('not-a-unit');
   check(retainedLink?.detail).toBe('symbolic link');
@@ -829,7 +829,7 @@ async function nestedRootStaysByteIdentical(fx: Churn, superseded: readonly stri
   check(report.nestedRoots, JSON.stringify(await readdir(nestedTarget))).toEqual([
     join(report.targetDir, 'nested-root'),
   ]);
-  check(reclaimPaths(applied)).toEqual(superseded);
+  check(reclaimPaths(applied)).toEqual([...superseded]);
   check(await snapshot(nestedTarget)).toEqual(nestedBefore);
   await scopedTo(nestedTarget, async () => {
     await expectFresh(nestedWs);
@@ -863,7 +863,7 @@ async function cliPlansReadOnlyAndApplies(fx: Churn, superseded: readonly string
   const applyRun = await cli(['--apply', fx.ws]);
   check(applyRun.code, applyRun.stderr).toBe(0);
   const applyReport = parseReport(applyRun.stdout);
-  check(reclaimPaths(planned(applyReport))).toEqual(superseded);
+  check(reclaimPaths(planned(applyReport))).toEqual([...superseded]);
   const receipt = parseReport(await readFile(join(fx.target, RETENTION_RECEIPT), 'utf8'));
   check(receipt).toEqual(applyReport);
   for (const path of superseded) check(await exists(path), path).toBe(false);
@@ -908,7 +908,7 @@ async function keepsHalfWrittenCurrentRoot(fx: Churn, superseded: readonly strin
   await emptyHash(currentBin);
   const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
   check(keepReason(applied, currentBin)).toBe('newest-of-identity');
-  check(reclaimPaths(applied)).toEqual(superseded);
+  check(reclaimPaths(applied)).toEqual([...superseded]);
   check(await exists(currentBin)).toBe(true);
   const rebuilt = await buildJson(fx.ws);
   const compiled = rebuilt.filter((artifact) => !artifact.fresh);
@@ -1049,7 +1049,7 @@ async function automaticCadence(fx: Churn, superseded: readonly string[]): Promi
   check(failed.completed).toBeUndefined();
   await writeFile(path, original);
   const recovered = await retain(fx.ws, { apply: true, automatic: true, now: due });
-  check(reclaimPaths(planned(recovered))).toEqual(superseded);
+  check(reclaimPaths(planned(recovered))).toEqual([...superseded]);
   check(recovered.completed?.at).toBe(due.getTime());
   // Invalid/foreign/backward/busy evidence cannot suppress a real current pass.
   const invalidReceipts = [
