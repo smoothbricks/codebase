@@ -2792,27 +2792,48 @@ fn claim_port_block_with(
     Ok(None)
 }
 
+/// A block's kernel listeners while its reservation runs.
+#[cfg(target_os = "macos")]
+struct BoundPortBlock {
+    /// Released when the reservation ends.
+    listeners: Vec<std::net::TcpListener>,
+    /// A fixture store's claim listeners by port, handed to the store once the block is its own.
+    claims: Vec<(u16, std::net::TcpListener)>,
+}
+
+/// Binds every port of `block` that neither `existing` grants nor the store's own fixture
+/// `claims` already hold. A fixture store's claim ports, the first service port of each
+/// initial-size cell (08_testing.md), come back apart from the rest.
 #[cfg(target_os = "macos")]
 fn bind_port_block(
     block: crate::metadata::PortBlock,
     existing: Option<&GrantSet>,
-) -> std::io::Result<Option<Vec<std::net::TcpListener>>> {
-    let mut listeners = Vec::with_capacity(usize::from(block.size()));
+    claims: Option<&crate::storage::bootstrap::FixturePortClaims>,
+) -> std::io::Result<Option<BoundPortBlock>> {
+    let cell = block.size().min(crate::metadata::NEW_PORT_BLOCK_SIZE);
+    let mut bound = BoundPortBlock {
+        listeners: Vec::with_capacity(usize::from(block.size())),
+        claims: Vec::new(),
+    };
     for port in block.base()..block.base() + block.size() {
         if existing.is_some_and(|grants| {
             grants
                 .port_blocks()
                 .any(|owned| port >= owned.base() && port - owned.base() < owned.size())
-        }) {
+        }) || claims.is_some_and(|claims| claims.holds(port))
+        {
             continue;
         }
         match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
-            Ok(listener) => listeners.push(listener),
+            Ok(listener) if claims.is_some() && (port - block.base()) % cell == 1 => {
+                bound.claims.push((port, listener));
+            }
+            Ok(listener) => bound.listeners.push(listener),
             Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => return Ok(None),
             Err(error) => return Err(error),
         }
     }
-    Ok(Some(listeners))
+    Ok(Some(bound))
 }
 
 #[cfg(target_os = "macos")]
@@ -2856,26 +2877,38 @@ async fn reserve_port_grant_replacement(
         };
         reservation.markers.push(marker);
     }
-    reservation.listeners = match bind_port_block(block, existing).map_err(|error| {
+    let claims = inventory.fixture_port_claims();
+    let bound = match bind_port_block(block, existing, claims).map_err(|error| {
         CowshedError::environment_missing(
             format!("cannot bind macOS port block {block}: {error}"),
             "check the host's local port availability",
         )
     })? {
-        Some(listeners) => listeners,
+        Some(bound) => bound,
         None => return Ok(None),
     };
+    reservation.listeners = bound.listeners;
     // Claims and kernel listeners stay held across the authoritative re-read.
     // Only blocks already owned by this same workspace may overlap.
     let used = inventory
         .all_reserved_port_blocks()
         .await
         .map_err(native_integrity_error)?;
-    Ok((!used.blocks().any(|held| {
+    if used.blocks().any(|held| {
         held.overlaps(block)
             && !existing.is_some_and(|grants| grants.port_blocks().any(|owned| owned == held))
-    }))
-    .then_some(reservation))
+    }) {
+        return Ok(None);
+    }
+    // The block is this store's: its claims outlive the reservation, so no other claimant takes
+    // a base whose gateway listener is unbound. A reservation that never publishes leaves them
+    // with the store, whose own allocator skips them.
+    if let Some(claims) = claims {
+        for (port, listener) in bound.claims {
+            claims.hold(port, listener);
+        }
+    }
+    Ok(Some(reservation))
 }
 
 /// Claims the lowest initial-size block disjoint from every published block. All allocation
@@ -25725,7 +25758,7 @@ mod port_reservation_tests {
 
         // Pause the second allocator at its snapshot boundary. The first completes the
         // real claim -> canonical image/metadata publication -> reservation release handoff.
-        let mut first = reserve_port_grants(&inventory, &staging, stale.clone())
+        let first = reserve_port_grants(&inventory, &staging, stale.clone())
             .await
             .expect("first allocation");
         let first_block = first.grants.port_block.expect("first block");
@@ -25760,14 +25793,8 @@ mod port_reservation_tests {
         }
         .write_for_image(image.image())
         .expect("publish allocation");
-        // Transfer one reserved listener without an unbound interval: another concurrent
-        // fixture may claim every newly free host port immediately.
-        let service_index = first
-            .listeners
-            .iter()
-            .position(|listener| listener.local_addr().unwrap().port() == first_base + 1)
-            .expect("reserved service listener");
-        let old_listener = first.listeners.swap_remove(service_index);
+        // The store keeps the block's claim port across this handoff: another concurrent fixture
+        // may claim every newly free host port immediately.
         drop(first);
         assert_eq!(
             inventory
@@ -25840,7 +25867,6 @@ mod port_reservation_tests {
             .expect("claim after owner release")
             .expect("successful owner releases marker");
         std::fs::remove_file(released).expect("release probe");
-        drop(old_listener);
     }
 
     #[tokio::test]
@@ -26182,13 +26208,15 @@ mod port_reservation_tests {
             .expect("a block no listener on the host holds");
         let block = reservation.grants.port_block.expect("selected block");
         // A listener no inventory records: one service port of that block, outliving the guard.
+        // The first service port is the store's own claim, which it keeps; take the next one.
+        let outside_port = block.base() + 2;
         let service = reservation
             .listeners
             .iter()
             .position(|listener| {
-                listener.local_addr().expect("listener address").port() == block.base() + 1
+                listener.local_addr().expect("listener address").port() == outside_port
             })
-            .expect("the guard listens on every port of its block");
+            .expect("the guard listens on every unclaimed port of its block");
         let outside = reservation.listeners.remove(service);
         // Each connection waits, unaccepted, in one guard listener's queue; closing that listener
         // resets it, so the reset is the kernel's own word that the listener is gone.
@@ -26220,14 +26248,95 @@ mod port_reservation_tests {
         }
         let refused = match reserve_port_grants(&inventory, &staging, others).await {
             Ok(granted) => panic!(
-                "allocated {:?} although another listener holds port {}",
+                "allocated {:?} although another listener holds port {outside_port}",
                 granted.grants.port_block,
-                block.base() + 1
             ),
             Err(error) => error,
         };
         assert_eq!(refused.code, crate::error::ErrorCode::Conflict);
         drop(outside);
+    }
+
+    /// Every fixture store and test gateway on the host shares the fixture partition, and a
+    /// block's gateway listener is unbound while its workspace is detached or not yet served. A
+    /// store that let its claim go with the reservation lost such a block to the next claimant,
+    /// and its workspace's next attach failed on `AddrInUse` (the real-APFS making-room test lost
+    /// 45184 so). The store keeps the claim, so a second store offered only that block refuses it,
+    /// a claimant following the claim protocol cannot bind its claim port, and the claim closes
+    /// with the store's last handle.
+    #[tokio::test]
+    async fn a_fixture_store_keeps_its_port_block_claimed_until_the_store_closes() {
+        use std::io::{ErrorKind, Read};
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+
+        let owner_root = root("claim-owner");
+        let (owner, _) = inventory(&owner_root);
+        let reservation = reserve_port_grants(
+            &owner,
+            &owner_root.join("store/.staging"),
+            Default::default(),
+        )
+        .await
+        .expect("a block no claimant on the host holds");
+        let block = reservation.grants.port_block.expect("reserved block");
+        drop(reservation);
+
+        let claim = block.base() + 1;
+        let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, claim))
+            .expect_err("the store still holds its block's claim after the reservation ends");
+        assert_eq!(taken.kind(), ErrorKind::AddrInUse);
+
+        let contender_root = root("claim-contender");
+        let (contender, _) = inventory(&contender_root);
+        let mut others = crate::metadata::ReservedPortBlocks::default();
+        for candidate in PortBlock::macos_candidates(contender.port_allocation())
+            .filter(|candidate| *candidate != block)
+        {
+            others.insert(candidate);
+        }
+        match reserve_port_grants(&contender, &contender_root.join("store/.staging"), others).await
+        {
+            Ok(granted) => panic!(
+                "a second store took {:?}, which the first store holds",
+                granted.grants.port_block
+            ),
+            Err(error) => assert_eq!(error.code, crate::error::ErrorCode::Conflict, "{error}"),
+        }
+
+        // A connection queued, unaccepted, on the claim is reset when the claim closes: the
+        // kernel's own word that the store's last handle released it.
+        let mut queued =
+            TcpStream::connect((Ipv4Addr::LOCALHOST, claim)).expect("connect to the store's claim");
+        drop(owner);
+        let reset = queued
+            .read(&mut [0])
+            .expect_err("a connection queued on a closed claim is reset");
+        assert_eq!(reset.kind(), ErrorKind::ConnectionReset);
+    }
+
+    /// A foreign listener on a block's base, from a process that follows no claim protocol,
+    /// passes that block over whatever the store's records say.
+    #[tokio::test]
+    async fn a_foreign_listener_on_a_block_base_passes_the_block_over() {
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let root = root("foreign-base");
+        let (inventory, _) = inventory(&root);
+        let (occupied, _foreign) = PortBlock::macos_candidates(inventory.port_allocation())
+            .find_map(|candidate| {
+                let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, candidate.base())).ok()?;
+                Some((candidate, listener))
+            })
+            .expect("a block base this test can bind");
+        let granted =
+            reserve_port_grants(&inventory, &root.join("store/.staging"), Default::default())
+                .await
+                .expect("another block is free");
+        let block = granted.grants.port_block.expect("granted block");
+        assert!(
+            !block.overlaps(occupied),
+            "allocated {block}, whose base a foreign listener holds"
+        );
     }
 
     #[tokio::test]

@@ -1033,28 +1033,26 @@ pub enum MountGuardError {
 pub struct CanonicalRoots {
     store: Arc<Path>,
     telemetry: PathBuf,
-    port_allocation: crate::metadata::PortAllocation,
+    ports: PortPartition,
 }
 
 impl CanonicalRoots {
     pub fn global() -> Self {
-        Self::new(
-            PathBuf::from(STORE_ROOT),
-            crate::metadata::PortAllocation::Host,
-        )
+        Self::new(PathBuf::from(STORE_ROOT), PortPartition::Host)
     }
 
-    /// A test fixture store; its ports never come from the host allocation partition.
+    /// A test fixture store; its ports never come from the host allocation partition, and it
+    /// holds the claims on its blocks for as long as any handle to it lives.
     pub fn at(store: PathBuf) -> Self {
-        Self::new(store, crate::metadata::PortAllocation::Fixture)
+        Self::new(store, PortPartition::Fixture(Arc::default()))
     }
 
-    fn new(store: PathBuf, port_allocation: crate::metadata::PortAllocation) -> Self {
+    fn new(store: PathBuf, ports: PortPartition) -> Self {
         let telemetry = store.join("telemetry");
         Self {
             store: Arc::from(store),
             telemetry,
-            port_allocation,
+            ports,
         }
     }
 
@@ -1072,7 +1070,69 @@ impl CanonicalRoots {
     }
 
     pub fn port_allocation(&self) -> crate::metadata::PortAllocation {
-        self.port_allocation
+        match self.ports {
+            PortPartition::Host => crate::metadata::PortAllocation::Host,
+            PortPartition::Fixture(_) => crate::metadata::PortAllocation::Fixture,
+        }
+    }
+
+    /// The kernel claims a fixture store holds on its port blocks; the host store holds none.
+    pub fn fixture_port_claims(&self) -> Option<&FixturePortClaims> {
+        match &self.ports {
+            PortPartition::Host => None,
+            PortPartition::Fixture(claims) => Some(claims),
+        }
+    }
+}
+
+/// A store's port allocation partition. Two handles on one partition are equal whatever claims
+/// each holds: the claims are the store's kernel state, not its identity.
+#[derive(Clone, Debug)]
+enum PortPartition {
+    Host,
+    Fixture(Arc<FixturePortClaims>),
+}
+
+impl PartialEq for PortPartition {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Host, Self::Host) | (Self::Fixture(_), Self::Fixture(_))
+        )
+    }
+}
+
+impl Eq for PortPartition {}
+
+/// The kernel claims on a fixture store's port blocks (08_testing.md): a listener on the first
+/// service port of every initial-size cell of each block the store reserved, the port every test
+/// allocator on the host binds before it takes a block. Every fixture store and test gateway
+/// shares the fixture partition, and a block's gateway listener is unbound while its workspace
+/// is detached or not yet served, so the reservation hands its claims to the store and they close
+/// with the store's last handle: no other claimant takes the block in between.
+#[derive(Debug, Default)]
+pub struct FixturePortClaims {
+    #[cfg(target_os = "macos")]
+    held: std::sync::Mutex<BTreeMap<u16, std::net::TcpListener>>,
+}
+
+#[cfg(target_os = "macos")]
+impl FixturePortClaims {
+    /// Whether the store already holds `port`'s claim.
+    pub(crate) fn holds(&self, port: u16) -> bool {
+        self.held().contains_key(&port)
+    }
+
+    /// Keep `listener`, bound on its claim `port`, for the store's life.
+    pub(crate) fn hold(&self, port: u16, listener: std::net::TcpListener) {
+        self.held().insert(port, listener);
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, BTreeMap<u16, std::net::TcpListener>> {
+        // Every entry is one whole insert, so a holder that panicked left the map consistent.
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 

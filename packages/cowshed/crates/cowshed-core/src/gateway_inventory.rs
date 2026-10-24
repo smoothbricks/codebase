@@ -867,6 +867,13 @@ impl NativeGatewayInventory {
         self.storage.port_allocation()
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn fixture_port_claims(
+        &self,
+    ) -> Option<&crate::storage::bootstrap::FixturePortClaims> {
+        self.storage.roots().fixture_port_claims()
+    }
+
     /// Inventory over a caller-owned directory store: mount facts come from the mount
     /// records the directory host proves, never from the kernel mount table. Only a
     /// caller that opened a directory runtime selects this; native stores keep [`Self::new`].

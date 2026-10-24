@@ -18,9 +18,9 @@ data-plane connector; it is not the host control listener. Data-plane identity d
   reserved to the workspace (and connectable by its jobs) until the workspace is removed or a later block contains it,
   but carries no gateway listener. Growth is refused while any of the workspace's jobs runs, and the next exec reaches
   the gateway at the current block's base. Fixture stores allocate from a reserved fixture partition of the validation
-  range; the host never assigns there. Initial allocation, growth, explicit slot assignment, and gateway reallocation
-  obey the store's partition. The partition bounds are defined once in code; persisted-block validation covers the full
-  validation range.
+  range; the host never assigns there, and a fixture store holds its blocks' claims for as long as it is open. Initial
+  allocation, growth, explicit slot assignment, and gateway reallocation obey the store's partition. The partition
+  bounds are defined once in code; persisted-block validation covers the full validation range.
 - **Linux:** there is no port block. A controller-owned socket at
   `/private/cowshed/store/run/gateway/<workspaceIncarnation>.sock` is mounted as `/run/cowshed/gateway.sock` inside that
   workspace's private loopback-only network namespace. The controller launches exactly one trusted minimal connector in
