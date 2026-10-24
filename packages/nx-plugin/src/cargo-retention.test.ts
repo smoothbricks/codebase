@@ -38,7 +38,7 @@ import { EXTRACTED_BINARIES_METADATA, EXTRACTED_CARGO_METADATA, EXTRACTED_TARGET
 useFixtureCargoHome();
 
 /** The Nx and compiled plugin under test, one copy this file's Nx fixture shares. */
-const installation = testFileInstallation('cargo-retention-installation');
+const installation = testFileInstallation();
 afterAll(() => installation.retire());
 
 /** Three days past the newest stamp a fixture build can carry: drops only the recency root. */

@@ -66,7 +66,7 @@ let bodyDone: Promise<void> = Promise.resolve();
 /** A failed barrier keeps the fixture, even if a later cleanup attempt succeeds. */
 let barrierFailure: string | undefined;
 /** The Nx installation the fixture links; it must leave it as it was made. */
-const installation = testFileInstallation('smoo-nextest-partitions-installation');
+const installation = testFileInstallation();
 
 beforeAll(
   caseBody(async () => {

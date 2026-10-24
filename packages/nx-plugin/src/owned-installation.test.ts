@@ -31,24 +31,27 @@ afterEach(async () => {
   await rm(censusRoot, { recursive: true, force: true });
 });
 
+/** The argv of a process of its own that takes the copy kept as `name`, prints its `node_modules`, then runs `rest`. */
+function taker(name: string, rest: string): string[] {
+  return [
+    process.execPath,
+    '--preload',
+    '@smoothbricks/validation/bun/preload',
+    '-e',
+    `const { ownedInstallation } = await import(${JSON.stringify(join(import.meta.dir, 'owned-installation.ts'))});
+const installation = ownedInstallation(${JSON.stringify(censusRoot)}, ${JSON.stringify(name)});
+process.stdout.write(await installation.nodeModules());
+${rest}
+await installation.retire();`,
+  ];
+}
+
 /**
  * Take the copy kept as `name` and retire it in a process of its own, as one run of a test file does: a process
  * resolves each module once, so a take that shares this one's resolutions would not stand for the next run.
  */
 function take(name: string): { readonly modules: string; readonly stderr: string } {
-  const run = Bun.spawnSync(
-    [
-      process.execPath,
-      '--preload',
-      '@smoothbricks/validation/bun/preload',
-      '-e',
-      `const { ownedInstallation } = await import(${JSON.stringify(join(import.meta.dir, 'owned-installation.ts'))});
-const installation = ownedInstallation(${JSON.stringify(censusRoot)}, ${JSON.stringify(name)});
-process.stdout.write(await installation.nodeModules());
-await installation.retire();`,
-    ],
-    { cwd: dirname(import.meta.dir) },
-  );
+  const run = Bun.spawnSync(taker(name, ''), { cwd: dirname(import.meta.dir) });
   const stderr = run.stderr.toString();
   expect(run.exitCode, stderr).toBe(0);
   return { modules: run.stdout.toString(), stderr };
@@ -85,7 +88,7 @@ describe('a kept fixture installation', () => {
     expect((await lstat(join(again.modules, 'nx'))).isSymbolicLink()).toBe(true);
     await inCopy(again.modules, join(again.modules, 'nx'));
     expect((await readdir(join(censusRoot, KEPT, 'escaping'))).sort()).toEqual(
-      ['censuses.json', basename(dirname(again.modules))].sort(),
+      ['censuses.json', 'holders', 'lock', basename(dirname(again.modules))].sort(),
     );
     expect(await readlink(join(again.modules, 'nx'))).not.toStartWith('/');
   });
@@ -101,5 +104,47 @@ describe('a kept fixture installation', () => {
     expect(again.stderr).toContain(join(censusRoot, 'node_modules', 'nx'));
     expect(await Bun.file(join(modules, 'nx', 'index.js')).text()).toBe('module.exports = "changed";\n');
     expect((await stat(kept)).ino).toBe(untouched);
+  });
+
+  it('never changes a copy another live process holds, and removes it once nothing alive holds it', async () => {
+    // The holder takes the copy, prints its `node_modules` and a newline, and retires once its stdin closes.
+    const holder = Bun.spawn(
+      taker('shared', "process.stdout.write('\\n');\nfor await (const _ of Bun.stdin.stream()) {}"),
+      {
+        cwd: dirname(import.meta.dir),
+        stdin: 'pipe',
+        stdout: 'pipe',
+        stderr: 'pipe',
+      },
+    );
+    const reader = holder.stdout.getReader();
+    const decoder = new TextDecoder();
+    let printed = '';
+    while (!printed.endsWith('\n')) {
+      const next = await reader.read();
+      if (next.done)
+        throw new Error(`the holder ended before it took its copy: ${await new Response(holder.stderr).text()}`);
+      printed += decoder.decode(next.value);
+    }
+    const heldModules = printed.slice(0, -1);
+    const heldIndex = join(heldModules, 'nx', 'index.js');
+    const made = (await stat(heldIndex)).ino;
+    await writeFile(join(censusRoot, 'node_modules', 'nx', 'index.js'), 'module.exports = "changed";\n');
+    const again = take('shared');
+    expect(again.stderr).toContain('1 of 3 packages no longer hold what the host closure holds');
+    expect(again.stderr).toContain('another live process holds it, so it is made in a new directory');
+    expect(again.modules).not.toBe(heldModules);
+    expect(await Bun.file(join(again.modules, 'nx', 'index.js')).text()).toBe('module.exports = "changed";\n');
+    // The holder's copy is as it took it, so its retirement proves it unchanged.
+    expect(await Bun.file(heldIndex).text()).toBe('module.exports = "nx";\n');
+    expect((await stat(heldIndex)).ino).toBe(made);
+    holder.stdin.end();
+    const exit = await holder.exited;
+    expect(exit, await new Response(holder.stderr).text()).toBe(0);
+    // Nothing alive holds the old copy now: the next take proves the new one, copies nothing and removes the old.
+    expect(take('shared')).toEqual({ modules: again.modules, stderr: '' });
+    expect((await readdir(join(censusRoot, KEPT, 'shared'))).sort()).toEqual(
+      ['censuses.json', 'holders', 'lock', basename(dirname(again.modules))].sort(),
+    );
   });
 });

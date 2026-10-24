@@ -2057,9 +2057,17 @@ ones recorded beside the copy, so a run that changes nothing reads no file bytes
 nodes, if a fixture wrote into the copy, and leaves it for the next run to prove. The host's closure moves under a
 fixture that reads it: a shared Bun store relinked by another install, or, in a workspace that developer-links this
 plugin, the checkout its author is editing and rebuilding. Either fails the producer receipt's installation proof for
-work that is not the test's. Each test file names its own copy; two runs of one file at once share it, and a copy one of
-them makes again fails the other. This package's tests bind `censusRoot` to this repository; a consumer binds it to its
-own workspace root.
+work that is not the test's.
+
+Test files that name one copy share it. Bun runs many test files in one process, which takes the copy once, on the first
+`nodeModules()` of any of them, and each file's `retire()` proves that no fixture wrote into it since that take.
+Concurrent test processes, such as the shards of one run, share the copy too: an exclusive flock(2) on `lock` beside the
+record admits one take at a time, held by a perl child the kernel releases however its holder ends, and each taker names
+the copy it took in `holders/<pid>`. A copy that another live process holds is never changed in place: one that no
+longer holds what the host closure holds is made again, whole, in a new `installation-<uuid>`, and a copy that neither
+the record nor a live holder names is removed by the next take. A changed host closure is therefore copied once per run,
+not once per test file. This package's tests share one copy, `nx-plugin-tests`, and bind `censusRoot` to this
+repository; a consumer binds it to its own workspace root.
 
 The copy lies beneath `censusRoot`'s `node_modules`. Where `node_modules/.cache` is a real directory, as on a fresh CI
 checkout (a cowshed build volume links it elsewhere), Node's ancestor lookup from the copy reaches the host's own

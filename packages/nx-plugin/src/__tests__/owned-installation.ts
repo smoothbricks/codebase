@@ -5,9 +5,10 @@ import { ownedInstallation, type TestFileInstallation } from '../owned-installat
 const repositoryRoot = join(import.meta.dir, '../../../..');
 
 /**
- * The installation one test file owns, kept as `name`. Call once per file, at module scope, with a name no other file
- * uses: Bun runs many test files in one process, and each must own its copy.
+ * One test file's use of the copy every test file of this package shares. Call once per file, at module scope. One
+ * process takes the copy once for all its files, and concurrent test processes share it under its lock, so a changed
+ * host closure is copied once per run, not once per file.
  */
-export function testFileInstallation(name: string): TestFileInstallation {
-  return ownedInstallation(repositoryRoot, name);
+export function testFileInstallation(): TestFileInstallation {
+  return ownedInstallation(repositoryRoot, 'nx-plugin-tests');
 }

@@ -728,8 +728,8 @@ const FIXTURE_NX_JSON = {
   plugins: ['@smoothbricks/nx-plugin'],
 };
 
-/** The Nx installation this file's fixtures share: one copy kept for this file, not one per fixture. */
-const installation = testFileInstallation('ensure-built-installation');
+/** The Nx installation this file's fixtures share with this package's other test files; none may write into it. */
+const installation = testFileInstallation();
 
 /**
  * Two projects, `app:build` reading `lib:build`'s outputs through

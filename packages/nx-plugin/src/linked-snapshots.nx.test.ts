@@ -13,8 +13,8 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 import { managedAssetsRoot } from './managed-assets.js';
 
-/** The Nx and the plugin product the provider and the consumer link, one copy this file owns; none may write into it. */
-const installation = testFileInstallation('linked-snapshot-installation');
+/** The Nx and the plugin product the provider and the consumer link, the copy this package's tests share; none may write into it. */
+const installation = testFileInstallation();
 const SNAPSHOTS = join(managedAssetsRoot, 'raw/tooling/direnv/linked-snapshots.ts');
 const DECLARATION = { targets: ['linked-api:build'], artifactModules: [] };
 

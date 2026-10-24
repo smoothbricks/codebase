@@ -26,13 +26,17 @@
  * in the record beside it). A package in the copy that requires a dependency it does not
  * declare still reaches the host's top-level `node_modules` the same way; the census binds declared edges only.
  *
- * A test file uses its copy, on first use, for all its fixtures; retiring it fails, naming the changed nodes, if any
- * fixture wrote into it.
+ * The test files of one process share one take of a copy, and processes share the copy itself: an exclusive lock
+ * beside it admits one take at a time, and each taker records the copy it holds there. A copy that another live
+ * process holds is never changed in place: one that no longer holds what the host closure holds is made again, whole,
+ * in a new directory, and the old one is removed once nothing alive holds it. Retiring a file's use fails, naming the
+ * changed nodes, if any fixture wrote into the copy since this process took it.
  */
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { constants } from 'node:fs';
+import { constants, rmSync } from 'node:fs';
 import { cp, mkdir, readdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
-import { basename, dirname, join, relative } from 'node:path';
+import { basename, dirname, join, relative, resolve } from 'node:path';
 import { expandOutputs } from 'nx/src/native';
 import { readModulePackageJson } from 'nx/src/utils/package-json';
 import typia from 'typia';
@@ -211,6 +215,90 @@ async function writeKept(path: string, kept: KeptCensuses): Promise<void> {
   }
 }
 
+/** The file, beside a kept copy's record, whose exclusive flock admits one take of the copy at a time. */
+const LOCK = 'lock';
+
+/** The directory, beside a kept copy's record, where each process that took a copy names it, in a file named by pid. */
+const HOLDERS = 'holders';
+
+/**
+ * Takes the exclusive flock(2) of the file named by its argument and keeps it while its stdin is open: the kernel
+ * lets go of it however its holder ends, so a take killed mid-copy never strands the next one. Node has no flock;
+ * `cargo-retention.ts` holds Cargo's locks with a perl child the same way.
+ */
+const LOCK_HOLDER = [
+  'use strict; use Fcntl qw(:flock O_RDWR O_CREAT); $| = 1;',
+  'sysopen(my $fh, $ARGV[0], O_RDWR | O_CREAT, 0600) or die "open $ARGV[0]: $!\\n";',
+  'flock($fh, LOCK_EX) or die "flock $ARGV[0]: $!\\n";',
+  'print "held\\n"; my $end = <STDIN>;',
+].join('\n');
+
+/** Hold the exclusive lock of `path` until the returned release has run, waiting for whoever holds it now. */
+async function holdLock(path: string): Promise<() => Promise<void>> {
+  const child = spawn('perl', ['-e', LOCK_HOLDER, path], { stdio: ['pipe', 'pipe', 'pipe'] });
+  let stdout = '';
+  let stderr = '';
+  // The library compiles against ES2022, which has no Promise.withResolvers.
+  const held = new Promise<'held'>((hold) => {
+    child.stdout.setEncoding('utf8').on('data', (text: string) => {
+      stdout += text;
+      if (stdout.includes('held\n')) hold('held');
+    });
+  });
+  child.stderr.setEncoding('utf8').on('data', (text: string) => {
+    stderr += text;
+  });
+  const ended = new Promise<string>((end) => {
+    child.once('error', (error) => end(`perl could not start: ${error.message}`));
+    child.once('close', (code, signal) => end(`perl exited with ${code ?? signal}: ${stderr.trim()}`));
+  });
+  const first = await Promise.race([held, ended]);
+  if (first !== 'held') throw new Error(`the lock ${path} cannot be held: ${first}`);
+  return async () => {
+    child.stdin.end();
+    await ended;
+  };
+}
+
+/** Whether `pid` names a live process; one of another user's counts. */
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error instanceof Error && 'code' in error) {
+      if (error.code === 'ESRCH') return false;
+      if (error.code === 'EPERM') return true;
+    }
+    throw error;
+  }
+}
+
+/**
+ * The copies, by directory name, that other live processes took from `kept`. The record of a process that is gone is
+ * removed. A reused pid only keeps a copy longer and makes the next changed one elsewhere; it never changes one in use.
+ */
+async function heldByOthers(kept: string): Promise<ReadonlySet<string>> {
+  const held = new Set<string>();
+  for (const entry of await readdir(join(kept, HOLDERS))) {
+    const pid = Number(entry);
+    if (pid === process.pid) continue;
+    if (Number.isSafeInteger(pid) && pid > 0 && alive(pid))
+      held.add(await readFile(join(kept, HOLDERS, entry), 'utf8'));
+    else await rm(join(kept, HOLDERS, entry), { force: true });
+  }
+  return held;
+}
+
+/** Remove every copy directory in `kept` but those `keep` names. */
+async function sweep(kept: string, keep: ReadonlySet<string>): Promise<void> {
+  for (const entry of await readdir(kept)) {
+    if (entry.startsWith('installation-') && !keep.has(entry)) {
+      await rm(join(kept, entry), { recursive: true, force: true });
+    }
+  }
+}
+
 /** Copy the host package root `source` to its place under `root`, with the census's own exclusions. */
 function copyPackage(source: string, root: string, { place }: Placement): Promise<void> {
   return cp(source, join(root, place), {
@@ -269,17 +357,17 @@ async function clearLeftovers(
 }
 
 /**
- * The copy of the closure `censusRoot` resolves kept as `name`, proved to hold what the host closure holds, copying
+ * The copy of the closure `censusRoot` resolves kept in `kept`, proved to hold what the host closure holds, copying
  * again each package whose copy does not, and every package when the resolution edges moved or the copy is unproved.
- * Says so on stderr when a copy that was there fails its proof: a closure that keeps changing is itself worth knowing.
+ * A copy `inUse` names (another live process took it) is never changed in place: a changed one is made again, whole,
+ * in a new directory. Says so on stderr when a copy that was there fails its proof: a closure that keeps changing is
+ * itself worth knowing.
  *
  * Only the closure is read from `censusRoot`, never its proof: that installation is the host's, whose shared store
  * other tasks relink while the census reads it, which changes node stamps and would make every test that copies it
  * fail for the host's work rather than its own. The copy, which the fixture owns, is what gets proved.
  */
-async function keptInstallation(censusRoot: string, name: string): Promise<OwnedInstallation> {
-  await mkdir(join(censusRoot, KEPT, name), { recursive: true });
-  const kept = await realpath(join(censusRoot, KEPT, name));
+async function proveOrCopy(censusRoot: string, kept: string, inUse: ReadonlySet<string>): Promise<OwnedInstallation> {
   const record = join(kept, 'censuses.json');
   const recorded = await readKept(record);
   let unread = 'no detail';
@@ -300,6 +388,7 @@ async function keptInstallation(censusRoot: string, name: string): Promise<Owned
   const placesIn = (root: string) => new Map([...placed.values()].map(({ place }) => [join(root, place), place]));
   // Only a recorded copy is censused: a census of none would resolve the host's packages through the ancestor lookup.
   const current = recorded === null ? null : join(kept, recorded.installation);
+  await sweep(kept, new Set([...inUse, ...(current === null ? [] : [basename(current)])]));
   let unproved = 'no detail';
   const found =
     current === null
@@ -330,17 +419,21 @@ async function keptInstallation(censusRoot: string, name: string): Promise<Owned
               wanted,
               held,
             )}`;
-    process.stderr.write(`kept Nx installation ${current} failed its proof, copying again: ${why}\n`);
+    const elsewhere = inUse.has(basename(current))
+      ? '; another live process holds it, so it is made in a new directory'
+      : '';
+    process.stderr.write(`kept Nx installation ${current} failed its proof, copying again: ${why}${elsewhere}\n`);
   }
   // A copy made whole goes to a directory no census in this process has resolved from (copyCensus).
-  const root = current !== null && stale !== null ? current : join(kept, `installation-${randomUUID()}`);
+  const root =
+    current !== null && stale !== null && !inUse.has(basename(current))
+      ? current
+      : join(kept, `installation-${randomUUID()}`);
   if (root === current && stale !== null) {
     for (const [, { place }] of stale) await rm(join(root, place), { recursive: true, force: true });
     await Promise.all(stale.map(([source, placement]) => copyPackage(source, root, placement)));
   } else {
-    for (const entry of await readdir(kept)) {
-      if (entry !== 'censuses.json') await rm(join(kept, entry), { recursive: true, force: true });
-    }
+    await sweep(kept, inUse);
     await Promise.all([...placed].map(([source, placement]) => copyPackage(source, root, placement)));
     await linkCopies(censusRoot, root, host, placed);
   }
@@ -360,6 +453,28 @@ async function keptInstallation(censusRoot: string, name: string): Promise<Owned
   await writeKept(record, { version: 2, installation: basename(root), host, copy: census });
   return { root, census };
 }
+
+/**
+ * Take the copy kept as `name` in `censusRoot`'s tool cache under its lock, and record this process as its holder
+ * until it exits. A process that dies without the exit hook leaves a record of a dead pid, which the next take removes.
+ */
+async function keptInstallation(censusRoot: string, name: string): Promise<OwnedInstallation> {
+  await mkdir(join(censusRoot, KEPT, name, HOLDERS), { recursive: true });
+  const kept = await realpath(join(censusRoot, KEPT, name));
+  const release = await holdLock(join(kept, LOCK));
+  try {
+    const taken = await proveOrCopy(censusRoot, kept, await heldByOthers(kept));
+    const holder = join(kept, HOLDERS, String(process.pid));
+    await writeFile(holder, basename(taken.root), { mode: 0o600 });
+    process.once('exit', () => rmSync(holder, { force: true }));
+    return taken;
+  } finally {
+    await release();
+  }
+}
+
+/** This process's take of each kept copy, by the copy's directory: every test file of the process shares it. */
+const takes = new Map<string, Promise<OwnedInstallation>>();
 
 /**
  * End a test file's use of its installation, failing, with the changed nodes named, if its identity is no longer the
@@ -388,7 +503,7 @@ function retireOwnedInstallation({ root, census }: OwnedInstallation): void {
   throw new Error(`a fixture changed the installation it shares, in ${root}:\n${changed.slice(0, 20).join('\n')}`);
 }
 
-/** One test file's installation: taken on first use and shared by its fixtures, retired by the file's `afterAll`. */
+/** One test file's use of an installation: taken on first use and shared by its fixtures, retired by its `afterAll`. */
 export interface TestFileInstallation {
   /** The `node_modules` a fixture workspace links. */
   readonly nodeModules: () => Promise<string>;
@@ -397,20 +512,30 @@ export interface TestFileInstallation {
 }
 
 /**
- * The installation one test file owns: the copy of the closure `censusRoot` (the workspace whose Nx, plugin and
- * TypeScript the fixtures stand for) resolves, kept as `name` in `censusRoot`'s tool cache and proved on first use.
- * Call once per file, at module scope, with a name no other file uses: Bun runs many test files in one process, and
- * each must own its copy. Two runs of one file at once share it, and a copy one of them makes again fails the other.
+ * One test file's use of the copy of the closure `censusRoot` (the workspace whose Nx, plugin and TypeScript the
+ * fixtures stand for) resolves, kept as `name` in `censusRoot`'s tool cache and proved on first use. Call once per
+ * file, at module scope. Files that name one copy share it: Bun runs many test files in one process, which takes the
+ * copy once for all of them, and concurrent processes take it in turn under its lock, none changing a copy another
+ * holds. Retiring proves that no fixture wrote into the copy since this process took it.
  */
 export function ownedInstallation(censusRoot: string, name: string): TestFileInstallation {
-  let taken: Promise<OwnedInstallation> | undefined;
+  const key = resolve(censusRoot, KEPT, name);
+  let used = false;
+  const take = (): Promise<OwnedInstallation> => {
+    let taken = takes.get(key);
+    if (taken === undefined) {
+      taken = keptInstallation(censusRoot, name);
+      takes.set(key, taken);
+    }
+    return taken;
+  };
   return {
     nodeModules: async () => {
-      taken ??= keptInstallation(censusRoot, name);
-      return join((await taken).root, 'node_modules');
+      used = true;
+      return join((await take()).root, 'node_modules');
     },
     retire: async () => {
-      if (taken !== undefined) retireOwnedInstallation(await taken);
+      if (used) retireOwnedInstallation(await take());
     },
   };
 }
