@@ -24,6 +24,7 @@ import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import { CARGO_CLOSURE_INPUT } from './cargo-closure-input.js';
+import { CARGO_PRODUCER_METADATA } from './cargo-retention.js';
 import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { ALL_VERDICTS_EXECUTOR } from './executors/all-verdicts/schema.js';
@@ -856,11 +857,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // targets are declared package-locally, never derived from crate metadata.
       expect(targets['cargo-wasm']).toBeUndefined();
       expect(targets['cargo-napi']).toBeUndefined();
-      expect(targets['cargo-sweep']?.options).toMatchObject({
-        command: 'cargo sweep --time 7',
+      expect(targets['cargo-sweep']).toBeUndefined();
+      expect(targets['cargo-retention']?.options).toEqual({
+        command: 'node ../../node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-cargo-retain.js',
         cwd: 'packages/ferris',
       });
-      expect(targets['cargo-sweep']?.cache).toBe(false);
+      expect(targets['cargo-retention']?.cache).toBe(false);
       // Never cached: the download lands in CARGO_HOME, so a cache hit would
       // report success over a registry that still cannot resolve the lockfile.
       expect(targets['cargo-fetch']?.cache).toBe(false);
@@ -880,7 +882,20 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       ]) {
         expect(targets[name]?.dependsOn).toContain('cargo-fetch');
       }
-      expect(targets['cargo-sweep']?.dependsOn).toBeUndefined();
+      expect(targets['cargo-retention']?.dependsOn).toBeUndefined();
+      // Retention starts after the tasks that build into the target directory, named by this metadata, and no other.
+      for (const name of [
+        'cargo-test-compile',
+        'cargo-test-archive',
+        'cargo-lint',
+        CARGO_CROSS_LINT_TARGET,
+        'mutation',
+        'bench',
+      ]) {
+        expect(targets[name]?.metadata).toEqual(CARGO_PRODUCER_METADATA);
+      }
+      expect(targets['cargo-fetch']?.metadata).toBeUndefined();
+      expect(targets['cargo-retention']?.metadata).toBeUndefined();
       // The archive and the compile it stands for hash every crate's sources
       // AND the outputs of the targets they depend on: generated crate inputs
       // are gitignored, so a repository that had to restate `inputs` to add

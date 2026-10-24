@@ -401,11 +401,10 @@ in {
       # Test runner for inferred Cargo test targets. Generated targets must never
       # depend on an ambient host installation that CI does not reproduce.
       pkgs.cargo-nextest
-      # Target-dir GC for the inferred cargo-sweep target: cargo never removes
-      # superseded artifacts on its own (a busy workspace accumulated ~18k stale
-      # variants per crate and 26 GB of junk before this existed), and a sweep
-      # prunes them without touching the warm current-fingerprint surface.
-      pkgs.cargo-sweep
+      # The nx-plugin's Cargo retention holds Cargo's profile locks through a
+      # perl child: perl's flock is the flock(2) Cargo takes, and the kernel
+      # drops it with the child however the Nx process ends.
+      pkgs.perl
       # The stable-toolchain arm of smoo's workspace feature-unification policy:
       # `cargo hakari` generates and wires the workspace-hack crate that unifies
       # features when `[resolver] feature-unification` — nightly-only, and what

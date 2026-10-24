@@ -229,6 +229,7 @@
   "bin": {
     "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js",
     "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
+    "smoo-nx-cargo-retain": "./dist/bin/smoo-nx-cargo-retain.js",
     "smoo-nx-nextest-extract": "./dist/bin/smoo-nx-nextest-extract.js",
     "smoo-nx-bound-failures": "./dist/bin/smoo-nx-bound-failures.js",
     "smoo-nx-failures": "./dist/bin/smoo-nx-failures.js",

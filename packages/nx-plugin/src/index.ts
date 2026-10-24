@@ -27,6 +27,11 @@ import {
   resolveCargoClosureSource,
 } from './cargo-closure-input.js';
 import {
+  CARGO_PRODUCER_METADATA,
+  CARGO_RETAIN_BIN,
+  postTasksExecution as postCargoRetention,
+} from './cargo-retention.js';
+import {
   CARGO_TOOLCHAIN_NAMED_INPUT,
   CARGO_TOOLCHAIN_PIN_INPUTS,
   cargoRuntimeInput,
@@ -700,6 +705,7 @@ function createCargoWasmTarget(
     ]);
   return {
     executor: 'nx:run-commands',
+    metadata: CARGO_PRODUCER_METADATA,
     cache: true,
     dependsOn: ['^build'],
     inputs: repoRooted
@@ -744,6 +750,7 @@ function createCargoWasmTarget(
 function createCargoTestCompileTarget(projectRoot: string): TargetConfiguration {
   return {
     executor: 'nx:run-commands',
+    metadata: CARGO_PRODUCER_METADATA,
     cache: false,
     inputs: CARGO_INPUTS,
     outputs: [],
@@ -776,6 +783,7 @@ function createCargoTestCompileTarget(projectRoot: string): TargetConfiguration 
 function createCargoTestArchiveTarget(projectRoot: string, toolConfig: string): TargetConfiguration {
   return {
     executor: 'nx:run-commands',
+    metadata: CARGO_PRODUCER_METADATA,
     cache: true,
     inputs: CARGO_INPUTS,
     outputs: [`{projectRoot}/${CARGO_TEST_ARCHIVE_FILE}`],
@@ -838,6 +846,7 @@ function createCargoCrossTestTargets(
   return {
     [cargoCrossTestArchiveTargetName(triple)]: {
       executor: archiveExecutor,
+      metadata: CARGO_PRODUCER_METADATA,
       cache: true,
       // The toolchain inputs every cached cargo target carries, plus the
       // declared driver's own bytes. Those toolchain inputs are attached
@@ -892,6 +901,7 @@ function createCargoCrossTestTargets(
 function createCargoTestTarget(projectRoot: string): TargetConfiguration {
   return {
     executor: '@smoothbricks/nx-plugin:bounded-exec',
+    metadata: CARGO_PRODUCER_METADATA,
     cache: true,
     inputs: CARGO_INPUTS,
     dependsOn: [CARGO_TEST_COMPILE_TARGET],
@@ -1095,7 +1105,8 @@ function isBuildOutputPackageJson(packageJsonPath: string): boolean {
  * hint and the opt-in producer completion receipts. Each sees the same options and run context; neither reads the
  * other's output. The hint is recorded first so a producer-receipt bug cannot cost the controller its evidence. The
  * pair also serves a run on a host without a gateway its own CPU pool, which every task inherits
- * (`run-cpu-pool.ts`), and closes it when the run ends.
+ * (`run-cpu-pool.ts`), and closes it when the run ends. Last, once every task has finished, the post hook reclaims the
+ * superseded Cargo unit generations of each Cargo workspace the run built into (`cargo-retention.ts`).
  */
 export const preTasksExecution: PreTasksExecution<ProducerReceiptsOptions> = async (options, context) => {
   // Before any task is hashed: a workspace that declares the test-walk check
@@ -1109,6 +1120,7 @@ export const postTasksExecution: PostTasksExecution<ProducerReceiptsOptions> = a
   await postTaskResults(options, context);
   await postProducerReceipts(options, context);
   await closeRunCpuPool(context);
+  await postCargoRetention(options, context);
 };
 
 export default { createNodesV2, postTasksExecution, preTasksExecution };
@@ -1508,6 +1520,7 @@ async function createProjectTargets(
     // this target.
     targets['cargo-lint'] = {
       executor: 'nx:run-commands',
+      metadata: CARGO_PRODUCER_METADATA,
       cache: true,
       inputs: workspaceCargoInputs,
       outputs: [],
@@ -1546,6 +1559,7 @@ async function createProjectTargets(
     // macOS host demand the zig toolchain that the devenv profile keeps opt-in.
     targets[CARGO_CROSS_LINT_TARGET] = {
       executor: 'nx:run-commands',
+      metadata: CARGO_PRODUCER_METADATA,
       cache: true,
       inputs: workspaceCargoInputs,
       outputs: [],
@@ -1561,23 +1575,27 @@ async function createProjectTargets(
     // progress, so its bound is a wall-clock backstop, not a performance budget.
     targets.mutation = {
       executor: '@smoothbricks/nx-plugin:bounded-exec',
+      metadata: CARGO_PRODUCER_METADATA,
       cache: false,
       options: { command: cargoFrozen('mutants --workspace'), cwd: cargoWorkspaceRoot, timeoutMs: MUTATION_TIMEOUT_MS },
     };
     targets.bench = {
       executor: 'nx:run-commands',
+      metadata: CARGO_PRODUCER_METADATA,
       cache: false,
       options: { command: cargoFrozen('bench --workspace'), cwd: cargoWorkspaceRoot },
     };
-    // Target-dir GC. Cargo never removes superseded artifacts, so a busy
-    // workspace grows tens of GB of stale variants no fingerprint references;
-    // sweeping by age prunes exactly that junk while the warm current
-    // surface — the gated asset — survives untouched. Never cached: the
-    // verdict is about this machine's disk, not the commit.
-    targets['cargo-sweep'] = {
+    // A read-only preview of the retention pass the plugin's postTasksExecution
+    // schedules after runs that built (./cargo-retention.ts): the superseded unit
+    // generations it would reclaim and why everything else stays. Never cached:
+    // the verdict is about this machine's disk, not the commit.
+    targets['cargo-retention'] = {
       executor: 'nx:run-commands',
       cache: false,
-      options: { command: 'cargo sweep --time 7', cwd: cargoWorkspaceRoot },
+      options: {
+        command: `node ${posix.join(posix.relative(cargoWorkspaceRoot, '.'), CARGO_RETAIN_BIN)}`,
+        cwd: cargoWorkspaceRoot,
+      },
     };
   }
 
@@ -2284,6 +2302,7 @@ function createNapiTargets(
   // production loads never see it.
   targets['napi-debug'] = {
     executor: 'nx:run-commands',
+    metadata: CARGO_PRODUCER_METADATA,
     cache: true,
     dependsOn: ['^build'],
     inputs: cargoInputs,
@@ -2305,6 +2324,7 @@ function createNapiTargets(
       `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputPath('dist/native/host')}${recordInputs(null, profile, outputPath('dist/native/host'))}`;
     targets['cargo-napi'] = {
       executor: 'nx:run-commands',
+      metadata: CARGO_PRODUCER_METADATA,
       cache: true,
       dependsOn: ['^build'],
       inputs: cargoInputs,
@@ -2331,6 +2351,7 @@ function createNapiTargets(
       // target/<triple>.2.17/), so the executor names the `.node` itself.
       targets[targetName] = {
         executor: '@smoothbricks/nx-plugin:cargo-zigbuild',
+        metadata: CARGO_PRODUCER_METADATA,
         cache: true,
         inputs: napiInputs(projectRoot, repoRooted, []),
         outputs: [`{projectRoot}/${outputDirectory}/`],
@@ -2350,6 +2371,7 @@ function createNapiTargets(
       `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.${convention.outputName}.d.ts --target ${triple} ${commonCommand} --output-dir ${outputPath(outputDirectory)}${recordInputs(triple, profile, outputPath(outputDirectory))}`;
     targets[targetName] = {
       executor: 'nx:run-commands',
+      metadata: CARGO_PRODUCER_METADATA,
       cache: true,
       inputs: cargoInputs,
       outputs: [`{projectRoot}/${outputDirectory}/`],

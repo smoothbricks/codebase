@@ -4,6 +4,7 @@
     "src/nx-remote-cache-outage.test.ts": 215095,
     "src/executors/bounded-exec/go-progress-host.test.ts": 113358,
     "src/ensure-built.test.ts": 95053,
+    "src/cargo-retention.test.ts": 77327,
     "src/testing.test.ts": 71687,
     "src/nx-task-output-lease.test.ts": 51426,
     "src/nextest-partitions.test.ts": 51407,

@@ -168,9 +168,9 @@ last 60 lines before fixture retirement removes them. The record-change and rest
 The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
 
 - **Workspace owner:** the project beside a workspace `Cargo.toml` owns one `cargo-fetch`, `cargo-test-compile`,
-  `cargo-test-archive`, `cargo-lint`, cross-check, mutation, bench, and sweep target. Its `cargo-lint` and `cargo-test`
-  aggregates reach all workspace crates, including a root `[package]`; `cargo-test` is the ordinary suite, and the
-  project's `test` also reaches the serial test groups (below).
+  `cargo-test-archive`, `cargo-lint`, cross-check, mutation, bench, and `cargo-retention` target. Its `cargo-lint` and
+  `cargo-test` aggregates reach all workspace crates, including a root `[package]`; `cargo-test` is the ordinary suite,
+  and the project's `test` also reaches the serial test groups (below).
 - **Crate owner:** the deepest Nx project directory containing a crate owns `cargo-test-<crate>` targets. Its
   `cargo-lint` delegates to the workspace owner's one verdict, and `lint` never depends on the workspace test suite.
   Projects can own multiple crates. A nested independent workspace has its own prerequisites and does not inherit those
@@ -187,6 +187,35 @@ The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
   replayed from Fresh units, so the two share one unit set and the gate still fails. Cargo's own lock serializes the
   invocations that share the directory. `cargo-lint-cross` keeps `target/cargo-lint-cross`: a foreign triple's units are
   distinct anyway, and its own lock keeps the cross check from queueing behind host builds.
+- **Retention:** Cargo never deletes a unit generation a later build superseded, so a busy checkout's target directory
+  only grows. After each Nx run that executed a Cargo producer (an inferred target that builds, checks or tests into the
+  target directory, marked by its `cargoProducer` metadata: `cargo-test-compile`, `cargo-test-archive`, `cargo-test`,
+  `cargo-lint`, `cargo-lint-cross`, mutation, bench, and the napi and wasm builds), the plugin's `postTasksExecution`
+  checks whether each Cargo workspace is due for maintenance. Automatic passes run at most once per 24 hours after a
+  successful completed pass; its existing receipt records completion time and configuration/workspace/target identity. A
+  not-due hook reports that scheduling decision without locks, a fingerprint scan, cleanup or receipt replacement. It
+  does not claim newer outputs were inspected or the graph is unchanged. Busy, refused, invalid, foreign or
+  backward-clock receipt evidence never postpones the next attempt. The first executed producer after the interval runs
+  a current pass; cache replays, fetch and noop tasks start none. Manual preview and apply always run fresh. Due passes
+  reclaim superseded generations under `<profile>/build/<package>/<META>/`. They keep the newest generation of each unit
+  identity of a workspace member (identity is every fingerprint field but its edges and source state, integers read
+  exactly), every unit used in the last 24 hours (`-Zmtime-on-use` stamps each use), and the transitive dependency
+  closure of those across every profile, host and cross alike. A pass holds every profile's Cargo locks without waiting:
+  one held lock skips the pass as `busy`, and a profile it cannot read (legacy layout, unreadable fingerprint, missing
+  `build/` or lock) refuses the whole pass. It moves each reclaimed generation into the profile's
+  `.smoo-retention-trash/` under that hold, recording its inode first, and unlinks it after letting go; it writes its
+  last report to `<target>/.smoo-cargo-retention.json`. Cargo's root-relative fingerprint paths distinguish cross
+  profiles from nested target roots under the lock; mixed, foreign or unprovable cross-profile roots refuse the pass
+  rather than silently dropping their dependency edges. A pre-created target need not carry Cargo's optional backup tag;
+  a present but invalid tag still refuses the pass. Every pass still reads the current fingerprint graph. The locked
+  scan reuses directory-entry types and reads its small metadata files synchronously, avoiding duplicate stats and one
+  asynchronous dispatch per tiny file; it does not walk retained artifact contents or reuse an earlier graph that could
+  miss in-place recompiles. `cargo-retention` previews the same selection without changing anything. `incremental/`,
+  nested target directories (`cargo-lint-cross`) and the split-debuginfo objects rustc keeps inside current generations
+  (rust-lang/rust#161824) are not reclaimed, so the target directory is not bounded. Empty fingerprint hashes are kept
+  as unfinished compilations. The preservation proof covers Cargo's current unit and dependency records, not every debug
+  reference in copied binaries or other checkouts. In particular, a binary copied up before a failed link can outlive
+  the generation its debug map names; this pass does not establish that machine-wide debug closure.
 - **Scheduling:** inference never throttles Nx. It sets no `parallelism: false` or `parallel: false`, no cap, and no
   edge whose only purpose is keeping two cargo writers off one `target/`: Cargo owns that lock, and a second process
   waits inside cargo. An edge states a real consumer — fetch before frozen cargo, the archive before the runners,

@@ -1093,8 +1093,10 @@ delta incrementally, as an edit would.
   documents). Its database and its cache directory are always the same pair, so its eviction never deletes what another
   database indexes. A carried entry keeps the row the target held, last use included, so it ages out as it would have in
   the target, and the carry indexes every entry it places, so nothing it writes escapes Nx's eviction; its staging
-  directory is its own to delete (Land, "Carry"). Gc never opens a volume's contents. Cargo's target directory is
-  bounded by the tree it builds; cowshed does not prune it.
+  directory is its own to delete (Land, "Carry"). Gc never opens a volume's contents. Cargo does not bound its target
+  directory: it keeps every unit generation a later build superseded, and rustc keeps every split-debuginfo object set
+  it writes (rust-lang/rust#161824). The Nx plugin's Cargo retention reclaims superseded generations after each run that
+  built (`packages/nx-plugin/README.md`, "Cargo Workspace Layouts"); cowshed does not prune target directories.
 - A workspace's build volume retires with the workspace (`cowshed rm`, which collects before it answers, an unfinished
   clone's removal included), unless main adopted it.
 

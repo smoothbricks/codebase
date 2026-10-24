@@ -19,6 +19,10 @@ linker = "smoothbricks-macos-linker"
 [unstable]
 feature-unification = true
 checksum-freshness = true
+# Cargo stamps each unit's fingerprint hash file on every use, Fresh included,
+# so the nx-plugin's retention tells a unit still in use from one only built
+# long ago. It changes no unit hash and no freshness verdict.
+mtime-on-use = true
 
 [resolver]
 feature-unification = "workspace"
