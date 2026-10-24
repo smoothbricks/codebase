@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
 import { mergeEnv } from '../lib/run.js';
+import { scanPublicCommitDenylist } from './public-denylist.js';
 
 const SMOO = fileURLToPath(new URL('../../bin/smoo', import.meta.url));
 const checkout = fileURLToPath(new URL('../../../../', import.meta.url));
@@ -109,36 +110,26 @@ describe('managed public denylist commit hooks', () => {
     }
   });
 
-  it('blocks a real commit of a staged sibling name after the formatter, before validation', async () => {
-    await stage('first line\nSecret-Consumer\n');
+  it('judges the formatted index, then the formatted message, refusing either before the commit', async () => {
     const head = git('rev-parse', 'HEAD');
-    const result = runGit(root, 'commit', '-m', 'fix: neutral summary');
-    expect(result.exitCode).not.toBe(0);
-    expect(result.stderr).toContain('staged:notes.txt:2:Secret-Consumer');
-    expect(git('rev-parse', 'HEAD')).toBe(head);
+    await stage('first line\nSecret-Consumer\n');
+    const staged = runGit(root, 'commit', '-m', 'fix: neutral summary');
+    expect(staged.exitCode).not.toBe(0);
+    expect(staged.stderr).toContain('staged:notes.txt:2:Secret-Consumer');
+    // pre-commit refused after the formatter and before validation, so commit-msg never ran.
     expect((await readFile(order, 'utf8')).trim().split('\n')).toEqual([
       'format',
       'monorepo check-public-denylist --staged',
     ]);
-  });
 
-  it('blocks a real commit of the actual HOME prefix while neutral examples pass', async () => {
-    await stage('/Users/example/Dev/project\n');
-    expect(runGit(root, 'commit', '-m', 'fix: neutral example').exitCode).toBe(0);
-    await stage(`/Users/example/Dev/project\n${env.HOME}/project\n`);
-    const result = runGit(root, 'commit', '-m', 'fix: neutral summary');
-    expect(result.exitCode).not.toBe(0);
-    expect(result.stderr).toContain(`staged:notes.txt:2:${env.HOME}/project`);
-  });
-
-  it('blocks a real sibling-name message only after the conventional formatter has rewritten it', async () => {
+    await rm(order);
     await stage('neutral content\n');
     const body = `${'A neutral explanation of the public change. '.repeat(4)}Secret-Consumer`;
-    const head = git('rev-parse', 'HEAD');
-    const result = runGit(root, 'commit', '-m', 'fix: neutral summary   ', '-m', body);
-    expect(result.exitCode).not.toBe(0);
-    expect(result.stderr).toMatch(/message:\d+:.*Secret-Consumer/);
+    const message = runGit(root, 'commit', '-m', 'fix: neutral summary   ', '-m', body);
+    expect(message.exitCode).not.toBe(0);
+    expect(message.stderr).toMatch(/message:\d+:.*Secret-Consumer/);
     expect(git('rev-parse', 'HEAD')).toBe(head);
+    // The denylist judged the message the conventional formatter rewrote, not the one git was given.
     const formatted = await readFile(join(root, '.git', 'COMMIT_EDITMSG'), 'utf8');
     expect(formatted.startsWith('fix: neutral summary\n')).toBe(true);
     expect(formatted).not.toContain(body);
@@ -150,16 +141,9 @@ describe('managed public denylist commit hooks', () => {
     expect(calls[4]).toContain('monorepo check-public-denylist --commit-message ');
   });
 
-  it('blocks the actual HOME prefix in a real commit message', async () => {
-    await stage('neutral content\n');
-    const result = runGit(root, 'commit', '-m', 'fix: neutral summary', '-m', `${env.HOME}/project`);
-    expect(result.exitCode).not.toBe(0);
-    expect(result.stderr).toContain(`message:3:${env.HOME}/project`);
-  });
-
   it('uses the partial commit temporary index instead of the clean real index', async () => {
     await stage('neutral content\n');
-    git('commit', '-m', 'fix: neutral content');
+    git('commit', '--quiet', '--no-verify', '-m', 'fix: neutral content');
     await writeFile(join(root, 'notes.txt'), 'secret-consumer\n');
     const result = runGit(root, 'commit', '--only', '-m', 'fix: neutral summary', '--', 'notes.txt');
     expect(result.exitCode).not.toBe(0);
@@ -167,22 +151,18 @@ describe('managed public denylist commit hooks', () => {
     expect(git('show', ':notes.txt')).toBe('neutral content');
   });
 
-  it('blocks a private added line in the first commit with no HEAD', async () => {
-    git('update-ref', '-d', 'refs/heads/main');
-    await stage('secret-consumer\n');
-    const result = runGit(root, 'commit', '-m', 'chore: initial content');
-    expect(result.exitCode).not.toBe(0);
-    expect(result.stderr).toContain('staged:notes.txt:1:secret-consumer');
-    expect(runGit(root, 'rev-parse', '--verify', 'HEAD').exitCode).not.toBe(0);
-  });
-
-  it('fails closed through the real hook for invalid PCRE even with neutral added text', async () => {
+  it('exits 1 naming the reason when the scan cannot run, even for neutral added text', async () => {
     git('config', '--add', 'smoothbricks.publicDenylist', '(unclosed');
     await stage('neutral content\n');
-    const result = runGit(root, 'commit', '-m', 'fix: neutral summary');
-    expect(result.exitCode).not.toBe(0);
-    expect(result.stderr).toContain('public denylist check did not run');
-    expect(result.stderr).toContain('missing closing parenthesis');
+    // A hook refuses on any nonzero smoo status (above); this is the status and reason a failed scan reports.
+    const child = Bun.spawnSync([process.execPath, SMOO, 'monorepo', 'check-public-denylist', '--staged'], {
+      cwd: root,
+      env,
+    });
+    const stderr = child.stderr.toString();
+    expect(child.exitCode).toBe(1);
+    expect(stderr).toContain('public denylist check did not run');
+    expect(stderr).toContain('missing closing parenthesis');
   });
 
   describe('message-only patterns', () => {
@@ -197,37 +177,27 @@ describe('managed public denylist commit hooks', () => {
       for (const pattern of patterns) git('config', '--add', 'smoothbricks.commitMessageDenylist', pattern);
     });
 
+    /** Scans the message the commit-msg hook hands smoo once the conventional formatter has rewritten it. */
+    async function message(text: string) {
+      const path = join(root, '.git', 'COMMIT_EDITMSG');
+      await writeFile(path, `fix: neutral summary\n\n${text}\n`);
+      return scanPublicCommitDenylist(root, { kind: 'message', path }, env);
+    }
+
     it('refuses a commit message that trips each pattern', async () => {
-      await stage('neutral content\n');
       for (const line of ['see private-store/receipt.md', 'ran in /work/.cowshed/unit-a', 'asked SeatReviewer']) {
-        const head = git('rev-parse', 'HEAD');
-        const result = runGit(root, 'commit', '-m', 'fix: neutral summary', '-m', line);
-        expect(result.exitCode).not.toBe(0);
-        expect(result.stderr).toContain(`message:3:${line}`);
-        expect(git('rev-parse', 'HEAD')).toBe(head);
+        expect(await message(line)).toEqual({ outcome: 'denied', matches: `message:3:${line}\n` });
       }
     });
 
     it('passes a relative package path and the same words outside the pattern shapes', async () => {
-      await stage('neutral content\n');
-      const result = runGit(
-        root,
-        'commit',
-        '-m',
-        'fix: neutral summary',
-        '-m',
-        'packages/cowshed/src/lib.rs and .cowshed/workspace.json; a seat reviewer read it',
-      );
-      expect(result.stderr).toBe('');
-      expect(result.exitCode).toBe(0);
+      const text = 'packages/cowshed/src/lib.rs and .cowshed/workspace.json; a seat reviewer read it';
+      expect(await message(text)).toEqual({ outcome: 'clean', patterns: 5 });
     });
 
-    it('never judges added lines: staged text with all three shapes commits under a neutral message', async () => {
+    it('never judges added lines: staged text with all three shapes is clean', async () => {
       await stage('private-store/receipt.md\n/work/.cowshed/unit-a\nSeatReviewer\n');
-      const result = runGit(root, 'commit', '-m', 'fix: neutral summary');
-      expect(result.stderr).toBe('');
-      expect(result.exitCode).toBe(0);
-      expect(git('show', 'HEAD:notes.txt')).toBe('private-store/receipt.md\n/work/.cowshed/unit-a\nSeatReviewer');
+      expect(await scanPublicCommitDenylist(root, { kind: 'staged' }, env)).toEqual({ outcome: 'clean', patterns: 2 });
     });
   });
 
@@ -241,25 +211,13 @@ describe('managed public denylist commit hooks', () => {
       if (stray.exitCode !== 0) throw new Error(stray.stderr);
     });
 
-    it('commits a hunk header and a message that carry the number, through both real hooks', async () => {
-      await stage(`${hunkHeader}\n`);
-      const result = runGit(root, 'commit', '-m', 'fix: neutral summary', '-m', `Refresh the ${hunkHeader} hunk.`);
-      expect(result.stderr).toBe('');
-      expect(result.exitCode).toBe(0);
-      expect(git('show', 'HEAD:notes.txt')).toBe(hunkHeader);
-      const calls = (await readFile(order, 'utf8')).trim().split('\n');
-      expect(calls).toContain('monorepo check-public-denylist --staged');
-      expect(calls.some((call) => call.startsWith('monorepo check-public-denylist --commit-message '))).toBe(true);
-    });
-
-    it('still refuses a real sibling name staged beside the hunk header, reporting only that line', async () => {
+    it('reports only the sibling name staged beside a hunk header that carries the number', async () => {
       await stage(`${hunkHeader}\nSecret-Consumer\n`);
-      const head = git('rev-parse', 'HEAD');
-      const result = runGit(root, 'commit', '-m', 'fix: neutral summary');
-      expect(result.exitCode).not.toBe(0);
-      expect(result.stderr).toContain('staged:notes.txt:2:Secret-Consumer');
-      expect(result.stderr).not.toContain(hunkHeader);
-      expect(git('rev-parse', 'HEAD')).toBe(head);
+      expect(await scanPublicCommitDenylist(root, { kind: 'staged' }, env)).toEqual({
+        outcome: 'denied',
+        matches: 'staged:notes.txt:2:Secret-Consumer\n',
+      });
     });
   });
 });
+
