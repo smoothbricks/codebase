@@ -416,32 +416,6 @@ it('a Cargo that cannot run, or whose answer is not metadata, is a CargoMetadata
   });
 });
 
-it('source edits, non-Rust edits and a rewrite of the same bytes never run Cargo', async () => {
-  await withCannedWorkspace(async ({ root, cargo, answer, members, workspace }) => {
-    await answer('cold');
-    expect(await members()).toEqual(['cold']);
-    const unkeyed: [string, () => Promise<void>][] = [
-      ['a source edit', () => put(workspace, 'crates/leaf/src/lib.rs', 'pub fn leaf() -> u8 { 2 }\n')],
-      ['a new source file', () => put(workspace, 'crates/leaf/src/extra.rs', 'pub const EXTRA: u8 = 1;\n')],
-      ['a non-Rust edit', () => put(workspace, 'README.md', '# edited\n')],
-      ['a new non-Rust file', () => put(workspace, 'crates/leaf/notes.json', '{}\n')],
-      ['the manifest rewritten with the same bytes', () => touch(workspace, 'crates/leaf/Cargo.toml')],
-      ['Cargo.lock rewritten with the same bytes', () => touch(workspace, 'Cargo.lock')],
-      [
-        'a source edit outside the workspace',
-        () => put(root, 'external/src/lib.rs', 'pub fn external() -> u8 { 11 }\n'),
-      ],
-    ];
-    for (const [what, change] of unkeyed) {
-      await change();
-      // A Cargo asked after this change would say so.
-      await answer(`after ${what}`);
-      expect(await members(), what).toEqual(['cold']);
-    }
-    expect(await spawned(cargo)).toBe(1);
-  });
-});
-
 interface KeyedFile {
   readonly name: string;
   /** Relative to the fixture root; the workspace is `workspace/` in it. */
@@ -480,63 +454,121 @@ const KEYED_FILES: readonly KeyedFile[] = [
   { name: 'tooling/direnv/devenv.lock', path: 'workspace/tooling/direnv/devenv.lock', exists: false, removable: true },
 ];
 
-for (const file of KEYED_FILES) {
-  it(`resolves again exactly once when ${file.name} changes, and not again for the same bytes`, async () => {
-    await withCannedWorkspace(async ({ root, cargo, answer, members }) => {
-      const resolvesAs = async (name: string): Promise<string[]> => {
-        await answer(name);
-        return members();
-      };
-      expect(await resolvesAs('cold')).toEqual(['cold']);
-      expect(await spawned(cargo)).toBe(1);
+// One canned workspace walks every input Cargo's answer keys on, each step from the state the one before left. A change
+// to a keyed input is a cache miss by construction; the same bytes, and a change nothing keys on, are answered from the
+// cache. Every merged case's label stays in its assertion messages.
+it("resolves again exactly once when an input Cargo's answer keys on changes, and never for the same bytes or what it does not key on", async () => {
+  await withCannedWorkspace(async ({ root, workspace, cargo, answer, members, environment }) => {
+    const resolvesAs = async (name: string, selection: Readonly<Record<string, string>> = {}): Promise<string[]> => {
+      await answer(name);
+      return withEnvironment(selection, members);
+    };
+    expect(await resolvesAs('cold')).toEqual(['cold']);
+    let runs = await spawned(cargo);
+    expect(runs).toBe(1);
 
+    // Changes nothing Cargo's answer keys on: the cache answers, and Cargo, asked now, would say otherwise.
+    const unkeyed: [string, () => Promise<void>][] = [
+      ['a source edit', () => put(workspace, 'crates/leaf/src/lib.rs', 'pub fn leaf() -> u8 { 2 }\n')],
+      ['a new source file', () => put(workspace, 'crates/leaf/src/extra.rs', 'pub const EXTRA: u8 = 1;\n')],
+      ['a non-Rust edit', () => put(workspace, 'README.md', '# edited\n')],
+      ['a new non-Rust file', () => put(workspace, 'crates/leaf/notes.json', '{}\n')],
+      ['the manifest rewritten with the same bytes', () => touch(workspace, 'crates/leaf/Cargo.toml')],
+      ['Cargo.lock rewritten with the same bytes', () => touch(workspace, 'Cargo.lock')],
+      [
+        'a source edit outside the workspace',
+        () => put(root, 'external/src/lib.rs', 'pub fn external() -> u8 { 11 }\n'),
+      ],
+    ];
+    for (const [what, change] of unkeyed) {
+      await change();
+      // A Cargo asked after this change would say so.
+      await answer(`after ${what}`);
+      expect(await members(), what).toEqual(['cold']);
+    }
+    expect(await spawned(cargo)).toBe(1);
+
+    // Each input Cargo's answer keys on: one change resolves again once; the same bytes never do, nor bytes with an
+    // identical size and mtime; removing a removable input resolves again once more.
+    for (const file of KEYED_FILES) {
+      const { name } = file;
       const original = file.exists ? await readFile(join(root, file.path), 'utf8') : '';
       await put(root, file.path, `${original}# one\n`);
-      expect(await resolvesAs('one')).toEqual(['one']);
-      expect(await spawned(cargo)).toBe(2);
+      expect(await resolvesAs(`${name}: one`), name).toEqual([`${name}: one`]);
+      runs += 1;
+      expect(await spawned(cargo), name).toBe(runs);
 
       // The bytes are the same, so Cargo, which would answer differently, is not asked.
       await touch(root, file.path);
-      expect(await resolvesAs('same bytes')).toEqual(['one']);
-      expect(await spawned(cargo)).toBe(2);
+      expect(await resolvesAs(`${name}: same bytes`), name).toEqual([`${name}: one`]);
+      expect(await spawned(cargo), name).toBe(runs);
 
       // Identical size and mtime cannot stand in for the current bytes.
       const before = await stat(join(root, file.path));
       await put(root, file.path, `${original}# two\n`);
       await utimes(join(root, file.path), before.atime, before.mtime);
-      expect(await resolvesAs('two')).toEqual(['two']);
-      expect(await spawned(cargo)).toBe(3);
+      expect(await resolvesAs(`${name}: two`), name).toEqual([`${name}: two`]);
+      runs += 1;
+      expect(await spawned(cargo), name).toBe(runs);
 
       if (file.removable) {
         await rm(join(root, file.path));
-        expect(await resolvesAs('removed')).toEqual(['removed']);
-        expect(await spawned(cargo)).toBe(4);
+        expect(await resolvesAs(`${name}: removed`), name).toEqual([`${name}: removed`]);
+        runs += 1;
+        expect(await spawned(cargo), name).toBe(runs);
       }
-      expect(await resolvesAs('settled')).toEqual([file.removable ? 'removed' : 'two']);
-      expect(await spawned(cargo)).toBe(file.removable ? 4 : 3);
-    });
-  });
-}
+      expect(await resolvesAs(`${name}: settled`), name).toEqual([
+        file.removable ? `${name}: removed` : `${name}: two`,
+      ]);
+      expect(await spawned(cargo), name).toBe(runs);
+    }
 
-it('retargeting a configuration symlink with identical bytes still resolves the new canonical input', async () => {
-  await withCannedWorkspace(async ({ root, workspace, cargo, answer, members }) => {
+    // A configuration symlink retargeted with identical bytes: its canonical input is what Cargo's answer keys on.
+    const retargets = 'retargeting a configuration symlink with identical bytes still resolves the new canonical input';
     const config = join(workspace, '.cargo/config.toml');
     await put(root, 'config-a.toml', '[net]\noffline=true\n');
     await put(root, 'config-b.toml', '[net]\noffline=true\n');
     await mkdir(dirname(config), { recursive: true });
     await symlink(join(root, 'config-a.toml'), config);
-    await answer('first target');
-    expect(await members()).toEqual(['first target']);
-    expect(await spawned(cargo)).toBe(1);
+    expect(await resolvesAs('symlink: first target'), retargets).toEqual(['symlink: first target']);
+    runs += 1;
+    expect(await spawned(cargo), retargets).toBe(runs);
 
     await rm(config);
     await symlink(join(root, 'config-b.toml'), config);
-    await answer('second target');
-    expect(await members()).toEqual(['second target']);
-    expect(await spawned(cargo)).toBe(2);
-    await answer('unchanged');
-    expect(await members()).toEqual(['second target']);
-    expect(await spawned(cargo)).toBe(2);
+    expect(await resolvesAs('symlink: second target'), retargets).toEqual(['symlink: second target']);
+    runs += 1;
+    expect(await spawned(cargo), retargets).toBe(runs);
+    expect(await resolvesAs('symlink: unchanged'), retargets).toEqual(['symlink: second target']);
+    expect(await spawned(cargo), retargets).toBe(runs);
+
+    // The cargo on PATH and the rustup selection are keyed by value: each new selection resolves again once.
+    const selects = 'resolves again exactly once when the cargo on PATH or the rustup selection changes';
+    expect(await resolvesAs('toolchain a', { RUSTUP_TOOLCHAIN: 'fixture-a' }), selects).toEqual(['toolchain a']);
+    runs += 1;
+    expect(await spawned(cargo), selects).toBe(runs);
+    expect(await resolvesAs('same selection', { RUSTUP_TOOLCHAIN: 'fixture-a' }), selects).toEqual(['toolchain a']);
+    expect(await spawned(cargo), selects).toBe(runs);
+
+    expect(await resolvesAs('toolchain b', { RUSTUP_TOOLCHAIN: 'fixture-b' }), selects).toEqual(['toolchain b']);
+    runs += 1;
+    expect(await spawned(cargo), selects).toBe(runs);
+
+    const selected = { RUSTUP_TOOLCHAIN: 'fixture-b', RUSTUP_HOME: join(root, 'rustup-home') };
+    expect(await resolvesAs('rustup home', selected), selects).toEqual(['rustup home']);
+    runs += 1;
+    expect(await spawned(cargo), selects).toBe(runs);
+
+    // The same bytes of Cargo, found elsewhere, are not the same Cargo: a toolchain proxy is a path.
+    const other = join(root, 'other-bin');
+    await mkdir(other, { recursive: true });
+    await writeFile(join(other, 'cargo'), await readFile(join(cargo.bin, 'cargo')), { mode: 0o755 });
+    const elsewhere = { ...selected, PATH: `${other}${delimiter}${environment.PATH}` };
+    expect(await resolvesAs('another cargo', elsewhere), selects).toEqual(['another cargo']);
+    runs += 1;
+    expect(await spawned(cargo), selects).toBe(runs);
+    expect(await resolvesAs('same cargo', elsewhere), selects).toEqual(['another cargo']);
+    expect(await spawned(cargo), selects).toBe(runs);
   });
 });
 
@@ -560,39 +592,6 @@ it('a resolution input read failure is not a missing file or a reusable answer',
     await answer('trap');
     expect(await members()).toEqual(['cold']);
     expect(await spawned(cargo)).toBe(1);
-  });
-});
-
-it('resolves again exactly once when the cargo on PATH or the rustup selection changes', async () => {
-  await withCannedWorkspace(async ({ root, cargo, answer, members, environment }) => {
-    const resolvesAs = async (name: string, selection: Record<string, string> = {}): Promise<string[]> => {
-      await answer(name);
-      return withEnvironment(selection, members);
-    };
-    expect(await resolvesAs('cold')).toEqual(['cold']);
-    expect(await spawned(cargo)).toBe(1);
-
-    expect(await resolvesAs('toolchain a', { RUSTUP_TOOLCHAIN: 'fixture-a' })).toEqual(['toolchain a']);
-    expect(await spawned(cargo)).toBe(2);
-    expect(await resolvesAs('same selection', { RUSTUP_TOOLCHAIN: 'fixture-a' })).toEqual(['toolchain a']);
-    expect(await spawned(cargo)).toBe(2);
-
-    expect(await resolvesAs('toolchain b', { RUSTUP_TOOLCHAIN: 'fixture-b' })).toEqual(['toolchain b']);
-    expect(await spawned(cargo)).toBe(3);
-
-    const selected = { RUSTUP_TOOLCHAIN: 'fixture-b', RUSTUP_HOME: join(root, 'rustup-home') };
-    expect(await resolvesAs('rustup home', selected)).toEqual(['rustup home']);
-    expect(await spawned(cargo)).toBe(4);
-
-    // The same bytes of Cargo, found elsewhere, are not the same Cargo: a toolchain proxy is a path.
-    const other = join(root, 'other-bin');
-    await mkdir(other, { recursive: true });
-    await writeFile(join(other, 'cargo'), await readFile(join(cargo.bin, 'cargo')), { mode: 0o755 });
-    const elsewhere = { ...selected, PATH: `${other}${delimiter}${environment.PATH}` };
-    expect(await resolvesAs('another cargo', elsewhere)).toEqual(['another cargo']);
-    expect(await spawned(cargo)).toBe(5);
-    expect(await resolvesAs('same cargo', elsewhere)).toEqual(['another cargo']);
-    expect(await spawned(cargo)).toBe(5);
   });
 });
 
@@ -714,34 +713,6 @@ it('fresh processes that ask at once for a workspace nobody has resolved share o
   });
 });
 
-it('a worker that exits on SIGTERM while Cargo resolves leaves no cargo child behind', async () => {
-  await withCannedWorkspace(async ({ root, workspace, manifest, cargo, answer, environment }) => {
-    await answer('before');
-    await cargo.beforeAnswer.close();
-    const worker = join(root, 'worker.ts');
-    await writeFile(
-      worker,
-      [
-        `import { readCargoResolve } from ${JSON.stringify(sourceModule)};`,
-        // What an Nx plugin worker does on SIGTERM, SIGINT, SIGQUIT and its host hanging up.
-        "process.once('SIGTERM', () => process.exit(0));",
-        `readCargoResolve(${JSON.stringify(manifest)}, ${JSON.stringify(workspace)})`,
-        '  .then(() => process.exit(2), () => process.exit(3));',
-        '',
-      ].join('\n'),
-    );
-    const proc = spawnDrained([process.execPath, worker], workspace, environment);
-    const [pid] = (await cargo.waitForRuns((runs) => runs.spawned === 1, 'the cargo child')).pids;
-    if (pid === undefined) throw new Error('the cargo child has no pid');
-    expect(alive(pid)).toBe(true);
-    proc.kill('SIGTERM');
-    const ended = await guardEvent(proc.ended, 'the worker to exit on SIGTERM', () => proc.describe());
-    expect(ended.exitCode, proc.describe()).toBe(0);
-    // The child's end is the end of its connection to the fixture, killed before it answered.
-    await cargo.waitForDisconnects([pid]);
-  });
-});
-
 it("a worker that exits with callers waiting on two resolutions leaves none of Cargo's processes behind, and the next process resolves normally", async () => {
   await withCannedWorkspace(async (fixture) => {
     const { root, workspace, manifest, cargo, answer, environment } = fixture;
@@ -802,27 +773,30 @@ it("a worker that exits with callers waiting on two resolutions leaves none of C
 // A standalone `smoo-nx-cargo-hash` has no handler of its own, so a signal would end it on the spot,
 // before any exit hook could take the Cargo it started along. The module forwards the signal to
 // Cargo's process group and then raises it again, so the command still ends by that signal.
-for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
-  it(`a standalone smoo-nx-cargo-hash ended by ${signal} takes its cargo child and what the child left behind with it`, async () => {
-    await withCannedWorkspace(async ({ workspace, cargo, answer, environment }) => {
-      await answer('before');
-      await cargo.leaveGrandchildren(true);
-      await cargo.beforeAnswer.close();
+const signals = ['SIGTERM', 'SIGINT', 'SIGHUP'] as const;
+it('a standalone smoo-nx-cargo-hash ended by SIGTERM, SIGINT or SIGHUP takes its cargo child and what the child left behind with it', async () => {
+  await withCannedWorkspace(async ({ workspace, cargo, answer, environment }) => {
+    await answer('before');
+    await cargo.leaveGrandchildren(true);
+    // One workspace serves all three: each process ends while its own child holds before the answer, so each starts a
+    // child of its own and the children before it are already dead.
+    await cargo.beforeAnswer.close();
+    for (const [index, signal] of signals.entries()) {
       const proc = spawnDrained([process.execPath, cliModule, 'Cargo.toml'], workspace, environment);
       const runs = await cargo.waitForRuns(
-        (held) => held.read === 1 && held.grandchildren.length === 1,
-        'the cargo child to hold an answer',
+        (held) => held.read === index + 1 && held.grandchildren.length === index + 1,
+        `the cargo child of the ${signal} process to hold an answer`,
       );
-      const running = [...runs.pids, ...runs.grandchildren];
-      for (const pid of running) expect(alive(pid)).toBe(true);
+      const running = [...runs.pids.slice(index), ...runs.grandchildren.slice(index)];
+      for (const pid of running) expect(alive(pid), signal).toBe(true);
 
       proc.kill(signal);
       const ended = await guardEvent(proc.ended, `smoo-nx-cargo-hash to end by ${signal}`, () => proc.describe());
       expect(ended.signalCode, proc.describe()).toBe(signal);
       await cargo.waitForDisconnects(running);
-    });
+    }
   });
-}
+});
 
 /* ---- The same, with the real Cargo, through the project graph and the hash command ---- */
 
@@ -931,7 +905,9 @@ function closureOf(graph: CreateNodesResultV2, projectRoot: string) {
   );
 }
 
-it('a project graph over an unchanged Cargo workspace runs Cargo once, however often it is recomputed', async () => {
+it('a project graph and fresh smoo-nx-cargo-hash processes over one Cargo workspace run Cargo once per changed input, and a refused resolution fails the graph', async () => {
+  // One Nx and Cargo workspace serves the graph, its refused resolution and the fresh hash processes. Each step changes
+  // what Cargo keys on or asks the same question again; every merged case's label stays in its assertion messages.
   await withGraphWorkspace(async ({ root, workspace, cargo, graph }) => {
     const baseline = byFile(await graph());
     expect(closureOf(baseline, 'packages/app')).toContain(crateFiles('{bridge,leaf}'));
@@ -971,38 +947,75 @@ it('a project graph over an unchanged Cargo workspace runs Cargo once, however o
       expect(await spawned(cargo), what).toBe(expected);
     }
 
-    // And what changes the resolution is seen: the new graph is not the cached one.
-    await put(workspace, 'crates/leaf/Cargo.toml', LEAF_MANIFEST + LEAF_LINK);
-    relock(workspace);
-    const edited = byFile(await graph());
-    expect(closureOf(edited, 'packages/app')).toContain(crateFiles('{bridge,leaf,unrelated}'));
-    expect(byFile(await graph())).toEqual(edited);
-    expect(await spawned(cargo)).toBe(expected + 1);
-  });
-});
-
-it('a Cargo workspace Cargo refuses fails the project graph with a CargoMetadataError, and no runtime hash stands in', async () => {
-  await withGraphWorkspace(async ({ workspace, cargo, graph }) => {
-    expect(closureOf(byFile(await graph()), 'packages/app')).toContain(crateFiles('{bridge,leaf}'));
-
-    // Cargo refuses a Cargo.lock the manifests have outgrown (`--locked`).
+    // Cargo refuses a Cargo.lock the manifests have outgrown (`--locked`). A refusal is no answer: each computation
+    // asks Cargo again.
+    const refused =
+      'a Cargo workspace Cargo refuses fails the project graph with a CargoMetadataError, and no runtime hash stands in';
     await put(workspace, 'crates/leaf/Cargo.toml', LEAF_MANIFEST + LEAF_LINK);
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const refusal = expectGraphRefusal(await rejectionOf(graph()), join(workspace, 'Cargo.toml'));
       for (const [, error] of refusal.errors) {
-        expect(error.message).toContain('lock file');
-        expect(error.message).toContain('--locked');
+        expect(error.message, refused).toContain('lock file');
+        expect(error.message, refused).toContain('--locked');
       }
     }
-    // A refusal is no answer: the second computation asked Cargo again.
-    expect(await spawned(cargo)).toBe(3);
+    expected += 2;
+    expect(await spawned(cargo), refused).toBe(expected);
 
+    // Relocked to the manifests, the graph names the new dependency, and is stable under it.
     relock(workspace);
-    const repaired = byFile(await graph());
-    expect(closureOf(repaired, 'packages/app')).toContain(crateFiles('{bridge,leaf,unrelated}'));
-    expect(JSON.stringify(repaired)).not.toContain('--include-workspace');
-    expect(byFile(await graph())).toEqual(repaired);
-    expect(await spawned(cargo)).toBe(4);
+    const edited = byFile(await graph());
+    expect(closureOf(edited, 'packages/app')).toContain(crateFiles('{bridge,leaf,unrelated}'));
+    expect(JSON.stringify(edited)).not.toContain('--include-workspace');
+    expect(byFile(await graph())).toEqual(edited);
+    expected += 1;
+    expect(await spawned(cargo), refused).toBe(expected);
+
+    // Fresh smoo-nx-cargo-hash processes, as nx.json's runtime input runs them: a process per hash, many at once at the
+    // start of a run.
+    const fresh = 'fresh smoo-nx-cargo-hash processes over an unchanged Cargo workspace run Cargo once between them';
+    const hash = async (...flags: string[]): Promise<string> => {
+      const child = Bun.spawn([process.execPath, cliModule, ...flags, '--closure', 'packages/app', 'Cargo.toml'], {
+        cwd: workspace,
+        env: { ...process.env, ...cargo.environment },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ]);
+      expect(exitCode, stderr).toBe(0);
+      expect(stderr).toBe('');
+      return stdout;
+    };
+    // A manifest comment the cache has not keyed yet: the cold processes resolve it, once between them.
+    await appendFile(join(workspace, 'crates/leaf/Cargo.toml'), '# cli\n');
+    const cold = await Promise.all(Array.from({ length: 4 }, () => hash()));
+    const [initial] = cold;
+    if (initial === undefined) throw new Error('no hash command ran');
+    for (const output of cold) expect(output, fresh).toBe(initial);
+    expected += 1;
+    expect(await spawned(cargo), fresh).toBe(expected);
+    for (let round = 0; round < 3; round += 1) expect(await hash(), fresh).toBe(initial);
+    expect(await spawned(cargo), fresh).toBe(expected);
+
+    // The digest still follows what it hashes: a source outside the Nx workspace, not one inside it.
+    await put(root, 'external/src/lib.rs', 'pub fn answer() -> u8 { 20 }\n');
+    const sourceEdited = await hash();
+    expect(sourceEdited, fresh).not.toBe(initial);
+    await put(workspace, 'crates/leaf/src/lib.rs', 'pub fn answer() -> u8 { 3 }\n');
+    expect(await hash(), fresh).toBe(sourceEdited);
+    expect(await spawned(cargo), fresh).toBe(expected);
+
+    // A manifest outside the Nx workspace is one of Cargo's inputs: one more child, for it alone.
+    await appendFile(join(root, 'external/Cargo.toml'), '# note\n');
+    const manifestEdited = await hash();
+    expect(manifestEdited, fresh).not.toBe(sourceEdited);
+    expect(await hash(), fresh).toBe(manifestEdited);
+    expected += 1;
+    expect(await spawned(cargo), fresh).toBe(expected);
   });
 });
 
@@ -1054,51 +1067,6 @@ for (const replaced of [false, true]) {
     });
   });
 }
-
-it('fresh smoo-nx-cargo-hash processes over an unchanged Cargo workspace run Cargo once between them', async () => {
-  await withGraphWorkspace(async ({ root, workspace, cargo }) => {
-    // As nx.json's runtime input runs it: a process per hash, many at once at the start of a run.
-    const hash = async (...flags: string[]): Promise<string> => {
-      const child = Bun.spawn([process.execPath, cliModule, ...flags, '--closure', 'packages/app', 'Cargo.toml'], {
-        cwd: workspace,
-        env: { ...process.env, ...cargo.environment },
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(child.stdout).text(),
-        new Response(child.stderr).text(),
-        child.exited,
-      ]);
-      expect(exitCode, stderr).toBe(0);
-      expect(stderr).toBe('');
-      return stdout;
-    };
-
-    const cold = await Promise.all(Array.from({ length: 4 }, () => hash()));
-    const [initial] = cold;
-    if (initial === undefined) throw new Error('no hash command ran');
-    for (const output of cold) expect(output).toBe(initial);
-    expect(await spawned(cargo)).toBe(1);
-    for (let round = 0; round < 3; round += 1) expect(await hash()).toBe(initial);
-    expect(await spawned(cargo)).toBe(1);
-
-    // The digest still follows what it hashes: a source outside the Nx workspace, not one inside it.
-    await put(root, 'external/src/lib.rs', 'pub fn answer() -> u8 { 20 }\n');
-    const sourceEdited = await hash();
-    expect(sourceEdited).not.toBe(initial);
-    await put(workspace, 'crates/leaf/src/lib.rs', 'pub fn answer() -> u8 { 2 }\n');
-    expect(await hash()).toBe(sourceEdited);
-    expect(await spawned(cargo)).toBe(1);
-
-    // A manifest outside the Nx workspace is one of Cargo's inputs: one more child, for it alone.
-    await appendFile(join(root, 'external/Cargo.toml'), '# note\n');
-    const manifestEdited = await hash();
-    expect(manifestEdited).not.toBe(sourceEdited);
-    expect(await hash()).toBe(manifestEdited);
-    expect(await spawned(cargo)).toBe(2);
-  });
-});
 
 it('a Cargo child that never answers is killed and named at the resolve bound', async () => {
   await withCannedWorkspace(async ({ cargo, answer, workspace, manifest }) => {
