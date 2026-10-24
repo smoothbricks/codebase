@@ -83,7 +83,7 @@ error[E0599]: no method named `span` found for reference `&TraceContext` in the 
 fn provenance_probe_callsite_stays_the_tracked_file() {
     let probe = "provenance_required_9_9.rs";
     let preferred = format!(
-        "error[E0599]: no method named `span` found for reference `&TraceContext` in the current scope\n --> /tmp/lmao-provenance/{probe}:4:19\n  |\n{CALLSITE_SOURCE}\n  |                   ^^^^\n  |\n{SPAN_HELP}\n --> src/context.rs:76:4\n"
+        "error[E0599]: no method named `span` found for reference `&TraceContext` in the current scope\n --> wip/provenance-probe-9-9/{probe}:4:19\n  |\n{CALLSITE_SOURCE}\n  |                   ^^^^\n  |\n{SPAN_HELP}\n --> src/context.rs:76:4\n"
     );
     let bound = bind_probe_callsite(&preferred, probe).unwrap();
     assert_eq!(
@@ -184,7 +184,7 @@ fn strip_rustc_position(path: &str) -> &str {
 const CALLSITE_SOURCE: &str =
     "4 |     let _ = trace.span(TextInput::Static(\"missing\"), None, 8, |_| Ok::<_, ()>(()));";
 
-/// The probe is a temp copy, so rustc names that file. Require the same
+/// The probe is a copy, so rustc names that file. Require the same
 /// callsite (line 4, column 19, the direct `span` invocation) and rewrite the
 /// path to the tracked fixture before comparing.
 fn bind_probe_callsite(stderr: &str, probe_name: &str) -> Result<String, String> {
@@ -222,7 +222,7 @@ fn bind_probe_callsite(stderr: &str, probe_name: &str) -> Result<String, String>
     Ok(out)
 }
 
-/// Compile a unique temp copy that has no sibling `.stderr`. trybuild writes
+/// Compile a unique copy that has no sibling `.stderr`. trybuild writes
 /// its preferred variation to `wip/<that name>.stderr` and panics so a missing
 /// snapshot is not a pass. The tracked snapshot is never opened for write.
 fn preferred_compile_fail(case: &str) -> (String, String) {
@@ -239,7 +239,15 @@ fn capture_preferred(case: &str) -> Result<(String, String), String> {
         .map_err(|err| format!("clock: {err}"))?
         .as_nanos();
     let probe_name = format!("provenance_required_{}_{nanos}.rs", std::process::id());
-    let dir = std::env::temp_dir().join(format!("lmao-provenance-{}-{nanos}", std::process::id()));
+    // trybuild keeps rustc's line:column only for the input file it was handed,
+    // matched as given relative to this crate. A probe anywhere else under the
+    // workspace, as under a TMPDIR inside the checkout, becomes `$WORKSPACE/...`
+    // with its position erased. trybuild's own `wip/` ignores itself.
+    let probe_dir =
+        Path::new("wip").join(format!("provenance-probe-{}-{nanos}", std::process::id()));
+    let probe = probe_dir.join(&probe_name);
+    let dir = cwd.join(&probe_dir);
+    fs::create_dir_all(cwd.join("wip")).map_err(|err| format!("create wip: {err}"))?;
     fs::create_dir(&dir).map_err(|err| format!("create {}: {err}", dir.display()))?;
     let rs = dir.join(&probe_name);
     if let Err(err) = fs::copy(case, &rs) {
@@ -272,7 +280,7 @@ fn capture_preferred(case: &str) -> Result<(String, String), String> {
     let started = SystemTime::now();
     let _panicked = panic::catch_unwind(AssertUnwindSafe(|| {
         let t = trybuild::TestCases::new();
-        t.compile_fail(&rs);
+        t.compile_fail(&probe);
     }));
 
     let read = read_fresh_wip(&wip, started);
