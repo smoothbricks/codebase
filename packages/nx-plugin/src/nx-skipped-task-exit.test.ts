@@ -1,11 +1,12 @@
 import { expect, it, onTestFinished } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { whenChanged } from './__tests__/path-change.js';
+import { publishFixtureSocketDirectory, retireFixtureSocketDirectory } from './testing.js';
 
 /**
  * Guards the exit-status hunk of `patches/nx@23.2.1.patch`. When a task fails, Nx skips the tasks that depend on it,
@@ -37,68 +38,166 @@ exports.postTasksExecution = async (options, context) => {
 };
 `;
 
-it('exits 1, not 130, when a failed task leaves a task that depends on it unrun', async () => {
-  await withNxFixture('nx-skipped-exit-', async ({ workspace, socketDirectory }) => {
-    await symlink(join(repositoryRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
-    await writeFile(join(workspace, 'nx.json'), JSON.stringify({ plugins: ['./results-hook.js'] }));
-    await writeFile(join(workspace, 'results-hook.js'), resultsHook);
-    await writeFile(join(workspace, 'package.json'), JSON.stringify({ name: 'skipped-exit', private: true }));
-    await mkdir(join(workspace, 'p'));
-    await writeFile(
-      join(workspace, 'p', 'project.json'),
-      JSON.stringify({
-        name: 'p',
-        targets: {
-          fail: { executor: 'nx:run-commands', options: { command: 'exit 1' } },
-          after: { executor: 'nx:run-commands', dependsOn: ['fail'], options: { command: 'echo after' } },
-        },
-      }),
-    );
+const exitLabel = 'exits 1, not 130, when a failed task leaves a task that depends on it unrun';
+const interruptLabel = 'distinguishes parallel failure bailout from a real interrupt with pending tasks';
 
-    for (const bail of [false, true]) {
-      const ran = spawnSync('bun', [nxEntry, 'run', 'p:after', `--nx-bail=${bail}`, '--outputStyle=static'], {
-        cwd: workspace,
-        env: fixtureNxEnv(workspace, socketDirectory),
-        encoding: 'utf8',
-      });
-      const output = `${ran.stdout}${ran.stderr}`;
-      expect(ran.status, output).toBe(1);
-      expect(output).toContain('Tasks not run because their dependencies failed or --nx-bail=true:\n\n- p:after');
-      expect(output).toContain('Failed tasks:\n\n- p:fail');
-      // Nx's own results: the failed task, and nothing for the task it skipped or bailed before.
-      expect(JSON.parse(await readFile(join(workspace, 'task-results.json'), 'utf8'))).toEqual({ 'p:fail': 'failure' });
-    }
-  });
-});
-
-it('distinguishes parallel failure bailout from a real interrupt with pending tasks', async () => {
-  for (const interrupt of [false, true]) {
-    await withNxFixture('nx-bail-interrupt-', async ({ workspace, socketDirectory }) => {
-      await symlink(join(repositoryRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
-      await writeFile(join(workspace, 'nx.json'), JSON.stringify({ plugins: ['./results-hook.js'] }));
-      await writeFile(join(workspace, 'results-hook.js'), resultsHook);
-      await writeFile(join(workspace, 'package.json'), JSON.stringify({ name: 'bail-interrupt', private: true }));
-      await mkdir(join(workspace, 'p'));
-      await writeFile(
-        join(workspace, 'hold.cjs'),
-        `const { createServer } = require('node:net');
+/** The held task: it listens, writes `ready` to its workspace, and waits to be bailed out or interrupted. */
+const holdScript = `const { createServer } = require('node:net');
 const { writeFileSync } = require('node:fs');
 createServer().listen(0, '127.0.0.1', () => {
   writeFileSync('ready', '');
   console.log('nx-interrupt-ready');
 });
-`,
-      );
-      await writeFile(
-        join(workspace, 'fail.ts'),
-        `import { existsSync } from 'node:fs';
+`;
+
+/** Fails once the `release` file exists; a `release` that never appears leaves it pending. */
+function failScript(release: string): string {
+  return `import { existsSync } from 'node:fs';
 import { whenChanged } from ${JSON.stringify(pathChange)};
-await whenChanged('.', () => existsSync(${JSON.stringify(interrupt ? 'never-released' : 'ready')}));
+await whenChanged('.', () => existsSync(${JSON.stringify(release)}));
 process.exit(1);
-`,
+`;
+}
+
+/** Clears what an earlier step left in its workspace, so its assertions read only its own run. */
+async function clearStep(workspace: string): Promise<void> {
+  await rm(join(workspace, 'task-results.json'), { force: true });
+  await rm(join(workspace, 'ready'), { force: true });
+}
+
+/** A fixture workspace's `node_modules` link, Nx config, results hook and package. */
+async function writeWorkspace(workspace: string, name: string): Promise<void> {
+  await symlink(join(repositoryRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
+  await writeFile(join(workspace, 'nx.json'), JSON.stringify({ plugins: ['./results-hook.js'] }));
+  await writeFile(join(workspace, 'results-hook.js'), resultsHook);
+  await writeFile(join(workspace, 'package.json'), JSON.stringify({ name, private: true }));
+}
+
+/**
+ * One step of the parallel walk: `run-many` of `held` and `after` with `--nx-bail=true`. Without an interrupt the step
+ * bails out on the failing task; with one it sends SIGINT once `held` is listening, and must exit 130.
+ */
+async function runParallelStep(workspace: string, socketDirectory: string, interrupt: boolean): Promise<void> {
+  const step = `${interruptLabel}, interrupt=${interrupt}`;
+  await clearStep(workspace);
+  const stopReady = new AbortController();
+  const ready = interrupt ? whenChanged(workspace, () => existsSync(join(workspace, 'ready')), stopReady.signal) : null;
+  const child = spawn(
+    'bun',
+    [nxEntry, 'run-many', '-t', 'held,after', '-p', 'p', '--parallel=2', '--nx-bail=true', '--outputStyle=static'],
+    {
+      cwd: workspace,
+      env: fixtureNxEnv(workspace, socketDirectory),
+      detached: process.platform !== 'win32',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
+  let output = '';
+  const ended = Promise.withResolvers<number | null>();
+  child.once('error', (error) => {
+    ended.reject(error);
+  });
+  child.once('close', ended.resolve);
+  child.stdout.setEncoding('utf8').on('data', (text: string) => {
+    output += text;
+  });
+  child.stderr.setEncoding('utf8').on('data', (text: string) => {
+    output += text;
+  });
+  const describe = () => `${step}\npid ${child.pid}, exit ${child.exitCode}, signal ${child.signalCode}\n${output}`;
+  const retire = async () => {
+    stopReady.abort();
+    try {
+      if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
+        try {
+          process.kill(process.platform === 'win32' ? child.pid : -child.pid, 'SIGKILL');
+        } catch (error) {
+          if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) throw error;
+        }
+      }
+      await ended.promise;
+    } finally {
+      // Nx and its tasks are reaped first; a failure of the readiness wait is still reported after.
+      await ready?.catch((error: unknown) => {
+        if (error !== stopReady.signal.reason) throw error;
+      });
+    }
+  };
+  onTestFinished(retire);
+  try {
+    if (ready !== null) {
+      await guardEvent(
+        Promise.race([
+          ready,
+          ended.promise.then((code) => {
+            throw new Error(`Nx exited ${code} before its task was ready\n${output}`);
+          }),
+        ]),
+        `${step}: Nx held task readiness`,
+        describe,
       );
+      expect(child.kill('SIGINT')).toBe(true);
+    }
+    const code = await guardEvent(ended.promise, `${step}: Nx bailout or interrupt to exit`, describe);
+    expect(code, `${step}\n${output}`).toBe(interrupt ? 130 : 1);
+    const results = JSON.parse(await readFile(join(workspace, 'task-results.json'), 'utf8'));
+    if (interrupt) {
+      expect(results, step).toMatchObject({ 'p:held': 'stopped' });
+    } else {
+      expect(results, step).toEqual({ 'p:held': 'stopped', 'p:fail': 'failure' });
+      expect(output, step).toContain('Tasks not run because their dependencies failed or --nx-bail=true:\n\n- p:after');
+    }
+  } finally {
+    await retire();
+  }
+}
+
+it('exits 1 for a failed task and a parallel bailout, 130 only for a real interrupt', async () => {
+  await withNxFixture(
+    'nx-skipped-exit-',
+    async ({ root, workspace, socketDirectory }) => {
+      // Walks 1 and 2: `p:after` is skipped behind the failed `p:fail`, with and without --nx-bail.
+      await writeWorkspace(workspace, 'skipped-exit');
+      await mkdir(join(workspace, 'p'));
       await writeFile(
-        join(workspace, 'p/project.json'),
+        join(workspace, 'p', 'project.json'),
+        JSON.stringify({
+          name: 'p',
+          targets: {
+            fail: { executor: 'nx:run-commands', options: { command: 'exit 1' } },
+            after: { executor: 'nx:run-commands', dependsOn: ['fail'], options: { command: 'echo after' } },
+          },
+        }),
+      );
+      for (const bail of [false, true]) {
+        const step = `${exitLabel}, --nx-bail=${bail}`;
+        await clearStep(workspace);
+        const ran = spawnSync('bun', [nxEntry, 'run', 'p:after', `--nx-bail=${bail}`, '--outputStyle=static'], {
+          cwd: workspace,
+          env: fixtureNxEnv(workspace, socketDirectory),
+          encoding: 'utf8',
+        });
+        const output = `${ran.stdout}${ran.stderr}`;
+        expect(ran.status, `${step}\n${output}`).toBe(1);
+        expect(output, step).toContain(
+          'Tasks not run because their dependencies failed or --nx-bail=true:\n\n- p:after',
+        );
+        expect(output, step).toContain('Failed tasks:\n\n- p:fail');
+        // Nx's own results: the failed task, and nothing for the task it skipped or bailed before.
+        expect(JSON.parse(await readFile(join(workspace, 'task-results.json'), 'utf8')), step).toEqual({
+          'p:fail': 'failure',
+        });
+      }
+
+      // Walks 3 and 4 run in a sibling workspace: this walk's `p:fail` waits for a release, while the first walk's
+      // `p:fail` exits at once, so the two `p` projects cannot share a workspace. The SIGINT walk runs last, since it
+      // destroys the pending state of its workspace.
+      const parallel = join(root, 'parallel');
+      await mkdir(join(parallel, 'p'), { recursive: true });
+      await writeWorkspace(parallel, 'bail-interrupt');
+      await writeFile(join(parallel, 'hold.cjs'), holdScript);
+      await writeFile(
+        join(parallel, 'p', 'project.json'),
         JSON.stringify({
           name: 'p',
           targets: {
@@ -108,78 +207,18 @@ process.exit(1);
           },
         }),
       );
-      const stopReady = new AbortController();
-      const ready = interrupt
-        ? whenChanged(workspace, () => existsSync(join(workspace, 'ready')), stopReady.signal)
-        : null;
-      const child = spawn(
-        'bun',
-        [nxEntry, 'run-many', '-t', 'held,after', '-p', 'p', '--parallel=2', '--nx-bail=true', '--outputStyle=static'],
-        {
-          cwd: workspace,
-          env: fixtureNxEnv(workspace, socketDirectory),
-          detached: process.platform !== 'win32',
-          stdio: ['ignore', 'pipe', 'pipe'],
-        },
-      );
-      let output = '';
-      const ended = Promise.withResolvers<number | null>();
-      child.once('error', (error) => {
-        ended.reject(error);
-      });
-      child.once('close', ended.resolve);
-      child.stdout.setEncoding('utf8').on('data', (text: string) => {
-        output += text;
-      });
-      child.stderr.setEncoding('utf8').on('data', (text: string) => {
-        output += text;
-      });
-      const describe = () => `pid ${child.pid}, exit ${child.exitCode}, signal ${child.signalCode}\n${output}`;
-      const retire = async () => {
-        stopReady.abort();
-        try {
-          if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
-            try {
-              process.kill(process.platform === 'win32' ? child.pid : -child.pid, 'SIGKILL');
-            } catch (error) {
-              if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) throw error;
-            }
-          }
-          await ended.promise;
-        } finally {
-          // Nx and its tasks are reaped first; a failure of the readiness wait is still reported after.
-          await ready?.catch((error: unknown) => {
-            if (error !== stopReady.signal.reason) throw error;
-          });
-        }
-      };
-      onTestFinished(retire);
+      // withNxFixture publishes and retires only its own workspace's socket alias. This workspace runs no daemon
+      // (NX_DAEMON=false), so retiring it is its alias alone; removing the root takes the rest.
+      const parallelSocket = await publishFixtureSocketDirectory(parallel);
       try {
-        if (ready !== null) {
-          await guardEvent(
-            Promise.race([
-              ready,
-              ended.promise.then((code) => {
-                throw new Error(`Nx exited ${code} before its task was ready\n${output}`);
-              }),
-            ]),
-            'Nx held task readiness',
-            describe,
-          );
-          expect(child.kill('SIGINT')).toBe(true);
-        }
-        const code = await guardEvent(ended.promise, 'Nx bailout or interrupt to exit', describe);
-        expect(code, output).toBe(interrupt ? 130 : 1);
-        const results = JSON.parse(await readFile(join(workspace, 'task-results.json'), 'utf8'));
-        if (interrupt) {
-          expect(results).toMatchObject({ 'p:held': 'stopped' });
-        } else {
-          expect(results).toEqual({ 'p:held': 'stopped', 'p:fail': 'failure' });
-          expect(output).toContain('Tasks not run because their dependencies failed or --nx-bail=true:\n\n- p:after');
+        for (const interrupt of [false, true]) {
+          await writeFile(join(parallel, 'fail.ts'), failScript(interrupt ? 'never-released' : 'ready'));
+          await runParallelStep(parallel, parallelSocket, interrupt);
         }
       } finally {
-        await retire();
+        await retireFixtureSocketDirectory(parallel);
       }
-    });
-  }
+    },
+    'exit',
+  );
 });
