@@ -9,6 +9,15 @@ import { fileURLToPath } from 'node:url';
 import { prunePublishedExports } from '../../cli/src/monorepo/published-exports.ts';
 
 const root = fileURLToPath(new URL('../../..', import.meta.url));
+/** Runs one step and logs its wall time, on failure too, so a slow run names the step that was slow. */
+function run(step, file, args, options) {
+  const started = performance.now();
+  try {
+    return execFileSync(file, args, options);
+  } finally {
+    console.error(`verify-packages: ${step} ${((performance.now() - started) / 1000).toFixed(2)}s`);
+  }
+}
 const flechettePatch = {
   package: '@uwdata/flechette@2.7.0',
   path: 'patches/@uwdata%2Fflechette@2.7.0.patch',
@@ -62,23 +71,23 @@ try {
     // Let Bun select published files and resolve workspace ranges without
     // mutating manifests that concurrent compiler tasks are reading.
     const sourceArchive = join(temporary, `${name}-source.tgz`);
-    execFileSync('bun', ['pm', 'pack', '--filename', sourceArchive, '--ignore-scripts', '--quiet'], {
+    run(`${name}: pack source`, 'bun', ['pm', 'pack', '--filename', sourceArchive, '--ignore-scripts', '--quiet'], {
       cwd: source,
       stdio: 'inherit',
     });
     const staged = join(temporary, 'staged', name);
     mkdirSync(staged, { recursive: true });
-    execFileSync('tar', ['-xzf', sourceArchive, '-C', staged, '--strip-components=1']);
+    run(`${name}: unpack source`, 'tar', ['-xzf', sourceArchive, '-C', staged, '--strip-components=1']);
     const stagedManifestPath = join(staged, 'package.json');
     const stagedManifest = JSON.parse(readFileSync(stagedManifestPath, 'utf8'));
     writeFileSync(stagedManifestPath, `${JSON.stringify(prunePublishedExports(stagedManifest).manifest, null, 2)}\n`);
-    execFileSync('bun', ['pm', 'pack', '--filename', archive, '--ignore-scripts', '--quiet'], {
+    run(`${name}: pack pruned`, 'bun', ['pm', 'pack', '--filename', archive, '--ignore-scripts', '--quiet'], {
       cwd: staged,
       stdio: 'inherit',
     });
     const target = join(temporary, 'inspected', name);
     mkdirSync(target, { recursive: true });
-    execFileSync('tar', ['-xzf', archive, '-C', target, '--strip-components=1']);
+    run(`${name}: unpack pruned`, 'tar', ['-xzf', archive, '-C', target, '--strip-components=1']);
     const packed = JSON.parse(readFileSync(join(target, 'package.json'), 'utf8'));
     assert.equal(packed.name, manifest.name);
     assert.equal(packed.publishConfig.access, 'public');
@@ -141,12 +150,12 @@ try {
     // Keep every dependency inside this disposable install, including with Bun's
     // isolated linker. No workspace source, global store, or TS paths overrides.
     writeFileSync(join(consumer, 'bunfig.toml'), `[install]\nlinker = "${linker}"\nglobalStore = false\n`);
-    execFileSync('bun', ['install', '--backend=copyfile', '--ignore-scripts'], {
+    run(`${linker}: bun install`, 'bun', ['install', '--backend=copyfile', '--ignore-scripts'], {
       cwd: consumer,
       env: runtimeEnv,
       stdio: 'inherit',
     });
-    execFileSync('bun', ['install', '--frozen-lockfile', '--ignore-scripts'], {
+    run(`${linker}: frozen bun install`, 'bun', ['install', '--frozen-lockfile', '--ignore-scripts'], {
       cwd: consumer,
       env: runtimeEnv,
       stdio: 'inherit',
@@ -162,7 +171,8 @@ try {
       assert.deepEqual(readFileSync(resolved), readFileSync(join(inspected, packed.exports['.'].import)));
       assert.equal(require(`@smoothbricks/${name}/package.json`).version, manifests.get(name).version);
     }
-    execFileSync(
+    run(
+      `${linker}: tsc platform`,
       'node',
       [join(nodeModules, 'typescript', 'bin', 'tsc'), '-p', join(consumer, 'platform', 'tsconfig.json')],
       {
@@ -170,24 +180,20 @@ try {
         stdio: 'inherit',
       },
     );
-    execFileSync('node', [join(consumer, 'dist', 'platform', 'consumer.js')], {
+    run(`${linker}: node platform consumer`, 'node', [join(consumer, 'dist', 'platform', 'consumer.js')], {
       cwd: consumer,
       env: runtimeEnv,
       stdio: 'inherit',
     });
-    execFileSync('bun', [join(consumer, 'dist', 'platform', 'consumer.js')], {
+    run(`${linker}: bun platform consumer`, 'bun', [join(consumer, 'dist', 'platform', 'consumer.js')], {
       cwd: consumer,
       env: runtimeEnv,
       stdio: 'inherit',
     });
-    execFileSync(
-      'node',
-      [join(nodeModules, 'typescript', 'bin', 'tsc'), '-p', join(consumer, 'composed', 'tsconfig.json')],
-      { cwd: consumer, stdio: 'inherit' },
-    );
-    // Generate the example's codecs from its imported public types using the repository's
-    // normal compiler. The preceding strict tsc pass still checks all package declarations.
-    execFileSync('ttsc', ['-p', join(consumer, 'composed', 'tsconfig.json'), '--emit'], {
+    // Strict-check the composed program, every package declaration included (skipLibCheck: false), and generate
+    // its codecs from the imported public types with the repository's normal compiler. noEmitOnError: a type
+    // error fails here and emits nothing to run.
+    run(`${linker}: ttsc composed`, 'ttsc', ['-p', join(consumer, 'composed', 'tsconfig.json'), '--emit'], {
       cwd: consumer,
       env: runtimeEnv,
       stdio: 'inherit',
@@ -195,7 +201,7 @@ try {
     // Both runners select built StateBus exports and development React for act/StrictMode.
     for (const executable of ['scenario', 'edge-cases'])
       for (const runner of ['node', 'bun'])
-        execFileSync(runner, [join(consumer, 'dist', 'composed', `${executable}.js`)], {
+        run(`${linker}: ${runner} ${executable}`, runner, [join(consumer, 'dist', 'composed', `${executable}.js`)], {
           cwd: consumer,
           env: runtimeEnv,
           stdio: 'inherit',
