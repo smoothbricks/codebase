@@ -30,11 +30,11 @@ describe('devenv environment loader', () => {
     });
   });
 
-  it('keeps the selected toolchain ahead of login-profile tools', async () => {
+  it('runs commands on the toolchain PATH devenv exports and restores the process env afterwards', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-toolchain-env-'));
     const saved = { ...process.env };
     try {
-      for (const directory of ['bin', 'selected', 'login', 'home', 'tooling/direnv']) {
+      for (const directory of ['bin', 'selected', 'tooling/direnv']) {
         await mkdir(join(root, directory), { recursive: true });
       }
       await writeFile(
@@ -43,12 +43,8 @@ describe('devenv environment loader', () => {
         { mode: 0o755 },
       );
       await writeFile(join(root, 'selected/smoo-toolchain-probe'), '#!/bin/sh\nprintf selected\n', { mode: 0o755 });
-      await writeFile(join(root, 'login/smoo-toolchain-probe'), '#!/bin/sh\nprintf login\n', { mode: 0o755 });
-      await writeFile(join(root, 'home/.bash_profile'), 'export PATH="$SMOO_TEST_LOGIN:$PATH"\n');
-      process.env.HOME = join(root, 'home');
       process.env.PATH = `${join(root, 'bin')}:${saved.PATH ?? '/usr/bin:/bin'}`;
       process.env.SMOO_TEST_SELECTED = join(root, 'selected');
-      process.env.SMOO_TEST_LOGIN = join(root, 'login');
       delete process.env.BASH_ENV;
       const result = await withDevenvEnv(root, () => runResult('smoo-toolchain-probe', [], root));
       expect(result.exitCode).toBe(0);

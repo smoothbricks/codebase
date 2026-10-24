@@ -127,8 +127,8 @@ describe('github-actions-bootstrap build-shell environment persistence', () => {
 const REAL_NIX = spawnSync('sh', ['-c', 'command -v nix'], { encoding: 'utf8' }).stdout.trim();
 
 const NIX_STUB = `#!/usr/bin/env bash
-if [ "$1" = eval ]; then exec "$REAL_NIX" "$@"; fi
 printf '%s\\n' "nix $*" >> "$NIX_CALLS"
+if [ "$1" = eval ]; then exec "$REAL_NIX" "$@"; fi
 `;
 
 interface InstallRun {
@@ -229,8 +229,11 @@ describe('github-actions-bootstrap install-devenv', () => {
     const run = runInstallDevenv(LOCK_WITH_REV, { devenvVersion: 'devenv 2.3.1+fffffff (aarch64-darwin)' });
     expect(run.status).toBe(0);
     expect(run.stdout).toContain('using locked devenv');
-    // The warm path must cost nothing: no eval of the flake, no profile writes.
-    expect(run.nixCalls).toBe('');
+    // The warm path's only nix call is the lock read that names the rev to
+    // match; a flake eval or a profile write would be the cost it must not pay.
+    const calls = run.nixCalls.trimEnd().split('\n');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatch(/^nix eval --raw --impure --expr /);
   });
 
   it('replaces a restored devenv that is a different commit than the lock', () => {
