@@ -84,7 +84,7 @@ func (t *fileTransformer) findResultInline(call *shimast.CallExpression) (*resul
 		pa := expr.AsPropertyAccessExpression()
 		name := shimast.NodeText(pa.Name())
 
-		if resultMethods[name] {
+		if resultRoots[name] {
 			// Chain root: receiver must be a Checker-proved LMAO context.
 			recvType := t.checker.GetTypeAtLocation(pa.Expression)
 			if recvType == nil || !isLmaoContextType(t.checker, recvType) {

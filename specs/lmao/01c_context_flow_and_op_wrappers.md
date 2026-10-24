@@ -132,8 +132,10 @@ SpanContext (interface) - user-facing, what ops receive
 
 **Dual Metadata References - Row 0 vs Rows 1+:**
 
-Span names are not stored on an internal `_spanName` property. `writeSpanStart()` writes the span name directly into
-`message_values[0]`, which keeps span naming aligned with the unified `message` column used in Arrow output.
+`writeSpanStart()` writes the span name as row 0's `message`, in the storage the buffer's message layout selects
+(`message_values[0]`, a vocabulary index, or the dedicated `_spanName` slot of static-only and dynamic-only buffers),
+which keeps span naming aligned with the unified `message` column used in Arrow output. `resolveMessage(buffer, 0)`, and
+so `ctx.spanName`, reads it back from any of them.
 
 - **Row 0 (span-start)**: Uses `_callsiteMetadata` for `git_sha`, `package_name`, `package_file`
 - **Rows 1+ (span-ok/err/exception, logs)**: Uses `_opMetadata` for `git_sha`, `package_name`, `package_file`
@@ -493,6 +495,10 @@ type SpanContext<Ctx extends OpContext> = {
   // Result helpers
   ok<S>(value: S): OkResult<S, Ctx['logSchema']>;
   err<E>(error: E): ErrResult<E, Ctx['logSchema']>;
+
+  // This span's row-0 name, and Blocked.service on it (01r "ctx.blocked()")
+  readonly spanName: string;
+  blocked(config?: BlockedConfig): ErrResult<Blocked, Ctx['logSchema']>;
 
   // Scoped attributes (read-only view)
   scope: Readonly<Partial<InferSchema<Ctx['logSchema']>>>;

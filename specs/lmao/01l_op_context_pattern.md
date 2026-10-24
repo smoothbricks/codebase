@@ -737,7 +737,7 @@ const { defineOp } = defineOpContext({
 
 Cannot use in `ctx`:
 
-- `buffer`, `tag`, `log`, `scope`, `setScope`, `ok`, `err`, `span`, `ff`, `deps`
+- `buffer`, `tag`, `log`, `scope`, `setScope`, `ok`, `err`, `blocked`, `spanName`, `span`, `ff`, `deps`
 - Any name starting with `_`
 
 ## Type Inference

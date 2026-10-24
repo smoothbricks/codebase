@@ -1,8 +1,7 @@
 ---
 title: Errors & retry
 description: >-
-  Result types, typed error codes, transient errors, blocked errors, and backoff
-  policies.
+  Result types, typed error codes, transient errors, blocked errors, and backoff policies.
 sidebar:
   order: 5
 id: vx-wCnf_QMS
@@ -62,11 +61,11 @@ return ctx.err(SERVICE_UNAVAILABLE({ status: 503 }, { maxAttempts: 5 }));
 
 ## Backoff policies
 
-| Helper | Signature |
-|---|---|
-| `linearBackoff` | `linearBackoff(maxAttempts, baseDelayMs = 100)` |
+| Helper               | Signature                                            |
+| -------------------- | ---------------------------------------------------- |
+| `linearBackoff`      | `linearBackoff(maxAttempts, baseDelayMs = 100)`      |
 | `exponentialBackoff` | `exponentialBackoff(maxAttempts, baseDelayMs = 100)` |
-| `fixedDelay` | `fixedDelay(maxAttempts, delayMs = 1000)` |
+| `fixedDelay`         | `fixedDelay(maxAttempts, delayMs = 1000)`            |
 
 ## `Blocked`
 
@@ -80,6 +79,18 @@ return ctx.err(Blocked.index('search-index'));
 
 Each factory takes an optional `BlockedConfig` (`{ maxAttempts?, nextRetry?(attempt) }`).
 
+When a span is named for the service it calls, `ctx.blocked(config?)` is
+`ctx.err(Blocked.service(ctx.spanName, config))`: the span name is the service name, and the result chains the schema's
+row-1 setters like any `ctx.err()`.
+
+```ts
+const call = await ctx.span('payment-api', (spanCtx) => {
+  spanCtx.tag.http_status(503);
+  return spanCtx.blocked({ maxAttempts: 5 }).retry_after_sec(60);
+});
+if (!call.success) return ctx.err(call.error);
+```
+
 ## `RetriesExhausted`
 
 `RetriesExhausted` is the error type representing a transient failure whose retry policy ran out of attempts. It's
@@ -87,11 +98,9 @@ exported both from the root and as the focused subpath `@smoothbricks/lmao/error
 
 ## Helpers
 
-- `hasErrorCode(error)` — a type guard narrowing an unknown value to `{ code: string }`, useful when inspecting an
-  error of unknown origin.
+- `errorCodeOf(error)` — the `error_code` a span records for an error: a code error's `code`, else a tagged error's
+  `_tag` (`'Blocked'`, `'RetriesExhausted'`), else `undefined`.
 - Result builders also expose `.line(n)` (alongside `.with({...})` and `.message('...')`) to record a source line.
 
-:::note
-Retry applies to **child spans** (`ctx.span(...)`), not to the root `trace(...)`. See
-[Retry transient failures](/guides/retry-transient-failures/).
-:::
+:::note Retry applies to **child spans** (`ctx.span(...)`), not to the root `trace(...)`. See
+[Retry transient failures](/guides/retry-transient-failures/). :::

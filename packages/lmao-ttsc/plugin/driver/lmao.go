@@ -123,7 +123,7 @@ func collectProgramCompilation(prog *driver.Program, options compilerOptions) (*
 		if sf == nil || sf.IsDeclarationFile {
 			continue
 		}
-		t := &fileTransformer{file: sf, cwd: options.cwd, checker: prog.Checker, processed: map[*shimast.CallExpression]bool{}, opSpans: map[*shimast.CallExpression]bool{}, fnSpans: map[*shimast.CallExpression]bool{}, physicalLogCalls: map[*shimast.CallExpression]callMessagePhysicalLayout{}, currentLogLocalIDs: map[*shimast.CallExpression]uint16{}, vocabulary: collector}
+		t := &fileTransformer{file: sf, cwd: options.cwd, checker: prog.Checker, processed: map[*shimast.CallExpression]bool{}, opSpans: map[*shimast.CallExpression]bool{}, fnSpans: map[*shimast.CallExpression]bool{}, blockedReceivers: map[*shimast.Node]bool{}, physicalLogCalls: map[*shimast.CallExpression]callMessagePhysicalLayout{}, currentLogLocalIDs: map[*shimast.CallExpression]uint16{}, vocabulary: collector}
 		t.collectOptimizations(sf.AsNode(), false)
 		t.destructures = t.collectDestructuredRewrites(sf.AsNode())
 		compilation.files[sf] = &collectedFile{transformer: t}
@@ -222,6 +222,15 @@ func callExpr(expr *shimast.Node, args []*shimast.Node) *shimast.Node {
 var logMethods = map[string]bool{"info": true, "debug": true, "warn": true, "error": true, "trace": true}
 var resultMethods = map[string]bool{"ok": true, "err": true}
 
+// blockedMethods is the ctx.blocked() porcelain over err. A `.blocked(` call is not LMAO's
+// alone, so its line injection admits only receivers the collect phase proved to be LMAO
+// contexts (blockedReceivers), unlike the receiver-blind ok/err.
+var blockedMethods = map[string]bool{"blocked": true}
+
+// resultRoots are the context calls whose result takes row-1 fluent writes; the result
+// inline and the op analysis prove their receiver themselves.
+var resultRoots = map[string]bool{"ok": true, "err": true, "blocked": true}
+
 type fileTransformer struct {
 	file *shimast.SourceFile
 	cwd  string
@@ -240,6 +249,9 @@ type fileTransformer struct {
 	// that receiver's callsite plan. A closure body is KNOWN at the call site,
 	// which is why it needs no Op provenance proof of its own.
 	fnSpans map[*shimast.CallExpression]bool
+	// blockedReceivers holds the receivers of `.blocked(...)` calls the collect phase
+	// proved to be LMAO contexts; the mutation walk injects their line without the checker.
+	blockedReceivers map[*shimast.Node]bool
 	// destructures holds the §3 function literals whose destructured context
 	// parameter was proven safe to re-root onto `__ctx`.
 	destructures       []destructuredRewrite
@@ -280,6 +292,7 @@ func (t *fileTransformer) walk(node *shimast.Node) {
 		case t.tryTaskLine(call):
 		case t.tryChainLine(call, logMethods, isLogReceiver):
 		case t.tryChainLine(call, resultMethods, nil):
+		case t.tryChainLine(call, blockedMethods, t.isBlockedReceiver):
 		}
 	}
 	node.ForEachChild(func(child *shimast.Node) bool {
@@ -307,6 +320,10 @@ func calleeNames(call *shimast.CallExpression) (recv *shimast.Node, name string)
 		return nil, shimast.NodeText(expr)
 	}
 	return nil, ""
+}
+
+func (t *fileTransformer) isBlockedReceiver(recv *shimast.Node) bool {
+	return t.blockedReceivers[recv]
 }
 
 // --- §5 defineModule metadata ------------------------------------------------

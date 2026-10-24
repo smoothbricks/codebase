@@ -387,7 +387,20 @@ describe('Effective Schema Computation', () => {
       const schema = defineLogSchema({ userId: S.category() });
 
       // Test each reserved property
-      const reservedProps = ['buffer', 'tag', 'log', 'scope', 'setScope', 'ok', 'err', 'span', 'ff', 'deps'];
+      const reservedProps = [
+        'buffer',
+        'tag',
+        'log',
+        'scope',
+        'setScope',
+        'ok',
+        'err',
+        'blocked',
+        'spanName',
+        'span',
+        'ff',
+        'deps',
+      ];
 
       for (const prop of reservedProps) {
         const invalidCtx: Record<string, unknown> = { [prop]: 'bad' };

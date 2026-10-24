@@ -231,11 +231,12 @@ still retaining safely proven capability bits. Capacity overflow beyond `0xffff`
 nonzero analyzed capacity is clamped to a minimum of two; zero uses the normal adaptive capacity.
 
 Capability analysis is closed-world. It accepts only direct, recognized forms: calls through `tag`/known log methods,
-`ff(...)` or `ff.flag(...)`, direct `span`/`spanSync`/`ok`/`err`/`setScope` calls, and property access through `scope`
-or `deps`. It emits hint `0` if the first parameter is not a simple identifier, the context escapes or is used as a
-value, access is computed/unknown, a nested function is entered, or another use cannot be proven safe. A callback whose
-first parameter is destructured is therefore conservatively hinted as `0`, and stays hinted `0` after §3 rewrites it:
-hint analysis reads the callback as written, so the hint does not depend on the rewrite. Its span calls do lower.
+`ff(...)` or `ff.flag(...)`, direct `span`/`spanSync`/`ok`/`err`/`blocked`/`setScope` calls, property access through
+`scope` or `deps`, and reads of `spanName`, which need no capability. It emits hint `0` if the first parameter is not a
+simple identifier, the context escapes or is used as a value, access is computed/unknown, a nested function is entered,
+or another use cannot be proven safe. A callback whose first parameter is destructured is therefore conservatively
+hinted as `0`, and stays hinted `0` after §3 rewrites it: hint analysis reads the callback as written, so the hint does
+not depend on the rewrite. Its span calls do lower.
 
 `defineOp` is annotated only when no fourth argument already exists. Its fourth argument is
 `{ runtimeHint, eagerColumns }`; the third argument carries the injected source metadata (§5), or `undefined` when no
@@ -410,6 +411,11 @@ return ctx.ok(user).with({ userId: user.id }).message('Created');
 // Transformer outputs:
 return ctx.ok(user).line(42).with({ userId: user.id }).message('Created');
 ```
+
+`ctx.blocked(...)` stays out of this receiver-blind set, because a `.blocked(` call is not LMAO's alone. The collect
+phase records each `.blocked(...)` receiver the checker proves to be an LMAO context, and the walk injects `.line(N)`
+only on those, so a bare or non-inlined `ctx.blocked()` chain carries its line as `ctx.err()` does. Its chain is
+otherwise a result chain for the row-1 inline and for `eagerColumns`.
 
 #### 6.1 One static-message representation
 

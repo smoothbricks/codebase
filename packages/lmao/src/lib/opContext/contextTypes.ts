@@ -26,6 +26,8 @@ export const RESERVED_CONTEXT_PROPS = [
   'setScope',
   'ok',
   'err',
+  'blocked',
+  'spanName',
   'span',
   'ff',
   'deps',

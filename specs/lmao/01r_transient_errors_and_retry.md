@@ -217,6 +217,8 @@ class Blocked extends Error implements TaggedError<'Blocked'> {
   get _tag(): 'Blocked';
   readonly reason: BlockedReason;
   readonly blockedConfig: BlockedConfig | undefined;
+  get origin(): SpanIdentity | undefined; // the span that first completed with it
+  bindOrigin(origin: SpanIdentity): this; // first binding wins
 
   // message: `Blocked: ${getBlockedReasonName(reason)}`; name: 'Blocked'
   constructor(reason: BlockedReason, config?: BlockedConfig);
@@ -249,6 +251,15 @@ interface BlockedConfig {
 `getBlockedReasonName` names a resource reason as `${resourceType}/${resourceId}`, which is how `RetriesExhausted`
 reports it.
 
+### Origin <a id="smoo/lmao!n/op-context-tagged-errors.blocked-origin"></a>
+
+The factories are context-free, so a `Blocked` starts without a span. The first span-bound `ctx.err()` that completes
+with it, including `ctx.blocked()`, binds that span's `SpanIdentity` (`{ trace_id, span_id, thread_id }`,
+[01b4](./01b4_span_identity.md)) as `origin`; a parent that rebinds the error with its own `ctx.err(child.error)` finds
+it bound and keeps the child's. The identity is copied, not the buffer, because span buffers are pooled. An engine that
+receives a `Blocked` no span completed with binds its own span through `bindOrigin()` under the same first-binding rule.
+`toJSON()` writes `origin.thread_id` as decimal text, because JSON carries no bigint.
+
 ### Usage <a id="smoo/lmao!n/op-context-tagged-errors.usage"></a>
 
 ```typescript
@@ -258,14 +269,14 @@ const processOrder = defineOp('processOrder', async (ctx, orderId: string) => {
   // Check if payment service is available
   if (!(await isServiceHealthy('payment-api'))) {
     // Do NOT retry in the span loop - service is down, wait for recovery
-    return new Err(Blocked.service('payment-api'));
+    return ctx.err(Blocked.service('payment-api'));
   }
 
   // Check if order execution already completed
   const execution = await getExecution(orderId);
   if (execution.ended) {
     // Do NOT retry - execution already finished
-    return new Err(Blocked.ended(execution.id));
+    return ctx.err(Blocked.ended(execution.id));
   }
 
   // This CAN be retried if it fails transiently
@@ -278,6 +289,42 @@ if (result.isErr(Blocked)) {
   // Handle temporary unavailability - retry, queue, etc.
 }
 ```
+
+### `ctx.blocked()` <a id="smoo/lmao!n/op-context-tagged-errors.ctx-blocked"></a>
+
+A span named for the service it calls blocks on that service with `ctx.blocked(config?)`, which is
+`ctx.err(Blocked.service(ctx.spanName, config))`. `ctx.spanName` reads the span's row-0 span-start name, so the span
+name and the `Blocked` service name cannot drift apart, and `config` reaches `blockedConfig` unchanged: the engine calls
+the closure the Op passed.
+
+```typescript
+const call = await ctx.span('payment-api', async (spanCtx) => {
+  const response = await fetch(url);
+  spanCtx.tag.http_status(response.status); // row 0
+  if (response.status === 503) {
+    const retryAfterSec = parseRetryAfter(response.headers);
+    return spanCtx
+      .blocked({ maxAttempts: 5, nextRetry: (attempt) => (attempt === 1 ? retryAfterSec * 1000 : 5000 * 2 ** attempt) })
+      .retry_after_sec(retryAfterSec); // row 1
+  }
+  return spanCtx.ok(await response.json());
+});
+if (!call.success) return ctx.err(call.error); // the parent completes with its own Err
+```
+
+The result is the schema-bound `ErrResult<Blocked, LogSchema>` that `ctx.err()` returns, so the schema's row-1 setters
+chain with their column types (`.retry_after_sec(n)` exists when the schema declares `retry_after_sec`). The span
+records `span-err` with `error_code` `'Blocked'`
+([01h Err](./01h_entry_types_and_logging_primitives.md#smoo/lmao!n/lmao-entry-fluenterr)), its row-0 tags and its row-1
+result tags, and `origin` names that span.
+
+`spanName` and `blocked` are prototype getters of the span context: a span that never blocks allocates nothing for them,
+and destructuring (`({ blocked, spanName }) => …`) binds the context. Both are reserved context properties. The compiler
+counts a `blocked(...)` call as the result capability and a `spanName` read as no capability
+([01o](./01o_typescript_transformer.md#smoo/lmao!n/transformer)).
+
+`Blocked.service(name)` names a service other than the span's; `Blocked.ended()` and `Blocked.index()` name the other
+reasons.
 
 ## Retry Loop Implementation <a id="smoo/lmao!n/op-retry.retry-loop-implementation"></a>
 

@@ -51,17 +51,19 @@ const GET = defineOp('GET', async ({ span, log, tag, deps, ff, env, scope, setSc
 
 ### Context Properties Available via Destructuring
 
-| Property | Purpose                                       |
-| -------- | --------------------------------------------- |
-| `span`   | Invoke other ops: `span('name', op, ...args)` |
-| `log`    | Logging: `log.info()`, `log.warn()`, etc.     |
-| `tag`    | Span attributes: `tag.method('GET')`          |
-| `deps`   | Dependencies (Op instances)                   |
-| `ff`     | Feature flags                                 |
-| `env`    | Environment config                            |
-| `scope`  | Scoped attributes                             |
-| `ok`     | Success result helper                         |
-| `err`    | Error result helper                           |
+| Property   | Purpose                                       |
+| ---------- | --------------------------------------------- |
+| `span`     | Invoke other ops: `span('name', op, ...args)` |
+| `log`      | Logging: `log.info()`, `log.warn()`, etc.     |
+| `tag`      | Span attributes: `tag.method('GET')`          |
+| `deps`     | Dependencies (Op instances)                   |
+| `ff`       | Feature flags                                 |
+| `env`      | Environment config                            |
+| `scope`    | Scoped attributes                             |
+| `ok`       | Success result helper                         |
+| `err`      | Error result helper                           |
+| `blocked`  | `err(Blocked.service(spanName, config))`      |
+| `spanName` | This span's name                              |
 
 ## API Patterns <a id="smoo/lmao!n/codegen-architecture.api-patterns"></a>
 

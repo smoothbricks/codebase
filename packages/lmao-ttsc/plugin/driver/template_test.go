@@ -70,6 +70,8 @@ export class SpanContext {
   readonly tag: GeneratedTagWriter;
   ok(value: unknown): FluentResult;
   err(value: unknown): FluentResult;
+  blocked(config?: unknown): FluentResult;
+  readonly spanName: string;
   ff(name: string): boolean;
   span(name: string, op: Op): Promise<unknown>;
 }

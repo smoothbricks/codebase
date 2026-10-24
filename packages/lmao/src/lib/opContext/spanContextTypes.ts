@@ -19,6 +19,7 @@
  */
 
 import type { FluentLogEntry as FluentLogEntryFromGenerator } from '../codegen/spanLoggerGenerator.js';
+import type { Blocked, BlockedConfig } from '../errors/Blocked.js';
 import type { AnyResult, ErrResult, ExtractError, ExtractSuccess, OkResult, Result } from '../result.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from '../schema/evaluator.js';
 import type { LogSchema } from '../schema/LogSchema.js';
@@ -378,6 +379,25 @@ export type SpanContext<Ctx extends OpContext> = {
    */
   err<E>(error: E): ErrResult<E, Ctx['logSchema']>;
 
+  /**
+   * This span's name: the row-0 span-start message the caller passed to `span(name, …)`.
+   */
+  readonly spanName: string;
+
+  /**
+   * Block on the service this span is named for: `ctx.err(Blocked.service(ctx.spanName, config))`.
+   *
+   * The returned result is the same schema-bound Err as `ctx.err()`, so row-1 setters chain
+   * (`.retry_after_sec(60)`) and the span records `error_code` `'Blocked'`.
+   *
+   * @example
+   * const call = await ctx.span('payment-api', (spanCtx) => {
+   *   spanCtx.tag.http_status(503);
+   *   return spanCtx.blocked({ nextRetry: (attempt) => attempt * 5000 }).retry_after_sec(60);
+   * });
+   * if (!call.success) return ctx.err(call.error);
+   */
+  blocked(config?: BlockedConfig): ErrResult<Blocked, Ctx['logSchema']>;
   /**
    * Create a child span with its own buffer.
    *

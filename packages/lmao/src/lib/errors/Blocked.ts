@@ -53,6 +53,7 @@
  */
 
 import type { TaggedError } from '../result.js';
+import type { SpanIdentity } from '../traceId.js';
 
 //#region smoo/lmao!n/op-context-tagged-errors.blocked
 /**
@@ -95,12 +96,15 @@ type BlockedInspectView = {
   _tag: 'Blocked';
   reason: BlockedReason;
   blockedConfig?: BlockedConfig;
+  origin?: SpanIdentity;
 };
 
 type BlockedJsonView = {
   _tag: 'Blocked';
   reason: BlockedReason;
   blockedConfig?: Omit<BlockedConfig, 'nextRetry'> & { nextRetry?: string };
+  // thread_id as decimal text: JSON carries no bigint.
+  origin?: { trace_id: string; span_id: number; thread_id: string };
 };
 
 export class Blocked extends Error implements TaggedError<'Blocked'> {
@@ -113,6 +117,7 @@ export class Blocked extends Error implements TaggedError<'Blocked'> {
   /** Retry configuration */
   readonly blockedConfig: BlockedConfig | undefined;
 
+  private _origin: SpanIdentity | undefined;
   constructor(
     /** The reason this Op is blocked */
     readonly reason: BlockedReason,
@@ -124,6 +129,19 @@ export class Blocked extends Error implements TaggedError<'Blocked'> {
     this.blockedConfig = config;
   }
 
+  /**
+   * The span that first completed with this Blocked. Undefined until a span-bound `ctx.err()`
+   * (or `ctx.blocked()`) binds it; a parent that rebinds the error keeps the original.
+   */
+  get origin(): SpanIdentity | undefined {
+    return this._origin;
+  }
+
+  /** Bind the completing span; the first binding wins, so a rebind never moves it. */
+  bindOrigin(origin: SpanIdentity): this {
+    if (this._origin === undefined) this._origin = origin;
+    return this;
+  }
   /** Create a Blocked error for a service being unavailable */
   static service(name: string, config?: BlockedConfig): Blocked {
     return new Blocked({ type: 'service', name }, config);
@@ -145,12 +163,14 @@ export class Blocked extends Error implements TaggedError<'Blocked'> {
       _tag: this._tag,
       reason: this.reason,
       ...(this.blockedConfig ? { blockedConfig: this.blockedConfig } : {}),
+      ...(this._origin ? { origin: this._origin } : {}),
     };
   }
 
   /** Clean output for JSON.stringify */
   toJSON(): BlockedJsonView {
     const config = this.blockedConfig;
+    const origin = this._origin;
     return {
       _tag: this._tag,
       reason: this.reason,
@@ -161,6 +181,9 @@ export class Blocked extends Error implements TaggedError<'Blocked'> {
               ...(config.nextRetry ? { nextRetry: '[closure]' } : {}),
             },
           }
+        : {}),
+      ...(origin
+        ? { origin: { trace_id: origin.trace_id, span_id: origin.span_id, thread_id: origin.thread_id.toString() } }
         : {}),
     };
   }

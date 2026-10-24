@@ -36,8 +36,8 @@ const (
 
 var contextCapability = map[string]uint32{
 	"tag": runtimeHintTag, "log": runtimeHintLog, "ff": runtimeHintFF,
-	"span": runtimeHintSpan, "spanSync": runtimeHintSpan,
-	"ok": runtimeHintResult, "err": runtimeHintResult,
+	"span": runtimeHintSpan, "spanSync": runtimeHintSpan, "spanName": 0,
+	"ok": runtimeHintResult, "err": runtimeHintResult, "blocked": runtimeHintResult,
 	"scope": runtimeHintScope, "setScope": runtimeHintScope, "deps": runtimeHintDeps,
 }
 
@@ -363,7 +363,7 @@ func contextWriterRoot(call *shimast.CallExpression, ctxName string) string {
 		}
 		if next.Kind == shimast.KindIdentifier && shimast.NodeText(next) == ctxName {
 			switch shimast.NodeText(access.Name()) {
-			case "ok", "err":
+			case "ok", "err", "blocked":
 				return "result"
 			}
 			return ""
@@ -408,7 +408,7 @@ func (a *eagerColumnAnalyzer) provenCallWrites(call *shimast.CallExpression) (ea
 		}
 		if !proved && call.Expression.Kind == shimast.KindPropertyAccessExpression {
 			access := call.Expression.AsPropertyAccessExpression()
-			if access.Expression.Kind == shimast.KindIdentifier && shimast.NodeText(access.Expression) == a.ctxName && resultMethods[shimast.NodeText(access.Name())] {
+			if access.Expression.Kind == shimast.KindIdentifier && shimast.NodeText(access.Expression) == a.ctxName && resultRoots[shimast.NodeText(access.Name())] {
 				return eagerColumnSet{}, true
 			}
 		}
@@ -749,10 +749,13 @@ func isClosedWorldCapabilityUse(access *shimast.Node, name string) bool {
 		}
 		grandparent := parent.Parent
 		return grandparent != nil && grandparent.Kind == shimast.KindCallExpression && grandparent.AsCallExpression().Expression == parent
-	case "span", "spanSync", "ok", "err", "setScope":
+	case "span", "spanSync", "ok", "err", "blocked", "setScope":
 		return parent != nil && parent.Kind == shimast.KindCallExpression && parent.AsCallExpression().Expression == access
 	case "deps", "scope":
 		return parent != nil && parent.Kind == shimast.KindPropertyAccessExpression && parent.AsPropertyAccessExpression().Expression == access
+	case "spanName":
+		// A read of the readonly row-0 name getter; it needs no capability bit.
+		return true
 	default:
 		return false
 	}
@@ -877,6 +880,17 @@ func (t *fileTransformer) collectOptimizations(root *shimast.Node, emitHints boo
 							hints:   group,
 							isGroup: true,
 						})
+					}
+				}
+			case "blocked":
+				// Prove the receiver here, while the tree is untouched: the mutation
+				// walk's line injection cannot query the checker (blockedMethods).
+				if emitHints {
+					break
+				}
+				if recv, _ := calleeNames(call); recv != nil {
+					if recvType := t.checker.GetTypeAtLocation(recv); recvType != nil && isLmaoContextType(t.checker, recvType) {
+						t.blockedReceivers[recv] = true
 					}
 				}
 			case "span":

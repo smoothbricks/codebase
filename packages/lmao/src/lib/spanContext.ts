@@ -31,15 +31,17 @@ import {
   type ScopeUpdate,
   type SpanLoggerImpl,
 } from './codegen/spanLoggerGenerator.js';
+import { Blocked, type BlockedConfig } from './errors/Blocked.js';
 import type { RetryPolicy } from './errors/retry-policy.js';
 import { TransientError } from './errors/Transient.js';
 import type { Op } from './op.js';
 import type { OpContext, OpMetadata, SpanContext, SpanFn, SpanLogger, SpanSyncFn } from './opContext/types.js';
 import type { CallsitePlan, PhysicalLayoutPlan } from './physicalLayoutPlan.js';
+import { resolveMessage } from './resolveMessage.js';
 import {
   Err,
   type ErrResult,
-  hasErrorCode,
+  errorCodeOf,
   Ok,
   type OkResult,
   type Result,
@@ -64,6 +66,7 @@ import {
 } from './schema/systemSchema.js';
 import type { InferSchema, LogSchema } from './schema/types.js';
 import { thrownEvidence, thrownMessage } from './thrownValue.js';
+import { extractSpanIdentity } from './traceId.js';
 import type { AnySpanBuffer, LogBinding, SpanBuffer } from './types.js';
 import { isThreadSpanView } from './wasm/threadSpanView.js';
 
@@ -562,10 +565,8 @@ export function writeSpanEnd<T extends LogSchema, S, E>(buffer: SpanBuffer<T>, r
     writeSpanEndEntry(buffer, ENTRY_TYPE_SPAN_OK);
   } else if (result instanceof Err) {
     writeSpanEndEntry(buffer, ENTRY_TYPE_SPAN_ERR);
-    // Write error_code if the error has a code property
-    if (hasErrorCode(result.error)) {
-      buffer.error_code(1, result.error.code);
-    }
+    const code = errorCodeOf(result.error);
+    if (code !== undefined) buffer.error_code(1, code);
   }
 }
 //#endregion smoo/lmao!n/lmao-entry-span-lifecycle-entry-types.end
@@ -900,7 +901,14 @@ export function createSpanContextClass<Ctx extends OpContext>(
         // State is required: it is both the writer target and completion owner.
         const { OkClass, ErrClass } = callsitePlan;
         this.ok = <V>(value: V): OkResult<V, Ctx['logSchema']> => new OkClass<V>(value, this);
-        this.err = <E>(error: E): ErrResult<E, Ctx['logSchema']> => new ErrClass<E>(error, this);
+        this.err = <E>(error: E): ErrResult<E, Ctx['logSchema']> => {
+          // 01r "Blocked origin": the first span to complete with a Blocked names it; a
+          // parent's rebind finds it bound and allocates no identity.
+          if (error instanceof Blocked && error.origin === undefined) {
+            error.bindOrigin(extractSpanIdentity(this._spanBuffer));
+          }
+          return new ErrClass<E>(error, this);
+        };
       }
       //#endregion smoo/lmao!n/codegen-destructured-context
 
@@ -1117,6 +1125,21 @@ export function createSpanContextClass<Ctx extends OpContext>(
       return this._spanBuffer;
     }
 
+    //#region smoo/lmao!n/op-context-tagged-errors.ctx-blocked
+    // 01r "ctx.blocked()": the span's row-0 name is the Blocked service. Prototype getters,
+    // not constructor closures: a span that never blocks pays nothing, and destructuring
+    // ({ blocked, spanName }) still binds this context.
+    get spanName(): string {
+      const name = resolveMessage(this._spanBuffer, 0);
+      // Invariant: writeSpanStart names row 0 before any callback receives this context.
+      if (name === undefined) throw new TypeError('Span context has no span-start name at row 0');
+      return name;
+    }
+
+    get blocked(): (config?: BlockedConfig) => ErrResult<Blocked, Ctx['logSchema']> {
+      return (config) => this.err(Blocked.service(this.spanName, config));
+    }
+    //#endregion smoo/lmao!n/op-context-tagged-errors.ctx-blocked
     //#region smoo/lmao!n/scope-attributes.read
     // 01i read-only scope view: the immutable _scopeValues snapshot (setScope is wired in the
     // destructured-context region; the immutable merge is _setScope in spanLoggerGenerator).

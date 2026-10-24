@@ -891,7 +891,7 @@ When defining attribute schemas, these names must be avoided to prevent conflict
 **Span Completion** (`ok`, `err`):
 
 - `ok(result)` - success with optional result data (creates `span-ok` entry)
-- `err(error)` - error with optional context (creates `span-err` entry; a code error also fills `error_code`)
+- `err(error)` - error with optional context (creates `span-err` entry; a code or tagged error also fills `error_code`)
 - Follows OpenTelemetry's `Span.setStatus()` pattern
 
 **Child Spans** (`span`):
@@ -970,8 +970,9 @@ class Ok<V, T extends LogSchema = LogSchema> {
 
 ### Err <a id="smoo/lmao!n/lmao-entry-fluenterr"></a>
 
-Returned by `ctx.err(error)`. It is the `Err<E>` class with the same row-1 chaining methods. A code error built with
-`defineCodeError` (for example `NOT_FOUND({ userId })`) carries the `code` that becomes `error_code`:
+Returned by `ctx.err(error)`. It is the `Err<E>` class with the same row-1 chaining methods. `errorCodeOf(error)` names
+the `error_code` it records: a code error built with `defineCodeError` (for example `NOT_FOUND({ userId })`) records its
+`code`, and a tagged error without one (`Blocked`, `RetriesExhausted`) records its `_tag`:
 
 ```typescript
 class Err<E, T extends LogSchema = LogSchema> {

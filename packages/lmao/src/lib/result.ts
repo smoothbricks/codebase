@@ -650,11 +650,14 @@ export function defineCodeError<Code extends string>(code: Code) {
 }
 
 /**
- * Check if an error has a `code` property.
- * Used by writeSpanEnd to extract error_code for logging.
+ * The `error_code` an error records on its span's row 1: a code error's `code`, else a
+ * tagged error's `_tag` (`Blocked`, `RetriesExhausted`). `undefined` leaves the column null.
  */
-export function hasErrorCode(error: unknown): error is { code: string } {
-  return error !== null && typeof error === 'object' && 'code' in error && typeof error.code === 'string';
+export function errorCodeOf(error: unknown): string | undefined {
+  if (error === null || typeof error !== 'object') return undefined;
+  if ('code' in error && typeof error.code === 'string') return error.code;
+  if ('_tag' in error && typeof error._tag === 'string') return error._tag;
+  return undefined;
 }
 
 // =============================================================================
