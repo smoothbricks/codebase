@@ -118,7 +118,7 @@
           "bunToolchain"
         ],
         "options": {
-          "command": "bun test --timeout=0 src/monorepo/setup-environment.test.ts",
+          "command": "bun test --timeout=0 src/monorepo/setup-environment",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
@@ -133,7 +133,7 @@
           "bunToolchain"
         ],
         "options": {
-          "command": "bun test --timeout=0 --path-ignore-patterns='**/setup-environment.test.ts' --shard=1/4",
+          "command": "bun test --timeout=0 --path-ignore-patterns='**/setup-environment*.test.ts' --shard=1/4",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
@@ -148,7 +148,7 @@
           "bunToolchain"
         ],
         "options": {
-          "command": "bun test --timeout=0 --path-ignore-patterns='**/setup-environment.test.ts' --shard=2/4",
+          "command": "bun test --timeout=0 --path-ignore-patterns='**/setup-environment*.test.ts' --shard=2/4",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
@@ -163,7 +163,7 @@
           "bunToolchain"
         ],
         "options": {
-          "command": "bun test --timeout=0 --path-ignore-patterns='**/setup-environment.test.ts' --shard=3/4",
+          "command": "bun test --timeout=0 --path-ignore-patterns='**/setup-environment*.test.ts' --shard=3/4",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
@@ -178,7 +178,7 @@
           "bunToolchain"
         ],
         "options": {
-          "command": "bun test --timeout=0 --path-ignore-patterns='**/setup-environment.test.ts' --shard=4/4",
+          "command": "bun test --timeout=0 --path-ignore-patterns='**/setup-environment*.test.ts' --shard=4/4",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000

@@ -324,9 +324,11 @@ Concrete targets use `{tool}-{output}` names and describe the tool that runs and
   `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`, `*-bun`, and `*-wasm` instead of duplicating commands.
 - `lint` is an aggregate validation target. It is not a formatting target.
 
-This CLI's `cli:test` target runs the slow shell-entry integration file on its own and divides every other Bun test file
-across four native `--shard` targets. All five bounded targets must pass; the four shards ignore only the shell-entry
-file, so new tests discovered under `src/` remain in the suite without maintaining a file list or extending its timeout.
+This CLI's `cli:test` target runs the slow shell-entry integration files (`src/monorepo/setup-environment*.test.ts`, one
+per subject over the shared fixture in `src/monorepo/__tests__/helpers/shell-entry.ts`) on their own and divides every
+other Bun test file across four native `--shard` targets. All five bounded targets must pass; the four shards ignore
+only the shell-entry files, so new tests discovered under `src/` remain in the suite without maintaining a file list or
+extending its timeout.
 
 `smoo nx refresh-test-timings <project>` rewrites a project's `--timings` manifest. It runs the project's `bun test`
 shard command once without `--shard`, plus `--update-timings`, in the shards' cwd, so Bun writes every test file's
