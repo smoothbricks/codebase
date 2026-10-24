@@ -24,7 +24,7 @@ describe('land failure summary', () => {
       '- nx-plugin:test-shard3',
       '',
     ].join('\n');
-    expect(summarizeFailures(output)).toBe('failed nx-plugin:test-shard3\n' + first + '\n\n' + second + '\n');
+    expect(summarizeFailures(output)).toBe(`failed nx-plugin:test-shard3\n${first}\n\n${second}\n`);
   });
 
   it('retains multiline assertion diffs verbatim and drops only known passing-test progress', () => {
@@ -44,7 +44,7 @@ describe('land failure summary', () => {
       '- cli:test-shard-3',
       '',
     ].join('\n');
-    expect(summarizeFailures(output)).toBe('failed cli:test-shard-3\n' + message + '\n');
+    expect(summarizeFailures(output)).toBe(`failed cli:test-shard-3\n${message}\n`);
   });
 
   it.each([
@@ -63,6 +63,33 @@ describe('land failure summary', () => {
     },
   ])('$name', ({ output, expected }) => {
     expect(summarizeFailures(output)).toBe(expected);
+  });
+
+  // Each diagnostic a land stops on, printed twice by its task and listed twice by Nx, is reported once under it.
+  it.each([
+    'error: expect(received).toEqual(expected)\n\nExpected: []\nReceived: ["orphan"]\n    at fixture.test.ts:206:43',
+    'error: daemon to answer PING: no event within 30000 ms',
+    'TIMEOUT [30.000s] test_case',
+    'bounded-exec: outlived its 120000ms bound',
+    'bounded-exec: wedged, no test finished for 180000ms',
+  ])('reports %p once under its task', (message) => {
+    const task = 'cowshed:cargo-test-cowshed-core-shard1';
+    const output = [
+      `> nx run ${task}`,
+      '',
+      message,
+      '',
+      message,
+      '',
+      ' NX   Running target gate failed',
+      '',
+      'Failed tasks:',
+      '',
+      `- ${task}`,
+      `- ${task}`,
+      '',
+    ].join('\n');
+    expect(summarizeFailures(output)).toBe(`failed ${task}\n${message}\n`);
   });
 
   it('extracts exact errors from verbose failed tasks instead of replaying fixture progress and daemon dumps', () => {
@@ -90,7 +117,7 @@ describe('land failure summary', () => {
       '- nx-plugin:test-shard3',
       '',
     ].join('\n');
-    expect(summarizeFailures(output)).toBe('failed nx-plugin:test-shard3\n' + message + '\n');
+    expect(summarizeFailures(output)).toBe(`failed nx-plugin:test-shard3\n${message}\n`);
   });
 
   it('does not hide failures before tasks start or invent evidence for an empty log', () => {

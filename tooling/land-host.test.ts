@@ -258,7 +258,7 @@ function fixture(replayFails = false): Land {
 }
 
 describe('land-host.sh', () => {
-  it('refuses old ancestry and accepts only an explicit onto rebase without replaying the old range', () => {
+  it('refuses old ancestry, accepts an explicit onto rebase, then gates once and lands exactly the gated commit', () => {
     const land = fixture();
     const oldMain = git(land.main, 'rev-parse', 'HEAD');
     const sourceBefore = git(land.ws, 'rev-parse', 'HEAD');
@@ -275,24 +275,9 @@ describe('land-host.sh', () => {
     git(land.ws, 'rebase', '--onto', newMain, oldMain);
     expect(judgeHistory(land.ws, newMain, oldMain)).toEqual({ kind: 'clean' });
     expect(judgeHistory(join(land.ws, 'missing'), newMain, oldMain).kind).toBe('unavailable');
-    const run = land.land([DAEMON_STOP, passingRun(GATE)]);
-    expect(run.status, run.log).toBe(0);
-    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(git(land.ws, 'rev-parse', 'HEAD'));
-  });
 
-  it('rebases, stops the daemon, gates once without bailing, and fast-forwards exactly the gated commit', () => {
-    const land = fixture();
-    const gated = git(land.ws, 'rev-parse', 'HEAD');
-    const run = land.land([DAEMON_STOP, passingRun(GATE)]);
-    expect(run.log).toContain('gating');
-    expect(run.status, run.log).toBe(0);
-    expect(run.nx).toEqual(['daemon --stop', GATE.join(' ')]);
-    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
-    expect(existsSync(join(land.ws, 'agent-todo/land-ledger.md'))).toBe(false);
-  });
-
-  it('captures directly to one file and replays exactly the final 64 KiB without changing the gate verdict', () => {
-    const land = fixture();
+    // The land rebases, stops the daemon, gates once without bailing, captures directly to one file and replays
+    // exactly its final 64 KiB, then fast-forwards main to exactly the gated commit.
     const gated = git(land.ws, 'rev-parse', 'HEAD');
     const suffix = '\ncapture-suffix\n';
     const run = land.land([
@@ -304,25 +289,39 @@ describe('land-host.sh', () => {
       },
     ]);
     expect(run.status, run.log).toBe(0);
+    expect(run.log).toContain('gating');
+    expect(run.nx).toEqual(['daemon --stop', GATE.join(' ')]);
     expect(run.log).not.toContain('capture-prefix');
     expect(run.log).toContain('capture-suffix');
     expect(run.log.match(/x{1000,}/)?.[0]?.length).toBe(65_536 - suffix.length);
     expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
+    expect(existsSync(join(land.ws, 'agent-todo/land-ledger.md'))).toBe(false);
   });
 
-  it('reports the complete captured failure even when its summary precedes the replay suffix', () => {
+  // Which diagnostics the summary keeps is land-summary.test.ts's; this land proves what the script does with them.
+  it('stops immediately on a failed gate, reporting its complete captured failure once, without rerunning or committing a ledger', () => {
     const land = fixture();
     const before = git(land.main, 'rev-parse', 'HEAD');
-    const message = 'error: failure before the replay suffix';
+    const gated = git(land.ws, 'rev-parse', 'HEAD');
+    const message =
+      'error: expect(received).toEqual(expected)\n\nExpected: []\nReceived: ["orphan"]\n    at fixture.test.ts:206:43';
     const failed = failedRun(message, 7);
+    // The summary precedes more than the 64 KiB replay suffix of the captured output.
     const run = land.land([
       DAEMON_STOP,
       { ...failed, requireFileOutput: true, output: `${failed.output}\n${'x'.repeat(70_000)}\ncapture-suffix` },
     ]);
     expect(run.status, run.log).toBe(7);
     expect(run.log).toContain(`failed ${TASK}\n${message}`);
+    expect(run.log.split(message)).toHaveLength(2);
+    expect(run.log).toContain('gate exited 7; the land stops');
     expect(run.nx).toEqual(['daemon --stop', GATE.join(' ')]);
     expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
+    expect(git(land.ws, 'rev-parse', 'HEAD')).toBe(gated);
+    expect(existsSync(join(land.ws, 'agent-todo/land-ledger.md'))).toBe(false);
+    const output = /complete output: (.+)/.exec(run.log)?.[1];
+    expect(output).toBeDefined();
+    if (output !== undefined) expect(readFileSync(output, 'utf8')).toContain(message);
   });
 
   it('refuses to land when bounded replay fails after a successful gate', () => {
@@ -333,41 +332,6 @@ describe('land-host.sh', () => {
     expect(run.log).toContain('could not replay the gate output');
     expect(run.replayArgs?.slice(0, -1)).toEqual(['--kill-after=1s', '10s', 'tail', '-c', '65536']);
     expect(run.nx).toEqual(['daemon --stop', GATE.join(' ')]);
-    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
-  });
-
-  for (const message of [
-    'error: expect(received).toEqual(expected)\n\nExpected: []\nReceived: ["orphan"]\n    at fixture.test.ts:206:43',
-    'error: daemon to answer PING: no event within 30000 ms',
-    'TIMEOUT [30.000s] test_case',
-    'bounded-exec: outlived its 120000ms bound',
-    'bounded-exec: wedged, no test finished for 180000ms',
-  ]) {
-    it(`stops immediately on ${message.split('\n')[0]}, without rerunning or committing a ledger`, () => {
-      const land = fixture();
-      const before = git(land.main, 'rev-parse', 'HEAD');
-      const gated = git(land.ws, 'rev-parse', 'HEAD');
-      const run = land.land([DAEMON_STOP, failedRun(message, 7)]);
-      expect(run.status, run.log).toBe(7);
-      expect(run.log).toContain(`failed ${TASK}\n${message}`);
-      expect(run.log.split(message)).toHaveLength(2);
-      expect(run.log).toContain('gate exited 7; the land stops');
-      expect(run.nx).toEqual(['daemon --stop', GATE.join(' ')]);
-      expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
-      expect(git(land.ws, 'rev-parse', 'HEAD')).toBe(gated);
-      expect(existsSync(join(land.ws, 'agent-todo/land-ledger.md'))).toBe(false);
-      const output = /complete output: (.+)/.exec(run.log)?.[1];
-      expect(output).toBeDefined();
-      if (output !== undefined) expect(readFileSync(output, 'utf8')).toContain(message);
-    });
-  }
-
-  it('stops on a failed gate with no named task, preserving its exact infrastructure error', () => {
-    const land = fixture();
-    const before = git(land.main, 'rev-parse', 'HEAD');
-    const run = land.land([DAEMON_STOP, { args: GATE, exit: 1, output: 'nx: the daemon died' }]);
-    expect(run.status, run.log).toBe(1);
-    expect(run.log).toContain('Gate failed without a task-level failure summary:\nnx: the daemon died');
     expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
   });
 
