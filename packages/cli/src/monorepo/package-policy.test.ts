@@ -1184,10 +1184,9 @@ describe('workspace package script policy', () => {
     }
   });
 
-  // The reconcile family shares one workspace and one reconcile pass. The validators count failures across the whole
-  // workspace, so the pre-repair total is the sum of what each package counted alone (bun-tests 2, vitest 2, nx-bun 2,
-  // app 7, external-app 3). The drift package joins after that total is taken, since its own pre-repair count was never
-  // asserted.
+  // The reconcile family shares one workspace and one reconcile pass. The validator prints one finding per failure and
+  // names the package each belongs to, so the pre-repair findings are grouped per package and every count is asserted.
+  // The drift package joins after that count is taken, since its own pre-repair count was never asserted.
   it('creates and repairs test typecheck configs for every test-runner shape in one workspace', async () => {
     const root = await createWorkspace({
       rootName: '@smoothbricks/codebase',
@@ -1242,7 +1241,13 @@ describe('workspace package script policy', () => {
         extends: '../../tsconfig.base.json',
         compilerOptions: { baseUrl: '.', rootDir: 'src', outDir: 'dist' },
       });
-      expect(validateWorkspaceDependencies(root)).toBe(2 + 2 + 2 + 7 + 3);
+      const { failures: preRepairFailures, findings: preRepairFindings } = captureValidatorFindings(() =>
+        validateWorkspaceDependencies(root),
+      );
+      const preRepairByPackage = { lib: 0, 'bun-tests': 2, vitest: 2, 'nx-bun': 2, app: 7, 'external-app': 3 };
+      expect(countFindingsByPackage(preRepairFindings, Object.keys(preRepairByPackage))).toEqual(preRepairByPackage);
+      expect(preRepairFindings).toHaveLength(preRepairFailures);
+      expect(preRepairFailures).toBe(Object.values(preRepairByPackage).reduce((total, count) => total + count, 0));
 
       await writeWorkspacePackage(root, { dir: 'drift', name: '@smoothbricks/drift', scripts: { test: 'bun test' } });
       await writeJson(join(root, 'packages/drift/tsconfig.lib.json'), {
@@ -1762,6 +1767,29 @@ function captureConsoleErrors(): string[] {
     errors.push(args.join(' '));
   });
   return errors;
+}
+
+/**
+ * Runs a validator that reports each failure as one console.error line, and returns its count with those lines.
+ * The spy is restored here, so a silenced console never leaks into the next test.
+ */
+function captureValidatorFindings(validate: () => number): { failures: number; findings: string[] } {
+  const findings = captureConsoleErrors();
+  try {
+    return { failures: validate(), findings };
+  } finally {
+    console.error = originalConsoleError;
+  }
+}
+
+/** Counts findings per package directory: a finding names its package as `packages/<dir>:` or inside `packages/<dir>/`. */
+function countFindingsByPackage(findings: readonly string[], dirs: readonly string[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const dir of dirs) {
+    const markers = [`packages/${dir}:`, `packages/${dir}/`];
+    counts[dir] = findings.filter((finding) => markers.some((marker) => finding.includes(marker))).length;
+  }
+  return counts;
 }
 
 function validRootPackage(extra: Record<string, unknown> = {}): Record<string, unknown> {
