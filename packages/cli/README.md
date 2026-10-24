@@ -125,6 +125,12 @@ while package manifests are not forced to depend on Bun just because a test tsco
 does explicitly declare `@types/bun`, `sherif` can keep duplicate declarations consistent, but `smoo` owns the semantic
 root `bun@x.y.z` to `@types/bun x.y.z` relationship.
 
+A root dependency these policies check (the tool devDependencies, `@types/bun`, `@types/node`, `ttsc`) may be a Bun
+catalog reference, `catalog:` or `catalog:<name>`. smoo then judges the catalog entry Bun installs, names that entry in
+a failure (`package.json workspaces.catalog.nx must be ...`), and `update`, `validate --fix` and `init --runtime-only`
+repair the entry and keep the reference. Bun reads the catalogs from the object form of `workspaces` once it holds
+`catalog` or `catalogs`, and otherwise from the top level of the root manifest; smoo reads them from the same place.
+
 ## LMAO Test Tracing
 
 `smoo monorepo setup-test-tracing` configures LMAO-backed Bun test tracing for workspace packages. It is a bulk wrapper

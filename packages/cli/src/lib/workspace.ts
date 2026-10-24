@@ -20,6 +20,7 @@ import {
   type PackageRepository,
   readJson,
   readJsonObject,
+  workspacePackagePatterns,
 } from './json.js';
 
 export type { PackageJson, PackageNxConfig, PackageRepository };
@@ -205,25 +206,14 @@ export function listPackageJsonRecords(root: string): PackageInfo[] {
   }
   return [
     { ...rootPackage, path: '.' },
-    ...getWorkspacePackagesForPatterns(root, getWorkspacePatternsFromPackageJson(rootPackage.json)),
+    ...getWorkspacePackagesForPatterns(root, workspacePackagePatterns(rootPackage.json.workspaces) ?? ['packages/*']),
   ];
 }
 
 export function getWorkspacePatterns(root: string): string[] {
   const raw = readJson(join(root, 'package.json'));
   const pkg = isPackageJson(raw) ? raw : null;
-  return pkg ? getWorkspacePatternsFromPackageJson(pkg) : ['packages/*'];
-}
-
-function getWorkspacePatternsFromPackageJson(pkg: PackageJson): string[] {
-  const workspaces = pkg.workspaces;
-  if (Array.isArray(workspaces)) {
-    return workspaces.filter((entry): entry is string => typeof entry === 'string');
-  }
-  if (workspaces && typeof workspaces === 'object' && Array.isArray(workspaces.packages)) {
-    return workspaces.packages.filter((entry): entry is string => typeof entry === 'string');
-  }
-  return ['packages/*'];
+  return (pkg ? workspacePackagePatterns(pkg.workspaces) : undefined) ?? ['packages/*'];
 }
 
 export function readPackageJson(path: string): PackageInfo | null {

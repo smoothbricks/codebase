@@ -2,7 +2,79 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ciPushBranches, readSmooGithub, writeJsonObject } from './json.js';
+import {
+  ciPushBranches,
+  dependencyVersion,
+  type PackageJson,
+  readSmooGithub,
+  setDependencyVersion,
+  workspacePackagePatterns,
+  writeJsonObject,
+} from './json.js';
+
+describe('workspacePackagePatterns', () => {
+  it('reads the array and the object form alike, and nothing else', () => {
+    expect(workspacePackagePatterns(['packages/*', 'tooling'])).toEqual(['packages/*', 'tooling']);
+    expect(workspacePackagePatterns({ packages: ['packages/*'], catalog: { zod: '^4.0.0' } })).toEqual(['packages/*']);
+    expect(workspacePackagePatterns({ catalog: { zod: '^4.0.0' } })).toBeUndefined();
+    expect(workspacePackagePatterns(undefined)).toBeUndefined();
+  });
+});
+
+describe('dependencyVersion through root catalogs', () => {
+  const members = { zod: 'catalog:', react: 'catalog:ui', vitest: '^4.1.0' };
+
+  it('resolves a catalog: value where Bun reads it, and a literal as itself', () => {
+    const root: PackageJson = {
+      workspaces: { packages: ['packages/*'], catalog: { zod: '^4.0.0' }, catalogs: { ui: { react: '19.2.8' } } },
+    };
+    expect(dependencyVersion(root, 'dependencies', members, 'zod')).toEqual({
+      version: '^4.0.0',
+      path: 'workspaces.catalog.zod',
+    });
+    expect(dependencyVersion(root, 'dependencies', members, 'react')).toEqual({
+      version: '19.2.8',
+      path: 'workspaces.catalogs.ui.react',
+    });
+    expect(dependencyVersion(root, 'dependencies', { zod: 'catalog:default' }, 'zod')?.version).toBe('^4.0.0');
+    expect(dependencyVersion(root, 'dependencies', members, 'vitest')).toEqual({
+      version: '^4.1.0',
+      path: 'dependencies.vitest',
+    });
+    expect(dependencyVersion(root, 'dependencies', members, 'absent')).toBeUndefined();
+  });
+
+  it('reads the top-level catalogs only while workspaces holds none, as bun install 1.4.3 does', () => {
+    const topLevel: PackageJson = { workspaces: { packages: ['packages/*'] }, catalog: { zod: '^3.0.0' } };
+    expect(dependencyVersion(topLevel, 'dependencies', members, 'zod')).toEqual({
+      version: '^3.0.0',
+      path: 'catalog.zod',
+    });
+    const shadowed: PackageJson = {
+      workspaces: { packages: ['packages/*'], catalog: { other: '1.0.0' } },
+      catalog: { zod: '^3.0.0' },
+    };
+    expect(dependencyVersion(shadowed, 'dependencies', members, 'zod')).toEqual({
+      version: undefined,
+      path: 'workspaces.catalog.zod',
+    });
+  });
+
+  it('writes a repaired version into the catalog entry and keeps the reference', () => {
+    const root: PackageJson = { workspaces: { packages: ['packages/*'], catalog: { zod: '^3.0.0' } } };
+    const dependencies = { zod: 'catalog:', react: 'catalog:ui', vitest: '^4.0.0' };
+    expect(setDependencyVersion(root, dependencies, 'zod', '^4.0.0')).toBe(true);
+    expect(setDependencyVersion(root, dependencies, 'zod', '^4.0.0')).toBe(false);
+    expect(setDependencyVersion(root, dependencies, 'react', '19.2.8')).toBe(true);
+    expect(setDependencyVersion(root, dependencies, 'vitest', '^4.1.0')).toBe(true);
+    expect(dependencies).toEqual({ zod: 'catalog:', react: 'catalog:ui', vitest: '^4.1.0' });
+    expect(root.workspaces).toEqual({
+      packages: ['packages/*'],
+      catalog: { zod: '^4.0.0' },
+      catalogs: { ui: { react: '19.2.8' } },
+    });
+  });
+});
 
 describe('ciPushBranches', () => {
   it('reads the configured branches in order, the first being the staging one', () => {

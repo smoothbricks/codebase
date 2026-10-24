@@ -29,6 +29,7 @@ import {
   checkWorkspaceConfigPolicy,
 } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import {
+  dependencyVersion,
   ensureNx,
   ensurePublishConfig,
   ensureRepositoryObject,
@@ -330,9 +331,11 @@ export function validateRootPackagePolicy(root: string): number {
     failures++;
   }
   const bunVersion = packageManager?.startsWith('bun@') ? packageManager.slice('bun@'.length) : null;
-  const devDependencies = rootPackage.devDependencies;
-  if (!bunVersion || !devDependencies || devDependencies['@types/bun'] !== bunVersion) {
-    console.error('package.json devDependencies.@types/bun must match packageManager bun version');
+  const typesBun = dependencyVersion(rootPackage, 'devDependencies', rootPackage.devDependencies, '@types/bun');
+  if (!bunVersion || typesBun?.version !== bunVersion) {
+    console.error(
+      `package.json ${typesBun?.path ?? 'devDependencies.@types/bun'} must match packageManager bun version`,
+    );
     failures++;
   }
   const engines = rootPackage.engines;

@@ -12,6 +12,12 @@ import type {
   PackageSmooGithub,
   StringMap,
 } from '@smoothbricks/nx-plugin/workspace-manifest';
+import {
+  catalogName,
+  ensureRootCatalog,
+  rootCatalog,
+  rootCatalogPath,
+} from '@smoothbricks/nx-plugin/workspace-manifest';
 import typia, { type IValidation } from 'typia';
 
 export * from '@smoothbricks/nx-plugin/workspace-manifest';
@@ -280,4 +286,48 @@ function isPublishConfig(value: unknown): value is PackagePublishConfig {
 
 function isRepositoryObject(value: unknown): value is PackageRepository {
   return value !== null && value !== undefined && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** A dependency's version as Bun installs it, and where in the root manifest that version is written. */
+export interface DependencyVersion {
+  /** The version; `undefined` when a `catalog:` value names an entry the root's catalogs lack. */
+  readonly version: string | undefined;
+  /** JSON path of the version for messages: `devDependencies.nx`, or the catalog entry `workspaces.catalog.nx`. */
+  readonly path: string;
+}
+
+/**
+ * The version Bun installs for `name` in `dependencies` (the `field` map of a manifest whose root manifest is
+ * `root`): the value itself, or the root catalog entry its `catalog:` value names. `undefined` when undeclared.
+ */
+export function dependencyVersion(
+  root: PackageJson,
+  field: string,
+  dependencies: StringMap | undefined,
+  name: string,
+): DependencyVersion | undefined {
+  const value = dependencies?.[name];
+  if (value === undefined) {
+    return undefined;
+  }
+  const catalog = catalogName(value);
+  if (catalog === null) {
+    return { version: value, path: `${field}.${name}` };
+  }
+  return { version: rootCatalog(root, catalog)?.[name], path: `${rootCatalogPath(root, catalog)}.${name}` };
+}
+
+/**
+ * Write `name`'s version where Bun reads it: into the root catalog entry its `catalog:` value names, so the member
+ * keeps its reference, otherwise over the value itself.
+ */
+export function setDependencyVersion(
+  root: PackageJson,
+  dependencies: StringMap,
+  name: string,
+  version: string,
+): boolean {
+  const value = dependencies[name];
+  const catalog = value === undefined ? null : catalogName(value);
+  return setStringProperty(catalog === null ? dependencies : ensureRootCatalog(root, catalog), name, version);
 }

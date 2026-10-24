@@ -4,8 +4,10 @@ import { managedTtscPatch } from '@smoothbricks/nx-plugin/managed-files/files';
 import typia from 'typia';
 import { cliPackageVersion, isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
 import {
+  dependencyVersion,
   ensureDependencyMap,
   readJsonObject,
+  setDependencyVersion,
   setPackageStringField,
   setStringProperty,
   writeJsonObject,
@@ -144,10 +146,10 @@ export async function applyRootDevDependencyDefaults(root: string, context: Tool
   let changed = false;
   const devDependencies = ensureDependencyMap(pkg, 'devDependencies');
   for (const dependency of rootDevDependencies) {
-    const current = devDependencies[dependency.name];
-    if (typeof current !== 'string' || !satisfiesDependencyPolicy(context.policy, current, dependency)) {
+    const current = dependencyVersion(pkg, 'devDependencies', devDependencies, dependency.name)?.version;
+    if (current === undefined || !satisfiesDependencyPolicy(context.policy, current, dependency)) {
       const version = await resolveDependencyVersion(context.policy, dependency);
-      changed = setStringProperty(devDependencies, dependency.name, version) || changed;
+      changed = setDependencyVersion(pkg, devDependencies, dependency.name, version) || changed;
     }
   }
   // `delete` returns true for an absent key, so an unguarded delete reported
@@ -175,10 +177,10 @@ async function applyRootPackageToolDefaults(root: string, context: ToolContext):
   let workspaceChanged = false;
   const devDependencies = ensureDependencyMap(pkg, 'devDependencies');
   for (const dependency of rootDevDependencies) {
-    const current = devDependencies[dependency.name];
-    if (typeof current !== 'string' || !satisfiesDependencyPolicy(context.policy, current, dependency)) {
+    const current = dependencyVersion(pkg, 'devDependencies', devDependencies, dependency.name)?.version;
+    if (current === undefined || !satisfiesDependencyPolicy(context.policy, current, dependency)) {
       const version = await resolveDependencyVersion(context.policy, dependency);
-      dependencyChanged = setStringProperty(devDependencies, dependency.name, version) || dependencyChanged;
+      dependencyChanged = setDependencyVersion(pkg, devDependencies, dependency.name, version) || dependencyChanged;
     }
   }
   if (cliPackageName in devDependencies) {
@@ -275,13 +277,18 @@ export function validateRootDevDependencies(policy: ToolPolicy, rootPackage: Pac
   const devDependencies = pkg.devDependencies;
   let failures = 0;
   for (const dependency of rootDevDependencies) {
-    const version = devDependencies?.[dependency.name];
-    if (typeof version !== 'string') {
+    const declared = dependencyVersion(pkg, 'devDependencies', devDependencies, dependency.name);
+    if (declared === undefined) {
       console.error(`package.json devDependencies.${dependency.name} must be defined`);
       failures++;
-    } else if (!satisfiesDependencyPolicy(policy, version, dependency)) {
+    } else if (declared.version === undefined) {
       console.error(
-        `package.json devDependencies.${dependency.name} must be ${formatExpectedDependency(policy, dependency)}; found ${version}`,
+        `package.json devDependencies.${dependency.name} is ${devDependencies?.[dependency.name]}, but ${declared.path} is not defined`,
+      );
+      failures++;
+    } else if (!satisfiesDependencyPolicy(policy, declared.version, dependency)) {
+      console.error(
+        `package.json ${declared.path} must be ${formatExpectedDependency(policy, dependency)}; found ${declared.version}`,
       );
       failures++;
     }
@@ -307,7 +314,7 @@ function removeObsoleteTtscPatch(pkg: PackageJson): boolean {
 
 function syncTtscPatch(pkg: PackageJson): boolean {
   let changed = removeObsoleteTtscPatch(pkg);
-  if (pkg.devDependencies?.ttsc === managedTtscPatch.version) {
+  if (dependencyVersion(pkg, 'devDependencies', pkg.devDependencies, 'ttsc')?.version === managedTtscPatch.version) {
     const patches = pkg.patchedDependencies ?? {};
     changed = setStringProperty(patches, managedTtscPatch.key, managedTtscPatch.path) || changed;
     pkg.patchedDependencies = patches;
@@ -325,7 +332,9 @@ function validateTtscPatch(rootPackage: PackageJson | null): number {
     failures++;
   }
   if (
-    rootPackage?.devDependencies?.ttsc === managedTtscPatch.version &&
+    rootPackage !== null &&
+    dependencyVersion(rootPackage, 'devDependencies', rootPackage.devDependencies, 'ttsc')?.version ===
+      managedTtscPatch.version &&
     patches?.[managedTtscPatch.key] !== managedTtscPatch.path
   ) {
     console.error(
@@ -755,6 +764,11 @@ function addWorkspacePattern(pkg: PackageJson, pattern: string): boolean {
       return false;
     }
     workspaces.packages.push(pattern);
+    return true;
+  }
+  if (workspaces) {
+    // The object form also holds the catalogs; replacing it whole would drop them.
+    workspaces.packages = ['packages/*', pattern];
     return true;
   }
   pkg.workspaces = ['packages/*', pattern];

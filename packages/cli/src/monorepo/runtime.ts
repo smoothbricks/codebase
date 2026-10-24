@@ -1,10 +1,12 @@
 import { join } from 'node:path';
 import {
+  dependencyVersion,
   ensureDependencyMap,
   ensureEngines,
   type PackageJson,
   parseStringArrayText,
   readJsonObject,
+  setDependencyVersion,
   setPackageStringField,
   setStringProperty,
   writeJsonObject,
@@ -47,13 +49,15 @@ export async function syncRootRuntimeVersions(root: string): Promise<void> {
   changed = setPackageStringField(packageJson, 'packageManager', `bun@${bunVersion}`) || changed;
   const devDependencies = ensureDependencyMap(packageJson, 'devDependencies');
   changed =
-    setStringProperty(
+    setDependencyVersion(
+      packageJson,
       devDependencies,
       '@types/node',
       await runtimeTypesRange(root, '@types/node', nodeVersion, 'major'),
     ) || changed;
   changed =
-    setStringProperty(
+    setDependencyVersion(
+      packageJson,
       devDependencies,
       '@types/bun',
       await runtimeTypesRange(root, '@types/bun', bunVersion, 'exact'),
@@ -113,7 +117,8 @@ export function validateRuntimePins(packageJson: PackageJson, runtime: RuntimeVe
     );
     failures++;
   }
-  const typesNode = packageJson.devDependencies?.['@types/node'] ?? null;
+  const typesNode =
+    dependencyVersion(packageJson, 'devDependencies', packageJson.devDependencies, '@types/node')?.version ?? null;
   const typesNodeParts = typesNode ? /^\^(\d+)\.(\d+)\.(\d+)$/.exec(typesNode) : null;
   if (!typesNodeParts || typesNodeParts[1] !== nodeMajor) {
     console.error(

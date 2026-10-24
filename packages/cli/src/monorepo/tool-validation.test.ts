@@ -323,6 +323,63 @@ ${extra}  ];
     }
   });
 
+  it('judges catalog: tool dependencies by their catalog entries and repairs the entries, keeping the references', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-tool-validation-'));
+    try {
+      await writeJson(join(root, 'package.json'), {
+        name: '@fixture/app',
+        version: '0.0.0',
+        private: true,
+        workspaces: {
+          packages: ['packages/*', 'tooling'],
+          // nx is below the 23.1.0 minimum, prettier has no entry: both fail, and both are repaired here.
+          catalog: { nx: '22.0.0', ttsc: '0.25.0', typescript: '^6.0.0' },
+        },
+        devDependencies: {
+          '@biomejs/biome': '^3.0.0',
+          '@nx/js': '23.2.0',
+          '@smoothbricks/nx-plugin': '^0.4.0',
+          eslint: '^10.0.0',
+          'eslint-stdout': await currentEslintStdoutRange(),
+          nx: 'catalog:',
+          prettier: 'catalog:',
+          ttsc: 'catalog:',
+          typescript: 'catalog:',
+          '@typescript/native': 'npm:typescript@^7.0.2',
+        },
+      });
+      await writeFile(join(root, 'bun.lock'), lockfileWithTtsc('0.25.0'));
+      await writeJson(join(root, 'tooling/package.json'), {
+        name: '@fixture/tooling',
+        private: true,
+        dependencies: { '@smoothbricks/cli': await currentCliRange() },
+      });
+      const devenvPath = join(root, 'tooling/direnv/devenv.nix');
+      await mkdir(dirname(devenvPath), { recursive: true });
+      await writeFile(
+        devenvPath,
+        '{pkgs, ...}: {\n  packages = with pkgs; [\n    bun\n    git\n    git-format-staged\n    jq\n    alejandra\n    coreutils\n    gnutar\n  ];\n}\n',
+      );
+
+      expect(await validateToolConfig(root)).toBe(2);
+      await applyToolConfigDefaults(root);
+      expect(await validateToolConfig(root)).toBe(0);
+      const rootPackage = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+      expect(rootPackage.devDependencies).toMatchObject({
+        nx: 'catalog:',
+        prettier: 'catalog:',
+        ttsc: 'catalog:',
+        typescript: 'catalog:',
+      });
+      expect(rootPackage.workspaces).toEqual({
+        packages: ['packages/*', 'tooling'],
+        catalog: { nx: '23.1.0', prettier: '^3.6.1', ttsc: '0.25.0', typescript: '^6.0.0' },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('bumps consumer CLI pin to npm latest even when the running CLI is a linked prerelease', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-tool-validation-'));
     try {

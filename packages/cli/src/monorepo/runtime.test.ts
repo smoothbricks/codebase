@@ -93,6 +93,17 @@ describe('validateRuntimePins', () => {
     expect(validateRuntimePins(pkg, runtime)).toBe(2);
   });
 
+  test('judges a catalog: @types/node by the catalog entry Bun installs', () => {
+    const pkg: PackageJson = {
+      ...aligned(),
+      workspaces: { packages: ['packages/*'], catalog: { '@types/node': '^24.13.0' } },
+      devDependencies: { '@types/node': 'catalog:' },
+    };
+    expect(validateRuntimePins(pkg, runtime)).toBe(0);
+    pkg.workspaces = { packages: ['packages/*'], catalog: { '@types/node': '^26.1.1' } };
+    expect(validateRuntimePins(pkg, runtime)).toBe(1);
+  });
+
   test('fails a missing @types/node pin', () => {
     const pkg: PackageJson = aligned();
     pkg.devDependencies = {};
