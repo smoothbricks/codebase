@@ -96,7 +96,7 @@
           "go-test"
         ],
         "options": {
-          "command": "bun test --timeout=0 --parallel=3",
+          "command": "bun test --timeout=0",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
