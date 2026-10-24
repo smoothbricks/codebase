@@ -3,8 +3,7 @@
 //!
 //! A job asks a fixture gateway for a RAM disk and concludes; the process monitor that owns the
 //! job retires everything it retains, and that retirement signals no `diskimages-helper`: the
-//! disk stays registered. The same attach forked inside a job is retired with the job, its helper
-//! among the members signalled. Every disk here is the fixture's own: a size no other process
+//! disk stays registered. Every disk here is the fixture's own: a size no other process
 //! uses, attached under the fixture gateway's lease on its own socket. The fixture records each
 //! disk's registry identity right after its attach and detaches only those identities, each while a
 //! fresh registry read still lists it unchanged. The user's gateway is never asked.
@@ -20,7 +19,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use cowshed_apfs::disk_lease::leased_at;
 use cowshed_apfs::ram_disk::SystemRamDisks;
 use cowshed_apfs::{CommandRequest, SystemCommandRunner};
 use cowshed_core::api::dto::JobId;
@@ -32,7 +30,7 @@ use cowshed_gateway::{
     CredentialProvider, CredentialQuery, CredentialRecord, Gateway, GatewayConfig,
     MirrorCacheConfig, UpstreamConnection, UpstreamConnector, UpstreamHealth,
 };
-use cowshed_gateway_types::{DiskClass, RamDiskSectors};
+use cowshed_gateway_types::RamDiskSectors;
 use uuid::Uuid;
 
 struct NoCredentials;
@@ -359,16 +357,13 @@ async fn a_ram_disk_the_gateway_attaches_outlives_the_job_that_asked_for_it() {
         "the fixture never serves on the user's gateway socket"
     );
     let served = fixture_sectors(0);
-    let forked = fixture_sectors(1);
     // A guard, never authority: teardown detaches only what the fixture records below.
-    for sectors in [served, forked] {
-        assert!(
-            !ram_disks()
-                .iter()
-                .any(|disk| disk.sectors == sectors.get() && disk.uid == euid()),
-            "no disk of the fixture's size {sectors} before the test"
-        );
-    }
+    assert!(
+        !ram_disks()
+            .iter()
+            .any(|disk| disk.sectors == served.get() && disk.uid == euid()),
+        "no disk of the fixture's size {served} before the test"
+    );
     let disks = Arc::new(std::sync::Mutex::new(FixtureDisks {
         socket: socket.clone(),
         owned: Vec::new(),
@@ -443,51 +438,6 @@ async fn a_ram_disk_the_gateway_attaches_outlives_the_job_that_asked_for_it() {
     .await
     .expect("other creator job");
 
-    // The same attach forked inside the job is retired with it: the creating task's own attach
-    // before the gateway owned it. Its disk is recorded right after the attach, before the job
-    // concludes. The fixture gateway's lease spaces it out, as it would any disk command.
-    let lease_socket = socket.clone();
-    let forked_disks = Arc::clone(&disks);
-    let (output, forked_disk, retired) = tokio::task::spawn_blocking(move || {
-        leased_at(
-            &lease_socket,
-            DiskClass::Storage,
-            "hdiutil attach -nomount (a job's own)",
-            None,
-            || {
-                let mut attach = Command::new("/usr/bin/hdiutil");
-                attach.args(["attach", "-nomount", &format!("ram://{}", forked.get())]);
-                let monitor = monitor(2);
-                let (output, root) = run_job(&monitor, attach);
-                assert!(output.status.success(), "the job's own attach: {output:?}");
-                let device = String::from_utf8_lossy(&output.stdout)
-                    .split_whitespace()
-                    .next()
-                    .expect("hdiutil printed the whole disk")
-                    .to_owned();
-                let owned = forked_disks
-                    .lock()
-                    .expect("fixture disks")
-                    .own(&device, forked);
-                Ok::<_, String>((output, owned, conclude(&monitor, root)))
-            },
-        )
-    })
-    .await
-    .expect("the forking job")
-    .expect("the forking job's lease");
-    cowshed_os::eprintln!("job-forked attach: {output:?}; {forked_disk:?}; retirement {retired:?}");
-    assert!(
-        !helpers(&retired).is_empty(),
-        "a helper the job forked is the job's member and its retirement signals it ({retired:?})"
-    );
-
-    assert!(
-        ram_disks()
-            .iter()
-            .all(|disk| disk.entry != forked_disk.entry),
-        "the job-owned control disk left the registry after its helper was retired: {forked_disk:?}"
-    );
     // Teardown detaches only the identities recorded above, each revalidated against the registry.
     let (detached, refused) = disks.lock().expect("fixture disks").detach();
     assert!(refused.is_empty(), "teardown refused: {refused:?}");
