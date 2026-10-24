@@ -33,152 +33,91 @@ describe('what shell entry fetches for a Cargo workspace', () => {
     return existsSync(directory) ? readdirSync(directory) : [];
   };
 
-  // Shell entry's installs never fetch: devenv's smoo:cargo-fetch task runs `--cargo`, gated by `--cargo --check`.
+  // Shell entry's installs never fetch: devenv's smoo:cargo-fetch task runs --cargo, gated by --cargo --check.
   const CARGO = { cargo: true } as const;
+  const CHECK = { cargo: true, check: true } as const;
+  /** An entry on a CI runner, with its secrets injected: a fetch that fails there fails the entry. */
+  const CI = { cargo: true, ciSecrets: { SMOO_NPM_TOKEN: 'registry-value', SMOO_TOKEN: 'shell-value' } } as const;
+  /** What Cargo says when its fetch can reach no registry. */
+  const REFUSAL = 'failed to download from `https://index.crates.io/config.json`';
 
-  it('installs without fetching; the cargo task fetches each workspace once per change to what the fetch reads', async () => {
+  // One repository, entered in sequence: each step starts from what the one before it left, and asserts only what it
+  // adds to the ledger of runs, so the order is the case.
+  it('fetches each workspace once per change to what the fetch reads, in each CARGO_HOME, with its stamps outside them', async () => {
+    const limits = [String(GIT_HTTP_LOW_SPEED_LIMIT), String(GIT_HTTP_LOW_SPEED_TIME_S)];
     await withManagedRepository(
       { workspaces: ['packages/*'], files: CARGO_PROJECT },
-      async ({ root, xdgCache, enterShell: enter, cargoRuns }) => {
+      async ({ root, ledgers, cargoHome, xdgCache, enterShell: enter, cargoRuns, cargoLowSpeed }) => {
+        const bothWorkspaces = [fetch('Cargo.toml'), fetch('packages/native/Cargo.toml')];
+
+        // An install fetches nothing, and neither does the status of the cargo task, which says nothing is fetched yet.
         expect(await enter()).toEqual(HEALTHY);
+        expect((await enter(CHECK)).exitCode).toBe(1);
         expect(cargoRuns()).toEqual([]);
+
+        // The cargo task fetches the root workspace and the member that is one, gives each fetch the step's git
+        // low-speed limits, and stamps it.
         expect(await enter(CARGO)).toEqual(HEALTHY);
-        expect(await enter(CARGO)).toEqual(HEALTHY);
-        expect(cargoRuns()).toEqual([fetch('Cargo.toml'), fetch('packages/native/Cargo.toml')]);
+        expect(cargoRuns()).toEqual(bothWorkspaces);
+        expect(cargoLowSpeed()).toEqual([limits, limits]);
         expect(stamps(xdgCache)).toHaveLength(2);
 
+        // The status of the task says a copy of the checkout that shares CARGO_HOME is fetched already.
+        const clone = join(dirname(root), 'clone');
+        await cp(root, clone, { recursive: true, verbatimSymlinks: true });
+        const copied = repository(clone, ledgers, join(dirname(root), 'bin'));
+        expect(await copied.enterShell(CHECK)).toEqual(HEALTHY);
+
+        // The lockfile changed, so the root workspace fetches again and the member does not, from an entry that carries
+        // other git limits: the fetch gets the step's, whatever the entry carried.
         await edit(join(root, 'Cargo.lock'), 'version = 4\n\n[[package]]\nname = "arrow-ipc"\n');
-        expect(await enter(CARGO)).toEqual(HEALTHY);
+        const carried = { GIT_HTTP_LOW_SPEED_LIMIT: '1000000', GIT_HTTP_LOW_SPEED_TIME: '1' };
+        expect(await enter({ ...CARGO, env: carried })).toEqual(HEALTHY);
+        expect(cargoRuns().slice(2)).toEqual([fetch('Cargo.toml')]);
+        expect(cargoLowSpeed()).toEqual([limits, limits, limits]);
+
         // Adding Cargo configuration changes what the fetch reads as much as editing it does.
         await mkdir(join(root, 'packages/native/.cargo'));
         await edit(join(root, 'packages/native/.cargo/config.toml'), '[net]\noffline = false\n');
         expect(await enter(CARGO)).toEqual(HEALTHY);
-        expect(await enter(CARGO)).toEqual(HEALTHY);
-        expect(cargoRuns().slice(2)).toEqual([fetch('Cargo.toml'), fetch('packages/native/Cargo.toml')]);
-      },
-    );
-  });
+        expect(cargoRuns().slice(3)).toEqual([fetch('packages/native/Cargo.toml')]);
 
-  it('reports through --check whether CARGO_HOME holds every workspace, so a fresh one fetches', async () => {
-    await withManagedRepository({ files: CARGO_PROJECT }, async (original) => {
-      expect((await original.enterShell({ cargo: true, check: true })).exitCode).toBe(1);
-      expect(await original.enterShell(CARGO)).toEqual(HEALTHY);
-      expect(await original.enterShell({ cargo: true, check: true })).toEqual(HEALTHY);
-
-      // A copy of the checkout sharing CARGO_HOME is fetched already.
-      const clone = join(dirname(original.root), 'clone');
-      await cp(original.root, clone, { recursive: true, verbatimSymlinks: true });
-      const copied = repository(clone, join(dirname(original.root), 'ledgers'), join(dirname(original.root), 'bin'));
-      expect(await copied.enterShell({ cargo: true, check: true })).toEqual(HEALTHY);
-
-      await rm(original.cargoHome, { recursive: true, force: true });
-      expect((await original.enterShell({ cargo: true, check: true })).exitCode).toBe(1);
-      expect(await original.enterShell(CARGO)).toEqual(HEALTHY);
-      expect(original.cargoRuns()).toEqual([fetch('Cargo.toml'), fetch('Cargo.toml')]);
-    });
-  });
-
-  it('fetches again into a recreated CARGO_HOME and into another one, each keeping its own stamp', async () => {
-    await withManagedRepository({ files: CARGO_PROJECT }, async ({ cargoHome, enterShell: enter, cargoRuns }) => {
-      expect(await enter(CARGO)).toEqual(HEALTHY);
-      // Another CARGO_HOME holds none of what the first one fetched.
-      expect(await enter({ ...CARGO, cargoHome: `${cargoHome}-other` })).toEqual(HEALTHY);
-      expect(cargoRuns()).toHaveLength(2);
-      // Neither fetch spoiled the other's stamp.
-      expect(await enter(CARGO)).toEqual(HEALTHY);
-      expect(await enter({ ...CARGO, cargoHome: `${cargoHome}-other` })).toEqual(HEALTHY);
-      expect(cargoRuns()).toHaveLength(2);
-
-      // The same path, deleted and created again: a stamp outside CARGO_HOME survives it, so what
-      // it promises must not.
-      await rm(cargoHome, { recursive: true });
-      await mkdir(cargoHome);
-      expect(await enter(CARGO)).toEqual(HEALTHY);
-      expect(cargoRuns()).toHaveLength(3);
-      expect(await enter(CARGO)).toEqual(HEALTHY);
-      expect(cargoRuns()).toHaveLength(3);
-    });
-  });
-
-  it('keeps its stamp in the private XDG cache, entering a CARGO_HOME that is writable only where Cargo writes', async () => {
-    await withManagedRepository(
-      { files: CARGO_PROJECT },
-      async ({ cargoHome, xdgCache, enterShell: enter, cargoRuns }) => {
-        // CARGO_HOME as a cowshed sandbox grants it: Cargo's state files and its `registry` and
-        // `git` caches are writable, and nothing else — no entry may be created at its root.
-        await mkdir(join(cargoHome, 'registry'), { recursive: true });
-        await mkdir(join(cargoHome, 'git'));
+        // Another CARGO_HOME holds none of what the first one fetched. This one is as a cowshed sandbox grants it:
+        // Cargo's state files and its registry and git caches are writable, and nothing else, so no entry may be
+        // created at its root and a stamp kept there would fail the entry.
+        const sandboxHome = join(dirname(cargoHome), 'cargo-home-sandbox');
+        await mkdir(join(sandboxHome, 'registry'), { recursive: true });
+        await mkdir(join(sandboxHome, 'git'));
         for (const file of CARGO_STATE_FILES) {
-          await writeFile(join(cargoHome, file), '');
+          await writeFile(join(sandboxHome, file), '');
         }
-        await chmod(cargoHome, 0o555);
+        await chmod(sandboxHome, 0o555);
         try {
           // The fixture is only a model of the grant when the root really refuses a new entry.
-          await expect(writeFile(join(cargoHome, 'smoo-fetched'), '')).rejects.toThrow('EACCES');
-
+          await expect(writeFile(join(sandboxHome, 'smoo-fetched'), '')).rejects.toThrow('EACCES');
+          const stamped = stamps(xdgCache).length;
+          expect(await enter({ ...CARGO, cargoHome: sandboxHome })).toEqual(HEALTHY);
+          expect(cargoRuns().slice(4)).toEqual(bothWorkspaces);
+          // Neither fetch spoiled the other's stamp: the first CARGO_HOME has nothing left to fetch either.
           expect(await enter(CARGO)).toEqual(HEALTHY);
-          expect(await enter(CARGO)).toEqual(HEALTHY);
-          expect(cargoRuns()).toEqual([fetch('Cargo.toml')]);
-          expect(readdirSync(cargoHome).sort()).toEqual([...CARGO_STATE_FILES, 'git', 'registry'].sort());
-          expect(stamps(xdgCache)).toHaveLength(1);
+          expect(await enter({ ...CARGO, cargoHome: sandboxHome })).toEqual(HEALTHY);
+          expect(cargoRuns()).toHaveLength(6);
+          // The sandbox's stamps are in the private XDG cache, and nothing was created at the root of its CARGO_HOME.
+          expect(stamps(xdgCache)).toHaveLength(stamped + 2);
+          expect(readdirSync(sandboxHome).sort()).toEqual([...CARGO_STATE_FILES, 'git', 'registry'].sort());
         } finally {
-          await chmod(cargoHome, 0o755);
+          await chmod(sandboxHome, 0o755);
         }
-      },
-    );
-  });
 
-  it('falls back to ~/.cache/smoo without XDG_CACHE_HOME, leaving ~/.cargo to Cargo', async () => {
-    await withManagedRepository({ files: CARGO_PROJECT }, async ({ root, enterShell: enter, cargoRuns }) => {
-      const home = join(dirname(root), 'home');
-      await mkdir(home);
-      expect(await enter({ ...CARGO, home })).toEqual(HEALTHY);
-      expect(await enter({ ...CARGO, home })).toEqual(HEALTHY);
-      expect(cargoRuns()).toEqual([fetch('Cargo.toml')]);
-      expect(readdirSync(join(home, '.cargo')).sort()).toEqual(['.package-cache', 'registry']);
-      expect(readdirSync(join(home, '.cache', 'smoo'))).toEqual(['cargo-fetched']);
-      expect(readdirSync(join(home, '.cache', 'smoo', 'cargo-fetched'))).toHaveLength(1);
-    });
-  });
-
-  it("loads the shell when the fetch fails, naming Cargo's cause, and fetches again on the next entry", async () => {
-    await withManagedRepository(
-      { workspaces: ['packages/*'], files: { ...CARGO_PROJECT, 'cargo-fails': '' } },
-      async ({ root, xdgCache, enterShell: enter, cargoRuns }) => {
-        const failed = await enter(CARGO);
-        expect(failed.exitCode).toBe(0);
-        expect(failed.stderr).toContain('cargo fetch --locked --manifest-path Cargo.toml');
-        expect(failed.stderr).toContain('failed to download from `https://index.crates.io/config.json`');
-        expect((await enter(CARGO)).exitCode).toBe(0);
-        // Two workspaces, and each fetch fails at once, so the ledger is written in event order: the step stopped at the
-        // first failed fetch and never began the second.
-        expect(cargoRuns()).toEqual([fetch('Cargo.toml'), fetch('Cargo.toml')]);
-        // A fetch that failed promised nothing: no stamp, not even the directory for one.
-        expect(existsSync(join(xdgCache, 'smoo'))).toBe(false);
-
-        await rm(join(root, 'cargo-fails'));
+        // A stamp outside CARGO_HOME survives the deletion of CARGO_HOME, so what it promises must not: a CARGO_HOME
+        // that is gone holds nothing, and one created again at the same path is another directory, fetched into again.
+        await rm(cargoHome, { recursive: true });
+        expect((await enter(CHECK)).exitCode).toBe(1);
+        await mkdir(cargoHome);
         expect(await enter(CARGO)).toEqual(HEALTHY);
+        expect(cargoRuns().slice(6)).toEqual(bothWorkspaces);
         expect(await enter(CARGO)).toEqual(HEALTHY);
-        // Both workspaces fetch and stamp once nothing fails.
-        expect(cargoRuns()).toHaveLength(4);
-        expect(stamps(xdgCache)).toHaveLength(2);
-      },
-    );
-  });
-
-  it('fails a CI fetch that fails', async () => {
-    await withManagedRepository(
-      { workspaces: ['packages/*'], files: { ...CARGO_PROJECT, 'cargo-fails': '' } },
-      async ({ xdgCache, enterShell: enter, cargoRuns }) => {
-        const entry = await enter({
-          cargo: true,
-          ciSecrets: { SMOO_NPM_TOKEN: 'registry-value', SMOO_TOKEN: 'shell-value' },
-        });
-        expect(entry.exitCode).toBe(1);
-        expect(entry.stderr).toContain('failed to download from `https://index.crates.io/config.json`');
-        // The step stopped at the failed fetch: the second workspace was never begun.
-        expect(cargoRuns()).toEqual([fetch('Cargo.toml')]);
-        expect(existsSync(join(xdgCache, 'smoo'))).toBe(false);
+        expect(cargoRuns()).toHaveLength(8);
       },
     );
   });
@@ -191,18 +130,46 @@ describe('what shell entry fetches for a Cargo workspace', () => {
   // behind wherever the kill lands. The case asserts what holds then: the entry returned (the bounded exit), said which
   // fetch it ended, past which deadline and holding which lock, and stamped nothing. That a live process tree dies with
   // its fetch is proved where events order it: with the clock held by hand and readiness through a pipe
-  // (cargo-fetch-run.test.ts), and through this script by the signal cases below.
+  // (cargo-fetch-run.test.ts), and through this script by the signal rounds below.
   const STALL_DEADLINE_MS = 1;
-  for (const [mode, entry, exitCode] of [
-    ['local', CARGO, 0],
-    ['CI', { cargo: true, ciSecrets: { SMOO_NPM_TOKEN: 'registry-value', SMOO_TOKEN: 'shell-value' } }, 1],
-  ] as const) {
-    it(`ends a fetch that outlives its deadline and stamps nothing, in a ${mode} entry`, async () => {
-      await withManagedRepository(
-        { files: { ...CARGO_PROJECT, 'cargo-hangs': '' } },
-        async ({ cargoHome, xdgCache, enterShell: enter }) => {
-          const entered = await enter({ ...entry, deadlineMs: STALL_DEADLINE_MS });
-          expect(entered.exitCode).toBe(exitCode);
+
+  // One repository again, whose fetches never finish: the fixture's cargo is told how to fail by a file in the
+  // checkout, so each step swaps that file and enters. The private XDG cache stays empty until the last step, and
+  // every step before it says so.
+  it('loads the shell when a fetch fails or outlives its deadline, fails a CI one, and ends a fetch along with the step that a signal ends', async () => {
+    await withManagedRepository(
+      { workspaces: ['packages/*'], files: { ...CARGO_PROJECT, 'cargo-fails': '' } },
+      async ({ root, ledgers, cargoHome, xdgCache, enterShell: enter, startShell, cargoRuns }) => {
+        // A fetch that did not finish promised nothing: no stamp, not even the directory for one.
+        const unstamped = () => expect(existsSync(join(xdgCache, 'smoo'))).toBe(false);
+
+        // A fetch Cargo refuses loads the shell, naming Cargo's cause. Two workspaces, and the fetch fails at once, so
+        // the ledger is written in event order: the step stopped at the failed fetch and never began the second.
+        const failed = await enter(CARGO);
+        expect(failed.exitCode).toBe(0);
+        expect(failed.stderr).toContain('cargo fetch --locked --manifest-path Cargo.toml');
+        expect(failed.stderr).toContain(REFUSAL);
+        expect(cargoRuns()).toEqual([fetch('Cargo.toml')]);
+        unstamped();
+
+        // A CI entry fails with it, and stops at the failed fetch as well.
+        const refused = await enter(CI);
+        expect(refused.exitCode).toBe(1);
+        expect(refused.stderr).toContain(REFUSAL);
+        expect(cargoRuns().slice(1)).toEqual([fetch('Cargo.toml')]);
+        unstamped();
+
+        // A fetch that outlives its deadline is ended, and the entry says which fetch, past which deadline and holding
+        // which lock: a local entry loads the shell, a CI one fails. Each begins its fetch, and says so: the failures
+        // before left no stamp that would let a local entry skip it.
+        await rm(join(root, 'cargo-fails'));
+        await writeFile(join(root, 'cargo-hangs'), '');
+        for (const [mode, options, exitCode] of [
+          ['local', CARGO, 0],
+          ['CI', CI, 1],
+        ] as const) {
+          const entered = await enter({ ...options, deadlineMs: STALL_DEADLINE_MS });
+          expect({ mode, exitCode: entered.exitCode }).toEqual({ mode, exitCode });
           for (const fact of [
             'cargo fetch --locked --manifest-path Cargo.toml',
             `past its ${STALL_DEADLINE_MS} ms deadline`,
@@ -210,42 +177,17 @@ describe('what shell entry fetches for a Cargo workspace', () => {
           ]) {
             expect(entered.stderr).toContain(fact);
           }
-          expect(existsSync(join(xdgCache, 'smoo'))).toBe(false);
-        },
-      );
-    });
-  }
+          unstamped();
+        }
 
-  // Cargo runs `git fetch` for git dependencies, and git reads its low-speed limit from these variables ahead of its
-  // configuration: the fetch gets the step's limits whatever the entry carried, which is what ends a stalled transfer.
-  // The recording cargo shows what reached it.
-  it("gives each fetch the step's git low-speed limits, over any the entry carried", async () => {
-    const limits = [String(GIT_HTTP_LOW_SPEED_LIMIT), String(GIT_HTTP_LOW_SPEED_TIME_S)];
-    await withManagedRepository(
-      { workspaces: ['packages/*'], files: CARGO_PROJECT },
-      async ({ root, enterShell: enter, cargoLowSpeed }) => {
-        expect(await enter(CARGO)).toEqual(HEALTHY);
-        expect(cargoLowSpeed()).toEqual([limits, limits]);
-
-        // The lockfile changed, so the root workspace fetches again, from an entry that carries other limits.
-        await edit(join(root, 'Cargo.lock'), 'version = 4\n\n[[package]]\nname = "arrow-ipc"\n');
-        const carried = { GIT_HTTP_LOW_SPEED_LIMIT: '1000000', GIT_HTTP_LOW_SPEED_TIME: '1' };
-        expect(await enter({ ...CARGO, env: carried })).toEqual(HEALTHY);
-        expect(cargoLowSpeed()).toEqual([limits, limits, limits]);
-      },
-    );
-  });
-
-  // The fetch leads a process group of its own, so the signal that ends the step no longer reaches it the way a
-  // terminal's does: the step ends it, and what it started, as it ends.
-  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
-    it(`takes the fetch and what the fetch started along when ${signal} ends the step`, async () => {
-      await withManagedRepository(
-        { files: { ...CARGO_PROJECT, 'cargo-stalls': '' } },
-        async ({ ledgers, startShell }) => {
-          const lifetime = join(ledgers, 'stall-lifetime');
-          const up = join(ledgers, 'stall-up');
-          execFileSync('mkfifo', [lifetime, up]);
+        // The fetch leads a process group of its own, so the signal that ends the step no longer reaches it the way a
+        // terminal's does: the step ends it, and what it started, as it ends.
+        await rm(join(root, 'cargo-hangs'));
+        await writeFile(join(root, 'cargo-stalls'), '');
+        const lifetime = join(ledgers, 'stall-lifetime');
+        const up = join(ledgers, 'stall-up');
+        execFileSync('mkfifo', [lifetime, up]);
+        for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
           // Each end of a pipe opens only once the other does: read both before the fixture's cargo writes.
           const gone = readFile(lifetime, 'utf8');
           const said = readFile(up, 'utf8');
@@ -253,10 +195,23 @@ describe('what shell entry fetches for a Cargo workspace', () => {
           expect(await said).toBe('up\n');
           entry.kill(signal);
           await entry.exited;
-          expect(entry.signalCode).toBe(signal);
+          expect({ signal, ended: entry.signalCode }).toEqual({ signal, ended: signal });
           expect(await gone).toBe('');
-        },
-      );
-    });
-  }
+          unstamped();
+        }
+
+        // Once nothing fails, both workspaces fetch and stamp. This entry has neither CARGO_HOME nor XDG_CACHE_HOME, as
+        // on a developer machine: its stamps go to ~/.cache/smoo, and ~/.cargo is left to Cargo.
+        await rm(join(root, 'cargo-stalls'));
+        const home = join(dirname(root), 'home');
+        await mkdir(home);
+        const before = cargoRuns().length;
+        expect(await enter({ ...CARGO, home })).toEqual(HEALTHY);
+        expect(cargoRuns().slice(before)).toEqual([fetch('Cargo.toml'), fetch('packages/native/Cargo.toml')]);
+        expect(readdirSync(join(home, '.cargo')).sort()).toEqual(['.package-cache', 'registry']);
+        expect(readdirSync(join(home, '.cache', 'smoo'))).toEqual(['cargo-fetched']);
+        expect(readdirSync(join(home, '.cache', 'smoo', 'cargo-fetched'))).toHaveLength(2);
+      },
+    );
+  });
 });

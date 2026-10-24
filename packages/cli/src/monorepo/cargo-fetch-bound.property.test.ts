@@ -12,6 +12,7 @@ import {
   GIT_HTTP_LOW_SPEED_TIME_S,
   judgeBound,
   judgeReap,
+  smooCacheDirectory,
   TEARDOWN_PATIENCE,
 } from '../../../nx-plugin/managed/raw/tooling/direnv/cargo-fetch-bound.ts';
 
@@ -225,5 +226,53 @@ describe('the kill of a process group', () => {
     }
     expect(TEARDOWN_PATIENCE.rounds * TEARDOWN_PATIENCE.pauseMs).toBeLessThanOrEqual(100);
     expect(DEADLINE_PATIENCE.rounds * DEADLINE_PATIENCE.pauseMs).toBeGreaterThanOrEqual(1000);
+  });
+});
+
+/**
+ * Where a fetch keeps its stamp is a choice over two facts the shell reads, XDG_CACHE_HOME and the home directory, so
+ * it is proved by calls and not through a shell entry. That an entry puts its stamp there, and none in CARGO_HOME, is
+ * proved through the real script in setup-environment-cargo.test.ts.
+ */
+describe('the directory smoo keeps its records in', () => {
+  const HOME = '/home/dev';
+  const segment = fc.stringMatching(/^[a-z0-9_-]{1,8}$/);
+  /** An absolute path with nothing in it for a join to normalise, so the directory it names is plain concatenation. */
+  const absolute = fc.array(segment, { minLength: 1, maxLength: 4 }).map((segments) => `/${segments.join('/')}`);
+
+  it('is smoo under an absolute XDG_CACHE_HOME, and under ~/.cache when there is none or it is not absolute', () => {
+    for (const [xdgCacheHome, directory] of [
+      ['/var/cache/xdg', '/var/cache/xdg/smoo'],
+      ['/var/cache/xdg/', '/var/cache/xdg/smoo'],
+      ['/', '/smoo'],
+      [undefined, '/home/dev/.cache/smoo'],
+      // The XDG base directory rule has a value that is not absolute invalid, and ignores it. Nothing in it is
+      // expanded.
+      ['', '/home/dev/.cache/smoo'],
+      ['xdg-cache', '/home/dev/.cache/smoo'],
+      ['./xdg-cache', '/home/dev/.cache/smoo'],
+      ['../xdg-cache', '/home/dev/.cache/smoo'],
+      ['~/xdg-cache', '/home/dev/.cache/smoo'],
+    ] as const) {
+      expect({ xdgCacheHome, directory: smooCacheDirectory(xdgCacheHome, HOME) }).toEqual({ xdgCacheHome, directory });
+    }
+    expect(smooCacheDirectory(undefined, `${HOME}/`)).toBe('/home/dev/.cache/smoo');
+  });
+
+  it('takes an absolute XDG_CACHE_HOME whatever the home is, and the home only when it is none', () => {
+    fc.assert(
+      fc.property(absolute, absolute, (xdgCacheHome, home) => {
+        expect(smooCacheDirectory(xdgCacheHome, home)).toBe(`${xdgCacheHome}/smoo`);
+      }),
+    );
+    const none = fc.oneof(
+      fc.constant(undefined),
+      fc.string().filter((value) => !value.startsWith('/')),
+    );
+    fc.assert(
+      fc.property(none, absolute, (xdgCacheHome, home) => {
+        expect(smooCacheDirectory(xdgCacheHome, home)).toBe(`${home}/.cache/smoo`);
+      }),
+    );
   });
 });
