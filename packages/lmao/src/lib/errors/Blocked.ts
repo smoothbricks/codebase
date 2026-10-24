@@ -86,7 +86,7 @@ export function getBlockedReasonName(reason: BlockedReason): string {
  * that may reference updated information (e.g., fresh Retry-After headers).
  */
 export interface BlockedConfig {
-  /** Max canary retries before RetriesExhausted (default: 5) */
+  /** Body executions allowed, the first included, before RetriesExhausted (default: 5); 1 never re-executes. */
   readonly maxAttempts?: number;
   /** Closure returning delay in ms before next retry. Captures Op context. */
   readonly nextRetry?: (attempt: number) => number;

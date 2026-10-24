@@ -243,7 +243,7 @@ type BlockedReason =
 // Closure-based retry config — the closure captures Op execution context, so each
 // re-execution can produce a fresh delay (e.g. updated Retry-After headers).
 interface BlockedConfig {
-  readonly maxAttempts?: number; // default 5, then RetriesExhausted
+  readonly maxAttempts?: number; // body executions, the first included (default 5), then RetriesExhausted
   readonly nextRetry?: (attempt: number) => number; // delay ms before next retry
 }
 ```
