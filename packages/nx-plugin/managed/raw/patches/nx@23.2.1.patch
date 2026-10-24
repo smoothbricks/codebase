@@ -3907,10 +3907,10 @@ index ab0d47a6d12a4ce8cb6b140364b1ada923fab95a..894bbfc883a7108a9fdd118691d6e2bc
      }
 diff --git a/dist/src/tasks-runner/remote-cache-outage.d.ts b/dist/src/tasks-runner/remote-cache-outage.d.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..c90e1548c5daeb6af73703df347f3e288413d75a
+index 0000000000000000000000000000000000000000..319e84017d461f91e924f78d273f6665e98c3013
 --- /dev/null
 +++ b/dist/src/tasks-runner/remote-cache-outage.d.ts
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,35 @@
 +import type { CachedResult } from '../native';
 +import type { RemoteCacheV2 } from './default-tasks-runner';
 +export declare const REMOTE_CACHE_ANSWER_WITHIN_MS = 90000;
@@ -3939,18 +3939,19 @@ index 0000000000000000000000000000000000000000..c90e1548c5daeb6af73703df347f3e28
 +export declare class RemoteCacheOutageGuard implements RemoteCacheV2 {
 +    private readonly remote;
 +    private readonly server;
++    private readonly withinMs;
 +    private unavailable;
-+    constructor(remote: RemoteCacheV2, server: string);
++    constructor(remote: RemoteCacheV2, server: string, withinMs?: number);
 +    retrieve(hash: string, cacheDirectory: string): Promise<CachedResult | null>;
 +    store(hash: string, cacheDirectory: string, terminalOutput: string, code: number): Promise<boolean>;
 +    private request;
 +}
 diff --git a/dist/src/tasks-runner/remote-cache-outage.js b/dist/src/tasks-runner/remote-cache-outage.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..2a47f153ddaefc9f33f7c1badaaf28815e36c6b4
+index 0000000000000000000000000000000000000000..cd0ca33b3061b521120c1e97d50cdf76907a7f55
 --- /dev/null
 +++ b/dist/src/tasks-runner/remote-cache-outage.js
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,183 @@
 +"use strict";
 +Object.defineProperty(exports, "__esModule", { value: true });
 +exports.RemoteCacheOutageGuard = exports.REMOTE_CACHE_ANSWER_WITHIN_MS = void 0;
@@ -4040,9 +4041,11 @@ index 0000000000000000000000000000000000000000..2a47f153ddaefc9f33f7c1badaaf2881
 + * exits is removed then.
 + */
 +class RemoteCacheOutageGuard {
-+    constructor(remote, server) {
++    /** `withinMs` bounds each native call; a test passes a short one, a run keeps `REMOTE_CACHE_ANSWER_WITHIN_MS`. */
++    constructor(remote, server, withinMs = exports.REMOTE_CACHE_ANSWER_WITHIN_MS) {
 +        this.remote = remote;
 +        this.server = server;
++        this.withinMs = withinMs;
 +        this.unavailable = false;
 +    }
 +    async retrieve(hash, cacheDirectory) {
@@ -4090,7 +4093,7 @@ index 0000000000000000000000000000000000000000..2a47f153ddaefc9f33f7c1badaaf2881
 +        if (this.unavailable) {
 +            return skipped;
 +        }
-+        const outcome = settleRemoteCacheRequest(await settleWithin(native, exports.REMOTE_CACHE_ANSWER_WITHIN_MS));
++        const outcome = settleRemoteCacheRequest(await settleWithin(native, this.withinMs));
 +        switch (outcome.kind) {
 +            case 'answered':
 +                return outcome.value;

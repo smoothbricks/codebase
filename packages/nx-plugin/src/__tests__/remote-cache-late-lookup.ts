@@ -6,17 +6,28 @@
  * native client through a wrapper that only records when the native lookup settles, so the last
  * line comes once the late artifact has been unpacked wherever the guard sent it.
  *
- * Usage: bun remote-cache-late-lookup.ts <root> <hash>
+ * The guard's deadline is `<withinMs>`, so the case waits only until its held lookup is overtaken.
+ *
+ * Usage: bun remote-cache-late-lookup.ts <root> <hash> <withinMs>
  */
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { HttpRemoteCache } from 'nx/src/native/index.js';
 import { RemoteCacheOutageGuard } from 'nx/src/tasks-runner/remote-cache-outage.js';
 
-const [root, hash] = process.argv.slice(2);
+const [root, hash, within] = process.argv.slice(2);
 const server = process.env.NX_SELF_HOSTED_REMOTE_CACHE_SERVER;
-if (root === undefined || hash === undefined || server === undefined) {
-  throw new Error('usage: remote-cache-late-lookup.ts <root> <hash>, with NX_SELF_HOSTED_REMOTE_CACHE_SERVER set');
+const withinMs = Number(within);
+if (
+  root === undefined ||
+  hash === undefined ||
+  server === undefined ||
+  !Number.isSafeInteger(withinMs) ||
+  withinMs < 1
+) {
+  throw new Error(
+    'usage: remote-cache-late-lookup.ts <root> <hash> <withinMs>, with NX_SELF_HOSTED_REMOTE_CACHE_SERVER set',
+  );
 }
 
 /** A cache entry holding the one output `app/result.txt`. */
@@ -53,7 +64,7 @@ const observed = {
   store: (key: string, cacheDirectory: string, terminalOutput: string, code: number) =>
     native.store(key, cacheDirectory, terminalOutput, code),
 };
-const guarded = await new RemoteCacheOutageGuard(observed, server).retrieve(hash, cache);
+const guarded = await new RemoteCacheOutageGuard(observed, server, withinMs).retrieve(hash, cache);
 await writeEntry(cache, 'local');
 console.log(JSON.stringify({ guarded }));
 

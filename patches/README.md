@@ -175,7 +175,9 @@ unexpected status, a damaged or unsafe archive, local disk) is rethrown unchange
 outage prints one line naming the server, the request and the cause, and that process asks the server nothing more:
 every lookup misses and every store is skipped, so tasks run exactly as with no remote cache. The bound covers the whole
 native call (a store builds its archive inside it) and is longer than the gateway's own outage answer (connect 5 s plus
-response head 60 s), so it decides only when the server itself cannot answer.
+response head 60 s), so it decides only when the server itself cannot answer. The guard takes the bound as an optional
+third constructor argument; `getHttpCache` passes none, so a run keeps 90 s, and a test that constructs the guard itself
+passes a short one instead of waiting the real bound out.
 
 The native call the deadline overtook keeps running, unread, and a late lookup would still unpack its artifact into the
 directory it was given: over the entry the task wrote meanwhile, or while the task writes it. So a lookup never gets the
@@ -185,12 +187,14 @@ its native call settles, and one still unsettled when the process exits is remov
 store's late native call only reads the entry. Nx Cloud and the plugin caches are not wrapped.
 
 `packages/nx-plugin/src/nx-remote-cache-outage.test.ts` holds property tests of the decision and the line, and runs the
-actual installed Nx against real local servers that refuse, hang up after reading the request, accept and never answer,
-answer 503, and answer a lookup 404 then hang up on the store: each task runs and passes with exactly one diagnostic,
-and the server is asked nothing after the outage. A 400 still fails the run. A real native lookup held past the deadline
-and then answered with a real native artifact leaves the task's own entry intact, while the same native call given the
-cache directory overwrites it. Drop the hunk, and keep the test, once the pinned upstream version treats an unreachable
-cache as a miss ([nrwl/nx#36651](https://github.com/nrwl/nx/pull/36651) proposes it, unmerged).
+actual installed Nx against real local servers that refuse, hang up after reading the request, answer 503, and answer a
+lookup 404 then hang up on the store: each task runs and passes with exactly one diagnostic, and the server is asked
+nothing after the outage. A 400 still fails the run. A server that accepts and never answers is the guard's own
+deadline, so that case runs in process: a guard with a 100 ms bound over a native stand-in whose calls never settle
+misses, says one line naming the bound, and asks nothing more. A real native lookup held past that short deadline and
+then answered with a real native artifact leaves the task's own entry intact, while the same native call given the cache
+directory overwrites it. Drop the hunk, and keep the test, once the pinned upstream version treats an unreachable cache
+as a miss ([nrwl/nx#36651](https://github.com/nrwl/nx/pull/36651) proposes it, unmerged).
 
 ## Non-workspace file packages
 

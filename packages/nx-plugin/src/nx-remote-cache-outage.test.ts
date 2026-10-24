@@ -1,12 +1,14 @@
-import { describe, expect, it } from 'bun:test';
-import { mkdir, readdir, readFile, symlink, writeFile } from 'node:fs/promises';
+import { describe, expect, it, spyOn } from 'bun:test';
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer, type Server, type Socket } from 'node:net';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fc from 'fast-check';
 import {
   describeRemoteCacheOutage,
   REMOTE_CACHE_ANSWER_WITHIN_MS,
+  RemoteCacheOutageGuard,
   settleRemoteCacheRequest,
 } from 'nx/src/tasks-runner/remote-cache-outage.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
@@ -40,6 +42,13 @@ const NATIVE_FATAL = [
 ] as const;
 
 const DIAGNOSTIC = /^.*Remote cache .* is unavailable.*$/gm;
+
+/**
+ * The deadline the in-process guards take in place of `REMOTE_CACHE_ANSWER_WITHIN_MS`. Each case holds its answer
+ * off by construction (a remote that never settles, a server that answers only after the guard gave up), so the bound
+ * is the case's subject and its length decides nothing but how long the case waits.
+ */
+const WITHIN_MS = 100;
 
 describe('the outage decision', () => {
   const detail = fc.string({ unit: 'grapheme', maxLength: 80 });
@@ -275,24 +284,35 @@ describe('a run against an unreachable remote cache', () => {
     }
   });
 
-  it('builds when the cache server accepts and never answers', async () => {
-    const sockets = new Set<Socket>();
-    const heads: string[] = [];
-    const { server, origin } = await listen(requestHeads(sockets, heads));
+  it('misses a lookup the server never answers, says so once, and asks the server nothing more', async () => {
+    const server = 'http://127.0.0.1:9';
+    const asked: string[] = [];
+    // A native client whose server accepted and never answered: its calls never settle.
+    const silent = {
+      retrieve(hash: string): Promise<never> {
+        asked.push(`GET ${hash}`);
+        return new Promise<never>(() => {});
+      },
+      store(hash: string): Promise<never> {
+        asked.push(`PUT ${hash}`);
+        return new Promise<never>(() => {});
+      },
+    };
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    const cacheDirectory = await mkdtemp(join(tmpdir(), 'nx-cache-stalled-'));
     try {
-      await withNxFixture('nx-cache-stalled-', async ({ workspace, socketDirectory }) => {
-        await buildFixture(workspace);
-        expectRanWithoutCache(
-          await build(workspace, socketDirectory, origin),
-          origin,
-          `no result within ${REMOTE_CACHE_ANSWER_WITHIN_MS} ms`,
-        );
-      });
-      expect(heads).toHaveLength(1);
-      expect(heads[0]).toMatch(/^GET \/v1\/cache\/\S+ HTTP\/1\.1$/);
+      const guard = new RemoteCacheOutageGuard(silent, server, WITHIN_MS);
+      expect(await guard.retrieve('1234', cacheDirectory)).toBeNull();
+      expect(await guard.store('1234', cacheDirectory, 'built', 0)).toBe(false);
+      expect(await guard.retrieve('5678', cacheDirectory)).toBeNull();
+      expect(asked).toEqual(['GET 1234']);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toContain(
+        describeRemoteCacheOutage(server, 'GET /v1/cache/1234', `no result within ${WITHIN_MS} ms`),
+      );
     } finally {
-      for (const socket of sockets) socket.destroy();
-      await close(server);
+      warn.mockRestore();
+      await rm(cacheDirectory, { recursive: true, force: true });
     }
   });
 
@@ -365,11 +385,14 @@ describe('a lookup the deadline overtook', () => {
       }),
     );
     await withNxFixture('nx-cache-late-', async ({ root, workspace, socketDirectory }) => {
-      const child = Bun.spawn(['bun', join(import.meta.dir, '__tests__', 'remote-cache-late-lookup.ts'), root, hash], {
-        env: { ...fixtureNxEnv(workspace, socketDirectory), NX_SELF_HOSTED_REMOTE_CACHE_SERVER: server.url.origin },
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
+      const child = Bun.spawn(
+        ['bun', join(import.meta.dir, '__tests__', 'remote-cache-late-lookup.ts'), root, hash, String(WITHIN_MS)],
+        {
+          env: { ...fixtureNxEnv(workspace, socketDirectory), NX_SELF_HOSTED_REMOTE_CACHE_SERVER: server.url.origin },
+          stdout: 'pipe',
+          stderr: 'pipe',
+        },
+      );
       const stderr = new Response(child.stderr).text();
       const steps = child.stdout.pipeThrough(new TextDecoderStream()).getReader();
       let printed = '';
@@ -396,7 +419,7 @@ describe('a lookup the deadline overtook', () => {
       const log = await stderr;
       expect(await child.exited, log).toBe(0);
       expect(JSON.parse(printed.trim().split('\n')[3] ?? 'null'), log).toEqual({ late: 'hit' });
-      expect(log).toContain(`no result within ${REMOTE_CACHE_ANSWER_WITHIN_MS} ms`);
+      expect(log).toContain(`no result within ${WITHIN_MS} ms`);
       expect(lateAnswers).toBe(1);
       const cache = join(root, 'cache');
       expect(await readFile(join(cache, hash, 'app', 'result.txt'), 'utf8')).toBe('local');
