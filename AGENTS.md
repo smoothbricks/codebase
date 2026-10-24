@@ -68,8 +68,11 @@
     failure is a defect with a receipt. Every error you raise carries the context you already have at the throw site -
     the operation, the subject (ids, paths, versions), the values involved and the cause - in the structured error
     result, so the reader needs no second run to understand it.
+16. **No env-var, lock or ceremony fixes.** Never add environment variables, lock files, holder markers, wrapper
+    protocols or hooks to work around a tool or coordinate agents; fix the tool itself. Cowshed's jobserver and land
+    turn are the coordination. Anything else needs Danny's explicit approval first.
 
-16. **Pay for computation once; keep what it proves.** Prefer work that leaves reusable structure: one structure, many
+17. **Pay for computation once; keep what it proves.** Prefer work that leaves reusable structure: one structure, many
     consumers; compute order once. Derived state (indexes, envelopes, checkpoints, caches) is a byproduct, never a
     second store; units name their authoritative source and why no duplicate store exists. Assess every unit through
     this byproduct lens. Flag these **second-ledger / second-store** shapes by name:
@@ -84,7 +87,7 @@
     - **Canonical copy:** another canonical copy beside the live source.
     - **Shadow config:** a copy beside the declared config.
 
-17. **Remove our work first; cache last. Cache over fork.** Measure and optimize our code before memoizing. If removing
+18. **Remove our work first; cache last. Cache over fork.** Measure and optimize our code before memoizing. If removing
     the remaining work requires an upstream fork/patch, prefer a boundary cache; name the upstream alternative and its
     maintenance cost in the design record, and explain why the fork is not worth carrying. Caches stay basis-keyed,
     recomputable and disposable, never second stores.
