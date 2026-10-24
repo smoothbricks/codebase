@@ -348,7 +348,7 @@
           }
         ],
         "options": {
-          "command": "bun test --timeout=0 ./src/executors/bounded-exec/ram-temp-host.test.ts ./src/executors/bounded-exec/executor-host.test.ts ./src/executors/bounded-exec/go-progress-host.test.ts ./src/executors/bounded-exec/cargo-progress-host.test.ts ./src/nx-daemon-stop-host.test.ts ./src/nx-daemon-watch-stream-host.test.ts",
+          "command": "bun test --timeout=0 ./src/executors/bounded-exec/ram-temp-host.test.ts ./src/executors/bounded-exec/executor-host.test.ts ./src/executors/bounded-exec/go-progress-host.test.ts ./src/executors/bounded-exec/cargo-progress-host.test.ts ./src/nx-daemon-stop-host.test.ts ./src/nx-daemon-watch-stream-host.test.ts ./src/executors/bounded-exec/hang-diagnostics-host.test.ts",
           "cwd": "{projectRoot}",
           "env": {
             "COWSHED_EXECUTABLE": "{workspaceRoot}/packages/cowshed/bin/cowshed"

@@ -1,12 +1,9 @@
 import { describe, expect, it, jest } from 'bun:test';
-import { spawn } from 'node:child_process';
-import { once } from 'node:events';
 import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { churnFailures, startChurn } from '../../__tests__/churn-group.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
-import { processTable } from '../../testing.js';
 import {
   captureHangDiagnostics,
   HANG_CAPTURE_MS,
@@ -374,32 +371,6 @@ describe('pre-expiry hang diagnostics', () => {
     expect(calls.map((call) => call.file)).toEqual(['ps', 'sudo', 'ps']);
     expect(capture.text).toContain('stack sample pid 101 stderr:\nsudo: a password is required');
     expect(capture.text).toContain('stack sample pid 101: no stack;');
-  });
-
-  it('ends a privileged probe through sudo, so its root lsof does not outlive sudo', async () => {
-    // The privileged probe exists only on Darwin, where it runs `sudo -n lsof`.
-    if (process.platform !== 'darwin') return;
-    // `-r 30` lists once, then sleeps holding its pipe: alive and silent when stopped, as a slow scan is.
-    const command = `lsof -r 30 -nP -p ${process.pid}`;
-    const probe = spawn('sudo', ['-n', ...command.split(' ')], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    try {
-      const exited = once(probe, 'exit');
-      let stderr = '';
-      probe.stderr.setEncoding('utf8').on('data', (chunk: string) => {
-        stderr += chunk;
-      });
-      // The first listing is the readiness event: sudo has finished starting and lsof runs as root.
-      const listed = await Promise.race([once(probe.stdout, 'data').then(() => true), exited.then(() => false)]);
-      expect(listed, `sudo -n ${command} ended before listing: ${stderr}`).toBe(true);
-      if (probe.pid === undefined) throw new Error('sudo has no pid');
-      stopProbe('sudo', probe.pid);
-      await exited;
-      const left = (await processTable()).filter((entry) => entry.command.trim() === command);
-      expect(left, 'root lsof rows left after sudo exited').toEqual([]);
-    } finally {
-      probe.stdout.destroy();
-      probe.stderr.destroy();
-    }
   });
 
   it('ends a probe whose members fork as it is stopped, leaving none behind', async () => {
