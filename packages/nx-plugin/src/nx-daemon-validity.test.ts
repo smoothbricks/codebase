@@ -1,8 +1,9 @@
 import { expect, it } from 'bun:test';
 import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
-import { mkdir, readdir, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { createConnection, createServer } from 'node:net';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -466,30 +467,39 @@ function watchClient(workspace: string, env: Record<string, string>) {
   };
 }
 
+/** One change that must not restart the daemon, and the marker whose report proves the watcher judged it. */
+interface QuietChange {
+  readonly what: string;
+  readonly marker: string;
+  readonly change: () => Promise<void>;
+}
+
 /**
- * Runs `change` under a file-watcher client of the daemon, then writes a marker the watcher must report. Watch events
- * arrive in order, so once the marker is reported the change was judged too. The daemon must still be the same process.
+ * Runs each change under one file-watcher client of the daemon, then writes its marker, which the watcher must report.
+ * Watch events arrive in order, so once a marker is reported its change was judged too. The daemon must still be the
+ * same process after all of them.
  */
 async function quietAfter(
   workspace: string,
   env: Record<string, string>,
   daemon: Daemon,
   what: string,
-  marker: string,
-  change: () => Promise<void>,
+  changes: readonly QuietChange[],
 ): Promise<void> {
   const client = watchClient(workspace, env);
   try {
     expect(await client.next(`the file watcher registering before ${what}`)).toEqual({ kind: 'ready', details: [] });
-    await change();
-    await writeFile(join(workspace, 'p', marker), 'marker\n');
-    for (;;) {
-      const event = await client.next(`the file watcher reporting ${marker} after ${what}`);
-      expect(
-        event.kind,
-        `${what} made the daemon stop instead of judging the change in place: ${JSON.stringify(client.seen)}`,
-      ).toBe('changed');
-      if (event.details.includes(`p/${marker}`)) break;
+    for (const { what: label, marker, change } of changes) {
+      await change();
+      await writeFile(join(workspace, 'p', marker), 'marker\n');
+      for (;;) {
+        const event = await client.next(`the file watcher reporting ${marker} after ${label}`);
+        expect(
+          event.kind,
+          `${label} made the daemon stop instead of judging the change in place: ${JSON.stringify(client.seen)}`,
+        ).toBe('changed');
+        if (event.details.includes(`p/${marker}`)) break;
+      }
     }
   } finally {
     await client.end();
@@ -542,10 +552,10 @@ it('has no 20 ms outdated-check loop or lockfile hashing left in the installed d
 });
 
 it('awaits an answerable daemon after a closed PING without another socket-directory event', async () => {
-  await withNxFixture('nx-daemon-validity-readiness-', async ({ socketDirectory, workspace }) => {
-    await fixtureWorkspace(workspace);
-    await mkdir(socketDirectory, { recursive: true });
-    const socketPath = join(socketDirectory, 'readiness.sock');
+  // No Nx runs here: the server stands in for the daemon, so the root is a plain temp directory.
+  const directory = await mkdtemp(join(tmpdir(), 'nx-validity-'));
+  try {
+    const socketPath = join(directory, 'readiness.sock');
     let requests = 0;
     const server = createServer((socket) => {
       socket.once('data', () => {
@@ -559,14 +569,16 @@ it('awaits an answerable daemon after a closed PING without another socket-direc
     server.listen(socketPath, () => listening.resolve());
     await listening.promise;
     try {
-      await untilServing({ processId: process.pid, socketPath }, workspace);
+      await untilServing({ processId: process.pid, socketPath }, directory);
       expect(requests).toBe(2);
     } finally {
       const closed = Promise.withResolvers<void>();
       server.close(() => closed.resolve());
       await closed.promise;
     }
-  });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 /** Valid lockfiles keep the real graph usable while the watcher judges byte changes. */
@@ -624,41 +636,44 @@ async function lockContents(
   return [Buffer.from(text), Buffer.from(`${text}\n`), Buffer.from(`${text}\n\n`)];
 }
 
-for (const lockfile of LOCKFILES) {
-  it(`restarts the daemon on ${lockfile} create, change, replace, and delete, and only then`, async () => {
-    await withNxFixture(
-      'nx-daemon-validity-lock-',
-      async ({ root, socketDirectory, workspace }) => {
-        if (lockfile === 'pnpm-lock.yaml') {
-          // pnpm's parser requires its hoisting metadata, even with no packages.
-          // Keep the installation directory fixture-owned, never write through the repository link.
-          await fixtureWorkspace(workspace, join(repositoryRoot, 'node_modules/nx'));
-          await writeFile(join(workspace, 'node_modules/.modules.yaml'), 'hoistedDependencies: {}\n');
-        } else {
-          await fixtureWorkspace(workspace);
-        }
-        const env = fixtureNxEnv(workspace, socketDirectory);
+it('restarts the daemon on each root lockfile create, change, replace, and delete, and only then', async () => {
+  await withNxFixture(
+    'nx-daemon-validity-lock-',
+    async ({ root, socketDirectory, workspace }) => {
+      // One fixture walks every root lockfile. Each one is deleted at its last step, so the next starts clean.
+      // pnpm's parser requires its hoisting metadata, even with no packages.
+      // Keep the installation directory fixture-owned, never write through the repository link.
+      await fixtureWorkspace(workspace, join(repositoryRoot, 'node_modules/nx'));
+      await writeFile(join(workspace, 'node_modules/.modules.yaml'), 'hoistedDependencies: {}\n');
+      const env = fixtureNxEnv(workspace, socketDirectory);
+      let daemon = await startDaemon(workspace, env);
+      for (const lockfile of LOCKFILES) {
         const lock = join(workspace, lockfile);
         const [one, two, three] = await lockContents(lockfile, root);
-        let daemon = await startDaemon(workspace, env);
         daemon = await restarted(workspace, daemon, `creating ${lockfile}`, () => writeFile(lock, one));
         daemon = await restarted(workspace, daemon, `changing ${lockfile}`, () => writeFile(lock, two));
         daemon = await restarted(workspace, daemon, `replacing ${lockfile} by rename`, async () => {
           await writeFile(`${lock}.next`, three);
           await rename(`${lock}.next`, lock);
         });
-        await quietAfter(workspace, env, daemon, `a same-bytes rewrite of ${lockfile}`, 'same-bytes.txt', () =>
-          writeFile(lock, three),
-        );
-        await quietAfter(workspace, env, daemon, `a nested ${lockfile} in p`, 'nested.txt', () =>
-          writeFile(join(workspace, 'p', lockfile), one),
-        );
-        await restarted(workspace, daemon, `deleting ${lockfile}`, () => rm(lock));
-      },
-      FIXTURE_WORKSPACE,
-    );
-  });
-}
+        await quietAfter(workspace, env, daemon, `the quiet changes around ${lockfile}`, [
+          {
+            what: `a same-bytes rewrite of ${lockfile}`,
+            marker: `same-bytes-${lockfile}.txt`,
+            change: () => writeFile(lock, three),
+          },
+          {
+            what: `a nested ${lockfile} in p`,
+            marker: `nested-${lockfile}.txt`,
+            change: () => writeFile(join(workspace, 'p', lockfile), one),
+          },
+        ]);
+        daemon = await restarted(workspace, daemon, `deleting ${lockfile}`, () => rm(lock));
+      }
+    },
+    FIXTURE_WORKSPACE,
+  );
+});
 
 it('does not serve a request sent on a connection opened before a lockfile change', async () => {
   await withNxFixture(
