@@ -1135,7 +1135,7 @@ impl FixturePortClaims {
 
     /// Hold `listener`, already bound on `port`, as the store's claim: a test's way to claim a
     /// port it never lets go of.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn hold(&self, port: u16, listener: std::net::TcpListener) {
         self.held()
             .insert(port, cowshed_os::fork_lock::Fenced::new(listener));
