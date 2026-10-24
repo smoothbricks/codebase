@@ -2542,7 +2542,7 @@ async function createWorkspace(parent: string = tmpdir()): Promise<WorkspaceFixt
 }
 
 function leaseAt(directory: string): RamTempLease {
-  return { directory, mountpoint: dirname(directory), volumeKey: 'scripted attach' };
+  return { directory, mountpoint: dirname(directory), attach: 'scripted attach' };
 }
 
 /**

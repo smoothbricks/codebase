@@ -320,10 +320,10 @@ export interface RamTempLease {
   directory: string;
   mountpoint: string;
   /**
-   * The attach of the volume the lease was taken on ({@link MountedVolume.key}). A read of the mountpoint that finds
+   * The attach of the volume the lease was taken on ({@link MountedVolume.attach}). A read of the mountpoint that finds
    * another attach, or none, is not this lease's volume: its free space is some other filesystem's.
    */
-  volumeKey: string;
+  attach: string;
 }
 
 export interface RamUnavailable {
@@ -455,6 +455,11 @@ interface MountedVolume {
   readonly registryEntry: string;
   /** This attach of the volume: its root's and its marker's identity, never times that change while it is in use. */
   readonly key: string;
+  /**
+   * The attach alone: its root's identity and its I/O Registry entry. A rewrite of the marker changes {@link key}, which
+   * provenance then proves again, while the leases on the attach stay where they are.
+   */
+  readonly attach: string;
   readonly device: number;
   /** The lease directories on it. */
   readonly leases: readonly string[];
@@ -740,7 +745,7 @@ export class RamTempVolume {
               lease: {
                 directory: value.directory,
                 mountpoint: this.paths.mountpoint,
-                volumeKey: value.volume.key,
+                attach: value.volume.attach,
               },
               held: [...value.held, ...settled.value.held].map((lease) => lease.text),
               reaped: [...settled.value.reaped],
@@ -782,7 +787,7 @@ export class RamTempVolume {
         const directory = await this.make(op);
         return {
           ledger: next,
-          value: { ok: true, value: { directory, mountpoint: this.paths.mountpoint, volumeKey: volume.key } },
+          value: { ok: true, value: { directory, mountpoint: this.paths.mountpoint, attach: volume.attach } },
         };
       },
     );
@@ -1299,15 +1304,14 @@ export class RamTempVolume {
     if (root.dev === parent.dev || !mark.isFile())
       return failed('provenance', 'gateway marker is not on a separately mounted RAM volume');
     const names = await readdir(this.paths.mountpoint);
+    const rootIdentity = `root ${root.dev}:${root.ino}:${root.birthtimeNs}`;
+    const registry = `registry ${marker.registryEntry}`;
     return {
       ok: true,
       value: {
         registryEntry: marker.registryEntry,
-        key: [
-          `root ${root.dev}:${root.ino}:${root.birthtimeNs}`,
-          `marker ${mark.dev}:${mark.ino}:${mark.birthtimeNs}:${mark.ctimeNs}`,
-          `registry ${marker.registryEntry}`,
-        ].join(' '),
+        key: [rootIdentity, `marker ${mark.dev}:${mark.ino}:${mark.birthtimeNs}:${mark.ctimeNs}`, registry].join(' '),
+        attach: `${rootIdentity} ${registry}`,
         device: Number(root.dev),
         leases: names.filter((name) => LEASE_NAME.test(name)),
       },
@@ -2030,7 +2034,7 @@ function leaseOn(
       lost: `no marked volume is mounted at ${lease.mountpoint} any more: it was detached while the task held its lease`,
     };
   }
-  if (volume.key !== lease.volumeKey) {
+  if (volume.attach !== lease.attach) {
     return {
       lost: `${lease.mountpoint} holds another attach of the volume than the one the lease was taken on: it was detached and made again while the task held its lease`,
     };

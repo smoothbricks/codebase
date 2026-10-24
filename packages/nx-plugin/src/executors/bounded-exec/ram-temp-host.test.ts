@@ -41,6 +41,7 @@ import {
 import {
   attachedDisks,
   detachOwned,
+  fixtureRamVolume,
   ownsRecordedDisk,
   recordedRamAttach,
   registryDevice,
@@ -686,7 +687,8 @@ async function aLeaseLostUnderItsTask(): Promise<void> {
   const { parent, paths, capacity, owned, gatewaySocket } = fixture;
   expectFixtureVolume(paths, capacity);
   const stopGateway = await startFixtureGateway(fixture);
-  const volume = new RamTempVolume(paths, capacity, createHostCommands(undefined, gatewaySocket));
+  // The module attaches the disk through the fixture gateway and records it, so the teardown can detach it.
+  const volume = fixtureRamVolume(fixture, undefined);
   try {
     const acquired = await volume.acquire(provisionOnly);
     if (!acquired.ok) {
