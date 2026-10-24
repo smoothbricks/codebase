@@ -94,36 +94,6 @@ describe('release planning with fixture git repositories', () => {
     });
   });
 
-  it('collects release tags from a fetched remote checkout instead of walking local commit history', async () => {
-    await withFixtureRepo(async (root) => {
-      await writePackage(root, '@scope/a', 'packages/a', '1.0.0');
-      await git(root, ['add', '.']);
-      await git(root, ['commit', '-m', 'release a']);
-      await tag(root, 'a@1.0.0', '2025-01-01T00:00:00Z');
-      await git(root, ['init', '--bare', 'remote.git']);
-      await git(root, ['remote', 'add', 'origin', join(root, 'remote.git')]);
-      await git(root, ['push', 'origin', 'main', '--tags']);
-      await git(root, ['clone', '--branch', 'main', join(root, 'remote.git'), 'checkout']);
-      const checkout = join(root, 'checkout');
-      await git(checkout, ['fetch', '--tags', 'origin', 'main']);
-      const head = await gitOutput(checkout, ['rev-parse', 'HEAD']);
-
-      const records = await collectOwnedReleaseTagRecords(
-        [{ name: '@scope/a', projectName: 'a', path: 'packages/a' }],
-        head,
-        {
-          listReleaseTagsByCreatorDate: () => gitReleaseTagsByCreatorDate(checkout),
-          isAncestor: (ancestor, descendant) => gitIsAncestor(checkout, ancestor, descendant),
-          packageVersionAtRef: (packagePath, ref) => packageVersionAtRef(checkout, packagePath, ref),
-          durableTagState: async () => ({ npmPublished: false, githubReleaseExists: false }),
-        },
-      );
-
-      expect(records.map((record) => record.tag)).toEqual(['a@1.0.0']);
-      expect(pendingReleaseTargets(records, 'not-head').map((target) => target.sha)).toEqual([head]);
-    });
-  });
-
   it('keeps fixture Nx state out of a shared workspace-data directory', async () => {
     // Host CI runners export these to a per-lane tree shared by every task in the run. A fixture
     // Nx inheriting any of them works in, or overwrites, another workspace's state.
@@ -158,7 +128,9 @@ describe('release planning with fixture git repositories', () => {
           NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx', 'workspace-data'),
           NX_CACHE_DIRECTORY: join(root, '.nx', 'cache'),
         });
-        // The escape lifts the job's rule for its one child alone, never for anything else.
+        // The escape lifts the job's rule for its one child alone, never for anything else. A fixture `nx` without
+        // it runs under `NX_DAEMON_START=never`, which the patched Nx honours by starting no daemon
+        // (`packages/nx-plugin/src/nx-daemon-start-never.test.ts` owns that half).
         expect('NX_DAEMON_START' in env).toBe(options.daemon !== 'fixture-owned');
       }
       expect(process.env.NX_DAEMON_START).toBe('never');
@@ -212,11 +184,12 @@ describe('release planning with fixture git repositories', () => {
     }
   });
 
-  it('leaves no process of its Nx daemon running once the fixture retires', async () => {
+  it('leaves no process of its Nx daemon running once the fixture retires, though its body threw', async () => {
     let fixtureRoot = '';
     let daemonPids: number[] = [];
     let daemonOwned = false;
-    await withFixtureRepo(async (root) => {
+    // The body fails with its daemon up; a body that returns retires through the same finally.
+    const thrown = withFixtureRepo(async (root) => {
       fixtureRoot = root;
       await writeWorkspace(root);
       await writeBuildablePackage(root, '@scope/a', 'packages/a');
@@ -224,28 +197,11 @@ describe('release planning with fixture git repositories', () => {
       daemonPids = (await nxDaemonProcesses(root)).map((entry) => entry.pid);
       // The fixture's own daemon, by the marker its escaped client started it with.
       daemonOwned = daemonPids[0] !== undefined && (await fixtureDaemonOwnedBy(daemonPids[0], root));
-    });
-
-    // Ownership proves a live fixture daemon existed; Nx may run its plugins in-process.
-    expect(daemonOwned).toBe(true);
-    expect(await survivors(fixtureRoot, daemonPids)).toEqual([]);
-  });
-
-  it('leaves no process of its Nx daemon running once a fixture body throws', async () => {
-    let fixtureRoot = '';
-    let daemonPids: number[] = [];
-    let daemonOwned = false;
-    const thrown = withFixtureRepo(async (root) => {
-      fixtureRoot = root;
-      await writeWorkspace(root);
-      await writeBuildablePackage(root, '@scope/a', 'packages/a');
-      await runFixtureNx(root, ['show', 'projects'], FIXTURE_STARTS_ITS_OWN_DAEMON);
-      daemonPids = (await nxDaemonProcesses(root)).map((entry) => entry.pid);
-      daemonOwned = daemonPids[0] !== undefined && (await fixtureDaemonOwnedBy(daemonPids[0], root));
       throw new Error('the fixture body failed on purpose');
     });
 
     await expect(thrown).rejects.toThrow('the fixture body failed on purpose');
+    // Ownership proves a live fixture daemon existed; Nx may run its plugins in-process.
     expect(daemonOwned).toBe(true);
     expect(await survivors(fixtureRoot, daemonPids)).toEqual([]);
   });
@@ -276,24 +232,6 @@ describe('release planning with fixture git repositories', () => {
     `);
 
     expect(await survivors(root, [])).toEqual([]);
-  });
-
-  /**
-   * The product contract the escape exists beside: under the rule every cowshed job runs with
-   * (`NX_DAEMON_START=never`), a fixture `nx` asked for a daemon, without the escape, starts none,
-   * and the fixture leaves no daemon behind. Nothing covered this before the rule was installed,
-   * which is how three retirement tests that relied on a client starting one went unnoticed.
-   */
-  it('starts no daemon without the escape, under the rule every job runs with', async () => {
-    let recorded: number[] = [];
-    await withFixtureRepo(async (root) => {
-      await writeWorkspace(root);
-      await writeBuildablePackage(root, '@scope/a', 'packages/a');
-      await runFixtureNx(root, ['show', 'projects'], { daemon: 'job-rule' });
-      recorded = (await nxDaemonProcesses(root)).map((entry) => entry.pid);
-      expect(existsSync(join(root, '.nx', 'workspace-data', 'd', 'server-process.json'))).toBe(false);
-    });
-    expect(recorded).toEqual([]);
   });
 
   it('repairs multiple fetched remote targets from a runner clone, building each at its own checkout', async () => {
@@ -371,50 +309,14 @@ describe('release planning with fixture git repositories', () => {
     });
   });
 
-  it('pushes current release refs to a local bare remote', async () => {
-    await withFixtureRepo(async (author) => {
-      await writePackage(author, '@scope/pushed', 'packages/pushed', '1.0.0');
-      await git(author, ['add', '.']);
-      await git(author, ['commit', '-m', 'release pushed package']);
-      const releaseSha = await gitOutput(author, ['rev-parse', 'HEAD']);
-      await git(author, ['init', '--bare', 'remote.git']);
-      await git(author, ['remote', 'add', 'origin', join(author, 'remote.git')]);
-      await git(author, ['push', 'origin', 'main']);
-      const pkg: ReleasePackageInfo = {
-        name: '@scope/pushed',
-        projectName: 'pushed',
-        path: 'packages/pushed',
-        version: '1.0.0',
-      };
-      const shell = new LocalGitRepairShell(author);
-
-      const summary = await completeReleaseAtHead(shell, [pkg], false, false);
-
-      expect(summary.pushed).toBe(true);
-      expect(shell.pushes).toEqual([['pushed@1.0.0']]);
-      const remoteTags = await gitOutput(author, [
-        'ls-remote',
-        '--tags',
-        'origin',
-        'refs/tags/pushed@1.0.0^{}',
-        'refs/tags/@scope/pushed@1.0.0^{}',
-      ]);
-      expect(remoteTags).toBe(`${releaseSha}\trefs/tags/pushed@1.0.0^{}`);
-    });
-  });
-
-  it('kills timed-out fixture Git process groups so descendants cannot hold output pipes open', async () => {
+  it('ends a timed-out fixture Git process group, descendants and members forked mid-kill included', async () => {
     await withFixtureRepo(async (root) => {
       // The descendant outlives any run: a broken group kill leaves its pipes open, so the test never returns and the
       // leg's no-progress bound fails the run, rather than passing once a shorter sleep ended on its own.
       await expect(
         git(root, ['-c', "alias.hold-pipes=!sh -c 'sleep 86400 & exit 0'", 'hold-pipes'], undefined, 100),
       ).rejects.toThrow('timed out after 100ms');
-    });
-  });
 
-  it('ends the members a timed-out fixture Git process group forks while it is being ended', async () => {
-    await withFixtureRepo(async (root) => {
       // Eight shell chains, each forking its successor and exiting, keep some member inside fork at
       // almost any instant. One group SIGKILL misses the child a fork in progress makes, and that
       // child keeps the chain, and git's pipes, alive: then the test never returns and the leg's
@@ -426,7 +328,7 @@ describe('release planning with fixture git repositories', () => {
     });
   });
 
-  it('repairs a scoped package from its project-name release tag without creating a package-name tag', async () => {
+  it('repairs a fetched remote checkout from its project-name release tag, creating no package-name tag', async () => {
     await withFixtureRepo(async (author) => {
       await writePackage(author, '@scope/cli', 'packages/cli', '0.2.0');
       await git(author, ['add', '.']);
@@ -449,18 +351,25 @@ describe('release planning with fixture git repositories', () => {
         path: 'packages/cli',
         version: '0.0.0',
       };
-      const records = await collectOwnedReleaseTagRecords([pkg], 'origin/main', {
-        listReleaseTagsByCreatorDate: () => gitReleaseTagsByCreatorDate(runner),
-        isAncestor: (ancestor, descendant) => gitIsAncestor(runner, ancestor, descendant),
-        packageVersionAtRef: (packagePath, ref) => packageVersionAtRef(runner, packagePath, ref),
-        durableTagState: async () => ({ npmPublished: false, githubReleaseExists: false }),
-      });
+      // The tags come from the fetched remote, not from walking local commit history. The release tip is named by its
+      // remote ref or, when the remote has no such ref, by the HEAD commit (fetchReleaseRepairRef); both name it.
+      const collect = (tip: string) =>
+        collectOwnedReleaseTagRecords([pkg], tip, {
+          listReleaseTagsByCreatorDate: () => gitReleaseTagsByCreatorDate(runner),
+          isAncestor: (ancestor, descendant) => gitIsAncestor(runner, ancestor, descendant),
+          packageVersionAtRef: (packagePath, ref) => packageVersionAtRef(runner, packagePath, ref),
+          durableTagState: async () => ({ npmPublished: false, githubReleaseExists: false }),
+        });
+      const records = await collect('origin/main');
+      const recordsAtHead = await collect(releaseSha);
       const pending = pendingReleaseTargets(records, 'not-head');
 
       const shell = new LocalGitRepairShell(runner);
       const summaries = await repairPendingTargets(shell, pending, 'origin/main', false);
 
       expect(records.map((record) => record.tag)).toEqual(['cli@0.2.0']);
+      expect(recordsAtHead.map((record) => record.tag)).toEqual(['cli@0.2.0']);
+      expect(pendingReleaseTargets(recordsAtHead, 'not-head').map((target) => target.sha)).toEqual([releaseSha]);
       expect(pending.map((target) => target.sha)).toEqual([releaseSha]);
       expect(shell.pushes).toEqual([['cli@0.2.0']]);
       expect(shell.builds).toEqual([{ head: releaseSha, packages: ['@scope/cli'] }]);
@@ -472,14 +381,36 @@ describe('release planning with fixture git repositories', () => {
     });
   });
 
-  it('refuses a release whose branch diverged mid-run instead of dying on raw git output', async () => {
+  it('pushes release refs to a local bare remote, then refuses a release whose branch diverged mid-run', async () => {
     await withFixtureRepo(async (author) => {
       await writePackage(author, '@scope/cli', 'packages/cli', '0.1.0');
       await git(author, ['add', '.']);
-      await git(author, ['commit', '-m', 'initial']);
+      await git(author, ['commit', '-m', 'release cli 0.1.0']);
+      const firstSha = await gitOutput(author, ['rev-parse', 'HEAD']);
       await git(author, ['init', '--bare', 'remote.git']);
       await git(author, ['remote', 'add', 'origin', join(author, 'remote.git')]);
       await git(author, ['push', 'origin', 'main']);
+      const first: ReleasePackageInfo = {
+        name: '@scope/cli',
+        projectName: 'cli',
+        path: 'packages/cli',
+        version: '0.1.0',
+      };
+      const pushing = new LocalGitRepairShell(author);
+
+      const summary = await completeReleaseAtHead(pushing, [first], false, false);
+
+      expect(summary.pushed).toBe(true);
+      expect(pushing.pushes).toEqual([['cli@0.1.0']]);
+      const remoteTags = await gitOutput(author, [
+        'ls-remote',
+        '--tags',
+        'origin',
+        'refs/tags/cli@0.1.0^{}',
+        'refs/tags/@scope/cli@0.1.0^{}',
+      ]);
+      expect(remoteTags).toBe(`${firstSha}\trefs/tags/cli@0.1.0^{}`);
+
       await git(author, ['clone', '--branch', 'main', join(author, 'remote.git'), 'runner']);
       const runner = join(author, 'runner');
       await git(runner, ['config', 'user.name', 'Test User']);
@@ -498,16 +429,11 @@ describe('release planning with fixture git repositories', () => {
       await git(author, ['push', 'origin', 'main']);
       const remoteSha = await gitOutput(author, ['rev-parse', 'HEAD']);
 
-      const pkg: ReleasePackageInfo = {
-        name: '@scope/cli',
-        projectName: 'cli',
-        path: 'packages/cli',
-        version: '0.2.0',
-      };
+      const next: ReleasePackageInfo = { ...first, version: '0.2.0' };
       const shell = new LocalGitRepairShell(runner);
 
       expect(releaseSha).not.toBe(remoteSha);
-      await expect(shell.pushReleaseRefs([pkg])).rejects.toThrow(
+      await expect(shell.pushReleaseRefs([next])).rejects.toThrow(
         new RegExp(
           `diverged: origin/main is at ${remoteSha},.+release commit history at ${releaseSha}.+Nothing was published.+Re-run the release workflow`,
           's',

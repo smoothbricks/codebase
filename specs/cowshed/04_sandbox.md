@@ -1048,10 +1048,12 @@ A fixture `nx` spawned with the named `FIXTURE_STARTS_ITS_OWN_DAEMON` option
 fixture's own daemon; that one child alone, never the job or any other fixture `nx`, which keep the rule. The daemon is
 started with `SMOO_FIXTURE_NX_DAEMON` naming its fixture root, and the test proves the daemon it retires carries it, so
 it cannot pass on a daemon some other run left. The escape is named at every call site because an invisible one would
-become the leak the rule exists to stop, and a companion test proves that without it a fixture under the rule starts no
-daemon. An explicit `nx daemon --start` is a start like any other: under `NX_DAEMON_START=never` the patched Nx refuses
-it as policy, exiting 1 with a reason naming the variable and the fixture escape, so the escape is the only path by
-which a job's process starts a daemon.
+become the leak the rule exists to stop: the fixture-environment test
+(`packages/cli/src/release/__tests__/fixture-repo.test.ts`) proves that only the escape drops `NX_DAEMON_START`, and
+`packages/nx-plugin/src/nx-daemon-start-never.test.ts` proves that a client under it starts no daemon. An explicit
+`nx daemon --start` is a start like any other: under `NX_DAEMON_START=never` the patched Nx refuses it as policy,
+exiting 1 with a reason naming the variable and the fixture escape, so the escape is the only path by which a job's
+process starts a daemon.
 
 One Nx state per checkout. Every job of an Nx project (`nx.json`, 15_capabilities.md), read-write or read-only, gets
 `NX_WORKSPACE_DATA_DIRECTORY` and `NX_CACHE_DIRECTORY` naming the checkout's own `<project>/.nx/workspace-data` and
