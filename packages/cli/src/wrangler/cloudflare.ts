@@ -1,4 +1,5 @@
 import typia from 'typia';
+import { parseRetryAfter, processRetryShell, type RetryPolicy, type RetryShell, retryTransient } from '../lib/retry.js';
 import type { LiveKvNamespace } from './stage.js';
 
 export interface R2Bucket {
@@ -172,6 +173,24 @@ export class CloudflareApiError extends Error {
 
 type CloudflareFetcher = (input: string, init?: RequestInit) => Promise<Response>;
 
+/** A string body can be sent again; a stream could not, and a repeated call must send what the first one did. */
+type CloudflareRequest = Omit<RequestInit, 'body'> & { body?: string };
+
+/**
+ * Six attempts, waiting 2, 4, 8, 16 and 30 s between them (60 s in all): the account-level limit is lifted within
+ * seconds once a concurrent deploy's burst ends, and a limit that outlasts a minute is a real overload that should
+ * fail the deploy rather than hold the runner. A Retry-After beyond 30 s ends the retrying.
+ */
+const RATE_LIMIT_RETRY_POLICY: RetryPolicy = {
+  attempts: 6,
+  baseDelayMs: 2000,
+  maxDelayMs: 30_000,
+  maxRetryAfterMs: 30_000,
+};
+/** Cloudflare's answer to concurrent account-level calls, which the HTTP status alone does not always carry. */
+const RATE_LIMIT_MESSAGE = /reduce your concurrent request rate/i;
+const IDEMPOTENT_METHOD = /^(?:GET|PUT|DELETE)$/;
+
 export class CloudflareRestClient implements CloudflareClient {
   private readonly accountPath: string;
 
@@ -180,6 +199,7 @@ export class CloudflareRestClient implements CloudflareClient {
     private readonly apiToken: string,
     private readonly fetcher: CloudflareFetcher = fetch,
     private readonly apiBaseUrl = 'https://api.cloudflare.com/client/v4',
+    private readonly retryShell: RetryShell = processRetryShell,
   ) {
     if (!accountId || !apiToken) {
       throw new Error('CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are required.');
@@ -438,7 +458,7 @@ export class CloudflareRestClient implements CloudflareClient {
   }
 
   /** A read: the payload *is* the envelope, so a 2xx carrying nothing is a failed read. */
-  private async request(path: string, init?: RequestInit): Promise<CloudflareEnvelope> {
+  private async request(path: string, init?: CloudflareRequest): Promise<CloudflareEnvelope> {
     const { response, text } = await this.send(path, init);
     if (response.ok && EMPTY_BODY.test(text)) {
       throw new CloudflareApiError(`Cloudflare returned an empty response body for ${path}.`, response.status, []);
@@ -451,49 +471,84 @@ export class CloudflareRestClient implements CloudflareClient {
    * answer a successful call with no envelope at all: an empty body or a bare null. On a 2xx that
    * carries nothing to read, the call succeeded.
    */
-  private async mutate(path: string, init: RequestInit): Promise<void> {
+  private async mutate(path: string, init: CloudflareRequest): Promise<void> {
     const { response, text } = await this.send(path, init);
     if (response.ok && EMPTY_BODY.test(text)) return;
     readEnvelope(path, response, text);
   }
 
-  private async send(path: string, init: RequestInit = {}): Promise<{ response: Response; text: string }> {
-    const response = await this.fetcher(`${this.apiBaseUrl}${path}`, {
-      ...init,
-      headers: {
-        Authorization: `Bearer ${this.apiToken}`,
-        'Content-Type': 'application/json',
-        ...init.headers,
+  /**
+   * One call, repeated while Cloudflare answers that the account is being called too fast. The answer to a
+   * 429 is a refusal before the call ran, so every method may repeat it; the same message under another status
+   * does not say whether the call ran, so only a read or an idempotent write (GET, PUT, DELETE) repeats it.
+   * After the bounded attempts the last answer is thrown as the same CloudflareApiError as ever.
+   */
+  private send(path: string, init: CloudflareRequest = {}): Promise<{ response: Response; text: string }> {
+    const method = (init.method ?? 'GET').toUpperCase();
+    return retryTransient(
+      async () => {
+        const response = await this.fetcher(`${this.apiBaseUrl}${path}`, {
+          ...init,
+          headers: {
+            Authorization: `Bearer ${this.apiToken}`,
+            'Content-Type': 'application/json',
+            ...init.headers,
+          },
+        });
+        const text = await response.text();
+        if (response.ok) return { kind: 'done', value: { response, text } };
+        const body = parseBody(text);
+        const failure = apiFailure(path, response, body);
+        // The message counts only as the answer's sole complaint: next to another error the call may be failing for
+        // a reason a repeat would not change.
+        const messageOnly =
+          body?.errors?.length && body.errors.every((error) => RATE_LIMIT_MESSAGE.test(error.message ?? ''));
+        if (response.status !== 429 && !(IDEMPOTENT_METHOD.test(method) && messageOnly)) {
+          return { kind: 'done', value: { response, text } };
+        }
+        return {
+          kind: 'transient',
+          error: failure,
+          reason: failure.message,
+          retryAfterMs: parseRetryAfter(response.headers.get('Retry-After'), Date.now()),
+        };
       },
-    });
-    return { response, text: await response.text() };
+      RATE_LIMIT_RETRY_POLICY,
+      this.retryShell,
+    );
   }
 }
 
-/** The envelope, or a failure named by endpoint and Cloudflare's own codes — never by credential. */
-function readEnvelope(path: string, response: Response, text: string): CloudflareEnvelope {
-  let body: CloudflareEnvelope | null;
+function parseBody(text: string): CloudflareEnvelope | null {
   try {
-    body = parseCloudflareEnvelope(text);
+    return parseCloudflareEnvelope(text);
   } catch {
     // Not JSON at all; the same failure as JSON of the wrong shape.
-    body = null;
+    return null;
   }
+}
+
+/** The failure an answer amounts to, named by endpoint and Cloudflare's own codes — never by credential. */
+function apiFailure(path: string, response: Response, body: CloudflareEnvelope | null): CloudflareApiError {
   if (!body) {
-    throw new CloudflareApiError(`Cloudflare returned a malformed response for ${path}.`, response.status, []);
+    return new CloudflareApiError(`Cloudflare returned a malformed response for ${path}.`, response.status, []);
   }
-  if (!response.ok || !body.success) {
-    const errors = body.errors ?? [];
-    const message =
-      errors
-        .map((error) => error.message)
-        .filter(Boolean)
-        .join('; ') || `HTTP ${response.status}`;
-    throw new CloudflareApiError(
-      `Cloudflare API ${path} failed: ${message}`,
-      response.status,
-      errors.flatMap((error) => error.code ?? []),
-    );
-  }
+  const errors = body.errors ?? [];
+  const message =
+    errors
+      .map((error) => error.message)
+      .filter(Boolean)
+      .join('; ') || `HTTP ${response.status}`;
+  return new CloudflareApiError(
+    `Cloudflare API ${path} failed: ${message}`,
+    response.status,
+    errors.flatMap((error) => error.code ?? []),
+  );
+}
+
+/** The envelope, or the failure it amounts to. */
+function readEnvelope(path: string, response: Response, text: string): CloudflareEnvelope {
+  const body = parseBody(text);
+  if (!body || !response.ok || !body.success) throw apiFailure(path, response, body);
   return body;
 }
