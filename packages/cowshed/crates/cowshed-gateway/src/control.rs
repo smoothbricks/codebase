@@ -22,8 +22,10 @@ use zeroize::{Zeroize, Zeroizing};
 use cowshed_gateway_types::{
     CPU_TOKENS_OP, CpuBudgetStatus, DISK_LEASE_OP, DaemonStatus, DiskClass, EgressGrant,
     EgressMode, HostPattern, JOBSERVER_OP, LeaseClass, LeaseState, MirrorRoute, PhaseShare,
-    RESIDENT_POOL_OP, TASK_ADMIT_OP, TaskClass, TaskGrant, TaskOutcome, TaskQueueStatus,
-    TaskRunCaps, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+    RAM_ATTACH_OP, RAM_DETACH_OP, RESIDENT_POOL_OP, RamAttachRefusal, RamDetached, RamDiskAttached,
+    RamDiskDevice, RamDiskEntry, RamDiskSectors, RamDisks, TASK_ADMIT_OP, TaskClass, TaskGrant,
+    TaskOutcome, TaskQueueStatus, TaskRunCaps, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy,
+    WorkspaceSession, WorkspaceToken,
 };
 
 use crate::{
@@ -466,6 +468,16 @@ enum ControlRequest {
         #[serde(rename = "repoId")]
         repo_id: cowshed_core::repository::RepoId,
     },
+    /// Attach one RAM disk of this many sectors (05_gateway.md, "RAM disks").
+    RamAttach {
+        sectors: RamDiskSectors,
+    },
+    /// Detach the RAM disk `registry_entry` registers as `device` (05_gateway.md, "RAM disks").
+    RamDetach {
+        device: RamDiskDevice,
+        #[serde(rename = "registryEntry")]
+        registry_entry: RamDiskEntry,
+    },
 }
 
 /// A request as the control socket reads it: a one-shot [`ControlRequest`] answered and closed,
@@ -678,6 +690,12 @@ struct ControlResponse {
     /// The install that cut a queued CPU ask off, beside [`ControlFailureCode::InstallRestart`].
     #[serde(skip_serializing_if = "Option::is_none")]
     install: Option<cowshed_gateway_types::InstallRestart>,
+    /// The whole disk a `ram-attach` attached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ram_disk: Option<RamDiskAttached>,
+    /// What is known of a `ram-detach`: `terminal`, `not-started` or `unknown`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ram_detach: Option<RamDetached>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -928,6 +946,7 @@ pub(crate) struct ControlServices {
     pub cpu_budget: CpuBudget,
     pub task_server: crate::task_server::TaskServer,
     pub jobserver: crate::jobserver::JobserverFifos,
+    pub ram_disks: Option<Arc<dyn RamDisks>>,
 }
 
 impl ControlServices {
@@ -956,6 +975,7 @@ impl fmt::Debug for ControlServices {
             .field("disk_leases", &self.disk_leases)
             .field("cpu_budget", &self.cpu_budget)
             .field("task_server", &self.task_server)
+            .field("ram_disks", &self.ram_disks)
             .finish()
     }
 }
@@ -1783,6 +1803,8 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         "task-terminal" => &["op", "unit", "outcome"],
         "task-queue" => &["op"],
         "nx-cache-clear" => &["op", "repoId"],
+        RAM_ATTACH_OP => &["op", "sectors"],
+        RAM_DETACH_OP => &["op", "device", "registryEntry"],
         TASK_ADMIT_OP => &[
             "op",
             "unit",
@@ -2228,6 +2250,47 @@ async fn dispatch(
             },
             None,
         ),
+        ControlRequest::RamAttach { sectors } => (
+            attach_ram_disk(services.ram_disks.clone(), sectors).await,
+            None,
+        ),
+        ControlRequest::RamDetach {
+            device,
+            registry_entry,
+        } => (
+            detach_ram_disk(services.ram_disks.clone(), device, registry_entry).await,
+            None,
+        ),
+    }
+}
+
+/// Attach a RAM disk on a blocking thread: `hdiutil` takes as long as the host's disk services do,
+/// and an attach is never interrupted (05_gateway.md, "RAM disks").
+async fn attach_ram_disk(
+    attacher: Option<Arc<dyn RamDisks>>,
+    sectors: RamDiskSectors,
+) -> ControlResponse {
+    let Some(attacher) = attacher else {
+        return failure(
+            ControlFailureCode::Rejected,
+            "this gateway attaches no RAM disk: its daemon supplied no disk runner".to_owned(),
+        );
+    };
+    match tokio::task::spawn_blocking(move || attacher.attach(sectors)).await {
+        Ok(Ok(attached)) => ControlResponse {
+            ram_disk: Some(attached),
+            ..success()
+        },
+        Ok(Err(refusal @ RamAttachRefusal::TooLarge { .. })) => {
+            failure(ControlFailureCode::InvalidRequest, refusal.to_string())
+        }
+        Ok(Err(refusal @ RamAttachRefusal::Failed(_))) => {
+            failure(ControlFailureCode::Rejected, refusal.to_string())
+        }
+        Err(error) => failure(
+            ControlFailureCode::Rejected,
+            format!("the RAM disk attach thread failed: {error}"),
+        ),
     }
 }
 
@@ -2331,6 +2394,68 @@ fn check_response(response: &ControlResponse) -> Result<(), ControlError> {
     }
 }
 
+/// Detach a RAM disk on a blocking thread no connection owns: once dispatched, the detach runs to
+/// its end and the exact `hdiutil` child is reaped whether or not the requester still waits, so its
+/// disconnect, death or job retirement never cancels it (05_gateway.md, "RAM disks"). Every
+/// outcome is said on the gateway's stderr, a started detach's by its own thread, so it is said
+/// even when no connection remains to hear the answer.
+async fn detach_ram_disk(
+    disks: Option<Arc<dyn RamDisks>>,
+    device: RamDiskDevice,
+    entry: RamDiskEntry,
+) -> ControlResponse {
+    let say = move |device: &RamDiskDevice, detached: &RamDetached| {
+        cowshed_os::eprintln!("cowshed: ram-detach {device} entry={entry} outcome={detached}");
+    };
+    let detached = match disks {
+        None => {
+            let detached = RamDetached::NotStarted {
+                reason: "this gateway detaches no RAM disk: its daemon supplied no disk runner"
+                    .to_owned(),
+            };
+            say(&device, &detached);
+            detached
+        }
+        Some(disks) => {
+            let target = device.clone();
+            match tokio::task::spawn_blocking(move || {
+                let detached = disks.detach(
+                    &target,
+                    entry,
+                    cowshed_core::api::dto::MAX_INLINE_OUTPUT_BYTES,
+                );
+                say(&target, &detached);
+                detached
+            })
+            .await
+            {
+                Ok(detached) => detached,
+                Err(error) => {
+                    // A blocking task is cancelled only before it starts running.
+                    let detached = if error.is_cancelled() {
+                        RamDetached::NotStarted {
+                            reason: format!(
+                                "the RAM disk detach thread was cancelled before it ran: {error}"
+                            ),
+                        }
+                    } else {
+                        RamDetached::Unknown {
+                            reason: format!(
+                                "the RAM disk detach thread failed after it started: {error}"
+                            ),
+                        }
+                    };
+                    say(&device, &detached);
+                    detached
+                }
+            }
+        }
+    };
+    ControlResponse {
+        ram_detach: Some(detached),
+        ..success()
+    }
+}
 fn success() -> ControlResponse {
     ControlResponse {
         ok: true,
@@ -2352,6 +2477,8 @@ fn success() -> ControlResponse {
         task_queue: None,
         nx_cache_cleared: None,
         install: None,
+        ram_disk: None,
+        ram_detach: None,
     }
 }
 
@@ -2589,6 +2716,39 @@ mod tests {
             parse_control_request(br#"{"op":"nx-cache-clear","repoId":"acme/widget","all":true}"#)
                 .is_err()
         );
+
+        // A RAM attach names a positive size and nothing else: no argv reaches hdiutil.
+        assert!(matches!(
+            parse_control_request(br#"{"op":"ram-attach","sectors":131072}"#),
+            Ok(Incoming::Request(ControlRequest::RamAttach { sectors })) if sectors.get() == 131_072
+        ));
+        for refused in [
+            &br#"{"op":"ram-attach","sectors":0}"#[..],
+            br#"{"op":"ram-attach","sectors":-1}"#,
+            br#"{"op":"ram-attach","sectors":"131072"}"#,
+            br#"{"op":"ram-attach"}"#,
+            br#"{"op":"ram-attach","sectors":131072,"argv":["-force"]}"#,
+        ] {
+            assert!(parse_control_request(refused).is_err());
+        }
+
+        // A RAM detach names a whole disk and its registry entry and nothing else: no force.
+        assert!(matches!(
+            parse_control_request(br#"{"op":"ram-detach","device":"/dev/disk7","registryEntry":"0x100000abc"}"#),
+            Ok(Incoming::Request(ControlRequest::RamDetach { device, registry_entry }))
+                if device.as_str() == "/dev/disk7" && registry_entry.get() == 0x1_0000_0abc
+        ));
+        for refused in [
+            &br#"{"op":"ram-detach","device":"/dev/disk7"}"#[..],
+            br#"{"op":"ram-detach","registryEntry":"0x100000abc"}"#,
+            br#"{"op":"ram-detach","device":"/dev/disk7","registryEntry":"0x100000abc","force":true}"#,
+            br#"{"op":"ram-detach","device":"/dev/disk7s1","registryEntry":"0x100000abc"}"#,
+            br#"{"op":"ram-detach","device":"/dev/disk7","registryEntry":"0x100000ABC"}"#,
+            br#"{"op":"ram-detach","device":"/dev/disk7","registryEntry":"0x0"}"#,
+            br#"{"op":"ram-detach","device":"/dev/disk7","registryEntry":4294970044}"#,
+        ] {
+            assert!(parse_control_request(refused).is_err());
+        }
         assert!(
             parse_control_request(
                 format!(
@@ -2767,5 +2927,158 @@ mod tests {
             Err(ControlError::InvalidResponse)
         ));
         answering.await.expect("answers");
+    }
+
+    /// RAM disks whose detach starts, says so, and ends only once the test releases it, then says
+    /// how it ended: a detach the test can hold in flight while its connection goes away.
+    #[derive(Debug)]
+    struct HeldDetach {
+        started: std::sync::Mutex<std::sync::mpsc::SyncSender<()>>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        ended: std::sync::Mutex<std::sync::mpsc::SyncSender<RamDetached>>,
+    }
+
+    impl RamDisks for HeldDetach {
+        fn attach(&self, sectors: RamDiskSectors) -> Result<RamDiskAttached, RamAttachRefusal> {
+            unreachable!("this fixture only detaches; asked to attach {sectors}")
+        }
+
+        fn detach(
+            &self,
+            device: &RamDiskDevice,
+            _entry: RamDiskEntry,
+            output_limit: usize,
+        ) -> RamDetached {
+            self.started
+                .lock()
+                .unwrap()
+                .send(())
+                .expect("the test waits for the start");
+            self.release
+                .lock()
+                .unwrap()
+                .recv()
+                .expect("the test releases the detach");
+            let detached = RamDetached::terminal(
+                cowshed_gateway_types::RamDetachStatus::Exit(0),
+                format!(
+                    "\"{}\" ejected.\n",
+                    device.as_str().trim_start_matches("/dev/")
+                )
+                .as_bytes(),
+                b"",
+                output_limit,
+            );
+            self.ended
+                .lock()
+                .unwrap()
+                .send(detached.clone())
+                .expect("the test waits for the end");
+            detached
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanickingDetach;
+
+    impl RamDisks for PanickingDetach {
+        fn attach(&self, sectors: RamDiskSectors) -> Result<RamDiskAttached, RamAttachRefusal> {
+            unreachable!("this fixture only detaches; asked to attach {sectors}")
+        }
+
+        fn detach(
+            &self,
+            device: &RamDiskDevice,
+            _entry: RamDiskEntry,
+            _limit: usize,
+        ) -> RamDetached {
+            panic!("the detach of {device} panicked after it started")
+        }
+    }
+
+    fn disk7() -> (RamDiskDevice, RamDiskEntry) {
+        (
+            RamDiskDevice::parse("/dev/disk7").expect("a whole disk"),
+            RamDiskEntry::parse("0x100000abc").expect("an entry"),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_ram_detach_answer_is_one_typed_outcome_on_the_wire() {
+        let (device, entry) = disk7();
+        let unserved = detach_ram_disk(None, device.clone(), entry).await;
+        assert_eq!(
+            serde_json::to_value(&unserved).expect("encode"),
+            serde_json::json!({
+                "ok": true,
+                "ramDetach": {
+                    "outcome": "not-started",
+                    "reason": "this gateway detaches no RAM disk: its daemon supplied no disk runner",
+                },
+            })
+        );
+        let lost = detach_ram_disk(Some(Arc::new(PanickingDetach)), device, entry).await;
+        assert!(
+            matches!(&lost.ram_detach, Some(RamDetached::Unknown { reason }) if reason.contains("after it started")),
+            "a thread lost after it started is unknown, never terminal or not-started: {:?}",
+            serde_json::to_value(&lost)
+        );
+        let terminal = RamDetached::terminal(
+            cowshed_gateway_types::RamDetachStatus::Signal(9),
+            b"out",
+            b"err",
+            cowshed_core::api::dto::MAX_INLINE_OUTPUT_BYTES,
+        );
+        let wire = serde_json::json!({
+            "outcome": "terminal",
+            "status": {"signal": 9},
+            "stdout": "out",
+            "stderr": "err",
+            "stdoutTruncated": false,
+            "stderrTruncated": false,
+        });
+        assert_eq!(serde_json::to_value(&terminal).expect("encode"), wire);
+        assert_eq!(
+            serde_json::from_value::<RamDetached>(wire).expect("decode"),
+            terminal
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dispatched_ram_detach_outlives_the_connection_that_asked_for_it() {
+        let (started, has_started) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let (ended, has_ended) = std::sync::mpsc::sync_channel(1);
+        let disks: Arc<dyn RamDisks> = Arc::new(HeldDetach {
+            started: std::sync::Mutex::new(started),
+            release: std::sync::Mutex::new(released),
+            ended: std::sync::Mutex::new(ended),
+        });
+        let (device, entry) = disk7();
+        let asking = tokio::spawn(detach_ram_disk(Some(disks), device, entry));
+        tokio::task::spawn_blocking(move || has_started.recv())
+            .await
+            .expect("the start waiter")
+            .expect("the detach started");
+        // The requester's connection task goes away while the detach is in flight.
+        asking.abort();
+        assert!(matches!(asking.await, Err(error) if error.is_cancelled()));
+        release
+            .send(())
+            .expect("the detach still waits for its release");
+        let detached = tokio::task::spawn_blocking(move || has_ended.recv())
+            .await
+            .expect("the end waiter")
+            .expect("the detach ran to its end with no one left to answer");
+        assert_eq!(
+            detached,
+            RamDetached::Terminal {
+                status: cowshed_gateway_types::RamDetachStatus::Exit(0),
+                stdout: "\"disk7\" ejected.\n".to_owned(),
+                stderr: String::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            }
+        );
     }
 }

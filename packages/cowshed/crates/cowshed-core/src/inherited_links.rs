@@ -593,7 +593,10 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("create temp tree");
-        TempTree(root)
+        // Links are repointed through held directories, whose chain opens without following a
+        // symlink, so the tree is spelled the way the kernel resolves it (`/var` is `/private/var`
+        // on macOS) whatever temporary directory the runner supplies.
+        TempTree(fs::canonicalize(&root).expect("canonical temp tree"))
     }
 
     #[test]

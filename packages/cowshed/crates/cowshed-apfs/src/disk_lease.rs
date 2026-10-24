@@ -129,6 +129,21 @@ pub fn leased<T, E: fmt::Display + From<VolumeRenameRefused>>(
     leased_class(class, &describe(program, args), deadline, run)
 }
 
+/// The same command admission against an explicitly selected gateway, never the host socket.
+pub fn leased_on<T, E: fmt::Display + From<VolumeRenameRefused>>(
+    socket: &Path,
+    program: &Path,
+    args: &[impl AsRef<OsStr>],
+    deadline: Option<CommandDeadline>,
+    run: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    refuse_volume_rename(program, args)?;
+    match class_of(program) {
+        Some(class) => leased_at(socket, class, &describe(program, args), deadline, run),
+        None => run(),
+    }
+}
+
 /// Admit a descriptor-native namespace operation through the same client as disk children.
 /// The operation record is its real native effect, not an invented executable or second runner.
 pub(crate) fn namespace<T, E: fmt::Display>(

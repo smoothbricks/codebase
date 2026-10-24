@@ -1,5 +1,6 @@
 use cowshed_core::CowshedError;
 use cowshed_core::api::{EmptyResult, JsonEnvelope, ResultBody};
+use cowshed_os::stdio::Blocking;
 use serde::Serialize;
 use std::io::{self, Write};
 
@@ -112,6 +113,18 @@ impl<W: Write, E: Write> Output<W, E> {
 
     pub fn into_inner(self) -> (W, E) {
         (self.stdout, self.stderr)
+    }
+}
+
+impl Output<Blocking<io::Stdout>, Blocking<io::Stderr>> {
+    /// This process's own stdout and stderr, each written as a blocking descriptor even when a
+    /// process sharing it left it nonblocking ([`cowshed_os::stdio`]).
+    pub fn stdio(quiet: bool) -> Self {
+        Self::new(
+            Blocking::new(io::stdout()),
+            Blocking::new(io::stderr()),
+            quiet,
+        )
     }
 }
 

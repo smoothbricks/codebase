@@ -73,14 +73,19 @@ pub(crate) async fn run(
     let request = request(args);
     let deadline = CommandDeadline::new(args.deadline);
     let registry_entry = args.registry_entry;
+    let gateway_socket = args.gateway_socket.clone();
     tokio::task::spawn_blocking(move || match (registry_entry, input) {
         // A bound detach reads no input, from either caller.
-        (Some(entry), _) => SystemCommandRunner.run_detach_of_entry(&request, entry),
-        (None, ToolInput::Inherited) => {
-            SystemCommandRunner.run_with_inherited_input(&request, deadline)
+        (Some(entry), _) => {
+            SystemCommandRunner.run_detach_of_entry(&request, entry, gateway_socket.as_deref())
         }
+        (None, ToolInput::Inherited) => SystemCommandRunner.run_with_inherited_input(
+            &request,
+            deadline,
+            gateway_socket.as_deref(),
+        ),
         (None, ToolInput::Bytes(bytes)) => {
-            SystemCommandRunner.run_with_input(&request, deadline, bytes)
+            SystemCommandRunner.run_with_input(&request, deadline, bytes, gateway_socket.as_deref())
         }
     })
     .await
@@ -224,6 +229,7 @@ mod tests {
             tool,
             deadline: cowshed_apfs::DISK_CHILD_DEADLINE,
             args: argv.iter().map(OsString::from).collect(),
+            gateway_socket: None,
             registry_entry: None,
         }
     }

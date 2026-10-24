@@ -1249,11 +1249,17 @@ pub(crate) async fn relay_foreground(
     })
 }
 
+/// A write of the child's output that the descriptor refused. A full pipe never ends here: the
+/// CLI's stdio waits for its reader ([`cowshed_os::stdio`]), so only a reader that is gone is told to
+/// check its consumer.
 pub(crate) fn output_error(error: io::Error) -> CowshedError {
-    CowshedError::environment_missing(
-        format!("could not write child output: {error}"),
-        "check that the output consumer is still connected",
-    )
+    let hint = match error.kind() {
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset => {
+            "check that the output consumer is still connected"
+        }
+        _ => "check the file or device the command's output is written to",
+    };
+    CowshedError::environment_missing(format!("could not write child output: {error}"), hint)
 }
 
 fn project_inventory_error(error: impl std::fmt::Display) -> CowshedError {

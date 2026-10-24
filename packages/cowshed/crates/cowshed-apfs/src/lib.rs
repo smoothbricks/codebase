@@ -10,6 +10,8 @@ pub mod disk_lease;
 pub mod image;
 pub mod media_cap;
 pub mod mounts;
+#[cfg(target_os = "macos")]
+pub mod ram_disk;
 pub mod release_authority;
 pub mod store_lock;
 pub mod template;
@@ -626,6 +628,7 @@ impl SystemCommandRunner {
         &self,
         request: &CommandRequest,
         entry: u64,
+        gateway_socket: Option<&Path>,
     ) -> Result<CommandOutput, CommandRunError> {
         // A detach reads nothing, and a host connection's own input is its protocol socket.
         self.run_admitted(
@@ -633,7 +636,7 @@ impl SystemCommandRunner {
             CommandDeadline::new(DISK_CHILD_DEADLINE),
             ChildInput::Null,
             |deadline, run| {
-                crate::disk_lease::leased(&request.program, &request.args, deadline, || {
+                Self::admit(request, gateway_socket, deadline, || {
                     revalidate_detach(request, entry)?;
                     run()
                 })
@@ -641,14 +644,13 @@ impl SystemCommandRunner {
         )
     }
 
-    /// The facade run, including standard input. Its SAFE budget begins before the blocking
-    /// thread handoff; an image command keeps the shared 120 s warning point and never kills.
     pub fn run_with_inherited_input(
         &self,
         request: &CommandRequest,
         deadline: CommandDeadline,
+        gateway_socket: Option<&Path>,
     ) -> Result<CommandOutput, CommandRunError> {
-        self.run_facade(request, deadline, ChildInput::Inherited)
+        self.run_facade(request, deadline, ChildInput::Inherited, gateway_socket)
     }
 
     /// The facade run with `input` as the child's whole standard input, closed after it: the
@@ -658,8 +660,14 @@ impl SystemCommandRunner {
         request: &CommandRequest,
         deadline: CommandDeadline,
         input: Vec<u8>,
+        gateway_socket: Option<&Path>,
     ) -> Result<CommandOutput, CommandRunError> {
-        self.run_facade(request, deadline, ChildInput::Bytes(Arc::new(input)))
+        self.run_facade(
+            request,
+            deadline,
+            ChildInput::Bytes(Arc::new(input)),
+            gateway_socket,
+        )
     }
 
     fn run_facade(
@@ -667,6 +675,7 @@ impl SystemCommandRunner {
         request: &CommandRequest,
         deadline: CommandDeadline,
         input: ChildInput,
+        gateway_socket: Option<&Path>,
     ) -> Result<CommandOutput, CommandRunError> {
         let deadline = if is_disk_image_command(request) {
             CommandDeadline::new(DISK_CHILD_DEADLINE)
@@ -674,8 +683,22 @@ impl SystemCommandRunner {
             deadline
         };
         self.run_admitted(request, deadline, input, |deadline, run| {
-            crate::disk_lease::leased(&request.program, &request.args, deadline, run)
+            Self::admit(request, gateway_socket, deadline, run)
         })
+    }
+
+    fn admit(
+        request: &CommandRequest,
+        gateway_socket: Option<&Path>,
+        deadline: Option<CommandDeadline>,
+        run: impl FnOnce() -> Result<CommandOutput, CommandRunError>,
+    ) -> Result<CommandOutput, CommandRunError> {
+        match gateway_socket {
+            Some(socket) => {
+                crate::disk_lease::leased_on(socket, &request.program, &request.args, deadline, run)
+            }
+            None => crate::disk_lease::leased(&request.program, &request.args, deadline, run),
+        }
     }
 
     /// The same run under custom admission. The callback receives the SAFE budget so a real
@@ -8199,7 +8222,7 @@ mod tests {
         if std::env::var_os(DISK_CHILD_INPUT_ROLE).is_some() {
             let null = SystemCommandRunner.run(&read).expect("null-input child");
             let inherited = SystemCommandRunner
-                .run_with_inherited_input(&read, CommandDeadline::new(DISK_CHILD_DEADLINE))
+                .run_with_inherited_input(&read, CommandDeadline::new(DISK_CHILD_DEADLINE), None)
                 .expect("inheriting child");
             println!(
                 "null={} inherited={}",
@@ -8250,11 +8273,11 @@ mod tests {
             ],
         );
         let given = SystemCommandRunner
-            .run_with_input(&read, deadline(), b"passphrase\nrest".to_vec())
+            .run_with_input(&read, deadline(), b"passphrase\nrest".to_vec(), None)
             .expect("child given bytes");
         assert_eq!(given.stdout, b"got passphraserest");
         let empty = SystemCommandRunner
-            .run_with_input(&read, deadline(), Vec::new())
+            .run_with_input(&read, deadline(), Vec::new(), None)
             .expect("child given nothing");
         assert_eq!(empty.stdout, b"eof");
 
@@ -8266,6 +8289,7 @@ mod tests {
                 &CommandRequest::new("cat", Vec::<OsString>::new()),
                 deadline(),
                 large.clone(),
+                None,
             )
             .expect("cat given a megabyte");
         assert_eq!(echoed.status, ProcessStatus::Exit(0));
@@ -8280,6 +8304,7 @@ mod tests {
                 &CommandRequest::new("true", Vec::<OsString>::new()),
                 deadline(),
                 large,
+                None,
             )
             .expect("a child that never reads its input");
         assert_eq!(ignored.status, ProcessStatus::Exit(0));
@@ -8405,7 +8430,12 @@ mod tests {
         );
         let large = vec![b'x'; 1 << 20];
         let ran = SystemCommandRunner
-            .run_with_input(&request, CommandDeadline::new(DISK_CHILD_DEADLINE), large)
+            .run_with_input(
+                &request,
+                CommandDeadline::new(DISK_CHILD_DEADLINE),
+                large,
+                None,
+            )
             .expect("the child ends the run");
         assert_eq!(ran.status, ProcessStatus::Exit(0));
         let pid: libc::pid_t = String::from_utf8(ran.stdout)
@@ -10065,6 +10095,7 @@ mod tests {
                 SystemCommandRunner.run_with_inherited_input(
                     &request(verb),
                     CommandDeadline::new(DISK_CHILD_DEADLINE),
+                    None,
                 ),
                 SystemCommandRunner
                     .run_guarded(&request(verb), || Ok::<_, ApfsError>(true))

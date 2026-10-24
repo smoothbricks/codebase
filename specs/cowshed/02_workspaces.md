@@ -1718,8 +1718,10 @@ it, stay. A holder that finds the path naming another inode once granted refuses
   byte-exact. The record is a claim, never proof: a reader believes it only as far as the kernel confirms it.
 - **The command holds the lock with cowshed.** `lock` and `land-turn` hand their command the lock's descriptor (and
   `land-turn` its ticket's): the lock belongs to the open file description, so the kernel releases it only once cowshed,
-  the command and every process the command handed the descriptor to have closed it. Killing cowshed alone never lets
-  another holder in while its command runs. A waiter killed before the grant takes its pending request with it.
+  the command, every process the command handed the descriptor to and every short-lived copy the spawn's PATH search
+  made, which the kernel closes moments after the spawn returns, have closed it; a waiter's grant, never a probe at the
+  spawn's return or at the command's exit, proves the release. Killing cowshed alone never lets another holder in while
+  its command runs. A waiter killed before the grant takes its pending request with it.
 - **No daemon cowshed launches holds it; the command's descendants do.** Every daemon cowshed launches (a workspace
   supervisor, through the supervisor manager's program spawner; a job; the kept Nx daemon inside one) is spawned through
   the descriptor seal, which marks every inherited descriptor close-on-exec but standard input, output and error (and a

@@ -96,6 +96,35 @@
           "killAfterMs": 10000
         }
       },
+      "ram-fixture": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "dependsOn": [
+          {
+            "target": "cargo-fetch",
+            "projects": [
+              "@smoothbricks/codebase"
+            ]
+          }
+        ],
+        "inputs": [
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
+          "{workspaceRoot}/.cargo/config.toml",
+          "{projectRoot}/crates/**/*",
+          "cargoToolchain",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh rustc -vV"
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/.cache/ram-fixture/"
+        ],
+        "options": {
+          "command": "cargo build --frozen -p cowshed-gateway --example ram_fixture -Z unstable-options --artifact-dir packages/cowshed/.cache/ram-fixture",
+          "cwd": "{workspaceRoot}"
+        }
+      },
       "api-generator": {
         "executor": "nx:run-commands",
         "cache": true,

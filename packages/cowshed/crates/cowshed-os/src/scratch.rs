@@ -233,16 +233,8 @@ impl Reaper {
     }
 
     pub fn host() -> io::Result<Self> {
-        // A RAM TMPDIR is another owner's lease. Never descend into it, even for our children.
         let temp = fs::canonicalize(std::env::temp_dir())?;
-        let mut roots = vec![PathBuf::from("/tmp")];
-        if !temp
-            .components()
-            .any(|part| part.as_os_str().to_string_lossy().starts_with("smoo-ram"))
-        {
-            roots.push(temp);
-        }
-        Self::new(roots)
+        Self::new(host_roots(temp))
     }
 
     pub fn sweep(&mut self, store: &Path, dry_run: bool) -> Report {
@@ -288,6 +280,61 @@ impl Reaper {
         }
         report
     }
+}
+
+/// The roots a host sweep may enter. Bounded-exec gives its command a RAM
+/// lease as TMPDIR (a child of the volume ram-temp.ts mounts below the
+/// per-user root), so a daemon or gc started under such a command would
+/// otherwise sweep inside that lease: bounded-exec alone reclaims leases,
+/// under its own lock and ledger, and this selection is where that owner
+/// boundary is kept (specs/cowshed/01_storage.md, Shared temporary scratch).
+fn host_roots(temp: PathBuf) -> Vec<PathBuf> {
+    let mut roots = vec![PathBuf::from("/tmp")];
+    if !is_ram_temp_owned(&temp) {
+        roots.push(temp);
+    }
+    roots
+}
+
+/// Whether a canonical path is at or below a bounded-exec RAM temp volume.
+/// The names count only in the slots ram-temp.ts mounts them in: the leaf
+/// ram<revision> (and its ram<revision>-new staging sibling) directly below
+/// /private/var/folders/cowshed/<uid>, a fixture volume mounted by its
+/// smoo-ram name below that root's t, or a volume-name mount under /Volumes
+/// (revisions 1-2). A ram-shaped name anywhere else is an ordinary temp
+/// root and stays in the sweep.
+fn is_ram_temp_owned(path: &Path) -> bool {
+    let parts: Vec<String> = path
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if parts.len() >= 3 && parts[1] == "Volumes" && parts[2].starts_with("smoo-ram") {
+        return true;
+    }
+    if parts.len() < 7
+        || parts[1..5] != ["private", "var", "folders", "cowshed"]
+        || !digits(&parts[5])
+    {
+        return false;
+    }
+    if ram_mountpoint(&parts[6]) {
+        return true;
+    }
+    parts[6] == "t"
+        && parts
+            .get(7)
+            .is_some_and(|name| name.starts_with("smoo-ram"))
+}
+
+fn ram_mountpoint(name: &str) -> bool {
+    let Some(revision) = name.strip_prefix("ram") else {
+        return false;
+    };
+    digits(revision.strip_suffix("-new").unwrap_or(revision))
+}
+
+fn digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn kept(path: &Path, reason: impl Into<String>) -> Finding {

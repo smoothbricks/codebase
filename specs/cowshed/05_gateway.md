@@ -780,6 +780,12 @@ the reconcile.
 deleted. Nx work of the project in flight, a backend starting or a clear already running is the failure code `busy`,
 whose message names that work; any other refusal is `rejected`.
 
+`{"op":"ram-attach","sectors":<n>}` is one-shot and attaches one RAM disk of `n` 512-byte sectors for the caller ("RAM
+disks", below). It answers `ramDisk: { device: "/dev/diskN" }`, the whole disk `hdiutil` printed.
+`{"op":"ram-detach","device":"/dev/diskN","registryEntry":"0x<hex>"}` is one-shot and detaches the RAM disk that I/O
+Registry entry registers as that whole disk. It answers `ramDetach`, whose `outcome` is `terminal`, `not-started` or
+`unknown` (same section).
+
 Every request is one line. A one-shot request is followed by the client's EOF and answered with one line; a
 `disk-lease`, `cpu-tokens`, `jobserver` or `resident-pool` request is held for as long as its client keeps the
 connection open.
@@ -862,6 +868,74 @@ so attaches stall beside mount churn and stay fast once the two are kept apart. 
 The regression is `cowshed-gateway`'s `contention_attaches_stay_fast_beside_mount_churn_only_under_the_lease`, run by
 name with `--ignored`: eight real attach/detach loops beside two real mount loops for 40 s, first through a real
 gateway's lease and then unleased: leased attaches stay fast, unleased ones stall behind the mount churn.
+
+## RAM disks
+
+A legacy DiskImages RAM disk lives in the `diskimages-helper` process that `hdiutil attach ram://<n>` forks; the helper
+calls `setsid` and serves the disk until it is detached. A job's conclusion retires every member that outlives its
+leader, `setsid` lives included (11_shell.md, "Process identity and signal ownership"), so a helper a job forked dies
+with that job, and the disk with it, under every other job's use of the disk: open files on it read EIO, and its paths
+ENOENT.
+
+The helper of a RAM disk a host-shared volume lives on belongs to the gateway, which no job contains; a job's retirement
+must never reach it. `ram-attach` forks `hdiutil attach -nomount ram://<n>` from the gateway, through
+`SystemCommandRunner` under the storage class of the gateway's own disk-lifecycle lease, as a protected disk-image
+command that is never killed. The request names a size and nothing else; no argv, path or option reaches `hdiutil` from
+the wire. `sectors` must be a positive integer whose bytes fit in the host's physical memory (`hw.memsize`): a RAM disk
+larger than memory is swap. A request with another field, or a size outside that range, is `invalid-request`; an attach
+that fails, or a gateway whose daemon supplied no disk runner, is `rejected` with its reason, `hdiutil`'s exit and
+stderr included. A gateway on Linux attaches none.
+
+A volume may be reused only with gateway-creation provenance bound to its exact live IORegistry entry. A mounted legacy
+volume is not proof of gateway ownership and is never adopted by the new plugin. The production RAM optimization may
+report explicit capability or provenance unavailability and run on owned ordinary temporary storage; an I/O failure,
+malformed provenance or unreadable pending authority is still an error. Required RAM boundary fixtures never substitute
+another medium.
+
+The gateway records nothing about the disk. Its caller owns the volume on it, proves that ownership by the disk's I/O
+Registry entry, which it reads right after the attach, and detaches the disk only through `ram-detach` naming that entry
+and its whole disk: the disk just attached for it when its provisioning fails, and any later one, a stray it reclaims
+included. It never detaches one through `disk-command`, and never with `-force`. The helper's own session keeps it out
+of the gateway's process group, so a gateway restart leaves the disk attached. A caller that stops waiting leaves the
+attach running; a disk it never collects is a stray the volume's next creator reclaims.
+
+`ram-detach` is the gateway's other RAM disk mutation and has the attach's owner. The gateway forks
+`hdiutil detach <device>` through `SystemCommandRunner`'s registry-bound detach under the storage class of its own
+disk-lifecycle lease, as a protected disk-image command that is never killed. Inside the grant, immediately before the
+spawn, the runner reads `registryEntry` again and spawns only while that entry still registers `device` as its whole
+disk, so a name recycled while the request queued is never detached. The request names that pair and nothing else:
+`device` is a whole disk, `/dev/disk<N>`, and `registryEntry` a nonzero entry id written `0x` and lowercase hex without
+leading zeros. Any other field or form is `invalid-request`, which dispatched nothing. There is no force: a disk still
+in use stays attached, and its caller keeps the staging it owns.
+
+Once dispatched, the detach runs on a gateway blocking thread that no connection owns: the requester's disconnect, its
+death and its job's retirement never cancel or signal it, and the gateway reaps the exact `hdiutil` child before it
+answers. The answer is `ok: true` with `ramDetach`, whose `outcome` says what is known:
+
+- `terminal`: `hdiutil` ran and was reaped. `status` is `{"exit":<code>}` or `{"signal":<number>}`; `stdout` and
+  `stderr` are its output as lossy UTF-8, each cut to the 64 KiB inline output frame (`MAX_INLINE_OUTPUT_BYTES`,
+  07_api.md) with `stdoutTruncated` and `stderrTruncated` saying whether it was. Only exit 0 detached the disk.
+- `not-started` with `reason`: refused before any spawn, so nothing was detached. The entry no longer registers `device`
+  or could not be read; Disk Arbitration would put the release behind an administrator prompt or cannot read the disk's
+  owner; the spawn failed; the gateway has no disk runner (a gateway on Linux detaches none); or the blocking thread was
+  cancelled before it ran.
+- `unknown` with `reason`: `hdiutil` may have run, but its end was not observed: a wait or reap failure, an end with
+  neither exit status nor signal, or a blocking thread that panicked. The caller fences the disk as possibly detached
+  and settles it by the entry's presence in the registry, never by assuming either end.
+
+A requester that receives no answer knows no more than `unknown`. The gateway says every outcome on its stderr, as
+`cowshed: ram-detach <device> entry=<entry> outcome=<outcome>` followed by the status or the cause.
+
+The regression is `cowshed-gateway`'s `a_ram_disk_the_gateway_attaches_outlives_the_job_that_asked_for_it`: a fixture
+gateway on its own socket attaches a disk of a size no other process uses for a job the test's process monitor owns.
+When the job concludes, its retirement signals no `diskimages-helper` and the disk stays registered; the same attach
+forked inside the job is retired with it and the disk leaves the registry. Only the fixture's own disks are detached.
+The detach's are `cowshed-gateway`'s `ram_detach` tests, each on a fixture gateway of its own with disks only it
+attached: `a_ram_detach_outlives_the_requester_that_asked_for_it` kills a job's requester and retires its job while the
+detach waits behind a namespace phase the test holds; the retirement signals no `hdiutil`, and the disk leaves the
+registry once the phase drains. `a_ram_detach_refuses_an_entry_that_does_not_register_the_device` swaps the entries of
+two fixture disks, answers `not-started` for both and leaves both registered, then detaches one by its own entry while
+the other stays registered under the same whole disk.
 
 ## Host CPU budget
 

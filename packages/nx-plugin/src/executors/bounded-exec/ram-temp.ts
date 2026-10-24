@@ -30,6 +30,8 @@ import {
   type SubtreeHandle,
   type SubtreeOwner,
 } from './owned-subtree.js';
+import { attachRamDisk } from './ram-attach.js';
+import { detachGatewayRamDisk } from './ram-detach.js';
 import {
   captureHeldVerdict,
   type HeldCandidate,
@@ -57,6 +59,11 @@ import type { TempVolumeSpace } from './verdict.js';
  *   no `diskimagesiod`, so it spends none of the AppleDiskImages2 attach budget
  *   that cowshed's images and tests draw on (specs/cowshed/01a_apfs.md, "How
  *   the APFS host degrades"; measured 2026-10-05).
+ * - The disk lives as long as that helper, and a helper forked inside a job is
+ *   the job's member, which the job's end retires under every other lease. So
+ *   the helper belongs to the cowshed gateway, which no job contains and which
+ *   attaches the disk (`ram-attach`, specs/cowshed/05_gateway.md, "RAM disks");
+ *   a task never does.
  * - Attach + format + mount costs ~2 s and is DiskArbitration traffic, so the
  *   volume is created once, lazily, and every task takes a subdirectory.
  * - Spotlight's mds keeps one IOKit right for every APFS volume it admits, for
@@ -84,7 +91,7 @@ import type { TempVolumeSpace } from './verdict.js';
  * One caller creates or detaches the volume at a time, and a caller that finds
  * either in flight yields and looks again; each dead lease is settled by the
  * one caller that claimed it, and every other caller passes it by. A claim
- * names its owner's pid, so a claim whose owner died is void. Before it
+ * names its owner's pid; death voids it only with no pending detach. Before it
  * removes a lease or detaches the volume, a caller takes the lock again and
  * checks that the volume, the lease directory and its own claim are still as
  * it claimed them. A lease is a directory named after the task process's pid;
@@ -120,13 +127,14 @@ import type { TempVolumeSpace } from './verdict.js';
  * holder has an identity a cheap `lstat` re-proves (a mount below the lease),
  * the ledger keeps that proof (`ram-temp-held.ts`) and later tasks check it
  * instead of probing the host; any change sends the lease back to a probe.
- * Every disk child runs under a deadline, in its own process group so the
- * deadline also reaches the helper it spawned, so a wedged DiskArbitration
- * fails the task instead of every task waiting on the volume. A detach is the
- * exception: never killed at its deadline, because an interrupted detach can
- * wedge DiskArbitration itself; its wait is bounded and reported by name, and
- * a stray's detach gets the short stray bound, so one wedged stray cannot
- * hold the create claim while a chain of tasks queues behind it.
+ * SAFE disk children delegate their execution budget and reap to cowshed. Protected
+ * image commands are never killed at the caller's deadline. A detach publishes its
+ * exact custody before it spawns. While its live caller still waits on the facade the
+ * custody is `waiting`, and other callers queue behind it as behind any claim. Once
+ * that caller stops waiting, or its run throws without an answer, the custody is
+ * `reported`: no lease is admitted until a normal terminal answer or the bound registry
+ * entry's absence proves it safe. A dead caller alone proves neither; its death only
+ * turns queueing into reporting. The facade pid is a diagnostic, never authority.
  *
  * A cowshed sandbox denies writes to /private/tmp (EPERM on the lock), and
  * cannot attach disk images at all; there the task keeps the workspace's own
@@ -200,6 +208,13 @@ export interface CommandOutput {
   status: number;
   stdout: string;
   stderr: string;
+  /** A bounded wait or a signalled facade is not a terminal disk-child receipt. */
+  readonly pending?: {
+    /** Diagnostic only: neither this pid's death nor reuse releases detach authority. */
+    readonly pid: number | null;
+    /** This exact child object's normal exit; null means native completion could not be proved. */
+    readonly completion: Promise<CommandOutput | null>;
+  };
 }
 
 /** The host programs the volume lifecycle runs. A seam so the state machine is testable without DiskArbitration. */
@@ -213,6 +228,14 @@ export interface DetachBinding {
 
 export interface HostCommands {
   run(file: string, args: readonly string[], deadlineMs?: number, binding?: DetachBinding): Promise<CommandOutput>;
+  /**
+   * Attach a RAM disk of `sectors` 512-byte sectors through its owner, answering its whole disk (`/dev/diskN`). The
+   * owner is the cowshed gateway (`ram-attach`), never this task: a helper the task's own job forked would end with it.
+   */
+  attachRam(sectors: number): Promise<Result<string, string | RamUnavailable>>;
+  /** Exact attach receipts owned by this caller; names and capacity never establish this authority. */
+  ownsRamDisk?(disk: AttachedRamDisk): boolean;
+  detachRam(device: string, registryEntry: string, deadlineMs?: number): Promise<CommandOutput>;
 }
 
 /**
@@ -299,6 +322,19 @@ export interface RamTempLease {
   capacityBytes: number;
 }
 
+export interface RamUnavailable {
+  readonly kind: 'ram-unavailable';
+  readonly reason: 'gateway-unsupported' | 'gateway-absent' | 'unproven-owner';
+  readonly detail: string;
+}
+
+interface GatewayVolumeMarker {
+  readonly version: 1;
+  readonly volumeName: string;
+  readonly owner: 'gateway';
+  readonly registryEntry: string;
+}
+
 export type RamTempAcquisition =
   /**
    * `held`: dead leases that could not be reclaimed, each with what still holds it. `reaped`: the
@@ -315,12 +351,14 @@ export type RamTempAcquisition =
       retained: string[];
     }
   /** Inside a cowshed sandbox: /private/tmp is not writable and no image can attach. */
-  | { kind: 'sandboxed'; detail: string };
+  | { kind: 'sandboxed'; detail: string }
+  | { kind: 'unavailable'; reason: RamUnavailable['reason']; detail: string };
 
 /** A host command or filesystem step failed while the volume was being created, mounted or detached. */
 type ProvisionFailed = { kind: 'provision-failed'; step: string; detail: string };
 
 export type RamTempError =
+  | RamUnavailable
   | ProvisionFailed
   /** A failed task left the volume (nearly) full: the likely cause of its failure. */
   | { kind: 'volume-full'; mountpoint: string; capacityBytes: number; freeBytes: number }
@@ -331,6 +369,8 @@ export type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
 
 export function describeRamTempError(error: RamTempError): string {
   switch (error.kind) {
+    case 'ram-unavailable':
+      return `RAM acceleration unavailable (${error.reason}): ${error.detail}`;
     case 'provision-failed':
       return `RAM temp volume: ${error.step} failed: ${error.detail}`;
     case 'volume-full':
@@ -360,10 +400,24 @@ interface ClaimOwner {
   readonly token: string;
 }
 
+/** Published before spawn, retained across caller death. Null registry identity means only a terminal receipt suffices. */
+interface DetachCustody {
+  readonly physical: string;
+  readonly registryEntry: string | null;
+  /**
+   * `waiting` while its caller still awaits the facade, so other callers queue; `reported` once that caller stopped
+   * waiting or its run threw, so other callers reconcile against the registry or refuse.
+   */
+  readonly phase: 'waiting' | 'reported';
+  /** Diagnostic only: the facade its caller stopped waiting on, when one was spawned. */
+  readonly facadePid: number | null;
+}
+
 /** The volume is being created or detached: no other caller takes a lease or detaches meanwhile. */
 interface LifecycleClaim {
   readonly kind: 'create' | 'detach';
   readonly owner: ClaimOwner;
+  readonly pending?: DetachCustody;
 }
 
 /** One caller is settling the lease `name`, as it was when claimed: stopping, probing and removing it. */
@@ -379,7 +433,7 @@ interface HeldEntry {
   readonly verdict: HeldVerdict;
 }
 
-/** What the lock admits changes to, published beside the lock file. Claims of dead owners are void. */
+/** What the lock admits changes to. Dead callers void only claims with no pending detach authority. */
 interface Ledger {
   readonly lifecycle: LifecycleClaim | null;
   readonly claims: readonly LeaseClaim[];
@@ -390,6 +444,7 @@ const EMPTY_LEDGER: Ledger = { lifecycle: null, claims: [], held: [] };
 
 /** The volume as one locked step finds it mounted. */
 interface MountedVolume {
+  readonly registryEntry: string;
   readonly capacity: number;
   /** This attach of the volume: its root's and its marker's identity, never times that change while it is in use. */
   readonly key: string;
@@ -404,6 +459,7 @@ interface MountedVolume {
  * `subtrees`: the supervisor this caller asks to retire a dead lease's recorded subtree.
  */
 interface Operation {
+  provenance?: string;
   readonly owner: ClaimOwner;
   readonly subtrees: SubtreeOwner;
   claimed: boolean;
@@ -509,6 +565,7 @@ export class RamTempVolume {
     private readonly commands: HostCommands,
     private readonly pid: number = process.pid,
     private readonly isAlive: (pid: number) => boolean = processIsAlive,
+    private readonly policy: 'required' | 'optional' = 'required',
   ) {
     this.sectors = Math.ceil(capacityBytes / SECTOR_BYTES);
     this.ledgerPath = `${paths.lockFile}.ledger`;
@@ -519,6 +576,8 @@ export class RamTempVolume {
    * lease found on the way is settled through `subtrees`, the supervisor that owns the caller.
    */
   async acquire(subtrees: SubtreeOwner): Promise<Result<RamTempAcquisition, RamTempError>> {
+    const readiness = await rootReadiness(this.paths);
+    if (!readiness.ok) return readiness;
     const op: Operation = { owner: { pid: this.pid, token: randomUUID() }, subtrees, claimed: false, made: null };
     let result: Result<RamTempAcquisition, LockedError>;
     try {
@@ -537,6 +596,9 @@ export class RamTempVolume {
     }
     // The caller gets no lease, so the one made for it goes; a returned lease is never touched.
     const cleanup = [...(ended.ok ? [] : [ended.error]), ...(await this.undo(op))];
+    if (result.error.kind === 'ram-unavailable' && this.policy === 'optional' && cleanup.length === 0) {
+      return { ok: true, value: { kind: 'unavailable', reason: result.error.reason, detail: result.error.detail } };
+    }
     if (result.error.kind !== 'lock-denied') {
       return { ok: false, error: alsoFailed(result.error, cleanup) };
     }
@@ -641,10 +703,13 @@ export class RamTempVolume {
       }
       const value = taken.value;
       switch (value.kind) {
-        case 'wait':
+        case 'wait': {
           // Another caller is creating or detaching the volume: look again once it has.
-          waited = await this.waitOut(value.claim, waited);
+          const yielded = await this.yieldTo(op, value.claim, waited);
+          if (!yielded.ok) return yielded;
+          waited = yielded.value;
           continue;
+        }
         case 'create':
           return await this.create(op);
         case 'leased': {
@@ -683,7 +748,7 @@ export class RamTempVolume {
 
   /** With this caller's creation claim published: provision the volume, then take the first lease on it. */
   private async create(op: Operation): Promise<Result<RamTempAcquisition, LockedError>> {
-    const provisioned = await this.provisionVolume();
+    const provisioned = await this.provisionVolume(op);
     if (!provisioned.ok) {
       return provisioned;
     }
@@ -790,9 +855,12 @@ export class RamTempVolume {
       switch (value.kind) {
         case 'unmounted':
           return { ok: true, value: [] };
-        case 'wait':
-          waited = await this.waitOut(value.claim, waited);
+        case 'wait': {
+          const yielded = await this.yieldTo(op, value.claim, waited);
+          if (!yielded.ok) return yielded;
+          waited = yielded.value;
           continue;
+        }
         case 'claimed': {
           const settled = await this.settle(op, value.volume, value.candidates);
           if (!settled.ok) {
@@ -849,7 +917,7 @@ export class RamTempVolume {
     const due = Math.floor(elapsed / CLAIM_WAIT_NOTICE_MS);
     if (due > wait.notices) {
       process.stderr.write(
-        `RAM temp volume: waited ${(elapsed / 1000).toFixed(1)} s on the ${claim.kind} claim of pid ${claim.owner.pid} (token ${claim.owner.token}) in ${this.ledgerPath}; if that pid is not ${claim.kind === 'create' ? 'creating' : 'detaching'} ${this.paths.mountpoint}, remove the ledger once no task uses the volume\n`,
+        `RAM temp volume: waited ${(elapsed / 1000).toFixed(1)} s on the ${claim.kind} claim of pid ${claim.owner.pid} (token ${claim.owner.token}) in ${this.ledgerPath}${claim.pending === undefined ? `; if that pid is not ${claim.kind === 'create' ? 'creating' : 'detaching'} ${this.paths.mountpoint}, remove the ledger once no task uses the volume` : `; that caller still waits on its detach of ${claim.pending.physical}, whose custody the ledger keeps`}\n`,
       );
     }
     await sleep(LOCK_RETRY_MS);
@@ -902,7 +970,140 @@ export class RamTempVolume {
     }
   }
 
-  /** Drop whatever claims `op` still holds: an operation that failed part way leaves none behind it. */
+  /**
+   * Yield to another caller's lifecycle claim. Every claim is queued behind, a detach whose live caller still waits on
+   * its facade included. Reported custody, or waiting custody whose caller died, admits nothing until its exact
+   * registry entry is gone: the caller's liveness only chooses between queueing and reporting, never clears custody.
+   */
+  private async yieldTo(
+    op: Operation,
+    claim: LifecycleClaim,
+    waited: ClaimWait | null,
+  ): Promise<Result<ClaimWait | null, LockedError>> {
+    const pending = claim.pending;
+    if (pending === undefined || (pending.phase === 'waiting' && this.isAlive(claim.owner.pid))) {
+      return { ok: true, value: await this.waitOut(claim, waited) };
+    }
+    const reconciled = await this.reconcileDetach(op, claim);
+    return reconciled.ok ? { ok: true, value: waited } : reconciled;
+  }
+
+  /** A detach nobody waits on any more can be reconciled only against its exact registry identity, outside the lock. */
+  private async reconcileDetach(op: Operation, claim: LifecycleClaim): Promise<Result<void, LockedError>> {
+    const pending = claim.pending;
+    if (pending === undefined) return { ok: true, value: undefined };
+    if (pending.registryEntry !== null) {
+      const registry = await this.commands.run('/usr/sbin/ioreg', ['-r', '-c', 'IOHDIXHDDriveOutKernel', '-l', '-w0']);
+      if (registry.status !== 0) return failed('detach custody', commandText(registry));
+      const disks = ramDisksIn(registry.stdout, '');
+      if (!disks.ok) return failed('detach custody', disks.error);
+      if (!disks.value.some((disk) => disk.entry === pending.registryEntry)) {
+        return this.locked(op, 'detach custody', async (ledger) => ({
+          ledger: sameDetach(ledger.lifecycle, claim.owner, pending) ? { ...ledger, lifecycle: null } : ledger,
+          value: undefined,
+        }));
+      }
+    }
+    return failed(
+      'detach custody',
+      `${pending.physical} (registry ${pending.registryEntry ?? 'unbound'}, ${pending.phase} by pid ${claim.owner.pid}, facade ${pending.facadePid ?? 'unrecorded'}) still has pending detach authority in ${this.ledgerPath}; no lease admitted until terminal completion${pending.registryEntry === null ? '' : ' or that registry entry disappears'}`,
+    );
+  }
+
+  /** Publish authority before spawn: a crash anywhere after this point must not admit a lease past the detach. */
+  private async runDetach(
+    op: Operation,
+    physical: string,
+    registryEntry: string | null,
+    deadlineMs?: number,
+  ): Promise<Result<CommandOutput, RamTempError>> {
+    const custody: DetachCustody = { physical, registryEntry, phase: 'waiting', facadePid: null };
+    const begun = await this.locked(op, 'detach custody', async (ledger): Promise<Step<boolean>> => {
+      const claim = ledger.lifecycle;
+      if (claim?.owner.token !== op.owner.token || claim.pending !== undefined) return { ledger, value: false };
+      return { ledger: { ...ledger, lifecycle: { ...claim, pending: custody } }, value: true };
+    });
+    if (!begun.ok)
+      return begun.error.kind === 'lock-denied'
+        ? failed('lock', begun.error.detail)
+        : { ok: false, error: begun.error };
+    if (!begun.value)
+      return failed('detach custody', 'the operation no longer owns an idle lifecycle claim; nothing detached');
+    let output: CommandOutput;
+    try {
+      if (registryEntry === null)
+        throw new Error('detach has no captured registry identity; retained without dispatch');
+      output = await this.commands.detachRam(physical, registryEntry, deadlineMs);
+    } catch (error) {
+      // Whether a child started is unknown, so its custody is reported, never dropped.
+      const reported = await this.reportDetach(op, custody, null);
+      const detail = `the detach of ${physical} gave no answer (${errorText(error)}); its custody stays reported in ${this.ledgerPath}`;
+      return failed('detach custody', reported.ok ? detail : `${detail}; ${describeRamTempError(reported.error)}`);
+    }
+    const pending = output.pending;
+    if (pending === undefined) {
+      const finished = await this.finishDetach(op, custody, false);
+      return finished.ok ? { ok: true, value: output } : finished;
+    }
+    const retained = await this.reportDetach(op, custody, pending.pid);
+    // The gateway owns the mutation. Only its authoritative terminal/not-started reply clears this request; a lost connection does not.
+    void pending.completion
+      .then(async (terminal) => {
+        if (terminal === null) return;
+        const finished = await this.finishDetach(op, custody, true);
+        process.stderr.write(
+          `RAM temp volume: detach of ${physical} completed after its caller stopped waiting (${commandText(terminal)}); ${finished.ok ? 'terminal receipt processed' : describeRamTempError(finished.error)}\n`,
+        );
+      })
+      .catch((error: unknown) => {
+        process.stderr.write(
+          `RAM temp volume: detach completion for ${physical} could not publish: ${errorText(error)}\n`,
+        );
+      });
+    return retained.ok ? { ok: true, value: output } : retained;
+  }
+
+  /** Only this operation's exact terminal receipt can clear its pending authority; a late receipt cannot clear a successor. */
+  private async finishDetach(
+    op: Operation,
+    custody: DetachCustody,
+    release: boolean,
+  ): Promise<Result<void, RamTempError>> {
+    const finished = await this.locked(op, 'detach completion', async (ledger) => {
+      const claim = ledger.lifecycle;
+      if (claim === null || !sameDetach(claim, op.owner, custody)) return { ledger, value: undefined };
+      return {
+        ledger: { ...ledger, lifecycle: release ? null : { kind: claim.kind, owner: claim.owner } },
+        value: undefined,
+      };
+    });
+    if (finished.ok) return finished;
+    return finished.error.kind === 'lock-denied'
+      ? failed('lock', finished.error.detail)
+      : { ok: false, error: finished.error };
+  }
+
+  /** Its caller stops waiting on the detach: the exact custody becomes reported, its facade pid kept for diagnosis. */
+  private async reportDetach(
+    op: Operation,
+    custody: DetachCustody,
+    facadePid: number | null,
+  ): Promise<Result<void, RamTempError>> {
+    const reported = await this.locked(op, 'detach custody', async (ledger): Promise<Step<undefined>> => {
+      const claim = ledger.lifecycle;
+      if (claim === null || !sameDetach(claim, op.owner, custody)) return { ledger, value: undefined };
+      return {
+        ledger: { ...ledger, lifecycle: { ...claim, pending: { ...custody, phase: 'reported', facadePid } } },
+        value: undefined,
+      };
+    });
+    if (reported.ok) return reported;
+    return reported.error.kind === 'lock-denied'
+      ? failed('lock', reported.error.detail)
+      : { ok: false, error: reported.error };
+  }
+
+  /** Drop finished claims, never the authority of a detach whose caller merely stopped waiting. */
   private async end(op: Operation): Promise<Result<void, RamTempError>> {
     if (!op.claimed) {
       return { ok: true, value: undefined };
@@ -929,31 +1130,46 @@ export class RamTempVolume {
     step: string,
     change: (ledger: Ledger, volume: MountedVolume | null) => Promise<Step<T>>,
   ): Promise<Result<T, LockedError>> {
-    const lock = await this.lock();
-    if (!lock.ok) {
-      return lock.error.code === 'EPERM'
-        ? { ok: false, error: { kind: 'lock-denied', detail: `${this.paths.lockFile}: ${lock.error.message}` } }
-        : failed('lock', lock.error.message);
-    }
-    try {
-      const read = await this.readLedger();
-      if (!read.ok) {
-        return read;
+    for (;;) {
+      // Registry work stays outside the lock. A changed locked identity invalidates this
+      // snapshot; release the lock and prove the replacement afresh before any mutation.
+      const initialLedger = await this.readLedger();
+      if (!initialLedger.ok) return initialLedger;
+      const before = await this.observe();
+      if (!before.ok) return before;
+      if (before.value !== null && op.provenance !== before.value.key) {
+        const validated = await this.validateProvenance(before.value);
+        if (!validated.ok) return validated;
+        op.provenance = before.value.key;
       }
-      const volume = await this.observe();
-      const next = await change(prune(read.value.ledger, volume, this.isAlive), volume);
-      const text = ledgerText(next.ledger);
-      if (text !== (read.value.text ?? ledgerText(EMPTY_LEDGER))) {
-        await publishLedger(this.ledgerPath, text);
+      const lock = await this.lock();
+      if (!lock.ok) {
+        return lock.error.code === 'EPERM'
+          ? { ok: false, error: { kind: 'lock-denied', detail: `${this.paths.lockFile}: ${lock.error.message}` } }
+          : failed('lock', lock.error.message);
       }
-      op.claimed =
-        next.ledger.lifecycle?.owner.token === op.owner.token ||
-        next.ledger.claims.some((claim) => claim.owner.token === op.owner.token);
-      return { ok: true, value: next.value };
-    } catch (error) {
-      return failed(step, errorText(error));
-    } finally {
-      await lock.value.close();
+      try {
+        const read = await this.readLedger();
+        if (!read.ok) return read;
+        const observed = await this.observe();
+        if (!observed.ok) return observed;
+        const volume = observed.value;
+        if (volume !== null && (volume.key !== before.value?.key || op.provenance !== volume.key)) {
+          op.provenance = undefined;
+          continue;
+        }
+        const next = await change(prune(read.value.ledger, volume, this.isAlive), volume);
+        const text = ledgerText(next.ledger);
+        if (text !== (read.value.text ?? ledgerText(EMPTY_LEDGER))) await publishLedger(this.ledgerPath, text);
+        op.claimed =
+          next.ledger.lifecycle?.owner.token === op.owner.token ||
+          next.ledger.claims.some((claim) => claim.owner.token === op.owner.token);
+        return { ok: true, value: next.value };
+      } catch (error) {
+        return failed(step, errorText(error));
+      } finally {
+        await lock.value.close();
+      }
     }
   }
 
@@ -973,18 +1189,21 @@ export class RamTempVolume {
       }
       return failed('ledger', `${this.ledgerPath}: ${errorText(error)}`);
     }
-    // Claims that cannot be read cannot be honoured, so no lease or volume change is safe until it is
-    // removed; only this module writes it, in one rename, so a malformed one is not its own.
+    // An unreadable ledger may hold detached-child authority even after every caller died.
+    // Preserve it and refuse admission rather than suggesting pid death authorizes its removal.
     const refused = (detail: string) =>
       failed<{ ledger: Ledger; text: string | null }>(
         'ledger',
-        `${this.ledgerPath} ${detail}; remove it once no task uses the volume`,
+        `${this.ledgerPath} ${detail}; retained; no lease or detach admitted while its authority is unreadable`,
       );
     let wire: unknown;
     try {
       wire = JSON.parse(text);
     } catch (error) {
       return refused(`is not JSON: ${errorText(error)}`);
+    }
+    if (isRecord(wire) && wire.version !== 1 && wire.version !== 2) {
+      return refused(`has unsupported version ${JSON.stringify(wire.version)}`);
     }
     const ledger = parseLedger(wire);
     return ledger === undefined ? refused("is not this module's ledger") : { ok: true, value: { ledger, text } };
@@ -995,30 +1214,108 @@ export class RamTempVolume {
    * names this attach: the root's and the marker's identity and birth, and the marker's change
    * time, which nothing changes once it is written. The root's own times change with every lease.
    */
-  private async observe(): Promise<MountedVolume | null> {
+  private async observe(): Promise<Result<MountedVolume | null, RamTempError>> {
     const markerPath = join(this.paths.mountpoint, MARKER_FILE);
-    const marker = await readFile(markerPath, 'utf8').catch(() => null);
-    if (marker?.trim() !== this.paths.volumeName) {
-      return null;
+    let markerText: string;
+    try {
+      const handle = await open(markerPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        markerText = await handle.readFile('utf8');
+      } finally {
+        await handle.close();
+      }
+    } catch (error) {
+      return errorCode(error) === 'ENOENT' ? { ok: true, value: null } : failed('provenance', errorText(error));
+    }
+    if (markerText.trim() === this.paths.volumeName) {
+      return {
+        ok: false,
+        error: {
+          kind: 'ram-unavailable',
+          reason: 'unproven-owner',
+          detail: `${this.paths.mountpoint} has a legacy name-only marker; no lease, reclaim or detach admitted`,
+        },
+      };
+    }
+    let marker: unknown;
+    try {
+      marker = JSON.parse(markerText);
+    } catch (error) {
+      return failed('provenance', `malformed volume marker: ${errorText(error)}`);
+    }
+    if (
+      !isRecord(marker) ||
+      marker.version !== 1 ||
+      marker.volumeName !== this.paths.volumeName ||
+      marker.owner !== 'gateway' ||
+      typeof marker.registryEntry !== 'string' ||
+      !/^0x[0-9a-f]+$/.test(marker.registryEntry)
+    ) {
+      return failed('provenance', 'the marker is not version-1 gateway provenance for this volume');
     }
     const [root, parent, mark] = await Promise.all([
       stat(this.paths.mountpoint, { bigint: true }),
       stat(join(this.paths.mountpoint, '..'), { bigint: true }),
       lstat(markerPath, { bigint: true }),
     ]);
-    if (root.dev === parent.dev) {
-      return null;
-    }
+    if (root.dev === parent.dev || !mark.isFile())
+      return failed('provenance', 'gateway marker is not on a separately mounted RAM volume');
     const [fs, names] = await Promise.all([statfs(this.paths.mountpoint), readdir(this.paths.mountpoint)]);
     return {
-      capacity: fs.blocks * fs.bsize,
-      key: [
-        `root ${root.dev}:${root.ino}:${root.birthtimeNs}`,
-        `marker ${mark.dev}:${mark.ino}:${mark.birthtimeNs}:${mark.ctimeNs}`,
-      ].join(' '),
-      device: Number(root.dev),
-      leases: names.filter((name) => LEASE_NAME.test(name)),
+      ok: true,
+      value: {
+        capacity: fs.blocks * fs.bsize,
+        registryEntry: marker.registryEntry,
+        key: [
+          `root ${root.dev}:${root.ino}:${root.birthtimeNs}`,
+          `marker ${mark.dev}:${mark.ino}:${mark.birthtimeNs}:${mark.ctimeNs}`,
+          `registry ${marker.registryEntry}`,
+        ].join(' '),
+        device: Number(root.dev),
+        leases: names.filter((name) => LEASE_NAME.test(name)),
+      },
     };
+  }
+
+  /** Prove this immutable marker belongs to the exact live attachment, outside the lock. */
+  private async validateProvenance(volume: MountedVolume): Promise<Result<void, RamTempError>> {
+    const registry = await this.commands.run('/usr/sbin/ioreg', ['-r', '-c', 'IOHDIXHDDriveOutKernel', '-l', '-w0']);
+    const mounts = await this.commands.run('/sbin/mount', []);
+    if (registry.status !== 0 || mounts.status !== 0)
+      return failed('provenance', commandText(registry.status !== 0 ? registry : mounts));
+    const parsed = ramDisksIn(registry.stdout, mounts.stdout);
+    if (!parsed.ok) return failed('provenance', parsed.error);
+    const disk = parsed.value.find((candidate) => candidate.entry === volume.registryEntry);
+    return disk !== undefined &&
+      disk.physical !== null &&
+      disk.uid === this.paths.uid &&
+      disk.sectors === this.sectors &&
+      disk.mountpoints.includes(this.paths.mountpoint)
+      ? { ok: true, value: undefined }
+      : failed(
+          'provenance',
+          `recorded registry entry ${volume.registryEntry} no longer names this mounted volume; no lease or detach admitted`,
+        );
+  }
+
+  /** Capture only the exact whole disk this attach answered, before any filesystem mutation. */
+  private async attachedIdentity(physical: string): Promise<Result<AttachedRamDisk, RamTempError>> {
+    const registry = await this.commands.run('/usr/sbin/ioreg', ['-r', '-c', 'IOHDIXHDDriveOutKernel', '-l', '-w0']);
+    if (registry.status !== 0) return failed('attach identity', commandText(registry));
+    const parsed = ramDisksIn(registry.stdout, '');
+    if (!parsed.ok) return failed('attach identity', parsed.error);
+    const matches = parsed.value.filter((disk) => disk.physical === physical);
+    const [disk] = matches;
+    return matches.length === 1 &&
+      disk !== undefined &&
+      disk.physical !== null &&
+      disk.uid === this.paths.uid &&
+      disk.sectors === this.sectors
+      ? { ok: true, value: { ...disk, physical: disk.physical } }
+      : failed(
+          'attach identity',
+          `${physical} is not the unique registry identity of this gateway attach; no provisioning or guessed detach`,
+        );
   }
 
   /**
@@ -1285,38 +1582,60 @@ export class RamTempVolume {
   }
 
   /** Check the root the volume mounts below, detach what earlier creators left, then attach and provision the volume. */
-  private async provisionVolume(): Promise<Result<void, RamTempError>> {
+  private async provisionVolume(op: Operation): Promise<Result<void, RamTempError>> {
+    try {
+      const [root, parent] = await Promise.all([stat(this.paths.mountpoint), stat(join(this.paths.mountpoint, '..'))]);
+      if (root.dev === parent.dev && (await readdir(this.paths.mountpoint)).length !== 0) {
+        return {
+          ok: false,
+          error: {
+            kind: 'ram-unavailable',
+            reason: 'unproven-owner',
+            detail: `${this.paths.mountpoint} is an unmounted directory with unowned contents; nothing removed or hidden by a new mount`,
+          },
+        };
+      }
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') return failed('provenance', errorText(error));
+    }
     const root = await rootReadiness(this.paths);
     if (!root.ok) {
       return root;
     }
-    const strays = await this.reclaimStrays(this.holdersPass());
+    const strays = await this.reclaimStrays(op, this.holdersPass());
     if (!strays.ok) {
       return strays;
     }
-    const attached = await this.commands.run('/usr/bin/hdiutil', ['attach', '-nomount', `ram://${this.sectors}`]);
-    if (attached.status !== 0) {
-      // A deadlined attach took its helper's process group down with it; one that attached
-      // regardless is a stray the next creator detaches.
-      return failed('hdiutil attach', commandText(attached));
+    const attached = await this.commands.attachRam(this.sectors);
+    if (!attached.ok) {
+      // An attach whose answer never came may still finish; its disk is a stray the next creator detaches.
+      return typeof attached.error === 'string'
+        ? failed('ram-attach', attached.error)
+        : { ok: false, error: attached.error };
     }
-    const physical = /^(\/dev\/disk\d+)\b/.exec(attached.stdout)?.[1];
-    if (!physical) {
-      return failed('hdiutil attach', `no device in: ${attached.stdout.trim()}`);
-    }
-    const provisioned = await this.provision(physical);
+    const physical = attached.value;
+    const identity = await this.attachedIdentity(physical);
+    if (!identity.ok) return identity;
+    const provisioned = await this.provision(physical, identity.value.entry);
     if (provisioned.ok) {
       return provisioned;
     }
-    // `-force` only here: `physical` is the disk this process's own attach just printed, which nothing else names.
-    const detached = await this.commands.run('/usr/bin/hdiutil', ['detach', '-force', physical]);
+    // Rollback uses the exact captured entry, without force; a busy owned staging volume is retained.
+    const command = await this.runDetach(op, physical, identity.value.entry);
+    if (!command.ok)
+      return failed(provisioned.error.step, [provisioned.error.detail, describeRamTempError(command.error)].join('; '));
+    const detached = command.value;
+    if (detached.pending !== undefined) {
+      return failed(provisioned.error.step, [provisioned.error.detail, commandText(detached)].join('; '));
+    }
     // The detach takes every volume of the disk with it. What it leaves at the staging directory and the
     // mountpoint is a bare directory on the host's Data volume each: removed here, and already absent is done.
     const detachFailure =
       detached.status === 0
         ? null
-        : `hdiutil detach -force ${physical} then failed (${commandText(detached)}), so it stays attached until the next creator reclaims it`;
-    const directoryFailures = await removeMountDirectories([this.paths.staging, this.paths.mountpoint]);
+        : `gateway detach ${physical} then failed (${commandText(detached)}); owned staging is retained`;
+    const directoryFailures =
+      detached.status === 0 ? await removeMountDirectories([this.paths.staging, this.paths.mountpoint]) : [];
     const failures = [...(detachFailure === null ? [] : [detachFailure]), ...directoryFailures];
     return failures.length === 0
       ? provisioned
@@ -1334,7 +1653,7 @@ export class RamTempVolume {
    * the final mount leaves the volume attached at the staging directory or unmounted; the next
    * creator's reclaim detaches either.
    */
-  private async provision(physical: string): Promise<Result<void, ProvisionFailed>> {
+  private async provision(physical: string, registryEntry: string): Promise<Result<void, ProvisionFailed>> {
     const container = await this.commands.run('/usr/sbin/diskutil', ['apfs', 'createContainer', physical]);
     const containerDisk = operationDisk(container.stdout);
     if (container.status !== 0 || !containerDisk) {
@@ -1368,7 +1687,13 @@ export class RamTempVolume {
       return atStaging;
     }
     try {
-      await writeFile(join(staging, MARKER_FILE), `${this.paths.volumeName}\n`);
+      const marker: GatewayVolumeMarker = {
+        version: 1,
+        volumeName: this.paths.volumeName,
+        owner: 'gateway',
+        registryEntry,
+      };
+      await writeFile(join(staging, MARKER_FILE), `${JSON.stringify(marker)}\n`);
     } catch (error) {
       return failed('marker', errorText(error));
     }
@@ -1456,7 +1781,7 @@ export class RamTempVolume {
    * this volume is debris — unformatted, staged, or mounted without its marker. One carrying a
    * lease, or with anything attached below it, is still in use and stops the creation instead.
    */
-  private async reclaimStrays(holders: Holders): Promise<Result<void, RamTempError>> {
+  private async reclaimStrays(op: Operation, holders: Holders): Promise<Result<void, RamTempError>> {
     const strays = await this.attached();
     if (!strays.ok) {
       return strays;
@@ -1484,12 +1809,19 @@ export class RamTempVolume {
           return failed('reclaim', holdingText(point, held.value));
         }
       }
-      const detached = await detachRamDisk(
-        this.commands,
-        disk,
-        `hdiutil detach (stray ${disk.physical})`,
-        STRAY_DETACH_DEADLINE_MS,
-      );
+      if (this.commands.ownsRamDisk?.(disk) !== true) {
+        return {
+          ok: false,
+          error: {
+            kind: 'ram-unavailable',
+            reason: 'unproven-owner',
+            detail: `${disk.physical} has no exact gateway creation receipt; no reclaim or detach admitted`,
+          },
+        };
+      }
+      const command = await this.runDetach(op, disk.physical, disk.entry, STRAY_DETACH_DEADLINE_MS);
+      if (!command.ok) return command;
+      const detached = detachOutcome(command.value, disk, `hdiutil detach (stray ${disk.physical})`);
       if (!detached.ok) {
         return detached;
       }
@@ -1542,7 +1874,9 @@ export class RamTempVolume {
     }
     // Detaching frees the archives' pages anyway, but a deletion of this process's still walking the volume holds it busy.
     await archiveDeletions();
-    const detached = await detachRamDisk(this.commands, disk, 'hdiutil detach');
+    const command = await this.runDetach(op, disk.physical, disk.entry);
+    if (!command.ok) return command;
+    const detached = detachOutcome(command.value, disk, 'hdiutil detach');
     if (!detached.ok) {
       return detached;
     }
@@ -1669,12 +2003,15 @@ function heldContext(volume: MountedVolume, name: string, identity: string): Hel
 }
 
 /**
- * The ledger with the claims of dead owners voided, and the verdicts kept only for leases still on
- * this attach of the volume. A claim's owner is judged as a lease's is, by its pid.
+ * Dead callers void only claims without pending detach custody. A pending command's authority
+ * survives every pid observation; verdicts still belong only to this attach of the volume.
  */
 function prune(ledger: Ledger, volume: MountedVolume | null, isAlive: (pid: number) => boolean): Ledger {
   return {
-    lifecycle: ledger.lifecycle !== null && isAlive(ledger.lifecycle.owner.pid) ? ledger.lifecycle : null,
+    lifecycle:
+      ledger.lifecycle !== null && (ledger.lifecycle.pending !== undefined || isAlive(ledger.lifecycle.owner.pid))
+        ? ledger.lifecycle
+        : null,
     claims: ledger.claims.filter((claim) => isAlive(claim.owner.pid)),
     held:
       volume === null
@@ -1685,9 +2022,19 @@ function prune(ledger: Ledger, volume: MountedVolume | null, isAlive: (pid: numb
   };
 }
 
+/** The operation token and registry incarnation, never a pid or reusable BSD name alone, identify a pending detach. */
+function sameDetach(claim: LifecycleClaim | null, owner: ClaimOwner, custody: DetachCustody): boolean {
+  return (
+    claim?.owner.token === owner.token &&
+    claim.pending?.physical === custody.physical &&
+    claim.pending.registryEntry === custody.registryEntry
+  );
+}
+
 function withoutClaimsOf(ledger: Ledger, owner: ClaimOwner): Ledger {
   return {
-    lifecycle: ledger.lifecycle?.owner.token === owner.token ? null : ledger.lifecycle,
+    lifecycle:
+      ledger.lifecycle?.owner.token === owner.token && ledger.lifecycle.pending === undefined ? null : ledger.lifecycle,
     claims: ledger.claims.filter((claim) => claim.owner.token !== owner.token),
     held: ledger.held,
   };
@@ -1712,7 +2059,8 @@ function settledLedger(
 
 /** The ledger's wire form, version 1. */
 function ledgerText(ledger: Ledger): string {
-  return `${JSON.stringify({ version: 1, lifecycle: ledger.lifecycle, claims: ledger.claims, held: ledger.held })}\n`;
+  // Older readers reject version 2 instead of pruning the pending authority by the caller's pid.
+  return `${JSON.stringify({ version: ledger.lifecycle?.pending === undefined ? 1 : 2, lifecycle: ledger.lifecycle, claims: ledger.claims, held: ledger.held })}\n`;
 }
 
 /** Publish the ledger in one rename, so no reader, and no crash, ever leaves half of it. */
@@ -1737,7 +2085,7 @@ async function publishLedger(path: string, text: string): Promise<void> {
  * so its lease is probed afresh; it never stands for a lease nothing holds.
  */
 function parseLedger(value: unknown): Ledger | undefined {
-  if (!isRecord(value) || value.version !== 1) {
+  if (!isRecord(value) || (value.version !== 1 && value.version !== 2)) {
     return undefined;
   }
   const { lifecycle: lifecycleWire, claims: claimsWire, held: heldWire } = value;
@@ -1754,8 +2102,11 @@ function parseLedger(value: unknown): Ledger | undefined {
     if ((kind !== 'create' && kind !== 'detach') || owner === undefined) {
       return undefined;
     }
-    lifecycle = { kind, owner };
+    const pending = lifecycleWire.pending === undefined ? undefined : parseDetachCustody(lifecycleWire.pending);
+    if (lifecycleWire.pending !== undefined && pending === undefined) return undefined;
+    lifecycle = pending === undefined ? { kind, owner } : { kind, owner, pending };
   }
+  if ((value.version === 2) !== (lifecycle?.pending !== undefined)) return undefined;
   const claims: LeaseClaim[] = [];
   for (const entry of claimsWire) {
     if (!isRecord(entry)) {
@@ -1782,6 +2133,20 @@ function parseLedger(value: unknown): Ledger | undefined {
   return { lifecycle, claims, held };
 }
 
+function parseDetachCustody(value: unknown): DetachCustody | undefined {
+  if (!isRecord(value)) return undefined;
+  const { physical, registryEntry, phase, facadePid } = value;
+  if (
+    (phase !== 'waiting' && phase !== 'reported') ||
+    typeof physical !== 'string' ||
+    !/^\/dev\/disk\d+$/.test(physical) ||
+    (registryEntry !== null && (typeof registryEntry !== 'string' || !/^0x[0-9a-f]+$/.test(registryEntry))) ||
+    (facadePid !== null && (typeof facadePid !== 'number' || !Number.isSafeInteger(facadePid) || facadePid <= 0))
+  )
+    return undefined;
+  return { physical, registryEntry, phase, facadePid };
+}
+
 function parseOwner(value: unknown): ClaimOwner | undefined {
   if (!isRecord(value)) {
     return undefined;
@@ -1805,6 +2170,7 @@ function alsoFailed(primary: RamTempError, cleanup: readonly RamTempError[]): Ra
   const after = `cleanup then failed: ${cleanup.map(describeRamTempError).join('; ')}`;
   switch (primary.kind) {
     case 'provision-failed':
+    case 'ram-unavailable':
     case 'root-unready':
       return { ...primary, detail: `${primary.detail}; ${after}` };
     case 'volume-full':
@@ -1965,20 +2331,22 @@ export function ramDisksIn(registry: string, table: string): Result<RamDisk[], s
 /**
  * Detach a RAM disk an inventory found, by its whole-disk name, bound to the registry entry the inventory read it as.
  * A BSD name passes to the next disk once its disk goes, and a detach can queue for the disk admission meanwhile, so
- * `cowshed disk-command` reads the entry again inside the admission, immediately before it spawns `hdiutil`, and
+ * the gateway reads the entry again inside its own admission, immediately before it spawns `hdiutil`, and
  * refuses, detaching nothing, unless the entry still names this whole disk (specs/cowshed/06_cli.md, `--registry-entry`).
  * That refusal is this detach's failure, named, and never retried with `-force`: this process did not just attach the
  * disk. The window that remains is cowshed's, from its read to hdiutil's own open of the name.
  */
 export async function detachRamDisk(
-  commands: HostCommands,
+  commands: Pick<HostCommands, 'detachRam'>,
   disk: AttachedRamDisk,
   step: string,
   deadlineMs?: number,
 ): Promise<Result<void, ProvisionFailed>> {
-  const detached = await commands.run('/usr/bin/hdiutil', ['detach', disk.physical], deadlineMs, {
-    registryEntry: disk.entry,
-  });
+  const detached = await commands.detachRam(disk.physical, disk.entry, deadlineMs);
+  return detachOutcome(detached, disk, step);
+}
+
+function detachOutcome(detached: CommandOutput, disk: AttachedRamDisk, step: string): Result<void, ProvisionFailed> {
   if (detached.status === 0) {
     return { ok: true, value: undefined };
   }
@@ -2004,11 +2372,9 @@ export async function detachRamDisk(
 const HOST_COMMAND_DEADLINE_MS = 120_000;
 
 /**
- * How long one creator waits on a stray's detach before it reports the stray by name and
- * gives the create claim back. A stray detach that makes no progress is DiskArbitration's
- * wedge, not this volume's: at 120 s a chain of creators each waited the full bound on the
- * same stray and the claim never moved. The detach itself is never killed (below); the
- * bound is on the wait, and the next creator finds the stray gone or names it again.
+ * How long a creator waits on a stray's detach before reporting it. The wait is bounded,
+ * not the detach: its exact custody remains in the existing ledger until terminal completion
+ * or the bound registry entry's absence. A wedged stray fences only this volume.
  */
 const STRAY_DETACH_DEADLINE_MS = 30_000;
 
@@ -2018,6 +2384,7 @@ export function diskCommand(
   args: readonly string[],
   deadlineMs: number,
   binding?: DetachBinding,
+  gatewaySocket?: string,
 ): { args: string[]; lifetime: 'stop-wait' | 'facade-owned' } | null {
   const program = basename(file);
   if (program !== 'hdiutil' && program !== 'diskutil') {
@@ -2026,10 +2393,11 @@ export function diskCommand(
   // Match SystemCommandRunner's protected-image policy, including its case-sensitive verbs.
   const image = program === 'hdiutil' || args[0] === 'image' || args[0] === 'eject';
   const bound = binding === undefined ? [] : ['--registry-entry', binding.registryEntry];
+  const gateway = gatewaySocket === undefined ? [] : ['--gateway-socket', gatewaySocket];
   return {
     args: image
-      ? ['disk-command', program, ...bound, '--', ...args]
-      : ['disk-command', program, '--deadline-ms', String(deadlineMs), '--', ...args],
+      ? ['disk-command', program, ...gateway, ...bound, '--', ...args]
+      : ['disk-command', program, ...gateway, '--deadline-ms', String(deadlineMs), '--', ...args],
     lifetime: image ? 'stop-wait' : 'facade-owned',
   };
 }
@@ -2071,7 +2439,13 @@ export function createHostCommands(
   return {
     async run(file, args, callDeadlineMs, binding) {
       const deadlineMs = callDeadlineMs ?? defaultDeadlineMs;
-      const disk = diskCommand(file, args, deadlineMs, binding);
+      const disk = diskCommand(
+        file,
+        args,
+        deadlineMs,
+        binding,
+        gatewaySocket === GATEWAY_SOCKET ? undefined : gatewaySocket,
+      );
       if (disk !== null) {
         return runBounded(cowshed, disk.args, deadlineMs, disk.lifetime);
       }
@@ -2106,6 +2480,12 @@ export function createHostCommands(
         }
       }
     },
+    detachRam(device, registryEntry, callDeadlineMs) {
+      return detachGatewayRamDisk(gatewaySocket, device, registryEntry, callDeadlineMs ?? defaultDeadlineMs);
+    },
+    attachRam(sectors) {
+      return attachRamDisk(gatewaySocket, sectors, defaultDeadlineMs);
+    },
   };
 }
 
@@ -2125,28 +2505,36 @@ function runBounded(
   // reap and lease custody; a wrapper's exit or signal is not the disk child's exit or signal.
   const child = spawn(file, [...args], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
   const stdout: Buffer[] = [];
+  let complete: ((output: CommandOutput | null) => void) | undefined;
+  const completion =
+    lifetime === 'stop-wait'
+      ? new Promise<CommandOutput | null>((settled) => {
+          complete = settled;
+        })
+      : null;
   const stderr: Buffer[] = [];
   child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
   child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
   const text = (chunks: Buffer[]) => Buffer.concat(chunks).toString('utf8');
   // Set once the deadline has fired and is killing the group: from then on it owns the result.
   let timedOut = false;
-  // Safe disk commands have no Node timer: the CLI owns the total admission + child budget,
-  // kills only its owned safe child, and returns after reap. Protected image output is already
-  // file-backed in cowshed, so only that caller may close its pipes and stop waiting.
+  let stoppedWaiting = false;
+  // Safe disk commands have no Node timer: the CLI owns admission, execution and reap.
+  // Protected commands keep draining their pipes after stop-wait: closing a live facade's
+  // output is not proof its native child ended, and must not manufacture an early exit.
   const timer =
     lifetime === 'facade-owned'
       ? undefined
       : setTimeout(() => {
-          if (lifetime === 'stop-wait') {
-            child.stdout.destroy();
-            child.stderr.destroy();
+          if (completion !== null) {
+            stoppedWaiting = true;
             child.unref();
             // A piped child's streams are sockets; only a socket can be unref'd.
             if (child.stdout instanceof Socket) child.stdout.unref();
             if (child.stderr instanceof Socket) child.stderr.unref();
             resolve({
               status: 1,
+              pending: { pid: child.pid ?? null, completion },
               stdout: text(stdout),
               stderr: [
                 text(stderr),
@@ -2167,17 +2555,30 @@ function runBounded(
   child.on('error', (error) => {
     clearTimeout(timer);
     if (timedOut) return;
-    resolve({ status: 1, stdout: text(stdout), stderr: error.message });
+    const output = { status: 1, stdout: text(stdout), stderr: error.message };
+    complete?.(child.pid === undefined ? output : null);
+    resolve(
+      child.pid !== undefined && completion !== null ? { ...output, pending: { pid: child.pid, completion } } : output,
+    );
   });
   child.on('close', (code, signal) => {
     clearTimeout(timer);
     if (timedOut) return;
     const error = text(stderr);
-    resolve({
+    const output = {
       status: code ?? 1,
       stdout: text(stdout),
       stderr: signal === null ? error : [error, `killed by ${signal}`].filter(Boolean).join('\n'),
-    });
+    };
+    // Wrapper errors can report wait/reap failure with a native child still alive (06_cli.md).
+    const terminal = code !== null && (code < 100 || code > 106);
+    complete?.(terminal ? output : null);
+    if (!terminal && completion !== null && stoppedWaiting) {
+      process.stderr.write(
+        `RAM temp volume: cowshed command ${child.pid ?? 'unknown'} ended without a native terminal receipt: ${commandText(output)}\n`,
+      );
+    }
+    resolve(!terminal && completion !== null ? { ...output, pending: { pid: child.pid ?? null, completion } } : output);
   });
   return promise;
 }

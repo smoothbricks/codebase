@@ -84,7 +84,13 @@ impl Fixture {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&root).expect("fixture root");
-        Self { root }
+        // The sweep holds mountpoint parents through a chain opened without following a symlink,
+        // so the store is spelled the way the kernel resolves it (`/var` is `/private/var` on
+        // macOS), as the derived production mount root is, whatever temporary directory the runner
+        // supplies.
+        Self {
+            root: std::fs::canonicalize(&root).expect("canonical fixture root"),
+        }
     }
 
     fn config(&self) -> ApfsSubstrateConfig {

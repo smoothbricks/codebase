@@ -39,6 +39,7 @@ use cowshed_gateway::{
     GatewayControlClient, GatewayError, GatewayHandle, MirrorCacheConfig, StartupHeal,
     StartupProbe, SupervisorRecovery, WorkspaceSession,
 };
+use cowshed_os::stdio::Blocking;
 use sha2::{Digest as _, Sha256};
 use std::convert::Infallible;
 use std::fs;
@@ -824,7 +825,7 @@ where
     // Activation restarts a gateway that runs; one that answers is refused the restart while a
     // land or a gate of it runs, before the install changes anything.
     if client.status().await.is_ok() {
-        refuse_restart_while_busy(slot, &home, &client, &mut io::stderr()).await?;
+        refuse_restart_while_busy(slot, &home, &client, &mut Blocking::new(io::stderr())).await?;
     }
     install_nx_cache_server(&mut executor, &home, &candidate.source)?;
     let spec = LaunchAgentSpec::gateway(&executable, &bun).map_err(launchd_error)?;
@@ -1228,7 +1229,13 @@ pub(crate) fn remove_path_entries(stable: &Path) -> Result<RemovalOutcome> {
 pub(crate) async fn stop_for_host_move(slot: &InstallSlot) -> Result<()> {
     let client = GatewayControlClient::new(control_socket_path()).map_err(control_error)?;
     if client.status().await.is_ok() {
-        refuse_restart_while_busy(slot, &canonical_home()?, &client, &mut io::stderr()).await?;
+        refuse_restart_while_busy(
+            slot,
+            &canonical_home()?,
+            &client,
+            &mut Blocking::new(io::stderr()),
+        )
+        .await?;
     }
     stop_service(false).map(|_| ())
 }
@@ -1554,6 +1561,12 @@ async fn run_daemon() -> Result<()> {
             max_bytes: 1024 * 1024 * 1024,
             cap_bytes: 10 * 1024 * 1024 * 1024,
         }),
+        // The RAM temp volume's disk is attached here, so no job owns its helper (05_gateway.md,
+        // "RAM disks").
+        #[cfg(target_os = "macos")]
+        ram_disks: Some(Arc::new(cowshed_apfs::ram_disk::SystemRamDisks::new(
+            paths.control_socket.clone(),
+        ))),
         ..paths.config(effective_uid(), executable)
     };
     let telemetry = ArrowAuditConfig::new(paths.telemetry.clone())
@@ -2931,7 +2944,7 @@ pub async fn refresh_gateway_binary(
         let client = GatewayControlClient::new(socket.clone()).map_err(control_error)?;
         let target = LaunchAgentTarget::new(home, GATEWAY_LABEL).map_err(launchd_error)?;
         // Setup reports the refresh itself; the wait says only what it is still waiting for.
-        let mut output = Output::new(io::sink(), io::stderr(), false);
+        let mut output = Output::new(io::sink(), Blocking::new(io::stderr()), false);
         await_healthy(
             &mut output,
             slot,
@@ -3019,7 +3032,7 @@ async fn refresh_gateway_from<C: LaunchctlCommand>(
     // Before anything is installed: a refusal leaves the installed cowshed and the gateway as
     // they were.
     if restarts && let Some((slot, client)) = gates {
-        refuse_restart_while_busy(slot, home, client, &mut io::stderr()).await?;
+        refuse_restart_while_busy(slot, home, client, &mut Blocking::new(io::stderr())).await?;
     }
     // The packaged Nx cache server is part of this build's install. A current agent is still
     // repaired, so this runs before the no-op return and before any activation: a missing

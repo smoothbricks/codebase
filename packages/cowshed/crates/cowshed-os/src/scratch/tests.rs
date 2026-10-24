@@ -544,3 +544,67 @@ fn an_archive_root_that_outlives_its_record_gets_the_record_back() {
         "the restored record lets the next listing finish it"
     );
 }
+
+#[test]
+fn host_roots_never_enter_a_bounded_exec_ram_lease() {
+    for temp in [
+        // The TMPDIR bounded-exec gives its command: a lease below the volume
+        // mounted at the per-user root's ram<revision> leaf, at any depth below it.
+        "/private/var/folders/cowshed/4242/ram3/12345-aBcDeF",
+        "/private/var/folders/cowshed/4242/ram3/12345-aBcDeF/nested",
+        "/private/var/folders/cowshed/4242/ram3",
+        "/private/var/folders/cowshed/4242/ram3/.archive/1700000000-12345-aBcDeF",
+        "/private/var/folders/cowshed/4242/ram3-new",
+        // Another revision's checkout mounts beside it, never on one directory.
+        "/private/var/folders/cowshed/4242/ram4/12345-aBcDeF",
+        // Revisions 1-2 mounted by volume name; fixtures still mount by name under t.
+        "/Volumes/smoo-ram2-4242/12345-aBcDeF",
+        "/Volumes/smoo-ram-4242/12345-aBcDeF",
+        "/private/var/folders/cowshed/4242/t/smoo-ram-test-31736-0/12345-aBcDeF",
+        "/private/var/folders/cowshed/4242/t/smoo-ram-test-31736-0-new",
+    ] {
+        assert_eq!(
+            host_roots(PathBuf::from(temp)),
+            vec![PathBuf::from("/tmp")],
+            "RAM-owned temp root {temp} must be left to bounded-exec"
+        );
+    }
+}
+
+#[test]
+fn host_roots_still_sweep_non_ram_temp_roots_with_ram_shaped_names() {
+    for temp in [
+        "/private/var/folders/cowshed/4242/t",
+        "/private/var/folders/cowshed/4242/t/ram3",
+        "/private/var/folders/cowshed/4242/mnt",
+        "/private/var/folders/cowshed/4242/ram3x/lease",
+        "/private/var/folders/cowshed/4242/ram/lease",
+        "/private/var/folders/cowshed/4242/ram-new/lease",
+        "/private/var/folders/cowshed/4242/rambunctious/lease",
+        "/private/var/folders/cowshed/not-a-uid/ram3/lease",
+        "/private/var/folders/other/4242/ram3/lease",
+        "/private/tmp/ram3/lease",
+        "/tmp/smoo-ram-notes/temp",
+        "/Volumes/other-volume/ram3/lease",
+        "/private/var/folders/ab/cdef/T",
+    ] {
+        assert_eq!(
+            host_roots(PathBuf::from(temp)),
+            vec![PathBuf::from("/tmp"), PathBuf::from(temp)],
+            "non-RAM temp root {temp} stays in the sweep"
+        );
+    }
+}
+
+#[test]
+fn a_reaper_built_for_a_ram_lease_tmpdir_holds_no_ram_root() {
+    let reaper = Reaper::new(host_roots(PathBuf::from(
+        "/private/var/folders/cowshed/4242/ram3/12345-aBcDeF",
+    )))
+    .unwrap();
+    assert_eq!(reaper.roots.len(), 1);
+    assert_eq!(
+        reaper.roots[0].path,
+        PathBuf::from("/tmp").canonicalize().unwrap()
+    );
+}

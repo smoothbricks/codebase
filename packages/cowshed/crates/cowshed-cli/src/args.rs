@@ -252,6 +252,8 @@ pub struct DiskCommandArgs {
     /// `--registry-entry`: the IORegistry entry ID the caller inventoried the device of its
     /// `hdiutil detach <device>` as; the detach runs only while that entry still names the device.
     pub registry_entry: Option<u64>,
+    /// An explicitly selected gateway for disk admission; absent uses the host gateway.
+    pub gateway_socket: Option<PathBuf>,
 }
 
 /// `land-turn <repo> [--workspace <ws>] [--outside-lock <path>] -- <cmd...>`: the repository whose
@@ -1085,6 +1087,7 @@ pub fn cli_command() -> ClapCommand {
                 .arg(positional("tool", 0..=1))
                 .arg(value("deadline-ms"))
                 .arg(value("registry-entry"))
+                .arg(value("gateway-socket"))
                 .arg(
                     Arg::new("argv")
                         .value_parser(value_parser!(OsString))
@@ -1656,6 +1659,10 @@ const DISK_COMMAND: CommandSpec = CommandSpec {
             meaning: "before -- only: total SAFE admission-and-child budget in milliseconds; default 120000. Image commands retain their 120 s warning-only, never-kill policy",
         },
         Opt {
+            spelling: "--gateway-socket <absolute path>",
+            meaning: "before -- only: select this gateway for disk admission, with the same peer authentication and native child custody",
+        },
+        Opt {
             spelling: "--registry-entry <id>",
             meaning: "before -- only, with `hdiutil -- detach <device>` and nothing else: the IORegistry entry ID (0x… or decimal) the caller inventoried the device as. Inside the host disk admission, immediately before the spawn, the detach runs only while that entry is still registered with <device> as its whole disk; otherwise nothing is detached and the command fails 100–106, so a name recycled while the command queued is never detached",
         },
@@ -1715,6 +1722,16 @@ fn parse_disk_command(matches: &ArgMatches, global: &GlobalOptions) -> Result<Co
             std::time::Duration::from_millis(millis.get())
         }
     };
+    let gateway_socket = os(matches, "gateway-socket").map(PathBuf::from);
+    if gateway_socket
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        return Err(UsageError::new(
+            "--gateway-socket must be an absolute path",
+            USAGE,
+        ));
+    }
     let registry_entry = match os(matches, "registry-entry") {
         None => None,
         Some(value) => {
@@ -1738,6 +1755,7 @@ fn parse_disk_command(matches: &ArgMatches, global: &GlobalOptions) -> Result<Co
         deadline,
         args,
         registry_entry,
+        gateway_socket,
     }))
 }
 
@@ -6371,6 +6389,56 @@ mod tests {
     }
 
     #[test]
+    fn disk_command_gateway_socket_is_explicit_absolute_and_before_the_separator() {
+        let Command::DiskCommand(args) = parse_args([
+            "disk-command",
+            "hdiutil",
+            "--gateway-socket",
+            "/tmp/fixture/gateway.sock",
+            "--",
+            "info",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("disk command");
+        };
+        assert_eq!(
+            args.gateway_socket,
+            Some(PathBuf::from("/tmp/fixture/gateway.sock"))
+        );
+        assert!(
+            parse_args([
+                "disk-command",
+                "hdiutil",
+                "--gateway-socket",
+                "relative.sock",
+                "--",
+                "info"
+            ])
+            .is_err()
+        );
+        let Command::DiskCommand(args) = parse_args([
+            "disk-command",
+            "hdiutil",
+            "--",
+            "info",
+            "--gateway-socket",
+            "native-value",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("disk command");
+        };
+        assert_eq!(args.gateway_socket, None);
+        assert_eq!(
+            args.args,
+            ["info", "--gateway-socket", "native-value"].map(OsString::from)
+        );
+    }
+
+    #[test]
     fn disk_command_deadline_is_positive_and_only_before_the_separator() {
         let Command::DiskCommand(args) = parse_args([
             "disk-command",
@@ -6433,6 +6501,7 @@ mod tests {
                 tool: DiskTool::Hdiutil,
                 deadline: cowshed_apfs::DISK_CHILD_DEADLINE,
                 args: vec![OsString::from("info")],
+                gateway_socket: None,
                 registry_entry: None,
             })
         );

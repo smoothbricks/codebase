@@ -189,6 +189,13 @@ socket below the fixture past Darwin's 104-byte `sun_path`. A fixture that holds
 such as a test `HOME`, takes the granted `TMPDIR`. An invalid requested alias fails loudly; it never falls through to a
 global or temp directory.
 
+RAM host fixtures own a private root, control socket, volume paths, lock and exact attached registry identities. Every
+attach and every facade or non-facade disk operation uses a real fixture gateway, never the installed gateway or the
+user's shared RAM volume. `cowshed-gateway`'s `ram_fixture` executable serves that gateway until its stdin closes; host
+tests start the prebuilt helper, wait for its socket readiness, detach only identities their own attaches recorded, then
+close the helper. `disk-command --gateway-socket` routes native tools to the same fixture admission, with registry-bound
+detach revalidation inside it. Size and UID distinguish fixture inventories but never authorize teardown.
+
 A fixture's child directory is a real, non-symlink directory owned by the test process UID with mode 0700. Drop cleans
 every path the fixture created. No fixture adds a grant, a host cache path, a script wrapper, or a sandbox disable. FIFO
 readiness reads are nonblocking asynchronous reads: dropping a failed or cancelled wait closes its descriptor, never
@@ -482,23 +489,26 @@ Parametrized over the substrate the host provides, and never gated off on it: a 
 skip. On macOS these are the `real_apfs_*` tests, compiled only for macOS: small `.dmg` images (1 GiB caps) under
 `/private/var/folders/cowshed/<uid>/t/<pid>-<n>` (the label is said on stderr, not spelled, so sockets below fit
 `sun_path`) (`cowshed_os::scratch::macos_scratch_root`), driven by the production host — real
-`diskutil`/`hdiutil`/`fsck_apfs`/`mount_apfs`, descriptor-native `funmount` and the live kernel mount table. A mount
-state a test needs (wrong flags, an impostor volume, a busy holder) is produced on a real volume, never by a substitute
-mount source. Every scratch root selects its backing image paths, then calls the same production owned-attachment
-cleanup used by normal removal, recovery-marker reads, reverse-order teardown, duplicate-attachment rejection, and
-staging GC. Each cleanup rereads image/whole-device/volume identity and retains each owned volume's raw pin through
-namespace admission and same-root-FD `funmount`, then runs guarded `hdiutil detach` of the exact physical device under
-the image's lease. The detach guard rechecks after storage admission; a cached device number, caller mount set or
-mountpoint never authorizes an effect. A failed release keeps the scratch tree intact for the next run, rather than
-deleting a still-attached image's backing files. Before any release, a scratch root ends every process working in its
-tree, selected by the working directory the kernel reports (`proc_pidinfo` `PROC_PIDVNODEPATHINFO`, which still names a
-deleted directory): `SIGTERM`, as `nx daemon --stop` sends it, then `SIGKILL` after a 10s grace. A stock Nx daemon a
-fixture started detaches from its starter, so a failed test's unwinding otherwise never reached it and it kept running
-in the deleted root. Successful cleanup removes the root, and every run first ends the processes working under, then
-reclaims the roots and attachments of, runs whose owner pid is gone. On Linux: a scratch ZFS pool on a loopback/file
-vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool exported on teardown; the Linux leg also exercises
-`cowshed-helper` and the Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The
-same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
+`diskutil`/`hdiutil`/`fsck_apfs`/`mount_apfs`, descriptor-native `funmount` and the live kernel mount table. The
+per-user scratch parent is host state `cowshed setup` provisions, never fixture state: a fixture creates only `t` inside
+it and refuses a missing or foreign root, so the one CI leg that runs these tests on a setup-less host provisions
+setup's same mount-root directories first (.github/workflows/publish.yml). A mount state a test needs (wrong flags, an
+impostor volume, a busy holder) is produced on a real volume, never by a substitute mount source. Every scratch root
+selects its backing image paths, then calls the same production owned-attachment cleanup used by normal removal,
+recovery-marker reads, reverse-order teardown, duplicate-attachment rejection, and staging GC. Each cleanup rereads
+image/whole-device/volume identity and retains each owned volume's raw pin through namespace admission and same-root-FD
+`funmount`, then runs guarded `hdiutil detach` of the exact physical device under the image's lease. The detach guard
+rechecks after storage admission; a cached device number, caller mount set or mountpoint never authorizes an effect. A
+failed release keeps the scratch tree intact for the next run, rather than deleting a still-attached image's backing
+files. Before any release, a scratch root ends every process working in its tree, selected by the working directory the
+kernel reports (`proc_pidinfo` `PROC_PIDVNODEPATHINFO`, which still names a deleted directory): `SIGTERM`, as
+`nx daemon --stop` sends it, then `SIGKILL` after a 10s grace. A stock Nx daemon a fixture started detaches from its
+starter, so a failed test's unwinding otherwise never reached it and it kept running in the deleted root. Successful
+cleanup removes the root, and every run first ends the processes working under, then reclaims the roots and attachments
+of, runs whose owner pid is gone. On Linux: a scratch ZFS pool on a loopback/file vdev (`cowshed.itest.<pid>`) with
+datasets destroyed and the pool exported on teardown; the Linux leg also exercises `cowshed-helper` and the
+Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The same flow table runs on
+both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
 The panic/kill cleanup fixture reads only its own child's stdout pipe. Before ending that child it requires two complete
 line-start image records (the mounted RAW image, then the retained RAW input) and the worker record; neither a sibling's
@@ -696,7 +706,8 @@ target names each owned host file.
 Drain fixtures read report publications on native directory-write events and await the serving task and resident's
 completion directly. CPU-admission holders announce readiness on stdout before blocking on their open stdin; consumers
 follow that stream rather than poll job PIDs. Missing events are hangs owned by the target's no-progress diagnosis,
-never independent test deadlines.
+never independent test deadlines. A test proves a descriptor's release by the kernel's grant to a waiter, never by a
+non-blocking probe at the spawn's return or at the child's reaping.
 
 An unfinished test name is not holder attribution. During the final ten seconds of an unchanged no-progress interval,
 the executor takes one bounded pre-signal snapshot of its runner, descendants and retained process group. Resumed

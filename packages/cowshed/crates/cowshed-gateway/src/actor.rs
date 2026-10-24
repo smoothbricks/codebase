@@ -375,6 +375,7 @@ impl Gateway {
                         sim_broker: sim_broker.clone(),
                         audit_tail: audit_tail.clone(),
                         startup: config.startup.clone(),
+                        ram_disks: config.ram_disks.clone(),
                         disk_leases: crate::disk_lease::DiskLeases::start(config.disk_lease),
                         cpu_budget: cpu_budget.clone(),
                         task_server: crate::task_server::TaskServer::start(

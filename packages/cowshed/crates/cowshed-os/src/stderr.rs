@@ -10,6 +10,10 @@
 //! the whole line first and hands it to the kernel in one write, which an append-mode file
 //! places whole.
 //!
+//! Another process sharing stderr may have left it nonblocking (06_cli.md): each line, in place
+//! or on the writer thread, waits for room as a blocking descriptor would ([`crate::stdio`]),
+//! never panicking on `EAGAIN` or counting it as a refusal.
+//!
 //! A daemon (the gateway, each workspace supervisor) runs its whole async runtime on its main
 //! thread, so a line written there in place stops every request it serves until the kernel
 //! takes the line. The log lives on the same APFS container as the store, and a container
@@ -24,6 +28,7 @@
 //! refused the first of them, never a full queue.
 //! [`flush`] waits for the queue before the process exits.
 
+use crate::stdio::Blocking;
 use std::fmt;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -61,7 +66,7 @@ fn write(text: String) {
         },
         None => text,
     };
-    if let Err(error) = io::stderr().lock().write_all(text.as_bytes()) {
+    if let Err(error) = Blocking::new(io::stderr().lock()).write_all(text.as_bytes()) {
         panic!("failed printing to stderr: {error}");
     }
 }
@@ -69,7 +74,7 @@ fn write(text: String) {
 /// From now on, queue this process's stderr lines for a writer thread of their own (see the
 /// module). Refuses a second detach, and a writer thread that cannot start.
 pub fn detach() -> io::Result<()> {
-    let detached = Detached::spawn(io::stderr(), QUEUE_LINES)?;
+    let detached = Detached::spawn(Blocking::new(io::stderr()), QUEUE_LINES)?;
     DETACHED
         .set(detached)
         .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, "stderr is already detached"))

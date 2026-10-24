@@ -271,6 +271,9 @@ pub struct GatewayConfig {
     pub executable_sha256: Option<String>,
     /// What status reports of the daemon's startup pass; `None` for a gateway no daemon owns.
     pub startup: Option<Arc<dyn StartupProbe>>,
+    /// What attaches and detaches the host's RAM disks for `ram-attach` and `ram-detach` (05_gateway.md, "RAM disks"): the
+    /// daemon's disk runner, which this crate does not link. `None` attaches none.
+    pub ram_disks: Option<Arc<dyn cowshed_gateway_types::RamDisks>>,
     /// Existing standalone accepted-artifact server, started lazily per Nx project.
     pub nx_cache: Option<crate::nx_cache::NxCacheServiceConfig>,
     /// macOS: the socket an install serves while it restarts this gateway (`handoff_path`). The
@@ -299,6 +302,7 @@ impl Default for GatewayConfig {
             task_server: TaskServerLimits::default(),
             executable_sha256: None,
             startup: None,
+            ram_disks: None,
             nx_cache: None,
             listener_handoff: None,
         }

@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, it } from 'bun:test';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { expectFixtureVolume } from '../../__tests__/fixture-ram-volume.js';
 import { standInCowshed } from '../../__tests__/stand-in-cowshed.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from '../../bounded-test-policy.js';
 import { CPU_POOL_ENV, type CpuPool, createCpuPool } from './cpu-pool.js';
@@ -12,16 +13,69 @@ import { CPU_TOKENS_ENV } from './cpu-tokens.js';
 import { resolveCowshedExecutable } from './executor.js';
 import { SUPERVISOR_SOCKET_ENV } from './owned-subtree.js';
 import { COWSHED_EXECUTABLE_ENV } from './ram-temp.js';
+import {
+  detachOwned,
+  removeScratchDirectories,
+  type ScratchVolume,
+  scratchVolume,
+  startFixtureGateway,
+} from './ram-temp-fixtures.js';
 import type { BoundedExecOptions } from './schema.js';
 import { VERDICT_FILE } from './verdict.js';
 
 /**
- * The production runner's built Node artifact, run in its own process, with the real RAM volume and CPU-budget owners.
- * `test-host` already depends on this package's build; these peers must not compile TypeScript inside a test.
- * These proofs need the host (`hdiutil` on darwin), so the pure shards exclude this file.
+ * The production runner's built Node artifact, run in its own process, with the real CPU-budget owner and, on macOS, a
+ * RAM volume of this file's own: never the user's, which no test leases, creates or detaches. `test-host` already
+ * depends on this package's build; these peers must not compile TypeScript inside a test. These proofs need the host
+ * (`hdiutil` on darwin), so the pure shards exclude this file.
  */
 const PACKAGE_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 const EXECUTOR = join(PACKAGE_ROOT, 'dist/executors/bounded-exec/executor.js');
+const FIXTURES = join(PACKAGE_ROOT, 'dist/executors/bounded-exec/ram-temp-fixtures.js');
+
+/**
+ * The RAM volume every runner in this file leases on, made once on macOS: index 3 of this process's scratch volumes, the
+ * one the RAM host walk leaves free. Its disk is attached by its real fixture gateway and recorded by registry identity in
+ * its `owned` file, the only disks teardown detaches.
+ */
+let ramVolume: ScratchVolume | undefined;
+let stopRamGateway: (() => Promise<void>) | undefined;
+beforeAll(async () => {
+  if (process.platform !== 'darwin') return;
+  ramVolume = scratchVolume(3);
+  stopRamGateway = await startFixtureGateway(ramVolume);
+});
+
+/** A runner script's `runBoundedExecWith` volume: this file's own on macOS, none elsewhere, as the default runner. */
+function volumeSource(): string {
+  if (process.platform !== 'darwin') {
+    return '() => null';
+  }
+  if (ramVolume === undefined) throw new Error('the fixture gateway must be ready before a runner starts');
+  const { paths, capacity } = ramVolume;
+  expectFixtureVolume(paths, capacity);
+  return `(cowshed) => fixtureRamVolume(${JSON.stringify({ paths, capacity, owned: ramVolume.owned, gatewaySocket: ramVolume.gatewaySocket })}, cowshed)`;
+}
+
+/** The runner scripts' imports: the runner that takes a volume, and the fixture volume it is given. */
+const RUNNER_IMPORTS = [
+  `import { runBoundedExecWith } from ${JSON.stringify(EXECUTOR)};`,
+  `import { fixtureRamVolume } from ${JSON.stringify(FIXTURES)};`,
+].join('\n');
+
+afterAll(async () => {
+  if (ramVolume === undefined) {
+    return;
+  }
+  // Only the disks this file's runners recorded; a refusal throws before anything holding the evidence is removed.
+  try {
+    await detachOwned(ramVolume.owned, ramVolume.paths.uid, ramVolume.gatewaySocket);
+  } finally {
+    await stopRamGateway?.();
+  }
+  removeScratchDirectories(ramVolume.paths);
+  await rm(ramVolume.parent, { recursive: true, force: true });
+});
 
 /**
  * Names a child never inherits from the process that starts it: budget markers a bounded-exec parent sets for its
@@ -178,7 +232,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
       await writeFile(
         script,
         [
-          `import { runDefaultBoundedExec } from ${JSON.stringify(EXECUTOR)};`,
+          RUNNER_IMPORTS,
           RESOURCES_HANDLER,
           `const options = ${JSON.stringify({
             command: `node -e "console.log('lease')"`,
@@ -187,7 +241,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
             parallelism: 1,
           })};`,
           `const context = ${JSON.stringify({ root })};`,
-          'const results = await Promise.all(Array.from({ length: 5 }, () => runDefaultBoundedExec(options, context)));',
+          `const volume = ${volumeSource()};`,
+          'const results = await Promise.all(Array.from({ length: 5 }, () => runBoundedExecWith(options, context, volume)));',
           "console.log('leases-complete');",
           'process.exitCode = results.every((result) => result.success) ? 0 : 1;',
           '',
@@ -484,9 +539,9 @@ async function writeRunner(
   await writeFile(
     script,
     [
-      `import { runDefaultBoundedExec } from ${JSON.stringify(EXECUTOR)};`,
+      RUNNER_IMPORTS,
       RESOURCES_HANDLER,
-      `const result = await runDefaultBoundedExec(${JSON.stringify(options)}, ${JSON.stringify(context)});`,
+      `const result = await runBoundedExecWith(${JSON.stringify(options)}, ${JSON.stringify(context)}, ${volumeSource()});`,
       'process.exitCode = result.success ? 0 : 1;',
       '',
     ].join('\n'),
@@ -620,13 +675,14 @@ async function writeChurnWorker(root: string, name: string, stopFile: string): P
     script,
     [
       "import { existsSync } from 'node:fs';",
-      `import { runDefaultBoundedExec } from ${JSON.stringify(EXECUTOR)};`,
+      RUNNER_IMPORTS,
       RESOURCES_HANDLER,
       `const options = ${JSON.stringify(CHURN_OPTIONS)};`,
+      `const volume = ${volumeSource()};`,
       `const context = ${JSON.stringify({ root })};`,
       `for (let run = 1; !existsSync(${JSON.stringify(stopFile)}); run += 1) {`,
       `  process.stdout.write('cowshed-test churn ${name} begin ' + run + '\\n');`,
-      '  const result = await runDefaultBoundedExec(options, context);',
+      '  const result = await runBoundedExecWith(options, context, volume);',
       '  if (!result.success) {',
       `    process.stderr.write('cowshed host proof churn ${name} failed at run ' + run + ':\\n');`,
       '    process.stderr.write(result.terminalOutput);',
@@ -666,7 +722,16 @@ async function withChurn<T>(
       const inFlight = [...output.matchAll(CHURN_BEGIN)].length - [...output.matchAll(CHURN_RAN)].length;
       return { run, mark: output.length, inFlight };
     });
-    const value = await body();
+    const value = await Promise.race([
+      body(),
+      ...workers.map(({ name, run }) =>
+        run.exited.then((code) => {
+          throw new Error(
+            `owned churn ${name} exited ${code} while the foreground body still waited; ${attribution(run, 'during foreground wait')}`,
+          );
+        }),
+      ),
+    ]);
     const begun = marks.reduce(
       (sum, { run, mark, inFlight }) => sum + inFlight + [...run.stdout().slice(mark).matchAll(CHURN_BEGIN)].length,
       0,

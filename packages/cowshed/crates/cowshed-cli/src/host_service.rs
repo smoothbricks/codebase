@@ -20,6 +20,7 @@ use cowshed_core::api::server::{
     RouterResponse, serve_controller_connection,
 };
 use cowshed_core::{CowshedError, Result};
+use cowshed_os::stdio::Blocking;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
@@ -149,7 +150,7 @@ async fn answer(request: RouterRequest) -> Result<RouterResponse> {
         }
         Op::HostGatewayStart(_) => {
             // Guidance the verb says while the gateway comes up goes to this process's stderr.
-            let mut output = Output::new(std::io::sink(), std::io::stderr(), false);
+            let mut output = Output::new(std::io::sink(), Blocking::new(std::io::stderr()), false);
             respond::<operations::HostGatewayStart>(
                 &crate::gateway_service::start(&mut output).await?,
             )
@@ -228,6 +229,7 @@ async fn answer(request: RouterRequest) -> Result<RouterResponse> {
                     .map(CommandArg::into_os_string)
                     .collect(),
                 registry_entry: request.registry_entry,
+                gateway_socket: None,
             };
             if args.registry_entry.is_some() {
                 crate::args::bound_detach(args.tool, &args.args).map_err(|refusal| {
@@ -282,6 +284,6 @@ impl EventSource for DiskEvents {
 /// A store-wide mount that changed the store but whose gateway view could not follow says so on
 /// stderr, exactly as the verb does: the work completed, so it is no failure, and no silence.
 fn report_stale(stale: &[(cowshed_core::repository::RepoId, CowshedError)]) -> Result<()> {
-    let mut output = Output::new(std::io::sink(), std::io::stderr(), false);
+    let mut output = Output::new(std::io::sink(), Blocking::new(std::io::stderr()), false);
     crate::runtime::report_stale_gateway_views(&mut output, stale)
 }

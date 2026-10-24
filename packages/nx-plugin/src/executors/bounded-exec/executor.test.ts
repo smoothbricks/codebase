@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, jest } from 'bun:
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { closeSync } from 'node:fs';
-import { access, mkdir, mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -36,7 +36,13 @@ import {
 import { captureHangDiagnostics, HANG_CAPTURE_MS, type HangDiagnostics } from './hang-diagnostics.js';
 import { createNoSpaceWatch } from './no-space.js';
 import { cowshedSubtreeOwner, type SubtreeOwner } from './owned-subtree.js';
-import type { RamTempAcquisition, RamTempError, RamTempLease, Result } from './ram-temp.js';
+import {
+  describeRamTempError,
+  type RamTempAcquisition,
+  type RamTempError,
+  type RamTempLease,
+  type Result,
+} from './ram-temp.js';
 import { readRecord, type TempVolumeSpace, VERDICT_FILE } from './verdict.js';
 
 const workspaces: string[] = [];
@@ -1244,6 +1250,172 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toContain('exited 1: stand-in: the supervisor socket is unreachable\n');
   });
 
+  for (const unavailable of [
+    { kind: 'unavailable', reason: 'unproven-owner', detail: 'the legacy marker does not prove gateway ownership' },
+    { kind: 'unavailable', reason: 'gateway-unsupported', detail: 'the gateway does not serve ram-attach' },
+    { kind: 'unavailable', reason: 'gateway-absent', detail: 'the owned gateway fixture socket is absent' },
+  ] satisfies Extract<RamTempAcquisition, { kind: 'unavailable' }>[]) {
+    for (const status of [0, 7]) {
+      it(`uses owned ordinary scratch for ${unavailable.reason}, preserving command status ${status}`, async () => {
+        await withOrdinaryTempWorkspace(async (workspace) => {
+          const volume = scriptedVolume({ ok: true, value: unavailable });
+          const owner = await standInOwner(workspace.root);
+          const evidenceAtRetirement: string[] = [];
+          const supervised: SubtreeOwner = {
+            rootArgv: (command) => owner.rootArgv(command),
+            async retire(handle, graceMs) {
+              const outcome = await owner.retire(handle, graceMs);
+              const directory = await readFile(join(workspace.root, 'observed-tmpdir'), 'utf8');
+              evidenceAtRetirement.push(await readFile(join(directory, 'command-evidence'), 'utf8'));
+              return outcome;
+            },
+          };
+          const record = { task: { id: 'optional:command', hash: null }, directory: join(workspace.root, 'verdict') };
+          const result = await runBoundedExec(
+            {
+              command: 'node temp-probe.js',
+              env: { PROBE_EXIT_CODE: String(status) },
+              timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+            },
+            { ...workspace.context, record },
+            createProcessTreeKiller(),
+            volume,
+            null,
+            null,
+            undefined,
+            undefined,
+            supervised,
+          );
+          const directory = await readFile(join(workspace.root, 'observed-tmpdir'), 'utf8');
+          expect(result.success, result.terminalOutput).toBe(status === 0);
+          expect(dirname(directory)).toBe(await realpath(join(workspace.root, 'ordinary')));
+          expect(directory).not.toStartWith(await realpath(join(workspace.root, 'ram3')));
+          expect(result.terminalOutput).toContain(`actual-tmpdir=${directory}\n`);
+          expect(result.terminalOutput).toContain(
+            `RAM temp volume unavailable (${unavailable.reason}: ${unavailable.detail}); using owned ordinary TMPDIR ${directory}\n`,
+          );
+          expect(result.terminalOutput.match(/RAM temp volume unavailable/g)).toHaveLength(1);
+          expect(result.terminalOutput).not.toContain('RAM temp volume: lease');
+          expect(evidenceAtRetirement).toEqual(['command evidence\n']);
+          expect(volume.order).toEqual([]);
+          expect(volume.released).toEqual([]);
+          expect((await readRecord(record.directory))?.verdict).toEqual(
+            status === 0 ? { outcome: 'passed' } : { outcome: 'failed', exitCode: status, tests: [] },
+          );
+          if (status === 0) {
+            expect(await exists(directory)).toBe(false);
+            expect(result.terminalOutput).not.toContain('Ordinary temp directory retained');
+          } else {
+            expect(await readFile(join(directory, 'command-evidence'), 'utf8')).toBe('command evidence\n');
+            expect(result.terminalOutput).toContain('Command exited with status 7:');
+            expect(result.terminalOutput).toContain(
+              `Ordinary temp directory retained at ${directory}: the run did not pass\n`,
+            );
+          }
+        });
+      });
+    }
+  }
+
+  it('keeps an explicit target TMPDIR when optional RAM is unavailable without claiming its medium or cleaning it', async () => {
+    await withOrdinaryTempWorkspace(async (workspace) => {
+      const target = join(workspace.root, 'target-temp');
+      await mkdir(target);
+      const volume = scriptedVolume({
+        ok: true,
+        value: { kind: 'unavailable', reason: 'unproven-owner', detail: 'legacy marker' },
+      });
+      const result = await runBoundedExec(
+        { command: 'node temp-probe.js', env: { TMPDIR: target }, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+        workspace.context,
+        createProcessTreeKiller(),
+        volume,
+        null,
+        null,
+        undefined,
+        undefined,
+        await standInOwner(workspace.root),
+      );
+      expect(result.success, result.terminalOutput).toBe(true);
+      expect(await readFile(join(workspace.root, 'observed-tmpdir'), 'utf8')).toBe(target);
+      expect(await readFile(join(target, 'command-evidence'), 'utf8')).toBe('command evidence\n');
+      expect(await readdir(join(workspace.root, 'ordinary'))).toEqual([]);
+      expect(result.terminalOutput).toContain(`using target-provided TMPDIR ${target} (medium not inferred)\n`);
+      expect(result.terminalOutput.match(/RAM temp volume unavailable/g)).toHaveLength(1);
+      expect(result.terminalOutput).not.toContain('using owned ordinary TMPDIR');
+      expect(volume.order).toEqual([]);
+    });
+  });
+
+  for (const mode of ['admission-refused', 'retire-refused', 'retire-failed']) {
+    it(`retains ordinary scratch when the command subtree is not retired: ${mode}`, async () => {
+      await withOrdinaryTempWorkspace(async (workspace) => {
+        const volume = scriptedVolume({
+          ok: true,
+          value: { kind: 'unavailable', reason: 'gateway-absent', detail: 'owned socket absent' },
+        });
+        const owner = await standInOwner(workspace.root, {
+          admission: mode === 'admission-refused' ? 'notMember' : 'admitted',
+          retire: mode === 'retire-failed' ? 'fail' : 'retire',
+        });
+        const supervised: SubtreeOwner =
+          mode === 'retire-refused'
+            ? {
+                rootArgv: (command) => owner.rootArgv(command),
+                retire: async () => ({ kind: 'refused', reason: 'jobEnded' }),
+              }
+            : owner;
+        const result = await runBoundedExec(
+          { command: 'node temp-probe.js', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+          workspace.context,
+          createProcessTreeKiller(),
+          volume,
+          null,
+          null,
+          undefined,
+          undefined,
+          supervised,
+        );
+        const directory = await readFile(join(workspace.root, 'observed-tmpdir'), 'utf8');
+        expect(result.success, result.terminalOutput).toBe(mode !== 'retire-failed');
+        expect(await readFile(join(directory, 'command-evidence'), 'utf8')).toBe('command evidence\n');
+        expect(result.terminalOutput).toContain(
+          `Ordinary temp directory retained at ${directory}: the command subtree was not retired\n`,
+        );
+        expect(volume.order).toEqual([]);
+      });
+    });
+  }
+
+  it('refuses a missing configured ordinary scratch parent rather than using inherited RAM or another directory', async () => {
+    await withOrdinaryTempWorkspace(async (workspace) => {
+      process.env.COWSHED_RUNTIME_LINK = join(workspace.root, 'missing-runtime');
+      const volume = scriptedVolume({
+        ok: true,
+        value: { kind: 'unavailable', reason: 'gateway-unsupported', detail: 'no ram-attach' },
+      });
+      const result = await runBoundedExec(
+        { command: 'node temp-probe.js', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+        workspace.context,
+        createProcessTreeKiller(),
+        volume,
+        null,
+        null,
+        undefined,
+        undefined,
+        await standInOwner(workspace.root),
+      );
+      expect(result.success).toBe(false);
+      expect(result.terminalOutput).toContain('gateway-unsupported: no ram-attach');
+      expect(result.terminalOutput).toContain(
+        `could not create ordinary scratch under ${process.env.COWSHED_RUNTIME_LINK}:`,
+      );
+      expect(await exists(join(workspace.root, 'observed-tmpdir'))).toBe(false);
+      expect(await readdir(join(workspace.root, 'ordinary'))).toEqual([]);
+      expect(volume.order).toEqual([]);
+    });
+  });
+
   it('keeps the inherited TMPDIR inside a sandbox and says so once', async () => {
     const workspace = await createWorkspace();
     const volume = scriptedVolume({ ok: true, value: { kind: 'sandboxed', detail: 'lock: EPERM' } });
@@ -1270,30 +1442,34 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(volume.released).toEqual([]);
   });
 
-  it('does not run the command when the volume cannot be provisioned', async () => {
-    const workspace = await createWorkspace();
-    const marker = join(workspace.root, 'ran');
-    const volume = scriptedVolume({
-      ok: false,
-      error: { kind: 'provision-failed', step: 'hdiutil attach', detail: 'exit 1: Device not configured' },
+  for (const error of [
+    { kind: 'provision-failed', step: 'hdiutil attach', detail: 'exit 1: Device not configured' },
+    { kind: 'provision-failed', step: 'read marker', detail: 'EIO' },
+    { kind: 'provision-failed', step: 'read marker', detail: 'malformed gateway provenance' },
+    { kind: 'provision-failed', step: 'read ledger', detail: 'corrupt ledger' },
+    { kind: 'provision-failed', step: 'pending detach', detail: 'unknown running custody' },
+  ] satisfies RamTempError[]) {
+    it(`does not run the command or fall back on a hard RAM error: ${error.detail}`, async () => {
+      const workspace = await createWorkspace();
+      const marker = join(workspace.root, 'ran');
+      const volume = scriptedVolume({ ok: false, error });
+      const result = await runBoundedExec(
+        { command: `touch ${marker}`, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+        workspace.context,
+        createProcessTreeKiller(),
+        volume,
+        null,
+        null,
+        undefined,
+        undefined,
+        await standInOwner(workspace.root),
+      );
+      expect(result.success).toBe(false);
+      expect(result.terminalOutput).toBe(`${describeRamTempError(error)}\n`);
+      expect(await exists(marker)).toBe(false);
+      expect(volume.order).toEqual([]);
     });
-
-    const result = await runBoundedExec(
-      { command: `touch ${marker}`, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
-      workspace.context,
-      createProcessTreeKiller(),
-      volume,
-      null,
-      null,
-      undefined,
-      undefined,
-      await standInOwner(workspace.root),
-    );
-
-    expect(result.success).toBe(false);
-    expect(result.terminalOutput).toBe('RAM temp volume: hdiutil attach failed: exit 1: Device not configured\n');
-    expect(await exists(marker)).toBe(false);
-  });
+  }
 
   it('names the full volume when a failed command left it without space', async () => {
     const workspace = await createWorkspace();
@@ -2338,8 +2514,8 @@ function ignoresTerm(root: string): { command: string; armed: () => Promise<void
   };
 }
 
-async function createWorkspace(): Promise<WorkspaceFixture> {
-  const root = await mkdtemp(join(tmpdir(), 'smoothbricks-bounded-exec-'));
+async function createWorkspace(parent: string = tmpdir()): Promise<WorkspaceFixture> {
+  const root = await mkdtemp(join(parent, 'smoothbricks-bounded-exec-'));
   workspaces.push(root);
   return {
     root,
@@ -2477,4 +2653,44 @@ function inheritedFrom(pool: CpuPool): InheritedCpuPool {
 /** The count a pool of `tokens` lends a run that wants `want`: min(want, tokens). */
 function lentCount(want: number, tokens: number): number {
   return Math.min(want, tokens);
+}
+
+/** Every path belongs to this fixture; its ordinary parent is granted even when the suite inherits a RAM TMPDIR. */
+async function withOrdinaryTempWorkspace(body: (workspace: WorkspaceFixture) => Promise<void>): Promise<void> {
+  const workspace = await createWorkspace(
+    process.env.COWSHED_RUNTIME_LINK ?? (process.platform === 'darwin' ? '/private/tmp' : '/tmp'),
+  );
+  const inherited = process.env.TMPDIR;
+  const runtime = process.env.COWSHED_RUNTIME_LINK;
+  const ordinary = join(workspace.root, 'ordinary');
+  const legacy = join(workspace.root, 'ram3');
+  await mkdir(ordinary);
+  await workspace.write('ram3/.smoo-ram', 'legacy-volume-name\n');
+  await workspace.write('ram3/existing', 'leave these bytes untouched\n');
+  await workspace.write(
+    'temp-probe.js',
+    [
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      'const directory = process.env.TMPDIR;',
+      "fs.writeFileSync('observed-tmpdir', directory);",
+      "fs.writeFileSync(path.join(directory, 'command-evidence'), 'command evidence\\n');",
+      "console.log('actual-tmpdir=' + directory);",
+      'process.exit(Number(process.env.PROBE_EXIT_CODE ?? 0));',
+      '',
+    ].join('\n'),
+  );
+  process.env.TMPDIR = legacy;
+  process.env.COWSHED_RUNTIME_LINK = ordinary;
+  try {
+    await body(workspace);
+    expect((await readdir(legacy)).sort()).toEqual(['.smoo-ram', 'existing']);
+    expect(await readFile(join(legacy, '.smoo-ram'), 'utf8')).toBe('legacy-volume-name\n');
+    expect(await readFile(join(legacy, 'existing'), 'utf8')).toBe('leave these bytes untouched\n');
+  } finally {
+    if (inherited === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = inherited;
+    if (runtime === undefined) delete process.env.COWSHED_RUNTIME_LINK;
+    else process.env.COWSHED_RUNTIME_LINK = runtime;
+  }
 }

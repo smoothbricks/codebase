@@ -1024,6 +1024,39 @@ mod tests {
         assert!(!lock_line_holds(waiter, 0xfd, 1, 1311));
     }
 
+    /// The lock at `path`, once the kernel grants it after its holders let go. A probe at a
+    /// spawn's return, or at its command's reaping, never proves the lock released: copies of
+    /// the parent's descriptors outlive both. Darwin's `posix_spawnp` (Libc `sys/posix_spawn.c`)
+    /// and `execvp` try each `PATH` entry in turn, and XNU clones the process for every try
+    /// before it looks the program up (`fdt_fork` copies a spawn's close-on-exec descriptors and
+    /// an exec's inherited ones); a try that fails is torn down by its own thread after the call
+    /// has returned. A forked child reports its `exec` before `exec` has closed every
+    /// close-on-exec descriptor. A lock still held when the wait begins is named on stderr first,
+    /// so a holder that never lets go, which this wait never outlasts, leaves its name in the
+    /// test's output.
+    fn granted(path: &Path) -> io::Result<HeldLock> {
+        match Opened::open(path)?.try_hold()? {
+            Ok(grant) => Ok(grant),
+            Err(waiter) => {
+                cowshed_os::eprintln!(
+                    "{} is still held after its holder let go; waiting for the kernel to grant it: {}",
+                    path.display(),
+                    holders(path)
+                );
+                waiter.hold()
+            }
+        }
+    }
+
+    /// Whether `command` still ran when the kernel granted the lock at `path` its holder let go
+    /// of ([`granted`]): the proof that the command kept no copy of it.
+    fn granted_while_running(path: &Path, command: &mut std::process::Child) -> io::Result<bool> {
+        let grant = granted(path)?;
+        let running = command.try_wait()?.is_none();
+        drop(grant);
+        Ok(running)
+    }
+
     /// The boundary that keeps an inherited lock from escaping into a lasting service. A command
     /// handed the lock holds it with its taker; every process cowshed starts to outlive its starter
     /// (a workspace supervisor, a job, the Nx daemon inside one) is spawned through
@@ -1048,18 +1081,22 @@ mod tests {
         crate::exec::prepare_child_descriptors(&mut command).expect("seal the child's descriptors");
         let mut service = command.spawn_locked().expect("spawn the service");
         drop(held);
-        let free = File::open(&path).expect("open the lock").try_lock();
+        // Collect the observation before ending the service, and assert only once it is reaped.
+        let released = granted_while_running(&path, &mut service);
         service.kill().expect("end the service");
         service.wait().expect("reap the service");
         assert!(
-            free.is_ok(),
-            "a process cowshed started kept the lock its starter let go of: {free:?}"
+            released.expect("wait for the lock"),
+            "a process cowshed started kept the lock its starter let go of: the kernel granted it only after the service ended"
         );
     }
 
     /// The handoff itself, independent of how Node or another runtime spawns its children.
     /// Both real commands wait on our stdin pipe; only the explicitly handed descriptor keeps
-    /// the lock after the parent closes its copy, and EOF releases the child and the lock.
+    /// the lock after the parent closes its copy, and EOF releases the child and the lock. A
+    /// handed command shares the open file description, so a waiter refused while it reads is
+    /// proof; an unhanded one keeps no copy, which only a grant while it reads proves
+    /// ([`granted_while_running`]), and the release at its exit is the next waiter's grant.
     #[test]
     fn only_a_command_handed_the_descriptor_keeps_the_lock_until_it_exits() {
         use cowshed_os::fork_lock::Spawn as _;
@@ -1084,21 +1121,29 @@ mod tests {
             drop(held);
             // Collect the observation without asserting until our child has been released
             // and reaped, so a failing oracle cannot strand it or its inherited lock.
-            let free = Opened::open(&path)
-                .and_then(Opened::try_hold)
-                .map(|grant| grant.is_ok());
+            let failure = if handed {
+                Opened::open(&path).and_then(Opened::try_hold).map(|grant| {
+                    grant.ok().map(|grant| {
+                        drop(grant);
+                        format!(
+                            "the kernel granted the lock while the command it was handed to still ran; it shows: {}",
+                            holders(&path)
+                        )
+                    })
+                })
+            } else {
+                granted_while_running(&path, &mut child).map(|running| {
+                    (!running).then(|| {
+                        "the kernel granted the lock only after the command it was not handed to had ended".to_owned()
+                    })
+                })
+            };
             drop(child.stdin.take());
             let status = child.wait().expect("reap the reader");
             assert!(status.success(), "reader exit: {status}");
-            assert_eq!(free.expect("probe the lock"), !handed, "handed: {handed}");
-            assert!(
-                Opened::open(&path)
-                    .expect("open the released lock")
-                    .try_hold()
-                    .expect("probe the released lock")
-                    .is_ok(),
-                "the exited child left the lock held (handed: {handed})"
-            );
+            assert_eq!(failure.expect("probe the lock"), None, "handed: {handed}");
+            // The reader has exited, so the kernel grants the lock to the next waiter.
+            drop(granted(&path).expect("wait for the released lock"));
         }
     }
 }

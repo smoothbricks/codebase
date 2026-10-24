@@ -406,9 +406,10 @@ it still take their turn; the next full listing walks it again from its root.
 The roots are canonical `/tmp` and the daemon/CLI's non-RAM temp root, deduplicated. Foreign `node_*`, `bash_*`,
 `cargo_*`, `bun_*`, `devenv-*`, and `sccache_*` entries are excluded, even if they contain a marker. Bounded-exec
 remains the sole owner of RAM lease reclamation: `ram-temp.ts::settle` runs under its kernel lock, claim ledger and
-identity recheck during acquire/release. This sweep never enters `smoo-ram*` volumes, leases, staging, `.archive`,
-`.archive/.deleting`, locks or ledgers, and reports that delegation. Reclamation and retention decisions are printed by
-path and reason; the summary states the examined count and bound.
+identity recheck during acquire/release. This sweep never enters the per-user `ram<revision>` mounts below
+`/private/var/folders/cowshed/<uid>`, their leases, staging, `.archive`, `.archive/.deleting`, locks or ledgers, and
+reports that delegation. Reclamation and retention decisions are printed by path and reason; the summary states the
+examined count and bound.
 
 ## Tradeoffs
 

@@ -206,6 +206,15 @@ lifecycle/result metadata, hashes, bounded summaries, and—only when the canoni
 `BinaryData` `utf8|base64` tagged union. Live progress on stderr remains control-only NDJSON. Unbounded child output
 never enters JSON, and controller commitments never receive either inline encoding.
 
+The CLI writes its stdout and stderr with a blocking write's semantics whatever flags the inherited descriptors carry: a
+foreground job's relayed bytes and cowshed's own `cowshed:` diagnostic lines alike. `O_NONBLOCK` belongs to the open
+file description, which a parent that drives the same pipe from an event loop, such as Node, may set; a write the kernel
+then refuses with `EAGAIN` waits in `poll(2)` for `POLLOUT` on that same descriptor, with no deadline, and is made
+again. Cowshed never clears the flag: the description is the parent's too. Only a real failure ends the relay with an
+error: `EPIPE` once the reader is gone, `EIO`, or a closed descriptor. Observed before this rule: a foreground exec
+relaying a 22-minute gate exited 5 with `could not write child output: Resource temporarily unavailable (os error 35)`
+while its consumer was still reading.
+
 `JobInfo` also carries structured stdin metadata (`kind`, delivered `bytes`, `complete`, and an optional normalized
 workspace-relative `path`) and the explicit `output-limit` terminal state. The configurable combined stdout+stderr
 capture quota defaults to 1 GiB. Crossing counts protected plus in-flight bytes, then TERM/grace/KILLs the process
@@ -312,6 +321,11 @@ lease"). The option is parsed only before `--`; every later argument remains the
 the tool. A Disk Arbitration release of a disk-image disk another user owns, or one whose disk cannot be named, is
 refused before it spawns as a conflict (`ReleaseNeedsAuthorization`, 01a_apfs.md "Release authority"), never left
 waiting on an administrator prompt.
+
+`--gateway-socket <absolute path>`, before `--`, selects the control socket for this command's disk-lifecycle admission
+instead of the host socket. It uses the same peer authentication, admission and child runner; it changes neither release
+authority nor registry-bound revalidation inside admission. No environment variable selects this route. A relative path
+is refused.
 
 For SAFE commands, the facade starts one monotonic total admission-and-child budget before handing work to the blocking
 runner: 120000 ms by default, or the supplied positive integer milliseconds. Exhausted admission never executes the

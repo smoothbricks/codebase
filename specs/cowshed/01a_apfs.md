@@ -838,8 +838,12 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    on a dead pipe: the command finishes, and the next invocation reconciles the result from the kernel's attachment
    inventory (an attach that completed is registered, one that never started left nothing). Nothing in cowshed kills it.
    The bounded-exec RAM volume's detach follows the same rule on its side: it is never killed at its deadline, its wait
-   is bounded and reported by name, and a stray's detach gets a short bound before the creator reports it and gives the
-   create claim back, so one wedged stray cannot hold a chain of creators.
+   is bounded and reported by name, but a stopped wait is not a completed operation: its exact detach and volume claim
+   remain until a normal native terminal receipt, or a registry-bound detach's exact recorded entry disappearing, proves
+   the detach finished. A proven gateway pre-spawn refusal releases the claim without inventing a native exit; an
+   unknown result retains it. PID death alone is not completion. RAM provisioning captures the exact entry before
+   mutation and rolls back through the same non-forced gateway detach; a busy owned staging volume remains with its
+   refusal. A new lease cannot enter a volume a still-running detach can remove; unrelated volumes remain independent.
 
    **No disk-image command is killed.** For a disk-image command the caller's deadline is a warning point, not a kill:
    it is waited for, synchronously and still holding its leases, and reports its verb, target, elapsed time and observed

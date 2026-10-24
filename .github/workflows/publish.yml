@@ -289,13 +289,72 @@ jobs:
           --github-output "$GITHUB_OUTPUT"
 
       # Step 8
+      - name: Provision the per-user mount root for macOS tests
+        # The real-APFS tests mount images below /private/var/folders/cowshed/<uid>/t, whose
+        # per-user root only "cowshed setup" provisions (mount_root_operations in cowshed-core's
+        # macOS bootstrap: a root:wheel 0755 prefix, then uid:gid 0700 user directories). The
+        # bootstrap owner of that provisioning authorizes through an interactive prompt, so a
+        # runner cannot run it, and no fixture may create the root-owned prefix from inside its
+        # ordinary grants (specs/cowshed/08_testing.md). The job therefore applies setup's same
+        # three owned-directory operations, split by the privilege each actually needs: sudo
+        # creates only the prefix and the per-user root, each beneath a root-owned parent no
+        # unprivileged writer can plant a link in, while mnt is created by the runner inside
+        # its own 0700 root, exactly as the fixtures create t there. A symlink, non-directory
+        # or foreign owner in any path's place is refused, never repaired over, and every
+        # result is attested by one portable lstat read (python3), never a platform stat
+        # dialect. The uid and gid are the runner account's own, read here, never assumed.
+        if: matrix.arch == 'arm64' && steps.platform-outputs.outputs.projects != ''
+        run: |
+          directory_metadata() {
+            python3 -c 'import os, stat, sys
+          path = sys.argv[1]
+          try:
+              found = os.lstat(path)
+          except FileNotFoundError:
+              print("absent")
+              raise SystemExit(0)
+          if not stat.S_ISDIR(found.st_mode):
+              raise SystemExit("refusing mount root path " + path + ": not a plain directory")
+          print(found.st_uid, found.st_gid, format(stat.S_IMODE(found.st_mode), "o"))' "$1"
+          }
+          ensure_owned_directory() {
+            path="$1"; owner="$2"; group="$3"; mode="$4"; authority="$5"
+            metadata="$(directory_metadata "$path")" || exit 1
+            if [ "$metadata" != "absent" ]; then
+              case "$metadata" in
+                "$owner $group "*) ;;
+                *)
+                  echo "refusing foreign mount root directory $path: owned by $metadata, expected $owner $group" >&2
+                  exit 1
+                  ;;
+              esac
+            fi
+            if [ "$authority" = "privileged" ]; then
+              sudo install -d -o "$owner" -g "$group" -m "$mode" "$path"
+            else
+              install -d -m "$mode" "$path"
+            fi
+            actual="$(directory_metadata "$path")" || exit 1
+            if [ "$actual" != "$owner $group $mode" ]; then
+              echo "mount root path $path is $actual, expected $owner $group $mode" >&2
+              exit 1
+            fi
+          }
+          uid="$(id -u)"
+          gid="$(id -g)"
+          prefix="/private/var/folders/cowshed"
+          ensure_owned_directory "$prefix" 0 0 755 privileged
+          ensure_owned_directory "$prefix/$uid" "$uid" "$gid" 700 privileged
+          ensure_owned_directory "$prefix/$uid/mnt" "$uid" "$gid" 700 runner
+
+      # Step 9
       - name: 🧪 Unit test selected macOS and iOS packages
         # Only the runner-native leg can execute what it built; the foreign
         # architecture ships as an artifact without running here.
         if: matrix.arch == 'arm64' && steps.platform-outputs.outputs.projects != ''
         run: smoo github-ci nx-run-many --targets test --projects "${{ steps.platform-outputs.outputs.projects }}"
 
-      # Step 9
+      # Step 10
       - name: 📤 Upload macOS platform outputs (${{ matrix.arch }})
         if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -308,7 +367,7 @@ jobs:
 
       # --- Cleanup ------------------------------------------------------------
 
-      # Step 10
+      # Step 11
       - name: 🧹 Cleanup and cache Nix/devenv
         # success() is default; always() still saves GH Nix cache after a red job.
         if: always()

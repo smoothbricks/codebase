@@ -1,15 +1,16 @@
-import { describe, expect, it } from 'bun:test';
-import { execFileSync } from 'node:child_process';
+import { describe, expect, it, jest } from 'bun:test';
+import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { closeSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, watch, writeFileSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
-import { tmpdir } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { churnScript, openForProbe, writerRemains } from '../../__tests__/churn-group.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { awaitExit, ownedSocketDirectory } from '../../testing.js';
+import { attachRamDisk } from './ram-attach.js';
 import {
   type AttachedRamDisk,
   COWSHED_EXECUTABLE_ENV,
@@ -18,6 +19,7 @@ import {
   describeRamTempError,
   detachRamDisk,
   diskCommand,
+  type HostCommands,
   imagesBackedUnder,
   mountsBelow,
   operationDisk,
@@ -138,6 +140,12 @@ describe('the root the RAM temp volume mounts below', () => {
         const volume = new RamTempVolume(paths, 512, {
           async run(file) {
             throw new Error(`${file} ran before the root was checked`);
+          },
+          async detachRam() {
+            throw new Error('no disk exists');
+          },
+          async attachRam() {
+            throw new Error('a RAM disk was attached before the root was checked');
           },
         });
         const error: RamTempError = { kind: 'root-unready', root, detail };
@@ -500,8 +508,8 @@ describe('detaching a RAM disk an inventory found', () => {
     const calls: unknown[] = [];
     const result = await detachRamDisk(
       {
-        async run(file, args, deadlineMs, binding) {
-          calls.push({ file, args, deadlineMs, binding });
+        async detachRam(device, registryEntry, deadlineMs) {
+          calls.push({ device, registryEntry, deadlineMs });
           return output;
         },
       },
@@ -516,10 +524,9 @@ describe('detaching a RAM disk an inventory found', () => {
     expect(result).toEqual({ ok: true, value: undefined });
     expect(calls).toEqual([
       {
-        file: '/usr/bin/hdiutil',
-        args: ['detach', '/dev/disk540'],
+        device: '/dev/disk540',
         deadlineMs: undefined,
-        binding: { registryEntry: '0x10005557b' },
+        registryEntry: '0x10005557b',
       },
     ]);
   });
@@ -554,5 +561,731 @@ describe('detaching a RAM disk an inventory found', () => {
       },
     });
     expect(calls).toHaveLength(1);
+  });
+});
+
+/** A gateway on an owned socket that answers each connection's one line with `answer(line)` once the client half-closes. */
+async function withGateway<T>(answer: (line: string) => string, body: (socket: string) => Promise<T>): Promise<T> {
+  const directory = await ownedSocketDirectory('ra-', 'gw.sock');
+  const socket = join(directory, 'gw.sock');
+  const server = createServer({ allowHalfOpen: true }, (client) => {
+    let line = '';
+    client.on('data', (chunk: Buffer) => {
+      line += chunk.toString('utf8');
+    });
+    client.on('end', () => client.end(answer(line)));
+  });
+  try {
+    const { promise: listening, resolve: listened, reject: failed } = Promise.withResolvers<void>();
+    server.once('error', failed);
+    server.listen(socket, listened);
+    await listening;
+    server.off('error', failed);
+    return await body(socket);
+  } finally {
+    server.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+describe("the gateway's ram-attach", () => {
+  it('asks for one size, half-closed, and answers the whole disk the gateway names', async () => {
+    const asked: string[] = [];
+    const attached = await withGateway(
+      (line) => {
+        asked.push(line);
+        return '{"ok":true,"ramDisk":{"device":"/dev/disk7"}}\n';
+      },
+      (socket) => createHostCommands(BOUNDED_TEST_IDLE_TIMEOUT_MS, socket).attachRam(131_072),
+    );
+    expect(asked).toEqual(['{"op":"ram-attach","sectors":131072}\n']);
+    expect(attached).toEqual({ ok: true, value: '/dev/disk7' });
+  });
+
+  it('names a gateway that predates the operation, a refusal, and an answer without a whole disk', async () => {
+    const answers = [
+      '{"ok":false,"code":"invalid-request","error":"gateway control encoding failed: unknown gateway control operation"}\n',
+      '{"ok":false,"code":"rejected","error":"hdiutil attach -nomount ram://131072 ended exit 1: no memory"}\n',
+      '{"ok":true,"ramDisk":{"device":"/dev/disk7s1"}}\n',
+    ];
+    const outcomes = [];
+    for (const answer of answers) {
+      outcomes.push(
+        await withGateway(
+          () => answer,
+          (socket) => attachRamDisk(socket, 131_072, BOUNDED_TEST_IDLE_TIMEOUT_MS),
+        ),
+      );
+    }
+    expect(outcomes).toEqual([
+      {
+        ok: false,
+        error: {
+          kind: 'ram-unavailable',
+          reason: 'gateway-unsupported',
+          detail:
+            'gateway predates ram-attach (invalid-request: gateway control encoding failed: unknown gateway control operation)',
+        },
+      },
+      {
+        ok: false,
+        error:
+          'the gateway refused ram-attach (rejected: hdiutil attach -nomount ram://131072 ended exit 1: no memory)',
+      },
+      { ok: false, error: `the gateway's ram-attach answer names no whole disk: ${answers[2]?.trim()}` },
+    ]);
+  });
+
+  it('attaches nothing itself when no gateway answers', async () => {
+    const directory = await ownedSocketDirectory('ra-', 'gw.sock');
+    try {
+      const socket = join(directory, 'gw.sock');
+      const outcome = await attachRamDisk(socket, 131_072, BOUNDED_TEST_IDLE_TIMEOUT_MS);
+      expect(outcome.ok).toBe(false);
+      expect(outcome).toMatchObject({ ok: false, error: { kind: 'ram-unavailable', reason: 'gateway-absent' } });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('creating the RAM temp volume', () => {
+  it('asks its owner for the disk and never runs an attach of its own', async () => {
+    // A root the creation accepts, and paths below it, so nothing here can find the user's volume.
+    const parent = mkdtempSync(join(tmpdir(), 'ra-create-'));
+    const root = join(parent, 'root');
+    mkdirSync(root, { mode: 0o700 });
+    const paths = {
+      ...ramTempPaths(userInfo()),
+      root,
+      mountpoint: join(root, 'ram'),
+      staging: join(root, 'ram-new'),
+      lockFile: join(parent, 'v.lock'),
+    };
+    const ran: string[] = [];
+    const asked: number[] = [];
+    const commands: HostCommands = {
+      async run(file, args): Promise<CommandOutput> {
+        ran.push([file, ...args].join(' '));
+        // The stray inventory finds no RAM disk and nothing mounted; no other command may run before the attach.
+        if (file === '/usr/sbin/ioreg' || file === '/sbin/mount') {
+          return { status: 0, stdout: '', stderr: '' };
+        }
+        throw new Error(`${file} ${args.join(' ')} ran: the creation attached a disk of its own`);
+      },
+      async detachRam() {
+        throw new Error('no disk exists');
+      },
+      async attachRam(sectors) {
+        asked.push(sectors);
+        return { ok: false, error: 'the owner refused' };
+      },
+    };
+    try {
+      const volume = new RamTempVolume(paths, 64 * 1024 * 1024, commands);
+      const acquired = await volume.acquire({
+        rootArgv() {
+          throw new Error('a creation that failed admits no command');
+        },
+        async retire() {
+          throw new Error('a creation that failed settles no dead lease');
+        },
+      });
+      expect(acquired).toEqual({
+        ok: false,
+        error: { kind: 'provision-failed', step: 'ram-attach', detail: 'the owner refused' },
+      });
+      expect(asked).toEqual([131_072]);
+      expect(ran).toEqual(['/usr/sbin/ioreg -r -c IOHDIXHDDriveOutKernel -l -w0', '/sbin/mount']);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+});
+
+/** No native disk command runs: the only child is this owned facade, whose effect and exit have separate controls. */
+async function detachCustodyFixture(mode: 'stray' | 'rollback' = 'stray', boundMs = 300) {
+  const directory = await ownedSocketDirectory('rc-', 's.sock');
+  const socketPath = join(directory, 's.sock');
+  const registry = join(directory, 'registry');
+  const executable = join(directory, 'cowshed');
+  const root = join(directory, 'root');
+  mkdirSync(root, { mode: 0o700 });
+  const paths = {
+    ...ramTempPaths(userInfo()),
+    root,
+    mountpoint: join(root, 'ram'),
+    staging: join(root, 'ram-new'),
+    lockFile: join(directory, 'v.lock'),
+    volumeName: 'owned-scripted-ram',
+  };
+  const capacity = 131_072 * 512;
+  const entry = '0x100000abc';
+  const image = [
+    `+-o IOHDIXHDDriveOutKernel <class IOHDIXHDDriveOutKernel, id ${entry}, registered, matched, active, busy 0, retain 1>`,
+    '{',
+    '  "image-path" = <"ram://131072">',
+    `  "owner-uid" = ${paths.uid}`,
+    '  "BSD Name" = "disk7"',
+    '}',
+    '',
+  ].join('\n');
+  await writeFile(registry, mode === 'stray' ? image : '');
+  const connected = Promise.withResolvers<Socket>();
+  let connection: Socket | undefined;
+  const server = createServer((socket) => {
+    connection = socket;
+    connected.resolve(socket);
+  });
+  const listening = Promise.withResolvers<void>();
+  server.once('error', listening.reject);
+  server.listen(socketPath, listening.resolve);
+  await listening.promise;
+  server.off('error', listening.reject);
+  const session = connected.promise.then((socket) => ({
+    socket,
+    lines: createInterface({ input: socket })[Symbol.asyncIterator](),
+  }));
+  const expected = ['disk-command', 'hdiutil', '--registry-entry', entry, '--', 'detach', '/dev/disk7'];
+  await writeFile(
+    executable,
+    `#!${process.execPath}\n` +
+      `import { once } from 'node:events';
+import { writeFile } from 'node:fs/promises';
+import { createConnection } from 'node:net';
+import { createInterface } from 'node:readline';
+const args = process.argv.slice(2);
+if (args[2] === '--gateway-socket') {
+  if (args[3] !== ${JSON.stringify(join(directory, 'unused-gateway.sock'))}) throw new Error('foreign gateway route');
+  args.splice(2, 2);
+}
+if (JSON.stringify(args) !== ${JSON.stringify(JSON.stringify(expected))}) throw new Error('unexpected disk argv: ' + JSON.stringify(args));
+const socket = createConnection(${JSON.stringify(socketPath)});
+await once(socket, 'connect');
+const lines = createInterface({ input: socket });
+socket.write('ready ' + process.pid + '\\n');
+for await (const command of lines) {
+  if (command === 'inspect') socket.write('alive\\n');
+  else if (command === 'complete') {
+    await writeFile(${JSON.stringify(registry)}, '');
+    socket.write('effect\\n');
+  } else if (command === 'finish' || command === 'cleanup' || command === 'wrapper-failure') {
+    if (command === 'wrapper-failure') {
+      process.stderr.write('owned wrapper wait failed; native terminal status unavailable\\n');
+      process.exitCode = 100;
+    }
+    if (command === 'finish') {
+      process.stdout.write('owned terminal stdout\\n');
+      process.stderr.write('owned terminal stderr\\n');
+    }
+    socket.end('exiting\\n');
+    break;
+  } else if (command === 'signal') process.kill(process.pid, 'SIGTERM');
+  else throw new Error('unexpected fixture control: ' + command);
+}
+lines.close();
+socket.end();
+`,
+    { mode: 0o755 },
+  );
+  const host = createHostCommands(300, join(directory, 'unused-gateway.sock'), 'shared', executable);
+  const output = Promise.withResolvers<CommandOutput>();
+  const calls: string[] = [];
+  let attaches = 0;
+  let recorded = mode === 'stray';
+  const commands: HostCommands = {
+    async run(file, args, _deadlineMs, binding) {
+      calls.push([file, ...args].join(' '));
+      if (file === '/usr/sbin/ioreg') return { status: 0, stdout: await readFile(registry, 'utf8'), stderr: '' };
+      if (file === '/sbin/mount') return { status: 0, stdout: '', stderr: '' };
+      if (mode === 'rollback' && file === '/usr/sbin/diskutil')
+        return { status: 1, stdout: '', stderr: 'owned provisioning failure' };
+      if (file !== '/usr/bin/hdiutil') throw new Error(`unexpected fixture command: ${file}`);
+      // The production caller's bound is the subject; the scripted child cannot complete until commanded.
+      const result = await host.run(file, args, boundMs, binding);
+      output.resolve(result);
+      return result;
+    },
+    ownsRamDisk: (disk) =>
+      recorded && disk.entry === entry && disk.physical === '/dev/disk7' && disk.sectors === capacity / 512,
+    detachRam: (device, registryEntry, deadlineMs) =>
+      commands.run('/usr/bin/hdiutil', ['detach', device], deadlineMs, { registryEntry }),
+    async attachRam() {
+      attaches += 1;
+      if (mode === 'rollback') {
+        recorded = true;
+        await writeFile(registry, image);
+      }
+      return mode === 'rollback'
+        ? { ok: true, value: '/dev/disk7' }
+        : { ok: false, error: 'owned attach admission reached' };
+    },
+  };
+  const subtrees = {
+    rootArgv(): never {
+      throw new Error('no command is admitted by this scripted volume');
+    },
+    async retire(): Promise<never> {
+      throw new Error('no subtree exists on this scripted volume');
+    },
+  };
+  let pid: number | undefined;
+  async function event() {
+    const { lines } = await session;
+    const next = await lines.next();
+    if (next.done) throw new Error('scripted facade closed before its event');
+    return next.value;
+  }
+  return {
+    directory,
+    socketPath,
+    executable,
+    registry,
+    paths,
+    capacity,
+    entry,
+    image,
+    commands,
+    subtrees,
+    calls,
+    output: output.promise,
+    attaches: () => attaches,
+    volume: () => new RamTempVolume(paths, capacity, commands),
+    ledger: () => JSON.parse(readFileSync(`${paths.lockFile}.ledger`, 'utf8')),
+    event,
+    async ready() {
+      const match = /^ready (\d+)$/.exec(await event());
+      if (match === null) throw new Error('scripted facade did not report readiness');
+      pid = Number(match[1]);
+      return pid;
+    },
+    async send(command: 'inspect' | 'complete' | 'finish' | 'signal' | 'wrapper-failure') {
+      (await session).socket.write(`${command}\n`);
+    },
+    async cleanup() {
+      try {
+        if (connection !== undefined && !connection.destroyed) {
+          const closed = once(connection, 'close');
+          if (!connection.writableEnded) connection.write('cleanup\n');
+          await closed;
+        }
+        if (pid !== undefined)
+          await awaitExit([{ pid, ppid: process.pid, stat: 'S', command: executable }], 'scripted detach facade');
+      } finally {
+        const closed = Promise.withResolvers<void>();
+        server.close((error) => (error ? closed.reject(error) : closed.resolve()));
+        await closed.promise;
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  };
+}
+
+/** Publication is a rename; observe that event instead of sleeping for a late completion callback. */
+function clearedDetachLedger(directory: string, ledgerPath: string) {
+  const cleared = Promise.withResolvers<void>();
+  const watcher = watch(directory, (_event, filename) => {
+    if (filename !== 'v.lock.ledger') return;
+    try {
+      const ledger = JSON.parse(readFileSync(ledgerPath, 'utf8'));
+      if (ledger.version === 1 && ledger.lifecycle === null) cleared.resolve();
+    } catch (error) {
+      cleared.reject(error);
+    }
+  });
+  return { promise: cleared.promise, close: () => watcher.close() };
+}
+
+describe('RAM detach custody after a bounded wait', () => {
+  it('fences the next lease while the scripted child lives, without fencing an unrelated volume', async () => {
+    const fixture = await detachCustodyFixture();
+    jest.useFakeTimers();
+    try {
+      const acquiring = fixture.volume().acquire(fixture.subtrees);
+      const pid = await fixture.ready();
+      jest.advanceTimersByTime(300);
+      const failed = await acquiring;
+      jest.useRealTimers();
+      expect(failed.ok).toBe(false);
+      expect(JSON.stringify(failed)).toContain('left running, not killed');
+      expect(fixture.ledger()).toMatchObject({
+        version: 2,
+        lifecycle: {
+          kind: 'create',
+          pending: {
+            physical: '/dev/disk7',
+            registryEntry: fixture.entry,
+            phase: 'reported',
+            facadePid: pid,
+          },
+        },
+        claims: [],
+      });
+      // Version 2 is the current fail-closed wire; historical-reader behavior is not inferred from this field.
+      expect(JSON.stringify(await fixture.volume().acquire(fixture.subtrees))).toContain('no lease admitted');
+      expect(fixture.attaches()).toBe(0);
+      await fixture.send('inspect');
+      expect(await fixture.event()).toBe('alive');
+
+      let unrelatedAdmitted = false;
+      const unrelated = new RamTempVolume(
+        {
+          ...fixture.paths,
+          lockFile: join(fixture.directory, 'other.lock'),
+          mountpoint: join(fixture.paths.root, 'other'),
+          staging: join(fixture.paths.root, 'other-new'),
+        },
+        fixture.capacity,
+        {
+          async run(file) {
+            if (file !== '/usr/sbin/ioreg' && file !== '/sbin/mount')
+              throw new Error(`unexpected unrelated command: ${file}`);
+            return { status: 0, stdout: '', stderr: '' };
+          },
+          async detachRam() {
+            throw new Error('no unrelated disk');
+          },
+          async attachRam() {
+            unrelatedAdmitted = true;
+            return { ok: false, error: 'unrelated admission reached' };
+          },
+        },
+      );
+      expect(JSON.stringify(await unrelated.acquire(fixture.subtrees))).toContain('unrelated admission reached');
+      expect(unrelatedAdmitted).toBe(true);
+
+      await writeFile(fixture.registry, 'incomplete registry');
+      expect(JSON.stringify(await fixture.volume().acquire(fixture.subtrees))).toContain(
+        'not an IOHDIXHDDriveOutKernel entry',
+      );
+      expect(fixture.ledger().version).toBe(2);
+      await writeFile(fixture.registry, fixture.image);
+      const cleared = clearedDetachLedger(fixture.directory, `${fixture.paths.lockFile}.ledger`);
+      try {
+        await fixture.send('complete');
+        expect(await fixture.event()).toBe('effect');
+        await fixture.send('finish');
+        expect(await fixture.event()).toBe('exiting');
+        const output = await fixture.output;
+        expect(output.pending).toBeDefined();
+        expect(await output.pending?.completion).toEqual({
+          status: 0,
+          stdout: 'owned terminal stdout\n',
+          stderr: 'owned terminal stderr\n',
+        });
+        await cleared.promise;
+      } finally {
+        cleared.close();
+      }
+      expect(fixture.ledger()).toEqual({ version: 1, lifecycle: null, claims: [], held: [] });
+      expect(JSON.stringify(await fixture.volume().acquire(fixture.subtrees))).toContain(
+        'owned attach admission reached',
+      );
+      expect(fixture.attaches()).toBe(1);
+    } finally {
+      jest.useRealTimers();
+      await fixture.cleanup();
+    }
+  });
+
+  it('keeps a dead caller fenced until its bound registry incarnation disappears, even with its facade still alive', async () => {
+    const fixture = await detachCustodyFixture();
+    const script = join(fixture.directory, 'caller.mjs');
+    await writeFile(
+      script,
+      `import { once } from 'node:events';
+import { readFile } from 'node:fs/promises';
+import { createHostCommands, RamTempVolume } from ${JSON.stringify(new URL('../../../dist/executors/bounded-exec/ram-temp.js', import.meta.url).href)};
+const paths = ${JSON.stringify(fixture.paths)};
+const host = createHostCommands(300, ${JSON.stringify(join(fixture.directory, 'unused-gateway.sock'))}, 'shared', ${JSON.stringify(fixture.executable)});
+const commands = {
+  async run(file, args, deadline, binding) {
+    if (file === '/usr/sbin/ioreg') return { status: 0, stdout: await readFile(${JSON.stringify(fixture.registry)}, 'utf8'), stderr: '' };
+    if (file === '/sbin/mount') return { status: 0, stdout: '', stderr: '' };
+    if (file !== '/usr/bin/hdiutil') throw new Error('unexpected child command: ' + file);
+    return host.run(file, args, 300, binding);
+  },
+  async attachRam() { throw new Error('the bounded detach must precede attach admission'); },
+  ownsRamDisk: (disk) => disk.entry === ${JSON.stringify(fixture.entry)} && disk.physical === '/dev/disk7',
+  detachRam: (device, registryEntry, deadlineMs) => commands.run('/usr/bin/hdiutil', ['detach', device], deadlineMs, { registryEntry }),
+};
+const volume = new RamTempVolume(paths, ${fixture.capacity}, commands);
+const result = await volume.acquire({ rootArgv() { throw new Error('no subtree'); }, async retire() { throw new Error('no subtree'); } });
+console.log(JSON.stringify(result));
+process.stdin.resume();
+await once(process.stdin, 'end');
+`,
+    );
+    const caller = spawn('node', [script], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const ended = once(caller, 'close');
+    const lines = createInterface({ input: caller.stdout });
+    // The caller can publish its bounded result before the independent facade reports readiness.
+    const receipt = lines[Symbol.asyncIterator]().next();
+    const errors: Buffer[] = [];
+    caller.stderr.on('data', (chunk: Buffer) => errors.push(chunk));
+    try {
+      const facade = await Promise.race([
+        fixture.ready(),
+        ended.then(([code, signal]) => {
+          throw new Error(
+            `owned caller exited before its facade became ready (${code}/${signal}): ${Buffer.concat(errors).toString()}`,
+          );
+        }),
+      ]);
+      const next = await receipt;
+      if (next.done)
+        throw new Error(`owned caller stdout ended without a receipt: ${Buffer.concat(errors).toString()}`);
+      expect(next.value).toContain('left running, not killed');
+      const before = fixture.ledger();
+      expect(before.lifecycle.owner.pid).toBe(caller.pid);
+      if (caller.pid === undefined) throw new Error('owned caller has no pid');
+      caller.kill('SIGKILL');
+      expect(await ended).toEqual([null, 'SIGKILL']);
+      expect(Buffer.concat(errors).toString()).toBe('');
+      expect(JSON.stringify(await fixture.volume().acquire(fixture.subtrees))).toContain('no lease admitted');
+      expect(fixture.ledger()).toEqual(before);
+      expect(() => process.kill(facade, 0)).not.toThrow();
+      expect(fixture.attaches()).toBe(0);
+      await fixture.send('complete');
+      expect(await fixture.event()).toBe('effect');
+      expect(JSON.stringify(await fixture.volume().acquire(fixture.subtrees))).toContain(
+        'owned attach admission reached',
+      );
+      expect(fixture.attaches()).toBe(1);
+      expect(fixture.ledger()).toEqual({ version: 1, lifecycle: null, claims: [], held: [] });
+      // The registry witness permits admission while this exact old facade still waits for its exit control.
+      await fixture.send('inspect');
+      expect(await fixture.event()).toBe('alive');
+    } finally {
+      lines.close();
+      if (caller.exitCode === null && caller.signalCode === null) caller.kill('SIGKILL');
+      await ended;
+      await fixture.cleanup();
+    }
+  });
+
+  it('retains captured provisioning rollback custody until terminal receipt or exact entry absence', async () => {
+    const fixture = await detachCustodyFixture('rollback');
+    jest.useFakeTimers();
+    try {
+      const acquiring = fixture.volume().acquire(fixture.subtrees);
+      await fixture.ready();
+      jest.advanceTimersByTime(300);
+      expect(JSON.stringify(await acquiring)).toContain('owned provisioning failure');
+      jest.useRealTimers();
+      expect(fixture.ledger()).toMatchObject({
+        version: 2,
+        lifecycle: { pending: { registryEntry: fixture.entry, phase: 'reported' } },
+      });
+      const afterDeath = new RamTempVolume(fixture.paths, fixture.capacity, fixture.commands, process.pid, () => false);
+      expect(JSON.stringify(await afterDeath.acquire(fixture.subtrees))).toContain(
+        'no lease admitted until terminal completion',
+      );
+      expect(fixture.attaches()).toBe(1);
+      const cleared = clearedDetachLedger(fixture.directory, `${fixture.paths.lockFile}.ledger`);
+      try {
+        await fixture.send('finish');
+        expect(await fixture.event()).toBe('exiting');
+        expect((await (await fixture.output).pending?.completion)?.status).toBe(0);
+        await cleared.promise;
+      } finally {
+        cleared.close();
+      }
+      expect(fixture.ledger()).toEqual({ version: 1, lifecycle: null, claims: [], held: [] });
+      expect(fixture.calls.filter((call) => call.startsWith('/usr/bin/hdiutil'))).toEqual([
+        '/usr/bin/hdiutil detach /dev/disk7',
+      ]);
+    } finally {
+      jest.useRealTimers();
+      await fixture.cleanup();
+    }
+  });
+
+  it('never mistakes a signalled facade for a terminal disk-child receipt', async () => {
+    const fixture = await detachCustodyFixture();
+    try {
+      const acquiring = fixture.volume().acquire(fixture.subtrees);
+      await fixture.ready();
+      await fixture.send('signal');
+      expect((await acquiring).ok).toBe(false);
+      expect(await (await fixture.output).pending?.completion).toBeNull();
+      expect(fixture.ledger().version).toBe(2);
+      expect(JSON.stringify(await fixture.volume().acquire(fixture.subtrees))).toContain('no lease admitted');
+      expect(fixture.attaches()).toBe(0);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it('retains authority on wrapper failure both before and after the caller stops waiting', async () => {
+    for (const bounded of [false, true]) {
+      const fixture = await detachCustodyFixture();
+      jest.useFakeTimers();
+      try {
+        const acquiring = fixture.volume().acquire(fixture.subtrees);
+        await fixture.ready();
+        if (bounded) {
+          jest.advanceTimersByTime(300);
+          expect((await acquiring).ok).toBe(false);
+        }
+        await fixture.send('wrapper-failure');
+        expect(await fixture.event()).toBe('exiting');
+        expect((await acquiring).ok).toBe(false);
+        jest.useRealTimers();
+        const output = await fixture.output;
+        expect(output.status).toBe(bounded ? 1 : 100);
+        expect(await output.pending?.completion).toBeNull();
+        expect(fixture.ledger().version).toBe(2);
+        expect(JSON.stringify(await fixture.volume().acquire(fixture.subtrees))).toContain('no lease admitted');
+        expect(fixture.attaches()).toBe(0);
+      } finally {
+        jest.useRealTimers();
+        await fixture.cleanup();
+      }
+    }
+  });
+
+  it('preserves other claim owners when exact registry absence clears pending custody', async () => {
+    const fixture = await detachCustodyFixture();
+    const claim = {
+      name: `${process.pid}-abc123`,
+      identity: 'owned-lease-identity',
+      owner: { pid: process.pid, token: 'another-live-operation' },
+    };
+    try {
+      await writeFile(fixture.registry, '');
+      await writeFile(
+        `${fixture.paths.lockFile}.ledger`,
+        JSON.stringify({
+          version: 2,
+          lifecycle: {
+            kind: 'detach',
+            owner: { pid: process.pid, token: 'original-detach' },
+            pending: { physical: '/dev/disk7', registryEntry: fixture.entry, phase: 'reported', facadePid: null },
+          },
+          claims: [claim],
+          held: [],
+        }),
+      );
+      expect(JSON.stringify(await fixture.volume().acquire(fixture.subtrees))).toContain(
+        'owned attach admission reached',
+      );
+      expect(fixture.ledger()).toEqual({ version: 1, lifecycle: null, claims: [claim], held: [] });
+      expect(fixture.attaches()).toBe(1);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it('refuses unknown versions and malformed pending custody without mutating their ledger', async () => {
+    const fixture = await detachCustodyFixture();
+    const owner = { pid: process.pid, token: 'owned-operation' };
+    const pending = { physical: '/dev/disk7', registryEntry: fixture.entry, phase: 'reported', facadePid: process.pid };
+    const invalid = [
+      { version: 99, lifecycle: null },
+      { version: 2, lifecycle: null },
+      { version: 1, lifecycle: { kind: 'detach', owner, pending } },
+      { version: 2, lifecycle: { kind: 'detach', owner, pending: { ...pending, registryEntry: 'unknown' } } },
+      { version: 2, lifecycle: { kind: 'detach', owner, pending: { ...pending, facadePid: -1 } } },
+      { version: 2, lifecycle: { kind: 'detach', owner, pending: { ...pending, phase: 'stopped' } } },
+      {
+        version: 2,
+        lifecycle: {
+          kind: 'detach',
+          owner,
+          pending: { physical: pending.physical, registryEntry: pending.registryEntry, facadePid: null },
+        },
+      },
+    ];
+    try {
+      for (const header of invalid) {
+        const text = JSON.stringify({ ...header, claims: [], held: [] });
+        await writeFile(`${fixture.paths.lockFile}.ledger`, text);
+        expect((await fixture.volume().acquire(fixture.subtrees)).ok).toBe(false);
+        expect(readFileSync(`${fixture.paths.lockFile}.ledger`, 'utf8')).toBe(text);
+      }
+      expect(fixture.calls).toEqual([]);
+      expect(fixture.attaches()).toBe(0);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it('queues a concurrent caller behind a detach its live caller still awaits, then admits it after the terminal exit', async () => {
+    // The caller's bound never fires here: the subject is the ordinary wait on a running detach.
+    const fixture = await detachCustodyFixture('stray', 600_000);
+    const lookedAgain = Promise.withResolvers<void>();
+    let looks = 0;
+    try {
+      const first = fixture.volume().acquire(fixture.subtrees);
+      await fixture.ready();
+      expect(fixture.ledger()).toMatchObject({
+        version: 2,
+        lifecycle: {
+          kind: 'create',
+          owner: { pid: process.pid },
+          pending: { physical: '/dev/disk7', registryEntry: fixture.entry, phase: 'waiting', facadePid: null },
+        },
+      });
+      // Liveness only chooses queueing over reporting; a second ask proves the caller queued and looked again.
+      const second = new RamTempVolume(fixture.paths, fixture.capacity, fixture.commands, process.pid, (pid) => {
+        expect(pid).toBe(process.pid);
+        looks += 1;
+        if (looks === 2) lookedAgain.resolve();
+        return true;
+      }).acquire(fixture.subtrees);
+      await lookedAgain.promise;
+      expect(fixture.attaches()).toBe(0);
+      await fixture.send('complete');
+      expect(await fixture.event()).toBe('effect');
+      await fixture.send('finish');
+      expect(await fixture.event()).toBe('exiting');
+      expect((await fixture.output).pending).toBeUndefined();
+      expect(JSON.stringify(await first)).toContain('owned attach admission reached');
+      expect(JSON.stringify(await second)).toContain('owned attach admission reached');
+      expect(fixture.attaches()).toBe(2);
+      expect(fixture.calls.filter((call) => call.startsWith('/usr/bin/hdiutil'))).toEqual([
+        '/usr/bin/hdiutil detach /dev/disk7',
+      ]);
+      expect(fixture.ledger()).toEqual({ version: 1, lifecycle: null, claims: [], held: [] });
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it('reports custody when the detach run throws, refusing while its caller still lives', async () => {
+    const fixture = await detachCustodyFixture();
+    const commands: HostCommands = {
+      async run(file, args, deadlineMs, binding) {
+        if (file === '/usr/bin/hdiutil') throw new Error('owned run failure');
+        return fixture.commands.run(file, args, deadlineMs, binding);
+      },
+      ownsRamDisk: fixture.commands.ownsRamDisk,
+      async detachRam() {
+        throw new Error('owned run failure');
+      },
+      attachRam: (sectors) => fixture.commands.attachRam(sectors),
+    };
+    const volume = () => new RamTempVolume(fixture.paths, fixture.capacity, commands);
+    try {
+      expect(JSON.stringify(await volume().acquire(fixture.subtrees))).toContain('owned run failure');
+      expect(fixture.ledger()).toMatchObject({
+        version: 2,
+        lifecycle: {
+          kind: 'create',
+          owner: { pid: process.pid },
+          pending: { physical: '/dev/disk7', registryEntry: fixture.entry, phase: 'reported', facadePid: null },
+        },
+      });
+      // The caller is this live process: waiting custody would queue behind it forever, reported custody answers.
+      expect(JSON.stringify(await volume().acquire(fixture.subtrees))).toContain('reported by pid');
+      expect(fixture.attaches()).toBe(0);
+      await writeFile(fixture.registry, '');
+      expect(JSON.stringify(await volume().acquire(fixture.subtrees))).toContain('owned attach admission reached');
+      expect(fixture.attaches()).toBe(1);
+      expect(fixture.ledger()).toEqual({ version: 1, lifecycle: null, claims: [], held: [] });
+    } finally {
+      await fixture.cleanup();
+    }
   });
 });

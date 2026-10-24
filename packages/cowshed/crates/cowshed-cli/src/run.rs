@@ -121,7 +121,7 @@ impl Invocation {
             Prepared::Command(parsed) => parsed.global.quiet,
             Prepared::GatewayGitFetch | Prepared::WorkspaceSupervisor(_) => false,
         };
-        let mut output = output::Output::new(io::stdout(), io::stderr(), quiet);
+        let mut output = output::Output::stdio(quiet);
         crate::lock::report(&mut output, &error)
     }
 }
@@ -149,8 +149,7 @@ pub fn prepare(arguments: Vec<OsString>) -> Result<Invocation, i32> {
     match parse_then_prepare(&arguments, |parsed| {
         if let args::Command::Lock(mut lock) = parsed.command {
             let state = crate::lock::State::adopt(lock.state_fd.take()).map_err(|error| {
-                let mut output =
-                    output::Output::new(io::stdout(), io::stderr(), parsed.global.quiet);
+                let mut output = output::Output::stdio(parsed.global.quiet);
                 crate::lock::report(&mut output, &error)
             })?;
             Ok(Invocation(Prepared::Lock {
@@ -160,8 +159,7 @@ pub fn prepare(arguments: Vec<OsString>) -> Result<Invocation, i32> {
             }))
         } else if let args::Command::Hold(hold) = parsed.command {
             let report = |error: &CowshedError| {
-                let mut output =
-                    output::Output::new(io::stdout(), io::stderr(), parsed.global.quiet);
+                let mut output = output::Output::stdio(parsed.global.quiet);
                 crate::lock::report(&mut output, error)
             };
             let mut state =
@@ -219,7 +217,7 @@ async fn run_with(invocation: Invocation, interrupts: InterruptPolicy) -> Ending
     match invocation.0 {
         Prepared::Command(parsed) => run_parsed(parsed, interrupts).await,
         Prepared::Lock { args, state, quiet } => {
-            let mut output = output::Output::new(io::stdout(), io::stderr(), quiet);
+            let mut output = output::Output::stdio(quiet);
             Ending::Finished(crate::lock::dispatch(&args, state, &mut output, interrupts).await)
         }
         Prepared::Hold {
@@ -228,7 +226,7 @@ async fn run_with(invocation: Invocation, interrupts: InterruptPolicy) -> Ending
             control,
             quiet,
         } => {
-            let mut output = output::Output::new(io::stdout(), io::stderr(), quiet);
+            let mut output = output::Output::stdio(quiet);
             Ending::Finished(
                 crate::hold::dispatch(&args, state, control, &mut output, interrupts).await,
             )
@@ -256,9 +254,7 @@ async fn run_parsed(parsed: args::Cli, interrupts: InterruptPolicy) -> Ending {
 /// Runs one parsed command to its exit code, or answers the signal that interrupted it.
 async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i32, i32> {
     let json = parsed.global.json;
-    let stdout = io::stdout();
-    let stderr = io::stderr();
-    let mut output = output::Output::new(stdout, stderr, parsed.global.quiet);
+    let mut output = output::Output::stdio(parsed.global.quiet);
     // Help is an answer, not a diagnostic: it goes to stdout, exits 0, and is never suppressed by
     // --quiet, because it is the output the caller asked for.
     if let args::Command::Help(topic) = &parsed.command {
@@ -619,9 +615,7 @@ fn finish<W: io::Write, E: io::Write>(
 
 fn emit_error(error: CowshedError, command_map: Option<&str>, json: bool, quiet: bool) -> i32 {
     let exit_code = i32::from(error.exit_code());
-    let stdout = io::stdout();
-    let stderr = io::stderr();
-    let mut output = output::Output::new(stdout, stderr, quiet);
+    let mut output = output::Output::stdio(quiet);
     if let Err(write_error) = write_error(&mut output, error, json, command_map) {
         cowshed_os::eprintln!("cowshed: failed to write command result: {write_error}");
         1

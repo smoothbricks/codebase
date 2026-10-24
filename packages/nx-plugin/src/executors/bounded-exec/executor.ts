@@ -1,7 +1,8 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import { accessSync, constants } from 'node:fs';
+import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { availableParallelism, userInfo } from 'node:os';
-import { delimiter, isAbsolute, join, resolve as resolvePath } from 'node:path';
+import { delimiter, isAbsolute, join, relative, resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Duplex, Readable } from 'node:stream';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
@@ -200,10 +201,38 @@ export default function boundedExecExecutor(
   return runDefaultBoundedExec(options, recordContext(context));
 }
 
-/** Runs with the normal process, RAM lease and CPU-budget owners, with an optional stdout sink. */
+/**
+ * Runs with the normal process, RAM lease and CPU-budget owners, with an optional stdout sink, on the user's RAM temp
+ * volume where there is one: the Nx executor's runs, never a test's.
+ */
 export function runDefaultBoundedExec(
   options: BoundedExecOptions,
   context: BoundedExecContext,
+): Promise<BoundedExecResult> {
+  // Only macOS has `hdiutil ram://`; elsewhere the command keeps the inherited TMPDIR.
+  return runBoundedExecWith(options, context, (cowshed) =>
+    process.platform === 'darwin'
+      ? new RamTempVolume(
+          ramTempPaths(userInfo()),
+          RAM_TEMP_CAPACITY_BYTES,
+          createHostCommands(undefined, undefined, undefined, cowshed),
+          undefined,
+          undefined,
+          'optional',
+        )
+      : null,
+  );
+}
+
+/**
+ * The default runner with every owner but its RAM volume, which `volume` makes for the cowshed the run's disk commands go
+ * through: a host proof passes a fixture volume of its own (`fixtureRamVolume`), so no test leases, creates or detaches
+ * the user's.
+ */
+export function runBoundedExecWith(
+  options: BoundedExecOptions,
+  context: BoundedExecContext,
+  volume: (cowshed: string | undefined) => TempVolume | null,
 ): Promise<BoundedExecResult> {
   // A target that names the cowshed its disk commands run through names it for this run's own RAM volume work and
   // for its command alike. Nx resolves `{workspaceRoot}/…` in an option to a workspace-relative path, which the
@@ -218,15 +247,7 @@ export function runDefaultBoundedExec(
   );
   const run: BoundedExecOptions =
     cowshed === undefined ? options : { ...options, env: { ...options.env, [COWSHED_EXECUTABLE_ENV]: cowshed } };
-  // Only macOS has `hdiutil ram://`; elsewhere the command keeps the inherited TMPDIR.
-  const tempVolume =
-    process.platform === 'darwin'
-      ? new RamTempVolume(
-          ramTempPaths(userInfo()),
-          RAM_TEMP_CAPACITY_BYTES,
-          createHostCommands(undefined, undefined, undefined, cowshed),
-        )
-      : null;
+  const tempVolume = volume(cowshed);
   // The command's processes are owned by the supervisor that serves this job, when one does
   // (specs/cowshed/07_api.md, `JobSubtreeHandle`); with none, nothing here may end what it leaves.
   const owner = process.env[SUPERVISOR_SOCKET_ENV] === undefined ? null : cowshedSubtreeOwner(cowshed ?? 'cowshed');
@@ -393,6 +414,9 @@ export async function runBoundedExec(
   }
 
   let lease: RamTempLease | null = null;
+  let ordinaryTemp: string | null = null;
+  // Before spawn there is nothing to retire. Once started, only the owner's terminal retirement permits deletion.
+  let subtreeRetired = true;
   // A lease is removed when its command ends, so it is taken only where whatever the command leaves
   // in it can be ended by its owner first: the supervisor's subtree retirement, never a census.
   if (tempVolume !== null && owner === null) {
@@ -420,6 +444,31 @@ export async function runBoundedExec(
       for (const retained of acquired.value.retained) {
         appendStderr(`RAM temp volume: dead lease ${retained}\n`);
       }
+    } else if (acquired.value.kind === 'unavailable') {
+      const unavailable = `RAM temp volume unavailable (${acquired.value.reason}: ${acquired.value.detail})`;
+      if (options.env?.TMPDIR !== undefined) {
+        appendStderr(`${unavailable}; using target-provided TMPDIR ${options.env.TMPDIR} (medium not inferred)\n`);
+      } else {
+        // The granted runtime namespace is on the workspace's backing filesystem, not its inherited RAM TMPDIR.
+        const configuredParent =
+          process.env.COWSHED_RUNTIME_LINK ?? (process.platform === 'darwin' ? '/private/tmp' : '/tmp');
+        try {
+          const parent = await realpath(configuredParent);
+          if (/^ram\d+(?:-new)?(?:\/|$)/.test(relative(ramTempPaths(userInfo()).root, parent))) {
+            appendStderr(
+              `${unavailable}; refusing ordinary scratch inside the shared RAM namespace: ${configuredParent} resolves to ${parent}\n`,
+            );
+            return { success: false, terminalOutput: outputChunks.join('') };
+          }
+          ordinaryTemp = await mkdtemp(join(parent, `smoo-bounded-exec-${process.pid}-`));
+        } catch (error) {
+          appendStderr(
+            `${unavailable}; could not create ordinary scratch under ${configuredParent}: ${error instanceof Error ? error.message : String(error)}\n`,
+          );
+          return { success: false, terminalOutput: outputChunks.join('') };
+        }
+        appendStderr(`${unavailable}; using owned ordinary TMPDIR ${ordinaryTemp}\n`);
+      }
     } else {
       appendStderr(
         `RAM temp volume unavailable in this sandbox (${acquired.value.detail}); TMPDIR stays ${process.env.TMPDIR ?? '(unset)'}\n`,
@@ -446,6 +495,7 @@ export async function runBoundedExec(
     const retired = await owner.retire(answer.handle, LEFTOVER_GRACE_MS);
     switch (retired.kind) {
       case 'retired':
+        subtreeRetired = true;
         for (const entry of retired.signalled) {
           appendStderr(`cowshed: the supervisor stopped ${describeSignalled(entry)}, which the command left running\n`);
         }
@@ -467,23 +517,44 @@ export async function runBoundedExec(
         return;
     }
   };
-  // `keep`: the run did not pass, so its scratch is archived on the volume rather than deleted (ram-temp.ts, `retain`).
-  const releaseLease = async (keep: boolean): Promise<void> => {
-    await retireSubtree();
-    if (lease === null || owner === null) {
-      return;
-    }
-    const held = lease;
-    lease = null;
-    const released = await tempVolume?.release(held, keep || state.retireError !== null, owner);
-    if (released?.ok) {
-      for (const retained of released.value) {
-        appendStderr(`RAM temp volume: lease ${retained}\n`);
+  // Failed scratch remains evidence: RAM leases are archived; ordinary scratch is retained at its reported path.
+  let tempReleased: Promise<void> | null = null;
+  const releaseLease = (keep: boolean): Promise<void> => {
+    tempReleased ??= (async () => {
+      await retireSubtree();
+      if (ordinaryTemp !== null) {
+        const held = ordinaryTemp;
+        ordinaryTemp = null;
+        if (keep || state.retireError !== null || !subtreeRetired) {
+          appendStderr(
+            `Ordinary temp directory retained at ${held}: ${!subtreeRetired ? 'the command subtree was not retired' : 'the run did not pass'}\n`,
+          );
+        } else {
+          try {
+            await rm(held, { recursive: true, force: true });
+          } catch (error) {
+            appendStderr(
+              `Ordinary temp directory retained at ${held}: cleanup failed: ${error instanceof Error ? error.message : String(error)}\n`,
+            );
+          }
+        }
       }
-    } else if (released) {
-      const left = await censusDiagnostic(held.directory);
-      appendStderr(`${describeRamTempError(released.error)}\n${left === null ? '' : `${left}\n`}`);
-    }
+      if (lease === null || owner === null) {
+        return;
+      }
+      const held = lease;
+      lease = null;
+      const released = await tempVolume?.release(held, keep || state.retireError !== null, owner);
+      if (released?.ok) {
+        for (const retained of released.value) {
+          appendStderr(`RAM temp volume: lease ${retained}\n`);
+        }
+      } else if (released) {
+        const left = await censusDiagnostic(held.directory);
+        appendStderr(`${describeRamTempError(released.error)}\n${left === null ? '' : `${left}\n`}`);
+      }
+    })();
+    return tempReleased;
   };
 
   // The wait is one span line, as cowshed's own spans read. On a host without a gateway the Nx run serves its own
@@ -667,7 +738,7 @@ export async function runBoundedExec(
       root === undefined
         ? spawn(shellCommand, [], {
             cwd,
-            env: mergeEnv(lease, env),
+            env: mergeEnv(lease?.directory ?? ordinaryTemp, env),
             shell: true,
             stdio: hooked === null ? 'pipe' : ['pipe', 'pipe', 'pipe', 'pipe'],
             detached: process.platform !== 'win32',
@@ -675,7 +746,7 @@ export async function runBoundedExec(
           })
         : spawn(root.file, root.args, {
             cwd,
-            env: mergeEnv(lease, env),
+            env: mergeEnv(lease?.directory ?? ordinaryTemp, env),
             stdio: ['pipe', 'pipe', 'pipe', hooked === null ? 'ignore' : 'pipe', 'pipe'],
             detached: process.platform !== 'win32',
             windowsHide: true,
@@ -684,6 +755,7 @@ export async function runBoundedExec(
     // Nothing started, so nothing runs under the grant: it goes back here, with the RAM lease.
     return refuse(`cowshed: could not start the command: ${error instanceof Error ? error.message : String(error)}\n`);
   }
+  subtreeRetired = false;
   if (root !== undefined) {
     const channel = child.stdio[HANDLE_FD];
     const leased = lease;
@@ -1132,10 +1204,10 @@ function buildCommand(options: BoundedExecOptions): string {
   return parts.join(' ');
 }
 
-/** The lease's directory is the command's TMPDIR unless the target names one itself. */
-function mergeEnv(lease: RamTempLease | null, env: Record<string, string>): NodeJS.ProcessEnv {
+/** Owned scratch is the command's TMPDIR unless the target names one itself. */
+function mergeEnv(directory: string | null, env: Record<string, string>): NodeJS.ProcessEnv {
   const inherited = withoutPoolEnv(process.env);
-  return lease === null ? { ...inherited, ...env } : { ...inherited, TMPDIR: lease.directory, ...env };
+  return directory === null ? { ...inherited, ...env } : { ...inherited, TMPDIR: directory, ...env };
 }
 
 /** The process's environment without the CPU pool's descriptor: a pool and its count only a grant may give. */

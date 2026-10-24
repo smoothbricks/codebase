@@ -339,6 +339,12 @@
               "cowshed"
             ],
             "target": "build"
+          },
+          {
+            "projects": [
+              "cowshed"
+            ],
+            "target": "ram-fixture"
           }
         ],
         "options": {

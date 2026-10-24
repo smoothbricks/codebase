@@ -1564,19 +1564,26 @@ from its cause. A Bun other than the declared one passes startup, and on Bun 1.4
 refuses, so a child's JSON document reaches the parent that reads it cut mid-string while the child exits 0: the leg
 fails three layers from the cause as `JSON Parse error: Unterminated string`. The check is not made on Windows.
 
-On a macOS host, a `bounded-exec` task whose processes a cowshed supervisor owns runs with its own `TMPDIR` lease: a
-directory on one RAM-backed APFS volume per user, so test temp files never reach the SSD. The volume is created lazily
-by the first task that needs it and detached when the last live lease ends, since its pages return only on detach. It is
-a legacy DiskImages RAM disk, so it spends none of the AppleDiskImages2 attach budget cowshed counts
-(`specs/cowshed/01a_apfs.md`, "How the APFS host degrades"). A target's own `env.TMPDIR` wins over the lease. Inside a
-cowshed sandbox, which cannot write the lock in `/private/tmp`, the task keeps its inherited `TMPDIR` and says so once.
+On a macOS host, a `bounded-exec` task whose processes a cowshed supervisor owns attempts its own `TMPDIR` lease on a
+RAM-backed APFS volume per user. RAM is acceleration, not a guarantee that temporary bytes never reach ordinary storage.
+The volume is created lazily by the first task that needs it and detached when the last live lease ends, since its pages
+return only on detach. It is a legacy DiskImages RAM disk, so it spends none of the AppleDiskImages2 attach budget
+cowshed counts (`specs/cowshed/01a_apfs.md`, "How the APFS host degrades"). The task never attaches the disk itself: the
+cowshed gateway does (`ram-attach`, `specs/cowshed/05_gateway.md`, "RAM disks"). The disk lives in a `diskimages-helper`
+process, and a helper the task's own job forked would be retired when that job ends, taking the volume from under every
+other job's lease, whose open files then read EIO. The helper belongs to the gateway; no job's retirement reaches it. A
+target's own `env.TMPDIR` wins over the lease. Inside a cowshed sandbox, which cannot write the lock in `/private/tmp`,
+the task keeps its inherited `TMPDIR` and says so once.
 
-The lease is the default for every owned `bounded-exec` target, every test target included, so a test's scratch lives on
-the RAM volume unless its target names `env.TMPDIR`. Reclamation never deletes the scratch of a run that did not pass: a
-lease whose task died, or whose own run failed, timed out or was signalled, is renamed whole into
-`/private/var/folders/cowshed/<uid>/ram3/.archive/<archived at, epoch ms>-<lease>`, on the same volume, so the move is
-one `rename(2)` and copies nothing (the build-volume trash does the same, `specs/cowshed/16_build_volumes.md`, "Garbage
-collection"). The task that reclaims it says where on stderr
+Every owned `bounded-exec` target attempts the lease, test targets included. Explicit RAM unavailability uses a unique
+owned ordinary directory under the granted runtime alias, or `/private/tmp` on macOS when no alias is configured. It
+never reuses inherited RAM as its fallback. The report names the actual medium/path and typed reason once; an explicit
+target `env.TMPDIR` wins, is labelled target-provided, and is never cleaned by the executor. Successful ordinary scratch
+is removed only after subtree retirement; failed or unretired scratch remains at its reported path. Reclamation never
+deletes the scratch of a run that did not pass: a lease whose task died, or whose own run failed, timed out or was
+signalled, is renamed whole into `/private/var/folders/cowshed/<uid>/ram3/.archive/<archived at, epoch ms>-<lease>`, on
+the same volume, so the move is one `rename(2)` and copies nothing (the build-volume trash does the same,
+`specs/cowshed/16_build_volumes.md`, "Garbage collection"). The task that reclaims it says where on stderr
 (`RAM temp volume: dead lease <lease> archived at <archive>: kept until …`). A passing run's lease is deleted. The
 volume keeps the newest two archives, the failing run under triage and the one before it, which a triage compares to
 tell a flake from a regression; that bound is a stated reason, not a measurement. It keeps none when less than half the
@@ -1631,7 +1638,26 @@ for a fork's pull request, a GitHub macOS runner) has no `COWSHED_SUPERVISOR_SOC
 nothing retires what they leave beyond the runner's own job teardown, and on macOS no RAM lease is taken, which every
 run says. The self-hosted NixOS runner gets ownership exactly when its `nx` runs inside a cowshed job whose supervisor
 serves the socket. The host temp-directory proof runs the real default executor for that contract on Linux; on macOS it
-exercises RAM-volume recovery, shared leases and final detach.
+exercises RAM-volume recovery, shared leases and final detach. No test leases, creates or detaches the user's volume:
+every macOS host proof runs the executor on a fixture volume of its own (`runBoundedExecWith` with `fixtureRamVolume`),
+whose mountpoint, lock and size no other process uses. Its real fixture gateway attaches the disk; every facade and
+non-facade disk command uses that gateway's own socket. Teardown detaches only exact registry identities its attaches
+recorded, never disks selected by UID or size alone. `fixtureRamVolume` refuses the user's own paths, size and gateway.
+The host target depends on `cowshed:ram-fixture`, which builds the native helper before any test; no test compiles or
+installs a gateway.
+
+RAM is optional acceleration for the production executor, not a correctness prerequisite. Gateway absence, an
+unsupported RAM operation, or unproven legacy ownership yields a typed unavailable reason and one report of the actual
+owned ordinary temporary medium used instead. It never falls back to a job-owned attach or inherits a potentially unsafe
+shared RAM directory. Required fixture RAM remains required. I/O errors, malformed new markers, unknown ledgers and
+unresolved mutation custody fail closed.
+
+The volume marker is version 1 JSON containing `volumeName`, `owner: "gateway"` and the exact `registryEntry` captured
+immediately after this gateway attach. Before leasing, a fresh registry/mount snapshot proves that entry still names
+this mounted volume; the root and marker identities are revalidated under the ledger lock. A changed identity refuses
+instead of silently following a replacement. A legacy name-only marker or an unmarked disk with no exact creation
+receipt is unproven: it is not leased, rewritten, reclaimed or detached. Fixture debris reclamation consumes only the
+exact identities its own real attaches recorded, never UID or size alone.
 
 The volume's kernel `O_EXLOCK` admits ledger mutations and releases on process death. It is held only for cheap lease
 and operation claims and their publication: host-wide process and disk-inventory probes, directory cleanup, provisioning
@@ -1643,14 +1669,23 @@ release would have.
 Checkouts of this plugin from before the ledger lease under the kernel lock alone and never read the claims, and
 checkouts from before the move below the cowshed root mount the volume at `/Volumes`, so no two protocols may share a
 volume. The protocol's revision (3) names the volume, its mountpoint, its lock and its ledger, and adds as many sectors
-to the RAM disk: the creator's stray reclaim matches uid and size, so no revision detaches another's disk, mounted or
-still attaching. On a host running several, each revision has its own volume; a revision-2 volume, still under
-`/Volumes`, is detached by revision 2's own last release, never by revision 3.
+to the RAM disk: inventory distinguishes revisions by uid and size, while exact creation identity alone authorizes
+reclamation, so no revision detaches another's disk, mounted or still attaching. On a host running several, each
+revision has its own volume; a revision-2 volume, still under `/Volumes`, is detached by revision 2's own last release,
+never by revision 3.
 
-A creation or detach claim is void once its owner's pid is gone. A crashed owner whose pid was reused holds every caller
-waiting on the volume, and macOS gives no cheap way to tell the new process from the old without running `ps` under the
-lock. So every 15 s that a caller waits on the same claim, stderr names its kind, owner pid, token, ledger and the wait
-so far.
+An ordinary operation claim is void once its owner's pid is gone. A pending protected detach differs: caller timeout or
+death does not finish the child or release its authority over the volume. Its custody is published before the spawn, as
+`waiting` while its caller still awaits the facade: other callers queue behind it as behind any claim. Once that caller
+stops waiting, or its run throws without an answer, the custody is `reported`: the existing ledger retains that exact
+operation token and disk identity, and refuses every other caller by name, until the gateway proves its native child
+reaped, proves nothing started, or a fresh registry read proves the exact entry gone. A broken requester connection or
+an unknown native outcome proves none of these and retains authority. A dead caller's `waiting` custody is reconciled
+the same way; its liveness only chooses queueing over reporting. A PID is diagnostic, never the proof that a pending
+detach ended. While a pending detach exists, ledger version 2 makes older readers refuse rather than discard the claim;
+normal version 1 returns only after the pending authority clears, preserving every lease entry. Unknown versions refuse
+by name without rewriting them. Every 15 s a caller waiting on a claim names its kind, owner pid, token, ledger and wait
+so far; another volume's ledger remains independent.
 
 Each reclaim pass reads at most one I/O Registry and mount-table snapshot, not one per lease. A dead lease held only by
 mounted filesystems keeps a positive verdict with stable mount and lease identities. A valid positive still names and
@@ -1678,8 +1713,11 @@ by the census, never signalled), beside a dead lease that recorded no handle and
 (kept, then reclaimed once that job ends), a later dead lease whose archive rotates the oldest out and is deleted in the
 background, a failed run's own lease archived below the half-volume floor and so deleted with every other archive, and
 the final detach. Its supervisor is a stand-in speaking the subtree verbs' wire shapes, whose tree is the root's process
-group (`src/__tests__/stand-in-cowshed.ts`). External symlink targets and held directory modes stay unchanged, without
-duplicate provision and teardown; its 60 s case bound is unchanged and its target has the progress bound.
+group (`src/__tests__/stand-in-cowshed.ts`). Its volume uses a real private gateway served by `ram_fixture`, with
+`recordedRamAttach` capturing every attached identity and `disk-command --gateway-socket` routing native admission. The
+helper is closed only after exact-owned teardown; no test asks the installed gateway. External symlink targets and held
+directory modes stay unchanged, without duplicate provision and teardown; its 60 s case bound is unchanged and its
+target has the progress bound.
 
 The host target names both owned files with `./` paths: Bun otherwise interprets a bare path as a filter over recursive
 test discovery. This changes no selected case or timeout. The failed-provisioning regression keeps its exact injected
@@ -1712,30 +1750,33 @@ The volume is created under its final name, `smoo-ram3-<uid>`, and is never rena
 private staging directory, `/private/var/folders/cowshed/<uid>/ram3-new`, then unmounted and mounted again at its
 mountpoint, so a creator that dies part way never leaves an unmarked volume there. No DiskArbitration call makes either
 directory, so none removes them: the task that detaches the volume, or whose provisioning step failed, removes both.
-Before creating, a task detaches every RAM disk of the same uid and size that is mounted nowhere but at those two paths:
-the debris of a creator that was killed or ran into its deadline. One that still carries a lease directory, or has
-something attached below it, is named in the task's error instead. The task finds these disks, and the one it detaches
-with the last lease, in the I/O Registry (an `IOHDIXHDDriveOutKernel` entry per RAM disk, with its size and owner uid)
-and their mounts in the mount table, never in `hdiutil info`: measured 2026-10-22, `hdiutil info` left an attached RAM
-disk out of 2 of 10 listings while other images attached and detached, and a disk left out would read as absent. A
-registry read that does not parse whole fails the task instead. A BSD name passes to the next disk once its disk goes,
-so every detach of a disk the task did not just attach is cowshed's registry-bound detach
-(`cowshed disk-command hdiutil --registry-entry <id> -- detach <device>`, `specs/cowshed/06_cli.md`), which detaches
-only while the inventoried entry still names the device; a refusal is named and never retried with `-force`. Only a disk
-the task has just attached itself is detached with `-force`. The option is new: a cowshed that predates it answers
-`unknown flag` (exit 2), the release fails naming that output and the volume stays attached, so a host installs cowshed
-from the same main as this plugin before running it.
+Before creating, a task inventories RAM disks of the same uid and size, but those fields authorize no detach. Only an
+exact creation receipt owned by this volume permits debris reclamation; unknown legacy or unmarked disks make the RAM
+optimization unavailable and are left untouched. One that still carries a lease directory, or has something attached
+below it, is named in the task's error instead. The task finds these disks, and the one it detaches with the last lease,
+in the I/O Registry (an `IOHDIXHDDriveOutKernel` entry per RAM disk, with its size and owner uid) and their mounts in
+the mount table, never in `hdiutil info`: measured 2026-10-22, `hdiutil info` left an attached RAM disk out of 2 of 10
+listings while other images attached and detached, and a disk left out would read as absent. A registry read that does
+not parse whole fails the task instead. A BSD name passes to the next disk once its disk goes, so every RAM detach,
+including provisioning rollback, is the typed gateway-owned `ram-detach` of an exact device and registry entry
+(specs/cowshed/05_gateway.md, "RAM disks"). The gateway revalidates that identity inside its own lease before spawning
+the native tool. It uses no force; a busy owned staging volume stays in place with its named refusal. A requester or its
+job ending cannot kill this protected mutation. Authoritative terminal, proven not-started and unknown outcomes remain
+distinct; only the first two or exact entry disappearance release pending authority. A gateway that predates
+`ram-attach`, or has no control listener, makes optional RAM unavailable with its typed reason, not a task failure.
+Required RAM fixtures still fail. No task ever attaches the disk itself.
 
-Every `hdiutil` and `diskutil` execution goes through `cowshed disk-command`, including host-test inventory and cleanup.
-The cowshed is the installed one on `PATH`, which must provide this command, unless `COWSHED_EXECUTABLE` names another.
-Where `PATH` provides no cowshed, a workspace that itself provides a launcher — its own cowshed package's
-`packages/cowshed/bin/cowshed`, or a linked one's `node_modules/@smoothbricks/cowshed/bin/cowshed` — names that launcher
-for the run and its command instead; an environment with no cowshed anywhere keeps the bare name, so its spawn failure
-names the missing installed tool. A target may set it in its `env`, workspace-relative or absolute: the task's own RAM
-volume work and its command then both run that cowshed, given to the command as an absolute path. This repository sets
-it to `packages/cowshed/bin/cowshed`, after `cowshed:build`, on the targets that exercise the facade (both real-APFS
-groups and `nx-plugin:test-host`), so they test this checkout's cowshed, not an installed one that may predate a command
-the checkout added. Cowshed alone owns disk-lifecycle leasing. Safe disk commands use
+RAM attach and detach go through their typed gateway operations; every other `hdiutil` and `diskutil` execution goes
+through `cowshed disk-command`, including host-test inventory. The cowshed is the installed one on `PATH`, which must
+provide this command, unless `COWSHED_EXECUTABLE` names another. Where `PATH` provides no cowshed, a workspace that
+itself provides a launcher — its own cowshed package's `packages/cowshed/bin/cowshed`, or a linked one's
+`node_modules/@smoothbricks/cowshed/bin/cowshed` — names that launcher for the run and its command instead; an
+environment with no cowshed anywhere keeps the bare name, so its spawn failure names the missing installed tool. A
+target may set it in its `env`, workspace-relative or absolute: the task's own RAM volume work and its command then both
+run that cowshed, given to the command as an absolute path. This repository sets it to `packages/cowshed/bin/cowshed`,
+after `cowshed:build`, on the targets that exercise the facade (both real-APFS groups and `nx-plugin:test-host`), so
+they test this checkout's cowshed, not an installed one that may predate a command the checkout added. Cowshed alone
+owns disk-lifecycle leasing. Safe disk commands use
 `cowshed disk-command diskutil --deadline-ms <positive integer> -- <args>`: the CLI owns that total monotonic budget
 across lease admission and child execution, never starts a child after it expires, and kills and reaps an overrun safe
 child before returning. Node waits for the facade's actual terminal exit without a second timer or lease. Only protected

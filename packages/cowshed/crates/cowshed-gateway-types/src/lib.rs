@@ -18,6 +18,7 @@
 pub mod cpu_budget;
 pub mod disk_lease;
 pub mod policy;
+pub mod ram_disk;
 pub mod repo_id;
 pub mod session;
 pub mod status;
@@ -39,6 +40,12 @@ pub use policy::{
     CanonicalHost, CanonicalTarget, EgressGrant, EgressMode, HostPattern, MirrorProtocol,
     MirrorRoute, PolicyDenial, PolicyError, ResolvedMirrorRoute, TargetScheme, WorkspacePolicy,
     decode_percent, mirror_scope_matches, normalize_path, path_matches_prefix, raw_path_admissible,
+};
+
+pub use ram_disk::{
+    InvalidRamDiskDevice, InvalidRamDiskEntry, RAM_ATTACH_OP, RAM_DETACH_OP, RAM_DISK_SECTOR_BYTES,
+    RamAttachRefusal, RamAttachRequest, RamDetachRequest, RamDetachStatus, RamDetached,
+    RamDiskAttached, RamDiskDevice, RamDiskEntry, RamDiskSectors, RamDisks,
 };
 pub use repo_id::{InvalidRepoId, validate_repo_id};
 pub use session::{

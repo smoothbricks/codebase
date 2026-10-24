@@ -29,18 +29,30 @@
 //! shell host (cowshed-shell), a process of its own that releases nothing a peer observes, and a
 //! foreign runtime hosting the Node addon, whose own spawns this lock cannot see.
 //!
-//! The spawn call is the whole window, because it returns only once the child has run `exec` or
-//! failed to:
+//! The spawn call is the whole window in which a concurrent spawn can carry such a descriptor
+//! across `exec` into the command it starts, because it returns only once the child has run
+//! `exec` or failed to:
 //!
 //! - `std::process::Command::spawn` on its fork path (`library/std/src/sys/process/unix/unix.rs`,
 //!   `Command::spawn`) reads a close-on-exec status pipe until end of stream, which the child's
 //!   `exec` produces by closing it, or until the child's report of a failed `exec`, after which it
 //!   has waited for the child. Every `pre_exec` closure runs before that `exec`.
-//! - Its `posix_spawn` path is one `posix_spawnp` call: Darwin builds the child's image inside
-//!   that system call, and glibc and musl spawn with `CLONE_VFORK`, which suspends the caller until
-//!   the child has run `exec`.
+//! - Its `posix_spawn` path is one `posix_spawnp` call: Darwin builds each child's image inside
+//!   the `posix_spawn` system call, and glibc and musl spawn with `CLONE_VFORK`, which suspends the
+//!   caller until the child has run `exec`.
 //! - `tokio::process::Command::spawn` calls `std::process::Command::spawn` synchronously before it
 //!   registers the child with the runtime (tokio 1.53, `src/process/mod.rs`).
+//!
+//! The return does not mean every close-on-exec copy is closed. Darwin's `posix_spawnp` (Libc
+//! `sys/posix_spawn.c`) and `execvp` try each `PATH` entry in turn, and XNU makes a child for
+//! every try before it looks the program up (`fdt_fork`); a try that fails holds copies of the
+//! spawner's descriptors (a spawn's close-on-exec ones, an exec's inherited ones) until its own
+//! thread exits, after the call has returned. On Darwin a forked child also reports its `exec`
+//! before `exec` has closed every close-on-exec descriptor. These transient kernel copies reach no
+//! command and have no owner: they close moments later on their own, so a peer can see a release
+//! lag its close by that teardown, and a waiter's grant, never a probe at the spawn's return,
+//! proves it. An authorized handoff differs: a command handed a descriptor across `exec`
+//! (`keep_across_exec` in cowshed-core's held locks) holds it until the command closes it.
 //!
 //! Neither guard is held across an `.await`. A thread holding the shared guard runs only the spawn
 //! call, which drops no [`Fenced`]; a [`Fenced`] never holds another one, so its drop never asks

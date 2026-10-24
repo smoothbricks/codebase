@@ -524,30 +524,55 @@ mod tests {
 
     /// A mountpoint nothing is mounted at is a plain directory of the volume beneath it: held, it
     /// answers that volume's device — the host's, for a directory under the temp root — and is
-    /// not a mount root. The volume's own root answers the same device as a root.
+    /// not a mount root. The volume's own root answers the same filesystem as a root.
+    ///
+    /// The subject is read from a descriptor opened separately from the hold, through the raw
+    /// `descriptor_filesystem` boundary, so no expected value comes from the `hold_mount` result
+    /// under test: a hold of the wrong volume cannot select its own oracle. The kernel table is
+    /// joined on the subject's FSID, never `st_dev`: an APFS volume group's siblings (the sealed
+    /// system snapshot at `/` and Data, which the temp root is firmlinked onto) share one
+    /// `st_dev`, so a device-number search answers whichever sibling the table lists first.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_held_mountpoint_nothing_is_mounted_at_answers_the_volume_beneath_it() {
+        use std::ffi::{CStr, OsStr};
+        use std::os::unix::ffi::OsStrExt;
+
         let directory = std::env::temp_dir().join(format!(
             "cowshed-unmounted-mountpoint-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&directory).unwrap();
-        let held = hold_mount(&directory).expect("hold the bare mountpoint");
-        use std::os::unix::fs::MetadataExt;
-        let device = std::fs::metadata(&directory).unwrap().dev();
-        // By device, not path prefix: a firmlinked temp root lies on the Data volume, not `/`.
-        let beneath = kernel_mounts()
-            .unwrap()
+        let subject = std::fs::File::open(&directory).expect("open the bare mountpoint");
+        let subject = descriptor_filesystem(&subject).expect("read the subject filesystem");
+        let subject_id = FilesystemId::from_native(subject.f_fsid);
+        // SAFETY: Darwin NUL-terminates both names in a record this snapshot owns.
+        let source_device = unsafe { CStr::from_ptr(subject.f_mntfromname.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        let mut owning = kernel_filesystems()
+            .expect("read the kernel mount table")
             .into_iter()
-            .find(|mount| {
-                std::fs::metadata(&mount.mount_point).is_ok_and(|root| root.dev() == device)
-            })
-            .expect("the volume holding the temp root");
-        assert_eq!(held.source_device(), beneath.source_device);
+            .filter(|entry| FilesystemId::from_native(entry.f_fsid) == subject_id);
+        let beneath = owning.next().expect("the mount owning the temp root");
+        assert!(owning.next().is_none(), "one mount owns one FSID");
+        // SAFETY: same NUL-termination and ownership as the subject record.
+        let tabled_device = unsafe { CStr::from_ptr(beneath.f_mntfromname.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(tabled_device, source_device);
+        // SAFETY: same record ownership and NUL termination as the table's f_mntfromname.
+        let mount_point = PathBuf::from(OsStr::from_bytes(
+            unsafe { CStr::from_ptr(beneath.f_mntonname.as_ptr()) }.to_bytes(),
+        ));
+
+        let held = hold_mount(&directory).expect("hold the bare mountpoint");
+        assert_eq!(held.filesystem_id(), subject_id);
+        assert_eq!(held.source_device(), source_device.as_str());
         assert!(!held.is_root(), "a bare mountpoint is not a mount root");
-        let root = hold_mount(&beneath.mount_point).expect("hold the volume's root");
-        assert_eq!(root.source_device(), beneath.source_device);
+        let root = hold_mount(&mount_point).expect("hold the volume's root");
+        assert_eq!(root.filesystem_id(), subject_id);
+        assert_eq!(root.source_device(), source_device.as_str());
         assert!(root.is_root());
         drop(held);
         std::fs::remove_dir(&directory).unwrap();

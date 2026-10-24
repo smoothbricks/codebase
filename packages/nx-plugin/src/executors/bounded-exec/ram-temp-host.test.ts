@@ -15,11 +15,12 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { statfs } from 'node:fs/promises';
-import { tmpdir, userInfo } from 'node:os';
+import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { OpContextBinding } from '@smoothbricks/lmao';
 import { useTestSpan } from '@smoothbricks/lmao/testing/bun';
+import { expectFixtureVolume } from '../../__tests__/fixture-ram-volume.js';
 import { whenChanged } from '../../__tests__/path-change.js';
 import { standInCowshed } from '../../__tests__/stand-in-cowshed.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
@@ -30,18 +31,23 @@ import {
   archiveDeletions,
   type CommandOutput,
   createHostCommands,
-  describeRamTempError,
-  detachRamDisk,
   type HostCommands,
   mountsBelow,
   operationDisk,
-  type RamDisk,
   type RamTempError,
   type RamTempPaths,
   RamTempVolume,
-  ramDisksIn,
 } from './ram-temp.js';
-import { registryDevice } from './ram-temp-fixtures.js';
+import {
+  attachedDisks,
+  detachOwned,
+  ownsRecordedDisk,
+  recordedRamAttach,
+  registryDevice,
+  removeScratchDirectories,
+  scratchVolume,
+  startFixtureGateway,
+} from './ram-temp-fixtures.js';
 
 const MIB = 1024 * 1024;
 
@@ -55,92 +61,11 @@ const provisionOnly: SubtreeOwner = {
   },
 };
 
-/**
- * A volume of its own for one test: a lock beside it, and a name and a size no other test
- * process uses, since the size and the user are what identify a RAM disk as this volume's. It
- * mounts in `t` below the per-user root `cowshed setup` makes, as the module's own volume mounts
- * below that root, so mds keeps no right for it (specs/cowshed/01a_apfs.md, "Spotlight media references").
- */
-function scratchVolume(index: number): { parent: string; paths: RamTempPaths; capacity: number } {
-  const parent = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'rt-'));
-  const { uid } = userInfo();
-  const root = `/private/var/folders/cowshed/${uid}`;
-  const fixtures = join(root, 't');
-  try {
-    mkdirSync(fixtures, { mode: 0o700 });
-  } catch (error) {
-    if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) {
-      throw error;
-    }
-  }
-  const name = `smoo-ram-test-${process.pid}-${index}`;
-  return {
-    parent,
-    paths: {
-      root,
-      uid,
-      mountpoint: join(fixtures, name),
-      lockFile: join(parent, 'v.lock'),
-      volumeName: name,
-      staging: join(fixtures, `${name}-new`),
-    },
-    capacity: 64 * MIB + (process.pid * 4 + index + 1) * 512,
-  };
-}
-
-/**
- * Remove what a failed run left of the scratch volume's directories. Teardown must not hide the failure it follows,
- * so a directory `rmdirSync` refuses, one still mounted on, is said on stderr instead of thrown.
- */
-function removeScratchDirectories(paths: RamTempPaths): void {
-  for (const directory of [paths.mountpoint, paths.staging]) {
-    try {
-      rmdirSync(directory);
-    } catch (error) {
-      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) {
-        process.stderr.write(`scratch volume teardown: rmdir ${directory}: ${String(error)}\n`);
-      }
-    }
-  }
-}
-
-/** This test's RAM disks, read from the I/O Registry as the module reads them: `hdiutil info` drops attached disks. */
-async function attachedDisks(paths: RamTempPaths, capacity: number): Promise<RamDisk[]> {
-  const host = createHostCommands();
-  const registry = await host.run('/usr/sbin/ioreg', ['-r', '-c', 'IOHDIXHDDriveOutKernel', '-l', '-w0']);
-  const table = await host.run('/sbin/mount', []);
-  if (registry.status !== 0 || table.status !== 0) {
-    throw new Error(
-      `inventory RAM disks: ioreg exit ${registry.status}: ${registry.stderr}; mount exit ${table.status}: ${table.stderr}`,
-    );
-  }
-  const disks = ramDisksIn(registry.stdout, table.stdout);
-  if (!disks.ok) {
-    throw new Error(`inventory RAM disks: ${disks.error}`);
-  }
-  return disks.value.filter((disk) => disk.uid === paths.uid && disk.sectors === capacity / 512);
-}
-
-async function detachAll(paths: RamTempPaths, capacity: number): Promise<void> {
-  const host = createHostCommands();
-  for (const disk of await attachedDisks(paths, capacity)) {
-    const { physical } = disk;
-    if (physical === null) {
-      throw new Error(`a RAM disk of ${disk.sectors} sectors has published no media to detach yet`);
-    }
-    // Revalidated against a fresh registry read, and never forced: teardown did not just attach this disk.
-    const detached = await detachRamDisk(host, { ...disk, physical }, 'teardown detach');
-    if (!detached.ok) {
-      throw new Error(describeRamTempError(detached.error));
-    }
-  }
-}
-
 /** A cowshed sandbox cannot attach images: creation fails at the host instead of leasing. */
 function expectSandboxed(error: RamTempError): void {
   expect(error.kind).toBe('provision-failed');
   if (error.kind === 'provision-failed') {
-    expect(['ioreg (RAM disks)', 'hdiutil attach']).toContain(error.step);
+    expect(['ioreg (RAM disks)', 'ram-attach']).toContain(error.step);
   }
 }
 
@@ -173,7 +98,9 @@ function expectUntouched(outside: string): void {
 }
 
 async function nativeRamVolume(): Promise<void> {
-  const { parent, paths, capacity } = scratchVolume(1);
+  const fixture = scratchVolume(1);
+  const { parent, paths, capacity, owned, gatewaySocket } = fixture;
+  expectFixtureVolume(paths, capacity);
   const trace = useTestSpan<OpContextBinding>();
   const caseStartedAt = Date.now();
   process.stderr.write(`RAM lifecycle case started pid=${process.pid} wallAtMs=${caseStartedAt}\n`);
@@ -205,8 +132,10 @@ async function nativeRamVolume(): Promise<void> {
   chmodSync(outside, 0o555);
   // The host's own commands, with one injectable image in the I/O Registry listing. The steps that
   // mount, unmount or place the volume are recorded in the order provisioning runs them.
-  const delegate = createHostCommands();
+  const delegate = createHostCommands(undefined, gatewaySocket);
   const host: HostCommands = {
+    detachRam: delegate.detachRam,
+    ownsRamDisk: (disk) => ownsRecordedDisk(owned, disk),
     async run(file, args, deadlineMs, binding) {
       const startedAt = Date.now();
       const starting = JSON.stringify({
@@ -239,6 +168,12 @@ async function nativeRamVolume(): Promise<void> {
       trace.log.info(finished);
       return output;
     },
+    // Only the fixture gateway attaches this disk; no operation asks the user's gateway.
+    attachRam: recordedRamAttach(
+      delegate.attachRam,
+      (file, args, deadlineMs, binding) => host.run(file, args, deadlineMs, binding),
+      owned,
+    ),
   };
   const attachedBelow: { image: string | null; failInventory: boolean } = { image: null, failInventory: false };
   const provisioning: string[] = [];
@@ -250,20 +185,27 @@ async function nativeRamVolume(): Promise<void> {
       }
       if (step === 'unmount') {
         // The volume leaves the staging directory only once its marker is in it.
-        expect(readFileSync(join(paths.staging, '.smoo-ram'), 'utf8')).toBe(`${paths.volumeName}\n`);
+        expect(JSON.parse(readFileSync(join(paths.staging, '.smoo-ram'), 'utf8'))).toMatchObject({
+          version: 1,
+          volumeName: paths.volumeName,
+          owner: 'gateway',
+        });
       }
-      if (file === '/usr/sbin/ioreg' && attachedBelow.failInventory) {
+      if (file === '/usr/sbin/ioreg' && args.includes('AppleDiskImageDevice') && attachedBelow.failInventory) {
         attachedBelow.failInventory = false;
         return { status: 1, stdout: '', stderr: 'injected holder inventory failure' };
       }
       const output = await host.run(file, args, deadlineMs, binding);
-      return file === '/usr/sbin/ioreg' && attachedBelow.image !== null
+      return file === '/usr/sbin/ioreg' && args.includes('AppleDiskImageDevice') && attachedBelow.image !== null
         ? {
             ...output,
             stdout: [output.stdout, ...registryDevice(`file://${attachedBelow.image}`, 'disk999')].join('\n'),
           }
         : output;
     },
+    attachRam: (sectors) => host.attachRam(sectors),
+    detachRam: host.detachRam,
+    ownsRamDisk: host.ownsRamDisk,
   };
   const alive = new Set([101, 202]);
   const first = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid));
@@ -275,14 +217,15 @@ async function nativeRamVolume(): Promise<void> {
     }
     return output.stdout;
   };
+  const stopGateway = await startFixtureGateway(fixture);
   const volume = new RamTempVolume(paths, capacity, host);
   try {
     // The debris: a volume mounted at the mountpoint by a creator that died before its marker
     // (the order this module used to create in), and a RAM disk whose deadlined attach finished
     // with nobody left to format it.
-    const sectors = `ram://${capacity / 512}`;
-    const orphan = await host.run('/usr/bin/hdiutil', ['attach', '-nomount', sectors]);
-    if (orphan.status !== 0) {
+    // Both are the test's own attaches, recorded by registry identity for its teardown.
+    const orphan = await host.attachRam(capacity / 512);
+    if (!orphan.ok) {
       const acquired = await volume.acquire(subtrees);
       expect(acquired.ok).toBe(false);
       if (!acquired.ok) {
@@ -290,7 +233,7 @@ async function nativeRamVolume(): Promise<void> {
       }
       return;
     }
-    const physical = /^(\/dev\/disk\d+)\b/.exec(orphan.stdout)?.[1] ?? '';
+    const physical = orphan.value;
     const container = operationDisk(await run('/usr/sbin/diskutil', ['apfs', 'createContainer', physical])) ?? '';
     const orphanVolume =
       operationDisk(
@@ -298,8 +241,14 @@ async function nativeRamVolume(): Promise<void> {
       ) ?? '';
     mkdirSync(paths.mountpoint, { mode: 0o700 });
     await run('/sbin/mount_apfs', ['-o', 'nobrowse,noowners', `/dev/${orphanVolume}`, paths.mountpoint]);
-    await run('/usr/bin/hdiutil', ['attach', '-nomount', sectors]);
-    expect((await attachedDisks(paths, capacity)).map((disk) => disk.mountpoints)).toEqual([[paths.mountpoint], []]);
+    const unformatted = await host.attachRam(capacity / 512);
+    if (!unformatted.ok) {
+      throw new Error(`the unformatted debris: ${unformatted.error}`);
+    }
+    expect((await attachedDisks(paths, capacity, gatewaySocket)).map((disk) => disk.mountpoints)).toEqual([
+      [paths.mountpoint],
+      [],
+    ]);
 
     // An unmarked volume that carries a lease is someone's TMPDIR: it is named, not detached.
     const lease = join(paths.mountpoint, `${process.pid}-abcdef`);
@@ -324,9 +273,29 @@ async function nativeRamVolume(): Promise<void> {
     // Mounted and marked at its staging directory, unmounted, then mounted at its mountpoint: never renamed.
     expect(provisioning).toEqual(['mount_apfs', 'unmount', 'mount']);
     expect(a.value.lease.mountpoint).toBe(paths.mountpoint);
-    expect(readFileSync(join(paths.mountpoint, '.smoo-ram'), 'utf8')).toBe(`${paths.volumeName}\n`);
+    const markerPath = join(paths.mountpoint, '.smoo-ram');
+    const originalMarker = readFileSync(markerPath, 'utf8');
+    writeFileSync(
+      markerPath,
+      `${JSON.stringify({ version: 1, volumeName: paths.volumeName, owner: 'gateway', registryEntry: '0x1' })}\n`,
+    );
+    try {
+      const mismatch = await new RamTempVolume(paths, capacity, commands).acquire(subtrees);
+      expect(mismatch.ok).toBe(false);
+      expect(JSON.stringify(mismatch)).toContain('no longer names this mounted volume');
+      expect(existsSync(a.value.lease.directory)).toBe(true);
+    } finally {
+      writeFileSync(markerPath, originalMarker);
+    }
+    expect(JSON.parse(readFileSync(join(paths.mountpoint, '.smoo-ram'), 'utf8'))).toMatchObject({
+      version: 1,
+      volumeName: paths.volumeName,
+      owner: 'gateway',
+    });
     expect(existsSync(paths.staging)).toBe(false);
-    expect((await attachedDisks(paths, capacity)).map((disk) => disk.mountpoints)).toEqual([[paths.mountpoint]]);
+    expect((await attachedDisks(paths, capacity, gatewaySocket)).map((disk) => disk.mountpoints)).toEqual([
+      [paths.mountpoint],
+    ]);
 
     const leaseA = a.value.lease;
     const b = await second.acquire(subtrees);
@@ -535,11 +504,15 @@ async function nativeRamVolume(): Promise<void> {
       await Promise.all([writerExited, bystanderExited]);
     }
     expect(existsSync(paths.mountpoint)).toBe(false);
-    expect(await attachedDisks(paths, capacity)).toEqual([]);
+    expect(await attachedDisks(paths, capacity, gatewaySocket)).toEqual([]);
   } finally {
     // Restore the owner write the outside directory was given, so the parent can be removed.
     chmodSync(outside, 0o755);
-    await detachAll(paths, capacity);
+    try {
+      await detachOwned(owned, paths.uid, gatewaySocket);
+    } finally {
+      await stopGateway();
+    }
     removeScratchDirectories(paths);
     rmSync(parent, { recursive: true, force: true });
   }
@@ -560,10 +533,18 @@ async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
   const trace = useTestSpan<OpContextBinding>();
   process.stderr.write(`RAM provisioning case started in ${process.pid}\n`);
   for (const { injected, reported } of FAILING_STEPS) {
-    const { parent, paths, capacity } = scratchVolume(2);
-    const host = createHostCommands();
+    const fixture = scratchVolume(2);
+    const { parent, paths, capacity, owned, gatewaySocket } = fixture;
+    expectFixtureVolume(paths, capacity);
+    const host = createHostCommands(undefined, gatewaySocket);
     const calls: { file: string; args: readonly string[]; output: CommandOutput }[] = [];
     const commands: HostCommands = {
+      ownsRamDisk: (disk) => ownsRecordedDisk(owned, disk),
+      async detachRam(device, entry, deadlineMs) {
+        const output = await host.detachRam(device, entry, deadlineMs);
+        calls.push({ file: '/usr/bin/hdiutil', args: ['detach', device], output });
+        return output;
+      },
       async run(file, args, deadlineMs, binding) {
         const record =
           stepOf(paths, file, args) !== null ||
@@ -594,7 +575,14 @@ async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
         process.stderr.write(`${finished}\n`);
         return output;
       },
+      // Through `run`, so the injection and the record see the attach as every other step.
+      attachRam: recordedRamAttach(
+        host.attachRam,
+        (file, args, deadlineMs, binding) => commands.run(file, args, deadlineMs, binding),
+        owned,
+      ),
     };
+    const stopGateway = await startFixtureGateway(fixture);
     try {
       const refused = await new RamTempVolume(paths, capacity, commands).acquire(provisionOnly);
       const refusal = JSON.stringify({ injected, refused }, null, 2);
@@ -675,7 +663,11 @@ async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
       expect(existsSync(paths.mountpoint)).toBe(false);
     } finally {
       trace.log.info(JSON.stringify({ injected, phase: 'test-teardown-start' }));
-      await detachAll(paths, capacity);
+      try {
+        await detachOwned(owned, paths.uid, gatewaySocket);
+      } finally {
+        await stopGateway();
+      }
       removeScratchDirectories(paths);
       rmSync(parent, { recursive: true, force: true });
       trace.log.info(JSON.stringify({ injected, phase: 'test-teardown-done' }));
