@@ -202,8 +202,10 @@ export const PUBLIC_DENYLIST_ALLOWLIST_PATH = 'tooling/public-denylist-allowlist
 
 export type PublicCommitSubject = { readonly kind: 'staged' } | { readonly kind: 'message'; readonly path: string };
 
-type AddedLine = { readonly path: string; readonly line: number; readonly text: string };
-type Allowlist = {
+/** A line a commit adds: its path (empty for a commit message), its number in the new file, and its text. */
+export type AddedLine = { readonly path: string; readonly line: number; readonly text: string };
+/** The public references an allowlist exempts from a sibling match: package scopes, repository names, exact lines. */
+export type Allowlist = {
   readonly scopes: readonly string[];
   readonly repositories: readonly string[];
   readonly lines: readonly { readonly path: string; readonly text: string }[];
@@ -364,10 +366,19 @@ function readAllowlist(root: string, env: Environment): Allowlist | { failure: s
   const content = git(root, ['show', `:${PUBLIC_DENYLIST_ALLOWLIST_PATH}`], env);
   if (content.exitCode !== 0)
     return { failure: `${PUBLIC_DENYLIST_ALLOWLIST_PATH}: git show index: ${content.stderr}` };
+  return parseAllowlist(content.stdout);
+}
+
+/**
+ * The rules of the tab-separated allowlist `content`: `package-scope<TAB>@scope`, `repository<TAB>name` and
+ * `line<TAB>path<TAB>text`, one per line. Blank lines and `#` comments are skipped; the first malformed row fails
+ * the whole allowlist, naming its line, rather than being skipped.
+ */
+export function parseAllowlist(content: string): Allowlist | { failure: string } {
   const scopes: string[] = [];
   const repositories: string[] = [];
   const lines: { path: string; text: string }[] = [];
-  for (const [index, row] of content.stdout.split('\n').entries()) {
+  for (const [index, row] of content.split('\n').entries()) {
     if (row === '' || row.startsWith('#')) continue;
     const [kind, value, text, ...extra] = row.split('\t');
     if (
@@ -495,33 +506,66 @@ function addedIndexLines(root: string, env: Environment): { lines: AddedLine[] }
       env,
     );
     if (diff.exitCode !== 0) return { failure: `${path}: git diff --cached: ${diff.stderr}` };
-    let line = 0;
-    let inHunk = false;
-    for (const row of diff.stdout.split('\n')) {
-      const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(row);
-      if (hunk) {
-        line = Number(hunk[1]);
-        inHunk = true;
-      } else if (row.startsWith('diff --git ')) {
-        inHunk = false;
-      } else if (inHunk && row.startsWith('+')) {
-        lines.push({ path, line, text: row.slice(1) });
-        line++;
-      } else if (inHunk && row.startsWith(' ')) {
-        line++;
-      }
-    }
+    for (const added of parseAddedLines(path, diff.stdout)) lines.push(added);
   }
   return { lines };
 }
 
-type Exemption =
+/**
+ * The lines a `git diff --unified=0` of `path` adds, numbered as in the new file. Only rows inside a hunk count: a
+ * patch's `+++` file header, like every header of a type change's second patch, follows a `diff --git` row and
+ * precedes its `@@` row, so it is never read as an added line.
+ */
+export function parseAddedLines(path: string, diff: string): AddedLine[] {
+  const lines: AddedLine[] = [];
+  let line = 0;
+  let inHunk = false;
+  for (const row of diff.split('\n')) {
+    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(row);
+    if (hunk) {
+      line = Number(hunk[1]);
+      inHunk = true;
+    } else if (row.startsWith('diff --git ')) {
+      inHunk = false;
+    } else if (inHunk && row.startsWith('+')) {
+      lines.push({ path, line, text: row.slice(1) });
+      line++;
+    } else if (inHunk && row.startsWith(' ')) {
+      line++;
+    }
+  }
+  return lines;
+}
+
+/** What excuses a sibling match on a line: the whole line, or only the byte spans of its public references. */
+export type Exemption =
   | { readonly wholeLine: true }
   | { readonly wholeLine: false; readonly spans: readonly { readonly start: number; readonly end: number }[] };
 
 const WHOLE_LINE_EXEMPTION: Exemption = { wholeLine: true };
 
-function referenceExemption(line: AddedLine, allowlist: Allowlist, references: readonly RegExp[]): Exemption {
+/**
+ * The public references an allowlist exempts from a sibling match: a declared package scope followed by `/` or an
+ * encoded `%2F` and a package name, and a declared repository name as a whole word. Both are case-insensitive, as
+ * the sibling match is.
+ */
+export function publicReferencePatterns(allowlist: Allowlist): RegExp[] {
+  return [
+    ...allowlist.scopes.map(
+      (scope) => new RegExp(`${escapeRegex(scope)}(?:/|%2[fF])[a-zA-Z0-9._-]+`, SIBLING_MATCH_FLAGS),
+    ),
+    ...allowlist.repositories.map(
+      (repository) => new RegExp(`(?<!\\w)${escapeRegex(repository)}(?!\\w)`, SIBLING_MATCH_FLAGS),
+    ),
+  ];
+}
+
+/**
+ * What excuses a sibling match on `line`: the whole line when the allowlist names it exactly, or declares that very
+ * rule in the allowlist file itself; otherwise the byte spans of its public `references`. git's `--column` is a byte
+ * offset, so the spans are bytes, not UTF-16 string indexes.
+ */
+export function referenceExemption(line: AddedLine, allowlist: Allowlist, references: readonly RegExp[]): Exemption {
   for (const allowed of allowlist.lines) {
     if (
       (line.path === allowed.path && line.text === allowed.text) ||
@@ -607,14 +651,7 @@ async function judgeAddedLines(
       );
       if ('failure' in spans) return spans;
       if (spans.rows !== '') {
-        const references = [
-          ...allowlist.scopes.map(
-            (scope) => new RegExp(`${escapeRegex(scope)}(?:/|%2[fF])[a-zA-Z0-9._-]+`, SIBLING_MATCH_FLAGS),
-          ),
-          ...allowlist.repositories.map(
-            (repository) => new RegExp(`(?<!\\w)${escapeRegex(repository)}(?!\\w)`, SIBLING_MATCH_FLAGS),
-          ),
-        ];
+        const references = publicReferencePatterns(allowlist);
         const exemptions = new Map<number, Exemption>();
         const siblingRegexes = siblings.map((pattern) => new RegExp(pattern, SIBLING_MATCH_FLAGS));
         const flagged = new Set<number>();
