@@ -20,20 +20,21 @@
 //! caller, with the same unjournaled raw writers init_state and grow_state
 //! use. It must never run on an image inside a speculation window: there
 //! is no undo log to roll these writes back, by design — the imported
-//! image becomes a new checkpoint basis, it does not mutate a live one.
+//! image becomes a new snapshot, it does not mutate a live one.
 //! When rows outgrow a target slot, the image grows through grow_state, so
 //! unchanged regions are copied exactly the way growth copies them.
 //!
-//! rewrite_group_eager is the eager executor: it exports the whole group
-//! at the old basis, initializes one new image from the target program,
-//! and per slot either region-copies (geometry identical, no up plan: the
-//! bytes and the intern ids move untouched, so the interner is never
-//! re-based) or re-imports through the logical form, applying the slot's
-//! ax up plan first when one is declared. The ax language itself stays
-//! the embedder's, behind UpEvaluator, the same boundary row_exprs draws
-//! for RowExpression; this module owns row iteration, field assembly,
-//! coercion to the target field types, and the allocation bound (one new
-//! logical slot, sized by the old slot's rows times the plan's fields).
+//! rewrite_slot_set rewrites a set of slots eagerly: it exports every
+//! source slot first, initializes one new image from the target program,
+//! and per slot either region-copies (geometry identical and no
+//! transform: the bytes and the intern ids move untouched, so the
+//! interner is never re-based) or re-imports through the logical form,
+//! applying the slot's field transform plan first when one is declared.
+//! The expression language itself stays the embedder's, behind
+//! ExprEvaluator, the same boundary row_exprs draws for RowExpression;
+//! this module owns row iteration, field assembly, coercion to the
+//! target field types, and the allocation bound (one new logical slot,
+//! sized by the old slot's rows times the plan's fields).
 
 use crate::aggregates;
 use crate::bitmap_ops;
@@ -92,7 +93,7 @@ impl Eq for LogicalValue {}
 
 impl LogicalValue {
     /// The variant's name, for typed mismatch causes.
-    pub fn kind_name(&self) -> &'static str {
+    pub(crate) fn kind_name(&self) -> &'static str {
         match self {
             Self::Bool(_) => "bool",
             Self::U32(_) => "u32",
@@ -109,7 +110,7 @@ impl LogicalValue {
 /// Total deterministic order over logical values: variant rank, then the
 /// variant's own order (floats by the standard total order on bits).
 /// Keyed exports sort by it, so export order never depends on probe order.
-pub fn cmp_logical(a: &LogicalValue, b: &LogicalValue) -> Ordering {
+fn cmp_logical(a: &LogicalValue, b: &LogicalValue) -> Ordering {
     fn rank(v: &LogicalValue) -> u8 {
         match v {
             LogicalValue::Bool(_) => 0,
@@ -192,7 +193,7 @@ pub struct LogicalAggregate {
 
 /// A scalar's continuation: its value and the comparison timestamp that
 /// won it. Importing the value without the timestamp would let an older
-/// row overwrite it after migration.
+/// row overwrite it after the slot is rebuilt.
 #[derive(Clone, Debug)]
 pub struct LogicalScalar {
     pub value: LogicalValue,
@@ -358,34 +359,17 @@ pub trait InternLookup {
 }
 
 /// The caller's interner: resolves ids to text on export and interns text
-/// back to ids on import. Passing the checkpoint's own interner keeps
+/// back to ids on import. Passing the source image's own interner keeps
 /// every id stable — the interner moves without re-basing.
 pub trait Interner: InternLookup {
     fn intern(&mut self, text: &str) -> Result<u32, ErrorCode>;
-}
-
-/// A resolver for raw-only slots: any interned lane reached through it is
-/// a typed refusal, never a silent raw passthrough.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoIntern;
-
-impl InternLookup for NoIntern {
-    fn text(&self, _id: u32) -> Option<&str> {
-        None
-    }
-}
-
-impl Interner for NoIntern {
-    fn intern(&mut self, _text: &str) -> Result<u32, ErrorCode> {
-        Err(ErrorCode::InvalidProgram)
-    }
 }
 
 // =============================================================================
 // Errors
 // =============================================================================
 
-/// Why an export, import, rewrite, or up-plan application refused. The
+/// Why an export, import, rewrite, or transform application refused. The
 /// VM's own refusals ride as Vm with their ErrorCode intact.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogicalExportCause {
@@ -2046,7 +2030,7 @@ fn import_nested(
 /// grows through grow_state when the rows, the bitmap image, the struct
 /// arena, or the eviction index outgrow the target slot. The target slot
 /// must be empty (aggregates and scalars are overwritten whole); change
-/// flags stay clear, as on a fresh checkpoint basis.
+/// flags stay clear, as on a freshly initialized image.
 pub fn import_slot(
     image: &mut Vec<u8>,
     logical: &LogicalSlot,
@@ -2060,119 +2044,74 @@ pub fn import_slot(
     )
 }
 
-/// Build one new image from a target program and import every logical
-/// slot into it: the eager executor's import half. Slots not named stay
-/// at their target initial values. The result is geometry-validated
-/// before it is returned.
-pub fn import_group(
-    target_program: &[u8],
-    accepted_program_magics: &[u32],
-    slots: &[LogicalSlot],
-    encoding: &dyn Fn(u32) -> SlotEncoding,
-    interner: &mut dyn Interner,
-) -> Result<Vec<u8>, LogicalExportError> {
-    let size = state_init::calculate_state_size(target_program, accepted_program_magics).map_err(
-        |refusal| LogicalExportError {
-            op: "import_group",
-            slot: 0,
-            cause: LogicalExportCause::Vm(refusal.code()),
-        },
-    )?;
-    let mut image = wrap("import_group", 0, reserve_image(size))?;
-    state_init::init_state(&mut image, target_program, accepted_program_magics).map_err(
-        |code| LogicalExportError {
-            op: "import_group",
-            slot: 0,
-            cause: LogicalExportCause::Vm(code),
-        },
-    )?;
-    let mut seen: Vec<u32> = Vec::with_capacity(slots.len());
-    for logical in slots {
-        if seen.contains(&logical.slot) {
-            return Err(LogicalExportError {
-                op: "import_group",
-                slot: logical.slot,
-                cause: LogicalExportCause::DuplicateKey,
-            });
-        }
-        seen.push(logical.slot);
-        import_slot(&mut image, logical, &encoding(logical.slot), interner)?;
-    }
-    state_init::validate_state(&image).map_err(|code| LogicalExportError {
-        op: "import_group",
-        slot: 0,
-        cause: LogicalExportCause::Vm(code),
-    })?;
-    Ok(image)
-}
-
 // =============================================================================
-// The ax up plan
+// Field transforms
 // =============================================================================
 
-/// How one target field of an up route is produced from the old row.
+/// How one target field is produced from the old row.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum UpField {
+pub enum FieldTransform {
     /// Copy old field by index (coerced to the target field type).
     Copy(u8),
-    /// An opaque ax expression over the old row, evaluated by the
-    /// embedder's UpEvaluator: bytecode and its constants, as the route
-    /// compiler emitted them.
+    /// An opaque expression over the old row, evaluated by the
+    /// embedder's ExprEvaluator: bytecode and its constants, in the
+    /// embedder's own expression encoding.
     Expr {
         bytecode: Vec<u8>,
         constants: Vec<u8>,
     },
-    Const(LogicalValue),
     Absent,
-    /// Project an old VO field's writer bytes through the reader codec
-    /// named by its root commitment (the structural rung's evolved read).
-    /// Evaluation goes through UpEvaluator::project: this crate owns no
-    /// VO codec, exactly as it owns no ax evaluator.
+    /// Project an old value-object field's writer bytes through the
+    /// reader codec named by its root commitment: an evolved read of the
+    /// stored frame. Evaluation goes through ExprEvaluator::project:
+    /// this crate owns no value-object codec, exactly as it owns no
+    /// expression evaluator.
     Project {
         from: u8,
         reader: [u8; 32],
     },
 }
 
-/// One slot's per-field up plan, in target field order. A scalar or
+/// One slot's per-field transform plan, in target field order. A scalar or
 /// aggregate slot takes exactly one field, over its old value.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UpPlan {
-    pub fields: Vec<UpField>,
+pub struct TransformPlan {
+    pub fields: Vec<FieldTransform>,
 }
 
-/// The frozen old row an up expression reads: its key, its fields (the
-/// old value as field 0 for scalar and aggregate slots), its comparison
-/// timestamp, and the whole exported group as the frozen basis for reads
-/// of other slots in the group.
-pub struct UpRowView<'a> {
+/// The frozen old row a transform expression reads: its key, its fields
+/// (the old value as field 0 for scalar and aggregate slots), its
+/// comparison timestamp, and the whole exported slot set as the frozen
+/// basis for reads of other slots in the set.
+pub struct TransformRowView<'a> {
     pub key: Option<&'a LogicalValue>,
     pub key2: Option<&'a LogicalValue>,
     pub fields: &'a [Option<LogicalValue>],
     pub cmp_ts: Option<f64>,
-    pub group: &'a [LogicalSlot],
+    pub basis: &'a [LogicalSlot],
 }
 
-/// The embedder's ax evaluator for up expressions. Evaluation is a pure
-/// function of the bytecode, constants, and the frozen row view: no
-/// clock, no entropy, no live state (the old image is already frozen in
-/// the exported group). None is an absent field.
-pub trait UpEvaluator {
+/// The embedder's expression evaluator for field transforms. Evaluation
+/// is a pure function of the bytecode, constants, and the frozen row
+/// view: no clock, no entropy, no live state (the old image is already
+/// frozen in the exported slot set). None is an absent field.
+pub trait ExprEvaluator {
     fn eval(
         &mut self,
         bytecode: &[u8],
         constants: &[u8],
-        row: &UpRowView<'_>,
+        row: &TransformRowView<'_>,
     ) -> Result<Option<LogicalValue>, ErrorCode>;
 
-    /// Project one VO field's writer bytes to the reader codec named by
-    /// its root commitment. The default refuses: an evaluator with no VO
-    /// codecs cannot silently pass writer bytes through as reader bytes.
+    /// Project one value-object field's writer bytes to the reader codec
+    /// named by its root commitment. The default refuses: an evaluator
+    /// with no value-object codecs cannot silently pass writer bytes
+    /// through as reader bytes.
     fn project(
         &mut self,
         _bytes: &[u8],
         _reader: &[u8; 32],
-        _row: &UpRowView<'_>,
+        _row: &TransformRowView<'_>,
     ) -> Result<Option<LogicalValue>, ErrorCode> {
         Err(ErrorCode::InvalidProgram)
     }
@@ -2274,16 +2213,16 @@ fn coerce(
     Ok(Some(out))
 }
 
-fn eval_up_field(
-    up: &UpField,
-    view: &UpRowView<'_>,
+fn eval_field_transform(
+    up: &FieldTransform,
+    view: &TransformRowView<'_>,
     target: StructFieldType,
     field: u32,
-    eval: &mut dyn UpEvaluator,
+    eval: &mut dyn ExprEvaluator,
 ) -> CauseResult<Option<LogicalValue>> {
     match up {
-        UpField::Absent => Ok(None),
-        UpField::Copy(old) => match view.fields.get(usize::from(*old)) {
+        FieldTransform::Absent => Ok(None),
+        FieldTransform::Copy(old) => match view.fields.get(usize::from(*old)) {
             Some(Some(value)) => coerce(value.clone(), target, field),
             Some(None) => Ok(None),
             None => Err(LogicalExportCause::FieldShape {
@@ -2291,8 +2230,7 @@ fn eval_up_field(
                 found: view.fields.len(),
             }),
         },
-        UpField::Const(value) => coerce(value.clone(), target, field),
-        UpField::Project { from, reader } => match view.fields.get(usize::from(*from)) {
+        FieldTransform::Project { from, reader } => match view.fields.get(usize::from(*from)) {
             Some(Some(LogicalValue::Bytes(payload))) => {
                 match eval
                     .project(payload, reader, view)
@@ -2313,7 +2251,7 @@ fn eval_up_field(
                 found: view.fields.len(),
             }),
         },
-        UpField::Expr {
+        FieldTransform::Expr {
             bytecode,
             constants,
         } => match eval
@@ -2344,32 +2282,32 @@ fn scalar_target_type(old: &LogicalSlot) -> CauseResult<StructFieldType> {
     }
 }
 
-/// Apply one slot's ax up plan over its exported rows, producing the
+/// Apply one slot's field transform plan over its exported rows, producing the
 /// target-shape logical slot. Rows evaluate in export order and fields
 /// in plan order, so the result is a deterministic function of the old
 /// slot, the plan, and the evaluator's answers. Keys, comparison
 /// timestamps, aggregate counts, and eviction entries carry unchanged:
 /// the plan rewrites values, never row identity or fold continuation.
-pub fn apply_up_plan(
+pub fn apply_transform(
     old: &LogicalSlot,
     target_field_types: &[StructFieldType],
-    plan: &UpPlan,
-    group: &[LogicalSlot],
-    eval: &mut dyn UpEvaluator,
+    plan: &TransformPlan,
+    basis: &[LogicalSlot],
+    eval: &mut dyn ExprEvaluator,
 ) -> Result<LogicalSlot, LogicalExportError> {
     wrap(
-        "apply_up_plan",
+        "apply_transform",
         old.slot,
-        apply_up_plan_inner(old, target_field_types, plan, group, eval),
+        apply_transform_inner(old, target_field_types, plan, basis, eval),
     )
 }
 
-fn apply_up_plan_inner(
+fn apply_transform_inner(
     old: &LogicalSlot,
     target_field_types: &[StructFieldType],
-    plan: &UpPlan,
-    group: &[LogicalSlot],
-    eval: &mut dyn UpEvaluator,
+    plan: &TransformPlan,
+    basis: &[LogicalSlot],
+    eval: &mut dyn ExprEvaluator,
 ) -> CauseResult<LogicalSlot> {
     let mut out = old.clone();
     if let Some(aggregate) = &old.aggregate {
@@ -2381,15 +2319,15 @@ fn apply_up_plan_inner(
         }
         let target = scalar_target_type(old)?;
         let fields = [Some(aggregate.value.clone())];
-        let view = UpRowView {
+        let view = TransformRowView {
             key: None,
             key2: None,
             fields: &fields,
             cmp_ts: None,
-            group,
+            basis,
         };
-        let value = eval_up_field(&plan.fields[0], &view, target, 0, eval)?.ok_or(
-            LogicalExportCause::InvalidRow("aggregate up produced no value"),
+        let value = eval_field_transform(&plan.fields[0], &view, target, 0, eval)?.ok_or(
+            LogicalExportCause::InvalidRow("aggregate transform produced no value"),
         )?;
         let value = if AggType::from_u8(old.agg_type) == Some(AggType::Count) {
             match value {
@@ -2418,15 +2356,15 @@ fn apply_up_plan_inner(
             scalar_target_type(old)?
         };
         let fields = [Some(scalar.value.clone())];
-        let view = UpRowView {
+        let view = TransformRowView {
             key: None,
             key2: None,
             fields: &fields,
             cmp_ts: Some(scalar.cmp_ts),
-            group,
+            basis,
         };
-        let value = eval_up_field(&plan.fields[0], &view, target, 0, eval)?.ok_or(
-            LogicalExportCause::InvalidRow("scalar up produced no value"),
+        let value = eval_field_transform(&plan.fields[0], &view, target, 0, eval)?.ok_or(
+            LogicalExportCause::InvalidRow("scalar transform produced no value"),
         )?;
         out.scalar = Some(LogicalScalar {
             value,
@@ -2442,16 +2380,16 @@ fn apply_up_plan_inner(
     }
     let mut rows = Vec::with_capacity(old.rows.len());
     for row in &old.rows {
-        let view = UpRowView {
+        let view = TransformRowView {
             key: Some(&row.key),
             key2: row.key2.as_ref(),
             fields: &row.fields,
             cmp_ts: row.cmp_ts,
-            group,
+            basis,
         };
         let mut fields = Vec::with_capacity(plan.fields.len());
         for (index, up) in plan.fields.iter().enumerate() {
-            fields.push(eval_up_field(
+            fields.push(eval_field_transform(
                 up,
                 &view,
                 target_field_types[index],
@@ -2472,18 +2410,18 @@ fn apply_up_plan_inner(
 }
 
 // =============================================================================
-// Eager group rewrite
+// Eager slot-set rewrite
 // =============================================================================
 
 /// One slot's place in an eager rewrite: where it comes from in the old
 /// image, where it lands in the target program, its lane encodings, and
-/// its ax up plan when the route declares one.
+/// its field transform plan when one is declared.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SlotRewrite {
+pub struct SlotTransfer {
     pub source: u32,
     pub target: u32,
     pub encoding: SlotEncoding,
-    pub up: Option<UpPlan>,
+    pub transform: Option<TransformPlan>,
 }
 
 /// Primary data size of a slot whose geometry bind_slot validated, as
@@ -2664,20 +2602,20 @@ fn region_copy_slot(
     Ok(())
 }
 
-/// The eager executor: rewrite a whole dependency group from the old
-/// image into one new image of the target program. Every source is
-/// exported first, at the old basis, so up expressions read a frozen
-/// group; then each slot either region-copies (geometry identical and
-/// no up plan) or imports through its logical form with its up plan
-/// applied. Target slots the plan does not name stay at their initial
-/// values. The result is geometry-validated before it is returned.
-pub fn rewrite_group_eager(
+/// Rewrite a set of slots from the old image into one new image of the
+/// target program, eagerly. Every source is exported first, so
+/// transform expressions read a frozen slot set; then each slot either
+/// region-copies (geometry identical and no transform) or imports
+/// through its logical form with its transform plan applied. Target
+/// slots the transfers do not name stay at their initial values. The
+/// result is geometry-validated before it is returned.
+pub fn rewrite_slot_set(
     old: &[u8],
     target_program: &[u8],
     accepted_program_magics: &[u32],
-    plan: &[SlotRewrite],
+    plan: &[SlotTransfer],
     interner: &mut dyn Interner,
-    up_eval: Option<&mut dyn UpEvaluator>,
+    evaluator: Option<&mut dyn ExprEvaluator>,
 ) -> Result<Vec<u8>, LogicalExportError> {
     let mut exported: Vec<LogicalSlot> = Vec::with_capacity(plan.len());
     for rewrite in plan {
@@ -2690,42 +2628,42 @@ pub fn rewrite_group_eager(
     }
     let size = state_init::calculate_state_size(target_program, accepted_program_magics).map_err(
         |refusal| LogicalExportError {
-            op: "rewrite_group_eager",
+            op: "rewrite_slot_set",
             slot: 0,
             cause: LogicalExportCause::Vm(refusal.code()),
         },
     )?;
-    let mut image = wrap("rewrite_group_eager", 0, reserve_image(size))?;
+    let mut image = wrap("rewrite_slot_set", 0, reserve_image(size))?;
     state_init::init_state(&mut image, target_program, accepted_program_magics).map_err(
         |code| LogicalExportError {
-            op: "rewrite_group_eager",
+            op: "rewrite_slot_set",
             slot: 0,
             cause: LogicalExportCause::Vm(code),
         },
     )?;
-    let mut up_eval = up_eval;
+    let mut evaluator = evaluator;
     for (rewrite, logical) in plan.iter().zip(exported.iter()) {
         let old_meta =
             state_init::bind_slot(old, rewrite.source).map_err(|code| LogicalExportError {
-                op: "rewrite_group_eager",
+                op: "rewrite_slot_set",
                 slot: rewrite.source,
                 cause: LogicalExportCause::Vm(code),
             })?;
         let new_meta =
             state_init::bind_slot(&image, rewrite.target).map_err(|code| LogicalExportError {
-                op: "rewrite_group_eager",
+                op: "rewrite_slot_set",
                 slot: rewrite.target,
                 cause: LogicalExportCause::Vm(code),
             })?;
-        let identical = rewrite.up.is_none()
+        let identical = rewrite.transform.is_none()
             && wrap(
-                "rewrite_group_eager",
+                "rewrite_slot_set",
                 rewrite.target,
                 geometry_identical(old, &old_meta, &image, &new_meta),
             )?;
         if identical {
             wrap(
-                "rewrite_group_eager",
+                "rewrite_slot_set",
                 rewrite.target,
                 region_copy_slot(old, &old_meta, &mut image, &new_meta),
             )?;
@@ -2733,11 +2671,13 @@ pub fn rewrite_group_eager(
         }
         let mut logical = logical.clone();
         logical.slot = rewrite.target;
-        if let Some(up) = &rewrite.up {
-            let eval = up_eval.as_deref_mut().ok_or(LogicalExportError {
-                op: "rewrite_group_eager",
+        if let Some(transform) = &rewrite.transform {
+            let eval = evaluator.as_deref_mut().ok_or(LogicalExportError {
+                op: "rewrite_slot_set",
                 slot: rewrite.target,
-                cause: LogicalExportCause::InvalidRow("an up plan with no evaluator to run it"),
+                cause: LogicalExportCause::InvalidRow(
+                    "a transform plan with no evaluator to run it",
+                ),
             })?;
             let has_descriptor = match new_meta.slot_type() {
                 SlotType::StructMap | SlotType::StructMap2 => true,
@@ -2746,7 +2686,7 @@ pub fn rewrite_group_eager(
             };
             let target_types: Vec<StructFieldType> = if has_descriptor {
                 let (descriptor, _, _, _) = wrap(
-                    "rewrite_group_eager",
+                    "rewrite_slot_set",
                     rewrite.target,
                     target_descriptor(&image, &new_meta),
                 )?;
@@ -2754,13 +2694,13 @@ pub fn rewrite_group_eager(
             } else {
                 Vec::new()
             };
-            logical = apply_up_plan(&logical, &target_types, up, &exported, eval)?;
+            logical = apply_transform(&logical, &target_types, transform, &exported, eval)?;
             logical.slot = rewrite.target;
         }
         import_slot(&mut image, &logical, &rewrite.encoding, interner)?;
     }
     state_init::validate_state(&image).map_err(|code| LogicalExportError {
-        op: "rewrite_group_eager",
+        op: "rewrite_slot_set",
         slot: 0,
         cause: LogicalExportCause::Vm(code),
     })?;

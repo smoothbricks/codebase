@@ -1,8 +1,8 @@
 //! Acceptance coverage for logical slot export/import: per-kind
 //! round trips (export of import is the identity), fold continuation
 //! after import (the same next batch lands identically on the original
-//! and on the migrated image), the eager group rewrite with ax up
-//! plans, and typed refusals. Generated cases come from a deterministic
+//! and on the rebuilt image), the eager slot-set rewrite with field
+//! transform plans, and typed refusals. Generated cases come from a deterministic
 //! LCG so every run exercises the same states.
 
 use columine_types::PROGRAM_MAGIC;
@@ -13,11 +13,11 @@ use columine_types::types::{
 use columine_vm::hashmap_ops::{CmpType, Strategy, batch_map_upsert};
 use columine_vm::hooks::NoVm;
 use columine_vm::logical_export::{
-    CellEncoding, InternLookup, Interner, LogicalAggregate, LogicalCondition, LogicalConditionCell,
-    LogicalEvictionEntry, LogicalExportCause, LogicalInner, LogicalNestedEntry, LogicalRow,
-    LogicalScalar, LogicalSlot, LogicalValue, NoIntern, SlotEncoding, SlotRewrite, UpEvaluator,
-    UpField, UpPlan, UpRowView, apply_up_plan, export_slot, import_group, import_slot,
-    rewrite_group_eager,
+    CellEncoding, ExprEvaluator, FieldTransform, InternLookup, Interner, LogicalAggregate,
+    LogicalCondition, LogicalConditionCell, LogicalEvictionEntry, LogicalExportCause, LogicalInner,
+    LogicalNestedEntry, LogicalRow, LogicalScalar, LogicalSlot, LogicalValue, SlotEncoding,
+    SlotTransfer, TransformPlan, TransformRowView, apply_transform, export_slot, import_slot,
+    rewrite_slot_set,
 };
 use columine_vm::meta::SlotMetaView;
 use columine_vm::state_init::{
@@ -87,6 +87,21 @@ fn fresh_image(prog: &[u8]) -> Vec<u8> {
     image
 }
 
+/// Build a fresh image from a program and import every slot into it.
+fn import_image(
+    prog: &[u8],
+    slots: &[LogicalSlot],
+    enc: &SlotEncoding,
+    interner: &mut TestInterner,
+) -> Vec<u8> {
+    let mut image = fresh_image(prog);
+    for logical in slots {
+        import_slot(&mut image, logical, enc, interner).expect("import slot");
+    }
+    validate_state(&image).expect("assembled image validates");
+    image
+}
+
 /// An interner owned by the test: ids are stable indices into its table,
 /// so export through it and import through it must keep every id.
 #[derive(Default)]
@@ -144,14 +159,7 @@ fn round_trip(
     enc: &SlotEncoding,
     interner: &mut TestInterner,
 ) -> Vec<u8> {
-    let image = import_group(
-        prog,
-        MAGICS,
-        std::slice::from_ref(logical),
-        &|_| *enc,
-        interner,
-    )
-    .expect("import");
+    let image = import_image(prog, std::slice::from_ref(logical), enc, interner);
     validate_state(&image).expect("imported image validates");
     let back = export_slot(&image, logical.slot, enc, interner).expect("export");
     assert_eq!(&back, logical, "export of import is the identity");
@@ -599,17 +607,17 @@ fn generated_hashmap_states_round_trip_and_continue_identically() {
             ),
             ErrorCode::Ok
         );
-        let exported = export_slot(&original, 0, &SlotEncoding::RAW, &NoIntern).expect("export");
-        let mut migrated = import_group(
+        let exported = export_slot(&original, 0, &SlotEncoding::RAW, &TestInterner::default())
+            .expect("export");
+        let mut migrated = import_image(
             &prog_big,
-            MAGICS,
             std::slice::from_ref(&exported),
-            &|_| SlotEncoding::RAW,
-            &mut NoIntern,
-        )
-        .expect("import");
+            &SlotEncoding::RAW,
+            &mut TestInterner::default(),
+        );
         assert_eq!(
-            export_slot(&migrated, 0, &SlotEncoding::RAW, &NoIntern).expect("re-export"),
+            export_slot(&migrated, 0, &SlotEncoding::RAW, &TestInterner::default())
+                .expect("re-export"),
             exported
         );
 
@@ -644,8 +652,10 @@ fn generated_hashmap_states_round_trip_and_continue_identically() {
             );
         }
         assert_eq!(
-            export_slot(&original, 0, &SlotEncoding::RAW, &NoIntern).expect("export original"),
-            export_slot(&migrated, 0, &SlotEncoding::RAW, &NoIntern).expect("export migrated"),
+            export_slot(&original, 0, &SlotEncoding::RAW, &TestInterner::default())
+                .expect("export original"),
+            export_slot(&migrated, 0, &SlotEncoding::RAW, &TestInterner::default())
+                .expect("export migrated"),
             "continuing the fold after import matches continuing the original"
         );
     }
@@ -656,17 +666,18 @@ fn generated_hashmap_states_round_trip_and_continue_identically() {
 /// the projection ran.
 struct FieldNumberEval;
 
-impl UpEvaluator for FieldNumberEval {
+impl ExprEvaluator for FieldNumberEval {
     fn eval(
         &mut self,
         bytecode: &[u8],
         _constants: &[u8],
-        row: &UpRowView<'_>,
+        row: &TransformRowView<'_>,
     ) -> Result<Option<LogicalValue>, ErrorCode> {
         let index = usize::from(*bytecode.first().ok_or(ErrorCode::InvalidProgram)?);
         match row.fields.get(index) {
             Some(Some(LogicalValue::U32(v))) => Ok(Some(LogicalValue::F64(f64::from(*v) + 0.5))),
             Some(Some(LogicalValue::I64(v))) => Ok(Some(LogicalValue::F64(*v as f64))),
+            Some(Some(LogicalValue::F64(v))) => Ok(Some(LogicalValue::F64(*v + 20.0))),
             Some(None) | None => Ok(None),
             _ => Err(ErrorCode::InvalidCellValue),
         }
@@ -676,7 +687,7 @@ impl UpEvaluator for FieldNumberEval {
         &mut self,
         bytes: &[u8],
         _reader: &[u8; 32],
-        _row: &UpRowView<'_>,
+        _row: &TransformRowView<'_>,
     ) -> Result<Option<LogicalValue>, ErrorCode> {
         Ok(Some(LogicalValue::Bytes(
             bytes.iter().rev().copied().collect(),
@@ -685,7 +696,7 @@ impl UpEvaluator for FieldNumberEval {
 }
 
 #[test]
-fn eager_rewrite_copies_unchanged_and_applies_up_plan() {
+fn eager_rewrite_copies_unchanged_and_applies_transform_plan() {
     // Slot 0: hash map, geometry identical in both programs (region copy).
     // Slot 1: struct map old [U32, String, Vo] -> new [String, F64, Vo]
     // by Copy, Expr, Project.
@@ -738,34 +749,32 @@ fn eager_rewrite_copies_unchanged_and_applies_up_plan() {
         ],
         None,
     )];
-    let old_image = import_group(
+    let old_image = import_image(
         &old_prog,
-        MAGICS,
         &[old_map.clone(), old_rows],
-        &|_| SlotEncoding::RAW,
+        &SlotEncoding::RAW,
         &mut interner,
-    )
-    .expect("build old image");
+    );
 
     let plan = vec![
-        SlotRewrite {
+        SlotTransfer {
             source: 0,
             target: 0,
             encoding: SlotEncoding::RAW,
-            up: None,
+            transform: None,
         },
-        SlotRewrite {
+        SlotTransfer {
             source: 1,
             target: 1,
             encoding: SlotEncoding::RAW,
-            up: Some(UpPlan {
+            transform: Some(TransformPlan {
                 fields: vec![
-                    UpField::Copy(1),
-                    UpField::Expr {
+                    FieldTransform::Copy(1),
+                    FieldTransform::Expr {
                         bytecode: vec![0],
                         constants: Vec::new(),
                     },
-                    UpField::Project {
+                    FieldTransform::Project {
                         from: 2,
                         reader: [7u8; 32],
                     },
@@ -774,7 +783,7 @@ fn eager_rewrite_copies_unchanged_and_applies_up_plan() {
         },
     ];
     let mut eval = FieldNumberEval;
-    let new_image = rewrite_group_eager(
+    let new_image = rewrite_slot_set(
         &old_image,
         &new_prog,
         MAGICS,
@@ -789,7 +798,8 @@ fn eager_rewrite_copies_unchanged_and_applies_up_plan() {
         old_map,
         "the geometry-identical slot moves whole, comparison timestamp included"
     );
-    let migrated = export_slot(&new_image, 1, &SlotEncoding::RAW, &interner).expect("export up");
+    let migrated =
+        export_slot(&new_image, 1, &SlotEncoding::RAW, &interner).expect("export transformed");
     assert_eq!(
         migrated.rows,
         vec![row(
@@ -805,7 +815,7 @@ fn eager_rewrite_copies_unchanged_and_applies_up_plan() {
 }
 
 #[test]
-fn apply_up_plan_preserves_aggregate_count_and_scalar_timestamp() {
+fn apply_transform_preserves_aggregate_count_and_scalar_timestamp() {
     let mut eval = FieldNumberEval;
     let mut agg = base_slot(0, SlotType::Aggregate);
     agg.agg_type = AggType::Avg as u8;
@@ -813,10 +823,14 @@ fn apply_up_plan_preserves_aggregate_count_and_scalar_timestamp() {
         value: LogicalValue::F64(80.0),
         count: 4,
     });
-    let up = UpPlan {
-        fields: vec![UpField::Const(LogicalValue::F64(100.0))],
+    let plan = TransformPlan {
+        fields: vec![FieldTransform::Expr {
+            bytecode: vec![0],
+            constants: Vec::new(),
+        }],
     };
-    let out = apply_up_plan(&agg, &[], &up, std::slice::from_ref(&agg), &mut eval).expect("up agg");
+    let out = apply_transform(&agg, &[], &plan, std::slice::from_ref(&agg), &mut eval)
+        .expect("transform aggregate");
     assert_eq!(
         out.aggregate,
         Some(LogicalAggregate {
@@ -831,20 +845,20 @@ fn apply_up_plan_preserves_aggregate_count_and_scalar_timestamp() {
         value: LogicalValue::U32(6),
         cmp_ts: 33.25,
     });
-    let up = UpPlan {
-        fields: vec![UpField::Expr {
+    let plan = TransformPlan {
+        fields: vec![FieldTransform::Expr {
             bytecode: vec![0],
             constants: Vec::new(),
         }],
     };
-    let out = apply_up_plan(
+    let out = apply_transform(
         &scalar,
         &[StructFieldType::Float64],
-        &up,
+        &plan,
         std::slice::from_ref(&scalar),
         &mut eval,
     )
-    .expect("up scalar");
+    .expect("transform scalar");
     assert_eq!(
         out.scalar,
         Some(LogicalScalar {
@@ -859,15 +873,25 @@ fn refusals_are_typed() {
     let prog = program(1, &halt(slot_def(0, SlotType::HashMap as u8, 8)));
     let mut image = fresh_image(&prog);
     // A truncated image refuses as InvalidState, not a panic.
-    let error = export_slot(&image[..40], 0, &SlotEncoding::RAW, &NoIntern)
-        .expect_err("truncated image refuses");
+    let error = export_slot(
+        &image[..40],
+        0,
+        &SlotEncoding::RAW,
+        &TestInterner::default(),
+    )
+    .expect_err("truncated image refuses");
     assert_eq!(error.cause, LogicalExportCause::Vm(ErrorCode::InvalidState));
     assert_eq!(error.op, "export_slot");
 
     // Kind mismatch on import.
     let wrong = base_slot(0, SlotType::HashSet);
-    let error = import_slot(&mut image, &wrong, &SlotEncoding::RAW, &mut NoIntern)
-        .expect_err("kind mismatch refuses");
+    let error = import_slot(
+        &mut image,
+        &wrong,
+        &SlotEncoding::RAW,
+        &mut TestInterner::default(),
+    )
+    .expect_err("kind mismatch refuses");
     assert_eq!(
         error.cause,
         LogicalExportCause::KindMismatch {
@@ -882,8 +906,13 @@ fn refusals_are_typed() {
         row(LogicalValue::U32(1), vec![Some(LogicalValue::U32(1))], None),
         row(LogicalValue::U32(1), vec![Some(LogicalValue::U32(2))], None),
     ];
-    let error = import_slot(&mut image, &dup, &SlotEncoding::RAW, &mut NoIntern)
-        .expect_err("duplicate key refuses");
+    let error = import_slot(
+        &mut image,
+        &dup,
+        &SlotEncoding::RAW,
+        &mut TestInterner::default(),
+    )
+    .expect_err("duplicate key refuses");
     assert_eq!(error.cause, LogicalExportCause::DuplicateKey);
 
     // An interned id the resolver does not know refuses by name.
@@ -900,6 +929,7 @@ fn refusals_are_typed() {
     let mut interner = TestInterner::default();
     let mut image = fresh_image(&prog);
     import_slot(&mut image, &one, &enc, &mut interner).expect("import interned");
-    let error = export_slot(&image, 0, &enc, &NoIntern).expect_err("unknown intern id refuses");
+    let error = export_slot(&image, 0, &enc, &TestInterner::default())
+        .expect_err("unknown intern id refuses");
     assert_eq!(error.cause, LogicalExportCause::UnknownInternId(0));
 }

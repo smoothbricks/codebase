@@ -91,8 +91,8 @@ enum StoredSource {
 
 /// One live stored row, borrowing the state image. The sweep constructs
 /// this view for the row it visits; an embedder evaluating an expression
-/// over a frozen row (a checkpoint-migration up expression) constructs
-/// it with lookup or lookup2, which validate the slot first.
+/// over a frozen stored row constructs it with lookup, which validates
+/// the slot first.
 pub struct StoredRow<'a> {
     state: &'a [u8],
     source: StoredSource,
@@ -108,37 +108,39 @@ impl<'a> StoredRow<'a> {
         }
     }
 
-    /// The stored row of a one-key struct map at key, or None when the
-    /// key is absent. The slot's geometry is validated before the probe,
-    /// so a malformed image is a typed error, never a wild read.
-    pub fn lookup(state: &'a [u8], slot: u32, key: u32) -> Result<Option<Self>, ErrorCode> {
-        let map = crate::state_init::bind_struct_map(state, slot)?;
-        Ok(map.find(state, key).map(|position| Self {
-            state,
-            source: StoredSource::Map(map),
-            position,
-        }))
-    }
-
-    /// The stored row of a two-key struct map at (key1, key2), or None
-    /// when the pair is absent, with the same validation as lookup.
-    pub fn lookup2(
+    /// The stored row of a struct map at the given key, or None when the
+    /// key is absent. One-key maps take key2: None; two-key maps require
+    /// Some(key2) — a mismatch with the slot's kind is InvalidProgram.
+    /// The slot's geometry is validated before the probe, so a malformed
+    /// image is a typed error, never a wild read.
+    pub fn lookup(
         state: &'a [u8],
         slot: u32,
-        key1: u32,
-        key2: u32,
+        key: u32,
+        key2: Option<u32>,
     ) -> Result<Option<Self>, ErrorCode> {
         let meta = crate::state_init::bind_slot(state, slot)?;
-        if meta.slot_type() != SlotType::StructMap2 {
-            return Err(ErrorCode::InvalidProgram);
+        match (meta.slot_type(), key2) {
+            (SlotType::StructMap, None) => {
+                let map = StructMapSlot::bind(state, slot);
+                Ok(map.find(state, key).map(|position| Self {
+                    state,
+                    source: StoredSource::Map(map),
+                    position,
+                }))
+            }
+            (SlotType::StructMap2, Some(key2)) => {
+                let map = StructMap2Slot::bind(state, slot);
+                let arena_header =
+                    bytes::read_u32(state, meta.meta_base + SlotMetaOffset::GRACE_SECONDS);
+                Ok(map.find(state, key, key2).map(|position| Self {
+                    state,
+                    source: StoredSource::Map2(map, arena_header),
+                    position,
+                }))
+            }
+            _ => Err(ErrorCode::InvalidProgram),
         }
-        let map = StructMap2Slot::bind(state, slot);
-        let arena_header = bytes::read_u32(state, meta.meta_base + SlotMetaOffset::GRACE_SECONDS);
-        Ok(map.find(state, key1, key2).map(|position| Self {
-            state,
-            source: StoredSource::Map2(map, arena_header),
-            position,
-        }))
     }
 
     pub fn key(&self) -> u32 {
@@ -268,8 +270,8 @@ impl<'a> BatchView<'a> {
     }
 
     /// Attach a stored row for stored-row expressions: the same read the
-    /// sweep supplies per visited row, for an embedder evaluating over a
-    /// frozen image (a migration up expression over the old row).
+    /// sweep supplies per visited row, for an embedder evaluating an
+    /// expression over a frozen stored row.
     pub fn with_stored_row(mut self, row: StoredRow<'a>) -> Self {
         self.stored_row = Some(row);
         self
