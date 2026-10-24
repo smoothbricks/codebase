@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test';
+import { expect, it } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdir, readFile, rm, symlink, unlink, utimes, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
@@ -94,16 +94,17 @@ async function withSocketDir<T>(workspace: string, slot: 'a' | 'b', body: (dir: 
 }
 
 /**
- * A daemon serves `workspace` under `servingEnv`, then a second one is started under `challengerEnv`. The two share
- * a socket path only when their environments name one.
+ * A second daemon started under `challengerEnv` while `serving` runs under `servingEnv`: it must exit, and leave the
+ * record and the serving daemon alone. The two share a socket path only when their environments name one. `label` is
+ * the case the step came from, and leads every diagnostic.
  */
 async function secondDaemonDefers(
   workspace: string,
+  serving: DaemonRecord,
   servingEnv: Record<string, string>,
   challengerEnv: Record<string, string>,
+  label: string,
 ): Promise<void> {
-  const serving = await startedDaemon(workspace, servingEnv);
-
   // What a second client does when its probe found no daemon: start one. The record is judged whole once its directory
   // is watched and after every change there, so whether the second daemon took it cannot be missed.
   const stopWatching = new AbortController();
@@ -119,7 +120,8 @@ async function secondDaemonDefers(
   second.stderr.setEncoding('utf8').on('data', (text: string) => {
     output += text;
   });
-  const exited = new Promise<number | null>((resolve) => second.once('exit', resolve));
+  const { promise: exited, resolve: exitResolve } = Promise.withResolvers<number | null>();
+  second.once('exit', exitResolve);
   // Unpatched, the second daemon never exits: it takes the record and serves. Either ends the wait.
   const tookRecord = whenChanged(
     join(workspace, '.nx/workspace-data/d'),
@@ -129,59 +131,72 @@ async function secondDaemonDefers(
   try {
     const displaced = await guardEvent(
       Promise.race([exited.then(() => false), tookRecord.then(() => true)]),
-      'the second daemon to exit or take the record',
+      `${label}: the second daemon to exit or take the record`,
       () => `second daemon ${second.pid}, exit ${second.exitCode}\n${output}`,
     );
-    expect(displaced, `the second daemon ${second.pid} took the record from ${serving.processId}\n${output}`).toBe(
-      false,
-    );
-    expect(await exited, output).toBe(0);
-    expect(await daemonRecord(workspace)).toEqual(serving);
-    expect(isRunning(serving.processId)).toBe(true);
+    expect(
+      displaced,
+      `${label}: the second daemon ${second.pid} took the record from ${serving.processId}\n${output}`,
+    ).toBe(false);
+    expect(await exited, `${label}\n${output}`).toBe(0);
+    expect(await daemonRecord(workspace), label).toEqual(serving);
+    expect(isRunning(serving.processId), label).toBe(true);
 
     // The serving daemon still answers on its socket: no client starts another.
-    expect(JSON.parse(nx(workspace, servingEnv, 'show', 'projects', '--json'))).toEqual(['p']);
-    expect(await daemonRecord(workspace)).toEqual(serving);
+    expect(JSON.parse(nx(workspace, servingEnv, 'show', 'projects', '--json')), label).toEqual(['p']);
+    expect(await daemonRecord(workspace), label).toEqual(serving);
   } finally {
     if (second.pid !== undefined && second.exitCode === null) {
       terminate(second.pid);
       await exited;
     }
     stopWatching.abort();
-    try {
-      // Stopped under the environment that started it, before the caller removes the socket directory it bound.
-      await stopFixtureNxDaemon(workspace, servingEnv);
-    } finally {
-      await tookRecord.catch((error: unknown) => {
-        if (error !== stopWatching.signal.reason) throw error;
-      });
-    }
+    await tookRecord.catch((error: unknown) => {
+      if (error !== stopWatching.signal.reason) throw error;
+    });
   }
 }
 
-describe('a second daemon started for a workspace a daemon serves', () => {
-  it('exits and leaves the serving daemon alone when each binds a socket directory of its own', async () => {
-    await withNxFixture('nx-daemon-claim-', async ({ socketDirectory, workspace }) => {
-      await fixtureWorkspace(workspace);
-      const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
-      await withSocketDir(workspace, 'a', async (servingDir) => {
-        await withSocketDir(workspace, 'b', async (challengerDir) => {
-          await secondDaemonDefers(
-            workspace,
-            { ...env, NX_SOCKET_DIR: servingDir },
-            { ...env, NX_SOCKET_DIR: challengerDir },
-          );
-        });
-      });
-    });
-  });
+it('a serving daemon keeps its workspace: second daemons defer, and clients on other socket directories are served', async () => {
+  await withNxFixture('nx-daemon-claim-', async ({ socketDirectory, workspace }) => {
+    await fixtureWorkspace(workspace);
+    const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
+    await withSocketDir(workspace, 'a', async (servingDir) => {
+      await withSocketDir(workspace, 'b', async (otherDir) => {
+        const servingEnv = { ...env, NX_SOCKET_DIR: servingDir };
+        try {
+          const serving = await startedDaemon(workspace, servingEnv);
 
-  it('exits and leaves the serving daemon alone when both use one socket directory', async () => {
-    await withNxFixture('nx-daemon-claim-shared-', async ({ socketDirectory, workspace }) => {
-      await fixtureWorkspace(workspace);
-      await withSocketDir(workspace, 'a', async (socketDir) => {
-        const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true', NX_SOCKET_DIR: socketDir };
-        await secondDaemonDefers(workspace, env, env);
+          // The daemon takes on each client's environment, and NX_SOCKET_DIR is part of it: clients that name another
+          // socket directory are served by this same daemon.
+          const clientLabel = 'keeps serving clients whose socket directory differs from the one it bound';
+          expect(JSON.parse(nx(workspace, env, 'show', 'projects', '--json')), clientLabel).toEqual(['p']);
+          expect(
+            JSON.parse(nx(workspace, { ...env, NX_SOCKET_DIR: otherDir }, 'show', 'projects', '--json')),
+            clientLabel,
+          ).toEqual(['p']);
+          expect(await daemonRecord(workspace), clientLabel).toEqual(serving);
+          expect(isRunning(serving.processId), clientLabel).toBe(true);
+
+          // Second daemons go last: they are the steps that would displace the record if the patch regressed, so
+          // every read above runs first.
+          const challengers = [
+            {
+              label: 'exits and leaves the serving daemon alone when each binds a socket directory of its own',
+              env: { ...env, NX_SOCKET_DIR: otherDir },
+            },
+            {
+              label: 'exits and leaves the serving daemon alone when both use one socket directory',
+              env: servingEnv,
+            },
+          ];
+          for (const challenger of challengers) {
+            await secondDaemonDefers(workspace, serving, servingEnv, challenger.env, challenger.label);
+          }
+        } finally {
+          // Stopped under the environment that started it, before the caller removes the socket directory it bound.
+          await stopFixtureNxDaemon(workspace, servingEnv);
+        }
       });
     });
   });
@@ -200,31 +215,6 @@ it('replaces a daemon whose socket was removed, which no client could reach', as
     expect(JSON.parse(nx(workspace, env, 'show', 'projects', '--json'))).toEqual(['p']);
     const replacement = await daemonRecord(workspace);
     expect(replacement?.processId).not.toBe(lost.processId);
-  });
-});
-
-it('keeps serving clients whose socket directory differs from the one it bound', async () => {
-  await withNxFixture('nx-daemon-claim-env-', async ({ socketDirectory, workspace }) => {
-    await fixtureWorkspace(workspace);
-    const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
-    await withSocketDir(workspace, 'a', async (socketDir) => {
-      await withSocketDir(workspace, 'b', async (otherSocketDir) => {
-        const servingEnv = { ...env, NX_SOCKET_DIR: socketDir };
-        try {
-          const serving = await startedDaemon(workspace, servingEnv);
-          // The daemon takes on each client's environment; NX_SOCKET_DIR is part of it.
-          expect(JSON.parse(nx(workspace, env, 'show', 'projects', '--json'))).toEqual(['p']);
-          expect(
-            JSON.parse(nx(workspace, { ...env, NX_SOCKET_DIR: otherSocketDir }, 'show', 'projects', '--json')),
-          ).toEqual(['p']);
-          expect(await daemonRecord(workspace)).toEqual(serving);
-          expect(isRunning(serving.processId)).toBe(true);
-        } finally {
-          // Stopped under the environment that started it, before the caller removes the socket directory it bound.
-          await stopFixtureNxDaemon(workspace, servingEnv);
-        }
-      });
-    });
   });
 });
 
