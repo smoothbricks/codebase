@@ -220,4 +220,3 @@ describe('managed public denylist commit hooks', () => {
     });
   });
 });
-
