@@ -63,7 +63,9 @@
     shims, dead APIs or hand-maintained copies of derivable contracts; required protocol evolution remains a contract.
     Avoid needless allocation/copying, pay for computation once and retain what it proves. Specs state the target design
     in present tense, not a diary: implement an agreed better design and update its spec with the same unit, never omit
-    the capability. Put implementation gaps and evidence in the owning brief, not status notes in the spec.
+    the capability. Put implementation gaps and evidence in the owning brief, not status notes in the spec. A unit is
+    done when the production path calls it and a smoke run shows it: name the call site. A component no production code
+    reaches is wired in the same unit or deleted; never accepted as done.
 14. **Depend on published revisions, never host paths.** Patch a dependency by git source and locked revision
     (`rev = "<sha>"`), never by filesystem path: Cargo serves it from the local git cache, so the same tree builds on
     any host and in CI. A path patch bakes one machine's checkout into the build and fails everywhere else.
