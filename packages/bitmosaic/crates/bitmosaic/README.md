@@ -181,6 +181,12 @@ roaring-rs. They cover hostile framing, unaligned images, the full-u32 cardinali
 domain, all five-by-five container count/algebra pairings, patch witnesses, refusal atomicity, and retained-scratch
 allocation behavior.
 
+`bitmosaic::oracle` (present with `bench-internals` and in the library's own tests) holds two operation-list steps whose
+inputs come from a recipe aimed at the container ladder. `patch_step` patches one image and checks, after every
+operation, that its bytes are a fresh encoding and that the report, witnesses and reads match a BTreeSet; `and_step`
+intersects two sets on every forced skew arm, owned, mapped and through the u64 tier. The default test lane runs both
+from fixed seeds, and every container-tag pairing on every forced arm.
+
 Benchmarks use the bench profile and report workload-specific observations: attach separately from attached operations,
 owned accounting separately from wire bytes, run-rich count/algebra cells, enumerable/restaged controls, and warm patch
 allocations. No speed ratio from an earlier layout is a claim about native v1. Compare interleaved controls on the same

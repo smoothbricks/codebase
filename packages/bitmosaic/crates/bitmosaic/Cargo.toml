@@ -11,10 +11,12 @@ publish = ["crates-io"]
 
 [features]
 # Skew-arm instrument: the balanced-arm force switch and the position
-# counters the A/B harness reads. Absent from a shipped build — a counter
-# compiled into a kernel is a cost on the very path it claims to witness,
-# and the arm switch would put a load and a branch in front of a chooser
-# that is otherwise pure arithmetic on cardinalities already in register.
+# counters the A/B harness reads, and the differential oracle steps
+# (`bitmosaic::oracle`) the fuzz targets drive on every forced arm. Absent
+# from a shipped build — a counter compiled into a kernel is a cost on the
+# very path it claims to witness, and the arm switch would put a load and a
+# branch in front of a chooser that is otherwise pure arithmetic on
+# cardinalities already in register.
 bench-internals = []
 # Opt OUT of the wasm32 SIMD128 hand kernel (`words_and_count`). It is
 # enabled per function with `#[target_feature(enable = "simd128")]`, so the

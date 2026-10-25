@@ -21,16 +21,12 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::BTreeSet;
-#[cfg(feature = "bench-internals")]
-use std::sync::{Mutex, MutexGuard};
 
 use bitmosaic::{Bitmosaic, Bitmosaic64, Bitmosaic64View, BitmosaicBuilder, BitmosaicView};
 use roaring::RoaringBitmap;
 
 #[test]
 fn run_record_skew_is_independent_of_member_skew() {
-    #[cfg(feature = "bench-internals")]
-    let _guard = instrument();
     let left = Bitmosaic::from_sorted((0..25_000).chain(32_768..57_768));
     let right = Bitmosaic::from_sorted((0..1000u32).flat_map(|i| (i * 60 + 5)..(i * 60 + 15)));
     assert_eq!(left.container_census().4, 1);
@@ -55,21 +51,6 @@ fn run_record_skew_is_independent_of_member_skew() {
         }),
         0
     );
-}
-
-/// The arm switch is PROCESS-global, matching the crate's other
-/// kernel-forcing seams, while `cargo test` runs a file's tests as parallel
-/// threads in one process. Anything that moves the switch holds this first,
-/// or a neighbouring test picks your arm out from under you. The position
-/// counters need no such guard — they are per-thread.
-#[cfg(feature = "bench-internals")]
-static INSTRUMENT: Mutex<()> = Mutex::new(());
-
-#[cfg(feature = "bench-internals")]
-fn instrument() -> MutexGuard<'static, ()> {
-    INSTRUMENT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 // ── allocation instrument ────────────────────────────────────────────────
@@ -217,7 +198,6 @@ fn assert_arms_agree(name: &str, a: &Bitmosaic, b: &Bitmosaic, expected: u64) {
     #[cfg(feature = "bench-internals")]
     {
         use bitmosaic::skew::{Arm, force};
-        let _held = instrument();
         for (arm, label) in [(Arm::Balanced, "balanced"), (Arm::Drive, "drive")] {
             force(arm);
             assert_eq!(a.and_len(b), expected, "{name}: forced {label} arm");
@@ -266,7 +246,6 @@ fn assert_fts_wire_arms_agree(name: &str, a: &[u32], b: &[u32], expected: u64) {
     #[cfg(feature = "bench-internals")]
     {
         use bitmosaic::skew::{Arm, force};
-        let _held = instrument();
         for (arm, label) in [(Arm::Balanced, "balanced"), (Arm::Drive, "drive")] {
             force(arm);
             assert_eq!(
@@ -725,7 +704,6 @@ fn intersection_allocates_nothing_at_any_skew() {
         #[cfg(feature = "bench-internals")]
         {
             use bitmosaic::skew::{Arm, force};
-            let _held = instrument();
             for (arm, label) in [(Arm::Balanced, "balanced"), (Arm::Drive, "drive")] {
                 force(arm);
                 let allocs = allocations_during(|| {
@@ -776,7 +754,6 @@ fn the_builder_is_where_allocation_lives() {
 fn the_shipped_chooser_engages_and_moves_the_census() {
     use bitmosaic::skew;
 
-    let _held = instrument();
     let census_of = |a: &Bitmosaic, b: &Bitmosaic, arm: skew::Arm| {
         skew::force(arm);
         skew::reset();
@@ -900,8 +877,6 @@ fn the_shipped_chooser_engages_and_moves_the_census() {
 fn a_balanced_pair_stays_on_the_merge() {
     use bitmosaic::skew;
 
-    let _held = instrument();
-
     let mut rng = Rng(0xBA1A_0001);
     let mut a_vals = BTreeSet::new();
     let mut b_vals = BTreeSet::new();
@@ -964,7 +939,6 @@ fn key_crossover_routes_both_lips_in_owned_and_mapped_forms() {
         BitmosaicView::open(&below_bytes).unwrap(),
     );
 
-    let _held = instrument();
     let owned_census = |large: &Bitmosaic| {
         skew::force(skew::Arm::Auto);
         skew::reset();

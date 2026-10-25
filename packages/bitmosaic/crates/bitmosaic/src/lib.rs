@@ -27,6 +27,8 @@
 
 mod array;
 mod ef;
+#[cfg(any(test, feature = "bench-internals"))]
+pub mod oracle;
 mod patch;
 mod range;
 mod wire;
@@ -950,10 +952,10 @@ fn words_as_bytes(words: &[u64]) -> &[u8] {
 /// instrument stepped inside a probe loop prices itself into the arm it is
 /// comparing.
 ///
-/// The counters are PER-THREAD, so a census belongs to the thread that
-/// produced it and concurrent work elsewhere cannot land in it; they also
-/// share no cache line with anything. The arm switch is process-global, on
-/// the crate's other kernel-forcing seams: set it once at harness startup.
+/// The counters and the arm switch are PER-THREAD, so a census belongs to
+/// the thread that produced it, concurrent work elsewhere cannot land in it,
+/// and a forced arm governs only the thread that forced it: tests running
+/// as parallel threads of one process each keep their own arm.
 ///
 /// SUBJECT of every count: the positions the chooser controls, namely the
 /// Array/Cone/Stride sequence pairs and the forest's chunk-key walk. The
@@ -962,14 +964,15 @@ fn words_as_bytes(words: &[u64]) -> &[u8] {
 #[cfg(any(test, feature = "bench-internals"))]
 pub mod skew {
     use core::cell::Cell;
-    use core::sync::atomic::{AtomicU8, Ordering};
     use std::thread::LocalKey;
 
     pub(crate) const AUTO: u8 = 0;
     pub(crate) const BALANCED: u8 = 1;
     pub(crate) const DRIVE: u8 = 2;
 
-    pub(crate) static ARM: AtomicU8 = AtomicU8::new(AUTO);
+    thread_local! {
+        pub(crate) static ARM: Cell<u8> = const { Cell::new(AUTO) };
+    }
 
     thread_local! {
         pub(crate) static LINEAR_POSITIONS: Cell<u64> = const { Cell::new(0) };
@@ -1030,17 +1033,14 @@ pub mod skew {
     /// one process run, so an A/B over this switch cancels code layout,
     /// link order and frequency drift.
     ///
-    /// Process-global: a harness sets it around the arm it is timing, and
-    /// concurrent callers see the same arm.
+    /// Per-thread: a harness sets it around the arm it is timing, on the
+    /// thread that runs the kernels.
     pub fn force(arm: Arm) {
-        ARM.store(
-            match arm {
-                Arm::Auto => AUTO,
-                Arm::Balanced => BALANCED,
-                Arm::Drive => DRIVE,
-            },
-            Ordering::Relaxed,
-        );
+        ARM.set(match arm {
+            Arm::Auto => AUTO,
+            Arm::Balanced => BALANCED,
+            Arm::Drive => DRIVE,
+        });
     }
 
     /// Zero this thread's counters.
@@ -1084,7 +1084,7 @@ fn ratio_says_drive(small: usize, large: usize, ratio: usize) -> bool {
 #[cfg(any(test, feature = "bench-internals"))]
 #[inline(always)]
 fn ratio_says_drive(small: usize, large: usize, ratio: usize) -> bool {
-    match skew::ARM.load(core::sync::atomic::Ordering::Relaxed) {
+    match skew::ARM.get() {
         skew::BALANCED => false,
         skew::DRIVE => small <= large,
         _ => large >= small * ratio,
