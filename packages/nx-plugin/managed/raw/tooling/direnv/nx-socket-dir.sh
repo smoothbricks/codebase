@@ -15,8 +15,18 @@
 # cowshed fork entered from a shell that had been in main's checkout did
 # exactly that: its Nx held main's database on main's build volume, and the
 # next land into main could not adopt. The smoo Nx wrappers drop the same
-# keys on the same evidence (WORKSPACE_STATE_ENV_KEYS). An override
-# inherited without a root, or with this root, is the caller's own and stays.
+# keys when the caller's root is another workspace (WORKSPACE_STATE_ENV_KEYS).
+#
+# The root is not the only evidence: an environment can carry another
+# workspace's absolute overrides with no root at all, or with a root a
+# launcher rebound to this checkout (an agent session that came from main's
+# shell, through `cowshed exec --host`, kept main's cache and task database
+# and wrote into main's .nx). An override whose path lies inside an Nx
+# workspace, the nearest nx.json at or above it, other than this checkout
+# belongs to that workspace, and the whole set goes with it: the cache moves
+# with the database. An override inside this checkout, inside its build
+# volume, or inside no workspace at all (CI's shared bind) is the caller's
+# own and stays.
 #
 # One socket dir per Nx workspace. DEVENV_RUNTIME is keyed to the devenv ROOT,
 # so every workspace sharing one devenv - a sibling repository, a
@@ -55,10 +65,28 @@
 # the caller's binding for it and stays. An inherited one that resolves
 # elsewhere belongs to another workspace, so the workspace takes its own.
 smoo_nx_checkout="$(pwd -P)"
+smoo_nx_foreign=
 if [ -n "${NX_WORKSPACE_ROOT_PATH:-}" ] &&
   [ "$(cd "$NX_WORKSPACE_ROOT_PATH" >/dev/null 2>&1 && pwd -P)" != "$smoo_nx_checkout" ]; then
+  smoo_nx_foreign=1
+fi
+for smoo_nx_state in "${NX_WORKSPACE_DATA_DIRECTORY:-}" "${NX_CACHE_DIRECTORY:-}" "${NX_DAEMON_SOCKET_DIR:-}"; do
+  case "$smoo_nx_state" in
+    /*) ;;
+    *) continue ;;
+  esac
+  while [ -n "$smoo_nx_state" ] && [ ! -f "$smoo_nx_state/nx.json" ]; do
+    smoo_nx_state="${smoo_nx_state%/*}"
+  done
+  if [ -n "$smoo_nx_state" ] &&
+    [ "$(cd "$smoo_nx_state" >/dev/null 2>&1 && pwd -P)" != "$smoo_nx_checkout" ]; then
+    smoo_nx_foreign=1
+  fi
+done
+if [ -n "$smoo_nx_foreign" ]; then
   unset NX_WORKSPACE_DATA_DIRECTORY NX_CACHE_DIRECTORY NX_DAEMON_SOCKET_DIR
 fi
+unset smoo_nx_foreign smoo_nx_state
 export NX_WORKSPACE_ROOT_PATH="$PWD"
 smoo_nx_socket=""
 if [ -f .cowshed/workspace.json ]; then

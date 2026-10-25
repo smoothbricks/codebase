@@ -284,6 +284,36 @@ describe('nx-socket-dir.sh', () => {
     });
   });
 
+  it('drops Nx state inside another workspace whatever root the caller names', () => {
+    withScratch((scratch) => {
+      cowshedCheckout(scratch);
+      writeFileSync(join(scratch.checkout, 'nx.json'), '{}\n');
+      // main's checkout: an Nx workspace whose shell made its overrides absolute.
+      const main = join(scratch.hostRuntime, 'main');
+      mkdirSync(main);
+      writeFileSync(join(main, 'nx.json'), '{}\n');
+      const mains = {
+        NX_WORKSPACE_DATA_DIRECTORY: join(main, '.nx/workspace-data'),
+        NX_CACHE_DIRECTORY: join(main, '.nx/cache'),
+      };
+      const dropped = {
+        NX_WORKSPACE_DATA_DIRECTORY: undefined,
+        NX_CACHE_DIRECTORY: undefined,
+        NX_DAEMON_SOCKET_DIR: undefined,
+      };
+      // An agent session from main's shell, through a launcher that dropped the root.
+      expect(hostShell(scratch, mains).state).toEqual(dropped);
+      // The same session after a launcher rebound the root to this checkout.
+      expect(hostShell(scratch, { ...mains, NX_WORKSPACE_ROOT_PATH: scratch.checkout }).state).toEqual(dropped);
+      // One foreign path takes the pair: a cache split from its database names artifacts it never wrote.
+      expect(
+        hostShell(scratch, {
+          NX_WORKSPACE_DATA_DIRECTORY: join(scratch.checkout, '.nx/workspace-data'),
+          NX_CACHE_DIRECTORY: join(main, '.nx/cache'),
+        }).state,
+      ).toEqual(dropped);
+    });
+  });
   it('keeps the Nx state overrides bound for this workspace or for no root at all', () => {
     withScratch((scratch) => {
       const overrides = {
@@ -298,6 +328,15 @@ describe('nx-socket-dir.sh', () => {
       symlinkSync(scratch.checkout, alias);
       expect(hostShell(scratch, { ...overrides, NX_WORKSPACE_ROOT_PATH: alias }).state).toEqual(overrides);
       expect(hostShell(scratch, { ...overrides, NX_WORKSPACE_ROOT_PATH: '.' }).state).toEqual(overrides);
+      // Overrides inside this checkout, by any spelling, or inside its build volume, which holds no nx.json.
+      writeFileSync(join(scratch.checkout, 'nx.json'), '{}\n');
+      const owned = {
+        NX_WORKSPACE_DATA_DIRECTORY: join(alias, '.nx/workspace-data'),
+        NX_CACHE_DIRECTORY: join(scratch.hostRuntime, 'build-volume/nx/cache'),
+        NX_DAEMON_SOCKET_DIR: join(scratch.checkout, '.nx/daemon'),
+      };
+      expect(hostShell(scratch, owned).state).toEqual(owned);
+      expect(hostShell(scratch, { ...owned, NX_WORKSPACE_ROOT_PATH: scratch.checkout }).state).toEqual(owned);
     });
   });
 });
