@@ -10,7 +10,8 @@ publish.workspace = true
 # The same full test set runs in bounded hash partitions, never serialized and with no raised
 # timeout. Five shards later exhausted the 120s execution bound on a loaded local host:
 # first at 258/264 tests after a 139.8s CPU-token wait outside that bound, then at 212/264.
-# Eight reduce each batch's serial work; membership stays derived from nextest's test-name hash.
+# Eight reduce each batch's serial work. Membership is nextest's test-name hash, except the slow
+# tests .config/nextest-timings.json names, which the exception shards take by measured time.
 [package.metadata.smoothbricks.test]
 shards = 8
 

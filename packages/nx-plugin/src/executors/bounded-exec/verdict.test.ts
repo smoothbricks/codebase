@@ -7,6 +7,7 @@ import fc from 'fast-check';
 
 import { onProgressClock } from '../../__tests__/progress-clock.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
+import { measuredTimings } from '../../nextest-timings.js';
 import {
   type BoundedExecContext,
   createProcessTreeKiller,
@@ -21,6 +22,7 @@ import {
   JUNIT_FILE,
   judgeOperationalFailure,
   judgeRun,
+  junitCaseTimes,
   junitFailures,
   readRecord,
   taskDirectory,
@@ -340,6 +342,26 @@ running 1 test
     </testsuite>
 </testsuites>`;
     expect(junitFailures(report)).toEqual({ timedOut: ['nt t::slow'], cancelled: [], failed: ['nt t::assert'] });
+  });
+
+  it("keeps a crate's tests of at least the floor from nextest's JUnit report, one timing entry per name", () => {
+    // nextest writes the binary id as the case's classname and the test path as its name.
+    const report = `<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="6" time="60.0">
+<testsuite name="cowshed-cli::command_dispatch" tests="3">
+<testcase name="macos::directory_walk" classname="cowshed-cli::command_dispatch" time="41.250"/>
+<testcase name="macos::quick" classname="cowshed-cli::command_dispatch" time="0.300"/>
+<testcase name="shared::name" classname="cowshed-cli::command_dispatch" time="2.000"><failure type="test failure"><![CDATA[<testcase name="in::output" time="99"/>]]></failure></testcase>
+</testsuite>
+<testsuite name="cowshed-cli" tests="1"><testcase name="shared::name" classname="cowshed-cli" time="1.500"/></testsuite>
+<testsuite name="cowshed-clippy" tests="1"><testcase name="other::crate" classname="cowshed-clippy" time="9.000"/></testsuite>
+<testsuite name="cowshed-core" tests="1"><testcase name="core::slow" classname="cowshed-core" time="50.000"/></testsuite>
+</testsuites>
+`;
+    expect(measuredTimings(junitCaseTimes(report), 'cowshed-cli', 3000)).toEqual({
+      'macos::directory_walk': 41250,
+      'shared::name': 3500,
+    });
   });
 
   it("reads nextest's abort of a test its command was told to stop as neither a failure nor a timeout", () => {

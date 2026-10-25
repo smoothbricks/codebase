@@ -166,6 +166,29 @@ export function junitFailures(xml: string): JunitFailures {
   return { timedOut, cancelled, failed };
 }
 
+/** One test case of a JUnit report: nextest's binary id (its `classname`), the test's name and its seconds. */
+export interface JunitCaseTime {
+  readonly binary: string;
+  readonly name: string;
+  readonly seconds: number;
+}
+
+/** Every test case of a JUnit document with the `time` it ran for; a case without one is not timed and not listed. */
+export function junitCaseTimes(xml: string): JunitCaseTime[] {
+  const text = xml.replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '').replace(/<!--[\s\S]*?-->/g, '');
+  const cases: JunitCaseTime[] = [];
+  for (const [, attributes = ''] of text.matchAll(/<testcase\b((?:[^>"']|"[^"]*"|'[^']*')*?)\/?>/g)) {
+    const time = attribute(attributes, 'time');
+    const seconds = time === null ? Number.NaN : Number(time);
+    const name = attribute(attributes, 'name');
+    if (name === null || !Number.isFinite(seconds)) {
+      continue;
+    }
+    cases.push({ binary: attribute(attributes, 'classname') ?? '', name, seconds });
+  }
+  return cases;
+}
+
 function attribute(attributes: string, name: string): string | null {
   const match = new RegExp(`(?:^|\\s)${name}\\s*=\\s*("([^"]*)"|'([^']*)')`).exec(attributes);
   if (match === null) {

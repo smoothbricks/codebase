@@ -911,6 +911,19 @@ Concrete targets come from concrete files:
   independently. Drivers run the built production Node executor, supplied by the test target's build dependency, rather
   than starting a native TypeScript compiler for every case inside the shard's progress bound. Each case settles its
   owned processes before the next case starts; the fixture is removed only after the final settlement.
+- A sharded crate can name its slow tests with their measured milliseconds in
+  `<cargo-workspace>/.config/nextest-timings.json` (`{ "<crate>": { "<test path>": <ms> } }`). Those tests leave the
+  hash: the crate's exception shards run them, dealt longest first onto the shard with the least time so far, and its
+  ordinary shards hash only what the manifest does not name. The last exception shard also runs the exceptional tests
+  the manifest does not name, so the targets stay an exact partition however stale the manifest is: a renamed test
+  selects nothing and a new slow test is hashed until the next refresh. A hash spreads many short tests evenly but drops
+  a few long ones wherever their names fall: one cowshed-core gate's eight hash shards held 83 to 276 s of test time
+  around a 168 s mean, because its 51, 38 and 18 s tests shared buckets; dealt by time, the same reports put at most 101
+  s on any of the crate's sixteen targets. `smoo-nx-nextest-timings <crate> <report.xml>...`, run from the cargo
+  workspace root, rewrites one crate's entry from the JUnit reports bounded-exec keeps for the crate's targets
+  (`.nx/workspace-data/bounded-exec/<project>%3A<target>/report.xml`), naming each test of at least 3 s. The manifest
+  may time only a member that declares `shards`, by test paths a `test(=…)` filter matches literally; anything else
+  fails graph construction.
 - A repository's serial test groups each run in one runner, `cargo-test-group-<group>`, owned by the cargo workspace
   root beside `cargo-test-archive`. A group is declared once, in `<cargo-workspace>/.config/nextest.toml`: a
   `[test-groups.<group>]` table with `max-threads = 1`, and default-profile overrides that name it with `test-group` and

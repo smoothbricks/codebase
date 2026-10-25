@@ -81,6 +81,7 @@ import {
   EXTRACTED_TARGET_DIR,
   NEXTEST_EXTRACT_BIN,
 } from './nextest-extraction.js';
+import { NEXTEST_TIMINGS_PATH, namedTestsFilter, readNextestTimings, timedShardMembers } from './nextest-timings.js';
 import {
   type ProducerReceiptsOptions,
   postTasksExecution as postProducerReceipts,
@@ -2540,10 +2541,28 @@ async function resolveCargoWorkspaces(
     // piece excludes them: each test is selected by exactly one target.
     const serialExclusion = serialGroups.length === 0 ? null : serialGroups.map((group) => group.filter).join(' or ');
     const notSerial = serialExclusion === null ? [] : [`not (${serialExclusion})`];
+    const timings = readNextestTimings(join(absoluteRoot, NEXTEST_TIMINGS_PATH));
+    for (const crate of Object.keys(timings)) {
+      if (!attributed.some((pkg) => pkg.name === crate && pkg.testShards > 1)) {
+        throw new Error(
+          `${posix.join(rootProject.root, NEXTEST_TIMINGS_PATH)} times ${crate}, which is no member of this Cargo ` +
+            'workspace that declares smoothbricks.test.shards above 1',
+        );
+      }
+    }
     for (const pkg of attributed) {
       const pieces: CargoTestPiece[] = [];
       const sharded = pkg.testShards > 1;
-      const pin = sharded && exceptional !== null ? exceptional : null;
+      const timed = timings[pkg.name] ?? {};
+      const named = Object.keys(timed);
+      const exceptionalHere = sharded ? exceptional : null;
+      // The tests the hash does not place: nextest.toml's exceptional class and the measured slow tests.
+      const pin =
+        named.length === 0
+          ? exceptionalHere
+          : exceptionalHere === null
+            ? namedTestsFilter(named)
+            : `(${exceptionalHere}) or (${namedTestsFilter(named)})`;
       const ordinary = [`package(${pkg.name})`, ...(pin === null ? [] : [`not (${pin})`]), ...notSerial].join(' and ');
       for (let index = 1; index <= pkg.testShards; index += 1) {
         const targetName = cargoTestPackageTargetName(pkg.name, sharded ? `shard${index}` : undefined);
@@ -2554,10 +2573,23 @@ async function resolveCargoWorkspaces(
         });
       }
       if (pin !== null) {
+        // Measured tests are dealt by time; the last shard also takes every exceptional test the
+        // manifest does not name, so the exception shards stay an exact cover of the pin.
+        const members = named.length === 0 ? null : timedShardMembers(timed, pkg.testShards);
         for (let index = 1; index <= pkg.testShards; index += 1) {
+          const own = members?.[index - 1];
+          const unnamed =
+            own !== undefined && exceptionalHere !== null && index === pkg.testShards
+              ? ` or ((${exceptionalHere}) and not (${namedTestsFilter(named)}))`
+              : '';
           pieces.push({
-            extra: ` --partition hash:${index}/${pkg.testShards}`,
-            selector: [`package(${pkg.name}) and (${pin})`, ...notSerial].join(' and '),
+            extra: own === undefined ? ` --partition hash:${index}/${pkg.testShards}` : '',
+            selector: [
+              own === undefined
+                ? `package(${pkg.name}) and (${pin})`
+                : `package(${pkg.name}) and ((${namedTestsFilter(own)})${unnamed})`,
+              ...notSerial,
+            ].join(' and '),
             targetName: cargoTestPackageTargetName(pkg.name, `${CARGO_TEST_EXCEPTIONS_SUFFIX}-shard${index}`),
           });
         }

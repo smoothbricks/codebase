@@ -582,7 +582,10 @@ of gate for a one-line change).
   three-file Rust change.
 - **A suite that outlasts the rest of the gate is sharded.** A runner's grant never grows, so one long runner finishes
   on the tokens it started with while the host idles. cowshed-cli runs in eight hash partitions
-  (`[package.metadata.smoothbricks.test] shards = 8`), as cowshed-core does: 492 tests, the longest runner 95 s.
+  (`[package.metadata.smoothbricks.test] shards = 8`), as cowshed-core does: 492 tests, the longest runner 95 s. The
+  slow tests of both are named with their measured time in `.config/nextest-timings.json` and dealt onto their exception
+  shards longest first; only the rest is hashed (nx-plugin README, cargo test targets), since a hash left cowshed-core's
+  shards at 83 to 276 s of test time around a 168 s mean.
 - **Lint keys the files the ESLint config loads, not their directory.** Each lint target keys the workspace ESLint
   configs and every workspace file they load, read and resolved by the loader ESLint uses (jiti for a TypeScript config,
   Node otherwise); `bun.lock` and the root manifest key installed packages, and a load the walk cannot key fails graph

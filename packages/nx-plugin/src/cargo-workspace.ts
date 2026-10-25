@@ -600,7 +600,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * exact partition of whatever the crate currently contains.
  *
  * It is declared rather than inferred because the only honest input is how long
- * the suite takes, which target inference cannot measure. Defaulting to 1 keeps
+ * the suite takes, which target inference cannot measure. Measured time places a
+ * crate's slow tests instead of the hash once `.config/nextest-timings.json` names
+ * them (nextest-timings.ts). Defaulting to 1 keeps
  * small crates on a single target without paying another Cargo freshness check.
  */
 function readTestShards(cratePackage: Record<string, unknown>, crateTomlPath: string): number {

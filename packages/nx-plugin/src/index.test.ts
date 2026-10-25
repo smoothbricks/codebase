@@ -2325,16 +2325,25 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('partitions ordinary and exceptional tests into disjoint hash shards of the same declared count', async () => {
+  it('partitions ordinary, exceptional and measured tests into disjoint shards of the same declared count', async () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write('packages/rusty/package.json', '{"name":"rusty"}\n');
-      await workspace.write('packages/rusty/Cargo.toml', '[workspace]\nmembers = ["crates/big", "crates/small"]\n');
+      await workspace.write(
+        'packages/rusty/Cargo.toml',
+        '[workspace]\nmembers = ["crates/big", "crates/small", "crates/timed"]\n',
+      );
       await workspace.write(
         'packages/rusty/crates/big/Cargo.toml',
         '[package]\nname = "big"\n\n[package.metadata.smoothbricks.test]\nshards = 3\n',
       );
       await workspace.write('packages/rusty/crates/small/Cargo.toml', '[package]\nname = "small"\n');
+      await workspace.write(
+        'packages/rusty/crates/timed/Cargo.toml',
+        '[package]\nname = "timed"\n\n[package.metadata.smoothbricks.test]\nshards = 3\n',
+      );
+      const timings = 'packages/rusty/.config/nextest-timings.json';
+      await workspace.write(timings, '{"timed":{"slow::a":9000,"slow::b":5000,"slow::c":4000,"slow::d":3000}}\n');
 
       const targets = await inferProjectTargets(workspace, 'packages/rusty/package.json');
 
@@ -2383,6 +2392,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'cargo-test-big-exceptions-shard2',
         'cargo-test-big-exceptions-shard3',
         'cargo-test-small',
+        'cargo-test-timed-shard1',
+        'cargo-test-timed-shard2',
+        'cargo-test-timed-shard3',
+        'cargo-test-timed-exceptions-shard1',
+        'cargo-test-timed-exceptions-shard2',
+        'cargo-test-timed-exceptions-shard3',
       ]);
       for (const name of [
         'cargo-test-big-shard1',
@@ -2401,6 +2416,41 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test-big-exceptions-shard1']?.inputs).toEqual(targets['cargo-test-big-shard1']?.inputs);
       // Exceptional pieces fan out like the ordinary ones: nothing is exclusive.
       expectNoSchedulerThrottle(targets);
+
+      // A crate the timing manifest measures hashes only what it does not name; its exception shards
+      // take the named tests longest first onto the least-loaded shard (a; b; then c and d, as c left
+      // the third shard lightest), and the last also takes the exceptional tests it does not name.
+      const named = 'test(=slow::a) or test(=slow::b) or test(=slow::c) or test(=slow::d)';
+      for (const index of [1, 2, 3]) {
+        expect(targets[`cargo-test-timed-shard${index}`]?.options?.command).toContain(
+          `-E 'package(timed) and not ((${exceptional}) or (${named}))' --partition hash:${index}/3 --no-fail-fast`,
+        );
+      }
+      for (const [index, own] of [
+        [1, 'test(=slow::a)'],
+        [2, 'test(=slow::b)'],
+        [3, `test(=slow::c) or test(=slow::d)) or ((${exceptional}) and not (${named})`],
+      ] as const) {
+        expect(targets[`cargo-test-timed-exceptions-shard${index}`]?.options?.command).toContain(
+          `-E 'package(timed) and ((${own}))' --no-fail-fast --no-tests=pass`,
+        );
+      }
+
+      // The manifest may only time a crate that shards, by test paths a filter names literally.
+      for (const [manifest, refusal] of [
+        ['{"small":{"slow::a":9000}}', /times small, which is no member of this Cargo workspace that declares/],
+        ['{"timed":{"slow(a)":9000}}', /timed names "slow\(a\)", which is not a Rust test path/],
+      ] as const) {
+        await workspace.write(timings, manifest);
+        const failure = await inferProjectTargets(workspace, 'packages/rusty/package.json').then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+        if (!(failure instanceof AggregateCreateNodesError)) {
+          throw new Error(`${manifest}: expected AggregateCreateNodesError, got ${String(failure)}`);
+        }
+        expect(failure.errors[0]?.[1]?.message).toMatch(refusal);
+      }
     } finally {
       await workspace.cleanup();
     }

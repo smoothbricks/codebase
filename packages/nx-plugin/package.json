@@ -231,6 +231,7 @@
     "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
     "smoo-nx-cargo-retain": "./dist/bin/smoo-nx-cargo-retain.js",
     "smoo-nx-nextest-extract": "./dist/bin/smoo-nx-nextest-extract.js",
+    "smoo-nx-nextest-timings": "./dist/bin/smoo-nx-nextest-timings.js",
     "smoo-nx-bound-failures": "./dist/bin/smoo-nx-bound-failures.js",
     "smoo-nx-failures": "./dist/bin/smoo-nx-failures.js",
     "smoo-nx-test-walks": "./dist/bin/smoo-nx-test-walks.js",
