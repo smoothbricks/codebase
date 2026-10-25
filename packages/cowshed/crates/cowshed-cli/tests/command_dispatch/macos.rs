@@ -1970,92 +1970,63 @@ fn fixture_nx(checkout: &Path) -> PathBuf {
         .expect("the fixture's Bun-installed Nx")
 }
 
-/// A genuine sibling checkout of the suite's ordinary Bun-installed patched Nx product.
-/// Its private dependency namespace stays beside that product; no repository package is borrowed.
+/// A genuine sibling checkout of the suite's ordinary Bun-installed patched Nx product: a workspace
+/// root whose `node_modules/nx` links its `packages/nx`, and beside that product its private
+/// dependency namespace, as Bun's isolated linker lays out a workspace member. Both are cloned from
+/// the fixture's installed Nx, for the reason [`clone_repository_nx_install`] gives: producing them
+/// with `bun install --offline` reads Bun's host cache, cold on a runner whose `node_modules` was
+/// seeded (measured: publish runs 40202667203 and 40216849079 on macOS arm64, `no cached manifest
+/// for "@clack/core"`), and 08_testing.md ("Fixtures") gives no fixture a host cache path. No
+/// repository package is borrowed: every store entry Nx's closure reaches is cloned, and only the
+/// packages Bun shares through its global store stay there.
 fn developer_nx(fixture: &Fixture) -> (PathBuf, PathBuf) {
     let checkout = fixture._scratch.path().join("developer-checkout");
     fs::create_dir_all(checkout.join("packages")).unwrap();
     let nx = checkout.join("packages/nx");
-    clone_tree(&fixture_nx(&fixture.checkout), &nx);
-    let product = ["package.json", "dist/bin/nx.js"];
-    let before = product.map(|file| fs::read(nx.join(file)).expect("maintained developer product"));
-    fs::copy(
-        repository_root().join("bunfig.toml"),
-        nx.join("bunfig.toml"),
-    )
-    .expect("the existing Bun install configuration");
-    let configuration =
-        fs::read(nx.join("bunfig.toml")).expect("actual developer Bun configuration");
-    cowshed_os::eprintln!(
-        "developer Nx bunfig.toml sha256={}",
-        cowshed_core::api::dto::Sha256Digest::compute(&configuration)
-    );
-    let bun = host_bun();
-    let context = Command::new(&bun)
-        .args(["--print", "process.cwd()"])
-        .env("PWD", &nx)
-        .current_dir(&nx)
-        .output()
-        .expect("observe the installer package root");
-    assert!(
-        context.status.success(),
-        "{}",
-        String::from_utf8_lossy(&context.stderr)
-    );
-    assert_eq!(
-        PathBuf::from(String::from_utf8(context.stdout).unwrap().trim()),
-        nx,
-        "the observed Bun root is the standalone developer package"
-    );
-    cowshed_os::eprintln!("developer Nx installer root: {}", nx.display());
-    // Production mode is frozen and never writes a missing lock. The ordinary producer must
-    // generate this package's exact lock first, just as the covered-install fixture does.
-    let lock_started = Instant::now();
-    let locked = Command::new(&bun)
-        .args([
-            "install",
-            "--lockfile-only",
-            "--ignore-scripts",
-            "--offline",
-        ])
-        .env("PWD", &nx)
-        .current_dir(&nx)
-        .output()
-        .expect("produce the actual developer package lock");
-    cowshed_os::eprintln!(
-        "developer Nx lock producer: {:?}; stdout: {}; stderr: {}",
-        lock_started.elapsed(),
-        String::from_utf8_lossy(&locked.stdout),
-        String::from_utf8_lossy(&locked.stderr)
-    );
-    assert!(
-        locked.status.success(),
-        "the ordinary developer package lock producer failed"
-    );
-    assert!(
-        nx.join("bun.lock").is_file(),
-        "the normal producer wrote this package's own lock"
-    );
-    let began = Instant::now();
-    let install = Command::new(&bun)
-        .args(["install", "--production", "--ignore-scripts", "--offline"])
-        .env("PWD", &nx)
-        .current_dir(&nx)
-        .output()
-        .expect("install the developer package's exact production closure");
-    cowshed_os::eprintln!(
-        "developer Nx production install: {:?}; stdout: {}; stderr: {}",
-        began.elapsed(),
-        String::from_utf8_lossy(&install.stdout),
-        String::from_utf8_lossy(&install.stderr)
-    );
-    assert!(
-        install.status.success(),
-        "the real developer package install failed"
-    );
-    // Nx's unchanged CLI resolves its global namespace four levels above dist/bin.
-    // Produce that genuine workspace binding with Bun, never a hand-made self alias.
-    let package_lock = fs::read(nx.join("bun.lock")).expect("the package's own production lock");
+    let installed = fixture_nx(&fixture.checkout);
+    clone_tree(&installed, &nx);
+    let modules = nx.join("node_modules");
+    clone_nx_store_entries(&installed, &modules.join(".bun"));
+    // Nx's bindings are the links Bun left beside it in its store entry. A relative one names a
+    // store entry, now cloned under this package's `.bun`; one into Bun's global store stays.
+    let bun_root = bun_namespace(&installed);
+    let bindings = installed
+        .parent()
+        .expect("Nx sits in its store entry's node_modules");
+    let mut groups = vec![PathBuf::new()];
+    while let Some(group) = groups.pop() {
+        fs::create_dir_all(modules.join(&group)).unwrap();
+        for item in fs::read_dir(bindings.join(&group)).expect("Nx's store entry bindings") {
+            let item = item.expect("an Nx binding");
+            let file_name = item.file_name();
+            let file_type = item.file_type().expect("an Nx binding's kind");
+            if file_name.as_encoded_bytes().starts_with(b"@") && file_type.is_dir() {
+                groups.push(group.join(&file_name));
+                continue;
+            }
+            // The Nx package itself and Bun's dot bookkeeping are no dependency bindings.
+            if !file_type.is_symlink() || file_name.as_encoded_bytes().starts_with(b".") {
+                continue;
+            }
+            let text = fs::read_link(item.path()).expect("an Nx binding's link text");
+            let target = if text.is_absolute() {
+                text
+            } else {
+                let entry = lexical_target(&item.path(), &text);
+                let inside = entry
+                    .strip_prefix(bun_root)
+                    .expect("a relative Nx binding names a Bun store entry");
+                group
+                    .components()
+                    .map(|_| Path::new(".."))
+                    .collect::<PathBuf>()
+                    .join(".bun")
+                    .join(inside)
+            };
+            std::os::unix::fs::symlink(&target, modules.join(group.join(&file_name)))
+                .expect("the developer package's dependency binding");
+        }
+    }
     fs::write(
         checkout.join("package.json"),
         serde_json::to_vec(&serde_json::json!({
@@ -2065,76 +2036,11 @@ fn developer_nx(fixture: &Fixture) -> (PathBuf, PathBuf) {
         .unwrap(),
     )
     .unwrap();
-    fs::write(checkout.join("bunfig.toml"), &configuration).unwrap();
-    for args in [
-        [
-            "install",
-            "--lockfile-only",
-            "--ignore-scripts",
-            "--offline",
-        ],
-        ["install", "--production", "--ignore-scripts", "--offline"],
-    ] {
-        let began = Instant::now();
-        let result = Command::new(&bun)
-            .args(args)
-            .env("PWD", &checkout)
-            .current_dir(&checkout)
-            .output()
-            .expect("produce the developer checkout's ordinary workspace namespace");
-        cowshed_os::eprintln!(
-            "developer Nx workspace producer {args:?}: {:?}; stdout: {}; stderr: {}",
-            began.elapsed(),
-            String::from_utf8_lossy(&result.stdout),
-            String::from_utf8_lossy(&result.stderr)
-        );
-        assert!(
-            result.status.success(),
-            "the actual workspace namespace producer failed"
-        );
-        assert!(
-            checkout.join("bun.lock").is_file(),
-            "the root producer wrote its own lock"
-        );
-    }
-    assert_eq!(
-        fs::read(nx.join("bun.lock")).unwrap(),
-        package_lock,
-        "the root producer preserves the package's own production lock"
-    );
-    assert_eq!(checkout.join("node_modules/nx").canonicalize().unwrap(), nx);
-    cowshed_os::eprintln!(
-        "developer Nx workspace bun.lock sha256={}",
-        cowshed_core::api::dto::Sha256Digest::compute(
-            &fs::read(checkout.join("bun.lock")).unwrap()
-        )
-    );
-    for (file, bytes) in product.into_iter().zip(before) {
-        let after = fs::read(nx.join(file)).expect("the installed developer product");
-        assert_eq!(
-            after, bytes,
-            "ordinary dependency installation must not change the maintained Nx {file}"
-        );
-        cowshed_os::eprintln!(
-            "developer Nx {file} sha256={}",
-            cowshed_core::api::dto::Sha256Digest::compute(&after)
-        );
-    }
-    let lock =
-        fs::read(nx.join("bun.lock")).expect("ordinary Bun wrote the developer closure lock");
-    cowshed_os::eprintln!(
-        "developer Nx bun.lock sha256={}",
-        cowshed_core::api::dto::Sha256Digest::compute(&lock)
-    );
-    assert!(
-        fs::metadata(nx.join("dist/bin/nx.js"))
-            .expect("the real developer Nx program")
-            .permissions()
-            .mode()
-            & 0o111
-            != 0,
-        "the maintained developer program remains executable"
-    );
+    let workspace = checkout.join("node_modules");
+    fs::create_dir_all(&workspace).unwrap();
+    std::os::unix::fs::symlink("../packages/nx", workspace.join("nx"))
+        .expect("the workspace's Nx binding");
+    link_nx_bins(&nx, &workspace);
     (checkout, nx)
 }
 
@@ -2337,18 +2243,59 @@ fn directory_nx_install_is_materialized_once_across_checkout_templates() {
 }
 
 fn write_repository_nx_install(installed: &Path, nx: &Path) {
-    let bun_root = nx
+    clone_nx_store_entries(nx, &installed.join(".bun"));
+    // The links Bun's install leaves at the namespace root, recreated relative so they
+    // survive the cloning every fixture performs: `node_modules/nx` and its `.bin` entries.
+    let bun_root = bun_namespace(nx);
+    let nx_entry = nx
         .ancestors()
+        .find(|ancestor| ancestor.parent() == Some(bun_root))
+        .expect("the repository's Nx sits in a Bun store entry");
+    std::os::unix::fs::symlink(
+        Path::new(".bun")
+            .join(nx_entry.file_name().expect("the Nx store entry is named"))
+            .join("node_modules/nx"),
+        installed.join("nx"),
+    )
+    .expect("the namespace's Nx link");
+    link_nx_bins(nx, installed);
+}
+
+/// The Bun install namespace, `node_modules/.bun`, whose store entry holds `nx`.
+fn bun_namespace(nx: &Path) -> &Path {
+    nx.ancestors()
         .find(|ancestor| ancestor.file_name() == Some(std::ffi::OsStr::new(".bun")))
-        .expect("the repository's Nx sits in its Bun install namespace");
-    let bun_destination = installed.join(".bun");
-    fs::create_dir_all(&bun_destination).unwrap();
-    // The store entries the closure reaches, by entry directory name: cloning an entry
-    // clones the package and the dependency links Bun left beside it in one move. The set
-    // is closed along the entries' own relative links, so a cloned entry never points at
-    // a sibling that was not cloned with it. Packages Bun shares through its global store
-    // are already installed on the host and stay there — the read-grant traversal expects
-    // them in the store, not in the checkout.
+        .expect("the installed Nx sits in its Bun install namespace")
+}
+
+/// Where the relative link at `link` with text `target` points, resolved lexically against the
+/// link's own directory, as Bun wrote it.
+fn lexical_target(link: &Path, target: &Path) -> PathBuf {
+    let mut resolved = link
+        .parent()
+        .expect("a Bun store link has a directory")
+        .to_path_buf();
+    for component in target.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            std::path::Component::Normal(part) => resolved.push(part),
+            _ => {}
+        }
+    }
+    resolved
+}
+
+/// Clone into `bun_destination` every store entry of `nx`'s Bun namespace that its installed
+/// closure reaches, by entry directory name: cloning an entry clones the package and the
+/// dependency links Bun left beside it in one move. The set is closed along the entries' own
+/// relative links, so a cloned entry never points at a sibling that was not cloned with it.
+/// Packages Bun shares through its global store are already installed on the host and stay
+/// there — the read-grant traversal expects them in the store, not in the checkout.
+fn clone_nx_store_entries(nx: &Path, bun_destination: &Path) {
+    let bun_root = bun_namespace(nx);
+    fs::create_dir_all(bun_destination).unwrap();
     let mut entries = std::collections::BTreeMap::new();
     for directory in nx_install_closure(nx).values() {
         let Some(entry) = directory
@@ -2388,21 +2335,8 @@ fn write_repository_nx_install(installed: &Path, nx: &Path) {
                     if target.is_absolute() {
                         continue;
                     }
-                    // Resolve the link lexically against its own directory, then take the
-                    // store entry that holds the resolved path, if it is one of Bun's.
-                    let mut resolved = path
-                        .parent()
-                        .expect("a Bun store entry link has a directory")
-                        .to_path_buf();
-                    for component in target.components() {
-                        match component {
-                            std::path::Component::ParentDir => {
-                                resolved.pop();
-                            }
-                            std::path::Component::Normal(part) => resolved.push(part),
-                            _ => {}
-                        }
-                    }
+                    // The store entry that holds the link's lexical target, if it is one of Bun's.
+                    let resolved = lexical_target(&path, &target);
                     let Some(linked) = resolved
                         .ancestors()
                         .find(|ancestor| ancestor.parent() == Some(bun_root))
@@ -2427,29 +2361,21 @@ fn write_repository_nx_install(installed: &Path, nx: &Path) {
     }
     for (name, entry) in &entries {
         // A link Bun left for a package this host never installed names an entry that
-        // does not exist; there is nothing to clone for it, and the traversal below
+        // does not exist; there is nothing to clone for it, and the traversal
         // asserts on whatever a consumer actually reaches.
         if entry.exists() {
             clone_or_copy_tree(entry, &bun_destination.join(name));
         }
     }
-    // The links Bun's install leaves at the namespace root, recreated relative so they
-    // survive the cloning every fixture performs: `node_modules/nx` and its `.bin` entries.
-    let nx_entry = nx
-        .ancestors()
-        .find(|ancestor| ancestor.parent() == Some(bun_root))
-        .expect("the repository's Nx sits in a Bun store entry");
-    std::os::unix::fs::symlink(
-        Path::new(".bun")
-            .join(nx_entry.file_name().expect("the Nx store entry is named"))
-            .join("node_modules/nx"),
-        installed.join("nx"),
-    )
-    .expect("the namespace's Nx link");
+}
+
+/// `nx`'s `bin` entries as Bun links them in `namespace`, whose `nx` binding names it:
+/// `.bin/<name>` → `../nx/<path>`.
+fn link_nx_bins(nx: &Path, namespace: &Path) {
     let manifest: serde_json::Value = serde_json::from_slice(
-        &fs::read(nx.join("package.json")).expect("the repository's Nx manifest"),
+        &fs::read(nx.join("package.json")).expect("the installed Nx manifest"),
     )
-    .expect("the repository's Nx manifest parses");
+    .expect("the installed Nx manifest parses");
     let bins: Vec<(String, String)> = match &manifest["bin"] {
         serde_json::Value::String(path) => vec![("nx".to_owned(), path.clone())],
         serde_json::Value::Object(map) => map
@@ -2463,11 +2389,11 @@ fn write_repository_nx_install(installed: &Path, nx: &Path) {
             .collect(),
         _ => Vec::new(),
     };
-    fs::create_dir_all(installed.join(".bin")).unwrap();
+    fs::create_dir_all(namespace.join(".bin")).unwrap();
     for (name, path) in bins {
         std::os::unix::fs::symlink(
             Path::new("../nx").join(path),
-            installed.join(".bin").join(&name),
+            namespace.join(".bin").join(&name),
         )
         .unwrap_or_else(|error| panic!("the namespace's .bin/{name} link: {error}"));
     }
@@ -8186,42 +8112,70 @@ async fn cpu_budget(socket: &Path) -> cowshed_gateway_types::CpuBudgetStatus {
 const LOADING_CHECKOUT: &str = "/loaded-host/another-checkout";
 
 /// Another checkout's background work holding the whole host, background's room with no gate work,
-/// in the fixture gateway's real ledger (05_gateway.md, "Room for a gate"): a background job of this project then waits
-/// for a returned token, as on a host other work has loaded. Its tokens return when it drops.
+/// in the fixture gateway's real ledger (05_gateway.md, "Room for a gate"), and its one-token job
+/// running on the probation token beyond it (05_gateway.md, "A one-token job starts on
+/// probation"): a background job of this project then waits for a returned token, as on a host
+/// other work has loaded. Without the probation hold a one-token ask starts at once, and an exec
+/// that names no want asks one token on a host of at most three, ⌊N/2⌋ (measured: publish runs
+/// 40202667203 and 40216849079 on a 3-CPU macOS arm64 runner). Its tokens return when it drops.
 struct LoadedHost {
     _lease: tokio::io::BufReader<tokio::net::UnixStream>,
+    _probation: tokio::io::BufReader<tokio::net::UnixStream>,
 }
 
 impl LoadedHost {
     async fn hold(socket: &Path) -> Self {
-        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
         let total = cpu_budget(socket).await.total;
-        let mut stream = tokio::net::UnixStream::connect(socket)
-            .await
-            .expect("connect the gateway's control socket");
-        let mut request = serde_json::to_string(&cowshed_gateway_types::CpuTokensRequest::new(
+        let whole = serde_json::to_string(&cowshed_gateway_types::CpuTokensRequest::new(
             std::num::NonZeroUsize::new(total).expect("a host has a token"),
             LOADING_CHECKOUT,
             "another checkout's background build",
         ))
         .expect("encode the request");
+        let lease = Self::ask(socket, whole, "granted").await;
+        // The supervisor's ask for a one-token job it can stop. This holder never writes
+        // `probation-over`, so the probation token stays lent until it drops.
+        let one = serde_json::json!({
+            "op": "jobserver", "want": 1, "checkout": LOADING_CHECKOUT,
+            "command": "another checkout's one-token job", "class": "background",
+            "pool": true, "probation": true,
+            "job": { "repoId": "loaded-host/another-checkout",
+                "workspaceIncarnation": "0123456789abcdef0123456789abcdef", "jobId": 1 }
+        })
+        .to_string();
+        let probation = Self::ask(socket, one, "probation").await;
+        Self {
+            _lease: lease,
+            _probation: probation,
+        }
+    }
+
+    /// Send `request` on a new control connection and hold it once the gateway answers `lease`.
+    async fn ask(
+        socket: &Path,
+        mut request: String,
+        lease: &str,
+    ) -> tokio::io::BufReader<tokio::net::UnixStream> {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let mut stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .expect("connect the gateway's control socket");
         request.push('\n');
         stream
             .write_all(request.as_bytes())
             .await
-            .expect("ask for the whole host");
-        let mut lease = tokio::io::BufReader::new(stream);
+            .expect("ask the gateway's ledger");
+        let mut held = tokio::io::BufReader::new(stream);
         loop {
             let mut line = String::new();
-            lease
-                .read_line(&mut line)
+            held.read_line(&mut line)
                 .await
                 .expect("the gateway answers");
             let answer: serde_json::Value =
                 serde_json::from_str(&line).expect("a JSON answer line");
             assert_eq!(answer["ok"], true, "{answer}");
-            if answer["lease"] == "granted" {
-                return Self { _lease: lease };
+            if answer["lease"] == lease {
+                return held;
             }
         }
     }
