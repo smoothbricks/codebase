@@ -869,10 +869,15 @@ the handshake bound.
   progress, because CPU tokens have no admission deadline (Host CPU budget, "No admission deadline, for any class").
 - **The gateway control plane heartbeats the same way.** A one-shot request is connected, written and half-closed within
   the control bound. While its answer is not ready, and while an audit-tail follow waits for events, the gateway writes
-  `{"ok":true,"progress":n}` every 5 s, once its actor has answered a ping. The client reads past those lines under the
-  15 s silence bound. An answer that takes as long as its work (`nx-cache-clear`, `ram-attach`, `first-launch`) is
-  therefore never cut off, and a gateway whose actor stopped turning is named `SILENT`. A held request (`disk-lease`,
-  `cpu-tokens`, `jobserver`, `resident-pool`) keeps its own protocol above.
+  `{"ok":true,"progress":n}` every 5 s, once its actor has answered a ping. A heartbeat line, once begun, is written
+  whole before the answer. The client reads past those lines. Until the first one arrives it allows the gateway 60 s of
+  silence, because a gateway of an earlier build, which a client meets during an install, never heartbeats, and its slow
+  answers (`first-launch`, `ram-attach`) still arrive within the minute doctor always gave it. Once a heartbeat has
+  arrived, the 15 s silence bound applies. An answer that takes as long as its work (`nx-cache-clear`, `ram-attach`,
+  `first-launch`) is therefore never cut off, and a gateway whose actor stopped turning is named `SILENT`. `cpu-budget`
+  is never heartbeated: an install reads it from a client of another build, whose reader ignores unknown fields and
+  would take a heartbeat line for a ledger with no gate jobs, and it answers from the ledger at once. A held request
+  (`disk-lease`, `cpu-tokens`, `jobserver`, `resident-pool`) keeps its own protocol above.
 - **Spans.** A failure reaches the boundary that owns the wait as a value. An owner that has a span ends it `span-err`
   with the failure's message.
 

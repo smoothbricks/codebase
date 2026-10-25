@@ -56,6 +56,12 @@ type BoxControlIo = Box<dyn ControlIo>;
 type ControlReader = BufReader<PeerStream<BoxControlIo>>;
 /// The process a control client waits on, as its failures name it.
 const GATEWAY: &str = "gateway daemon";
+/// The silence a client allows a gateway before its first heartbeat line. A gateway of an earlier
+/// build never heartbeats, and during an install a client talks to one: its slow answers
+/// (`first-launch`, `ram-attach`) still arrive within the minute doctor always gave it. Once a
+/// heartbeat has come, the peer has proved it heartbeats and [`deadline::HEARTBEAT_SILENCE`]
+/// applies.
+const UNPROVEN_SILENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 enum ControlEndpoint {
@@ -346,7 +352,7 @@ impl GatewayControlClient {
         }
         .await;
         sent.map_err(|error| ControlError::Wait(stream.fail(error)))?;
-        stream.hold(deadline::idle(op, deadline::HEARTBEAT_SILENCE));
+        stream.hold(deadline::idle(op, UNPROVEN_SILENCE));
         Ok(BufReader::new(stream))
     }
 
@@ -2240,6 +2246,10 @@ async fn serve_request<W>(
     W: AsyncWrite + Unpin,
 {
     let (response, mut subscription) = match request {
+        // `cpu-budget` is the one request a client of another build reads with a reader that
+        // ignores unknown fields, which would take a heartbeat line for an answer with no gate
+        // jobs; it answers from the ledger at once, so it is never heartbeated.
+        Ok(request @ ControlRequest::CpuBudget) => dispatch(request, &services).await,
         Ok(request) => answered(&mut writer, &services.handle, dispatch(request, &services)).await,
         Err(error) => {
             let code = if matches!(error, ControlError::Unauthorized) {
@@ -2305,21 +2315,38 @@ impl<'a> Heartbeat<'a> {
         self.beats.tick().await;
     }
 
-    /// Ping the actor and write one heartbeat. A ping that fails writes none, said here; only a
-    /// failed write is an error: the client is gone.
-    async fn beat<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<(), ControlError> {
-        if let Err(error) = self.handle.ping().await {
-            cowshed_os::eprintln!(
-                "cowshed: a control answer's heartbeat could not ping the gateway actor: {error}"
-            );
-            return Ok(());
+    /// Whether the actor answers a ping. One that does not is said here, and no heartbeat goes
+    /// out for it. Cancelling this writes nothing.
+    async fn alive(&self) -> bool {
+        match self.handle.ping().await {
+            Ok(()) => true,
+            Err(error) => {
+                cowshed_os::eprintln!(
+                    "cowshed: a control answer's heartbeat could not ping the gateway actor: {error}"
+                );
+                false
+            }
         }
+    }
+
+    /// Write the next heartbeat line, whole: a line is never left half written for the answer
+    /// to follow. Only a failed write is an error: the client is gone.
+    async fn write<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<(), ControlError> {
         self.seq += 1;
         let response = ControlResponse {
             progress: Some(self.seq),
             ..success()
         };
         write_response(writer, &response).await
+    }
+
+    /// Ping, and write a heartbeat when the actor answered.
+    async fn beat<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<(), ControlError> {
+        if self.alive().await {
+            self.write(writer).await
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -2339,12 +2366,13 @@ async fn answered<T, W: AsyncWrite + Unpin>(
             answer = &mut work => return answer,
             () = heartbeat.due() => {}
         }
-        let beaten = tokio::select! {
+        // Only the ping races the answer; a heartbeat once begun is written whole.
+        let alive = tokio::select! {
             biased;
             answer = &mut work => return answer,
-            beaten = heartbeat.beat(writer) => beaten,
+            alive = heartbeat.alive() => alive,
         };
-        if beaten.is_err() {
+        if alive && heartbeat.write(writer).await.is_err() {
             return work.await;
         }
     }
@@ -2818,6 +2846,7 @@ where
             return Err(ControlError::InvalidResponse);
         }
         if serde_json::from_slice::<ProgressLine>(&bytes).is_ok() {
+            reader.get_mut().silence(deadline::HEARTBEAT_SILENCE);
             continue;
         }
         return serde_json::from_slice(&bytes)
@@ -3336,7 +3365,8 @@ mod tests {
     }
 
     /// A daemon that takes the request and never answers, not even a heartbeat, is named
-    /// `SILENT` once the silence bound elapses; that elapsing is this scenario's event.
+    /// `SILENT` once the silence a peer that has not shown it heartbeats is allowed elapses; that
+    /// elapsing is this scenario's event.
     #[tokio::test(start_paused = true)]
     async fn a_daemon_that_takes_status_and_stays_silent_is_named_silent() {
         let id = Uuid::new_v4().simple().to_string();
@@ -3362,7 +3392,7 @@ mod tests {
             matches!(
                 &refused,
                 Err(ControlError::Wait(WaitError::Silent(silent)))
-                    if silent.op == "status" && silent.silent_for == deadline::HEARTBEAT_SILENCE
+                    if silent.op == "status" && silent.silent_for == UNPROVEN_SILENCE
             ),
             "{refused:?}"
         );

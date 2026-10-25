@@ -32,6 +32,9 @@ pub const HANDSHAKE: Bound = Bound::new(LatencyClass::Handshake, Duration::from_
 pub const REAP: Bound = Bound::new(LatencyClass::Reap, Duration::from_secs(5));
 /// How often a holder says it is still there on a connection it holds open for a long wait.
 pub const HEARTBEAT: Duration = Duration::from_secs(5);
+/// The resolution of the timers that wake a wait.
+const TIMER_TICK: Duration = Duration::from_millis(1);
+
 /// The silence a long wait allows its holder: three missed heartbeats.
 pub const HEARTBEAT_SILENCE: Duration = Duration::from_secs(15);
 
@@ -375,6 +378,15 @@ impl<S> PeerStream<S> {
         self.rebound(Bounding::Held(idle));
     }
 
+    /// Hold a held connection's holder to `idle` of silence from here on; the wait's start and
+    /// last progress stay. A request's budget is left as it is.
+    pub fn silence(&mut self, idle: Duration) {
+        if let Bounding::Held(held) = &mut self.bounding {
+            held.set_silence(idle);
+            self.rearm();
+        }
+    }
+
     fn rebound(&mut self, bounding: Bounding) {
         self.bounding = bounding;
         self.rearm();
@@ -407,9 +419,17 @@ impl<S> PeerStream<S> {
         }
     }
 
+    /// The timer only wakes the wait; the bound decides it. Tokio's timer fires on a millisecond
+    /// tick, so it can wake a little before the bound: with more than a tick left the timer is
+    /// re-armed for the rest, which also lets time pass before the next decision.
     fn poll_bound<T>(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<T>> {
-        ready!(self.timer.as_mut().poll(cx));
-        Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, self.expiry())))
+        loop {
+            ready!(self.timer.as_mut().poll(cx));
+            if self.bounding.remaining() < TIMER_TICK {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, self.expiry())));
+            }
+            self.rearm();
+        }
     }
 
     /// `error`, which an operation through this stream returned, as the typed failure of the
@@ -537,7 +557,12 @@ mod tests {
         assert_eq!(expired.op, "status");
         assert_eq!(expired.class, LatencyClass::Control);
         assert_eq!(expired.last, Progress::Sent { bytes: 16 });
-        assert_eq!(expired.elapsed, Duration::from_millis(50), "{failure}");
+        // The bound holds to the timer's tick.
+        assert!(
+            expired.elapsed > Duration::from_millis(49)
+                && expired.elapsed <= Duration::from_millis(50),
+            "{failure}"
+        );
         assert_eq!(failure.code(), "TIMEOUT");
         assert_eq!(failure.retry_class(), RetryClass::Terminal);
     }
@@ -592,8 +617,16 @@ mod tests {
         };
         assert_eq!(silent.op, "job terminal");
         assert_eq!(silent.last, Progress::Received { bytes: 5 });
-        assert_eq!(silent.silent_for, Duration::from_millis(80), "{failure}");
-        assert_eq!(silent.elapsed, Duration::from_millis(230), "{failure}");
+        assert!(
+            silent.silent_for > Duration::from_millis(79)
+                && silent.silent_for <= Duration::from_millis(80),
+            "{failure}"
+        );
+        assert!(
+            silent.elapsed > Duration::from_millis(229)
+                && silent.elapsed <= Duration::from_millis(230),
+            "{failure}"
+        );
         drop(holder.await.expect("the holder ran"));
     }
 

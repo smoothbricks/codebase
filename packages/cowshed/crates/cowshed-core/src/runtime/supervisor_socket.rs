@@ -719,23 +719,39 @@ where
         self.beats.tick().await;
     }
 
-    /// Probe and write one heartbeat. A probe that fails writes none: the caller's silence bound
-    /// then names this supervisor, and the probe's error is said here, where it happened. Only a
-    /// failed write is an error: the caller is gone.
-    async fn beat(&mut self, writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
-        let job = match (self.probe)().await {
-            Ok(job) => job,
+    /// What the next heartbeat reports, or `None` when the probe failed: no heartbeat goes out,
+    /// the caller's silence bound then names this supervisor, and the probe's error is said here,
+    /// where it happened. Cancelling this writes nothing.
+    async fn read(&mut self) -> Option<Option<JobPulse>> {
+        match (self.probe)().await {
+            Ok(job) => Some(job),
             Err(error) => {
                 cowshed_os::eprintln!(
                     "cowshed: a call's heartbeat could not read the supervisor: {}",
                     error.message
                 );
-                return Ok(());
+                None
             }
-        };
+        }
+    }
+
+    /// Write one heartbeat frame, whole. Only a failed write is an error: the caller is gone.
+    async fn write(
+        &mut self,
+        writer: &mut (impl AsyncWrite + Unpin),
+        job: Option<JobPulse>,
+    ) -> Result<()> {
         self.seq += 1;
         let seq = self.seq;
         write_json(writer, &Response::Progress(ProgressWire { seq, job })).await
+    }
+
+    /// Read and write one heartbeat.
+    async fn beat(&mut self, writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
+        match self.read().await {
+            Some(job) => self.write(writer, job).await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -760,12 +776,16 @@ where
             answer = &mut work => return answer,
             () = heartbeat.due() => {}
         }
-        let beaten = tokio::select! {
+        // Only the probe races the answer; a heartbeat once begun is written whole, so no frame
+        // is ever left half written for the answer to follow.
+        let read = tokio::select! {
             biased;
             answer = &mut work => return answer,
-            beaten = heartbeat.beat(writer) => beaten,
+            read = heartbeat.read() => read,
         };
-        if beaten.is_err() {
+        if let Some(job) = read
+            && heartbeat.write(writer, job).await.is_err()
+        {
             return work.await;
         }
     }

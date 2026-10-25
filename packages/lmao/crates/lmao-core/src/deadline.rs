@@ -235,6 +235,12 @@ impl Idle {
         Duration::from_nanos(clock.monotonic_nanos().saturating_sub(self.started_ns))
     }
 
+    /// Allow the holder `idle` of silence from here on, keeping the wait's start and its last
+    /// progress: a holder that has just shown it heartbeats is held to the heartbeat's bound.
+    pub fn set_silence(&mut self, idle: Duration) {
+        self.idle = idle;
+    }
+
     /// The holder showed `progress`: the silence starts over.
     pub fn observe(&mut self, progress: Progress, clock: &dyn Clock) {
         self.last_ns = clock.monotonic_nanos();
