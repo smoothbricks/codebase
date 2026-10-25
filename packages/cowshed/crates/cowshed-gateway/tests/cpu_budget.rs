@@ -200,6 +200,22 @@ impl Asker {
         asker
     }
 
+    /// One held request line on `socket`, and the first answer it hears.
+    async fn open(socket: &Path, request: Value) -> (Self, Value) {
+        let stream = UnixStream::connect(socket).await.expect("connect");
+        let (reader, mut writer) = stream.into_split();
+        writer
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .expect("ask");
+        let mut asker = Self {
+            lines: BufReader::new(reader),
+            _writer: writer,
+        };
+        let first = asker.answer().await;
+        (asker, first)
+    }
+
     async fn ask(socket: &Path, want: usize, checkout: &str) -> Self {
         let stream = UnixStream::connect(socket).await.expect("connect");
         let (reader, mut writer) = stream.into_split();
@@ -655,13 +671,14 @@ async fn a_gate_jobs_pool_admits_each_child_while_older_background_work_stays_qu
     // The land's gate job holds only its orchestrator's token.
     let (gate, pool) = Asker::gate_job(&socket, "/w/land").await;
     let mut a = Asker::ask(&socket, 2, "/w/a").await;
-    assert_eq!(a.granted().await, 2);
-    // Background holds its half, so c queues.
+    // Beside gate work the host is quiet: background's grant is one token, whatever it wants.
+    assert_eq!(a.granted().await, 1);
+    // A second background token would leave background at half the host, so c queues.
     let mut queued = Asker::ask(&socket, 1, "/w/c").await;
     // A land task asks the gate job's pool after c queued. The pool lends nothing of its own: the
-    // child is granted the host's free token, ahead of c, not a share of the gate's single token.
+    // child is granted the host's free tokens, ahead of c, not a share of the gate's single token.
     let mut task = Asker::child(&pool, 2).await;
-    assert_eq!(task.granted().await, 1);
+    assert_eq!(task.granted().await, 2);
     assert_eq!(queued.granted_within(Duration::from_millis(50)).await, None);
     let status = ledger(&socket).await;
     let land = status
@@ -669,13 +686,67 @@ async fn a_gate_jobs_pool_admits_each_child_while_older_background_work_stays_qu
         .iter()
         .find(|checkout| checkout.checkout == "/w/land")
         .expect("the land holds");
-    assert_eq!((land.held, land.running), (2, 2), "{status:?}");
+    assert_eq!((land.held, land.running), (3, 2), "{status:?}");
     drop(task);
-    // Background still holds its half: c is served when background returns a token.
+    // Background still holds its one token: c is served when background returns it.
     assert_eq!(queued.granted_within(Duration::from_millis(50)).await, None);
     drop(a);
     assert_eq!(queued.granted().await, 1);
     drop((gate, queued));
+    gateway.drain().await.expect("drain");
+}
+
+/// 05_gateway.md "A fork or attach waits for its repository's gate" and "One gate per repository",
+/// over the socket: a fork of a repository whose land gates is queued with the cause naming that
+/// land's gate job, the ledger lists it, and it is granted when the repository's last gate-class
+/// request leaves; a fork of another repository is granted at once; and a second gate job of the
+/// land's repository is queued with the land as its cause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_waits_for_its_repositorys_gate_and_hears_which_one() {
+    let (gateway, _root, socket) = gateway(4).await;
+    let quiet = |repo: &str, command: &str| serde_json::json!({ "op": "quiet", "repoId": repo, "command": command });
+    let (land, _pool) = Asker::gate_job(&socket, "/w/land").await;
+    let (mut fork, queued) = Asker::open(&socket, quiet("owner/land", "fork x")).await;
+    assert_eq!(queued["lease"], "queued", "{queued}");
+    assert_eq!(queued["cause"]["kind"], "quiet", "{queued}");
+    assert_eq!(
+        queued["cause"]["gate"]["repository"], "owner/land",
+        "{queued}"
+    );
+    assert_eq!(queued["cause"]["gate"]["checkout"], "/w/land", "{queued}");
+    assert_eq!(
+        queued["cause"]["gate"]["command"], "nx run-many -t gate",
+        "{queued}"
+    );
+    let (mut other, queued) = Asker::open(&socket, quiet("owner/other", "fork y")).await;
+    assert_eq!(queued["lease"], "queued", "{queued}");
+    assert!(queued.get("cause").is_none(), "{queued}");
+    assert_eq!(other.answer().await["lease"], "granted");
+    let (second, queued) = Asker::open(&socket, gate_request(1, "/x/land", "second gate")).await;
+    assert_eq!(queued["lease"], "queued", "{queued}");
+    assert_eq!(queued["cause"]["kind"], "repository-gate", "{queued}");
+    assert_eq!(queued["cause"]["gate"]["checkout"], "/w/land", "{queued}");
+    let status = ledger(&socket).await;
+    assert_eq!(
+        status
+            .quiet
+            .iter()
+            .map(|waiter| (waiter.repository.as_str(), waiter.command.as_str()))
+            .collect::<Vec<_>>(),
+        [("owner/land", "fork x")],
+        "{status:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), fork.answer())
+            .await
+            .is_err(),
+        "a fork of a gating repository waits"
+    );
+    drop(second);
+    drop(land);
+    assert_eq!(fork.answer().await["lease"], "granted");
+    assert!(ledger(&socket).await.quiet.is_empty());
+    drop((fork, other));
     gateway.drain().await.expect("drain");
 }
 
@@ -757,13 +828,14 @@ async fn a_restart_no_install_serves_cuts_a_queued_ask_off_unnamed() {
 async fn an_older_land_task_is_served_before_a_younger_lands_and_a_feature_builds_that_asked_first()
 {
     let (gateway, _root, socket) = gateway(4).await;
-    let (older, older_pool) = Asker::gate_job(&socket, "/w/older").await;
-    let (younger, younger_pool) = Asker::gate_job(&socket, "/w/younger").await;
-    // A feature shed holds the rest of the host with two runners, and its next one waits first.
+    // A feature shed's two runners start while no gate works; the lands then take the rest of the
+    // host, and the feature's next runner waits first.
     let mut feature_one = Asker::ask(&socket, 1, "/w/feature").await;
     assert_eq!(feature_one.granted().await, 1);
     let mut feature_two = Asker::ask(&socket, 1, "/w/feature").await;
     assert_eq!(feature_two.granted().await, 1);
+    let (older, older_pool) = Asker::gate_job(&socket, "/w/older").await;
+    let (younger, younger_pool) = Asker::gate_job(&socket, "/w/younger").await;
     let mut feature_next = Asker::ask(&socket, 1, "/w/feature").await;
     // Then the younger land's task asks through its pool, and the older land's task asks last.
     let mut younger_task = Asker::child(&younger_pool, 1).await;
@@ -873,13 +945,15 @@ async fn an_older_land_task_is_served_before_a_younger_lands_and_a_feature_build
     );
     drop(older_task);
     assert_eq!(younger_task.granted().await, 1);
+    // The lands hold the host's larger part: the feature waits while they work.
+    drop(feature_two);
     assert_eq!(
         feature_next.granted_within(Duration::from_millis(50)).await,
         None
     );
-    drop(feature_two);
+    drop((older, younger, younger_task));
     assert_eq!(feature_next.granted().await, 1);
-    drop((older, younger, younger_task, feature_next));
+    drop(feature_next);
     gateway.drain().await.expect("drain");
 }
 
@@ -1215,7 +1289,8 @@ async fn a_kept_daemons_start_drawn_on_a_lands_gate_pool_is_granted_while_backgr
     let (gateway, _root, socket) = gateway(4).await;
     let (gate, pool) = Asker::gate_job(&socket, "/w/land").await;
     let mut background = Asker::ask(&socket, 2, "/w/tests").await;
-    assert_eq!(background.granted().await, 2);
+    // Beside the land the host is quiet: background is granted one token, all it may hold here.
+    assert_eq!(background.granted().await, 1);
     let admission = GatewayJobCpu::new(socket.clone());
     let start = "node /w/land/node_modules/nx/dist/src/daemon/server/start.js --kept";
     // Asked of the host alone, as the keeper asked it before: it queues behind background's room.
@@ -1247,8 +1322,8 @@ async fn a_kept_daemons_start_drawn_on_a_lands_gate_pool_is_granted_while_backgr
         .expect("the land's gate pool grants the start");
     assert_eq!(
         ledger(&socket).await.held,
-        4,
-        "the gate's, background's two and the start's"
+        3,
+        "the gate's, background's one and the start's"
     );
     // Its host ask was withdrawn when the pool won: only the host-alone stake still waits.
     waiters_reach(&socket, "/w/land", 1).await;

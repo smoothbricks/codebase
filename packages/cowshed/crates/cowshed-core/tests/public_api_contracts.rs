@@ -1359,6 +1359,7 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
                     waiters: Vec::new(),
                 }],
                 probation: None,
+                quiet: Vec::new(),
             },
         )),
         land_turns: Vec::new(),

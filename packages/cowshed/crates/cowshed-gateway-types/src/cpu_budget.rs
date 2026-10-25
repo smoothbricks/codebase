@@ -26,6 +26,10 @@ pub const CPU_TOKENS_OP: &str = "cpu-tokens";
 pub const JOBSERVER_OP: &str = "jobserver";
 /// The control operation a resident job asks with: a relay pool and no token of its own.
 pub const RESIDENT_POOL_OP: &str = "resident-pool";
+/// The control operation a fork, or an attach that mounts, asks with before it runs: it waits
+/// while gate-class work of its repository holds or waits (05_gateway.md "A fork or attach waits
+/// for its repository's gate").
+pub const QUIET_OP: &str = "quiet";
 /// What a job on probation's requester writes on its held connection once it stopped the job
 /// without a grant: the probation token passes on and the ask waits where it was (05_gateway.md
 /// "A one-token job starts on probation").
@@ -191,6 +195,8 @@ pub struct JobserverAnswer {
     pub install: Option<InstallRestart>,
     /// The broker's queue snapshot at admission; absent when granted immediately.
     pub queue: Option<CpuQueueWait>,
+    /// Why the ask still waits and for whom, beside `queue`: absent when it was granted at once.
+    pub cause: Option<CpuWaitCause>,
 }
 
 /// The refusal code of a CPU ask a gateway cut off because an install is restarting it
@@ -318,6 +324,62 @@ impl std::fmt::Display for CpuQueueWait {
     }
 }
 
+/// Why an admission still waits after its transition, and for whom (05_gateway.md "Gate
+/// admission", "Room for a gate"). A gate job's ask names the job holding its repository's gate
+/// order; background, and a fork or attach of a repository whose gate works, name the gate job
+/// whose work quiets them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CpuWaitCause {
+    /// Another gate job heads this request's repository: gates are serialized per repository,
+    /// so this one waits for that job's last request to leave.
+    RepositoryGate { gate: CpuQueueEntry },
+    /// Gate-class work holds or waits: background is granted one token at a time beside it, and
+    /// a fork or attach of the gate's repository waits for its end.
+    Quiet { gate: CpuQueueEntry },
+    /// Nothing but tokens: none is free for the request in its order yet.
+    Tokens,
+}
+
+impl std::fmt::Display for CpuWaitCause {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RepositoryGate { gate } => {
+                write!(out, "cause=repository-gate behind gate job: {gate}")
+            }
+            Self::Quiet { gate } => write!(out, "cause=quiet beside gate job: {gate}"),
+            Self::Tokens => out.write_str("cause=tokens"),
+        }
+    }
+}
+
+/// The one line a fork, or an attach that mounts, writes:
+/// `{"op":"quiet","repoId":"owner/repo","command":"fork <ws>"}`. The gateway answers
+/// [`crate::LeaseState::Queued`], with a [`CpuWaitCause::Quiet`] naming the repository's gate job
+/// while one holds or waits, and [`crate::LeaseState::Granted`] once none does; the client then
+/// closes and runs the operation.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuietRequest<'a> {
+    op: &'static str,
+    pub repo_id: &'a str,
+    pub command: &'a str,
+    /// The CPU pool the requester inherited, when it runs under one: a fork or attach a
+    /// repository's own gate job asks for names that gate's pool, and does not wait for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<&'a str>,
+}
+
+impl<'a> QuietRequest<'a> {
+    pub const fn new(repo_id: &'a str, command: &'a str, pool: Option<&'a str>) -> Self {
+        Self {
+            op: QUIET_OP,
+            repo_id,
+            command,
+            pool,
+        }
+    }
+}
 /// The one line a client writes:
 /// `{"op":"cpu-tokens","want":8,"checkout":"/path/to/checkout","command":"…"}`.
 ///
@@ -367,6 +429,9 @@ pub struct CpuBudgetStatus {
     /// still waits in `background` for its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probation: Option<CpuProbation>,
+    /// The forks and attaches waiting for their repository's gate work to end, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quiet: Vec<CpuQuietWaiter>,
 }
 
 /// One gate job's runners that hold tokens, in one checkout.
@@ -472,35 +537,22 @@ impl CpuHolder {
     }
 }
 
-/// Background's cap beside gate-class work on a host of `total` tokens: half the host, rounded
-/// down, and at least one (05_gateway.md "Room for a gate"). While gate-class work holds or waits,
-/// no background grant takes the class past it, so the gate takes back the rest at the next
-/// returned tokens. It is also the share an exec that names no want asks for, and the count of
-/// later background grants that makes a waiting background head overdue.
+/// Half the host's `total` tokens, rounded down, and at least one: the share an exec that names no
+/// want asks for, and the count of later background grants that makes a waiting background head
+/// overdue (05_gateway.md "No background request is passed over without bound").
 pub fn background_limit(total: usize) -> usize {
     (total / 2).max(1)
 }
 
-/// Whether gate-class work holds or waits for tokens on a ledger, which decides background's cap
-/// ([`background_cap`]).
+/// Whether gate-class work holds or waits for tokens on a ledger. While it does the host is quiet
+/// (05_gateway.md "Room for a gate"): each background grant is one token, made only while the work
+/// behind the oldest gate job then holds less than half the host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GateWork {
     /// No gate-class request holds tokens or waits for them.
     Absent,
     /// A gate-class request holds tokens or waits for them.
     HoldsOrWaits,
-}
-
-/// The most tokens background-class work may be granted up to on a host of `total` tokens
-/// (05_gateway.md "Room for a gate", Danny tg#9527): all of them while no gate-class work holds or
-/// waits, so no token idles while background wants it, and [`background_limit`] beside gate-class
-/// work. No grant shrinks, so background may hold more than the cap in force when a gate arrives;
-/// it then gets no grant past the cap, and the gate takes the returned tokens first.
-pub fn background_cap(total: usize, gate: GateWork) -> usize {
-    match gate {
-        GateWork::Absent => total,
-        GateWork::HoldsOrWaits => background_limit(total),
-    }
 }
 
 /// The tokens of this host's ledger: one per core the host reports (05_gateway.md "Host CPU
@@ -517,8 +569,7 @@ pub fn background_share() -> NonZeroUsize {
 }
 
 impl CpuBudgetStatus {
-    /// This ledger's [`background_limit`]: background's cap beside gate-class work, and the
-    /// share an exec that names no want asks for.
+    /// This ledger's [`background_limit`]: the share an exec that names no want asks for.
     pub fn background_limit(&self) -> usize {
         background_limit(self.total)
     }
@@ -532,13 +583,7 @@ impl CpuBudgetStatus {
         }
     }
 
-    /// The cap in force on this ledger's background grants ([`background_cap`]).
-    pub fn background_cap(&self) -> usize {
-        background_cap(self.total, self.gate_work())
-    }
-
-    /// The tokens background-class work holds, over the cap in force when a gate arrived after
-    /// background's grants.
+    /// The tokens background-class work holds.
     pub fn background_held(&self) -> usize {
         self.background.iter().map(|stake| stake.held).sum()
     }
@@ -563,6 +608,20 @@ pub struct CpuGateWaiter {
     pub waited_ms: u64,
 }
 
+/// One fork or attach waiting for its repository's gate work to end (05_gateway.md "A fork or
+/// attach waits for its repository's gate").
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CpuQuietWaiter {
+    pub repository: String,
+    /// The client process, when its socket named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    /// What the client said it waits to run: `fork <ws>` or `attach <ws>`.
+    pub command: String,
+    /// Milliseconds since it asked.
+    pub waited_ms: u64,
+}
 #[cfg(test)]
 mod tests {
     use base64::Engine as _;

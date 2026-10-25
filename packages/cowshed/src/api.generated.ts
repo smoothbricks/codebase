@@ -627,6 +627,10 @@ export type CpuBudgetStatus = {
    * still waits in `background` for its own.
    */
   readonly probation?: CpuProbation;
+  /**
+   * The forks and attaches waiting for their repository's gate work to end, oldest first.
+   */
+  readonly quiet?: ReadonlyArray<CpuQuietWaiter>;
 };
 
 export type CpuCheckoutStatus = {
@@ -761,6 +765,26 @@ export type CpuProbation = {
    * Milliseconds since the token was lent.
    */
   readonly lentMs: number & tags.Type<'uint64'>;
+};
+
+/**
+ * One fork or attach waiting for its repository's gate work to end (05_gateway.md "A fork or
+ * attach waits for its repository's gate").
+ */
+export type CpuQuietWaiter = {
+  readonly repository: string;
+  /**
+   * The client process, when its socket named one.
+   */
+  readonly pid?: number & tags.Type<'int32'>;
+  /**
+   * What the client said it waits to run: `fork <ws>` or `attach <ws>`.
+   */
+  readonly command: string;
+  /**
+   * Milliseconds since it asked.
+   */
+  readonly waitedMs: number & tags.Type<'uint64'>;
 };
 
 /**

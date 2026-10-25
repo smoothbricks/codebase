@@ -49,7 +49,13 @@ impl JobserverFifos {
         })?;
         let directory = cowshed_gateway_types::cpu_pool_directory(store, incarnation)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        CpuPool::start(std::sync::Arc::new(directory), source)
+        CpuPool::start(
+            PoolScope {
+                directory: std::sync::Arc::new(directory),
+                gate: None,
+            },
+            source,
+        )
     }
 
     /// Name the fifo directory, sweeping a previous gateway's leftover fifos.
@@ -183,6 +189,16 @@ pub(crate) enum PoolSource {
     Probation,
 }
 
+/// Where a pool serves, and the gate job it serves when it serves one: the directory every pool
+/// of its workspace's jobs lies in, and, for a gate's root pool and every pool served under it,
+/// the gate job, so the host budget knows that job's pools (05_gateway.md "A fork or attach
+/// waits for its repository's gate").
+#[derive(Clone)]
+struct PoolScope {
+    directory: std::sync::Arc<PathBuf>,
+    gate: Option<(crate::cpu_budget::CpuBudget, crate::cpu_budget::JobAge)>,
+}
+
 /// What a pool's socket children are granted from.
 #[derive(Clone)]
 enum PoolLedger {
@@ -208,7 +224,12 @@ pub(crate) struct CpuPool {
 }
 
 impl CpuPool {
-    fn start(directory: std::sync::Arc<PathBuf>, source: PoolSource) -> io::Result<Self> {
+    fn start(scope: PoolScope, source: PoolSource) -> io::Result<Self> {
+        let gate = match &source {
+            PoolSource::Relay { host, job, .. } => Some((host.clone(), *job)),
+            _ => scope.gate,
+        };
+        let directory = scope.directory;
         use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
         std::fs::DirBuilder::new()
             .recursive(true)
@@ -231,6 +252,13 @@ impl CpuPool {
             tokio::io::unix::AsyncFd::new(listener)
         })?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        if let Some((budget, job)) = &gate {
+            budget.gate_pool(*job, std::sync::Arc::from(path.as_path()));
+        }
+        let scope = PoolScope {
+            directory: std::sync::Arc::clone(&directory),
+            gate,
+        };
         let made = || {
             fifo.as_ref()
                 .expect("a lent pool made its fifo above")
@@ -279,7 +307,7 @@ impl CpuPool {
                         }
                     } => match accepted {
                         Ok(stream) => {
-                            children.spawn(serve_pool_until_retired(stream, ledger.clone(), std::sync::Arc::clone(&directory), child_stopped.clone()));                        }
+                            children.spawn(serve_pool_until_retired(stream, ledger.clone(), scope.clone(), child_stopped.clone()));                        }
                         Err(error) => { cowshed_os::eprintln!("cowshed: CPU pool listener failed: {error}"); break; }
                     },
                     ended = children.join_next(), if !children.is_empty() => {
@@ -429,13 +457,13 @@ async fn refuse_retired_pool(mut stream: cowshed_os::fork_lock::Fenced<tokio::ne
 async fn serve_pool_until_retired(
     mut stream: cowshed_os::fork_lock::Fenced<tokio::net::UnixStream>,
     ledger: PoolLedger,
-    directory: std::sync::Arc<PathBuf>,
+    scope: PoolScope,
     mut stopped: tokio::sync::watch::Receiver<()>,
 ) -> bool {
     let retired = tokio::select! {
         biased;
         _ = stopped.changed() => true,
-        _ = serve_pool(&mut stream, ledger, directory) => false,
+        _ = serve_pool(&mut stream, ledger, scope) => false,
     };
     if retired {
         refuse_retired_pool(stream).await;
@@ -705,7 +733,7 @@ impl Admission {
 async fn serve_pool(
     stream: &mut cowshed_os::fork_lock::Fenced<tokio::net::UnixStream>,
     ledger: PoolLedger,
-    directory: std::sync::Arc<PathBuf>,
+    scope: PoolScope,
 ) {
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
     // The pid names the child in the ledger's status; nothing is decided by it.
@@ -785,7 +813,7 @@ async fn serve_pool(
     };
     let pool = if children {
         let tokens = std::num::NonZeroUsize::new(tokens).expect("a CPU grant is nonzero");
-        match CpuPool::start(directory, PoolSource::Lent(tokens)) {
+        match CpuPool::start(scope, PoolSource::Lent(tokens)) {
             Ok(pool) => Some(pool),
             Err(error) => {
                 let _ = pool_reply(reader.get_mut(), &serde_json::json!({"ok":false,"code":"rejected","error":format!("cannot serve child CPU pool: {error}")})).await;
@@ -1032,7 +1060,10 @@ mod tests {
             ));
             let root = scratch.path().join("s");
             let pool = CpuPool::start(
-                std::sync::Arc::new(root.clone()),
+                PoolScope {
+                    directory: std::sync::Arc::new(root.clone()),
+                    gate: None,
+                },
                 PoolSource::Lent(std::num::NonZeroUsize::new(2).unwrap()),
             )
             .unwrap();

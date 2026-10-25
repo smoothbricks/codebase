@@ -2034,15 +2034,17 @@ fn land_turn_line(queue: &LandTurnQueue) -> String {
 }
 
 /// The host CPU ledger in the operator's words (05_gateway.md "Host CPU budget"), in the order the
-/// ledger serves it: tokens held of the total, with what background holds and the cap in force on
-/// its grants, which is the whole host with no gate work (05_gateway.md "Room for a gate"); the
+/// ledger serves it: tokens held of the total, with what background holds and what its grants may
+/// take, the whole host with no gate work and one token a grant while gate work quiets the host
+/// (05_gateway.md "Room for a gate"); the
 /// leases held past the hold limit, oldest first, so the first lines answer who holds the host
 /// and since when (05_gateway.md "The hold limit"), each listed again under its own gate job or
 /// stake; then the request running on the probation token, if one is lent (05_gateway.md "A
 /// one-token job starts on probation"); the running gate jobs, the head — the oldest — first; the
 /// waiting gate-class requests in the order returned tokens go to them; then each checkout's
 /// background stake, served behind
-/// them. Each running gate job and background stake is followed by its leases, oldest grant first,
+/// them; and last the forks and attaches waiting for their repository's gate (05_gateway.md "A
+/// fork or attach waits for its repository's gate"). Each running gate job and background stake is followed by its leases, oldest grant first,
 /// so the reader sees who holds the tokens and since when rather than guessing from the checkout,
 /// and a background stake by its waiting requests. A queue entry is named by its process and wait
 /// age as a lease is by its grant's: one gate job's tasks are one entry each, and the job's number
@@ -2056,16 +2058,19 @@ fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
             )];
         }
     };
-    let cap = match ledger.gate_work() {
-        cowshed_gateway_types::GateWork::Absent => "with no gate work",
-        cowshed_gateway_types::GateWork::HoldsOrWaits => "beside gate work",
+    let room = match ledger.gate_work() {
+        cowshed_gateway_types::GateWork::Absent => {
+            format!("at most {} with no gate work", ledger.total)
+        }
+        cowshed_gateway_types::GateWork::HoldsOrWaits => {
+            "quiet beside gate work: one token a grant while it holds under half".to_owned()
+        }
     };
     let mut lines = vec![format!(
-        "gateway cpu budget: held {}/{} tokens, background holds {}, at most {} {cap}",
+        "gateway cpu budget: held {}/{} tokens, background holds {}, {room}",
         ledger.held,
         ledger.total,
         ledger.background_held(),
-        ledger.background_cap()
     )];
     let limit_minutes = cowshed_gateway_types::HOLD_LIMIT.as_secs() / 60;
     for (checkout, holder) in leases_past_the_hold_limit(ledger) {
@@ -2155,6 +2160,16 @@ fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
             )
         }));
     }
+    lines.extend(ledger.quiet.iter().enumerate().map(|(place, waiter)| {
+        format!(
+            "gateway quiet queue {}: repository={}: {}, waiting {}: {}",
+            place + 1,
+            waiter.repository,
+            pid_words(waiter.pid),
+            age_words(waiter.waited_ms),
+            waiter.command
+        )
+    }));
     lines
 }
 
@@ -5192,6 +5207,7 @@ mod tests {
                     waiters: Vec::new(),
                 }],
                 probation: None,
+                quiet: Vec::new(),
             })
         }
 
@@ -5215,7 +5231,7 @@ mod tests {
 
             assert_eq!(
                 lines[0],
-                "gateway cpu budget: held 18/18 tokens, background holds 12, at most 9 beside gate work"
+                "gateway cpu budget: held 18/18 tokens, background holds 12, quiet beside gate work: one token a grant while it holds under half"
             );
             assert_eq!(
                 lines[1],
@@ -5302,13 +5318,14 @@ mod tests {
                     waiters: Vec::new(),
                 }],
                 probation: None,
+                quiet: Vec::new(),
             });
             let lines = cpu_budget_lines(&ledger);
 
             assert_eq!(
                 lines[..4],
                 [
-                    "gateway cpu budget: held 18/18 tokens, background holds 13, at most 9 beside gate work",
+                    "gateway cpu budget: held 18/18 tokens, background holds 13, quiet beside gate work: one token a grant while it holds under half",
                     "gateway cpu hold past 30m: /mnt/app/account-placement: pid 29272, 12/18 tokens, granted 48m18s ago: cargo test",
                     "gateway cpu hold past 30m: /mnt/app/land: pid 31102, 4/18 tokens, granted 41m00s ago: nx run-many",
                     "gateway cpu hold past 30m: /mnt/app/account-placement: pid 29301, 1/1 tokens, granted 31m05s ago: bun test",

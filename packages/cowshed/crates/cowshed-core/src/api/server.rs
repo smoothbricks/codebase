@@ -893,6 +893,11 @@ impl RouterReply {
     ) -> std::result::Result<(), Result<RouterResponse>> {
         self.0.send(response)
     }
+
+    /// Resolves once the caller stopped waiting for the answer.
+    pub async fn closed(&mut self) {
+        self.0.closed().await;
+    }
 }
 
 /// Cloneable ingress for a single-owner router actor.

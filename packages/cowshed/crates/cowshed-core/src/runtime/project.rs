@@ -39,7 +39,8 @@ use crate::api::operations::{
 use crate::api::process::JobProcessTree;
 use crate::api::resources::{JobResourceSample, SampleInterval};
 use crate::api::server::{
-    ConnectionAuthority, EventSource, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
+    ConnectionAuthority, EventSource, RouterCommand, RouterHandle, RouterReply, RouterRequest,
+    RouterResponse,
 };
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
@@ -220,6 +221,13 @@ pub trait ProjectRuntimeHost: Send + 'static {
     /// (02_workspaces.md, "Making room for an attach"): best effort, never failing the verb. A
     /// host without disk images has no media to make room among.
     async fn make_media_room(&mut self, _demand: crate::media_room::AttachDemand) {}
+    /// The wait `operation` takes for its repository's gate before it runs: a fork's, or an
+    /// attach's of a detached workspace (05_gateway.md "A fork or attach waits for its
+    /// repository's gate"). The project actor runs it off its queue and routes the operation once
+    /// it ends. A host whose verbs attach nothing has none.
+    async fn quiet_wait(&mut self, _operation: &OperationRequest) -> Option<QuietWait> {
+        None
+    }
     async fn attach(&mut self, workspace: WorkspaceName, options: AttachOptions) -> Result<()>;
     async fn detach(&mut self, workspace: WorkspaceName) -> Result<()>;
     async fn resize(
@@ -1235,6 +1243,16 @@ fn startup_conflict_exhausted(conflict: &crate::storage::lifecycle::Conflict) ->
     )
 }
 
+/// A fork's or an attach's wait for its repository's gate: the gateway it asks, the repository,
+/// and what it waits to run.
+pub struct QuietWait {
+    pub socket: PathBuf,
+    pub repo: RepoId,
+    pub command: String,
+    /// The CPU pool the requester inherited: a gate job's own fork or attach does not wait for it.
+    pub pool: Option<String>,
+}
+
 /// The router's answer to one request: ready now, or when the job it waits on gets there.
 enum Routed {
     Now(RouterResponse),
@@ -1252,8 +1270,52 @@ impl ProjectActor {
     }
 
     async fn run(mut self) {
-        while let Some(command) = self.receiver.recv().await {
-            let (request, reply) = command.into_parts();
+        // A fork or attach that waited for its repository's gate comes back here and is routed
+        // without asking again; the actor serves everything else meanwhile. A caller that stops
+        // waiting ends its wait, which leaves the gateway's queue, and its operation never runs.
+        let (admit, mut admitted) = mpsc::unbounded_channel::<(RouterRequest, RouterReply)>();
+        loop {
+            let (request, reply, waited) = tokio::select! {
+                biased;
+                Some((request, reply)) = admitted.recv() => (request, reply, true),
+                command = self.receiver.recv() => match command {
+                    Some(command) => {
+                        let (request, reply) = command.into_parts();
+                        (request, reply, false)
+                    }
+                    None => break,
+                },
+            };
+            if !waited && self.authorize(&request).is_ok() {
+                let quiet = self.host.quiet_wait(request.operation()).await;
+                self.host.release_intent_leases();
+                if let Some(QuietWait {
+                    socket,
+                    repo,
+                    command,
+                    pool,
+                }) = quiet
+                {
+                    let admit = admit.clone();
+                    let mut reply = reply;
+                    tokio::spawn(async move {
+                        let waited = tokio::select! {
+                            waited = super::job_cpu::wait_for_quiet(&socket, &repo, &command, pool.as_deref()) => Some(waited),
+                            () = reply.closed() => None,
+                        };
+                        match waited {
+                            None => {}
+                            Some(Ok(())) => {
+                                let _ = admit.send((request, reply));
+                            }
+                            Some(Err(error)) => {
+                                let _ = reply.send(Err(error));
+                            }
+                        }
+                    });
+                    continue;
+                }
+            }
             let routed = match request.steps().cloned() {
                 Some(steps) => cowshed_os::timing::reporting(steps, self.route(request)).await,
                 None => self.route(request).await,
@@ -1276,11 +1338,13 @@ impl ProjectActor {
         self.host.shutdown().await;
     }
 
-    async fn route(&mut self, request: RouterRequest) -> Result<Routed> {
+    /// Whether this controller serves `request` from its connection: its repository's, no host
+    /// operation, and a coordinator's unless the operation is a worker's. Checked before a fork or
+    /// attach waits for its repository's gate, so a refused request holds no place in that queue,
+    /// and again by `route`.
+    fn authorize(&self, request: &RouterRequest) -> Result<()> {
         self.validate_connection_authority(request.authority())?;
         let method = request.method();
-        let _span = cowshed_os::timing::span_named("route", || method.to_owned());
-        let (authority, operation, upload, _) = request.into_parts();
         let scope = operations::operation(method)
             .map(|info| info.scope)
             .ok_or_else(|| CowshedError::internal(format!("{method} has no declaration")))?;
@@ -1292,8 +1356,16 @@ impl ProjectActor {
             ));
         }
         if scope != Scope::Worker {
-            require_coordinator(&authority)?;
+            require_coordinator(request.authority())?;
         }
+        Ok(())
+    }
+
+    async fn route(&mut self, request: RouterRequest) -> Result<Routed> {
+        self.authorize(&request)?;
+        let method = request.method();
+        let _span = cowshed_os::timing::span_named("route", || method.to_owned());
+        let (authority, operation, upload, _) = request.into_parts();
         // What the operation may attach. Each arm makes room for it only after the checks that
         // authorize and validate its request, so a refused request has no effect on the host.
         let demand = crate::media_room::attach_demand(&operation);
@@ -14111,6 +14183,34 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             self.gateway_control.as_ref(),
         )
         .await;
+    }
+
+    async fn quiet_wait(&mut self, operation: &OperationRequest) -> Option<QuietWait> {
+        use OperationRequest as Op;
+        let command = match operation {
+            Op::CoordinatorFork(request) => format!("fork {}", request.workspace),
+            Op::WorkspaceAttach(request) => {
+                // An attach of a mounted workspace attaches nothing, so it never waits. One the
+                // controller cannot read is left to the attach, which says why.
+                let detached = self.current(&request.workspace).await.is_ok_and(|current| {
+                    matches!(
+                        current.derived.mount_state,
+                        crate::storage::lifecycle::MountState::Detached
+                    )
+                });
+                if !detached {
+                    return None;
+                }
+                format!("attach {}", request.workspace)
+            }
+            _ => return None,
+        };
+        Some(QuietWait {
+            socket: self.descriptor.storage.control_socket(),
+            repo: self.descriptor.repo_id.clone(),
+            command,
+            pool: super::job_cpu::requester_cpu_pool(),
+        })
     }
 
     async fn attach(&mut self, workspace: WorkspaceName, options: AttachOptions) -> Result<()> {

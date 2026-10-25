@@ -540,9 +540,15 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   without bound"); gate-class grants are not counted.
 - **CPU admission is work-conserving**: over the same generated sequences, with no gate-class request holding or waiting
   a token stays free while background waits only when two or more checkouts wait and a waiting request wants more than
-  the free tokens; a gate-class request never waits beside a free token; and while one waits, background is granted only
-  one floor token at a time, and only while it then holds under half the host (05_gateway.md, "Room for a gate", Danny
-  tg#9527).
+  the free tokens; a gate-class request never waits beside a free token; and while one holds or waits, background is
+  granted only one token at a time, and only while it then holds under half the host (05_gateway.md, "Room for a gate",
+  Danny tg#9527, tg#10536).
+- **Gate work quiets the host, table-driven**: rows of host size, background held before a gate, the gate's tokens and a
+  newcomer's want give the newcomer's grant (the whole room with no gate work, one token beside it while the floor is
+  open, none once it is shut); rows of gate requests by repository give a fork's or attach's quiet ask its answer (run
+  now, or wait naming the gate job heading its repository) and the transition that releases it; rows of queued asks give
+  each its typed cause (repository-gate, quiet or tokens) (05_gateway.md, "One gate per repository", "A fork or attach
+  waits for its repository's gate").
 
 ## Integration tests (real substrate)
 

@@ -23,10 +23,10 @@ use cowshed_os::deadline::{self, Peer, PeerStream, WaitError};
 use cowshed_gateway_types::{
     CPU_TOKENS_OP, CpuBudgetStatus, DISK_LEASE_OP, DaemonStatus, DiskClass, EgressGrant,
     EgressMode, FIRST_LAUNCH_OP, FirstLaunch, FirstLaunchProbe, HostPattern, JOBSERVER_OP,
-    LeaseClass, LeaseState, MirrorRoute, PhaseShare, RAM_DETACH_OP, RAM_LEASE_OP, RESIDENT_POOL_OP,
-    RamAttachRefusal, RamDetached, RamDiskAttached, RamDiskDevice, RamDiskEntry, RamDiskSectors,
-    RamDisks, TASK_ADMIT_OP, TaskClass, TaskGrant, TaskOutcome, TaskQueueStatus, TaskRunCaps,
-    WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+    LeaseClass, LeaseState, MirrorRoute, PhaseShare, QUIET_OP, RAM_DETACH_OP, RAM_LEASE_OP,
+    RESIDENT_POOL_OP, RamAttachRefusal, RamDetached, RamDiskAttached, RamDiskDevice, RamDiskEntry,
+    RamDiskSectors, RamDisks, TASK_ADMIT_OP, TaskClass, TaskGrant, TaskOutcome, TaskQueueStatus,
+    TaskRunCaps, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 
 use crate::{
@@ -533,6 +533,12 @@ enum Incoming {
         command: String,
         job: JobserverJobIn,
     },
+    /// A fork or an attach that mounts, waiting while its repository's gate works.
+    Quiet {
+        repo_id: cowshed_core::repository::RepoId,
+        command: String,
+        pool: Option<PathBuf>,
+    },
     TaskAdmit {
         unit: String,
         owner: String,
@@ -649,6 +655,17 @@ struct ResidentPoolIn {
     job: JobserverJobIn,
 }
 
+/// A `quiet` request's fields: the repository a fork or attach works in, and what it runs.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuietIn {
+    repo_id: cowshed_core::repository::RepoId,
+    command: String,
+    /// The CPU pool the requester inherited, when it runs under one.
+    #[serde(default)]
+    pool: Option<PathBuf>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct JobserverJobIn {
@@ -725,6 +742,9 @@ struct ControlResponse {
     cpu_budget: Option<CpuBudgetStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     queue: Option<cowshed_gateway_types::cpu_budget::CpuQueueWait>,
+    /// Why a queued ask waits, and for whom.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cause: Option<cowshed_gateway_types::CpuWaitCause>,
     /// What a selected task-server unit runs under.
     #[serde(skip_serializing_if = "Option::is_none")]
     task_grant: Option<TaskGrant>,
@@ -1152,6 +1172,7 @@ async fn serve<R, W>(
                 writer,
                 tenure,
                 granted,
+                lease(LeaseState::Queued),
                 |()| lease(LeaseState::Granted),
                 "disk-lease scheduler",
                 scheduler_stopped,
@@ -1175,6 +1196,7 @@ async fn serve<R, W>(
                 writer,
                 stake,
                 granted,
+                lease(LeaseState::Queued),
                 |tokens| ControlResponse {
                     tokens: Some(tokens),
                     ..lease(LeaseState::Granted)
@@ -1247,6 +1269,38 @@ async fn serve<R, W>(
             )
             .await;
         }
+        Ok(Incoming::Quiet {
+            repo_id,
+            command,
+            pool,
+        }) => {
+            let crate::cpu_budget::QuietAsk {
+                stake,
+                gate,
+                granted,
+            } = services.cpu_budget.ask_quiet(
+                Arc::from(repo_id.as_str()),
+                pool,
+                Claim::new(&command, pid),
+            );
+            // A cut-off drops the gate's sender as it drops the grant's: `hold` then refuses it.
+            let gate = gate.await.ok().flatten();
+            let budget = services.cpu_budget.clone();
+            hold(
+                reader,
+                writer,
+                stake,
+                granted,
+                ControlResponse {
+                    cause: gate.map(|gate| cowshed_gateway_types::CpuWaitCause::Quiet { gate }),
+                    ..lease(LeaseState::Queued)
+                },
+                |()| lease(LeaseState::Granted),
+                "CPU budget",
+                |_| cpu_ask_cut_off(&budget),
+            )
+            .await;
+        }
         Ok(Incoming::TaskAdmit {
             unit,
             owner,
@@ -1284,6 +1338,7 @@ async fn serve<R, W>(
                 writer,
                 tenure,
                 granted,
+                lease(LeaseState::Queued),
                 |answer| match answer {
                     Ok(grant) => ControlResponse {
                         task_grant: Some(grant),
@@ -1304,15 +1359,17 @@ async fn serve<R, W>(
     }
 }
 
-/// Hold one lease for this connection — a disk lease or CPU tokens — whose stake is `stake`:
-/// answer `queued` at once, the `granted` answer once the scheduler admits it, then hold until the
-/// client closes. A client that closes while queued leaves the queue; either way, dropping the
+/// Hold one lease for this connection — a disk lease, CPU tokens or a quiet ask — whose stake is
+/// `stake`: answer `queued` at once, the `granted` answer once the scheduler admits it, then hold
+/// until the client closes. A client that closes while queued leaves the queue; either way, dropping the
 /// stake gives back whatever it held. A scheduler that drops the grant is answered `stopped`.
+#[allow(clippy::too_many_arguments)]
 async fn hold<R, W, S, G>(
     mut reader: R,
     mut writer: W,
     stake: S,
     granted: tokio::sync::oneshot::Receiver<G>,
+    queued: ControlResponse,
     answer: impl FnOnce(G) -> ControlResponse,
     scheduler: &str,
     stopped: impl FnOnce(&str) -> ControlResponse,
@@ -1321,10 +1378,7 @@ async fn hold<R, W, S, G>(
     W: AsyncWrite + Unpin,
 {
     let asked = std::time::Instant::now();
-    if write_response(&mut writer, &lease(LeaseState::Queued))
-        .await
-        .is_err()
-    {
+    if write_response(&mut writer, &queued).await.is_err() {
         return;
     }
     let mut discard = [0_u8; 64];
@@ -1388,17 +1442,16 @@ async fn hold_jobserver<R, W>(
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let queue = match queued.await {
-        Ok(mut queue) => {
-            if let Some(wait) = &mut queue {
-                wait.request.repository = wait
-                    .request
-                    .repository
-                    .take()
-                    .or_else(|| options.pool_job.as_ref().map(|job| job.repo_id.to_string()));
-            }
-            queue
+    let (queue, cause) = match queued.await {
+        Ok(Some(crate::cpu_budget::Queued { mut wait, cause })) => {
+            wait.request.repository = wait
+                .request
+                .repository
+                .take()
+                .or_else(|| options.pool_job.as_ref().map(|job| job.repo_id.to_string()));
+            (Some(wait), Some(cause))
         }
+        Ok(None) => (None, None),
         Err(_) => {
             let _ = write_response(&mut writer, &cpu_ask_cut_off(&budget)).await;
             return;
@@ -1408,6 +1461,7 @@ async fn hold_jobserver<R, W>(
         &mut writer,
         &ControlResponse {
             queue,
+            cause,
             ..lease(LeaseState::Queued)
         },
     )
@@ -2052,6 +2106,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
             "probation",
         ],
         RESIDENT_POOL_OP => &["op", "checkout", "command", "job"],
+        QUIET_OP => &["op", "repoId", "command", "pool"],
         _ => {
             return Err(ControlError::Encoding(
                 "unknown gateway control operation".to_owned(),
@@ -2095,6 +2150,18 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
             checkout,
             command,
             job: checked_job(job)?,
+        });
+    }
+    if op == QUIET_OP {
+        let QuietIn {
+            repo_id,
+            command,
+            pool,
+        } = serde_json::from_value(value).map_err(encoding)?;
+        return Ok(Incoming::Quiet {
+            repo_id,
+            command,
+            pool,
         });
     }
     let jobserver = op == JOBSERVER_OP;
@@ -2960,6 +3027,7 @@ fn success() -> ControlResponse {
         cpu_pool: None,
         cpu_budget: None,
         queue: None,
+        cause: None,
         task_grant: None,
         task_queue: None,
         nx_cache_cleared: None,

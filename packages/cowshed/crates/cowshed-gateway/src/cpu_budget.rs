@@ -18,12 +18,14 @@
 //!
 //! Fairness only acts when a grant is made: a running nextest or cargo cannot hand tokens back,
 //! and its FIFO, implicit make token and test-thread sizing are never resized. Admission is
-//! work-conserving: while no gate-class work holds or waits, background may be granted every
-//! token, so none idles while background wants it. Beside gate-class work no background grant takes
-//! the class past half the host ([`background_cap`]), and a gate that arrives after background
-//! filled the host takes back its share from the next returned tokens: no grant shrinks, and
-//! nothing is killed or timed. Class
-//! ranks first: while any gate-class request waits, returned tokens go to gate-class work ahead
+//! work-conserving while no gate-class work holds or waits: background may be granted every
+//! token, so none idles while background wants it. Gate-class work quiets the host: beside it each
+//! background grant is one token, made only while the work behind the oldest gate job then holds
+//! less than half the host ([`Ledger::floor_open`]), and a gate that arrives after background filled
+//! the host takes back its share from the next returned tokens: no grant shrinks, and nothing is
+//! killed or timed. A fork or attach of a repository whose gate works waits here for that gate to
+//! end ([`Ledger::ask_quiet`]), so the quiet a land's gate needs is the gateway's state, not an
+//! announcement. Class ranks first: while any gate-class request waits, returned tokens go to gate-class work ahead
 //! of queued background. A land's gate runs as a gate job whose pool relays each of its tasks'
 //! asks here at gate class (`jobserver.rs`), ranked by the gate job's own admission: gate work is
 //! served oldest job first, and within one job in the order its tasks asked, so an older land
@@ -42,7 +44,8 @@ use std::time::{Duration, Instant};
 
 use cowshed_gateway_types::{
     CpuBackgroundStake, CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, CpuHolder,
-    CpuProbation, CpuWaiter, GateWork, InstallRestart, background_cap, background_limit,
+    CpuProbation, CpuQuietWaiter, CpuWaitCause, CpuWaiter, InstallRestart, background_limit,
+    cpu_budget::{CpuQueueEntry, CpuQueueWait, JobserverClass},
     host_tokens,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -189,17 +192,42 @@ struct Checkout {
     waiting: VecDeque<Waiter>,
 }
 
+/// A fork or an attach that mounts, waiting for its repository's gate work to end (05_gateway.md
+/// "A fork or attach waits for its repository's gate"). It holds no token.
+#[derive(Debug)]
+struct QuietWaiter {
+    ticket: Ticket,
+    repo: Arc<str>,
+    claim: Claim,
+    asked: Instant,
+}
+
+/// The most tokens the work behind the oldest gate job (background, and younger gate jobs) may
+/// hold on a host of `total` tokens: less than half the host, and at least one on a host of two
+/// or more, so on the smallest hosts that work still runs on one (05_gateway.md "Room for a gate").
+fn behind_limit(total: usize) -> usize {
+    // A host of one token has none to spare beside a gate.
+    (total.saturating_sub(1) / 2).max(usize::from(total >= 2))
+}
+
+/// What a request queued by an admission transition hears: the queue it waits in, and why.
+#[derive(Debug)]
+pub(crate) struct Queued {
+    pub(crate) wait: CpuQueueWait,
+    pub(crate) cause: CpuWaitCause,
+}
 /// The budget's state.
 ///
-/// Invariants: `free` plus every checkout's `held` is `total`; no background grant takes the
-/// class past the cap in force when it is made ([`Ledger::background_cap`]); a checkout is present exactly while it holds or waits; every
-/// ticket in `tickets` is a holder or a waiter of the checkout it names; all gate holders in one
-/// repository belong to one job, including holders in different checkouts.
+/// Invariants: `free` plus every checkout's `held` is `total`; a background grant made beside
+/// gate-class work is one token, made while the floor is open ([`Ledger::floor_open`]); a
+/// checkout is present exactly while it holds or waits; every ticket in `tickets` is a holder or
+/// a waiter of the checkout it names; all gate holders in one repository belong to one job,
+/// including holders in different checkouts; every quiet waiter's repository has gate work.
 #[derive(Debug)]
 pub(crate) struct Ledger {
     total: usize,
-    /// [`background_limit`] of `total`: background's cap beside gate-class work, and the later
-    /// background grants that make a waiting background head overdue.
+    /// [`background_limit`] of `total`: the later background grants that make a waiting
+    /// background head overdue.
     background: usize,
     free: usize,
     checkouts: HashMap<Arc<str>, Checkout>,
@@ -207,11 +235,18 @@ pub(crate) struct Ledger {
     /// The waiter the probation token is lent to, and since when: one token beyond `total`, never
     /// counted in `free` (05_gateway.md "A one-token job starts on probation").
     lent: Option<(Ticket, Instant)>,
+    /// The forks and attaches waiting for their repository's gate work to end, oldest first.
+    quiet: Vec<QuietWaiter>,
+    /// Every CPU pool a gate job serves, its root's and each pool served under it, by endpoint: a
+    /// quiet ask whose requester's pool is one of the pools of the gate job heading its repository
+    /// works for that gate and does not wait for it. A background or resident job of the same
+    /// workspace has pools in the same directory and none of these.
+    gate_pools: HashMap<Arc<std::path::Path>, Ticket>,
 }
 
 impl Ledger {
-    /// The host's ledger: background's cap is the whole host with no gate-class work and half of
-    /// it beside gate-class work ([`background_cap`]).
+    /// The host's ledger: background may take the whole host with no gate-class work, and one
+    /// token a grant beside it ([`Ledger::floor_open`]).
     pub(crate) fn host(limits: CpuBudgetLimits) -> Self {
         let total = limits.tokens.get();
         Self::with(total, background_limit(total))
@@ -225,6 +260,8 @@ impl Ledger {
             checkouts: HashMap::new(),
             tickets: HashMap::new(),
             lent: None,
+            quiet: Vec::new(),
+            gate_pools: HashMap::new(),
         }
     }
 
@@ -245,6 +282,8 @@ impl Ledger {
     pub(crate) fn leave(&mut self, now: Instant, ticket: Ticket, grants: &mut Vec<Grant>) {
         self.return_probation(ticket);
         let Some(name) = self.tickets.remove(&ticket) else {
+            // A fork or attach that closed while it waited for its repository's gate.
+            self.quiet.retain(|waiter| waiter.ticket != ticket);
             return;
         };
         let checkout = self
@@ -269,6 +308,15 @@ impl Ledger {
         if checkout.running.is_empty() && checkout.waiting.is_empty() {
             self.checkouts.remove(&name);
         }
+        let jobs: std::collections::HashSet<Ticket> = self
+            .checkouts
+            .values()
+            .flat_map(|checkout| {
+                let held = checkout.running.iter().map(|holder| holder.job);
+                held.chain(checkout.waiting.iter().map(|waiter| waiter.job))
+            })
+            .collect();
+        self.gate_pools.retain(|_, job| jobs.contains(job));
         self.admit(now, grants);
     }
 
@@ -283,12 +331,12 @@ impl Ledger {
     /// first, as long as that work as a whole then still holds less than half the host, so the
     /// job being served and the older ones always hold the larger part.
     ///
-    /// With no gate-class demand, background is fair between checkouts, within its room: the free
-    /// tokens within the cap in force ([`Ledger::background_cap`]), every token when no gate-class
-    /// work holds or waits. The next grant goes to the waiting
+    /// With no gate-class work, background is fair between checkouts over every free token; beside
+    /// it each background grant is one token, in the same order, while the floor is open
+    /// ([`Ledger::floor_open`]). The next grant goes to the waiting
     /// checkout that holds the fewest tokens (the older head waiter on a tie), to its oldest
     /// waiter, except that an overdue head goes first ([`Ledger::overdue`]). A checkout's fair
-    /// share is the cap in force divided among the checkouts holding or waiting; its claim
+    /// share is the host divided among the checkouts holding or waiting; its claim
     /// is what remains of that share, at least one. While another checkout
     /// waits, the grant is exactly the claim or the `want`, whichever is smaller, so nobody
     /// outruns a waiting peer; with nobody else waiting it is the whole room up to `want`. A head
@@ -418,39 +466,6 @@ impl Ledger {
         }
     }
 
-    /// Tokens background-class work may still take: the free ones, up to the cap in force
-    /// ([`Ledger::background_cap`]). With no gate-class work that is every free token; beside it no
-    /// grant takes the class past half the host, so a gate takes the tokens background returns.
-    fn background_room(&self) -> usize {
-        let held: usize = self
-            .checkouts
-            .values()
-            .flat_map(|checkout| &checkout.running)
-            .filter(|holder| holder.class == Class::Background)
-            .map(|holder| holder.tokens)
-            .sum();
-        self.free.min(self.background_cap().saturating_sub(held))
-    }
-
-    /// Whether any gate-class request holds tokens or waits for them, a behind-head one included.
-    fn gate_work(&self) -> GateWork {
-        let gate = |class: &Class| class.repo().is_some();
-        if self.checkouts.values().any(|checkout| {
-            checkout.running.iter().any(|holder| gate(&holder.class))
-                || checkout.waiting.iter().any(|waiter| gate(&waiter.class))
-        }) {
-            GateWork::HoldsOrWaits
-        } else {
-            GateWork::Absent
-        }
-    }
-
-    /// Background's cap in force ([`background_cap`]): the whole host with no gate-class work, half
-    /// of it beside gate-class work.
-    fn background_cap(&self) -> usize {
-        background_cap(self.total, self.gate_work())
-    }
-
     /// A running job owns its repository until its last holder leaves. Otherwise the oldest
     /// queued job is the head. A ticket minted earlier but enqueued late cannot preempt a holder.
     fn gate_head(&self, repo: &str) -> Option<Ticket> {
@@ -487,6 +502,94 @@ impl Ledger {
             .is_some_and(|repo| self.gate_head(repo) == Some(waiter.job))
     }
 
+    /// Gate job `job` as a queue entry: its root request, whose ticket is the job's, or once the
+    /// root has left while relayed tasks still hold, its oldest task.
+    fn gate_job(&self, job: Ticket) -> CpuQueueEntry {
+        self.checkouts
+            .iter()
+            .flat_map(|(name, checkout)| {
+                let holders = checkout
+                    .running
+                    .iter()
+                    .map(|holder| (holder.ticket, holder.job, &holder.class, &holder.claim));
+                let waiters = checkout
+                    .waiting
+                    .iter()
+                    .map(|waiter| (waiter.ticket, waiter.job, &waiter.class, &waiter.claim));
+                holders
+                    .chain(waiters)
+                    .map(move |(ticket, owner, class, claim)| (ticket, owner, name, class, claim))
+            })
+            .filter(|(_, owner, ..)| *owner == job)
+            .min_by_key(|(ticket, ..)| *ticket)
+            .map(|(_, _, name, class, claim)| queue_entry(name, class, job, claim))
+            .expect("a gate job the ledger heads has a holder or a waiter")
+    }
+
+    /// A CPU pool gate job `job` serves, at `endpoint`, while the job holds or waits.
+    pub(crate) fn gate_pool(&mut self, job: Ticket, endpoint: Arc<std::path::Path>) {
+        let serves = self.checkouts.values().any(|checkout| {
+            checkout.running.iter().any(|holder| holder.job == job)
+                || checkout.waiting.iter().any(|waiter| waiter.job == job)
+        });
+        if serves {
+            self.gate_pools.insert(endpoint, job);
+        }
+    }
+
+    /// A fork or an attach that mounts asks whether `repo` is quiet: `None` when no gate-class
+    /// request of `repo` holds or waits, and it may run now; otherwise it waits, holding no
+    /// token, and the gate job heading `repo` is the one it waits for (05_gateway.md "A fork or
+    /// attach waits for its repository's gate"). One whose requester's `pool` lies in that gate
+    /// job's own pools works for the gate itself, and waiting would wait for itself: it runs now.
+    pub(crate) fn ask_quiet(
+        &mut self,
+        ticket: Ticket,
+        repo: Arc<str>,
+        pool: Option<&std::path::Path>,
+        claim: Claim,
+        asked: Instant,
+    ) -> Option<CpuQueueEntry> {
+        let head = self.gate_head(&repo)?;
+        if pool.is_some_and(|pool| self.gate_pools.get(pool) == Some(&head)) {
+            return None;
+        }
+        let gate = self.gate_job(head);
+        self.quiet.push(QuietWaiter {
+            ticket,
+            repo,
+            claim,
+            asked,
+        });
+        Some(gate)
+    }
+
+    /// The forks and attaches whose repository's gate work has ended leave the queue and may run.
+    pub(crate) fn release_quiet(&mut self, released: &mut Vec<Ticket>) {
+        let (waiting, done): (Vec<QuietWaiter>, Vec<QuietWaiter>) = std::mem::take(&mut self.quiet)
+            .into_iter()
+            .partition(|waiter| self.gate_head(&waiter.repo).is_some());
+        self.quiet = waiting;
+        released.extend(done.into_iter().map(|waiter| waiter.ticket));
+    }
+
+    /// The tokens held by the work behind gate job `head`: background, and younger gate jobs.
+    fn behind(&self, head: Ticket) -> usize {
+        self.checkouts
+            .values()
+            .flat_map(|checkout| &checkout.running)
+            .filter(|holder| holder.class == Class::Background || holder.job > head)
+            .map(|holder| holder.tokens)
+            .sum()
+    }
+
+    /// Whether the floor is open beside gate job `head`: one more token to the work behind it
+    /// leaves that work within [`behind_limit`], under half the host and at least one token, so
+    /// `head` and the older jobs keep the larger part and the work behind them is never starved. Beside gate-class work every background grant is this floor's one token
+    /// (05_gateway.md "Room for a gate").
+    fn floor_open(&self, head: Ticket) -> bool {
+        self.behind(head) < behind_limit(self.total)
+    }
     /// The global age head for diagnostics, including a holder with no task currently queued.
     fn queue_head(&self) -> Option<(&Arc<str>, Ticket)> {
         self.checkouts
@@ -521,19 +624,14 @@ impl Ledger {
             })
             .min_by_key(|(_, _, waiter)| waiter.order())?;
         let head = waiter.job;
-        let holders = || {
+        let job_holds = &|job: Ticket| {
             self.checkouts
                 .values()
                 .flat_map(|checkout| &checkout.running)
+                .any(|holder| holder.class.repo().is_some() && holder.job == job)
         };
-        let behind: usize = holders()
-            .filter(|holder| holder.class == Class::Background || holder.job > head)
-            .map(|holder| holder.tokens)
-            .sum();
-        let job_holds = &|job: Ticket| {
-            holders().any(|holder| holder.class.repo().is_some() && holder.job == job)
-        };
-        let starved = (2 * (behind + 1) < self.total)
+        let starved = self
+            .floor_open(head)
             .then(|| {
                 self.checkouts
                     .iter()
@@ -576,11 +674,13 @@ impl Ledger {
         })
     }
 
-    /// The next background grant by checkout fairness; `None` when nobody can be granted now. It
-    /// takes only the background room: free tokens within the class's limit.
+    /// The next background grant by checkout fairness; `None` when nobody can be granted now. With
+    /// no gate-class work it may take every free token. Beside gate-class work the host is quiet:
+    /// the same order picks, the grant is one token, and only while the floor is open beside the
+    /// oldest gate job (05_gateway.md "Room for a gate").
     fn next_background(&self) -> Option<Pick> {
-        let room = self.background_room();
-        if room == 0 {
+        let quiet = self.queue_head().map(|(_, job)| job);
+        if quiet.is_some_and(|head| !self.floor_open(head)) {
             return None;
         }
         let (name, checkout, position, head) = self
@@ -595,19 +695,26 @@ impl Ledger {
                 Some((name, checkout, position, head))
             })
             .min_by_key(|(_, checkout, _, head)| self.turn(checkout, head))?;
-        let share = (self.background_cap() / self.checkouts.len()).max(1);
+        if quiet.is_some() {
+            return Some(Pick {
+                checkout: Arc::clone(name),
+                position,
+                tokens: 1,
+            });
+        }
+        let share = (self.total / self.checkouts.len()).max(1);
         let least = head.want.min(share.saturating_sub(checkout.held).max(1));
         let peers_wait = self
             .checkouts
             .iter()
             .any(|(other, peer)| other != name && !peer.waiting.is_empty());
-        if peers_wait && room < least {
+        if peers_wait && self.free < least {
             return None;
         }
         let tokens = if peers_wait {
             least
         } else {
-            head.want.min(room)
+            head.want.min(self.free)
         };
         Some(Pick {
             checkout: Arc::clone(name),
@@ -616,9 +723,8 @@ impl Ledger {
         })
     }
 
-    /// The wait left by this admission transition, or none when it granted immediately.
-    fn queued(&self, ticket: Ticket) -> Option<cowshed_gateway_types::cpu_budget::CpuQueueWait> {
-        use cowshed_gateway_types::cpu_budget::{CpuQueueEntry, CpuQueueWait, JobserverClass};
+    /// The wait left by this admission transition, and why; none when it granted immediately.
+    fn queued(&self, ticket: Ticket) -> Option<Queued> {
         let checkout = self.tickets.get(&ticket)?;
         let request = self
             .checkouts
@@ -626,16 +732,6 @@ impl Ledger {
             .waiting
             .iter()
             .find(|waiter| waiter.ticket == ticket)?;
-        let entry = |name: &str, class: &Class, job, claim: &Claim| CpuQueueEntry {
-            repository: class.repo().map(|repo| repo.to_string()),
-            class: match class {
-                Class::Gate(_) => JobserverClass::Gate,
-                Class::Background => JobserverClass::Background,
-            },
-            checkout: name.to_owned(),
-            job,
-            command: claim.command.to_string(),
-        };
         let mut holders = Vec::new();
         let mut ahead = Vec::new();
         for (name, stake) in &self.checkouts {
@@ -643,7 +739,7 @@ impl Ledger {
                 holders.push((
                     holder.job,
                     holder.ticket,
-                    entry(name, &holder.class, holder.job, &holder.claim),
+                    queue_entry(name, &holder.class, holder.job, &holder.claim),
                 ));
             }
             for waiter in &stake.waiting {
@@ -654,18 +750,35 @@ impl Ledger {
                 if same_queue && waiter.order() < request.order() {
                     ahead.push((
                         waiter.order(),
-                        entry(name, &waiter.class, waiter.job, &waiter.claim),
+                        queue_entry(name, &waiter.class, waiter.job, &waiter.claim),
                     ));
                 }
             }
         }
         holders.sort_unstable_by_key(|(job, ticket, _)| (*job, *ticket));
         ahead.sort_unstable_by_key(|(order, _)| *order);
-        Some(CpuQueueWait {
-            request: entry(checkout, &request.class, request.job, &request.claim),
-            position: ahead.len() + 1,
-            holders: holders.into_iter().map(|(_, _, entry)| entry).collect(),
-            ahead: ahead.into_iter().map(|(_, entry)| entry).collect(),
+        let cause = match &request.class {
+            Class::Gate(repo) => match self.gate_head(repo) {
+                Some(head) if head != request.job => CpuWaitCause::RepositoryGate {
+                    gate: self.gate_job(head),
+                },
+                _ => CpuWaitCause::Tokens,
+            },
+            Class::Background => match self.queue_head() {
+                Some((_, head)) => CpuWaitCause::Quiet {
+                    gate: self.gate_job(head),
+                },
+                None => CpuWaitCause::Tokens,
+            },
+        };
+        Some(Queued {
+            wait: CpuQueueWait {
+                request: queue_entry(checkout, &request.class, request.job, &request.claim),
+                position: ahead.len() + 1,
+                holders: holders.into_iter().map(|(_, _, entry)| entry).collect(),
+                ahead: ahead.into_iter().map(|(_, entry)| entry).collect(),
+            },
+            cause,
         })
     }
 
@@ -778,10 +891,33 @@ impl Ledger {
                     lent_ms: millis_since(since, now),
                 }
             }),
+            quiet: self
+                .quiet
+                .iter()
+                .map(|waiter| CpuQuietWaiter {
+                    repository: waiter.repo.to_string(),
+                    pid: waiter.claim.pid,
+                    command: waiter.claim.command.to_string(),
+                    waited_ms: millis_since(waiter.asked, now),
+                })
+                .collect(),
         }
     }
 }
 
+/// A request as a queue snapshot names it: its repository and class, checkout, job and command.
+fn queue_entry(name: &str, class: &Class, job: Ticket, claim: &Claim) -> CpuQueueEntry {
+    CpuQueueEntry {
+        repository: class.repo().map(|repo| repo.to_string()),
+        class: match class {
+            Class::Gate(_) => JobserverClass::Gate,
+            Class::Background => JobserverClass::Background,
+        },
+        checkout: name.to_owned(),
+        job,
+        command: claim.command.to_string(),
+    }
+}
 /// One group's granted leases as the status names them, the oldest grant first, with the tokens
 /// they hold together. The age is the lease's, from its grant: the ledger knows no other.
 fn leases(mut holders: Vec<&Holder>, now: Instant) -> (usize, Vec<CpuHolder>) {
@@ -815,13 +951,28 @@ enum Message {
         /// The job whose age ranks it.
         job: Ticket,
         granted: oneshot::Sender<usize>,
-        queued: Option<oneshot::Sender<Option<cowshed_gateway_types::cpu_budget::CpuQueueWait>>>,
+        queued: Option<oneshot::Sender<Option<Queued>>>,
         /// Told when the ask is lent the probation token; `None` for an ask that may not be.
         lent: Option<oneshot::Sender<()>>,
+    },
+    /// A fork or an attach that mounts asks whether its repository's gate works.
+    Quiet {
+        ticket: Ticket,
+        repo: Arc<str>,
+        pool: Option<std::path::PathBuf>,
+        claim: Claim,
+        /// Told the gate job it waits for, or `None` when it may run at once.
+        gate: oneshot::Sender<Option<CpuQueueEntry>>,
+        granted: oneshot::Sender<()>,
     },
     Leave {
         ticket: Ticket,
         released: Instant,
+    },
+    /// A CPU pool a gate job serves.
+    GatePool {
+        job: Ticket,
+        endpoint: Arc<std::path::Path>,
     },
     /// The requester stopped its job on probation without a grant.
     ProbationOver {
@@ -852,8 +1003,17 @@ pub(crate) struct CpuBudget {
 pub(crate) struct JobserverAsk {
     pub(crate) stake: Stake,
     pub(crate) granted: oneshot::Receiver<usize>,
-    pub(crate) queued: oneshot::Receiver<Option<cowshed_gateway_types::cpu_budget::CpuQueueWait>>,
+    pub(crate) queued: oneshot::Receiver<Option<Queued>>,
     pub(crate) lent: Option<oneshot::Receiver<()>>,
+}
+
+/// A quiet ask's stake and what it hears: the gate job it waits for, `None` when its repository
+/// is quiet already, and its grant (05_gateway.md "A fork or attach waits for its repository's
+/// gate"). Dropping the stake leaves the queue.
+pub(crate) struct QuietAsk {
+    pub(crate) stake: Stake,
+    pub(crate) gate: oneshot::Receiver<Option<CpuQueueEntry>>,
+    pub(crate) granted: oneshot::Receiver<()>,
 }
 
 /// One request's stake in the budget, waiting or holding. Dropping it returns what it holds.
@@ -951,7 +1111,7 @@ impl CpuBudget {
         want: NonZeroUsize,
         claim: Claim,
         rank: Rank,
-        queued: Option<oneshot::Sender<Option<cowshed_gateway_types::cpu_budget::CpuQueueWait>>>,
+        queued: Option<oneshot::Sender<Option<Queued>>>,
         lent: Option<oneshot::Sender<()>>,
     ) -> (Stake, oneshot::Receiver<usize>) {
         let ticket = self.tickets.fetch_add(1, Ordering::Relaxed);
@@ -982,6 +1142,45 @@ impl CpuBudget {
             },
             receiver,
         )
+    }
+
+    /// A fork or an attach that mounts asks to run while no gate-class request of `repo` holds or
+    /// waits (05_gateway.md "A fork or attach waits for its repository's gate").
+    pub(crate) fn ask_quiet(
+        &self,
+        repo: Arc<str>,
+        pool: Option<std::path::PathBuf>,
+        claim: Claim,
+    ) -> QuietAsk {
+        let ticket = self.tickets.fetch_add(1, Ordering::Relaxed);
+        let (gate, told) = oneshot::channel();
+        let (granted, receiver) = oneshot::channel();
+        let _ = self.messages.send(Message::Quiet {
+            ticket,
+            repo,
+            pool,
+            claim,
+            gate,
+            granted,
+        });
+        QuietAsk {
+            stake: Stake {
+                ticket,
+                messages: self.messages.clone(),
+            },
+            gate: told,
+            granted: receiver,
+        }
+    }
+
+    /// Record a CPU pool gate job `job` serves, so a fork or attach its own work asks for does not
+    /// wait for it.
+    pub(crate) fn gate_pool(&self, job: JobAge, endpoint: Arc<std::path::Path>) {
+        // An actor that is gone records nothing.
+        let _ = self.messages.send(Message::GatePool {
+            job: job.0,
+            endpoint,
+        });
     }
 
     /// The ledger as it stands; `None` when the budget is gone.
@@ -1043,12 +1242,17 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
     let mut grants: HashMap<Ticket, oneshot::Sender<usize>> = HashMap::new();
     // The asks that may be lent the probation token, told when they are.
     let mut lends: HashMap<Ticket, oneshot::Sender<()>> = HashMap::new();
+    // The forks and attaches waiting for their repository's gate work to end, told when it does.
+    let mut quiets: HashMap<Ticket, oneshot::Sender<()>> = HashMap::new();
+    let mut released = Vec::new();
     let mut cut: Option<CutOff> = None;
     let mut effects = Vec::new();
     while let Some(message) = messages.recv().await {
         let started = Instant::now();
         let transition = match &message {
             Message::Ask { ticket, .. } => Some(("ask", *ticket, None)),
+            Message::Quiet { ticket, .. } => Some(("quiet", *ticket, None)),
+            Message::GatePool { .. } => None,
             Message::Leave { ticket, released } => Some(("release", *ticket, Some(*released))),
             Message::ProbationOver { ticket } => Some(("probation-over", *ticket, None)),
             Message::Status { .. } | Message::CutOff { .. } => None,
@@ -1096,10 +1300,38 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                     let _ = queued.send(ledger.queued(ticket));
                 }
             }
+            Message::GatePool { job, endpoint } => ledger.gate_pool(job, endpoint),
+            Message::Quiet {
+                ticket,
+                repo,
+                pool,
+                claim,
+                gate,
+                granted,
+            } => {
+                // After a cut-off the restart forgets every gate job: nothing is left to wait for.
+                if cut.is_some() {
+                    let _ = gate.send(None);
+                    let _ = granted.send(());
+                    continue;
+                }
+                match ledger.ask_quiet(ticket, repo, pool.as_deref(), claim, Instant::now()) {
+                    None => {
+                        let _ = gate.send(None);
+                        let _ = granted.send(());
+                    }
+                    Some(holder) => {
+                        quiets.insert(ticket, granted);
+                        let _ = gate.send(Some(holder));
+                    }
+                }
+            }
             Message::Leave { ticket, .. } => {
                 grants.remove(&ticket);
                 lends.remove(&ticket);
+                quiets.remove(&ticket);
                 ledger.leave(Instant::now(), ticket, &mut effects);
+                ledger.release_quiet(&mut released);
                 if let Some(cut) = &mut cut {
                     cut.left(ticket);
                 }
@@ -1112,6 +1344,10 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                 // Every sender still here is a queued ask: dropped, its waiter refuses.
                 let waiting: std::collections::HashSet<Ticket> =
                     grants.drain().map(|(ticket, _)| ticket).collect();
+                // The restart forgets the gate work every quiet waiter waits for: each runs now.
+                for (_, granted) in quiets.drain() {
+                    let _ = granted.send(());
+                }
                 // Nothing is lent after a cut-off: an install is restarting the gateway.
                 lends.clear();
                 let mut cutting = CutOff {
@@ -1140,6 +1376,11 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                 let _ = granted.send(grant.tokens);
             }
             lends.remove(&grant.ticket);
+        }
+        for ticket in released.drain(..) {
+            if let Some(granted) = quiets.remove(&ticket) {
+                let _ = granted.send(());
+            }
         }
         let elapsed = started.elapsed();
         if let Some((cause, ticket, released)) = transition {
@@ -1344,6 +1585,37 @@ mod tests {
             self.ledger.lend(now).map(|lent| lent.ticket)
         }
 
+        /// A fork or attach of `repo` asks to run: the gate job it waits for, or `None` when it may
+        /// run now.
+        fn quiet(&mut self, ms: u64, ticket: Ticket, repo: &str) -> Option<Ticket> {
+            let now = self.origin + Duration::from_millis(ms);
+            self.ledger
+                .ask_quiet(
+                    ticket,
+                    Arc::from(repo),
+                    None,
+                    Claim::new(&format!("fork t{ticket}"), Some(7)),
+                    now,
+                )
+                .map(|gate| gate.job)
+        }
+
+        /// The forks and attaches the transitions so far released, as the actor finds them.
+        fn released(&mut self) -> Vec<Ticket> {
+            let mut released = Vec::new();
+            self.ledger.release_quiet(&mut released);
+            released
+        }
+
+        /// Why queued `ticket` waits: the cause's kind and the gate job it names.
+        fn cause(&self, ticket: Ticket) -> (&'static str, Option<Ticket>) {
+            match self.ledger.queued(ticket).expect("a queued ticket").cause {
+                CpuWaitCause::RepositoryGate { gate } => ("repository-gate", Some(gate.job)),
+                CpuWaitCause::Quiet { gate } => ("quiet", Some(gate.job)),
+                CpuWaitCause::Tokens => ("tokens", None),
+            }
+        }
+
         /// Each grant as `(ticket, tokens)`; its wait is kept in `waited`.
         fn grants(&mut self) -> Vec<(Ticket, usize)> {
             // Every transition, including a cancellation and a relayed child's release, preserves
@@ -1457,9 +1729,11 @@ mod tests {
             held_ms,
         };
         let mut clock = Clock::new(16);
-        assert_eq!(clock.ask(0, 1, "shed", 4), [(1, 4)]);
+        assert_eq!(clock.ask(0, 1, "shed", 6), [(1, 6)]);
         assert_eq!(clock.ask_land(1_000, 2, "land", 1), [(2, 1)]);
-        assert_eq!(clock.ask(2_000, 3, "shed", 8), [(3, 4)]);
+        // Beside the land the shed's next runner is granted one token, which brings the work
+        // behind the land to 7 of 16, as much as it may hold.
+        assert_eq!(clock.ask(2_000, 3, "shed", 8), [(3, 1)]);
         let status = clock.status(3_000);
         assert_eq!(
             status.gate_jobs,
@@ -1475,9 +1749,9 @@ mod tests {
             status.background,
             [CpuBackgroundStake {
                 checkout: "shed".into(),
-                held: 8,
+                held: 7,
                 waiters: Vec::new(),
-                holders: vec![lease(1, 4, 4, 3_000), lease(3, 4, 8, 1_000)],
+                holders: vec![lease(1, 6, 6, 3_000), lease(3, 1, 8, 1_000)],
             }]
         );
 
@@ -1499,9 +1773,9 @@ mod tests {
             status.background,
             [CpuBackgroundStake {
                 checkout: "shed".into(),
-                held: 5,
+                held: 2,
                 waiters: Vec::new(),
-                holders: vec![lease(3, 4, 8, 7_000), lease(4, 1, 1, 4_000)],
+                holders: vec![lease(3, 1, 8, 7_000), lease(4, 1, 1, 4_000)],
             }]
         );
         assert!(clock.balanced());
@@ -1548,18 +1822,17 @@ mod tests {
     }
 
     #[test]
-    fn a_background_newcomer_waits_beside_gate_work_while_background_holds_its_half() {
-        // Tokens are never handed back by a running job, so beside a land a background newcomer
-        // whose class already holds its half queues for the runner's departure. Once no gate work
-        // holds or waits, background's cap is the whole host again.
+    fn beside_a_land_each_background_newcomer_takes_one_token_and_the_host_once_it_ends() {
+        // Beside a land the host is quiet: each background grant is one token, whatever it wants,
+        // so no newcomer starts a run sized to half the host. Once no gate work holds or waits,
+        // background takes the whole host again.
         let mut clock = Clock::new(36);
         assert_eq!(clock.ask_land(0, 1, "land", 1), [(1, 1)]);
-        assert_eq!(clock.ask(0, 2, "carry", 18), [(2, 18)]);
-        assert_eq!(clock.ask(1, 3, "train", 18), []);
-        assert_eq!(clock.leave(2, 2), [(3, 18)]);
-        assert_eq!(clock.ask(3, 4, "carry", 18), []);
-        assert_eq!(clock.leave(4, 1), [(4, 18)]);
-        assert_eq!(clock.status(4).held, 36);
+        assert_eq!(clock.ask(0, 2, "carry", 18), [(2, 1)]);
+        assert_eq!(clock.ask(1, 3, "train", 18), [(3, 1)]);
+        assert_eq!(clock.leave(2, 1), []);
+        assert_eq!(clock.ask(3, 4, "carry", 18), [(4, 18)]);
+        assert_eq!(clock.status(3).held, 20);
         assert!(clock.balanced());
     }
 
@@ -1578,14 +1851,12 @@ mod tests {
     #[test]
     fn a_lone_waiter_takes_the_room_even_below_its_fair_share() {
         let mut clock = Clock::new(18);
-        // A land in a's checkout caps background at half the host.
-        assert_eq!(clock.ask_land(0, 1, "a", 1), [(1, 1)]);
-        assert_eq!(clock.ask(0, 2, "a", 6), [(2, 6)]);
-        // b's fair share is 4 of background's 9, but no peer waits: the 3 left must not sit idle.
-        assert_eq!(clock.ask(1, 3, "b", 18), [(3, 3)]);
-        assert_eq!(clock.status(1).held, 10);
-        assert_eq!(clock.leave(2, 3), []);
-        assert_eq!(clock.leave(3, 2), []);
+        assert_eq!(clock.ask(0, 1, "a", 15), [(1, 15)]);
+        // b's fair share is 9 of the host's 18, but no peer waits: the 3 left must not sit idle.
+        assert_eq!(clock.ask(1, 2, "b", 18), [(2, 3)]);
+        assert_eq!(clock.status(1).held, 18);
+        assert_eq!(clock.leave(2, 2), []);
+        assert_eq!(clock.leave(3, 1), []);
         assert!(clock.balanced());
     }
 
@@ -1695,44 +1966,46 @@ mod tests {
         assert_eq!(clock.leave(3, 1), [(11, 1)]);
         assert_eq!(clock.leave(4, 2), [(12, 1)]);
         assert_eq!(clock.leave(5, 3), [(13, 1)]);
-        // Beside the land, background's cap is half the host, which it still holds: a returned
-        // token stays free for the land's next task.
+        // Beside the land background is granted only while it then holds under half the host: at
+        // 4 and then 3 of 8, a returned token stays free for the land's next task.
         assert_eq!(clock.leave(6, 4), []);
-        // Under its cap again, background is served by ordinary fairness: the checkout holding
-        // least first.
-        assert_eq!(clock.leave(7, 5), [(9, 1)]);
-        // The land ends: background's cap is the whole host again.
-        assert_eq!(clock.leave(8, 11), []);
-        assert_eq!(clock.leave(8, 12), []);
-        assert_eq!(clock.leave(8, 13), [(10, 1)]);
+        assert_eq!(clock.leave(7, 5), []);
+        // At 2 of 8 one more token keeps it under half: the checkout holding least takes it.
+        assert_eq!(clock.leave(8, 6), [(9, 1)]);
+        // The land ends with its last task: background takes the whole host again.
+        assert_eq!(clock.leave(9, 11), []);
+        assert_eq!(clock.leave(9, 12), []);
+        assert_eq!(clock.leave(9, 13), [(10, 1)]);
         assert!(clock.balanced());
     }
 
     #[test]
-    fn a_land_task_queued_behind_background_in_its_own_checkout_goes_first() {
+    fn a_land_asking_after_its_own_checkouts_background_goes_first() {
         let mut clock = Clock::new(4);
         assert_eq!(clock.ask_land(0, 0, "other", 2), [(0, 2)]);
         assert_eq!(clock.ask(0, 1, "ws", 1), [(1, 1)]);
-        assert_eq!(clock.ask(0, 2, "ws", 1), [(2, 1)]);
-        assert_eq!(clock.ask(1, 3, "ws", 1), []);
-        assert_eq!(clock.ask_land(2, 4, "ws", 1), []);
-        // The land task is granted first; the next returned token is background's again.
-        assert_eq!(clock.leave(3, 1), [(4, 1)]);
-        assert_eq!(clock.leave(4, 2), [(3, 1)]);
+        // Background holds the one token it may beside a land: ws's next runner waits.
+        assert_eq!(clock.ask(1, 2, "ws", 1), []);
+        // ws's own land asks after it and is granted the free token first.
+        assert_eq!(clock.ask_land(2, 4, "ws", 1), [(4, 1)]);
+        // A returned background token stays free while the younger land holds behind the older.
+        assert_eq!(clock.leave(3, 1), []);
+        // The older land ends: the work behind ws's land holds nothing, so the runner takes one.
+        assert_eq!(clock.leave(4, 0), [(2, 1)]);
         assert!(clock.balanced());
     }
 
     #[test]
     fn an_older_land_is_served_before_a_younger_land_and_both_before_a_feature_build() {
         let mut clock = Clock::new(8);
+        // A feature shed's builds start while no gate works, and take a quarter of the host.
+        assert_eq!(clock.ask(0, 3, "feature", 2), [(3, 2)]);
         // Two land gate jobs start: a's is older than b's.
-        assert_eq!(clock.ask_land(0, 1, "a", 2), [(1, 2)]);
-        assert_eq!(clock.ask_land(1, 2, "b", 2), [(2, 2)]);
-        // A feature shed's builds hold background's half, and its next build waits first.
-        assert_eq!(clock.ask(2, 3, "feature", 2), [(3, 2)]);
-        assert_eq!(clock.ask(2, 4, "feature", 2), [(4, 2)]);
-        assert_eq!(clock.ask(3, 5, "feature", 2), []);
-        // Then the younger land's task asks, and the older land's task asks last of all.
+        assert_eq!(clock.ask_land(1, 1, "a", 3), [(1, 3)]);
+        assert_eq!(clock.ask_land(1, 2, "b", 3), [(2, 3)]);
+        // The feature's next build waits first; then the younger land's task asks, and the older
+        // land's task asks last of all.
+        assert_eq!(clock.ask(2, 4, "feature", 2), []);
         assert_eq!(clock.ask_task(4, 6, 2, "b", 2), []);
         assert_eq!(clock.ask_task(5, 7, 1, "a", 2), []);
         let queue: Vec<(String, u64)> = clock
@@ -1742,11 +2015,10 @@ mod tests {
             .map(|waiter| (waiter.checkout, waiter.job))
             .collect();
         assert_eq!(queue, [("a".to_owned(), 1), ("b".to_owned(), 2)]);
-        // Served in the reverse of the order they asked: the older land, the younger land, then
-        // the feature build.
+        // The feature's returned tokens go to the older land's task first.
         assert_eq!(clock.leave(6, 3), [(7, 2)]);
-        assert_eq!(clock.leave(7, 7), [(6, 2)]);
-        assert_eq!(clock.leave(8, 6), [(5, 2)]);
+        // Then the younger land's task, after the floor token of the feature, which holds nothing.
+        assert_eq!(clock.leave(7, 7), [(4, 1), (6, 1)]);
         assert!(clock.balanced());
     }
 
@@ -1932,6 +2204,246 @@ mod tests {
         assert!(clock.balanced());
     }
 
+    /// Gate work quiets the host (05_gateway.md "Room for a gate"). Each row is a host of `total`
+    /// tokens where background already holds `held`, granted before any gate; a land's gate job
+    /// then asks `gate` tokens (none: no gate work); and a newcomer asks `want`. With no gate work
+    /// it takes its want from every free token; beside a gate it takes one token while the work
+    /// behind the gate then holds less than half the host, and nothing once that floor is shut.
+    #[test]
+    fn beside_gate_work_a_background_grant_is_one_token_while_the_floor_is_open() {
+        // (total, background held, the gate's tokens, the newcomer's want, its grant)
+        type Row = (usize, usize, Option<usize>, usize, Option<usize>);
+        let rows: [Row; 9] = [
+            (18, 0, None, 9, Some(9)),
+            (18, 7, None, 4, Some(4)),
+            (18, 0, Some(1), 9, Some(1)),
+            (18, 7, Some(1), 4, Some(1)),
+            (18, 8, Some(1), 4, None),
+            (18, 0, Some(17), 1, Some(1)),
+            (3, 0, Some(1), 2, Some(1)),
+            (2, 0, Some(1), 1, Some(1)),
+            (1, 0, Some(1), 1, None),
+        ];
+        for (row, (total, held, gate, want, grant)) in rows.into_iter().enumerate() {
+            let mut clock = Clock::new(total);
+            if held > 0 {
+                assert_eq!(clock.ask(0, 1, "busy", held), [(1, held)], "row {row}");
+            }
+            if let Some(gate) = gate {
+                assert_eq!(clock.ask_land(1, 2, "land", gate), [(2, gate)], "row {row}");
+            }
+            let expected: Vec<(Ticket, usize)> =
+                grant.map(|tokens| (3, tokens)).into_iter().collect();
+            assert_eq!(clock.ask(2, 3, "newcomer", want), expected, "row {row}");
+            assert!(clock.balanced(), "row {row}");
+        }
+    }
+
+    /// A test's scratch checkout that already holds a token beside a land gets its next one: beside
+    /// gate work background is served one token a grant in checkout-fair order, not only to the
+    /// checkouts holding nothing, so a test waiting on its scratch job's second job does not wait
+    /// for the very gate it runs under. A younger land's tokens count behind the older one.
+    #[test]
+    fn beside_a_land_a_checkout_holding_a_token_gets_one_more_while_the_floor_is_open() {
+        let mut clock = Clock::new(18);
+        assert_eq!(clock.ask_land(0, 1, "land", 4), [(1, 4)]);
+        assert_eq!(clock.ask(1, 2, "scratch", 1), [(2, 1)]);
+        assert_eq!(clock.ask(2, 3, "scratch", 2), [(3, 1)]);
+        // A younger land of another repository holds 6: with background's 2 the work behind the
+        // older land holds 8, so one more token would leave it at half the host.
+        assert_eq!(clock.ask_land(3, 4, "younger", 6), [(4, 6)]);
+        assert_eq!(clock.ask(4, 5, "scratch", 1), []);
+        assert_eq!(clock.leave(5, 4), [(5, 1)]);
+        assert!(clock.balanced());
+    }
+
+    /// A fork or attach waits for its own repository's gate (05_gateway.md "A fork or attach waits
+    /// for its repository's gate"). Each row asks for gate-class requests on a four-token host,
+    /// then a fork of one repository asks to run: at once while no gate-class request of that
+    /// repository holds or waits, and otherwise waiting for the gate job heading it, the holder
+    /// ahead of an older queued job and a job's root ahead of its tasks.
+    #[test]
+    fn a_fork_waits_only_for_its_own_repositorys_gate_and_names_the_job_heading_it() {
+        // (gate requests as (ticket, repository, job, want), the fork's repository, the job it waits for)
+        type Row = (
+            &'static [(Ticket, &'static str, Ticket, usize)],
+            &'static str,
+            Option<Ticket>,
+        );
+        let rows: [Row; 6] = [
+            (&[], "owner/a", None),
+            (&[(1, "owner/a", 1, 1)], "owner/a", Some(1)),
+            (&[(1, "owner/a", 1, 1)], "owner/b", None),
+            (
+                &[(1, "owner/b", 1, 4), (2, "owner/a", 2, 4)],
+                "owner/a",
+                Some(2),
+            ),
+            (
+                &[(1, "owner/a", 1, 4), (2, "owner/a", 2, 1)],
+                "owner/a",
+                Some(1),
+            ),
+            (
+                &[(3, "owner/a", 1, 4), (1, "owner/a", 1, 4)],
+                "owner/a",
+                Some(1),
+            ),
+        ];
+        for (row, (gates, repo, waits_for)) in rows.into_iter().enumerate() {
+            let mut clock = Clock::new(4);
+            for &(ticket, gate, job, want) in gates {
+                clock.ask_as(
+                    0,
+                    ticket,
+                    &format!("ws{ticket}"),
+                    want,
+                    (Class::Gate(Arc::from(gate)), job),
+                );
+            }
+            assert_eq!(clock.quiet(1, 100, repo), waits_for, "row {row}");
+            assert_eq!(
+                clock.status(1).quiet.len(),
+                usize::from(waits_for.is_some()),
+                "row {row}"
+            );
+        }
+    }
+
+    /// A fork or attach the repository's own gate job asks for names one of that job's pools and
+    /// runs at once: it would otherwise wait for itself. A pool beside them in the same workspace
+    /// directory, a background job's, waits, and so does a younger gate job's; a gate job's pools
+    /// are forgotten with it.
+    #[test]
+    fn a_gate_jobs_own_fork_runs_at_once_and_any_other_waits() {
+        use std::path::Path;
+        let mut clock = Clock::new(4);
+        let gate = |job| (Class::Gate(Arc::from("owner/a")), job);
+        assert_eq!(clock.ask_as(0, 1, "land", 1, gate(1)), [(1, 1)]);
+        assert_eq!(clock.ask_as(0, 2, "next", 1, gate(2)), []);
+        for (job, endpoint) in [
+            (1, "/s/run/cpu/land/root"),
+            (1, "/s/run/cpu/land/child"),
+            (2, "/s/run/cpu/next/root"),
+        ] {
+            clock.ledger.gate_pool(job, Arc::from(Path::new(endpoint)));
+        }
+        let now = clock.origin;
+        let mut quiet = |ticket, pool: &str| {
+            clock
+                .ledger
+                .ask_quiet(
+                    ticket,
+                    Arc::from("owner/a"),
+                    Some(Path::new(pool)),
+                    Claim::new("fork", Some(7)),
+                    now,
+                )
+                .map(|gate| gate.job)
+        };
+        // (ticket, the requester's pool, the gate job it waits for)
+        for (ticket, pool, waits) in [
+            (10, "/s/run/cpu/land/root", None),
+            (11, "/s/run/cpu/land/child", None),
+            (12, "/s/run/cpu/land/background", Some(1)),
+            (13, "/s/run/cpu/next/root", Some(1)),
+        ] {
+            assert_eq!(quiet(ticket, pool), waits, "ticket {ticket}");
+        }
+        assert_eq!(clock.leave(1, 1), [(2, 1)]);
+        assert_eq!(
+            clock
+                .ledger
+                .gate_pools
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            [2],
+            "a gate job's pools are forgotten with it"
+        );
+        assert!(clock.balanced());
+    }
+
+    /// A waiting fork runs once its repository's last gate-class request leaves, not when the
+    /// gate's root does while its task still holds; a fork that closes while it waits leaves the
+    /// queue and is never released; the status names each waiting one.
+    #[test]
+    fn a_waiting_fork_runs_when_its_repositorys_last_gate_request_leaves() {
+        let mut clock = Clock::new(4);
+        let gate = |job| (Class::Gate(Arc::from("owner/a")), job);
+        assert_eq!(clock.ask_as(0, 1, "land", 1, gate(1)), [(1, 1)]);
+        assert_eq!(clock.ask_as(0, 2, "land", 2, gate(1)), [(2, 2)]);
+        assert_eq!(clock.quiet(1, 10, "owner/a"), Some(1));
+        assert_eq!(clock.quiet(2, 11, "owner/a"), Some(1));
+        assert_eq!(clock.quiet(2, 12, "owner/b"), None);
+        assert_eq!(
+            clock.status(5).quiet,
+            [
+                CpuQuietWaiter {
+                    repository: "owner/a".into(),
+                    pid: Some(7),
+                    command: "fork t10".into(),
+                    waited_ms: 4,
+                },
+                CpuQuietWaiter {
+                    repository: "owner/a".into(),
+                    pid: Some(7),
+                    command: "fork t11".into(),
+                    waited_ms: 3,
+                },
+            ]
+        );
+        assert_eq!(clock.leave(6, 11), []);
+        assert!(clock.released().is_empty());
+        assert_eq!(clock.leave(7, 1), []);
+        assert!(clock.released().is_empty());
+        assert_eq!(clock.leave(8, 2), []);
+        assert_eq!(clock.released(), [10]);
+        assert!(clock.status(8).quiet.is_empty());
+        assert!(clock.balanced());
+    }
+
+    /// A queued ask hears why it waits (05_gateway.md "One gate per repository"): each row asks in
+    /// turn on a four-token host that background fills before any gate, and names the cause its
+    /// own admission transition left it with.
+    #[test]
+    fn a_queued_ask_names_the_gate_it_waits_for() {
+        let mut clock = Clock::new(4);
+        assert_eq!(clock.ask(0, 1, "busy", 4), [(1, 4)]);
+        // (ticket, checkout, gate repository and job, its cause, the gate job the cause names)
+        type Row = (
+            Ticket,
+            &'static str,
+            Option<(&'static str, Ticket)>,
+            &'static str,
+            Option<Ticket>,
+        );
+        let rows: [Row; 5] = [
+            (2, "other", None, "tokens", None),
+            (3, "land", Some(("owner/a", 3)), "tokens", None),
+            (
+                4,
+                "second",
+                Some(("owner/a", 4)),
+                "repository-gate",
+                Some(3),
+            ),
+            (5, "late", None, "quiet", Some(3)),
+            (6, "land-b", Some(("owner/b", 6)), "tokens", None),
+        ];
+        for (ticket, checkout, gate, kind, job) in rows {
+            let class = gate.map_or((Class::Background, ticket), |(repo, job)| {
+                (Class::Gate(Arc::from(repo)), job)
+            });
+            assert_eq!(
+                clock.ask_as(ticket, ticket, checkout, 1, class),
+                [],
+                "ticket {ticket}"
+            );
+            assert_eq!(clock.cause(ticket), (kind, job), "ticket {ticket}");
+        }
+    }
+
     #[derive(Clone, Debug)]
     enum Op {
         Ask {
@@ -1969,7 +2481,7 @@ mod tests {
         /// more checkouts wait and a waiting request wants more than the free tokens, so background
         /// may hold every token; a gate-class request never waits beside a free token, so a gate
         /// that arrives after background filled the host takes the next returned one; and while a
-        /// gate-class request waits, background is granted only one floor token at a time, and only
+        /// gate-class request holds or waits, background is granted one token at a time, and only
         /// while it then holds less than half the host.
         #[test]
         fn background_takes_every_free_token_without_gate_work_and_a_waiting_gate_takes_them_first(
@@ -2003,18 +2515,18 @@ mod tests {
                     }
                 };
                 for (granted, tokens) in grants {
-                    let gate_waits = live.values().any(|asked| asked.gate && asked.held.is_none());
+                    let gate_works = live.values().any(|asked| asked.gate);
                     let asked = live.get_mut(&granted).expect("a granted ticket is live");
                     asked.held = Some(tokens);
-                    if !asked.gate && gate_waits {
+                    if !asked.gate && gate_works {
                         let background: usize = live
                             .values()
                             .filter(|asked| !asked.gate)
                             .filter_map(|asked| asked.held)
                             .sum();
                         prop_assert!(
-                            tokens == 1 && 2 * background < total,
-                            "ticket {granted} was granted {tokens} while a gate waits; background holds {background} of {total}"
+                            tokens == 1 && background <= behind_limit(total),
+                            "ticket {granted} was granted {tokens} beside gate work; background holds {background} of {total}"
                         );
                     }
                 }

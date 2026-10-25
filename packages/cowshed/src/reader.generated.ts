@@ -56,6 +56,7 @@ type ReaderName =
   | 'CPU_GATE_WAITER'
   | 'CPU_HOLDER'
   | 'CPU_PROBATION'
+  | 'CPU_QUIET_WAITER'
   | 'CPU_TOTALS'
   | 'CPU_WAITER'
   | 'CREDENTIAL_REPORT'
@@ -243,6 +244,7 @@ type ReaderName =
   | 'SEQ__CPU_GATE_JOB'
   | 'SEQ__CPU_GATE_WAITER'
   | 'SEQ__CPU_HOLDER'
+  | 'SEQ__CPU_QUIET_WAITER'
   | 'SEQ__CPU_WAITER'
   | 'SEQ__CREDENTIAL_ROUTE'
   | 'SEQ__DATABASE_HOLDER'
@@ -586,6 +588,7 @@ const READERS: Readers<ReaderName> = {
       ['gateQueue', 'SEQ__CPU_GATE_WAITER'],
       ['background', 'SEQ__CPU_BACKGROUND_STAKE'],
       ['probation', 'CPU_PROBATION'],
+      ['quiet', 'SEQ__CPU_QUIET_WAITER'],
     ],
   },
   CPU_CHECKOUT_STATUS: {
@@ -636,6 +639,15 @@ const READERS: Readers<ReaderName> = {
       ['pid', 'LEAF'],
       ['command', 'LEAF'],
       ['lentMs', 'LEAF'],
+    ],
+  },
+  CPU_QUIET_WAITER: {
+    kind: 'record',
+    fields: [
+      ['repository', 'LEAF'],
+      ['pid', 'LEAF'],
+      ['command', 'LEAF'],
+      ['waitedMs', 'LEAF'],
     ],
   },
   CPU_TOTALS: {
@@ -1870,6 +1882,7 @@ const READERS: Readers<ReaderName> = {
   SEQ__CPU_GATE_JOB: { kind: 'seq', element: 'CPU_GATE_JOB' },
   SEQ__CPU_GATE_WAITER: { kind: 'seq', element: 'CPU_GATE_WAITER' },
   SEQ__CPU_HOLDER: { kind: 'seq', element: 'CPU_HOLDER' },
+  SEQ__CPU_QUIET_WAITER: { kind: 'seq', element: 'CPU_QUIET_WAITER' },
   SEQ__CPU_WAITER: { kind: 'seq', element: 'CPU_WAITER' },
   SEQ__CREDENTIAL_ROUTE: { kind: 'seq', element: 'CREDENTIAL_ROUTE' },
   SEQ__DATABASE_HOLDER: { kind: 'seq', element: 'DATABASE_HOLDER' },

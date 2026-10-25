@@ -166,6 +166,7 @@ static CPU_BUDGET_STATUS: Reader = Reader::Record(&[
     ("gateQueue", &SEQ__CPU_GATE_WAITER),
     ("background", &SEQ__CPU_BACKGROUND_STAKE),
     ("probation", &CPU_PROBATION),
+    ("quiet", &SEQ__CPU_QUIET_WAITER),
 ]);
 static CPU_CHECKOUT_STATUS: Reader = Reader::Record(&[
     ("checkout", &LEAF),
@@ -201,6 +202,12 @@ static CPU_PROBATION: Reader = Reader::Record(&[
     ("pid", &LEAF),
     ("command", &LEAF),
     ("lentMs", &LEAF),
+]);
+static CPU_QUIET_WAITER: Reader = Reader::Record(&[
+    ("repository", &LEAF),
+    ("pid", &LEAF),
+    ("command", &LEAF),
+    ("waitedMs", &LEAF),
 ]);
 static CPU_TOTALS: Reader = Reader::Record(&[("userUs", &LEAF), ("sysUs", &LEAF)]);
 static CPU_WAITER: Reader = Reader::Record(&[
@@ -984,6 +991,7 @@ static SEQ__CPU_CHECKOUT_STATUS: Reader = Reader::Seq(&CPU_CHECKOUT_STATUS);
 static SEQ__CPU_GATE_JOB: Reader = Reader::Seq(&CPU_GATE_JOB);
 static SEQ__CPU_GATE_WAITER: Reader = Reader::Seq(&CPU_GATE_WAITER);
 static SEQ__CPU_HOLDER: Reader = Reader::Seq(&CPU_HOLDER);
+static SEQ__CPU_QUIET_WAITER: Reader = Reader::Seq(&CPU_QUIET_WAITER);
 static SEQ__CPU_WAITER: Reader = Reader::Seq(&CPU_WAITER);
 static SEQ__CREDENTIAL_ROUTE: Reader = Reader::Seq(&CREDENTIAL_ROUTE);
 static SEQ__DATABASE_HOLDER: Reader = Reader::Seq(&DATABASE_HOLDER);

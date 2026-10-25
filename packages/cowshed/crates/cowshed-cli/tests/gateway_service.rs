@@ -424,6 +424,7 @@ fn gateway_status_says_an_install_is_pending() {
             gate_queue: Vec::new(),
             background: Vec::new(),
             probation: None,
+            quiet: Vec::new(),
         })
     };
     let rendered = |pending: bool, json: bool| {
@@ -581,6 +582,7 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
             },
         ],
         probation: None,
+        quiet: Vec::new(),
     };
 
     let mut output = Output::new(Vec::new(), Vec::new(), false);
@@ -600,7 +602,7 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
     assert_eq!(
         ledger_lines,
         [
-            "cowshed: gateway cpu budget: held 17/18 tokens, background holds 4, at most 9 beside gate work",
+            "cowshed: gateway cpu budget: held 17/18 tokens, background holds 4, quiet beside gate work: one token a grant while it holds under half",
             "cowshed: gateway cpu hold past 30m: /w/older-land: pid 9, 1/1 tokens, granted 1h02m05s ago: bun test",
             "cowshed: gateway cpu hold past 30m: /w/younger-land: pid 71437, 3/18 tokens, granted 34m07s ago: cargo --frozen test -p app",
             "cowshed: gateway gate head: repository=owner/repo /w/older-land gate job 3: held 12, running 2",
@@ -729,6 +731,7 @@ fn gateway_status_tells_apart_the_tasks_of_one_gate_job_waiting_for_tokens() {
             waiters: Vec::new(),
         }],
         probation: None,
+        quiet: Vec::new(),
     };
 
     let mut output = Output::new(Vec::new(), Vec::new(), false);
@@ -798,6 +801,7 @@ fn gateway_status_names_the_requests_a_background_stake_has_waiting() {
             ],
         }],
         probation: None,
+        quiet: Vec::new(),
     };
 
     let mut output = Output::new(Vec::new(), Vec::new(), false);
@@ -856,6 +860,7 @@ fn gateway_status_says_an_empty_gate_queue_is_empty() {
             gate_jobs: Vec::new(),
             background: Vec::new(),
             probation: None,
+            quiet: Vec::new(),
         })),
     )
     .expect("status emits");
