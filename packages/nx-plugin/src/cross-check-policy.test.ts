@@ -65,14 +65,14 @@ describe('Linux cross-check policy', () => {
     expect(CARGO_CROSS_LINT_COMMAND).toContain(`--target ${CARGO_LINUX_TRIPLE}`);
   });
 
-  it('passes clippy-driver no arguments, so the gate and a plain clippy share one unit set', () => {
+  it('denies warnings through build.warnings, never clippy-driver arguments', () => {
     // Anything after `--` becomes CLIPPY_ARGS, part of every member's fingerprint.
     for (const command of [CARGO_LINT_CLIPPY_COMMAND, CARGO_CROSS_LINT_COMMAND]) {
       expect(command).not.toContain(' -- ');
     }
   });
 
-  it('fails on warnings it replays from units a plain clippy already checked', async () => {
+  it('fails on warnings it replays from its own Fresh units', async () => {
     const project = await mkdtemp(join(tmpdir(), 'cargo-lint-warnings-'));
     const clippy = async (command: string): Promise<{ exitCode: number; output: string }> => {
       const child = Bun.spawn(['sh', '-c', command], {
@@ -99,24 +99,19 @@ describe('Linux cross-check policy', () => {
         'version = 4\n\n[[package]]\nname = "warning-fixture"\nversion = "0.1.0"\n',
       );
       await writeFile(join(project, 'src/lib.rs'), 'pub fn planted() {\n    let unused = 1;\n}\n');
-      const plain = cargoFrozen('clippy --workspace --all-targets');
-
-      const first = await clippy(plain);
-      expect(first).toMatchObject({ exitCode: 0 });
+      // Clippy checks the crate once and fails on the warning it compiled.
+      const first = await clippy(CARGO_LINT_CLIPPY_COMMAND);
+      expect(first.exitCode).not.toBe(0);
       expect(first.output).toContain('Checking warning-fixture');
       expect(first.output).toContain('unused variable');
+      expect(first.output).toContain('warnings are denied by `build.warnings` configuration');
 
-      // Fresh: the gate replays the plain run's units and their warning, and fails on it.
-      const gate = await clippy(CARGO_LINT_CLIPPY_COMMAND);
-      expect(gate.exitCode).not.toBe(0);
-      expect(gate.output).not.toContain('Checking warning-fixture');
-      expect(gate.output).toContain('unused variable');
-      expect(gate.output).toContain('warnings are denied by `build.warnings` configuration');
-
-      // And the gate left the plain run's units Fresh in turn.
-      const again = await clippy(plain);
-      expect(again).toMatchObject({ exitCode: 0 });
-      expect(again.output).not.toContain('Checking warning-fixture');
+      // Fresh: the rerun compiles nothing, replays the unit's warning, and still fails on it.
+      const replay = await clippy(CARGO_LINT_CLIPPY_COMMAND);
+      expect(replay.exitCode).not.toBe(0);
+      expect(replay.output).not.toContain('Checking warning-fixture');
+      expect(replay.output).toContain('unused variable');
+      expect(replay.output).toContain('warnings are denied by `build.warnings` configuration');
     } finally {
       await rm(project, { recursive: true, force: true });
     }
