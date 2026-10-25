@@ -12,6 +12,7 @@ import {
   extractRefs,
   findSpecLinkViolations,
   judgeRefs,
+  pinnedMissingKeys,
   type SpecLinkFinding,
   type SpecLinkRow,
   type SpecLinkTree,
@@ -104,8 +105,15 @@ reasons(
 );
 refs('a bracketed path without Code: is not an entry', `See [${q('gone/src/lib.rs')}] for details.`, 0);
 
+// ── shapes a review planted after the first landing ───────────────────────────────────────────
+reasons('a directory link with a trailing slash resolves', '[docs](../../packages/widget/docs/)', []);
+reasons('a link to the repository root resolves', '[root](../..)', []);
+reasons('a range starting past the end fires', `See ${q('packages/widget/src/index.ts:99-1')}.`, ['line-out-of-range']);
+reasons('a Code: entry may cite a column', `Code: [${q('crates/core/src/lib.rs:1:5')}] ${q('run_core')}.`, []);
+refs('a tilde fence holds examples, not references', `~~~\n${q('gone/src/nope.ts:3')}\n~~~`, 0);
+
 // ── the ratchet ────────────────────────────────────────────────────────────────────────────────
-const brief = 'agent-todo/brief.md';
+const brief = 'agents-todo/brief.md';
 const owned = (path: string): boolean => path === brief;
 const finding = judgeRefs(extractRefs(SPEC, `See ${q('gone/src/nope.ts:3')}.`), tree);
 const row = (count: number): SpecLinkRow => ({
@@ -130,10 +138,28 @@ verdict('a row without a reason fails', findSpecLinkViolations(finding, [{ ...ro
 ]);
 verdict(
   'a row naming no tracked brief fails',
-  findSpecLinkViolations(finding, [{ ...row(1), defect: 'agent-todo/gone.md' }], owned),
+  findSpecLinkViolations(finding, [{ ...row(1), defect: 'agents-todo/gone.md' }], owned),
   ['unowned'],
 );
-
+const suffixTree: SpecLinkTree = {
+  files: ['elsewhere/plugin/optimization.go'],
+  textOf: (p) => (p === 'elsewhere/plugin/optimization.go' ? 'package plugin\n' : undefined),
+};
+const external = extractRefs(SPEC, `See ${q('plugin/optimization.go:1')}.`);
+const unpinned = judgeRefs(external, suffixTree).length;
+if (unpinned !== 0) fail('a unique suffix resolves an unledgered citation', 0, unpinned);
+const pinned = judgeRefs(external, suffixTree, pinnedMissingKeys([{ ...row(1), raw: 'plugin/optimization.go:1' }])).map(
+  (f) => f.reason,
+);
+if (JSON.stringify(pinned) !== JSON.stringify(['missing-file']))
+  fail('a ledgered other-tree citation stays missing under a suffix match', ['missing-file'], pinned);
+const exactTree: SpecLinkTree = { files: ['plugin/optimization.go'], textOf: () => 'package plugin\n' };
+const exact = judgeRefs(
+  external,
+  exactTree,
+  pinnedMissingKeys([{ ...row(1), raw: 'plugin/optimization.go:1' }]),
+).length;
+if (exact !== 0) fail('creating the cited file itself resolves a pinned citation', 0, exact);
 if (failures > 0) {
   console.error(`Spec-link fixtures failed: ${failures} planted shape(s) did not get the verdict they plant.`);
   process.exit(1);

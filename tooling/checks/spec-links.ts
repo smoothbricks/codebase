@@ -40,6 +40,8 @@ export interface SpecRef {
   readonly target: string;
   /** The greatest cited line, when the reference cites one. */
   readonly lastLine?: number;
+  /** The first cited line, when the reference cites a range. */
+  readonly firstLine?: number;
   readonly symbols: readonly string[];
 }
 
@@ -84,7 +86,7 @@ const FRAG_LINE = /^L(\d+)(?:-L(\d+))?$/;
 const CODE_START = /\bCode:\s/g;
 const ENTRY = new RegExp(`\\[\\s*${TICK}([^${TICK}]+)${TICK}\\s*\\]`, 'g');
 const SYM_NEXT = new RegExp(`^\\s*${TICK}([^${TICK}]+)${TICK}\\s*([,;.]?)`);
-const ENTRY_LINE = /^(.+?):(\d+)(?:-(\d+))?$/;
+const ENTRY_LINE = /^(.+?):(\d+)(?:-(\d+))?(?::\d+)?$/;
 const FENCE = TICK + TICK + TICK;
 
 /** Fenced blocks blanked to empty lines, so offsets and line numbers still name the original text. */
@@ -93,7 +95,7 @@ function blankFences(text: string): string {
   return text
     .split('\n')
     .map((line) => {
-      if (line.trimStart().startsWith(FENCE)) {
+      if (line.trimStart().startsWith(FENCE) || line.trimStart().startsWith('~~~')) {
         fenced = !fenced;
         return '';
       }
@@ -154,6 +156,7 @@ export function extractRefs(spec: string, text: string): SpecRef[] {
         raw: token,
         target: pm[1] ?? '',
         lastLine: Number(pm[3] ?? pm[2]),
+        ...(pm[3] === undefined ? {} : { firstLine: Number(pm[2]) }),
         symbols: [],
       });
     }
@@ -173,6 +176,7 @@ export function extractRefs(spec: string, text: string): SpecRef[] {
         raw: href,
         target,
         ...(frag === null || frag === undefined ? {} : { lastLine: Number(frag[2] ?? frag[1]) }),
+        ...(frag?.[2] === undefined ? {} : { firstLine: Number(frag[1]) }),
         symbols: [],
       });
     }
@@ -196,6 +200,7 @@ export function extractRefs(spec: string, text: string): SpecRef[] {
         raw: entry.raw,
         target: lm === null ? entry.raw : (lm[1] ?? ''),
         ...(lm === null ? {} : { lastLine: Number(lm[3] ?? lm[2]) }),
+        ...(lm?.[3] === undefined ? {} : { firstLine: Number(lm[2]) }),
         symbols: symbolChain(after),
       });
     }
@@ -273,17 +278,23 @@ function symbolExists(body: string, symbol: string): boolean {
 }
 
 /** The pure verdict over extracted references: every reference that does not resolve in the tree. */
-export function judgeRefs(refs: readonly SpecRef[], tree: SpecLinkTree): SpecLinkFinding[] {
+export function judgeRefs(
+  refs: readonly SpecRef[],
+  tree: SpecLinkTree,
+  pinnedMissing: ReadonlySet<string> = new Set(),
+): SpecLinkFinding[] {
   const set = new Set(tree.files);
   const findings: SpecLinkFinding[] = [];
   for (const ref of refs) {
     let path: string;
     if (ref.kind === 'link') {
-      const resolved = posix.normalize(posix.join(posix.dirname(ref.spec), ref.target));
+      const joined = posix.normalize(posix.join(posix.dirname(ref.spec), ref.target));
+      const resolved = joined.length > 1 && joined.endsWith('/') ? joined.slice(0, -1) : joined;
       if (resolved === '..' || resolved.startsWith('../')) {
         findings.push({ ref, reason: 'escapes-repo', detail: 'the link leaves this repository' });
         continue;
       }
+      if (resolved === '.') continue;
       if (!set.has(resolved)) {
         if (tree.files.some((f) => f.startsWith(`${resolved}/`))) continue;
         findings.push({ ref, reason: 'missing-file', detail: `names no tracked file: ${resolved}` });
@@ -291,6 +302,14 @@ export function judgeRefs(refs: readonly SpecRef[], tree: SpecLinkTree): SpecLin
       }
       path = resolved;
     } else {
+      if (pinnedMissing.has(refKey(ref.spec, ref.kind, ref.raw, undefined)) && !set.has(ref.target)) {
+        findings.push({
+          ref,
+          reason: 'missing-file',
+          detail: 'ledgered as naming another tree; a suffix match is not its fix',
+        });
+        continue;
+      }
       const resolution = resolveRepoPath(ref.target, tree.files, set);
       if ('missing' in resolution) {
         findings.push({ ref, reason: 'missing-file', detail: 'names no tracked file' });
@@ -311,6 +330,14 @@ export function judgeRefs(refs: readonly SpecRef[], tree: SpecLinkTree): SpecLin
       findings.push({ ref, reason: 'missing-file', detail: `names no readable tracked file: ${path}` });
       continue;
     }
+    if (ref.firstLine !== undefined && (ref.firstLine < 1 || ref.firstLine > lineCount(text))) {
+      findings.push({
+        ref,
+        reason: 'line-out-of-range',
+        detail: `cites line ${ref.firstLine} of ${path}, which has ${lineCount(text)} lines`,
+      });
+      continue;
+    }
     if (ref.lastLine !== undefined && ref.lastLine > lineCount(text)) {
       findings.push({
         ref,
@@ -329,6 +356,19 @@ export function judgeRefs(refs: readonly SpecRef[], tree: SpecLinkTree): SpecLin
 
 function refKey(spec: string, kind: SpecRefKind, raw: string, symbol: string | undefined): string {
   return `${spec}|${kind}|${raw}|${symbol ?? ''}`;
+}
+
+/**
+ * Ledger keys whose reference stays missing while its target is not itself a tracked path: rows without a
+ * symbol ledger a citation of another tree, so a later unrelated file that merely ends the same way cannot
+ * clear the row. Symbol rows resolve their file by design and links escape by path arithmetic; neither is pinned.
+ */
+export function pinnedMissingKeys(ledger: readonly SpecLinkRow[]): ReadonlySet<string> {
+  return new Set(
+    ledger
+      .filter((row) => row.symbol === undefined && row.kind !== 'link')
+      .map((row) => refKey(row.spec, row.kind, row.raw, undefined)),
+  );
 }
 
 /**
@@ -363,7 +403,7 @@ export function findSpecLinkViolations(
 
 /** Every reference in tracked specs that does not resolve against the tracked tree. */
 export async function scanSpecLinks(): Promise<{ checked: number; findings: SpecLinkFinding[] }> {
-  const git = Bun.spawn(['git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z'], {
+  const git = Bun.spawn(['git', 'ls-files', '--cached', '-z'], {
     cwd: REPO_ROOT,
     stdout: 'pipe',
     stderr: 'pipe',
@@ -391,10 +431,15 @@ export async function scanSpecLinks(): Promise<{ checked: number; findings: Spec
     .filter((f) => f.startsWith('specs/') && f.endsWith('.md'))
     .sort()
     .flatMap((spec) => {
-      const text = textOf(spec);
-      return text === undefined ? [] : extractRefs(spec, text);
+      let text: string;
+      try {
+        text = readFileSync(resolve(REPO_ROOT, spec), 'utf8');
+      } catch (error) {
+        throw new Error(`cannot read tracked spec ${spec}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return extractRefs(spec, text);
     });
-  return { checked: refs.length, findings: judgeRefs(refs, { files, textOf }) };
+  return { checked: refs.length, findings: judgeRefs(refs, { files, textOf }, pinnedMissingKeys(SPEC_LINKS)) };
 }
 
 export function formatViolation(violation: SpecLinkViolation): string {
