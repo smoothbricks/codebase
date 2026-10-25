@@ -250,6 +250,11 @@ same-effective-uid combined BSD read must retain its actual EPERM. Both detached
 the retained sibling completes its fork/exec work, and an unrelated process in the same checkout survives. Missing final
 counters remain UnreadFinalUsage, never zeroes, and cannot replace identity, ancestry, watch or signal proof.
 
+A whole job's membership read, exit watch and signal take the same public reads. The job-groups proof holds a
+setuid-root `top` in a test-owned group: its membership record names root's effective uid, and its exact life is watched
+and ended by SIGTERM. The combined read refused that member with EPERM, and with it the retirement of a job whose leader
+exited while Nx's setuid `ps` ran: the job stayed draining with its CPU tokens and its client never saw its end.
+
 The exit-watch fallback is proven on the real kernel in the ordinary lane: registering launchd (pid 1, which no user may
 SIGKILL) yields the withheld watch and the observer's own child the status watch. A scripted withheld exit folds no
 status and the `UnreadExitStatus` gap. The host-controller lane's

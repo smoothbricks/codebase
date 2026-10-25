@@ -375,8 +375,12 @@ fn a_zombie_holder_is_not_reported_as_running() {
 
 /// A caller-opened state descriptor, separate from stdout and stderr, handed through exec.
 fn state_command(dir: &Dir) -> Command {
-    let mut command = Command::new("sh");
-    command
+    state_command_in(dir, Command::new("sh"))
+}
+
+/// [`state_command`] run by `shell`, an `sh` that may sit behind a wrapper.
+fn state_command_in(dir: &Dir, mut shell: Command) -> Command {
+    shell
         .args(["-c", r#"state=$1; shift; exec "$0" "$@" 3>"$state""#])
         .arg(cowshed())
         .arg(dir.path.join("state"))
@@ -386,7 +390,7 @@ fn state_command(dir: &Dir) -> Command {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command
+    shell
 }
 
 fn state_events(dir: &Dir) -> Vec<LockWaiterEvent> {
@@ -521,18 +525,24 @@ fn an_unopened_state_descriptor_cannot_adopt_a_runtime_descriptor() {
 fn a_capture_failure_reports_failed_on_the_owned_state_channel() {
     let dir = Dir::new("capture-failure");
     let ran = dir.path.join("ran");
-    let mut command = state_command(&dir);
+    // Darwin answers launchd's identity to every uid, so the waiter runs under a Seatbelt profile
+    // that denies it every read of another process's info: capturing pid 1 fails with EPERM, and
+    // no mocked syscall is involved.
     #[cfg(target_os = "macos")]
-    {
-        // BSDINFOWITHUNIQID requires the same user; launchd belongs to root.
-        // SAFETY: geteuid has no memory operands.
-        assert_ne!(
-            unsafe { libc::geteuid() },
-            0,
-            "this fixture requires a non-root caller"
-        );
+    let mut command = {
+        let mut sandboxed = Command::new("/usr/bin/sandbox-exec");
+        sandboxed.args([
+            "-p",
+            "(version 1)(allow default)(deny process-info-pidinfo (target others))",
+            "--",
+            "sh",
+        ]);
+        let mut command = state_command_in(&dir, sandboxed);
         command.args(["--owned-pid", "1"]);
-    }
+        command
+    };
+    #[cfg(target_os = "linux")]
+    let mut command = state_command(&dir);
     #[cfg(target_os = "linux")]
     {
         let pid = std::process::id().to_string();
@@ -574,6 +584,8 @@ fn a_capture_failure_reports_failed_on_the_owned_state_channel() {
     );
     #[cfg(target_os = "linux")]
     assert!(reason.contains("Too many open files"), "{reason}");
+    #[cfg(target_os = "macos")]
+    assert!(reason.contains("Operation not permitted"), "{reason}");
     assert!(!ran.exists(), "failed capture started the command");
     assert!(!dir.lock().exists(), "failed capture opened the lock");
 }

@@ -633,11 +633,11 @@ fn recorded_life(life: ProcessIdentity) -> io::Result<Option<Process>> {
             "recorded process life needs a positive pid and unique id",
         ));
     }
-    Ok(running_info(pid)?
-        .filter(|info| info.unique.unique_id == life.birth.0)
-        .map(|info| Process {
+    Ok(running_identity(pid)?
+        .filter(|identity| identity.unique_id == life.birth.0)
+        .map(|identity| Process {
             pid,
-            version: info.unique.id_version.cast_unsigned(),
+            version: identity.id_version.cast_unsigned(),
         }))
 }
 
@@ -874,7 +874,10 @@ pub fn job_members(leader: &Birth) -> io::Result<Vec<Process>> {
 #[cfg(target_os = "macos")]
 pub(crate) fn job_member_records(leader: &Birth) -> io::Result<Vec<ProcessRecord>> {
     proven_members(leader, |pgid| {
-        Ok(running_in_group(pgid)?.iter().map(record_of).collect())
+        Ok(running_in_group(pgid)?
+            .into_iter()
+            .map(|life| life.record)
+            .collect())
     })
 }
 
@@ -886,9 +889,11 @@ fn proven_members<T>(
 ) -> io::Result<Vec<T>> {
     let pgid = i32::try_from(leader.pid()).map_err(io::Error::other)?;
     // `Some(true)` while the leader holds its pid, `Some(false)` while another process does,
-    // `None` once no process holds it.
+    // `None` once no process holds it. Its start time answers whoever the leader runs as, alive or
+    // exited and held unreaped; its rusage birth is declined (`EPERM`) once it execs a setuid-root
+    // program.
     let holds = |leader: GroupLeader| -> io::Result<Option<bool>> {
-        Ok(birth_time(leader.pgid)?.map(|birth| birth == leader.birth))
+        Ok(start_time(leader.pgid)?.map(|start| start == leader.start))
     };
     if let Birth::Observed(leader) = leader {
         match holds(*leader)? {
@@ -1150,7 +1155,7 @@ pub struct Process {
 #[cfg(target_os = "macos")]
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "signaling process {pid} with signal {signal} failed: {source}; expected_version={expected_version}, caller_euid={caller_euid}, post_failure_unfenced(uid,flags,version)={post_failure:?}, exit_watch=unavailable (none held at the signal boundary)"
+    "signaling process {pid} with signal {signal} failed: {source}; expected_version={expected_version}, caller_euid={caller_euid}, post_failure(uid,flags,version)={post_failure:?}, exit_watch=unavailable (none held at the signal boundary)"
 )]
 struct SignalPermissionDenied {
     pid: i32,
@@ -1174,16 +1179,26 @@ struct UniqueIdentifierInfo {
     _reserved: [u8; 20],
 }
 
-/// `struct proc_bsdinfowithuniqid`: a process's BSD record and its identity, read in one call.
+/// `PROC_PIDUNIQIDENTIFIERINFO`: a life's unique ids and pid version. The kernel answers it,
+/// and `PROC_PIDT_SHORTBSDINFO`, for a process of any effective uid. It refuses
+/// `PROC_PIDT_BSDINFOWITHUNIQID` with `EPERM` for a process whose effective uid is not the
+/// caller's: a job member running a setuid-root program, such as the `/bin/ps` Nx runs to find a
+/// task's processes when it is told to stop, whose real uid is still the job's. Measured on Darwin
+/// 25.6 with `/usr/bin/top` (euid 0, ruid ours): flavor 18 answers `EPERM`, flavors 17 and 13
+/// answer, and `proc_signal_with_audittoken` delivers STOP, CONT and TERM to it. An exited
+/// process, reaped or not, answers `ESRCH` to all three.
 #[cfg(target_os = "macos")]
-#[repr(C)]
-struct BsdInfoWithUniqueId {
-    bsd: libc::proc_bsdinfo,
-    unique: UniqueIdentifierInfo,
-}
+const PROC_PIDUNIQIDENTIFIERINFO: libc::c_int = 17;
 
+/// One running life as [`running_life`] reads it: its record, the pid version it carried at the
+/// read's end, and the group and BSD flags it held within the read.
 #[cfg(target_os = "macos")]
-const PROC_PIDT_BSDINFOWITHUNIQID: libc::c_int = 18;
+struct RunningLife {
+    record: ProcessRecord,
+    version: u32,
+    pgid: u32,
+    flags: u32,
+}
 
 /// `audit_token_t`.
 #[cfg(target_os = "macos")]
@@ -1205,27 +1220,27 @@ unsafe extern "C" {
 #[cfg(target_os = "macos")]
 fn members_of(pgid: i32) -> io::Result<Vec<Process>> {
     Ok(running_in_group(pgid)?
-        .iter()
-        .map(|info| Process {
-            pid: info.bsd.pbi_pid.cast_signed(),
-            version: info.unique.id_version.cast_unsigned(),
+        .into_iter()
+        .map(|life| Process {
+            pid: life.record.pid.cast_signed(),
+            version: life.version,
         })
         .collect())
 }
 
-/// The record of every running process that holds the group id, each read in one call.
+/// The record of every running process that holds the group id.
 #[cfg(target_os = "macos")]
-fn running_in_group(pgid: i32) -> io::Result<Vec<BsdInfoWithUniqueId>> {
+fn running_in_group(pgid: i32) -> io::Result<Vec<RunningLife>> {
     let mut members = Vec::new();
     for pid in group_pids(pgid)? {
         // Exited (an unreaped process answers ESRCH too) or gone: nothing to signal.
-        let Some(info) = running_info(pid)? else {
+        let Some(life) = running_life(pid)? else {
             continue;
         };
-        // One call read both, so the group is this very process's: one the id now names a
-        // newer process for would have answered with that process's version.
-        if i32::try_from(info.bsd.pbi_pgid).ok() == Some(pgid) {
-            members.push(info);
+        // The group was read inside the life's identity fence, so it is this very process's:
+        // a newer process given the id would have answered with another unique id.
+        if i32::try_from(life.pgid).ok() == Some(pgid) {
+            members.push(life);
         }
     }
     Ok(members)
@@ -1242,11 +1257,12 @@ pub(crate) fn signal_life(pid: u32, unique_id: u64, signal: libc::c_int) -> io::
     let pid = i32::try_from(pid).map_err(io::Error::other)?;
     let mut refused = None;
     loop {
-        let Some(info) = running_info(pid)?.filter(|info| info.unique.unique_id == unique_id)
+        let Some(identity) =
+            running_identity(pid)?.filter(|identity| identity.unique_id == unique_id)
         else {
             return Ok(false);
         };
-        let version = info.unique.id_version.cast_unsigned();
+        let version = identity.id_version.cast_unsigned();
         if refused == Some(version) {
             return Ok(false);
         }
@@ -1257,10 +1273,51 @@ pub(crate) fn signal_life(pid: u32, unique_id: u64, signal: libc::c_int) -> io::
     }
 }
 
+/// The identity of the life `pid` holds now; `None` once it has exited, reaped or not.
 #[cfg(target_os = "macos")]
-fn running_info(pid: i32) -> io::Result<Option<BsdInfoWithUniqueId>> {
-    // SAFETY: flavor 18 writes exactly struct proc_bsdinfowithuniqid.
-    unsafe { pid_info(pid, PROC_PIDT_BSDINFOWITHUNIQID) }
+fn running_identity(pid: i32) -> io::Result<Option<UniqueIdentifierInfo>> {
+    // SAFETY: flavor 17 writes exactly struct proc_uniqidentifierinfo.
+    unsafe { pid_info(pid, PROC_PIDUNIQIDENTIFIERINFO) }
+}
+
+/// The public metadata of the life `pid` holds now, fenced by its immutable unique id; `None` once
+/// it has exited, reaped or not. BSD credentials, ppid and group are a snapshot of that life, not
+/// an atomic image claim or signal authority. An exec may change the pid version without changing
+/// the birth or ancestry. No failed call is classified as absence.
+#[cfg(target_os = "macos")]
+fn running_life(pid: i32) -> io::Result<Option<RunningLife>> {
+    let Some(before) = running_identity(pid)? else {
+        return Ok(None);
+    };
+    // SAFETY: SHORTBSDINFO writes exactly libc's struct proc_bsdshortinfo.
+    let Some(bsd) =
+        (unsafe { pid_info::<libc::proc_bsdshortinfo>(pid, libc::PROC_PIDT_SHORTBSDINFO) })?
+    else {
+        return Ok(None);
+    };
+    let Some(started) = start_time(pid)? else {
+        return Ok(None);
+    };
+    let Some(after) = running_identity(pid)? else {
+        return Ok(None);
+    };
+    if before.unique_id != after.unique_id {
+        return Ok(None);
+    }
+    Ok(Some(RunningLife {
+        record: ProcessRecord {
+            pid: bsd.pbsi_pid,
+            ppid: bsd.pbsi_ppid,
+            unique_id: after.unique_id,
+            parent_unique_id: after.parent_unique_id,
+            // xnu `proc_pidshortbsdinfo`: `pbsi_uid` is the credential's effective uid.
+            uid: bsd.pbsi_uid,
+            started_seconds: started / 1_000_000,
+        },
+        version: after.id_version.cast_unsigned(),
+        pgid: bsd.pbsi_pgid,
+        flags: bsd.pbsi_flags,
+    }))
 }
 
 /// Read one exact libproc payload; only ESRCH proves that no running life holds the pid.
@@ -1304,46 +1361,10 @@ pub struct ProcessRecord {
     pub started_seconds: u64,
 }
 
-/// The public metadata of one running life, fenced by its immutable unique id.
-/// BSD credentials and ppid are a snapshot of that life, not an atomic image claim or signal
-/// authority. An exec may change the pid version without changing the birth or ancestry.
+/// The public metadata of the life `pid` holds now ([`running_life`]).
 #[cfg(target_os = "macos")]
 pub(crate) fn process_record(pid: i32) -> io::Result<Option<ProcessRecord>> {
-    const PROC_PIDUNIQIDENTIFIERINFO: libc::c_int = 17;
-    // Unlike BSDINFOWITHUNIQID, both public flavors permit a different effective uid: a
-    // legitimate setuid helper remains observable. No failed call is classified as absence.
-    // SAFETY: flavor 17 writes exactly struct proc_uniqidentifierinfo.
-    let Some(before) =
-        (unsafe { pid_info::<UniqueIdentifierInfo>(pid, PROC_PIDUNIQIDENTIFIERINFO) })?
-    else {
-        return Ok(None);
-    };
-    // SAFETY: SHORTBSDINFO writes exactly libc's struct proc_bsdshortinfo.
-    let Some(bsd) =
-        (unsafe { pid_info::<libc::proc_bsdshortinfo>(pid, libc::PROC_PIDT_SHORTBSDINFO) })?
-    else {
-        return Ok(None);
-    };
-    let Some(started) = start_time(pid)? else {
-        return Ok(None);
-    };
-    // SAFETY: the same exact flavor/type pair as the opening identity fence.
-    let Some(after) =
-        (unsafe { pid_info::<UniqueIdentifierInfo>(pid, PROC_PIDUNIQIDENTIFIERINFO) })?
-    else {
-        return Ok(None);
-    };
-    if before.unique_id != after.unique_id {
-        return Ok(None);
-    }
-    Ok(Some(ProcessRecord {
-        pid: bsd.pbsi_pid,
-        ppid: bsd.pbsi_ppid,
-        unique_id: after.unique_id,
-        parent_unique_id: after.parent_unique_id,
-        uid: bsd.pbsi_uid,
-        started_seconds: started / 1_000_000,
-    }))
+    Ok(running_life(pid)?.map(|life| life.record))
 }
 
 /// The kernel's identity of the life `pid` names now: its unique id (`p_uniqueid`), which the
@@ -1351,19 +1372,6 @@ pub(crate) fn process_record(pid: i32) -> io::Result<Option<ProcessRecord>> {
 #[cfg(target_os = "macos")]
 pub(crate) fn life_of(pid: i32) -> io::Result<Option<u64>> {
     Ok(process_record(pid)?.map(|record| record.unique_id))
-}
-
-#[cfg(target_os = "macos")]
-fn record_of(info: &BsdInfoWithUniqueId) -> ProcessRecord {
-    ProcessRecord {
-        pid: info.bsd.pbi_pid,
-        ppid: info.bsd.pbi_ppid,
-        unique_id: info.unique.unique_id,
-        parent_unique_id: info.unique.parent_unique_id,
-        // xnu `proc_pidbsdinfo`: `pbi_uid` is the credential's effective uid.
-        uid: info.bsd.pbi_uid,
-        started_seconds: info.bsd.pbi_start_tvsec,
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1382,9 +1390,9 @@ impl Process {
     /// process, whose record is never this one's: the pid's running process must still carry this
     /// process's version.
     pub(crate) fn record(&self) -> io::Result<Option<ProcessRecord>> {
-        Ok(running_info(self.pid)?
-            .filter(|info| info.unique.id_version.cast_unsigned() == self.version)
-            .map(|info| record_of(&info)))
+        Ok(running_life(self.pid)?
+            .filter(|life| life.version == self.version)
+            .map(|life| life.record))
     }
 
     /// The process at the other end of a connected Unix socket, as the kernel recorded it when
@@ -1421,9 +1429,9 @@ impl Process {
                 format!("pid {pid} names no process"),
             ));
         }
-        Ok(running_info(pid)?.map(|info| Self {
+        Ok(running_identity(pid)?.map(|identity| Self {
             pid,
-            version: u32::from_ne_bytes(info.unique.id_version.to_ne_bytes()),
+            version: identity.id_version.cast_unsigned(),
         }))
     }
 
@@ -1461,15 +1469,8 @@ impl Process {
     /// Read diagnostic facts only after EPERM; failure remains a permission denial.
     #[cold]
     fn signal_permission_denied(&self, signal: libc::c_int) -> io::Error {
-        let post_failure = running_info(self.pid).map(|info| {
-            info.map(|info| {
-                (
-                    info.bsd.pbi_uid,
-                    info.bsd.pbi_flags,
-                    info.unique.id_version.cast_unsigned(),
-                )
-            })
-        });
+        let post_failure = running_life(self.pid)
+            .map(|life| life.map(|life| (life.record.uid, life.flags, life.version)));
         // SAFETY: geteuid takes no pointers and only reads the caller's credential.
         let caller_euid = unsafe { libc::geteuid() };
         let source = io::Error::from_raw_os_error(libc::EPERM);
@@ -1501,8 +1502,8 @@ impl Process {
                 ),
             )
         })?;
-        match running_info(self.pid)? {
-            Some(info) if info.unique.id_version.cast_unsigned() == self.version => {
+        match running_identity(self.pid)? {
+            Some(identity) if identity.id_version.cast_unsigned() == self.version => {
                 Ok(ExitWatch(queue))
             }
             Some(_) => Err(io::Error::new(
@@ -1526,8 +1527,8 @@ impl Process {
     /// since is its exit, not an error.
     pub(super) fn resident_bytes(&self) -> io::Result<Option<u64>> {
         let read = cowshed_os::process::resident_bytes(self.pid);
-        match running_info(self.pid)? {
-            Some(info) if info.unique.id_version.cast_unsigned() == self.version => read,
+        match running_identity(self.pid)? {
+            Some(identity) if identity.id_version.cast_unsigned() == self.version => read,
             Some(_) | None => Ok(None),
         }
     }
@@ -1539,8 +1540,8 @@ impl Process {
     /// read met.
     pub(super) fn listening_ports(&self) -> io::Result<Option<BTreeSet<u16>>> {
         let read = cowshed_os::process::listening_ports(self.pid);
-        match running_info(self.pid)? {
-            Some(info) if info.unique.id_version.cast_unsigned() == self.version => read.map(Some),
+        match running_identity(self.pid)? {
+            Some(identity) if identity.id_version.cast_unsigned() == self.version => read.map(Some),
             Some(_) | None => Ok(None),
         }
     }
@@ -1600,11 +1601,11 @@ impl Life {
     /// The process this life is now, in one read of its pid; `None` once it has exited, reaped
     /// or not, since no other process is given its unique id.
     pub(crate) fn current(self) -> io::Result<Option<Process>> {
-        Ok(running_info(self.pid)?
-            .filter(|info| info.unique.unique_id == self.unique_id)
-            .map(|info| Process {
+        Ok(running_identity(self.pid)?
+            .filter(|identity| identity.unique_id == self.unique_id)
+            .map(|identity| Process {
                 pid: self.pid,
-                version: info.unique.id_version.cast_unsigned(),
+                version: identity.id_version.cast_unsigned(),
             }))
     }
 
@@ -2547,6 +2548,90 @@ os._exit(0)
         assert!(!super::signal_life(pid, ours.unique_id, libc::SIGKILL).unwrap());
     }
 
+    /// A member running a setuid-root program -- the `/bin/ps` Nx runs to find a task's processes
+    /// when it is told to stop -- carries root's effective uid and the job's real uid. Its group's
+    /// membership is read and its life watched and signalled like any other member's: the kernel
+    /// delivers the job's signals to it. Read with `PROC_PIDT_BSDINFOWITHUNIQID`, it answered
+    /// `EPERM`, which refused the retirement of every job whose leader exited around such a
+    /// member: the job stayed draining with its CPU tokens, and its client never saw its end.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_setuid_root_member_is_read_watched_and_signalled_like_any_other() {
+        // `top` in logging mode, setuid root on every macOS host, runs until it is signalled.
+        let (job, top) = group_with_child("/usr/bin/top -l 0 -s 1 >/dev/null & echo $!; wait");
+        let group = OwnedGroup(job);
+        let birth = super::Birth::Observed(leader(group.0.id()));
+        // The shell forks before `top` execs: the member is read until it runs as root.
+        let member = loop {
+            let records = super::job_member_records(&birth).expect("the job's membership");
+            let member = records
+                .iter()
+                .find(|record| record.pid == top)
+                .copied()
+                .expect("top is a member of the job's group");
+            if member.uid == 0 {
+                break member;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let watch = member
+            .life()
+            .watch_exit()
+            .expect("watch the member")
+            .expect("the member runs");
+        assert!(super::signal_life(top, member.unique_id, libc::SIGTERM).expect("signal"));
+        watch.wait().expect("the member exits");
+        assert!(!super::signal_life(top, member.unique_id, libc::SIGKILL).expect("signal"));
+    }
+
+    /// A leader that execs a setuid-root program still proves its group, running and once it
+    /// exited and is held unreaped: its start time answers whoever it runs as. Its rusage birth,
+    /// which the kernel declines a process of another effective uid with `EPERM`, refused the
+    /// membership of a job whose command was such a program, and with it the job's retirement.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_leader_running_a_setuid_root_program_still_proves_its_group() {
+        let mut group = OwnedGroup(
+            Command::new("/bin/sh")
+                .args(["-c", "read _; exec /usr/bin/top -l 0 -s 1 >/dev/null"])
+                .stdin(Stdio::piped())
+                .process_group(0)
+                .spawn_locked()
+                .expect("spawn a job group"),
+        );
+        let pid = group.0.id();
+        let birth = super::Birth::Observed(leader(pid));
+        std::io::Write::write_all(group.0.stdin.as_mut().expect("piped stdin"), b"\n")
+            .expect("let the leader exec top");
+        // The leader is read until it runs `top`, as root.
+        let members = loop {
+            let members = super::job_member_records(&birth).expect("the job's membership");
+            if members
+                .iter()
+                .any(|member| member.pid == pid && member.uid == 0)
+            {
+                break members;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(members.len(), 1, "{members:?}");
+        let leader_pid = i32::try_from(pid).unwrap();
+        // SAFETY: kill takes plain integers; the leader is this test's unreaped child.
+        assert_eq!(unsafe { libc::kill(leader_pid, libc::SIGKILL) }, 0);
+        assert_eq!(
+            super::await_exit_unreaped(leader_pid).unwrap(),
+            crate::api::dto::ExitStatus::Signaled {
+                signal: libc::SIGKILL,
+                core_dumped: false,
+            }
+        );
+        assert!(
+            super::job_member_records(&birth)
+                .expect("the exited leader's group")
+                .is_empty()
+        );
+    }
+
     /// A group led by `sh` whose child is `script`'s last background job: the leader, held
     /// unreaped by the test, and the child's pid, which `script` prints. The leader's stdin is a
     /// pipe the returned leader holds open, for a child that waits on it.
@@ -3317,8 +3402,9 @@ os._exit(0)
     /// A pid another user's process now holds is told from the recorded leader by its start
     /// time, which the kernel answers whoever owns the process: a start that differs names
     /// another process, so the group is not the job's, and a lost supervisor's ledger naming it is
-    /// taken without a signal or a refusal. A start that matches is still inspected, and another
-    /// user's members cannot be, so that stays a refusal. An earlier build's rusage birth cannot
+    /// taken without a signal or a refusal. A start that matches is inspected: every member's
+    /// identity is public whoever owns it (11_shell.md), so the group is read, and signalling
+    /// another user's process stays the kernel's refusal. An earlier build's rusage birth cannot
     /// be compared at all -- the kernel declines another user's rusage -- and stays a refusal.
     /// launchd (pid 1, root) stands in for the recycled pid.
     #[cfg(target_os = "macos")]
@@ -3344,9 +3430,19 @@ os._exit(0)
             super::ownership(&group(Some(started + 1), None)).unwrap(),
             super::Ownership::NotOwned
         ));
-        assert!(
-            super::ownership(&group(Some(started), None)).is_err(),
-            "a holder whose start matches the record is never released uninspected"
+        let super::Ownership::Owned(members) = super::ownership(&group(Some(started), None))
+            .expect("a holder whose start matches the record is inspected")
+        else {
+            panic!("a holder whose start matches the record is never released uninspected");
+        };
+        let launchd = members
+            .iter()
+            .find(|member| member.pid() == HOLDER)
+            .expect("launchd holds its own group");
+        assert_eq!(
+            launchd.signal(libc::SIGCONT).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the kernel refuses this user a signal to another user's process"
         );
         let Err(legacy) = super::ownership(&group(None, Some(3_131_429_805_919))) else {
             panic!("an earlier build's birth was compared against another user's process");
