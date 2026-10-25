@@ -2593,7 +2593,10 @@ os._exit(0)
     fn a_leader_running_a_setuid_root_program_still_proves_its_group() {
         let mut group = OwnedGroup(
             Command::new("/bin/sh")
-                .args(["-c", "read _; exec /usr/bin/top -l 0 -s 1 >/dev/null"])
+                .args([
+                    "-c",
+                    "sleep 600 & read _; exec /usr/bin/top -l 0 -s 1 >/dev/null",
+                ])
                 .stdin(Stdio::piped())
                 .process_group(0)
                 .spawn_locked()
@@ -2614,7 +2617,14 @@ os._exit(0)
             }
             std::thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(members.len(), 1, "{members:?}");
+        // The leader, and a sibling that outlives it, so a leader read as gone fails the read below
+        // instead of reading an empty group.
+        assert_eq!(members.len(), 2, "{members:?}");
+        let sibling = members
+            .iter()
+            .find(|member| member.pid != pid)
+            .expect("the leader's live sibling")
+            .pid;
         let leader_pid = i32::try_from(pid).unwrap();
         // SAFETY: kill takes plain integers; the leader is this test's unreaped child.
         assert_eq!(unsafe { libc::kill(leader_pid, libc::SIGKILL) }, 0);
@@ -2625,10 +2635,13 @@ os._exit(0)
                 core_dumped: false,
             }
         );
-        assert!(
+        assert_eq!(
             super::job_member_records(&birth)
                 .expect("the exited leader's group")
-                .is_empty()
+                .iter()
+                .map(|member| member.pid)
+                .collect::<Vec<_>>(),
+            [sibling]
         );
     }
 
