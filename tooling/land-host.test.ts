@@ -26,7 +26,9 @@ import type { Call } from './land-host.plan.ts';
 // a scenario scripts: its exact output, exit status and run summary rows). A scenario names every nx call the land may
 // make, in order: a call it did not script fails the land. node runs the publisher, recording what land-publish.ts gave
 // it and refusing when FIX_PUBLISH says so, and the workspace's tooling/land-inputs.mts, recording the tasks it was asked
-// about and printing the inputs the fixture keeps in inputs.json.
+// about and printing the inputs the fixture keeps in inputs.json. The build-volume pick runs land-pick.ts for real but for
+// its `price` verb, which reads Cargo's fingerprints and the store's seed sidecars (land-pick.test.ts's): a scenario
+// that names a price (FIX_PRICE) is answered with it, and main's reseed preview and reseed answer as the scenario says.
 
 const tooling = import.meta.dir;
 const repo = dirname(tooling);
@@ -100,8 +102,15 @@ exit 64
   bun: `#!/bin/sh
 case $1 in
 nx) shift; exec "$FIX_BUN" "$FIX_FAKE_NX" "$@" ;;
-*) exec "$FIX_BUN" "$@" ;;
+*/land-pick.ts)
+  if [ "$2" = price ] && [ -n "$FIX_PRICE" ]; then
+    [ "$FIX_PRICE" = fail ] && { echo 'land-pick: the scenario refuses to price' >&2; exit 1; }
+    echo "$FIX_PRICE"
+    exit 0
+  fi
+  ;;
 esac
+exec "$FIX_BUN" "$@"
 `,
   cowshed: `#!/bin/sh
 [ "$1" = --json ] && shift
@@ -151,9 +160,30 @@ exec)
   cd "$FIX_WS" && exec "$@"
   ;;
 reseed)
-  # The fixture's main was never seeded: the preview refuses, as cowshed does for a missing seed.
-  printf '{"ok":false,"error":{"code":"notFound","message":"main has no seed"}}\\n'
-  exit 1
+  printf '%s\\n' "$*" >>"$FIX_STATE/reseed.log"
+  case " $* " in
+  *' --dry-run '*)
+    # Main has no seed unless the scenario seeds it; a conflict stands for any other refused preview.
+    case $FIX_PREVIEW in
+    seed) printf '{"ok":true,"result":{"seed":"%s","dryRun":true}}\\n' "$FIX_SEED" ;;
+    conflict)
+      printf '{"ok":false,"error":{"code":"conflict","message":"unfinished lifecycle journal entry"}}\\n'
+      exit 2
+      ;;
+    *)
+      printf '{"ok":false,"error":{"code":"notFound","message":"main has no seed"}}\\n'
+      exit 1
+      ;;
+    esac
+    ;;
+  *)
+    if [ "$FIX_RESEED" = fail ]; then
+      printf '{"ok":false,"error":{"code":"io","message":"release the superseded build volume"}}\\n'
+      exit 1
+    fi
+    printf '{"ok":true,"result":{"seed":"%s","dryRun":false}}\\n' "$FIX_SEED"
+    ;;
+  esac
   ;;
 *) exit 64 ;;
 esac
@@ -196,6 +226,19 @@ interface LandRun {
   readonly nx: readonly string[];
   /** Arguments received by the planted unavailable replay tool, when this fixture uses it. */
   readonly replayArgs?: readonly string[];
+  /** The arguments of each `cowshed reseed` the land ran, in order. */
+  readonly reseeds: readonly string[];
+}
+
+/** Main's seed in a scenario that has one. */
+const SEED = 'a895a1ce6c80439484c0edd59a646063';
+
+/** What a land's build-volume pick meets: main's reseed preview, what land-pick.ts prices, and the reseed itself. */
+interface PickScenario {
+  readonly preview?: 'seed' | 'conflict';
+  /** land-pick.ts price's stdout (`own`, `seed <id>`), or `fail` for a pricing that exits 1. */
+  readonly price?: string;
+  readonly reseed?: 'fail';
 }
 
 interface Land {
@@ -215,7 +258,7 @@ afterEach(() => {
 });
 
 /** A main repository carrying the land tooling, and a workspace one commit ahead of it. */
-function fixture(replayFails = false, publishFails = false): Land {
+function fixture(replayFails = false, publishFails = false, pick: PickScenario = {}): Land {
   const root = mkdtempSync(join(tmpdir(), 'land-host-'));
   roots.push(root);
   const main = join(root, 'main');
@@ -290,6 +333,10 @@ function fixture(replayFails = false, publishFails = false): Land {
           FIX_PUBLISH: publishFails ? 'refuse' : 'accept',
           FIX_MAIN: main,
           FIX_WS: ws,
+          FIX_PREVIEW: pick.preview ?? 'notFound',
+          FIX_SEED: SEED,
+          FIX_PRICE: pick.price ?? '',
+          FIX_RESEED: pick.reseed ?? 'ok',
           // The land's temporary files, so a case can prove none is left behind.
           TMPDIR: join(state, 'tmp'),
         },
@@ -300,11 +347,13 @@ function fixture(replayFails = false, publishFails = false): Land {
       }
       const nxLog = join(state, 'nx.log');
       const replayLog = join(state, 'replay.args');
+      const reseedLog = join(state, 'reseed.log');
       return {
         status: run.status ?? -1,
         log: run.stderr,
         nx: existsSync(nxLog) ? readFileSync(nxLog, 'utf8').trimEnd().split('\n') : [],
         replayArgs: existsSync(replayLog) ? readFileSync(replayLog, 'utf8').trimEnd().split('\n') : undefined,
+        reseeds: existsSync(reseedLog) ? readFileSync(reseedLog, 'utf8').trimEnd().split('\n') : [],
       };
     },
   };
@@ -344,7 +393,8 @@ describe('land-host.sh', () => {
     ]);
     expect(run.status, run.log).toBe(0);
     expect(run.log).toContain('gating');
-    expect(run.log).toContain("main has no seed to price; the gate builds on ws's own build volume");
+    expect(run.log).toContain("the reseed preview found nothing to price; the gate builds on ws's own build volume");
+    expect(run.reseeds).toEqual(['ws --from main --dry-run']);
     expect(run.nx).toEqual(['daemon --stop', GATE.join(' '), MAIN_BUILD.join(' ')]);
     expect(run.log).toContain("building main's outputs");
     expect(run.log).not.toContain('capture-prefix');
@@ -559,6 +609,75 @@ describe('land-host.sh', () => {
     expect(run.log).not.toContain('land-host: lib:lint failed');
   });
 
+  describe('build-volume pick', () => {
+    const PREVIEW = 'ws --from main --dry-run';
+    const RESEED = 'ws --from main';
+    const passing = (): Call[] => [DAEMON_STOP, passingRun(GATE), passingRun(MAIN_BUILD)];
+
+    it('reseeds onto the seed it priced when that seed leaves less to compile, then gates and lands', () => {
+      const land = fixture(false, false, { preview: 'seed', price: `seed ${SEED}` });
+      const gated = git(land.ws, 'rev-parse', 'HEAD');
+      const run = land.land(passing());
+      expect(run.status, run.log).toBe(0);
+      expect(run.reseeds).toEqual([PREVIEW, PREVIEW, RESEED]);
+      expect(run.log).toContain(`reseeding ws from main's seed ${SEED}`);
+      expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
+    });
+
+    it('keeps its own build volume when that prices cheaper', () => {
+      const land = fixture(false, false, { preview: 'seed', price: 'own' });
+      const run = land.land(passing());
+      expect(run.status, run.log).toBe(0);
+      expect(run.reseeds).toEqual([PREVIEW]);
+      expect(run.log).not.toContain('reseeding');
+    });
+
+    it('keeps its own build volume when main seed changed after it was priced', () => {
+      const priced = '0'.repeat(32);
+      const land = fixture(false, false, { preview: 'seed', price: `seed ${priced}` });
+      const run = land.land(passing());
+      expect(run.status, run.log).toBe(0);
+      expect(run.reseeds).toEqual([PREVIEW, PREVIEW]);
+      expect(run.log).toContain(
+        `main's seed changed after it was priced (priced ${priced}, now ${SEED}); the gate builds on ws's own build volume`,
+      );
+    });
+
+    it('gates on its own build volume when the pricing fails, and says so', () => {
+      const land = fixture(false, false, { preview: 'seed', price: 'fail' });
+      const run = land.land(passing());
+      expect(run.status, run.log).toBe(0);
+      expect(run.reseeds).toEqual([PREVIEW]);
+      expect(run.log).toContain('land-pick: the scenario refuses to price');
+      expect(run.log).toContain("could not price ws's build volumes; the gate builds on its own");
+    });
+
+    it('says a reseed that did not finish, and still gates and lands', () => {
+      const land = fixture(false, false, { preview: 'seed', price: `seed ${SEED}`, reseed: 'fail' });
+      const gated = git(land.ws, 'rev-parse', 'HEAD');
+      const run = land.land(passing());
+      expect(run.status, run.log).toBe(0);
+      expect(run.reseeds).toEqual([PREVIEW, PREVIEW, RESEED]);
+      expect(run.log).toContain('release the superseded build volume');
+      expect(run.log).toContain(
+        'the reseed did not finish (cowshed exited 1); the gate builds on whichever build volume it left linked to ws',
+      );
+      expect(run.log).not.toContain("the gate builds on ws's own build volume");
+      expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
+    });
+
+    it('tells a failed reseed preview from a missing seed', () => {
+      const land = fixture(false, false, { preview: 'conflict' });
+      const run = land.land(passing());
+      expect(run.status, run.log).toBe(0);
+      expect(run.reseeds).toEqual([PREVIEW]);
+      expect(run.log).toContain('unfinished lifecycle journal entry');
+      expect(run.log).toContain(
+        "the reseed preview failed (cowshed exited 2); the gate builds on ws's own build volume",
+      );
+      expect(run.log).not.toContain('found nothing to price');
+    });
+  });
   it('refuses to land main itself', () => {
     const land = fixture();
     const run = spawnSync('sh', [join(land.main, 'tooling/land-host.sh'), 'main'], { encoding: 'utf8' });

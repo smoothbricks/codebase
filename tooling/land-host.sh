@@ -7,8 +7,9 @@
 #    that reason alone is retried against the newer head.
 # 2. Pick the build volume the gate builds on (16_build_volumes.md, "Picking a land's build volume"): the workspace's
 #    own, or a clone of main's latest seed, whichever leaves fewer Cargo compile seconds for the rebased tree
-#    (tooling/land-pick.ts). A pick that cannot be priced, or a reseed cowshed refuses, is said and the gate builds on
-#    the workspace's own volume: the pick decides where the gate starts, never whether the tree lands.
+#    (tooling/land-pick.ts), reseeding only onto the seed it priced. A pick that cannot be priced is said and the gate
+#    builds on the workspace's own volume; a reseed that fails is said, and the gate builds on whichever volume it left
+#    linked: the pick decides where the gate starts, never whether the tree lands.
 # 3. Stop <workspace>'s Nx daemon. Its file map can be stale across a rebase (fseventsd drops events), and a gate
 #    that hashes a tree other than the rebased one proves nothing about it. The gate starts a fresh daemon.
 # 4. Gate the rebased tree on the host: `nx run-many -t gate --nx-bail=false`. The root Nx graph owns
@@ -93,20 +94,43 @@ allow_envrc() {
 }
 
 # Points <workspace> at the build volume that leaves the gate least to compile for $head: its own, or a clone of main's
-# latest seed. Only where the gate starts is chosen here: a seed nobody can price, a failed pricing or a refused reseed
-# is said, and the gate builds on the workspace's own volume.
+# latest seed. Only where the gate starts is chosen here. A preview that fails, a failed pricing and a seed that changed
+# after it was priced are said, and the gate builds on the workspace's own volume. A reseed that fails is said with
+# cowshed's status, and the gate builds on whichever volume it left linked: a reseed links its clone before it records
+# and releases the old volume (16_build_volumes.md, "Workspace reseed").
 pick_build_volume() {
   preview=$(cowshed --json reseed "$workspace" --from main --dry-run) || {
-    say "main has no seed to price; the gate builds on $workspace's own build volume"
+    status=$?
+    printf '%s\n' "$preview" >&2
+    case $(bun "$here/land-pick.ts" refusal "$preview") in
+    notFound) say "the reseed preview found nothing to price; the gate builds on $workspace's own build volume" ;;
+    *) say "the reseed preview failed (cowshed exited $status); the gate builds on $workspace's own build volume" ;;
+    esac
     return 0
   }
   choice=$(cd "$checkout" && direnv exec "$checkout" bun "$here/land-pick.ts" price "$checkout" "$built_tree" "$preview" </dev/null) || {
     say "could not price $workspace's build volumes; the gate builds on its own"
     return 0
   }
-  [ "$choice" = seed ] || return 0
-  say "reseeding $workspace from main's seed: it leaves less to compile for $head"
-  cowshed --json reseed "$workspace" --from main >&2 || say "the reseed was refused; the gate builds on $workspace's own build volume"
+  case $choice in
+  "seed "*) priced=${choice#seed } ;;
+  *) return 0 ;;
+  esac
+  # The reseed clones main's latest seed as it then stands, and a fork or land can publish another while the pick
+  # prices: reseed only onto the seed that was priced.
+  current=
+  if again=$(cowshed --json reseed "$workspace" --from main --dry-run); then
+    current=$(bun "$here/land-pick.ts" seed "$again") || current=
+  fi
+  if [ "$current" != "$priced" ]; then
+    say "main's seed changed after it was priced (priced $priced, now ${current:-unreadable}); the gate builds on $workspace's own build volume"
+    return 0
+  fi
+  say "reseeding $workspace from main's seed $priced: it leaves less to compile for $head"
+  cowshed --json reseed "$workspace" --from main >&2 || {
+    status=$?
+    say "the reseed did not finish (cowshed exited $status); the gate builds on whichever build volume it left linked to $workspace"
+  }
 }
 # `nx <args>` in <workspace>'s own devenv. A gate takes no input, and a task that reads stdin must not eat a loop's.
 workspace_nx() {

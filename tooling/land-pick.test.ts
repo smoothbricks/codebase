@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'bun:test';
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   changedLockEntries,
   configMeaning,
@@ -7,8 +10,10 @@ import {
   type Member,
   owningMember,
   pick,
+  previewRefusal,
   previewSeed,
   price,
+  readUnitTimes,
   testOnlyUnit,
   type UnitTime,
 } from './land-pick.ts';
@@ -180,7 +185,7 @@ describe('price', () => {
 });
 
 describe('pick', () => {
-  const priced = (seconds: number) => ({ seconds, units: 1, dirty: [], unpriced: [] });
+  const priced = (seconds: number, unpriced: readonly string[] = []) => ({ seconds, units: 1, dirty: [], unpriced });
 
   it('builds on the cheaper image, and keeps the own volume on a tie', () => {
     expect(pick(priced(100), priced(10), 4)).toEqual({ pick: 'seed', basis: 'cargo' });
@@ -190,6 +195,20 @@ describe('pick', () => {
 
   it('lets space decide for main seed when no unit was timed', () => {
     expect(pick(priced(0), priced(0), 0)).toEqual({ pick: 'seed', basis: 'space' });
+  });
+
+  it('keeps the own volume when the seed leaves a member unpriced that the own volume does not', () => {
+    expect(pick(priced(100), priced(10, ['os']), 4)).toEqual({ pick: 'own', basis: 'unpriced', members: ['os'] });
+    expect(pick(priced(100, ['app']), priced(10, ['app', 'os']), 4)).toEqual({
+      pick: 'own',
+      basis: 'unpriced',
+      members: ['os'],
+    });
+  });
+
+  it('compares seconds when the seed leaves no member unpriced that the own volume prices', () => {
+    expect(pick(priced(100, ['os']), priced(10, ['os']), 4)).toEqual({ pick: 'seed', basis: 'cargo' });
+    expect(pick(priced(100, ['os']), priced(10), 4)).toEqual({ pick: 'seed', basis: 'cargo' });
   });
 });
 
@@ -203,5 +222,59 @@ describe('previewSeed', () => {
     expect(previewSeed('not json')).toBeUndefined();
     expect(previewSeed(JSON.stringify({ ok: false, error: { code: 'notFound' } }))).toBeUndefined();
     expect(previewSeed(JSON.stringify({ ok: true, result: { seed: '../x' } }))).toBeUndefined();
+  });
+});
+
+describe('previewRefusal', () => {
+  it('reads the error code of a refused preview, and nothing from an answer or other text', () => {
+    expect(previewRefusal(JSON.stringify({ ok: false, error: { code: 'notFound', message: 'no seed' } }))).toBe(
+      'notFound',
+    );
+    expect(previewRefusal(JSON.stringify({ ok: false, error: { code: 'conflict' } }))).toBe('conflict');
+    expect(previewRefusal(JSON.stringify({ ok: true, result: { seed: 'a895a1ce6c80439484c0edd59a646063' } }))).toBe(
+      undefined,
+    );
+    expect(previewRefusal('')).toBeUndefined();
+    expect(previewRefusal(JSON.stringify({ ok: false, error: { code: 7 } }))).toBeUndefined();
+  });
+});
+
+describe('readUnitTimes', () => {
+  const T = 1_700_000_000;
+  /** Writes a fingerprint generation's files, each at its own modification time in seconds. */
+  function generation(checkout: string, name: string, files: Record<string, number>): void {
+    for (const [file, seconds] of Object.entries(files)) {
+      const path = join(checkout, 'target/debug/build/core', name, file);
+      mkdirSync(join(path, '..'), { recursive: true });
+      writeFileSync(path, '');
+      utimesSync(path, seconds, seconds);
+    }
+  }
+
+  it('times a compile from fingerprint/invoked.timestamp and a build-script run from run/invoked.timestamp', () => {
+    const checkout = mkdtempSync(join(tmpdir(), 'land-pick-'));
+    try {
+      generation(checkout, 'compiled', {
+        'fingerprint/invoked.timestamp': T,
+        'fingerprint/lib-core.json': T + 12,
+        'fingerprint/lib-core': T + 100,
+      });
+      generation(checkout, 'ran', {
+        'run/invoked.timestamp': T + 50,
+        'fingerprint/run-build-script-build-script-build.json': T + 53,
+        'fingerprint/run-build-script-build-script-build': T + 60,
+      });
+      // Used last, but with no stamp it has no compile to time, so it neither prices nor displaces lib-core.
+      generation(checkout, 'unstamped', { 'fingerprint/lib-core.json': T + 500, 'fingerprint/lib-core': T + 1000 });
+      const times = [...(readUnitTimes(checkout, [core]).get('core') ?? [])].sort((a, b) =>
+        a.unit.localeCompare(b.unit),
+      );
+      expect(times).toEqual([
+        { unit: 'lib-core', seconds: 12 },
+        { unit: 'run-build-script-build-script-build', seconds: 3 },
+      ]);
+    } finally {
+      rmSync(checkout, { recursive: true, force: true });
+    }
   });
 });

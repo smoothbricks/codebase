@@ -8,7 +8,9 @@
 //
 //   land-pick.ts price CHECKOUT BUILT_TREE RESEED_PREVIEW_JSON
 //
-// prints the pick (`seed` or `own`) on stdout and the priced report on stderr. Pure decisions are exported for tests.
+// prints the pick (`seed <seed id>` or `own`) on stdout and the priced report on stderr. Two readers of a reseed
+// preview serve the shell: `seed RESEED_PREVIEW_JSON` prints the seed id it names, and `refusal RESEED_PREVIEW_JSON`
+// the error code of a refused one (`unreadable` when the text is no cowshed envelope). Pure decisions are exported.
 
 import { spawnSync } from 'node:child_process';
 import { lstatSync, readdirSync, readFileSync, readlinkSync, statSync } from 'node:fs';
@@ -207,30 +209,48 @@ export function price(
 /** Which image the gate builds on, and what decided it. */
 export type Pick =
   | { readonly pick: 'seed' | 'own'; readonly basis: 'cargo' }
-  | { readonly pick: 'seed'; readonly basis: 'space' };
+  | { readonly pick: 'seed'; readonly basis: 'space' }
+  | { readonly pick: 'own'; readonly basis: 'unpriced'; readonly members: readonly string[] };
 
 /**
- * The cheaper image wins; a tie keeps the workspace's own volume, so a land never replaces a volume for nothing.
- * When no fingerprint priced any unit (no Cargo target, or a Cargo-less project), space decides and main's seed wins:
- * unpriced workspace-only build state retains private blocks.
+ * The cheaper image wins; a tie keeps the workspace's own volume, so a land never replaces a volume for nothing. A
+ * dirty member no fingerprint priced is never priced free: a seed that leaves one dirty that the own volume does not
+ * is never the cheaper image, whatever its seconds. When no fingerprint priced any unit (no Cargo target, or a
+ * Cargo-less project), space decides and main's seed wins: unpriced workspace-only build state retains private blocks.
  */
 export function pick(own: Price, seed: Price, timedUnits: number): Pick {
   if (timedUnits === 0) return { pick: 'seed', basis: 'space' };
+  const ownUnpriced = new Set(own.unpriced);
+  const members = seed.unpriced.filter((member) => !ownUnpriced.has(member));
+  if (members.length > 0) return { pick: 'own', basis: 'unpriced', members };
   return { pick: seed.seconds < own.seconds ? 'seed' : 'own', basis: 'cargo' };
+}
+
+/** A cowshed `--json` envelope, or undefined when the text is not JSON. */
+function envelope(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
 }
 
 /** The reseed preview's seed id (`cowshed --json reseed <ws> --from main --dry-run`). */
 export function previewSeed(preview: string): string | undefined {
-  let envelope: unknown;
-  try {
-    envelope = JSON.parse(preview);
-  } catch {
-    return undefined;
-  }
-  if (typeof envelope !== 'object' || envelope === null || !('result' in envelope)) return undefined;
-  const result: unknown = envelope.result;
+  const parsed = envelope(preview);
+  if (typeof parsed !== 'object' || parsed === null || !('result' in parsed)) return undefined;
+  const result: unknown = parsed.result;
   if (typeof result !== 'object' || result === null || !('seed' in result)) return undefined;
   return typeof result.seed === 'string' && /^[0-9a-f]{32}$/.test(result.seed) ? result.seed : undefined;
+}
+
+/** The error code of a refused reseed preview, or undefined when the text is no envelope cowshed refused with. */
+export function previewRefusal(preview: string): string | undefined {
+  const parsed = envelope(preview);
+  if (typeof parsed !== 'object' || parsed === null || !('error' in parsed)) return undefined;
+  const error: unknown = parsed.error;
+  if (typeof error !== 'object' || error === null || !('code' in error)) return undefined;
+  return typeof error.code === 'string' ? error.code : undefined;
 }
 
 // ---- the shell: everything below reads the world and hands plain values to the decisions above ----
@@ -249,7 +269,10 @@ function run(command: string, args: readonly string[], cwd: string): string {
 
 /** A file of a tree, or undefined when the tree has no such path. */
 function treeFile(checkout: string, tree: string, path: string): string | undefined {
-  const result = spawnSync('git', ['-C', checkout, 'cat-file', 'blob', `${tree}:${path}`], { encoding: 'utf8' });
+  const result = spawnSync('git', ['-C', checkout, 'cat-file', 'blob', `${tree}:${path}`], {
+    encoding: 'utf8',
+    maxBuffer: 1 << 28,
+  });
   return result.status === 0 ? result.stdout : undefined;
 }
 
@@ -307,11 +330,13 @@ function readMembers(checkout: string): Member[] {
 /**
  * Each member's units and compile seconds, read from the fingerprints of the checkout's host dev/test target
  * (target/debug/build/<package>/<unit hash>/fingerprint). Cargo writes invoked.timestamp before it starts the
- * compiler and the unit's <unit>.json fingerprint once the unit is built, so their modification times bound the
- * unit's compile; its dep-info is written at the start and says nothing. Of a unit's generations the one whose hash
- * file was used last wins: every build that uses a unit stamps that file (-Zmtime-on-use), and nothing else.
+ * compiler (a build script's run keeps it in run/invoked.timestamp beside fingerprint/) and the unit's <unit>.json
+ * fingerprint once the unit is built, so their modification times bound the unit's compile; its dep-info is written
+ * at the start and says nothing. A generation with neither stamp has no compile to time. Of a unit's generations the
+ * one whose hash file was used last wins: every build that uses a unit stamps that file (-Zmtime-on-use), and nothing
+ * else.
  */
-function readUnitTimes(checkout: string, members: readonly Member[]): Map<string, UnitTime[]> {
+export function readUnitTimes(checkout: string, members: readonly Member[]): Map<string, UnitTime[]> {
   const build = join(checkout, 'target', 'debug', 'build');
   const times = new Map<string, UnitTime[]>();
   for (const member of members) {
@@ -330,9 +355,10 @@ function readUnitTimes(checkout: string, members: readonly Member[]): Map<string
       } catch {
         continue;
       }
-      const invoked = files.includes('invoked.timestamp')
-        ? statSync(join(fingerprint, 'invoked.timestamp')).mtimeMs
-        : undefined;
+      const stamp = files.includes('invoked.timestamp')
+        ? join(fingerprint, 'invoked.timestamp')
+        : join(build, member.name, generation, 'run', 'invoked.timestamp');
+      const invoked = statSync(stamp, { throwIfNoEntry: false })?.mtimeMs;
       if (invoked === undefined) continue;
       for (const file of files) {
         if (!files.includes(`${file}.json`)) continue;
@@ -391,11 +417,8 @@ function priceImage(
   return dirty.kind === 'all' ? { ...priced, because: dirty.because } : priced;
 }
 
-if (import.meta.main) {
-  const [verb, checkout, builtTree, preview] = process.argv.slice(2);
-  if (verb !== 'price' || checkout === undefined || builtTree === undefined || preview === undefined) {
-    fail('usage: land-pick.ts price CHECKOUT BUILT_TREE RESEED_PREVIEW_JSON');
-  }
+/** The `price` verb: prices both images, says the report on stderr and prints the pick on stdout. */
+function priceCommand(checkout: string, builtTree: string, preview: string): void {
   const seedId = previewSeed(preview);
   if (seedId === undefined) fail(`the reseed preview names no seed: ${preview}`);
   const seedSidecar = join(storeBuildDirectory(checkout), `${seedId}.dmg.json`);
@@ -412,5 +435,22 @@ if (import.meta.main) {
   process.stderr.write(
     `${JSON.stringify({ ...verdict, gateTree, timedUnits, own: { tree: builtTree, ...own }, seed: { id: seedId, tree: seedTree, ...seed } })}\n`,
   );
-  process.stdout.write(`${verdict.pick}\n`);
+  process.stdout.write(verdict.pick === 'seed' ? `seed ${seedId}\n` : 'own\n');
+}
+
+if (import.meta.main) {
+  const [verb, first, second, third] = process.argv.slice(2);
+  if (verb === 'price' && first !== undefined && second !== undefined && third !== undefined) {
+    priceCommand(first, second, third);
+  } else if (verb === 'seed' && first !== undefined && second === undefined) {
+    const seedId = previewSeed(first);
+    if (seedId === undefined) fail(`the reseed preview names no seed: ${first}`);
+    process.stdout.write(`${seedId}\n`);
+  } else if (verb === 'refusal' && first !== undefined && second === undefined) {
+    process.stdout.write(`${previewRefusal(first) ?? 'unreadable'}\n`);
+  } else {
+    fail(
+      'usage: land-pick.ts price CHECKOUT BUILT_TREE RESEED_PREVIEW_JSON | seed RESEED_PREVIEW_JSON | refusal RESEED_PREVIEW_JSON',
+    );
+  }
 }

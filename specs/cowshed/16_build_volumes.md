@@ -680,9 +680,10 @@ An image's price is the compile seconds of the workspace's Cargo units it would 
 - **What a unit costs.** Its compile seconds in the workspace's host dev/test target
   (`target/debug/build/<package>/<unit hash>/fingerprint/`): the modification time of the unit's `<unit>.json`
   fingerprint, which Cargo writes once the unit is built, less that of `invoked.timestamp`, written before the compiler
-  starts. Of a unit's generations, the one whose hash file was used last counts (`-Zmtime-on-use`, "One Cargo
-  environment on every path"). A unit costs the same whichever image holds it, so the workspace's own fingerprints price
-  both images. A dirty member with no timed unit is reported `unpriced`, never priced free. Registry units are not
+  starts (a build script's run keeps it in `run/invoked.timestamp` beside `fingerprint/`; a generation with neither
+  stamp is not timed). Of a unit's generations, the one whose hash file was used last counts (`-Zmtime-on-use`, "One
+  Cargo environment on every path"). A unit costs the same whichever image holds it, so the workspace's own fingerprints
+  price both images. A dirty member with no timed unit is reported `unpriced`, never priced free. Registry units are not
   priced: sccache serves them. Every price is serial unit-seconds, not gate wall time.
 - **Equal Cargo environments and one freshness mode are assumed.** A unit whose environment input differs between the
   build that filled an image and the gate (a `CC_<target>` one set and the other did not) rebuilds whatever its tree,
@@ -690,12 +691,18 @@ An image's price is the compile seconds of the workspace's Cargo units it would 
   gate's are `"content"`); the price sees neither. "One Cargo environment on every path" forbids the first, and "Clones
   preserve mtimes; directories are never copied" the second: never mix modes in one build volume.
 
-The cheaper image wins; a tie keeps the workspace's own volume, so a land never replaces a volume for nothing. With no
-timed unit at all, space decides for main's seed (above). The pick only chooses where the gate starts: a reseed preview
-that finds no seed, a pricing failure, and a reseed cowshed refuses (a held lock, main's image lock under a fork, a land
-or a seed compaction included; an admitted job's hold) are each said, and the gate builds on the workspace's own volume.
-A seed compaction changes no price: its copy is published at the copied seed's tree with that seed's bytes ("Seed
-compaction"), so a reseed that clones it gates on what was priced.
+The cheaper image wins; a tie keeps the workspace's own volume, so a land never replaces a volume for nothing. A seed
+that leaves a member `unpriced` that the own volume does not is never the cheaper image, whatever its seconds: that
+member's compile is unknown, not free. With no timed unit at all, space decides for main's seed (above). The reseed
+clones main's latest seed as it stands when it runs, so right before it the land previews again and reseeds only when
+that seed is still the one it priced. The pick only chooses where the gate starts: a reseed preview that fails (one
+finding nothing to price said apart from any other), a pricing failure and a seed that changed after it was priced are
+each said, and the gate builds on the workspace's own volume. A reseed that fails is said with cowshed's status, and the
+gate builds on whichever volume the build link then names: a refused reseed (a held lock, main's image lock under a
+fork, a land or a seed compaction included; an admitted job's hold) leaves the own volume linked, while one that fails
+after publication leaves the seed's clone linked (Workspace reseed). A seed compaction changes no price: its copy is
+published at the copied seed's tree with that seed's bytes ("Seed compaction"), so a reseed that clones it gates on what
+was priced.
 
 Measured 2026-10-25 on SmoothBricks (`cargo test --no-run --workspace` at tree `e5578ec`, each candidate a clone of a
 seed): main's seed (1 path apart) rebuilt 94 units, 1151-1290 serial s and 123-154 s wall, from a host shell that set
@@ -707,8 +714,10 @@ move the pick. A seed 442 paths apart rebuilt 144 units, 2650 serial s and 206 s
 dirty-unit rules named exactly the 18 packages that rebuilt.
 
 - **Enforced by**: `tooling/land-pick.test.ts` (ownership, test-only reach, closure, lock and configuration changes,
-  pricing, the tie and space rules, the preview's seed) and `tooling/land-host.test.ts` (a land whose main has no seed
-  gates on the workspace's own volume and says so).
+  pricing, the tie, space and unpriced-member rules, compile and build-script run timing, the preview's seed and refusal
+  code) and `tooling/land-host.test.ts` (a land reseeds onto the seed it priced, keeps its own volume when that prices
+  cheaper, when main's seed changed after the price, when the pricing fails, and when the preview finds no seed or fails
+  otherwise, each said apart, and says a reseed that did not finish; every one of them gates and lands).
 
 ### Clearing a checkout's Nx state
 
