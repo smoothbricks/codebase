@@ -1,18 +1,20 @@
 import { describe, expect, it } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { cp, lstat, mkdir, readdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, cp, lstat, mkdir, readdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
   AUTOMATIC_INTERVAL_MS,
   describeRetention,
   fingerprintIdentity,
+  RECENT_USE_MS,
   RETENTION_RECEIPT,
   readCargoFingerprint,
   refusedAnywhere,
   retainCargoWorkspace,
 } from './cargo-retention.js';
 import {
+  artifacts,
   backdate,
   build,
   buildJson,
@@ -24,6 +26,7 @@ import {
   churnGenerations,
   clearLock,
   clearReceipt,
+  DAY3,
   emptyHash,
   exists,
   expectFresh,
@@ -59,6 +62,7 @@ import {
   TRASH,
   toggleFeature,
   validateScanWork,
+  withEnv,
   writeMid,
 } from './testing/cargo-fixture.js';
 import { useFixtureCargoHome } from './testing/fixture-cargo-home.js';
@@ -82,6 +86,35 @@ function keepsExactDigitsInTheParser(): void {
   );
   check(readCargoFingerprint('{').ok, 'a truncated fingerprint').toBe(false);
   check(readCargoFingerprint('{"rustc":1.5,"deps":[]}').ok, 'a fractional integer field').toBe(false);
+}
+
+/** Case: a toolchain is no part of a unit's identity, so the same unit built by a newer compiler supersedes the older one's. */
+function identityIgnoresToolchain(): void {
+  const check = labelled('a newer toolchain supersedes an older one: identity ignores rustc and the --sysroot flag');
+  const identity = (rustc: string, rustflags: string, features = '[]'): string => {
+    const parsed = readCargoFingerprint(
+      `{"rustc":${rustc},"features":${JSON.stringify(features)},"target":17066949999414752808,"profile":1,"rustflags":${rustflags},"deps":[],"local":[]}`,
+    );
+    if (!parsed.ok) throw new Error(parsed.error);
+    return fingerprintIdentity('ret-leaf', 'lib-ret_leaf', parsed.value);
+  };
+  const base = identity('8522741132697106019', '["--sysroot","/nix/store/a-rust","-C","target-cpu=native"]');
+  check(
+    identity('4410052297246879569', '["--sysroot","/nix/store/b-rust","-C","target-cpu=native"]'),
+    'another compiler and sysroot',
+  ).toBe(base);
+  check(identity('4410052297246879569', '["-C","target-cpu=native"]'), 'a compiler run without the sysroot flag').toBe(
+    base,
+  );
+  check(
+    identity('4410052297246879569', '["--sysroot=/nix/store/c-rust","-C","target-cpu=native"]'),
+    'the joined sysroot spelling',
+  ).toBe(base);
+  check(identity('8522741132697106019', '["-C","target-cpu=generic"]'), 'another flag').not.toBe(base);
+  check(
+    identity('8522741132697106019', '["--sysroot","/nix/store/a-rust","-C","target-cpu=native"]', '["extra"]'),
+    'another feature set',
+  ).not.toBe(base);
 }
 
 /** Case: refuses the whole pass over one unreadable fingerprint and changes nothing. */
@@ -155,22 +188,28 @@ async function refusesWithoutPerl(fx: Churn): Promise<void> {
   check(await exists(join(fx.target, 'debug', TRASH)), 'trash unchanged').toBe(trashBefore);
 }
 
-/** Case: refuses a legacy-layout profile instead of reporting a clean zero. */
-async function refusesLegacyLayout(fx: Churn): Promise<void> {
+/** A profile whose only unit records are a legacy layout's: Cargo's locks, an empty `build/`, `.fingerprint` and `deps`. */
+async function plantLegacyOnlyProfile(fx: Churn): Promise<string> {
+  const profile = join(fx.target, 'legacy-profile');
+  await put(join(profile, '.cargo-lock'), '');
+  await put(join(profile, '.cargo-build-lock'), '');
+  await mkdir(join(profile, 'build'), { recursive: true });
+  await put(join(profile, '.fingerprint', 'legacy-unit-0123456789abcdef', 'lib-legacy-unit.json'), '{}\n');
+  await mkdir(join(profile, 'deps'));
+  return profile;
+}
+
+/** Case: refuses a profile that holds only an old layout's records instead of reporting a clean zero. */
+async function refusesLegacyOnlyProfile(fx: Churn): Promise<void> {
   const check = labelled('refuses a legacy-layout profile instead of reporting a clean zero');
-  const leaf = only((await metasOf(fx.target, 'ret-leaf')).slice(0, 1), 'a ret-leaf generation');
-  const fingerprints = join(leaf, 'fingerprint');
-  const jsonName = (await readdir(fingerprints)).find((name) => name.endsWith('.json'));
-  if (jsonName === undefined) throw new Error(`no fingerprint json under ${fingerprints}`);
-  const legacy = join(fx.target, 'debug', '.fingerprint');
-  await mkdir(legacy, { recursive: true });
-  await cp(join(fingerprints, jsonName), join(legacy, jsonName));
+  const profile = await plantLegacyOnlyProfile(fx);
   const buildDir = join(fx.target, 'debug', 'build');
   const before = await snapshot(buildDir);
   const report = await retain(fx.ws, { apply: true, now: future() });
   check(refused(report).reason).toContain('legacy');
+  check(refused(report).profile, 'names the profile').toBe(profile);
   check(await snapshot(buildDir)).toEqual(before);
-  await rm(legacy, { recursive: true });
+  await rm(profile, { recursive: true });
 }
 
 /** Case: refuses a profile with Cargo locks but no build directory (split build-dir shape). */
@@ -364,6 +403,35 @@ async function keepsForeignEntries(fx: Churn, superseded: readonly string[]): Pr
   await rm(join(fx.target, 'keep.txt'));
 }
 
+/** Case: a profile that still holds an old layout's records reclaims its new-layout generations and reports the old ones retained. */
+async function reclaimsAroundLegacyEntries(fx: Churn, superseded: readonly string[]): Promise<void> {
+  const check = labelled(
+    'reclaims the new-layout generations of a profile that also holds the legacy layout, and reports it',
+  );
+  const profile = join(fx.target, 'debug');
+  const records = join(profile, '.fingerprint');
+  const outputs = join(profile, 'deps');
+  const script = join(profile, 'build', 'legacy-build-0123456789abcdef');
+  await put(
+    join(records, 'legacy-unit-0123456789abcdef', 'lib-legacy-unit.json'),
+    '{"rustc":1,"deps":[],"local":[]}\n',
+  );
+  await put(join(outputs, 'liblegacy_unit-0123456789abcdef.rlib'), 'legacy\n');
+  await put(join(script, 'output'), 'legacy\n');
+  const legacy = [records, outputs, script];
+  const before = await Promise.all(legacy.map((path) => snapshot(path)));
+  const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
+  check(reclaimPaths(applied)).toEqual([...superseded]);
+  for (const path of legacy) check(keepReason(applied, path), path).toBe('legacy-layout');
+  check(
+    applied.retained.filter((entry) => entry.path.startsWith(`${script}/`)),
+    'one entry per legacy build-script directory',
+  ).toEqual([]);
+  check(await Promise.all(legacy.map((path) => snapshot(path)))).toEqual(before);
+  await expectFresh(fx.ws);
+  for (const path of legacy) await rm(path, { recursive: true });
+}
+
 /** Case: never follows a symlinked generation directory; the link is retained and its target untouched. */
 async function keepsSymlinkedGeneration(fx: Churn, superseded: readonly string[]): Promise<void> {
   const check = labelled('never follows a symlinked generation directory or a symlinked fingerprint file');
@@ -548,8 +616,7 @@ async function cliPlansReadOnlyAndApplies(fx: Churn, superseded: readonly string
   check(receipt).toEqual(applyReport);
   for (const path of superseded) check(await exists(path), path).toBe(false);
   await expectFresh(fx.ws);
-  const legacy = join(fx.target, 'debug', '.fingerprint');
-  await mkdir(legacy, { recursive: true });
+  const legacy = await plantLegacyOnlyProfile(fx);
   const refusedRun = await cli([fx.ws]);
   check(refusedRun.code, refusedRun.stderr).toBe(3);
   check(refused(parseReport(refusedRun.stdout)).reason).toContain('legacy');
@@ -881,7 +948,12 @@ async function passesCrossBuiltNestedRoot(fx: ProcMacro): Promise<void> {
     await expectFresh(fx.ws, ['--target', fx.host]);
   });
   // A profile of the nested root that it cannot read refuses that root alone: the target directory's pass stands.
-  await mkdir(join(nested, fx.host, 'debug', '.fingerprint'));
+  const [unit] = appNew;
+  if (unit === undefined) throw new Error('no new ret-app generation');
+  const fingerprints = join(unit, 'fingerprint');
+  const jsonName = (await readdir(fingerprints)).find((name) => name.endsWith('.json'));
+  if (jsonName === undefined) throw new Error(`no fingerprint json under ${fingerprints}`);
+  await writeFile(join(fingerprints, jsonName), '{');
   const refusal = await retain(fx.ws, { apply: true, now: future() });
   check(planned(refusal).kind).toBe('reclaimed');
   check(nestedOf(refusal, nested)).toMatchObject({ kind: 'refused', profile: join(nested, fx.host, 'debug') });
@@ -889,9 +961,124 @@ async function passesCrossBuiltNestedRoot(fx: ProcMacro): Promise<void> {
   check(refusal.completed, 'a refused root completes nothing').toBeUndefined();
 }
 
+/** What Cargo hashes of a toolchain: the compiler's version text, and the flags (a sysroot among them) it is run with. */
+interface Toolchain {
+  readonly env: Record<string, string>;
+}
+
+/** The real compiler under a script that adds a line of its own to `-vV` and a sysroot path of its own to its flags. */
+async function toolchain(root: string, name: string): Promise<Toolchain> {
+  const real = Bun.which('rustc');
+  if (real === null) throw new Error('rustc is not on PATH');
+  const sysroot = execFileSync(real, ['--print', 'sysroot'], { encoding: 'utf8' }).trim();
+  const directory = join(root, `toolchain-${name}`);
+  await mkdir(directory, { recursive: true });
+  const quoted = `'${real.replaceAll("'", "'\\''")}'`;
+  const compiler = join(directory, 'rustc');
+  await writeFile(
+    compiler,
+    lines(
+      '#!/bin/sh',
+      `if [ "$1" = "-vV" ]; then ${quoted} -vV; echo "toolchain: ${name}"; exit 0; fi`,
+      `exec ${quoted} "$@"`,
+    ),
+  );
+  await chmod(compiler, 0o755);
+  const link = join(directory, 'sysroot');
+  await symlink(sysroot, link, 'dir');
+  return { env: { RUSTC: compiler, RUSTFLAGS: `--sysroot ${link}` } };
+}
+
+/** Case: a newer toolchain supersedes an older one's generations, ordered by last use and never while both are recent. */
+async function supersedesOlderToolchain(fx: Churn, older: Toolchain, newer: Toolchain): Promise<void> {
+  const check = labelled('a newer toolchain supersedes an older one, ordered by last use, never while both are recent');
+  const everything = async (): Promise<string[]> =>
+    (await Promise.all(['ret-leaf', 'ret-mid', 'ret-app', 'ret-ext'].map((pkg) => metasOf(fx.target, pkg))))
+      .flat()
+      .sort();
+  const buildWith = (toolchain: Toolchain): Promise<void> =>
+    withEnv(toolchain.env, async () => {
+      await build(fx.ws);
+    });
+  await buildWith(older);
+  const olderGenerations = await everything();
+  await buildWith(newer);
+  const newerGenerations = (await everything()).filter((path) => !olderGenerations.includes(path));
+  if (olderGenerations.length === 0 || newerGenerations.length === 0) {
+    throw new Error('a toolchain made no generations of its own');
+  }
+  // Both compilers were used a moment ago, so both are roots and nothing goes.
+  const recent = planned(await retain(fx.ws, { apply: true }));
+  check(recent.reclaim, 'two toolchains in recent use').toEqual([]);
+  // Outside the recency window the older one's generations, its dependency units included, are superseded.
+  const plan = planned(await retain(fx.ws, { apply: false, now: future() }));
+  check(reclaimPaths(plan), 'the older toolchain').toEqual(olderGenerations);
+  for (const path of newerGenerations) {
+    check(keepReason(plan, path), path).toMatch(/^(newest-of-identity|dependency-of-kept)$/);
+  }
+  const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
+  check(reclaimPaths(applied)).toEqual(olderGenerations);
+  for (const path of olderGenerations) check(await exists(path), path).toBe(false);
+  for (const path of newerGenerations) check(await exists(path), path).toBe(true);
+  await withEnv(newer.env, async () => {
+    await expectFresh(fx.ws);
+  });
+  // The order is last use, not which compiler is which: built again, the older one is the newer.
+  await buildWith(older);
+  const reversed = planned(await retain(fx.ws, { apply: false, now: future() }));
+  check(reclaimPaths(reversed), 'the toolchain used last wins').toEqual(newerGenerations);
+}
+
+/** The newest mtime among a generation's hash files: what `-Zmtime-on-use` stamps on every use of its units. */
+async function hashMtime(meta: string): Promise<number> {
+  const fingerprints = join(meta, 'fingerprint');
+  const hashes = (await readdir(fingerprints)).filter(
+    (name) => !name.endsWith('.json') && name !== 'invoked.timestamp' && !/^(dep|output)-/.test(name),
+  );
+  if (hashes.length === 0) throw new Error(`no hash file under ${fingerprints}`);
+  const times = await Promise.all(hashes.map(async (name) => (await lstat(join(fingerprints, name))).mtimeMs));
+  return Math.max(...times);
+}
+
+/** Case: a pass says whether Cargo recorded use, and a no-op build stamps exactly the units it used, when asked to. */
+async function reportsRecencyFromStampedUse(fx: Churn, stamping: boolean): Promise<void> {
+  const check = labelled(
+    `reports recency from stamped use, and a no-op build stamps the units it used (mtime-on-use ${String(stamping)})`,
+  );
+  const unknown = { kind: 'recency-unknown', reason: 'mtime-on-use off' } as const;
+  await build(fx.ws);
+  check(planned(await retain(fx.ws, { apply: false })).recency, 'compiled and never reused').toEqual(unknown);
+  const used = (await Promise.all(['ret-mid', 'ret-leaf', 'ret-ext'].map((pkg) => metasOf(fx.target, pkg)))).flat();
+  const unused = await metasOf(fx.target, 'ret-app');
+  // A hash file with no compile stamp beside it has nothing to be newer than: that is no evidence either.
+  const stamps = [...used, ...unused].map((meta) => join(meta, 'fingerprint', 'invoked.timestamp'));
+  for (const stamp of stamps) await rm(stamp);
+  check(planned(await retain(fx.ws, { apply: false })).recency, 'no compile stamps').toEqual(unknown);
+  for (const stamp of stamps) await put(stamp, '');
+  await backdate([...used, ...unused]);
+  const aged = Date.now() - DAY3;
+  // `ret-mid` and what it builds on: a no-op build of them, and nothing of `ret-app`.
+  const run = await cargoOk(
+    fx.ws,
+    ['build', '-p', 'ret-mid', '--locked', '--offline', '--message-format=json'],
+    cargoEnv(),
+  );
+  check(
+    artifacts(run).filter((artifact) => !artifact.fresh),
+    'the no-op build compiled nothing',
+  ).toEqual([]);
+  const stamped = async (meta: string): Promise<boolean> => (await hashMtime(meta)) > aged + RECENT_USE_MS;
+  for (const meta of used) check(await stamped(meta), `${meta}, used`).toBe(stamping);
+  for (const meta of unused) check(await stamped(meta), `${meta}, not used`).toBe(false);
+  check(planned(await retain(fx.ws, { apply: false })).recency, 'after the reuse').toEqual(
+    stamping ? { kind: 'use-stamped' } : unknown,
+  );
+}
+
 describe('cargo retention against real Cargo target layouts', () => {
   it('walks the retention cases over one churned Cargo target, asserting after every step (mtime-on-use false)', async () => {
     keepsExactDigitsInTheParser();
+    identityIgnoresToolchain();
     await inFixture(async (root) => {
       const fx = await churnFixture(root, false);
       await scopedTo(fx.target, async () => {
@@ -899,7 +1086,7 @@ describe('cargo retention against real Cargo target layouts', () => {
         // Refusals first: each asserts its refusal and puts back the bytes it touched.
         await refusesOverUnreadableFingerprint(fx);
         await refusesWithoutPerl(fx);
-        await refusesLegacyLayout(fx);
+        await refusesLegacyOnlyProfile(fx);
         await refusesSplitBuildDir(fx);
         await refusesSymlinkedFingerprint(fx);
         // The first plan and reclaim use the generations churnGenerations made.
@@ -909,6 +1096,7 @@ describe('cargo retention against real Cargo target layouts', () => {
         await toggleFeature(fx);
         await noOpPassReadsFingerprintsOnce(fx);
         await keepsForeignEntries(fx, await toggleFeature(fx));
+        await reclaimsAroundLegacyEntries(fx, await toggleFeature(fx));
         await keepsSymlinkedGeneration(fx, await toggleFeature(fx));
         await reclaimsOnlyProvenTrash(fx, await toggleFeature(fx));
         await keepsForeignNestedRoot(fx, await toggleFeature(fx));
@@ -924,6 +1112,28 @@ describe('cargo retention against real Cargo target layouts', () => {
         await automaticCadence(fx, await toggleFeature(fx));
       });
     });
+  });
+
+  it('a newer toolchain supersedes an older one, ordered by last use, never while both are recent', async () => {
+    await inFixture(async (root) => {
+      const fx = await churnFixture(root, false);
+      const older = await toolchain(root, 'a');
+      const newer = await toolchain(root, 'b');
+      await scopedTo(fx.target, async () => {
+        await supersedesOlderToolchain(fx, older, newer);
+      });
+    });
+  });
+
+  it('reports recency-unknown until Cargo stamps a reused unit, and a no-op build stamps exactly the units it used', async () => {
+    for (const stamping of [false, true]) {
+      await inFixture(async (root) => {
+        const fx = await churnFixture(root, stamping);
+        await scopedTo(fx.target, async () => {
+          await reportsRecencyFromStampedUse(fx, stamping);
+        });
+      });
+    }
   });
 
   it(RECLAIM_TITLE(true), async () => {

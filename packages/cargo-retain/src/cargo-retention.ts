@@ -7,16 +7,19 @@
  * without bound. Age alone cannot tell a superseded generation from a current one, and this
  * volume is mounted `noatime`. The selector therefore reads Cargo's own records only:
  *
- * - Every `fingerprint/<kind>.json` names its unit's identity (every field but `deps` and
- *   `local`, unknown fields included) and its dependency edges (`deps[i][3]`, the dependency's
- *   fingerprint hash). Integers are kept exact: `JSON.parse` hands each number's source text
- *   to the reviver, so a u64 is never rounded through a double.
+ * - Every `fingerprint/<kind>.json` names its unit's identity (every field but `deps`, `local` and the
+ *   toolchain, which is `rustc` and the `--sysroot` flag; unknown fields included) and its dependency edges
+ *   (`deps[i][3]`, the dependency's fingerprint hash). Integers are kept exact: `JSON.parse` hands each number's
+ *   source text to the reviver, so a u64 is never rounded through a double.
  * - The hash file beside it (`fingerprint/<kind>`) holds that unit's own fingerprint hash as
  *   the 16 hex digits of the u64's little-endian bytes; an edge resolves to every unit whose
- *   hash file holds it. Cargo stamps the hash file's mtime on every use when
- *   `-Zmtime-on-use` is on, and `invoked.timestamp` marks the unit's last compile.
- * - Roots are the newest generation of each identity of a workspace member package, and
- *   every unit used within {@link RECENT_USE_MS} of now. Kept is the transitive dependency
+ *   hash file holds it. Cargo stamps the hash file's mtime on every use when `-Zmtime-on-use` is on (cowshed
+ *   exports it), and `invoked.timestamp` marks the unit's last compile. A hash file newer than its compile by
+ *   more than {@link RECENT_USE_MS} proves the stamping; a root whose units show none reports `recency-unknown`,
+ *   because a unit's last use is then only its last compile.
+ * - Roots are the newest generation of each identity of a workspace member package, whichever toolchain built
+ *   it (a newer toolchain supersedes an older one, ordered by last use), and every unit used within
+ *   {@link RECENT_USE_MS} of now. Kept is the transitive dependency
  *   closure of the roots across every profile of the target directory: a cross build's
  *   build scripts and proc macros live in the host profile. An edge whose hash no unit holds
  *   keeps every unit whose kind could carry the dependency's name. A generation is reclaimed
@@ -30,11 +33,12 @@
  * profile's `.smoo-retention-trash/<pass>/`, listing its device and inode in a manifest
  * first; it unlinks the trash after letting go of the Cargo locks, under the target's own
  * retention lock, and deletes only manifest entries whose inode matches. Anything this
- * selector cannot read (a legacy layout, an unreadable fingerprint, a profile without
- * `build/` or without Cargo's locks) refuses the whole pass: its edges are unknowable. So does
+ * selector cannot read (an unreadable fingerprint, a profile whose only unit records are a legacy layout's,
+ * a profile without `build/` or without Cargo's locks) refuses the whole pass: its edges are unknowable. So does
  * a lock that cannot be attempted at all (nothing that could hold it starts here, its file will
  * not open): nothing was read or changed, and the reason is a value, because a maintenance pass
- * never fails the run it follows.
+ * never fails the run it follows. A profile holding a legacy layout beside the current one is read for the
+ * current one alone: the legacy entries are reported retained as `legacy-layout`, and nothing is reclaimed from them.
  *
  * A Cargo target root nested inside the target directory (`target/cargo-lint`, `target/cargo-lint-cross`, each
  * built with its own `--target-dir`) is a target directory of its own; units never depend across roots. The
@@ -92,7 +96,8 @@ export type KeepReason =
   | 'not-a-unit'
   | 'incomplete-fingerprint'
   | 'unproven-trash-entry'
-  | 'foreign-root';
+  | 'foreign-root'
+  | 'legacy-layout';
 
 /** A reclaimed (or, planned, reclaimable) generation: `bytes` free with it, `linkedBytes` stay linked elsewhere. */
 export interface Reclaimable {
@@ -106,6 +111,16 @@ export interface Retained {
   readonly reason: KeepReason;
   readonly detail?: string;
 }
+/**
+ * Whether Cargo recorded the use of a root's units. `-Zmtime-on-use` stamps a unit's hash file on every use, so a
+ * hash file newer than its compile by more than {@link RECENT_USE_MS} proves it; without any, a unit's last use is
+ * its last compile, and "recently used" only means "recently compiled".
+ */
+export type Recency =
+  | { readonly kind: 'use-stamped' }
+  | { readonly kind: 'recency-unknown'; readonly reason: 'mtime-on-use off' }
+  | { readonly kind: 'no-units' };
+
 /** What one root's pass did: planned or reclaimed generations, a skip behind a held lock, or a refusal. */
 export type PassOutcome =
   | {
@@ -114,6 +129,7 @@ export type PassOutcome =
       readonly reclaimedBytes: number;
       readonly linkedBytes: number;
       readonly retained: readonly Retained[];
+      readonly recency: Recency;
     }
   | { readonly kind: 'busy'; readonly lock: string }
   | { readonly kind: 'refused'; readonly profile: string; readonly reason: string };
@@ -155,6 +171,8 @@ const REQUIRED_LOCKS = ['.cargo-lock', '.cargo-build-lock'] as const;
 const OPTIONAL_LOCKS = ['.cargo-artifact-lock'] as const;
 const LEGACY_MARKERS = ['.fingerprint', 'deps'] as const;
 const META_NAME = /^[0-9a-f]{16}$/;
+/** The old layout's build script directory: `build/<crate>-<hash>`. */
+const LEGACY_SCRIPT_NAME = /-[0-9a-f]{16}$/;
 const HASH_TEXT = /^[0-9a-f]{16}$/;
 const INTEGER = /^-?(?:0|[1-9]\d*)$/;
 const MANIFEST_NAME = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.json$/;
@@ -249,12 +267,34 @@ function canonical(value: unknown): string {
   }
 }
 
-/** Package, kind and every fingerprint field but its edges (`deps`) and source state (`local`). */
+/** Fingerprint fields that are not a unit's identity: its edges, its source state and the compiler that built it. */
+const NOT_IDENTITY: ReadonlySet<string> = new Set(['deps', 'local', 'rustc']);
+
+/** `rustflags` without the `--sysroot <path>` (or `--sysroot=<path>`) that names the toolchain it ran against. */
+function withoutSysroot(flags: readonly unknown[]): unknown[] {
+  const kept: unknown[] = [];
+  for (let index = 0; index < flags.length; index += 1) {
+    const flag = flags[index];
+    if (flag === '--sysroot') index += 1;
+    else if (typeof flag !== 'string' || !flag.startsWith('--sysroot=')) kept.push(flag);
+  }
+  return kept;
+}
+
+/**
+ * Package, kind and every fingerprint field but its edges (`deps`), its source state (`local`) and its toolchain
+ * (`rustc`, and the sysroot in `rustflags`): the same unit built by another toolchain is another generation of it,
+ * and the newest generation, by last use, is the one kept.
+ */
 export function fingerprintIdentity(pkg: string, kind: string, fingerprint: CargoFingerprint): string {
   const fields = Object.keys(fingerprint)
-    .filter((field) => field !== 'deps' && field !== 'local')
+    .filter((field) => !NOT_IDENTITY.has(field))
     .sort()
-    .map((field) => `${JSON.stringify(field)}=${canonical(fingerprint[field])}`);
+    .map((field) => {
+      const value = fingerprint[field];
+      const flags = field === 'rustflags' && Array.isArray(value) ? withoutSysroot(value) : value;
+      return `${JSON.stringify(field)}=${canonical(flags)}`;
+    });
   return [JSON.stringify(pkg), JSON.stringify(kind), ...fields].join('\u0000');
 }
 
@@ -466,6 +506,8 @@ interface ProfileScan {
   readonly root: string | undefined;
   readonly metas: readonly Meta[];
   readonly anomalies: readonly Retained[];
+  /** Units whose hash file is newer than their compile by more than {@link RECENT_USE_MS}: Cargo stamped a use. */
+  readonly stamped: number;
 }
 
 function mtimeMs(path: string): number | undefined {
@@ -476,6 +518,11 @@ function mtimeMs(path: string): number | undefined {
 /** Directory types already returned by the kernel; never follow a symbolic link to classify an entry. */
 function directoryEntries(path: string) {
   return readdirSync(path, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+/** A profile whose only unit records are a legacy layout's: this selector cannot read their edges. */
+function legacyOnly(markers: readonly string[]): string {
+  return `legacy target layout: ${markers.join(', ')} hold the only unit records`;
 }
 
 /**
@@ -489,16 +536,13 @@ function scanProfile(profile: string, targetDir: string): Result<ProfileScan, st
   const nestedRoot = dirname(profile);
   const nestedPrefix = relative(nestedRoot, join(profile, 'build')) + sep;
   const profileEntries = directoryEntries(profile);
-  for (const marker of LEGACY_MARKERS) {
-    if (profileEntries.some((entry) => entry.name === marker)) {
-      return { ok: false, error: `legacy target layout: ${marker} is present` };
-    }
-  }
+  const legacy = LEGACY_MARKERS.filter((marker) => profileEntries.some((entry) => entry.name === marker));
   const build = join(profile, 'build');
   if (!profileEntries.some((entry) => entry.name === 'build' && entry.isDirectory())) {
-    return { ok: false, error: 'no build directory' };
+    return { ok: false, error: legacy.length > 0 ? legacyOnly(legacy) : 'no build directory' };
   }
   const metas: Meta[] = [];
+  let stamped = 0;
   const anomalies: Retained[] = [];
   for (const pkgEntry of directoryEntries(build)) {
     const pkg = pkgEntry.name;
@@ -507,7 +551,12 @@ function scanProfile(profile: string, targetDir: string): Result<ProfileScan, st
       anomalies.push({ path: pkgPath, reason: 'not-a-unit', detail: 'not a directory' });
       continue;
     }
-    for (const entry of directoryEntries(pkgPath)) {
+    const children = directoryEntries(pkgPath);
+    if (LEGACY_SCRIPT_NAME.test(pkg) && !children.some((child) => META_NAME.test(child.name))) {
+      anomalies.push({ path: pkgPath, reason: 'legacy-layout', detail: 'an old-layout build script directory' });
+      continue;
+    }
+    for (const entry of children) {
       const name = entry.name;
       const path = join(pkgPath, name);
       if (!entry.isDirectory()) {
@@ -577,13 +626,15 @@ function scanProfile(profile: string, targetDir: string): Result<ProfileScan, st
             root = observed;
           }
         }
+        const hashTime = mtimeMs(hashPath) ?? 0;
+        if (invoked > 0 && hashTime - invoked > RECENT_USE_MS) stamped += 1;
         meta.units.push({
           meta,
           kind,
           hash: hash === '' ? undefined : hash,
           identity: fingerprintIdentity(pkg, kind, fingerprint.value),
           deps: fingerprint.value.deps.map(([, depName, , depHash]) => ({ hash: hashText(depHash), name: depName })),
-          lastUse: Math.max(mtimeMs(hashPath) ?? 0, invoked),
+          lastUse: Math.max(hashTime, invoked),
         });
       }
       metas.push(meta);
@@ -592,7 +643,15 @@ function scanProfile(profile: string, targetDir: string): Result<ProfileScan, st
   if (root === undefined && nestedRoot !== targetDir) {
     return { ok: false, error: 'no fingerprint local path proves this depth-two profile belongs to the target' };
   }
-  return { ok: true, value: { root, metas, anomalies } };
+  if (legacy.length > 0 && metas.length === 0) return { ok: false, error: legacyOnly(legacy) };
+  for (const marker of legacy) {
+    anomalies.push({
+      path: join(profile, marker),
+      reason: 'legacy-layout',
+      detail: 'old-layout unit records; this selector reads the current layout only',
+    });
+  }
+  return { ok: true, value: { root, metas, anomalies, stamped } };
 }
 
 // ---- Selection ----
@@ -1161,6 +1220,7 @@ async function pass(
   if (attempt.kind === 'unavailable') return complete(lockRefusal(targetDir, "Cargo's locks", attempt.reason));
   const cargo = attempt.hold;
   const metas: Meta[] = [];
+  let stamped = 0;
   const anomalies: Retained[] = [];
   let selection: Selection;
   try {
@@ -1191,6 +1251,7 @@ async function pass(
       ownedProfiles.push(profile);
       metas.push(...scanned.value.metas);
       anomalies.push(...scanned.value.anomalies);
+      stamped += scanned.value.stamped;
     }
     performance.measure('cargoRetention:scan', { start: scanStarted });
     const selectionStarted = performance.now();
@@ -1222,7 +1283,9 @@ async function pass(
       }
     }
     const linkedBytes = reclaim.reduce((sum, entry) => sum + entry.linkedBytes, 0);
-    return complete(outcome('planned', reclaim, linkedBytes, [...selection.kept, ...anomalies]));
+    return complete(
+      outcome('planned', reclaim, linkedBytes, [...selection.kept, ...anomalies], recencyOf(metas, stamped)),
+    );
   }
   const linked = new Map<string, bigint>();
   const reclaim: Reclaimable[] = [];
@@ -1235,7 +1298,7 @@ async function pass(
   }
   let linkedBytes = 0n;
   for (const blocks of linked.values()) linkedBytes += blocks;
-  return complete(outcome('reclaimed', reclaim, Number(linkedBytes), retained));
+  return complete(outcome('reclaimed', reclaim, Number(linkedBytes), retained, recencyOf(metas, stamped)));
 }
 
 /** A pass that could not even attempt a lock changed nothing: it is refused, naming why on one line. */
@@ -1247,20 +1310,45 @@ function lockRefusal(targetDir: string, lock: string, reason: string): PassOutco
   };
 }
 
+/** What a root's units say of Cargo's recording of use. */
+function recencyOf(metas: readonly Meta[], stamped: number): Recency {
+  if (metas.length === 0) return { kind: 'no-units' };
+  return stamped > 0 ? { kind: 'use-stamped' } : { kind: 'recency-unknown', reason: 'mtime-on-use off' };
+}
+
 /** `linkedBytes`: planned, the candidates' bytes linked outside them; reclaimed, the inodes still linked after the pass. */
 function outcome(
   kind: 'planned' | 'reclaimed',
   reclaim: readonly Reclaimable[],
   linkedBytes: number,
   retained: readonly Retained[],
+  recency: Recency,
 ): PassOutcome {
-  return { kind, reclaim, reclaimedBytes: reclaim.reduce((sum, entry) => sum + entry.bytes, 0), linkedBytes, retained };
+  return {
+    kind,
+    reclaim,
+    reclaimedBytes: reclaim.reduce((sum, entry) => sum + entry.bytes, 0),
+    linkedBytes,
+    retained,
+    recency,
+  };
 }
 
 // ---- Reporting and the Nx hook ----
 
 function gib(bytes: number): string {
   return `${(bytes / 2 ** 30).toFixed(2)} GiB`;
+}
+
+/** Empty when Cargo's stamping of use is evident, or there is nothing to judge it by. */
+function describeRecency(recency: Recency): string {
+  switch (recency.kind) {
+    case 'use-stamped':
+    case 'no-units':
+      return '';
+    case 'recency-unknown':
+      return `; recency unknown: ${recency.reason}, so a unit's last use is its last compile`;
+  }
 }
 
 function describeOutcome(subject: string, outcome: RetentionOutcome): string {
@@ -1270,7 +1358,8 @@ function describeOutcome(subject: string, outcome: RetentionOutcome): string {
       const verb = outcome.kind === 'planned' ? 'would reclaim' : 'reclaimed';
       return (
         `${subject}: ${verb} ${gib(outcome.reclaimedBytes)} in ${outcome.reclaim.length} superseded unit generations ` +
-        `(${gib(outcome.linkedBytes)} more stays linked elsewhere); ${outcome.retained.length} retained`
+        `(${gib(outcome.linkedBytes)} more stays linked elsewhere); ${outcome.retained.length} retained` +
+        describeRecency(outcome.recency)
       );
     }
     case 'not-due':

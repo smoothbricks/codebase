@@ -20,7 +20,7 @@ import {
 import { outsideTreesTmpdir } from './outside-trees.js';
 
 /** Three days past the newest stamp a fixture build can carry: drops only the recency root. */
-const DAY3 = 3 * RECENT_USE_MS;
+export const DAY3 = 3 * RECENT_USE_MS;
 export const RETENTION_LOCK = '.smoo-cargo-retention.lock';
 export const TRASH = '.smoo-retention-trash';
 
@@ -109,7 +109,7 @@ export async function build(workspace: string, extra: string[] = []): Promise<Ca
   return cargoOk(workspace, ['build', '--workspace', '--locked', '--offline', ...extra]);
 }
 
-interface Artifact {
+export interface Artifact {
   readonly name: string;
   readonly packageId: string;
   readonly fresh: boolean;
@@ -129,7 +129,7 @@ export function parseReport(text: string): RetentionReport {
   if (!checked.success) throw new Error(`invalid retention report: ${JSON.stringify(checked.errors)}`);
   return checked.data;
 }
-function artifacts(run: CargoRun): Artifact[] {
+export function artifacts(run: CargoRun): Artifact[] {
   const found: Artifact[] = [];
   for (const line of run.stdout.split('\n')) {
     if (!line.startsWith('{')) continue;
