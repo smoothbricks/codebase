@@ -118,7 +118,10 @@ const ignoredNativeManifestDirectories = new Set([
   'vendor',
 ]);
 
-const obsoleteTtscPatchedDependencyKey = 'ttsc@0.19.3';
+// Every ttsc registration but the managed one names a release smoo no longer repairs, the rule the Nx patch follows.
+function obsoleteTtscPatchKeys(patches: Record<string, string> | undefined): string[] {
+  return Object.keys(patches ?? {}).filter((key) => key.startsWith('ttsc@') && key !== managedTtscPatch.key);
+}
 
 export async function applyToolConfigDefaults(root: string): Promise<void> {
   const context = await readToolContext(root);
@@ -302,10 +305,13 @@ export function validateRootDevDependencies(policy: ToolPolicy, rootPackage: Pac
 
 function removeObsoleteTtscPatch(pkg: PackageJson): boolean {
   const patchedDependencies = pkg.patchedDependencies;
-  if (!patchedDependencies || !(obsoleteTtscPatchedDependencyKey in patchedDependencies)) {
+  const obsolete = obsoleteTtscPatchKeys(patchedDependencies);
+  if (!patchedDependencies || obsolete.length === 0) {
     return false;
   }
-  delete patchedDependencies[obsoleteTtscPatchedDependencyKey];
+  for (const key of obsolete) {
+    delete patchedDependencies[key];
+  }
   if (Object.keys(patchedDependencies).length === 0) {
     delete pkg.patchedDependencies;
   }
@@ -325,10 +331,8 @@ function syncTtscPatch(pkg: PackageJson): boolean {
 function validateTtscPatch(rootPackage: PackageJson | null): number {
   const patches = rootPackage?.patchedDependencies;
   let failures = 0;
-  if (patches && obsoleteTtscPatchedDependencyKey in patches) {
-    console.error(
-      `package.json patchedDependencies.${obsoleteTtscPatchedDependencyKey} is obsolete; run smoo monorepo update`,
-    );
+  for (const key of obsoleteTtscPatchKeys(patches)) {
+    console.error(`package.json patchedDependencies.${key} is obsolete; run smoo monorepo update`);
     failures++;
   }
   if (

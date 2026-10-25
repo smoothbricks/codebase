@@ -145,6 +145,9 @@ export function createRecording(project: string, walk: Readonly<Record<string, s
 /** Hooks that record every watch input ttsc derives for a delivered module. */
 export function recordingHooks(recording: Recording): TtscTransformHooks {
   return {
+    // One Bun module-loading session reads each delivered path from disk and never watches.
+    exactPath: true,
+    watching: false,
     addWatchFile(file, evidence) {
       if (evidence?.state === undefined) {
         recording.unprovable ??= `ttsc reported no generation state for ${file}`;
@@ -158,7 +161,8 @@ export function recordingHooks(recording: Recording): TtscTransformHooks {
       }
     },
     markVolatile() {
-      recording.unprovable ??= 'a plugin declared an output volatile';
+      // A plugin-declared volatile output or an unavailable input observation: the store withdraws it.
+      recording.unprovable ??= 'ttsc marked the output volatile';
     },
   };
 }

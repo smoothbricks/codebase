@@ -88,9 +88,17 @@ const LIB_FIRST = ['tsconfig.lib.json', 'tsconfig.json', 'tsconfig.test.json'] a
 /**
  * The shared transform calls `addWatchFile` once per plugin-reported
  * dependency so type-only inputs can enter a bundler's watch graph. Bun's
- * runtime loader has no such channel, so there is nothing to forward.
+ * runtime loader has no such channel, so there is nothing to forward. One
+ * setup is one module-loading session that never watches, and the paths Bun
+ * hands `onLoad` are the files themselves. Without a persistent host cache a
+ * volatile delivery needs no withdrawal beyond ttsc's own generation eviction.
  */
-const TRANSFORM_HOOKS: TtscTransformHooks = { addWatchFile: () => undefined };
+const TRANSFORM_HOOKS: TtscTransformHooks = {
+  addWatchFile: () => undefined,
+  exactPath: true,
+  watching: false,
+  markVolatile: () => undefined,
+};
 const cache = createTtscTransformCache({ watch: pollingDirectoryWatch(WATCH_POLL_INTERVAL_MS) });
 /**
  * Resolved options per candidate project. `ResolvedTtscUnpluginOptions` is

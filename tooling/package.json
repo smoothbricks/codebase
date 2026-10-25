@@ -97,6 +97,6 @@
   },
   "dependencies": {
     "@smoothbricks/cli": "workspace:*",
-    "typia": "14.0.6"
+    "typia": "15.2.1"
   }
 }

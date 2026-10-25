@@ -28,8 +28,7 @@ runs:
     # A prefix hit is safe. ttsc names every entry by a hash of what it was compiled from (the ttsc and tsgo versions,
     # platform and architecture, the Go toolchain and its build environment, the plugin sources) and runs an entry only
     # when its name is the one it computes for this checkout, so a restored entry of other inputs is dead weight and
-    # never a wrong binary. devenv pins the typescript-go tree (TTSC_TYPESCRIPT_GO_DIR), so a prefix hit never sends
-    # ttsc to compile it from an empty `go list -m` directory.
+    # never a wrong binary.
     - name: Restore ttsc plugin binaries
       id: restore
       if: inputs.mode == 'restore'

@@ -19,18 +19,6 @@
   pkgs,
   ...
 }: let
-  # ttsc's native-plugin patch compiles microsoft/typescript-go with one
-  # corrected file. `go list -m` only fills `.Dir` after the module is already
-  # in GOMODCACHE, which CI does not restore (and GOPROXY is often off under
-  # nix). Pin the commit ttsc 0.30.4's patch requires so the tree is in the
-  # devenv closure and TTSC_TYPESCRIPT_GO_DIR names it.
-  typescriptGo = pkgs.fetchFromGitHub {
-    owner = "microsoft";
-    repo = "typescript-go";
-    rev = "56ab4af42157";
-    hash = "sha256-ebjX+1+9axEqsnZXCRZSumA38gPNdmoz98tMt2oftN4=";
-  };
-
   # The nixpkgs the Go pin below comes from (devenv.yaml `nixpkgs-go`).
   goPkgs = import inputs.nixpkgs-go {inherit (pkgs.stdenv.hostPlatform) system;};
 
@@ -44,8 +32,8 @@
   # The revision is can1357/TypeScript perf/checker-speedups-v3: 36 checker,
   # arena and scheduler commits on microsoft/TypeScript main 6ad8c56f9b5a,
   # while they are upstreamed. Its Go module (tsc/, Go 1.27) builds with the
-  # nixpkgs-go input's go_1_27 inside this derivation; the shell's own Go stays the
-  # one ttsc vendors. The sparse checkout keeps the ~61k test baselines out of
+  # nixpkgs-go input's go_1_27 inside this derivation, the same Go the shell
+  # provides because ttsc vendors that line. The sparse checkout keeps the ~61k test baselines out of
   # the store, and GOWORK=off keeps the repository's go.work (tools/) out of
   # the module build.
   typecheckTsc = goPkgs.buildGo127Module {
@@ -191,7 +179,6 @@ in {
       # processes, about 1.75 GB RSS, to 1 process, about 0.65 GB. Nx 23.2.1
       # reads only "false" as off (project-graph/plugins/isolation/enabled.js).
       NX_ISOLATE_PLUGINS = "false";
-      TTSC_TYPESCRIPT_GO_DIR = "${typescriptGo}";
       SMOO_TYPECHECK_TSC = "${typecheckTsc}/bin/tsc";
     }
     # Playwright's downloaded Ubuntu browser has no runtime closure on NixOS
@@ -350,7 +337,7 @@ in {
   # comment that rots.
   #
   # It needs its own input because the fleet's nixpkgs does not carry that patch:
-  # devenv-nixpkgs rolling ships go 1.26.5, while ttsc 0.30.4 vendors go1.26.8.
+  # devenv-nixpkgs rolling has no Go 1.27, while ttsc 0.34.1 vendors go1.27.3.
   # Same idiom, and same reason, for any single-package pin — one leaf package
   # from a nixpkgs that has it, lock-pinned, prebuilt, rather than a fleet-wide
   # bump that would move rustc, bun and node too. Not every pairing is
@@ -390,7 +377,7 @@ in {
   # `nixpkgs_2`.
   packages =
     [
-      goPkgs.go
+      goPkgs.go_1_27
       pkgs.nodejs_26
       pkgs.binaryen
       # Smoo's GitHub Actions validator uses the managed prebuilt package above.

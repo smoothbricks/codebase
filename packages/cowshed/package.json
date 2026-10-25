@@ -809,7 +809,7 @@
   },
   "dependencies": {
     "@smoothbricks/nx-cache-server": "workspace:*",
-    "typia": "14.0.6"
+    "typia": "15.2.1"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.7.3",
