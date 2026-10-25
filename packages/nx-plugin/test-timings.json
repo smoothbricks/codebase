@@ -8,6 +8,7 @@
     "src/testing.test.ts": 71687,
     "src/nx-task-output-lease.test.ts": 51426,
     "src/nextest-partitions.test.ts": 51407,
+    "src/managed-files/cache-ttsc-plugins.test.ts": 50590,
     "src/cargo-resolve-cache.test.ts": 48863,
     "src/nx-daemon-validity.test.ts": 45795,
     "src/task-results.test.ts": 43485,
