@@ -18,15 +18,15 @@ use std::time::{Duration, Instant, SystemTime};
 
 use super::storage_host::RuntimeStorageHost;
 use crate::api::dto::{
-    AdoptionSkip, CarrySide, DatabaseHolder, GcCandidate, GcDeferred, GcReason, GitOid, LandSeed,
-    NxCarry, RebaseBuildVolume, RebaseCarrySkip, Sha256Digest,
+    AdoptionSkip, CarrySide, DatabaseHolder, GcCandidate, GcDeferred, GcReason, GitOid, NxCarry,
+    RebaseBuildVolume, RebaseCarrySkip, Sha256Digest,
 };
 use crate::api::held_lock::{LockHolding, LockOperation};
 use crate::build_volume::migrate::{MintedBeside, MintedVolume};
 use crate::build_volume::{
     BuildStateRefresh, BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord,
     BuildVolumeRole, BuildVolumeStage, BuildVolumeState, CapturedBuildVolume, Registrant,
-    Registration, TrackedBuildStateRefusal, cargo, carry, link, nx,
+    Registration, ReleaseClaim, TrackedBuildStateRefusal, cargo, carry, link, nx,
 };
 use crate::capabilities::BuildStatePath;
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
@@ -203,21 +203,26 @@ impl<H: RuntimeStorageHost> Contended<H> {
 
 /// What [`BuildVolumes::freeze_seed`] did with the target's seed after Nx and existing Cargo
 /// profiles admitted capture (Land step 5.6).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) enum Freeze {
-    /// The seed is captured from the guarded landing volume and every older seed retired.
-    Frozen,
+    /// The seed is captured from the guarded landing volume, and every older seed claimed for
+    /// its retirement once the target's image lock is let go.
+    Frozen { superseded: SupersededSeeds },
     /// A conflicting storage claim refused capture; the previous seed stays.
     SealBusy { reason: String },
 }
 
-impl From<Freeze> for LandSeed {
-    fn from(freeze: Freeze) -> Self {
-        match freeze {
-            Freeze::Frozen => Self::Frozen,
-            Freeze::SealBusy { reason } => Self::SealBusy { reason },
-        }
-    }
+/// The seeds of `target` a new seed replaced (16_build_volumes.md, "Garbage collection"), each
+/// claimed for its release under the target's image lock, after which no fork or land of the
+/// target reads them: [`BuildVolumes::retire_superseded`] commits each to `build/.deleting`
+/// once that lock is let go, so no seed's rename, sync or hand-over to the gateway runs under it.
+/// Dropped unretired, the claims go and the seeds stay recorded under the target, for the next
+/// seed's retirement or `gc`.
+#[derive(Debug)]
+#[must_use = "retire_superseded releases the seeds once the target's image lock is let go"]
+pub(crate) struct SupersededSeeds {
+    target: WorkspaceName,
+    claims: Vec<ReleaseClaim>,
 }
 
 /// What [`BuildVolumes::adopt`] did: how long the move took, and the target's previous volume.
@@ -365,12 +370,14 @@ pub(crate) struct Peer {
     pub lock: PathBuf,
 }
 
-/// What a seed refresh (Fork step 2) did, and each live workspace at the fork's tree that did
-/// not seed the target, with why.
-#[derive(Clone, Debug)]
+/// What a seed refresh (Fork step 2) did, each live workspace at the fork's tree that did not
+/// seed the target, with why, and the seeds a new one replaced, for their retirement once the
+/// target's image lock is let go.
+#[derive(Debug)]
 pub(crate) struct Refreshed {
     pub passed: Vec<(WorkspaceName, LandedSkip)>,
     pub outcome: Refresh,
+    pub superseded: Option<SupersededSeeds>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1032,57 +1039,67 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// the older seed is forked), then captured into `destination`'s live volume, registered
     /// but not yet proven, published or mounted. A source with no seed gives none. The
     /// caller holds `source`'s image lock and runs this beside the capture of `source`'s image;
-    /// [`Self::ready_fork`] does the rest once it lets that lock go.
+    /// [`Self::ready_fork`] does the rest once it lets that lock go. Beside the capture, the
+    /// seeds the refresh replaced, claimed: the caller retires them ([`Self::retire_superseded`])
+    /// once its create has let every lock go, whether or not the fork succeeded.
     pub async fn capture_fork(
         &self,
         source: Owner,
         source_checkout: PathBuf,
         destination: WorkspaceName,
         aim: Aim,
-    ) -> Result<Option<CapturedFork>> {
+    ) -> (Result<Option<CapturedFork>>, Option<SupersededSeeds>) {
         // Where the new workspace's live volume is placed: the tree its checkout starts at.
         let placed = aim.tree.clone();
-        let refreshed = self
+        let mut refreshed = match self
             .refresh_seed(
                 source.clone(),
                 source_checkout,
                 aim,
                 LockHolding::of(LockOperation::Fork, &destination),
             )
-            .await?;
+            .await
+        {
+            Ok(refreshed) => refreshed,
+            Err(error) => return (Err(error), None),
+        };
         say_refresh(&source.name, &destination, &refreshed);
-        self.blocking(move |host, layout| {
-            let Some((seed, record)) = layout.seed_of(&source.name, &source.incarnation)? else {
-                return Ok(None);
-            };
-            let started = Instant::now();
-            let captured = host
-                .capture_fork_build_volume(
-                    layout,
-                    &seed,
-                    // The fork's intent answers for the volume until it publishes `destination`.
-                    &Registration::new(
-                        BuildVolumeRecord {
-                            checked_out: Some(placed),
-                            ..BuildVolumeRecord::new(
-                                record.tree.clone(),
-                                BuildVolumeRole::Linked {
-                                    checkout: destination,
-                                },
-                            )
-                        },
-                        Registrant::Intent,
-                    ),
-                )
-                .map_err(storage)?;
-            Ok(Some(CapturedFork {
-                seed,
-                tree: record.tree,
-                captured,
-                started,
-            }))
-        })
-        .await
+        let superseded = refreshed.superseded.take();
+        let captured = self
+            .blocking(move |host, layout| {
+                let Some((seed, record)) = layout.seed_of(&source.name, &source.incarnation)?
+                else {
+                    return Ok(None);
+                };
+                let started = Instant::now();
+                let captured = host
+                    .capture_fork_build_volume(
+                        layout,
+                        &seed,
+                        // The fork's intent answers for the volume until it publishes `destination`.
+                        &Registration::new(
+                            BuildVolumeRecord {
+                                checked_out: Some(placed),
+                                ..BuildVolumeRecord::new(
+                                    record.tree.clone(),
+                                    BuildVolumeRole::Linked {
+                                        checkout: destination,
+                                    },
+                                )
+                            },
+                            Registrant::Intent,
+                        ),
+                    )
+                    .map_err(storage)?;
+                Ok(Some(CapturedFork {
+                    seed,
+                    tree: record.tree,
+                    captured,
+                    started,
+                }))
+            })
+            .await;
+        (captured, superseded)
     }
 
     /// The captured live volume proven and published, `destination`'s own seed cloned from it
@@ -1401,8 +1418,8 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     }
 
     /// Land step 5.6, under the target's image lock: close Nx, retain its open locks and the
-    /// existing Cargo profile locks through mounted capture and publication, then retire every
-    /// older seed. Other contributed cache/index handles do not refuse capture. Quiet retains
+    /// existing Cargo profile locks through mounted capture and publication, then claim every
+    /// older seed for [`Self::retire_superseded`] once the lock is let go. Other contributed cache/index handles do not refuse capture. Quiet retains
     /// the stopped supervisor's admission lease and shared GC hold throughout this operation.
     pub async fn freeze_seed(
         &self,
@@ -1466,6 +1483,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 return Ok(Refreshed {
                     passed: Vec::new(),
                     outcome: Refresh::NoBuildVolume,
+                    superseded: None,
                 });
             };
             let mut passed = Vec::new();
@@ -1475,7 +1493,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             // less. That is the reseed's case, whatever the session's tree.
             if target.name.is_main()
                 && age.moved_from().is_some()
-                && let Some(landed) = seed_from_landed(
+                && let Some((landed, superseded)) = seed_from_landed(
                     &*this.host,
                     &this.layout,
                     &target,
@@ -1487,10 +1505,15 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 return Ok(Refreshed {
                     passed,
                     outcome: landed,
+                    superseded: Some(superseded),
                 });
             }
-            let outcome = reseed(&*this.host, &this.layout, &target, age)?;
-            Ok(Refreshed { passed, outcome })
+            let (outcome, superseded) = reseed(&*this.host, &this.layout, &target, age)?;
+            Ok(Refreshed {
+                passed,
+                outcome,
+                superseded,
+            })
         })
         .await
         .map_err(|error| CowshedError::internal(format!("build volume task failed: {error}")))?
@@ -1692,6 +1715,33 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         .await
     }
 
+    /// Retire `superseded`, the seeds a new one replaced, once the target's image lock that
+    /// claimed them is let go: each is committed to `build/.deleting` and its record removed, the
+    /// gateway freeing the bytes. The land or fork it serves has its seed, so a failure is said
+    /// on stderr and the seeds stay recorded under the target, for the next seed's retirement or
+    /// `gc`.
+    pub async fn retire_superseded(&self, superseded: SupersededSeeds) {
+        if superseded.claims.is_empty() {
+            return;
+        }
+        let target = superseded.target.clone();
+        let started = Instant::now();
+        let retired = self
+            .blocking(move |host, layout| retire_seeds(host, layout, superseded))
+            .await;
+        cowshed_os::timing::event("build-volume", || {
+            format!(
+                "retire {target}'s superseded seeds in {:?}",
+                started.elapsed()
+            )
+        });
+        if let Err(error) = retired {
+            cowshed_os::eprintln!(
+                "cowshed: {target}'s superseded seeds stay recorded as its: {error}; the next seed's retirement or `cowshed gc` retires them"
+            );
+        }
+    }
+
     /// Release a target's previous volume after its adoption, inside the land: nothing links it,
     /// so only a job admitted on it before the move keeps it. Held, it stays recorded superseded
     /// under the target, and that job's end releases it
@@ -1765,11 +1815,17 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     owned.push((id, whose));
                 }
             }
+            // The live volume goes last, so a refusal of any other leaves the checkout's link
+            // naming a volume that is still there.
+            owned.sort_by_key(|(_, whose)| *whose == "live");
             for (id, whose) in owned {
                 match host.release_build_volume(layout, &id).map_err(storage)? {
                     release @ BuildVolumeRelease::Deleted { .. } => {
                         say_release(&id, &format!("{}'s {whose}", owner.name), &release);
                     }
+                    // A seed is never mounted and no job is admitted on one: its claim is a
+                    // superseded seed's retirement by an earlier land or fork, which frees it.
+                    BuildVolumeRelease::Held { open } if whose == "seed" && open.is_empty() => {}
                     BuildVolumeRelease::Held { open } => {
                         return Err(CowshedError::conflict(
                             format!(
@@ -2639,10 +2695,9 @@ fn seal(
         return Ok(Err(skip(busy, Side::Landing)));
     }
     match host.clone_quiet_build_volume(layout, quiet, &BuildVolumeId::mint(), registration) {
-        Ok(()) => {
-            retire_seeds(host, layout, target, previous)?;
-            Ok(Ok(Freeze::Frozen))
-        }
+        Ok(()) => Ok(Ok(Freeze::Frozen {
+            superseded: claim_superseded(host, layout, target, previous)?,
+        })),
         Err(ApfsStorageError::BuildVolumeHeld { image, open, .. }) => Ok(Ok(Freeze::SealBusy {
             reason: volume_busy_reason(&image, &open),
         })),
@@ -2663,43 +2718,64 @@ fn volume_busy_reason(image: &Path, open: &[cowshed_os::process::Holder]) -> Str
     )
 }
 
-/// Release `previous`, the seeds of `target` a new one replaced (16_build_volumes.md, "Garbage
-/// collection"): each is committed to `build/.deleting` and its owner record retired, and the
-/// gateway's deleter frees the bytes, so neither a land nor a fork's seed refresh waits on freeing
-/// a seed nothing reads any more. A seed is never mounted and no job is admitted on one, so a hold
-/// on it is an integrity fault.
-fn retire_seeds(
+/// Claim `previous`, the seeds of `target` a new one replaced, under the target's image lock
+/// (16_build_volumes.md, "Garbage collection"), for [`retire_seeds`] once it is let go. A seed is
+/// never mounted and no job is admitted on one, so a seed already claimed is one an earlier land
+/// or fork claimed and is retiring now, its lock let go: it is left to that.
+fn claim_superseded(
     host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     target: &Owner,
     previous: Vec<BuildVolumeId>,
-) -> Result<()> {
-    let held = |old: &BuildVolumeId| {
-        CowshedError::integrity(
-            format!(
-                "seed {old} of {} is held by a job, but no job is ever admitted on a seed",
-                target.name
-            ),
-            "cowshed doctor --json",
-        )
-    };
+) -> Result<SupersededSeeds> {
+    let mut claims = Vec::with_capacity(previous.len());
     for old in previous {
-        let claim = match host.claim_build_volume(layout, &old).map_err(storage)? {
-            BuildVolumeClaim::Claimed(claim) => claim,
-            BuildVolumeClaim::Held { .. } => return Err(held(&old)),
-        };
-        let refused = match host.release_claimed(layout, claim) {
-            Ok(refused) => refused,
-            Err(ApfsStorageError::BuildVolumeHeld { .. }) => return Err(held(&old)),
-            Err(error) => return Err(storage(error)),
-        };
-        say_release(
-            &old,
-            &format!("{}'s superseded seed", target.name),
-            &BuildVolumeRelease::Deleted { refused },
-        );
+        match host.claim_build_volume(layout, &old).map_err(storage)? {
+            BuildVolumeClaim::Claimed(claim) => claims.push(claim),
+            BuildVolumeClaim::Held { .. } => {}
+        }
     }
-    Ok(())
+    Ok(SupersededSeeds {
+        target: target.name.clone(),
+        claims,
+    })
+}
+
+/// Release `superseded`, claimed by [`claim_superseded`]: each is committed to
+/// `build/.deleting` and its owner record retired, and the gateway's cleanup frees the bytes, so
+/// neither a land nor a fork's seed refresh waits on freeing a seed nothing reads any more. A
+/// seed is never mounted, so a release refused for a holder is an integrity fault.
+fn retire_seeds(
+    host: &impl RuntimeStorageHost,
+    layout: &BuildVolumeLayout,
+    superseded: SupersededSeeds,
+) -> Result<()> {
+    let SupersededSeeds { target, claims } = superseded;
+    // Every seed is tried, so one that fails keeps no other claimed past this retirement; the
+    // first failure answers.
+    let mut failed = None;
+    for claim in claims {
+        let old = claim.id().clone();
+        match host.release_claimed(layout, claim) {
+            Ok(refused) => say_release(
+                &old,
+                &format!("{target}'s superseded seed"),
+                &BuildVolumeRelease::Deleted { refused },
+            ),
+            Err(ApfsStorageError::BuildVolumeHeld { .. }) => {
+                failed.get_or_insert(CowshedError::integrity(
+                    format!(
+                        "seed {old} of {target} is held by a job, but no job is ever admitted on a seed"
+                    ),
+                    "cowshed doctor --json",
+                ));
+            }
+            Err(error) => {
+                failed.get_or_insert(storage(error));
+            }
+        }
+    }
+    failed.map_or(Ok(()), Err)
 }
 
 /// The capacity main's first build volume is minted at beside its image, from `source`'s
@@ -2880,7 +2956,7 @@ fn seed_from_landed(
     aim: &Aim,
     holding: &LockHolding,
     passed: &mut Vec<(WorkspaceName, LandedSkip)>,
-) -> Result<Option<Refresh>> {
+) -> Result<Option<(Refresh, SupersededSeeds)>> {
     // The unlocked read only selects; the read under the candidate's lock decides.
     let mut candidates = Vec::new();
     for peer in &aim.landed {
@@ -2924,12 +3000,15 @@ fn seed_from_landed(
             continue;
         };
         match capture(host, layout, target, &live, Some(aim.tree.clone()))? {
-            Ok(elapsed_ms) => {
-                return Ok(Some(Refresh::Landed {
-                    workspace: peer.name.clone(),
-                    tree: aim.tree.clone(),
-                    elapsed_ms,
-                }));
+            Ok((elapsed_ms, superseded)) => {
+                return Ok(Some((
+                    Refresh::Landed {
+                        workspace: peer.name.clone(),
+                        tree: aim.tree.clone(),
+                        elapsed_ms,
+                    },
+                    superseded,
+                )));
             }
             Err(skip) => passed.push((peer.name.clone(), LandedSkip::Capture(skip))),
         }
@@ -2938,31 +3017,36 @@ fn seed_from_landed(
 }
 
 /// A reseed (16_build_volumes.md, "Which volume a seed holds", step 2): capture the target's
-/// live volume when it is nearer the fork's tree than the seed, or as near and written since.
+/// live volume when it is nearer the fork's tree than the seed, or as near and written since;
+/// with the seeds a capture replaced.
 fn reseed(
     host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     target: &Owner,
     age: SeedAge,
-) -> Result<Refresh> {
+) -> Result<(Refresh, Option<SupersededSeeds>)> {
     if !age.reseeds() {
-        return Ok(Refresh::Kept);
+        return Ok((Refresh::Kept, None));
     }
     let behind_ms = age.behind().map(millis);
     Ok(match capture(host, layout, target, &age.live, age.tree)? {
-        Ok(elapsed_ms) => Refresh::Reseeded {
-            behind_ms,
-            elapsed_ms,
-        },
-        Err(reason) => Refresh::Skipped { behind_ms, reason },
+        Ok((elapsed_ms, superseded)) => (
+            Refresh::Reseeded {
+                behind_ms,
+                elapsed_ms,
+            },
+            Some(superseded),
+        ),
+        Err(reason) => (Refresh::Skipped { behind_ms, reason }, None),
     })
 }
 
 /// Freeze `source`, recorded at `tree`, as `target`'s seed after Nx and existing Cargo profiles
-/// admit capture, then commit every older seed of `target` to `build/.deleting`
-/// ([`retire_seeds`]): the fork this refresh serves never waits on freeing them, and no
-/// step of it reads them again. Measured on build 48a8ffff, an inline free of one 300 GiB
-/// superseded seed held a provision about 12 minutes in `ftruncate`. The elapsed milliseconds. Their
+/// admit capture, then claim every older seed of `target` ([`claim_superseded`]) for its
+/// retirement once the target's image lock is let go: the fork this refresh serves never waits
+/// on releasing them under it, and no step of it reads them again. Measured on build 48a8ffff,
+/// an inline free of one 300 GiB superseded seed held a provision about 12 minutes in
+/// `ftruncate`. The elapsed milliseconds and the claimed seeds. Their
 /// guards and the exclusive build hold stay alive through mounted capture and publication.
 /// Exempt cache/index handles may stay open. A skip leaves every seed as it was.
 fn capture(
@@ -2971,7 +3055,7 @@ fn capture(
     target: &Owner,
     source: &BuildVolumeId,
     tree: Option<GitOid>,
-) -> Result<std::result::Result<u64, CaptureSkip>> {
+) -> Result<std::result::Result<(u64, SupersededSeeds), CaptureSkip>> {
     let started = Instant::now();
     let mount = host.mount_build_volume(layout, source).map_err(storage)?;
     let state = BuildVolumeState::read(&mount)?;
@@ -3048,12 +3132,12 @@ fn capture(
         }
         Err(error) => return Err(storage(error)),
     }
-    retire_seeds(host, layout, target, previous)?;
+    let superseded = claim_superseded(host, layout, target, previous)?;
     let elapsed_ms = millis(started.elapsed());
     cowshed_os::timing::event("build-volume", || {
         format!("seed {} from {source} in {elapsed_ms} ms", target.name)
     });
-    Ok(Ok(elapsed_ms))
+    Ok(Ok((elapsed_ms, superseded)))
 }
 
 /// Say on stderr what a seed refresh of `target` did beyond keeping a seed that needed nothing:
@@ -3942,6 +4026,67 @@ mod tests {
         scratch.release_all();
     }
 
+    /// A seed an earlier land or fork claimed for its retirement is that retirement's to
+    /// release: a retiring workspace's own release leaves it and releases the rest.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_a_retirement_leaves_a_seed_another_retirement_claims() {
+        let scratch = Scratch::directory("build-claimed-seed");
+        let topic = owner("topic", '1');
+        let (checkout, live, _) = scratch.linked_checkout("topic", 1);
+        let seed = BuildVolumeId::mint();
+        scratch
+            .host
+            .clone_build_volume(
+                &scratch.layout,
+                &live,
+                &seed,
+                &registered(BuildVolumeRecord::new(
+                    None,
+                    BuildVolumeRole::Seed {
+                        target: topic.name.clone(),
+                        incarnation: topic.incarnation.clone(),
+                    },
+                )),
+            )
+            .unwrap();
+        let BuildVolumeClaim::Claimed(claim) = scratch
+            .host
+            .claim_build_volume(&scratch.layout, &seed)
+            .unwrap()
+        else {
+            panic!("nothing holds the seed");
+        };
+        let target = topic.name.clone();
+        scratch
+            .volumes
+            .release_owned(topic, checkout)
+            .await
+            .expect("the claimed seed is left to its retirement");
+        assert!(
+            !scratch.layout.image(&live).exists(),
+            "the live volume is released"
+        );
+        assert!(
+            scratch.layout.image(&seed).exists(),
+            "the claimed seed is left"
+        );
+        retire_seeds(
+            &*scratch.host,
+            &scratch.layout,
+            SupersededSeeds {
+                target,
+                claims: vec![claim],
+            },
+        )
+        .unwrap();
+        assert!(
+            !scratch.layout.image(&seed).exists(),
+            "its retirement releases it"
+        );
+        scratch.release_all();
+    }
+
     /// Collection decides only the images it listed before it read what links them. A verb that
     /// crosses its mutation fence and makes a volume after the collection read the journal is
     /// absent from those links, and its volume is not one of the images listed: it is left to a
@@ -4007,7 +4152,7 @@ mod tests {
         fs::create_dir_all(staged.join(".cowshed")).unwrap();
         let prepared = scratch
             .volumes
-            .capture_fork(
+            .capture_fork_retired(
                 main.clone(),
                 main_checkout,
                 lane.name.clone(),
@@ -4341,7 +4486,7 @@ mod tests {
         };
         let topic_checkout = checkout("topic");
         let prepared = volumes
-            .capture_fork(
+            .capture_fork_retired(
                 main.clone(),
                 main_checkout.clone(),
                 topic.name.clone(),
@@ -5324,13 +5469,14 @@ mod tests {
             .expect("Nx and Cargo are idle");
         let target = owner("main", '0');
         let locked = scratch.lock(&target).await;
+        let frozen = scratch
+            .volumes
+            .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
+            .await
+            .unwrap();
         assert_eq!(
-            scratch
-                .volumes
-                .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
-                .await
-                .unwrap(),
-            Ok(Freeze::Frozen)
+            retired_or_skipped(&scratch.volumes, frozen).await,
+            Ok(Froze::Frozen)
         );
         let mut previous = scratch
             .layout
@@ -5368,17 +5514,18 @@ mod tests {
         for digit in ['b', 'c'] {
             let tree = GitOid::new(digit.to_string().repeat(40)).unwrap();
             if let Some(quiet) = quiet.take() {
+                let frozen = scratch
+                    .volumes
+                    .freeze_seed(&locked, &quiet, tree.clone())
+                    .await
+                    .unwrap();
                 assert_eq!(
-                    scratch
-                        .volumes
-                        .freeze_seed(&locked, &quiet, tree.clone())
-                        .await
-                        .unwrap(),
-                    Ok(Freeze::Frozen),
+                    retired_or_skipped(&scratch.volumes, frozen).await,
+                    Ok(Froze::Frozen),
                     "the landing capture admits exempt open caches"
                 );
             } else {
-                capture(
+                let (_, superseded) = capture(
                     &*scratch.host,
                     &scratch.layout,
                     &target,
@@ -5387,6 +5534,7 @@ mod tests {
                 )
                 .unwrap()
                 .expect("direct capture admits the same exempt open caches");
+                retire_seeds(&*scratch.host, &scratch.layout, superseded).unwrap();
             }
             let (seed, record) = scratch
                 .layout
@@ -5705,7 +5853,7 @@ fn main() {
             .await
             .unwrap()
             .expect("the initial capture has no writer");
-        assert_eq!(frozen, Freeze::Frozen);
+        assert_eq!(retired(&scratch.volumes, frozen).await, Froze::Frozen);
         let original_seed = scratch
             .layout
             .seed_of(&target.name, &target.incarnation)
@@ -5815,7 +5963,7 @@ fn main() {
         drop(quiet);
         drop(locked);
         scratch.release_all();
-        assert_eq!(frozen.unwrap(), Ok(Freeze::Frozen));
+        assert!(matches!(frozen.unwrap(), Ok(Freeze::Frozen { .. })));
         assert_eq!(
             seed.expect("the exempt cache permits publication").1.tree,
             Some(tree)
@@ -5854,13 +6002,14 @@ fn main() {
             .expect("nothing has opened Nx");
         let target = owner("main", '0');
         let locked = scratch.lock(&target).await;
+        let frozen = scratch
+            .volumes
+            .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
+            .await
+            .unwrap();
         assert_eq!(
-            scratch
-                .volumes
-                .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
-                .await
-                .unwrap(),
-            Ok(Freeze::Frozen)
+            retired_or_skipped(&scratch.volumes, frozen).await,
+            Ok(Froze::Frozen)
         );
         let previous = seeds_of(&scratch.layout, &target).unwrap();
         let lock = database.with_extension("lock");
@@ -5937,9 +6086,10 @@ fn main() {
         let database = mount.join("nx/workspace-data/T-v3.db");
         fs::write(&database, b"").unwrap();
         let target = owner("main", '0');
-        capture(&*scratch.host, &scratch.layout, &target, &live, None)
+        let (_, superseded) = capture(&*scratch.host, &scratch.layout, &target, &live, None)
             .unwrap()
             .expect("the initial capture has no holder");
+        retire_seeds(&*scratch.host, &scratch.layout, superseded).unwrap();
         let previous = seeds_of(&scratch.layout, &target).unwrap();
         let holder = Connection::open(&database).unwrap();
         holder
@@ -6125,9 +6275,8 @@ fn main() {
             Some(libc::SIGTERM),
             "the recorded landing daemon is stopped as `nx daemon --stop` stops it"
         );
-        assert_eq!(
-            frozen.unwrap(),
-            Ok(Freeze::Frozen),
+        assert!(
+            matches!(frozen.unwrap(), Ok(Freeze::Frozen { .. })),
             "with its own daemon stopped the landing volume seals"
         );
         let (_, record) = seed.expect("capture publishes the seed after the daemon stops");
@@ -6167,7 +6316,7 @@ fn main() {
         let tree = GitOid::new("a".repeat(40)).unwrap();
         // Clock ordering is supplied explicitly; this exercises admission and publication,
         // not the independent image-mtime comparison.
-        let reseeded = reseed(
+        let reseeded = reseed_retired(
             &*scratch.host,
             &scratch.layout,
             &target,
@@ -6240,7 +6389,7 @@ fn main() {
         let tree = GitOid::new("a".repeat(40)).unwrap();
         // Clock ordering is supplied explicitly; this exercises the release, not the
         // image-mtime comparison.
-        let reseeded = reseed(
+        let reseeded = reseed_retired(
             &*scratch.host,
             &scratch.layout,
             &target,
@@ -6314,7 +6463,7 @@ fn main() {
         fs::create_dir_all(staged.join(".cowshed")).unwrap();
         let prepared = scratch
             .volumes
-            .capture_fork(
+            .capture_fork_retired(
                 main.clone(),
                 main_checkout.to_owned(),
                 destination.name.clone(),
@@ -6389,7 +6538,7 @@ fn main() {
         fs::create_dir_all(topic_checkout.join(".cowshed")).unwrap();
         let prepared = scratch
             .volumes
-            .capture_fork(
+            .capture_fork_retired(
                 main.clone(),
                 main_checkout.clone(),
                 topic.name.clone(),
@@ -6458,7 +6607,7 @@ fn main() {
         };
         let prepared = scratch
             .volumes
-            .capture_fork(
+            .capture_fork_retired(
                 topic.clone(),
                 topic_checkout.clone(),
                 sibling.name.clone(),
@@ -6930,7 +7079,7 @@ fn main() {
             serde_json::json!({ "processId": daemon.id(), "socketPath": socket }).to_string(),
         )
         .unwrap();
-        let reseeded = reseed(
+        let reseeded = reseed_retired(
             &*scratch.host,
             &scratch.layout,
             &target,
@@ -7002,7 +7151,7 @@ fn main() {
             )
             .unwrap();
         let job = scratch.layout.admit(&live).expect("a job's hold");
-        let reseeded = reseed(
+        let reseeded = reseed_retired(
             &*scratch.host,
             &scratch.layout,
             &target,
@@ -7075,6 +7224,69 @@ fn main() {
     }
 
     #[cfg(target_os = "macos")]
+    /// What a freeze did, once its superseded seeds are retired as a land retires them after it
+    /// lets the target's image lock go.
+    #[derive(Debug, Eq, PartialEq)]
+    enum Froze {
+        Frozen,
+        SealBusy { reason: String },
+    }
+
+    async fn retired<H: RuntimeStorageHost>(volumes: &BuildVolumes<H>, freeze: Freeze) -> Froze {
+        match freeze {
+            Freeze::Frozen { superseded } => {
+                volumes.retire_superseded(superseded).await;
+                Froze::Frozen
+            }
+            Freeze::SealBusy { reason } => Froze::SealBusy { reason },
+        }
+    }
+
+    async fn retired_or_skipped<H: RuntimeStorageHost>(
+        volumes: &BuildVolumes<H>,
+        freeze: std::result::Result<Freeze, AdoptionSkip>,
+    ) -> std::result::Result<Froze, AdoptionSkip> {
+        match freeze {
+            Ok(freeze) => Ok(retired(volumes, freeze).await),
+            Err(skip) => Err(skip),
+        }
+    }
+
+    /// [`reseed`] with the seeds it superseded retired at once, as a fork retires them once it
+    /// lets the target's image lock go.
+    fn reseed_retired(
+        host: &impl RuntimeStorageHost,
+        layout: &BuildVolumeLayout,
+        target: &Owner,
+        age: SeedAge,
+    ) -> Result<Refresh> {
+        let (refresh, superseded) = reseed(host, layout, target, age)?;
+        if let Some(superseded) = superseded {
+            retire_seeds(host, layout, superseded)?;
+        }
+        Ok(refresh)
+    }
+
+    impl<H: RuntimeStorageHost> BuildVolumes<H> {
+        /// [`Self::capture_fork`], the seeds its refresh replaced retired as the fork's caller
+        /// retires them.
+        async fn capture_fork_retired(
+            &self,
+            source: Owner,
+            source_checkout: PathBuf,
+            destination: WorkspaceName,
+            aim: Aim,
+        ) -> Result<Option<CapturedFork>> {
+            let (captured, superseded) = self
+                .capture_fork(source, source_checkout, destination, aim)
+                .await;
+            if let Some(superseded) = superseded {
+                self.retire_superseded(superseded).await;
+            }
+            captured
+        }
+    }
+
     fn owner(name: &str, digit: char) -> Owner {
         Owner {
             name: WorkspaceName::new(name).unwrap(),
@@ -7117,7 +7329,7 @@ fn main() {
             .await
             .unwrap()
             .expect("nothing holds the landing volume");
-        assert_eq!(frozen, Freeze::Frozen);
+        assert_eq!(retired(&scratch.volumes, frozen).await, Froze::Frozen);
         let (seed, _) = scratch
             .layout
             .seed_of(&WorkspaceName::main(), &owner("main", '0').incarnation)
@@ -7625,7 +7837,7 @@ fn main() {
             .await
             .unwrap()
             .expect("nothing holds the landing volume");
-        assert_eq!(frozen, Freeze::Frozen);
+        assert_eq!(retired(&scratch.volumes, frozen).await, Froze::Frozen);
         let closed = scratch
             .volumes
             .close_target(main_checkout.clone())
@@ -7823,13 +8035,16 @@ fn main() {
                     .freeze_seed(&locked, &quiet, tree.clone())
                     .await?
                     .expect("nothing holds the landing volume");
-                assert_eq!(frozen, Freeze::Frozen);
+                let Freeze::Frozen { superseded } = frozen else {
+                    panic!("nothing holds the landing volume: {frozen:?}");
+                };
                 let adopted = volumes
                     .adopt(&locked, &quiet, closed, main_checkout, tree)
                     .await?
                     .expect("nothing opened the target's volume since");
                 drop(quiet);
                 drop(locked);
+                volumes.retire_superseded(superseded).await;
                 volumes.release_previous(adopted.previous).await
             })
         };

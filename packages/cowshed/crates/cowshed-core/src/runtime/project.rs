@@ -6017,20 +6017,30 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             }
         };
         // A busy seal keeps the previous seed and the adoption still runs: the seal fences only
-        // the captured bytes, and the restored volume is as quiet for the target as before.
-        let seed = match timed_async(
+        // the captured bytes, and the restored volume is as quiet for the target as before. The
+        // seeds a freeze replaced are claimed under the lock and retired once it is let go.
+        let (seed, superseded) = match timed_async(
             "land",
             "freeze-seed",
             volumes.freeze_seed(&locked, &quiet, tree.clone()),
         )
         .await?
         {
-            Ok(frozen) => LandSeed::from(frozen),
+            Ok(super::build_volumes::Freeze::Frozen { superseded }) => {
+                (LandSeed::Frozen, Some(superseded))
+            }
+            Ok(super::build_volumes::Freeze::SealBusy { reason }) => {
+                (LandSeed::SealBusy { reason }, None)
+            }
             Err(reason) => return Ok(skipped(reason)),
         };
         let (closed, carried) = match carried {
             Ok(carried) => carried,
             Err(reason) => {
+                drop(locked);
+                if let Some(superseded) = superseded {
+                    volumes.retire_superseded(superseded).await;
+                }
                 return Ok(LandBuildVolume {
                     seed,
                     adoption: Adoption::Skipped { reason },
@@ -6044,34 +6054,56 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         )
         .await?
         {
-            Err(reason) => Adoption::Skipped { reason },
+            Err(reason) => {
+                drop(locked);
+                if let Some(superseded) = superseded {
+                    volumes.retire_superseded(superseded).await;
+                }
+                Adoption::Skipped { reason }
+            }
             Ok(super::build_volumes::Adopted {
                 elapsed_ms,
                 previous,
             }) => {
+                // A kept workspace's capture of the target's new seed is the last step under the
+                // target's image lock; its publication, mount and link run after it.
+                let refork = if retire {
+                    None
+                } else {
+                    Some(
+                        volumes
+                            .refork(&locked, landing_owner.clone(), landing.to_owned())
+                            .await,
+                    )
+                };
+                drop(locked);
+                let refork = match refork.transpose() {
+                    Ok(refork) => refork,
+                    Err(error) => {
+                        if let Some(superseded) = superseded {
+                            volumes.retire_superseded(superseded).await;
+                        }
+                        return Err(error);
+                    }
+                };
                 // Nothing links the previous volume and its record says superseded under the
-                // target, so its release (an unmount, detach and unlink, each waiting on
-                // storagekitd) needs nothing the target's next steps touch, and runs beside them.
-                // A job admitted on it before the move keeps it, recorded as the target's, until
-                // that job's end releases it.
-                let release = timed_async(
-                    "land",
-                    "release-previous",
-                    volumes.release_previous(previous),
-                );
+                // target, and no fork reads a superseded seed, so their releases (each a rename,
+                // sync and hand-over to the gateway, and for the volume an unmount and detach
+                // waiting on storagekitd) run once the lock is let go, beside the target's next
+                // steps. A job admitted on the previous volume before the move keeps it,
+                // recorded as the target's, until that job's end releases it.
+                let release = async {
+                    if let Some(superseded) = superseded {
+                        volumes.retire_superseded(superseded).await;
+                    }
+                    timed_async(
+                        "land",
+                        "release-previous",
+                        volumes.release_previous(previous),
+                    )
+                    .await
+                };
                 let in_target = async {
-                    // A kept workspace's capture of the target's new seed is the last step under
-                    // the target's image lock; its publication, mount and link run after it.
-                    let refork = if retire {
-                        None
-                    } else {
-                        Some(
-                            volumes
-                                .refork(&locked, landing_owner.clone(), landing.to_owned())
-                                .await?,
-                        )
-                    };
-                    drop(locked);
                     if let Some(refork) = refork {
                         timed_async("land", "refork", volumes.ready_refork(refork)).await?;
                     }
@@ -10336,48 +10368,34 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let substrate = self.substrate.clone();
         // An unpublished clone never landed anywhere: main is what has to hold its work.
         let containment = self.main_containment()?;
+        // Its supervisor stops before the clone's image lock is taken, as a published
+        // workspace's rm stops one (02_workspaces.md, `rm`): the stop waits for the clone's jobs,
+        // and nothing waits for them under the lock. The stopped supervisor's socket stays bound
+        // until the retirement ends, so none starts meanwhile, and every fence below is read
+        // after the only writer has stopped.
+        let mount_point = self.workspace_mount_path(workspace)?;
+        self.require_mount_unheld_before_stop(workspace, &mount_point)
+            .await?;
+        let _stopped = self
+            .stop_supervisor_with_mode(
+                workspace,
+                if options.force {
+                    RetireWhen::Now
+                } else {
+                    RetireWhen::AfterJobs
+                },
+                NxDaemonRetirement::Recorded,
+            )
+            .await?;
         let result = async {
             let (retired, (abandoned, tips, mount, forced, recovery)) = substrate
                 .execute_pending_clone_retirement(metadata, identity, |stage| {
                     let this = &mut *self;
                     let containment = &containment;
                     async move {
-                        let first = this
-                            .removal_git_fence_at(&stage.mount_point, stage.workspace.incarnation())
-                            .await?;
-                        if !options.force {
-                            Self::require_session_state_clean(workspace, &first)?;
-                        }
-                        this.require_session_landed(
-                            workspace,
-                            &first,
-                            options.abandon,
-                            containment,
-                        )
-                        .await?;
-                        this.require_mount_unheld_before_stop(workspace, &stage.mount_point)
-                            .await?;
-                        let _stopped = this
-                            .stop_supervisor_with_mode(
-                                workspace,
-                                if options.force {
-                                    RetireWhen::Now
-                                } else {
-                                    RetireWhen::AfterJobs
-                                },
-                                NxDaemonRetirement::Recorded,
-                            )
-                            .await?;
                         let last = this
                             .removal_git_fence_at(&stage.mount_point, stage.workspace.incarnation())
                             .await?;
-                        if last.head != first.head {
-                            return Err(removal_head_moved_refusal(
-                                workspace,
-                                &first.head,
-                                &last.head,
-                            ));
-                        }
                         let forced = if options.force {
                             Some(overridden_by_force(&last, None))
                         } else {
@@ -10465,6 +10483,13 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 .unmount(&main.derived.workspace)
                 .await
                 .map_err(native_storage_error)?;
+        }
+        // A refused retirement leaves the clone unfinished, and its supervisor, stopped before
+        // the lock, stopped: only a pending clone's publication starts one.
+        if result.is_err() {
+            cowshed_os::eprintln!(
+                "cowshed: {workspace}'s supervisor stays stopped: the rm that stopped it was refused, and an unfinished fork's supervisor starts only once it publishes"
+            );
         }
         result
     }
@@ -13160,6 +13185,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             let readying = build_volumes.clone();
             let abandoning_capture = build_volumes.clone();
             let abandoning = build_volumes.clone();
+            let retiring = build_volumes.clone();
+            // The seeds the refresh replaced come back beside the capture, and are retired once
+            // the create has let every lock go: a git-worktree fork holds the source's until its
+            // initializer ends.
+            let (replaced, seeds) = tokio::sync::oneshot::channel();
             let capture = {
                 let (source_mount, destination) = (source_mount.clone(), destination.clone());
                 let seed_source = super::build_volumes::Owner {
@@ -13167,11 +13197,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     incarnation: source.derived.workspace.incarnation().clone(),
                 };
                 async move {
-                    timed_async(
-                        "fork",
-                        "build-volume",
-                        capturing.capture_fork(seed_source, source_mount, destination, aim),
-                    )
+                    timed_async("fork", "build-volume", async {
+                        let (captured, superseded) = capturing
+                            .capture_fork(seed_source, source_mount, destination, aim)
+                            .await;
+                        let _ = replaced.send(superseded);
+                        captured
+                    })
                     .await
                 }
             };
@@ -13253,8 +13285,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                             .await
                     },
                 )
-                .await
-                .map_err(|error| native_clone_error(error, &mut reclaimed))?;
+                .await;
+            if let Ok(Some(superseded)) = seeds.await {
+                retiring.retire_superseded(superseded).await;
+            }
+            let receipt = receipt.map_err(|error| native_clone_error(error, &mut reclaimed))?;
             // Published, the image owns its block: the kernel claim ends with publication, or a
             // gateway reconcile in another process installing the workspace's session finds the
             // block's base port taken and moves the workspace to another block (05_gateway.md).
@@ -13578,6 +13613,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 let readying = build_volumes.clone();
                 let abandoning_capture = build_volumes.clone();
                 let abandoning = build_volumes.clone();
+                let retiring = build_volumes.clone();
+                // As for `resume_fork`: the replaced seeds are retired once the fork lets every
+                // lock go.
+                let (replaced, seeds) = tokio::sync::oneshot::channel();
                 let capture = {
                     let (source_mount, forked) = (source_mount.clone(), forked.clone());
                     let seed_source = super::build_volumes::Owner {
@@ -13585,11 +13624,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         incarnation: source_fact.derived.workspace.incarnation().clone(),
                     };
                     async move {
-                        timed_async(
-                            "fork",
-                            "build-volume",
-                            capturing.capture_fork(seed_source, source_mount, forked, aim),
-                        )
+                        timed_async("fork", "build-volume", async {
+                            let (captured, superseded) = capturing
+                                .capture_fork(seed_source, source_mount, forked, aim)
+                                .await;
+                            let _ = replaced.send(superseded);
+                            captured
+                        })
                         .await
                     }
                 };
@@ -13674,8 +13715,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                             Ok::<_, CowshedError>(())
                         },
                     )
-                    .await
-                    .map_err(|error| native_clone_error(error, &mut reclaimed))?;
+                    .await;
+                if let Ok(Some(superseded)) = seeds.await {
+                    retiring.retire_superseded(superseded).await;
+                }
+                let receipt = receipt.map_err(|error| native_clone_error(error, &mut reclaimed))?;
                 // Published, the image owns its block; see `resume_fork`.
                 drop(reservation);
                 self.mark_lifecycle_fence_complete(&destination).await;

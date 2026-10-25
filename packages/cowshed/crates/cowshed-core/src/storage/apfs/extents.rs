@@ -64,6 +64,11 @@ impl ImageGeneration {
 }
 
 impl ExtentProof {
+    /// The runs the proof read, at most where its walk stopped.
+    pub fn extents(&self) -> ExtentCount {
+        self.extents
+    }
+
     pub fn revalidate(&self, image: &Path) -> Result<(), ApfsStorageError> {
         let metadata = fs::metadata(image)
             .map_err(|error| io_error("revalidate image extent generation", image, error))?;

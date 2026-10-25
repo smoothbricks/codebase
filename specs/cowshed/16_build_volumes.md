@@ -651,9 +651,9 @@ below).
       a daemon that outlives its stop is `landingDaemonStayed`, and a held Cargo profile is `landingBuilding`, with the
       resource and holder named. Retain the Nx open locks and admitted Cargo locks through the mounted-source capture.
       Every other contributed path is exempt under the named-list rule above. Capture does not unmount the live volume
-      or kill an index reader. On success, publish the target's new seed and retire its previous seed. Writes after the
-      snapshot reach the seed through a reseed (Targets and seeds); the documented new-host-profile gap is not claimed
-      closed.
+      or kill an index reader. On success, publish the target's new seed and claim its previous seeds, released once the
+      land lets go of the target's image lock (Garbage collection). Writes after the snapshot reach the seed through a
+      reseed (Targets and seeds); the documented new-host-profile gap is not claimed closed.
 
    Resolving either build volume for mounting takes its per-image lease **before** reading the attachment inventory. A
    recovered attachment owns a raw IOMedia pin across the subsequent kernel mount-table read and mount, just as a
@@ -698,7 +698,8 @@ below).
    5. hand ownership in the sidecars: the target owns the adopted volume, and its background label becomes
       `build <target>`; its previous volume becomes superseded under the target at its incarnation and is released
       before land returns (GC below), unless a running job's hold still owns it, in which case it stays the target's and
-      that job's end releases it. This applies with `--no-retire` too. Nothing links it any more, so its release runs
+      that job's end releases it. This applies with `--no-retire` too. Nothing links it any more, so its release starts
+      once the land lets go of the target's image lock, with the release of the seeds its freeze replaced, and runs
       beside what the land does in the target next (its supervisor, a kept workspace's fresh clone, the adoption check
       of step 7), so the release's unmount, detach and commit rename can overlap them. It frees no byte before land
       returns: the gateway's cleanup frees the committed image off the land's path, never starting a cut while gate work
@@ -971,9 +972,15 @@ delta incrementally, as an edit would.
   reseed, a cache clear, a dry-run probe), naming it claimed, not released. A land's or a carry's hold waits out an
   exclusive claim instead, and then refuses only when the image is gone: only a release deletes it, so a capture, a
   probe or a release that declines under its claim delays such a hold and never refuses it.
-- A held lifecycle or image lock likewise defers release. A superseded seed is retired only under its target's image
-  lock, which the land and reseed paths hold while they replace it, and seed retirement takes that lock as a typed
-  witness, so collection never releases a seed that a land or reseed is replacing.
+- A held lifecycle or image lock likewise defers release. A superseded seed is claimed under its target's image lock,
+  which the land and reseed paths hold while they replace it, and released once that lock is let go: the claim keeps
+  collection, and a later land or reseed of the target, off it, so none releases a seed another is retiring, and no
+  seed's rename, sync or hand-over to the gateway runs under the lock. A seed already claimed when a land or reseed
+  reads the target's seeds is one an earlier one is retiring, and is left to it, as is one a retiring workspace's own
+  release finds claimed. A land retires its seeds once it lets the target's lock go, and a fork once its create has let
+  every lock go (a git-worktree fork holds its source's until its initializer ends), whether or not either succeeds;
+  only a crash, or a retirement that fails and says so on stderr, leaves a superseded seed recorded under its target,
+  for the next seed's retirement or collection.
 - Collection decides from a snapshot, and a land can move a target's link onto a volume after it: an `rm` that retires
   the landing workspace while that workspace's land still runs sees the landing volume linked by nothing, and once it
   releases it, main's link names a volume that no longer exists. So each release claims the volume first and reads again

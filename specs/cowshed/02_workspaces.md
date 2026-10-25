@@ -1529,12 +1529,15 @@ fence under them, so a journaled request's refusal never stands between the call
 `--abandon` authorizes destroying what main lacks. A removal re-issued after a session's retirement finished, by a
 replay or an earlier call, answers with that retirement's report, whichever options either carried.
 
-A named `rm` can retire an unfinished fork without activating it. The exact pending image is mounted and validated under
-its image lock, then receives the same dirty-state, HEAD-stability and landed-work checks as an active workspace. A
-refusal preserves the image and original clone intent and leaves its mount state as it found it: an image the `rm`
-attached to inspect is detached again, and one it found mounted stays mounted. Once retirement is authorized, its
-journal record retains the original clone source so an interrupted removal can recover. The clone's owned volume and
-seed are released before its source, through the same direct-release or recovery-preservation choice, before answering.
+A named `rm` can retire an unfinished fork without activating it. Its supervisor, if one runs, is stopped first, before
+the clone's image lock is taken, as an active workspace's `rm` stops one: the stop waits for the clone's jobs, and
+nothing waits for them under the lock. The exact pending image is then mounted and validated under its image lock, and
+receives the same dirty-state and landed-work checks as an active workspace, read after its only writer stopped. A
+refusal leaves its supervisor stopped, which only the clone's publication starts again, and says so; it preserves the
+image and original clone intent and leaves its mount state as it found it: an image the `rm` attached to inspect is
+detached again, and one it found mounted stays mounted. Once retirement is authorized, its journal record retains the
+original clone source so an interrupted removal can recover. The clone's owned volume and seed are released before its
+source, through the same direct-release or recovery-preservation choice, before answering.
 
 Removal-scoped startup never finishes the named target's own unpublished clone: it leaves the clone intent for the `rm`
 to retire, so whatever stopped the clone — a duplicate port block, a start revision the source no longer holds — cannot

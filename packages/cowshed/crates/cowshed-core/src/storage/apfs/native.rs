@@ -2825,7 +2825,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 .map_err(|error| io_error("release a retired workspace image", image, error))
         })?;
         if released {
-            self.hand_over(&entry);
+            self.hand_over(&entry, cowshed_gateway_types::ReleaseRecord::default());
             deletion_log::log_deletion_for_image(
                 image,
                 DeletionOp::ReclaimImage,
@@ -2840,15 +2840,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     /// its config names (05_gateway.md, "Deleting released images"), and return: nothing here frees
     /// it. A config that names none (a fixture store no test gave a gateway) says so once, and the
     /// entry waits in `.deleting` for a gateway's start.
-    pub(super) fn hand_over(&self, entry: &Path) {
+    pub(super) fn hand_over(&self, entry: &Path, record: cowshed_gateway_types::ReleaseRecord) {
         match &self.config.cleanup {
-            Some(socket) => {
-                super::deleter::hand_over(
-                    socket,
-                    entry,
-                    cowshed_gateway_types::ReleaseRecord::default(),
-                );
-            }
+            Some(socket) => super::deleter::hand_over(socket, entry, record),
             None => {
                 static SAID: std::sync::Once = std::sync::Once::new();
                 SAID.call_once(|| {
@@ -2901,7 +2895,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let released = super::release::commit_release(image, &entry)
             .map_err(|error| io_error("release an image nothing owns", image, error))?;
         if released {
-            self.hand_over(&entry);
+            self.hand_over(&entry, cowshed_gateway_types::ReleaseRecord::default());
         }
         Ok(released)
     }

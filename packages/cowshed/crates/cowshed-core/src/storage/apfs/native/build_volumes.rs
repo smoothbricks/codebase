@@ -348,6 +348,11 @@ where
             Ok(proof) => proof,
             Err(error) => return Err(self.unregister(layout, &destination, creating, error)),
         };
+        // A seed's record keeps its proof's count, for the cleanup that frees it once released.
+        let registration = match &proof {
+            Some(proof) => registration.counted(proof.extents().get()),
+            None => registration,
+        };
         if let Err(error) = layout.publish(&destination, &registration) {
             return Err(self.unregister(layout, &destination, creating, host_error(error)));
         }
@@ -798,10 +803,11 @@ where
             .try_exists()
             .map_err(|error| io_error("inspect a build volume before release", &image, error))?;
         // Resolve ownership before deleting anything; unreadable evidence refuses release.
-        let recorded = layout
+        let record = layout
             .read_record_present(id)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?
-            .map(|record| record.role);
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        let extents = record.as_ref().and_then(|record| record.extents);
+        let recorded = record.map(|record| record.role);
         if present && recorded.is_none() {
             return Err(ApfsStorageError::Host(format!(
                 "build volume {id} at {} has no ownership record; refusing to release an unregistered image",
@@ -836,7 +842,13 @@ where
         })?;
         if removed {
             layout.journal_release(id, recorded.as_ref(), true);
-            self.hand_over(&layout.released(id));
+            self.hand_over(
+                &layout.released(id),
+                cowshed_gateway_types::ReleaseRecord {
+                    unique_bytes: None,
+                    extents: extents.and_then(std::num::NonZeroU64::new),
+                },
+            );
         }
         // A volume whose image was already gone is retired by its record alone, said as such.
         if remove_if_present(&layout.record(id))? && !removed {

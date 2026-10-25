@@ -2147,11 +2147,12 @@ uninterruptible waits behind them.
   `{"op":"released","entry":"<absolute path>","uniqueBytes":<n>?,"extents":<n>?}`, answered `{"ok":true}` once the
   gateway has queued the entry. The two counts are the releaser's record of the image: `uniqueBytes`, the bytes it does
   not share with its source, which freeing it returns, and `extents`, its physical runs, which freeing it costs. Each is
-  present only when the releaser knows it: seed capture and compaction record them, and a release that walks no extent
-  map (13_telemetry.md, "Native image observations") knows neither. If the gateway is absent, does not answer within the
-  2 s every admission's acknowledgement has ("A fork or attach waits for its repository's gate"), or refuses, the
-  releaser says so once on stderr, and the entry waits for the gateway's next start: its rename is the release, so the
-  verb still answers.
+  present only when the releaser knows it: a seed's release sends `extents`, the count its publication proof read and
+  its record keeps (at most 7141, where that proof stops; 16_build_volumes.md, "Targets and seeds"), and a release that
+  walks no extent map (13_telemetry.md, "Native image observations") knows neither. If the gateway is absent, does not
+  answer within the 2 s every admission's acknowledgement has ("A fork or attach waits for its repository's gate"), or
+  refuses, the releaser says so once on stderr, and the entry waits for the gateway's next start: its rename is the
+  release, so the verb still answers.
 - **The gateway validates what it is handed.** An entry is an absolute path, with no `..` component, inside the
   gateway's store and in a `.deleting` directory; anything else is refused as `invalid-request` and queued nowhere.
 - **One thread, `image-cleanup`, owns the queue.** The gateway starts it when it starts serving ("Startup contract",
