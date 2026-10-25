@@ -19,8 +19,9 @@ fn the_host_exits_with_its_childs_exit_code() {
         .status_locked()
         .unwrap();
     assert_eq!(status.code(), Some(7));
+    // `/bin/sh` is the one program path every supported host has: NixOS keeps no `/usr/bin/true`.
     let status = Command::new(cowshed())
-        .args([VERB, "/usr/bin/true"])
+        .args([VERB, "/bin/sh", "-c", "exit 0"])
         .status_locked()
         .unwrap();
     assert_eq!(status.code(), Some(0));

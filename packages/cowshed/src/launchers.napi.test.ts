@@ -72,7 +72,7 @@ class Fixture {
   /** A fifo the fixture's runs read `reads` times (a run only writing it reads it 0 times). */
   fifo(name: string, reads: number): string {
     const path = join(this.root, name);
-    const made = spawnSync('/usr/bin/mkfifo', [path]);
+    const made = spawnSync('mkfifo', [path]);
     expect(made.status).toBe(0);
     this.#fifos.push({ path, reads });
     return path;
