@@ -417,11 +417,12 @@ existed. While a request waits, the client now checks every 5 s (`DAEMON_LIVENES
 when the request began still runs. A pid that does not run loses the daemon with an error naming that pid and the socket
 (`daemonGone`). Under `NX_DAEMON_START=never` the error is tagged `daemonStartForbidden`, and the request continues in
 its own process. The file-watcher and project-graph-listener streams take the same check from when they connect. Once
-their daemon is gone, each callback gets that error and then `closed`, and the stream is let go. A record that names no
-pid arms no check (smoothbricks `specs/cowshed/05_gateway.md`, "Deadlines"). A third case of
-`nx-daemon-validity.test.ts` binds a listener that never answers on the recorded socket, under a record naming a pid
-that has ended. The client's request must fail with that pid and socket named; before this hunk it waited out the
-keep-alive.
+their daemon is gone, each callback gets that error, and the stream is let go. A file watcher then gets `closed`, which
+`nx watch` exits on. A project-graph listener gets the error alone, because its consumer debounces its callback and
+keeps only the last call. A record that names no pid arms no check (smoothbricks `specs/cowshed/05_gateway.md`,
+"Deadlines"). A third case of `nx-daemon-validity.test.ts` binds a listener that never answers on the recorded socket,
+under a record naming a pid that has ended. The client's request must fail with that pid and socket named; before this
+hunk it waited out the keep-alive.
 
 ## Package-manager runs keep the daemon's graph
 
