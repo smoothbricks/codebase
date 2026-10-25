@@ -3,6 +3,7 @@
   "files": {
     "src/monorepo/linked-snapshots.test.ts": 14876,
     "src/cli.test.ts": 14775,
+    "src/lib/nx-tools.test.ts": 15440,
     "src/release/__tests__/fixture-repo.test.ts": 10328,
     "src/monorepo/setup-environment.test.ts": 7105,
     "src/monorepo/setup-environment-links.test.ts": 6507,

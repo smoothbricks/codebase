@@ -10,7 +10,6 @@
     "./package.json": "./package.json",
     ".": {
       "types": "./dist/ts/build-inputs.d.ts",
-      "development": "./src/build-inputs.ts",
       "import": "./dist/ts/build-inputs.js",
       "default": "./dist/ts/build-inputs.js"
     }

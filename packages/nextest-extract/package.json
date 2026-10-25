@@ -10,7 +10,6 @@
     "./package.json": "./package.json",
     ".": {
       "types": "./dist/ts/nextest-extraction.d.ts",
-      "development": "./src/nextest-extraction.ts",
       "import": "./dist/ts/nextest-extraction.js",
       "default": "./dist/ts/nextest-extraction.js"
     }
