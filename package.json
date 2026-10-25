@@ -141,7 +141,7 @@
       },
       "spec-links": {
         "executor": "nx:run-commands",
-        "cache": false,
+        "cache": true,
         "inputs": [
           "{workspaceRoot}/**/*"
         ],
