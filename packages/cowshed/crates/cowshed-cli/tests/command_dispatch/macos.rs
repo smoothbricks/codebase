@@ -7767,7 +7767,7 @@ async fn directory_killed_covered_install_restores_links_its_postinstall_removed
     // before writing `ready` is reported with its actual state and stderr.
     while !fs::read_to_string(&ready).is_ok_and(|text| !text.is_empty()) {
         let status = job.status().await.expect("the covered job's status");
-        if !matches!(status.state, cowshed_core::api::dto::JobState::Running) {
+        if status.state.is_terminal() {
             let mut logs = job
                 .logs(cowshed_core::api::JobStream::Stderr, 0, false)
                 .await
