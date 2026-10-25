@@ -19,7 +19,9 @@ use cowshed_core::api::{
     BranchLandings, LandingCommits, UnlandedChange, UnlandedPaths, WorkspaceIncarnation,
     WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspaceRole, WorkspaceState,
 };
-use cowshed_core::landing::{annotate_listing, measure, resolve_target, unmatched_commits};
+use cowshed_core::landing::{
+    abandoned_refs, annotate_listing, measure, resolve_target, unmatched_commits,
+};
 use cowshed_core::repository::RepoId;
 use cowshed_os::fork_lock::Run as _;
 
@@ -661,6 +663,76 @@ async fn an_unpicked_commit_beside_a_picked_one_is_named_and_the_picked_file_is_
     );
 }
 
+/// The gc sweep's question (01_storage.md, "Retention") of an abandonment main holds partly: one
+/// commit main took by pick and then edited past, and one it never took, which also changed a file
+/// the picked commit changed. Patch identity holds the picked commit, so `gate.txt`, which only it
+/// changed, is not named although main's lines lack its change; `shared.txt` and `notes.txt`,
+/// which the untaken commit changed, are named, and only the untaken commit is counted.
+#[tokio::test]
+async fn an_abandonment_main_holds_partly_is_kept_naming_only_what_neither_proof_holds() {
+    let fixture = Fixture::new("abandoned-partly");
+    fixture.parent_commit("gate.txt", "alpha\nbeta\ngamma\n", "gate");
+    fixture.parent_commit("shared.txt", "one\ntwo\nthree\n", "shared");
+    let mount = fixture.clone_workspace("partly");
+    fs::write(mount.join("gate.txt"), "alpha\nbeta shed\ngamma\n").expect("edit gate");
+    fs::write(mount.join("shared.txt"), "one shed\ntwo\nthree\n").expect("edit shared");
+    git(&mount, ["add", "-A"]);
+    commit(&mount, "cover the gate");
+    let picked = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
+    fs::write(mount.join("shared.txt"), "one shed\ntwo\nthree shed\n").expect("edit shared");
+    fs::write(mount.join("notes.txt"), "never picked\n").expect("add notes");
+    git(&mount, ["add", "-A"]);
+    commit(&mount, "shed notes");
+    let head = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
+    pick(&fixture, &mount, &picked);
+    fixture.write_parent("gate.txt", "alpha\nbeta main\ngamma\n");
+    fixture.write_parent("shared.txt", "one main\ntwo\nthree\n");
+    git(fixture.parent(), ["add", "-A"]);
+    commit(fixture.parent(), "main rewrites both");
+    git(
+        fixture.parent(),
+        [
+            "update-ref",
+            &format!("refs/cowshed/partly/abandoned/{head}/HEAD"),
+            &head,
+        ],
+    );
+
+    let target = resolve_target(fixture.store(), &fixture.parent(), TARGET)
+        .await
+        .expect("main resolves");
+    let (measured, unreadable) = abandoned_refs(fixture.store(), &target)
+        .await
+        .expect("main's abandonments are measured");
+    assert!(unreadable.is_empty(), "{unreadable:?}");
+    let [refs] = measured.as_slice() else {
+        panic!("one abandonment, measured: {measured:?}");
+    };
+    assert!(!refs.landed(), "{refs:?}");
+    let [tip] = refs.tips.as_slice() else {
+        panic!("one kept tip: {refs:?}");
+    };
+    let LandingCommits::Measured {
+        unlanded,
+        landed,
+        unlanded_paths: UnlandedPaths::Named { paths },
+        ..
+    } = &tip.commits
+    else {
+        panic!("a live measurement names its files: {tip:?}");
+    };
+    assert_eq!((*unlanded, *landed), (1, 1), "{tip:?}");
+    assert_eq!(
+        paths
+            .iter()
+            .map(|unlanded| (unlanded.path.as_str(), &unlanded.change))
+            .collect::<Vec<_>>(),
+        [
+            ("notes.txt", &UnlandedChange::Added),
+            ("shared.txt", &UnlandedChange::Conflict),
+        ]
+    );
+}
 /// A squash of two commits matches neither one's patch, so once main edits past the squashed
 /// lines no proof holds them: both commits are unlanded and named. Patch identity admits a commit
 /// main holds verbatim, never a squash or a resolution it cannot see in any single patch.

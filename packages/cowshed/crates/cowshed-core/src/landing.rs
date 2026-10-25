@@ -151,19 +151,15 @@ pub async fn published_holding(
     {
         return None;
     }
-    let target_ahead = target
-        .commits_ahead_of(published.tip.as_str(), target_tip.as_str())
-        .await
-        .ok()?;
-    let target_behind = target
-        .commits_ahead_of(target_tip.as_str(), published.tip.as_str())
+    let divergence = target
+        .divergence(published.tip.as_str(), target_tip.as_str())
         .await
         .ok()?;
     Some(PublishedHolding {
         reference: published.branch,
         tip: published.tip,
-        target_ahead,
-        target_behind,
+        target_ahead: divergence.ahead,
+        target_behind: divergence.behind,
     })
 }
 
@@ -469,12 +465,8 @@ async fn counted(
     let tip = target.tip.as_str();
     // Strict on both endpoints: if the workspace cannot see main's tip even with main's object
     // store attached, the comparison has not been made and must not be reported as if it had.
-    let ahead = workspace
-        .commits_ahead_of(tip, head)
-        .await
-        .map_err(|error| error.message)?;
-    let behind = workspace
-        .commits_ahead_of(head, tip)
+    let crate::git::Divergence { ahead, behind } = workspace
+        .divergence(tip, head)
         .await
         .map_err(|error| error.message)?;
     let unheld = if ahead == 0 {

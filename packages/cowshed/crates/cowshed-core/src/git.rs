@@ -184,6 +184,15 @@ pub struct CommitSubject {
     pub subject: String,
 }
 
+/// How far two commits' histories have diverged ([`GitRepository::divergence`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Divergence {
+    /// Commits `head` has that `revision` does not.
+    pub ahead: u64,
+    /// Commits `revision` has that `head` does not.
+    pub behind: u64,
+}
+
 /// What a head carries that a target holds neither by content nor by patch identity
 /// ([`GitRepository::content_not_held`]).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -220,6 +229,93 @@ impl TreeEntry {
 
 /// Path to its entry on each side of a tree comparison, `(from, to)`, in path order.
 type TreeChanges = std::collections::BTreeMap<Vec<u8>, (Option<TreeEntry>, Option<TreeEntry>)>;
+
+/// What the content proof can say of one file a head changed before anything is merged
+/// ([`content_proof`]).
+enum ContentProof<'a> {
+    Held,
+    Unheld(UnlandedChange),
+    /// Both sides changed a regular file's bytes, so only merging them can tell.
+    Merge(Merge<'a>),
+}
+
+/// A regular file's entry at the merge base, the head and the target, all three present.
+struct Merge<'a> {
+    base: &'a TreeEntry,
+    here: &'a TreeEntry,
+    target: &'a TreeEntry,
+}
+
+impl Merge<'_> {
+    /// The head's mode change, when the target holds the content but not it.
+    fn mode_change(&self) -> Option<UnlandedChange> {
+        (self.here.mode != self.target.mode && self.here.mode != self.base.mode)
+            .then_some(UnlandedChange::Mode)
+    }
+}
+
+/// Why `revision` does not hold `head`'s change to one file, as far as the entries alone tell.
+/// Each side is the file's entry at the merge base, the head and the target, absent where the
+/// file is.
+fn content_proof<'a>(
+    base: Option<&'a TreeEntry>,
+    here: Option<&'a TreeEntry>,
+    target: Option<&'a TreeEntry>,
+) -> ContentProof<'a> {
+    let merge = match (base, here, target) {
+        (_, None, None) => return ContentProof::Held,
+        (_, None, Some(_)) => return ContentProof::Unheld(UnlandedChange::Deleted),
+        (None, Some(_), None) => return ContentProof::Unheld(UnlandedChange::Added),
+        (Some(_), Some(_), None) => return ContentProof::Unheld(UnlandedChange::DeletedInTarget),
+        (None, Some(here), Some(target)) => {
+            return ContentProof::Unheld(if here.oid == target.oid {
+                UnlandedChange::Mode
+            } else {
+                UnlandedChange::Conflict
+            });
+        }
+        (Some(base), Some(here), Some(target)) => Merge { base, here, target },
+    };
+    let content = if merge.here.oid == merge.target.oid || merge.here.oid == merge.base.oid {
+        None
+    } else if merge.target.oid == merge.base.oid {
+        Some(UnlandedChange::Missing)
+    } else if [merge.base, merge.here, merge.target]
+        .iter()
+        .all(|entry| entry.is_regular_file())
+    {
+        return ContentProof::Merge(merge);
+    } else {
+        // A symlink or submodule both sides moved to different places has no lines to merge.
+        Some(UnlandedChange::Conflict)
+    };
+    match content.or_else(|| merge.mode_change()) {
+        Some(change) => ContentProof::Unheld(change),
+        None => ContentProof::Held,
+    }
+}
+
+/// Blobs read in one batch: each one's bytes are a span of the batch's output.
+#[derive(Default)]
+struct Blobs {
+    bytes: Vec<u8>,
+    spans: Vec<std::ops::Range<usize>>,
+}
+
+impl Blobs {
+    fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        self.spans.iter().map(|span| &self.bytes[span.clone()])
+    }
+}
+
+/// One commit of a range listing ([`parse_range_listing`]): its oid, whether it is a merge, its
+/// subject and every path it changes against its first parent.
+struct RangeCommit<'a> {
+    oid: &'a str,
+    merge: bool,
+    subject: &'a str,
+    paths: Vec<&'a [u8]>,
+}
 
 #[derive(Clone, Debug)]
 pub struct GitRepository {
@@ -1638,7 +1734,7 @@ impl GitRepository {
 
     /// How many commits are reachable from any of `heads` and not from `target`.
     ///
-    /// Strict about the target like [`Self::commits_ahead_of`]: a target this repository cannot
+    /// Strict about the target like [`Self::divergence`]: a target this repository cannot
     /// see is refused rather than dropped from the range. `None` counts every commit the heads
     /// reach: nothing proves any of it is held elsewhere.
     async fn commits_reachable(&self, target: Option<&str>, heads: &[&str]) -> Result<u64> {
@@ -1755,15 +1851,37 @@ impl GitRepository {
         parse_one_path(root_output, "git object store")
     }
 
-    /// How many commits `head` has that `revision` does not.
+    /// How many commits `head` has that `revision` does not, and how many `revision` has that
+    /// `head` does not, from one `rev-list --left-right --count`.
     ///
     /// Strict where [`Self::commits_ahead`] is lenient: an endpoint this repository cannot see is
     /// refused rather than dropped from the range. Dropping it silently would turn "I cannot see
     /// the target" into a plausible-looking count, which is the one failure mode a landing check
     /// must not have.
-    pub async fn commits_ahead_of(&self, revision: &str, head: &str) -> Result<u64> {
+    pub async fn divergence(&self, revision: &str, head: &str) -> Result<Divergence> {
         self.require_commits([revision, head]).await?;
-        self.count_range(&format!("{revision}..{head}")).await
+        let counts = self
+            .read_one(
+                [
+                    "rev-list",
+                    "--left-right",
+                    "--count",
+                    &format!("{revision}...{head}"),
+                ],
+                "count commits",
+            )
+            .await?;
+        // The left side is `revision`'s own commits, the right side `head`'s.
+        let parsed = counts
+            .split_once('\t')
+            .and_then(|(behind, ahead)| Some((ahead.parse().ok()?, behind.parse().ok()?)));
+        let Some((ahead, behind)) = parsed else {
+            return Err(CowshedError::integrity(
+                format!("git reported unparseable commit counts: {counts}"),
+                "repair the git repository",
+            ));
+        };
+        Ok(Divergence { ahead, behind })
     }
 
     /// Refuse an endpoint this repository cannot see instead of letting git drop it from a range:
@@ -1803,8 +1921,21 @@ impl GitRepository {
     /// held. A squash of several commits or a conflict-resolved pick matches no commit's patch, so
     /// it is held by content or not at all.
     ///
+    /// Patch identity is asked first, because it decides which files the content proof is asked
+    /// of. A file is unheld only while a commit that changes it is held by neither proof, and every
+    /// commit `rev-list <range> -- <file>` names changes that file, or a path under it, against
+    /// its first parent. One `git log` over the range lists those paths for every commit; a file
+    /// none of the commits outside the patch-held set changes is held without being merged. A
+    /// target that took most of a range by pick and then edited past it, which is what keeps an
+    /// abandonment's refs (01_storage.md, "Retention"), merges only the files of the commits it did
+    /// not take. Each merge is one `git merge-file`, git having no batch form of it, and the
+    /// target's versions they are judged against are read in one `git cat-file --batch`. In a
+    /// range without merges history simplification drops nothing, so the same listing names the
+    /// commits that change an unheld file; a range with a merge asks `rev-list` file by file,
+    /// since a merge can drop a side branch's commits from that answer.
+    ///
     /// Nothing is written: `merge-file -p` prints its result rather than storing it. Strict on
-    /// both endpoints like [`Self::commits_ahead_of`]. Histories with no merge base are refused:
+    /// both endpoints like [`Self::divergence`]. Histories with no merge base are refused:
     /// there is no change of `head`'s to judge, only two unrelated trees.
     pub async fn content_not_held(&self, revision: &str, head: &str) -> Result<ContentNotHeld> {
         self.require_commits([revision, head]).await?;
@@ -1813,45 +1944,93 @@ impl GitRepository {
         if changed.is_empty() {
             return Ok(ContentNotHeld::default());
         }
+        let held = self.held_commits(revision, head).await?;
+        let listing = self.range_listing(revision, head).await?;
+        let range = parse_range_listing(&listing)?;
+        let unheld_changes: std::collections::BTreeSet<&[u8]> = range
+            .iter()
+            .filter(|commit| !held.contains(commit.oid))
+            .flat_map(|commit| commit.paths.iter().copied())
+            .collect();
         let differing = self.tree_changes(revision, head).await?;
-        let mut unheld = Vec::new();
+        let mut unheld = std::collections::BTreeMap::new();
+        let mut merged_paths = Vec::new();
+        let mut merges = Vec::new();
         for (path, (target, here)) in &differing {
             // A path only the target changed is the target's own work, not the workspace's.
             let Some((base, _)) = changed.get(path) else {
                 continue;
             };
-            if let Some(change) = self
-                .change_not_held(base.as_ref(), here.as_ref(), target.as_ref())
-                .await?
-            {
-                unheld.push((path.as_slice(), change));
+            if !changes_path(&unheld_changes, path) {
+                continue;
+            }
+            match content_proof(base.as_ref(), here.as_ref(), target.as_ref()) {
+                ContentProof::Held => {}
+                ContentProof::Unheld(change) => {
+                    unheld.insert(path.as_slice(), change);
+                }
+                ContentProof::Merge(merge) => {
+                    merged_paths.push(path.as_slice());
+                    merges.push(merge);
+                }
             }
         }
-        if unheld.is_empty() {
-            return Ok(ContentNotHeld::default());
+        for (path, change) in merged_paths
+            .into_iter()
+            .zip(self.merged_changes(&merges).await?)
+        {
+            if let Some(change) = change {
+                unheld.insert(path, change);
+            }
         }
-        let held = self.held_commits(revision, head).await?;
+        let linear = range.iter().all(|commit| !commit.merge);
+        let listed: std::collections::BTreeSet<&str> =
+            range.iter().map(|commit| commit.oid).collect();
         let mut paths = Vec::new();
         let mut unmatched = std::collections::BTreeSet::new();
         for (path, change) in unheld {
-            let changing = self.commits_changing(revision, head, path).await?;
-            // Every unheld file differs from the merge base, so some commit of the range changed it.
-            // Git disagreeing with itself here must not read as "held by patch identity".
-            if changing.is_empty() {
-                return Err(CowshedError::integrity(
-                    format!(
-                        "git reported that {revision} lacks the change to {}, yet no commit of \
-                         {revision}..{head} changes it: refusing to guess which is right",
-                        String::from_utf8_lossy(path)
-                    ),
-                    "repair the git repository",
-                ));
-            }
-            let mut unheld_by = changing
-                .into_iter()
-                .filter(|oid| !held.contains(oid))
-                .peekable();
-            if unheld_by.peek().is_some() {
+            let unheld_by: Vec<&str> = if linear {
+                range
+                    .iter()
+                    .filter(|commit| {
+                        !held.contains(commit.oid)
+                            && commit.paths.iter().any(|changed| within(changed, path))
+                    })
+                    .map(|commit| commit.oid)
+                    .collect()
+            } else {
+                let changing = self.commits_changing(revision, head, path).await?;
+                // Every unheld file differs from the merge base, so some commit of the range
+                // changed it. Git disagreeing with itself here must not read as "held by patch
+                // identity".
+                if changing.is_empty() {
+                    return Err(CowshedError::integrity(
+                        format!(
+                            "git reported that {revision} lacks the change to {}, yet no commit of \
+                             {revision}..{head} changes it: refusing to guess which is right",
+                            String::from_utf8_lossy(path)
+                        ),
+                        "repair the git repository",
+                    ));
+                }
+                let mut unheld_by = Vec::new();
+                for oid in changing.iter().filter(|oid| !held.contains(*oid)) {
+                    // Both answers come out of the same range, so every commit git names is listed.
+                    let Some(listed) = listed.get(oid.as_str()) else {
+                        return Err(CowshedError::integrity(
+                            format!(
+                                "git named {oid} as a commit of {revision}..{head} that changes {}, \
+                                 yet does not list it in that range: refusing to guess which is right",
+                                String::from_utf8_lossy(path)
+                            ),
+                            "repair the git repository",
+                        ));
+                    };
+                    unheld_by.push(*listed);
+                }
+                unheld_by
+            };
+            if !unheld_by.is_empty() {
                 unmatched.extend(unheld_by);
                 paths.push(UnlandedPath {
                     path: String::from_utf8_lossy(path).into_owned(),
@@ -1859,105 +2038,163 @@ impl GitRepository {
                 });
             }
         }
-        let commits = self
-            .range_subjects(revision, head, |oid| unmatched.contains(oid))
-            .await?;
-        // `unmatched` came out of the same range, so every one of its commits is listed there.
-        if commits.len() != unmatched.len() {
-            return Err(CowshedError::integrity(
-                format!(
-                    "git named {} commits of {revision}..{head} that change an unheld file, yet \
-                     lists {} of them in that range: refusing to guess which is right",
-                    unmatched.len(),
-                    commits.len()
-                ),
-                "repair the git repository",
-            ));
-        }
+        let commits = range
+            .iter()
+            .filter(|commit| unmatched.contains(commit.oid))
+            .map(|commit| {
+                Ok(CommitSubject {
+                    oid: parse_oid(commit.oid.to_owned(), "commit subject")?,
+                    subject: commit.subject.to_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(ContentNotHeld { paths, commits })
     }
 
-    /// Why `revision` does not hold `head`'s change to one file, or `None` when it does. Each
-    /// side is the file's entry at the merge base, the head and the target, absent where the file
-    /// is.
-    async fn change_not_held(
-        &self,
-        base: Option<&TreeEntry>,
-        here: Option<&TreeEntry>,
-        target: Option<&TreeEntry>,
-    ) -> Result<Option<UnlandedChange>> {
-        let (base, here, target) = match (base, here, target) {
-            (_, None, None) => return Ok(None),
-            (_, None, Some(_)) => return Ok(Some(UnlandedChange::Deleted)),
-            (None, Some(_), None) => return Ok(Some(UnlandedChange::Added)),
-            (Some(_), Some(_), None) => return Ok(Some(UnlandedChange::DeletedInTarget)),
-            (None, Some(here), Some(target)) => {
-                return Ok(Some(if here.oid == target.oid {
-                    UnlandedChange::Mode
-                } else {
-                    UnlandedChange::Conflict
-                }));
-            }
-            (Some(base), Some(here), Some(target)) => (base, here, target),
-        };
-        let content = if here.oid == target.oid || here.oid == base.oid {
-            None
-        } else if target.oid == base.oid {
-            Some(UnlandedChange::Missing)
-        } else if [base, here, target]
-            .iter()
-            .all(|entry| entry.is_regular_file())
-        {
-            self.merged_change(base, here, target).await?
-        } else {
-            // A symlink or submodule both sides moved to different places has no lines to merge.
-            Some(UnlandedChange::Conflict)
-        };
-        Ok(content.or_else(|| {
-            (here.mode != target.mode && here.mode != base.mode).then_some(UnlandedChange::Mode)
-        }))
-    }
-
-    /// Merge the workspace's change (`base` to `here`) into the target's version of a file both
+    /// Merge each workspace change (`base` to `here`) into the target's version of a file both
     /// sides changed, and judge whether the target's version already holds it
     /// ([`crate::held_change`]): a conflicted region is held when the target has the workspace's
-    /// hunks in it beside its own.
-    async fn merged_change(
-        &self,
-        base: &TreeEntry,
-        here: &TreeEntry,
-        target: &TreeEntry,
-    ) -> Result<Option<UnlandedChange>> {
-        let merged = self
+    /// hunks in it beside its own. One answer per merge, in order, a mode change the content holds
+    /// included. The target's versions are read in one `git cat-file --batch`.
+    async fn merged_changes(&self, merges: &[Merge<'_>]) -> Result<Vec<Option<UnlandedChange>>> {
+        let mut printed = Vec::with_capacity(merges.len());
+        for merge in merges {
+            let merged = self
+                .run([
+                    "merge-file",
+                    "-p",
+                    "--diff3",
+                    &format!("--marker-size={}", crate::held_change::MARKER_SIZE),
+                    "--object-id",
+                    merge.target.oid.as_str(),
+                    merge.base.oid.as_str(),
+                    merge.here.oid.as_str(),
+                ])
+                .await?;
+            // `merge-file` exits with its conflict count, capped at 127, and with 255 when it
+            // cannot merge at all, as for binary content.
+            printed.push(if matches!(merged.status.code(), Some(0..=127)) {
+                Ok(merged.stdout)
+            } else {
+                Err(UnlandedChange::Unmergeable {
+                    reason: git_message("merge the workspace's change into the target's", &merged),
+                })
+            });
+        }
+        let judged: Vec<&str> = merges
+            .iter()
+            .zip(&printed)
+            .filter(|(_, printed)| printed.is_ok())
+            .map(|(merge, _)| merge.target.oid.as_str())
+            .collect();
+        let held = self.blobs(&judged).await?;
+        let mut held = held.iter();
+        let mut changes = Vec::with_capacity(merges.len());
+        for (merge, printed) in merges.iter().zip(printed) {
+            let content = match printed {
+                Err(unmergeable) => Some(unmergeable),
+                Ok(merged) => {
+                    let Some(held) = held.next() else {
+                        return Err(CowshedError::internal(
+                            "git read fewer of the target's versions than were merged",
+                        ));
+                    };
+                    match crate::held_change::judge(&merged, held) {
+                        crate::held_change::Verdict::Held => merge.mode_change(),
+                        crate::held_change::Verdict::Missing => Some(UnlandedChange::Missing),
+                        crate::held_change::Verdict::Conflict => Some(UnlandedChange::Conflict),
+                    }
+                }
+            };
+            changes.push(content);
+        }
+        Ok(changes)
+    }
+
+    /// The bytes of each blob `oids` names, in order, from one `git cat-file --batch`. An
+    /// object that is missing or not a blob is an error, and so is an answer git cut short.
+    async fn blobs(&self, oids: &[&str]) -> Result<Blobs> {
+        if oids.is_empty() {
+            return Ok(Blobs::default());
+        }
+        let mut input = Vec::with_capacity(oids.iter().map(|oid| oid.len() + 1).sum());
+        for oid in oids {
+            input.extend_from_slice(oid.as_bytes());
+            input.push(b'\n');
+        }
+        let output = self.run_input(["cat-file", "--batch"], input).await?;
+        if !output.status.success() {
+            return Err(git_internal("read the target's versions of files", &output));
+        }
+        let unreadable = |oid: &str| {
+            CowshedError::integrity(
+                format!("git reported an unreadable batch answer for {oid}"),
+                "repair the git installation",
+            )
+        };
+        let mut spans = Vec::with_capacity(oids.len());
+        let mut at = 0;
+        for oid in oids {
+            let rest = &output.stdout[at..];
+            let header_end = rest
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .ok_or_else(|| unreadable(oid))?;
+            let header = std::str::from_utf8(&rest[..header_end]).map_err(|_| unreadable(oid))?;
+            let size = header
+                .strip_prefix(*oid)
+                .and_then(|answer| answer.strip_prefix(" blob "))
+                .ok_or_else(|| {
+                    CowshedError::internal(format!(
+                        "git cannot read the target's version of a file: {header}"
+                    ))
+                })?
+                .parse::<usize>()
+                .map_err(|_| unreadable(oid))?;
+            let start = at + header_end + 1;
+            let end = start + size;
+            if output.stdout.get(end) != Some(&b'\n') {
+                return Err(unreadable(oid));
+            }
+            spans.push(start..end);
+            at = end + 1;
+        }
+        if at != output.stdout.len() {
+            return Err(CowshedError::integrity(
+                "git answered more of a batch read than it was asked",
+                "repair the git installation",
+            ));
+        }
+        Ok(Blobs {
+            bytes: output.stdout,
+            spans,
+        })
+    }
+
+    /// The commits of `revision..head` as `git log` lists them for [`parse_range_listing`]:
+    /// oldest first, each with its parents, its subject and every path it changes against its
+    /// first parent, all of a root commit's. Renames are a deletion and an addition, and each
+    /// option a config could change (`log.showRoot`, `log.diffMerges`, `diff.renames`,
+    /// `diff.ignoreSubmodules`) is spelled out.
+    async fn range_listing(&self, revision: &str, head: &str) -> Result<Vec<u8>> {
+        let output = self
             .run([
-                "merge-file",
-                "-p",
-                "--diff3",
-                &format!("--marker-size={}", crate::held_change::MARKER_SIZE),
-                "--object-id",
-                target.oid.as_str(),
-                base.oid.as_str(),
-                here.oid.as_str(),
+                "log",
+                "--reverse",
+                "-z",
+                "--name-only",
+                "--no-renames",
+                "--root",
+                "--diff-merges=first-parent",
+                "--ignore-submodules=none",
+                "--format=%x00%H%x00%P%x00%s",
+                &format!("{revision}..{head}"),
             ])
             .await?;
-        // `merge-file` exits with its conflict count, capped at 127, and with 255 when it cannot
-        // merge at all, as for binary content.
-        if !matches!(merged.status.code(), Some(0..=127)) {
-            return Ok(Some(UnlandedChange::Unmergeable {
-                reason: git_message("merge the workspace's change into the target's", &merged),
-            }));
+        if !output.status.success() {
+            return Err(git_internal("list the range's commits and paths", &output));
         }
-        let held = self.run(["cat-file", "blob", target.oid.as_str()]).await?;
-        if !held.status.success() {
-            return Err(git_internal("read the target's version of a file", &held));
-        }
-        Ok(
-            match crate::held_change::judge(&merged.stdout, &held.stdout) {
-                crate::held_change::Verdict::Held => None,
-                crate::held_change::Verdict::Missing => Some(UnlandedChange::Missing),
-                crate::held_change::Verdict::Conflict => Some(UnlandedChange::Conflict),
-            },
-        )
+        Ok(output.stdout)
     }
 
     async fn merge_base(&self, revision: &str, head: &str) -> Result<String> {
@@ -2079,7 +2316,7 @@ impl GitRepository {
     ///   equivalent to an unrelated upstream one. A false equivalence between two unrelated
     ///   markers is not a proof of anything.
     ///
-    /// Strict on both endpoints like [`Self::commits_ahead_of`]: a commit this repository cannot
+    /// Strict on both endpoints like [`Self::divergence`]: a commit this repository cannot
     /// see has not been compared, and an empty list for it would read as "nothing is lost".
     pub async fn commits_not_held(&self, revision: &str, head: &str) -> Result<Vec<CommitSubject>> {
         self.require_commits([revision, head]).await?;
@@ -3399,6 +3636,40 @@ impl GitRepository {
         )
         .await
     }
+
+    /// [`Self::run`] for a batch verb, with `input` on its stdin. The input is written while
+    /// git's output is drained: a batch verb answers as it reads, so writing all of it before
+    /// reading any answer deadlocks once the answers fill the stdout pipe. A write that fails
+    /// because git exited early is not reported, git's status and answers are: a batch git did not
+    /// read whole answers short, which its caller refuses.
+    async fn run_input<I, S>(&self, args: I, input: Vec<u8>) -> Result<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut child = git_command_with_objects(
+            #[cfg(target_os = "macos")]
+            &self.store_root,
+            &self.root,
+            self.alternate_objects.as_deref(),
+            #[cfg(target_os = "macos")]
+            None,
+        )?
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn_locked()
+        .map_err(|error| git_spawn_error(&error))?;
+        let stdin = child.stdin.take();
+        let write = async move {
+            if let Some(mut stdin) = stdin {
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stdin, &input).await;
+            }
+        };
+        let ((), output) = tokio::join!(write, child.wait_with_output());
+        output.map_err(|error| git_spawn_error(&error))
+    }
 }
 
 async fn run_git_at<I, S>(
@@ -4167,6 +4438,30 @@ pub(crate) fn git_ended(output: &Output) -> String {
     }
 }
 
+/// Controller Git at `root` with `alternate_objects` attached, before its verb.
+fn git_command_with_objects(
+    #[cfg(target_os = "macos")] store_root: &Path,
+    root: &Path,
+    alternate_objects: Option<&Path>,
+    #[cfg(target_os = "macos")] writable: Option<&Path>,
+) -> Result<Command> {
+    #[cfg(target_os = "macos")]
+    let git = sandboxed_git_command_with_paths(
+        store_root,
+        root,
+        alternate_objects.map(ExtraRead::AlternateObjects),
+        writable,
+    )?;
+    #[cfg(not(target_os = "macos"))]
+    let git = git_command_at(root);
+    let mut command = Command::from(git);
+    if let Some(objects) = alternate_objects {
+        command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects);
+    }
+    command.kill_on_drop(true);
+    Ok(command)
+}
+
 async fn run_git_at_with_objects<I, S>(
     #[cfg(target_os = "macos")] store_root: &Path,
     root: &Path,
@@ -4178,25 +4473,18 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    #[cfg(target_os = "macos")]
-    let git = sandboxed_git_command_with_paths(
+    git_command_with_objects(
+        #[cfg(target_os = "macos")]
         store_root,
         root,
-        alternate_objects.map(ExtraRead::AlternateObjects),
+        alternate_objects,
+        #[cfg(target_os = "macos")]
         writable,
-    )?;
-    #[cfg(not(target_os = "macos"))]
-    let git = git_command_at(root);
-    let mut command = Command::from(git);
-    command.args(args);
-    if let Some(objects) = alternate_objects {
-        command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects);
-    }
-    command.kill_on_drop(true);
-    command
-        .output_locked()
-        .await
-        .map_err(|error| git_spawn_error(&error))
+    )?
+    .args(args)
+    .output_locked()
+    .await
+    .map_err(|error| git_spawn_error(&error))
 }
 
 fn ensure_git_success(operation: &str, output: Output) -> Result<()> {
@@ -4773,6 +5061,62 @@ fn parse_oid(value: String, description: &str) -> Result<GitOid> {
     })
 }
 
+/// The commits of a `git log -z --name-only --format=%x00%H%x00%P%x00%s` listing, in its order.
+/// Each commit is an empty field, its oid, its parents (none for a root), its subject (which may be
+/// empty) and its paths, the first behind a newline; an empty field ends the listing.
+fn parse_range_listing(listing: &[u8]) -> Result<Vec<RangeCommit<'_>>> {
+    let unreadable = || {
+        CowshedError::integrity(
+            "git reported an unreadable listing of a range's commits and paths",
+            "repair the git installation",
+        )
+    };
+    fn text(field: &[u8]) -> Result<&str> {
+        std::str::from_utf8(field)
+            .map_err(|_| CowshedError::internal("commit listing is not valid UTF-8"))
+    }
+    let mut fields = listing.split(|byte| *byte == 0).peekable();
+    let mut commits = Vec::new();
+    loop {
+        if fields.next().is_none_or(|marker| !marker.is_empty()) {
+            return Err(unreadable());
+        }
+        let Some(oid) = fields.next() else {
+            return Ok(commits);
+        };
+        let parents = fields.next().ok_or_else(unreadable)?;
+        let subject = fields.next().ok_or_else(unreadable)?;
+        let mut paths = Vec::new();
+        while let Some(path) = fields.next_if(|field| !field.is_empty()) {
+            paths.push(if paths.is_empty() {
+                path.strip_prefix(b"\n").ok_or_else(unreadable)?
+            } else {
+                path
+            });
+        }
+        commits.push(RangeCommit {
+            oid: text(oid)?,
+            merge: parents.contains(&b' '),
+            subject: text(subject)?,
+            paths,
+        });
+    }
+}
+
+/// Whether `changed` is `path` or a path under it as a directory: what
+/// `rev-list -- :(literal)<path>` matches.
+fn within(changed: &[u8], path: &[u8]) -> bool {
+    changed.starts_with(path) && (changed.len() == path.len() || changed[path.len()] == b'/')
+}
+
+/// Whether `changes` holds `path` or a path under it as a directory ([`within`]).
+fn changes_path(changes: &std::collections::BTreeSet<&[u8]>, path: &[u8]) -> bool {
+    changes
+        .range::<[u8], _>((std::ops::Bound::Included(path), std::ops::Bound::Unbounded))
+        .take_while(|changed| changed.starts_with(path))
+        .any(|changed| within(changed, path))
+}
+
 fn parse_one_path(bytes: &[u8], description: &str) -> Result<PathBuf> {
     let value = parse_one_line(bytes, description)?;
     Ok(PathBuf::from(OsString::from_vec(value.to_vec())))
@@ -4906,9 +5250,9 @@ mod tests {
 
     use super::{
         BundleVerificationScratch, CloneOrigin, CowshedUpstream, FALLBACK_MAIN_REMOTE,
-        GitRepository, MAIN_REMOTE, MainRemote, RemoteUrl, WorkspaceRepository, ensure_git_success,
-        git_ended, git_message, held_by_repository_blocking, ignored_by_rules, is_git_repository,
-        parse_lines, workspace_remote_name,
+        GitRepository, MAIN_REMOTE, MainRemote, RemoteUrl, WorkspaceRepository, changes_path,
+        ensure_git_success, git_ended, git_message, held_by_repository_blocking, ignored_by_rules,
+        is_git_repository, parse_lines, parse_range_listing, workspace_remote_name,
     };
 
     #[cfg(target_os = "macos")]
@@ -5521,6 +5865,70 @@ mod tests {
             children.iter().all(|line| !line.contains("maintenance")),
             "{children:#?}"
         );
+    }
+
+    /// A range listing is read as git writes it: a commit that changes nothing, one with an empty
+    /// subject and a nested path, and a merge, which lists what it changes against its first parent.
+    #[tokio::test]
+    async fn a_range_listing_names_each_commit_with_its_subject_and_first_parent_paths() {
+        let store = crate::temp_root::FixtureStore::new();
+        let root = repository();
+        let repo = GitRepository::from_root(store.shared(), &root);
+        let base = repo.head_oid().await.expect("read base");
+        git(&root, &["commit", "-q", "--allow-empty", "-m", "nothing"]);
+        fs::create_dir_all(root.join("dir")).expect("create dir");
+        fs::write(root.join("dir/nested"), "nested\n").expect("write nested");
+        fs::write(root.join("top"), "top\n").expect("write top");
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "--allow-empty-message", "-m", ""]);
+        git(&root, &["switch", "-qc", "side", base.as_str()]);
+        fs::write(root.join("side"), "side\n").expect("write side");
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "side work"]);
+        git(&root, &["switch", "-q", "main"]);
+        git(&root, &["merge", "-q", "--no-edit", "side"]);
+        let head = repo.head_oid().await.expect("read head");
+
+        let listing = repo
+            .range_listing(base.as_str(), head.as_str())
+            .await
+            .expect("list the range");
+        let commits = parse_range_listing(&listing).expect("read the listing");
+        let mut read: Vec<(&str, bool, Vec<&[u8]>)> = commits
+            .iter()
+            .map(|commit| (commit.subject, commit.merge, commit.paths.clone()))
+            .collect();
+        read.sort();
+        assert_eq!(
+            read,
+            [
+                ("", false, vec![b"dir/nested".as_slice(), b"top"]),
+                ("Merge branch 'side'", true, vec![b"side".as_slice()]),
+                ("nothing", false, vec![]),
+                ("side work", false, vec![b"side".as_slice()]),
+            ]
+        );
+        assert!(
+            commits
+                .iter()
+                .any(|commit| commit.oid == head.as_str() && commit.subject.starts_with("Merge")),
+            "the merge is listed under its own oid"
+        );
+    }
+
+    /// `rev-list -- :(literal)<path>` matches the path and every path under it as a directory,
+    /// never a path that merely starts with the same bytes.
+    #[test]
+    fn a_path_is_changed_by_itself_or_a_path_under_it_and_by_nothing_beside_it() {
+        let changes: std::collections::BTreeSet<&[u8]> =
+            [b"a-b".as_slice(), b"a.c", b"dir/x", b"exact"]
+                .into_iter()
+                .collect();
+        assert!(changes_path(&changes, b"exact"));
+        assert!(changes_path(&changes, b"dir"));
+        assert!(!changes_path(&changes, b"a"));
+        assert!(!changes_path(&changes, b"di"));
+        assert!(!changes_path(&changes, b"dir/x/y"));
     }
 
     fn repository() -> Repository {

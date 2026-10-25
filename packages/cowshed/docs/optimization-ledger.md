@@ -114,3 +114,33 @@ taskpolicy -b direnv exec . cargo nextest run --cargo-profile release -p cowshed
   -E 'test(control::tests::) | test(macos::control_socket_is_local_authenticated_and_reports_status) | test(macos::revision_tombstone_and_rotation_preserve_authority) | test(macos::session_current_benchmark)' \
   --run-ignored all --no-capture --build-jobs 2
 ```
+
+## Abandoned-ref sweep: patch identity before content
+
+Production enters through `gc` and `doctor` → `sweep_abandoned_refs` → `landing::abandoned_refs` → `counted` →
+`GitRepository::divergence` and `GitRepository::content_not_held`, once per kept tip on every run (01_storage.md,
+"Retention"). Every git call is its own sandboxed controller process, so the phase costs what its process count costs.
+
+`content_not_held` used to merge every file both sides changed, with one `git merge-file` and one `git cat-file blob`
+each, before it asked patch identity, and then ran one `rev-list -- <file>` per unheld file. On the SB store (33 kept
+namespaces, 36 measured tips) that was 2,840 merges, 2,840 blob reads and over 700 rev-lists. Patch identity now comes
+first. One `git log --name-only --diff-merges=first-parent` over the range names the paths each commit changes, and only
+a file that a commit outside the patch-held set changes is judged by content: 599 merges, with the target's versions
+read in one `git cat-file --batch` per tip. In a range without merges that listing also names the commits changing an
+unheld file, so no rev-list runs; none of the 36 ranges has a merge. `divergence` counts ahead and behind in one
+`rev-list --left-right --count`. Nothing is cached or stored, and the verdict is unchanged.
+
+The arms ran back to back from an unsandboxed host shell against the real store, both at main `314830f3c4`, through the
+debug test profile:
+
+| Arm    | `abandoned_refs` wall (s) | user (s) | sys (s) |
+| ------ | ------------------------: | -------: | ------: |
+| Before |                     248.4 |    109.8 |    46.1 |
+| After  |                      38.1 |     24.8 |     6.5 |
+
+Both arms serialized byte-identical `AbandonedRefs`. Two earlier before-runs took 214.0 s and 250.9 s; the whole
+`gc --dry-run` of the installed build took 225.6 s the same day.
+
+Two costs remain. `git cherry` recomputes main's patch-ids for every tip: 12.2 s summed over the 36 tips, unsandboxed.
+The 599 merges cost about 30 ms each, about 18 s. Keying a stored per-file verdict by the base, head and target blob ids
+would skip only the merges of files main has not touched since the previous gc. It is not built.
