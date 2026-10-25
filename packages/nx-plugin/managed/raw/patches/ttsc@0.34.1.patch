@@ -90,3 +90,30 @@ index f6ee81fb1af41deea022b92e838a7c4665eb9778..112faf913ce38b1f4624b38db3783937
  }
  
  // forceNoEmit sets noEmit so the program type-checks without writing files.
+diff --git a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js b/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
+--- a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
++++ b/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
+@@ -20,10 +20,10 @@
+  * Cold asynchronous reads run in an exclusively owned worker. Its complete
+  * environment snapshot is passed explicitly to the native reader. Publication
+  * rechecks both current host variables and external witnesses after transfer.
+- * The worker reads the parent's shared environment for native fallback rules;
+- * neither it nor this owner writes that environment. Explicit reader inputs
+- * still use the request snapshot and publication still qualifies that
+- * snapshot.
++ * The worker keeps the environment copy it started with, never SHARE_ENV:
++ * Bun replaces the parent's process.env object for SHARE_ENV, stranding every
++ * module that captured the old one (node:os tmpdir() among them). Explicit
++ * reader inputs use the request snapshot, which publication qualifies.
+  *
+  * @evidence contracts/common.md#principled-implementation Readings pair complete environment identity with the producer's native pre-read witness; cached reuse validates that witness and asynchronous publication rechecks variables/witness after transfer. Synchronous fresh reads publish their paired observations without an extra post-read holds call here; native metadata distinguishability remains a premise.
+  * @evidence contracts/common.md#clear-and-simple-design One owner shares observation records across synchronous reads, cache-only proof and asynchronous preparation.
+@@ -253,7 +253,7 @@
+     function acquireWorker() {
+         if (worker !== undefined)
+             return worker;
+-        const created = new node_worker_threads_1.Worker((0, workerModuleUrl_1.workerModuleUrl)(node_path_1.default.join(__dirname, `pluginBuildEnvironmentWorker${node_path_1.default.extname(__filename)}`)), { env: node_worker_threads_1.SHARE_ENV });
++        const created = new node_worker_threads_1.Worker((0, workerModuleUrl_1.workerModuleUrl)(node_path_1.default.join(__dirname, `pluginBuildEnvironmentWorker${node_path_1.default.extname(__filename)}`)), {});
+         worker = created;
+         const retire = () => {
+             if (worker === created)
