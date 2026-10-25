@@ -4,7 +4,6 @@ import { once } from 'node:events';
 import { mkdir, mkdtemp, readdir, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from './bounded-test-policy.js';
 import {
   EXTRACTED_BINARIES_METADATA,
   EXTRACTED_CARGO_METADATA,
@@ -82,8 +81,8 @@ describe('ensureNextestArchiveExtracted', () => {
         await writeFile(archive, 'rebuilt archive bytes');
       };
 
-      // Nothing else holds the lock, so no staleness bound can decide this case: it takes the leg's backstop.
-      const timing = { ...FAST, staleAfterMs: BOUNDED_TEST_IDLE_TIMEOUT_MS };
+      // Nothing else holds the lock, so no staleness bound can decide this case.
+      const timing = { ...FAST, staleAfterMs: Number.POSITIVE_INFINITY };
       await expect(ensureNextestArchiveExtracted(archive, paths.root, rebuiltMidway, () => {}, timing)).rejects.toThrow(
         /changed while it was being extracted/,
       );

@@ -6,15 +6,6 @@ import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 /**
- * The helper a per-crate runner calls before `nextest run`, as the root
- * `node_modules` links it. Spelled through the package link rather than this
- * file's real location: under an isolated install that location is a store
- * path outside the workspace, which would differ per machine in a command Nx
- * hashes.
- */
-export const NEXTEST_EXTRACT_BIN = 'node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-nextest-extract.js';
-
-/**
  * Where nextest puts things inside an extracted archive, relative to the
  * extraction directory (nextest-runner's `reuse_build` constants). A run given
  * these three paths reuses that build exactly as `--archive-file` would after
@@ -360,20 +351,13 @@ function childSettled(
   child: ChildProcess,
   event: 'close' | 'exit',
 ): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  // A promise settles once, so whichever of 'error' and `event` comes second changes nothing; the listener stays so a
+  // late 'error' is never an unhandled one.
   // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the cargo metadata read (--frozen --no-deps, no package-cache lock) and the nextest archive extraction it settles last as long as their work; the operator's interrupt or the enclosing runner's bound ends a hung one
   return new Promise((resolve, reject) => {
-    function onError(error: Error) {
-      if (event === 'close') child.removeListener('close', onSettled);
-      else child.removeListener('exit', onSettled);
-      reject(error);
-    }
-    function onSettled(code: number | null, signal: NodeJS.Signals | null) {
-      child.removeListener('error', onError);
-      resolve({ code, signal });
-    }
-    child.once('error', onError);
-    if (event === 'close') child.once('close', onSettled);
-    else child.once('exit', onSettled);
+    child.once('error', reject);
+    if (event === 'close') child.once('close', (code, signal) => resolve({ code, signal }));
+    else child.once('exit', (code, signal) => resolve({ code, signal }));
   });
 }
 

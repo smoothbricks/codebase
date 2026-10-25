@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFi
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import type { BuildInputRecord } from '../../build-inputs.js';
+import type { BuildInputRecord } from '@smoothbricks/build-inputs';
 import typescriptEmitExecutor, { type CompilerInvocation, runTypeScriptEmit } from './executor.js';
 
 async function fixture(source: string) {

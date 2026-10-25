@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
+import { NEXTEST_EXTRACTION_DIRECTORY, nextestArchiveKey } from '@smoothbricks/nextest-extract';
 import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
@@ -18,7 +19,6 @@ import {
   writeRecord,
 } from './executors/bounded-exec/verdict.js';
 import { createNodesV2ForPlatform } from './index.js';
-import { NEXTEST_EXTRACTION_DIRECTORY, nextestArchiveKey } from './nextest-extraction.js';
 import { descendantsDiagnostic } from './testing.js';
 
 useFixtureCargoHome();

@@ -1079,7 +1079,7 @@ export const PLUGIN_NEXTEST_CONFIG_PATH = 'node_modules/@smoothbricks/nx-plugin/
  * contain spaces.
  *
  * The file is named through the workspace root's `node_modules` link, as
- * `NEXTEST_EXTRACT_BIN` is, never through where the plugin really lives: a
+ * tool package CLIs are (tool-bins.ts), never through where the plugin really lives: a
  * plugin linked from a checkout outside the workspace sits a different number
  * of `../` away from each workspace depending on how deep that workspace is,
  * and that count re-keyed every target of every Cargo project — and every

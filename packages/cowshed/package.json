@@ -309,11 +309,11 @@
         ],
         "options": {
           "cwd": "packages/cowshed",
-          "command": "napi build --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64 && node ../../node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-build-inputs.js --manifest-path crates/cowshed-cli/Cargo.toml --dep-info aarch64-apple-darwin/debug/cowshed.d --output dist/bin/darwin-arm64"
+          "command": "napi build --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64 && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-cli/Cargo.toml --dep-info aarch64-apple-darwin/debug/cowshed.d --output dist/bin/darwin-arm64"
         },
         "configurations": {
           "production": {
-            "command": "napi build --release --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64 && node ../../node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-build-inputs.js --manifest-path crates/cowshed-cli/Cargo.toml --dep-info aarch64-apple-darwin/release/cowshed.d --output dist/bin/darwin-arm64"
+            "command": "napi build --release --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64 && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-cli/Cargo.toml --dep-info aarch64-apple-darwin/release/cowshed.d --output dist/bin/darwin-arm64"
           }
         }
       },
@@ -348,11 +348,11 @@
         ],
         "options": {
           "cwd": "packages/cowshed",
-          "command": "napi build --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64 && node ../../node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-build-inputs.js --manifest-path crates/cowshed-cli/Cargo.toml --dep-info x86_64-apple-darwin/debug/cowshed.d --output dist/bin/darwin-x64"
+          "command": "napi build --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64 && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-cli/Cargo.toml --dep-info x86_64-apple-darwin/debug/cowshed.d --output dist/bin/darwin-x64"
         },
         "configurations": {
           "production": {
-            "command": "napi build --release --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64 && node ../../node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-build-inputs.js --manifest-path crates/cowshed-cli/Cargo.toml --dep-info x86_64-apple-darwin/release/cowshed.d --output dist/bin/darwin-x64"
+            "command": "napi build --release --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64 && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-cli/Cargo.toml --dep-info x86_64-apple-darwin/release/cowshed.d --output dist/bin/darwin-x64"
           }
         }
       },
@@ -570,7 +570,7 @@
         ],
         "options": {
           "comment": "Build prerequisite for the cowshed-core exceptional shards, not a test. public_api_contracts' capability probe cargo-checks its case crates against cowshed-core, and its dependency build exceeded the 120s test bound on a cold hosted arm64 runner. This runs the ignored capability_probe_dependencies_check from the same archive with empty case crates, warming the shared target/ before the bounded shards. The 600s budget is a build budget, as in wire-warmup. cache:false is required because target/ is not an Nx output: a cached skip on a fresh runner would leave the probe cold. It reuses the generated runners' content-keyed extraction under Cargo's target directory rather than `--archive-file`, which unpacks into a fresh $TMPDIR/nextest-archive-* that a killed run never removes.",
-          "command": "extracted=\"$(node node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-nextest-extract.js .cache/nextest/archive.tar.zst)\" && cargo --frozen nextest run --binaries-metadata \"$extracted/target/nextest/binaries-metadata.json\" --cargo-metadata \"$extracted/target/nextest/cargo-metadata.json\" --target-dir-remap \"$extracted/target\" --workspace-remap . -E 'package(cowshed-core) and test(=capability_probe_dependencies_check)' --run-ignored only --no-tests=fail --user-config-file none",
+          "command": "extracted=\"$(node \"$(realpath node_modules/@smoothbricks/nx-plugin)/../nextest-extract/dist/ts/bin/smoo-nx-nextest-extract.js\" .cache/nextest/archive.tar.zst)\" && cargo --frozen nextest run --binaries-metadata \"$extracted/target/nextest/binaries-metadata.json\" --cargo-metadata \"$extracted/target/nextest/cargo-metadata.json\" --target-dir-remap \"$extracted/target\" --workspace-remap . -E 'package(cowshed-core) and test(=capability_probe_dependencies_check)' --run-ignored only --no-tests=fail --user-config-file none",
           "cwd": ".",
           "timeoutMs": 600000,
           "killAfterMs": 10000

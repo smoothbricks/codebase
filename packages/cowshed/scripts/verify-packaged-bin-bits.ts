@@ -25,7 +25,7 @@ const BIN_ROOT = new URL('../dist/bin', import.meta.url).pathname;
 const EXECUTABLE_OWNER_BIT = 0o100;
 /**
  * The record of what a build read, which `smoo-nx-build-inputs` writes beside the binaries it
- * describes (@smoothbricks/nx-plugin `BUILD_INPUTS_FILE`): data, never a binary to execute.
+ * describes (@smoothbricks/build-inputs `BUILD_INPUTS_FILE`): data, never a binary to execute.
  */
 const BUILD_INPUTS_FILE = '.build-inputs.json';
 

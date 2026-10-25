@@ -27,9 +27,13 @@ import {
   writeMid,
 } from '@smoothbricks/cargo-retain/testing/cargo-fixture';
 import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
+import {
+  EXTRACTED_BINARIES_METADATA,
+  EXTRACTED_CARGO_METADATA,
+  EXTRACTED_TARGET_DIR,
+} from '@smoothbricks/nextest-extract';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
-import { EXTRACTED_BINARIES_METADATA, EXTRACTED_CARGO_METADATA, EXTRACTED_TARGET_DIR } from './nextest-extraction.js';
 
 useFixtureCargoHome();
 
@@ -208,7 +212,7 @@ describe('cargo retention after real Nx runs', () => {
         expect(reclaimPaths(applied)).toEqual(expect.arrayContaining(gen.superseded));
         const extracted = spawnSync(
           'node',
-          [join(import.meta.dir, '..', 'dist', 'bin', 'smoo-nx-nextest-extract.js'), restored],
+          [join(import.meta.dir, '../../nextest-extract/dist/ts/bin/smoo-nx-nextest-extract.js'), restored],
           { cwd: fx.ws, env: cargoEnv(), encoding: 'utf8' },
         );
         expect(extracted.status, extracted.stderr).toBe(0);

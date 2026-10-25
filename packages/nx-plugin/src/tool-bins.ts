@@ -8,7 +8,7 @@ const PLUGIN_LINK = 'node_modules/@smoothbricks/nx-plugin';
  * the workspace root) an inferred target runs in.
  *
  * A tool package is a dependency of this plugin, never of the workspace root, so the root `node_modules` has no link to
- * it. Its CLI is named through the plugin's root link, as `NEXTEST_EXTRACT_BIN` is and for the same reason (never the
+ * it. Its CLI is named through the plugin's root link, as the plugin's own `nextest.toml` is and for the same reason (never the
  * plugin's real location, whose depth from each workspace differs), and then one step up to the package beside the
  * plugin: every install layout puts a package's dependencies next to it, the workspace's `packages/` directory for a
  * linked checkout, a hoisted `node_modules/@smoothbricks/`, a bun or pnpm store's per-package `node_modules`. The kernel

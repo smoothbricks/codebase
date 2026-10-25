@@ -26,9 +26,6 @@ import { normalize as normalizePosix } from 'node:path/posix';
 /** The record's file name inside each output directory. */
 export const BUILD_INPUTS_FILE = '.build-inputs.json';
 
-/** The producer command for native builds, from the workspace root: node_modules/.bin links it only on a fresh install. */
-export const BUILD_INPUTS_BIN = 'node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-build-inputs.js';
-
 export interface BuildInputRecord {
   readonly version: 1;
   readonly files: Readonly<Record<string, string>>;

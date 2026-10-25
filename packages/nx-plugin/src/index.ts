@@ -4,6 +4,11 @@ import { createRequire } from 'node:module';
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  EXTRACTED_BINARIES_METADATA,
+  EXTRACTED_CARGO_METADATA,
+  EXTRACTED_TARGET_DIR,
+} from '@smoothbricks/nextest-extract';
+import {
   type CreateDependencies,
   type CreateNodesContextV2,
   type CreateNodesResultV2,
@@ -18,7 +23,6 @@ import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { parse as parseToml } from 'smol-toml';
 import { type ParsedCommandLine, parseJsonConfigFileContent, readConfigFile, sys as typescriptSys } from 'typescript';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
-import { BUILD_INPUTS_BIN } from './build-inputs.js';
 import { bunLockDependencies, bunLockInput, bunLockNode } from './bun-lock-scope.js';
 import {
   CARGO_CLOSURE_INPUT,
@@ -79,12 +83,6 @@ import { ALL_VERDICTS_EXECUTOR } from './executors/all-verdicts/schema.js';
 import { GATEWAY_SOCKET } from './executors/bounded-exec/gateway-lease.js';
 import { closeRunCpuPool, serveRunCpuPool } from './executors/bounded-exec/run-cpu-pool.js';
 import { hashVersionlessCrateManifests } from './manifest-hash.js';
-import {
-  EXTRACTED_BINARIES_METADATA,
-  EXTRACTED_CARGO_METADATA,
-  EXTRACTED_TARGET_DIR,
-  NEXTEST_EXTRACT_BIN,
-} from './nextest-extraction.js';
 import { NEXTEST_TIMINGS_PATH, namedTestsFilter, readNextestTimings, timedShardMembers } from './nextest-timings.js';
 import {
   type ProducerReceiptsOptions,
@@ -2440,8 +2438,8 @@ function createNapiTargets(
       CARGO_PROFILE_OUTPUT_DIR[profile],
       `lib${config.cargoPackage.replaceAll('-', '_')}.d`,
     );
-    const bin = posix.join(posix.relative(cargoCwd, '.'), BUILD_INPUTS_BIN);
-    return ` && node ${bin} --manifest-path ${config.manifestPath} --dep-info ${depInfo} --output ${outputDirectory}`;
+    const bin = toolCommand(cargoCwd, 'build-inputs', 'dist/ts/bin/smoo-nx-build-inputs.js', 'node');
+    return ` && ${bin} --manifest-path ${config.manifestPath} --dep-info ${depInfo} --output ${outputDirectory}`;
   };
   const hasHostPlatformTarget = config.targets.some((triple) => {
     const convention = NAPI_TARGET_CONVENTIONS[triple];
@@ -3008,13 +3006,18 @@ async function cargoTestRunnerInputs(
 function nextestRunnerCommand(workspace: CargoWorkspace, selector: string, flags: string): string {
   const toolConfig = nextestToolConfigArg(workspace.projectRoot);
   // Relative to the runner's cwd, so the hashed command is the same in every checkout.
-  const extractBin = posix.join(posix.relative(workspace.projectRoot, '.'), NEXTEST_EXTRACT_BIN);
+  const extract = toolCommand(
+    workspace.projectRoot,
+    'nextest-extract',
+    'dist/ts/bin/smoo-nx-nextest-extract.js',
+    'node',
+  );
   const reuseExtraction =
     `--binaries-metadata "$extracted/${EXTRACTED_BINARIES_METADATA}" ` +
     `--cargo-metadata "$extracted/${EXTRACTED_CARGO_METADATA}" ` +
     `--target-dir-remap "$extracted/${EXTRACTED_TARGET_DIR}"`;
   return (
-    `extracted="$(node ${extractBin} ${CARGO_TEST_ARCHIVE_FILE})" && ` +
+    `extracted="$(${extract} ${CARGO_TEST_ARCHIVE_FILE})" && ` +
     cargoFrozen(
       `nextest run ${reuseExtraction} --workspace-remap . -E ${shellWord(selector)}${flags} --user-config-file none ${toolConfig}`,
     )

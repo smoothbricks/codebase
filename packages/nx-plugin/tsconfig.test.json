@@ -27,6 +27,8 @@
     {
       "path": "../validation/tsconfig.lib.json"
     },
-    { "path": "../cargo-retain/tsconfig.lib.json" }
+    { "path": "../cargo-retain/tsconfig.lib.json" },
+    { "path": "../build-inputs/tsconfig.lib.json" },
+    { "path": "../nextest-extract/tsconfig.lib.json" }
   ]
 }

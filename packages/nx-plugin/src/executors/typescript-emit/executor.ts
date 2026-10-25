@@ -3,9 +3,6 @@ import { once } from 'node:events';
 import { realpathSync } from 'node:fs';
 import { chmod, lstat, readdir, rm, rmdir, stat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-
-import { readJsonFile } from 'nx/src/devkit-exports.js';
-
 import {
   type BuildInputRecord,
   buildInputRecord,
@@ -14,7 +11,8 @@ import {
   pathspecFiles,
   workspacePath,
   writeBuildInputs,
-} from '../../build-inputs.js';
+} from '@smoothbricks/build-inputs';
+import { readJsonFile } from 'nx/src/devkit-exports.js';
 import type { TypeScriptEmitOptions } from './schema.js';
 
 interface TypeScriptEmitContext {

@@ -47,7 +47,7 @@ async function gateway(serve: (client: Socket) => void): Promise<string> {
 
 /** The runner command the plugin infers for a nextest piece, as `index.ts` builds it. */
 const NEXTEST_PIECE =
-  `extracted="$(node node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-nextest-extract.js .cache/nextest/archive.tar.zst)" && ` +
+  `extracted="$(node "$(realpath node_modules/@smoothbricks/nx-plugin)/../nextest-extract/dist/ts/bin/smoo-nx-nextest-extract.js" .cache/nextest/archive.tar.zst)" && ` +
   `cargo --frozen nextest run --binaries-metadata "$extracted/m.json" --workspace-remap . -E 'package(core)' --partition hash:1/5 --no-tests=pass`;
 
 /** The test-thread ceilings of a run whose environment names none. */

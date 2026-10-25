@@ -912,7 +912,7 @@ Concrete targets come from concrete files:
   it. A failed emit removes nothing, and an `outDir` that holds a TypeScript source is refused before the compiler runs.
   It writes `.build-inputs.json` into the `outDir`: the SHA-256 of every file the config's `include` matches less its
   `exclude`, taken before the emit, and those globs as Git pathspecs. The macOS napi targets write the same record from
-  rustc's dep-info file through
+  rustc's dep-info file through `@smoothbricks/build-inputs`'s
   `smoo-nx-build-inputs --manifest-path <Cargo.toml> --dep-info <path under the target directory> --output <dir>`. The
   record is inside the target's outputs, so a cache hit restores it with them; a live developer link
   (`@smoothbricks/cli`, "Declared Links") checks it to tell a current build from a stale one by content. The shell entry
@@ -930,7 +930,13 @@ Concrete targets come from concrete files:
   through a `typia` import binding left in the emitted JavaScript (`file:line:column` and the call): ttsc emits a typia
   call untransformed, without an error, when the emitting package does not list `typia` itself, and such a call throws
   at run time. The package keeps its JavaScript bin for every other platform; a caller that wants the native executable
-  names `dist/bin/<platform>/<name>` and depends on this target.
+  names `dist/bin/<platform>/<name>` and depends on this target. A run compiles only its host's executable (scriptc 0.4
+  has no cross-compilation target), and a published tarball carries only what the publishing host built, so commands
+  this plugin infers for other workspaces (`smoo-nx-nextest-extract`, `smoo-nx-build-inputs`) keep running the tool
+  package's JavaScript bin through `node`; native executables serve callers in the workspace that builds them (the
+  land's failure summary, cowshed's own targets). The next unit publishes all four: one `scriptc-native` run per
+  platform on that platform's runner, collected into one tarball as cowshed's `cli-<arch>-<os>` targets are, after which
+  inferred commands name `dist/bin/<platform>/<name>`.
 - `typecheck` is inferred from `tsconfig.lib.json` and runs the native compiler `SMOO_TYPECHECK_TSC` names (built by
   `devenv.smoo.nix` from a pinned TypeScript revision) as `-p tsconfig.lib.json --noEmit`, directly rather than through
   `ttsc`. Transform plugins' diagnostics are enforced by `tsc-js`, which runs them.
@@ -955,19 +961,19 @@ Concrete targets come from concrete files:
   `cargo --frozen nextest run --binaries-metadata … --cargo-metadata … --target-dir-remap … --workspace-remap . -E 'package(<crate>)'`
   from the archive's one extraction. Runners therefore execute rather than build: they compile nothing in cargo's build
   tree, and fan out instead of chaining. They do not unpack the archive each: before the run, `smoo-nx-nextest-extract`
-  hashes it and extracts it into `<target_directory>/nextest-extracted/<sha256>` unless a runner already did — one
-  extracts, the others wait — so a workspace with ~200 test binaries and ~25 crates unpacks them once per archive
-  instead of once per crate. The directory is keyed by the archive's bytes, so a rebuilt or cache-restored archive never
-  runs an older extraction's binaries, and publishing one removes the others. The target directory is the one
-  `cargo metadata` reports for the runner's Cargo workspace, so a `build.target-dir` setting moves the extractions with
-  the build tree. An extraction is per-checkout tool state like the rest of that tree, never an Nx output: it lives in
-  Cargo's build tree, which a checkout with a build volume keeps off its source tree, and it never sits under a declared
-  output such as `.cache/nextest`. `cargo clean` removes it. A repository's own target that runs tests from the
-  workspace archive calls the same helper and passes the same reuse flags: `nextest run --archive-file` unpacks the
-  whole archive into a fresh directory under its `TMPDIR`, which for a `bounded-exec` task on macOS is a lease on the
-  shared RAM volume (measured: a 548 MB archive unpacks to 1.97 GiB, and four such tasks filled the 8 GiB volume). The
-  RAM lease holds what tests write, never the binaries they run. `--workspace-remap` is required — an archive records
-  the producing tree's absolute paths, and without it a restored archive hands tests another checkout's
+  (`@smoothbricks/nextest-extract`) hashes it and extracts it into `<target_directory>/nextest-extracted/<sha256>`
+  unless a runner already did — one extracts, the others wait — so a workspace with ~200 test binaries and ~25 crates
+  unpacks them once per archive instead of once per crate. The directory is keyed by the archive's bytes, so a rebuilt
+  or cache-restored archive never runs an older extraction's binaries, and publishing one removes the others. The target
+  directory is the one `cargo metadata` reports for the runner's Cargo workspace, so a `build.target-dir` setting moves
+  the extractions with the build tree. An extraction is per-checkout tool state like the rest of that tree, never an Nx
+  output: it lives in Cargo's build tree, which a checkout with a build volume keeps off its source tree, and it never
+  sits under a declared output such as `.cache/nextest`. `cargo clean` removes it. A repository's own target that runs
+  tests from the workspace archive calls the same helper and passes the same reuse flags: `nextest run --archive-file`
+  unpacks the whole archive into a fresh directory under its `TMPDIR`, which for a `bounded-exec` task on macOS is a
+  lease on the shared RAM volume (measured: a 548 MB archive unpacks to 1.97 GiB, and four such tasks filled the 8 GiB
+  volume). The RAM lease holds what tests write, never the binaries they run. `--workspace-remap` is required — an
+  archive records the producing tree's absolute paths, and without it a restored archive hands tests another checkout's
   `CARGO_MANIFEST_DIR`. With it the archive is relocatable, so one cache entry serves every checkout of the same commit;
   nextest re-points `CARGO_BIN_EXE_<name>`/`NEXTEST_BIN_EXE_<name>` at the extracted binaries at runtime, but a test
   that reads them through the compile-time `env!` macro keeps the producing tree's path. Per-crate runners accept an
