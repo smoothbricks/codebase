@@ -483,6 +483,12 @@ function projectLintCommands(
 type NapiArchitecture = 'arm64' | 'x64';
 type NapiTargetFamily = 'linux' | 'macos';
 
+/** A host's directory under a package's `dist/bin`, as `@smoothbricks/cowshed`'s launcher names it. */
+const EXECUTABLE_PLATFORM_DIRECTORY: Readonly<Record<NapiTargetFamily, Readonly<Record<NapiArchitecture, string>>>> = {
+  linux: { arm64: 'linux-arm64', x64: 'linux-x64' },
+  macos: { arm64: 'darwin-arm64', x64: 'darwin-x64' },
+};
+
 interface NapiPlatform {
   architecture: NapiArchitecture;
   targetFamily: NapiTargetFamily;
@@ -1126,6 +1132,7 @@ export default { createNodesV2, createDependencies, postTasksExecution, preTasks
 
 interface PackageJson {
   bin?: unknown;
+  devDependencies?: Record<string, unknown>;
   name?: string;
   napi?: Record<string, unknown>;
   /** npm's own "never published" flag, which is what makes a package a deployable target rather than a library. */
@@ -1138,26 +1145,95 @@ interface PackageJson {
 }
 
 function packageBinOutputs(packageJson: PackageJson, packageJsonPath: string): string[] {
+  return [...new Set(packageBinEntries(packageJson, packageJsonPath).values())];
+}
+
+/** `package.json#bin` as npm links it: each command's name and executable path; a lone path is the unscoped package's. */
+function packageBinEntries(packageJson: PackageJson, packageJsonPath: string): Map<string, string> {
   if (packageJson.bin === undefined) {
-    return [];
+    return new Map();
   }
   if (typeof packageJson.bin === 'string') {
     if (packageJson.bin.length === 0) {
       throw new Error(`${packageJsonPath}: bin must not be empty`);
     }
-    return [packageJson.bin];
+    return new Map([[(packageJson.name ?? '').replace(/^@[^/]*\//, ''), packageJson.bin]]);
   }
   if (!isRecord(packageJson.bin)) {
     throw new Error(`${packageJsonPath}: bin must be a string or an object of executable paths`);
   }
-  const outputs = new Set<string>();
+  const entries = new Map<string, string>();
   for (const [name, output] of Object.entries(packageJson.bin)) {
     if (typeof output !== 'string' || output.length === 0) {
       throw new Error(`${packageJsonPath}: bin.${name} must be a non-empty executable path`);
     }
-    outputs.add(output);
+    entries.set(name, output);
   }
-  return [...outputs];
+  return entries;
+}
+
+const SCRIPTC_NATIVE_TARGET = 'scriptc-native';
+
+/**
+ * `scriptc-native`: each `package.json#bin` entry compiled by scriptc, from the JavaScript `tsc-js` emitted, to the
+ * host executable `dist/bin/<platform>/<name>`. A package opts in by depending on `scriptc`, which also pins the
+ * compiler the target runs. Its JavaScript is emitted below `dist/` beside `bin/` (`dist/ts`), so the two targets'
+ * outputs never overlap; `dist/tsconfig.json` is the nearest config, the one scriptc type-checks that JavaScript under.
+ */
+function scriptcNativeTarget(
+  packageJson: PackageJson,
+  packageJsonPath: string,
+  projectRoot: string,
+  libTsconfigPath: string,
+  hostPlatform: NapiPlatform | null,
+  toolchainInputs: NonNullable<TargetConfiguration['inputs']>,
+): TargetConfiguration | null {
+  if (packageJson.devDependencies?.scriptc === undefined || hostPlatform === null) {
+    return null;
+  }
+  const javascriptRoot = typescriptOutDir(libTsconfigPath, packageJsonPath);
+  const [outputRoot, below] = javascriptRoot?.split('/') ?? [];
+  if (
+    javascriptRoot === null ||
+    outputRoot !== 'dist' ||
+    below === undefined ||
+    below === 'bin' ||
+    below === 'tsconfig.json'
+  ) {
+    throw new Error(
+      `${packageJsonPath}: a scriptc package emits its JavaScript below dist/ beside dist/bin and dist/tsconfig.json; ` +
+        `set tsconfig.lib.json compilerOptions.outDir to "dist/ts" (it is ${JSON.stringify(javascriptRoot)})`,
+    );
+  }
+  const entries = packageBinEntries(packageJson, packageJsonPath);
+  if (entries.size === 0) {
+    throw new Error(`${packageJsonPath}: a scriptc package names the executables it compiles in bin`);
+  }
+  for (const [name, entry] of entries) {
+    if (!/^[\w.-]+$/.test(name) || !posix.normalize(entry).startsWith(`${javascriptRoot}/`) || !entry.endsWith('.js')) {
+      throw new Error(
+        `${packageJsonPath}: bin.${name} must name JavaScript tsc-js emits under ${javascriptRoot}/ (it is ${entry})`,
+      );
+    }
+  }
+  const platform = EXECUTABLE_PLATFORM_DIRECTORY[hostPlatform.targetFamily][hostPlatform.architecture];
+  return {
+    executor: '@smoothbricks/nx-plugin:scriptc-native',
+    cache: true,
+    inputs: [
+      'production',
+      '^production',
+      ...toolchainInputs,
+      '{projectRoot}/tsconfig.lib.json',
+      { externalDependencies: ['scriptc'] },
+    ],
+    outputs: [
+      `{projectRoot}/${outputRoot}/tsconfig.json`,
+      ...[...entries.keys()].map((name) => `{projectRoot}/${outputRoot}/bin/${platform}/${name}`),
+    ],
+    dependsOn: ['tsc-js'],
+    options: { cwd: projectRoot, platform, javascriptRoot, outputRoot, entries: Object.fromEntries(entries) },
+  };
 }
 
 /**
@@ -1331,6 +1407,17 @@ async function createProjectTargets(
         cwd: projectRoot,
       },
     };
+    const scriptcNative = scriptcNativeTarget(
+      packageJson,
+      packageJsonPath,
+      projectRoot,
+      libTsconfigPath,
+      hostPlatform,
+      toolchainInputs,
+    );
+    if (scriptcNative !== null) {
+      targets[SCRIPTC_NATIVE_TARGET] = scriptcNative;
+    }
   }
 
   if (hasTestTsconfig) {
@@ -2255,21 +2342,28 @@ interface ResolvedNapiConfig {
 }
 
 function inferTypescriptOutputs(tsconfigPath: string, packageJsonPath: string): string[] {
+  const outDir = typescriptOutDir(tsconfigPath, packageJsonPath);
+  // No .tsbuildinfo here: the emit executor overlays incremental: false, so
+  // tsc-js never writes one and a declared-but-absent output fails the
+  // release-candidate output inspection.
+  return outDir === null
+    ? ['{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}']
+    : [`{projectRoot}/${outDir}/`];
+}
+
+/** The project-relative `compilerOptions.outDir` the config itself states, or null when it states none. */
+function typescriptOutDir(tsconfigPath: string, packageJsonPath: string): string | null {
   const tsconfig: unknown = readJsonFile(tsconfigPath);
   const compilerOptions = isRecord(tsconfig) && isRecord(tsconfig.compilerOptions) ? tsconfig.compilerOptions : null;
   const outDir = compilerOptions?.outDir;
   if (typeof outDir !== 'string' || outDir.length === 0) {
-    // No .tsbuildinfo here: the emit executor overlays incremental: false, so
-    // tsc-js never writes one and a declared-but-absent output fails the
-    // release-candidate output inspection.
-    return ['{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}'];
+    return null;
   }
-
   const normalized = posix.normalize(outDir.replaceAll('\\', '/'));
   if (normalized === '.' || normalized === '..' || normalized.startsWith('../') || normalized.startsWith('/')) {
     throw new Error(`${packageJsonPath}: tsconfig.lib.json compilerOptions.outDir must stay inside the project`);
   }
-  return [`{projectRoot}/${normalized}/`];
+  return normalized.replace(/\/$/, '');
 }
 
 function resolveNapiConfig(
@@ -2484,6 +2578,7 @@ async function readPackageJson(packageJsonPath: string): Promise<PackageJson> {
   const rawNx = isRecord(parsed.nx) ? parsed.nx : undefined;
   return {
     ...('bin' in parsed ? { bin: parsed.bin } : {}),
+    ...(isRecord(parsed.devDependencies) ? { devDependencies: parsed.devDependencies } : {}),
     ...(typeof parsed.name === 'string' ? { name: parsed.name } : {}),
     ...(isRecord(parsed.napi) ? { napi: parsed.napi } : {}),
     ...(typeof parsed.private === 'boolean' ? { private: parsed.private } : {}),

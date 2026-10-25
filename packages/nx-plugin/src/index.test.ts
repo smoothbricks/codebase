@@ -317,6 +317,70 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('compiles the bins of a scriptc package from its dist/ts emit into dist/bin/<host platform>', async () => {
+    const workspace = await createWorkspace();
+    try {
+      const manifest = {
+        name: '@scope/tool',
+        bin: { 'smoo-nx-tool': './dist/ts/bin/smoo-nx-tool.js' },
+        devDependencies: { scriptc: '0.4.4' },
+      };
+      await workspace.write('packages/tool/package.json', JSON.stringify(manifest));
+      await workspace.write('packages/tool/tsconfig.lib.json', '{"compilerOptions":{"outDir":"dist/ts"}}\n');
+      await workspace.write('packages/plain/package.json', JSON.stringify({ ...manifest, devDependencies: {} }));
+      await workspace.write('packages/plain/tsconfig.lib.json', '{"compilerOptions":{"outDir":"dist/ts"}}\n');
+
+      const mac = await inferProjectTargets(
+        workspace,
+        'packages/tool/package.json',
+        createNodesV2ForPlatform('darwin', 'arm64'),
+      );
+      expect(mac['scriptc-native']).toMatchObject({
+        executor: '@smoothbricks/nx-plugin:scriptc-native',
+        cache: true,
+        dependsOn: ['tsc-js'],
+        outputs: ['{projectRoot}/dist/tsconfig.json', '{projectRoot}/dist/bin/darwin-arm64/smoo-nx-tool'],
+        options: {
+          cwd: 'packages/tool',
+          platform: 'darwin-arm64',
+          javascriptRoot: 'dist/ts',
+          outputRoot: 'dist',
+          entries: { 'smoo-nx-tool': './dist/ts/bin/smoo-nx-tool.js' },
+        },
+      });
+      expect(mac['scriptc-native']?.inputs).toContainEqual({ externalDependencies: ['scriptc'] });
+      expect(mac['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/ts/']);
+      expect(mac.build?.dependsOn).toContain('scriptc-native');
+      const linux = await inferProjectTargets(
+        workspace,
+        'packages/tool/package.json',
+        createNodesV2ForPlatform('linux', 'x64'),
+      );
+      expect(linux['scriptc-native']?.outputs).toEqual([
+        '{projectRoot}/dist/tsconfig.json',
+        '{projectRoot}/dist/bin/linux-x64/smoo-nx-tool',
+      ]);
+      // The platform is an option, so the two hosts' builds never share a cache entry.
+      expect(linux['scriptc-native']?.options?.platform).toBe('linux-x64');
+      expect(await inferProjectTargets(workspace, 'packages/plain/package.json')).not.toHaveProperty('scriptc-native');
+
+      // Emitting into dist/ itself would put the JavaScript and the executables in one output.
+      await workspace.write('packages/tool/tsconfig.lib.json', '{"compilerOptions":{"outDir":"dist"}}\n');
+      const failure = await inferProjectTargets(workspace, 'packages/tool/package.json').then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      if (!(failure instanceof AggregateCreateNodesError)) {
+        throw new Error(`expected AggregateCreateNodesError, got ${String(failure)}`);
+      }
+      expect(failure.errors[0]?.[1]?.message).toMatch(
+        /set tsconfig\.lib\.json compilerOptions\.outDir to "dist\/ts" \(it is "dist"\)/,
+      );
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('hashes the manifests without their versions for checks, raw for artifacts', async () => {
     const workspace = await createWorkspace();
     try {

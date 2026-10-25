@@ -918,6 +918,19 @@ Concrete targets come from concrete files:
   (`@smoothbricks/cli`, "Declared Links") checks it to tell a current build from a stale one by content. The shell entry
   that bootstraps the plugin (`tooling/direnv/enter-shell.ts`) keeps its build marker under `node_modules/.cache`, not
   under `outDir`, where the executor would remove it as a file its emit did not write.
+- `scriptc-native` is inferred for a package that lists `scriptc` in `devDependencies` (that pin is the compiler the
+  target runs; the workspace root lists `scriptc` in `trustedDependencies` so its install links the platform compiler).
+  After `tsc-js`, it compiles each `package.json#bin` entry with `scriptc build --strip --no-keep-llvm` into the host
+  executable `dist/bin/<platform>/<name>` (`darwin-arm64`, `darwin-x64`, `linux-arm64`, `linux-x64`, the directories
+  `@smoothbricks/cowshed`'s launcher reads); the platform is a target option, so each host's build has its own cache
+  entry. Such a package emits its JavaScript into `dist/ts` (`tsconfig.lib.json` `outDir`; inference refuses `dist`
+  itself or `dist/bin`) and its bins point there, so the JavaScript and the executables are disjoint outputs. scriptc
+  type-checks emitted JavaScript under the nearest `tsconfig.json`, and the workspace's refuses untyped code, so the
+  target writes `dist/tsconfig.json` (strict, `nodenext`) beside `bin`. Before compiling, it fails on any member access
+  through a `typia` import binding left in the emitted JavaScript (`file:line:column` and the call): ttsc emits a typia
+  call untransformed, without an error, when the emitting package does not list `typia` itself, and such a call throws
+  at run time. The package keeps its JavaScript bin for every other platform; a caller that wants the native executable
+  names `dist/bin/<platform>/<name>` and depends on this target.
 - `typecheck` is inferred from `tsconfig.lib.json` and runs the native compiler `SMOO_TYPECHECK_TSC` names (built by
   `devenv.smoo.nix` from a pinned TypeScript revision) as `-p tsconfig.lib.json --noEmit`, directly rather than through
   `ttsc`. Transform plugins' diagnostics are enforced by `tsc-js`, which runs them.
