@@ -58,7 +58,7 @@ type ControlReader = BufReader<PeerStream<BoxControlIo>>;
 const GATEWAY: &str = "gateway daemon";
 /// The silence a client allows a gateway before its first heartbeat line. A gateway of an earlier
 /// build never heartbeats, and during an install a client talks to one: its slow answers
-/// (`first-launch`, `ram-attach`) still arrive within the minute doctor always gave it. Once a
+/// (`first-launch`, `ram-detach`) still arrive within the minute doctor always gave it. Once a
 /// heartbeat has come, the peer has proved it heartbeats and [`deadline::HEARTBEAT_SILENCE`]
 /// applies.
 const UNPROVEN_SILENCE: std::time::Duration = std::time::Duration::from_secs(60);
@@ -496,7 +496,6 @@ impl ControlRequest {
             Self::TaskTerminal { .. } => "task-terminal",
             Self::TaskQueue => "task-queue",
             Self::NxCacheClear { .. } => "nx-cache-clear",
-            Self::RamAttach { .. } => RAM_ATTACH_OP,
             Self::RamDetach { .. } => RAM_DETACH_OP,
             Self::FirstLaunch => FIRST_LAUNCH_OP,
         }
