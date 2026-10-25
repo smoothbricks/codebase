@@ -161,14 +161,18 @@ Leader exit begins nonterminal `draining`, not terminal publication, even while 
 output open: that descendant is an outliving member, not a reason to keep running. Sealing waits for both output EOFs
 and the retirement proof. The actor retains the process, CPU and volume claims while its native membership operation
 snapshots the outliving processes, sends TERM, waits the existing grace, ends survivors and joins their exits. Only a
-successful retirement reply permits sealing the terminal record and releasing the leader. A refusal keeps the claims and
-the nonterminal job, and reaches waiters as an error; an explicit cancellation or retirement can retry it. The durable
-`containment`, `outlived` and `outlivedIncomplete` receipt names the proof, the live members retirement signalled
-(including a live leader on cancellation), and whether native retirement may have ended members it could not name. Rows
-preserve each known observed-tree index, pid, image and last signal; a successful receipt leaves no scoped survivors.
-The marker defaults false and is omitted on the wire when false. Empty rows prove no member was ended only when the
-marker is false. A never-born job has no containment, empty rows and a false marker. Kernel-proven emptiness is not an
-exhaustive metadata census.
+successful retirement reply permits sealing the terminal record and releasing the leader. A refusal keeps the claims,
+the nonterminal job and its client's hold, and reaches every waiter as its typed error: a log follower at a stream's
+current end included, since nothing ends that stream on its own any more. An explicit cancellation or retirement retries
+it, a holder's close among them. On Darwin a refusal that came while the job's observer held running lives (survivors
+still exiting past the bounded wait after SIGKILL, a root member the kernel will not let it signal) also re-runs once
+that observer holds none: their exits, not a clock, conclude the job. A re-run refused in turn stands until an explicit
+retry. The durable `containment`, `outlived` and `outlivedIncomplete` receipt names the proof, the live members
+retirement signalled (including a live leader on cancellation), and whether native retirement may have ended members it
+could not name. Rows preserve each known observed-tree index, pid, image and last signal; a successful receipt leaves no
+scoped survivors. The marker defaults false and is omitted on the wire when false. Empty rows prove no member was ended
+only when the marker is false. A never-born job has no containment, empty rows and a false marker. Kernel-proven
+emptiness is not an exhaustive metadata census.
 
 On Darwin membership is the held leader's group plus the existing observer's retained running lives, including lives
 that called `setsid`. The receipt is always `observed`, never `kernel`: `NOTE_FORK` can coalesce, and a forked child can

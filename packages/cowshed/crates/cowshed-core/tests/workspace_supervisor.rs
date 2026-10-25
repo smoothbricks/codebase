@@ -9723,14 +9723,17 @@ async fn cpu_the_observed_processes_never_counted_is_the_job_span_s_unattributed
     reap(leader);
 }
 
-/// A real native supervisor, including its protected credentials and ownership ledger.
+/// A real native supervisor, including its protected credentials and ownership ledger, whose
+/// CPU budget is `cpu`.
 #[cfg(target_os = "macos")]
 fn native_process_fixture(
     name: &str,
     membership: Option<&std::path::Path>,
+    cpu: Arc<dyn JobCpuAdmission>,
 ) -> (WorkspaceSupervisorHandle, PathBuf, TempRoot) {
     let (mut config, root) = isolated_config(name);
     config.default_cwd = None;
+    config.cpu = cpu;
     config.term_grace = Duration::from_secs(1);
     std::fs::create_dir_all(&config.sandbox.home).unwrap();
     std::fs::create_dir_all(config.workspace_root.join(".cowshed/bin")).unwrap();
@@ -9775,7 +9778,8 @@ async fn terminal_descendant_reproduction(detach: bool, cancel: bool, hold_outpu
     use cowshed_core::runtime::process_events::{Darwin, ProcessReads as _};
     use tokio::io::AsyncReadExt as _;
 
-    let (handle, ledger, root) = native_process_fixture("terminal-descendant", None);
+    let (handle, ledger, root) =
+        native_process_fixture("terminal-descendant", None, Arc::new(ImmediateCpu));
     let socket = root.join("child.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let script = r#"
@@ -9998,6 +10002,133 @@ async fn cancellation_reaps_a_descendant_that_started_a_new_session() {
     terminal_descendant_reproduction(true, true, false).await;
 }
 
+/// A refused membership retirement answers its client instead of hanging it, keeps the job held
+/// with its CPU tokens, and its survivors' exits conclude the job (11_shell.md, "Shell activation
+/// and process reuse"). The job runs `/usr/sbin/lsof` as root through `sudo -n`. lsof's real uid is
+/// root's, so when the leader exits the kernel refuses retirement's signal to it (EPERM); SIGTERM
+/// is ignored so sudo neither ends nor relays it first. The parked `wait` and log follower get
+/// that refusal and the hold outlives it. Once this test closes the file lsof watches, lsof and
+/// sudo exit on their own, and the observer holding no running life re-runs the retirement, which
+/// seals the job and returns its tokens. Needs this host's passwordless sudo grant for
+/// `/usr/sbin/lsof`; every cow sandbox denies `/usr/bin/sudo` itself, so it runs in the host lane.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_refused_retirement_answers_its_client_and_its_survivors_exits_conclude_it()
+ {
+    use cowshed_core::runtime::supervisor_socket;
+    use std::io::BufRead as _;
+
+    let (requests, mut asked) = mpsc::unbounded_channel();
+    let (handle, _ledger, root) = native_process_fixture(
+        "refused-retirement",
+        None,
+        Arc::new(ScriptedCpu {
+            requests,
+            stakes: None,
+        }),
+    );
+    // lsof lists this process's hold on `watched` once a second, and ends once nothing holds it.
+    let watched = root.join("watched");
+    let holding = std::fs::File::create(&watched).unwrap();
+    let listing_path = root.join("listing");
+    let fifo = std::ffi::CString::new(listing_path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: a NUL-terminated path in this test's own root.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let job = handle
+        .exec(
+            None,
+            None,
+            ExecRequest {
+                command: ExecCommand::Argv(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    r#"trap '' TERM; /usr/bin/sudo -n /usr/sbin/lsof -nP +r 1 -a -p "$1" "$2" > "$3" & read _"#
+                        .into(),
+                    "refused-retirement".into(),
+                    CommandArg::from(std::process::id().to_string()),
+                    CommandArg::from(watched.into_os_string()),
+                    CommandArg::from(listing_path.clone().into_os_string()),
+                ]),
+                cwd: None,
+                scope: ExecScope::HostGate,
+                ..gate(request(StdinSource::Open))
+            },
+            AdmissionSource::Coordinator,
+        )
+        .await
+        .unwrap();
+    let cpu = asked.recv().await.unwrap();
+    cpu.answer.send(Ok(NonZeroUsize::new(2).unwrap())).unwrap();
+    let mut released = cpu.released;
+    // lsof's first listing is the readiness event: sudo started it and it runs as root.
+    let (listing, header) = tokio::task::spawn_blocking(move || {
+        let mut listing = std::io::BufReader::new(std::fs::File::open(listing_path).unwrap());
+        let mut header = String::new();
+        listing.read_line(&mut header).unwrap();
+        (listing, header)
+    })
+    .await
+    .unwrap();
+    assert!(
+        header.starts_with("COMMAND"),
+        "sudo -n /usr/sbin/lsof ended before listing; this host must grant it without a password"
+    );
+    let (_remote, socket) = served(&handle).await;
+    let hold = supervisor_socket::hold(&socket, &authority().workspace_incarnation, job)
+        .await
+        .unwrap();
+    // The client's wait and its stdout follower, each in the actor's mailbox before the leader
+    // exits: one poll sends each command.
+    let mut waiting = std::pin::pin!(handle.wait(job));
+    let mut following = std::pin::pin!(handle.log_read(job, StreamKind::Stdout, 0, true));
+    assert!(
+        tokio::time::timeout(Duration::ZERO, &mut waiting)
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::time::timeout(Duration::ZERO, &mut following)
+            .await
+            .is_err()
+    );
+    handle
+        .stdin_write(job, 0, Bytes::from_static(b"\n"))
+        .await
+        .unwrap();
+
+    let refusal = waiting.await.unwrap_err();
+    assert!(
+        refusal.message.contains("proc_signal_with_audittoken")
+            && refusal.message.contains("Operation not permitted"),
+        "{refusal:?}"
+    );
+    assert_eq!(
+        following.await.unwrap_err(),
+        refusal,
+        "the follower ends with the refusal"
+    );
+    assert_eq!(handle.info(job).await.unwrap().state, JobState::Draining);
+    assert_eq!(
+        released.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+        "a refusal keeps the job's tokens"
+    );
+    hold.release().await.expect("the hold outlives the refusal");
+
+    drop(holding);
+    released
+        .await
+        .expect("the concluded job returns its tokens");
+    let ended = handle.wait(job).await.unwrap();
+    assert_eq!(
+        (ended.state, ended.exit),
+        (JobState::Exited, Some(ExitStatus::Exited { code: 0 }))
+    );
+    drop(listing);
+    handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn terminal_reaps_a_detached_descendant_still_holding_output_open() {
@@ -10012,7 +10143,8 @@ async fn a_declared_resident_survives_unrelated_terminal_and_refused_start() {
     use cowshed_core::runtime::job_groups::Process;
     use cowshed_core::runtime::process_events::{Darwin, ProcessReads as _};
 
-    let (handle, ledger, _root) = native_process_fixture("resident-membership", None);
+    let (handle, ledger, _root) =
+        native_process_fixture("resident-membership", None, Arc::new(ImmediateCpu));
     let resident = handle
         .exec(
             None,
@@ -10134,7 +10266,8 @@ fn native_runtime_drop_retires_observed_detached_membership() {
         .build()
         .unwrap();
     let (handle, ledger, _root, peer, life, exit) = runtime.block_on(async {
-        let (handle, ledger, root) = native_process_fixture("runtime-drop-membership", None);
+        let (handle, ledger, root) =
+            native_process_fixture("runtime-drop-membership", None, Arc::new(ImmediateCpu));
         let socket = root.join("child.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let script = r#"
@@ -10240,7 +10373,8 @@ async fn membership_endpoint_is_job_bound_and_never_admits_coordinator_authority
 
     let sockets = TempRoot::new_in(&temp_parent::canonical_parent(), "cs-members");
     let socket = sockets.join("s.sock");
-    let (handle, ledger, root) = native_process_fixture("subtree-endpoint", Some(&socket));
+    let (handle, ledger, root) =
+        native_process_fixture("subtree-endpoint", Some(&socket), Arc::new(ImmediateCpu));
     let bound = supervisor_socket::bind(&socket).await.unwrap();
     let serving = tokio::spawn(supervisor_socket::serve(bound, handle.clone(), None, None));
     supervisor_socket::hello(&socket).await.unwrap();
@@ -10951,7 +11085,8 @@ async fn a_sealed_job_keeps_no_process_observation() {
     // The lives each job runs, as the script below counts them, and each one's argv bytes.
     const LIVES: usize = 32;
     const ARGV_BYTES: usize = 64 * 128;
-    let (handle, _ledger, _root) = native_process_fixture("concluded-observation", None);
+    let (handle, _ledger, _root) =
+        native_process_fixture("concluded-observation", None, Arc::new(ImmediateCpu));
     // Each of 32 lives runs an 8 KiB argv and forks a child that shares it until its own exec,
     // as a compiler driver and the tools it starts do.
     let argv: Vec<CommandArg> = (0..64)

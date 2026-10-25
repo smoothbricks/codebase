@@ -2543,7 +2543,9 @@ async fn serve_process_events(
 /// terminal `JobInfo` when it ends, or `null` again when the holder releases it. A holder that
 /// closes the connection first — it exited, or was killed, `SIGKILL` included, since the kernel
 /// closes its socket — has left a job nobody waits for, and the job is killed
-/// (05_gateway.md, "A job lives with its requester").
+/// (05_gateway.md, "A job lives with its requester"). A refused retirement ends neither: the job
+/// keeps running with its claims, and the holder's own waits carry the refusal, so the hold stays
+/// until it is released or closed (11_shell.md, "Shell activation and process reuse").
 async fn serve_hold(
     mut stream: UnixStream,
     supervisor: &WorkspaceSupervisorHandle,
@@ -2563,30 +2565,48 @@ async fn serve_hold(
     )
     .await?;
     let (mut reader, mut writer) = stream.into_split();
-    tokio::select! {
+    // One read of the holder's demand outlives a refused wait, so a frame it began stays whole.
+    let read = read_json::<HoldDemand>(&mut reader);
+    tokio::pin!(read);
+    let demand = tokio::select! {
         biased;
-        ended = caller.wait(job_id) => {
-            let delivered_end = ended.is_ok();
-            let response = match ended {
-                Ok(info) => Response::Ok { value: to_value(&info)?, bytes: 0 },
-                Err(error) => Response::Err(error),
-            };
-            let written = write_json(&mut writer, &response).await;
-            if delivered_end && written.is_ok() {
-                owed.record(job_id, |owed| owed.end = true);
-            }
-            written
-        }
-        demand = read_json::<HoldDemand>(&mut reader) => match demand {
-            Ok(HoldDemand::Release) => {
-                write_json(
+        ended = caller.wait(job_id) => match ended {
+            Ok(info) => {
+                let written = write_json(
                     &mut writer,
-                    &Response::Ok { value: serde_json::Value::Null, bytes: 0 },
+                    &Response::Ok { value: to_value(&info)?, bytes: 0 },
                 )
-                .await
+                .await;
+                if written.is_ok() {
+                    owed.record(job_id, |owed| owed.end = true);
+                }
+                return written;
             }
-            Err(_) => kill_unheld(supervisor, job_id).await,
+            // A refused retirement leaves the job running and held; its waiters have the error.
+            // An ended job's error answers the hold, as its record would.
+            Err(error) => match caller.info(job_id).await {
+                Ok(info) if !info.state.is_terminal() => None,
+                _ => return write_json(&mut writer, &Response::Err(error)).await,
+            },
         },
+        demand = &mut read => Some(demand),
+    };
+    let demand = match demand {
+        Some(demand) => demand,
+        None => read.await,
+    };
+    match demand {
+        Ok(HoldDemand::Release) => {
+            write_json(
+                &mut writer,
+                &Response::Ok {
+                    value: serde_json::Value::Null,
+                    bytes: 0,
+                },
+            )
+            .await
+        }
+        Err(_) => kill_unheld(supervisor, job_id).await,
     }
 }
 

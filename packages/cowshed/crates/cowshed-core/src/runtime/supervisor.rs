@@ -69,6 +69,7 @@ use crate::runtime::nx_daemon::{NxDaemonKeeper, Probe, Verdict};
 #[cfg(target_os = "macos")]
 use crate::runtime::process_monitor::ProcessMonitor;
 use crate::runtime::process_stream::JobProcessStream;
+use crate::runtime::retirement_refusal::{AtEnd, Refusal, RetirementRun, at_end};
 use crate::runtime::supervisor_socket::AdmissionSource;
 use crate::runtime::volume_usage::{HostVolume, HostVolumeStat, VolumeBaseline, VolumeMountpoint};
 use crate::storage::job_artifact::{
@@ -4456,9 +4457,9 @@ struct JobStateRecord {
 /// Process, volume and CPU claims remain held through draining and every refusal.
 enum RetirementState {
     Unstarted,
-    Draining,
+    Draining(RetirementRun),
     Ended,
-    Refused(CowshedError),
+    Refused(Refusal),
 }
 
 /// The complete authored environment's identity, before session or activation overlays. Values
@@ -4951,7 +4952,10 @@ impl SupervisorActor {
                         },
                     }
                 }
-                _ = self.membership_changed.notified() => self.record_groups(),
+                _ = self.membership_changed.notified() => {
+                    self.record_groups();
+                    self.rerun_refused();
+                }
                 event = self.event_receiver.recv() => {
                     match event {
                         Some(event) => self.handle_event(event),
@@ -5482,8 +5486,8 @@ impl SupervisorActor {
                 } else if self.lifecycle == ActorLifecycle::Retired {
                     let _ = reply.send(Ok(()));
                 } else if let Some(error) = self.jobs.values().find_map(|job| {
-                    if let RetirementState::Refused(error) = &job.retirement {
-                        Some(error.clone())
+                    if let RetirementState::Refused(refusal) = &job.retirement {
+                        Some(refusal.error().clone())
                     } else {
                         None
                     }
@@ -7058,8 +7062,8 @@ impl SupervisorActor {
         };
         if job.terminal() {
             let _ = reply.send(job.terminal_outcome());
-        } else if let RetirementState::Refused(error) = &job.retirement {
-            let _ = reply.send(Err(error.clone()));
+        } else if let RetirementState::Refused(refusal) = &job.retirement {
+            let _ = reply.send(Err(refusal.error().clone()));
         } else {
             job.waiters.push(reply);
         }
@@ -7197,21 +7201,30 @@ impl SupervisorActor {
             Ok(Some(chunk)) => {
                 let _ = reply.send(Ok(chunk));
             }
-            Ok(None) if follow && !job.terminal() => {
-                job.log_waiters.push(PendingLog {
+            Ok(None) => match at_end(
+                follow,
+                job.terminal(),
+                matches!(job.retirement, RetirementState::Refused(_)),
+            ) {
+                AtEnd::Wait => job.log_waiters.push(PendingLog {
                     stream,
                     offset,
                     reply,
-                });
-            }
-            Ok(None) => {
-                let (_, len, eof) = job.stream(stream);
-                let _ = reply.send(Ok(LogChunk {
-                    bytes: Bytes::new(),
-                    next_offset: len,
-                    eof: eof || job.terminal(),
-                }));
-            }
+                }),
+                AtEnd::Refused => {
+                    if let RetirementState::Refused(refusal) = &job.retirement {
+                        let _ = reply.send(Err(refusal.error().clone()));
+                    }
+                }
+                AtEnd::Answer => {
+                    let (_, len, eof) = job.stream(stream);
+                    let _ = reply.send(Ok(LogChunk {
+                        bytes: Bytes::new(),
+                        next_offset: len,
+                        eof: eof || job.terminal(),
+                    }));
+                }
+            },
             Err(error) => {
                 let _ = reply.send(Err(error));
             }
@@ -7310,15 +7323,15 @@ impl SupervisorActor {
                 }
                 // A descendant may still hold stdout/stderr open. Drain at leader exit, not
                 // after EOF; sealing still waits for both streams and membership proof.
-                self.retire_membership(job_id);
+                self.retire_membership(job_id, RetirementRun::Requested);
             }
             ProcessEvent::Retired { job_id, retirement } => {
                 let Some(job) = self.jobs.get_mut(&job_id) else {
                     return;
                 };
-                if !matches!(job.retirement, RetirementState::Draining) {
+                let RetirementState::Draining(run) = job.retirement else {
                     return;
-                }
+                };
                 let retirement = retirement.and_then(|receipt| {
                     if job.info.pid.is_none()
                         && (!receipt.outlived.is_empty() || receipt.outlived_incomplete)
@@ -7340,7 +7353,7 @@ impl SupervisorActor {
                         }
                         job.retirement = RetirementState::Ended;
                     }
-                    Err(error) => self.refuse_membership(job_id, error),
+                    Err(error) => self.refuse_membership(job_id, error, run),
                 }
             }
             ProcessEvent::WaitFailed { job_id, error } => {
@@ -7624,14 +7637,14 @@ impl SupervisorActor {
         // once the command is placed; retirement waits for the birth, as on macOS.
         #[cfg(target_os = "linux")]
         if job.cgroup.is_some() && job.birth.is_some() {
-            self.retire_membership(job_id);
+            self.retire_membership(job_id, RetirementRun::Requested);
             return Ok(());
         }
         #[cfg(target_os = "macos")]
         if job.monitor.is_some() && job.birth.is_some() {
             // Retirement takes the membership snapshot before sending a signal, so a process
             // ended by cancellation cannot disappear from the job's outlived receipt.
-            self.retire_membership(job_id);
+            self.retire_membership(job_id, RetirementRun::Requested);
             return Ok(());
         }
         if !initiate {
@@ -7650,13 +7663,13 @@ impl SupervisorActor {
     /// Retire membership off the actor while retaining the actual parent's handle, unreaped
     /// leader and all resource claims. Resident jobs use this same boundary when their own
     /// foreground leader ends; another job's terminal never ends the resident.
-    fn retire_membership(&mut self, job_id: JobId) -> bool {
+    fn retire_membership(&mut self, job_id: JobId, run: RetirementRun) -> bool {
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return false;
         };
         match &job.retirement {
             RetirementState::Ended => return true,
-            RetirementState::Draining | RetirementState::Refused(_) => return false,
+            RetirementState::Draining(_) | RetirementState::Refused(_) => return false,
             RetirementState::Unstarted => {}
         }
         #[cfg(target_os = "linux")]
@@ -7664,7 +7677,7 @@ impl SupervisorActor {
             let cgroup = Arc::clone(cgroup);
             let grace = self.term_grace;
             let events = self.events.clone();
-            job.retirement = RetirementState::Draining;
+            job.retirement = RetirementState::Draining(run);
             if job.info.pid.is_some() {
                 job.info.state = JobState::Draining;
             }
@@ -7700,7 +7713,7 @@ impl SupervisorActor {
             let birth = birth.clone();
             let grace = self.term_grace;
             let events = self.events.clone();
-            job.retirement = RetirementState::Draining;
+            job.retirement = RetirementState::Draining(run);
             job.info.state = JobState::Draining;
             tokio::spawn(async move {
                 let retirement = tokio::task::spawn_blocking(move || monitor.retire(birth, grace))
@@ -7718,7 +7731,10 @@ impl SupervisorActor {
         true
     }
 
-    fn refuse_membership(&mut self, job_id: JobId, error: CowshedError) {
+    /// A refused retirement keeps the job's claims and reaches every waiter as its typed error,
+    /// a log follower included: nothing ends its stream on its own any more (11_shell.md). Its
+    /// observer's running lives ending re-runs it ([`Self::rerun_refused`]), at once if none runs.
+    fn refuse_membership(&mut self, job_id: JobId, error: CowshedError, run: RetirementRun) {
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
         };
@@ -7733,13 +7749,38 @@ impl SupervisorActor {
         for waiter in job.kill_waiters.drain(..) {
             let _ = waiter.send(Err(error.clone()));
         }
+        for waiter in job.log_waiters.drain(..) {
+            let _ = waiter.reply.send(Err(error.clone()));
+        }
         for waiter in self.retire_waiters.drain(..) {
             let _ = waiter.send(Err(error.clone()));
         }
         for waiter in self.quiesce_waiters.drain(..) {
             let _ = waiter.send(Err(error.clone()));
         }
-        job.retirement = RetirementState::Refused(error);
+        job.retirement = RetirementState::Refused(Refusal::new(error, run));
+        // Its lives may have ended while the refusal was on its way here.
+        self.rerun_refused();
+    }
+
+    /// Re-run every refused retirement whose job's observer now holds no running life
+    /// ([`Refusal::reruns`]): the survivors' exits, not a clock, conclude the job.
+    fn rerun_refused(&mut self) {
+        let due: Vec<JobId> = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| {
+                matches!(&job.retirement, RetirementState::Refused(refusal)
+                    if refusal.reruns(observed_running(job)))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for job_id in due {
+            if let Some(job) = self.jobs.get_mut(&job_id) {
+                job.retirement = RetirementState::Unstarted;
+            }
+            self.retire_membership(job_id, RetirementRun::EmptyMembership);
+        }
     }
     async fn finish_ready_jobs(&mut self) {
         let ready = self
@@ -7762,7 +7803,7 @@ impl SupervisorActor {
     }
 
     async fn finalize_job(&mut self, job_id: JobId, forced_state: Option<JobState>) {
-        if !self.retire_membership(job_id) {
+        if !self.retire_membership(job_id, RetirementRun::Requested) {
             return;
         }
         let (links, observation) = match self.jobs.get_mut(&job_id) {
@@ -7889,7 +7930,7 @@ impl SupervisorActor {
             // Final accounting precedes removing the hierarchy. A refused finish retains all
             // claims and remains nonterminal; only an explicit request retries retirement.
             if let Err(error) = cgroup.finish() {
-                self.refuse_membership(job_id, cgroup_error(error));
+                self.refuse_membership(job_id, cgroup_error(error), RetirementRun::Requested);
                 return;
             }
             job.cgroup = None;
@@ -8806,6 +8847,21 @@ fn read_sealed_range(
         filled += read;
     }
     Ok(output)
+}
+
+/// How many lives the job's observer holds running now; `None` for a job with no observer.
+fn observed_running(job: &JobStateRecord) -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        job.monitor
+            .as_ref()
+            .map(|monitor| monitor.running_lives().len())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = job;
+        None
+    }
 }
 
 fn flush_log_waiters(job: &mut JobStateRecord) {

@@ -34,6 +34,7 @@ pub mod process_tree;
 pub mod process_usage;
 pub mod project;
 pub mod ref_lock;
+mod retirement_refusal;
 pub mod shell_host;
 pub mod shell_inherit;
 mod shell_job;

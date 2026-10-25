@@ -2075,7 +2075,9 @@ One boundary answer, no ambiguity:
   placement") — never ran: its `JobInfo` is `Killed` with no `pid` and no `exit`. A killed `JobInfo` with a `pid` and no
   `exit` is refused, so "never ran" and "ran and was killed" never share a projection. Cancellation uses the same
   membership retirement as spontaneous leader exit: snapshot, TERM, existing grace, KILL where necessary, and native
-  exit proof. A retirement refusal is an error, not permission to release the claim or publish terminal state. Neither
+  exit proof. A retirement refusal is an error, not permission to release the claim or publish terminal state: it
+  answers `wait` and a following `logs` with the typed error while the job stays held, and on Darwin a refusal that came
+  while members still ran re-runs once they have exited (11_shell.md, "Shell activation and process reuse"). Neither
   quiet output, elapsed age nor zero CPU authorizes cancellation.
 - **Binary stdin** is supported without shell interpolation: `ExecOptions.stdin` accepts inline `Uint8Array`,
   backpressured `AsyncIterable<Uint8Array>`, or a workspace-relative file object with the canonical no-follow open.

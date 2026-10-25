@@ -255,6 +255,14 @@ setuid-root `top` in a test-owned group: its membership record names root's effe
 and ended by SIGTERM. The combined read refused that member with EPERM, and with it the retirement of a job whose leader
 exited while Nx's setuid `ps` ran: the job stayed draining with its CPU tokens and its client never saw its end.
 
+A refusal that still happens must end the client, not hang it. The host-controller lane's
+`host_controller_a_refused_retirement_answers_its_client_and_its_survivors_exits_conclude_it` runs a real supervisor job
+whose member runs `lsof` as root through `sudo -n`. lsof's real uid is root's, so the kernel refuses retirement's signal
+to it with EPERM when the leader exits; SIGTERM is ignored so sudo neither ends nor relays it before that refusal. The
+parked `wait` and stdout follower both get that refusal, the job stays draining with its tokens and its hold, and once
+the test closes the file lsof watches, their exits re-run the retirement, which seals the job and returns its tokens. It
+needs the same passwordless sudo grant for `/usr/sbin/lsof`.
+
 The exit-watch fallback is proven on the real kernel in the ordinary lane: registering launchd (pid 1, which no user may
 SIGKILL) yields the withheld watch and the observer's own child the status watch. A scripted withheld exit folds no
 status and the `UnreadExitStatus` gap. The host-controller lane's
