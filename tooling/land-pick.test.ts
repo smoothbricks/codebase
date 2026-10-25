@@ -227,8 +227,8 @@ describe('previewSeed', () => {
 
 describe('previewRefusal', () => {
   it('reads the error code of a refused preview, and nothing from an answer or other text', () => {
-    expect(previewRefusal(JSON.stringify({ ok: false, error: { code: 'notFound', message: 'no seed' } }))).toBe(
-      'notFound',
+    expect(previewRefusal(JSON.stringify({ ok: false, error: { code: 'not-found', message: 'no seed' } }))).toBe(
+      'not-found',
     );
     expect(previewRefusal(JSON.stringify({ ok: false, error: { code: 'conflict' } }))).toBe('conflict');
     expect(previewRefusal(JSON.stringify({ ok: true, result: { seed: 'a895a1ce6c80439484c0edd59a646063' } }))).toBe(

@@ -163,16 +163,26 @@ reseed)
   printf '%s\\n' "$*" >>"$FIX_STATE/reseed.log"
   case " $* " in
   *' --dry-run '*)
-    # Main has no seed unless the scenario seeds it; a conflict stands for any other refused preview.
+    # Main has no seed unless the scenario seeds it; a conflict stands for any other refused preview. Codes and exit
+    # statuses are cowshed's (ErrorCode in cowshed-core's error.rs). seed-then-conflict answers once, then refuses.
     case $FIX_PREVIEW in
     seed) printf '{"ok":true,"result":{"seed":"%s","dryRun":true}}\\n' "$FIX_SEED" ;;
+    seed-then-conflict)
+      if [ ! -f "$FIX_STATE/previewed" ]; then
+        : >"$FIX_STATE/previewed"
+        printf '{"ok":true,"result":{"seed":"%s","dryRun":true}}\\n' "$FIX_SEED"
+        exit 0
+      fi
+      printf '{"ok":false,"error":{"code":"conflict","message":"lifecycle/image lock held"}}\\n'
+      exit 4
+      ;;
     conflict)
       printf '{"ok":false,"error":{"code":"conflict","message":"unfinished lifecycle journal entry"}}\\n'
-      exit 2
+      exit 4
       ;;
     *)
-      printf '{"ok":false,"error":{"code":"notFound","message":"main has no seed"}}\\n'
-      exit 1
+      printf '{"ok":false,"error":{"code":"not-found","message":"main has no seed"}}\\n'
+      exit 3
       ;;
     esac
     ;;
@@ -235,7 +245,7 @@ const SEED = 'a895a1ce6c80439484c0edd59a646063';
 
 /** What a land's build-volume pick meets: main's reseed preview, what land-pick.ts prices, and the reseed itself. */
 interface PickScenario {
-  readonly preview?: 'seed' | 'conflict';
+  readonly preview?: 'seed' | 'seed-then-conflict' | 'conflict';
   /** land-pick.ts price's stdout (`own`, `seed <id>`), or `fail` for a pricing that exits 1. */
   readonly price?: string;
   readonly reseed?: 'fail';
@@ -673,9 +683,21 @@ describe('land-host.sh', () => {
       expect(run.reseeds).toEqual([PREVIEW]);
       expect(run.log).toContain('unfinished lifecycle journal entry');
       expect(run.log).toContain(
-        "the reseed preview failed (cowshed exited 2); the gate builds on ws's own build volume",
+        "the reseed preview failed (cowshed exited 4); the gate builds on ws's own build volume",
       );
       expect(run.log).not.toContain('found nothing to price');
+    });
+
+    it('says a failed preview before the reseed as a failed preview, and reseeds nothing', () => {
+      const land = fixture(false, false, { preview: 'seed-then-conflict', price: `seed ${SEED}` });
+      const run = land.land(passing());
+      expect(run.status, run.log).toBe(0);
+      expect(run.reseeds).toEqual([PREVIEW, PREVIEW]);
+      expect(run.log).toContain('lifecycle/image lock held');
+      expect(run.log).toContain(
+        "the reseed preview before the reseed failed (cowshed exited 4); the gate builds on ws's own build volume",
+      );
+      expect(run.log).not.toContain("main's seed changed");
     });
   });
   it('refuses to land main itself', () => {

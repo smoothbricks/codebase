@@ -103,7 +103,7 @@ pick_build_volume() {
     status=$?
     printf '%s\n' "$preview" >&2
     case $(bun "$here/land-pick.ts" refusal "$preview") in
-    notFound) say "the reseed preview found nothing to price; the gate builds on $workspace's own build volume" ;;
+    not-found) say "the reseed preview found nothing to price; the gate builds on $workspace's own build volume" ;;
     *) say "the reseed preview failed (cowshed exited $status); the gate builds on $workspace's own build volume" ;;
     esac
     return 0
@@ -118,10 +118,13 @@ pick_build_volume() {
   esac
   # The reseed clones main's latest seed as it then stands, and a fork or land can publish another while the pick
   # prices: reseed only onto the seed that was priced.
-  current=
-  if again=$(cowshed --json reseed "$workspace" --from main --dry-run); then
-    current=$(bun "$here/land-pick.ts" seed "$again") || current=
-  fi
+  again=$(cowshed --json reseed "$workspace" --from main --dry-run) || {
+    status=$?
+    printf '%s\n' "$again" >&2
+    say "the reseed preview before the reseed failed (cowshed exited $status); the gate builds on $workspace's own build volume"
+    return 0
+  }
+  current=$(bun "$here/land-pick.ts" seed "$again") || current=
   if [ "$current" != "$priced" ]; then
     say "main's seed changed after it was priced (priced $priced, now ${current:-unreadable}); the gate builds on $workspace's own build volume"
     return 0
