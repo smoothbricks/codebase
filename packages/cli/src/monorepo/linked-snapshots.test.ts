@@ -40,7 +40,7 @@ import {
  * producer is the one boundary the fixture stands in for: a plugin package whose probe answers `hit` with a receipt
  * inventorying the provider's actual output bytes at that moment, or `miss`, or a frozen earlier receipt. That both
  * modules load in a plain Bun with nothing installed is proven by the children that load them: the `--links` run
- * below and developer-links-stale.test.ts.
+ * below and the shell-entry suite (setup-environment-links.test.ts).
  *
  * Bun keeps what it has imported or resolved for the life of its process. So a plugin never changes once it has
  * answered (a provider whose producer refused leaves a mark its probe reads), and a snapshot runs from the real path

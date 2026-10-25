@@ -1,27 +1,32 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Secret reference fixtures are literal shell and workflow text. */
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, spyOn } from 'bun:test';
 import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
-import type { SecretSpec } from '../../../nx-plugin/managed/raw/tooling/direnv/secret-references.ts';
+import {
+  maskSecretValues,
+  parseSmooSecrets,
+  readSecretGroups,
+  registryAuthEnvNames,
+  resolveSecretEnvironment,
+  type SecretSpec,
+} from '../../../nx-plugin/managed/raw/tooling/direnv/secret-references.ts';
 
 /**
- * The resolver under test is a managed raw script: at runtime it loads as
- * plain Bun source during bootstrap, BEFORE any workspace package — and
- * therefore before the ttsc/Typia transform preloads exist. The tests honor
- * that: the `import type` above typechecks this file against the real module
- * under `tsconfig.test.json` but is erased at runtime, and every behavioral
- * test loads the raw module in a plain `bun -e` child the same way
- * setup-environment.ts does, with no preloads in the chain.
+ * The resolver under test is a managed raw script: at runtime it loads as plain Bun source during bootstrap, BEFORE any
+ * workspace package — and therefore before the ttsc/Typia transform preloads exist. It has no top-level effect, so the
+ * cases import its functions and call them here: what a call settles on is its value, or the message of the refusal it
+ * throws, and it must say nothing on stderr. One case keeps the process whose subject it is: a plain `bun -e` child
+ * with no preloads in the chain loads the raw module the way setup-environment.ts does and resolves through a real
+ * provider command. Provider commands are real spawns throughout, because the resolver's own spawn path is under test.
  */
 const RAW_RESOLVER = join(managedAssetsRoot, 'raw/tooling/direnv/secret-references.ts');
 
-// The child scripts import the raw module dynamically on purpose: a static
-// value import would route it through the ttsc/Typia transform preloads, which
-// is exactly the chain bootstrap never has. Loading via a plain bun child
-// reproduces the real bootstrap module load — no plugins.
+// The child script imports the raw module dynamically in a plain Bun, so no ttsc/Typia transform preload is in its
+// chain, which is exactly the chain bootstrap has: no plugins. (This file's own static import runs through the test
+// preloads.)
 const RESOLVE_SCRIPT = `
 const resolver = await import(Bun.argv[1]);
 const request = JSON.parse(Bun.argv[2]);
@@ -33,79 +38,12 @@ try {
 }
 `;
 
-const PARSE_SCRIPT = `
-const resolver = await import(Bun.argv[1]);
-try {
-  process.stdout.write(JSON.stringify({ parsed: resolver.parseSmooSecrets(JSON.parse(Bun.argv[2])) }));
-} catch (error) {
-  process.stdout.write(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
-}
-`;
-
-const NPMRC_SCRIPT = `
-const resolver = await import(Bun.argv[1]);
-const npmrc = JSON.parse(Bun.argv[2]);
-const names = [...resolver.registryAuthEnvNames(npmrc)];
-process.stdout.write(JSON.stringify({ names }));
-`;
-
-const GROUPS_SCRIPT = `
-const resolver = await import(Bun.argv[1]);
-const { root } = JSON.parse(Bun.argv[2]);
-const groups = resolver.readSecretGroups(root).map(({ name, group, derivedGroup }) => ({ name, group, derivedGroup }));
-process.stdout.write(JSON.stringify({ groups }));
-`;
-
-interface BootstrapOutcome {
+/** What a call settled on: its value, or the message of the refusal it threw. */
+interface Outcome {
   readonly resolved?: Record<string, string>;
   readonly deferred?: readonly { readonly name: string; readonly group: string; readonly guidance: string }[];
   readonly parsed?: unknown;
   readonly error?: string;
-}
-
-interface GroupListing {
-  readonly groups: { name: string; group: string; derivedGroup: string }[];
-}
-
-function isGroupListing(value: unknown): value is GroupListing {
-  if (typeof value !== 'object' || value === null || !('groups' in value) || !Array.isArray(value.groups)) return false;
-  return value.groups.every(
-    (entry: unknown) =>
-      typeof entry === 'object' &&
-      entry !== null &&
-      'name' in entry &&
-      typeof entry.name === 'string' &&
-      'group' in entry &&
-      typeof entry.group === 'string' &&
-      'derivedGroup' in entry &&
-      typeof entry.derivedGroup === 'string',
-  );
-}
-
-/** Narrows a harness JSON envelope with `in` checks instead of assertions: unknown shapes fail the test. Field-level expectations below do the precise checking. */
-function isBootstrapOutcome(value: unknown): value is BootstrapOutcome {
-  if (typeof value !== 'object' || value === null) return false;
-  if ('resolved' in value && (typeof value.resolved !== 'object' || value.resolved === null)) return false;
-  if ('deferred' in value && !Array.isArray(value.deferred)) return false;
-  if ('error' in value && typeof value.error !== 'string') return false;
-  return true;
-}
-function mustOutcome(stdout: string): BootstrapOutcome {
-  const value: unknown = JSON.parse(stdout);
-  if (!isBootstrapOutcome(value)) throw new Error(`bootstrap harness returned a malformed envelope: ${stdout}`);
-  return value;
-}
-
-function mustNames(stdout: string): string[] {
-  const value: unknown = JSON.parse(stdout);
-  if (typeof value !== 'object' || value === null || !('names' in value)) {
-    throw new Error(`bootstrap harness returned a malformed envelope: ${stdout}`);
-  }
-  const names: unknown = value.names;
-  if (!Array.isArray(names) || !names.every((entry: unknown): entry is string => typeof entry === 'string')) {
-    throw new Error(`bootstrap harness returned malformed names: ${stdout}`);
-  }
-  return names;
 }
 
 /**
@@ -153,10 +91,9 @@ async function withProviderLedger(
   }
 }
 /**
- * Runs one script against the raw module in a plain Bun child. The child env
- * carries only PATH/HOME so parent suite state (CI, GITHUB_ACTIONS) cannot
- * leak into the routing flags; every decision input travels through the
- * explicit request instead.
+ * Runs one script against the raw module in a plain Bun child. The child env carries only PATH/HOME so parent suite
+ * state (CI, GITHUB_ACTIONS) cannot leak into the routing flags; every decision input travels through the explicit
+ * request instead.
  */
 async function runInBootstrap(
   script: string,
@@ -177,7 +114,34 @@ async function runInBootstrap(
   return { stdout, stderr, exitCode };
 }
 
-async function resolveInBootstrap(options: {
+/**
+ * Runs `call` and fails unless it said nothing on stderr: the resolver writes no output of its own, so a line there is
+ * a leak.
+ */
+async function silently<T>(call: () => T): Promise<Awaited<T>> {
+  const said: string[] = [];
+  const record = (...args: unknown[]): void => {
+    said.push(args.map(String).join(' '));
+  };
+  const error = spyOn(console, 'error').mockImplementation(record);
+  const warn = spyOn(console, 'warn').mockImplementation(record);
+  let result: Awaited<T>;
+  try {
+    result = await call();
+  } finally {
+    error.mockRestore();
+    warn.mockRestore();
+  }
+  expect(said).toEqual([]);
+  return result;
+}
+
+/** What a refusal comes to: its message, which is all the resolver lets out of one. */
+function refused(error: unknown): Outcome {
+  return { error: error instanceof Error ? error.message : String(error) };
+}
+
+async function resolve(options: {
   root: string;
   env?: Record<string, string | undefined>;
   /**
@@ -187,24 +151,24 @@ async function resolveInBootstrap(options: {
    * entry names its group out loud.
    */
   group?: string;
-}): Promise<BootstrapOutcome> {
-  const { stdout, stderr, exitCode } = await runInBootstrap(
-    RESOLVE_SCRIPT,
-    JSON.stringify({ root: options.root, env: options.env ?? {}, group: options.group ?? 'shell' }),
-  );
-  expect(stderr).toBe('');
-  expect(exitCode).toBe(0);
-  return mustOutcome(stdout);
+}): Promise<Outcome> {
+  return silently(async () => {
+    try {
+      const { values, deferred } = await resolveSecretEnvironment({
+        root: options.root,
+        env: options.env ?? {},
+        group: options.group ?? 'shell',
+      });
+      return { resolved: values, deferred };
+    } catch (error) {
+      return refused(error);
+    }
+  });
 }
 
 /** The groups this repository's own declarations settle on, per declared variable. */
-async function groupsInBootstrap(root: string): Promise<{ name: string; group: string; derivedGroup: string }[]> {
-  const { stdout, stderr, exitCode } = await runInBootstrap(GROUPS_SCRIPT, JSON.stringify({ root }));
-  expect(stderr).toBe('');
-  expect(exitCode).toBe(0);
-  const value: unknown = JSON.parse(stdout);
-  if (!isGroupListing(value)) throw new Error(`bootstrap harness returned a malformed listing: ${stdout}`);
-  return value.groups;
+function groupsOf(root: string): Promise<{ name: string; group: string; derivedGroup: string }[]> {
+  return silently(() => readSecretGroups(root).map(({ name, group, derivedGroup }) => ({ name, group, derivedGroup })));
 }
 
 /** Builds a fixture repository whose package.json and .npmrc are the resolver's real inputs. */
@@ -241,12 +205,29 @@ async function markCowshedWorkspace(root: string): Promise<void> {
   await writeFile(join(root, '.cowshed', 'workspace.json'), '{}');
 }
 
+describe('bootstrap load', () => {
+  it('resolves in a plain Bun child with no preloads, as shell entry loads the resolver before anything is installed', async () => {
+    await withFixture({ secrets: { SMOO_TOKEN: { command: emit('tok-from-provider') } } }, async (root) => {
+      const { stdout, stderr, exitCode } = await runInBootstrap(
+        RESOLVE_SCRIPT,
+        JSON.stringify({ root, env: {}, group: 'shell' }),
+      );
+      expect(stderr).toBe('');
+      expect(exitCode).toBe(0);
+      expect(JSON.parse(stdout)).toEqual({ resolved: { SMOO_TOKEN: 'tok-from-provider' }, deferred: [] });
+    });
+  });
+});
+
 describe('smoo.secrets shape validation', () => {
-  const parse = async (packageJson: unknown): Promise<BootstrapOutcome> => {
-    const { stdout, exitCode } = await runInBootstrap(PARSE_SCRIPT, JSON.stringify(packageJson));
-    expect(exitCode).toBe(0);
-    return mustOutcome(stdout);
-  };
+  const parse = (packageJson: unknown): Promise<Outcome> =>
+    silently(() => {
+      try {
+        return { parsed: parseSmooSecrets(packageJson) };
+      } catch (error) {
+        return refused(error);
+      }
+    });
 
   it('returns an empty map when nothing is declared', async () => {
     expect((await parse({ name: 'fixture' })).parsed).toEqual({});
@@ -294,11 +275,7 @@ describe('smoo.secrets shape validation', () => {
 });
 
 describe('registryAuthEnvNames', () => {
-  const names = async (npmrc: string | null): Promise<string[]> => {
-    const { stdout, exitCode } = await runInBootstrap(NPMRC_SCRIPT, JSON.stringify(npmrc));
-    expect(exitCode).toBe(0);
-    return mustNames(stdout);
-  };
+  const names = (npmrc: string | null): Promise<string[]> => silently(() => [...registryAuthEnvNames(npmrc)]);
 
   it('collects ${VAR} references from .npmrc text', async () => {
     expect(
@@ -331,7 +308,7 @@ describe('group derivation', () => {
         remoteCache: { server: 'https://nx-cache.example.net', tokenSecret: 'NX_REMOTE_CACHE_TOKEN' },
       },
       async (root) => {
-        expect(await groupsInBootstrap(root)).toEqual([
+        expect(await groupsOf(root)).toEqual([
           { name: 'SMOO_NPM_TOKEN', group: 'registry', derivedGroup: 'registry' },
           { name: 'NX_REMOTE_CACHE_TOKEN', group: 'nx-cache', derivedGroup: 'nx-cache' },
           { name: 'SMOO_TOKEN', group: 'shell', derivedGroup: 'shell' },
@@ -350,7 +327,7 @@ describe('group derivation', () => {
         },
       },
       async (root) => {
-        expect(await groupsInBootstrap(root)).toEqual([
+        expect(await groupsOf(root)).toEqual([
           { name: 'SMOO_NPM_TOKEN', group: 'shell', derivedGroup: 'registry' },
           { name: 'SMOO_TOKEN', group: 'deploy', derivedGroup: 'shell' },
         ]);
@@ -369,7 +346,7 @@ describe('group derivation', () => {
         // The by-name exclusion this replaced was applied before the .npmrc
         // reference was ever consulted; the derivation keeps that order, so
         // one pathological manifest behaves exactly as it did.
-        expect(await groupsInBootstrap(root)).toEqual([
+        expect(await groupsOf(root)).toEqual([
           { name: 'NX_REMOTE_CACHE_TOKEN', group: 'nx-cache', derivedGroup: 'nx-cache' },
         ]);
       },
@@ -378,7 +355,7 @@ describe('group derivation', () => {
 
   it('a repository declaring nothing has no groups', async () => {
     await withFixture({ secrets: {} }, async (root) => {
-      expect(await groupsInBootstrap(root)).toEqual([]);
+      expect(await groupsOf(root)).toEqual([]);
     });
   });
 });
@@ -390,7 +367,7 @@ describe('resolveSecretEnvironment', () => {
       async (root) => {
         // The declared command cannot run at all, so a resolution attempt would
         // fail loudly; an empty outcome proves the existing value preempted it.
-        expect(await resolveInBootstrap({ root, env: { SMOO_TOKEN: 'already-set' } })).toEqual({
+        expect(await resolve({ root, env: { SMOO_TOKEN: 'already-set' } })).toEqual({
           resolved: {},
           deferred: [],
         });
@@ -400,7 +377,7 @@ describe('resolveSecretEnvironment', () => {
 
   it('an empty environment value does not win; the provider supplies the value', async () => {
     await withFixture({ secrets: { SMOO_TOKEN: { command: emit('tok-from-provider') } } }, async (root) => {
-      expect(await resolveInBootstrap({ root, env: { SMOO_TOKEN: '' } })).toEqual({
+      expect(await resolve({ root, env: { SMOO_TOKEN: '' } })).toEqual({
         resolved: { SMOO_TOKEN: 'tok-from-provider' },
         deferred: [],
       });
@@ -409,13 +386,13 @@ describe('resolveSecretEnvironment', () => {
 
   it('trims one terminal newline, LF or CRLF, preserving interior content', async () => {
     await withFixture({ secrets: { SMOO_TOKEN: { command: emit('tok-from-provider\n') } } }, async (root) => {
-      expect(await resolveInBootstrap({ root, env: {} })).toEqual({
+      expect(await resolve({ root, env: {} })).toEqual({
         resolved: { SMOO_TOKEN: 'tok-from-provider' },
         deferred: [],
       });
     });
     await withFixture({ secrets: { SMOO_TOKEN: { command: emit('tok\r\nmid\r\n') } } }, async (root) => {
-      expect(await resolveInBootstrap({ root, env: {} })).toEqual({
+      expect(await resolve({ root, env: {} })).toEqual({
         resolved: { SMOO_TOKEN: 'tok\r\nmid' },
         deferred: [],
       });
@@ -424,7 +401,7 @@ describe('resolveSecretEnvironment', () => {
 
   it('missing variables on a CI runner refuse with injected-secret guidance and run nothing', async () => {
     await withFixture({ secrets: { SMOO_MISSING: { command: emit('NEVER-RAN-VALUE') } } }, async (root) => {
-      const outcome = await resolveInBootstrap({ root, env: { GITHUB_ACTIONS: 'true' } });
+      const outcome = await resolve({ root, env: { GITHUB_ACTIONS: 'true' } });
       expect(outcome.error).toContain('SMOO_MISSING');
       expect(outcome.error).toContain('inject');
       expect(outcome.error).not.toContain('NEVER-RAN-VALUE');
@@ -433,7 +410,7 @@ describe('resolveSecretEnvironment', () => {
 
   it('CI=true without a runner still runs the provider: agent harnesses set CI on every command', async () => {
     await withFixture({ secrets: { SMOO_TOKEN: { command: emit('tok-from-provider') } } }, async (root) => {
-      expect(await resolveInBootstrap({ root, env: { CI: 'true' } })).toEqual({
+      expect(await resolve({ root, env: { CI: 'true' } })).toEqual({
         resolved: { SMOO_TOKEN: 'tok-from-provider' },
         deferred: [],
       });
@@ -455,13 +432,13 @@ describe('resolveSecretEnvironment', () => {
         // The cache token is not excluded by name any more — it is in group
         // `nx-cache`, which shell entry defers, so its provider is never
         // reached to be unreachable.
-        expect(await resolveInBootstrap({ root, env: {} })).toEqual({
+        expect(await resolve({ root, env: {} })).toEqual({
           resolved: { SMOO_TOKEN: 'tok-from-provider' },
           deferred: [
             { name: 'NX_REMOTE_CACHE_TOKEN', group: 'nx-cache', guidance: expect.stringContaining('nx-cache') },
           ],
         });
-        const withoutCacheDeclaration = await resolveInBootstrap({ root, env: { GITHUB_ACTIONS: 'true' } });
+        const withoutCacheDeclaration = await resolve({ root, env: { GITHUB_ACTIONS: 'true' } });
         expect(withoutCacheDeclaration.error).toContain('SMOO_TOKEN');
         // CI refuses what shell entry needs, and the cache token is not that:
         // nothing shell entry runs reads `smoo.remoteCache`.
@@ -480,7 +457,7 @@ describe('resolveSecretEnvironment', () => {
         async (root) => {
           // Named in the result rather than silently omitted, which is what
           // the by-name exclusion this replaces used to do.
-          expect(await resolveInBootstrap({ root, env: {} })).toEqual({
+          expect(await resolve({ root, env: {} })).toEqual({
             resolved: {},
             deferred: [
               {
@@ -495,7 +472,7 @@ describe('resolveSecretEnvironment', () => {
           // And a cowshed workspace does not refuse it either: the gateway
           // rule is about registry credentials, and this is not one.
           await markCowshedWorkspace(root);
-          expect(await resolveInBootstrap({ root, env: {} })).toEqual({
+          expect(await resolve({ root, env: {} })).toEqual({
             resolved: {},
             deferred: [
               {
@@ -522,7 +499,7 @@ describe('resolveSecretEnvironment', () => {
           remoteCache: { server: 'https://nx-cache.example.net', tokenSecret: 'NX_REMOTE_CACHE_TOKEN' },
         },
         async (root) => {
-          const outcome = await resolveInBootstrap({ root, env: {}, group: 'nx-cache' });
+          const outcome = await resolve({ root, env: {}, group: 'nx-cache' });
 
           expect(outcome.resolved).toEqual({ NX_REMOTE_CACHE_TOKEN: 'cache-tok' });
           expect(outcome.deferred).toEqual([
@@ -545,7 +522,7 @@ describe('resolveSecretEnvironment', () => {
         },
       },
       async (root) => {
-        const outcome = await resolveInBootstrap({ root, env: { GITHUB_ACTIONS: 'true', SMOO_PRESENT: 'injected' } });
+        const outcome = await resolve({ root, env: { GITHUB_ACTIONS: 'true', SMOO_PRESENT: 'injected' } });
         expect(outcome.error).toContain('SMOO_MISSING');
         expect(outcome.error).not.toContain('SMOO_PRESENT');
       },
@@ -560,7 +537,7 @@ describe('resolveSecretEnvironment', () => {
       },
       async (root) => {
         await markCowshedWorkspace(root);
-        const outcome = await resolveInBootstrap({ root, env: {} });
+        const outcome = await resolve({ root, env: {} });
         expect(outcome.error).toContain('SMOO_NPM_TOKEN');
         expect(outcome.error).toContain('cowshed gateway');
         expect(outcome.error).not.toContain('LOCAL-RESOLVED-VALUE');
@@ -576,7 +553,7 @@ describe('resolveSecretEnvironment', () => {
       },
       async (root) => {
         await markCowshedWorkspace(root);
-        expect(await resolveInBootstrap({ root, env: {} })).toEqual({
+        expect(await resolve({ root, env: {} })).toEqual({
           resolved: { SMOO_GENERIC: 'generic-tok' },
           deferred: [],
         });
@@ -597,7 +574,7 @@ describe('resolveSecretEnvironment', () => {
           secrets: { SMOO_NPM_TOKEN: { command: emitAndRecord('SHELL-ENTRY-RESOLVED-VALUE', ledger.path) } },
         },
         async (root) => {
-          const outcome = await resolveInBootstrap({ root, env: {}, group: 'shell' });
+          const outcome = await resolve({ root, env: {}, group: 'shell' });
 
           expect(outcome.resolved).toEqual({});
           expect(outcome.error).toBeUndefined();
@@ -624,7 +601,7 @@ describe('resolveSecretEnvironment', () => {
         async (root) => {
           // The same .npmrc, a variable it does not name: the deferral keys on
           // the reference, not on a registry existing somewhere in the repo.
-          expect(await resolveInBootstrap({ root, env: {}, group: 'shell' })).toEqual({
+          expect(await resolve({ root, env: {}, group: 'shell' })).toEqual({
             resolved: { SMOO_GENERIC: 'generic-tok' },
             deferred: [],
           });
@@ -645,7 +622,7 @@ describe('resolveSecretEnvironment', () => {
           },
         },
         async (root) => {
-          const outcome = await resolveInBootstrap({ root, env: {}, group: 'registry' });
+          const outcome = await resolve({ root, env: {}, group: 'registry' });
 
           expect(outcome.resolved).toEqual({ SMOO_NPM_TOKEN: 'registry-tok' });
           // The shell secret is deferred, not resolved: one group, one
@@ -670,7 +647,7 @@ describe('resolveSecretEnvironment', () => {
         async (root) => {
           // The repository says this credential belongs to the shell, and
           // that is the whole of the rule: the override is not a hint.
-          expect(await resolveInBootstrap({ root, env: {}, group: 'shell' })).toEqual({
+          expect(await resolve({ root, env: {}, group: 'shell' })).toEqual({
             resolved: { SMOO_NPM_TOKEN: 'registry-tok' },
             deferred: [],
           });
@@ -687,7 +664,7 @@ describe('resolveSecretEnvironment', () => {
         async (root) => {
           // Nothing to defer and nothing to run: the developer who exported it
           // for this terminal already answered the question.
-          expect(await resolveInBootstrap({ root, env: { SMOO_NPM_TOKEN: 'exported' }, group: 'shell' })).toEqual({
+          expect(await resolve({ root, env: { SMOO_NPM_TOKEN: 'exported' }, group: 'shell' })).toEqual({
             resolved: {},
             deferred: [],
           });
@@ -705,7 +682,7 @@ describe('resolveSecretEnvironment', () => {
           // CI outranks the registry rule and is unchanged by it: a job that
           // needs the credential says so at setup rather than discovering it
           // at the first fetch, and there is no wrapper to run there.
-          const outcome = await resolveInBootstrap({ root, env: { GITHUB_ACTIONS: 'true' }, group: 'shell' });
+          const outcome = await resolve({ root, env: { GITHUB_ACTIONS: 'true' }, group: 'shell' });
 
           expect(outcome.error).toContain('SMOO_NPM_TOKEN');
           expect(outcome.error).toContain('inject');
@@ -727,7 +704,7 @@ describe('resolveSecretEnvironment', () => {
           // The gateway is the enrollment path there, so the wrapper does not
           // become a way around it.
           await markCowshedWorkspace(root);
-          const outcome = await resolveInBootstrap({ root, env: {}, group: 'registry' });
+          const outcome = await resolve({ root, env: {}, group: 'registry' });
 
           expect(outcome.error).toContain('SMOO_NPM_TOKEN');
           expect(outcome.error).toContain('cowshed gateway');
@@ -748,7 +725,7 @@ describe('resolveSecretEnvironment', () => {
         },
       },
       async (root) => {
-        const outcome = await resolveInBootstrap({ root, env: {} });
+        const outcome = await resolve({ root, env: {} });
         expect(outcome.error).toContain('SMOO_TOKEN');
         expect(outcome.error).toContain('exited with code 3');
         expect(outcome.error).not.toContain('sk-live-stderr');
@@ -759,7 +736,7 @@ describe('resolveSecretEnvironment', () => {
 
   it('an empty provider output refuses instead of assigning an empty secret', async () => {
     await withFixture({ secrets: { SMOO_TOKEN: { command: emit('') } } }, async (root) => {
-      const outcome = await resolveInBootstrap({ root, env: {} });
+      const outcome = await resolve({ root, env: {} });
       expect(outcome.error).toContain('SMOO_TOKEN');
       expect(outcome.error).toContain('no output');
     });
@@ -769,7 +746,7 @@ describe('resolveSecretEnvironment', () => {
     await withFixture(
       { secrets: { SMOO_TOKEN: { command: ['definitely-not-a-real-smoo-binary-xyz'] } } },
       async (root) => {
-        const outcome = await resolveInBootstrap({ root, env: {} });
+        const outcome = await resolve({ root, env: {} });
         expect(outcome.error).toContain('SMOO_TOKEN');
         expect(outcome.error).toContain('could not be started');
         expect(outcome.error).not.toContain('definitely-not-a-real-smoo-binary-xyz');
@@ -786,7 +763,7 @@ describe('resolveSecretEnvironment', () => {
         },
       },
       async (root) => {
-        const outcome = await resolveInBootstrap({ root, env: { GITHUB_ACTIONS: 'true' } });
+        const outcome = await resolve({ root, env: { GITHUB_ACTIONS: 'true' } });
         expect(outcome.error).toContain('SMOO_ONE');
         expect(outcome.error).toContain('SMOO_TWO');
       },
@@ -797,7 +774,7 @@ describe('resolveSecretEnvironment', () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-secret-references-'));
     try {
       await writeFile(join(root, 'package.json'), '{ not json');
-      const outcome = await resolveInBootstrap({ root, env: {} });
+      const outcome = await resolve({ root, env: {} });
       expect(outcome.error).toContain('not valid JSON');
       expect(outcome.error).toContain('package.json');
     } finally {
@@ -806,43 +783,15 @@ describe('resolveSecretEnvironment', () => {
   });
 });
 
-/**
- * Redaction is a byte operation on output the caller already captured, so the
- * harness carries both directions as base64: a text-only round trip would
- * hide exactly the invalid-UTF-8 bytes a failing install can emit.
- */
-const MASK_SCRIPT = `
-const resolver = await import(Bun.argv[1]);
-const { output, values } = JSON.parse(Bun.argv[2]);
-const captured = Buffer.from(output, 'base64');
-const masked = resolver.maskSecretValues(captured, values);
-process.stdout.write(JSON.stringify({
-  masked: Buffer.from(masked).toString('base64'),
-  captured: captured.toString('base64'),
-}));
-`;
-
 describe('maskSecretValues', () => {
-  const mask = async (output: Uint8Array, values: readonly string[]): Promise<{ masked: Buffer; captured: Buffer }> => {
-    const { stdout, stderr, exitCode } = await runInBootstrap(
-      MASK_SCRIPT,
-      JSON.stringify({ output: Buffer.from(output).toString('base64'), values }),
-    );
-    expect(stderr).toBe('');
-    expect(exitCode).toBe(0);
-    const value: unknown = JSON.parse(stdout);
-    if (
-      typeof value !== 'object' ||
-      value === null ||
-      !('masked' in value) ||
-      typeof value.masked !== 'string' ||
-      !('captured' in value) ||
-      typeof value.captured !== 'string'
-    ) {
-      throw new Error(`bootstrap harness returned a malformed envelope: ${stdout}`);
-    }
-    return { masked: Buffer.from(value.masked, 'base64'), captured: Buffer.from(value.captured, 'base64') };
-  };
+  // Redaction is a byte operation on output the caller already captured: the cases hand it raw bytes, invalid UTF-8
+  // included, and read back what the caller still holds.
+  const mask = (output: Uint8Array, values: readonly string[]): Promise<{ masked: Buffer; captured: Buffer }> =>
+    silently(() => {
+      // A node Buffer, as a captured child's output arrives: its `slice` is a view of the caller's own bytes.
+      const captured = Buffer.from(output);
+      return { masked: Buffer.from(maskSecretValues(captured, values)), captured };
+    });
 
   it('replaces every occurrence and leaves the surrounding failure legible', async () => {
     const output = Buffer.from('error: 401 for https://x:hunter2@registry/pkg\nretrying with hunter2\n');

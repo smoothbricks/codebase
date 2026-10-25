@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, it } from 'bun:test';
+import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
+  cpSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -14,22 +15,19 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
+import {
+  applyDeclaredLinks,
+  planDeclaredLinks,
+} from '../../../nx-plugin/managed/raw/tooling/direnv/developer-links.ts';
 
 /**
- * A live developer link runs whatever its checkout last built. The managed script is loaded the way shell entry loads
- * it, in a plain `bun -e` child; the provider is a real git workspace whose build units carry fixed modification times.
+ * A live developer link runs whatever its checkout last built. The managed script has no top-level effect, so the cases
+ * import it and run its postinstall (plan the declared links, then apply them) here: a refusal is the error it throws.
+ * The provider is a real git workspace whose build units carry fixed modification times.
  */
-const LINKS = join(managedAssetsRoot, 'raw/tooling/direnv/developer-links.ts');
 const HOST = `${process.platform}-${process.arch}`;
 const OTHER_HOST = process.arch === 'arm64' ? `${process.platform}-x64` : `${process.platform}-arm64`;
 const STORE = '.bun/linked-api@1.0.0/node_modules/linked-api';
-
-const PLAN = `
-const links = await import(Bun.argv[1]);
-const root = Bun.argv[2];
-links.applyDeclaredLinks(root, await links.planDeclaredLinks(root));
-`;
 
 const SOURCES = 1_700_000_000;
 const BUILT = SOURCES + 100;
@@ -63,11 +61,9 @@ interface Fixture {
 
 /**
  * A provider package with a TypeScript build (stamped by its build info) and a declared per-host native target, its
- * sources older than its outputs, and a consumer whose alias still links the store version.
+ * sources older than its outputs, and a consumer whose alias still links the store version, built under `base`.
  */
-function fixture(): Fixture {
-  const base = realpathSync(mkdtempSync(join(tmpdir(), 'developer-links-stale-')));
-  created.push(base);
+function build(base: string): void {
   const provider = join(base, 'provider');
   const source = join(provider, 'packages/api');
   write(
@@ -134,94 +130,128 @@ function fixture(): Fixture {
   );
   const alias = join(consumer, 'node_modules/linked-api');
   symlinkSync(STORE, alias);
-  return { source, consumer, alias };
 }
 
-function plan({ consumer }: Fixture) {
-  const run = spawnSync(process.execPath, ['-e', PLAN, LINKS, consumer], { encoding: 'utf8' });
-  return { status: run.status, stderr: run.stderr };
+/** The checkout every fixture starts from, built once: each case changes a copy of it. */
+let template: string | undefined;
+
+beforeAll(() => {
+  template = realpathSync(mkdtempSync(join(tmpdir(), 'developer-links-stale-template-')));
+  build(template);
+});
+
+afterAll(() => {
+  if (template !== undefined) rmSync(template, { recursive: true, force: true });
+});
+
+function fixture(): Fixture {
+  if (template === undefined) throw new Error('the checkout template is built before the first case runs');
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'developer-links-stale-')));
+  created.push(base);
+  // Copied with their modification times: every case is a judgment of them.
+  for (const part of ['provider', 'consumer']) {
+    cpSync(join(template, part), join(base, part), {
+      recursive: true,
+      verbatimSymlinks: true,
+      preserveTimestamps: true,
+    });
+  }
+  const consumer = join(base, 'consumer');
+  return { source: join(base, 'provider/packages/api'), consumer, alias: join(consumer, 'node_modules/linked-api') };
+}
+
+/** What the root postinstall says on stderr as it links `fixture`'s declaration: its plan, then its application. */
+async function link({ consumer }: Fixture): Promise<string> {
+  const lines: string[] = [];
+  const error = spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+    lines.push(args.map(String).join(' '));
+  });
+  try {
+    applyDeclaredLinks(consumer, await planDeclaredLinks(consumer));
+    return lines.join('\n');
+  } finally {
+    error.mockRestore();
+  }
+}
+
+/** The refusal the postinstall dies of, which is the error `planDeclaredLinks` throws; linking instead fails the case. */
+async function refusal(fixture: Fixture): Promise<string> {
+  const failure: unknown = await link(fixture).then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+  if (!(failure instanceof Error)) throw new Error('the postinstall linked a checkout it was expected to refuse');
+  return failure.message;
 }
 
 const iso = (seconds: number) => new Date(seconds * 1000).toISOString();
 
 describe('a live developer link whose build is older than its sources', () => {
-  it('links a checkout whose every build unit is newer than its inputs', () => {
+  it('links a checkout whose every build unit is newer than its inputs', async () => {
     const fresh = fixture();
-    const result = plan(fresh);
-    expect(result.stderr).not.toContain('refusing');
-    expect(result.status).toBe(0);
+    expect(await link(fresh)).not.toContain('refusing');
     expect(realpathSync(fresh.alias)).toBe(fresh.source);
   });
 
-  it('refuses when a TypeScript source is newer than the build info, naming both times and the cached rebuild', () => {
+  it('refuses when a TypeScript source is newer than the build info, naming both times and the cached rebuild', async () => {
     const stale = fixture();
     touch(join(stale.source, 'src/index.ts'), LATER);
-    const result = plan(stale);
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain(
+    const refused = await refusal(stale);
+    expect(refused).toContain(
       `packages/api/tsconfig.lib.json (outDir dist/js) was built at ${iso(BUILT)} (packages/api/dist/js/index.js), but packages/api/src/index.ts changed at ${iso(LATER)}`,
     );
-    expect(result.stderr).toContain('nx run api:build');
-    expect(result.stderr).not.toContain('--skip-nx-cache');
+    expect(refused).toContain('nx run api:build');
+    expect(refused).not.toContain('--skip-nx-cache');
     // Without a record, the refusal says what modification time cannot tell apart.
-    expect(result.stderr).toContain(
+    expect(refused).toContain(
       'no .build-inputs.json, so judged by modification time, where a file rewritten with its own bytes also counts',
     );
     // Refused, not fallen back: the alias is exactly what it was.
     expect(readlinkSync(stale.alias)).toBe(STORE);
   });
 
-  it('refuses when a declared target input is newer than that target output, and only for that unit', () => {
+  it('refuses when a declared target input is newer than that target output, and only for that unit', async () => {
     const stale = fixture();
     touch(join(stale.source, 'crates/api/src/lib.rs'), LATER);
-    const result = plan(stale);
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain(
+    const refused = await refusal(stale);
+    expect(refused).toContain(
       `nx target native-host was built at ${iso(BUILT)} (packages/api/dist/bin/${HOST}/api), but packages/api/crates/api/src/lib.rs changed at ${iso(LATER)}`,
     );
-    expect(result.stderr).not.toContain('tsconfig.lib.json (outDir');
+    expect(refused).not.toContain('tsconfig.lib.json (outDir');
     expect(readlinkSync(stale.alias)).toBe(STORE);
   });
 
-  it('refuses a published build that was never built', () => {
+  it('refuses a published build that was never built', async () => {
     const unbuilt = fixture();
     rmSync(join(unbuilt.source, 'dist/js'), { recursive: true });
-    const result = plan(unbuilt);
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain('packages/api/tsconfig.lib.json (outDir dist/js) was never built');
+    expect(await refusal(unbuilt)).toContain('packages/api/tsconfig.lib.json (outDir dist/js) was never built');
     expect(readlinkSync(unbuilt.alias)).toBe(STORE);
   });
 
-  it('ignores documentation, tests, the manifest and builds for another host', () => {
+  it('ignores documentation, tests, the manifest and builds for another host', async () => {
     const touched = fixture();
     for (const file of ['README.md', 'src/index.test.ts', 'package.json']) touch(join(touched.source, file), LATER);
-    const result = plan(touched);
-    expect(result.stderr).not.toContain('refusing');
-    expect(result.status).toBe(0);
+    expect(await link(touched)).not.toContain('refusing');
     expect(realpathSync(touched.alias)).toBe(touched.source);
   });
 
-  it('refuses a checkout outside Git that declares a build, and links one that declares none', () => {
+  it('refuses a checkout outside Git that declares a build, and links one that declares none', async () => {
     const untracked = fixture();
     rmSync(join(untracked.source, '../../.git'), { recursive: true });
-    const refused = plan(untracked);
-    expect(refused.status).not.toBe(0);
-    expect(refused.stderr).toContain(`cannot read the build state of ${untracked.source}`);
+    expect(await refusal(untracked)).toContain(`cannot read the build state of ${untracked.source}`);
     expect(readlinkSync(untracked.alias)).toBe(STORE);
     for (const file of ['tsconfig.lib.json', 'package.json']) rmSync(join(untracked.source, file));
     write(join(untracked.source, 'package.json'), JSON.stringify({ name: 'linked-api', version: '1.0.0' }), SOURCES);
-    const linked = plan(untracked);
-    expect(linked.status).toBe(0);
+    await link(untracked);
     expect(realpathSync(untracked.alias)).toBe(untracked.source);
   });
 
-  it('links again once the rebuild rewrote the outputs', () => {
+  it('links again once the rebuild rewrote the outputs', async () => {
     const rebuilt = fixture();
     touch(join(rebuilt.source, 'src/index.ts'), LATER);
-    expect(plan(rebuilt).status).not.toBe(0);
+    await refusal(rebuilt);
     touch(join(rebuilt.source, 'dist/js/index.js'), LATER + 1);
-    const result = plan(rebuilt);
-    expect(result.status).toBe(0);
+    await link(rebuilt);
     expect(realpathSync(rebuilt.alias)).toBe(rebuilt.source);
   });
 });
@@ -248,39 +278,34 @@ function record(fixture: Fixture): void {
 }
 
 describe('a live developer link whose build recorded its inputs', () => {
-  it('links when sources were rewritten with the bytes the build read', () => {
+  it('links when sources were rewritten with the bytes the build read', async () => {
     const touched = fixture();
     record(touched);
     for (const file of ['src/index.ts', 'tsconfig.lib.json', 'crates/api/src/lib.rs'])
       touch(join(touched.source, file), LATER);
-    const result = plan(touched);
-    expect(result.stderr).not.toContain('refusing');
-    expect(result.status).toBe(0);
+    expect(await link(touched)).not.toContain('refusing');
     expect(realpathSync(touched.alias)).toBe(touched.source);
   });
 
-  it('refuses an input with other bytes, naming it and the cached rebuild, and only for its unit', () => {
+  it('refuses an input with other bytes, naming it and the cached rebuild, and only for its unit', async () => {
     const changed = fixture();
     record(changed);
     write(join(changed.source, 'crates/api/src/lib.rs'), 'pub fn value() -> u8 { 2 }\n', BUILT - 50);
-    const result = plan(changed);
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain(
+    const refused = await refusal(changed);
+    expect(refused).toContain(
       `packages/api/dist/bin/${HOST} is stale: input packages/api/crates/api/src/lib.rs has other bytes than the build read`,
     );
-    expect(result.stderr).not.toContain('packages/api/dist/js is stale');
-    expect(result.stderr).toContain('nx run api:build');
+    expect(refused).not.toContain('packages/api/dist/js is stale');
+    expect(refused).toContain('nx run api:build');
     expect(readlinkSync(changed.alias)).toBe(STORE);
   });
 
-  it('refuses a source added under the recorded pathspecs and one removed since the build', () => {
+  it('refuses a source added under the recorded pathspecs and one removed since the build', async () => {
     const added = fixture();
     record(added);
     write(join(added.source, 'src/extra.ts'), 'export {};\n', SOURCES);
     write(join(added.source, 'src/extra.test.ts'), 'export {};\n', SOURCES);
-    const addedResult = plan(added);
-    expect(addedResult.status).not.toBe(0);
-    expect(addedResult.stderr).toContain(
+    expect(await refusal(added)).toContain(
       'packages/api/dist/js is stale: input packages/api/src/extra.ts was added since the build',
     );
     expect(readlinkSync(added.alias)).toBe(STORE);
@@ -288,7 +313,7 @@ describe('a live developer link whose build recorded its inputs', () => {
     const removed = fixture();
     record(removed);
     rmSync(join(removed.source, 'src/index.ts'));
-    expect(plan(removed).stderr).toContain(
+    expect(await refusal(removed)).toContain(
       'packages/api/dist/js is stale: input packages/api/src/index.ts was removed since the build',
     );
 
@@ -303,32 +328,26 @@ describe('a live developer link whose build recorded its inputs', () => {
         complete: [':(glob)packages/api/src/**/*.ts', ':(exclude,glob)packages/api/src/**/*.test.ts'],
       }),
     );
-    const deletedResult = plan(deleted);
-    expect(deletedResult.stderr).not.toContain('refusing');
-    expect(deletedResult.status).toBe(0);
+    expect(await link(deleted)).not.toContain('refusing');
   });
 
-  it('links again once a build restores outputs whose record names the current bytes', () => {
+  it('links again once a build restores outputs whose record names the current bytes', async () => {
     const restored = fixture();
     record(restored);
     write(join(restored.source, 'src/index.ts'), 'export const value = 2;\n', LATER);
-    expect(plan(restored).status).not.toBe(0);
+    await refusal(restored);
     // What a cache hit does: the outputs and their record come back together, older than the edit.
     record(restored);
     touch(join(restored.source, 'dist/js/.build-inputs.json'), BUILT);
-    const result = plan(restored);
-    expect(result.stderr).not.toContain('refusing');
-    expect(result.status).toBe(0);
+    expect(await link(restored)).not.toContain('refusing');
     expect(realpathSync(restored.alias)).toBe(restored.source);
   });
 
-  it('refuses a record it cannot read rather than trusting it', () => {
+  it('refuses a record it cannot read rather than trusting it', async () => {
     const broken = fixture();
     record(broken);
     writeFileSync(join(broken.source, 'dist/js/.build-inputs.json'), JSON.stringify({ version: 2, files: {} }));
-    const result = plan(broken);
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain('dist/js/.build-inputs.json is not a version 1 build input record');
+    expect(await refusal(broken)).toContain('dist/js/.build-inputs.json is not a version 1 build input record');
     expect(readlinkSync(broken.alias)).toBe(STORE);
   });
 });
