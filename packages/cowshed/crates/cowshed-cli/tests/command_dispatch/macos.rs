@@ -10,8 +10,8 @@ use cowshed_cli::output::Output;
 use cowshed_cli::runtime::{ActorBridge, CliService, dispatch};
 use cowshed_core::api::JsonEnvelope;
 use cowshed_core::api::dto::{
-    Adoption, AdoptionSkip, CarrySide, DatabaseHolder, ExpectedRefHead, GcReport, GitOid,
-    LandReport, LandSeed, LandedReport, RebaseBuildVolume, RebaseCarrySkip, RebaseReport,
+    Adoption, AdoptionSkip, DatabaseHolder, ExpectedRefHead, GcReport, GitOid, LandReport,
+    LandSeed, LandedReport, RebaseReport,
 };
 use cowshed_core::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx,
@@ -2459,7 +2459,7 @@ fn clone_or_copy_tree(source: &Path, destination: &Path) {
 /// default inputs include it). `declared` says whether `a:build` declares that output. Written,
 /// not committed: the caller commits once it has written all it adds.
 fn write_nx_project(checkout: &Path, nx: &Path, node: &Path, declared: bool) {
-    // A command a workspace runs by name, as the rebase carry's task-hash probe runs `node`,
+    // A command a workspace runs by name, as a land's publish job runs `node`,
     // resolves through its shim directory, which travels with every clone (03_caches.md).
     fs::create_dir_all(checkout.join(".cowshed/bin")).unwrap();
     std::os::unix::fs::symlink(node, checkout.join(".cowshed/bin/node")).unwrap();
@@ -4555,13 +4555,9 @@ async fn build_link_findings(service: &mut ActorBridge) -> Vec<String> {
         .collect()
 }
 
-/// An ungated lane fold, then a land carry, on one served build-nx project: the two scenarios
-/// share their setup, so the second pays no adopt, grant, gateway or serve of its own
-/// (08_testing.md, "Host limit"). The fold runs first: it compares every build-volume record but
-/// its unit's before and after, which only a project with no earlier land still reclaiming
-/// volumes behind it can promise.
+/// An ungated lane fold on one served build-nx project.
 #[tokio::test(flavor = "multi_thread")]
-async fn directory_a_lane_fold_then_a_land_carry_on_one_project_substrate_lifecycle() {
+async fn directory_a_lane_fold_on_one_project_substrate_lifecycle() {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
@@ -4570,67 +4566,14 @@ async fn directory_a_lane_fold_then_a_land_carry_on_one_project_substrate_lifecy
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
     let mut service = serve_project(&mut fixture, &nx_reads).await;
     an_ungated_fold_into_a_lane_base_is_git_alone(&fixture, &mut service).await;
-    a_land_carries_mains_nx_entries_into_the_volume_main_adopts(&fixture, &mut service, &node)
-        .await;
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
 }
-
-/// A land carries main's Nx cache entries into the volume main adopts (16_build_volumes.md,
-/// "Carry"): `a` lands and warms `a:build` and `a:test` in main; `b`, forked before that land
-/// and changing nothing `a` hashes, lands next without running them. `b` catches up with plain
-/// git, since `cowshed rebase` would carry `a`'s entries into its volume first. Main then adopts
-/// `b`'s volume, which never held `a`'s entries, and a fork of main still hits both.
-async fn a_land_carries_mains_nx_entries_into_the_volume_main_adopts(
-    fixture: &Fixture,
-    service: &mut ActorBridge,
-    node: &Path,
-) {
-    let nx_check = nx_run_many(node, "build test");
-
-    let b = new_workspace(service, "b").await;
-    fs::write(b.join("unrelated.txt"), b"nothing a hashes\n").unwrap();
-    git(&b, &["add", "unrelated.txt"]);
-    git(&b, &["commit", "-q", "-m", "add an unrelated file"]);
-
-    let a = new_workspace(service, "a").await;
-    fs::write(a.join("a/src.txt"), b"src, landed by a\n").unwrap();
-    git(&a, &["commit", "-q", "-am", "change a"]);
-    let report = land(service, "a", true, &[&nx_check]).await;
-    assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
-
-    git(
-        &b,
-        &["fetch", "-q", &fixture.checkout.to_string_lossy(), "HEAD"],
-    );
-    git(&b, &["rebase", "-q", "FETCH_HEAD"]);
-    let report = land(service, "b", true, &[]).await;
-    match &report.build_volume.adoption {
-        Adoption::Adopted { carried, .. } => {
-            assert_eq!(carried.stopped, None, "{report:?}");
-            assert!(
-                carried.entries >= 2,
-                "a:build and a:test, which main held and b's volume did not: {report:?}"
-            );
-        }
-        Adoption::Skipped { reason } => panic!("the adoption was skipped: {reason:?}"),
-    }
-
-    let fork = new_workspace(service, "fork").await;
-    let hits = nx_statuses(service, "fork", &fork, &nx_check).await;
-    assert_eq!(hits.len(), 2, "{hits:?}");
-    assert!(
-        hits.iter()
-            .all(|(_, status)| *status == nx::CacheStatus::LocalHit),
-        "a fork of main hits what a's land ran, though b's land adopted a volume without it: {hits:?}"
-    );
-}
-
 /// An ungated fold of a unit into its lane base is Git alone (02_workspaces.md "Lanes";
 /// 16_build_volumes.md, "Ungated folds"). Main refuses `--ungated` by name, before anything runs.
-/// Into the lane base, the rebase carries nothing; a lane-mate's commit then moves the lane base past
-/// the unit, and the land rebases the unit onto it, fast-forwards the lane base and retires the
-/// unit in one call, with no check, carry, seed freeze or adoption: every build volume record but
+/// Into the lane base, the rebase replays by Git alone; a lane-mate's commit then moves the lane
+/// base past the unit, and the land rebases the unit onto it, fast-forwards the lane base and
+/// retires the unit in one call, with no check, seed freeze or adoption: every build volume record but
 /// the unit's is byte-for-byte what it was, so the lane base keeps its volume and seed, and the
 /// unit's volume is released with the unit.
 async fn an_ungated_fold_into_a_lane_base_is_git_alone(
@@ -4688,7 +4631,6 @@ async fn an_ungated_fold_into_a_lane_base_is_git_alone(
     for args in [
         &["land", "unit", "--ungated"][..],
         &["land", "unit", "--into", "main", "--ungated"],
-        &["rebase", "unit", "--ungated"],
     ] {
         let (result, _, _) = run(service, args.iter().copied()).await;
         let refused = result.expect_err("main refuses an ungated fold");
@@ -4700,19 +4642,9 @@ async fn an_ungated_fold_into_a_lane_base_is_git_alone(
         );
     }
 
-    let (stdout, _) = succeed(
-        service,
-        ["--json", "rebase", "unit", "--into", "lane", "--ungated"],
-    )
-    .await;
+    let (stdout, _) = succeed(service, ["--json", "rebase", "unit", "--into", "lane"]).await;
     let envelope: JsonEnvelope<RebaseReport> = serde_json::from_slice(&stdout).unwrap();
     let rebased = envelope.result().expect("a successful rebase").clone();
-    assert_eq!(
-        rebased.build_volume,
-        RebaseBuildVolume::Skipped {
-            reason: RebaseCarrySkip::Ungated
-        }
-    );
     let unit_head = git_stdout(&unit, &["rev-parse", "HEAD"]);
     assert_eq!(rebased.oid.as_str(), unit_head);
     // A lane-mate's work lands in the lane base after that rebase, so the unit is behind it again.
@@ -4774,299 +4706,6 @@ async fn an_ungated_fold_into_a_lane_base_is_git_alone(
         "no seed freeze, adoption or new volume: only the unit's volume and seed are gone"
     );
     assert_land_outcome(fixture.storage.telemetry(), &landed);
-}
-
-/// A rebase carry, then a rebase whose supervisor does not answer, on one served build-nx project:
-/// the scenarios share their setup (08_testing.md, "Host limit"). The unanswered rebase stops the
-/// runtime and reopens it, so it ends the project; its workspace takes a name of its own, since the
-/// carry keeps `b`.
-#[tokio::test(flavor = "multi_thread")]
-async fn directory_a_rebase_carry_then_an_unanswered_rebase_substrate_lifecycle() {
-    let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with_directory(Project::Build {
-        nx: Some((&nx, &node)),
-        rust: None,
-    });
-    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-    let mut service = serve_project(&mut fixture, &nx_reads).await;
-    a_rebase_carries_mains_nx_entries_into_the_rebased_workspace(&mut service, &node).await;
-    a_rebase_whose_supervisor_does_not_answer_skips_the_carry(&mut fixture, service, &node).await;
-}
-/// A rebase carries main's Nx cache entries into the rebased workspace's volume
-/// (16_build_volumes.md, "Rebase carry"), and only those the rebased tree looks up: `b`, forked
-/// before main runs the check at the original tree and before `a` lands and warms `a:build` and
-/// `a:test` at its own, rebases after that land. Main then indexes both trees' entries; `b` takes
-/// the landed tree's two and none of the original's, and its run of the landed check hits both
-/// without re-running either. A rebase while a process holds `b`'s task database carries nothing
-/// and names that process.
-// Admitted to the 60 s lifecycle class below its 3× rule: its one low-load sample (34.983 s) ran
-// with the daemon off, and its daemon-on samples are load-dependent (08_testing.md, Integration
-// tests).
-async fn a_rebase_carries_mains_nx_entries_into_the_rebased_workspace(
-    service: &mut ActorBridge,
-    node: &Path,
-) {
-    let nx_check = nx_run_many(node, "build test");
-
-    let b = new_workspace(service, "b").await;
-    fs::write(b.join("unrelated.txt"), b"nothing a hashes\n").unwrap();
-    git(&b, &["add", "unrelated.txt"]);
-    git(&b, &["commit", "-q", "-m", "add an unrelated file"]);
-    // Entries no tree after the land looks up: what a rebase that carried main's whole cache
-    // copied, entry for entry.
-    sh(service, "main", &nx_check).await;
-
-    let a = new_workspace(service, "a").await;
-    fs::write(a.join("a/src.txt"), b"src, landed by a\n").unwrap();
-    git(&a, &["commit", "-q", "-am", "change a"]);
-    let report = land(service, "a", true, &[&nx_check]).await;
-    assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
-
-    let rebased = rebase(service, "b").await;
-    assert_eq!(rebased.oid.as_str(), git_stdout(&b, &["rev-parse", "HEAD"]));
-    match &rebased.build_volume {
-        RebaseBuildVolume::Carried { carried, deferred } => {
-            assert_eq!(carried.stopped, None, "{rebased:?}");
-            assert_eq!(
-                carried.entries, 2,
-                "a:build and a:test at the landed tree, and neither entry of the original: {rebased:?}"
-            );
-            assert_eq!(
-                *deferred, 0,
-                "neither task hashes another's outputs: {rebased:?}"
-            );
-        }
-        RebaseBuildVolume::Skipped { reason } => panic!("the carry was skipped: {reason}"),
-    }
-    let hits = nx_statuses(service, "b", &b, &nx_check).await;
-
-    let data = b.join(".nx/workspace-data");
-    let databases: Vec<PathBuf> = fs::read_dir(&data)
-        .expect("b's Nx workspace data")
-        .map(|entry| entry.expect("workspace data entry").path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "db"))
-        .collect();
-    let [database] = databases.as_slice() else {
-        panic!("one task database in {}: {databases:?}", data.display());
-    };
-    let holder = Holder(
-        Command::new("/usr/bin/tail")
-            .arg("-f")
-            .arg(database)
-            .stdout(Stdio::null())
-            .spawn()
-            .expect("spawn a database holder"),
-    );
-    let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
-    eventually(|| {
-        nx::holders(database)
-            .expect("query the database's holders")
-            .iter()
-            .any(|holder| holder.pid == pid)
-    })
-    .await;
-    let held = rebase(service, "b").await;
-    drop(holder);
-
-    assert_eq!(hits.len(), 2, "{hits:?}");
-    assert!(
-        hits.iter()
-            .all(|(_, status)| *status == nx::CacheStatus::LocalHit),
-        "b runs the landed check without re-running what a's land ran: {hits:?}"
-    );
-    match held.build_volume {
-        RebaseBuildVolume::Skipped {
-            reason:
-                RebaseCarrySkip::Held {
-                    side: CarrySide::Workspace,
-                    database: named,
-                    holders,
-                },
-        } => {
-            assert_eq!(
-                named.canonicalize().expect("the held database exists"),
-                database.canonicalize().expect("b's database exists")
-            );
-            assert!(
-                holders.iter().any(|holder| holder.pid == pid),
-                "tail is named among {holders:?}"
-            );
-        }
-        build_volume => panic!("a held database skips the carry: {build_volume:?}"),
-    }
-}
-
-/// A rebase whose workspace supervisor does not answer skips the carry and still rebases
-/// (16_build_volumes.md, "Rebase carry": an unavailable hash computation skips the carry with
-/// the root and reason). The fixture's runtime serves `b`'s supervisor in this test's own
-/// process, so stopping the process that answers its hello would stop the test with it. Once
-/// that runtime has retired `b`'s supervisor, its stand-in binds `b`'s supervisor socket under
-/// the socket lease and never accepts: it holds the socket and answers nothing, as a supervisor
-/// stalled in a blocking call does. A fresh runtime then rebases `b`, and the rebase names the
-/// root and the unanswered hello instead of failing after the tree has moved.
-async fn a_rebase_whose_supervisor_does_not_answer_skips_the_carry(
-    fixture: &mut Fixture,
-    mut service: ActorBridge,
-    node: &Path,
-) {
-    let nx_check = nx_run_many(node, "build test");
-
-    let b = new_workspace(&mut service, "unanswered").await;
-    // b's own run leaves its Nx state on its volume.
-    sh(&mut service, "unanswered", &nx_check).await;
-    service
-        .shutdown()
-        .await
-        .expect("the runtime retires b's supervisor");
-    let socket = cowshed_core::runtime::supervisor_socket::socket_path(
-        fixture.storage.store(),
-        &RepoId::parse("fixture/dispatch").expect("repository identity"),
-        &WorkspaceName::new("unanswered").expect("workspace name"),
-    );
-    let stalled = cowshed_core::runtime::supervisor_socket::bind(&socket)
-        .await
-        .expect("the stand-in holds b's supervisor socket");
-    let mut service = fixture.reopen().await;
-    let rebased = rebase(&mut service, "unanswered").await;
-    drop(stalled);
-    service.shutdown().await.expect("stop the runtime");
-    fixture.stop_gateway().await;
-
-    assert_eq!(rebased.oid.as_str(), git_stdout(&b, &["rev-parse", "HEAD"]));
-    match rebased.build_volume {
-        RebaseBuildVolume::Skipped {
-            reason: RebaseCarrySkip::TaskHashes { state, reason },
-        } => {
-            assert_eq!(
-                state.file_name(),
-                Some(std::ffi::OsStr::new(".nx")),
-                "{state:?}"
-            );
-            assert!(
-                reason.contains("cannot start the probe")
-                    && reason.contains("TIMEOUT: hello on ")
-                    && reason.contains("no answer within its handshake bound"),
-                "the skip names the unanswered supervisor's hello TIMEOUT: {reason}"
-            );
-        }
-        build_volume => panic!("an unanswering supervisor skips the carry: {build_volume:?}"),
-    }
-}
-
-/// A task that hashes its dependency's outputs is carried by task (16_build_volumes.md, "Rebase
-/// carry"): stock Nx hashes `a:test`, whose inputs name `dependentTasksOutputFiles`, only once
-/// `a:build` has written or restored `a/generated.txt`, and `b`'s copy of that file is stale. `b`
-/// runs the check at the original tree, so its `a/generated.txt` says what the original
-/// `a/src.txt` built; `a` changes `a/src.txt` and lands; `b` rebases. A hash of `a:test` from the
-/// file on disk would be a key no run looks up, so the carry takes main's latest `a:test` entry by
-/// task instead, and `b`'s run of the landed check hits both tasks.
-#[tokio::test(flavor = "multi_thread")]
-async fn directory_a_rebase_carries_a_task_that_hashes_its_dependencys_stale_outputs_substrate_lifecycle()
- {
-    let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with_directory(Project::Build {
-        nx: Some((&nx, &node)),
-        rust: None,
-    });
-    let node_path = node.display().to_string();
-    let project = serde_json::json!({
-        "name": "a",
-        "targets": {
-            "build": {
-                "executor": "nx:run-commands",
-                "cache": true,
-                "inputs": ["{projectRoot}/src.txt"],
-                "outputs": ["{projectRoot}/generated.txt"],
-                "options": {
-                    "command": format!(
-                        "{node_path} -e \"const fs = require('fs'); fs.writeFileSync('a/generated.txt', 'built from ' + fs.readFileSync('a/src.txt'))\""
-                    ),
-                },
-            },
-            "test": {
-                "executor": "nx:run-commands",
-                "cache": true,
-                "inputs": ["default", {"dependentTasksOutputFiles": "**/*.txt"}],
-                "dependsOn": ["build"],
-                "outputs": [],
-                "options": {
-                    "command": format!(
-                        "{node_path} -e \"require('fs').readFileSync('a/generated.txt')\""
-                    ),
-                },
-            },
-        },
-    });
-    fs::write(
-        fixture.checkout.join("a/project.json"),
-        serde_json::to_vec_pretty(&project).unwrap(),
-    )
-    .unwrap();
-    git(
-        &fixture.checkout,
-        &["commit", "-q", "-am", "a:test hashes a:build's outputs"],
-    );
-    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
-    let mut service = serve_project(&mut fixture, &nx_reads).await;
-    let nx_check = nx_run_many(&node, "build test");
-
-    let b = new_workspace(&mut service, "b").await;
-    fs::write(b.join("unrelated.txt"), b"nothing a hashes\n").unwrap();
-    git(&b, &["add", "unrelated.txt"]);
-    git(&b, &["commit", "-q", "-m", "add an unrelated file"]);
-    sh(&mut service, "b", &nx_check).await;
-
-    let a = new_workspace(&mut service, "a").await;
-    fs::write(a.join("a/src.txt"), b"src, landed by a\n").unwrap();
-    git(&a, &["commit", "-q", "-am", "change a"]);
-    let report = land(&mut service, "a", true, &[&nx_check]).await;
-    assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
-
-    let rebased = rebase(&mut service, "b").await;
-    let stale = fs::read(b.join("a/generated.txt")).expect("b's own build output");
-    let hits = nx_statuses(&mut service, "b", &b, &nx_check).await;
-    let built = fs::read(b.join("a/generated.txt")).expect("the restored build output");
-    service.shutdown().await.expect("stop the runtime");
-    fixture.stop_gateway().await;
-
-    assert_eq!(
-        stale, b"built from src\n",
-        "b's output on disk is the original tree's"
-    );
-    assert_eq!(built, b"built from src, landed by a\n");
-    match &rebased.build_volume {
-        RebaseBuildVolume::Carried { carried, deferred } => {
-            assert_eq!(carried.stopped, None, "{rebased:?}");
-            assert_eq!(
-                (carried.entries, *deferred),
-                (2, 1),
-                "a:build by its hash, a:test by task: {rebased:?}"
-            );
-        }
-        RebaseBuildVolume::Skipped { reason } => panic!("the carry was skipped: {reason}"),
-    }
-    assert_eq!(hits.len(), 2, "{hits:?}");
-    assert!(
-        hits.iter()
-            .all(|(_, status)| *status == nx::CacheStatus::LocalHit),
-        "b hits a:test though its own a/generated.txt was stale when it rebased: {hits:?}"
-    );
-}
-
-/// `cowshed rebase --json <workspace>`; answers the report the CLI printed.
-async fn rebase(service: &mut ActorBridge, workspace: &str) -> RebaseReport {
-    let (stdout, stderr) = succeed(service, ["--json", "rebase", workspace]).await;
-    let envelope: JsonEnvelope<RebaseReport> =
-        serde_json::from_slice(&stdout).unwrap_or_else(|error| {
-            panic!(
-                "rebase --json printed no report ({error}): {}\n{stderr}",
-                String::from_utf8_lossy(&stdout)
-            )
-        });
-    envelope
-        .result()
-        .cloned()
-        .expect("a successful rebase report")
 }
 
 /// Stock Nx's open lock fences the look-to-rename window: an opener skips the swap and is
@@ -5219,7 +4858,7 @@ async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
 /// An open cache outside the named Nx/Cargo writer exclusion does not delay capture or adoption.
 /// The land replaces main's previous seed while the reader remains alive, and a subsequent fork
 /// inherits the cache bytes without requiring that reader to close (16_build_volumes.md, Land
-/// step 5.6). The real-APFS runtime proof owns block-atomic image and SQLite consistency coverage.
+/// step 5.4). The real-APFS runtime proof owns block-atomic image and SQLite consistency coverage.
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_an_open_cache_reader_allows_seed_capture_and_adoption_substrate_lifecycle() {
     let (nx, node) = repository_nx();

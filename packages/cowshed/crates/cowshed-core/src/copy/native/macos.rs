@@ -128,10 +128,6 @@ pub fn copy_regular(input: &File, output: &File) -> io::Result<()> {
     fcopyfile(input, output, flags)
         .map_err(|error| super::metadata_error(output, "copy data and metadata", None, error))
 }
-/// The symlink at `source`, its target and every attribute, made at the absent `destination`.
-pub fn copy_symlink(source: &Path, destination: &Path) -> io::Result<()> {
-    copy_symlink_from(&open_object(source)?, source, destination)
-}
 
 fn copy_symlink_from(input: &File, source: &Path, destination: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(std::fs::read_link(source)?, destination)?;

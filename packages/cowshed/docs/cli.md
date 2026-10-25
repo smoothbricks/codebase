@@ -979,7 +979,8 @@ cowshed: workspace main rewritten contiguously: 2110000 extents -> 6, 2390594764
 clone copies that map, at about 140 µs per extent in one loaded RAW observation (60.8 s for 434,462 extents). Main
 fragments with every write it takes while clones share its blocks, so a long-used main can hold millions of extents.
 `cowshed doctor` reports main's extent count and that sensitivity as `main-extents`, and warns with this verb as the
-hint past 7,140 extents, about one second at that rate, where a fork refuses.
+hint past 7,140 extents, about one second at that rate. A fork past that bound warns, naming the measured first-write
+cost and `cowshed defrag <workspace>`, and proceeds.
 
 The workspace leaves the kernel exactly as it does for `resize`: a volume with a file open or a job running refuses
 before the image is touched, so run it while the checkout is idle. The data is then copied with plain reads and writes
@@ -1233,7 +1234,7 @@ refs/cowshed/raven/heads/cowshed/raven	9b2e77d4c1…
 Stdout is the preserved ref and the commit it names. Nothing preserves a workspace's work but `push` and `land`: the
 store volume that holds the images is excluded from backup (durability = git).
 
-### `cowshed rebase [<name>] [--onto <rev> | --into <lane> [--ungated]] [--gate]`
+### `cowshed rebase [<name>] [--onto <rev> | --into <lane>]`
 
 Brings the workspace branch up to current main: cowshed points the workspace's `main` remote at main's checkout
 (`cowshed-main` in a workspace where something else already holds that name), fetches it, and runs
@@ -1245,29 +1246,8 @@ when the repository's config turns it on, because a stash re-apply that conflict
 exits 0. A conflict aborts the rebase, restores the branch to the commit it had before, and exits 4 with git's output
 naming the conflicted paths.
 
-After a rebase that did not conflict, stock Nx computes hashes at the rebased tree. The workspace's build volume takes
-only missing target cache entries with those current hashes, not the target's historical cache. Hash selection is
-independent for each Nx root, covering cacheable non-continuous tasks with default and declared configurations, without
-guessing CLI overrides. Nx itself hashes a task with a custom hasher, or one whose inputs name
-`dependentTasksOutputFiles`, only after its dependencies ran, and the dependency outputs on disk in a rebased workspace
-are stale; such a deferred task takes, by its project, target and configuration, the one target entry Nx used last. A
-failed computation carries nothing and reports `{kind:"taskHashes", state, reason}` as the skip reason. A target whose
-task databases index no cache entry at all, because no Nx run cached a task into its build volume, carries nothing and
-reports `{kind:"unindexed", states}` rather than 0 carried entries. A shared row and byte budget caps the carry and
-reserves free space in both the image and its backing store. Neither a failed store-space query nor a failed hash probe
-falls back to an unbounded copy. A bound or failed copy reports `carried.stopped`, keeps completed entries and removes
-the partial entry; the rebase stands. The new head prints on stdout and what was carried, by hash and by deferred task,
-on stderr; `--json` gives `RebaseReport { oid, buildVolume }` with `buildVolume.deferred` counting the entries carried
-by deferred task. The carry stops the idle Nx daemon of each side, which restarts on its next client. A side whose task
-database another process holds carries nothing and names that process. The hash computation is a job of the workspace
-that asks for one CPU token at background class; `--gate` asks at gate class instead, for a land's rebase, which its
-lander runs under the land lock: queued behind background work, it would hold up every land waiting for that lock.
-
-`--ungated`, with `--into <lane>`, is the replay an ungated land runs before its fast-forward, run on its own for a unit
-that takes its lane-mates' work before it lands; the land rebases by itself, so this step is optional. It fetches and
-replays as above and then stops, computing no hash and carrying nothing; `buildVolume` is
-`{kind:"skipped", reason:{kind:"ungated"}}`. Without `--into`, or with `--into main`, it is refused (exit 2, naming
-main), and so is `--gate` beside it: an ungated rebase runs no job.
+The rebase is Git alone: it fetches and replays, and runs no job. The new head prints on stdout, and nothing about a
+build volume prints on stderr; `--json` gives `RebaseReport { oid }`.
 
 ### `cowshed land <name> [--into <lane> [--ungated]] [--check <cmd>] [--ref-lock <file> | --ref-turn <queue>]`
 
@@ -1296,18 +1276,17 @@ its checkout keeps it. A dirty folded workspace is kept too. The report's `folde
 (`retired`, or `kept` with why), and stderr says the same; a kept fold never fails the land, and a later `rm` retires
 it. Work the target does not hold is never folded. `--no-retire` folds nothing.
 
-`--ungated`, with `--into <lane>`, folds a unit into its lane base by Git alone: no check, no Nx cache initialization,
-carry, seed freeze or build-volume adoption. First it rebases the unit onto the lane base's checked-out branch, as
-`rebase --into <lane> --ungated` does; a unit whose head already holds that branch's tip is based on it and lands as it
-is, with no fetch and no replay. `--expected-source-head` names the unit's head before that rebase, and the report's
-`landedHead` is the head after it. A conflict rolls the replay back and refuses with exit 4, naming the conflicted
-paths, with the unit as it was and the lane base unmoved. Then it fast-forwards the lane base and retires the unit,
-whose volume and seed are released with it; the lane base keeps its volume and seed. A lane base that moves between the
-rebase and the fast-forward refuses the fast-forward, and its hint is to run the ungated land again. The report is
-`kind: landed` with seed `{kind:"unchanged"}` and adoption `{kind:"skipped", reason:{kind:"ungated"}}`, recorded as the
-land's outcome. Only a land into main gates, so main refuses `--ungated` (exit 2, naming main); `--check` and
-`--push-only` are refused with it (exit 2). With `--no-retire` it keeps the unit and collects nothing, since it released
-no volume.
+`--ungated`, with `--into <lane>`, folds a unit into its lane base by Git alone: no check, seed freeze or build-volume
+adoption. First it rebases the unit onto the lane base's checked-out branch, as `rebase --into <lane>` does; a unit
+whose head already holds that branch's tip is based on it and lands as it is, with no fetch and no replay.
+`--expected-source-head` names the unit's head before that rebase, and the report's `landedHead` is the head after it. A
+conflict rolls the replay back and refuses with exit 4, naming the conflicted paths, with the unit as it was and the
+lane base unmoved. Then it fast-forwards the lane base and retires the unit, whose volume and seed are released with it;
+the lane base keeps its volume and seed. A lane base that moves between the rebase and the fast-forward refuses the
+fast-forward, and its hint is to run the ungated land again. The report is `kind: landed` with seed `{kind:"unchanged"}`
+and adoption `{kind:"skipped", reason:{kind:"ungated"}}`, recorded as the land's outcome. Only a land into main gates,
+so main refuses `--ungated` (exit 2, naming main); `--check` and `--push-only` are refused with it (exit 2). With
+`--no-retire` it keeps the unit and collects nothing, since it released no volume.
 
 `--preflight` runs only the fences land runs before its check, with the same arguments, and stops: the plan, the
 workspace and its incarnation, the target, the source head, the dirty tree, the target branch and the target head. When
@@ -1323,10 +1302,10 @@ land lease or ref lock, attaches nothing, synchronizes no gateway and runs no ch
 
 `--ref-lock <file>` names the lock file every other writer of the target branch holds while it moves it, as an
 operator's Markdown commit into main holds it through lockf(1). Land takes the same exclusive lock only to re-read the
-target head, check it against `--expected-target-head`, fetch and fast-forward; the checks, Nx cache initialization,
-build-volume adoption and retirement run without it, so such a writer waits for that fence alone. A land that finds the
-lock held waits for it and says on stderr every 10 s how long and which processes hold the file. A target that moved
-while it waited is refused as moved (exit 4); the caller rebases and lands again.
+target head, check it against `--expected-target-head`, fetch and fast-forward; the checks, build-volume adoption and
+retirement run without it, so such a writer waits for that fence alone. A land that finds the lock held waits for it and
+says on stderr every 10 s how long and which processes hold the file. A target that moved while it waited is refused as
+moved (exit 4); the caller rebases and lands again.
 
 `--ref-turn <queue>` names instead the land-turn queue every other writer of the target branch takes while it moves it,
 as an operator's Markdown commit into main takes `cowshed land-turn <repo>.ref -- <commit>`. Land takes that turn for

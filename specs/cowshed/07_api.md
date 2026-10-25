@@ -575,8 +575,6 @@ pub struct RebaseOptions {
     pub expected_workspace_incarnation: Option<WorkspaceIncarnation>,
     pub expected_source_head: Option<GitOid>,
     pub expected_onto_head: Option<GitOid>,
-    pub gate: bool,                      // a land's rebase: the carry's jobs run as gate-class work (05)
-    pub mode: LandMode,                  // Ungated: an ungated land's own rebase, alone, carries nothing (02, "Lanes")
 }
 
 pub struct LandOptions {
@@ -664,7 +662,7 @@ impl Coordinator {
     pub async fn grant_project(&self, delta: ProjectGrantDelta) -> Result<ProjectGrants, CowshedError>;
     pub async fn revoke_project(&self, delta: ProjectGrantDelta) -> Result<ProjectGrants, CowshedError>;
     // `into`: the lane base the workspace lands into, main when None (02: "Lanes").
-    pub async fn rebase(&self, ws: &str, into: Option<&WorkspaceRef>, opts: RebaseOptions) -> Result<GitOid, CowshedError>;
+    pub async fn rebase(&self, ws: &str, into: Option<&WorkspaceRef>, opts: RebaseOptions) -> Result<RebaseReport, CowshedError>;
     pub async fn land(&self, ws: &str, into: Option<&WorkspaceRef>, opts: LandOptions) -> Result<LandReport, CowshedError>;
     pub async fn restore(&self, ws: &str, label: &str) -> Result<(), CowshedError>;
     pub async fn detach(&self, ws: &str) -> Result<EmptyResult, CowshedError>;
@@ -2224,8 +2222,7 @@ is one typed field of the same request, decoded by the same validation (`JobSche
 | `--host`                                                                  | `scope: ExecScope::HostGate`                                      | `scope: 'hostGate'`                                       |
 | `--background`                                                            | every exec answers its `JobHandle` at admission                   | the same                                                  |
 | `--timeout <dur>`                                                         | the caller's own deadline over `JobHandle::wait`                  | the same, over `wait()`                                   |
-| `rebase --gate`                                                           | `RebaseOptions::gate`                                             | `RebaseOptions.gate`                                      |
-| `rebase --ungated`, `land --ungated`                                      | `RebaseOptions::mode`, `LandOptions::mode`: `LandMode::Ungated`   | `mode: 'ungated'`                                         |
+| `land --ungated`                                                          | `LandOptions::mode`: `LandMode::Ungated`                          | `mode: 'ungated'`                                         |
 
 The gate class and host scope are the coordinator route's alone on both surfaces (`coordinator.exec`; the CLI is that
 route); a worker capability asks for background, interactive and resident work, a resident at either nice, in its own

@@ -80,11 +80,8 @@ static ADOPTION_SKIP__TARGET_HELD: Reader =
 static ADOPTION_SKIP__TARGET_OPENING: Reader =
     Reader::Record(&[("database", &LEAF), ("holders", &SEQ__DATABASE_HOLDER)]);
 static ADOPTION_SKIP__UNGATED: Reader = Reader::Record(&[]);
-static ADOPTION__ADOPTED: Reader = Reader::Record(&[
-    ("elapsedMs", &LEAF),
-    ("carried", &NX_CARRY),
-    ("check", &ADOPTION_CHECK),
-]);
+static ADOPTION__ADOPTED: Reader =
+    Reader::Record(&[("elapsedMs", &LEAF), ("check", &ADOPTION_CHECK)]);
 static ADOPTION__SKIPPED: Reader = Reader::Record(&[("reason", &ADOPTION_SKIP)]);
 static ADOPT_VIEW: Reader =
     Reader::Record(&[("workspace", &WORKSPACE_VIEW), ("reAdoption", &RE_ADOPTION)]);
@@ -120,7 +117,6 @@ static CACHE_MISS: Reader = Reader::Record(&[
     ("inputsDigest", &LEAF),
     ("inputsError", &LEAF),
 ]);
-static CARRY_SIDE: Reader = Reader::External(&[("workspace", &LEAF), ("target", &LEAF)]);
 static CHARGED_MEMORY_USAGE: Reader =
     Reader::Record(&[("currentBytes", &LEAF), ("peakBytes", &LEAF)]);
 static CHECKPOINT_INFO: Reader =
@@ -669,12 +665,6 @@ static MOUNT_RESULT: Reader = Reader::Record(&[
     ("mount", &LEAF),
     ("baseCommit", &LEAF),
 ]);
-static NX_CARRY: Reader = Reader::Record(&[
-    ("entries", &LEAF),
-    ("bytes", &LEAF),
-    ("elapsedMs", &LEAF),
-    ("stopped", &LEAF),
-]);
 static NX_STATE_CLEAR_RESULT: Reader = Reader::Record(&[
     ("workspace", &LEAF),
     ("volume", &LEAF),
@@ -821,49 +811,7 @@ static PUSH_REPORT: Reader = Reader::Record(&[
     ("destinationRef", &LEAF),
     ("previousDestinationHead", &LEAF),
 ]);
-static REBASE_BUILD_VOLUME: Reader = Reader::Internal {
-    tag: "kind",
-    arms: &[
-        ("carried", &REBASE_BUILD_VOLUME__CARRIED),
-        ("skipped", &REBASE_BUILD_VOLUME__SKIPPED),
-    ],
-};
-static REBASE_BUILD_VOLUME__CARRIED: Reader =
-    Reader::Record(&[("carried", &NX_CARRY), ("deferred", &LEAF)]);
-static REBASE_BUILD_VOLUME__SKIPPED: Reader = Reader::Record(&[("reason", &REBASE_CARRY_SKIP)]);
-static REBASE_CARRY_SKIP: Reader = Reader::Internal {
-    tag: "kind",
-    arms: &[
-        ("noWorkspaceVolume", &REBASE_CARRY_SKIP__NO_WORKSPACE_VOLUME),
-        ("noTargetVolume", &REBASE_CARRY_SKIP__NO_TARGET_VOLUME),
-        ("held", &REBASE_CARRY_SKIP__HELD),
-        ("opening", &REBASE_CARRY_SKIP__OPENING),
-        ("daemonStayed", &REBASE_CARRY_SKIP__DAEMON_STAYED),
-        ("taskHashes", &REBASE_CARRY_SKIP__TASK_HASHES),
-        ("unindexed", &REBASE_CARRY_SKIP__UNINDEXED),
-        ("ungated", &REBASE_CARRY_SKIP__UNGATED),
-    ],
-};
-static REBASE_CARRY_SKIP__DAEMON_STAYED: Reader =
-    Reader::Record(&[("side", &CARRY_SIDE), ("daemon", &DATABASE_HOLDER)]);
-static REBASE_CARRY_SKIP__HELD: Reader = Reader::Record(&[
-    ("side", &CARRY_SIDE),
-    ("database", &LEAF),
-    ("holders", &SEQ__DATABASE_HOLDER),
-]);
-static REBASE_CARRY_SKIP__NO_TARGET_VOLUME: Reader = Reader::Record(&[]);
-static REBASE_CARRY_SKIP__NO_WORKSPACE_VOLUME: Reader = Reader::Record(&[]);
-static REBASE_CARRY_SKIP__OPENING: Reader = Reader::Record(&[
-    ("side", &CARRY_SIDE),
-    ("database", &LEAF),
-    ("holders", &SEQ__DATABASE_HOLDER),
-]);
-static REBASE_CARRY_SKIP__TASK_HASHES: Reader =
-    Reader::Record(&[("state", &LEAF), ("reason", &LEAF)]);
-static REBASE_CARRY_SKIP__UNGATED: Reader = Reader::Record(&[]);
-static REBASE_CARRY_SKIP__UNINDEXED: Reader = Reader::Record(&[("states", &LEAF)]);
-static REBASE_REPORT: Reader =
-    Reader::Record(&[("oid", &LEAF), ("buildVolume", &REBASE_BUILD_VOLUME)]);
+static REBASE_REPORT: Reader = Reader::Record(&[("oid", &LEAF)]);
 static RECOVERED_IMAGE: Reader = Reader::Record(&[
     ("workspace", &LEAF),
     ("incarnation", &LEAF),

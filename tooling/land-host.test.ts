@@ -115,9 +115,6 @@ case $cmd in
 path) if [ "$1" = main ]; then echo "$FIX_MAIN"; else echo "$FIX_WS"; fi ;;
 rebase)
   shift
-  # A land's rebase carries at gate class (05_gateway.md, "A land is a gate job"): refuse one that does not ask.
-  [ "$1" = --gate ] || exit 64
-  shift
   [ "$1" = --expected-onto-head ] || exit 64
   now=$(git -C "$FIX_MAIN" rev-parse HEAD)
   [ "$2" = "$now" ] || fence ontoMoved "$now"

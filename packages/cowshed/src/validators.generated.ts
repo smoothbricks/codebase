@@ -167,11 +167,6 @@ export const parseCacheMiss = (json: string): Api.CacheMiss => assertCacheMiss(J
 export const assertCacheMissList = typia.createAssertEquals<readonly Api.CacheMiss[]>();
 export const parseCacheMissList = (json: string): readonly Api.CacheMiss[] => assertCacheMissList(JSON.parse(json));
 
-export const assertCarrySide = typia.createAssertEquals<Api.CarrySide>();
-export const parseCarrySide = (json: string): Api.CarrySide => assertCarrySide(JSON.parse(json));
-export const assertCarrySideList = typia.createAssertEquals<readonly Api.CarrySide[]>();
-export const parseCarrySideList = (json: string): readonly Api.CarrySide[] => assertCarrySideList(JSON.parse(json));
-
 export const assertChangeRepoIdRequest = typia.createAssertEquals<Api.ChangeRepoIdRequest>();
 export const parseChangeRepoIdRequest = (json: string): Api.ChangeRepoIdRequest =>
   assertChangeRepoIdRequest(JSON.parse(json));
@@ -1090,11 +1085,6 @@ export const assertMoveCheckoutRequestList = typia.createAssertEquals<readonly A
 export const parseMoveCheckoutRequestList = (json: string): readonly Api.MoveCheckoutRequest[] =>
   assertMoveCheckoutRequestList(JSON.parse(json));
 
-export const assertNxCarry = typia.createAssertEquals<Api.NxCarry>();
-export const parseNxCarry = (json: string): Api.NxCarry => assertNxCarry(JSON.parse(json));
-export const assertNxCarryList = typia.createAssertEquals<readonly Api.NxCarry[]>();
-export const parseNxCarryList = (json: string): readonly Api.NxCarry[] => assertNxCarryList(JSON.parse(json));
-
 export const assertNxStateClearResult = typia.createAssertEquals<Api.NxStateClearResult>();
 export const parseNxStateClearResult = (json: string): Api.NxStateClearResult =>
   assertNxStateClearResult(JSON.parse(json));
@@ -1326,19 +1316,6 @@ export const assertReAdoption = typia.createAssertEquals<Api.ReAdoption>();
 export const parseReAdoption = (json: string): Api.ReAdoption => assertReAdoption(JSON.parse(json));
 export const assertReAdoptionList = typia.createAssertEquals<readonly Api.ReAdoption[]>();
 export const parseReAdoptionList = (json: string): readonly Api.ReAdoption[] => assertReAdoptionList(JSON.parse(json));
-
-export const assertRebaseBuildVolume = typia.createAssertEquals<Api.RebaseBuildVolume>();
-export const parseRebaseBuildVolume = (json: string): Api.RebaseBuildVolume =>
-  assertRebaseBuildVolume(JSON.parse(json));
-export const assertRebaseBuildVolumeList = typia.createAssertEquals<readonly Api.RebaseBuildVolume[]>();
-export const parseRebaseBuildVolumeList = (json: string): readonly Api.RebaseBuildVolume[] =>
-  assertRebaseBuildVolumeList(JSON.parse(json));
-
-export const assertRebaseCarrySkip = typia.createAssertEquals<Api.RebaseCarrySkip>();
-export const parseRebaseCarrySkip = (json: string): Api.RebaseCarrySkip => assertRebaseCarrySkip(JSON.parse(json));
-export const assertRebaseCarrySkipList = typia.createAssertEquals<readonly Api.RebaseCarrySkip[]>();
-export const parseRebaseCarrySkipList = (json: string): readonly Api.RebaseCarrySkip[] =>
-  assertRebaseCarrySkipList(JSON.parse(json));
 
 export const assertRebaseOptions = typia.createAssertEquals<Api.RebaseOptions>();
 export const parseRebaseOptions = (json: string): Api.RebaseOptions => assertRebaseOptions(JSON.parse(json));

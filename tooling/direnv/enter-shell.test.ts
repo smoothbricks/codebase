@@ -76,10 +76,10 @@ function staleCheckout() {
  * checkout `.nx/workspace-data` is a link onto the checkout's build volume: the entry clears through it and keeps the
  * link, so the next Nx run writes the volume instead of making a real directory in the link's place.
  *
- * Everything else stays. The task database indexes `.nx/cache`, with its SQLite sidecars and Nx's open lock: a main
- * whose land changed the plugin once lost the adopted volume's whole index on its first shell entry, and every rebase
- * onto it then carried nothing. Nx's locks and its lockfile and file-hash caches are not the plugin's output. The
- * plugin's own state is content-keyed, and a concurrent Nx process writes it under its own lock (below).
+ * Everything else stays. The task database indexes `.nx/cache`, with its SQLite sidecars and Nx's open lock: deleting
+ * it would leave every entry unreachable and never evicted. Nx's locks and its lockfile and file-hash caches are not
+ * the plugin's output. The plugin's own state is content-keyed, and a concurrent Nx process writes it under its own
+ * lock (below).
  */
 it('a stale plugin build clears the daemon record and project graph through its link and keeps every other entry', () => {
   const { volume, link, enter, dispose } = staleCheckout();
@@ -121,8 +121,7 @@ it('a stale plugin build clears the daemon record and project graph through its 
 /**
  * A Cargo resolution holds `cargo-resolve/<id>/resolve.lock` while locked, offline Cargo runs, then publishes its
  * entry by a temporary file and a rename in that directory. A shell entry that emptied `.nx/workspace-data` removed
- * the directory from under its holder, and the publication failed `ENOENT` opening the temporary file: a rebase's
- * task-hash probe died so while the Nx daemon job started beside it entered a fresh shell over the just-rebased plugin.
+ * the directory from under its holder, and the publication failed `ENOENT` opening the temporary file.
  */
 it('a stale plugin build leaves a Cargo resolution a concurrent Nx process holds able to publish', () => {
   const { volume, enter, dispose } = staleCheckout();

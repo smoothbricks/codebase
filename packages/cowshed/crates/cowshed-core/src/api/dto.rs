@@ -3699,15 +3699,6 @@ pub struct RebaseOptions {
     pub expected_source_head: Option<GitOid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_onto_head: Option<GitOid>,
-    /// Run the rebase's own jobs — the carry's task hashes — as gate-class work. A land's rebase
-    /// is on the land's critical path: its lander runs it under the land lock, and a land is a
-    /// gate job (05_gateway.md, "A land is a gate job"). Any other rebase is background work.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub gate: bool,
-    /// `Ungated` is the rebase an ungated land into a lane base runs itself, alone: Git alone, no
-    /// carry (02_workspaces.md "Lanes"). Refused with `gate`, and when the target is main.
-    #[serde(skip_serializing_if = "LandMode::is_gated")]
-    pub mode: LandMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3737,8 +3728,8 @@ pub struct LandOptions {
     pub ref_turn: Option<LandTurnName>,
     /// `Ungated` folds a unit into its lane base by Git alone: it rebases the unit onto the lane
     /// base's branch (nothing when already based), then fast-forwards and retires, with no check,
-    /// no carry, no seed freeze, no adoption (02_workspaces.md "Lanes"). Refused into main, with
-    /// `check`, and with `push_only`.
+    /// no seed freeze, no adoption (02_workspaces.md "Lanes"). Refused into main, with `check`,
+    /// and with `push_only`.
     #[serde(skip_serializing_if = "LandMode::is_gated")]
     pub mode: LandMode,
     /// Run only land's fences before its check and stop, mutating nothing: no land lease, no
@@ -3766,12 +3757,12 @@ impl Default for LandOptions {
     }
 }
 
-/// Whether a land, and the rebase before it, runs the target's build-state steps
-/// (02_workspaces.md "Lanes"; 16_build_volumes.md "Ungated folds").
+/// Whether a land runs the target's build-state steps (02_workspaces.md "Lanes";
+/// 16_build_volumes.md "Ungated folds").
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LandMode {
-    /// The full close-out: checks, carry, seed freeze and adoption into the target.
+    /// The full close-out: checks, seed freeze and adoption into the target.
     #[default]
     Gated,
     /// A unit's fold into its lane base: the rebase onto its branch, the fast-forward and the
@@ -3945,12 +3936,12 @@ pub enum FoldKept {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LandBuildVolume {
-    /// What step 5.6 did with the target's seed.
+    /// What step 5.4 did with the target's seed.
     pub seed: LandSeed,
     pub adoption: Adoption,
 }
 
-/// The target's seed after a land (16_build_volumes.md, Land step 5.6).
+/// The target's seed after a land (16_build_volumes.md, Land step 5.4).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum LandSeed {
@@ -3967,12 +3958,11 @@ pub enum LandSeed {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Adoption {
-    /// The target's build link names the landing volume now (step 6), which first took the
-    /// target's Nx cache entries it lacked (`carried`); `check` is step 7.
+    /// The target's build link names the landing volume now (step 6), exactly as it was quiesced;
+    /// `check` is step 7.
     Adopted {
         #[serde(rename = "elapsedMs")]
         elapsed_ms: u64,
-        carried: NxCarry,
         check: AdoptionCheck,
     },
     /// The target kept its own volume and builds the landed delta itself. Never wrong, only
@@ -3986,173 +3976,12 @@ impl Adoption {
     }
 }
 
-/// Step 5: the Nx cache entries the target's previous volume indexed and the landing volume did
-/// not, carried into the landing volume before the target adopted it (16_build_volumes.md,
-/// "Carry"). Nx's entries are content-addressed, so another land's work stays a hit.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct NxCarry {
-    pub entries: u64,
-    /// The bytes Nx recorded for those entries.
-    pub bytes: u64,
-    pub elapsed_ms: u64,
-    /// Why the carry stopped before every missing entry was carried. Each entry carried until
-    /// then is whole and indexed; the rest are misses the target rebuilds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stopped: Option<String>,
-}
-
-/// What `cowshed rebase` did: the workspace's new head, and the Nx cache entries its target's
-/// volume held that the workspace's volume took (16_build_volumes.md, "Rebase carry").
+/// What `cowshed rebase` did: the workspace's new head. A rebase is Git alone
+/// (02_workspaces.md, "`cowshed rebase`").
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RebaseReport {
     pub oid: GitOid,
-    pub build_volume: RebaseBuildVolume,
-}
-
-/// The rebase carry's outcome. The rebase itself has succeeded either way; a skip only leaves
-/// the workspace to rebuild what its target already ran at the rebased tree.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
-pub enum RebaseBuildVolume {
-    /// The workspace's volume indexes every entry the target's held and it lacked among those the
-    /// rebased tree looks up, up to `carried.stopped`.
-    Carried {
-        carried: NxCarry,
-        /// How many of `carried.entries` were selected by deferred task: the latest entry of a
-        /// task Nx hashes only after its dependencies ran. The others were selected by their
-        /// current hash (16_build_volumes.md, "Rebase carry").
-        deferred: u64,
-    },
-    /// Nothing was carried, and nothing was left staged.
-    Skipped { reason: RebaseCarrySkip },
-}
-
-/// One of the two volumes a rebase carry reads or writes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CarrySide {
-    /// The rebased workspace's volume, which takes the entries.
-    Workspace,
-    /// The volume of what the workspace rebased onto, which holds them.
-    Target,
-}
-
-impl fmt::Display for CarrySide {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Workspace => "rebased workspace's",
-            Self::Target => "target's",
-        })
-    }
-}
-
-/// Why a rebase carried nothing (16_build_volumes.md, "Rebase carry"): a side's Nx task
-/// database had a writer other than the carry, or a side has no volume.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
-pub enum RebaseCarrySkip {
-    /// The rebased workspace links no build volume.
-    NoWorkspaceVolume,
-    /// The target links no build volume.
-    NoTargetVolume,
-    /// A process other than the side's stopped daemon holds its Nx task database.
-    Held {
-        side: CarrySide,
-        database: PathBuf,
-        holders: Vec<DatabaseHolder>,
-    },
-    /// An Nx process held, or waited on, the lock stock Nx opens the side's database under.
-    Opening {
-        side: CarrySide,
-        database: PathBuf,
-        holders: Vec<DatabaseHolder>,
-    },
-    /// The side's Nx daemon outlived its stop.
-    DaemonStayed {
-        side: CarrySide,
-        daemon: DatabaseHolder,
-    },
-    /// Stock Nx could not name the cache keys the rebased tree looks up at one of its Nx roots,
-    /// so there was nothing the carry could select: it carries only what the tree will ask for.
-    TaskHashes {
-        /// The root's Nx state directory (`<root>/.nx`), relative to the workspace.
-        state: PathBuf,
-        reason: String,
-    },
-    /// The target's task database indexes no cache entry at any Nx root the carry consulted:
-    /// stock Nx creates and fills `cache_outputs` only when a task runs through that cache, so
-    /// no Nx run cached a task into the target's volume. That is not "nothing missing": the
-    /// target's Nx ran its tasks through some other cache, such as a host shell's per-user
-    /// `~/.nx/<id>`, or ran none.
-    Unindexed {
-        /// Each such root's Nx state directory (`<root>/.nx`), relative to the workspace.
-        states: Vec<PathBuf>,
-    },
-    /// The rebase was ungated: a fold into a lane base is Git alone and carries nothing.
-    Ungated,
-}
-
-impl fmt::Display for RebaseCarrySkip {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let holders = |formatter: &mut fmt::Formatter<'_>, holders: &[DatabaseHolder]| {
-            for (index, holder) in holders.iter().enumerate() {
-                let separator = if index == 0 { "" } else { ", " };
-                write!(
-                    formatter,
-                    "{separator}pid {} ({})",
-                    holder.pid, holder.command
-                )?;
-            }
-            Ok(())
-        };
-        match self {
-            Self::NoWorkspaceVolume => {
-                formatter.write_str("the rebased workspace has no build volume")
-            }
-            Self::NoTargetVolume => formatter.write_str("the target has no build volume"),
-            Self::Held {
-                side,
-                database,
-                holders: held,
-            } => {
-                write!(formatter, "the {side} {} is open in ", database.display())?;
-                holders(formatter, held)
-            }
-            Self::Opening {
-                side,
-                database,
-                holders: held,
-            } => {
-                write!(
-                    formatter,
-                    "an Nx process was opening the {side} {}: ",
-                    database.display()
-                )?;
-                holders(formatter, held)
-            }
-            Self::DaemonStayed { side, daemon } => write!(
-                formatter,
-                "the {side} Nx daemon pid {} ({}) did not exit after SIGTERM",
-                daemon.pid, daemon.command
-            ),
-            Self::TaskHashes { state, reason } => write!(
-                formatter,
-                "stock Nx could not hash the rebased tree's tasks for {}: {reason}",
-                state.display()
-            ),
-            Self::Unindexed { states } => {
-                formatter.write_str("the target's Nx task database indexes no cache entry for ")?;
-                for (index, state) in states.iter().enumerate() {
-                    let separator = if index == 0 { "" } else { ", " };
-                    write!(formatter, "{separator}{}", state.display())?;
-                }
-                formatter.write_str(": no Nx run cached a task into the target's build volume")
-            }
-            Self::Ungated => formatter.write_str("an ungated rebase carries nothing"),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

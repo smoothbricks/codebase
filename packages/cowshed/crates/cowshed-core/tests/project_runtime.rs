@@ -1248,9 +1248,6 @@ impl ProjectRuntimeHost for FakeHost {
         Ok(cowshed_core::api::dto::RebaseReport {
             oid: GitOid::new("1111111111111111111111111111111111111111")
                 .map_err(|error| CowshedError::internal(error.to_string()))?,
-            build_volume: cowshed_core::api::dto::RebaseBuildVolume::Skipped {
-                reason: cowshed_core::api::dto::RebaseCarrySkip::NoWorkspaceVolume,
-            },
         })
     }
 

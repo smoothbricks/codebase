@@ -168,21 +168,14 @@ async function clearNxDaemonState(): Promise<void> {
   // The task database (`<machine>-v<schema>.db`, its SQLite `-wal`/`-shm`/`-journal`
   // and the `.lock` Nx opens it under) is the cache's index: Nx answers a hit only
   // for a `cache_outputs` row and evicts only by row, so deleting it leaves every
-  // entry in `.nx/cache` unreachable and never evicted. It went with the graph
-  // files once, on the first shell entry of a main whose land changed this plugin:
-  // the volume main had just adopted kept its gate's entries and lost their index,
-  // so every rebase onto main carried nothing (specs/cowshed/16_build_volumes.md,
-  // "Every checkout has exactly one Nx state").
+  // entry in `.nx/cache` unreachable and never evicted.
   //
   // Nothing else there is the old plugin's output either. Nx's locks and its
   // lockfile and file-hash caches do not depend on it, and the plugin's own state
   // (`cargo-resolve/`, `bounded-exec/`, producer receipts) is content-keyed, so a
   // rebuilt plugin finds it unreachable rather than wrong. A concurrent Nx process
   // writes that state under its own lock: emptying the directory raced it as
-  // deleting `.nx/cache` did. A rebase's task-hash probe held its Cargo resolution
-  // lock in `cargo-resolve/<id>/` when the Nx daemon job started beside it entered
-  // a fresh shell over the just-rebased plugin and deleted the directory, and the
-  // probe died `ENOENT` opening its cache entry's temporary file.
+  // deleting `.nx/cache` did.
   //
   // Deliberately the workspace-local path, NOT NX_WORKSPACE_DATA_DIRECTORY. Host
   // CI runners redirect that to a shared per-lane tree which also holds the cache

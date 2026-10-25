@@ -1,8 +1,6 @@
-//! The few SQLite calls carrying Nx's task database needs ([`super::carry`]), against the
-//! system library macOS ships in `/usr/lib`. Nx keeps its cache index in SQLite; reading and
-//! extending it through SQLite itself is what keeps a database another process wrote, its
-//! write-ahead log included, consistent. A crate would add a C build or a second copy of the
-//! library for a small FFI surface.
+//! The few SQLite calls a test needs to hold a database open in-process, as Nx or an index
+//! writer does, against the system library macOS ships in `/usr/lib`. A crate would add a C
+//! build or a second copy of the library for a small FFI surface.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io;

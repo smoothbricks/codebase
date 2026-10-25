@@ -43,7 +43,7 @@ pub(super) fn clone_fallback_error(error: &std::io::Error) -> bool {
 #[cfg(not(target_os = "macos"))]
 pub use linux::{copy_leaf, copy_regular, directory_metadata};
 #[cfg(target_os = "macos")]
-pub use macos::{copy_leaf, copy_regular, copy_symlink, directory_metadata};
+pub use macos::{copy_leaf, copy_regular, directory_metadata};
 
 /// Observe a logical hole in a freshly opened regular file: its first data region is not the
 /// whole of `length`. Physical compression alone is not a hole: SEEK_HOLE answers in the logical

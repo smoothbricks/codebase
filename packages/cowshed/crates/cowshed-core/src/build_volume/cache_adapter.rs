@@ -1,23 +1,9 @@
-//! The one pinned Nx cache boundary (16_build_volumes.md, "Carry"). Nx creates its own database;
-//! the carry's small row shim only recognizes and extends the two Nx-owned cache tables.
+//! The one pinned Nx cache boundary: every body that opens the checkout's own Nx cache (a land's
+//! publish, 05_gateway.md "Publication") runs behind this adapter's version and path checks.
 
 use bytes::{Bytes, BytesMut};
-use serde::Deserialize;
-use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 
 const ADAPTER: &str = include_str!("cache_adapter.js");
-const INITIALIZE: &str = r#"
-const answer = process.stdout.write.bind(process.stdout);
-process.stdout.write = process.stderr.write.bind(process.stderr);
-try {
-  const { databases } = openNxCache(process.argv[2]);
-  answer(`${JSON.stringify({ initialized: true, databases })}\n`);
-} catch (error) {
-  console.error(error);
-  process.exitCode = 1;
-}
-"#;
 
 /// Prefix a body once, then retain/clone the returned Bytes for every root's job. No body owns a
 /// second constructor or its own version-sensitive cache access.
@@ -29,73 +15,9 @@ pub fn script(body: &'static str) -> Bytes {
     script.freeze()
 }
 
-pub fn initialize_script() -> Bytes {
-    static SCRIPT: LazyLock<Bytes> = LazyLock::new(|| script(INITIALIZE));
-    SCRIPT.clone()
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Initialized {
-    initialized: bool,
-    databases: Vec<PathBuf>,
-}
-
-/// Accepts only an initialization that names this checkout's own v3 task databases.
-pub fn initialized(stdout: &[u8], root: &Path) -> Result<(), String> {
-    let result: Initialized = serde_json::from_slice(stdout)
-        .map_err(|error| format!("Nx cache initialization answered invalid JSON: {error}"))?;
-    if !result.initialized {
-        return Err("Nx cache initialization did not initialize the cache".into());
-    }
-    let workspace_data = root.join(".nx").join("workspace-data");
-    if result.databases.is_empty() {
-        return Err(format!(
-            "Nx cache initialization named no task database under {}",
-            workspace_data.display()
-        ));
-    }
-    for database in &result.databases {
-        let names_v3 = database
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().ends_with("-v3.db"));
-        if database.parent() != Some(workspace_data.as_path()) || !names_v3 {
-            return Err(format!(
-                "Nx cache initialization named {}, not a v3 task database of {}",
-                database.display(),
-                workspace_data.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cache_initialization_requires_the_exact_success_receipt() {
-        let root = Path::new("/checkout");
-        let workspace_data = "/checkout/.nx/workspace-data";
-        let good = format!(r#"{{"initialized":true,"databases":["{workspace_data}/task-v3.db"]}}"#);
-        assert!(initialized(good.as_bytes(), root).is_ok());
-        let refused = [
-            r#"{"initialized":false,"databases":[]}"#.to_string(),
-            r#"{"initialized":true}"#.to_string(),
-            r#"{"initialized":true,"databases":[]}"#.to_string(),
-            r#"{"initialized":true,"databases":["/elsewhere/.nx/workspace-data/task-v3.db"]}"#
-                .to_string(),
-            format!(r#"{{"initialized":true,"databases":["{workspace_data}/task.db"]}}"#),
-            format!(
-                r#"{{"initialized":true,"databases":["{workspace_data}/task-v3.db"],"foreign":true}}"#
-            ),
-            "not JSON".to_string(),
-        ];
-        for body in &refused {
-            assert!(initialized(body.as_bytes(), root).is_err(), "{body}");
-        }
-    }
 
     struct FixtureGuard(std::path::PathBuf);
 
@@ -143,7 +65,7 @@ mod tests {
             .stdin
             .take()
             .expect("node stdin")
-            .write_all(&initialize_script())
+            .write_all(&script("openNxCache(process.argv[2]);"))
             .expect("send adapter script");
         let output = child.wait_with_output().expect("collect node output");
 

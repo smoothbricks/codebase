@@ -143,7 +143,6 @@ export type AdoptView = {
 export type Adoption =
   | ({ readonly kind: 'adopted' } & {
       readonly elapsedMs: number & tags.Type<'uint64'>;
-      readonly carried: NxCarry;
       readonly check: AdoptionCheck;
     })
   | ({ readonly kind: 'skipped' } & {
@@ -348,11 +347,6 @@ export type CacheMiss = {
   readonly inputsDigest: Sha256Digest;
   readonly inputsError?: string;
 };
-
-/**
- * One of the two volumes a rebase carry reads or writes.
- */
-export type CarrySide = 'workspace' | 'target';
 
 export type ChangeRepoIdRequest = {
   readonly repoId: RepoId;
@@ -2034,15 +2028,15 @@ export type LandAdoptionCommitment = {
  */
 export type LandBuildVolume = {
   /**
-   * What step 5.6 did with the target's seed.
+   * What step 5.4 did with the target's seed.
    */
   readonly seed: LandSeed;
   readonly adoption: Adoption;
 };
 
 /**
- * Whether a land, and the rebase before it, runs the target's build-state steps
- * (02_workspaces.md "Lanes"; 16_build_volumes.md "Ungated folds").
+ * Whether a land runs the target's build-state steps (02_workspaces.md "Lanes";
+ * 16_build_volumes.md "Ungated folds").
  */
 export type LandMode = 'gated' | 'ungated';
 
@@ -2069,8 +2063,8 @@ export type LandOptions = {
   /**
    * `Ungated` folds a unit into its lane base by Git alone: it rebases the unit onto the lane
    * base's branch (nothing when already based), then fast-forwards and retires, with no check,
-   * no carry, no seed freeze, no adoption (02_workspaces.md "Lanes"). Refused into main, with
-   * `check`, and with `push_only`.
+   * no seed freeze, no adoption (02_workspaces.md "Lanes"). Refused into main, with `check`,
+   * and with `push_only`.
    */
   readonly mode?: LandMode;
   /**
@@ -2129,7 +2123,7 @@ export type LandRequest = {
 };
 
 /**
- * The target's seed after a land (16_build_volumes.md, Land step 5.6).
+ * The target's seed after a land (16_build_volumes.md, Land step 5.4).
  */
 export type LandSeed =
   | { readonly kind: 'unchanged' }
@@ -2433,25 +2427,6 @@ export type MountResult = {
 export type MoveCheckoutRequest = {
   readonly repoId: RepoId;
   readonly destination: string;
-};
-
-/**
- * Step 5: the Nx cache entries the target's previous volume indexed and the landing volume did
- * not, carried into the landing volume before the target adopted it (16_build_volumes.md,
- * "Carry"). Nx's entries are content-addressed, so another land's work stays a hit.
- */
-export type NxCarry = {
-  readonly entries: number & tags.Type<'uint64'>;
-  /**
-   * The bytes Nx recorded for those entries.
-   */
-  readonly bytes: number & tags.Type<'uint64'>;
-  readonly elapsedMs: number & tags.Type<'uint64'>;
-  /**
-   * Why the carry stopped before every missing entry was carried. Each entry carried until
-   * then is whole and indexed; the rest are misses the target rebuilds.
-   */
-  readonly stopped?: string;
 };
 
 /**
@@ -2874,85 +2849,19 @@ export type ReAdoption = {
   readonly retained: ReadonlyArray<string>;
 };
 
-/**
- * The rebase carry's outcome. The rebase itself has succeeded either way; a skip only leaves
- * the workspace to rebuild what its target already ran at the rebased tree.
- */
-export type RebaseBuildVolume =
-  | ({ readonly kind: 'carried' } & {
-      readonly carried: NxCarry;
-      /**
-       * How many of `carried.entries` were selected by deferred task: the latest entry of a
-       * task Nx hashes only after its dependencies ran. The others were selected by their
-       * current hash (16_build_volumes.md, "Rebase carry").
-       */
-      readonly deferred: number & tags.Type<'uint64'>;
-    })
-  | ({ readonly kind: 'skipped' } & {
-      readonly reason: RebaseCarrySkip;
-    });
-
-/**
- * Why a rebase carried nothing (16_build_volumes.md, "Rebase carry"): a side's Nx task
- * database had a writer other than the carry, or a side has no volume.
- */
-export type RebaseCarrySkip =
-  | { readonly kind: 'noWorkspaceVolume' }
-  | { readonly kind: 'noTargetVolume' }
-  | ({ readonly kind: 'held' } & {
-      readonly side: CarrySide;
-      readonly database: string;
-      readonly holders: ReadonlyArray<DatabaseHolder>;
-    })
-  | ({ readonly kind: 'opening' } & {
-      readonly side: CarrySide;
-      readonly database: string;
-      readonly holders: ReadonlyArray<DatabaseHolder>;
-    })
-  | ({ readonly kind: 'daemonStayed' } & {
-      readonly side: CarrySide;
-      readonly daemon: DatabaseHolder;
-    })
-  | ({ readonly kind: 'taskHashes' } & {
-      /**
-       * The root's Nx state directory (`<root>/.nx`), relative to the workspace.
-       */
-      readonly state: string;
-      readonly reason: string;
-    })
-  | ({ readonly kind: 'unindexed' } & {
-      /**
-       * Each such root's Nx state directory (`<root>/.nx`), relative to the workspace.
-       */
-      readonly states: ReadonlyArray<string>;
-    })
-  | { readonly kind: 'ungated' };
-
 export type RebaseOptions = {
   readonly onto?: RevisionTarget;
   readonly expectedWorkspaceIncarnation?: WorkspaceIncarnation;
   readonly expectedSourceHead?: GitOid;
   readonly expectedOntoHead?: GitOid;
-  /**
-   * Run the rebase's own jobs — the carry's task hashes — as gate-class work. A land's rebase
-   * is on the land's critical path: its lander runs it under the land lock, and a land is a
-   * gate job (05_gateway.md, "A land is a gate job"). Any other rebase is background work.
-   */
-  readonly gate?: boolean;
-  /**
-   * `Ungated` is the rebase an ungated land into a lane base runs itself, alone: Git alone, no
-   * carry (02_workspaces.md "Lanes"). Refused with `gate`, and when the target is main.
-   */
-  readonly mode?: LandMode;
 };
 
 /**
- * What `cowshed rebase` did: the workspace's new head, and the Nx cache entries its target's
- * volume held that the workspace's volume took (16_build_volumes.md, "Rebase carry").
+ * What `cowshed rebase` did: the workspace's new head. A rebase is Git alone
+ * (02_workspaces.md, "`cowshed rebase`").
  */
 export type RebaseReport = {
   readonly oid: GitOid;
-  readonly buildVolume: RebaseBuildVolume;
 };
 
 /**

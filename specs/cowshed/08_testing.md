@@ -701,8 +701,9 @@ sizing variable for its own run, so a gate's grant to the suite's process is no 
 Directory build-state freshness uses observed filesystem change times, not synthetic wall-clock marks. If a listed child
 or subtree disappears during a live scan, the nearest surviving ancestor records that removal; the root uses its
 modification time so binding renames do not count as build writes. A missing root still refuses, and other I/O errors
-name the actual path. The deterministic listing-then-removal regression checks those clocks and root refusal; the
-ordinary directory rebase lifecycle proves main can run Nx, fork, land and carry its indexed entries afterward.
+name the actual path. The deterministic listing-then-removal regression checks those clocks and root refusal;
+`directory_adoption_copies_nothing_from_the_target` proves an adopted volume indexes only the landing workspace's own Nx
+entries and holds none of the target's.
 
 Re-adoption has independent real walks for RAW replacement and prepublication RAW recovery. Each interrupted walk
 resumes the recorded replacement through `mount main` and ordinary startup without issuing a second replacement or

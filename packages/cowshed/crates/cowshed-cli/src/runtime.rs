@@ -22,11 +22,11 @@ use cowshed_core::api::{
     FoldedWorkspace, ForkOptions, GatewayStatus, GcOptions, GcReason, GcReport, GitOid, GrantDelta,
     GrantSet, JobInfo, JobStream, LandOptions, LandReport, LandTurnName, LandingCommits,
     MountResult, OutputPublication, ProjectGrantDelta, ProjectGrants, PublicationPolicy,
-    PushOptions, PushReport, RebaseBuildVolume, RebaseOptions, RebaseReport, RefLockPath,
-    RekeyResult, RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport,
-    ReseedResult, ResizeResult, ResizeVolume, RevisionTarget, RunSandboxMode, SccacheStatus,
-    StdinSource as CoreStdinSource, UnlandedPaths, UnprovenWorkspace, UtcTimestamp, WorkspaceInfo,
-    WorkspacePath, WorkspaceState, validate_command_argv,
+    PushOptions, PushReport, RebaseOptions, RebaseReport, RefLockPath, RekeyResult, RemoveOptions,
+    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
+    ResizeVolume, RevisionTarget, RunSandboxMode, SccacheStatus, StdinSource as CoreStdinSource,
+    UnlandedPaths, UnprovenWorkspace, UtcTimestamp, WorkspaceInfo, WorkspacePath, WorkspaceState,
+    validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{
@@ -2128,8 +2128,6 @@ where
                     .transpose()?,
                 expected_source_head: args.expected_source_head.map(os_git_oid).transpose()?,
                 expected_onto_head: args.expected_onto_head.map(os_git_oid).transpose()?,
-                gate: args.gate,
-                mode: args.mode,
             };
             let report = service
                 .rebase(&workspace, args.into.as_deref(), options)
@@ -2139,7 +2137,6 @@ where
             } else {
                 output
                     .bare_line(report.oid.as_str().as_bytes())
-                    .and_then(|()| output.guidance(&rebase_build_volume_line(&report.build_volume)))
                     .map_err(output_error)?;
             }
             Ok(success())
@@ -3735,29 +3732,6 @@ fn fold_line(folded: &FoldedWorkspace) -> String {
     )
 }
 
-/// What the rebase carried into the workspace's build volume, as one stderr line
-/// (16_build_volumes.md, "Rebase carry"); the same value the JSON report carries.
-fn rebase_build_volume_line(build: &RebaseBuildVolume) -> String {
-    match build {
-        RebaseBuildVolume::Skipped { reason } => {
-            format!("build volume: carried nothing of the target's Nx cache: {reason}")
-        }
-        RebaseBuildVolume::Carried { carried, deferred } => format!(
-            "build volume: carried {} Nx cache entr{} ({} by hash, {deferred} by deferred task; {} bytes) the target held into the rebased workspace in {} ms{}",
-            carried.entries,
-            if carried.entries == 1 { "y" } else { "ies" },
-            carried.entries - deferred,
-            carried.bytes,
-            carried.elapsed_ms,
-            carried
-                .stopped
-                .as_ref()
-                .map(|stopped| format!("; the carry stopped short: {stopped}"))
-                .unwrap_or_default()
-        ),
-    }
-}
-
 /// What the land did with build volumes, one stderr line each (16_build_volumes.md, Land steps
 /// 4–7); the seeded/adopted/skipped state is also the controller's durable `LandOutcome` record.
 fn land_build_volume_lines(build: &cowshed_core::api::dto::LandBuildVolume) -> Vec<String> {
@@ -3777,21 +3751,7 @@ fn land_build_volume_lines(build: &cowshed_core::api::dto::LandBuildVolume) -> V
         Adoption::Skipped { reason } => {
             lines.push(format!("build volume adoption skipped: {reason}"));
         }
-        Adoption::Adopted {
-            elapsed_ms,
-            carried,
-            check,
-        } => {
-            lines.push(format!(
-                "build volume: carried {} Nx cache entr{} ({} bytes) the target held into the landed volume in {} ms",
-                carried.entries,
-                if carried.entries == 1 { "y" } else { "ies" },
-                carried.bytes,
-                carried.elapsed_ms
-            ));
-            if let Some(stopped) = &carried.stopped {
-                lines.push(format!("build volume: the carry stopped short: {stopped}"));
-            }
+        Adoption::Adopted { elapsed_ms, check } => {
             lines.push(format!(
                 "build volume adopted by the target in {elapsed_ms} ms"
             ));

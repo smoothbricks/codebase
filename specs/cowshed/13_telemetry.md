@@ -369,8 +369,7 @@ Report the following independently, with unavailable measurements explicitly abs
   `PUT` and builds no archive);
 - a land's publication: the `published`, `existing` and `skipped` counts of `build_volume::nx::Published`, and each
   failed entry's cause on stderr;
-- client archive construction, land publication transfer, target download/extraction, local carry/copy bytes and time,
-  and Cargo build-volume warmth;
+- client archive construction, land publication transfer, target download/extraction, and Cargo build-volume warmth;
 - server complete-entry bytes, staging bytes, configured capacity, eviction count/bytes, interrupted-upload recovery,
   and actual allocated bytes where the filesystem reports them;
 - the target's exact landed head and the same successful cacheable task/hash set before and after adoption, every

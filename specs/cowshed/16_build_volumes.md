@@ -16,10 +16,10 @@ exists, and how each is enforced. It is the one place these rules live; other sp
   invalidate on main.
 - **Land in milliseconds.** A land runs no build on main. The landing workspace has already built and checked the exact
   tree main moves to; main takes that workspace's build volume by one `rename(2)`.
-- **Nothing copied but what a land would lose, nothing patched, nothing extra in the environment.** No cache entries are
-  copied between checkouts, with one exception: a land copies into the landing volume the target's Nx cache entries it
-  lacks (Land, "Carry"), because adopting the volume would otherwise discard them. Nx, Cargo and sccache run unmodified.
-  A process learns nothing about cowshed: it reads the same paths it always reads.
+- **Nothing copied, nothing patched, nothing extra in the environment.** No cache entries are copied between checkouts:
+  a land adopts the landing volume as it is, and what other lands ran reaches a fork through the project's Nx cache
+  (05_gateway.md, "Publication"). Nx, Cargo and sccache run unmodified. A process learns nothing about cowshed: it reads
+  the same paths it always reads.
 - **Generic.** Build volumes come from capability detection (15_capabilities.md), not from a project's configuration. A
   project that uses Nx, Cargo, Go, ttsc, zig or none of them gets exactly the build state its tools have.
 - **Bounded.** Every build volume and every cache inside one has an owner that deletes it. Nothing grows without bound.
@@ -226,7 +226,7 @@ itself.
 Cargo discovery runs at most four queries concurrently within one activation of each selected workspace shell. Answers
 and failures retain manifest order; a failed manifest does not hide independent workspaces. The existing tracked-input
 fingerprint caches the complete discovered path set, so unchanged refreshes run no Cargo query. This bound changes only
-discovery scheduling, not carry holds, journal identity or failure fences.
+discovery scheduling, not journal identity or failure fences.
 
 Capability detection names the build-state paths (15_capabilities.md, one contribution contract): the Cargo capability
 contributes each `cargo metadata` `target_directory` inside the checkout, the Nx capability contributes `.nx/cache` and
@@ -278,7 +278,7 @@ deleted in the background, never copied (Refresh). For the upstream checkout tha
 is declared discards it. That is deliberate: build state is rebuild-only, never migrated, and declared state is
 rebuildable by definition; copying many GiB out of the source image would cost the minutes this design exists to avoid.
 The author re-runs the checkout's reconstruct script once; from then on it lives on the volume, every fork inherits it
-warm, and a land carries it into main. The refresh reports the discard on stderr with that instruction.
+warm, and main adopts it at a land. The refresh reports the discard on stderr with that instruction.
 
 **A declared path is linked when it appears, never before.** A capability's path is linked at once, and its tool finds
 an empty directory it fills. A declared path's existence carries meaning to tools cowshed does not know: a build script
@@ -323,7 +323,7 @@ image through the same block-atomic live-capture path as source images. The resu
 A target's seed is made when the target is created (a clone of the seed it was forked from, or of its first build volume
 at its first touch), and **every gated land into the target refreshes it from the landing workspace's build volume** (an
 ungated fold into a lane base leaves it as it was, "Ungated folds"): `cowshed land` captures the guarded landing volume
-before the target adopts it (Land step 5.6). A named Nx or Cargo holder refuses capture without publishing a replacement
+before the target adopts it (Land step 5.4). A named Nx or Cargo holder refuses capture without publishing a replacement
 seed. A land made outside cowshed, a plain fast-forward of the target's branch to a tree a live workspace has checked
 out (an **external land**), makes that workspace's volume the seed at the target's next fork (Which volume a seed holds,
 below). Between lands a **reseed**, the first step of every fork of the target (Fork step 2), refreezes the seed from
@@ -459,7 +459,7 @@ limit (08_testing.md).
 compares the image modification times, never tool-file statistics. `seed-tree-behind` names the seed's tree and the
 target's `HEAD^{tree}` (and the number of commits since a matching tree when available); `target-moved-outside-land`
 names both recorded volume trees when neither equals HEAD. A next fork tries tree-matched capture; a plain Git
-fast-forward performs no carry, output restoration or adoption.
+fast-forward performs no output restoration or adoption.
 
 - **Enforced by**: a real-APFS test in which main runs an Nx task after adopting a landed volume and a fork reseeds main
   and hits that task; a keeper-held fork that reports a busy skip, keeps the existing seed and takes the cold path,
@@ -611,7 +611,7 @@ below).
    checked out, the branch fast-forwards through that checkout and the land continues at step 4. When nothing has the
    target branch checked out, the land compares-and-swaps the branch ref and **skips steps 4 to 7**: the target's
    checkout holds another branch, so its build volume and seed are not the landed branch's. The target keeps its build
-   volume and its seed; nothing is quiesced, carried, frozen or adopted.
+   volume and its seed; nothing is quiesced, frozen or adopted.
 4. **Quiesce the landing workspace.** The land holds the landing build volume (the shared `<id>.dmg.hold` a job holds,
    GC below) from before the workspace's jobs stop until its build-volume steps end (after step 7), so no collection in
    any process releases it while step 6 renames the target's link and records the target as its owner. Its supervisor
@@ -634,19 +634,16 @@ below).
    Cargo-profile guards through capture and publication. Other contributed paths remain exempt under the named-list rule
    (Owned index links). Mounted capture replaces the former detach-and-seal barrier; the new-host-profile gap remains as
    documented in Targets and seeds.
-5. **Close the target, carry, and freeze the seed.** Outside the repository lock, which fenced only the head: what keeps
-   these steps correct is the target's Nx open locks and image lock below (rule "The adoption needs the target's Nx
-   database closed"):
-   1. **stage the carry** (below) while the target still runs: copy into the landing volume the target's Nx cache
-      entries it lacks, indexing none of them yet;
-   2. query the open file descriptors of the target's current Nx task database (one query on one file). If any holder is
+5. **Close the target and freeze the seed.** Outside the repository lock, which fenced only the head: what keeps these
+   steps correct is the target's Nx open locks and image lock below (rule "The adoption needs the target's Nx database
+   closed"):
+   1. query the open file descriptors of the target's current Nx task database (one query on one file). If any holder is
       not the daemon named by the target's `nx/workspace-data/d` record, skip;
-   3. stop that daemon as stock `nx daemon --stop` does, a SIGTERM to the pid taken from the same record read that
+   2. stop that daemon as stock `nx daemon --stop` does, a SIGTERM to the pid taken from the same record read that
       verified it live, and wait for its exit on a process-exit event (it restarts on the next client). A test with a
       real stock daemon pins the equivalence: after this stop, `nx daemon` starts cleanly;
-   4. query again; any holder at all, including a daemon a host client started in between, means skip;
-   5. **commit the carry**: index what was staged, and copy what the target indexed since;
-   6. take the target's image lock and admit the landing volume's Nx state and existing Cargo profile locks immediately
+   3. query again; any holder at all, including a daemon a host client started in between, means skip;
+   4. take the target's image lock and admit the landing volume's Nx state and existing Cargo profile locks immediately
       before capture. A live task-database holder is `landingHeld`, a process opening that database is `landingOpening`,
       a daemon that outlives its stop is `landingDaemonStayed`, and a held Cargo profile is `landingBuilding`, with the
       resource and holder named. Retain the Nx open locks and admitted Cargo locks through the mounted-source capture.
@@ -671,18 +668,18 @@ below).
    image, expected device and mountpoint and the original command failure. There is no blind mount retry; unrelated
    command failures are never converted into success by a subsequent mount observation.
 
-   The land holds the target's image lock from 5.6 until 6.4 has renamed the target's link and a kept workspace has
+   The land holds the target's image lock from 5.4 until 6.4 has renamed the target's link and a kept workspace has
    captured its fresh clone of the target's latest seed (the new one, or the previous one retained by a skipped
    capture); the clone's mount and link run after the land lets go. Every fork of the target holds the same lock from
    before it reads the target's seed and link until it has captured its own (Fork steps 1 to 3), and so does every
    reseed, so neither reads a seed or a volume the land deletes. Without it, a land that freezes main's seed and
    releases main's previous volume while a fork of main is under way deletes the seed the fork has read, and the fork
    fails (`sync source image …: No such file or directory`). A land that finds the lock held says so on stderr and waits
-   for it. It waits with the target's daemon already stopped (5.3), so the longer it waits, the likelier an Nx client
+   for it. It waits with the target's daemon already stopped (5.2), so the longer it waits, the likelier an Nx client
    restarts it and 6.2 skips the swap, reported as any skip is.
 
-   A skip at 2 or 4 deletes what was staged, still freezes the seed (5.6), and skips the swap. A skipped capture at 5.6
-   keeps the previous seed and still swaps.
+   A skip at 1 or 3 still freezes the seed (5.4) and skips the swap. A skipped capture at 5.4 keeps the previous seed
+   and still swaps.
 
 6. **Adopt the build volume.** Under the Nx open locks and the target's image lock:
    1. take, without waiting, stock Nx's open lock of each of the target's task databases (the database's path with the
@@ -690,9 +687,9 @@ below).
       pinned Nx 23.2.1 `native/db/mod.rs`). A lock some process holds means an Nx process is opening the database: skip,
       and name it. Held, the locks keep every Nx process from opening a database until the rename is done; one that
       starts meanwhile waits, then opens the database by its path, so through the moved link;
-   2. query the target's task database once more: a holder that opened it since 5.4 means skip;
+   2. query the target's task database once more: a holder that opened it since 5.3 means skip;
    3. delete `nx/workspace-data/d` in the landing build volume, then copy into it the target's record of a live daemon
-      that runs outside every sandbox (the host daemon a client started since 5.3);
+      that runs outside every sandbox (the host daemon a client started since 5.2);
    4. `rename(2)` a new `.cowshed/build` symlink over the target's, naming the landing workspace's build volume, and let
       go of the locks;
    5. hand ownership in the sidecars: the target owns the adopted volume, and its background label becomes
@@ -748,169 +745,18 @@ without failing the land.
 8. **Retire the workspace**. An adopted build volume is now the target's and does not retire with it. After a
    compare-and-swap at step 3 nothing adopted it, so it is still the workspace's.
 
-### Carry
+### Adoption copies nothing
 
-A landing volume holds what its workspace forked from and what it ran since. The target's volume also holds what other
-lands and the target itself ran in the meantime. Adopting the landing volume as it is discards all of that, though Nx's
-entries are content-addressed and every one is a correct hit for any tree that computes its hash: a fork made right
-after such a land would miss tasks main's previous volume held at that very tree. So before the target adopts the
-landing volume, every Nx cache entry the target's task database indexes and the landing volume's does not is copied into
-the landing volume and indexed there. Only Nx state is carried; codegraph is cloned/adopted per Owned index links. A
-Cargo target directory is per tree and mtime-fresh, so the landing volume's is the one that matches the landed tree.
+The target adopts the landing volume exactly as the land quiesced it. Nothing of the target's previous volume is copied
+into it: what the target and other lands ran since the landing workspace forked stays in the previous volume, which is
+released (step 6.5). Those results reach later forks and sheds through the project's Nx cache instead: every gated land
+publishes its checks' attributed runs to it, and every shed reads it (05_gateway.md, "Publication"). A rebase is Git
+alone (02_workspaces.md, "`cowshed rebase`"): it computes no task hash, stops no Nx daemon and copies no cache entry,
+and the workspace's next gate reads what its target ran from the same cache.
 
-The staged carry owns a shared hold on the source build volume until commit finishes or staging is abandoned; the quiet
-landing volume already owns the destination hold. These holds protect both filesystems across the daemon-close interval,
-before the later target image lock is acquired. A lifecycle regression proves the source cannot be exclusively claimed
-while staging lives and is released after commit.
-
-Stock Nx (pinned 23.2.1, `native/cache/cache.rs`) keeps an entry in three places: the directory `<cache>/<hash>` with
-the task's outputs, the file `<cache>/terminalOutputs/<hash>`, and a `cache_outputs` row in the task database
-`<workspace-data>/<machine>-v<schema>.db`, which references a `task_details` row. `put` writes the files first and the
-row last, and `get` answers a hit only for a row. The carry keeps that order in two phases, so the target's database is
-closed only for as long as it was before:
-
-- **Stage**, while the target runs (5.1): one SQLite read of the target's database (its write-ahead log included) names
-  the rows the landing database lacks, most recently used first; each entry's files are copied with `copyfile(3)`
-  (bytes, mode and times) into the landing volume's `.carry/` staging directory, outside every tool's namespace. Nothing
-  indexes them, so nothing reads them.
-- **Commit**, once the target is closed (5.5): a staged entry whose row (code, size, creation time) is unchanged moves
-  into the cache by `rename(2)`. Nx rewrites an entry only by deleting its directory, rewriting it and re-stamping its
-  row, and evicts one by deleting its row first, so an unchanged row proves the staged copy whole; any other staged
-  entry is dropped. Rows the target indexed after the stage are copied now, nothing writing either side. Every placed
-  entry's `task_details` and `cache_outputs` rows are inserted in one transaction, as the target holds them, its
-  `accessed_at` included, so Nx's own age and size eviction treats them as it would have in the target. The transaction
-  runs with foreign keys enforced, so an index Nx could not have written fails the carry instead. `.carry/` is then
-  deleted.
-
-Entries cross from one image to another, so they are copied, never cloned. Their volume is the delta of what other lands
-and the target ran since the landing workspace forked, which is what a fork would otherwise rebuild. Copies run before
-the target's database is closed and cost no window; a failed copy (a full volume) stops the carry, keeps every entry
-carried until then, and is reported (`carried.stopped`); the land still succeeds.
-
-A landing Nx root with no task database never ran Nx. After build-state admission and before checks or fast-forward,
-each detected Nx root is initialized through its checkout's own pinned Nx 23.2.1 `DbCache`, constructed with
-`{nxCloudRemoteCache: null, skipRemoteCache: true}`. Nx owns the complete schema initialization; the adapter never
-invokes remote initialization. An initialization failure or a different Nx version stops only Nx-entry carry, naming the
-failure or found version in `carried.stopped`; validation, fast-forward and adoption policy are unchanged. The
-initialization runs as one gate-class job of the landing workspace: a land is a gate job (05_gateway.md, "A land is a
-gate job").
-
-Carry requires an existing Nx-initialized v3 database and refuses one it cannot recognize. It writes no DDL or `VACUUM`,
-and copies no schema, header, journal, version or task-history metadata from the target. Initialization is Nx-owned, not
-a `VACUUM INTO` copy of another checkout's schema. A carry that crashes leaves only `.carry/`, which the next stage on
-that volume deletes before it starts.
-
-- **Enforced by**: a real-APFS test in which one workspace lands and warms an Nx task in main, a second, forked before
-  that land and changing nothing the task hashes, lands without running it, and a fork of main hits the task.
-
-### Rebase carry
-
-A workspace forked before other lands holds none of what they ran. `cowshed rebase` moves its tree onto the target's,
-where the target's volume already holds those tasks' entries, so the workspace's next gate would re-run every task the
-target ran at that tree. So once a rebase has not conflicted, stock Nx computes task hashes in the rebased checkout.
-Only target entries with one of those current-tree hashes that the workspace lacks are eligible to carry; historical
-hashes are not copied merely because main still indexes them. Each Nx root is selected independently. An unavailable or
-failed hash computation skips the carry with the root and reason; it never falls back to copying all rows. A probe job
-that cannot be admitted, its workspace supervisor not answering included, is unavailable: the rebase has already moved
-the tree, so a carry the rebase cannot compute is skipped, never the rebase failed after it. The target's volume is the
-source and the workspace's is the destination. The hash computation runs as one job of the workspace per root, at
-background class, or at gate class when the rebase names `--gate`: a land's rebase, which its lander runs under the land
-lock, so that it is not queued behind the background work the land is served ahead of. An ungated rebase computes no
-hash and carries nothing: its report is `skipped` with `reason:{kind:"ungated"}` ("Ungated folds", below).
-
-The host controller stops each root's recorded daemon before admitting its hash probe, using the native stop and exit
-watch. Stop failures name that root and fail its selection. The sandboxed probe has no authority to signal a daemon a
-host shell started. It computes the graph in-process from the rebased files, including for plugins loading another
-checkout's Nx, even if the keeper starts a replacement meanwhile. This bypass is scoped to the hash computation; normal
-runs keep their daemon, and the carry still closes both databases with host authority before committing. Both volumes'
-shared build holds are acquired before staging and retained through commit, including while their Nx daemons stop. A
-reseed or release must not withdraw either filesystem in that interval: Nx open locks fence database openers, not volume
-capture or collection. A refused build hold fails the carry with its side and hold path; it does not clear cache state
-or retry without the hold.
-
-Selection covers cacheable, non-continuous tasks in each root, with no configuration and with each declared
-configuration, using Nx's own task graph, per-task environment and hasher. CLI overrides are not guessed: an invocation
-whose forwarded arguments produce another hash misses normally.
-
-Stock Nx hashes a task before any task runs only when its hash cannot depend on another task's run. A task with a custom
-hasher, or with dependencies and a `dependentTasksOutputFiles` input, is deferred: `nx run-many` hashes it only after
-its dependencies have run and written or restored their outputs (pinned Nx 23.2.1, `hash-task.js`
-`hashTasksThatDoNotDependOnOutputsOfOtherTasks`, then `hashTask` per task). In a rebased checkout the dependency outputs
-on disk are stale: outputs live on the workspace's image, and neither a rebase nor a land refreshes them. A deferred
-task hashed up front would name a key no run looks up, so the probe applies Nx's own rule and never hashes one.
-Selection therefore has two classes, and each names only current tasks:
-
-- **By hash**: each task Nx hashes up front contributes its hash. The requested hashes form the outer SQLite loop and
-  probe the source cache's primary key, so this class does not scan the source's historical cache.
-- **By task**: each deferred task contributes its identity (project, target and configuration, as `task_details` records
-  them) and selects the one source entry of that identity with the latest `cache_outputs.accessed_at`. That is the entry
-  the target's last run of the task read or wrote, at the target's head tree. The rebased tree is that head plus the
-  workspace's diff, so for every deferred task the diff does not reach it is the entry the gate looks up once the task's
-  dependencies have run; a deferred task the diff does reach costs one entry that misses, never more. The latest entry
-  is chosen before the destination is consulted: a destination that already holds it takes nothing for that task, never
-  an older entry. `task_details` has no index by identity and the carry never writes the target's database, so this
-  class reads the source's `cache_outputs` once, a table Nx's own eviction bounds, and probes `task_details` by its
-  primary key and the identities by theirs. The `task_details` history of evicted entries is never read.
-
-No entry is copied merely because the target still indexes it: one entry per current hash, at most one per current
-deferred task.
-
-1. **Select and stage** while both sides run: temporary SQLite tables index the current hashes and the deferred task
-   identities, joined to the target's missing rows. Only these entries are copied into the workspace volume's `.carry/`,
-   as at Land 5.1. The hash probe establishes the destination's own Nx task database. If it is absent, the carry stops
-   rather than copying the source's potentially unbounded task-history database just to initialize a cache.
-2. **Close each side**, the workspace first, as Land 5.2–5.4 close the target: when nothing but the side's daemon holds
-   its task database, stop that daemon (it restarts on its next client); any other holder skips.
-3. **Take both sides' open locks and look again**, as Land 6.1–6.2 do for the target: a lock some process holds, or a
-   database some process opened since the close, skips. The workspace's jobs keep running through a rebase, unlike a
-   landing workspace's, so this look is what proves nothing in the workspace writes its database during the commit; an
-   Nx process that starts meanwhile waits on the lock.
-4. **Commit**, as Land 5.5, retaining the same selection of both classes for entries indexed after stage (a deferred
-   task the target ran again since then selects its new latest entry, and the staged one is dropped), then let go of the
-   locks.
-
-One budget spans both phases and every Nx state. The row count is a defensive cap of the selected hash and deferred task
-counts across database pairs, including multiple machine databases that might index the same hash. Recorded entry bytes
-and block-rounded copied bytes are capped at a tenth of both the destination image's capacity and its backing store's.
-Both filesystems retain a tenth of their capacity free, and the allowance is reduced to the currently available space
-above either reserve. A sparse RAW image's virtual free space does not prove its backing store has space. Every
-filesystem object is charged and both free-space values checked before its write. A failed store-space query stops the
-carry, never falls back to image space alone. A cache row understating a file's size cannot hide an unbounded data copy.
-Files are walked once, not sized in a preliminary second traversal; regular-file reads are pinned and length-limited,
-growth or shrinkage refuses the partial entry, and directory metadata is restored after children. Hitting a bound stops
-with `carried.stopped`, keeps whole entries already carried, removes the partial entry, and leaves the rebase
-successful. Moving staged entries at commit consumes no second copy allowance.
-
-A skip deletes what was staged and names the side, the database and each process with its pid and command; the rebase
-itself has happened and stands. A copy that fails stops the carry and keeps what was carried until then, as at a land.
-The report is `RebaseReport { oid, buildVolume }`, where `buildVolume` is `carried` with the `NxCarry` counts and
-`deferred`, how many of `carried.entries` the by-task class selected (the rest were selected by hash), or `skipped` with
-the reason. A rebase moves no seed: the workspace's seed catches up with its volume at its next fork (Targets and
-seeds).
-
-The hash-probe skip is `buildVolume: {kind:"skipped", reason:{kind:"taskHashes", state, reason}}`, where `state` is the
-checkout-relative Nx state directory (`<root>/.nx`) and `reason` explains the failed process or unreadable/invalid
-output. This is a successful Git rebase with no carried entries, not a refused rebase.
-
-A target with nothing to select from is not a workspace missing nothing. When none of the target's task databases the
-carry reached indexes a cache entry (no `cache_outputs` rows, or no database) at any Nx root with a selection, the carry
-skips before either side is closed, with `reason:{kind:"unindexed", states}` naming those roots' checkout-relative Nx
-state directories: no Nx run cached a task into the target's volume, so a `carried` with 0 entries would hide it.
-
-- **Enforced by**: a real-APFS test in which a workspace forked before a land rebases after it, its report counts the
-  land's entries carried, and its run of the landed check then hits every task; a real-APFS test in which a task hashes
-  its dependency's outputs (`dependentTasksOutputFiles`), the rebased workspace's copy of those outputs on disk is
-  stale, and the task is still carried by task and hits; a carry regression with a historical cache larger than the
-  rebased tree's selected entries that asserts only selected files are written; a by-task selection test that carries
-  one entry per deferred task out of several of its historical entries, and none when the destination holds the latest;
-  row, recorded byte, actual copied byte, backing-store reserve/query failure, indexed-query plan (both classes) and
-  late-entry selection tests that preserve the completed prefix without a partial entry; and a unit test in which a
-  target database without `cache_outputs`, with an empty one, or absent reports `unindexed` while one indexing only
-  other hashes carries 0.
-
-A directory-host regression attempts both exclusive build claims during the recorded Nx daemon's shutdown. Both are
-refused, and carry still places and indexes the selected output. SQLite refusals retain the failed statement and
-extended result code; I/O/open failures also retain SQLite's OS errno, never a stale errno from a later lock refusal.
+- **Enforced by**: a directory-host test in which the target's volume indexes an Nx entry the landing volume lacks, and
+  after quiesce, seed freeze, close and adoption the adopted volume indexes only its own entry and holds none of the
+  target's files.
 
 ### Stacks and merge queues
 
@@ -930,15 +776,14 @@ again at any level above it. A lane whose units fold ungated pays one build in a
 
 ### Ungated folds
 
-A lane unit's ungated fold into its lane base (`rebase --into <lane> --ungated`, `land --into <lane> --ungated`,
-02_workspaces.md "Lanes") moves Git state only. Its rebase, alone or the one its land runs before the fast-forward, runs
-no hash probe and no carry. Its land runs no Nx cache initialization and no check, and skips Land steps 4 to 7: it
-quiesces no landing volume, carries nothing, closes no target Nx state, freezes no seed, adopts nothing and restores no
-output. The lane base keeps its build link, its build volume and its latest seed exactly as they were. The unit's volume
-is still the unit's, as after a compare-and-swap at Land step 3, so step 8 retires it with the unit and collection
-releases it like any retired checkout's volume (Garbage collection): nothing is adopted and nothing is left behind. The
-land report's seed is `unchanged` and its adoption is `skipped` with `reason:{kind:"ungated"}`, which its `LandOutcome`
-records (13_telemetry.md).
+A lane unit's ungated fold into its lane base (`land --into <lane> --ungated`, 02_workspaces.md "Lanes") moves Git state
+only. Its rebase, alone or the one its land runs before the fast-forward, is the ordinary rebase, Git alone. Its land
+runs no check and skips Land steps 4 to 7: it quiesces no landing volume, closes no target Nx state, freezes no seed,
+adopts nothing and restores no output. The lane base keeps its build link, its build volume and its latest seed exactly
+as they were. The unit's volume is still the unit's, as after a compare-and-swap at Land step 3, so step 8 retires it
+with the unit and collection releases it like any retired checkout's volume (Garbage collection): nothing is adopted and
+nothing is left behind. The land report's seed is `unchanged` and its adoption is `skipped` with
+`reason:{kind:"ungated"}`, which its `LandOutcome` records (13_telemetry.md).
 
 Main refuses `--ungated` by name: a land into main is where a tree is gated and its built volume adopted, so main and
 every fork of it stay warm. A lane base whose units fold ungated builds the lane's whole delta once, incrementally on
@@ -946,15 +791,16 @@ its own volume, at its own gated close-out into main, and main adopts that volum
 base's build volume, so a fork of the lane base meanwhile takes the seed the lane base already had and builds the folded
 delta incrementally, as an edit would.
 
-- **Enforced by**: unit tests of the rebase and land plans, in which an ungated fold into a lane base is Git alone and
-  retires as `rm` does, a gated plan is unchanged into main and into a lane base, and main, `--gate`, `--check` and
-  `--push-only` refuse an ungated fold; unit tests of an ungated land's rebase, in which a unit behind its lane base is
-  replayed onto the lane base's tip and fast-forwards it, a unit already based lands its own head with no fetch and no
-  replay, a conflicting replay is rolled back, names its conflicted paths and moves nothing, and a fast-forward refused
-  after that rebase names the ungated land's retry while a gated land's names `cowshed rebase`; and a directory-host
-  test in which main refuses `--ungated` by name, an ungated rebase reports the `ungated` skip, an ungated land of a
-  unit a lane-mate's commit left behind rebases it and fast-forwards the lane base in one call, only the lane base's
-  branch moves, every build volume record but the unit's is unchanged, and the unit's volume is released with the unit.
+- **Enforced by**: unit tests of the land plan, in which an ungated land into a lane base is Git alone and retires as
+  `rm` does, a gated plan is unchanged into main and into a lane base, and main, `--check` and `--push-only` refuse an
+  ungated land; unit tests of an ungated land's rebase, in which a unit behind its lane base is replayed onto the lane
+  base's tip and fast-forwards it, a unit already based lands its own head with no fetch and no replay, a conflicting
+  replay is rolled back, names its conflicted paths and moves nothing, and a fast-forward refused after that rebase
+  names the ungated land's retry while a gated land's names `cowshed rebase`; and a directory-host test in which main
+  refuses `--ungated` by name, a rebase of the unit into its lane base replays by Git alone, an ungated land of a unit a
+  lane-mate's commit left behind rebases it and fast-forwards the lane base in one call, only the lane base's branch
+  moves, the land reports the `ungated` skip, every build volume record but the unit's is unchanged, and the unit's
+  volume is released with the unit.
 
 ## Garbage collection
 
@@ -969,9 +815,9 @@ delta incrementally, as an edit would.
   a superseded volume then and waits for that release before it reports the job ended; a release that cannot run or
   fails is the job's terminal failure and leaves the record naming its owner, never a later collection's work. Job
   admission takes its hold without waiting and refuses while any exclusive claim has the volume (a release, a capture, a
-  reseed, a cache clear, a dry-run probe), naming it claimed, not released. A land's or a carry's hold waits out an
-  exclusive claim instead, and then refuses only when the image is gone: only a release deletes it, so a capture, a
-  probe or a release that declines under its claim delays such a hold and never refuses it.
+  reseed, a cache clear, a dry-run probe), naming it claimed, not released. A land's hold waits out an exclusive claim
+  instead, and then refuses only when the image is gone: only a release deletes it, so a capture, a probe or a release
+  that declines under its claim delays such a hold and never refuses it.
 - A held lifecycle or image lock likewise defers release. A superseded seed is claimed under its target's image lock,
   which the land and reseed paths hold while they replace it, and released once that lock is let go: the claim keeps
   collection, and a later land or reseed of the target, off it, so none releases a seed another is retiring, and no
@@ -1131,12 +977,10 @@ delta incrementally, as an edit would.
   reports the same ownership reasons.
 - Inside a build volume, Nx's own cache eviction runs unchanged (age and size bounds, configured in `nx.json` as Nx
   documents). Its database and its cache directory are always the same pair, so its eviction never deletes what another
-  database indexes. A carried entry keeps the row the target held, last use included, so it ages out as it would have in
-  the target, and the carry indexes every entry it places, so nothing it writes escapes Nx's eviction; its staging
-  directory is its own to delete (Land, "Carry"). Gc never opens a volume's contents. Cargo does not bound its target
-  directory: it keeps every unit generation a later build superseded, and rustc keeps every split-debuginfo object set
-  it writes (rust-lang/rust#161824). The Nx plugin's Cargo retention reclaims superseded generations after each run that
-  built (`packages/nx-plugin/README.md`, "Cargo Workspace Layouts"); cowshed does not prune target directories.
+  database indexes. Gc never opens a volume's contents. Cargo does not bound its target directory: it keeps every unit
+  generation a later build superseded, and rustc keeps every split-debuginfo object set it writes
+  (rust-lang/rust#161824). The Nx plugin's Cargo retention reclaims superseded generations after each run that built
+  (`packages/nx-plugin/README.md`, "Cargo Workspace Layouts"); cowshed does not prune target directories.
 - A workspace's build volume retires with the workspace (`cowshed rm`, which collects before it answers, an unfinished
   clone's removal included), unless main adopted it.
 
@@ -1147,16 +991,14 @@ Each rule states what is enforced and why. Each has an enforcing test or check; 
 ### Read-only cache-reuse advisor
 
 `node packages/cowshed/bin/cache-advisor.cjs --workspace <checkout> --main <main-checkout> -- [bun] nx run-many <args>`
-advises an operator before a gate; it never rebases, restores outputs, carries entries, reseeds, replaces or deletes an
-image. It accepts an explicit `run-many` argv, including project selection, configuration and task overrides, not shell
-text or package-script indirection. It runs in the workspace's ordinary activated toolchain environment. Its one JSON
-report is stdout; Nx diagnostics and failures are stderr.
+advises an operator before a gate; it never rebases, restores outputs, reseeds, replaces or deletes an image. It accepts
+an explicit `run-many` argv, including project selection, configuration and task overrides, not shell text or
+package-script indirection. It runs in the workspace's ordinary activated toolchain environment. Its one JSON report is
+stdout; Nx diagnostics and failures are stderr.
 
-The standalone script ships beside the cowshed launcher. The embedded `build_volume/task_hashes.js` remains the carry
-helper: its all-target/all-configuration selection and database writes, and its host-owned daemon stop, differ from an
-advisor for one next command. A new cowshed verb would add supervisor/controller/API lifecycle plumbing to a read-only
-calculation, and an advisory branch in carry would mix these incompatible authority contracts. The standalone surface
-can run from a workspace's existing read grant; it needs no new lifecycle operation or candidate write grant.
+The standalone script ships beside the cowshed launcher. A new cowshed verb would add supervisor/controller/API
+lifecycle plumbing to a read-only calculation. The standalone surface can run from a workspace's existing read grant; it
+needs no new lifecycle operation or candidate write grant.
 
 On macOS, the advisor starts one confined child with kernel denial of persistent writes except its private scratch
 directory. The nonpersistent `/dev/null` device is explicitly writable because Git opens it O_RDWR. All process signals
@@ -1496,9 +1338,8 @@ links afterwards, so it reads rows from the old volume and files from the new on
 the new cache lacks, stock Nx reports a hit and restores nothing: the task "succeeds" with its outputs missing. A run
 that started on the old tree and stays entirely on the old volume is correct; only the mix is wrong. The land therefore
 swaps only when no process holds the target's current task database open, and otherwise skips the swap (Land steps 5 and
-6). The daemon is stopped before the swap because it also keeps the database open (it records task history), and the
-carry commits while the database is closed. The landing workspace is quiesced first (Land step 4) for the same reason on
-its side.
+6). The daemon is stopped before the swap because it also keeps the database open (it records task history). The landing
+workspace is quiesced first (Land step 4) for the same reason on its side.
 
 A run that started on the old tree and stays wholly on the old volume is correct even when it hits; the hazard is only
 the mix.

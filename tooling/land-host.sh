@@ -4,8 +4,7 @@
 #
 # 1. Rebase <workspace> onto main's head. A conflict stops the land and leaves <workspace> as it was. Main can move
 #    between reading its head and the rebase; cowshed fences on the head it was told, and a fence that fired for
-#    that reason alone is retried against the newer head. The rebase carries at gate class (`cowshed rebase --gate`):
-#    its task-hash job holds up every land queued behind this one (05_gateway.md, "A land is a gate job").
+#    that reason alone is retried against the newer head.
 # 2. Stop <workspace>'s Nx daemon. Its file map can be stale across a rebase (fseventsd drops events), and a gate
 #    that hashes a tree other than the rebased one proves nothing about it. The gate starts a fresh daemon.
 # 3. Gate the rebased tree on the host: `nx run-many -t gate --nx-bail=false`. The root Nx graph owns
@@ -51,7 +50,7 @@ rebase_onto_main() {
     base=$(git -C "$main" rev-parse HEAD)
     # The old range must be explicitly cut off, never replayed by this ordinary rebase.
     (cd "$main" && direnv exec "$main" bun "$here/land-history.ts" "$checkout" "$base") || return 1
-    if outcome=$(cowshed --json rebase "$workspace" --gate --expected-onto-head "$base"); then
+    if outcome=$(cowshed --json rebase "$workspace" --expected-onto-head "$base"); then
       printf '%s\n' "$outcome" >&2
       head=$(git -C "$checkout" rev-parse HEAD)
       return 0

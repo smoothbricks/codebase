@@ -2993,12 +2993,6 @@
     "retired": {
       "buildVolume": {
         "adoption": {
-          "carried": {
-            "bytes": 4096,
-            "elapsedMs": 12,
-            "entries": 7,
-            "stopped": "stage entry 42: No space left on device"
-          },
           "check": {
             "failed": [
               {
@@ -3109,112 +3103,7 @@
     }
   },
   "RebaseReport": {
-    "carried": {
-      "buildVolume": {
-        "carried": {
-          "bytes": 8192,
-          "elapsedMs": 40,
-          "entries": 12
-        },
-        "deferred": 8,
-        "kind": "carried"
-      },
-      "oid": "7777777777777777777777777777777777777777"
-    },
-    "daemonStayed": {
-      "buildVolume": {
-        "kind": "skipped",
-        "reason": {
-          "daemon": {
-            "command": "node nx daemon",
-            "pid": 4646
-          },
-          "kind": "daemonStayed",
-          "side": "target"
-        }
-      },
-      "oid": "7777777777777777777777777777777777777777"
-    },
-    "noTargetVolume": {
-      "buildVolume": {
-        "kind": "skipped",
-        "reason": {
-          "kind": "noTargetVolume"
-        }
-      },
-      "oid": "7777777777777777777777777777777777777777"
-    },
-    "noWorkspaceVolume": {
-      "buildVolume": {
-        "kind": "skipped",
-        "reason": {
-          "kind": "noWorkspaceVolume"
-        }
-      },
-      "oid": "7777777777777777777777777777777777777777"
-    },
-    "targetOpening": {
-      "buildVolume": {
-        "kind": "skipped",
-        "reason": {
-          "database": "/Users/fixture/Dev/widget/.nx/workspace-data/A-v3.db",
-          "holders": [
-            {
-              "command": "node nx build widget",
-              "pid": 4545
-            }
-          ],
-          "kind": "opening",
-          "side": "target"
-        }
-      },
-      "oid": "7777777777777777777777777777777777777777"
-    },
-    "taskHashes": {
-      "buildVolume": {
-        "kind": "skipped",
-        "reason": {
-          "kind": "taskHashes",
-          "reason": "node - /Users/fixture/Dev/widget/apps/web ended Exited { code: 1 }: Error: the task graph has a circular dependency",
-          "state": "apps/web/.nx"
-        }
-      },
-      "oid": "7777777777777777777777777777777777777777"
-    },
-    "ungated": {
-      "buildVolume": {
-        "kind": "skipped",
-        "reason": {
-          "kind": "ungated"
-        }
-      },
-      "oid": "7777777777777777777777777777777777777777"
-    },
-    "unindexed": {
-      "buildVolume": {
-        "kind": "skipped",
-        "reason": {
-          "kind": "unindexed",
-          "states": [".nx", "apps/web/.nx"]
-        }
-      },
-      "oid": "7777777777777777777777777777777777777777"
-    },
-    "workspaceHeld": {
-      "buildVolume": {
-        "kind": "skipped",
-        "reason": {
-          "database": "/Users/fixture/Dev/widget/.nx/workspace-data/A-v3.db",
-          "holders": [
-            {
-              "command": "node nx run-many -t test",
-              "pid": 4444
-            }
-          ],
-          "kind": "held",
-          "side": "workspace"
-        }
-      },
+    "rebased": {
       "oid": "7777777777777777777777777777777777777777"
     }
   },

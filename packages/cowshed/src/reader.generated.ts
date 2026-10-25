@@ -39,7 +39,6 @@ type ReaderName =
   | 'BUILD_STATE_LISTING'
   | 'BUILD_VOLUME'
   | 'CACHE_MISS'
-  | 'CARRY_SIDE'
   | 'CHARGED_MEMORY_USAGE'
   | 'CHECKPOINT_INFO'
   | 'CHECKPOINT_RESULT'
@@ -152,7 +151,6 @@ type ReaderName =
   | 'LOGS_CHUNK'
   | 'MIRROR_INFO'
   | 'MOUNT_RESULT'
-  | 'NX_CARRY'
   | 'NX_STATE_CLEAR_RESULT'
   | 'NX_STORE_CLEAR_RESULT'
   | 'OUTLIVED_PROCESS'
@@ -196,18 +194,6 @@ type ReaderName =
   | 'PROTECTED_OUTPUT__FILE'
   | 'PROTECTED_OUTPUT__INLINE'
   | 'PUSH_REPORT'
-  | 'REBASE_BUILD_VOLUME'
-  | 'REBASE_BUILD_VOLUME__CARRIED'
-  | 'REBASE_BUILD_VOLUME__SKIPPED'
-  | 'REBASE_CARRY_SKIP'
-  | 'REBASE_CARRY_SKIP__DAEMON_STAYED'
-  | 'REBASE_CARRY_SKIP__HELD'
-  | 'REBASE_CARRY_SKIP__NO_TARGET_VOLUME'
-  | 'REBASE_CARRY_SKIP__NO_WORKSPACE_VOLUME'
-  | 'REBASE_CARRY_SKIP__OPENING'
-  | 'REBASE_CARRY_SKIP__TASK_HASHES'
-  | 'REBASE_CARRY_SKIP__UNGATED'
-  | 'REBASE_CARRY_SKIP__UNINDEXED'
   | 'REBASE_REPORT'
   | 'RECOVERED_IMAGE'
   | 'RECOVERY_CAUSE'
@@ -444,7 +430,6 @@ const READERS: Readers<ReaderName> = {
     kind: 'record',
     fields: [
       ['elapsedMs', 'LEAF'],
-      ['carried', 'NX_CARRY'],
       ['check', 'ADOPTION_CHECK'],
     ],
   },
@@ -501,13 +486,6 @@ const READERS: Readers<ReaderName> = {
       ['inputs', 'LEAF'],
       ['inputsDigest', 'LEAF'],
       ['inputsError', 'LEAF'],
-    ],
-  },
-  CARRY_SIDE: {
-    kind: 'external',
-    arms: [
-      ['workspace', 'LEAF'],
-      ['target', 'LEAF'],
     ],
   },
   CHARGED_MEMORY_USAGE: {
@@ -1390,15 +1368,6 @@ const READERS: Readers<ReaderName> = {
       ['baseCommit', 'LEAF'],
     ],
   },
-  NX_CARRY: {
-    kind: 'record',
-    fields: [
-      ['entries', 'LEAF'],
-      ['bytes', 'LEAF'],
-      ['elapsedMs', 'LEAF'],
-      ['stopped', 'LEAF'],
-    ],
-  },
   NX_STATE_CLEAR_RESULT: {
     kind: 'record',
     fields: [
@@ -1620,77 +1589,7 @@ const READERS: Readers<ReaderName> = {
       ['previousDestinationHead', 'LEAF'],
     ],
   },
-  REBASE_BUILD_VOLUME: {
-    kind: 'internal',
-    tag: 'kind',
-    arms: [
-      ['carried', 'REBASE_BUILD_VOLUME__CARRIED'],
-      ['skipped', 'REBASE_BUILD_VOLUME__SKIPPED'],
-    ],
-  },
-  REBASE_BUILD_VOLUME__CARRIED: {
-    kind: 'record',
-    fields: [
-      ['carried', 'NX_CARRY'],
-      ['deferred', 'LEAF'],
-    ],
-  },
-  REBASE_BUILD_VOLUME__SKIPPED: { kind: 'record', fields: [['reason', 'REBASE_CARRY_SKIP']] },
-  REBASE_CARRY_SKIP: {
-    kind: 'internal',
-    tag: 'kind',
-    arms: [
-      ['noWorkspaceVolume', 'REBASE_CARRY_SKIP__NO_WORKSPACE_VOLUME'],
-      ['noTargetVolume', 'REBASE_CARRY_SKIP__NO_TARGET_VOLUME'],
-      ['held', 'REBASE_CARRY_SKIP__HELD'],
-      ['opening', 'REBASE_CARRY_SKIP__OPENING'],
-      ['daemonStayed', 'REBASE_CARRY_SKIP__DAEMON_STAYED'],
-      ['taskHashes', 'REBASE_CARRY_SKIP__TASK_HASHES'],
-      ['unindexed', 'REBASE_CARRY_SKIP__UNINDEXED'],
-      ['ungated', 'REBASE_CARRY_SKIP__UNGATED'],
-    ],
-  },
-  REBASE_CARRY_SKIP__DAEMON_STAYED: {
-    kind: 'record',
-    fields: [
-      ['side', 'CARRY_SIDE'],
-      ['daemon', 'DATABASE_HOLDER'],
-    ],
-  },
-  REBASE_CARRY_SKIP__HELD: {
-    kind: 'record',
-    fields: [
-      ['side', 'CARRY_SIDE'],
-      ['database', 'LEAF'],
-      ['holders', 'SEQ__DATABASE_HOLDER'],
-    ],
-  },
-  REBASE_CARRY_SKIP__NO_TARGET_VOLUME: { kind: 'record', fields: [] },
-  REBASE_CARRY_SKIP__NO_WORKSPACE_VOLUME: { kind: 'record', fields: [] },
-  REBASE_CARRY_SKIP__OPENING: {
-    kind: 'record',
-    fields: [
-      ['side', 'CARRY_SIDE'],
-      ['database', 'LEAF'],
-      ['holders', 'SEQ__DATABASE_HOLDER'],
-    ],
-  },
-  REBASE_CARRY_SKIP__TASK_HASHES: {
-    kind: 'record',
-    fields: [
-      ['state', 'LEAF'],
-      ['reason', 'LEAF'],
-    ],
-  },
-  REBASE_CARRY_SKIP__UNGATED: { kind: 'record', fields: [] },
-  REBASE_CARRY_SKIP__UNINDEXED: { kind: 'record', fields: [['states', 'LEAF']] },
-  REBASE_REPORT: {
-    kind: 'record',
-    fields: [
-      ['oid', 'LEAF'],
-      ['buildVolume', 'REBASE_BUILD_VOLUME'],
-    ],
-  },
+  REBASE_REPORT: { kind: 'record', fields: [['oid', 'LEAF']] },
   RECOVERED_IMAGE: {
     kind: 'record',
     fields: [

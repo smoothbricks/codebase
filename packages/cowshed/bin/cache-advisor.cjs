@@ -2,8 +2,7 @@
 'use strict';
 
 // specs/cowshed/16_build_volumes.md, "Read-only cache-reuse advisor".
-// This is deliberately separate from task_hashes.js: carry opens the task database,
-// stops the daemon and records details. None of those operations belongs in a probe.
+// A read-only probe: it opens no task database for writing, stops no daemon and records nothing.
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');

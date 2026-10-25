@@ -15,13 +15,13 @@
 pub mod cache_adapter;
 pub mod cargo;
 #[cfg(target_os = "macos")]
-pub mod carry;
 pub mod discard;
 pub mod link;
 #[cfg(target_os = "macos")]
 pub mod migrate;
 pub mod nx;
 #[cfg(target_os = "macos")]
+#[cfg(test)]
 pub(crate) mod sqlite;
 
 use std::fs;
@@ -779,7 +779,7 @@ impl BuildVolumeLayout {
             .join(format!("{id}.{IMAGE_EXTENSION}{HOLD_SUFFIX}"))
     }
 
-    /// Hold `id` for a land or a carry, for as long as the answer lives: while any hold lives, no
+    /// Hold `id` for a land, for as long as the answer lives: while any hold lives, no
     /// release unmounts the volume (16_build_volumes.md, "Garbage collection"). An exclusive claim
     /// on the volume (a release, a seed capture, a reseed, a cache clear, a dry-run probe) is waited
     /// out, because only what it leaves says whether the volume is still there. Refused with
@@ -1237,7 +1237,7 @@ impl BuildVolumeLayout {
 }
 
 /// One job's claim on the build volume it was admitted with ([`BuildVolumeLayout::admit`]), or a
-/// land's or carry's ([`BuildVolumeLayout::hold`]): a
+/// land's ([`BuildVolumeLayout::hold`]): a
 /// shared lock that keeps every release from unmounting the volume until it is dropped, when the
 /// job ends. The kernel drops it with the process that held it, so a crashed supervisor leaves
 /// no stale claim. It is fenced (`fork_lock`): a child spawned while the claim was open copied
@@ -1912,8 +1912,8 @@ mod tests {
 
     /// A hold refuses only once a release has deleted the volume. Every other exclusive claim on
     /// the hold file keeps the volume: a seed capture, a reseed or cache clear, a dry-run probe,
-    /// a release that reads the volume again under its claim and declines it. A land's or a
-    /// carry's hold behind one of those waits for it and then holds the volume; it never refuses
+    /// a release that reads the volume again under its claim and declines it. A land's hold
+    /// behind one of those waits for it and then holds the volume; it never refuses
     /// it as being released. A hold that waited behind a release that did delete the volume
     /// refuses as released.
     ///

@@ -665,8 +665,6 @@ pub struct RebaseArgs {
     pub expected_workspace_incarnation: Option<OsString>,
     pub expected_source_head: Option<OsString>,
     pub expected_onto_head: Option<OsString>,
-    pub gate: bool,
-    pub mode: LandMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1061,8 +1059,6 @@ pub fn cli_command() -> ClapCommand {
             value("expected-workspace-incarnation"),
             value("expected-source-head"),
             value("expected-onto-head"),
-            flag("gate"),
-            flag("ungated"),
         ]))
         .subcommand(leaf("land").arg(positional("workspace", 0..=1)).args([
             value("into"),
@@ -3943,10 +3939,8 @@ const REBASE: CommandSpec = CommandSpec {
     trailing: "",
     summary: "rebase a workspace",
     about: &[
-        "Brings the workspace branch up to current main: fetches main's checkout into the workspace and rebases onto it. A dirty tree is refused before anything moves; commit or discard the uncommitted work first. A conflict aborts cleanly and names the conflicted paths, leaving the workspace as it was. Naming no workspace rebases the one you are standing in.",
+        "Brings the workspace branch up to current main: fetches main's checkout into the workspace and rebases onto it, by Git alone: it runs no job and touches no build volume. A dirty tree is refused before anything moves; commit or discard the uncommitted work first. A conflict aborts cleanly and names the conflicted paths, leaving the workspace as it was. Naming no workspace rebases the one you are standing in. The new head prints on stdout.",
         "With `--into <lane>`, the destination is what the unit lands into instead: the branch the lane base <lane> has checked out, fetched from its mount, so a unit forked from a lane base catches up with what its lane-mates have landed there.",
-        "Then stock Nx computes task hashes at the rebased tree, and the workspace's build volume takes only missing target cache entries with those hashes, not the target's entire historical cache. A failed hash computation carries nothing and names the root and reason. Row, byte and free-space bounds stop a carry before it fills the volume, reporting what was kept and why it stopped; the rebase still stands. The new head prints on stdout and what was carried on stderr. The carry stops each side's idle Nx daemon, which restarts on its next client; a side whose task database another process holds carries nothing and says which process.",
-        "With `--ungated` (and `--into <lane>`), the rebase is Git alone: it computes no task hash and carries nothing. It is the rebase an ungated land runs itself, alone, for a unit that takes its lane-mates' work before it lands. Main refuses `--ungated`.",
     ],
     options: &[
         Opt {
@@ -3962,14 +3956,6 @@ const REBASE: CommandSpec = CommandSpec {
         Opt {
             spelling: "--expected-onto-head <oid>",
             meaning: "refuse unless the revision being rebased onto is still this commit",
-        },
-        Opt {
-            spelling: "--gate",
-            meaning: "run the carry's jobs as gate-class work, ahead of background: a land's rebase, which its lander runs under the land lock",
-        },
-        Opt {
-            spelling: "--ungated",
-            meaning: "the rebase an ungated land runs itself, alone: Git alone, with no task hashing and no carry; needs --into <lane>, and conflicts with --gate",
         },
     ],
 };
@@ -3988,8 +3974,6 @@ fn parse_rebase(matches: &ArgMatches) -> Result<Command, UsageError> {
         expected_workspace_incarnation: os(matches, "expected-workspace-incarnation"),
         expected_source_head: os(matches, "expected-source-head"),
         expected_onto_head: os(matches, "expected-onto-head"),
-        gate: flagged(matches, "gate"),
-        mode: land_mode(matches),
     }))
 }
 
@@ -4006,7 +3990,7 @@ const LAND: CommandSpec = CommandSpec {
         "A land that retires its unit also retires the sessions it folded: each session whose own changes touch a path the landed range changed, and whose work the landed tip holds as `rm` measures it. A folded session's live owner is spared, never stopped, and a folded session with a dirty tree is kept. Each folded session is reported in `folded` with its outcome, `retired` or `kept` with why. A land with --no-retire folds nothing.",
         "An adopted build volume is renamed `[cowshed] <project> — build <target>` in the background. The target's previous volume is released before land returns, including with --no-retire, unless a running job's hold owns it. Release uses an unforced unmount with bounded grace, then force if needed, naming initial holders and every collection deferral. Seeds are never mounted or named: mounting one just to rename it would advance the image mtime used for seed freshness.",
         "With `--into <lane>`, the unit lands into the lane base <lane> instead of main: the lane base's checked-out branch is fast-forwarded, and the unit retires once the lane base holds its commits. The lane itself reaches main with `cowshed rebase <lane>` and `cowshed land <lane>`.",
-        "With `--into <lane> --ungated`, the fold is Git alone and one command: land first rebases the unit onto the branch the lane base has checked out, as `cowshed rebase <ws> --into <lane> --ungated` does, and a unit already based on that branch lands as it is, with nothing fetched or replayed. A conflict stops the land before anything moves, leaves the unit as it was and names the conflicted paths. --expected-source-head names the head before that rebase; the landed head is reported. Then no check, no Nx cache initialization, carry, seed freeze or build-volume adoption. The lane base keeps its build volume and seed, and the unit's volume is released with the unit. Only a land into main gates, so main refuses `--ungated`.",
+        "With `--into <lane> --ungated`, the fold is Git alone and one command: land first rebases the unit onto the branch the lane base has checked out, as `cowshed rebase <ws> --into <lane>` does, and a unit already based on that branch lands as it is, with nothing fetched or replayed. A conflict stops the land before anything moves, leaves the unit as it was and names the conflicted paths. --expected-source-head names the head before that rebase; the landed head is reported. Then no check, seed freeze or build-volume adoption. The lane base keeps its build volume and seed, and the unit's volume is released with the unit. Only a land into main gates, so main refuses `--ungated`.",
         "With `--preflight`, land runs only the fences it runs before its check, with the same arguments, and stops: the plan, the workspace and its incarnation, the target, the source head, the dirty-tree refusal, the target branch and the target head. It exits 4 with land's own refusal when land would refuse, and 0 with what it read otherwise. It takes no land lease and no ref lock, attaches nothing, synchronizes no gateway, runs no check and finishes no interrupted work, so it runs beside a land of the same workspace; a detached lane base it cannot read without attaching is exit 5.",
     ],
     options: &[
@@ -4046,7 +4030,7 @@ const LAND: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--ungated",
-            meaning: "fold into the lane base by Git alone: rebase onto its branch (nothing when already based), fast-forward and retire, with no check and no build-volume carry or adoption; needs --into <lane>, and conflicts with --check and --push-only",
+            meaning: "fold into the lane base by Git alone: rebase onto its branch (nothing when already based), fast-forward and retire, with no check and no build-volume adoption; needs --into <lane>, and conflicts with --check and --push-only",
         },
         Opt {
             spelling: "--preflight",
@@ -5908,30 +5892,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_rebase_that_names_gate_runs_its_carry_as_gate_work() {
-        let rebase = |argv: &[&str]| {
-            let Command::Rebase(args) = parse_args(argv.iter().copied()).unwrap().command else {
-                panic!("expected rebase")
-            };
-            args.gate
-        };
-        assert!(!rebase(&["rebase", "raven"]));
-        assert!(rebase(&["rebase", "raven", "--gate"]));
-    }
-
-    #[test]
-    fn ungated_selects_the_lane_fold_on_rebase_and_land() {
-        let rebase = |argv: &[&str]| {
-            let Command::Rebase(args) = parse_args(argv.iter().copied()).unwrap().command else {
-                panic!("expected rebase")
-            };
-            args.mode
-        };
-        assert_eq!(rebase(&["rebase", "raven"]), LandMode::Gated);
-        assert_eq!(
-            rebase(&["rebase", "raven", "--into", "lane", "--ungated"]),
-            LandMode::Ungated
-        );
+    fn ungated_selects_the_lane_fold_on_land_and_rebase_has_no_such_flag() {
         let land = |argv: &[&str]| {
             let Command::Land(args) = parse_args(argv.iter().copied()).unwrap().command else {
                 panic!("expected land")
@@ -5943,6 +5904,12 @@ mod tests {
             land(&["land", "raven", "--into", "lane", "--ungated"]),
             LandMode::Ungated
         );
+        for argv in [
+            &["rebase", "raven", "--gate"][..],
+            &["rebase", "raven", "--into", "lane", "--ungated"],
+        ] {
+            assert!(parse_args(argv.iter().copied()).is_err(), "{argv:?}");
+        }
     }
 
     #[test]

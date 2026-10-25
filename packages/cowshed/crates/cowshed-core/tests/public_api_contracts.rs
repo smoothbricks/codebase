@@ -1074,8 +1074,6 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
         expected_workspace_incarnation: Some(incarnation()),
         expected_source_head: Some(oid('a')),
         expected_onto_head: None,
-        gate: false,
-        mode: cowshed_core::api::dto::LandMode::Gated,
     };
     let rebase_json = serde_json::to_value(&rebase).unwrap();
     assert_eq!(
@@ -1083,18 +1081,17 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
         incarnation().as_str()
     );
     assert!(rebase_json.get("expectedOntoHead").is_none());
-    // Background is the rebase's default class, so only a land's rebase names `gate`.
-    assert!(rebase_json.get("gate").is_none());
-    let land_rebase = RebaseOptions {
-        gate: true,
-        ..rebase
-    };
-    let land_rebase_json = serde_json::to_value(&land_rebase).unwrap();
-    assert_eq!(land_rebase_json["gate"], json!(true));
+    // A rebase is Git alone: it names no job class and no fold mode, and refuses either field.
     assert_eq!(
-        serde_json::from_value::<RebaseOptions>(land_rebase_json).unwrap(),
-        land_rebase
+        serde_json::from_value::<RebaseOptions>(rebase_json).unwrap(),
+        rebase
     );
+    for refused in [json!({"gate":true}), json!({"mode":"ungated"})] {
+        assert!(
+            serde_json::from_value::<RebaseOptions>(refused.clone()).is_err(),
+            "{refused}"
+        );
+    }
 
     let push = PushOptions {
         branch: None,

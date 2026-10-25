@@ -24,20 +24,20 @@ use std::{
 
 use cowshed_core::{
     api::{
-        AbandonedPreservation, AbandonedWork, BinaryData, BranchLandings, CarrySide,
-        CheckpointInfo, CommandArg, CpuMicros, CpuMicrosDelta, CpuTotals, DoctorReport, EgressMode,
-        EgressRule, ExecClass, ExecScope, ExitStatus, Finding, FindingSeverity, GcCandidate,
-        GcDeferred, GcReason, GcReport, GitOid, GrantSet, HostLoadSample, JobAccounting, JobId,
-        JobInfo, JobLeafAttribution, JobProcessLeaf, JobResourceSample, JobState,
-        JobStreamWatermark, JobVolumeUsage, LandReport, LandingCommits, OneCoreCpuPercent,
-        OneCoreCpuPermille, OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, PreservedRef,
-        ProcessCoverage, ProcessCoverageGap, ProtectedOutput, PushReport, RebaseBuildVolume,
-        RebaseCarrySkip, RebaseReport, RemoveReport, RepoRule, ResidentBytes, ResizeResult,
-        ResizeVolume, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind, StreamBytes, StreamInfo,
-        StreamLines, TraceContext, TraceId, UnlandedChange, UnlandedPath, UnlandedPaths,
-        UnprovenWorkspace, UsageReconciliation, UtcTimestamp, VolumeUnavailable, VolumeUsage,
-        VolumeUsedBytesDelta, WallMicros, WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding,
-        WorkspaceName, WorkspacePath, WorkspaceRole, WorkspaceState,
+        AbandonedPreservation, AbandonedWork, BinaryData, BranchLandings, CheckpointInfo,
+        CommandArg, CpuMicros, CpuMicrosDelta, CpuTotals, DoctorReport, EgressMode, EgressRule,
+        ExecClass, ExecScope, ExitStatus, Finding, FindingSeverity, GcCandidate, GcDeferred,
+        GcReason, GcReport, GitOid, GrantSet, HostLoadSample, JobAccounting, JobId, JobInfo,
+        JobLeafAttribution, JobProcessLeaf, JobResourceSample, JobState, JobStreamWatermark,
+        JobVolumeUsage, LandReport, LandingCommits, OneCoreCpuPercent, OneCoreCpuPermille,
+        OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, PreservedRef, ProcessCoverage,
+        ProcessCoverageGap, ProtectedOutput, PushReport, RebaseReport, RemoveReport, RepoRule,
+        ResidentBytes, ResizeResult, ResizeVolume, Sha256Digest, SimVerb, SpanId, StdinInfo,
+        StdinKind, StreamBytes, StreamInfo, StreamLines, TraceContext, TraceId, UnlandedChange,
+        UnlandedPath, UnlandedPaths, UnprovenWorkspace, UsageReconciliation, UtcTimestamp,
+        VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta, WallMicros, WorkspaceIncarnation,
+        WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath, WorkspaceRole,
+        WorkspaceState,
     },
     repository::RepoId,
 };
@@ -939,12 +939,6 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             },
             adoption: cowshed_core::api::dto::Adoption::Adopted {
                 elapsed_ms: 3,
-                carried: cowshed_core::api::dto::NxCarry {
-                    entries: 7,
-                    bytes: 4096,
-                    elapsed_ms: 12,
-                    stopped: Some("stage entry 42: No space left on device".to_owned()),
-                },
                 check: cowshed_core::api::dto::AdoptionCheck {
                     hits: 41,
                     misses: vec![cowshed_core::api::dto::CacheMiss {
@@ -1066,29 +1060,9 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         folded: Vec::new(),
         ..land_first.clone()
     };
-    // One document per `RebaseCarrySkip` arm and per side: an arm absent here is one the
-    // TypeScript union is not checked against.
-    let rebase_carried = RebaseReport {
+    let rebased = RebaseReport {
         oid: oid("7777777777777777777777777777777777777777"),
-        build_volume: RebaseBuildVolume::Carried {
-            carried: cowshed_core::api::dto::NxCarry {
-                entries: 12,
-                bytes: 8192,
-                elapsed_ms: 40,
-                stopped: None,
-            },
-            deferred: 8,
-        },
     };
-    let rebase_skipped = |reason| RebaseReport {
-        build_volume: RebaseBuildVolume::Skipped { reason },
-        ..rebase_carried.clone()
-    };
-    let holder = |pid, command: &str| cowshed_core::api::dto::DatabaseHolder {
-        pid,
-        command: command.to_owned(),
-    };
-    let database = || PathBuf::from("/Users/fixture/Dev/widget/.nx/workspace-data/A-v3.db");
 
     let push_new = PushReport {
         source_head: oid("3333333333333333333333333333333333333333"),
@@ -1227,17 +1201,35 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             BTreeMap::from([
                 (
                     "delivered",
-                    document("land report", &LandReport::Delivered(PushReport {
-                        source_head: oid("1111111111111111111111111111111111111111"),
-                        destination_ref: "refs/cowshed/raven/heads/topic".to_owned(),
-                        previous_destination_head: None,
-                    })),
+                    document(
+                        "land report",
+                        &LandReport::Delivered(PushReport {
+                            source_head: oid("1111111111111111111111111111111111111111"),
+                            destination_ref: "refs/cowshed/raven/heads/topic".to_owned(),
+                            previous_destination_head: None,
+                        }),
+                    ),
                 ),
-                ("firstLanding", document("land report", &LandReport::Landed(land_first))),
-                ("retired", document("land report", &LandReport::Landed(land_retired))),
-                ("adoptionSkipped", document("land report", &LandReport::Landed(land_held))),
-                ("landingBuilding", document("land report", &LandReport::Landed(land_building))),
-                ("landingOpening", document("land report", &LandReport::Landed(landing_opening))),
+                (
+                    "firstLanding",
+                    document("land report", &LandReport::Landed(land_first)),
+                ),
+                (
+                    "retired",
+                    document("land report", &LandReport::Landed(land_retired)),
+                ),
+                (
+                    "adoptionSkipped",
+                    document("land report", &LandReport::Landed(land_held)),
+                ),
+                (
+                    "landingBuilding",
+                    document("land report", &LandReport::Landed(land_building)),
+                ),
+                (
+                    "landingOpening",
+                    document("land report", &LandReport::Landed(landing_opening)),
+                ),
                 (
                     "landingDaemonUnverifiable",
                     document("land report", &LandReport::Landed(land_unverifiable)),
@@ -1246,7 +1238,10 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                     "adoptionSkippedOpening",
                     document("land report", &LandReport::Landed(land_opening)),
                 ),
-                ("ungated", document("land report", &LandReport::Landed(land_ungated))),
+                (
+                    "ungated",
+                    document("land report", &LandReport::Landed(land_ungated)),
+                ),
                 (
                     "preflighted",
                     document(
@@ -1265,78 +1260,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         ),
         (
             "RebaseReport",
-            BTreeMap::from([
-                ("carried", document("rebase report", &rebase_carried)),
-                (
-                    "noWorkspaceVolume",
-                    document(
-                        "rebase report",
-                        &rebase_skipped(RebaseCarrySkip::NoWorkspaceVolume),
-                    ),
-                ),
-                (
-                    "noTargetVolume",
-                    document(
-                        "rebase report",
-                        &rebase_skipped(RebaseCarrySkip::NoTargetVolume),
-                    ),
-                ),
-                (
-                    "workspaceHeld",
-                    document(
-                        "rebase report",
-                        &rebase_skipped(RebaseCarrySkip::Held {
-                            side: CarrySide::Workspace,
-                            database: database(),
-                            holders: vec![holder(4444, "node nx run-many -t test")],
-                        }),
-                    ),
-                ),
-                (
-                    "targetOpening",
-                    document(
-                        "rebase report",
-                        &rebase_skipped(RebaseCarrySkip::Opening {
-                            side: CarrySide::Target,
-                            database: database(),
-                            holders: vec![holder(4545, "node nx build widget")],
-                        }),
-                    ),
-                ),
-                (
-                    "daemonStayed",
-                    document(
-                        "rebase report",
-                        &rebase_skipped(RebaseCarrySkip::DaemonStayed {
-                            side: CarrySide::Target,
-                            daemon: holder(4646, "node nx daemon"),
-                        }),
-                    ),
-                ),
-                (
-                    "taskHashes",
-                    document(
-                        "rebase report",
-                        &rebase_skipped(RebaseCarrySkip::TaskHashes {
-                            state: PathBuf::from("apps/web/.nx"),
-                            reason: "node - /Users/fixture/Dev/widget/apps/web ended Exited { code: 1 }: Error: the task graph has a circular dependency".to_owned(),
-                        }),
-                    ),
-                ),
-                (
-                    "unindexed",
-                    document(
-                        "rebase report",
-                        &rebase_skipped(RebaseCarrySkip::Unindexed {
-                            states: vec![PathBuf::from(".nx"), PathBuf::from("apps/web/.nx")],
-                        }),
-                    ),
-                ),
-                (
-                    "ungated",
-                    document("rebase report", &rebase_skipped(RebaseCarrySkip::Ungated)),
-                ),
-            ]),
+            BTreeMap::from([("rebased", document("rebase report", &rebased))]),
         ),
         (
             "PushReport",

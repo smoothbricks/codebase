@@ -5595,30 +5595,17 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         ))
     }
 
-    /// Land steps 1b–2 of a gated land (02_workspaces.md, "`cowshed land`"; 16_build_volumes.md,
-    /// "Carry"): admit the landing workspace's build state, initialize its Nx caches, and run
-    /// each check in its sandbox. Answers the checks that passed and the carry's stop reason.
+    /// Land steps 1b–2 of a gated land (02_workspaces.md, "`cowshed land`"): admit the landing
+    /// workspace's build state and run each check in its sandbox. Answers the checks that passed.
     async fn gate_landing(
         &mut self,
         workspace: &WorkspaceName,
         current: &NativeWorkspace,
         source_mount: &Path,
         checks: Vec<String>,
-    ) -> Result<(CheckedLandChecks, Option<String>)> {
+    ) -> Result<CheckedLandChecks> {
         let (handle, build_volume) =
             timed_async("land", "supervisor", self.admit_build_state(workspace)).await?;
-        // A failed cache initialization is the carry's stop reason, not a refused land: checks and
-        // the fast-forward still run, and the carry copies nothing.
-        let carry_stopped = match timed_async(
-            "land",
-            "nx-cache-init",
-            initialize_nx_caches(&handle, build_volume.clone(), source_mount),
-        )
-        .await
-        {
-            Ok(()) => None,
-            Err(error) => Some(error.message),
-        };
         if !checks.is_empty() {
             self.reconcile_gateway_for_work(
                 workspace,
@@ -5713,7 +5700,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 ),
             }
         }
-        Ok((checked, carry_stopped))
+        Ok(checked)
     }
 
     /// Land's fences before its check, in land's order, each a read of the source, the target or
@@ -5830,9 +5817,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     }
 
     /// Land steps 4–7 (16_build_volumes.md, "Land"): quiesce the landing workspace, close the
-    /// target's Nx state and carry the target's cache entries into the landing volume, freeze
-    /// the target's seed from that volume, move the target's build link onto it, and restore
-    /// the declared outputs of the Nx runs already validated in the landing workspace.
+    /// target's Nx state, freeze the target's seed from the landing volume, move the target's
+    /// build link onto it as it is, copying nothing into it, and restore the declared outputs of
+    /// the Nx runs already validated in the landing workspace.
     async fn land_build_volume(
         &mut self,
         landing_owner: super::build_volumes::Owner,
@@ -5840,7 +5827,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         into: &NativeLandingInto,
         checks: &CheckedLandChecks,
         retire: bool,
-        carry_stopped: Option<String>,
     ) -> Result<crate::api::dto::LandBuildVolume> {
         use crate::api::dto::{Adoption, AdoptionSkip, LandBuildVolume, LandSeed};
         let workspace = &landing_owner.name;
@@ -5972,31 +5958,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             name: into.name.clone(),
             incarnation: target.derived.workspace.incarnation().clone(),
         };
-        // The carry's copies run while the target still runs; only its commit needs the
-        // target closed. Both precede the seed, so the seed holds what was carried.
-        let staging = timed_async(
-            "land",
-            "carry-stage",
-            volumes.stage(&quiet, into.mount.clone(), carry_stopped),
-        )
-        .await?;
         let closed = timed_async(
             "land",
             "close-target",
             volumes.close_target(into.mount.clone()),
         )
         .await?;
-        let carried = match closed {
-            Ok(closed) => {
-                let carried =
-                    timed_async("land", "carry-commit", volumes.commit(staging, &quiet)).await?;
-                Ok((closed, carried))
-            }
-            Err(reason) => {
-                volumes.unstage(&quiet).await?;
-                Err(reason)
-            }
-        };
         // The target's image lock from the seed's freeze until the target's link names the
         // adopted volume: every fork of the target holds it from its read of the target's seed
         // and link until its own link is written, and every reseed of the target while it
@@ -6046,8 +6013,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             }
             Err(reason) => return Ok(skipped(reason)),
         };
-        let (closed, carried) = match carried {
-            Ok(carried) => carried,
+        let closed = match closed {
+            Ok(closed) => closed,
             Err(reason) => {
                 drop(locked);
                 if let Some(superseded) = superseded {
@@ -6153,11 +6120,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         return Err(error);
                     }
                 };
-                Adoption::Adopted {
-                    elapsed_ms,
-                    carried,
-                    check,
-                }
+                Adoption::Adopted { elapsed_ms, check }
             }
         };
         Ok(LandBuildVolume { seed, adoption })
@@ -12511,20 +12474,16 @@ mod rebase_recovery_tests {
         );
     }
 
-    /// The fold's plan (16_build_volumes.md, "Ungated folds"): ungated into a lane base is Git
-    /// alone and retires the unit as `rm` does; a gated rebase or land plans what it always did,
-    /// into main and into a lane base alike; main refuses an ungated fold by name, and an
-    /// ungated fold refuses the gate surfaces it does not run.
+    /// The fold's plan (16_build_volumes.md, "Ungated folds"): an ungated land into a lane base
+    /// is Git alone and retires the unit as `rm` does; a gated land plans what it always did,
+    /// into main and into a lane base alike; main refuses an ungated land by name, and an ungated
+    /// land refuses the gate surfaces it does not run.
     #[test]
     fn an_ungated_fold_into_a_lane_base_plans_no_build_step_and_main_refuses_it() {
-        use crate::api::dto::{ExecClass, LandMode};
+        use crate::api::dto::LandMode;
         let lane = Lane::name("lane");
         let main = WorkspaceName::main();
 
-        assert_eq!(
-            rebase_plan(LandMode::Ungated, false, &lane).expect("an ungated rebase"),
-            RebasePlan::GitOnly
-        );
         let ungated = LandOptions {
             mode: LandMode::Ungated,
             ..LandOptions::default()
@@ -12534,34 +12493,18 @@ mod rebase_recovery_tests {
         assert!(matches!(plan.retirement(), CheckoutNxCheck::CloseRecorded));
 
         for target in [&main, &lane] {
-            assert_eq!(
-                rebase_plan(LandMode::Gated, false, target).expect("a rebase"),
-                RebasePlan::Carry {
-                    class: ExecClass::Background
-                }
-            );
-            assert_eq!(
-                rebase_plan(LandMode::Gated, true, target).expect("a land's rebase"),
-                RebasePlan::Carry {
-                    class: ExecClass::Gate
-                }
-            );
             let plan = land_plan(&LandOptions::default(), target).expect("a land");
             assert_eq!(plan, LandPlan::Gated);
             assert!(matches!(plan.retirement(), CheckoutNxCheck::Held));
         }
 
-        for refused in [
-            rebase_plan(LandMode::Ungated, false, &main).expect_err("main refuses"),
-            land_plan(&ungated, &main).expect_err("main refuses"),
-        ] {
-            assert_eq!(refused.code, crate::error::ErrorCode::Usage);
-            assert!(
-                refused.message.contains("the target is main"),
-                "{}",
-                refused.message
-            );
-        }
+        let refused = land_plan(&ungated, &main).expect_err("main refuses");
+        assert_eq!(refused.code, crate::error::ErrorCode::Usage);
+        assert!(
+            refused.message.contains("the target is main"),
+            "{}",
+            refused.message
+        );
         let checked = LandOptions {
             check: Some(vec!["just verify".to_owned()]),
             ..ungated.clone()
@@ -12571,7 +12514,6 @@ mod rebase_recovery_tests {
             ..ungated
         };
         for refused in [
-            rebase_plan(LandMode::Ungated, true, &lane).expect_err("no gate class"),
             land_plan(&checked, &lane).expect_err("no check"),
             land_plan(&pushed, &lane).expect_err("no push-only"),
         ] {
@@ -15412,13 +15354,6 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         self.wait_for_other_builds_as_a_land_step();
         let store_root = &std::sync::Arc::clone(self.git.store_root());
         require_single_destination(options.onto.as_ref(), into.as_ref())?;
-        let plan = rebase_plan(
-            options.mode,
-            options.gate,
-            &into
-                .as_ref()
-                .map_or_else(main_name, |into| into.workspace().clone()),
-        )?;
         self.validate_binding().await?;
         let current = self.current(&workspace).await?;
         if let Some(expected) = options.expected_workspace_incarnation.as_ref() {
@@ -15473,40 +15408,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         require_onto_head(options.expected_onto_head.as_ref(), &onto, &onto_head)?;
         run_git_rebase_atomically(store_root, &root, &onto, &source_head).await?;
         let oid = git_oid(store_root, &root).await?;
-        // The rebase has happened: a failed carry reads as such, never as a refused rebase.
-        let build_volume = match plan {
-    RebasePlan::GitOnly => crate::api::dto::RebaseBuildVolume::Skipped {
-        reason: crate::api::dto::RebaseCarrySkip::Ungated,
-    },
-    RebasePlan::Carry { class } => timed_async("rebase", "carry", async {
-        // Only what the rebased tree will look up is carried, so the hashes come from it, as
-        // it is checked out now, through jobs admitted on its own build volume, at the class
-        // the caller names: a land's rebase runs them as gate-class work. Admission is the
-        // probes' to fail: a supervisor that does not answer leaves the hashes unavailable,
-        // which skips the carry rather than failing a rebase that has already happened.
-        let admitted = self.admit_build_state(&workspace).await;
-        let mount = self.workspace_mount_path(&workspace)?;
-        let selections = timed_async(
-            "rebase",
-            "task-hashes",
-            rebased_task_hashes(admitted, &mount, class),
-        )
-        .await?;
-        self.build_volumes()?
-            .rebase_carry(root.clone(), into.mount.clone(), selections)
-            .await
-    })
-    .await
-    .map_err(|failed| {
-        failed.reworded(|message| {
-            format!(
-                "rebased {workspace} to {oid}, but carrying {}'s Nx cache into its build volume failed: {message}",
-                into.name
-            )
-        })
-    })?,
-};
-        Ok(RebaseReport { oid, build_volume })
+        Ok(RebaseReport { oid })
     }
 
     async fn land(
@@ -15551,8 +15453,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let source_repository = crate::git::GitRepository::from_root(store_root, &source_mount);
         let target_ref = format!("refs/heads/{target_branch}");
         let retire = options.retire;
-        // An ungated land initializes no Nx cache and runs no check: only a land into main gates.
-        let (checked, carry_stopped) = match plan {
+        // An ungated land runs no check: only a land into main gates.
+        let checked = match plan {
             LandPlan::Gated => {
                 self.gate_landing(
                     &workspace,
@@ -15562,7 +15464,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 )
                 .await?
             }
-            LandPlan::Ungated => (CheckedLandChecks::default(), None),
+            LandPlan::Ungated => CheckedLandChecks::default(),
         };
 
         // Land has no branch-name contract with the workspace: it delivers whatever branch the
@@ -15635,9 +15537,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         };
         // The ref fence (02_workspaces.md "`cowshed land`" step 3). The caller's ref lock or ref
         // turn (land_plan admits one at most), when it names one, is held from re-reading the
-        // target head through the fast-forward and for nothing else: the checks and Nx cache
-        // initialization before it and the adoption and retirement after it run outside, so a
-        // writer queued on it waits for this fence alone. The `delivery` span is the hold.
+        // target head through the fast-forward and for nothing else: the checks before it and the
+        // adoption and retirement after it run outside, so a writer queued on it waits for this
+        // fence alone. The `delivery` span is the hold.
         let ref_lock = match options.ref_lock.as_ref() {
             Some(path) => Some(
                 timed_async(
@@ -15707,7 +15609,6 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     &into,
                     &checked,
                     retire,
-                    carry_stopped,
                 ),
             )
             .await
@@ -19748,23 +19649,12 @@ fn require_distinct_target(unit: &WorkspaceName, target: &WorkspaceName) -> Resu
     Ok(())
 }
 
-/// What a rebase does once its replay has succeeded (16_build_volumes.md, "Rebase carry" and
-/// "Ungated folds").
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RebasePlan {
-    /// Hash the rebased tree's tasks as `class` jobs and carry the target's entries they name.
-    Carry { class: crate::api::dto::ExecClass },
-    /// The replay alone: an ungated rebase, alone or an ungated land's own, carries nothing.
-    GitOnly,
-}
-
 /// What a land does beside Git (02_workspaces.md, "`cowshed land`" and "Lanes";
 /// 16_build_volumes.md, "Land" and "Ungated folds").
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LandPlan {
-    /// Nx cache initialization, the checks, carry, seed freeze, adoption and output restoration.
+    /// The checks, seed freeze, adoption and output restoration.
     Gated,
     /// The rebase onto the lane base's branch, the fast-forward and the retire, by Git alone: the
     /// target keeps its build volume and seed, and the unit's volume retires with the unit.
@@ -19784,36 +19674,6 @@ impl LandPlan {
     }
 }
 
-/// A rebase's plan: `gate` names the carry's job class. An ungated rebase runs no job, and folds
-/// only into a lane base.
-#[cfg(target_os = "macos")]
-fn rebase_plan(
-    mode: crate::api::dto::LandMode,
-    gate: bool,
-    target: &WorkspaceName,
-) -> Result<RebasePlan> {
-    use crate::api::dto::{ExecClass, LandMode};
-    match mode {
-        LandMode::Gated => Ok(RebasePlan::Carry {
-            class: if gate {
-                ExecClass::Gate
-            } else {
-                ExecClass::Background
-            },
-        }),
-        LandMode::Ungated => {
-            require_lane_target("rebase", target)?;
-            if gate {
-                return Err(CowshedError::usage(
-                    "an ungated rebase runs no job, so it has none to run at gate class",
-                    "drop --gate, or drop --ungated to carry the target's Nx cache entries",
-                ));
-            }
-            Ok(RebasePlan::GitOnly)
-        }
-    }
-}
-
 /// A land's plan. An ungated land runs no check and advances its lane base, so it refuses
 /// `check` and `push_only`, and folds only into a lane base.
 #[cfg(target_os = "macos")]
@@ -19827,7 +19687,7 @@ fn land_plan(options: &LandOptions, target: &WorkspaceName) -> Result<LandPlan> 
     match options.mode {
         crate::api::dto::LandMode::Gated => Ok(LandPlan::Gated),
         crate::api::dto::LandMode::Ungated => {
-            require_lane_target("land", target)?;
+            require_lane_target(target)?;
             if options
                 .check
                 .as_ref()
@@ -19851,15 +19711,15 @@ fn land_plan(options: &LandOptions, target: &WorkspaceName) -> Result<LandPlan> 
 
 /// Only a land into main gates (02_workspaces.md "Lanes"), so main refuses an ungated fold.
 #[cfg(target_os = "macos")]
-fn require_lane_target(verb: &str, target: &WorkspaceName) -> Result<()> {
+fn require_lane_target(target: &WorkspaceName) -> Result<()> {
     if target.is_main() {
         return Err(CowshedError::usage(
             format!(
-                "an ungated {verb} folds a unit into its lane base, and the target is {target}: \
+                "an ungated land folds a unit into its lane base, and the target is {target}: \
                  only a land into main gates"
             ),
             format!(
-                "drop --ungated to {verb} into {target}, or name the lane base with --into <lane>"
+                "drop --ungated to land into {target}, or name the lane base with --into <lane>"
             ),
         ));
     }
@@ -20492,62 +20352,6 @@ async fn read_job_stdout(
     }
 }
 
-/// Land's cache-schema prerequisite (16_build_volumes.md, "Carry"), before checks/fast-forward
-/// and before quiescence. Even a no-check land initializes every detected Nx root through that
-/// checkout's pinned Nx, without computing a project/task graph or copying another DB's history.
-/// A failure here is not a refused land: the caller records it as the carry's stop reason, and
-/// checks and the fast-forward still run. Its jobs are gate-class work: a land is a gate job and
-/// only its lander lands (05_gateway.md, "A land is a gate job").
-#[cfg(target_os = "macos")]
-async fn initialize_nx_caches(
-    handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
-    build_volume: Option<PathBuf>,
-    mount: &Path,
-) -> Result<()> {
-    let state =
-        crate::build_volume::BuildVolumeState::read(&mount.join(crate::build_volume::BUILD_LINK))?;
-    for parent in nx_state_paths(&state) {
-        let root = parent.parent().unwrap_or(Path::new(""));
-        let request = nx_probe_request(
-            mount,
-            root,
-            crate::build_volume::cache_adapter::initialize_script(),
-            crate::api::dto::ExecClass::Gate,
-            Vec::new(),
-        )?;
-        let initialized = nx_probe_stdout(handle, build_volume.clone(), request)
-            .await
-            .and_then(|stdout| {
-                crate::build_volume::cache_adapter::initialized(&stdout, &mount.join(root))
-            });
-        if let Err(reason) = initialized {
-            return Err(CowshedError::environment_missing(
-                format!(
-                    "initialize the checkout's Nx cache at {} for the land carry: {reason}",
-                    parent.display()
-                ),
-                "install the checkout's pinned Nx 23.2.1 native product; the land's carry was skipped and the land itself is unaffected",
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// The directories the Nx states of `state` sit in, one per Nx tool state, in order.
-#[cfg(target_os = "macos")]
-fn nx_state_paths(
-    state: &crate::build_volume::BuildVolumeState,
-) -> std::collections::BTreeSet<&Path> {
-    state
-        .paths
-        .iter()
-        .filter(|path| {
-            crate::build_volume::BuildStateTool::of(path) == crate::build_volume::BuildStateTool::Nx
-        })
-        .filter_map(|path| path.checkout.as_path().parent())
-        .collect()
-}
-
 /// The one `node -` job that runs `script` in the Nx root `root` of the workspace mounted at
 /// `mount`, as the root's own directory so its `.envrc` gives its toolchain. Read-write, as a
 /// run: stock Nx records task details in the root's database. It asks for one token at `class`.
@@ -20646,80 +20450,6 @@ async fn publish_nx_run(
     let stdout = nx_probe_stdout(handle, build_volume, request).await?;
     crate::build_volume::nx::published(&stdout)
 }
-/// Rebase carry's selection (16_build_volumes.md, "Rebase carry"): for each Nx state the build
-/// volume of `workspace` (mounted at `mount`) holds, keyed by its `.nx` relative to the checkout,
-/// the task hashes stock Nx computes up front for the tree now checked out at that state's root
-/// and the tasks it defers ([`crate::build_volume::nx::task_hashes_script`], run there as a job
-/// of the workspace at `class`). The host stops the recorded daemon before admitting the probe:
-/// the sandboxed job cannot signal a host-started daemon. The probe computes locally even if the
-/// keeper restarts one. A root whose selection cannot be computed is the carry's skip, naming it:
-/// no root is ever given a selection it did not compute, so the carry never copies an entry the
-/// tree will not look up. A failed admission (`admitted`), its supervisor unreachable included,
-/// is a probe that cannot start: the first root is skipped with it.
-#[cfg(target_os = "macos")]
-async fn rebased_task_hashes(
-    admitted: Result<(
-        crate::runtime::supervisor::WorkspaceSupervisorHandle,
-        Option<PathBuf>,
-    )>,
-    mount: &Path,
-    class: crate::api::dto::ExecClass,
-) -> Result<
-    std::result::Result<
-        std::collections::BTreeMap<PathBuf, crate::build_volume::nx::TaskSelection>,
-        crate::api::dto::RebaseCarrySkip,
-    >,
-> {
-    let state =
-        crate::build_volume::BuildVolumeState::read(&mount.join(crate::build_volume::BUILD_LINK))?;
-    let mut selections = std::collections::BTreeMap::new();
-    for parent in nx_state_paths(&state) {
-        let root = parent.parent().unwrap_or(Path::new(""));
-        let request = nx_probe_request(
-            mount,
-            root,
-            crate::build_volume::nx::task_hashes_script(),
-            class,
-            Vec::new(),
-        )?;
-        let selection = match &admitted {
-            Ok((handle, build_volume)) => {
-                let data = mount.join(parent).join("workspace-data");
-                let stopped = tokio::task::spawn_blocking(move || {
-                    crate::build_volume::nx::stop_recorded_daemon(&data)
-                        .map_err(|error| {
-                            format!("cannot stop the Nx daemon in {}: {error}", data.display())
-                        })?
-                        .map_err(|busy| {
-                            format!("cannot stop the Nx daemon in {}: {busy}", data.display())
-                        })
-                })
-                .await
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()));
-                match stopped {
-                    Ok(_) => nx_probe_stdout(handle, build_volume.clone(), request)
-                        .await
-                        .and_then(|stdout| crate::build_volume::nx::task_selection(&stdout)),
-                    Err(reason) => Err(reason),
-                }
-            }
-            Err(unavailable) => Err(format!("cannot start the probe: {unavailable}")),
-        };
-        match selection {
-            Ok(selection) => {
-                selections.insert(parent.to_owned(), selection);
-            }
-            Err(reason) => {
-                return Ok(Err(crate::api::dto::RebaseCarrySkip::TaskHashes {
-                    state: parent.to_owned(),
-                    reason,
-                }));
-            }
-        }
-    }
-    Ok(Ok(selections))
-}
-
 #[cfg(target_os = "macos")]
 /// Read back the bounded tail of a finished job's stderr for diagnostic purposes.
 ///

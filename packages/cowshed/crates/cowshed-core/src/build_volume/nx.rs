@@ -1689,14 +1689,6 @@ pub struct OutputMiss {
     pub reason: String,
 }
 
-/// The program that names what the tree at an Nx root looks up: `node - <root>` with this on
-/// stdin, run as a job of the workspace (`task_hashes.js` says how it hashes).
-pub fn task_hashes_script() -> bytes::Bytes {
-    static SCRIPT: std::sync::LazyLock<bytes::Bytes> =
-        std::sync::LazyLock::new(|| super::cache_adapter::script(include_str!("task_hashes.js")));
-    SCRIPT.clone()
-}
-
 /// A land's publish (05_gateway.md "`/nx/v1/cache/{hash}`"): `node - <root> <JSON hashes>` with
 /// this on stdin, run as a job of the landing workspace, stores each named task result of that
 /// checkout's Nx cache to the project's store (`nx_publish.js` says how).
@@ -1734,72 +1726,6 @@ pub fn published(stdout: &[u8]) -> Result<Published, String> {
             String::from_utf8_lossy(stdout)
         )
     })
-}
-
-/// One Nx task as its `task_details` rows name it: a `configuration` of `None` is the row's
-/// `NULL`, a task run without one.
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
-#[serde(deny_unknown_fields)]
-pub struct TaskIdentity {
-    pub project: String,
-    pub target: String,
-    /// Required on the wire, `null` included: an absent key is a malformed answer, not a task
-    /// without a configuration.
-    #[serde(deserialize_with = "Option::deserialize")]
-    pub configuration: Option<String>,
-}
-
-/// What the tree at one Nx root looks up (16_build_volumes.md, "Rebase carry"): the hashes of
-/// the tasks stock Nx hashes before any task runs, and the identities of those it defers until
-/// their dependencies have run, whose hashes cover dependency outputs a rebased checkout holds
-/// stale.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct TaskSelection {
-    pub hashes: std::collections::BTreeSet<String>,
-    pub deferred: std::collections::BTreeSet<TaskIdentity>,
-}
-
-impl TaskSelection {
-    /// How many cache rows the selection can name at most: one per hash, one per deferred task.
-    pub fn len(&self) -> usize {
-        self.hashes.len() + self.deferred.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.hashes.is_empty() && self.deferred.is_empty()
-    }
-}
-
-/// The selection [`task_hashes_script`] printed. Nx names a cache entry by a decimal hash, the
-/// only name the carry joins to a path, and every task by a non-empty project and target;
-/// anything else is an error naming what was read.
-pub fn task_selection(stdout: &[u8]) -> Result<TaskSelection, String> {
-    let selection: TaskSelection = serde_json::from_slice(stdout).map_err(|error| {
-        format!(
-            "the task hash probe printed no selection ({error}): {}",
-            String::from_utf8_lossy(&stdout[..stdout.len().min(512)])
-        )
-    })?;
-    if let Some(hash) = selection
-        .hashes
-        .iter()
-        .find(|hash| hash.is_empty() || !hash.bytes().all(|byte| byte.is_ascii_digit()))
-    {
-        return Err(format!(
-            "the task hash probe printed {hash:?}, not an Nx hash"
-        ));
-    }
-    if let Some(task) = selection
-        .deferred
-        .iter()
-        .find(|task| task.project.is_empty() || task.target.is_empty())
-    {
-        return Err(format!(
-            "the task hash probe printed {task:?}, not an Nx task"
-        ));
-    }
-    Ok(selection)
 }
 
 /// Milliseconds since the epoch of `YYYY-MM-DDTHH:MM:SS.mmmZ`, as JavaScript's
@@ -2007,63 +1933,6 @@ mod tests {
             )
             .is_err()
         );
-    }
-
-    /// The probe's hashes and deferred tasks are the only names the carry selects by, so only
-    /// Nx's decimal hashes and whole task identities pass, and an answer of any other shape
-    /// selects nothing.
-    #[test]
-    fn task_selection_admits_only_nx_hashes_and_task_identities() {
-        assert_eq!(
-            task_selection(
-                br#"{"hashes":["17526140994862843286","42"],"deferred":[
-                    {"project":"a","target":"test","configuration":null},
-                    {"project":"a","target":"test","configuration":"ci"}]}"#
-            )
-            .unwrap(),
-            TaskSelection {
-                hashes: std::collections::BTreeSet::from([
-                    "17526140994862843286".to_owned(),
-                    "42".to_owned()
-                ]),
-                deferred: std::collections::BTreeSet::from([
-                    TaskIdentity {
-                        project: "a".to_owned(),
-                        target: "test".to_owned(),
-                        configuration: None,
-                    },
-                    TaskIdentity {
-                        project: "a".to_owned(),
-                        target: "test".to_owned(),
-                        configuration: Some("ci".to_owned()),
-                    },
-                ]),
-            }
-        );
-        assert!(
-            task_selection(br#"{"hashes":[],"deferred":[]}"#)
-                .unwrap()
-                .is_empty()
-        );
-        for refused in [
-            &br#"{"hashes":["../x"],"deferred":[]}"#[..],
-            br#"{"hashes":[""],"deferred":[]}"#,
-            br#"{"hashes":[42],"deferred":[]}"#,
-            br#"{"hashes":[],"deferred":[],"extra":1}"#,
-            br#"{"hashes":[]}"#,
-            br#"{"hashes":[],"deferred":[{"project":"a","target":"test"}]}"#,
-            br#"{"hashes":[],"deferred":[{"project":"","target":"test","configuration":null}]}"#,
-            br#"{"hashes":[],"deferred":[{"project":"a","target":"","configuration":null}]}"#,
-            br#"{"hashes":[],"deferred":[{"project":"a","target":"t","configuration":null,"x":1}]}"#,
-            b"{}",
-            b"",
-        ] {
-            assert!(
-                task_selection(refused).is_err(),
-                "{}",
-                String::from_utf8_lossy(refused)
-            );
-        }
     }
 
     #[test]
@@ -2776,81 +2645,6 @@ mod tests {
         let second = crate::runtime::nx_daemon::live_pid(&record).expect("a new live daemon");
         assert_ne!(first, second);
         assert_eq!(close(&stock.checkout, &state).unwrap(), Ok(()));
-    }
-
-    /// The host stops the recorded daemon; the rebase-carry probe runs sandboxed under
-    /// NX_DAEMON_START=never and cannot signal host processes. It computes its graph locally,
-    /// including under CI, and starts no replacement daemon. A real host daemon is the positive
-    /// control; denying cross-process signals to the probe proves it needs no stop authority.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_task_hash_probe_computes_its_graph_without_a_daemon_under_the_job_rule() {
-        use std::io::Write as _;
-
-        let root =
-            crate::scratch_directory::ScratchRoot::new("nx-task-hashes").expect("scratch root");
-        let stock = StockNx::new(root.path());
-        fs::create_dir_all(stock.checkout.join("p")).unwrap();
-        fs::write(
-            stock.checkout.join("p/project.json"),
-            r#"{"name":"p","targets":{"build":{"executor":"nx:noop","cache":true}}}"#,
-        )
-        .unwrap();
-        stock.daemon("--start");
-        let daemon = crate::runtime::nx_daemon::live_pid(&stock.record()).expect("a live daemon");
-        assert!(!cowshed_os::process::sandboxed(daemon).unwrap());
-        assert_eq!(
-            stop_recorded_daemon(&stock.workspace_data()).unwrap(),
-            Ok(Some(daemon))
-        );
-
-        let mut command = std::process::Command::new("/usr/bin/sandbox-exec");
-        command
-            .args([
-                "-p",
-                "(version 1) (allow default) (deny signal (target others))",
-                "node",
-            ])
-            .arg("-")
-            .arg(&stock.checkout)
-            .current_dir(&stock.checkout);
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("NX_") || key == "CI" {
-                command.env_remove(key);
-            }
-        }
-        let mut probe = command
-            .env("NX_DAEMON_START", "never")
-            .env("CI", "true")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn_locked()
-            .expect("node runs");
-        probe
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(&task_hashes_script())
-            .unwrap();
-        let output = probe.wait_with_output().unwrap();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "the probe failed: {stderr}");
-        assert!(
-            !stderr.contains("NX_DAEMON_START=never"),
-            "the probe asked for a daemon it may not start: {stderr}"
-        );
-        let selection = task_selection(&output.stdout).expect("a selection");
-        assert!(!selection.hashes.is_empty(), "p:build is hashed up front");
-        assert!(
-            !cowshed_os::process::running(daemon).unwrap(),
-            "the stale daemon was stopped"
-        );
-        assert_eq!(
-            crate::runtime::nx_daemon::live_pid(&stock.record()),
-            None,
-            "the probe started no daemon"
-        );
     }
 
     /// A real Nx client handed a held lock through the one held-command boundary

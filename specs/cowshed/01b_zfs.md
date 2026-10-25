@@ -72,7 +72,7 @@ starts with its source's files and its target's warm build state.
   clone carries every file's bytes and modification time, so every Cargo unit the seed held is Fresh in the fork and
   every Nx task the seed recorded is a cache hit.
 - **Seed.** A seed is a snapshot, `build/<id>@seed-<n>`, of the build dataset it freezes (the target's live dataset at a
-  reseed, the landing workspace's at Land step 5.6), taken under the writer exclusion of
+  reseed, the landing workspace's at Land step 5.4), taken under the writer exclusion of
   [16_build_volumes.md §Targets and seeds](./16_build_volumes.md#targets-and-seeds): the build hold, the Nx task
   database closed and every existing Cargo profile lock held. Only the clone primitive differs from APFS. A seed is
   identified by its snapshot's `guid`, which `zfs promote` and `zfs rename` keep while they change its name, so a seed
@@ -83,7 +83,7 @@ starts with its source's files and its target's warm build state.
   - the seed itself when it lies there: a reseed's snapshot, a land's seed once the swap's promote makes the landing
     dataset the target's, or a retained seed the adopted dataset descends from. `written@<seed>` is then exactly "the
     live dataset holds a write the seed does not";
-  - after a capture at Land step 5.6 before a skipped swap, a snapshot the land takes of the target's live dataset at
+  - after a capture at Land step 5.4 before a skipped swap, a snapshot the land takes of the target's live dataset at
     the skip, `build/<live-id>@cowshed:seed-mark-<n>`, recorded by `guid` beside the seed and destroyed when the seed is
     superseded. 16 has forks start from that new seed until the target's own volume is written again, and
     `written@<mark>` measures exactly that.
@@ -130,7 +130,7 @@ target's old build volume is removed. Only the primitives change.
   workspace remains.
 - **When land adopts nothing**, the workspace keeps its build dataset: adoption skipped by a holder (Land steps 5 and
   6), or a target whose checkout holds another branch, where the land compares-and-swaps the ref and skips steps 4 to 7.
-  It goes with the workspace, except as the holder of a seed: a capture at Land step 5.6 before a skipped swap publishes
+  It goes with the workspace, except as the holder of a seed: a capture at Land step 5.4 before a skipped swap publishes
   the target's new latest seed on that dataset, and the dataset stays for that seed (Retiring, step 2). Likewise a
   skipped capture before a successful swap leaves the target's latest seed on the target's old build dataset.
 - **`land --no-retire`** keeps the workspace and its worktree dataset. When the target adopted its build dataset, the

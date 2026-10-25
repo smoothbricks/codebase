@@ -1480,16 +1480,12 @@ core count.
   land's tasks take every returned token they want, the younger land's tasks take what the older one does not ask for,
   and the younger takes the older one's place when it completes. Neither is preempted: a running task of either keeps
   its grant. The jobs the land's own cowshed steps start are gate-class work too, since the land waits on each of them:
-  the rebase carry's task-hash computation, which the lander asks for with `cowshed rebase --gate`, `cowshed land`'s Nx
-  cache initialization (16_build_volumes.md, "Carry" and "Rebase carry"), and each `cowshed land --check` command
-  (02_workspaces.md, "`cowshed land`" step 2). Measured 2026-10-19 with the first two at background class: a land's
-  task-hash job waited 21 s in the background queue with no other gate running, and in one repository the same
-  computation took 48 s on one land and 297 s on the next, while that repository's whole land queue waited behind it.
-  Measured 2026-10-20 with `--check` at background class, on a three-token ledger (the macOS arm64 CI runner), whose
-  background room was one token under the half cap of that day: one long-lived ordinary background job held that token,
-  and the land's check waited at `check-wait` for the job to end, while the job was waiting for the land, so the land
-  never reached its adoption. At gate class the check is served ahead of background from every returned token. A process
-  that stays up idle between work is a resident ("A resident holds no token") and holds none.
+  each `cowshed land --check` command (02_workspaces.md, "`cowshed land`" step 2). Measured 2026-10-20 with `--check` at
+  background class, on a three-token ledger (the macOS arm64 CI runner), whose background room was one token under the
+  half cap of that day: one long-lived ordinary background job held that token, and the land's check waited at
+  `check-wait` for the job to end, while the job was waiting for the land, so the land never reached its adoption. At
+  gate class the check is served ahead of background from every returned token. A process that stays up idle between
+  work is a resident ("A resident holds no token") and holds none.
 - **A train's proof is gate-class work** (2026-10-25, from a measurement: another repository's train's pre-land proof,
   run as background work, held 3 of the 9 tokens it wanted for 33 minutes while a non-critical shed held 9 and 15 other
   checkouts queued). A train is the repository's next land: its owner proves the train's tree before asking for the land
@@ -1690,23 +1686,22 @@ core count.
   - **A kept daemon a land waits on starts as the land's gate task** (2026-10-21). A start under a holder names the
     holder's pool as the stake's `parentPool`, and the stake waits on that pool and the host ledger at once ("Work a
     holder starts draws on its grant"). The keeper's start (04_sandbox.md) has such a holder while its shed's supervisor
-    runs a gate job, the oldest one if several: a land's gate, or its rebase's task-hash job. A land resets the shed's
-    daemon and waits for its successor before its first gate, so that start is work the land waits on, and a land's own
-    work never contests the background room ("A land is a gate job"). The stake drawn on the gate's pool is asked of the
-    host at the gate's rank, as the gate's tasks are. A shed running no gate job asks the host alone, as background.
-    Measured 2026-10-21: a land's rebase ran its task-hash job in an idle shed, and the keeper asked its start at once.
-    Its background stake waited 324 s behind another repository's land and background tests, while the land waited 60 s
-    for the daemon and gave up. Over the same gateway log, 361 of 510 kept daemons' stakes waited 0 s, the median was 0
-    s, p90 34 s, p99 208 s, the longest 852 s, and 31 (6.1%) waited more than 60 s: a background stake waits as long as
-    background's room stays full, so no fixed wait bounds it. A land that runs its daemon reset and that wait as one
-    gate job waits for the daemon with no deadline. A start still waiting at the host when a gate job begins is that
-    gate's work too (2026-10-22): once a gate job of the shed holds its grant, the supervisor withdraws the keeper's
-    waiting background stake, which leaves the host queue, and asks it again with the oldest running gate job's pool as
-    its `parentPool`, as if it had started under that gate; a start already drawing on a pool keeps it, and the answer
-    of a withdrawn ask is dropped, never spawned. Measured 2026-10-22 in shed `icm-no-python`: the rebase's task-hash
-    gate ended at 04:39:32, the keeper's start queued as background at 04:39:35, and the land's gate began at 04:39:46
-    and waited on that daemon; the supervisor chose the stake's holder once, at the start, so the stake stayed a
-    background ask for 2,214 s.
+    runs a gate job, the oldest one if several: a land's gate. A land resets the shed's daemon and waits for its
+    successor before its first gate, so that start is work the land waits on, and a land's own work never contests the
+    background room ("A land is a gate job"). The stake drawn on the gate's pool is asked of the host at the gate's
+    rank, as the gate's tasks are. A shed running no gate job asks the host alone, as background. Measured 2026-10-21 in
+    a shed running no gate job, the keeper asked its start at once. Its background stake waited 324 s behind another
+    repository's land and background tests, while the land waited 60 s for the daemon and gave up. Over the same gateway
+    log, 361 of 510 kept daemons' stakes waited 0 s, the median was 0 s, p90 34 s, p99 208 s, the longest 852 s, and 31
+    (6.1%) waited more than 60 s: a background stake waits as long as background's room stays full, so no fixed wait
+    bounds it. A land that runs its daemon reset and that wait as one gate job waits for the daemon with no deadline. A
+    start still waiting at the host when a gate job begins is that gate's work too (2026-10-22): once a gate job of the
+    shed holds its grant, the supervisor withdraws the keeper's waiting background stake, which leaves the host queue,
+    and asks it again with the oldest running gate job's pool as its `parentPool`, as if it had started under that gate;
+    a start already drawing on a pool keeps it, and the answer of a withdrawn ask is dropped, never spawned. Measured
+    2026-10-22 in shed `icm-no-python`: the keeper's start queued as background at 04:39:35, and the land's gate began
+    at 04:39:46 and waited on that daemon; the supervisor chose the stake's holder once, at the start, so the stake
+    stayed a background ask for 2,214 s.
   - **CPU pool retirement.** Pool retirement unlinks its endpoint before closing its listener. It drains the kernel
     accept queue, not merely the runtime's readiness cache, and answers queued and already accepted connections with
     `{"ok":false,"code":"pool-retired","error":"the CPU pool owner's lease ended"}` followed by EOF. A new connection

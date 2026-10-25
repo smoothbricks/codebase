@@ -219,7 +219,7 @@ conversion. The specs below own the rest, not a handwritten API or enum inventor
 - `specs/lmao/01l_op_context_pattern.md`: inference-preserving contexts and Op authoring.
 - `packages/lmao/README.md`: tracer wiring, trace-testing and the TraceQuery/SQLite inspection entry.
 - `packages/nx-plugin/README.md`: inferred targets, Cargo closures, runtime inputs and build-state output safety.
-- `specs/cowshed/16_build_volumes.md`: workspace-owned build state, warm forks, cache carry and adoption.
+- `specs/cowshed/16_build_volumes.md`: workspace-owned build state, warm forks, seed compaction and adoption.
 - `packages/cowshed/skills/cowshed/SKILL.md`: the shed workflow: fork, exec, land, and what to do when `rm` refuses.
 - `packages/cowshed/docs/agents.md`: workspace ownership and the agent-facing CLI workflow.
 - `tooling/land-host.sh` and `tooling/land-host.test.ts`: current landing mechanics and refusal evidence.

@@ -63,7 +63,7 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 | Rebase                  | `cowshed rebase <ws>`                                                | Rebase the workspace branch onto main.                                                                                                                                                                                                     |
 | Preflight a land        | `cowshed land <ws> --preflight`                                      | Land's fences before its check, mutating nothing: exit 4 with land's own refusal (a dirty tree included), else 0.                                                                                                                          |
 | Land with a check       | `cowshed land <ws> --target main --check '<bare command>'`           | Check, fast-forward main, and retire on success.                                                                                                                                                                                           |
-| Rebase within a lane    | `cowshed rebase <ws> --into <lane> --ungated`                        | Optional: take lane-mates' work before landing, by Git alone: no task hashing, no carry. An ungated land rebases by itself.                                                                                                                |
+| Rebase within a lane    | `cowshed rebase <ws> --into <lane>`                                  | Optional: take lane-mates' work before landing, by Git alone. An ungated land rebases by itself.                                                                                                                                           |
 | Fold into a lane base   | `cowshed land <ws> --into <lane> --ungated`                          | Rebase onto the lane base's branch, fast-forward it by Git alone, and retire; the lane base's own land into main gates. Main refuses it.                                                                                                   |
 | Deliver a branch        | `cowshed push <ws> --branch <name>`                                  | Put the workspace branch in main's repository for review.                                                                                                                                                                                  |
 | Retire                  | `cowshed rm <ws>`                                                    | Remove a shed whose work main holds; a containment refusal names commits to fold into the batch.                                                                                                                                           |
@@ -91,6 +91,7 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
    `cowshed rm <ws>`, never land again. With `--no-retire` or after `push`, `rm` once main contains HEAD and every other
    local branch (a fork keeps only `cowshed/<ws>`; one branch per shed).
 5. `--force` on `rm` waives only transient state (dirty tree, the workspace's own running jobs; never a process cowshed
+<<<<<<< HEAD
    does not run holding the mount) and destroys the uncommitted tree; it can never waive containment, and it is never
    the answer to a refusal. `--abandon` is the sole way to destroy unlanded commits (they are bundled to
    `sessions/.trash/` first), and a shed whose work main holds never needs it. Use it, then `cowshed gc --abandoned`
@@ -98,6 +99,18 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
    clear from history. Work still wanted is landed or folded into a batch (below). Never answer an `rm` refusal by
    reflex: read what it names.
 6. Batch work is lane work: see "Batch a round of units" below.
+=======
+   does not run holding the mount) and destroys the uncommitted tree; it can never waive containment. `--abandon` is the
+   sole way to destroy unlanded commits (they are bundled to `sessions/.trash/` first). Never answer an `rm` refusal by
+   adding a flag.
+6. Batch work is lane work
+   ([02_workspaces.md, "Lanes"](../../../../specs/cowshed/02_workspaces.md#lanes-fork-and---into)): a repository's next
+   batch is a lane base, and a finished shed's work moves into it with `cowshed land <ws> --into <batch> --ungated`: one
+   command that rebases the shed onto the batch's branch, then folds it in by Git alone, with no check and no
+   build-volume adoption. The land fast-forwards the batch shed and retires the shed at once, so it never waits for the
+   batch to reach main. A unit meant for the batch from the start forks from it (`cowshed fork <batch> <unit>`); the
+   batch itself lands to main as an ordinary gated workspace, and its `--check` is the lane's one build.
+>>>>>>> e23d0b9b4f (refactor(cowshed): delete the land and rebase carries; rebase is Git alone)
 7. A shed whose work main already holds, or that carries none, is removed with plain `cowshed rm <ws>` and no check
    first: rm proves containment against live main, over every local branch: a commit is held when main's content carries
    its change or main holds a patch-equivalent commit (`git cherry`), so a cherry-pick main later edited past still

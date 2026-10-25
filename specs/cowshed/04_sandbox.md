@@ -270,9 +270,9 @@ record-nominated signal (Land 8). Both land boundaries carry the required `Contr
 the private supervisor call: the actor relinquishes keeper-record cleanup while still retiring admitted jobs. A
 supervisor of another build that cannot honor this handoff is a typed refusal, never a generic retirement fallback.
 Other callers explicitly select `Recorded`. The existing record-nominated target daemon stops in Land steps 5 and 6, and
-the non-land stops in detach, rm/retire, workspace rename, re-adoption, resize, rebase carry, migration, reseeding and
-idle-keeper cleanup remain outside this ledger-only cutover. Their ownership hardening is open; no safety guarantee for
-those paths is claimed here.
+the non-land stops in detach, rm/retire, workspace rename, re-adoption, resize, migration, reseeding and idle-keeper
+cleanup remain outside this ledger-only cutover. Their ownership hardening is open; no safety guarantee for those paths
+is claimed here.
 
 The trusted supervisor retains write access to `<workspace mount>/.cowshed/job/**` so it can allocate job IDs, capture
 streams, and write protected job records and lazy spill files. That authority must never reach repository-controlled

@@ -37,7 +37,7 @@ Find the symptom in the left column and follow the link.
 | `du` of an image stays large after the guest deleted its files                                                                                                                                           | [`hdiutil compact` does not reclaim a RAW image](#hdiutil-compact-does-not-reclaim-a-raw-image)                                                 |
 | Two paths that differ only in case collide                                                                                                                                                               | [Case sensitivity is fixed at format time](#case-sensitivity-is-fixed-at-format-time)                                                           |
 | A fork's mount takes tens of seconds; `doctor` reports `main-extents` or warns about extents                                                                                                             | [A clone's first write pays for its extent map](#a-clones-first-write-pays-for-its-extent-map)                                                  |
-| `clonefile requires source and destination on the same volume: …`; a land or rebase carries cache entries by copy, not by clone                                                                          | [`clonefile` does not cross a filesystem](#clonefile-does-not-cross-a-filesystem)                                                               |
+| `clonefile requires source and destination on the same volume: …`                                                                                                                                        | [`clonefile` does not cross a filesystem](#clonefile-does-not-cross-a-filesystem)                                                               |
 | Two attached volumes report one `Volume UUID` and one name                                                                                                                                               | [A clone inherits its volume's UUID and name](#a-clone-inherits-its-volumes-uuid-and-name)                                                      |
 | A volume rename lands on the Data volume                                                                                                                                                                 | [A volume is named only through its held mount root](#a-volume-is-named-only-through-its-held-mount-root)                                       |
 | State is lost on power loss; `sync_all` (`F_FULLFSYNC`) after a build stalls for seconds                                                                                                                 | [`fsync` does not persist on macOS; `F_FULLFSYNC` does](#fsync-does-not-persist-on-macos-f_fullfsync-does)                                      |
@@ -259,12 +259,9 @@ Find the symptom in the left column and follow the link.
 - **Fact.** A clone shares blocks only inside one APFS volume (`clonefile(2)` fails `EXDEV` across volumes), so files
   inside two separately mounted images cannot be cloned into each other, while whole image files on one store volume
   can.
-- **Rule.** A fork clones the backing image file, land and rebase carry copy the missing cache entry files with their
-  metadata, and the store is one volume so every image clone stays inside it.
+- **Rule.** A fork clones the backing image file, and the store is one volume so every image clone stays inside it.
 - **Owners.** [09_substrates.md §APFS image substrate (reference)](./09_substrates.md#apfs-image-substrate-reference);
   [03_caches.md §The reflink-reachability rule](./03_caches.md#the-reflink-reachability-rule);
-  [16_build_volumes.md §Carry](./16_build_volumes.md#carry);
-  [16_build_volumes.md §Rebase carry](./16_build_volumes.md#rebase-carry) (the rebase half);
   [01a_apfs.md §Dedicated store volume](./01a_apfs.md#dedicated-store-volume) (same-volume clones);
   [01a_apfs.md §Rejected APFS alternatives](./01a_apfs.md#rejected-apfs-alternatives), “Caches beside the images
   rejected”. Code: [`cowshed-apfs/src/lib.rs`] `clone_image`, `classify_clone_error`.
@@ -1070,8 +1067,8 @@ Find the symptom in the left column and follow the link.
   names paths because `COPYFILE_CLONE_FORCE` is one `clonefileat(2)` that opens none, and the crate's clippy
   configuration refuses `libc::copyfile`.
 - **Owners.** _No spec owner_: the module comment and the clippy reason state the rule. Code:
-  [`cowshed-core/src/copy/native/macos.rs`]; [`cowshed-core/src/build_volume/carry.rs`]; [`cowshed-core/clippy.toml`].
-  See also [`posix_spawnp` leaves transient descriptor copies](#posix_spawnp-leaves-transient-descriptor-copies),
+  [`cowshed-core/src/copy/native/macos.rs`]; [`cowshed-core/clippy.toml`]. See also
+  [`posix_spawnp` leaves transient descriptor copies](#posix_spawnp-leaves-transient-descriptor-copies),
   [Darwin has no `pipe2` and no `SOCK_CLOEXEC`](#darwin-has-no-pipe2-and-no-sock_cloexec).
 
 ### A process is its pid and its unique id
@@ -1274,7 +1271,6 @@ Find the symptom in the left column and follow the link.
 [`cowshed-cli/src/runtime.rs`]: ../../packages/cowshed/crates/cowshed-cli/src/runtime.rs
 [`cowshed-cli/src/setup_service.rs`]: ../../packages/cowshed/crates/cowshed-cli/src/setup_service.rs
 [`cowshed-core/clippy.toml`]: ../../packages/cowshed/crates/cowshed-core/clippy.toml
-[`cowshed-core/src/build_volume/carry.rs`]: ../../packages/cowshed/crates/cowshed-core/src/build_volume/carry.rs
 [`cowshed-core/src/build_volume/nx.rs`]: ../../packages/cowshed/crates/cowshed-core/src/build_volume/nx.rs
 [`cowshed-core/src/capabilities/cargo.rs`]: ../../packages/cowshed/crates/cowshed-core/src/capabilities/cargo.rs
 [`cowshed-core/src/copy.rs`]: ../../packages/cowshed/crates/cowshed-core/src/copy.rs

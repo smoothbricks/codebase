@@ -1,8 +1,8 @@
 //! The project side of build volumes (16_build_volumes.md): a fork first refreshes its target's
 //! seed for the tree it checks out, from a workspace that landed that tree outside `cowshed land`
 //! or from the target's own quiet volume, then clones it; a land quiesces the landing workspace,
-//! freezes the target's seed, and moves the target's one link; a rebase carries its target's Nx
-//! cache entries into the rebased workspace's volume; and collection deletes what nothing links.
+//! freezes the target's seed, and moves the target's one link onto the landing volume, copying
+//! nothing into it; and collection deletes what nothing links.
 //!
 //! Every step here runs inside one process's project actor, so no two of that process's steps
 //! interleave; another cowshed process's can, which is why collection defers what a workspace
@@ -18,15 +18,14 @@ use std::time::{Duration, Instant, SystemTime};
 
 use super::storage_host::RuntimeStorageHost;
 use crate::api::dto::{
-    AdoptionSkip, CarrySide, DatabaseHolder, GcCandidate, GcDeferred, GcReason, GitOid, NxCarry,
-    RebaseBuildVolume, RebaseCarrySkip, Sha256Digest,
+    AdoptionSkip, DatabaseHolder, GcCandidate, GcDeferred, GcReason, GitOid, Sha256Digest,
 };
 use crate::api::held_lock::{LockHolding, LockOperation};
 use crate::build_volume::migrate::{MintedBeside, MintedVolume};
 use crate::build_volume::{
     BuildStateRefresh, BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord,
     BuildVolumeRole, BuildVolumeStage, BuildVolumeState, CapturedBuildVolume, Registrant,
-    Registration, ReleaseClaim, TrackedBuildStateRefusal, cargo, carry, link, nx,
+    Registration, ReleaseClaim, TrackedBuildStateRefusal, cargo, link, nx,
 };
 use crate::capabilities::BuildStatePath;
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
@@ -155,7 +154,7 @@ pub(crate) struct Closed {
 
 /// The target's image lock, held by its land from before it freezes the target's seed until the
 /// target's link names the adopted volume and a kept workspace has its clone of the new seed
-/// (Land steps 5.6 to 6.4): every fork of the target holds the same lock from before it reads
+/// (Land steps 5.4 to 6.4): every fork of the target holds the same lock from before it reads
 /// the target's seed and link until it has linked its own (Fork steps 1 to 3), and so does every
 /// reseed of the target, so neither reads a seed or a volume the land deletes. The steps that
 /// need it take it by reference; only [`BuildVolumes::try_lock_target`] and [`Contended::wait`]
@@ -202,7 +201,7 @@ impl<H: RuntimeStorageHost> Contended<H> {
 }
 
 /// What [`BuildVolumes::freeze_seed`] did with the target's seed after Nx and existing Cargo
-/// profiles admitted capture (Land step 5.6).
+/// profiles admitted capture (Land step 5.4).
 #[derive(Debug)]
 pub(crate) enum Freeze {
     /// The seed is captured from the guarded landing volume, and every older seed claimed for
@@ -242,15 +241,6 @@ pub(crate) struct Adopted {
 pub(crate) struct Superseded {
     id: BuildVolumeId,
     owner: Owner,
-}
-
-/// A carry's first phase, done while the target still ran (Land step 5, "Carry").
-#[derive(Debug)]
-pub(crate) struct Staging {
-    staged: carry::Staged,
-    // The source filesystem must survive the gap between stage and commit.
-    source_hold: Option<BuildVolumeHold>,
-    elapsed: Duration,
 }
 
 /// How near a volume's recorded tree is to the tree a fork checks out (16_build_volumes.md,
@@ -1325,99 +1315,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         .await
     }
 
-    /// Rebase carry (16_build_volumes.md, "Rebase carry"): index in the volume `checkout` links
-    /// the Nx cache entries the target's volume indexes and it lacks, among those `selections`
-    /// names: for each Nx state of the workspace's volume (its `.nx`, relative to the checkout),
-    /// the task hashes stock Nx computed for the rebased tree there and the tasks it defers. A
-    /// selection that could not be computed is the skip it carries, after the volume skips; a
-    /// target whose task databases index no cache entry skips before either side closes. The
-    /// copies are staged while both sides run. Then each side's Nx state is closed as a land
-    /// closes the target's (its idle daemon stopped, any other holder a skip), and the commit
-    /// runs under both sides' Nx open locks once neither database has a holder, so nothing but
-    /// the carry writes either while it indexes. Both build holds span staging through
-    /// commit: Nx open locks do not fence a reseed or release of either filesystem.
-    /// A skip deletes what was staged.
-    pub async fn rebase_carry(
-        &self,
-        checkout: PathBuf,
-        target_checkout: PathBuf,
-        selections: std::result::Result<BTreeMap<PathBuf, nx::TaskSelection>, RebaseCarrySkip>,
-    ) -> Result<RebaseBuildVolume> {
-        let workspace = self.layout.linked(&checkout)?;
-        let target = self.layout.linked(&target_checkout)?;
-        self.blocking(move |host, layout| {
-            let skipped = |reason| Ok(RebaseBuildVolume::Skipped { reason });
-            let Some(workspace) = workspace else {
-                return skipped(RebaseCarrySkip::NoWorkspaceVolume);
-            };
-            let Some(target) = target else {
-                return skipped(RebaseCarrySkip::NoTargetVolume);
-            };
-            let selections = match selections {
-                Ok(selections) => selections,
-                Err(reason) => return skipped(reason),
-            };
-            let _workspace_hold = layout.hold(&workspace).map_err(|error| {
-                io(
-                    "hold the rebase carry destination",
-                    &layout.hold_path(&workspace),
-                    &error,
-                )
-            })?;
-            let _target_hold = layout.hold(&target).map_err(|error| {
-                io(
-                    "hold the rebase carry source",
-                    &layout.hold_path(&target),
-                    &error,
-                )
-            })?;
-            let started = Instant::now();
-            let into = host
-                .mount_build_volume(layout, &workspace)
-                .map_err(storage)?;
-            let into_state = BuildVolumeState::read(&into)?;
-            let from = host.mount_build_volume(layout, &target).map_err(storage)?;
-            let from_state = BuildVolumeState::read(&from)?;
-            // The volume's image is sparse: what it reports free, its store may not hold.
-            let staged = carry::stage_rebase(
-                &from,
-                &from_state,
-                &into,
-                &into_state,
-                &selections,
-                layout.images(),
-            );
-            let staged_in = started.elapsed();
-            // Nothing to select from is not nothing missing: say so before closing either side.
-            if let Some(states) = staged.unindexed() {
-                carry::unstage(&into).map_err(|error| io("unstage the carry", &into, &error))?;
-                return skipped(RebaseCarrySkip::Unindexed { states });
-            }
-            let sides = [
-                (CarrySide::Workspace, into.as_path(), &into_state),
-                (CarrySide::Target, from.as_path(), &from_state),
-            ];
-            let opens = match settle(&sides)? {
-                Ok(opens) => opens,
-                Err(reason) => {
-                    carry::unstage(&into)
-                        .map_err(|error| io("unstage the carry", &into, &error))?;
-                    return skipped(reason);
-                }
-            };
-            let committing = Instant::now();
-            let carried = carry::commit(staged, &into);
-            drop(opens);
-            let deferred = carried.deferred;
-            Ok(RebaseBuildVolume::Carried {
-                carried: nx_carry(carried, staged_in + committing.elapsed(), &workspace),
-                deferred,
-            })
-        })
-        .await
-    }
-
-    /// Land step 5.6, under the target's image lock: close Nx, retain its open locks and the
+    /// Land step 5.4, under the target's image lock: close Nx, retain its open locks and the
     /// existing Cargo profile locks through mounted capture and publication, then claim every
     /// older seed for [`Self::retire_superseded`] once the lock is let go. Other contributed cache/index handles do not refuse capture. Quiet retains
     /// the stopped supervisor's admission lease and shared GC hold throughout this operation.
@@ -1526,9 +1424,8 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         }
     }
 
-    /// Land step 5.2–5.4: when nothing but the target's daemon holds its task database,
-    /// stop that daemon. Answers the target's volume, closed, for [`Self::commit`] and
-    /// [`Self::adopt`].
+    /// Land step 5.1–5.3: when nothing but the target's daemon holds its task database,
+    /// stop that daemon. Answers the target's volume, closed, for [`Self::adopt`].
     pub async fn close_target(
         &self,
         target_checkout: PathBuf,
@@ -1546,80 +1443,6 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 return Ok(Err(skip(busy, Side::Target)));
             }
             Ok(Ok(Closed { id, mount, state }))
-        })
-        .await
-    }
-
-    /// Land step 5.1, carry phase 1 (16_build_volumes.md, "Carry"), while the target still runs:
-    /// stage in the quiet landing volume every Nx cache entry the target's volume indexes and
-    /// the landing volume lacks, and give it the target's code-graph index when it has none.
-    /// A `stopped` reason stages no Nx entries; independent index carry still runs.
-    pub async fn stage(
-        &self,
-        quiet: &Quiet,
-        target_checkout: PathBuf,
-        stopped: Option<String>,
-    ) -> Result<Staging> {
-        let target = self.layout.linked(&target_checkout)?;
-        let quiet = quiet.clone();
-        self.blocking(move |host, layout| {
-            let source_hold = target
-                .as_ref()
-                .map(|target| {
-                    layout.hold(target).map_err(|error| {
-                        io(
-                            "hold the land carry source",
-                            &layout.hold_path(target),
-                            &error,
-                        )
-                    })
-                })
-                .transpose()?;
-            let started = Instant::now();
-            let staged = match target {
-                Some(target) => {
-                    let mount = host.mount_build_volume(layout, &target).map_err(storage)?;
-                    let state = BuildVolumeState::read(&mount)?;
-                    match stopped {
-                        Some(reason) => carry::Staged::stopped(reason),
-                        None => carry::stage(&mount, &state, &quiet.mount, &quiet.state),
-                    }
-                }
-                None => stopped.map_or_else(carry::Staged::default, carry::Staged::stopped),
-            };
-            Ok(Staging {
-                staged,
-                source_hold,
-                elapsed: started.elapsed(),
-            })
-        })
-        .await
-    }
-
-    /// Land step 5.5, carry phase 2, once the target is closed: index in the landing volume what
-    /// [`Self::stage`] staged and the target did not change since, with what the target indexed
-    /// after it.
-    pub async fn commit(&self, staging: Staging, quiet: &Quiet) -> Result<NxCarry> {
-        let quiet = quiet.clone();
-        self.blocking(move |_, _| {
-            let started = Instant::now();
-            let carried = carry::commit(staging.staged, &quiet.mount);
-            drop(staging.source_hold);
-            Ok(nx_carry(
-                carried,
-                staging.elapsed + started.elapsed(),
-                &quiet.id,
-            ))
-        })
-        .await
-    }
-
-    /// Delete what [`Self::stage`] staged in the landing volume, for a land whose target could
-    /// not be closed: no row will index it, so nothing would ever delete it.
-    pub async fn unstage(&self, quiet: &Quiet) -> Result<()> {
-        let mount = quiet.mount.clone();
-        self.blocking(move |_, _| {
-            carry::unstage(&mount).map_err(|error| io("unstage the carry", &mount, &error))
         })
         .await
     }
@@ -3253,78 +3076,6 @@ fn target_opening(opening: nx::Opening) -> AdoptionSkip {
     AdoptionSkip::TargetOpening {
         database: opening.database,
         holders: opening.holders.into_iter().map(database_holder).collect(),
-    }
-}
-
-/// What a carry into the volume `into` reports, taking `elapsed` in all; also said as a timing
-/// event.
-fn nx_carry(carried: carry::Carried, elapsed: Duration, into: &BuildVolumeId) -> NxCarry {
-    let carry = NxCarry {
-        entries: carried.entries,
-        bytes: carried.bytes,
-        elapsed_ms: millis(elapsed),
-        stopped: carried.stopped,
-    };
-    cowshed_os::timing::event("build-volume", || {
-        format!(
-            "carried {} Nx entries ({} bytes) into {into} in {} ms",
-            carry.entries, carry.bytes, carry.elapsed_ms
-        )
-    });
-    carry
-}
-
-/// The rebase carry's commit precondition on each of `sides`, the volume mounted at its path
-/// with its state: its Nx state closed ([`nx::close`] stops only an idle daemon), then its open
-/// locks held and its task databases held by nothing. Answers the held locks, which keep every
-/// Nx process from opening either database until they are dropped, or the first side that
-/// failed it, with every lock taken until then let go.
-fn settle(
-    sides: &[(CarrySide, &Path, &BuildVolumeState)],
-) -> Result<std::result::Result<Vec<nx::Opens>, RebaseCarrySkip>> {
-    for &(side, mount, state) in sides {
-        if let Err(busy) =
-            nx::close(mount, state).map_err(|error| io("close the Nx state", mount, &error))?
-        {
-            return Ok(Err(rebase_skip(busy, side)));
-        }
-    }
-    let mut opens = Vec::with_capacity(sides.len());
-    for &(side, mount, state) in sides {
-        match nx::hold_opens(mount, state, mount)
-            .map_err(|error| io("lock the Nx opens", mount, &error))?
-        {
-            Ok(held) => opens.push(held),
-            Err(opening) => {
-                return Ok(Err(RebaseCarrySkip::Opening {
-                    side,
-                    database: opening.database,
-                    holders: opening.holders.into_iter().map(database_holder).collect(),
-                }));
-            }
-        }
-    }
-    for &(side, mount, state) in sides {
-        if let Err(busy) =
-            nx::held(mount, state).map_err(|error| io("look at the Nx state", mount, &error))?
-        {
-            return Ok(Err(rebase_skip(busy, side)));
-        }
-    }
-    Ok(Ok(opens))
-}
-
-fn rebase_skip(busy: nx::Busy, side: CarrySide) -> RebaseCarrySkip {
-    match busy {
-        nx::Busy::Held { database, holders } => RebaseCarrySkip::Held {
-            side,
-            database,
-            holders: holders.into_iter().map(database_holder).collect(),
-        },
-        nx::Busy::DaemonStayed { daemon } => RebaseCarrySkip::DaemonStayed {
-            side,
-            daemon: database_holder(daemon),
-        },
     }
 }
 
@@ -6135,7 +5886,7 @@ fn main() {
 
     /// An Nx client that opens the landing volume's task database after quiesce is named by
     /// capture admission as `landingHeld`, never treated as an exempt contributed cache
-    /// (16_build_volumes.md, Land step 5.6).
+    /// (16_build_volumes.md, Land step 5.4).
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_seed_freeze_skips_a_late_nx_database_holder_after_quiesce() {
@@ -6217,7 +5968,7 @@ fn main() {
 
     /// The landing checkout's own Nx daemon, recorded in the landing volume and started by a
     /// client after quiesce, is stopped again by capture admission before the mounted snapshot
-    /// (16_build_volumes.md, Land step 5.6).
+    /// (16_build_volumes.md, Land step 5.4).
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_seed_freeze_stops_a_late_landing_daemon_before_capture() {
@@ -6815,71 +6566,19 @@ fn main() {
         assert_eq!(seed_tree(), Some(landed));
         scratch.release_all();
     }
-    /// Land stages before taking the target image lock. Its staging value must keep
-    /// the source mounted through the separate close/commit calls, not just the copy.
+    /// Adoption copies nothing from the target (16_build_volumes.md, "Land" step 6): the
+    /// target's volume indexes an Nx entry the landing volume lacks, and once the target has
+    /// adopted the landing volume, that volume holds neither the entry's files nor its row. What
+    /// other lands ran reaches a fork through the project's Nx cache (05_gateway.md,
+    /// "Publication"), never through the adopted volume.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn directory_land_carry_retains_source_hold_until_commit() {
-        let scratch = Scratch::directory("land-carry-hold");
-        let (source_checkout, source, _) = scratch.linked_checkout("main", 1);
-        let (checkout, destination, _) = scratch.linked_checkout("topic", 1);
-        let quiet = scratch
-            .volumes
-            .quiesce(
-                scratch.landing(&checkout),
-                scratch.stopped(&checkout).await,
-                source_checkout.clone(),
-            )
-            .await
-            .unwrap()
-            .expect("the landing volume is idle");
-        let staged = scratch
-            .volumes
-            .stage(&quiet, source_checkout, None)
-            .await
-            .unwrap();
-        let source_during = scratch.layout.claim_release(&source).unwrap().is_none();
-        let destination_during = scratch
-            .layout
-            .claim_release(&destination)
-            .unwrap()
-            .is_none();
-        let result = scratch.volumes.commit(staged, &quiet).await.unwrap();
-        let source_after = scratch.layout.claim_release(&source).unwrap().is_some();
-        drop(quiet);
-        let destination_after = scratch
-            .layout
-            .claim_release(&destination)
-            .unwrap()
-            .is_some();
-        scratch.release_all();
-        assert!(
-            source_during,
-            "staging must retain the source build hold until commit"
-        );
-        assert!(
-            destination_during,
-            "the quiet landing volume retains its existing hold"
-        );
-        assert!(
-            source_after && destination_after,
-            "finished carry releases its holds"
-        );
-        assert!(result.stopped.is_none(), "{result:?}");
-    }
+    async fn directory_adoption_copies_nothing_from_the_target() {
+        use cowshed_os::fork_lock::Run as _;
 
-    /// Closing the idle Nx daemon creates a gap with no database holder. A reseed's
-    /// exclusive build claim must still fail on both volumes until carry commits.
-    /// On SIGTERM this fixture attempts exactly that claim, and hides only its own
-    /// source database when admitted, modeling the database path during a detached seal.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn directory_rebase_carry_holds_both_volumes_across_daemon_stop() {
-        use cowshed_os::fork_lock::{Run as _, Spawn as _};
-
-        let scratch = Scratch::directory("carry-seal");
-        let (source_checkout, source, from) = scratch.linked_checkout("main", 1);
-        let (checkout, destination, into) = scratch.linked_checkout("topic", 1);
+        let scratch = Scratch::directory("adopt-copies-nothing");
+        let (main_checkout, _, target) = scratch.linked_checkout("main", 1);
+        let (topic_checkout, topic, landing) = scratch.linked_checkout("topic", 1);
         let state = BuildVolumeState {
             paths: vec![
                 BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
@@ -6887,119 +6586,81 @@ fn main() {
             ],
             fingerprint: None,
         };
-        let schema = "CREATE TABLE task_details (hash TEXT PRIMARY KEY NOT NULL, project TEXT NOT NULL, target TEXT NOT NULL, configuration TEXT); CREATE TABLE cache_outputs (hash TEXT PRIMARY KEY NOT NULL, code INTEGER NOT NULL, size INTEGER NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (hash) REFERENCES task_details(hash));";
-        for mount in [&from, &into] {
-            state.write(mount).unwrap();
-            fs::create_dir_all(mount.join("nx/workspace-data")).unwrap();
-            let made = std::process::Command::new("/usr/bin/sqlite3")
+        let sqlite = |mount: &Path, statement: &str| {
+            let output = std::process::Command::new("/usr/bin/sqlite3")
                 .arg(mount.join("nx/workspace-data/task-v3.db"))
-                .arg(schema)
+                .arg(statement)
                 .output_locked()
                 .unwrap();
-            assert!(made.status.success(), "{made:?}");
-        }
-        let source_database = from.join("nx/workspace-data/task-v3.db");
-        let seeded = std::process::Command::new("/usr/bin/sqlite3")
-            .arg(&source_database)
-            .arg("INSERT INTO task_details VALUES ('1', 'a', 'build', NULL); INSERT INTO cache_outputs (hash,code,size) VALUES ('1',0,4);")
-            .output_locked()
-            .unwrap();
-        assert!(seeded.status.success(), "{seeded:?}");
-        fs::create_dir_all(from.join("nx/cache/1")).unwrap();
-        fs::write(from.join("nx/cache/1/output"), b"warm").unwrap();
-        for id in [&source, &destination] {
-            drop(scratch.layout.admit(id).unwrap());
-        }
-        let sockets =
-            crate::temp_root::TempRoot::new_in(&crate::temp_parent::scratch_parent(), "cs-carry");
-        let socket = sockets.join("d.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let admission = sockets.join("admission");
-        let data = from.join("nx/workspace-data");
-        fs::create_dir_all(data.join(nx::DAEMON_DIRECTORY)).unwrap();
-        let mut daemon = std::process::Command::new("/usr/bin/perl")
-            .args([
-                "-e",
-                r#"use Fcntl qw(:flock);
-                my ($source, $destination, $database, $out) = @ARGV;
-                $SIG{TERM} = sub {
-                    open(my $o, '>', $out) or die "open $out: $!";
-                    for my $hold ($source, $destination) {
-                        open(my $h, '+<', $hold) or die "open $hold: $!";
-                        if (flock($h, LOCK_EX | LOCK_NB)) {
-                            print $o "claimed\n";
-                            if ($hold eq $source) {
-                                rename($database, "$database.sealed") or die "hide $database: $!";
-                            }
-                        } else { print $o "refused\n"; }
-                    }
-                    close $o;
-                    exit 0;
-                };
-                $| = 1; print "ready\n";
-                select(undef, undef, undef, 600) while 1;"#,
-            ])
-            .arg(scratch.layout.hold_path(&source))
-            .arg(scratch.layout.hold_path(&destination))
-            .arg(&source_database)
-            .arg(&admission)
-            .current_dir(&data)
-            .stdout(std::process::Stdio::piped())
-            .spawn_locked()
-            .unwrap();
-        let mut ready = String::new();
-        std::io::BufRead::read_line(
-            &mut std::io::BufReader::new(daemon.stdout.take().unwrap()),
-            &mut ready,
-        )
-        .unwrap();
-        assert_eq!(ready, "ready\n");
-        fs::write(
-            data.join(nx::DAEMON_DIRECTORY).join("server-process.json"),
-            serde_json::json!({ "processId": daemon.id(), "socketPath": socket }).to_string(),
-        )
-        .unwrap();
-        let result = scratch
-            .volumes
-            .rebase_carry(
-                checkout,
-                source_checkout,
-                Ok(BTreeMap::from([(
-                    PathBuf::from(".nx"),
-                    nx::TaskSelection {
-                        hashes: BTreeSet::from(["1".to_owned()]),
-                        deferred: BTreeSet::new(),
-                    },
-                )])),
-            )
-            .await;
-        let stopped = daemon.try_wait().unwrap();
-        if stopped.is_none() {
-            daemon.kill().unwrap();
-            daemon.wait().unwrap();
-        }
-        let attempted = fs::read_to_string(&admission).unwrap_or_default();
-        let output = fs::read(into.join("nx/cache/1/output")).ok();
-        let rows = std::process::Command::new("/usr/bin/sqlite3")
-            .arg(into.join("nx/workspace-data/task-v3.db"))
-            .arg("SELECT count(*) FROM cache_outputs WHERE hash = '1';")
-            .output_locked()
-            .unwrap();
-        drop(listener);
-        scratch.release_all();
-        assert!(stopped.is_some(), "the carry stopped the recorded daemon");
-        assert_eq!(
-            attempted, "refused\nrefused\n",
-            "both volume claims must be refused; carry: {result:?}"
-        );
-        let RebaseBuildVolume::Carried { carried, .. } = result.unwrap() else {
-            panic!("carry was skipped")
+            assert!(output.status.success(), "{output:?}");
+            output.stdout
         };
-        assert_eq!(carried.entries, 1, "{carried:?}");
-        assert!(carried.stopped.is_none(), "{carried:?}");
-        assert_eq!(output.as_deref(), Some(b"warm".as_slice()));
-        assert!(rows.status.success(), "{rows:?}");
-        assert_eq!(rows.stdout, b"1\n");
+        // Stock Nx's two cache tables, and one entry each side ran: the target's "1", the
+        // landing workspace's "2".
+        for (mount, hash) in [(&target, "1"), (&landing, "2")] {
+            state.write(mount).unwrap();
+            fs::create_dir_all(mount.join("nx/workspace-data")).unwrap();
+            sqlite(
+                mount,
+                &format!(
+                    "CREATE TABLE task_details (hash TEXT PRIMARY KEY NOT NULL, project TEXT NOT NULL, target TEXT NOT NULL, configuration TEXT); \
+                     CREATE TABLE cache_outputs (hash TEXT PRIMARY KEY NOT NULL, code INTEGER NOT NULL, size INTEGER NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (hash) REFERENCES task_details(hash)); \
+                     INSERT INTO task_details VALUES ('{hash}', 'a', 'build', NULL); \
+                     INSERT INTO cache_outputs (hash, code, size) VALUES ('{hash}', 0, 4);"
+                ),
+            );
+            fs::create_dir_all(mount.join("nx/cache").join(hash)).unwrap();
+            fs::write(mount.join("nx/cache").join(hash).join("output"), b"warm").unwrap();
+        }
+        let quiet = scratch
+            .volumes
+            .quiesce(
+                scratch.landing(&topic_checkout),
+                scratch.stopped(&topic_checkout).await,
+                main_checkout.clone(),
+            )
+            .await
+            .unwrap()
+            .expect("nothing holds the landing volume");
+        let tree = GitOid::new("a".repeat(40)).unwrap();
+        let locked = scratch.lock(&owner("main", '0')).await;
+        let frozen = scratch
+            .volumes
+            .freeze_seed(&locked, &quiet, tree.clone())
+            .await
+            .unwrap()
+            .expect("nothing holds the landing volume");
+        assert_eq!(retired(&scratch.volumes, frozen).await, Froze::Frozen);
+        let closed = scratch
+            .volumes
+            .close_target(main_checkout.clone())
+            .await
+            .unwrap()
+            .expect("nothing holds the target's volume");
+        let adopted = scratch
+            .volumes
+            .adopt(&locked, &quiet, closed, main_checkout.clone(), tree)
+            .await
+            .unwrap()
+            .expect("nothing opened the target's volume since");
+        drop(quiet);
+        drop(locked);
+        scratch
+            .volumes
+            .release_previous(adopted.previous)
+            .await
+            .unwrap();
+        let linked = scratch.layout.linked(&main_checkout).unwrap();
+        let indexed = sqlite(&landing, "SELECT hash FROM cache_outputs ORDER BY hash;");
+        let copied = landing.join("nx/cache/1").exists();
+        scratch.release_all();
+        assert_eq!(linked, Some(topic), "the target adopted the landing volume");
+        assert_eq!(
+            String::from_utf8_lossy(&indexed),
+            "2\n",
+            "the adopted volume indexes only its own entry"
+        );
+        assert!(!copied, "the target's entry stays with its previous volume");
     }
 
     /// A shed's daemon keeper answers the reseed's stop of its daemon by admitting a start job
