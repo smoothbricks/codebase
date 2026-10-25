@@ -3,7 +3,7 @@
   "version": "0.1.3-next.0",
   "type": "module",
   "sideEffects": false,
-  "description": "Nx-compatible task archive server with labelled principals, atomic never-replace publication, and filesystem SIEVE retention.",
+  "description": "Nx-compatible task archive server with atomic never-replace publication, and filesystem SIEVE retention.",
   "license": "MIT",
   "repository": {
     "type": "git",

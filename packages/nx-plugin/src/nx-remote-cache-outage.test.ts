@@ -157,10 +157,15 @@ async function buildFixture(workspace: string): Promise<void> {
 }
 
 /** Build `app` against the cache at `server`. Spawned asynchronously: the server answers from this process. */
-async function build(workspace: string, socketDirectory: string, server: string): Promise<Run> {
+async function build(
+  workspace: string,
+  socketDirectory: string,
+  server: string,
+  extraEnv: Record<string, string> = {},
+): Promise<Run> {
   const child = Bun.spawn(['bun', nxEntry, 'run', 'app:build', '--outputStyle=static'], {
     cwd: workspace,
-    env: { ...fixtureNxEnv(workspace, socketDirectory), NX_SELF_HOSTED_REMOTE_CACHE_SERVER: server },
+    env: { ...fixtureNxEnv(workspace, socketDirectory), NX_SELF_HOSTED_REMOTE_CACHE_SERVER: server, ...extraEnv },
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -351,6 +356,34 @@ describe('a run against an unreachable remote cache', () => {
       expect(run.log).toContain('Misconfigured remote cache endpoint: Unexpected response status: 400');
       expect(run.log.match(DIAGNOSTIC)).toBeNull();
     });
+  });
+});
+
+describe('a run that reads the remote cache and never stores', () => {
+  it('runs a task the cache misses, and sends the cache no store', async () => {
+    const sockets = new Set<Socket>();
+    const heads: string[] = [];
+    const record = requestHeads(sockets, heads);
+    const miss = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n';
+    // Every lookup is a miss. A store would reach the server as a PUT, recorded like any other request.
+    const { server, origin } = await listen((socket) => {
+      record(socket);
+      socket.once('data', () => socket.end(miss));
+    });
+    try {
+      await withNxFixture('nx-cache-read-only-', async ({ workspace, socketDirectory }) => {
+        await buildFixture(workspace);
+        const run = await build(workspace, socketDirectory, origin, { NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY: 'true' });
+        expect(run.exitCode, run.log).toBe(0);
+        expect(run.result, run.log).toBe('built');
+        expect(run.log.match(DIAGNOSTIC)).toBeNull();
+      });
+      // The lookups reached the server; the task's store never did.
+      expect(heads.length, JSON.stringify(heads)).toBeGreaterThan(0);
+      for (const head of heads) expect(head).toMatch(/^GET \/v1\/cache\/\S+ HTTP\/1\.1$/);
+    } finally {
+      await close(server);
+    }
   });
 });
 

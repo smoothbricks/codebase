@@ -31,7 +31,7 @@ use crate::{
         CredentialProvider, SystemConnector, UpstreamConnector,
     },
     mirror::{MirrorCacheStatus, MirrorService},
-    nx_cache::{NxCacheBackend, NxCacheClearRefusal, NxCacheUse, NxPublication},
+    nx_cache::{NxCacheBackend, NxCacheClearRefusal, NxCacheUse},
     proxy,
     repo_mirror::{Git2RepoTransport, RepoMirrorError, RepoMirrorHandle, RepoTransport},
     sim_broker::{SimBrokerError, SimBrokerHandle, SimRunner, XcrunSimRunner},
@@ -77,31 +77,6 @@ impl GatewayHandle {
         let (reply, receive) = oneshot::channel();
         self.send(Command::ConfigureNxCache { backend, reply })
             .await?;
-        receive.await.map_err(|_| GatewayError::Stopped)?
-    }
-
-    pub async fn begin_nx_publication(
-        &self,
-        publication: NxPublication,
-    ) -> Result<(), GatewayError> {
-        let (reply, receive) = oneshot::channel();
-        self.send(Command::BeginNxPublication { publication, reply })
-            .await?;
-        receive.await.map_err(|_| GatewayError::Stopped)?
-    }
-
-    pub async fn end_nx_publication(
-        &self,
-        workspace_id: String,
-        token: WorkspaceToken,
-    ) -> Result<(), GatewayError> {
-        let (reply, receive) = oneshot::channel();
-        self.send(Command::EndNxPublication {
-            workspace_id,
-            token,
-            reply,
-        })
-        .await?;
         receive.await.map_err(|_| GatewayError::Stopped)?
     }
 
@@ -502,15 +477,6 @@ pub(crate) enum Command {
         result: Result<u64, NxCacheClearRefusal>,
         reply: oneshot::Sender<Result<u64, GatewayError>>,
     },
-    BeginNxPublication {
-        publication: NxPublication,
-        reply: oneshot::Sender<Result<(), GatewayError>>,
-    },
-    EndNxPublication {
-        workspace_id: String,
-        token: WorkspaceToken,
-        reply: oneshot::Sender<Result<(), GatewayError>>,
-    },
     Install {
         session: WorkspaceSession,
         reply: oneshot::Sender<Result<(), GatewayError>>,
@@ -621,7 +587,8 @@ pub(crate) struct Admission {
     pub protocol: Option<MirrorProtocol>,
     pub credential_allowed: bool,
     pub private_network_authorized: bool,
-    pub nx_token: Option<WorkspaceToken>,
+    /// Whether this request is the project Nx cache route's.
+    pub nx: bool,
     pub audit_kind: AuditKind,
     pub method: Method,
     pub request_path: String,
@@ -637,10 +604,9 @@ pub(crate) struct Admission {
 }
 
 impl Admission {
-    /// `RequestIntent::refusal_status` for an admitted request: only an Nx admission carries a
-    /// backend token.
+    /// `RequestIntent::refusal_status` for an admitted request.
     pub(crate) fn refusal_status(&self, otherwise: StatusCode) -> StatusCode {
-        if self.nx_token.is_some() {
+        if self.nx {
             crate::nx_cache::unavailable_status(&self.method)
         } else {
             otherwise
@@ -660,7 +626,7 @@ struct AdmissionSeed {
     protocol: Option<MirrorProtocol>,
     credential_allowed: bool,
     private_network_authorized: bool,
-    nx_token: Option<WorkspaceToken>,
+    nx: bool,
     audit_kind: AuditKind,
     method: Method,
     request_path: String,
@@ -669,10 +635,9 @@ struct AdmissionSeed {
 }
 
 impl AdmissionSeed {
-    /// `RequestIntent::refusal_status` for a queued request: only an Nx seed carries a backend
-    /// token.
+    /// `RequestIntent::refusal_status` for a queued request.
     fn refusal_status(&self, otherwise: StatusCode) -> StatusCode {
-        if self.nx_token.is_some() {
+        if self.nx {
             crate::nx_cache::unavailable_status(&self.method)
         } else {
             otherwise
@@ -692,7 +657,7 @@ impl AdmissionSeed {
             protocol: self.protocol,
             credential_allowed: self.credential_allowed,
             private_network_authorized: self.private_network_authorized,
-            nx_token: self.nx_token,
+            nx: self.nx,
             audit_kind: self.audit_kind,
             method: self.method,
             request_path: self.request_path,
@@ -857,8 +822,6 @@ struct Pending {
     reply: oneshot::Sender<Result<Admission, AdmissionError>>,
     timer: Option<JoinHandle<()>>,
     cancellation: Option<JoinHandle<()>>,
-    /// Set for a queued Nx publication, so ending that publication cancels exactly it.
-    nx_put: bool,
 }
 
 /// A request waiting for its project's standalone Nx backend to start. It keeps the original
@@ -869,7 +832,6 @@ struct NxPending {
     workspace_id: String,
     repo_id: String,
     generation: u64,
-    authentication: Authentication,
     intent: RequestIntent,
     reply: oneshot::Sender<Result<Admission, AdmissionError>>,
     timer: Option<JoinHandle<()>>,
@@ -1123,7 +1085,6 @@ struct Actor {
     sim_broker: SimBrokerHandle,
     sessions: HashMap<String, SessionState>,
     nx_backends: HashMap<String, NxBackendState>,
-    nx_publications: HashMap<String, NxPublication>,
     nx_queue: VecDeque<NxPending>,
     revisions: HashMap<String, u64>,
     permits: HashMap<u64, PermitState>,
@@ -1184,7 +1145,6 @@ impl Actor {
             sim_broker,
             sessions: HashMap::new(),
             nx_backends: HashMap::new(),
-            nx_publications: HashMap::new(),
             nx_queue: VecDeque::new(),
             revisions: HashMap::new(),
             permits: HashMap::new(),
@@ -1231,56 +1191,7 @@ impl Actor {
                         Command::NxCacheCleared { repo_id, result, reply } => {
                             self.nx_cache_cleared(&repo_id, result, reply);
                         }
-                        Command::BeginNxPublication { publication, reply } => {
-                            let result = match self.nx_backends.get(&publication.repo_id) {
-                                Some(NxBackendState::Ready { .. }) => Ok(()),
-                                Some(NxBackendState::Starting { .. }) => Err(GatewayError::NxAuthority(
-                                    "the project's Nx cache backend is still starting".to_owned(),
-                                )),
-                                Some(NxBackendState::Clearing) => Err(GatewayError::NxAuthority(
-                                    "the project's Nx cache store is being cleared".to_owned(),
-                                )),
-                                Some(NxBackendState::Failed { reason, .. }) => {
-                                    Err(GatewayError::NxAuthority(reason.clone()))
-                                }
-                                None => Err(GatewayError::NxAuthority(
-                                    "the project's Nx cache backend is not ready".to_owned(),
-                                )),
-                            }
-                            .and_then(|()| {
-                                publication
-                                    .validate()
-                                    .map_err(|reason| GatewayError::NxAuthority(reason.to_owned()))
-                            })
-                            .and_then(|()| {
-                                let session = self
-                                    .sessions
-                                    .get(&publication.workspace_id)
-                                    .ok_or(GatewayError::UnknownWorkspace)?;
-                                if session.repo_id != publication.repo_id
-                                    || session.revision != publication.expected_revision
-                                    || self.nx_publications.contains_key(&publication.workspace_id)
-                                    || session.token.matches(&publication.token)
-                                {
-                                    return Err(GatewayError::NxAuthority("Nx publication does not match the active project/session or already has a writer".to_owned()));
-                                }
-                                Ok(())
-                            });
-                            if result.is_ok() {
-                                self.nx_publications
-                                    .insert(publication.workspace_id.clone(), publication);
-                            }
-                            let _ = reply.send(result);
-                        }
-                        Command::EndNxPublication { workspace_id, token, reply } => {
-                            if self.nx_publications.get(&workspace_id).is_some_and(|publication| publication.token.matches(&token)) {
-                                self.nx_publications.remove(&workspace_id);
-                                self.cancel_nx_writes(&workspace_id).await;
-                            }
-                            let _ = reply.send(Ok(()));
-                        }
                         Command::Install { session, reply } => {
-                            self.nx_publications.remove(&session.workspace_id);
                             let result = self.install(session).await;
                             let _ = reply.send(result);
                         }
@@ -1289,7 +1200,6 @@ impl Actor {
                             expected_revision,
                             reply,
                         } => {
-                            self.nx_publications.remove(&workspace_id);
                             let result = self.remove(&workspace_id, expected_revision).await;
                             let _ = reply.send(result);
                         }
@@ -1549,7 +1459,7 @@ impl Actor {
         cowshed_os::eprintln!(
             "cowshed: Nx cache backend for {repo_id} stopped: its project has no session left"
         );
-        self.drop_nx_backend(repo_id).await;
+        self.drop_nx_backend(repo_id);
     }
 
     /// Serve `listener` for `workspace_id`; the task, and for a TCP listener a duplicate a
@@ -1712,13 +1622,13 @@ impl Actor {
                     }
             )
         ) {
-            return Err(GatewayError::NxAuthority(
+            return Err(GatewayError::NxBackend(
                 "the project's Nx cache backend is managed by the gateway".to_owned(),
             ));
         }
         backend
             .validate()
-            .map_err(|reason| GatewayError::NxAuthority(reason.to_owned()))?;
+            .map_err(|reason| GatewayError::NxBackend(reason.to_owned()))?;
         self.nx_backends.insert(
             backend.repo_id.clone(),
             NxBackendState::Ready {
@@ -1729,7 +1639,7 @@ impl Actor {
         Ok(())
     }
 
-    /// The project's Ready backend: the only backend state a publication or a request may use.
+    /// The project's Ready backend: the only backend state a request may use.
     fn nx_backend(&self, repo_id: &str) -> Option<&NxCacheBackend> {
         match self.nx_backends.get(repo_id) {
             Some(NxBackendState::Ready { backend, .. }) => Some(backend),
@@ -1783,7 +1693,7 @@ impl Actor {
             _ => false,
         };
         if exited {
-            self.drop_nx_backend(repo_id).await;
+            self.drop_nx_backend(repo_id);
         }
         match self.nx_backends.get(repo_id) {
             Some(NxBackendState::Ready { .. }) => return NxAdmission::Ready,
@@ -1808,7 +1718,7 @@ impl Actor {
     }
 
     /// The Nx work of `repo_id` this gateway serves now, by workspace: admitted and queued
-    /// requests and open publications. Clearing the store under any of it would cut it off.
+    /// requests. Clearing the store under any of it would cut it off.
     fn nx_cache_use(&self, repo_id: &str) -> NxCacheUse {
         let mut usage = NxCacheUse::default();
         for permit in self.permits.values() {
@@ -1820,7 +1730,7 @@ impl Actor {
             }
         }
         for pending in &self.queue {
-            if pending.seed.nx_token.is_some() && pending.seed.repo_id == repo_id {
+            if pending.seed.nx && pending.seed.repo_id == repo_id {
                 *usage
                     .queued
                     .entry(pending.seed.workspace_id.clone())
@@ -1835,12 +1745,6 @@ impl Actor {
                     .or_default() += 1;
             }
         }
-        usage.publishing = self
-            .nx_publications
-            .iter()
-            .filter(|(_, publication)| publication.repo_id == repo_id)
-            .map(|(workspace_id, _)| workspace_id.clone())
-            .collect();
         usage
     }
 
@@ -1953,21 +1857,10 @@ impl Actor {
         let _ = reply.send(result.map_err(GatewayError::from));
     }
 
-    /// Removes a backend -- its child gone, or its project's last session -- revokes its writers,
-    /// and cancels queued writes to it. A child it still owns is killed as it drops.
-    async fn drop_nx_backend(&mut self, repo_id: &str) {
+    /// Removes a backend -- its child gone, or its project's last session. A child it still owns
+    /// is killed as it drops.
+    fn drop_nx_backend(&mut self, repo_id: &str) {
         self.nx_backends.remove(repo_id);
-        let revoked: Vec<String> = self
-            .nx_publications
-            .iter()
-            .filter(|(_, publication)| publication.repo_id == repo_id)
-            .map(|(workspace_id, _)| workspace_id.clone())
-            .collect();
-        self.nx_publications
-            .retain(|_, publication| publication.repo_id != repo_id);
-        for workspace_id in revoked {
-            self.cancel_nx_writes(&workspace_id).await;
-        }
     }
 
     /// Installs the outcome of a start. Ready resumes this repo's queued requests; a failure
@@ -2096,25 +1989,16 @@ impl Actor {
             return;
         };
         let is_nx = matches!(intent.target, RequestTarget::LocalNx);
-        let publication = self.nx_publications.get(&workspace_id);
-        let writer = is_nx && publication.is_some_and(|publication| {
-            publication.repo_id == session.repo_id && publication.expected_revision == session.revision
-                && matches!(&authentication, Authentication::Bearer(Some(token)) if publication.token.matches_encoded(token))
-        });
-        let authenticated = writer
-            || match &authentication {
-                Authentication::Bearer(Some(token)) => session.token.matches_encoded(token),
-                Authentication::Bearer(None) => false,
-                Authentication::Generation(generation) => {
-                    *generation == session.generation && !is_nx
-                }
-            };
+        // The selected listener or socket already named this workspace, and with it the project.
+        // The Nx cache route takes no credential (05_gateway.md "`/nx/v1/cache/{hash}`").
+        let authenticated = match &authentication {
+            Authentication::Bearer(_) if is_nx => true,
+            Authentication::Bearer(Some(token)) => session.token.matches_encoded(token),
+            Authentication::Bearer(None) => false,
+            Authentication::Generation(generation) => *generation == session.generation && !is_nx,
+        };
         if !authenticated {
-            let status = if is_nx {
-                StatusCode::UNAUTHORIZED
-            } else {
-                StatusCode::PROXY_AUTHENTICATION_REQUIRED
-            };
+            let status = intent.refusal_status(StatusCode::PROXY_AUTHENTICATION_REQUIRED);
             let draft = denial_draft(
                 &workspace_id,
                 session,
@@ -2152,34 +2036,12 @@ impl Actor {
             .await;
             return;
         }
-        if is_nx && intent.method == Method::PUT && !writer {
-            self.refuse_nx(
-                &workspace_id,
-                &intent,
-                NxRefusal {
-                    status: AuditStatus::Denied,
-                    classification: "nx-publication-required",
-                    detail: None,
-                    message: "Nx cache publication requires an active qualified landing",
-                },
-                reply,
-            )
-            .await;
-            return;
-        }
         if is_nx {
             match self.nx_admission(&repo_id).await {
                 NxAdmission::Ready => {}
                 NxAdmission::Starting => {
-                    self.enqueue_nx(
-                        workspace_id,
-                        repo_id,
-                        authentication,
-                        intent,
-                        reply,
-                        cancelled,
-                    )
-                    .await;
+                    self.enqueue_nx(workspace_id, repo_id, intent, reply, cancelled)
+                        .await;
                     return;
                 }
                 NxAdmission::Unavailable(refusal) => {
@@ -2200,11 +2062,6 @@ impl Actor {
             &intent,
             if is_nx {
                 self.nx_backend(&repo_id)
-            } else {
-                None
-            },
-            if writer {
-                self.nx_publications.get(&workspace_id)
             } else {
                 None
             },
@@ -2272,7 +2129,6 @@ impl Actor {
         let (timer, cancellation) = self.spawn_queue_handles(queue_id, cancelled);
         self.queue.push_back(Pending {
             queue_id,
-            nx_put: is_nx && intent.method == Method::PUT,
             seed,
             reply,
             timer: Some(timer),
@@ -2325,7 +2181,7 @@ impl Actor {
                 workspace_id,
                 class,
                 generation: seed.generation,
-                nx_repo: seed.nx_token.as_ref().map(|_| seed.repo_id.clone()),
+                nx_repo: seed.nx.then(|| seed.repo_id.clone()),
             },
         );
         seed.activate(
@@ -2425,7 +2281,6 @@ impl Actor {
         &mut self,
         workspace_id: String,
         repo_id: String,
-        authentication: Authentication,
         intent: RequestIntent,
         reply: oneshot::Sender<Result<Admission, AdmissionError>>,
         cancelled: oneshot::Receiver<()>,
@@ -2456,7 +2311,6 @@ impl Actor {
             workspace_id,
             repo_id,
             generation,
-            authentication,
             intent,
             reply,
             timer: Some(timer),
@@ -2510,10 +2364,9 @@ impl Actor {
         self.promote();
     }
 
-    /// Revalidates one resumed Nx request against the session, its credential and the current
-    /// publication, then seeds it. A request that no longer holds its authority is refused.
+    /// Revalidates one resumed Nx request against its session, then seeds it. A request whose
+    /// session rotated while it waited is refused.
     async fn resume_one(&mut self, pending: NxPending) {
-        let is_put = pending.intent.method == Method::PUT;
         let Some(session) = self.sessions.get(&pending.workspace_id) else {
             self.refuse_nx_pending(
                 pending,
@@ -2527,55 +2380,24 @@ impl Actor {
             .await;
             return;
         };
-        let current =
-            session.generation == pending.generation && session.repo_id == pending.repo_id;
-        let authenticated = if is_put {
-            self.nx_publications
-                .get(&pending.workspace_id)
-                .is_some_and(|publication| {
-                    publication.repo_id == session.repo_id
-                        && publication.expected_revision == session.revision
-                        && matches!(
-                            &pending.authentication,
-                            Authentication::Bearer(Some(token)) if publication.token.matches_encoded(token)
-                        )
-                })
-        } else {
-            matches!(
-                &pending.authentication,
-                Authentication::Bearer(Some(token)) if session.token.matches_encoded(token)
-            )
-        };
-        if !(current && authenticated) {
-            let refusal = if is_put {
+        if session.generation != pending.generation || session.repo_id != pending.repo_id {
+            self.refuse_nx_pending(
+                pending,
                 NxRefusal {
                     status: AuditStatus::Cancelled,
-                    classification: "nx-publication-ended",
+                    classification: "session-rotated",
                     detail: None,
-                    message: "Nx publication ended before the backend was ready",
-                }
-            } else {
-                NxRefusal {
-                    status: AuditStatus::Unauthorized,
-                    classification: "nx-credential-revoked",
-                    detail: None,
-                    message: "gateway credential was revoked before the backend was ready",
-                }
-            };
-            self.refuse_nx_pending(pending, refusal).await;
+                    message: "workspace session rotated",
+                },
+            )
+            .await;
             return;
         }
-        let publication = if is_put {
-            self.nx_publications.get(&pending.workspace_id)
-        } else {
-            None
-        };
         let seed = match build_seed(
             &pending.workspace_id,
             session,
             &pending.intent,
             self.nx_backend(&pending.repo_id),
-            publication,
         ) {
             Ok(seed) => seed,
             Err((denial, hint)) => {
@@ -2607,7 +2429,6 @@ impl Actor {
             reply,
             timer,
             cancellation,
-            nx_put: is_put,
         };
         if self.can_activate(&workspace_id, &class) {
             let converted = self.take_pending(converted);
@@ -2635,60 +2456,6 @@ impl Actor {
             self.refuse_nx_pending(pending, NxRefusal::outage(reason.to_owned()))
                 .await;
         }
-    }
-
-    /// Cancels every queued Nx publication for a workspace in both queues: the Nx queue holds one
-    /// still waiting for its backend, and the ordinary queue holds one already seeded. Other queued
-    /// requests are untouched.
-    async fn cancel_nx_writes(&mut self, workspace_id: &str) {
-        let mut waiting = VecDeque::new();
-        let mut cancelled = Vec::new();
-        while let Some(pending) = self.nx_queue.pop_front() {
-            if pending.workspace_id == workspace_id && pending.intent.method == Method::PUT {
-                cancelled.push(pending);
-            } else {
-                waiting.push_back(pending);
-            }
-        }
-        self.nx_queue = waiting;
-        for pending in cancelled {
-            self.refuse_nx_pending(
-                pending,
-                NxRefusal {
-                    status: AuditStatus::Cancelled,
-                    classification: "nx-publication-ended",
-                    detail: None,
-                    message: "Nx publication ended before the backend was ready",
-                },
-            )
-            .await;
-        }
-        let mut retained = VecDeque::new();
-        while let Some(pending) = self.queue.pop_front() {
-            if pending.nx_put && pending.seed.workspace_id == workspace_id {
-                let pending = self.take_pending(pending);
-                let draft = pending_audit_draft(
-                    &pending.seed,
-                    AuditStatus::Cancelled,
-                    Some(StatusCode::FORBIDDEN),
-                    Some("nx-publication-ended"),
-                );
-                let recorded = self.record(draft).await;
-                let _ = pending.reply.send(Err(if recorded {
-                    admission_error(
-                        StatusCode::FORBIDDEN,
-                        "Nx publication ended before it was admitted",
-                        AuditStatus::Cancelled,
-                        None,
-                    )
-                } else {
-                    audit_unavailable(StatusCode::FORBIDDEN)
-                }));
-            } else {
-                retained.push_back(pending);
-            }
-        }
-        self.queue = retained;
     }
 
     async fn cancel_queued(&mut self, workspace_id: &str) {
@@ -3065,7 +2832,6 @@ impl Actor {
         if !self.draining || self.global_active.total() != 0 {
             return Ok(false);
         }
-        self.nx_publications.clear();
         for (_, state) in self.nx_backends.drain() {
             match state {
                 NxBackendState::Starting { task } => task.abort(),
@@ -3105,7 +2871,6 @@ impl Actor {
     }
 
     async fn force_stop(&mut self) -> Result<(), GatewayError> {
-        self.nx_publications.clear();
         for (_, state) in self.nx_backends.drain() {
             if let NxBackendState::Starting { task } = state {
                 task.abort();
@@ -3143,9 +2908,7 @@ fn build_seed(
     session: &SessionState,
     intent: &RequestIntent,
     nx_backend: Option<&NxCacheBackend>,
-    publication: Option<&NxPublication>,
 ) -> Result<AdmissionSeed, (&'static str, Option<String>)> {
-    let mut nx_token = None;
     let (target, mode, protocol, credential_allowed, private_network_authorized, upstream_path) =
         match &intent.target {
             RequestTarget::Generic(target) => {
@@ -3180,20 +2943,9 @@ fn build_seed(
                     .ok_or(("Nx cache path is invalid", None))?;
                 let backend =
                     nx_backend.ok_or(("project Nx cache backend is unavailable", None))?;
-                let token = if intent.method == Method::GET {
-                    &backend.read_token
-                } else if intent.method == Method::PUT {
-                    publication
-                        .filter(|publication| publication.hashes.contains(hash))
-                        .ok_or((
-                            "Nx cache publication requires an active qualified landing",
-                            None,
-                        ))?;
-                    &backend.write_token
-                } else {
+                if intent.method != Method::GET && intent.method != Method::PUT {
                     return Err(("Nx cache accepts only GET and PUT", None));
-                };
-                nx_token = Some(token.clone());
+                }
                 (
                     backend.target(),
                     EgressMode::Intercept,
@@ -3232,7 +2984,7 @@ fn build_seed(
         protocol,
         credential_allowed,
         private_network_authorized,
-        nx_token,
+        nx: matches!(intent.target, RequestTarget::LocalNx),
         audit_kind: match protocol {
             Some(MirrorProtocol::Npm) => AuditKind::Npm,
             None => intent.audit_kind,
@@ -3747,8 +3499,8 @@ pub enum GatewayError {
     RepoMirror(#[from] RepoMirrorError),
     #[error(transparent)]
     SimBroker(#[from] SimBrokerError),
-    #[error("Nx cache authority refused: {0}")]
-    NxAuthority(String),
+    #[error("Nx cache backend refused: {0}")]
+    NxBackend(String),
     #[error("Nx cache store not cleared: {0}")]
     NxCacheClear(#[from] NxCacheClearRefusal),
     #[error("gateway session capacity is exhausted")]
@@ -3795,7 +3547,7 @@ mod tests {
             protocol: None,
             credential_allowed: false,
             private_network_authorized: false,
-            nx_token: None,
+            nx: false,
             audit_kind: AuditKind::Connect,
             method,
             request_path: "/".to_owned(),
@@ -4225,7 +3977,7 @@ mod tests {
         }
     }
 
-    /// A bearer-authenticated Nx request intent for one hash.
+    /// An Nx request intent for one hash.
     #[cfg(target_os = "macos")]
     fn nx_intent(method: Method, path: &str) -> RequestIntent {
         RequestIntent {
@@ -4243,8 +3995,6 @@ mod tests {
         NxCacheBackend {
             repo_id: repo_id.to_owned(),
             address: std::net::SocketAddr::from(([127, 0, 0, 1], 9)),
-            read_token: WorkspaceToken::from_bytes([101; 32]),
-            write_token: WorkspaceToken::from_bytes([102; 32]),
             reclaimed_staging_files: 3,
         }
     }
@@ -4318,7 +4068,7 @@ mod tests {
             .expect("Ready answers immediately")
             .expect("the authenticated GET activates");
         assert_eq!(admission.upstream_path, "/v1/cache/42");
-        assert!(admission.nx_token.is_some());
+        assert!(admission.nx);
         assert_eq!(fixture.actor.nx_queue.len(), 0);
         assert_eq!(fixture.actor.global_queued, 0);
         assert_eq!(fixture.actor.sessions["nx-ready"].queued, 0);
@@ -4328,39 +4078,36 @@ mod tests {
         fixture.finish().await;
     }
 
+    /// The Nx route takes no credential (05_gateway.md "`/nx/v1/cache/{hash}`"): the selected
+    /// endpoint names the workspace, so a PUT that presents nothing reaches its project's backend.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn nx_ready_rechecks_the_saved_credential_without_a_generation_change() {
-        let root = TestRoot::new("ready-recheck");
+    async fn nx_put_without_a_credential_reaches_the_backend() {
+        let root = TestRoot::new("put-open");
         let mut fixture = TestActor::new(&root).await;
-        let token = fixture
-            .install("nx-recheck", "owner/nx-recheck", 92, 1)
-            .await;
-        unit_starting(&mut fixture.actor, "owner/nx-recheck");
-        let (mut receive, _cancel) = unit_queued_get(&mut fixture, "nx-recheck", token).await;
-        // Isolate the credential predicate from the independent generation predicate.
+        fixture.install("nx-put", "owner/nx-put", 92, 1).await;
+        unit_ready(&mut fixture.actor, "owner/nx-put");
+        let (reply, mut receive) = oneshot::channel();
+        let (_cancel, cancelled) = oneshot::channel();
         fixture
             .actor
-            .nx_queue
-            .front_mut()
-            .expect("queued request")
-            .authentication =
-            Authentication::Bearer(Some(WorkspaceToken::from_bytes([93; 32]).encode()));
-        fixture
-            .actor
-            .nx_backend_started(
-                "owner/nx-recheck".to_owned(),
-                Ok((unit_backend("owner/nx-recheck"), unit_child().await)),
+            .admit(
+                "nx-put".to_owned(),
+                Authentication::Bearer(None),
+                nx_intent(Method::PUT, "/nx/v1/cache/42"),
+                reply,
+                cancelled,
             )
             .await;
-        let error = receive
+        let admission = receive
             .try_recv()
-            .expect("Ready answers the revoked request")
-            .err()
-            .expect("a revoked credential must not activate");
-        assert_eq!(error.audit_status, AuditStatus::Unauthorized);
-        assert!(fixture.actor.permits.is_empty());
-        assert_eq!(fixture.actor.global_queued, 0);
+            .expect("a Ready backend answers at once")
+            .expect("an uncredentialed PUT activates");
+        assert_eq!(admission.method, Method::PUT);
+        assert_eq!(admission.upstream_path, "/v1/cache/42");
+        assert!(admission.nx);
+        fixture.actor.complete(admission.permit_id);
+        drop(admission);
         fixture.finish().await;
     }
 
@@ -4593,26 +4340,13 @@ mod tests {
                 AuditStatus::Limited,
                 "nx-queue-limited"
             ));
-            let writer = WorkspaceToken::from_bytes([110 + index as u8; 32]);
-            let encoded = writer.encode();
-            fixture.actor.nx_publications.insert(
-                workspace.clone(),
-                NxPublication {
-                    workspace_id: workspace.clone(),
-                    repo_id: repo.clone(),
-                    expected_revision: 1,
-                    accepted_head: "a".repeat(40),
-                    hashes: std::collections::BTreeSet::from(["42".to_owned()]),
-                    token: writer,
-                },
-            );
             let (reply, mut receive) = oneshot::channel();
             let (_cancel, cancelled) = oneshot::channel();
             fixture
                 .actor
                 .admit(
                     workspace.clone(),
-                    Authentication::Bearer(Some(encoded)),
+                    Authentication::Bearer(None),
                     nx_intent(Method::PUT, "/nx/v1/cache/42"),
                     reply,
                     cancelled,
@@ -4620,7 +4354,7 @@ mod tests {
                 .await;
             let error = receive
                 .try_recv()
-                .expect("writer capacity refusal")
+                .expect("PUT capacity refusal")
                 .err()
                 .expect("capacity is bounded");
             assert_eq!(error.status, StatusCode::FORBIDDEN, "ready={ready}");
@@ -4918,7 +4652,7 @@ mod tests {
             .expect("the other project's Ready transition answers its waiter")
             .expect("the other project's authenticated GET activates");
         assert_eq!(other.upstream_path, "/v1/cache/44");
-        assert!(other.nx_token.is_some());
+        assert!(other.nx);
         assert_eq!(actor.nx_queue.len(), 0);
         assert_eq!(actor.global_queued, 0);
         assert_eq!(actor.sessions["nx-unit-other"].queued, 0);
@@ -4978,82 +4712,6 @@ mod tests {
         assert_eq!(fixture.actor.nx_queue.len(), 0);
         assert_eq!(fixture.actor.global_queued, 0);
         assert_eq!(fixture.actor.sessions["nx-other"].queued, 0);
-        fixture.finish().await;
-    }
-
-    /// Queue end revokes only the publication's queued PUTs. Each ordinary queued request and each
-    /// queued Nx GET stays, and the shared counters count exactly what remains.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn queue_end_cancels_only_queued_nx_puts() {
-        let root = TestRoot::new("queue-end");
-        let mut fixture = TestActor::new(&root).await;
-        fixture.install("nx-unit-q", "owner/nx-queue", 93, 1).await;
-        let actor = &mut fixture.actor;
-
-        let generation = actor.sessions["nx-unit-q"].generation;
-        let (put_reply, put_receive) = tokio::sync::oneshot::channel();
-        let (get_reply, _get_receive) = tokio::sync::oneshot::channel();
-        actor.nx_queue.push_back(NxPending {
-            queue_id: 1,
-            workspace_id: "nx-unit-q".to_owned(),
-            repo_id: "owner/nx-queue".to_owned(),
-            generation,
-            authentication: Authentication::Bearer(None),
-            intent: nx_intent(Method::PUT, "/nx/v1/cache/42"),
-            reply: put_reply,
-            timer: None,
-            cancellation: None,
-        });
-        actor.nx_queue.push_back(NxPending {
-            queue_id: 2,
-            workspace_id: "nx-unit-q".to_owned(),
-            repo_id: "owner/nx-queue".to_owned(),
-            generation,
-            authentication: Authentication::Bearer(None),
-            intent: nx_intent(Method::GET, "/nx/v1/cache/42"),
-            reply: get_reply,
-            timer: None,
-            cancellation: None,
-        });
-        let (generic_reply, _generic_receive) = tokio::sync::oneshot::channel();
-        actor.queue.push_back(Pending {
-            queue_id: 3,
-            seed: seed(Method::GET, EgressMode::Intercept),
-            reply: generic_reply,
-            timer: None,
-            cancellation: None,
-            nx_put: false,
-        });
-        let (ordinary_put_reply, mut ordinary_put_receive) = oneshot::channel();
-        let mut put_seed = seed(Method::PUT, EgressMode::Intercept);
-        put_seed.workspace_id = "nx-unit-q".to_owned();
-        actor.queue.push_back(Pending {
-            queue_id: 4,
-            seed: put_seed,
-            reply: ordinary_put_reply,
-            timer: None,
-            cancellation: None,
-            nx_put: true,
-        });
-        actor.sessions.get_mut("nx-unit-q").expect("session").queued = 3;
-        actor.global_queued = 4;
-
-        actor.cancel_nx_writes("nx-unit-q").await;
-
-        let refused = put_receive.await.expect("the queued PUT is answered");
-        let error = refused.err().expect("ended publication refuses its PUT");
-        assert_eq!(error.status, StatusCode::FORBIDDEN);
-        let ordinary_error = ordinary_put_receive
-            .try_recv()
-            .expect("the ordinary queued PUT is answered")
-            .err()
-            .expect("ended publication refuses an ordinary queued PUT");
-        assert_eq!(ordinary_error.status, StatusCode::FORBIDDEN);
-        assert_eq!(actor.nx_queue.len(), 1, "the queued Nx GET stays");
-        assert_eq!(actor.queue.len(), 1, "the ordinary queued request stays");
-        assert_eq!(actor.global_queued, 2);
-        assert_eq!(actor.sessions["nx-unit-q"].queued, 1);
         fixture.finish().await;
     }
 

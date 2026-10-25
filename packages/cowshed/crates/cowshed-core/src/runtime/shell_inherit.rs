@@ -102,13 +102,14 @@ const TOKEN_PREFIXES: [&str; 5] = ["ghp_", "xoxb-", "sk-", "AKIA", "-----BEGIN"]
 
 fn workspace_owned(name: &str) -> bool {
     use crate::workspace_environment::{
-        NODE_COMPILE_CACHE_ENV, NX_REMOTE_SERVER_ENV, PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV,
-        RUNTIME_LINK_ENV, TEMP_DIR_ENV,
+        NODE_COMPILE_CACHE_ENV, NX_REMOTE_READ_ONLY_ENV, NX_REMOTE_SERVER_ENV, PORT_BASE_ENV,
+        PORT_BLOCK_SIZE_ENV, RUNTIME_LINK_ENV, TEMP_DIR_ENV,
     };
     [
         PORT_BASE_ENV,
         PORT_BLOCK_SIZE_ENV,
         NX_REMOTE_SERVER_ENV,
+        NX_REMOTE_READ_ONLY_ENV,
         TEMP_DIR_ENV,
         NODE_COMPILE_CACHE_ENV,
         RUNTIME_LINK_ENV,
@@ -120,10 +121,9 @@ fn workspace_owned(name: &str) -> bool {
 }
 
 fn credential(name: &str, value: Option<&str>) -> bool {
-    use crate::workspace_environment::{NX_REMOTE_TOKEN_ENV, WORKSPACE_TOKEN_ENV};
+    use crate::workspace_environment::WORKSPACE_TOKEN_ENV;
     let upper = name.to_ascii_uppercase();
     name == WORKSPACE_TOKEN_ENV
-        || name == NX_REMOTE_TOKEN_ENV
         || PROXY_NAMES.contains(&name)
         || ["_TOKEN", "_SECRET", "_KEY"]
             .iter()

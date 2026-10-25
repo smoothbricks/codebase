@@ -347,8 +347,9 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   - The in-image `.cowshed/env`, sourced by the workspace's `.envrc`, exports what processes cowshed never spawned need
     and no file can give them: on macOS the dev-server port conventions `COWSHED_PORT_BASE` and
     `COWSHED_PORT_BLOCK_SIZE` (04_sandbox.md, cooperative-sandboxing caveat), and in an Nx checkout the local Nx cache
-    route's server and bearer, the bearer being the workspace token, because stock Nx takes it from nowhere else. It
-    never exports the bare token as `COWSHED_WORKSPACE_TOKEN`. A served mount also publishes the sccache capability's
+    route's server and its read-only flag (`NX_SELF_HOSTED_REMOTE_CACHE_SERVER`,
+    `NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true`; the route takes no credential, 05_gateway.md "`/nx/v1/cache/{hash}`").
+    It never exports the bare token as `COWSHED_WORKSPACE_TOKEN`. A served mount also publishes the sccache capability's
     client environment below, and Nx's `NX_MAX_CACHE_SIZE` default; explicit caller cache-size overrides are preserved.
     Linux exports no port values: services use private loopback and package/proxy wiring uses `http://127.0.0.1:7644`.
     No workspace-identity variable is exported; anything that needs identity derives it from cwd via
@@ -401,12 +402,11 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     supervisor: no locale, terminal, Xcode selection, login `PATH`, `NX_*`, `VIRTUAL_ENV` or `CARGO_HOME` from another
     shell reaches a job, and a tool a build needs from the host user's home is declared in the workspace devenv instead.
 
-    No registry client receives the workspace token from a file: it travels only as proxy userinfo, and to Nx as the
-    cache route's bearer. No job environment and no `.cowshed/env` carries it bare, and no file under the private
-    `home`, `config` or `cache` carries it. Within one workspace a child inherits its parent's proxy variables, token
-    included, by design; a fork's inherited shell export leaves the proxy variables and every token-bearing name out,
-    and the fork's own supervisor sets its own. The cargo `[env]` guidance above mirrors `SCCACHE_SERVER_UDS` for cargo
-    builds cowshed never spawned.
+    No registry client receives the workspace token from a file: it travels only as proxy userinfo. No job environment
+    and no `.cowshed/env` carries it bare, and no file under the private `home`, `config` or `cache` carries it. Within
+    one workspace a child inherits its parent's proxy variables, token included, by design; a fork's inherited shell
+    export leaves the proxy variables and every token-bearing name out, and the fork's own supervisor sets its own. The
+    cargo `[env]` guidance above mirrors `SCCACHE_SERVER_UDS` for cargo builds cowshed never spawned.
 
     **Paths under the checkout but outside the cwd.** sccache hashes every `CARGO_*` value and every env-dep value into
     a Rust key, and `SCCACHE_BASEDIR_CWD=1` normalizes only the request's cwd prefix. cargo runs a registry crate's
@@ -455,9 +455,10 @@ because it adds immediacy, not new reach, while the store's write surface strict
 
 **This cache is an optimization for cross-shed reuse and never blocks a build.** A refusal is a miss (`GET` 404) or
 not-stored (`PUT` 403), and the task runs or keeps its own result (05_gateway.md "`/nx/v1/cache/{hash}`"). A cache that
-cannot answer at all is a miss on the client too (05_gateway.md "The client half"). A shed's `PUT` is refused by
-authority, not reachability. The store is single-user, so its write boundary guards against an unverified producer, not
-a malicious writer: only a land whose gate verified the hashes publishes (05_gateway.md "Trust domain").
+cannot answer at all is a miss on the client too (05_gateway.md "The client half"). The store is per user and served on
+loopback, with no credential: a hash names a task's inputs, so a result stored under it is as trustworthy as the local
+cache (05_gateway.md, "No credential: one user, localhost"). Sheds only read it; a land is its only writer, by
+configuration (05_gateway.md, "Sheds read; a land writes").
 
 Nx's live database and local cache remain private to each checkout/build volume. Accepted task archives are a separate
 host-owned store, not a shared `.nx` directory, blob CAS, or Cargo warm volume. Cowshed reuses the public
@@ -470,15 +471,11 @@ package's server bundle rather than a workspace's source files. The package ship
 platform-independent JavaScript file, `dist/server/nx-cache-server.js`, and no compiled executables; cowshed bundles no
 interpreter (tg#7504). Setup installs a content-addressed copy of the bundle and records where its invoker's `PATH`
 finds `bun`, named as a devenv or nix profile and never as a store path (05_gateway.md), so that `bun` is the one the
-gateway runs. One process exclusively owns each entries directory. Its configuration and labelled read/write bearer
-principals are host-owned; no repository, workspace child environment, or sandbox receives a backend secret or
-filesystem grant. The host-owned backend necessarily holds its own host credentials. Clients receive only their own
-gateway authority (05_gateway.md). Normal iteration always reads accepted project results with read-only authority. Only
-an accepted landing may publish its successful current task hashes, including existing local hits without rebuilding,
-under temporary gateway write authority; exact-head/task-hash eligibility belongs to 05_gateway.md and
-16_build_volumes.md. There is no scratch store. Read-only authority denies publication, not necessarily archive creation
-or an attempted PUT by the stock client: measure that cost separately, and never describe a server-side 403 as zero
-upload overhead.
+gateway runs. One process exclusively owns each entries directory, and binds loopback only; its configuration is
+host-owned, and no repository, workspace child environment, or sandbox receives a filesystem grant to the store. Every
+checkout reads its project's results. Only a land publishes: after its gate passes it stores every task result its gate
+attributed, local hits included, without rebuilding (05_gateway.md, "Publication"). There is no scratch store, and a
+shed's read-only Nx client builds no archive and sends no `PUT`.
 
 The installed gateway starts the backend as `bun <installed bundle> --exit-on-stdin-eof`, `bun` resolved on that
 recorded `PATH` at each start (none found is a start failure said as one), and retains the write end of its stdin pipe
@@ -497,13 +494,12 @@ releases the lock.
 The server treats archives as opaque binary bytes in Nx's native format: no unpacking, repacking, database import, or
 whole-history copy. Publication streams into `.staging` on the same filesystem, verifies the declared positive byte
 length, then atomically hard-links to the final task key without replacement. Concurrent same-key writers produce one
-200 and conflicts produce 409, preserving the winner's whole archive. Different keys proceed independently. Read-only
-PUT is 403; missing/evicted GET is 404; GET success is 200 with `application/octet-stream` as a standard chunked
-complete binary body; a pinned GET stream uses chunked HTTP framing with archive bytes unchanged. Authentication failure
-is 401 with exactly `text/plain`. Successful PUT requires a positive `Content-Length` and returns 200 (the native Nx
-client and the current official Nx self-hosted caching OpenAPI both use 200). Failed or interrupted uploads never become
-cache hits. Startup removes abandoned staging files and reports the count; graceful stop drains requests, and hard death
-leaves only reclaimable staging.
+200 and conflicts produce 409, preserving the winner's whole archive. Different keys proceed independently.
+Missing/evicted GET is 404; GET success is 200 with `application/octet-stream` as a standard chunked complete binary
+body; a pinned GET stream uses chunked HTTP framing with archive bytes unchanged. Successful PUT requires a positive
+`Content-Length` and returns 200 (the native Nx client and the current official Nx self-hosted caching OpenAPI both use
+200). Failed or interrupted uploads never become cache hits. Startup removes abandoned staging files and reports the
+count; graceful stop drains requests, and hard death leaves only reclaimable staging.
 
 Retention reuses filesystem SIEVE: insertion order is mtime, `atime > mtime` is the visited bit, clearing restores atime
 to mtime, and a sibling `sieve.hand` persists the cursor. Mount access-clock behavior is not relied on; a successful GET
@@ -519,27 +515,25 @@ The sweep never evicts the archive its own commit just published. The protected 
 accounting, while other keys undergo SIEVE. Each PUT 200 still has its own archive immediately retrievable. There is no
 capacity enlargement or bypass.
 
-Before reading an authenticated writer's body, the server reserves its positive declared length from an independent
-staging budget, also `capBytes`. If outstanding reservations would exceed that budget it refuses 403 before streaming;
-there is no admission queue or retry service. The reservation covers streaming and completed uploads awaiting commit,
-and is released after cleanup. Live archives and in-flight staging each have their own logical bound, not one combined
-disk cap; filesystem allocation and metadata are measured separately. Startup reclaims abandoned staging. Eviction and
-reclamation report bytes/counts and failures, never silent success. A failed staging cleanup retains its reservation and
-reports the path/reason; it is not reusable budget. Restart reclaims those files before accepting requests and fails
-closed if reclamation fails. This is ownership of retained bytes, not a background retry path. An evicted archive
-remains an honest miss, and the gateway's post-adoption check requires all accepted cacheable hashes to hit
-(16_build_volumes.md).
+Before reading a `PUT`'s body, the server reserves its positive declared length from an independent staging budget, also
+`capBytes`. If outstanding reservations would exceed that budget it refuses 403 before streaming; there is no admission
+queue or retry service. The reservation covers streaming and completed uploads awaiting commit, and is released after
+cleanup. Live archives and in-flight staging each have their own logical bound, not one combined disk cap; filesystem
+allocation and metadata are measured separately. Startup reclaims abandoned staging. Eviction and reclamation report
+bytes/counts and failures, never silent success. A failed staging cleanup retains its reservation and reports the
+path/reason; it is not reusable budget. Restart reclaims those files before accepting requests and fails closed if
+reclamation fails. This is ownership of retained bytes, not a background retry path. An evicted archive remains an
+honest miss, and the gateway's post-adoption check requires all accepted cacheable hashes to hit (16_build_volumes.md).
 
 **Clearing.** `cowshed cache clear` (06_cli.md, "Cache clear") empties a project's store through the gateway, which owns
-its backend. It refuses while the project's Nx work is in flight — an admitted or queued request, a land holding
-publication authority, or a backend still starting — naming each workspace, and refuses a host-configured backend's
-store, which is not the gateway's. Otherwise the gateway stops the backend it started (`SIGTERM`, as a drain does; one
-still running after 10 s is killed and reaped), takes the store's lease itself (the same `flock` on
-`entries/.owner.lock`, never unlinked) and deletes every archive (each file in `entries/` whose name is a task key) and
-`sieve.hand`. Staging is left to the next backend's startup reclamation. A lease another process holds is a typed
-store-locked refusal. Until the clear reports, the project's requests get the outage's miss or refusal and no backend
-starts; the next request after it starts a fresh one. The store holds only what lands publish, so a cleared entry
-returns only through another land's publication.
+its backend. It refuses while the project's Nx work is in flight — an admitted or queued request, or a backend still
+starting — naming each workspace, and refuses a host-configured backend's store, which is not the gateway's. Otherwise
+the gateway stops the backend it started (`SIGTERM`, as a drain does; one still running after 10 s is killed and
+reaped), takes the store's lease itself (the same `flock` on `entries/.owner.lock`, never unlinked) and deletes every
+archive (each file in `entries/` whose name is a task key) and `sieve.hand`. Staging is left to the next backend's
+startup reclamation. A lease another process holds is a typed store-locked refusal. Until the clear reports, the
+project's requests get the outage's miss or refusal and no backend starts; the next request after it starts a fresh one.
+The store holds only what lands publish, so a cleared entry returns only through another land's publication.
 
 The package follows the repository's public-package release conventions (`npm:public`, generated conventional-commit
 versions, normal build/release targets). Each consumer migration adopts the published dependency and deletes the

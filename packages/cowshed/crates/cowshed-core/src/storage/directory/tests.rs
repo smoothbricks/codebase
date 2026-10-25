@@ -475,7 +475,6 @@ import("./compile-cache-lib.mjs").then((lib) => {
             temp_dir: &exec_temp,
             capability_env: &CapabilityContribution::default(),
         },
-        &zeroize::Zeroizing::new("token".to_owned()),
         metadata.platform,
         metadata.grants.port_block,
     )
@@ -581,7 +580,6 @@ import("./compile-cache-lib.mjs").then((lib) => {
             temp_dir: &exec_temp,
             capability_env: &CapabilityContribution::default(),
         },
-        &zeroize::Zeroizing::new("token".to_owned()),
         metadata.platform,
         metadata.grants.port_block,
     )

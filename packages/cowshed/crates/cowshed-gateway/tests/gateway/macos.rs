@@ -1,4 +1,6 @@
 use super::*;
+#[path = "nx_land_publish.rs"]
+mod nx_land_publish;
 #[path = "nx_outage.rs"]
 mod nx_outage;
 #[path = "nx_process.rs"]
@@ -1212,12 +1214,10 @@ async fn endpoint_identity_precedes_token_authentication() {
 
 /// A token dies with its workspace's authority. Restore installs the next revision with a fresh
 /// token on the same endpoint, and removal frees the block for a later workspace that brings its
-/// own; either way the old token authenticates nowhere. The Nx cache route takes the same
-/// per-workspace token, so it refuses the old one as well.
+/// own; either way the old token authenticates nowhere.
 #[tokio::test]
 async fn a_restored_or_removed_workspace_token_authenticates_nowhere() {
-    use cowshed_gateway::NxCacheBackend;
-    let (upstream_port, _captured, _upstream) = http_fixture(4, None).await;
+    let (upstream_port, _captured, _upstream) = http_fixture(3, None).await;
     let (config, _cache) = test_config();
     let gateway = gateway(
         config,
@@ -1230,16 +1230,6 @@ async fn a_restored_or_removed_workspace_token_authenticates_nowhere() {
     )
     .await;
     let handle = gateway.handle();
-    handle
-        .configure_nx_cache(NxCacheBackend {
-            repo_id: "owner/repo-revoked".to_owned(),
-            address: SocketAddr::from(([127, 0, 0, 1], upstream_port)),
-            read_token: WorkspaceToken::from_bytes([41; 32]),
-            write_token: WorkspaceToken::from_bytes([42; 32]),
-            reclaimed_staging_files: 0,
-        })
-        .await
-        .expect("configure project backend");
     let policy = WorkspacePolicy {
         grants: vec![grant("isolated.test", upstream_port)],
         mirrors: Vec::new(),
@@ -1250,10 +1240,6 @@ async fn a_restored_or_removed_workspace_token_authenticates_nowhere() {
             absolute_request("isolated.test", upstream_port, token, "/allowed"),
         )
     };
-    let cached = |endpoint: SocketAddr, token: &str| {
-        proxy_request(endpoint, nx_request(endpoint, "GET", token, "42"))
-    };
-
     let (original, original_token, _) = session(
         "revoked",
         "owner/repo-revoked",
@@ -1278,8 +1264,6 @@ async fn a_restored_or_removed_workspace_token_authenticates_nowhere() {
     handle.install(restored).await.expect("restore in place");
     let response = proxied(endpoint, &original_token).await;
     assert!(response.starts_with("HTTP/1.1 407"), "{response}");
-    let response = cached(endpoint, &original_token).await;
-    assert!(response.starts_with("HTTP/1.1 401"), "{response}");
     let response = proxied(endpoint, &restored_token).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 
@@ -1303,12 +1287,8 @@ async fn a_restored_or_removed_workspace_token_authenticates_nowhere() {
     for stale in [&original_token, &restored_token] {
         let response = proxied(endpoint, stale).await;
         assert!(response.starts_with("HTTP/1.1 407"), "{response}");
-        let response = cached(endpoint, stale).await;
-        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
     }
     let response = proxied(endpoint, &successor_token).await;
-    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    let response = cached(endpoint, &successor_token).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     gateway.drain().await.expect("drain gateway");
 }
@@ -3651,14 +3631,17 @@ impl AuditSink for NxRecordingAudit {
         Ok(())
     }
 }
-fn nx_request(endpoint: SocketAddr, method: &str, token: &str, hash: &str) -> String {
+fn nx_request(endpoint: SocketAddr, method: &str, hash: &str) -> String {
     format!(
-        "{method} /nx/v1/cache/{hash} HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "{method} /nx/v1/cache/{hash} HTTP/1.1\r\nHost: {endpoint}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     )
 }
+/// The Nx cache route takes no credential (05_gateway.md `/nx/v1/cache/{hash}`): the listener names
+/// the workspace and its project, and a GET or PUT reaches only that project's backend. A listener of
+/// another project has no backend here, so its GET is a 404 and reaches no backend at all.
 #[tokio::test]
-async fn nx_cache_route_is_project_bound_readonly_except_qualified_hashes() {
-    use cowshed_gateway::{NxCacheBackend, NxPublication};
+async fn nx_cache_route_is_project_bound_and_takes_no_credential() {
+    use cowshed_gateway::NxCacheBackend;
     let (port, mut captured, upstream) = http_fixture(2, None).await;
     let (config, _cache) = test_config();
     let audit = Arc::new(NxRecordingAudit::default());
@@ -3677,13 +3660,11 @@ async fn nx_cache_route_is_project_bound_readonly_except_qualified_hashes() {
         .configure_nx_cache(NxCacheBackend {
             repo_id: "owner/nx-one".to_owned(),
             address: SocketAddr::from(([127, 0, 0, 1], port)),
-            read_token: WorkspaceToken::from_bytes([41; 32]),
-            write_token: WorkspaceToken::from_bytes([42; 32]),
             reclaimed_staging_files: 0,
         })
         .await
         .expect("configure project backend");
-    let (source, source_token, _) = session(
+    let (source, _, _) = session(
         "nx-source",
         "owner/nx-one",
         block_endpoint(free_endpoint()),
@@ -3692,7 +3673,7 @@ async fn nx_cache_route_is_project_bound_readonly_except_qualified_hashes() {
         WorkspacePolicy::default(),
     );
     let source_endpoint = install_in_free_block(&handle, source).await;
-    let (foreign, foreign_token, _) = session(
+    let (foreign, _, _) = session(
         "nx-foreign",
         "owner/nx-two",
         block_endpoint(free_endpoint()),
@@ -3701,116 +3682,36 @@ async fn nx_cache_route_is_project_bound_readonly_except_qualified_hashes() {
         WorkspacePolicy::default(),
     );
     let foreign_endpoint = install_in_free_block(&handle, foreign).await;
-    let response = proxy_request(
-        source_endpoint,
-        nx_request(source_endpoint, "GET", &source_token, "42"),
-    )
-    .await;
+    let response = proxy_request(source_endpoint, nx_request(source_endpoint, "GET", "42")).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     let forwarded = captured.recv().await.expect("forwarded read");
     assert!(forwarded.starts_with("GET /v1/cache/42 "), "{forwarded}");
     assert!(
-        forwarded.to_ascii_lowercase().contains(
-            &format!(
-                "authorization: bearer {}",
-                WorkspaceToken::from_bytes([41; 32]).encode()
-            )
-            .to_ascii_lowercase()
-        )
+        !forwarded.to_ascii_lowercase().contains("authorization:"),
+        "{forwarded}"
     );
-    assert!(
-        !forwarded
-            .to_ascii_lowercase()
-            .contains("proxy-authorization")
-    );
-    let response = proxy_request(
-        source_endpoint,
-        nx_request(source_endpoint, "PUT", &source_token, "42"),
-    )
-    .await;
-    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
-    let response = proxy_request(
-        source_endpoint,
-        nx_request(source_endpoint, "GET", &foreign_token, "42"),
-    )
-    .await;
-    assert!(response.starts_with("HTTP/1.1 401"), "{response}");
-    assert!(
-        response
-            .to_ascii_lowercase()
-            .contains("content-type: text/plain\r\n")
-    );
-    let response = proxy_request(
-        foreign_endpoint,
-        nx_request(foreign_endpoint, "GET", &foreign_token, "42"),
-    )
-    .await;
-    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
-    let publication_token = WorkspaceToken::from_bytes([43; 32]);
-    handle
-        .begin_nx_publication(NxPublication {
-            workspace_id: "nx-source".to_owned(),
-            repo_id: "owner/nx-one".to_owned(),
-            expected_revision: 1,
-            accepted_head: "a".repeat(40),
-            hashes: BTreeSet::from(["42".to_owned()]),
-            token: publication_token.clone(),
-        })
-        .await
-        .expect("private qualified publication");
-    let encoded = publication_token.encode();
-    let response = proxy_request(
-        source_endpoint,
-        nx_request(source_endpoint, "PUT", &encoded, "43"),
-    )
-    .await;
-    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
-    let response = proxy_request(
-        source_endpoint,
-        nx_request(source_endpoint, "PUT", &source_token, "42"),
-    )
-    .await;
-    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
-    let response = proxy_request(
-        source_endpoint,
-        nx_request(source_endpoint, "PUT", &encoded, "42"),
-    )
-    .await;
+    let response = proxy_request(source_endpoint, nx_request(source_endpoint, "PUT", "42")).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    let forwarded = captured.recv().await.expect("forwarded publication");
+    let forwarded = captured.recv().await.expect("forwarded PUT");
     assert!(forwarded.starts_with("PUT /v1/cache/42 "), "{forwarded}");
     assert!(
-        forwarded.to_ascii_lowercase().contains(
-            &format!(
-                "authorization: bearer {}",
-                WorkspaceToken::from_bytes([42; 32]).encode()
-            )
-            .to_ascii_lowercase()
-        )
+        !forwarded.to_ascii_lowercase().contains("authorization:"),
+        "{forwarded}"
     );
-    handle
-        .end_nx_publication("nx-source".to_owned(), publication_token)
-        .await
-        .expect("revoke publication");
-    let response = proxy_request(
-        source_endpoint,
-        nx_request(source_endpoint, "PUT", &encoded, "42"),
-    )
-    .await;
-    assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    let response = proxy_request(foreign_endpoint, nx_request(foreign_endpoint, "GET", "42")).await;
+    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
     gateway.drain().await.expect("drain gateway");
     upstream.await.expect("upstream fixture");
+    assert!(
+        captured.try_recv().is_err(),
+        "the foreign project reached no backend"
+    );
     let events = audit.events.lock().expect("audit events");
     assert!(
-        events
-            .iter()
-            .any(|event| event.path.as_deref() == Some("/nx/v1/cache/42")
-                && event.status == AuditStatus::Denied)
-    );
-    assert!(
-        events.iter().any(
-            |event| event.http_status == Some(401) && event.status == AuditStatus::Unauthorized
-        )
+        events.iter().all(
+            |event| event.status != AuditStatus::Unauthorized && event.http_status != Some(401)
+        ),
+        "the Nx route never refuses for want of a credential"
     );
 }
 
@@ -3851,8 +3752,8 @@ async fn a_request_during_a_gateway_restart_is_answered_never_refused() {
             WorkspacePolicy::default(),
         )
     };
-    let ask = |endpoint: SocketAddr, token: &str| {
-        let request = nx_request(endpoint, "GET", token, "42");
+    let ask = |endpoint: SocketAddr| {
+        let request = nx_request(endpoint, "GET", "42");
         async move {
             let mut stream = TcpStream::connect(endpoint).await?;
             stream.write_all(request.as_bytes()).await?;
@@ -3861,9 +3762,9 @@ async fn a_request_during_a_gateway_restart_is_answered_never_refused() {
     };
 
     let old = start(config.clone()).await;
-    let (session_one, token, _) = restarting(free_endpoint());
+    let (session_one, _, _) = restarting(free_endpoint());
     let endpoint = install_in_free_block(&old.handle(), session_one).await;
-    let mut before = ask(endpoint, &token).await.expect("the gateway serves");
+    let mut before = ask(endpoint).await.expect("the gateway serves");
     assert!(
         read_response_head(&mut before)
             .await
@@ -3882,7 +3783,7 @@ async fn a_request_during_a_gateway_restart_is_answered_never_refused() {
     .expect("the install's handoff");
     old.drain().await.expect("the old gateway drains and exits");
     // No gateway runs now: the restart's window.
-    let mut during = ask(endpoint, &token)
+    let mut during = ask(endpoint)
         .await
         .expect("the request is queued on the carried listener, not refused");
     let new = start(config.clone()).await;
@@ -3901,7 +3802,7 @@ async fn a_request_during_a_gateway_restart_is_answered_never_refused() {
 
     // The same restart with no install serving the handoff: the window refuses.
     new.drain().await.expect("the new gateway drains");
-    let refused = ask(endpoint, &token)
+    let refused = ask(endpoint)
         .await
         .expect_err("with nothing carried, a restart refuses the request");
     assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);

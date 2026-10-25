@@ -16,6 +16,8 @@
 #    starts ahead of other execs, at nice 0 where they run at +10 (05_gateway.md, "Host CPU budget").
 #    After the gate passes, `bun run check:linux` cross-lints the same tree for Linux: the pre-push hook refuses a
 #    tree whose Linux cross check is not cached, so a land that skipped it would leave main unpushable.
+#    After the gate and the Linux cross check pass, the gate run's task results are published to the
+#    project's localhost Nx cache, the only writer to it (sheds only read it).
 # 4. `cowshed land` fast-forwards main to exactly the gated commit and retires the workspace. If main moved
 #    meanwhile, rebase and gate the new tree; this is a source fence, never a retry of a red gate.
 # 5. Build main's outputs at the landed commit (`nx run-many -t build` in main). Main's built products (the plugin's,
@@ -118,14 +120,26 @@ gate_workspace() {
   fi
   replay_gate_output "$output"
   rm "$output"
+  # The gate's task hashes are read now, straight after the gate, so the run summary is the gate's own.
+  hashes=$(mktemp "${TMPDIR:-/tmp}/land-hashes.XXXXXX")
+  bun "$here/land-publish.ts" hashes "$checkout/.nx/cache/run.json" >"$hashes" || {
+    hashes_status=$?
+    say "could not read the gate's task hashes from $checkout/.nx/cache/run.json; the land stops"
+    exit "$hashes_status"
+  }
   say "cross-linting $head for Linux"
   cowshed exec "$workspace" --class gate --host -- direnv exec "$checkout" bun run check:linux </dev/null >"$output" 2>&1 || {
     linux_status=$?
     replay_gate_output "$output"
     say "Linux cross check exited $linux_status; the land stops; complete output: $output"
+    rm "$hashes"
     exit "$linux_status"
   }
   rm "$output"
+  # The gate and the Linux cross check passed, so the gate's task results are the land's to publish. The cache never
+  # blocks a land: a failed publish is said, and the land goes on.
+  cowshed exec "$workspace" --class gate --host -- direnv exec "$checkout" bun "$here/land-publish.ts" publish "$checkout" "$hashes" </dev/null >&2 || say "publishing the gate's Nx results failed (status $?); the land goes on: the cache never blocks a land"
+  rm "$hashes"
 }
 
 # Builds main's outputs at the commit the land moved it to. The land already happened, so a failure is said, not undone.

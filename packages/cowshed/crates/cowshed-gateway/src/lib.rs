@@ -61,7 +61,7 @@ pub use mirror::{
     MirrorOutcome, MirrorProtocolMetadata, MirrorRedirect, MirrorRequest, MirrorResourceKind,
     MirrorResponse, MirrorService, MirrorUpstream,
 };
-pub use nx_cache::{NxCacheBackend, NxCacheServiceConfig, NxPublication, bun_on_path};
+pub use nx_cache::{NxCacheBackend, NxCacheServiceConfig, bun_on_path};
 #[cfg(target_os = "macos")]
 pub use platform::KeychainCredentialProvider;
 #[cfg(target_os = "linux")]

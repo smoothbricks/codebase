@@ -34,12 +34,9 @@ function startEnv(root: string, capBytes: number) {
   return {
     ...process.env,
     NX_CACHE_SERVER_DIR: join(root, 'entries'),
-    NX_CACHE_SERVER_HOST: '127.0.0.1',
     NX_CACHE_SERVER_PORT: '0',
     NX_CACHE_SERVER_MAX_BYTES: String(Math.min(capBytes, 8 * 1024 * 1024)),
     NX_CACHE_SERVER_CAP_BYTES: String(capBytes),
-    NX_CACHE_SERVER_WRITE_TOKENS: 'publisher:process-write',
-    NX_CACHE_SERVER_READ_TOKENS: 'reader:process-read',
   };
 }
 
@@ -243,14 +240,10 @@ test('hard death during a real upload leaves no hit and restart reclaims staging
       socket.once('error', reject);
     });
     const staging = join(root, 'entries', '.staging');
-    socket.write(
-      'PUT /v1/cache/interrupted HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer process-write\r\nContent-Length: 8388608\r\n\r\n',
-    );
+    socket.write('PUT /v1/cache/interrupted HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8388608\r\n\r\n');
     socket.write(Buffer.alloc(64 * 1024, 7));
     await awaitStaged(staging, abort.signal, first.child.exited);
-    const before = await fetch(`${first.origin}/v1/cache/interrupted`, {
-      headers: { authorization: 'Bearer process-read' },
-    });
+    const before = await fetch(`${first.origin}/v1/cache/interrupted`);
     expect(before.status).toBe(404);
     first.child.kill('SIGKILL');
     await first.child.exited;
@@ -258,13 +251,7 @@ test('hard death during a real upload leaves no hit and restart reclaims staging
     restarted = await start(root);
     expect(restarted.reclaimedStagingFiles).toBe(1);
     expect(await readdir(staging)).toEqual([]);
-    expect(
-      (
-        await fetch(`${restarted.origin}/v1/cache/interrupted`, {
-          headers: { authorization: 'Bearer process-read' },
-        })
-      ).status,
-    ).toBe(404);
+    expect((await fetch(`${restarted.origin}/v1/cache/interrupted`)).status).toBe(404);
   } finally {
     abort.abort();
     socket.destroy();
@@ -319,9 +306,7 @@ test('--exit-on-stdin-eof exits on parent EOF and frees the lease; the no-flag m
     expect(await eof.child.exited).toBe(0);
     next = await start(root);
     next.child.stdin.end();
-    const probe = await fetch(`${next.origin}/v1/cache/missing`, {
-      headers: { authorization: 'Bearer process-read' },
-    });
+    const probe = await fetch(`${next.origin}/v1/cache/missing`);
     expect(probe.status).toBe(404);
     next.child.kill('SIGTERM');
     await next.stderr.until('ev=stopping signal=SIGTERM');
@@ -349,9 +334,7 @@ test('stdin EOF drains an in-flight upload while the lease still refuses a secon
     socket.once('error', connected.reject);
     await connected.promise;
     const staged = awaitStaged(staging, abort.signal, first.child.exited);
-    socket.write(
-      `PUT /v1/cache/drained HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer process-write\r\nContent-Length: ${body.byteLength}\r\n\r\n`,
-    );
+    socket.write(`PUT /v1/cache/drained HTTP/1.1\r\nHost: localhost\r\nContent-Length: ${body.byteLength}\r\n\r\n`);
     socket.write(body.subarray(0, 64 * 1024));
     await staged;
     first.child.stdin.end();
@@ -371,9 +354,7 @@ test('stdin EOF drains an in-flight upload while the lease still refuses a secon
     socket.destroy();
     expect(await first.child.exited).toBe(0);
     fresh = await start(root);
-    const got = await fetch(`${fresh.origin}/v1/cache/drained`, {
-      headers: { authorization: 'Bearer process-read' },
-    });
+    const got = await fetch(`${fresh.origin}/v1/cache/drained`);
     expect(got.status).toBe(200);
     expect(new Uint8Array(await got.arrayBuffer())).toEqual(body);
     expect(await readdir(staging)).toEqual([]);
@@ -425,7 +406,6 @@ test('real server bounds published bytes and reports evicted entries as 404', as
       const uploaded = await fetch(`${running.origin}/v1/cache/${key}`, {
         method: 'PUT',
         body,
-        headers: { authorization: 'Bearer process-write' },
       });
       expect(uploaded.status).toBe(200);
       if (key !== 'new') {
@@ -437,20 +417,8 @@ test('real server bounds published bytes and reports evicted entries as 404', as
     let bytes = 0;
     for (const name of names) bytes += (await stat(join(root, 'entries', name))).size;
     expect(bytes).toBe(8192);
-    expect(
-      (
-        await fetch(`${running.origin}/v1/cache/old`, {
-          headers: { authorization: 'Bearer process-read' },
-        })
-      ).status,
-    ).toBe(404);
-    expect(
-      (
-        await fetch(`${running.origin}/v1/cache/new`, {
-          headers: { authorization: 'Bearer process-read' },
-        })
-      ).status,
-    ).toBe(200);
+    expect((await fetch(`${running.origin}/v1/cache/old`)).status).toBe(404);
+    expect((await fetch(`${running.origin}/v1/cache/new`)).status).toBe(200);
   } finally {
     running.child.kill('SIGTERM');
     expect(await running.child.exited).toBe(0);
@@ -471,9 +439,7 @@ test('full staging admission refuses 403 and cancellation releases its reservati
     const staging = join(root, 'entries', '.staging');
     const changes = watch(staging, { signal: abort.signal })[Symbol.asyncIterator]();
     let changed = changes.next();
-    socket.write(
-      'PUT /v1/cache/held HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer process-write\r\nContent-Length: 4096\r\n\r\npartial',
-    );
+    socket.write('PUT /v1/cache/held HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4096\r\n\r\npartial');
     for (;;) {
       await changed;
       if ((await readdir(staging)).length > 0) break;
@@ -482,7 +448,6 @@ test('full staging admission refuses 403 and cancellation releases its reservati
     const refused = await fetch(`${running.origin}/v1/cache/refused`, {
       method: 'PUT',
       body: 'x',
-      headers: { authorization: 'Bearer process-write' },
     });
     expect(refused.status).toBe(403);
     socket.destroy();
@@ -490,16 +455,9 @@ test('full staging admission refuses 403 and cancellation releases its reservati
     const stored = await fetch(`${running.origin}/v1/cache/after-cancel`, {
       method: 'PUT',
       body: 'x',
-      headers: { authorization: 'Bearer process-write' },
     });
     expect(stored.status).toBe(200);
-    expect(
-      (
-        await fetch(`${running.origin}/v1/cache/held`, {
-          headers: { authorization: 'Bearer process-read' },
-        })
-      ).status,
-    ).toBe(404);
+    expect((await fetch(`${running.origin}/v1/cache/held`)).status).toBe(404);
   } finally {
     abort.abort();
     socket.destroy();

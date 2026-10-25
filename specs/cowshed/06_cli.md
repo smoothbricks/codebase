@@ -429,12 +429,12 @@ The workspace is cleared first, through `coordinator.clearNxState` (07_api.md), 
 `nx-cache-clear` control operation (05_gateway.md). Each refuses as a `conflict` naming what is running, and a refusal
 clears nothing of that cache. The workspace refuses while a job or land holds its build volume, a lifecycle operation
 holds its image lock, or a process other than its Nx daemon has a task database open or is opening one. The store
-refuses while one of the project's Nx requests is admitted or queued, a land holds publication authority, or its backend
-is starting. These are the existing records of running work — the build volume's job-admission hold, Nx's own database
-descriptors and open locks, the gateway's admission table — and no second registry is kept. A store refusal after the
-workspace was cleared says the workspace was cleared; clearing is idempotent, so the same command clears the store once
-the named work ends. Nothing is stopped except the checkout's Nx daemon (as `nx daemon --stop` stops it) and the
-project's Nx backend, and each starts again on its next request.
+refuses while one of the project's Nx requests is admitted or queued, or its backend is starting. These are the existing
+records of running work — the build volume's job-admission hold, Nx's own database descriptors and open locks, the
+gateway's admission table — and no second registry is kept. A store refusal after the workspace was cleared says the
+workspace was cleared; clearing is idempotent, so the same command clears the store once the named work ends. Nothing is
+stopped except the checkout's Nx daemon (as `nx daemon --stop` stops it) and the project's Nx backend, and each starts
+again on its next request.
 
 Bare stdout is one line per cache,
 `cleared workspace <ws> Nx state: <n> entries in .nx/cache, <m> in .nx/workspace-data, build volume <id>` and

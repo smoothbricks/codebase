@@ -15,7 +15,6 @@ bytes = "1"
 cowshed-core.workspace = true
 cowshed-gateway-types = { path = "../cowshed-gateway-types" }
 cowshed-os = { path = "../cowshed-os" }
-getrandom = "0.3"
 http = "1"
 http-body = "=1.0.1"
 http-body-util = "=0.1.3"

@@ -9,8 +9,6 @@
  * Exit 2 is configuration refusal; exit 1 is operational startup failure.
  *
  *   NX_CACHE_SERVER_DIR=/srv/nx-cache \
- *   NX_CACHE_SERVER_WRITE_TOKENS=ci:$SECRET \
- *   NX_CACHE_SERVER_READ_TOKENS=shed:$OTHER \
  *   bun src/main.ts
  */
 

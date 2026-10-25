@@ -1,21 +1,21 @@
 //! Outage and midstream cases for the gateway's `/nx/v1/cache/{hash}` route, driven by the stock
 //! Nx client in a real workspace. Each gateway case is a fresh private fixture with its own gateway
-//! and its own `NX_SELF_HOSTED_REMOTE_CACHE_*` pointed at the gateway's session listener. Direct
+//! and its own `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` pointed at the gateway's session listener. Direct
 //! controls point the same client at the fixture backend with no gateway in between, so the
 //! backend's 5xx reaches the client, which reads it as its own outage (05_gateway.md "The client
 //! half"): one line, a miss or a skipped store, and nothing more asked of that server.
 //!
 //! Contract for the gateway route, as implemented in `proxy.rs` (`nx_backend_unavailable`): when the
 //! project backend is offline, unreachable, or answers 5xx before the response head, a GET is 404 and
-//! a PUT is 403, audited as `Failed` with classification `nx-backend-unavailable`. A PUT without a
-//! writer is refused as `nx-publication-required`. The local build still runs once and succeeds.
+//! a PUT is 403, audited as `Failed` with classification `nx-backend-unavailable`. The local build
+//! still runs once and succeeds.
 
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::Arc;
 
-use cowshed_gateway::{NxCacheBackend, NxCacheServiceConfig, NxPublication};
+use cowshed_gateway::{NxCacheBackend, NxCacheServiceConfig};
 use cowshed_gateway_types::WorkspacePolicy;
 use cowshed_os::fork_lock::RunAsync as _;
 use serde_json::{Value, json};
@@ -44,7 +44,7 @@ fn write_file(path: &Path, contents: impl AsRef<[u8]>) {
 
 /// One cached task, `app:build`, that appends a `run` line per real execution and writes
 /// `result.txt`. Its cache key covers `source.txt`, so the plugin's hint names exactly one hash.
-fn write_workspace(root: &Path) {
+pub(super) fn write_workspace(root: &Path) {
     let repository = repository_root();
     let plugin = std::fs::canonicalize(repository.join("packages/nx-plugin/loader.js"))
         .expect("this repository's nx-plugin loader");
@@ -82,7 +82,7 @@ fn write_workspace(root: &Path) {
 
 /// The environment of every stock Nx process here: only the managed `PATH` is inherited, every
 /// Nx path lives inside the fixture, and loopback is never sent through a proxy.
-fn scrub(command: &mut Command, root: &Path) {
+pub(super) fn scrub(command: &mut Command, root: &Path) {
     command
         .env_clear()
         .env(
@@ -106,8 +106,8 @@ fn scrub(command: &mut Command, root: &Path) {
 }
 
 /// Runs the stock `nx run app:build` once. With `remote`, the client's self-hosted cache points at
-/// that origin under that token; with a receipt, the plugin records a hint for this run.
-async fn nx_run(root: &Path, remote: Option<(&str, &str)>, receipt: Option<&str>) -> Output {
+/// that origin; with a receipt, the plugin records a hint for this run.
+async fn nx_run(root: &Path, remote: Option<&str>, receipt: Option<&str>) -> Output {
     let mut command = Command::new("node");
     command
         .arg(root.join("node_modules/.bin/nx"))
@@ -117,17 +117,15 @@ async fn nx_run(root: &Path, remote: Option<(&str, &str)>, receipt: Option<&str>
     if let Some(id) = receipt {
         command.env("COWSHED_NX_TASK_RECEIPT_ID", id);
     }
-    if let Some((origin, token)) = remote {
-        command
-            .env("NX_SELF_HOSTED_REMOTE_CACHE_SERVER", origin)
-            .env("NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN", token);
+    if let Some(origin) = remote {
+        command.env("NX_SELF_HOSTED_REMOTE_CACHE_SERVER", origin);
     }
     command.output_locked().await.expect("run the stock Nx")
 }
 
 /// Real executions of `app:build`: one `run` line each. A remote restore appends nothing, and a
 /// run that failed before executing leaves no marker at all, which is zero executions.
-fn executions(root: &Path) -> usize {
+pub(super) fn executions(root: &Path) -> usize {
     match std::fs::read_to_string(root.join("app/runs.txt")) {
         Ok(text) => text.lines().count(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
@@ -135,7 +133,7 @@ fn executions(root: &Path) -> usize {
     }
 }
 
-fn run_text(output: &Output) -> String {
+pub(super) fn run_text(output: &Output) -> String {
     format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -238,19 +236,17 @@ fn backend_config(address: std::net::SocketAddr) -> NxCacheBackend {
     NxCacheBackend {
         repo_id: REPO.to_owned(),
         address,
-        read_token: cowshed_gateway_types::WorkspaceToken::from_bytes([81; 32]),
-        write_token: cowshed_gateway_types::WorkspaceToken::from_bytes([82; 32]),
         reclaimed_staging_files: 0,
     }
 }
 
-/// A session on its own listener for the project, and the encoded token its client holds.
+/// A session on its own listener for the project.
 async fn install_session(
     handle: &cowshed_gateway::GatewayHandle,
     workspace_id: &str,
     token_byte: u8,
-) -> (std::net::SocketAddr, String) {
-    let (session, token, _) = super::session(
+) -> std::net::SocketAddr {
+    let (session, _, _) = super::session(
         workspace_id,
         REPO,
         super::block_endpoint(super::free_endpoint()),
@@ -258,12 +254,11 @@ async fn install_session(
         1,
         WorkspacePolicy::default(),
     );
-    let endpoint = super::install_in_free_block(handle, session).await;
-    (endpoint, token)
+    super::install_in_free_block(handle, session).await
 }
 
 /// The Nx route's audit events for one hash and method: the HTTP status and classification of each.
-fn nx_events(
+pub(super) fn nx_events(
     audit: &super::NxRecordingAudit,
     hash: &str,
     method: &str,
@@ -281,7 +276,7 @@ fn nx_events(
         .collect()
 }
 
-async fn gateway_with(
+pub(super) async fn gateway_with(
     config: cowshed_gateway::GatewayConfig,
     health: super::UpstreamHealth,
 ) -> (cowshed_gateway::Gateway, Arc<super::NxRecordingAudit>) {
@@ -322,8 +317,8 @@ fn assert_unavailable_backend(
     let puts = nx_events(audit, hash, "PUT");
     assert!(
         puts.iter().any(|(status, class)| *status == Some(403)
-            && class.as_deref() == Some("nx-publication-required")),
-        "PUT without a writer must be a 403 refusal: {puts:?}"
+            && class.as_deref() == Some("nx-backend-unavailable")),
+        "PUT to an unavailable backend must be a 403 refusal: {puts:?}"
     );
 }
 
@@ -338,14 +333,9 @@ async fn real_nx_client_with_no_service_config_executes_locally() {
     write_workspace(root.path());
     let (config, _cache) = super::test_config();
     let (gateway, audit) = gateway_with(config, super::UpstreamHealth::Healthy).await;
-    let (endpoint, token) = install_session(&gateway.handle(), "nx-outage-noconfig", 71).await;
+    let endpoint = install_session(&gateway.handle(), "nx-outage-noconfig", 71).await;
     let origin = format!("http://{endpoint}/nx");
-    let output = nx_run(
-        root.path(),
-        Some((origin.as_str(), token.as_str())),
-        Some(RUN_RECEIPT),
-    )
-    .await;
+    let output = nx_run(root.path(), Some(origin.as_str()), Some(RUN_RECEIPT)).await;
     let hash = recorded_hash(root.path(), RUN_RECEIPT);
     assert_unavailable_backend(root.path(), &output, &audit, &hash);
     gateway.drain().await.expect("drain gateway");
@@ -382,14 +372,9 @@ async fn real_nx_client_with_no_bun_on_path_executes_locally() {
         cap_bytes: 64 * 1024 * 1024,
     });
     let (gateway, audit) = gateway_with(config, super::UpstreamHealth::Healthy).await;
-    let (endpoint, token) = install_session(&gateway.handle(), "nx-outage-missing", 74).await;
+    let endpoint = install_session(&gateway.handle(), "nx-outage-missing", 74).await;
     let origin = format!("http://{endpoint}/nx");
-    let output = nx_run(
-        root.path(),
-        Some((origin.as_str(), token.as_str())),
-        Some(RUN_RECEIPT),
-    )
-    .await;
+    let output = nx_run(root.path(), Some(origin.as_str()), Some(RUN_RECEIPT)).await;
     let hash = recorded_hash(root.path(), RUN_RECEIPT);
     assert_unavailable_backend(root.path(), &output, &audit, &hash);
     gateway.drain().await.expect("drain gateway");
@@ -411,14 +396,9 @@ async fn real_nx_client_with_dead_backend_socket_executes_locally() {
         .configure_nx_cache(backend_config(dead_address()))
         .await
         .expect("configure dead backend");
-    let (endpoint, token) = install_session(&handle, "nx-outage-dead", 75).await;
+    let endpoint = install_session(&handle, "nx-outage-dead", 75).await;
     let origin = format!("http://{endpoint}/nx");
-    let output = nx_run(
-        root.path(),
-        Some((origin.as_str(), token.as_str())),
-        Some(RUN_RECEIPT),
-    )
-    .await;
+    let output = nx_run(root.path(), Some(origin.as_str()), Some(RUN_RECEIPT)).await;
     let hash = recorded_hash(root.path(), RUN_RECEIPT);
     assert_unavailable_backend(root.path(), &output, &audit, &hash);
     gateway.drain().await.expect("drain gateway");
@@ -441,14 +421,9 @@ async fn real_nx_client_with_offline_connector_never_reaches_the_backend() {
         .configure_nx_cache(backend_config(backend.address))
         .await
         .expect("configure fixture backend");
-    let (endpoint, token) = install_session(&handle, "nx-outage-offline", 76).await;
+    let endpoint = install_session(&handle, "nx-outage-offline", 76).await;
     let origin = format!("http://{endpoint}/nx");
-    let output = nx_run(
-        root.path(),
-        Some((origin.as_str(), token.as_str())),
-        Some(RUN_RECEIPT),
-    )
-    .await;
+    let output = nx_run(root.path(), Some(origin.as_str()), Some(RUN_RECEIPT)).await;
     let hash = recorded_hash(root.path(), RUN_RECEIPT);
     assert_unavailable_backend(root.path(), &output, &audit, &hash);
     gateway.drain().await.expect("drain gateway");
@@ -475,9 +450,9 @@ async fn real_nx_client_with_503_backend_executes_locally() {
         .configure_nx_cache(backend_config(backend.address))
         .await
         .expect("configure 503 backend");
-    let (endpoint, token) = install_session(&handle, "nx-outage-upstream503", 77).await;
+    let endpoint = install_session(&handle, "nx-outage-upstream503", 77).await;
     let origin = format!("http://{endpoint}/nx");
-    let output = nx_run(root.path(), Some((&origin, &token)), Some(RUN_RECEIPT)).await;
+    let output = nx_run(root.path(), Some(origin.as_str()), Some(RUN_RECEIPT)).await;
     assert!(output.status.success(), "{}", run_text(&output));
     let hash = recorded_hash(root.path(), RUN_RECEIPT);
     assert_unavailable_backend(root.path(), &output, &audit, &hash);
@@ -525,12 +500,12 @@ async fn nx_short_content_length_is_a_failed_transfer_not_a_completed_hit() {
         .configure_nx_cache(backend_config(address))
         .await
         .expect("short-body backend");
-    let (endpoint, token) = install_session(&handle, "nx-short-body", 78).await;
+    let endpoint = install_session(&handle, "nx-short-body", 78).await;
     let mut client = tokio::net::TcpStream::connect(endpoint)
         .await
         .expect("gateway client");
     client
-        .write_all(super::nx_request(endpoint, "GET", &token, "42").as_bytes())
+        .write_all(super::nx_request(endpoint, "GET", "42").as_bytes())
         .await
         .expect("cache request");
     let mut head = Vec::new();
@@ -634,12 +609,7 @@ async fn direct_nx_client_get_503_is_an_outage_miss_that_executes_locally() {
     write_workspace(root.path());
     let mut backend = spawn_backend(503, 503).await;
     let origin = format!("http://{}", backend.address);
-    let output = nx_run(
-        root.path(),
-        Some((origin.as_str(), "direct-control-token")),
-        Some(RUN_RECEIPT),
-    )
-    .await;
+    let output = nx_run(root.path(), Some(origin.as_str()), Some(RUN_RECEIPT)).await;
     assert!(
         output.status.success(),
         "a direct GET 503 is a miss, never a failed run: {}",
@@ -674,12 +644,7 @@ async fn direct_nx_client_get_404_put_503_skips_the_store_and_keeps_the_local_re
     write_workspace(root.path());
     let mut backend = spawn_backend(404, 503).await;
     let origin = format!("http://{}", backend.address);
-    let output = nx_run(
-        root.path(),
-        Some((origin.as_str(), "direct-control-token")),
-        Some(RUN_RECEIPT),
-    )
-    .await;
+    let output = nx_run(root.path(), Some(origin.as_str()), Some(RUN_RECEIPT)).await;
     assert!(
         output.status.success(),
         "a direct PUT 503 skips the store, never fails the run: {}",
@@ -711,13 +676,13 @@ async fn direct_nx_client_get_404_put_503_skips_the_store_and_keeps_the_local_re
     backend.task.abort();
 }
 
-/// Publication through the gateway to a 503 backend, with the stock store called directly.
+/// A store through the gateway to a 503 backend, with the stock store called directly.
 ///
 /// The source workspace runs locally once with a receipt, which gives the cached task's root and
-/// hash. A private publication for exactly that hash is installed, and the native
-/// `HttpRemoteCache.store` is called on that cache with the publication token. The store must
-/// report `false` without a Node error. The gateway forwards the PUT, the backend's 503 is an
-/// outage, and the audit records a 403 failed `nx-backend-unavailable`. The source marker stays at 1.
+/// hash. The native `HttpRemoteCache.store` is then called on the gateway's cache for that hash,
+/// with no credential, and must report `false` without a Node error. The gateway forwards the PUT,
+/// the backend's 503 is an outage, and the audit records a 403 failed `nx-backend-unavailable`. The
+/// source marker stays at 1.
 #[tokio::test]
 async fn native_store_through_gateway_to_503_backend_is_audited_and_returns_false() {
     let root = super::fixture_dir::secure_fixture_dir(&format!(
@@ -733,26 +698,12 @@ async fn native_store_through_gateway_to_503_backend_is_audited_and_returns_fals
         .configure_nx_cache(backend_config(backend.address))
         .await
         .expect("configure fixture backend");
-    let (endpoint, _token) = install_session(&handle, "nx-outage-publisher", 79).await;
+    let endpoint = install_session(&handle, "nx-outage-publisher", 79).await;
 
     let built = nx_run(root.path(), None, Some(PUBLISH_RECEIPT)).await;
     assert!(built.status.success(), "{}", run_text(&built));
     assert_eq!(executions(root.path()), 1, "the local run executes once");
     let hash = recorded_hash(root.path(), PUBLISH_RECEIPT);
-
-    let publication_token = cowshed_gateway_types::WorkspaceToken::from_bytes([80; 32]);
-    let encoded = publication_token.encode();
-    handle
-        .begin_nx_publication(NxPublication {
-            workspace_id: "nx-outage-publisher".to_owned(),
-            repo_id: REPO.to_owned(),
-            expected_revision: 1,
-            accepted_head: "a".repeat(40),
-            hashes: std::collections::BTreeSet::from([hash.clone()]),
-            token: publication_token,
-        })
-        .await
-        .expect("private qualified publication");
 
     let origin = format!("http://{endpoint}/nx");
     let store = Command::new("node")
@@ -774,7 +725,6 @@ async fn native_store_through_gateway_to_503_backend_is_audited_and_returns_fals
         .env("NX_DAEMON", "false")
         .env("NX_CACHE_DIRECTORY", root.path().join(".nx/cache"))
         .env("NX_SELF_HOSTED_REMOTE_CACHE_SERVER", &origin)
-        .env("NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN", &encoded)
         .env("NO_PROXY", "127.0.0.1,localhost")
         .output_locked()
         .await
@@ -820,7 +770,7 @@ async fn nx_route_ambiguous_paths_are_refused_without_an_upstream_request() {
         .configure_nx_cache(backend_config(backend.address))
         .await
         .expect("configure fixture backend");
-    let (endpoint, token) = install_session(&handle, "nx-outage-ambiguous", 83).await;
+    let endpoint = install_session(&handle, "nx-outage-ambiguous", 83).await;
     for path in [
         "/nx/v1/cache/42?query=1",
         "/nx/v1/cache/42/",
@@ -832,9 +782,7 @@ async fn nx_route_ambiguous_paths_are_refused_without_an_upstream_request() {
     ] {
         let response = super::proxy_request(
             endpoint,
-            format!(
-                "GET {path} HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
-            ),
+            format!("GET {path} HTTP/1.1\r\nHost: {endpoint}\r\nConnection: close\r\n\r\n"),
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 400"), "{path}: {response}");
@@ -860,12 +808,12 @@ async fn nx_route_accepts_every_key_the_backend_accepts() {
         .configure_nx_cache(backend_config(backend.address))
         .await
         .expect("configure fixture backend");
-    let (endpoint, token) = install_session(&handle, "nx-key-format", 85).await;
+    let endpoint = install_session(&handle, "nx-key-format", 85).await;
     let get = |hash: &str| {
         super::proxy_request(
             endpoint,
             format!(
-                "GET /nx/v1/cache/{hash} HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+                "GET /nx/v1/cache/{hash} HTTP/1.1\r\nHost: {endpoint}\r\nConnection: close\r\n\r\n"
             ),
         )
     };
@@ -943,15 +891,10 @@ async fn cold_observation(gateway: bool, repetition: usize) -> Value {
         .configure_nx_cache(backend_config(backend.address))
         .await
         .expect("configure fixture backend");
-    let (endpoint, token) = install_session(&handle, "nx-cold-reader", 84).await;
+    let endpoint = install_session(&handle, "nx-cold-reader", 84).await;
     let origin = format!("http://{endpoint}/nx");
     let started = std::time::Instant::now();
-    let output = nx_run(
-        root.path(),
-        Some((origin.as_str(), token.as_str())),
-        Some(receipt.as_str()),
-    )
-    .await;
+    let output = nx_run(root.path(), Some(origin.as_str()), Some(receipt.as_str())).await;
     let wall_ms = started.elapsed().as_millis();
     assert!(output.status.success(), "{}", run_text(&output));
     let hashes = recorded_hashes(root.path(), &receipt);

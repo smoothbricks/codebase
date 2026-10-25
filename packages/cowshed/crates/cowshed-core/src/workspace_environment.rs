@@ -15,7 +15,9 @@ pub const PORT_BASE_ENV: &str = "COWSHED_PORT_BASE";
 /// Capacity grants can grow it, so tools read the admitted size rather than assuming one.
 pub const PORT_BLOCK_SIZE_ENV: &str = "COWSHED_PORT_BLOCK_SIZE";
 pub const NX_REMOTE_SERVER_ENV: &str = "NX_SELF_HOSTED_REMOTE_CACHE_SERVER";
-pub const NX_REMOTE_TOKEN_ENV: &str = "NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN";
+/// A shed reads its project's Nx cache and never stores to it; only a land publishes
+/// (05_gateway.md "`/nx/v1/cache/{hash}`").
+pub const NX_REMOTE_READ_ONLY_ENV: &str = "NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY";
 /// The sandbox's `TMPDIR` ([`crate::storage::StorageLayout::exec_temp_dir`]), exported to host
 /// shells too, so a host gate and a land gate of one workspace share one scratch directory and
 /// neither shares the machine's: Bun reads every ancestor directory of its working directory
@@ -87,12 +89,11 @@ impl<'a> EnvironmentMount<'a> {
 }
 
 /// Atomically publish the source-able, workspace-local build environment inside an image. Its
-/// one caller is `workspace_credentials::publish_workspace_environment`, which reads the token
-/// the image publishes. A served mount also exports its `TMPDIR`, single-quoted, and its
-/// runtime link, and binds module compilation to the receiving workspace's private cache.
+/// one caller is `workspace_credentials::publish_workspace_environment`. A served mount also exports
+/// its `TMPDIR`, single-quoted, and its runtime link, and binds module compilation to the
+/// receiving workspace's private cache.
 pub(crate) fn write_workspace_environment(
     mount: EnvironmentMount<'_>,
-    token: &Zeroizing<String>,
     platform: Platform,
     port_block: Option<PortBlock>,
 ) -> Result<(), WorkspaceEnvironmentError> {
@@ -164,8 +165,8 @@ pub(crate) fn write_workspace_environment(
                 })
         })
         .transpose()?;
-    // Keep the secret token in one Zeroizing buffer. Reserve capability values'
-    // shell-escaped bound too so publication does not reallocate and copy the token.
+    // Keep the capability values in one Zeroizing buffer. Reserve their shell-escaped bound
+    // too so publication does not reallocate and copy them.
     let capability_bytes = match mount {
         EnvironmentMount::Served { capability_env, .. } => capability_env
             .env
@@ -186,8 +187,7 @@ pub(crate) fn write_workspace_environment(
         EnvironmentMount::Minted(_) => 0,
     };
     let mut contents = Zeroizing::new(String::with_capacity(
-        384 + token.len()
-            + DEV_CI_POLICY.len()
+        384 + DEV_CI_POLICY.len()
             + capability_bytes
             + installed_directory_text.map_or(0, |path| path.len() * 4 + 96)
             + node_compile_cache_text.map_or(0, |path| path.len() * 4 + 256)
@@ -197,8 +197,7 @@ pub(crate) fn write_workspace_environment(
     ));
     contents.push_str(DEV_CI_POLICY);
     // No bare `COWSHED_WORKSPACE_TOKEN`: every shell that sources this file would hand it to every
-    // child. The token appears only where a client presents it, the Nx cache route below;
-    // `.cowshed/workspace.json` is what marks a workspace.
+    // child. `.cowshed/workspace.json` is what marks a workspace.
     if let Some(block) = port_block {
         writeln!(
             &mut *contents,
@@ -210,9 +209,11 @@ pub(crate) fn write_workspace_environment(
     }
     if mount.root().join("nx.json").is_file() {
         let port = port_block.map_or(7_644, |block| block.base());
-        writeln!(&mut *contents,
-            "export {NX_REMOTE_SERVER_ENV}=http://127.0.0.1:{port}/nx\nexport {NX_REMOTE_TOKEN_ENV}={}", token.as_str())
-            .expect("writing to a String cannot fail");
+        writeln!(
+            &mut *contents,
+            "export {NX_REMOTE_SERVER_ENV}=http://127.0.0.1:{port}/nx\nexport {NX_REMOTE_READ_ONLY_ENV}=true"
+        )
+        .expect("writing to a String cannot fail");
     }
     if let (Some((temp_dir, runtime_link)), Some(node_compile_cache)) =
         (served, node_compile_cache_text)
@@ -337,7 +338,6 @@ mod tests {
                         temp_dir: Path::new(refused),
                         capability_env: &CapabilityContribution::default(),
                     },
-                    &Zeroizing::new("token".to_owned()),
                     Platform::Linux,
                     None,
                 ),
@@ -370,14 +370,14 @@ mod tests {
                 host_home: root,
                 capability_env: &CapabilityContribution::default(),
             },
-            &Zeroizing::new("token".to_owned()),
             Platform::Linux,
             None,
         )
         .unwrap();
         let published = std::fs::read_to_string(root.join(WORKSPACE_ENVIRONMENT_PATH)).unwrap();
         assert!(!published.contains(NX_REMOTE_SERVER_ENV));
-        assert!(!published.contains(NX_REMOTE_TOKEN_ENV));
+        assert!(!published.contains(NX_REMOTE_READ_ONLY_ENV));
+        assert!(!published.contains("NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN"));
         std::fs::write(root.join("nx.json"), "{}").unwrap();
         write_workspace_environment(
             EnvironmentMount::Served {
@@ -386,7 +386,6 @@ mod tests {
                 host_home: root,
                 capability_env: &CapabilityContribution::default(),
             },
-            &Zeroizing::new("token".to_owned()),
             Platform::Linux,
             None,
         )
@@ -396,8 +395,8 @@ mod tests {
             published
                 .contains("export NX_SELF_HOSTED_REMOTE_CACHE_SERVER=http://127.0.0.1:7644/nx\n")
         );
-        assert!(published.contains("export NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN=token\n"));
-        assert!(!published.contains("NX_CACHE_SERVER_WRITE_TOKENS"));
+        assert!(published.contains("export NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true\n"));
+        assert!(!published.contains("NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN"));
         assert!(!published.contains("--exit-on-stdin-eof"));
         for marker in [None, Some(""), Some("false"), Some("true")] {
             let mut command = std::process::Command::new("/bin/sh");
@@ -451,7 +450,6 @@ mod tests {
                 temp_dir: &root,
                 capability_env: &CapabilityContribution::default(),
             },
-            &Zeroizing::new("token".to_owned()),
             Platform::Linux,
             None,
         )
@@ -478,13 +476,8 @@ mod tests {
             )
             .as_bytes()
         );
-        write_workspace_environment(
-            EnvironmentMount::Minted(&mount),
-            &Zeroizing::new("token".to_owned()),
-            Platform::Linux,
-            None,
-        )
-        .unwrap();
+        write_workspace_environment(EnvironmentMount::Minted(&mount), Platform::Linux, None)
+            .unwrap();
         let output = std::process::Command::new("/bin/sh")
             .args([
                 "-c",
@@ -522,7 +515,6 @@ mod tests {
                 temp_dir: &root,
                 capability_env: &contribution,
             },
-            &Zeroizing::new("token".to_owned()),
             Platform::Linux,
             None,
         )
@@ -654,7 +646,6 @@ mod tests {
                 temp_dir: &temp_dir,
                 capability_env: &CapabilityContribution::default(),
             },
-            &Zeroizing::new("token".to_owned()),
             Platform::Linux,
             None,
         )
@@ -756,13 +747,8 @@ mod tests {
 
         // A minted image publishes no cache identity: an inherited sibling value is unset,
         // so neither runtime starts with a compile cache enabled into it.
-        write_workspace_environment(
-            EnvironmentMount::Minted(&mount),
-            &Zeroizing::new("token".to_owned()),
-            Platform::Linux,
-            None,
-        )
-        .unwrap();
+        write_workspace_environment(EnvironmentMount::Minted(&mount), Platform::Linux, None)
+            .unwrap();
         for program in &runtimes {
             run(&caller_cache, program, &disabled);
         }

@@ -6,8 +6,6 @@ import { type CacheServerConfig, cacheServerConfigFromEnv } from '../config.js';
 import { type RunningCacheServer, startCacheServer } from '../server.js';
 import { type CacheStore, isCacheKey, openCacheStore, stageEntry } from '../store.js';
 
-const WRITE_SECRET = 'write-secret-token';
-const READ_SECRET = 'read-secret-token';
 const KEY = '10018087211778381691';
 
 const live: RunningCacheServer[] = [];
@@ -34,14 +32,9 @@ async function serve(
   const directory = overrides.directory ?? (await scratchDirectory());
   const started = await startCacheServer({
     directory,
-    host: '127.0.0.1',
     port: 0,
     maxBytes: 8 * 1024 * 1024,
     capBytes: 64 * 1024 * 1024,
-    principals: [
-      { label: 'ci', bearer: `Bearer ${WRITE_SECRET}`, capability: 'write' },
-      { label: 'pr', bearer: `Bearer ${READ_SECRET}`, capability: 'read' },
-    ],
     ...overrides,
   });
   if (!started.ok) throw new Error(`${started.stage}: ${started.reason}`);
@@ -50,26 +43,14 @@ async function serve(
   return { server, directory };
 }
 
-const put = async (
-  server: RunningCacheServer,
-  key: string,
-  body: Uint8Array<ArrayBuffer>,
-  secret = WRITE_SECRET,
-): Promise<Response> =>
+const put = async (server: RunningCacheServer, key: string, body: Uint8Array<ArrayBuffer>): Promise<Response> =>
   fetch(`${server.origin}/v1/cache/${key}`, {
     method: 'PUT',
     body,
-    headers: {
-      authorization: `Bearer ${secret}`,
-      'content-type': 'application/octet-stream',
-    },
+    headers: { 'content-type': 'application/octet-stream' },
   });
 
-/** `null` sends no `authorization` header at all; a default parameter would swallow `undefined`. */
-const get = async (server: RunningCacheServer, key: string, secret: string | null = WRITE_SECRET) =>
-  fetch(`${server.origin}/v1/cache/${key}`, {
-    headers: secret === null ? {} : { authorization: `Bearer ${secret}` },
-  });
+const get = async (server: RunningCacheServer, key: string) => fetch(`${server.origin}/v1/cache/${key}`);
 
 function filled(size: number, byte: number): Uint8Array<ArrayBuffer> {
   const bytes = new Uint8Array(size);
@@ -94,6 +75,18 @@ describe('artifact round trip', () => {
   test('reports a miss for a key that was never published', async () => {
     const { server } = await serve();
     expect((await get(server, '404040404040404040')).status).toBe(404);
+  });
+
+  test('needs no credential to publish or read, from any local caller', async () => {
+    const { server } = await serve();
+    const artifact = filled(2048, 0xc3);
+
+    const stored = await fetch(`${server.origin}/v1/cache/${KEY}`, { method: 'PUT', body: artifact });
+    expect(stored.status).toBe(200);
+
+    const fetched = await fetch(`${server.origin}/v1/cache/${KEY}`);
+    expect(fetched.status).toBe(200);
+    expect(new Uint8Array(await fetched.arrayBuffer())).toEqual(artifact);
   });
 });
 
@@ -136,37 +129,6 @@ describe('a cache entry is never replaced', () => {
   });
 });
 
-describe('tokens', () => {
-  test('refuses a missing or unknown token in the form nx can report', async () => {
-    const { server, directory } = await serve();
-
-    for (const attempt of [await get(server, KEY, null), await get(server, KEY, 'not-a-real-token')]) {
-      expect(attempt.status).toBe(401);
-      // nx only surfaces a 401's body when the content type is exactly `text/plain`; with a charset
-      // parameter the operator gets "Requests should respond with text/plain on 401s" instead.
-      expect(attempt.headers.get('content-type')).toBe('text/plain');
-      expect(attempt.headers.get('www-authenticate')).toBe('Bearer');
-      expect(await attempt.text()).toContain('NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN');
-    }
-
-    expect((await put(server, KEY, filled(16, 1), 'not-a-real-token')).status).toBe(401);
-    expect((await readdir(directory)).sort()).toEqual(['.owner.lock', '.staging']);
-  });
-
-  test('a read-only token reads the cache but cannot publish into it', async () => {
-    const { server, directory } = await serve();
-    const artifact = filled(2048, 0xc3);
-    expect((await put(server, KEY, artifact)).status).toBe(200);
-
-    expect(new Uint8Array(await (await get(server, KEY, READ_SECRET)).arrayBuffer())).toEqual(artifact);
-
-    const refused = await put(server, '999999999999999999', filled(32, 9), READ_SECRET);
-    expect(refused.status).toBe(403);
-    expect(await refused.text()).toContain('may read the cache but not publish');
-    expect((await readdir(directory)).sort()).toEqual(['.owner.lock', '.staging', KEY]);
-  });
-});
-
 describe('cache keys', () => {
   test('rejects every key that could name something other than one entry', () => {
     for (const hostile of ['..', '.', '../escape', 'a/b', '/etc/passwd', '.staging', '', 'a'.repeat(129)]) {
@@ -184,7 +146,6 @@ describe('cache keys', () => {
     const refused = await fetch(`${server.origin}/v1/cache/..%2F..%2Fescape`, {
       method: 'PUT',
       body: filled(64, 0xff),
-      headers: { authorization: `Bearer ${WRITE_SECRET}` },
     });
 
     expect(refused.status).toBe(400);
@@ -201,13 +162,13 @@ describe('hot cache under pressure', () => {
       expect((await put(server, key, filled(4096, key.charCodeAt(0)))).status).toBe(200);
     }
     for (const key of ['a', 'b', 'c']) {
-      const read = await get(server, key, READ_SECRET);
+      const read = await get(server, key);
       expect(read.status).toBe(200);
       await read.arrayBuffer();
     }
     const fresh = filled(4096, 0x66);
     expect((await put(server, 'fresh', fresh)).status).toBe(200);
-    const read = await get(server, 'fresh', READ_SECRET);
+    const read = await get(server, 'fresh');
     expect(read.status).toBe(200);
     expect(new Uint8Array(await read.arrayBuffer())).toEqual(fresh);
     let published = 0;
@@ -244,7 +205,6 @@ describe('declared length', () => {
           controller.close();
         },
       }),
-      headers: { authorization: `Bearer ${WRITE_SECRET}` },
     });
 
     expect(refused.status).toBe(411);
@@ -303,73 +263,31 @@ describe('staging', () => {
 describe('startup configuration', () => {
   const withDirectory = { NX_CACHE_SERVER_DIR: '/srv/nx-cache' };
 
-  test('accepts a complete environment and parses every principal', () => {
+  test('accepts a complete environment', () => {
     const result = cacheServerConfigFromEnv({
       ...withDirectory,
       NX_CACHE_SERVER_PORT: '9123',
       NX_CACHE_SERVER_MAX_BYTES: '2048',
-      NX_CACHE_SERVER_WRITE_TOKENS: 'ci:secret-one',
-      NX_CACHE_SERVER_READ_TOKENS: 'pr:secret-two, shed:secret-three',
     });
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.config.port).toBe(9123);
     expect(result.config.maxBytes).toBe(2048);
-    expect(result.config.host).toBe('127.0.0.1');
-    expect(result.config.principals).toEqual([
-      { label: 'ci', bearer: 'Bearer secret-one', capability: 'write' },
-      { label: 'pr', bearer: 'Bearer secret-two', capability: 'read' },
-      { label: 'shed', bearer: 'Bearer secret-three', capability: 'read' },
-    ]);
-  });
-
-  test('refuses to start with no tokens at all', () => {
-    const result = cacheServerConfigFromEnv(withDirectory);
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.problems.join('\n')).toContain('NX_CACHE_SERVER_WRITE_TOKENS');
   });
 
   test('refuses a relative cache directory', () => {
     const result = cacheServerConfigFromEnv({
       NX_CACHE_SERVER_DIR: 'relative/cache',
-      NX_CACHE_SERVER_WRITE_TOKENS: 'ci:secret',
     });
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.problems.join('\n')).toContain('absolute path');
   });
 
-  test('refuses an unlabelled token without ever echoing the secret', () => {
-    const result = cacheServerConfigFromEnv({
-      ...withDirectory,
-      NX_CACHE_SERVER_WRITE_TOKENS: 'bare-secret-value',
-    });
-
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    const explanation = result.problems.join('\n');
-    expect(explanation).toContain('NX_CACHE_SERVER_WRITE_TOKENS entry 1');
-    expect(explanation).not.toContain('bare-secret-value');
-  });
-
-  test('refuses one secret configured with two capabilities', () => {
-    const result = cacheServerConfigFromEnv({
-      ...withDirectory,
-      NX_CACHE_SERVER_WRITE_TOKENS: 'ci:shared',
-      NX_CACHE_SERVER_READ_TOKENS: 'pr:shared',
-    });
-
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.problems.join('\n')).toContain('repeats a secret');
-  });
-
   test('refuses a port outside the range and names the bound', () => {
     const result = cacheServerConfigFromEnv({
       ...withDirectory,
-      NX_CACHE_SERVER_WRITE_TOKENS: 'ci:secret',
       NX_CACHE_SERVER_PORT: '70000',
     });
     expect(result.ok).toBe(false);
@@ -386,7 +304,7 @@ test('concurrent different-key uploads remain independent and whole', async () =
   );
   expect(statuses).toEqual(keys.map(() => 200));
   for (const [index, key] of keys.entries()) {
-    const response = await get(server, key, READ_SECRET);
+    const response = await get(server, key);
     expect(response.status).toBe(200);
     expect(new Uint8Array(await response.arrayBuffer())).toEqual(filled(1024 * 1024, index + 1));
   }
@@ -405,7 +323,6 @@ test("separate project listeners cannot read each other's same-key archive", asy
 test('retention configuration refuses a per-upload limit larger than its cap', () => {
   const configured = cacheServerConfigFromEnv({
     NX_CACHE_SERVER_DIR: '/srv/cache/entries',
-    NX_CACHE_SERVER_WRITE_TOKENS: 'publisher:secret',
     NX_CACHE_SERVER_MAX_BYTES: '4096',
     NX_CACHE_SERVER_CAP_BYTES: '2048',
   });

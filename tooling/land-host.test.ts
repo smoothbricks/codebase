@@ -17,16 +17,18 @@ import { judgeHistory, PRE_REWRITE_MAIN } from './land-history.ts';
 import type { Call } from './land-host.plan.ts';
 
 // Behavioural tests of tooling/land-host.sh: the script runs for real, against real git repositories for main and the
-// workspace and the real ancestry guard and failure reporter. Three things are stand-ins on PATH, because they are this machine's
+// workspace and the real ancestry guard and failure reporter. Four things are stand-ins on PATH, because they are this machine's
 // operator tooling and the gate itself: `cowshed` (a workspace is a git clone of main; rebase and land and their
 // fences are git operations; the gate must run as `exec <ws> --class gate --host --`, at the workspace root),
 // `direnv` (runs the command it is given) and `bun nx` (land-host.fake-nx.ts plays back
 // the calls a scenario scripts: its exact output and exit status). A scenario names every nx call the land may make,
 // in order: a call it did not
-// script fails the land.
+// script fails the land. node (the publisher's runtime) records what land-publish.ts gave it, and refuses when FIX_PUBLISH says so.
 
 const tooling = import.meta.dir;
 const repo = dirname(tooling);
+// The cowshed bridge that publishes the gate's Nx results: land-publish.ts reads it from the checkout it lands.
+const BRIDGE = 'packages/cowshed/crates/cowshed-core/src/build_volume';
 const bun = process.execPath;
 
 const TASK = 'cowshed:cargo-test-cowshed-core-shard1';
@@ -64,6 +66,12 @@ function failedRun(message: string, exit = 1): Call {
 }
 
 const stubs: Record<string, string> = {
+  node: `#!/bin/sh
+cat >"$FIX_STATE/publish.program"
+printf '%s\\n' "$@" >"$FIX_STATE/publish.args"
+[ "$FIX_PUBLISH" = refuse ] && { echo 'the publish was refused' >&2; exit 1; }
+echo '{"published":1,"existing":0,"skipped":0}'
+`,
   direnv: `#!/bin/sh
 case $1 in
 allow) exit 0 ;;
@@ -172,6 +180,8 @@ interface LandRun {
 interface Land {
   readonly main: string;
   readonly ws: string;
+  /** Where the fake tools record what they were given: the publisher's program and arguments. */
+  readonly state: string;
   /** Runs tooling/land-host.sh over the nx calls `plan` scripts; `moveMain` has main gain a commit as the land begins. */
   land(plan: readonly Call[], moveMain?: boolean): LandRun;
 }
@@ -184,7 +194,7 @@ afterEach(() => {
 });
 
 /** A main repository carrying the land tooling, and a workspace one commit ahead of it. */
-function fixture(replayFails = false): Land {
+function fixture(replayFails = false, publishFails = false): Land {
   const root = mkdtempSync(join(tmpdir(), 'land-host-'));
   roots.push(root);
   const main = join(root, 'main');
@@ -194,10 +204,15 @@ function fixture(replayFails = false): Land {
   mkdirSync(join(main, 'tooling'), { recursive: true });
   mkdirSync(state);
   mkdirSync(bin);
-  for (const file of ['land-host.sh', 'land-decide.ts', 'land-history.ts', 'land-summary.ts']) {
+  for (const file of ['land-host.sh', 'land-decide.ts', 'land-history.ts', 'land-publish.ts', 'land-summary.ts']) {
     cpSync(join(tooling, file), join(main, 'tooling', file));
   }
   symlinkSync(join(repo, 'node_modules'), join(main, 'node_modules'));
+  // The publisher reads the real bridge from the checkout it lands, at the path BRIDGE names.
+  mkdirSync(join(main, BRIDGE), { recursive: true });
+  for (const file of ['cache_adapter.js', 'nx_publish.js']) {
+    cpSync(join(repo, BRIDGE, file), join(main, BRIDGE, file));
+  }
   writeFileSync(join(main, 'nx.json'), '{}\n');
   // The land cross-lints the gated tree for Linux after the gate; the fixture's check passes.
   writeFileSync(join(main, 'package.json'), '{"scripts":{"check:linux":"echo linux cross check passed"}}\n');
@@ -224,6 +239,7 @@ function fixture(replayFails = false): Land {
   return {
     main,
     ws,
+    state,
     land(plan, moveMain = false) {
       writeFileSync(join(state, 'plan.json'), JSON.stringify(plan));
       if (moveMain) {
@@ -239,6 +255,7 @@ function fixture(replayFails = false): Land {
           FIX_BUN: bun,
           FIX_FAKE_NX: join(tooling, 'land-host.fake-nx.ts'),
           FIX_STATE: state,
+          FIX_PUBLISH: publishFails ? 'refuse' : 'accept',
           FIX_MAIN: main,
           FIX_WS: ws,
         },
@@ -381,6 +398,29 @@ describe('land-host.sh', () => {
     expect(run.log).toContain("main's build exited 1; the land stands");
     expect(existsSync(join(land.main, 'moved.txt'))).toBe(true);
     expect(git(land.main, 'rev-parse', 'HEAD')).toBe(git(land.ws, 'rev-parse', 'HEAD'));
+  });
+
+  it('publishes the gate task results once the Linux cross check passes, and lands', () => {
+    const land = fixture();
+    const gated = git(land.ws, 'rev-parse', 'HEAD');
+    const run = land.land([DAEMON_STOP, passingRun(GATE), passingRun(MAIN_BUILD)]);
+    expect(run.status, run.log).toBe(0);
+    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
+    // The publisher gets the cowshed bridge as one program, then the checkout and the gate's succeeded task hashes.
+    const bridge = join(repo, BRIDGE);
+    const program = `${readFileSync(join(bridge, 'cache_adapter.js'), 'utf8')}\n${readFileSync(join(bridge, 'nx_publish.js'), 'utf8')}`;
+    expect(readFileSync(join(land.state, 'publish.program'), 'utf8')).toBe(program);
+    expect(readFileSync(join(land.state, 'publish.args'), 'utf8')).toBe(`-\n${land.ws}\n["gate-hash"]\n`);
+  });
+
+  it('lands even when the publish is refused, and says so', () => {
+    const land = fixture(false, true);
+    const gated = git(land.ws, 'rev-parse', 'HEAD');
+    const run = land.land([DAEMON_STOP, passingRun(GATE), passingRun(MAIN_BUILD)]);
+    expect(run.status, run.log).toBe(0);
+    expect(run.log).toContain('the publish was refused');
+    expect(run.log).toContain('failed (status 1); the land goes on');
+    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
   });
 
   it('refuses to land main itself', () => {

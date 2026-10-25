@@ -186,24 +186,7 @@ async fn handle_request(
     }
     let authentication = match inherited_authentication {
         Authentication::Generation(generation) => Authentication::Generation(generation),
-        Authentication::Bearer(_) => Authentication::Bearer(presented_token(
-            request.headers(),
-            if fixed_target.is_none()
-                && request.uri().scheme().is_none()
-                && request.uri().authority().is_none()
-                && crate::nx_cache::route_hash(
-                    request
-                        .uri()
-                        .path_and_query()
-                        .map_or("/", |path| path.as_str()),
-                )
-                .is_some()
-            {
-                header::AUTHORIZATION
-            } else {
-                header::PROXY_AUTHORIZATION
-            },
-        )),
+        Authentication::Bearer(_) => Authentication::Bearer(presented_token(request.headers())),
     };
     if request.method() == Method::CONNECT {
         if fixed_target.is_some() {
@@ -280,7 +263,7 @@ async fn handle_request(
         .await);
     }
     if health == UpstreamHealth::Offline {
-        if admission.nx_token.is_some() {
+        if admission.nx {
             return Ok(nx_backend_unavailable(&context, admission, "offline", audit_kind).await);
         }
         complete_now(
@@ -322,7 +305,7 @@ async fn handle_request(
     {
         Ok(Ok(connection)) => connection,
         Ok(Err(_)) => {
-            if admission.nx_token.is_some() {
+            if admission.nx {
                 return Ok(nx_backend_unavailable(
                     &context,
                     admission,
@@ -348,7 +331,7 @@ async fn handle_request(
             ));
         }
         Err(_) => {
-            if admission.nx_token.is_some() {
+            if admission.nx {
                 return Ok(nx_backend_unavailable(
                     &context,
                     admission,
@@ -380,7 +363,7 @@ async fn handle_request(
         }
     };
     if upstream.transport == NegotiatedTransport::Raw {
-        if admission.nx_token.is_some() {
+        if admission.nx {
             return Ok(
                 nx_backend_unavailable(&context, admission, "raw-transport", audit_kind).await,
             );
@@ -439,7 +422,7 @@ async fn handle_request(
     {
         Ok(Ok(sender)) => sender,
         Ok(Err(_)) => {
-            if admission.nx_token.is_some() {
+            if admission.nx {
                 return Ok(nx_backend_unavailable(
                     &context,
                     admission,
@@ -465,7 +448,7 @@ async fn handle_request(
             ));
         }
         Err(_) => {
-            if admission.nx_token.is_some() {
+            if admission.nx {
                 return Ok(nx_backend_unavailable(
                     &context,
                     admission,
@@ -505,10 +488,7 @@ async fn handle_request(
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
             let request_timeout = request_timeout.try_recv().ok();
-            if request_timeout.is_none()
-                && admission.nx_token.is_some()
-                && !request_body_cause(&error)
-            {
+            if request_timeout.is_none() && admission.nx && !request_body_cause(&error) {
                 return Ok(nx_backend_unavailable(
                     &context,
                     admission,
@@ -548,7 +528,7 @@ async fn handle_request(
         }
         Err(_) => {
             let body_timeout = request_timeout.try_recv().ok();
-            if body_timeout.is_none() && admission.nx_token.is_some() {
+            if body_timeout.is_none() && admission.nx {
                 return Ok(nx_backend_unavailable(
                     &context,
                     admission,
@@ -586,7 +566,7 @@ async fn handle_request(
         }
     };
     let status = response.status();
-    if admission.nx_token.is_some() && !crate::nx_cache::client_reads(&admission.method, status) {
+    if admission.nx && !crate::nx_cache::client_reads(&admission.method, status) {
         let reason = format!("upstream-status-{}", status.as_u16());
         return Ok(nx_backend_unavailable(&context, admission, &reason, audit_kind).await);
     }
@@ -2005,13 +1985,6 @@ async fn prepare_upstream_request(
     };
     write_upstream_headers(&mut parts.headers, &admission.target, trace)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if let Some(token) = &admission.nx_token {
-        let encoded = zeroize::Zeroizing::new(format!("Bearer {}", token.encode()));
-        let mut value = HeaderValue::from_str(encoded.as_str())
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        value.set_sensitive(true);
-        parts.headers.insert(header::AUTHORIZATION, value);
-    }
     if admission.credential_allowed {
         let protocol = admission
             .protocol
@@ -2051,7 +2024,7 @@ async fn prepare_upstream_request(
     parts.uri = uri;
     let body = Limited::new(
         body,
-        if admission.nx_token.is_some() {
+        if admission.nx {
             MAX_NX_REQUEST_BODY
         } else {
             MAX_REQUEST_BODY
@@ -2463,10 +2436,12 @@ where
 /// Both spellings hand the same opaque token to the same constant-time comparison; neither is
 /// weaker than the other, and the token is stripped before upstream forwarding either way.
 ///
-/// `name` is `Proxy-Authorization` for every request, and `Authorization` only for a registry
-/// client on a local mirror route (see `handle_request`).
-fn presented_token(headers: &HeaderMap, name: HeaderName) -> Option<String> {
-    let values: Vec<_> = headers.get_all(name).iter().collect();
+/// Read from `Proxy-Authorization` only; a request's own `Authorization` is the client's.
+fn presented_token(headers: &HeaderMap) -> Option<String> {
+    let values: Vec<_> = headers
+        .get_all(header::PROXY_AUTHORIZATION)
+        .iter()
+        .collect();
     if values.len() != 1 {
         return None;
     }
@@ -2816,7 +2791,7 @@ impl Completion {
             admission.audit_kind,
         );
         draft.mirror_cache_status = mirror_cache_status;
-        let nx = admission.nx_token.is_some();
+        let nx = admission.nx;
         Self {
             lease: Some(admission.take_completion()),
             draft: Some(draft),

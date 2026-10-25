@@ -1,14 +1,12 @@
 //! A Nx read whose backend dies mid-body. The response head already said `200`, so the gateway
 //! cannot change it; the audit must name the cut as a failed transfer and never as a completed hit.
 //! One real `Gateway` and one real server, the package's bundle run by `bun` from `PATH`, which
-//! this test kills with SIGKILL. It proves that stream cut and nothing else: no restore,
-//! publication, or cutover claim.
+//! this test kills with SIGKILL. It proves that stream cut and nothing else: no restore or
+//! cutover claim.
 use super::*;
 
 use super::nx_process::{is_server_args, server_path, server_script};
-use cowshed_gateway::{
-    AuditEvent, AuditStatus, GatewayTimeouts, NxCacheServiceConfig, NxPublication,
-};
+use cowshed_gateway::{AuditEvent, AuditStatus, GatewayTimeouts, NxCacheServiceConfig};
 use cowshed_os::fork_lock::Run as _;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::DirBuilderExt as _;
@@ -38,10 +36,10 @@ async fn exchange(endpoint: SocketAddr, request: String) -> String {
 }
 
 /// Streams the artifact as one standard PUT, writing from one 64 KiB buffer reused for every chunk.
-async fn put_artifact(endpoint: SocketAddr, token: &str) -> String {
+async fn put_artifact(endpoint: SocketAddr) -> String {
     let mut stream = TcpStream::connect(endpoint).await.expect("connect gateway");
     let head = format!(
-        "PUT /nx/v1/cache/{HASH} HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {token}\r\nContent-Length: {ARTIFACT_BYTES}\r\nConnection: close\r\n\r\n"
+        "PUT /nx/v1/cache/{HASH} HTTP/1.1\r\nHost: {endpoint}\r\nContent-Length: {ARTIFACT_BYTES}\r\nConnection: close\r\n\r\n"
     );
     stream
         .write_all(head.as_bytes())
@@ -141,7 +139,7 @@ async fn host_controller_nx_backend_killed_mid_body_is_a_failed_transfer() {
     )
     .await;
     let handle = gateway.handle();
-    let (source, source_token, _) = session(
+    let (source, _, _) = session(
         SOURCE,
         REPO,
         block_endpoint(free_endpoint()),
@@ -152,27 +150,10 @@ async fn host_controller_nx_backend_killed_mid_body_is_a_failed_transfer() {
     let source_endpoint = install_in_free_block(&handle, source).await;
 
     // The first read starts the real server, which has no entry yet.
-    let first = exchange(
-        source_endpoint,
-        nx_request(source_endpoint, "GET", &source_token, HASH),
-    )
-    .await;
+    let first = exchange(source_endpoint, nx_request(source_endpoint, "GET", HASH)).await;
     assert!(first.starts_with("HTTP/1.1 404"), "{first}");
 
-    // A synthetic publication capability for one hash, not a qualified land.
-    let publication = WorkspaceToken::from_bytes([63; 32]);
-    handle
-        .begin_nx_publication(NxPublication {
-            workspace_id: SOURCE.to_owned(),
-            repo_id: REPO.to_owned(),
-            expected_revision: 1,
-            accepted_head: "a".repeat(40),
-            hashes: BTreeSet::from([HASH.to_owned()]),
-            token: publication.clone(),
-        })
-        .await
-        .expect("synthetic publication capability");
-    let stored = put_artifact(source_endpoint, &publication.encode()).await;
+    let stored = put_artifact(source_endpoint).await;
     assert!(stored.starts_with("HTTP/1.1 200"), "{stored}");
 
     // Read the head and a bounded preview of the body, then stop. The receive window is kept small
@@ -200,7 +181,7 @@ async fn host_controller_nx_backend_killed_mid_body_is_a_failed_transfer() {
         std::io::Error::last_os_error()
     );
     reader
-        .write_all(nx_request(source_endpoint, "GET", &source_token, HASH).as_bytes())
+        .write_all(nx_request(source_endpoint, "GET", HASH).as_bytes())
         .await
         .expect("write read request");
     let mut buffer = vec![0_u8; CHUNK_BYTES];

@@ -1717,6 +1717,45 @@ pub fn task_hashes_script() -> bytes::Bytes {
     SCRIPT.clone()
 }
 
+/// A land's publish (05_gateway.md "`/nx/v1/cache/{hash}`"): `node - <root> <JSON hashes>` with
+/// this on stdin, run as a job of the landing workspace, stores each named task result of that
+/// checkout's Nx cache to the project's store (`nx_publish.js` says how).
+pub fn publish_script() -> bytes::Bytes {
+    static SCRIPT: std::sync::LazyLock<bytes::Bytes> =
+        std::sync::LazyLock::new(|| super::cache_adapter::script(include_str!("nx_publish.js")));
+    SCRIPT.clone()
+}
+
+/// What one publish stored, found already stored, and skipped: a task Nx does not cache, or one
+/// whose result failed, has no entry to share.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Published {
+    pub published: u64,
+    pub existing: u64,
+    pub skipped: u64,
+}
+
+impl std::fmt::Display for Published {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} stored, {} already stored, {} not cacheable",
+            self.published, self.existing, self.skipped
+        )
+    }
+}
+
+/// The count [`publish_script`] printed; anything else is an error naming what was read.
+pub fn published(stdout: &[u8]) -> Result<Published, String> {
+    serde_json::from_slice(stdout).map_err(|error| {
+        format!(
+            "the publish printed no count ({error}): {}",
+            String::from_utf8_lossy(stdout)
+        )
+    })
+}
+
 /// One Nx task as its `task_details` rows name it: a `configuration` of `None` is the row's
 /// `NULL`, a task run without one.
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]

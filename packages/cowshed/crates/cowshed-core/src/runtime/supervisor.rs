@@ -2189,7 +2189,6 @@ pub(super) async fn sandbox_environment(
     let git_identity = crate::git::workspace_git_identity_config(&sandbox.workspace_mount)?;
     let path = bootstrap_path(sandbox)?;
     let port_base = sandbox.port_block.base().to_string();
-    let encoded_token = workspace_token.encode();
     let gateway_http = gateway_proxy_url(&port_base, &workspace_token);
 
     // Local services already have a bounded direct-connect capability. Sending
@@ -2234,10 +2233,14 @@ pub(super) async fn sandbox_environment(
         PORT_BLOCK_SIZE_ENV,
         OsStr::new(&sandbox.port_block.size().to_string()),
     );
-    // The bare token is no job's to read: the proxy userinfo and the Nx route carry it where a
-    // client presents it, and `.cowshed/workspace.json` marks a workspace. A caller's stale value
-    // (a host shell that sourced an older `.cowshed/env`) is withheld, not forwarded.
-    withheld.push(WORKSPACE_TOKEN_ENV);
+    // The bare token is no job's to read: the proxy userinfo carries it where a client presents
+    // it, and `.cowshed/workspace.json` marks a workspace. A caller's stale value (a host shell
+    // that sourced an older `.cowshed/env`) is withheld, not forwarded, including the retired
+    // `NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN` that older envs exported as the Nx bearer.
+    withheld.extend([
+        WORKSPACE_TOKEN_ENV,
+        "NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN",
+    ]);
     if sandbox
         .capabilities
         .contribution
@@ -2249,13 +2252,13 @@ pub(super) async fn sandbox_environment(
             OsStr::new(&format!("http://127.0.0.1:{port_base}/nx")),
         );
         own(
-            crate::workspace_environment::NX_REMOTE_TOKEN_ENV,
-            OsStr::new(&encoded_token),
+            crate::workspace_environment::NX_REMOTE_READ_ONLY_ENV,
+            OsStr::new("true"),
         );
     } else {
         withheld.extend([
             crate::workspace_environment::NX_REMOTE_SERVER_ENV,
-            crate::workspace_environment::NX_REMOTE_TOKEN_ENV,
+            crate::workspace_environment::NX_REMOTE_READ_ONLY_ENV,
         ]);
     }
     for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
@@ -10086,8 +10089,12 @@ mod workspace_toolchain_tests {
                 "http://attacker.example:9/nx".to_owned(),
             ),
             (
-                crate::workspace_environment::NX_REMOTE_TOKEN_ENV.to_owned(),
+                "NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN".to_owned(),
                 "attacker-token".to_owned(),
+            ),
+            (
+                crate::workspace_environment::NX_REMOTE_READ_ONLY_ENV.to_owned(),
+                "false".to_owned(),
             ),
         ]);
         let sandbox = sandbox_at(&mount);
@@ -10103,7 +10110,7 @@ mod workspace_toolchain_tests {
         };
         std::fs::create_dir_all(&sandbox.home).expect("home");
 
-        // Without an Nx project, the caller's endpoint and token are withheld, not passed through.
+        // Without an Nx project, the caller's endpoint, read-only flag and retired token are withheld.
         let mut plain = sandbox.clone();
         plain.configure_capabilities().expect("detect capabilities");
         let without_nx = sandbox_environment(&plain, &caller)
@@ -10114,10 +10121,11 @@ mod workspace_toolchain_tests {
             crate::workspace_environment::NX_REMOTE_SERVER_ENV
         )));
         assert!(!without_nx.contains_key(OsStr::new(
-            crate::workspace_environment::NX_REMOTE_TOKEN_ENV
+            crate::workspace_environment::NX_REMOTE_READ_ONLY_ENV
         )));
+        assert!(!without_nx.contains_key(OsStr::new("NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN")));
 
-        // With one, both names are the workspace's own read endpoint and workspace token.
+        // With one, the endpoint is the workspace's own and the read-only flag is set.
         std::fs::write(mount.join("nx.json"), "{}").expect("nx project");
         let mut configured = sandbox.clone();
         configured
@@ -10135,10 +10143,11 @@ mod workspace_toolchain_tests {
         );
         assert_eq!(
             child.get(OsStr::new(
-                crate::workspace_environment::NX_REMOTE_TOKEN_ENV
+                crate::workspace_environment::NX_REMOTE_READ_ONLY_ENV
             )),
-            Some(&std::ffi::OsString::from(token.encode()))
+            Some(&std::ffi::OsString::from("true"))
         );
+        assert!(!child.contains_key(OsStr::new("NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN")));
         assert_eq!(
             std::fs::read_link(&runtime_link).expect("owned runtime alias"),
             alias.target

@@ -196,6 +196,16 @@ deadline and then answered with a real native artifact leaves the task's own ent
 given the cache directory overwrites it. Drop the hunk, and keep the test, once the pinned upstream version treats an
 unreachable cache as a miss ([nrwl/nx#36651](https://github.com/nrwl/nx/pull/36651) proposes it, unmerged).
 
+## A shed reads the remote cache and never stores
+
+Stock Nx 23.2.1 has no read-only self-hosted cache: its `store` builds the gzip archive before the PUT. Every cowshed
+workspace's environment sets `NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true` beside `NX_SELF_HOSTED_REMOTE_CACHE_SERVER`
+(`specs/cowshed/05_gateway.md` "`/nx/v1/cache/{hash}`"; Danny tg#1780, tg#1782, tg#10456). `getHttpCache` then wraps the
+guard in `ReadOnlyRemoteCache` (`tasks-runner/remote-cache-outage.js`), whose `store` answers false before building
+anything. Only a land publishes, with the native client directly. The test "a run that reads the remote cache and never
+stores" in `packages/nx-plugin/src/nx-remote-cache-outage.test.ts` runs a cacheable task against a server that answers
+404 and requires only GETs, no PUT. Drop the hunk once upstream Nx has a read-only self-hosted option.
+
 ## Non-workspace file packages
 
 Bun's `file:` protocol identifies an installation source, not workspace membership. The pinned Nx parser keeps a

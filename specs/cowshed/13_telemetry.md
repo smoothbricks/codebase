@@ -322,44 +322,39 @@ inbound client is silent.
 
 ## Accepted-project Nx cache measurements
 
-The Nx gateway route (05_gateway.md) attributes every accepted-project read and refused or accepted write to the
-selected project, workspace incarnation and operation. Accepted publication additionally names the active land
-transaction, accepted source head, protected source-check/job identities and exact task hash. These are diagnostic
-projections of controller-owned qualification; audit records never authorize a writer or recover an unfinished
-publication.
+The Nx gateway route (05_gateway.md) attributes every accepted-project read and write to the selected project, workspace
+incarnation and operation, and a land's publish writes are attributed the same way. These are diagnostic projections;
+audit records authorize nothing.
 
 Report the following independently, with unavailable measurements explicitly absent rather than zero:
 
-- ordinary WIP reads, local/remote hit counts, denied `PUT` attempts and bytes/time, and artifacts actually published
-  (zero for a read-only workspace);
-- qualified current task count, local hits explicitly published without task execution, accepted/new versus already
-  existing archives, and missing/failed entries refused;
-- client archive construction, publication transfer, target download/extraction, local carry/copy bytes and time, and
-  Cargo build-volume warmth;
+- ordinary WIP lookups: local and remote hit counts, misses, and bytes and time (a shed's read-only client sends no
+  `PUT` and builds no archive);
+- a land's publication: the `published`, `existing` and `skipped` counts of `build_volume::nx::Published`, and each
+  failed entry's cause on stderr;
+- client archive construction, land publication transfer, target download/extraction, local carry/copy bytes and time,
+  and Cargo build-volume warmth;
 - server complete-entry bytes, staging bytes, configured capacity, eviction count/bytes, interrupted-upload recovery,
   and actual allocated bytes where the filesystem reports them;
 - the target's exact landed head and the same successful cacheable task/hash set before and after adoption, every
   hit/miss/exit status, the check timings, and its no-remote control.
 
-Read-only backend authorization is not evidence of a zero-cost client. Stock Nx's native HTTP cache may construct an
-in-memory gzip archive and attempt `PUT` before receiving 403; report that measured work instead of claiming no request
-or overhead. Task-hash archives are not a per-file content-addressed store, and transferred bytes are not filesystem
-allocation. A successful server-only HTTP smoke proves neither gateway authority nor a two-workspace adoption.
+A shed's read-only client builds no archive and sends no `PUT` (05_gateway.md, "A shed never uploads"), so its lookups
+are its whole Nx cost; a land's publish pays archive construction and `PUT` per stored result, measured there. Task-hash
+archives are not a per-file content-addressed store, and transferred bytes are not filesystem allocation. A successful
+server-only HTTP smoke proves neither the gateway's route nor a two-workspace adoption.
 
 ### Automated Nx proof surfaces
 
 These are process and API fixtures. They are not protected authorized-land, installed-adoption, undeclared-input audit
 or normal-client missing-artifact proofs, and they do not measure a stock client against a real land.
 
-- `cowshed-core` `tests/nx_publication.rs`, ordinary bridge case: the exact task and history exclusions hold, and a
-  changed hash, a failed result and a missing artifact are each refused.
-- The same file's ignored `host_controller_bridge_publishes_and_reads_through_the_production_server` runs the normal
-  packaged server binary. It proves that an existing local hit in `native.store` is reused without task execution, and
-  that a distinct database reader gets a remote hit through `HttpRemoteCache.store`. It reports the source marker,
-  publish time, compressed file length, allocated entry bytes, a read-only cold total in milliseconds, and misses.
+- `cowshed-gateway` `tests/gateway/nx_land_publish.rs`, ignored host case
+  `host_controller_a_landed_gate_publishes_and_another_shed_restores_it`: shed A's read-only run stores nothing; the
+  land's gate publish stores the attributed result once, and a second publish finds it already stored; shed B restores
+  it with nothing executed.
 - `cowshed-gateway` `tests/gateway/nx_process.rs`, ignored host case: a real `Gateway` is SIGKILLed, the kernel reports
-  its server's exit, a fresh server on the same store acquires the lock, and two sessions read through the read-only
-  route.
+  its server's exit, a fresh server on the same store acquires the lock, and two sessions read through the route.
 
 Live physical-bound eviction and killed-upload proofs remain with the server's own tests. No proof here checks
 entry-level stats for the entire store bound.
@@ -368,16 +363,16 @@ entry-level stats for the entire store bound.
 
 `cowshed-gateway` `tests/gateway/nx_outage.rs` runs the installed Nx client in fresh fixture workspaces with separate
 local caches and task databases. Real gateway cases cover missing service configuration, a missing executable, a dead
-backend socket, an offline connector, and a backend's pre-response 503. Each unavailable GET is an audited 404, the task
-executes locally once, and its ordinary read-only PUT is refused with 403. A hash-qualified direct native store against
-the 503 backend returns `false` without another task execution and records a failed `nx-backend-unavailable` PUT. The
-ordinary short-Content-Length case commits a 200 head and visible body prefix before closing the upstream early. It
-requires a client-visible short body and a failed `nx-transfer-failed` audit, never a completed read. Direct-client
-controls run the same client against the fixture backend with no gateway, so the backend's 503 reaches the client, which
-reads it as its own outage (05_gateway.md "The client half"): a GET 503 is a miss, the task executes once and the run
-succeeds; a PUT 503 after that execution skips the store and keeps the result. Each run prints exactly one outage line
-naming the server, the request and the 503, and asks that server nothing more; with no gateway there is no audit.
-Through the gateway the same backend stays an audited 404/403, the contrast these controls exist to show.
+backend socket, an offline connector, and a backend's pre-response 503. Each unavailable GET is an audited 404, and the
+task executes locally once. A direct native store of one task hash through the gateway to the 503 backend returns
+`false` without another task execution and records a failed `nx-backend-unavailable` PUT refused with 403. The ordinary
+short-Content-Length case commits a 200 head and visible body prefix before closing the upstream early. It requires a
+client-visible short body and a failed `nx-transfer-failed` audit, never a completed read. Direct-client controls run
+the same client against the fixture backend with no gateway, so the backend's 503 reaches the client, which reads it as
+its own outage (05_gateway.md "The client half"): a GET 503 is a miss, the task executes once and the run succeeds; a
+publishing client's PUT 503 after that execution skips the store and keeps the result. Each run prints exactly one
+outage line naming the server, the request and the 503, and asks that server nothing more; with no gateway there is no
+audit. Through the gateway the same backend stays an audited 404/403, the contrast these controls exist to show.
 
 Run fresh one-task cold controls both without an endpoint and through the gateway. Record each wall-time row, its
 cacheable-task count, execution marker, gateway statuses and backend-request count in a dated proof receipt. The rows
@@ -390,26 +385,26 @@ kills that backend after a real read has committed its 200 head and begun its bo
 stream and a failed `nx-transfer-failed` audit event, never a completed hit. This is a stream-failure proof surface, not
 task-result restoration or cutover evidence.
 
-### Stock Nx read-only client cost control
+### Stock Nx client cost control
 
 Governing sections: `specs/cowshed/05_gateway.md`, “`/nx/v1/cache/{hash}` — accepted-project Nx artifacts”;
 `specs/cowshed/13_telemetry.md`, “Accepted-project Nx cache measurements”.
 
-Nx 23.2.1's native HTTP cache has a zero-argument constructor configured by `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` and
-`NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN`. `DbCache` checks its local cache first. On a local miss, it can retrieve an
-accepted artifact through HTTP. After an executed task, it stores the result locally and then calls the remote store
-operation.
+Nx 23.2.1's native HTTP cache has a zero-argument constructor configured by `NX_SELF_HOSTED_REMOTE_CACHE_SERVER`.
+`DbCache` checks its local cache first. On a local miss, it can retrieve an accepted artifact through HTTP. After an
+executed task, it stores the result locally and then calls the remote store operation.
 
-There is no supported GET-only/skip-upload control checked before archive construction. `HttpRemoteCache.store` reads
-the cached outputs and constructs a complete in-memory gzip tar archive before sending `PUT`. A read-only token's 403
-response returns `false`; it does not avoid that work. `skipRemoteCache` disables retrieval too. The public
-`RemoteCacheV2` type is not an arbitrary provider-injection hook. Public pre/post task lifecycle hooks can wire
-environment variables and capture task results, but expose neither a provider handle nor a prearchive store veto.
+Stock Nx has no GET-only/skip-upload control checked before archive construction; the carried patch's
+`ReadOnlyRemoteCache` adds one on the `DbCache` path, answering `store` `false` before any archive is built.
+`HttpRemoteCache.store` reads the cached outputs and constructs a complete in-memory gzip tar archive before sending
+`PUT`. `skipRemoteCache` disables retrieval too. The public `RemoteCacheV2` type is not an arbitrary provider-injection
+hook. Public pre/post task lifecycle hooks can wire environment variables and capture task results, but expose neither a
+provider handle nor a prearchive store veto.
 
-Measure read-only archive construction and attempted PUT separately from accepted GET/restore and subsequent local hits.
-A dated proof receipt identifies the retained native/client and service executables, separates payload lengths,
-filesystem operations and process RSS, and names relay attribution. Client cost evidence alone does not qualify the
-artifact service, gateway or installed cutover, and cannot enable the removed public publication-control lane.
+Measure a shed's lookups and a land's publish separately: a land's archive construction and attempted `PUT` apart from
+accepted GET/restore and subsequent local hits. A dated proof receipt identifies the retained native/client and service
+executables, separates payload lengths, filesystem operations and process RSS, and names relay attribution. Client cost
+evidence alone does not prove the artifact service, gateway or installed cutover.
 
 Primary sources:
 

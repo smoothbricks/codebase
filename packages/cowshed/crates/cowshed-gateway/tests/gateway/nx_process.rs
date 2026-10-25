@@ -1,6 +1,6 @@
 //! The gateway's lazily started Nx cache server, `bun <bundle> --exit-on-stdin-eof`, as a real
 //! process: its lock, its refusal frame, its death with the gateway, and its stdin-EOF drain. Raw
-//! bytes service and process integration only; no archive restore, cutover, or publication claim.
+//! bytes service and process integration only; no archive restore or cutover claim.
 use super::*;
 
 use cowshed_os::fork_lock::{Run as _, RunAsync as _, Spawn as _};
@@ -57,28 +57,22 @@ fn server_command(script: &Path) -> tokio::process::Command {
     command
 }
 
-fn nx_put(endpoint: SocketAddr, token: &str, hash: &str, body: &str) -> String {
+fn nx_put(endpoint: SocketAddr, hash: &str, body: &str) -> String {
     format!(
-        "PUT /nx/v1/cache/{hash} HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "PUT /nx/v1/cache/{hash} HTTP/1.1\r\nHost: {endpoint}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
 }
 
-/// The environment every server in this test runs under. The read and write secrets are distinct,
-/// because the server refuses a secret that names both principals.
+/// The environment every server in this test runs under.
 fn server_env(command: &mut tokio::process::Command, entries: &Path) {
-    let read = WorkspaceToken::from_bytes([61; 32]).encode();
-    let write = WorkspaceToken::from_bytes([62; 32]).encode();
     command
         .env_clear()
         .env("PATH", server_path())
         .env("NX_CACHE_SERVER_DIR", entries)
-        .env("NX_CACHE_SERVER_HOST", "127.0.0.1")
         .env("NX_CACHE_SERVER_PORT", "0")
         .env("NX_CACHE_SERVER_MAX_BYTES", "1048576")
-        .env("NX_CACHE_SERVER_CAP_BYTES", "67108864")
-        .env("NX_CACHE_SERVER_READ_TOKENS", format!("workspace:{read}"))
-        .env("NX_CACHE_SERVER_WRITE_TOKENS", format!("accepted:{write}"));
+        .env("NX_CACHE_SERVER_CAP_BYTES", "67108864");
 }
 
 /// Read one newline-terminated line from a bounded stream, or `None` at its end. A line longer
@@ -104,7 +98,7 @@ async fn bounded_line(lines: &mut BufReader<tokio::io::Take<ChildStdout>>) -> Op
 #[tokio::test]
 #[ignore = "child of host_controller_nx_backend_process_serves_and_releases_its_store"]
 async fn nx_backend_gateway_child() {
-    use cowshed_gateway::{MirrorCacheConfig, NxCacheServiceConfig, NxPublication};
+    use cowshed_gateway::{MirrorCacheConfig, NxCacheServiceConfig};
 
     let root =
         PathBuf::from(std::env::var_os(CHILD_ENV).expect(
@@ -144,7 +138,7 @@ async fn nx_backend_gateway_child() {
     .await;
     let handle = gateway.handle();
 
-    let (source, source_token, _) = session(
+    let (source, _, _) = session(
         "nx-process-source",
         REPO,
         block_endpoint(free_endpoint()),
@@ -153,7 +147,7 @@ async fn nx_backend_gateway_child() {
         WorkspacePolicy::default(),
     );
     let source_endpoint = install_in_free_block(&handle, source).await;
-    let (reader, reader_token, _) = session(
+    let (reader, _, _) = session(
         "nx-process-reader",
         REPO,
         block_endpoint(free_endpoint()),
@@ -162,118 +156,32 @@ async fn nx_backend_gateway_child() {
         WorkspacePolicy::default(),
     );
     let reader_endpoint = install_in_free_block(&handle, reader).await;
-    let (foreign, foreign_token, _) = session(
-        "nx-process-foreign",
-        "owner/nx-process-foreign",
-        block_endpoint(free_endpoint()),
-        3,
-        1,
-        WorkspacePolicy::default(),
-    );
-    let foreign_endpoint = install_in_free_block(&handle, foreign).await;
 
-    // An ordinary workspace credential may not publish, before or after the backend starts.
-    let response = proxy_request(
-        source_endpoint,
-        nx_put(source_endpoint, &source_token, "42", "accepted-bytes"),
-    )
-    .await;
-    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
     // The first read of the project starts the real server and misses.
-    let response = proxy_request(
-        source_endpoint,
-        nx_request(source_endpoint, "GET", &source_token, "42"),
-    )
-    .await;
+    let response = proxy_request(source_endpoint, nx_request(source_endpoint, "GET", "42")).await;
     assert!(response.starts_with("HTTP/1.1 404"), "{response}");
 
-    let publication_token = WorkspaceToken::from_bytes([63; 32]);
-    let encoded = publication_token.encode();
-    handle
-        .begin_nx_publication(NxPublication {
-            workspace_id: "nx-process-source".to_owned(),
-            repo_id: REPO.to_owned(),
-            expected_revision: 1,
-            accepted_head: "a".repeat(40),
-            hashes: BTreeSet::from(["42".to_owned()]),
-            token: publication_token.clone(),
-        })
-        .await
-        .expect("private qualified publication");
+    // A workspace of the project stores with no credential. The first writer wins: a later PUT of
+    // the same key is 409 and replaces nothing.
     let response = proxy_request(
         source_endpoint,
-        nx_put(source_endpoint, &encoded, "42", "accepted-bytes"),
+        nx_put(source_endpoint, "42", "accepted-bytes"),
     )
     .await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     let response = proxy_request(
-        source_endpoint,
-        nx_put(source_endpoint, &encoded, "42", "differentbytes"),
+        reader_endpoint,
+        nx_put(reader_endpoint, "42", "differentbytes"),
     )
     .await;
     assert!(response.starts_with("HTTP/1.1 409"), "{response}");
 
-    // The second session reads what the first published, unchanged.
-    let response = proxy_request(
-        reader_endpoint,
-        nx_request(reader_endpoint, "GET", &reader_token, "42"),
-    )
-    .await;
+    // The second session reads what the first stored, unchanged.
+    let response = proxy_request(reader_endpoint, nx_request(reader_endpoint, "GET", "42")).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(response.contains("accepted-bytes"), "{response}");
-    let response = proxy_request(
-        reader_endpoint,
-        nx_request(reader_endpoint, "GET", &reader_token, "43"),
-    )
-    .await;
+    let response = proxy_request(reader_endpoint, nx_request(reader_endpoint, "GET", "43")).await;
     assert!(response.starts_with("HTTP/1.1 404"), "{response}");
-    let wrong = WorkspaceToken::from_bytes([99; 32]).encode();
-    let response = proxy_request(
-        reader_endpoint,
-        nx_request(reader_endpoint, "GET", &wrong, "42"),
-    )
-    .await;
-    assert!(response.starts_with("HTTP/1.1 401"), "{response}");
-    let response = proxy_request(
-        source_endpoint,
-        nx_put(source_endpoint, &encoded, "43", "x"),
-    )
-    .await;
-    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
-
-    // Revoking the writer ends its authority at once; the ordinary credential stays read-only.
-    handle
-        .end_nx_publication("nx-process-source".to_owned(), publication_token)
-        .await
-        .expect("revoke publication");
-    let response = proxy_request(
-        source_endpoint,
-        nx_put(source_endpoint, &encoded, "42", "accepted-bytes"),
-    )
-    .await;
-    assert!(response.starts_with("HTTP/1.1 401"), "{response}");
-    let response = proxy_request(
-        source_endpoint,
-        nx_put(source_endpoint, &source_token, "42", "accepted-bytes"),
-    )
-    .await;
-    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
-
-    // Credentials never cross projects: each session's token is refused by the other project's
-    // listener before any backend is asked for an accepted key. Auth runs before startup, so this
-    // starts no second server.
-    let response = proxy_request(
-        source_endpoint,
-        nx_request(source_endpoint, "GET", &foreign_token, "42"),
-    )
-    .await;
-    assert!(response.starts_with("HTTP/1.1 401"), "{response}");
-    let response = proxy_request(
-        foreign_endpoint,
-        nx_request(foreign_endpoint, "GET", &source_token, "42"),
-    )
-    .await;
-    assert!(response.starts_with("HTTP/1.1 401"), "{response}");
     // Every assertion above passed. The parent learns where the store lives and that the gateway
     // is serving; then it holds stdin until the parent closes it.
     let project = directory.join(format!("{:x}", Sha256::digest(REPO.as_bytes())));
@@ -428,7 +336,7 @@ async fn host_controller_a_projects_cache_server_ends_with_its_last_session() {
         ("nx-lifetime-scratch-b", "owner/nx-lifetime-scratch", 2),
         ("nx-lifetime-kept", "owner/nx-lifetime-kept", 3),
     ] {
-        let (installed, token, _) = session(
+        let (installed, _, _) = session(
             workspace,
             repo,
             block_endpoint(free_endpoint()),
@@ -436,12 +344,12 @@ async fn host_controller_a_projects_cache_server_ends_with_its_last_session() {
             1,
             WorkspacePolicy::default(),
         );
-        endpoints.push((install_in_free_block(&handle, installed).await, token));
+        endpoints.push(install_in_free_block(&handle, installed).await);
     }
     // Each project's first read starts its server and misses; the scratch project's starts first.
-    let read = |(endpoint, token): &(SocketAddr, String)| {
+    let read = |endpoint: &SocketAddr| {
         let endpoint = *endpoint;
-        let request = nx_request(endpoint, "GET", token, "42");
+        let request = nx_request(endpoint, "GET", "42");
         async move {
             let response = proxy_request(endpoint, request).await;
             assert!(response.starts_with("HTTP/1.1 404"), "{response}");

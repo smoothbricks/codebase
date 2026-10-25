@@ -368,10 +368,11 @@ same generator. Boundary round trips preserve signed deltas, absent build/charge
 positive schema controls reject a widened core column or an added process-specific column. The admitted APFS-baseline
 reader control is macOS-only; the fixed-column encoding and schema controls remain in all-targets Linux cross-checks.
 The supervisor's `host_controller_caller_supplied_nx_endpoint_and_token_never_reach_the_child` exercises the real
-host-side environment builder. Creating its independent global short runtime alias requires this lane. The fixture keeps
-its directory guard under its selected granted parent, supplies the canonical owned workspace mount to capability
-containment as the controller does, and removes its verified runtime alias on return or panic. Its success path asserts
-the alias is gone; it neither changes the production detector nor adds a sandbox grant.
+host-side environment builder: a caller's Nx endpoint, access token and `READ_ONLY=false` never reach the child, which
+gets the workspace's own endpoint and `READ_ONLY=true`. Creating its independent global short runtime alias requires
+this lane. The fixture keeps its directory guard under its selected granted parent, supplies the canonical owned
+workspace mount to capability containment as the controller does, and removes its verified runtime alias on return or
+panic. Its success path asserts the alias is gone; it neither changes the production detector nor adds a sandbox grant.
 
 Sandboxed TypeScript fixtures cannot allocate the host-controller's Rust-only `ScratchRoot` under world-shared
 `/private/tmp`. They use the same short-parent-link pattern in the job's already-admitted socket namespace: a short
@@ -392,8 +393,8 @@ included, and leaves the shared lock, which belongs to every sweep.
 
 Nx backend host-controller fixtures run the package's server bundle, `dist/server/nx-cache-server.js` from
 `nx run nx-cache-server:bundle`, under the `bun` on the test's `PATH`, bound on an ephemeral loopback listener owned by
-the fixture. The core ignored protocol fixture,
-`host_controller_bridge_publishes_and_reads_through_the_production_server`, and the gateway's process case,
+the fixture. The gateway's land case, `host_controller_a_landed_gate_publishes_and_another_shed_restores_it`
+(`nx_land_publish.rs`), and the gateway's process case,
 `host_controller_nx_backend_process_serves_and_releases_its_store`, are separate; each names one controller-owned
 backend. Neither grants a broader host bypass.
 

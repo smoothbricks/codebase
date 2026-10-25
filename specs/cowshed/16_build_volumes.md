@@ -729,6 +729,11 @@ supplies no restoration authority. Stock Nx writes a summary once at run complet
 capturing it immediately avoids treating a later check's summary as the earlier check's. These summaries are transient
 byproducts of the completed checks, not another validation ledger.
 
+The same attributed runs are what the land publishes to the project's Nx cache once every check has passed
+(05_gateway.md, "Publication"): each run's task hashes, local hits included, from the landing checkout's own cache, as a
+gate-class job of the landing workspace. An unattributed check publishes nothing, and a failed publication is said
+without failing the land.
+
 8. **Retire the workspace**. An adopted build volume is now the target's and does not retire with it. After a
    compare-and-swap at step 3 nothing adopted it, so it is still the workspace's.
 

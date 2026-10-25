@@ -5581,6 +5581,24 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             }
             checked.capture(source_mount, check, spawned, exited)?;
         }
+        // A passed gate is the project Nx cache's only writer (05_gateway.md "`/nx/v1/cache/{hash}`";
+        // Danny tg#1782): each attributed run's task results go from this checkout's own cache to
+        // the project's store. The cache never blocks a land, so a failed publish is said, and the
+        // land goes on.
+        for run in &checked.runs {
+            match publish_nx_run(&handle, build_volume.clone(), source_mount, run).await {
+                Ok(published) => cowshed_os::eprintln!(
+                    "cowshed: land published the Nx results of `{}` ({}): {published}",
+                    run.check,
+                    run.cache.display()
+                ),
+                Err(reason) => cowshed_os::eprintln!(
+                    "cowshed: land did not publish the Nx results of `{}` ({}): {reason}; the land goes on",
+                    run.check,
+                    run.cache.display()
+                ),
+            }
+        }
         Ok((checked, carry_stopped))
     }
 
@@ -20369,6 +20387,7 @@ async fn initialize_nx_caches(
             root,
             crate::build_volume::cache_adapter::initialize_script(),
             crate::api::dto::ExecClass::Gate,
+            Vec::new(),
         )?;
         let initialized = nx_probe_stdout(handle, build_volume.clone(), request)
             .await
@@ -20412,6 +20431,7 @@ fn nx_probe_request(
     root: &Path,
     script: bytes::Bytes,
     class: crate::api::dto::ExecClass,
+    args: Vec<crate::api::dto::CommandArg>,
 ) -> Result<ExecRequest> {
     let cwd = if root.as_os_str().is_empty() {
         None
@@ -20420,14 +20440,16 @@ fn nx_probe_request(
             CowshedError::integrity(error.to_string(), "use a workspace-relative Nx project")
         })?)
     };
+    let mut argv: Vec<crate::api::dto::CommandArg> = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "exec node - \"$@\"".into(),
+        "sh".into(),
+        crate::api::dto::CommandArg::new(mount.join(root)),
+    ];
+    argv.extend(args);
     Ok(ExecRequest {
-        command: crate::api::dto::ExecCommand::Argv(vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            "exec node - \"$1\"".into(),
-            "sh".into(),
-            crate::api::dto::CommandArg::new(mount.join(root)),
-        ]),
+        command: crate::api::dto::ExecCommand::Argv(argv),
         cwd,
         mode: RunSandboxMode::ReadWrite,
         env: std::collections::HashMap::new(),
@@ -20469,6 +20491,35 @@ async fn nx_probe_stdout(
     }
 }
 
+/// Publish one attributed Nx run of a passed land check: its task hashes, from the cache of the
+/// Nx root it ran in, through the landing workspace's own Nx cache route (the job's
+/// `NX_SELF_HOSTED_REMOTE_CACHE_SERVER`), as a gate-class job of that workspace.
+#[cfg(target_os = "macos")]
+async fn publish_nx_run(
+    handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
+    build_volume: Option<PathBuf>,
+    mount: &Path,
+    run: &crate::build_volume::nx::CheckedRun,
+) -> std::result::Result<crate::build_volume::nx::Published, String> {
+    // `run.cache` is `<root>/.nx/cache`, relative to the checkout.
+    let root = run
+        .cache
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| format!("{} names no Nx root", run.cache.display()))?;
+    let hashes: std::collections::BTreeSet<&str> = run.tasks.values().map(String::as_str).collect();
+    let hashes = serde_json::to_string(&hashes).map_err(|error| error.to_string())?;
+    let request = nx_probe_request(
+        mount,
+        root,
+        crate::build_volume::nx::publish_script(),
+        crate::api::dto::ExecClass::Gate,
+        vec![crate::api::dto::CommandArg::new(hashes)],
+    )
+    .map_err(|error| error.message)?;
+    let stdout = nx_probe_stdout(handle, build_volume, request).await?;
+    crate::build_volume::nx::published(&stdout)
+}
 /// Rebase carry's selection (16_build_volumes.md, "Rebase carry"): for each Nx state the build
 /// volume of `workspace` (mounted at `mount`) holds, keyed by its `.nx` relative to the checkout,
 /// the task hashes stock Nx computes up front for the tree now checked out at that state's root
@@ -20503,6 +20554,7 @@ async fn rebased_task_hashes(
             root,
             crate::build_volume::nx::task_hashes_script(),
             class,
+            Vec::new(),
         )?;
         let selection = match &admitted {
             Ok((handle, build_volume)) => {

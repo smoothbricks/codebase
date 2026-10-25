@@ -78,13 +78,11 @@ client may present it as `Proxy-Authorization: Basic` with the token as password
 send for proxy-URL userinfo). The Basic username authenticates nothing: `job-<job_id>` (a job's proxy URL, 03_caches.md)
 is recorded as the request's job attribution (13_telemetry.md "Attribution tiers"), and any other username, `cowshed`
 included, leaves the request to the query-time interval join. No other header carries the token: a request's
-`Authorization` is the client's own and authenticates nothing. The one non-proxy exception is the local Nx cache route
-below: stock Nx sends its bearer in `Authorization`, so only that exact route accepts that header, after endpoint
-selection. The gateway accepts no cookie, query parameter, URL userinfo, or path token; it strips `Proxy-Authorization`
-and `Authorization` before any upstream request. It decodes the presented value to bytes, rejects malformed or
-wrong-length values, and compares all 32 bytes in constant time. Missing or mismatched token is 401; a local Nx
-authentication refusal is 401 with exactly `Content-Type: text/plain`, and a proxy refusal uses the proxy's 407
-challenge.
+`Authorization` is the client's own and authenticates nothing. The local Nx cache route below takes no credential at
+all: endpoint selection alone names its workspace. The gateway accepts no cookie, query parameter, URL userinfo, or path
+token; it strips `Proxy-Authorization` and `Authorization` before any upstream request. It decodes the presented value
+to bytes, rejects malformed or wrong-length values, and compares all 32 bytes in constant time. A missing or mismatched
+token is the proxy's 407 challenge.
 
 **What the token proves, and to whom.** The token is per workspace and authenticates only at that workspace's own
 endpoint: the selected listener compares the presented value with its own session's token alone, so a token is worth
@@ -556,64 +554,52 @@ or the checksum database and verifies the database's signed tree.
 
 **This cache is an optimization for cross-shed reuse and never blocks a build.** Every refusal or failure on this route
 reaches the client as a miss (`GET` 404) or not-stored (`PUT` 403). The task then runs, or keeps the result it already
-produced, exactly as it would with no cache. The only exception is a credential that is not this workspace's, which is
-401 (Placement and identity). Stock Nx 23.2.1 fails a task on any other status (Busy gateway, below), so the gateway
-never answers or forwards one: drain, a closed audit sink, a stopped actor, a queue bound, a body timeout and a backend
-response head that Nx cannot read are all the method's 404/403. The audit and the log record the cause.
+produced, exactly as it would with no cache. Stock Nx 23.2.1 fails a task on any other status (Busy gateway, below), so
+the gateway never answers or forwards one: drain, a closed audit sink, a stopped actor, a queue bound, a body timeout
+and a backend response head that Nx cannot read are all the method's 404/403. The audit and the log record the cause.
 
 **The client half: an unreachable cache is a miss.** A gateway that cannot answer at all (a stopped listener, a
 host-wide stall) answers nothing the route can map. The carried Nx patch (`patches/README.md`, "A remote cache outage is
 a miss") makes the client read a refused or dropped connection, a 5xx and no result within 90 s as an outage: the lookup
 misses, the store is skipped, one line names the server and the cause, and that process asks the cache nothing more. The
 90 s exceed this route's own outage answer (`GatewayTimeouts` connect 5 s plus response head 60 s), so the gateway's
-audited miss decides whenever the gateway runs. 401 and every other status Nx reads as misconfiguration still fail the
-run.
+audited miss decides whenever the gateway runs. Every other status Nx reads as misconfiguration still fails the run.
 
-Every checkout may read its project's accepted task artifacts, during ordinary iteration as well as adoption. Nx keeps
-its local artifact cache and task database private to that checkout (16_build_volumes.md); this route shares neither
-path nor live database. The controller wires stock Nx's `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` to `<base>/nx`, without a
-trailing slash, and its access token to that endpoint's read authority. The backend's bearer credentials remain
-host-side. No scratch cache receives WIP artifacts.
+**No credential: one user, localhost** (Danny tg#10456). The store is one host directory of one user, served on
+loopback. A hash names a task's inputs, so a result stored under it by any shed is as trustworthy as that shed's own
+local cache: a task that builds under an input it does not declare poisons the local cache exactly as it would this one,
+and the remedy for both is declaring the input (16_build_volumes.md). So the route authenticates nothing, and no token,
+principal, transaction or receipt guards it. What it keeps is what correctness needs: project namespacing, the key
+charset, atomic first-writer-wins writes, and the eviction bound (03_caches.md, "Nx accepted-task artifact service").
 
-**Trust domain: one user, unverified producers.** This store is one host directory owned by one user. Every writer is
-that user's process, so the write boundary does not defend against a malicious writer, and CREEP's multi-tenant attacker
-(CVE-2025-36852) is not this deployment's threat. It defends against an unverified producer instead. A shed can build
-under an input its task does not declare, such as another toolchain resolved through a shed-private `tools/bin`. The
-result is stored under a hash that is correct by the declared inputs. The store is first-writer-wins: `link(2)` answers
-409 to every later writer, so that artifact becomes permanent. Every later reader would restore it, including a land
-gate and main's adoption checks, which must never be fed an artifact nobody verified. Only a land publishes, because the
-land gate verified its hashes. A shed holds read authority only. Its `PUT` 403 is an authority refusal, not a
-reachability failure: the backend is a local process. That 403 costs the shed the archive work below and the benefit of
-publishing, never the task.
+**Sheds read; a land writes** (tg#1780, tg#1782). Every checkout reads its project's results, during ordinary iteration
+as well as adoption. Nx keeps its local artifact cache and task database private to that checkout (16_build_volumes.md);
+this route shares neither path nor live database. The controller wires stock Nx's `NX_SELF_HOSTED_REMOTE_CACHE_SERVER`
+to `<base>/nx`, without a trailing slash, beside `NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true`, in `.cowshed/env` and in
+every job's environment (03_caches.md), and no access token. The read-only flag is configuration, not authority: the
+carried Nx patch makes a read-only client answer every store `false` before it builds an archive (patches/README.md, "A
+shed reads the remote cache and never stores"), so work in progress is never stored and never costs an upload. The
+gateway itself would store a shed's `PUT`; nothing configured sends one.
 
 The listener or Linux socket selects the workspace, its session selects the project, and only the exact, query-free
-`/nx/v1/cache/{hash}` route accepts Nx's `Authorization: Bearer` credential. A hash is one validated Nx task key: 1-128
-characters of `[A-Za-z0-9_-]`, the backend's own key charset. Nx uses a task's hash verbatim as its cache key, so this
-admits stock Nx's decimal hash and any hex, decimal or base64url value an executor's custom hasher returns; it excludes
-`/`, `\`, `.` and `%`, so a key is never a filesystem path or an escaped one. A final segment outside it does not name
-this route and is a 400 `invalid-target`. The gateway forwards `GET` to the selected project's backend as
-`GET /v1/cache/{hash}`. The publication receipt and the publication capability validate hashes by this same rule. An
-ordinary workspace credential has read authority only: `PUT` is 403 before any artifact is staged or forwarded. A
-sibling token, an expired transaction token, an ambiguous path, or a different project never acquires write authority.
+`/nx/v1/cache/{hash}` route reaches that project's backend, so a hash in one project never names another project's
+archive. A hash is one validated Nx task key: 1-128 characters of `[A-Za-z0-9_-]`, the backend's own key charset. Nx
+uses a task's hash verbatim as its cache key, so this admits stock Nx's decimal hash and any hex, decimal or base64url
+value an executor's custom hasher returns; it excludes `/`, `\`, `.` and `%`, so a key is never a filesystem path or an
+escaped one. A final segment outside it does not name this route and is a 400 `invalid-target`. The gateway forwards
+`GET` and `PUT` to the selected project's backend as `GET`/`PUT /v1/cache/{hash}`; any other method is denied before a
+backend starts or is waited for.
 
-Publication is private to an active, authorized land plan. The authorized initiation accepts the caller's exact expected
-source head; external source review remains the caller's workflow, not a gateway interpretation of a model's ACK. Before
-issuing temporary write authority, the controller requires a protected successful-check receipt. That receipt is not yet
-specified (16_build_volumes.md has no section for it), so no controller path issues write authority and no land
-publishes. When the receipt is specified, it binds the project, source incarnation, clean accepted head, successful
-check/job identities, and exact successful current task hashes. Only those hashes may be forwarded as `PUT` under that
-transaction. The ordinary worker cannot create or replace the receipt, request a publication operation, or obtain
-backend write credentials. A changed head or failed, forged, missing, or foreign receipt refuses publication. Land
-without qualification reports it explicitly and does not publish.
-
-The public publication-control lane remains removed. The actor accepts only a hash-scoped capability installed by an
-in-process caller; it does not verify a land plan or protected receipt. Publication authority remains controller-owned,
-never a public workspace operation or a standing worker grant.
-
-The controller revokes the temporary authority on completion, refusal, cancellation, or interrupted land. It is not
-written to `.cowshed/env`, shell configuration, source, or a later job's environment. Main's adoption checks and every
-ordinary exec remain read-only. A gateway restart restores ordinary read sessions from inventory, never a writer from an
-audit trail or an unfinished transaction.
+**Publication.** A land publishes after its gate passes. `cowshed land` attributes each passed check's Nx run from the
+run summary the check's Nx wrote (16_build_volumes.md, "Land step 7 source capture"), then runs `node - <root> <hashes>`
+with `build_volume/nx_publish.js` on stdin as a gate-class job of the landing workspace. The job stores every attributed
+task result from that checkout's own Nx cache through the workspace's own route, with plain `PUT`s from the stock native
+`HttpRemoteCache` itself, which the read-only flag the job also carries does not wrap: local hits as well as executed
+tasks, since stock Nx stores only what it executed. A task Nx does not cache, or one that failed, is skipped; a key
+already stored is counted, never replaced. The cache never blocks a land: a failed publish is said on stderr with its
+cause, and the land goes on. A repository whose land gates outside `cowshed land` publishes its gate's run with the same
+script (SmoothBricks: `tooling/land-host.sh` through `tooling/land-publish.ts`, after its host gate and Linux cross
+check pass).
 
 The existing artifact server is a controller-owned foreground child. The gateway passes `--exit-on-stdin-eof` and
 retains the write end of its stdin pipe; EOF drains the server and releases its store lock. A gateway SIGKILL closes
@@ -629,9 +615,9 @@ and unavailable FFI has no fallback. A second process must refuse before staging
 proofs pin exclusion and lifetime. Report native macOS proof separately from Linux compile/typecheck coverage.
 
 The gateway preserves the existing self-hosted cache protocol and artifact bytes. `GET` returns 200 for a complete
-artifact or 404 for a miss; `PUT` returns 200 for a publication, 409 for an existing key, or 403 for a read-only
-refusal. An incomplete, interrupted, or evicted artifact is never a successful empty restore. Project backend lifecycle
-and bounded eviction belong to 03_caches.md.
+artifact or 404 for a miss; `PUT` returns 200 for a stored archive, 409 for an existing key, or 403 for a refusal (the
+backend's full staging budget, or an outage below). An incomplete, interrupted, or evicted artifact is never a
+successful empty restore. Project backend lifecycle and bounded eviction belong to 03_caches.md.
 
 **Backend outage.** Before committing a response head, the gateway maps a project's backend startup, health, connect,
 handshake or response-head failure, and any upstream status Nx cannot read (5xx, or anything but `GET` 200/404 and `PUT`
@@ -648,8 +634,8 @@ reads every status but `GET` 200/404 and `PUT` 200/403/409 as a fatal misconfigu
 half", above); every other status stays fatal. So a busy gateway answers what a cache may always answer, not served now,
 and records why in its audit. Like an outage, that 404 is not evidence of absence and never counts as a hit. The price
 is work, not failure: a lookup wave wider than the queue re-runs its refused tasks, even ones the cache holds, and a
-refused publication is not stored. That extra work is the designed cost of a busy gateway, not a regression. Drain and
-audit fail-closed keep their own audit status and classification, not a backend outage's, but answer the same 404/403.
+refused `PUT` is not stored. That extra work is the designed cost of a busy gateway, not a regression. Drain and audit
+fail-closed keep their own audit status and classification, not a backend outage's, but answer the same 404/403.
 Unsupported Nx methods are denied before starting or waiting for a backend.
 
 **Backend lifecycle isolation.** Each repository's backend is supervised by a per-repository lifecycle state
@@ -671,19 +657,18 @@ restarted.
 started, failed to start or never started to `Clearing`: the backend stops, the store is cleared under its own lease
 (03_caches.md, "Nx accepted-task artifact service"), and the state is forgotten when the clear reports, so the next
 request starts a fresh backend. Every request meanwhile is refused as in the outage above, and no start begins. A
-repository with an admitted or queued Nx request or a publication is refused, naming the work by workspace; one that is
-`Starting` or already `Clearing`, or whose backend the host configured, is refused too.
+repository with an admitted or queued Nx request is refused, naming the work by workspace; one that is `Starting` or
+already `Clearing`, or whose backend the host configured, is refused too.
 
 **Outage before and after the response head.** The statuses above apply only before the response head. Once the upstream
 commits a success head, the gateway keeps `200` and cannot change it. A body that then fails, times out, or is dropped
 ends early, and its audit event is `failed` with classification `nx-transfer-failed`, never a hit or a completed read. A
 client must treat a short body as a failed read; the gateway stages and buffers nothing to hide the cut.
 
-**Read-only is an authority guarantee, not a client-cost claim.** Stock Nx 23.2.1's `native/cache/http_remote_cache.rs`
-has no independent read-only/skip-upload option. Its `store` first builds an in-memory gzip tar archive, then attempts
-`PUT`; 403 returns false without failing the task. `skipRemoteCache` disables reads too. Do not patch Nx or hide the
-attempts: measure archive construction, denied request bytes/time and backend publication separately (13_telemetry.md).
-A read-only WIP run may attempt uploads but publishes zero artifacts.
+**A shed never uploads.** Stock Nx 23.2.1's `native/cache/http_remote_cache.rs` has no read-only option: its `store`
+first builds an in-memory gzip tar archive, then attempts `PUT`, and `skipRemoteCache` disables reads too. The carried
+patch's read-only client (Sheds read; a land writes, above) answers every store before that archive exists, so a shed's
+run costs its project cache lookups only. Measure lookups and a land's publication separately (13_telemetry.md).
 
 ### `/sim/` — personal-session simulator broker (posture B)
 

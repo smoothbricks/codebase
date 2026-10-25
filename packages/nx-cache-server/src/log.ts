@@ -1,10 +1,9 @@
 /**
  * One line per event, logfmt, on stderr. stdout is reserved for the machine-readable readiness
- * record consumed by the host supervisor. Every event names its key, principal label and outcome.
+ * record consumed by the host supervisor. Every event names its key and outcome.
  * The supervisor stamps and collects these events; the server owns no permanent text log.
  *
- * No secret ever appears here. A principal is named by its configured label (`config.ts`), never by
- * its token, and every value that came from a request goes through `logValue` so a crafted cache key
+ * Every value that came from a request goes through `logValue`, so a crafted cache key
  * cannot forge a field or split one event across two lines.
  */
 

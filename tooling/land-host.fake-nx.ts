@@ -6,7 +6,7 @@
 // FIX_STATE names a directory holding `plan.json`, an array of calls. A call whose arguments are not the next
 // scripted one, or one past the end of the plan, exits 97 or 98 and says so: the script under test did something the
 // scenario did not expect. An expected argument ending in `*` matches any argument that starts the same way.
-import { appendFileSync, existsSync, fstatSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, fstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Call } from './land-host.plan.ts';
 
@@ -43,6 +43,30 @@ if (call.requireFileOutput) {
     process.stderr.write('fake nx: output must go directly to one regular capture file\n');
     process.exit(96);
   }
+}
+
+if (call.exit === 0 && args.includes('gate')) {
+  // What a gate run leaves for land-publish.ts to read: a run summary whose tasks carry the hashes it publishes.
+  mkdirSync(join('.nx', 'cache'), { recursive: true });
+  writeFileSync(
+    join('.nx', 'cache', 'run.json'),
+    JSON.stringify({
+      run: { command: `nx ${args.join(' ')}`, startTime: '', endTime: '', inner: false },
+      tasks: [
+        {
+          taskId: 'gate',
+          target: 'gate',
+          projectName: 'cowshed',
+          hash: 'gate-hash',
+          startTime: '',
+          endTime: '',
+          params: '',
+          cacheStatus: 'local-cache-hit',
+          status: 0,
+        },
+      ],
+    }),
+  );
 }
 
 if (call.output !== undefined) {

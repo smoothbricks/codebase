@@ -1,23 +1,21 @@
-//! Accepted-project Nx cache authority (05_gateway.md). Backend credentials never reach a
-//! workspace. Publication is an ephemeral in-process capability, never a standing session grant.
+//! The project Nx cache route (05_gateway.md "`/nx/v1/cache/{hash}`"): every workspace of a
+//! project reads and writes that project's localhost store; no credential guards it.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fmt,
     net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use cowshed_gateway_types::{CanonicalHost, CanonicalTarget, TargetScheme, WorkspaceToken};
+use cowshed_gateway_types::{CanonicalHost, CanonicalTarget, TargetScheme};
 
 /// One controller-owned project backend, using Nx's unchanged GET/PUT protocol.
 #[derive(Clone, Debug)]
 pub struct NxCacheBackend {
     pub repo_id: String,
     pub address: SocketAddr,
-    pub read_token: WorkspaceToken,
-    pub write_token: WorkspaceToken,
     /// Staging files reclaimed by startup recovery: an observation, never authority.
     pub reclaimed_staging_files: u64,
 }
@@ -29,9 +27,6 @@ impl NxCacheBackend {
         if !self.address.ip().is_loopback() || self.address.port() == 0 {
             return Err("Nx backend must have a nonzero loopback address");
         }
-        if self.read_token.matches(&self.write_token) {
-            return Err("Nx backend read and write credentials must differ");
-        }
         Ok(())
     }
 
@@ -41,39 +36,6 @@ impl NxCacheBackend {
             host: CanonicalHost::Ip(self.address.ip()),
             port: self.address.port(),
         }
-    }
-}
-
-/// A hash-scoped capability installed by an in-process caller. The qualified production land
-/// caller is deferred; this actor API does not itself verify a land plan or protected receipt.
-#[derive(Clone, Debug)]
-pub struct NxPublication {
-    pub workspace_id: String,
-    pub repo_id: String,
-    pub expected_revision: u64,
-    pub accepted_head: String,
-    pub hashes: BTreeSet<String>,
-    pub token: WorkspaceToken,
-}
-
-impl NxPublication {
-    pub(crate) fn validate(&self) -> Result<(), &'static str> {
-        cowshed_gateway_types::validate_identifier("workspace_id", &self.workspace_id)
-            .map_err(|_| "Nx publication workspace identity is invalid")?;
-        cowshed_gateway_types::validate_repo_id(&self.repo_id)
-            .map_err(|_| "Nx publication project identity is invalid")?;
-        if self.accepted_head.len() != 40
-            || !self
-                .accepted_head
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err("Nx publication must name the exact accepted source head");
-        }
-        if self.hashes.is_empty() || self.hashes.iter().any(|hash| !is_task_hash(hash)) {
-            return Err("Nx publication must name successful current task hashes");
-        }
-        Ok(())
     }
 }
 
@@ -334,25 +296,14 @@ pub(crate) async fn start_backend(
             ));
         }
     }
-    let read_token = mint_token()?;
-    let write_token = mint_token()?;
     let mut child = tokio::process::Command::new(&bun)
         .arg(&config.script)
         .arg("--exit-on-stdin-eof")
         .env_clear()
         .env("NX_CACHE_SERVER_DIR", project.join("entries"))
-        .env("NX_CACHE_SERVER_HOST", "127.0.0.1")
         .env("NX_CACHE_SERVER_PORT", "0")
         .env("NX_CACHE_SERVER_MAX_BYTES", config.max_bytes.to_string())
         .env("NX_CACHE_SERVER_CAP_BYTES", config.cap_bytes.to_string())
-        .env(
-            "NX_CACHE_SERVER_READ_TOKENS",
-            format!("workspace:{}", read_token.encode()),
-        )
-        .env(
-            "NX_CACHE_SERVER_WRITE_TOKENS",
-            format!("accepted:{}", write_token.encode()),
-        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -399,8 +350,6 @@ pub(crate) async fn start_backend(
             let backend = NxCacheBackend {
                 repo_id: repo_id.to_owned(),
                 address: SocketAddr::from(([127, 0, 0, 1], port)),
-                read_token,
-                write_token,
                 reclaimed_staging_files,
             };
             backend.validate().map_err(str::to_owned)?;
@@ -428,13 +377,11 @@ pub struct NxCacheUse {
     pub in_flight: BTreeMap<String, usize>,
     /// Nx requests waiting for an admission slot or for the backend's start.
     pub queued: BTreeMap<String, usize>,
-    /// Workspaces holding publication authority: a land publishing its task hashes.
-    pub publishing: BTreeSet<String>,
 }
 
 impl NxCacheUse {
     pub fn is_idle(&self) -> bool {
-        self.in_flight.is_empty() && self.queued.is_empty() && self.publishing.is_empty()
+        self.in_flight.is_empty() && self.queued.is_empty()
     }
 }
 
@@ -450,9 +397,6 @@ impl fmt::Display for NxCacheUse {
             parts.push(format!(
                 "{count} Nx request(s) queued from workspace {workspace}"
             ));
-        }
-        for workspace in &self.publishing {
-            parts.push(format!("a land publishing from workspace {workspace}"));
         }
         formatter.write_str(&parts.join(", "))
     }
@@ -579,12 +523,6 @@ pub(crate) fn clear_store(project: &Path) -> Result<u64, NxCacheClearRefusal> {
         Err(error) => return Err(failed("delete Nx cache SIEVE cursor", &hand, error)),
     }
     Ok(deleted)
-}
-
-pub(crate) fn mint_token() -> Result<WorkspaceToken, String> {
-    let mut bytes = zeroize::Zeroizing::new([0_u8; 32]);
-    getrandom::fill(&mut bytes[..]).map_err(|error| format!("mint Nx cache authority: {error}"))?;
-    Ok(WorkspaceToken::from_bytes(*bytes))
 }
 
 #[cfg(test)]
