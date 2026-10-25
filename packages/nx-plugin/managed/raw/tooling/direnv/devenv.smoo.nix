@@ -95,12 +95,13 @@
     ln -s ${pkgs.python3Packages.pyflakes}/bin/pyflakes "$out/bin/pyflakes"
   '';
 
-  # Builds every Linux artifact and the cross clippy; see `profiles.linux-cross`
-  # below for where it applies and why. The rust-std set is every Linux triple
-  # an artifact ships for except x86_64-unknown-linux-gnu, which the base shell
-  # already carries.
+  # Builds every Linux Rust artifact and the cross clippy; see
+  # `profiles.linux-cross` below for where it applies and why. zig itself is in
+  # the base shell (see `pkgs.zig` in `packages`). The rust-std set is every
+  # Linux triple an artifact ships for except x86_64-unknown-linux-gnu, which the
+  # base shell already carries.
   linuxToolchain = {
-    packages = [pkgs.zig pkgs.cargo-zigbuild];
+    packages = [pkgs.cargo-zigbuild];
     languages.rust.targets = [
       "aarch64-unknown-linux-gnu"
       "x86_64-unknown-linux-musl"
@@ -265,10 +266,10 @@ in {
       ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux linuxToolchain.languages.rust.targets;
   };
 
-  # The Linux toolchain: zig, driven through cargo-zigbuild, plus the Linux
-  # rust-std set. It builds every published Linux artifact — static musl CLIs,
-  # glibc 2.17 N-API addons — and `check:linux`'s cross clippy, with the same
-  # command on every host. zig carries glibc symbol-version stubs for every
+  # The Linux Rust toolchain: cargo-zigbuild driving zig, plus the Linux
+  # rust-std set. It builds every published Linux Rust artifact — static musl
+  # CLIs, glibc 2.17 N-API addons — and `check:linux`'s cross clippy, with the
+  # same command on every host. zig carries glibc symbol-version stubs for every
   # glibc and the musl sources inside its own store path, so nothing on the
   # build machine reaches the artifact: no loader path, no RUNPATH, no build
   # host's glibc floor. cargo-zigbuild supplies the `zig cc` shims and per-triple
@@ -277,10 +278,13 @@ in {
   # A Linux host carries it in the base shell, because its ordinary `build`
   # includes its own platform's artifacts. A macOS host opts in through the
   # `linux-cross` profile, activated by `devenv -P linux-cross` and driven by
-  # the root `check:linux` script: zig is a 380 MiB closure, about 0.9 GiB with
-  # the three rust-std targets, and nothing else on Darwin needs it. devenv 2.2.3
-  # has first-class profiles, so this is one gated module in the shared file
-  # rather than a second config directory that would re-import and re-pin
+  # the root `check:linux` script: the three rust-std targets are about 0.5 GiB
+  # and nothing else on Darwin needs them. zig is not in the profile: every
+  # host's base shell carries it, because the scriptc-<arch>-<family> targets
+  # compile every platform's executables through `zig cc` on every host, the
+  # host's own platform included (see `pkgs.zig` in `packages` below). devenv
+  # 2.2.3 has first-class profiles, so this is one gated module in the shared
+  # file rather than a second config directory that would re-import and re-pin
   # everything here.
   #
   # The profile supplies the toolchain and nothing else. CARGO_BUILD_TARGET is
@@ -406,6 +410,16 @@ in {
       # the channel above selects — is unavailable. `smoo monorepo validate` runs
       # `cargo hakari verify` for a workspace that took that route.
       pkgs.cargo-hakari
+      # The C compiler driver of every scriptc-<arch>-<family> target, on every
+      # host: scriptc refuses an SCRIPTC_TARGET build unless SCRIPTC_CC=zigcc
+      # (no other driver has cross sysroots), and the host's own platform builds
+      # the same way, so the darwin-x64 binary a macOS publish leg builds on an
+      # arm64 runner and the darwin-arm64 one a developer builds take one path.
+      # A profile cannot carry it: repair-pending rebuilds historical release
+      # commits in a plain `devenv shell`, which passes no profile (see the note
+      # on profiles below). The closure is about 380 MiB, fetched once per Nix
+      # store, not per checkout.
+      pkgs.zig
     ]
     ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux ([pkgs.chromium] ++ linuxToolchain.packages);
 

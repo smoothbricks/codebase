@@ -58,6 +58,10 @@
         "tslib": "^2.8.1",
       },
       "devDependencies": {
+        "@scriptc/runtime-darwin-arm64": "0.4.4",
+        "@scriptc/runtime-darwin-x64": "0.4.4",
+        "@scriptc/runtime-linux-arm64-musl": "0.4.4",
+        "@scriptc/runtime-linux-x64-musl": "0.4.4",
         "@smoothbricks/cargo-retain": "workspace:*",
         "@smoothbricks/validation": "workspace:*",
         "scriptc": "0.4.4",
@@ -162,6 +166,10 @@
         "tslib": "^2.8.1",
       },
       "devDependencies": {
+        "@scriptc/runtime-darwin-arm64": "0.4.4",
+        "@scriptc/runtime-darwin-x64": "0.4.4",
+        "@scriptc/runtime-linux-arm64-musl": "0.4.4",
+        "@scriptc/runtime-linux-x64-musl": "0.4.4",
         "@smoothbricks/validation": "workspace:*",
         "scriptc": "0.4.4",
       },
@@ -261,6 +269,10 @@
         "tslib": "^2.8.1",
       },
       "devDependencies": {
+        "@scriptc/runtime-darwin-arm64": "0.4.4",
+        "@scriptc/runtime-darwin-x64": "0.4.4",
+        "@scriptc/runtime-linux-arm64-musl": "0.4.4",
+        "@scriptc/runtime-linux-x64-musl": "0.4.4",
         "@smoothbricks/validation": "workspace:*",
         "scriptc": "0.4.4",
       },
@@ -1802,6 +1814,14 @@
     "@scriptc/cli-linux-x64-musl": ["@scriptc/cli-linux-x64-musl@0.4.4", "", { "os": "linux", "cpu": "x64" }, "sha512-6hA1YX0Ko1beXoi1O+uMUOg7qiSJePv0PSsLVc6e6lwJZCDU+pzkCZKX/vNVDGtK1mXj3T8RBZq4EUpIMtJUJA=="],
 
     "@scriptc/cli-win32-x64-msvc": ["@scriptc/cli-win32-x64-msvc@0.4.4", "", { "os": "win32", "cpu": "x64" }, "sha512-VpX2lS6xZUdeZCHiJ1+RGlhJY97AV0ZgkOOVxewIBWrlo6zyz/vsylxtiLAmFgpfz0ts3mDkd0cFmFdFVgS7cg=="],
+
+    "@scriptc/runtime-darwin-arm64": ["@scriptc/runtime-darwin-arm64@0.4.4", "", {}, "sha512-OsNhcroSH5dRv5mmXaL+XCwL5HIUQgB27VLEiX0IHOlBnuVcsQhOJ4sfHvwDZCqXcqLlHtqmWZuYpwIo15cXVQ=="],
+
+    "@scriptc/runtime-darwin-x64": ["@scriptc/runtime-darwin-x64@0.4.4", "", {}, "sha512-eqpkTvH+odDq8+oWfh3jip71cS8d9zQSDCmvqtX2gmFQw1n06B9jSyIw4IjnKskZBC12JqaBJ0P/KoPqgJ90EA=="],
+
+    "@scriptc/runtime-linux-arm64-musl": ["@scriptc/runtime-linux-arm64-musl@0.4.4", "", {}, "sha512-aMErcCTviEi2bv4a4MbL6d8GWJ6Go3FE8+xem3ws6TlZNjxnfqNHJB6Ks6AuJ5AXHxa2h//C4wKUb06sMTvbTw=="],
+
+    "@scriptc/runtime-linux-x64-musl": ["@scriptc/runtime-linux-x64-musl@0.4.4", "", {}, "sha512-a0ujlTY9IAuyliYmAj4Jtah7VpyGeWF0gD5AbxdVvXteocTXbAPo8YQyKx1ul9b6uNaVjSvV8+zkM4ZVgLsL8w=="],
 
     "@shikijs/core": ["@shikijs/core@4.3.1", "", { "dependencies": { "@shikijs/primitive": "4.3.1", "@shikijs/types": "4.3.1", "@shikijs/vscode-textmate": "^10.0.2", "@types/hast": "^3.0.4", "hast-util-to-html": "^9.0.5" } }, "sha512-ANMDxuaPsNMdDC1m4vfvhlDmJweMwkE5XitTwrq2rWHx5jM+dlm4MmHt2PP6t0uejfR77SuhrhJ0zEijIF/uhA=="],
 

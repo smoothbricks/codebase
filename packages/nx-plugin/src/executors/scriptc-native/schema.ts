@@ -1,12 +1,12 @@
 export interface ScriptcNativeOptions {
   /** The project root, relative to the workspace root. */
   cwd: string;
-  /** The host's directory under `<outputRoot>/bin` (`darwin-arm64`); an option so it keys the task's hash. */
-  platform: string;
-  /** The JavaScript `tsc-js` emitted, relative to cwd. */
-  javascriptRoot: string;
-  /** Where `tsconfig.json` and `bin/<platform>/<name>` are written, relative to cwd. */
-  outputRoot: string;
-  /** Each executable's name and its emitted JavaScript entry, relative to cwd. */
+  /** The package's emit config (`tsconfig.lib.json`), relative to cwd: the run emits it, transformed, into staging. */
+  tsConfig: string;
+  /** The triple `SCRIPTC_TARGET` names (`aarch64-linux-musl`). */
+  triple: string;
+  /** Where the executables are written (`dist/bin/linux-arm64`), relative to cwd. */
+  outputDirectory: string;
+  /** Each executable's name and its entry module, relative to the emitted JavaScript's root. */
   entries: Record<string, string>;
 }

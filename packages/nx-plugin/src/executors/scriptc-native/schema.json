@@ -2,33 +2,33 @@
   "$schema": "https://json-schema.org/schema",
   "version": 2,
   "title": "scriptc native executor",
-  "description": "Compile each package bin from its emitted JavaScript to a host executable with scriptc",
+  "description": "Compile each package bin from the package's transformed JavaScript to one platform's executable with scriptc and zig",
   "type": "object",
   "properties": {
     "cwd": {
       "type": "string",
       "description": "Project root, relative to the workspace root"
     },
-    "platform": {
+    "tsConfig": {
       "type": "string",
-      "description": "Host directory under <outputRoot>/bin, e.g. darwin-arm64"
+      "description": "The package's emit config, relative to cwd, which the run emits with ttsc into private staging"
     },
-    "javascriptRoot": {
+    "triple": {
       "type": "string",
-      "description": "The JavaScript tsc-js emitted, relative to cwd"
+      "description": "The triple SCRIPTC_TARGET names, e.g. aarch64-linux-musl"
     },
-    "outputRoot": {
+    "outputDirectory": {
       "type": "string",
-      "description": "Directory receiving tsconfig.json and bin/<platform>/<name>, relative to cwd"
+      "description": "Directory receiving the executables, e.g. dist/bin/linux-arm64, relative to cwd"
     },
     "entries": {
       "type": "object",
-      "description": "Executable name to its emitted JavaScript entry, relative to cwd",
+      "description": "Executable name to its entry module, relative to the emitted JavaScript's root",
       "additionalProperties": {
         "type": "string"
       }
     }
   },
-  "required": ["cwd", "platform", "javascriptRoot", "outputRoot", "entries"],
+  "required": ["cwd", "tsConfig", "triple", "outputDirectory", "entries"],
   "additionalProperties": false
 }

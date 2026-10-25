@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import {
-  EMITTED_JAVASCRIPT_TSCONFIG,
+  type EmitInvocation,
   runScriptcNative,
   type ScriptcInvocation,
+  type ScriptcRunner,
   untransformedTypiaCalls,
 } from './executor.js';
 
@@ -16,52 +17,62 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-/** A workspace with one package whose emitted JavaScript is `files` under `dist/ts`. */
-function workspace(files: Record<string, string>): { root: string; project: string } {
+function workspace(): { root: string; project: string } {
   const root = mkdtempSync(join(tmpdir(), 'scriptc-native-'));
   roots.push(root);
   const project = join(root, 'packages/tool');
-  for (const [path, text] of Object.entries(files)) {
-    mkdirSync(dirname(join(project, 'dist/ts', path)), { recursive: true });
-    writeFileSync(join(project, 'dist/ts', path), text);
-  }
+  mkdirSync(project, { recursive: true });
+  writeFileSync(join(project, 'tsconfig.lib.json'), '{"compilerOptions":{"rootDir":"src","outDir":"dist/ts"}}\n');
   return { root, project };
+}
+
+function write(directory: string, files: Record<string, string>): void {
+  for (const [path, text] of Object.entries(files)) {
+    mkdirSync(dirname(join(directory, path)), { recursive: true });
+    writeFileSync(join(directory, path), text);
+  }
 }
 
 const options = {
   cwd: 'packages/tool',
-  platform: 'darwin-arm64',
-  javascriptRoot: 'dist/ts',
-  outputRoot: 'dist',
-  entries: { 'smoo-nx-tool': 'dist/ts/bin/smoo-nx-tool.js' },
+  tsConfig: 'tsconfig.lib.json',
+  triple: 'aarch64-linux-musl',
+  outputDirectory: 'dist/bin/linux-arm64',
+  entries: { 'smoo-nx-tool': 'bin/smoo-nx-tool.js' },
 };
 
+/** A runner whose emit writes `emitted` into the staging directory, recording what each step saw. */
+function fake(emitted: Record<string, string>, builds: (count: number) => boolean) {
+  const emits: Array<EmitInvocation & { overlay: unknown }> = [];
+  const runs: Array<ScriptcInvocation & { staged: string[] }> = [];
+  const runner: ScriptcRunner = {
+    emit: async (invocation) => {
+      emits.push({ ...invocation, overlay: JSON.parse(readFileSync(invocation.tsconfig, 'utf8')) });
+      write(invocation.outDir, emitted);
+      return true;
+    },
+    build: async (invocation) => {
+      runs.push({ ...invocation, staged: readdirSync(dirname(dirname(invocation.entry))).sort() });
+      return builds(runs.length);
+    },
+  };
+  return { runner, emits, runs };
+}
+
 describe('scriptc-native', () => {
-  it('names every call through a typia binding that the transform left behind, and no runtime member read', () => {
-    const { project } = workspace({
+  it('names every member access on a typia import binding that the transform left behind', () => {
+    const { project } = workspace();
+    write(join(project, 'staged'), {
       'bin/smoo-nx-tool.js': "import { run } from '../tool.js';\nrun();\n",
       'tool.js': [
         "import typia, { TypeGuardError } from 'typia';",
         'export const isEntry = typia.createIs();',
         'export function run(raw) {',
         '  return typia.json.assertParse(raw) instanceof TypeGuardError;',
-        '  if (raw instanceof typia.TypeGuardError) throw new typia.TypeGuardError(raw);',
         '}',
         '',
       ].join('\n'),
-      'namespace.js': "import * as t from 'typia/lib/index.js';\nexport const check = t['assert'](input);\n",
-      'named.js': [
-        "import { createIs, TypeGuardError } from 'typia';",
-        'export const isEntry = createIs();',
-        'export const isError = (error) => error instanceof TypeGuardError;',
-        '',
-      ].join('\n'),
-      'destructured.js': [
-        "import typia from 'typia';",
-        'const { assertParse } = typia.json;',
-        'export const parse = (raw) => assertParse(raw);',
-        '',
-      ].join('\n'),
+      'namespace.js': "import * as t from 'typia/lib/index.js';\nexport const check = t['assert'];\n",
       // ttsc keeps the import after replacing every call; a kept import is not a call.
       'transformed.js': "import typia from 'typia';\nexport const is = (input) => typeof input === 'string';\n",
       // A name the module never imported from typia, and the text of a call, are not calls.
@@ -69,53 +80,79 @@ describe('scriptc-native', () => {
         "const typia = { createIs: () => true };\nexport const note = 'typia.createIs()' + typia.createIs();\n",
     });
     expect(
-      untransformedTypiaCalls(join(project, 'dist/ts')).map(
+      untransformedTypiaCalls(join(project, 'staged')).map(
         (call) => `${call.file.slice(project.length + 1)}:${call.line}:${call.column} ${call.text}`,
       ),
     ).toEqual([
-      'dist/ts/destructured.js:3:31 assertParse',
-      'dist/ts/named.js:2:24 createIs',
-      "dist/ts/namespace.js:2:22 t['assert']",
-      'dist/ts/tool.js:2:24 typia.createIs',
-      'dist/ts/tool.js:4:10 typia.json.assertParse',
+      "staged/namespace.js:2:22 t['assert']",
+      'staged/tool.js:2:24 typia.createIs',
+      'staged/tool.js:4:10 typia.json.assertParse',
     ]);
   });
 
-  it('compiles nothing while an untransformed typia call remains', async () => {
-    const { root, project } = workspace({
-      'bin/smoo-nx-tool.js': "import typia from 'typia';\nconsole.log(typia.is(process.argv[2]));\n",
-    });
-    const runs: ScriptcInvocation[] = [];
-    const result = await runScriptcNative(options, { root }, async (invocation) => {
-      runs.push(invocation);
-      return true;
-    });
-    expect(result).toEqual({ success: false });
+  it('compiles nothing while an untransformed typia call remains, and leaves no staging behind', async () => {
+    const { root, project } = workspace();
+    const { runner, runs } = fake(
+      { 'bin/smoo-nx-tool.js': "import typia from 'typia';\nconsole.log(typia.is(process.argv[2]));\n" },
+      () => true,
+    );
+    expect(await runScriptcNative(options, { root }, runner)).toEqual({ success: false });
     expect(runs).toEqual([]);
-    expect(() => readFileSync(join(project, 'dist/tsconfig.json'))).toThrow();
+    expect(existsSync(join(project, 'dist/bin'))).toBe(false);
+    expect(readdirSync(join(project, '.cache/scriptc'))).toEqual([]);
+    expect(readdirSync(project).sort()).toEqual(['.cache', 'tsconfig.lib.json']);
   });
 
-  it('builds each bin into dist/bin/<platform> under the emitted JavaScript config, stopping at a failed build', async () => {
-    const { root, project } = workspace({ 'bin/smoo-nx-tool.js': 'console.log(1);\n', 'bin/other.js': '' });
-    const runs: ScriptcInvocation[] = [];
-    const two = { ...options, entries: { ...options.entries, other: 'dist/ts/bin/other.js' } };
-    const result = await runScriptcNative(two, { root }, async (invocation) => {
-      runs.push(invocation);
-      return runs.length === 1;
-    });
-    expect(result).toEqual({ success: false });
+  it("emits into its own staging, then builds each bin there for the target's triple, stopping at a failed build", async () => {
+    const { root, project } = workspace();
+    const three = { ...options, entries: { ...options.entries, other: 'bin/other.js', third: 'bin/third.js' } };
+    const { runner, emits, runs } = fake(
+      { 'bin/smoo-nx-tool.js': 'console.log(1);\n', 'bin/other.js': '' },
+      (count) => count === 1,
+    );
+    expect(await runScriptcNative(three, { root }, runner)).toEqual({ success: false });
+    const staging = emits[0]?.outDir ?? '';
+    expect(dirname(staging)).toBe(join(project, '.cache/scriptc'));
+    expect(emits).toEqual([
+      {
+        tsconfig: expect.stringMatching(/\/packages\/tool\/\.ttsc-scriptc-aarch64-linux-musl-[^/]+\.json$/),
+        outDir: staging,
+        cwd: project,
+        // An overlay of the package's own emit config, writing only JavaScript, into staging.
+        overlay: {
+          extends: './tsconfig.lib.json',
+          compilerOptions: {
+            outDir: staging,
+            composite: false,
+            declaration: false,
+            declarationMap: false,
+            emitDeclarationOnly: false,
+            incremental: false,
+            sourceMap: false,
+          },
+        },
+      },
+    ]);
+    // scriptc type-checks the staged JavaScript under the strict config and module format written beside it.
+    const staged = ['bin', 'package.json', 'tsconfig.json'];
     expect(runs).toEqual([
       {
-        entry: join(project, 'dist/ts/bin/smoo-nx-tool.js'),
-        output: join(project, 'dist/bin/darwin-arm64/smoo-nx-tool'),
+        entry: join(staging, 'bin/smoo-nx-tool.js'),
+        output: join(project, 'dist/bin/linux-arm64/smoo-nx-tool'),
         cwd: project,
+        triple: 'aarch64-linux-musl',
+        staged,
       },
       {
-        entry: join(project, 'dist/ts/bin/other.js'),
-        output: join(project, 'dist/bin/darwin-arm64/other'),
+        entry: join(staging, 'bin/other.js'),
+        output: join(project, 'dist/bin/linux-arm64/other'),
         cwd: project,
+        triple: 'aarch64-linux-musl',
+        staged,
       },
     ]);
-    expect(JSON.parse(readFileSync(join(project, 'dist/tsconfig.json'), 'utf8'))).toEqual(EMITTED_JAVASCRIPT_TSCONFIG);
+    // The overlay and the staging are gone; only the executables' directory remains.
+    expect(readdirSync(join(project, '.cache/scriptc'))).toEqual([]);
+    expect(readdirSync(project).sort()).toEqual(['.cache', 'dist', 'tsconfig.lib.json']);
   });
 });

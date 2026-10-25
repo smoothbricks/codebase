@@ -29,6 +29,10 @@
     "tslib": "^2.8.1"
   },
   "devDependencies": {
+    "@scriptc/runtime-darwin-arm64": "0.4.4",
+    "@scriptc/runtime-darwin-x64": "0.4.4",
+    "@scriptc/runtime-linux-arm64-musl": "0.4.4",
+    "@scriptc/runtime-linux-x64-musl": "0.4.4",
     "@smoothbricks/validation": "workspace:*",
     "scriptc": "0.4.4"
   },

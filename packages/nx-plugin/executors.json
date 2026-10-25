@@ -23,7 +23,7 @@
     "scriptc-native": {
       "implementation": "./dist/executors/scriptc-native/executor.js",
       "schema": "./src/executors/scriptc-native/schema.json",
-      "description": "Compile each package bin from its emitted JavaScript to a host executable with scriptc"
+      "description": "Compile each package bin from the package's transformed JavaScript to one platform's executable with scriptc and zig"
     },
     "clean-outputs": {
       "implementation": "./dist/executors/clean-outputs/executor.js",

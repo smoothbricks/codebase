@@ -1,9 +1,10 @@
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { readdirSync, readFileSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { dirname, isAbsolute, join, relative } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 
 import ts from 'typescript';
 
@@ -18,14 +19,25 @@ interface ScriptcNativeResult {
   success: boolean;
 }
 
-/** One `scriptc build`: the emitted entry module and the executable it links, run from the project root. */
+/** One ttsc emit of the package's `tsconfig` (an overlay of its `tsconfig.lib.json`) into `outDir`. */
+export interface EmitInvocation {
+  readonly tsconfig: string;
+  readonly outDir: string;
+  readonly cwd: string;
+}
+
+/** One `scriptc build`: the emitted entry module and the executable it links for `triple`, run from the project root. */
 export interface ScriptcInvocation {
   readonly entry: string;
   readonly output: string;
   readonly cwd: string;
+  readonly triple: string;
 }
 
-export type ScriptcRunner = (invocation: ScriptcInvocation) => Promise<boolean>;
+export interface ScriptcRunner {
+  emit(invocation: EmitInvocation): Promise<boolean>;
+  build(invocation: ScriptcInvocation): Promise<boolean>;
+}
 
 /** A typia call the transform left in emitted JavaScript: it throws at run time instead of validating. */
 export interface UntransformedTypiaCall {
@@ -51,42 +63,73 @@ export const EMITTED_JAVASCRIPT_TSCONFIG = {
   },
 } as const;
 
+/** Where a run stages its emit: inside the project, so the emitted JavaScript resolves the project's dependencies. */
+const STAGING_DIRECTORY = '.cache/scriptc';
+
 export default function scriptcNativeExecutor(
   options: ScriptcNativeOptions,
   context: ScriptcNativeContext,
 ): Promise<ScriptcNativeResult> {
-  return runScriptcNative(options, context, runScriptc);
+  return runScriptcNative(options, context, { emit: runTtsc, build: runScriptc });
 }
 
+/**
+ * Every platform's run emits on its own: the four targets of a package run side by side and are collected on different
+ * hosts, so none of them reads or writes another's JavaScript, and the emit is no output of any of them.
+ */
 export async function runScriptcNative(
   options: ScriptcNativeOptions,
   context: ScriptcNativeContext,
   runner: ScriptcRunner,
 ): Promise<ScriptcNativeResult> {
   const cwd = isAbsolute(options.cwd) ? options.cwd : join(context.root, options.cwd);
-  const untransformed = untransformedTypiaCalls(join(cwd, options.javascriptRoot));
-  for (const call of untransformed) {
-    console.error(
-      'scriptc-native: ' +
-        relative(context.root, call.file) +
-        ':' +
-        call.line +
-        ':' +
-        call.column +
-        ': untransformed ' +
-        call.text +
-        ': ttsc emitted this typia call as written, which it does when the emitting package does not list typia itself',
-    );
+  const run = `${options.triple}-${process.pid}-${randomUUID()}`;
+  const staging = join(cwd, STAGING_DIRECTORY, run);
+  const overlay = join(cwd, `.ttsc-scriptc-${run}.json`);
+  const tsconfig = {
+    extends: `./${basename(options.tsConfig)}`,
+    compilerOptions: {
+      outDir: staging,
+      composite: false,
+      declaration: false,
+      declarationMap: false,
+      emitDeclarationOnly: false,
+      incremental: false,
+      sourceMap: false,
+    },
+  };
+  await writeFile(overlay, `${JSON.stringify(tsconfig, null, 2)}\n`, { flag: 'wx' });
+  try {
+    if (!(await runner.emit({ tsconfig: overlay, outDir: staging, cwd }))) return { success: false };
+    const untransformed = untransformedTypiaCalls(staging);
+    for (const call of untransformed) {
+      console.error(
+        'scriptc-native: ' +
+          relative(context.root, call.file) +
+          ':' +
+          call.line +
+          ':' +
+          call.column +
+          ': untransformed ' +
+          call.text +
+          ': ttsc emitted this typia call as written, which it does when the emitting package does not list typia itself',
+      );
+    }
+    if (untransformed.length > 0) return { success: false };
+    // The nearest configs of the emitted JavaScript: scriptc's type-check, and the module format the sources were written in.
+    await writeFile(join(staging, 'tsconfig.json'), `${JSON.stringify(EMITTED_JAVASCRIPT_TSCONFIG, null, 2)}\n`);
+    await writeFile(join(staging, 'package.json'), `${JSON.stringify({ type: 'module' })}\n`);
+    const binaries = join(cwd, options.outputDirectory);
+    await mkdir(binaries, { recursive: true });
+    for (const [name, entry] of Object.entries(options.entries)) {
+      const invocation = { entry: join(staging, entry), output: join(binaries, name), cwd, triple: options.triple };
+      if (!(await runner.build(invocation))) return { success: false };
+    }
+    return { success: true };
+  } finally {
+    await rm(overlay, { force: true });
+    await rm(staging, { recursive: true, force: true });
   }
-  if (untransformed.length > 0) return { success: false };
-  const outputRoot = join(cwd, options.outputRoot);
-  const binaries = join(outputRoot, 'bin', options.platform);
-  await mkdir(binaries, { recursive: true });
-  await writeFile(join(outputRoot, 'tsconfig.json'), `${JSON.stringify(EMITTED_JAVASCRIPT_TSCONFIG, null, 2)}\n`);
-  for (const [name, entry] of Object.entries(options.entries)) {
-    if (!(await runner({ entry: join(cwd, entry), output: join(binaries, name), cwd }))) return { success: false };
-  }
-  return { success: true };
 }
 
 /**
@@ -176,18 +219,36 @@ function scriptcCompiler(cwd: string): string {
   return join(dirname(manifestPath), bin);
 }
 
+async function runTtsc(invocation: EmitInvocation): Promise<boolean> {
+  return exited(
+    'ttsc',
+    spawn('ttsc', ['-p', invocation.tsconfig, '--emit'], { cwd: invocation.cwd, stdio: 'inherit' }),
+  );
+}
+
 async function runScriptc(invocation: ScriptcInvocation): Promise<boolean> {
+  // Every triple, the host's own included, builds the same way: scriptc refuses a SCRIPTC_TARGET build unless zig is
+  // its C compiler, since no other driver carries the other platforms' sysroots. zig is found on PATH (devenv.smoo.nix).
   // The LLVM IR scriptc keeps beside an executable by default is no declared output.
   const child = spawn(
     scriptcCompiler(invocation.cwd),
     ['build', invocation.entry, '-o', invocation.output, '--strip', '--no-keep-llvm'],
-    { cwd: invocation.cwd, stdio: 'inherit', windowsHide: true },
+    {
+      cwd: invocation.cwd,
+      env: { ...process.env, SCRIPTC_TARGET: invocation.triple, SCRIPTC_CC: 'zigcc' },
+      stdio: 'inherit',
+      windowsHide: true,
+    },
   );
+  return exited('scriptc', child);
+}
+
+async function exited(command: string, child: ReturnType<typeof spawn>): Promise<boolean> {
   try {
     await once(child, 'exit');
     return child.exitCode === 0 && child.signalCode === null;
   } catch (error) {
-    console.error(`scriptc: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`${command}: ${error instanceof Error ? error.message : String(error)}`);
     return false;
   }
 }

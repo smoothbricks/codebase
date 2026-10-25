@@ -317,65 +317,100 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('compiles the bins of a scriptc package from its dist/ts emit into dist/bin/<host platform>', async () => {
+  it('compiles the bins of a scriptc package into dist/bin/<platform>, one target per platform', async () => {
     const workspace = await createWorkspace();
     try {
+      const packs = {
+        '@scriptc/runtime-darwin-arm64': '0.4.4',
+        '@scriptc/runtime-darwin-x64': '0.4.4',
+        '@scriptc/runtime-linux-arm64-musl': '0.4.4',
+        '@scriptc/runtime-linux-x64-musl': '0.4.4',
+      };
       const manifest = {
         name: '@scope/tool',
         bin: { 'smoo-nx-tool': './dist/ts/bin/smoo-nx-tool.js' },
-        devDependencies: { scriptc: '0.4.4' },
+        devDependencies: { ...packs, scriptc: '0.4.4' },
       };
+      const libTsconfig = '{"compilerOptions":{"rootDir":"src","outDir":"dist/ts"}}\n';
       await workspace.write('packages/tool/package.json', JSON.stringify(manifest));
-      await workspace.write('packages/tool/tsconfig.lib.json', '{"compilerOptions":{"outDir":"dist/ts"}}\n');
+      await workspace.write('packages/tool/tsconfig.lib.json', libTsconfig);
       await workspace.write('packages/plain/package.json', JSON.stringify({ ...manifest, devDependencies: {} }));
-      await workspace.write('packages/plain/tsconfig.lib.json', '{"compilerOptions":{"outDir":"dist/ts"}}\n');
+      await workspace.write('packages/plain/tsconfig.lib.json', libTsconfig);
 
       const mac = await inferProjectTargets(
         workspace,
         'packages/tool/package.json',
         createNodesV2ForPlatform('darwin', 'arm64'),
       );
-      expect(mac['scriptc-native']).toMatchObject({
-        executor: '@smoothbricks/nx-plugin:scriptc-native',
-        cache: true,
-        dependsOn: ['tsc-js'],
-        outputs: ['{projectRoot}/dist/tsconfig.json', '{projectRoot}/dist/bin/darwin-arm64/smoo-nx-tool'],
-        options: {
-          cwd: 'packages/tool',
-          platform: 'darwin-arm64',
-          javascriptRoot: 'dist/ts',
-          outputRoot: 'dist',
-          entries: { 'smoo-nx-tool': './dist/ts/bin/smoo-nx-tool.js' },
-        },
-      });
-      expect(mac['scriptc-native']?.inputs).toContainEqual({ externalDependencies: ['scriptc'] });
+      const platforms = [
+        ['scriptc-arm64-macos', 'aarch64-macos', 'darwin-arm64', '@scriptc/runtime-darwin-arm64'],
+        ['scriptc-x64-macos', 'x86_64-macos', 'darwin-x64', '@scriptc/runtime-darwin-x64'],
+        ['scriptc-arm64-linux', 'aarch64-linux-musl', 'linux-arm64', '@scriptc/runtime-linux-arm64-musl'],
+        ['scriptc-x64-linux', 'x86_64-linux-musl', 'linux-x64', '@scriptc/runtime-linux-x64-musl'],
+      ] as const;
+      for (const [name, triple, directory, pack] of platforms) {
+        expect(mac[name]).toMatchObject({
+          executor: '@smoothbricks/nx-plugin:scriptc-native',
+          cache: true,
+          // A platform target's closure stays in its family (package-target-policy): no tsc-js sibling.
+          dependsOn: ['^*-js'],
+          outputs: [`{projectRoot}/dist/bin/${directory}/smoo-nx-tool`],
+          options: {
+            cwd: 'packages/tool',
+            tsConfig: 'tsconfig.lib.json',
+            triple,
+            outputDirectory: `dist/bin/${directory}`,
+            entries: { 'smoo-nx-tool': 'bin/smoo-nx-tool.js' },
+          },
+        });
+        expect(mac[name]?.inputs).toContainEqual({ externalDependencies: ['scriptc', pack] });
+      }
       expect(mac['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/ts/']);
-      expect(mac.build?.dependsOn).toContain('scriptc-native');
+      // Only the host's own platform joins build; the publish legs build the rest by family.
+      expect(mac.build?.dependsOn).toContain('scriptc-arm64-macos');
+      expect(mac.build?.dependsOn).not.toContain('scriptc-x64-macos');
       const linux = await inferProjectTargets(
         workspace,
         'packages/tool/package.json',
         createNodesV2ForPlatform('linux', 'x64'),
       );
-      expect(linux['scriptc-native']?.outputs).toEqual([
-        '{projectRoot}/dist/tsconfig.json',
-        '{projectRoot}/dist/bin/linux-x64/smoo-nx-tool',
-      ]);
-      // The platform is an option, so the two hosts' builds never share a cache entry.
-      expect(linux['scriptc-native']?.options?.platform).toBe('linux-x64');
-      expect(await inferProjectTargets(workspace, 'packages/plain/package.json')).not.toHaveProperty('scriptc-native');
+      // Every host infers the same four targets: a target's output does not depend on who built it.
+      for (const [name] of platforms) expect(linux[name]).toEqual(mac[name]);
+      expect(linux.build?.dependsOn).toContain('scriptc-x64-linux');
+      expect(linux.build?.dependsOn).not.toContain('scriptc-arm64-macos');
+      expect(Object.keys(await inferProjectTargets(workspace, 'packages/plain/package.json'))).not.toContainEqual(
+        expect.stringMatching(/^scriptc-/),
+      );
 
+      const refusal = async (): Promise<string | undefined> => {
+        const failure = await inferProjectTargets(workspace, 'packages/tool/package.json').then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+        if (!(failure instanceof AggregateCreateNodesError)) {
+          throw new Error(`expected AggregateCreateNodesError, got ${String(failure)}`);
+        }
+        return failure.errors[0]?.[1]?.message;
+      };
+      // A pack missing, or at another version than the compiler, is refused by name.
+      const { '@scriptc/runtime-darwin-x64': _dropped, ...threePacks } = packs;
+      await workspace.write(
+        'packages/tool/package.json',
+        JSON.stringify({
+          ...manifest,
+          devDependencies: { ...threePacks, '@scriptc/runtime-linux-x64-musl': '0.4.3', scriptc: '0.4.4' },
+        }),
+      );
+      expect(await refusal()).toMatch(
+        /list @scriptc\/runtime-darwin-x64@0\.4\.4, @scriptc\/runtime-linux-x64-musl@0\.4\.4 in devDependencies/,
+      );
       // Emitting into dist/ itself would put the JavaScript and the executables in one output.
-      await workspace.write('packages/tool/tsconfig.lib.json', '{"compilerOptions":{"outDir":"dist"}}\n');
-      const failure = await inferProjectTargets(workspace, 'packages/tool/package.json').then(
-        () => undefined,
-        (error: unknown) => error,
+      await workspace.write('packages/tool/package.json', JSON.stringify(manifest));
+      await workspace.write(
+        'packages/tool/tsconfig.lib.json',
+        '{"compilerOptions":{"rootDir":"src","outDir":"dist"}}\n',
       );
-      if (!(failure instanceof AggregateCreateNodesError)) {
-        throw new Error(`expected AggregateCreateNodesError, got ${String(failure)}`);
-      }
-      expect(failure.errors[0]?.[1]?.message).toMatch(
-        /set tsconfig\.lib\.json compilerOptions\.outDir to "dist\/ts" \(it is "dist"\)/,
-      );
+      expect(await refusal()).toMatch(/set tsconfig\.lib\.json compilerOptions\.outDir to "dist\/ts" \(it is "dist"\)/);
     } finally {
       await workspace.cleanup();
     }

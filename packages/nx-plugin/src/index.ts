@@ -1170,36 +1170,74 @@ function packageBinEntries(packageJson: PackageJson, packageJsonPath: string): M
   return entries;
 }
 
-const SCRIPTC_NATIVE_TARGET = 'scriptc-native';
+/**
+ * Every platform a scriptc package ships an executable for, with the triple `SCRIPTC_TARGET` names for it and the
+ * runtime pack scriptc links that triple against. Linux executables are static musl, as cowshed's CLI is, so one file
+ * runs on every distribution.
+ */
+const SCRIPTC_PLATFORMS: readonly (NapiPlatform & { readonly triple: string; readonly runtimePack: string })[] = [
+  {
+    architecture: 'arm64',
+    targetFamily: 'macos',
+    triple: 'aarch64-macos',
+    runtimePack: '@scriptc/runtime-darwin-arm64',
+  },
+  { architecture: 'x64', targetFamily: 'macos', triple: 'x86_64-macos', runtimePack: '@scriptc/runtime-darwin-x64' },
+  {
+    architecture: 'arm64',
+    targetFamily: 'linux',
+    triple: 'aarch64-linux-musl',
+    runtimePack: '@scriptc/runtime-linux-arm64-musl',
+  },
+  {
+    architecture: 'x64',
+    targetFamily: 'linux',
+    triple: 'x86_64-linux-musl',
+    runtimePack: '@scriptc/runtime-linux-x64-musl',
+  },
+];
+
+/** The scriptc target writing `platform`'s executables; its suffix is the platform family the publish legs select. */
+function scriptcTargetName(platform: NapiPlatform): string {
+  return `scriptc-${platform.architecture}-${platform.targetFamily}`;
+}
 
 /**
- * `scriptc-native`: each `package.json#bin` entry compiled by scriptc, from the JavaScript `tsc-js` emitted, to the
- * host executable `dist/bin/<platform>/<name>`. A package opts in by depending on `scriptc`, which also pins the
- * compiler the target runs. Its JavaScript is emitted below `dist/` beside `bin/` (`dist/ts`), so the two targets'
- * outputs never overlap; `dist/tsconfig.json` is the nearest config, the one scriptc type-checks that JavaScript under.
+ * `scriptc-<arch>-<family>`, one per platform in SCRIPTC_PLATFORMS: each `package.json#bin` entry compiled by scriptc
+ * to the executable `dist/bin/<platform>/<name>`, from the transformed JavaScript the run itself emits from
+ * `tsconfig.lib.json` into private staging, never from `tsc-js`'s output: a platform target's closure stays in its
+ * family (package-target-policy.ts) and the four are collected on different hosts, so none depends on a sibling or
+ * shares an output with another. A package opts in by depending on `scriptc`, which also pins the compiler the targets
+ * run, and lists each platform's runtime pack at that same version. Every host builds every platform the same way,
+ * `SCRIPTC_TARGET=<triple>` with zig as the C compiler, so a target's output does not depend on the host that built
+ * it, and like every platform target the host's own joins `build` while the publish legs build the rest. The bins
+ * name JavaScript below `dist/` beside `bin/` (`dist/ts`), so `tsc-js`'s output and the executables are disjoint.
  */
-function scriptcNativeTarget(
+function scriptcPlatformTargets(
   packageJson: PackageJson,
   packageJsonPath: string,
   projectRoot: string,
   libTsconfigPath: string,
-  hostPlatform: NapiPlatform | null,
   toolchainInputs: NonNullable<TargetConfiguration['inputs']>,
-): TargetConfiguration | null {
-  if (packageJson.devDependencies?.scriptc === undefined || hostPlatform === null) {
-    return null;
+): Record<string, TargetConfiguration> {
+  const compiler = packageJson.devDependencies?.scriptc;
+  if (compiler === undefined) {
+    return {};
+  }
+  const missingPacks = SCRIPTC_PLATFORMS.filter(
+    (platform) => packageJson.devDependencies?.[platform.runtimePack] !== compiler,
+  ).map((platform) => `${platform.runtimePack}@${String(compiler)}`);
+  if (missingPacks.length > 0) {
+    throw new Error(
+      `${packageJsonPath}: a scriptc package builds every platform's executable, each linked against its runtime pack at ` +
+        `the compiler's version; list ${missingPacks.join(', ')} in devDependencies beside scriptc`,
+    );
   }
   const javascriptRoot = typescriptOutDir(libTsconfigPath, packageJsonPath);
   const [outputRoot, below] = javascriptRoot?.split('/') ?? [];
-  if (
-    javascriptRoot === null ||
-    outputRoot !== 'dist' ||
-    below === undefined ||
-    below === 'bin' ||
-    below === 'tsconfig.json'
-  ) {
+  if (javascriptRoot === null || outputRoot !== 'dist' || below === undefined || below === 'bin') {
     throw new Error(
-      `${packageJsonPath}: a scriptc package emits its JavaScript below dist/ beside dist/bin and dist/tsconfig.json; ` +
+      `${packageJsonPath}: a scriptc package emits its JavaScript below dist/ beside dist/bin; ` +
         `set tsconfig.lib.json compilerOptions.outDir to "dist/ts" (it is ${JSON.stringify(javascriptRoot)})`,
     );
   }
@@ -1207,31 +1245,43 @@ function scriptcNativeTarget(
   if (entries.size === 0) {
     throw new Error(`${packageJsonPath}: a scriptc package names the executables it compiles in bin`);
   }
+  // Each bin's module, relative to the root of an emit of tsconfig.lib.json wherever it is written.
+  const modules: Record<string, string> = {};
   for (const [name, entry] of entries) {
-    if (!/^[\w.-]+$/.test(name) || !posix.normalize(entry).startsWith(`${javascriptRoot}/`) || !entry.endsWith('.js')) {
+    const emitted = posix.normalize(entry);
+    if (!/^[\w.-]+$/.test(name) || !emitted.startsWith(`${javascriptRoot}/`) || !emitted.endsWith('.js')) {
       throw new Error(
         `${packageJsonPath}: bin.${name} must name JavaScript tsc-js emits under ${javascriptRoot}/ (it is ${entry})`,
       );
     }
+    modules[name] = emitted.slice(javascriptRoot.length + 1);
   }
-  const platform = EXECUTABLE_PLATFORM_DIRECTORY[hostPlatform.targetFamily][hostPlatform.architecture];
-  return {
-    executor: '@smoothbricks/nx-plugin:scriptc-native',
-    cache: true,
-    inputs: [
-      'production',
-      '^production',
-      ...toolchainInputs,
-      '{projectRoot}/tsconfig.lib.json',
-      { externalDependencies: ['scriptc'] },
-    ],
-    outputs: [
-      `{projectRoot}/${outputRoot}/tsconfig.json`,
-      ...[...entries.keys()].map((name) => `{projectRoot}/${outputRoot}/bin/${platform}/${name}`),
-    ],
-    dependsOn: ['tsc-js'],
-    options: { cwd: projectRoot, platform, javascriptRoot, outputRoot, entries: Object.fromEntries(entries) },
-  };
+  const targets: Record<string, TargetConfiguration> = {};
+  for (const platform of SCRIPTC_PLATFORMS) {
+    const outputDirectory = `dist/bin/${EXECUTABLE_PLATFORM_DIRECTORY[platform.targetFamily][platform.architecture]}`;
+    targets[scriptcTargetName(platform)] = {
+      executor: '@smoothbricks/nx-plugin:scriptc-native',
+      cache: true,
+      inputs: [
+        'production',
+        '^production',
+        ...toolchainInputs,
+        '{projectRoot}/tsconfig.lib.json',
+        { externalDependencies: ['scriptc', platform.runtimePack] },
+      ],
+      outputs: [...entries.keys()].map((name) => `{projectRoot}/${outputDirectory}/${name}`),
+      // The emit type-checks against its dependencies' emitted JavaScript, as tsc-js does.
+      dependsOn: ['^*-js'],
+      options: {
+        cwd: projectRoot,
+        tsConfig: 'tsconfig.lib.json',
+        triple: platform.triple,
+        outputDirectory,
+        entries: modules,
+      },
+    };
+  }
+  return targets;
 }
 
 /**
@@ -1405,17 +1455,10 @@ async function createProjectTargets(
         cwd: projectRoot,
       },
     };
-    const scriptcNative = scriptcNativeTarget(
-      packageJson,
-      packageJsonPath,
-      projectRoot,
-      libTsconfigPath,
-      hostPlatform,
-      toolchainInputs,
+    Object.assign(
+      targets,
+      scriptcPlatformTargets(packageJson, packageJsonPath, projectRoot, libTsconfigPath, toolchainInputs),
     );
-    if (scriptcNative !== null) {
-      targets[SCRIPTC_NATIVE_TARGET] = scriptcNative;
-    }
   }
 
   if (hasTestTsconfig) {
