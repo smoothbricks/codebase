@@ -279,9 +279,14 @@ impl CopyFileIdentity {
 }
 
 /// Copy only into a newly created, held regular file. The caller owns publication and durability.
+/// Both descriptors bypass the page cache: a recovery image passes through once, and caching it
+/// evicts what the rest of the host is using. The native copy writes the source's data regions
+/// only, so a hole is neither read nor written.
 pub(crate) fn copy_held_file(source: &fs::File, destination: &fs::File) -> io::Result<()> {
     CopyFileIdentity::read(source)?;
     CopyFileIdentity::read(destination)?;
+    native::bypass_cache(source)?;
+    native::bypass_cache(destination)?;
     native::copy_regular(source, destination)
 }
 
@@ -290,7 +295,6 @@ pub(crate) fn verify_held_file(
     source: &fs::File,
     destination: &fs::File,
 ) -> io::Result<crate::api::Sha256Digest> {
-    use std::io::{Seek as _, SeekFrom};
     use std::os::unix::fs::MetadataExt as _;
     let before = CopyFileIdentity::read(source)?;
     let copied = CopyFileIdentity::read(destination)?;
@@ -330,10 +334,8 @@ pub(crate) fn verify_held_file(
             "sparse holes were materialized",
         ));
     }
-    let mut source = source;
-    let mut destination = destination;
-    source.seek(SeekFrom::Start(0))?;
-    destination.seek(SeekFrom::Start(0))?;
+    native::bypass_cache(source)?;
+    native::bypass_cache(destination)?;
     let digest = compare_file_bytes(source, destination, before.size)?;
     if CopyFileIdentity::read(source)? != before || CopyFileIdentity::read(destination)? != copied {
         return Err(io::Error::new(
@@ -344,34 +346,161 @@ pub(crate) fn verify_held_file(
     Ok(digest)
 }
 
+/// The bytes `compare_file_bytes` reads, compares and hashes per positional transfer.
+const COMPARE_CHUNK_BYTES: usize = 1 << 20;
+
+/// What a hole reads as, compared and hashed without a read.
+static ZEROS: [u8; COMPARE_CHUNK_BYTES] = [0; COMPARE_CHUNK_BYTES];
+
+/// What one file has over a [`Run`]: data to read, or a hole, which reads as zeros.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Content {
+    Data,
+    Hole,
+}
+
+/// A stretch `[start, end)` of the compared range over which each file is all data or all hole.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Run {
+    start: u64,
+    end: u64,
+    source: Content,
+    destination: Content,
+}
+
+/// One file's place among its data regions: the first region ending past the walk's offset, or
+/// `None` once only a hole remains.
+struct RegionCursor<'a> {
+    file: &'a fs::File,
+    region: Option<(u64, u64)>,
+}
+
+impl<'a> RegionCursor<'a> {
+    fn new(file: &'a fs::File, length: u64) -> io::Result<Self> {
+        Ok(Self {
+            file,
+            region: native::next_data_region(file, 0, length)?,
+        })
+    }
+
+    /// What the file has from `offset` on, and where that ends.
+    fn at(&mut self, offset: u64, length: u64) -> io::Result<(Content, u64)> {
+        if self.region.is_some_and(|(_, end)| end <= offset) {
+            self.region = native::next_data_region(self.file, offset, length)?;
+        }
+        Ok(match self.region {
+            None => (Content::Hole, length),
+            Some((start, _)) if start > offset => (Content::Hole, start),
+            Some((_, end)) => (Content::Data, end),
+        })
+    }
+}
+
+/// The runs of `[0, length)` in ascending order. Each ends at the nearer of the two files' next
+/// data or hole boundary, so one SEEK_DATA/SEEK_HOLE pair per data region of either file plans the
+/// whole comparison. A failed observation ends the walk: nothing after it is known.
+struct Runs<'a> {
+    source: RegionCursor<'a>,
+    destination: RegionCursor<'a>,
+    offset: u64,
+    length: u64,
+}
+
+impl<'a> Runs<'a> {
+    fn new(source: &'a fs::File, destination: &'a fs::File, length: u64) -> io::Result<Self> {
+        Ok(Self {
+            source: RegionCursor::new(source, length)?,
+            destination: RegionCursor::new(destination, length)?,
+            offset: 0,
+            length,
+        })
+    }
+
+    fn run_at(&mut self, start: u64) -> io::Result<Run> {
+        let (source, source_end) = self.source.at(start, self.length)?;
+        let (destination, destination_end) = self.destination.at(start, self.length)?;
+        Ok(Run {
+            start,
+            end: source_end.min(destination_end),
+            source,
+            destination,
+        })
+    }
+}
+
+impl Iterator for Runs<'_> {
+    type Item = io::Result<Run>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.length {
+            return None;
+        }
+        let run = self.run_at(self.offset);
+        self.offset = run.as_ref().map_or(self.length, |run| run.end);
+        Some(run)
+    }
+}
+
+/// The bytes `file` has over `[offset, offset + buffer.len())` inside one run: read when it has
+/// data there, the static zeros of its hole otherwise.
+fn run_bytes<'a>(
+    file: &fs::File,
+    content: Content,
+    buffer: &'a mut [u8],
+    offset: u64,
+) -> io::Result<&'a [u8]> {
+    use std::os::unix::fs::FileExt as _;
+    match content {
+        Content::Data => {
+            file.read_exact_at(buffer, offset)?;
+            Ok(buffer)
+        }
+        Content::Hole => Ok(&ZEROS[..buffer.len()]),
+    }
+}
+
+/// SHA-256 of the `length` logical bytes both files must hold identically, reading only where a
+/// file has data. A hole is compared and hashed from static zeros and read from neither file, so
+/// a run both files hold as holes costs no read at all. The digest still covers every logical
+/// byte, holes included: it is recorded evidence (the recovery journal's `published` digest and
+/// adopt's verified-copy content line). Every transfer is positional, so the descriptors' offsets
+/// are irrelevant; callers have matched both lengths to `length` and recheck identities after.
 fn compare_file_bytes(
-    mut source: &fs::File,
-    mut destination: &fs::File,
+    source: &fs::File,
+    destination: &fs::File,
     length: u64,
 ) -> io::Result<crate::api::Sha256Digest> {
     use sha2::{Digest as _, Sha256};
-    use std::io::Read as _;
+    use std::os::unix::fs::FileExt as _;
     let mut digest = Sha256::new();
-    let mut source_bytes = [0_u8; 65536];
-    let mut destination_bytes = [0_u8; 65536];
-    let mut remaining = length;
-    while remaining != 0 {
-        let count = usize::try_from(remaining.min(65536))
-            .map_err(|_| io::Error::other("read length exceeds usize"))?;
-        source.read_exact(&mut source_bytes[..count])?;
-        destination.read_exact(&mut destination_bytes[..count])?;
-        if source_bytes[..count] != destination_bytes[..count] {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "file content differs",
-            ));
+    let mut source_bytes = vec![0_u8; COMPARE_CHUNK_BYTES];
+    let mut destination_bytes = vec![0_u8; COMPARE_CHUNK_BYTES];
+    for run in Runs::new(source, destination, length)? {
+        let run = run?;
+        let mut position = run.start;
+        while position < run.end {
+            let count = usize::try_from(run.end - position)
+                .map_or(COMPARE_CHUNK_BYTES, |rest| rest.min(COMPARE_CHUNK_BYTES));
+            let held = run_bytes(source, run.source, &mut source_bytes[..count], position)?;
+            let copied = run_bytes(
+                destination,
+                run.destination,
+                &mut destination_bytes[..count],
+                position,
+            )?;
+            if held != copied {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "file content differs",
+                ));
+            }
+            digest.update(held);
+            position +=
+                u64::try_from(count).map_err(|_| io::Error::other("read length exceeds u64"))?;
         }
-        digest.update(&source_bytes[..count]);
-        remaining -=
-            u64::try_from(count).map_err(|_| io::Error::other("read length exceeds u64"))?;
     }
     let mut extra = [0];
-    if source.read(&mut extra)? != 0 || destination.read(&mut extra)? != 0 {
+    if source.read_at(&mut extra, length)? != 0 || destination.read_at(&mut extra, length)? != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "file grew during verification",
@@ -572,6 +701,10 @@ fn verify_with_snapshot(
                 };
                 let source_file = open(&source_path)?;
                 let destination_file = open(&destination_path)?;
+                native::bypass_cache(&source_file)
+                    .map_err(|error| read_error(&source_path, &error))?;
+                native::bypass_cache(&destination_file)
+                    .map_err(|error| read_error(&destination_path, &error))?;
                 if copy.allocated_bytes > original.allocated_bytes.saturating_add(65536)
                     && original.allocated_bytes < original.size
                     && native::has_holes(&source_file, original.size)
@@ -2081,3 +2214,6 @@ mod tests {
 
 #[cfg(test)]
 mod metadata_tests;
+
+#[cfg(test)]
+mod sparse_tests;

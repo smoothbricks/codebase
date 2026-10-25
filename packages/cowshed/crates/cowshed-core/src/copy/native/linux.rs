@@ -97,52 +97,26 @@ pub fn directory_metadata(source: &Path, destination: &Path) -> io::Result<()> {
     set_times(destination, &metadata)
 }
 
-/// Descriptor-only sparse copying for a newly created recovery artifact.
+/// Descriptor-only sparse copying for a newly created recovery artifact: only the source's data
+/// regions are read and written, positionally, into a destination already sized to the source.
 pub fn copy_regular(input: &fs::File, output: &fs::File) -> io::Result<()> {
-    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
-    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
     let metadata = input.metadata()?;
     let length = metadata.len();
     output.set_len(length)?;
-    let mut input = input;
-    let mut output = output;
-    let mut offset = 0_u64;
     let mut buffer = [0_u8; 65536];
-    while offset < length {
-        let start =
-            i64::try_from(offset).map_err(|_| io::Error::other("file offset exceeds off_t"))?;
-        // SAFETY: input remains open; the seek observes the next allocated logical extent.
-        let data = unsafe { libc::lseek(input.as_raw_fd(), start, libc::SEEK_DATA) };
-        if data < 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ENXIO) {
-                break;
-            }
-            return Err(error);
-        }
-        // SAFETY: the same live descriptor is queried for this extent's end.
-        let hole = unsafe { libc::lseek(input.as_raw_fd(), data, libc::SEEK_HOLE) };
-        if hole < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let data = u64::try_from(data).map_err(|_| io::Error::other("negative data extent"))?;
-        let end = u64::try_from(hole)
-            .map_err(|_| io::Error::other("negative hole extent"))?
-            .min(length);
-        if data < offset || end <= data {
-            return Err(io::Error::other("invalid sparse extent"));
-        }
-        input.seek(SeekFrom::Start(data))?;
-        output.seek(SeekFrom::Start(data))?;
-        offset = data;
-        while offset < end {
-            let count = usize::try_from((end - offset).min(65536))
+    let mut offset = 0_u64;
+    while let Some((start, end)) = super::next_data_region(input, offset, length)? {
+        let mut position = start;
+        while position < end {
+            let count = usize::try_from((end - position).min(65536))
                 .map_err(|_| io::Error::other("extent length exceeds usize"))?;
-            input.read_exact(&mut buffer[..count])?;
-            output.write_all(&buffer[..count])?;
-            offset +=
+            input.read_exact_at(&mut buffer[..count], position)?;
+            output.write_all_at(&buffer[..count], position)?;
+            position +=
                 u64::try_from(count).map_err(|_| io::Error::other("read length exceeds u64"))?;
         }
+        offset = end;
     }
     // Ownership changes may clear set-id bits and capabilities. Apply ownership first,
     // then mode, then the kernel ACL/xattrs (including security.capability), then times.

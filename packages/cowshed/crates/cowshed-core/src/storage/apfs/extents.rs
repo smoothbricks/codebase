@@ -19,6 +19,9 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use super::ApfsStorageError;
+#[cfg(target_os = "macos")]
+use crate::copy::native::bypass_cache;
+use crate::copy::native::next_data_region;
 use crate::storage::lifecycle::ExtentCount;
 use cowshed_apfs::SECTOR_BYTES;
 
@@ -366,34 +369,6 @@ fn io_error(operation: &'static str, path: &Path, source: io::Error) -> ApfsStor
     }
 }
 
-/// The next `[start, end)` run of data at or after `offset`, or `None` when only a hole remains.
-fn next_data_region(file: &File, offset: u64, length: u64) -> io::Result<Option<(u64, u64)>> {
-    use std::os::fd::AsRawFd;
-
-    if offset >= length {
-        return Ok(None);
-    }
-    let seek = |from: u64, whence| -> io::Result<Option<u64>> {
-        let from = libc::off_t::try_from(from).map_err(io::Error::other)?;
-        // SAFETY: the descriptor is live for the borrow of `file`; `lseek` only moves its offset,
-        // which nothing here reads (every transfer is positional).
-        let found = unsafe { libc::lseek(file.as_raw_fd(), from, whence) };
-        if found < 0 {
-            let error = io::Error::last_os_error();
-            return match error.raw_os_error() {
-                Some(libc::ENXIO) => Ok(None),
-                _ => Err(error),
-            };
-        }
-        u64::try_from(found).map(Some).map_err(io::Error::other)
-    };
-    let Some(start) = seek(offset, libc::SEEK_DATA)? else {
-        return Ok(None);
-    };
-    let end = seek(start, libc::SEEK_HOLE)?.unwrap_or(length);
-    Ok(Some((start, end.min(length))))
-}
-
 /// Call `run` with the start of every physically contiguous run of the file's data, ascending,
 /// skipping holes, until `run` breaks: one `F_LOG2PHYS_EXT` query per run. Elsewhere than macOS
 /// nothing maps a file to the device and no RAW image lives there, so each data region counts as
@@ -466,17 +441,6 @@ fn physical_run(file: &File, offset: u64, length: u64) -> io::Result<PhysicalRun
     }
 }
 
-#[cfg(target_os = "macos")]
-fn bypass_cache(file: &File) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    // SAFETY: `F_NOCACHE` takes an int flag and only changes the descriptor's caching policy.
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 /// Deallocate `[offset, offset + length)`, leaving a hole that reads as zeros.
 #[cfg(target_os = "macos")]
 fn punch_hole(file: &File, offset: u64, length: u64) -> io::Result<()> {
@@ -526,18 +490,20 @@ fn physical_run(_: &File, _: u64, _: u64) -> io::Result<PhysicalRun> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn bypass_cache(_: &File) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "image rewrites bypass the cache with macOS F_NOCACHE",
-    ))
-}
-
-#[cfg(not(target_os = "macos"))]
 fn punch_hole(_: &File, _: u64, _: u64) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "image holes are punched with macOS F_PUNCHHOLE",
+    ))
+}
+
+/// A rewrite copies a whole image, and the recovery copy's Linux pass-through would put every byte
+/// of it in the page cache: refuse, as every other rewrite primitive here does off macOS.
+#[cfg(not(target_os = "macos"))]
+fn bypass_cache(_: &File) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "image rewrites bypass the cache with macOS F_NOCACHE",
     ))
 }
 
