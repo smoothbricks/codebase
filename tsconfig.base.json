@@ -17,14 +17,6 @@
     "skipLibCheck": true,
     "strict": true,
     "target": "es2022",
-    "customConditions": ["development"],
-    "paths": {
-      "@smoothbricks/arrow-builder": ["./packages/arrow-builder/src/index.ts"],
-      "@smoothbricks/cli": ["./packages/cli/src/index.ts"],
-      "@smoothbricks/duration": ["./packages/duration/src/index.ts"],
-      "@smoothbricks/lmao": ["./packages/lmao/src/index.ts"],
-      "@smoothbricks/lmao-ttsc": ["./packages/lmao-ttsc/src/index.ts"],
-      "@smoothbricks/validation": ["./packages/validation/src/index.ts"]
-    }
+    "customConditions": ["development"]
   }
 }

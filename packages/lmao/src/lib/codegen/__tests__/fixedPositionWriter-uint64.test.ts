@@ -21,7 +21,7 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { createResultWriter, createTagWriter, ENTRY_TYPE_SPAN_OK, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
+import { createResultWriter, createTagWriter, ENTRY_TYPE_SPAN_OK, ENTRY_TYPE_SPAN_START, S } from '../../../index.js';
 import {
   createTestOpMetadata,
   createTestSchema,

@@ -17,11 +17,11 @@ describe('package export contract', () => {
 
     expect(manifest.name).toBe('@smoothbricks/validation');
     expect(manifest.exports['./package.json']).toBe('./package.json');
-    expect(testingConditions.development).toBe('./src/testing/index.ts');
+    expect(testingConditions.development).toBeUndefined();
     expect(testingConditions.types).toBe('./dist/testing/index.d.ts');
     expect(testingConditions.import).toBe('./dist/testing/index.js');
     expect(testingConditions.default).toBe('./dist/testing/index.js');
-    expect(conditions.development).toBe('./src/index.ts');
+    expect(conditions.development).toBeUndefined();
     expect(conditions.types).toBe('./dist/index.d.ts');
     expect(conditions.import).toBe('./dist/index.js');
     expect(conditions.default).toBe('./dist/index.js');

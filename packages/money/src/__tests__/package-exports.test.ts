@@ -16,7 +16,7 @@ describe('package export contract', () => {
 
     expect(manifest.name).toBe('@smoothbricks/money');
     expect(manifest.exports['./package.json']).toBe('./package.json');
-    expect(conditions.development).toBe('./src/index.ts');
+    expect(conditions.development).toBeUndefined();
     expect(conditions.types).toBe('./dist/index.d.ts');
     expect(conditions.import).toBe('./dist/index.js');
     expect(conditions.default).toBe('./dist/index.js');

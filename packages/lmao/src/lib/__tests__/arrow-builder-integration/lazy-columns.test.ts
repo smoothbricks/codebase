@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { createColumnBuffer } from '@smoothbricks/arrow-builder';
-import { createTagWriter, S } from '@smoothbricks/lmao';
+import { createTagWriter, S } from '../../../index.js';
 import { createSpanBuffer } from '../../spanBuffer.js';
 
 import { createTestOpMetadata, createTestSchema, createTestSpanContext, createTestTraceRoot } from '../test-helpers.js';

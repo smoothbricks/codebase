@@ -5,7 +5,7 @@ import {
   DEFAULT_BUFFER_CAPACITY,
   maskingTransforms,
 } from '@smoothbricks/arrow-builder';
-import { convertToArrowTable, createSpanBuffer, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
+import { convertToArrowTable, createSpanBuffer, ENTRY_TYPE_SPAN_START, S } from '../../../index.js';
 import { defineOpContext } from '../../defineOpContext.js';
 import { resolveMessage } from '../../resolveMessage.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';

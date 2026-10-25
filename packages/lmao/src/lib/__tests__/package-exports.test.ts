@@ -2,7 +2,6 @@ import { describe, expect, it } from 'bun:test';
 import { isRecord } from '@smoothbricks/validation';
 
 type ExportConditions = {
-  development?: string;
   types?: string;
   import?: string;
   default?: string;
@@ -25,7 +24,7 @@ function requireStringProperty(entry: Record<string, unknown>, key: keyof Export
 
 function expectCoreConditions(entry: unknown): asserts entry is ExportConditions {
   const record = requireRecord(entry, 'export conditions');
-  expect(requireStringProperty(record, 'development')).toBeString();
+  expect(record.development).toBeUndefined();
   expect(requireStringProperty(record, 'types')).toBeString();
   expect(requireStringProperty(record, 'import')).toBeString();
   expect(requireStringProperty(record, 'default')).toBeString();

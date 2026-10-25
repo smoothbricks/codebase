@@ -109,7 +109,6 @@ function buildTypeScriptPackageJson(
       './package.json': './package.json',
       '.': {
         types: './dist/index.d.ts',
-        development: './src/index.ts',
         import: './dist/index.js',
         default: './dist/index.js',
       },

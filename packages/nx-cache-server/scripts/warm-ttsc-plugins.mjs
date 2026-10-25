@@ -16,15 +16,13 @@
  * imports is still transformed through the real router.
  *
  * Run under the compiler preload ONLY — never add the trace preload itself:
- * its setup calls `afterAll()`, which throws outside `bun test`. Its module,
- * LMAO's Bun test harness, is imported instead: loading it does no setup, and
- * it routes through LMAO's own project, whose plugin key this project's never
- * covers.
+ * its setup calls `afterAll()`, which throws outside `bun test`. That preload
+ * and every other workspace library load from their built `dist`, which the
+ * router never claims, so only this project's own key needs warming.
  *
  * Never import test files from this script: warming must not execute tests.
  */
 
 import '../src/index.js';
-import '@smoothbricks/lmao/testing/bun';
 
 console.log('[nx-cache-server] ttsc runtime transform warm');

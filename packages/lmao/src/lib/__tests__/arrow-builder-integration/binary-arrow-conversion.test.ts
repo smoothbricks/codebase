@@ -8,6 +8,7 @@
 import { describe, expect, it } from 'bun:test';
 import { decode } from '@msgpack/msgpack';
 import { createColumnWriter } from '@smoothbricks/arrow-builder';
+import typia from 'typia';
 import {
   convertSpanTreeToArrowTable,
   convertToArrowTable,
@@ -15,8 +16,7 @@ import {
   createSpanBuffer,
   getSpanBufferClass,
   S,
-} from '@smoothbricks/lmao';
-import typia from 'typia';
+} from '../../../index.js';
 import { ENTRY_TYPE_INFO, ENTRY_TYPE_SPAN_START } from '../../schema/systemSchema.js';
 import { invokeWriterMethod, nextWriterRow, requireBinaryCell, requireColumn } from '../arrow-test-helpers.js';
 import { createTestOpMetadata, createTestSchema, createTestTraceRoot } from '../test-helpers.js';

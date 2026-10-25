@@ -22,7 +22,6 @@
  * warming must not execute tests.
  */
 
-import '@smoothbricks/lmao/testing/bun';
 import '../src/types.js';
 
 console.log('[cowshed] ttsc runtime transform warm');

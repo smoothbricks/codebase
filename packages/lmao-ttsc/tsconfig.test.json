@@ -1,9 +1,6 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "paths": {
-      "@smoothbricks/validation": ["../validation/src/index.ts"]
-    },
     "rootDir": "src",
     "types": ["bun", "node"],
     "composite": false,
