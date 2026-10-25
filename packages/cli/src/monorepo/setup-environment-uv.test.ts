@@ -108,6 +108,11 @@ describe('what shell entry syncs for a uv project', () => {
     // The interpreter devenv passes is the store path the PATH python resolves to, not the
     // profile wrapper itself.
     const realPython = realpathSync(pythonWhich);
+    // uv's own cache is not what this measures: the fixture's private XDG_CACHE_HOME would otherwise
+    // hand uv an empty cache, and every run would fetch the uv_build backend from the index again.
+    const uvCache = Bun.spawnSync([realUv, 'cache', 'dir'], { stdout: 'pipe', stderr: 'pipe' });
+    if (uvCache.exitCode !== 0) throw new Error(`uv cache dir failed: ${uvCache.stderr.toString()}`);
+    const env = { UV_CACHE_DIR: uvCache.stdout.toString().trim() };
     const REAL_UV_PROJECT = {
       'pyproject.toml':
         '[project]\nname = "workspace"\nversion = "0.1.0"\nrequires-python = ">=3.12"\n[tool.uv.workspace]\nmembers = ["python/*"]\n[tool.uv]\npackage = false\n',
@@ -125,7 +130,7 @@ describe('what shell entry syncs for a uv project', () => {
       );
       await chmod(wrapper, 0o755);
       const venv = join(original.state, 'venv');
-      const uv = { uvProjectEnvironment: venv, python: realPython };
+      const uv = { uvProjectEnvironment: venv, python: realPython, env };
       expect(await original.enterShell(uv)).toEqual(HEALTHY);
       expect(await original.enterShell(uv)).toEqual(HEALTHY);
       const settledRuns = original.uvRuns().length;
@@ -147,7 +152,7 @@ describe('what shell entry syncs for a uv project', () => {
       await cp(original.root, clone, { recursive: true, verbatimSymlinks: true });
       const cloneVenv = join(clone, 'tooling', 'direnv', '.devenv', 'state', 'venv');
       const copied = repository(clone, join(dirname(original.root), 'ledgers'), join(dirname(original.root), 'bin'));
-      expect(await copied.enterShell({ uvProjectEnvironment: cloneVenv, python: realPython })).toEqual(HEALTHY);
+      expect(await copied.enterShell({ uvProjectEnvironment: cloneVenv, python: realPython, env })).toEqual(HEALTHY);
       expect(copied.uvRuns()).toHaveLength(settledRuns);
       expect(copied.count('install')).toBe(1);
       const cloneImported = Bun.spawnSync(
