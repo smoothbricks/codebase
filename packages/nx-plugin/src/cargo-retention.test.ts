@@ -25,6 +25,7 @@ import { outsideTreesTmpdir } from './__tests__/outside-trees.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 import {
   AUTOMATIC_INTERVAL_MS,
+  describeRetention,
   fingerprintIdentity,
   RECENT_USE_MS,
   RETENTION_RECEIPT,
@@ -33,6 +34,7 @@ import {
   type RetentionOutcome,
   type RetentionReport,
   readCargoFingerprint,
+  refusedAnywhere,
   retainCargoWorkspace,
 } from './cargo-retention.js';
 import { EXTRACTED_BINARIES_METADATA, EXTRACTED_CARGO_METADATA, EXTRACTED_TARGET_DIR } from './nextest-extraction.js';
@@ -289,12 +291,28 @@ async function retain(root: string, options: RetentionOptions): Promise<Retentio
   return result.value;
 }
 
-function planned(report: RetentionReport): PlannedOutcome {
-  const outcome = report.outcome;
+function plannedIn(outcome: RetentionOutcome): PlannedOutcome {
   if (outcome.kind !== 'planned' && outcome.kind !== 'reclaimed') {
     throw new Error(`expected planned/reclaimed, got ${JSON.stringify(outcome)}`);
   }
   return outcome;
+}
+
+function planned(report: RetentionReport): PlannedOutcome {
+  return plannedIn(report.outcome);
+}
+
+/** What the pass of one nested root did, or a failure naming the nested roots the report has. */
+function nestedOf(report: RetentionReport, root: string): RetentionOutcome {
+  const found = report.nestedRoots.find((nested) => nested.root === root);
+  if (found === undefined) {
+    throw new Error(`no nested root ${root} in ${JSON.stringify(report.nestedRoots.map((nested) => nested.root))}`);
+  }
+  return found.outcome;
+}
+
+function nestedPlanned(report: RetentionReport, root: string): PlannedOutcome {
+  return plannedIn(nestedOf(report, root));
 }
 
 function refused(report: RetentionReport): { profile: string; reason: string } {
@@ -432,6 +450,87 @@ async function churnGenerations(fx: Churn): Promise<Generations> {
   const mid2 = (await metasOf(fx.target, 'ret-mid')).filter((path) => !mid1.includes(path));
   if (mid2.length === 0) throw new Error('the feature toggle made no new ret-mid generation');
   return generations;
+}
+
+interface ProcMacro {
+  readonly ws: string;
+  readonly pm: string;
+  readonly target: string;
+  /** The host triple: built for explicitly, target units go to `<triple>/<profile>` and the proc macro to the host profile. */
+  readonly host: string;
+}
+
+/** `ret-app` in a one-member workspace, using the proc macro `ret-pm` that lives in a workspace of its own. */
+async function procMacroFixture(root: string): Promise<ProcMacro> {
+  const version = execFileSync('rustc', ['-vV'], { encoding: 'utf8' });
+  const host = /^host: (.+)$/m.exec(version)?.[1];
+  if (host === undefined) throw new Error('rustc -vV named no host triple');
+  const ws = join(root, 'ws');
+  const pm = join(root, 'pm');
+  await put(join(ws, '.cargo/config.toml'), fixtureConfig(false));
+  await put(join(ws, 'Cargo.toml'), lines('[workspace]', 'members = ["crates/app"]', 'resolver = "2"'));
+  await put(
+    join(ws, 'crates/app/Cargo.toml'),
+    lines(
+      '[package]',
+      'name = "ret-app"',
+      'version = "0.1.0"',
+      'edition = "2021"',
+      '',
+      '[dependencies]',
+      'ret-pm = { path = "../../../pm" }',
+    ),
+  );
+  await put(join(ws, 'crates/app/src/lib.rs'), lines('ret_pm::answer!();'));
+  await put(
+    join(pm, 'Cargo.toml'),
+    lines(
+      '[package]',
+      'name = "ret-pm"',
+      'version = "0.1.0"',
+      'edition = "2021"',
+      '',
+      '[lib]',
+      'proc-macro = true',
+      '',
+      '[workspace]',
+    ),
+  );
+  await put(
+    join(pm, 'src/lib.rs'),
+    lines(
+      'extern crate proc_macro;',
+      'use proc_macro::TokenStream;',
+      '',
+      '#[proc_macro]',
+      'pub fn answer(_input: TokenStream) -> TokenStream {',
+      '    "pub fn answer() -> u8 { 42 }".parse().unwrap()',
+      '}',
+    ),
+  );
+  relock(ws);
+  return { ws, pm, target: join(ws, 'target'), host };
+}
+
+/** A running Cargo build's hold on a profile: the shared `.cargo-lock` flock(2), kept until the returned release. */
+async function holdProfile(lock: string): Promise<() => Promise<void>> {
+  const child = Bun.spawn(
+    [
+      'perl',
+      '-e',
+      'use Fcntl qw(:flock); open(my $fh, "<", $ARGV[0]) or die "$!"; flock($fh, LOCK_SH) or die "$!"; $| = 1; print "held\n"; 1 while defined(<STDIN>);',
+      lock,
+    ],
+    { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' },
+  );
+  const said = await child.stdout.getReader().read();
+  const line = said.value === undefined ? '' : new TextDecoder().decode(said.value);
+  if (line !== 'held\n')
+    throw new Error(`perl did not take ${lock}: ${line}${await new Response(child.stderr).text()}`);
+  return async () => {
+    await child.stdin.end();
+    await child.exited;
+  };
 }
 
 async function inFixture(run: (root: string) => Promise<void>): Promise<void> {
@@ -914,9 +1013,9 @@ async function reclaimsOnlyProvenTrash(fx: Churn, superseded: readonly string[])
   await rm(trash, { recursive: true });
 }
 
-/** Case: leaves a nested target directory byte-identical and reports it as a nested root. */
-async function nestedRootStaysByteIdentical(fx: Churn, superseded: readonly string[]): Promise<void> {
-  const check = labelled('leaves a nested target directory byte-identical and reports it as a nested root');
+/** Case: keeps a nested target root holding no unit of a workspace member whole, and reports it as a nested root. */
+async function keepsForeignNestedRoot(fx: Churn, superseded: readonly string[]): Promise<void> {
+  const check = labelled('keeps a nested target root holding no unit of a workspace member whole and reports it');
   const nestedWs = join(fx.root, 'nested');
   await put(
     join(nestedWs, 'Cargo.toml'),
@@ -931,16 +1030,84 @@ async function nestedRootStaysByteIdentical(fx: Churn, superseded: readonly stri
   const nestedBefore = await snapshot(nestedTarget);
   const report = await retain(fx.ws, { apply: true, now: future() });
   const applied = planned(report);
-  check(report.nestedRoots, JSON.stringify(await readdir(nestedTarget))).toEqual([
-    join(report.targetDir, 'nested-root'),
-  ]);
+  const nestedRoot = join(report.targetDir, 'nested-root');
+  check(
+    report.nestedRoots.map((nested) => nested.root),
+    JSON.stringify(await readdir(nestedTarget)),
+  ).toEqual([nestedRoot]);
   check(reclaimPaths(applied)).toEqual([...superseded]);
+  // Nothing proves the root is this workspace's, so the selection never runs over it.
+  const foreign = nestedPlanned(report, nestedRoot);
+  check(foreign.reclaim).toEqual([]);
+  check(keepReason(foreign, nestedRoot)).toBe('foreign-root');
   check(await snapshot(nestedTarget)).toEqual(nestedBefore);
   await scopedTo(nestedTarget, async () => {
     await expectFresh(nestedWs);
   });
   await expectFresh(fx.ws);
   await rm(nestedTarget, { recursive: true });
+}
+
+/**
+ * Case: reclaims a nested target root's superseded generations under its own locks and keeps its newest. The root holds
+ * the same workspace, as `cargo clippy --target-dir target/<name>` leaves it; the flip supersedes generations in both
+ * roots, and one pass reclaims each root's own and none across.
+ */
+async function reclaimsNestedRoot(fx: Churn): Promise<void> {
+  const check = labelled(
+    "reclaims a nested target root's superseded generations under its own locks and keeps its newest",
+  );
+  const nested = join(fx.target, 'nested-root');
+  const buildNested = (): Promise<void> =>
+    scopedTo(nested, async () => {
+      await build(fx.ws);
+    });
+  await buildNested();
+  const leafOld = only(await metasOf(nested, 'ret-leaf'), 'nested ret-leaf generation');
+  const extMeta = only(await metasOf(nested, 'ret-ext'), 'nested ret-ext generation');
+  // The flip supersedes every mid and app generation built so far, the nested root's among them once it is rebuilt.
+  const stale = await toggleFeature(fx);
+  await buildNested();
+  const nestedStale = stale.filter((path) => path.startsWith(`${nested}/`));
+  const ownStale = stale.filter((path) => !path.startsWith(`${nested}/`));
+  if (nestedStale.length === 0 || ownStale.length === 0)
+    throw new Error('the flip left a root with nothing superseded');
+  const incremental = join(nested, 'debug', 'incremental');
+  const incrementalBefore = await snapshot(incremental);
+  // A plan writes nothing and names each root's own superseded generations.
+  const beforePlan = await snapshot(nested);
+  const planReport = await retain(fx.ws, { apply: false, now: future() });
+  check(reclaimPaths(planned(planReport))).toEqual(ownStale);
+  const nestedPlan = nestedPlanned(planReport, nested);
+  check(nestedPlan.kind).toBe('planned');
+  check(reclaimPaths(nestedPlan)).toEqual(nestedStale);
+  check(nestedPlan.reclaimedBytes).toBeGreaterThan(0);
+  check(keepReason(nestedPlan, leafOld)).toBe('newest-of-identity');
+  check(keepReason(nestedPlan, extMeta)).toBe('dependency-of-kept');
+  check(describeRetention(planReport)).toContain(`nested ${nested}: would reclaim`);
+  check(await snapshot(nested)).toEqual(beforePlan);
+  // Applying reclaims both roots' superseded generations, keeps their newest, and leaves every profile in place.
+  const report = await retain(fx.ws, { apply: true, now: future() });
+  check(reclaimPaths(planned(report))).toEqual(ownStale);
+  const applied = nestedPlanned(report, nested);
+  check(applied.kind).toBe('reclaimed');
+  check(reclaimPaths(applied)).toEqual(nestedStale);
+  check(report.completed, 'every root reclaimed').toBeDefined();
+  for (const path of stale) check(await exists(path), path).toBe(false);
+  for (const path of [leafOld, extMeta, ...(await midAndApp(fx.target))]) check(await exists(path), path).toBe(true);
+  for (const lock of ['.cargo-lock', '.cargo-build-lock']) {
+    check(await exists(join(nested, 'debug', lock)), lock).toBe(true);
+  }
+  check(await snapshot(incremental)).toEqual(incrementalBefore);
+  await scopedTo(nested, async () => {
+    await expectFresh(fx.ws);
+  });
+  await expectFresh(fx.ws);
+  // A repeated pass is a no-op in every root.
+  const second = await retain(fx.ws, { apply: true, now: future() });
+  check(planned(second).reclaim).toEqual([]);
+  check(nestedPlanned(second, nested).reclaim).toEqual([]);
+  await rm(nested, { recursive: true });
 }
 
 /** Case: the CLI plans read-only, applies with a receipt, and exits 3 on a refused pass. */
@@ -1253,6 +1420,67 @@ async function keepsReferencedOlderDependency(fx: Churn): Promise<void> {
   await expectFresh(fx.ws);
 }
 
+/** Case: passes a cross-built nested root's host and cross profiles as one root, and skips it while one is locked. */
+async function passesCrossBuiltNestedRoot(fx: ProcMacro): Promise<void> {
+  const check = labelled(
+    "passes a cross-built nested root's host and cross profiles as one root and skips it while one is locked",
+  );
+  const nested = join(fx.target, 'nested-root');
+  const crossLock = join(nested, fx.host, 'debug', '.cargo-lock');
+  const buildNested = (): Promise<void> =>
+    scopedTo(nested, async () => {
+      await build(fx.ws, ['--target', fx.host]);
+    });
+  await buildNested();
+  const appOld = await metasOf(nested, 'ret-app');
+  const pmOld = await metasOf(nested, 'ret-pm');
+  // A new proc macro version supersedes the host generation of the proc macro and the app built on it.
+  const pmManifest = join(fx.pm, 'Cargo.toml');
+  await writeFile(pmManifest, (await readFile(pmManifest, 'utf8')).replace('version = "0.1.0"', 'version = "0.1.1"'));
+  relock(fx.ws);
+  await buildNested();
+  const appNew = (await metasOf(nested, 'ret-app')).filter((path) => !appOld.includes(path));
+  const pmNew = (await metasOf(nested, 'ret-pm')).filter((path) => !pmOld.includes(path));
+  if (appNew.length === 0 || pmNew.length === 0) throw new Error('the proc macro version bump made no new generation');
+  // A Cargo build holds the cross profile, a directory the target's own scan never reaches.
+  const release = await holdProfile(crossLock);
+  try {
+    const before = await snapshot(nested);
+    const locked = await retain(fx.ws, { apply: true, now: future() });
+    check(await snapshot(nested)).toEqual(before);
+    check(nestedOf(locked, nested)).toEqual({ kind: 'busy', lock: crossLock });
+    check(planned(locked).kind).toBe('reclaimed');
+    check(locked.completed, 'a busy root completes nothing').toBeUndefined();
+  } finally {
+    await release();
+  }
+  // Released, both profiles are one root: the superseded app and the proc macro only it used go, and the host-profile
+  // proc macro the kept cross-profile app uses stays.
+  const report = await retain(fx.ws, { apply: true, now: future() });
+  const applied = nestedPlanned(report, nested);
+  check(reclaimPaths(applied)).toEqual([...appOld, ...pmOld].sort());
+  for (const path of appNew) check(keepReason(applied, path), path).toBe('newest-of-identity');
+  for (const path of pmNew) check(keepReason(applied, path), path).toBe('dependency-of-kept');
+  check(report.completed, 'every root reclaimed').toBeDefined();
+  for (const path of [...appOld, ...pmOld]) check(await exists(path), path).toBe(false);
+  for (const path of [...appNew, ...pmNew]) check(await exists(path), path).toBe(true);
+  for (const profile of [join(nested, 'debug'), join(nested, fx.host, 'debug')]) {
+    for (const lock of ['.cargo-lock', '.cargo-build-lock']) {
+      check(await exists(join(profile, lock)), `${profile} ${lock}`).toBe(true);
+    }
+  }
+  await scopedTo(nested, async () => {
+    await expectFresh(fx.ws, ['--target', fx.host]);
+  });
+  // A profile of the nested root that it cannot read refuses that root alone: the target directory's pass stands.
+  await mkdir(join(nested, fx.host, 'debug', '.fingerprint'));
+  const refusal = await retain(fx.ws, { apply: true, now: future() });
+  check(planned(refusal).kind).toBe('reclaimed');
+  check(nestedOf(refusal, nested)).toMatchObject({ kind: 'refused', profile: join(nested, fx.host, 'debug') });
+  check(refusedAnywhere(refusal)).toBe(true);
+  check(refusal.completed, 'a refused root completes nothing').toBeUndefined();
+}
+
 describe('cargo retention against real Cargo target layouts', () => {
   it('walks the retention cases over one churned Cargo target, asserting after every step (mtime-on-use false)', async () => {
     keepsExactDigitsInTheParser();
@@ -1275,7 +1503,8 @@ describe('cargo retention against real Cargo target layouts', () => {
         await keepsForeignEntries(fx, await toggleFeature(fx));
         await keepsSymlinkedGeneration(fx, await toggleFeature(fx));
         await reclaimsOnlyProvenTrash(fx, await toggleFeature(fx));
-        await nestedRootStaysByteIdentical(fx, await toggleFeature(fx));
+        await keepsForeignNestedRoot(fx, await toggleFeature(fx));
+        await reclaimsNestedRoot(fx);
         await cliPlansReadOnlyAndApplies(fx, await toggleFeature(fx));
         await keepsIncompleteGeneration(fx, await toggleFeature(fx));
         await keepsHalfWrittenCurrentRoot(fx, await toggleFeature(fx));
@@ -1312,54 +1541,7 @@ describe('cargo retention against real Cargo target layouts', () => {
 
   it('keeps a proc macro only a cross build uses, whose unit lives in the host profile', async () => {
     await inFixture(async (root) => {
-      const version = execFileSync('rustc', ['-vV'], { encoding: 'utf8' });
-      const host = /^host: (.+)$/m.exec(version)?.[1];
-      if (host === undefined) throw new Error('rustc -vV named no host triple');
-      const ws = join(root, 'ws');
-      const pm = join(root, 'pm');
-      const target = join(ws, 'target');
-      await put(join(ws, '.cargo/config.toml'), fixtureConfig(false));
-      await put(join(ws, 'Cargo.toml'), lines('[workspace]', 'members = ["crates/app"]', 'resolver = "2"'));
-      await put(
-        join(ws, 'crates/app/Cargo.toml'),
-        lines(
-          '[package]',
-          'name = "ret-app"',
-          'version = "0.1.0"',
-          'edition = "2021"',
-          '',
-          '[dependencies]',
-          'ret-pm = { path = "../../../pm" }',
-        ),
-      );
-      await put(join(ws, 'crates/app/src/lib.rs'), lines('ret_pm::answer!();'));
-      await put(
-        join(pm, 'Cargo.toml'),
-        lines(
-          '[package]',
-          'name = "ret-pm"',
-          'version = "0.1.0"',
-          'edition = "2021"',
-          '',
-          '[lib]',
-          'proc-macro = true',
-          '',
-          '[workspace]',
-        ),
-      );
-      await put(
-        join(pm, 'src/lib.rs'),
-        lines(
-          'extern crate proc_macro;',
-          'use proc_macro::TokenStream;',
-          '',
-          '#[proc_macro]',
-          'pub fn answer(_input: TokenStream) -> TokenStream {',
-          '    "pub fn answer() -> u8 { 42 }".parse().unwrap()',
-          '}',
-        ),
-      );
-      relock(ws);
+      const { ws, target, host } = await procMacroFixture(root);
       await scopedTo(target, async () => {
         await build(ws, ['--target', host]);
         const pmMetas = await metasOf(target, 'ret-pm');
@@ -1383,6 +1565,15 @@ describe('cargo retention against real Cargo target layouts', () => {
           expect(refused(denied).reason).toMatch(/unproven|no fingerprint local path/);
           expect(await snapshot(target)).toEqual(before);
         }
+      });
+    });
+  });
+
+  it("passes a cross-built nested root's host and cross profiles as one root and skips it while one is locked", async () => {
+    await inFixture(async (root) => {
+      const fx = await procMacroFixture(root);
+      await scopedTo(fx.target, async () => {
+        await passesCrossBuiltNestedRoot(fx);
       });
     });
   });

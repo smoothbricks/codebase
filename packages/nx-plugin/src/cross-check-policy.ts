@@ -178,8 +178,9 @@ export const CARGO_CROSS_LINT_COMMAND = `${CARGO_CROSS_LINT_GUARD}; ${CARGO_ZIGB
  * check is the longest Cargo invocation in a gate, so in the dev build's
  * `target/` it would queue the test archive and every dev build behind its lock.
  * The price is that clippy compiles its own host units (build scripts,
- * proc-macros) once per directory, and cargo retention does not reclaim nested
- * target directories. A plain `cargo clippy --workspace --all-targets
+ * proc-macros) once per directory; cargo retention passes it as a nested root of
+ * the target directory, reclaiming its superseded generations but not its
+ * `incremental/`. A plain `cargo clippy --workspace --all-targets
  * --target-dir target/cargo-lint` checks exactly these units.
  */
 export const CARGO_LINT_CLIPPY_COMMAND = cargoFrozen(

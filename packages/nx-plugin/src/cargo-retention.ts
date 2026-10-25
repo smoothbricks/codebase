@@ -36,8 +36,18 @@
  * not open): nothing was read or changed, and the reason is a value, because a maintenance pass
  * never fails the run it follows.
  *
- * Not reclaimed here: `incremental/`, nested target directories, and the split-debuginfo
- * objects rustc keeps inside current units (rust-lang/rust#161824).
+ * A Cargo target root nested inside the target directory (`target/cargo-lint`, `target/cargo-lint-cross`, each
+ * built with its own `--target-dir`) is a target directory of its own; units never depend across roots. The
+ * target directory's scan finds it: it locks and reads the nested root's depth-two profile like
+ * its own, and that profile's root-relative fingerprint paths prove the root. A pass busy or
+ * refused there reaches no nested root. Each nested root then gets this same pass over its own
+ * profiles, host and cross, under only their Cargo locks and the target's one retention lock, so
+ * one that is busy or refused is left as it was and holds up no other. Only generations are
+ * reclaimed, never a root or a profile, and a nested root holding no unit of a workspace member
+ * has nothing proving it ours: it is kept whole, as `foreign-root`.
+ *
+ * Not reclaimed here: `incremental/` and the split-debuginfo objects rustc keeps inside current
+ * units (rust-lang/rust#161824).
  */
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -81,7 +91,8 @@ export type KeepReason =
   | 'no-fingerprint'
   | 'not-a-unit'
   | 'incomplete-fingerprint'
-  | 'unproven-trash-entry';
+  | 'unproven-trash-entry'
+  | 'foreign-root';
 
 /** A reclaimed (or, planned, reclaimable) generation: `bytes` free with it, `linkedBytes` stay linked elsewhere. */
 export interface Reclaimable {
@@ -95,7 +106,8 @@ export interface Retained {
   readonly reason: KeepReason;
   readonly detail?: string;
 }
-export type RetentionOutcome =
+/** What one root's pass did: planned or reclaimed generations, a skip behind a held lock, or a refusal. */
+export type PassOutcome =
   | {
       readonly kind: 'planned' | 'reclaimed';
       readonly reclaim: readonly Reclaimable[];
@@ -103,13 +115,18 @@ export type RetentionOutcome =
       readonly linkedBytes: number;
       readonly retained: readonly Retained[];
     }
-  | { readonly kind: 'not-due'; readonly nextDueAt: number }
   | { readonly kind: 'busy'; readonly lock: string }
   | { readonly kind: 'refused'; readonly profile: string; readonly reason: string };
+export type RetentionOutcome = PassOutcome | { readonly kind: 'not-due'; readonly nextDueAt: number };
+/** A Cargo target root nested inside the target directory, passed under its own profiles' Cargo locks. */
+export interface NestedRoot {
+  readonly root: string;
+  readonly outcome: PassOutcome;
+}
 export interface RetentionReport {
   readonly workspaceRoot: string;
   readonly targetDir: string;
-  readonly nestedRoots: readonly string[];
+  readonly nestedRoots: readonly NestedRoot[];
   readonly outcome: RetentionOutcome;
   /** Scheduling evidence only, never a cached selection or proof about later outputs. */
   readonly completed?: { readonly at: number; readonly configuration: string };
@@ -942,6 +959,11 @@ function schedulingConfiguration(
   }
 }
 
+/** Whether any root's pass refused: nothing was changed there, and the report names its profile and reason. */
+export function refusedAnywhere(report: RetentionReport): boolean {
+  return report.outcome.kind === 'refused' || report.nestedRoots.some((nested) => nested.outcome.kind === 'refused');
+}
+
 /** An invalid, foreign, busy, refused or backward-clock receipt never postpones maintenance. */
 function nextAutomaticPass(
   workspaceRoot: string,
@@ -1040,13 +1062,16 @@ export async function retainCargoWorkspace(
       );
       if (due !== undefined) return { ok: true, value: report({ kind: 'not-due', nextDueAt: due }) };
     }
-    const result = await pass(targetDir, layout.value.profiles, members, options);
+    const result = await passRoots(targetDir, layout.value.profiles, members, options);
     if (!result.ok) return result;
     const done: RetentionReport = {
       workspaceRoot,
       targetDir,
       ...result.value,
-      ...(options.apply && result.value.outcome.kind === 'reclaimed'
+      // A receipt schedules only a pass that reclaimed in every root: a busy or refused one is retried next run.
+      ...(options.apply &&
+      result.value.outcome.kind === 'reclaimed' &&
+      result.value.nestedRoots.every((nested) => nested.outcome.kind === 'reclaimed')
         ? { completed: { at: (options.now ?? new Date()).getTime(), configuration: configuration.value } }
         : {}),
     };
@@ -1066,18 +1091,64 @@ export async function retainCargoWorkspace(
   }
 }
 
+/** A nested root's pass; a root whose tag or profile locks cannot be read refuses, as one of its profiles would. */
+async function passNested(
+  root: string,
+  members: ReadonlySet<string>,
+  options: RetentionOptions,
+): Promise<Result<PassReport, RetentionError>> {
+  const layout = await discoverLayout(root);
+  if (layout.ok) return pass(root, layout.value.profiles, members, options, true);
+  if (layout.error.kind !== 'target-not-cargo') return layout;
+  return {
+    ok: true,
+    value: { outcome: { kind: 'refused', profile: root, reason: layout.error.detail }, nestedRoots: [] },
+  };
+}
+
+/**
+ * The target directory's pass, then the pass of each Cargo root it found nested, and of theirs, one
+ * after another: each root holds only its own profiles' Cargo locks, so a busy nested root waits on
+ * no other and holds none up. A target directory pass that is busy or refused found no nested roots.
+ */
+async function passRoots(
+  targetDir: string,
+  profiles: readonly string[],
+  members: ReadonlySet<string>,
+  options: RetentionOptions,
+): Promise<Result<{ readonly outcome: PassOutcome; readonly nestedRoots: readonly NestedRoot[] }, RetentionError>> {
+  const own = await pass(targetDir, profiles, members, options, false);
+  if (!own.ok) return own;
+  const { outcome } = own.value;
+  const nestedRoots: NestedRoot[] = [];
+  if (outcome.kind === 'planned' || outcome.kind === 'reclaimed') {
+    const pending = [...own.value.nestedRoots];
+    for (let root = pending.pop(); root !== undefined; root = pending.pop()) {
+      const passed = await passNested(root, members, options);
+      if (!passed.ok) return passed;
+      nestedRoots.push({ root, outcome: passed.value.outcome });
+      pending.push(...passed.value.nestedRoots);
+    }
+  }
+  nestedRoots.sort((a, b) => (a.root < b.root ? -1 : a.root > b.root ? 1 : 0));
+  return { ok: true, value: { outcome, nestedRoots } };
+}
+
 interface PassReport {
-  readonly outcome: RetentionOutcome;
+  readonly outcome: PassOutcome;
+  /** The roots nested in this one, proven by its depth-two profiles' fingerprints and passed after it. */
   readonly nestedRoots: readonly string[];
 }
+/** One Cargo target root's pass: the target directory's own, or (`nested`) a root found nested inside it. */
 async function pass(
   targetDir: string,
   profiles: readonly string[],
   members: ReadonlySet<string>,
   options: RetentionOptions,
+  nested: boolean,
 ): Promise<Result<PassReport, RetentionError>> {
   const nestedRoots = new Set<string>();
-  const complete = (outcome: RetentionOutcome): Result<PassReport, RetentionError> => ({
+  const complete = (outcome: PassOutcome): Result<PassReport, RetentionError> => ({
     ok: true,
     value: { outcome, nestedRoots: [...nestedRoots].sort() },
   });
@@ -1125,7 +1196,12 @@ async function pass(
     }
     performance.measure('cargoRetention:scan', { start: scanStarted });
     const selectionStarted = performance.now();
-    selection = select(metas, members, (options.now ?? new Date()).getTime());
+    // Cargo's own metadata makes the target directory the workspace's; a nested root is ours only by
+    // holding a member's unit. Without one the selection has no roots, and would reclaim everything.
+    selection =
+      nested && metas.length > 0 && !metas.some((meta) => members.has(meta.pkg))
+        ? { reclaim: [], kept: [{ path: targetDir, reason: 'foreign-root', detail: 'no unit of a workspace member' }] }
+        : select(metas, members, (options.now ?? new Date()).getTime());
     performance.measure('cargoRetention:select', { start: selectionStarted });
     if (options.apply) {
       for (const profile of ownedProfiles) {
@@ -1165,7 +1241,7 @@ async function pass(
 }
 
 /** A pass that could not even attempt a lock changed nothing: it is refused, naming why on one line. */
-function lockRefusal(targetDir: string, lock: string, reason: string): RetentionOutcome {
+function lockRefusal(targetDir: string, lock: string, reason: string): PassOutcome {
   return {
     kind: 'refused',
     profile: targetDir,
@@ -1179,7 +1255,7 @@ function outcome(
   reclaim: readonly Reclaimable[],
   linkedBytes: number,
   retained: readonly Retained[],
-): RetentionOutcome {
+): PassOutcome {
   return { kind, reclaim, reclaimedBytes: reclaim.reduce((sum, entry) => sum + entry.bytes, 0), linkedBytes, retained };
 }
 
@@ -1189,9 +1265,7 @@ function gib(bytes: number): string {
   return `${(bytes / 2 ** 30).toFixed(2)} GiB`;
 }
 
-export function describeRetention(report: RetentionReport): string {
-  const subject = `Cargo retention ${report.targetDir}`;
-  const outcome = report.outcome;
+function describeOutcome(subject: string, outcome: RetentionOutcome): string {
   switch (outcome.kind) {
     case 'planned':
     case 'reclaimed': {
@@ -1208,6 +1282,14 @@ export function describeRetention(report: RetentionReport): string {
     case 'refused':
       return `${subject}: refused, ${outcome.profile}: ${outcome.reason}; nothing was changed`;
   }
+}
+
+/** One line: the target directory's outcome, then each nested root's. */
+export function describeRetention(report: RetentionReport): string {
+  return [
+    describeOutcome(`Cargo retention ${report.targetDir}`, report.outcome),
+    ...report.nestedRoots.map((nested) => describeOutcome(`nested ${nested.root}`, nested.outcome)),
+  ].join('; ');
 }
 
 export function describeRetentionError(error: RetentionError): string {
@@ -1295,7 +1377,7 @@ export async function postTasksExecution(_options: unknown, context: PostTasksEx
     }
     done.push(result.value.workspaceRoot);
     const line = describeRetention(result.value);
-    if (result.value.outcome.kind === 'refused') logger.warn(line);
+    if (refusedAnywhere(result.value)) logger.warn(line);
     else logger.info(line);
   }
 }
