@@ -40,11 +40,15 @@ async function fixture(source: string) {
 }
 
 describe('@smoothbricks/nx-plugin TypeScript emit executor', () => {
-  it('emits executable transformed validation and declarations from the same program', async () => {
+  it('emits executable transformed validation and declarations from the same program, and nothing an earlier build left', async () => {
     const root = await fixture(
       "#!/usr/bin/env node\nimport typia from 'typia';\nexport const validate = typia.createValidate<{ value: number }>();\n",
     );
     try {
+      // What an earlier build left: a bin since moved to another package, and the output of a since-deleted module.
+      await mkdir(join(root, 'dist/bin'), { recursive: true });
+      await writeFile(join(root, 'dist/bin/moved.js'), 'export {};\n');
+      await writeFile(join(root, 'dist/deleted.js'), 'export {};\n');
       expect(
         await typescriptEmitExecutor(
           { cwd: root, tsConfig: 'tsconfig.lib.json', executableOutputs: ['dist/index.js'] },
@@ -52,7 +56,14 @@ describe('@smoothbricks/nx-plugin TypeScript emit executor', () => {
         ),
       ).toEqual({ success: true });
       expect((await stat(join(root, 'dist/index.js'))).mode & 0o111).toBe(0o111);
-      expect((await stat(join(root, 'dist/index.d.ts'))).isFile()).toBe(true);
+      expect((await readdir(join(root, 'dist'))).sort()).toEqual(['index.d.ts', 'index.d.ts.map', 'index.js']);
+      expect((await readdir(root)).sort()).toEqual([
+        'dist',
+        'node_modules',
+        'package.json',
+        'src',
+        'tsconfig.lib.json',
+      ]);
       const child = Bun.spawn(
         [
           'bun',
@@ -68,17 +79,35 @@ describe('@smoothbricks/nx-plugin TypeScript emit executor', () => {
       ]);
       expect(exit, errors).toBe(0);
       expect(text).toBe('[true,false]');
+      // A second emit over the same outputs: the compiler rewrites each one, so the removal keeps them all.
+      expect(
+        await typescriptEmitExecutor(
+          { cwd: root, tsConfig: 'tsconfig.lib.json', executableOutputs: ['dist/index.js'] },
+          { root },
+        ),
+      ).toEqual({ success: true });
+      expect((await readdir(join(root, 'dist'))).sort()).toEqual(['index.d.ts', 'index.d.ts.map', 'index.js']);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it('reports real type errors instead of claiming a successful build', async () => {
+  it('reports real type errors and removes nothing from the previous output instead of claiming a successful build', async () => {
     const root = await fixture("export const amount: number = 'not a number';\n");
     try {
+      await mkdir(join(root, 'dist'));
+      await writeFile(join(root, 'dist/previous.js'), 'export const amount = 1;\n');
       expect(await typescriptEmitExecutor({ cwd: root, tsConfig: 'tsconfig.lib.json' }, { root })).toEqual({
         success: false,
       });
+      expect(await readdir(join(root, 'dist'))).toContain('previous.js');
+      expect((await readdir(root)).sort()).toEqual([
+        'dist',
+        'node_modules',
+        'package.json',
+        'src',
+        'tsconfig.lib.json',
+      ]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -190,6 +219,44 @@ describe('@smoothbricks/nx-plugin TypeScript emit build input record', () => {
       expect(invocation?.args.slice(0, 3)).toEqual(['-p', join(lib, 'tsconfig.lib.json'), '--emit']);
     });
   });
+  it('removes only the outputs the emit left untouched, and the directories that leaves empty', async () => {
+    await inLibWorkspace(async (root) => {
+      const lib = join(root, 'packages/lib');
+      await mkdir(join(lib, 'dist/bin'), { recursive: true });
+      await writeFile(join(lib, 'dist/bin/moved.js'), 'export {};\n');
+      await writeFile(join(lib, 'dist/index.js'), 'export const index = 1;\n');
+      await writeFile(join(lib, 'dist/deleted.js'), 'export {};\n');
+      // The compiler rewrites what it still produces, unchanged bytes included, and writes what it newly produces.
+      const emit = async () => {
+        await writeFile(join(lib, 'dist/index.js'), 'export const index = 1;\n');
+        await writeFile(join(lib, 'dist/added.js'), 'export {};\n');
+        return true;
+      };
+      expect(await runTypeScriptEmit({ cwd: lib, tsConfig: 'tsconfig.lib.json' }, { root }, emit)).toEqual({
+        success: true,
+      });
+      expect((await readdir(join(lib, 'dist'))).sort()).toEqual(['.build-inputs.json', 'added.js', 'index.js']);
+    });
+  });
+
+  it('refuses an outDir that holds a TypeScript source before the compiler runs', async () => {
+    await inLibWorkspace(async (root) => {
+      const lib = join(root, 'packages/lib');
+      await mkdir(join(lib, 'dist'));
+      await writeFile(join(lib, 'dist/kept.ts'), 'export const kept = 1;\n');
+      let compiled = false;
+      const emit = async () => {
+        compiled = true;
+        return true;
+      };
+      await expect(runTypeScriptEmit({ cwd: lib, tsConfig: 'tsconfig.lib.json' }, { root }, emit)).rejects.toThrow(
+        `holds the TypeScript source ${join(lib, 'dist/kept.ts')}`,
+      );
+      expect(compiled).toBe(false);
+      expect(await readdir(join(lib, 'dist'))).toEqual(['kept.ts']);
+    });
+  });
+
   it('writes no record when the compiler fails', async () => {
     await inLibWorkspace(async (root) => {
       const lib = join(root, 'packages/lib');

@@ -887,11 +887,18 @@ aggregates.
 
 Concrete targets come from concrete files:
 
-- `tsc-js` emits transformed JavaScript through a temporary JS-only `ttsc` config, restores execute bits on outputs
-  declared by `package.json#bin`, then emits declarations and declaration maps from the original project with native
-  `tsc`. Direct project references and every cached output lane are preserved. It writes `.build-inputs.json` into the
-  `outDir`: the SHA-256 of every file the config's `include` matches less its `exclude`, taken before the emit, and
-  those globs as Git pathspecs. The macOS napi targets write the same record from rustc's dep-info file through
+- `tsc-js` runs `ttsc -p tsconfig.lib.json --emit` with flags that make it emit transformed JavaScript, declarations and
+  declaration maps from one non-incremental program, then restores execute bits on outputs declared by
+  `package.json#bin`. It writes no file beside the tsconfig, whose directory a consumer's ttsc transform lists while it
+  compiles. Direct project references and every cached output lane are preserved. The config's `outDir` is the target's
+  only output and holds exactly what this emit wrote: the compiler rewrites every output it produces in place, so after
+  a successful emit the executor removes each file under `outDir` whose inode, ctime and mtime are unchanged since
+  before the emit, and each directory that leaves empty. A file an earlier build wrote and this one no longer does (a
+  bin moved to another package, a deleted module) is gone before Nx captures the output, so no cache artifact carries
+  it. A failed emit removes nothing, and an `outDir` that holds a TypeScript source is refused before the compiler runs.
+  It writes `.build-inputs.json` into the `outDir`: the SHA-256 of every file the config's `include` matches less its
+  `exclude`, taken before the emit, and those globs as Git pathspecs. The macOS napi targets write the same record from
+  rustc's dep-info file through
   `smoo-nx-build-inputs --manifest-path <Cargo.toml> --dep-info <path under the target directory> --output <dir>`. The
   record is inside the target's outputs, so a cache hit restores it with them; a live developer link
   (`@smoothbricks/cli`, "Declared Links") checks it to tell a current build from a stale one by content.
