@@ -599,6 +599,8 @@ async function refusesWithoutPerl(fx: Churn): Promise<void> {
   const check = labelled('refuses the pass, changing nothing, when a lock cannot be attempted at all');
   const node = Bun.which('node');
   if (node === null) throw new Error('node is not on PATH');
+  // Earlier steps applied and left the lock file; a refused attempt must not create it again.
+  await clearLock(fx.target);
   const bin = join(fx.root, 'bin');
   await mkdir(bin);
   for (const tool of ['cargo', 'rustc']) {
@@ -608,6 +610,10 @@ async function refusesWithoutPerl(fx: Churn): Promise<void> {
   }
   const buildDir = join(fx.target, 'debug', 'build');
   const before = await snapshot(buildDir);
+  // Earlier walk steps may have left a receipt or trash; a refused pass changes neither.
+  const receiptPath = join(fx.target, RETENTION_RECEIPT);
+  const receiptBefore = (await exists(receiptPath)) ? await readFile(receiptPath, 'utf8') : null;
+  const trashBefore = await exists(join(fx.target, 'debug', TRASH));
   const refusedBecause = (run: RetentionRun, lock: string, cause: string): void => {
     if (!run.ok) throw new Error(`the pass failed instead of being refused: ${JSON.stringify(run.error)}`);
     check(refused(run.value).reason, cause).toBe(`cannot attempt ${lock}: ${cause}`);
@@ -636,8 +642,10 @@ async function refusesWithoutPerl(fx: Churn): Promise<void> {
   check(planned(await retain(fx.ws, { apply: false, now: future() })).kind).toBe('planned');
   await rm(join(fx.target, RETENTION_LOCK));
   check(await snapshot(buildDir)).toEqual(before);
-  check(await exists(join(fx.target, RETENTION_RECEIPT)), 'no receipt').toBe(false);
-  check(await exists(join(fx.target, 'debug', TRASH)), 'no trash').toBe(false);
+  check((await exists(receiptPath)) ? await readFile(receiptPath, 'utf8') : null, 'receipt unchanged').toBe(
+    receiptBefore,
+  );
+  check(await exists(join(fx.target, 'debug', TRASH)), 'trash unchanged').toBe(trashBefore);
 }
 
 /** Case: refuses a legacy-layout profile instead of reporting a clean zero. */
