@@ -33,10 +33,14 @@
    admission or priority for scarce resources are legitimate. They are not permission to hide a failing concurrent test.
 8. **Test at the defect's owner and the smallest real boundary.** Do not repeat dependency suites in consumers or
    re-prove OS internals. Exercise our real OS/process/network integration where that behavior matters; use real
-   in-memory implementations for logic, never fake echoes. Choose an oracle that can fail. Missing tests, infrastructure
-   errors and timeouts are not intended red. Measure performance claims in comparable regimes and retain the witness.
-   Never assert a tautology: a test that the OS behaves like the OS, or Nx like Nx, proves nothing - test our contract
-   at the boundary that can actually fail.
+   in-memory implementations for logic, never fake echoes. Decisions (event handling, ordering, timeouts, retries as
+   policy, recovery) live in a pure core fed injected events and an injected clock; test them as table-driven calls with
+   no real I/O or sleeps. The shell is decisionless I/O that maps OS events (watchers, sockets, signals, timers) into
+   core inputs and executes core outputs: one simple mock integration check plus actual runs prove it, and no test
+   drives core logic through real FSEvents, timers or a load generator. Choose an oracle that can fail. Missing tests,
+   infrastructure errors and timeouts are not intended red. Measure performance claims in comparable regimes and retain
+   the witness. Never assert a tautology: a test that the OS behaves like the OS, or Nx like Nx, proves nothing - test
+   our contract at the boundary that can actually fail.
 9. **Preserve inference.** Thread precise public types and generics from input through storage to returned values; fix
    source APIs instead of adding cast bridges or test-only wrappers. No `as any`, `as unknown as`, or
    `JSON.parse(...) as T` as validation. `as const` and `satisfies` preserve information. An `unknown` generic default

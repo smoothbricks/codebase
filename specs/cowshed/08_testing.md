@@ -6,6 +6,14 @@ each is explicit about where it runs.
 
 ## Unit tests (pure, all platforms)
 
+Decisions live in a pure core: event handling, ordering, timeouts, retry policy and recovery take injected events and an
+injected clock, so this tier reaches them as table-driven calls with no real I/O and no sleeps. The imperative shell is
+dumb, decisionless I/O: it maps OS events (FSEvents and other file watchers, sockets, signals, timers) into core inputs
+and executes core outputs. It gets one simple mock integration check — a synthetic OS event reaches the real core as its
+mapped input; the mock stands in for the OS, never for our code — and is proven by actual runs in practice. No test
+drives core logic through real FSEvents, real timers or a load generator; the real tiers below prove substrate and
+enforcement contracts, not decisions a core takes.
+
 No mounts, no root, no network — pure functions with table-driven cases:
 
 - **Sandbox rule generation** (Seatbelt profile text and Landlock ruleset spec, from the same grant snapshot): closed
