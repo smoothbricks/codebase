@@ -542,18 +542,15 @@ Find the symptom in the left column and follow the link.
   state” either way, and neither opt-out stops the `mds` port leak above (_owner text_). The `Exclusions` live in
   `/System/Volumes/Data/.Spotlight-V100`, which refuses writes even to a root LaunchDaemon: the boot script's `mktemp`
   there failed `Operation not permitted` on each of 26,970 launchd runs, and `mdutil -i off` refuses a `nobrowse` mount
-  with `-400`. On a scratch volume whose indexing is on, the marker turns `mdutil -s` from “Indexing enabled” to
-  “Indexing and searching disabled” at the next mount, and removing it turns it back (_measured_, macOS 26.6.2,
-  2026-10-25).
+  with `-400` (_measured_, macOS 26.6.2, 2026-10-25).
 - **Rule.** `adopt` plants an empty `.metadata_never_index` at main's volume root, which every clone inherits and git
-  excludes. The root boot service plants one at the root of each volume it mounts, after all of its mounts, and never
-  writes `Exclusions`. `mds` is never restarted and indexing never toggled.
+  excludes. The boot service writes no Spotlight policy: the session mount root keeps volumes unindexed
+  ([01a_apfs.md §Stable workspace mount root](./01a_apfs.md#stable-workspace-mount-root)). `mds` is never restarted and
+  indexing never toggled.
 - **Owners.** [01a_apfs.md §Images](./01a_apfs.md#images), “Spotlight”;
   [01a_apfs.md §Mount and per-volume policy](./01a_apfs.md#mount-and-per-volume-policy) (the Spotlight indexing row);
-  [01a_apfs.md §Dedicated store volume](./01a_apfs.md#dedicated-store-volume) (the boot service, step 4);
   [01b_zfs.md §Mount root and Spotlight](./01b_zfs.md#mount-root-and-spotlight). Code: [`cowshed-apfs/src/lib.rs`]
-  `SPOTLIGHT_OPT_OUT`, `initialize_volume_root`; [`cowshed-core/src/git.rs`] `ensure_cowshed_excludes`;
-  [`cowshed-core/src/storage/bootstrap/native/macos.rs`] `SPOTLIGHT_OPT_OUT_SHELL`, `boot_calls`. See also
+  `SPOTLIGHT_OPT_OUT`, `initialize_volume_root`; [`cowshed-core/src/git.rs`] `ensure_cowshed_excludes`. See also
   [Spotlight (`mds`) leaks a media port per admitted volume](#spotlight-mds-leaks-a-media-port-per-admitted-volume).
 
 ### `fseventsd` keeps a persistent event log per volume

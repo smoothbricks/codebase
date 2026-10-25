@@ -472,37 +472,14 @@ fn shell_quote(value: &str) -> String {
 }
 
 /// The boot layer uses only system tools: no user-writable executable runs as root.
-/// Spotlight reads an empty `.metadata_never_index` at a volume's root when the volume mounts;
-/// the Data volume's Search Privacy `Exclusions` are no alternative, since its `.Spotlight-V100`
-/// refuses writes even to this root daemon. The opt-out runs after every mount, so its refusal
-/// never costs one. It creates only an absent marker, exclusively (`set -C`), and refuses a
-/// symlink, directory or non-empty file at that name instead of writing through it.
-const SPOTLIGHT_OPT_OUT_SHELL: &str = r#"opt_out_of_spotlight() {
-    label=$1
-    marker="$2/.metadata_never_index"
-    boot_step="plant Spotlight opt-out for $label"
-    boot_line=$((LINENO + 1))
-    if [ -L "$marker" ] || { [ -e "$marker" ] && { [ ! -f "$marker" ] || [ -s "$marker" ]; }; }; then
-        echo "cowshed storage: $marker is not an empty regular file" >&2
-        return 1
-    fi
-    boot_line=$((LINENO + 2))
-    if [ ! -e "$marker" ]; then
-        (set -C; : > "$marker")
-    fi
-}
-"#;
-
 /// Boot failures retain the refusing step and source line without exposing credential bytes.
 const BOOT_FAILURE_SHELL: &str = r#"boot_step='initialize boot mounts'
 boot_line=1
 trap 'status=$?; if [ "$status" -ne 0 ]; then printf "cowshed storage: %s:%s: %s refused (exit %s)\n" "$0" "$boot_line" "$boot_step" "$status" >&2; fi' EXIT
 "#;
 
-/// Every mount first, then every Spotlight opt-out: no opt-out refusal can keep a volume unmounted.
-fn boot_calls(pins: &[FstabPin]) -> Result<String, NativeBootstrapError> {
+fn desired_mount_service(pins: &[FstabPin]) -> Result<MountServiceFiles, NativeBootstrapError> {
     let mut mounts = String::new();
-    let mut opt_outs = String::new();
     for pin in pins {
         Uuid::parse_str(&pin.volume_uuid).map_err(|_| {
             NativeBootstrapError::MalformedApfsInventory(format!(
@@ -516,26 +493,19 @@ fn boot_calls(pins: &[FstabPin]) -> Result<String, NativeBootstrapError> {
                 pin.mountpoint
             )))
         })?;
-        let label = shell_quote(&pin.label);
-        let mountpoint = shell_quote(mountpoint);
         mounts.push_str(&format!(
-            "mount_volume {label} {} {mountpoint}\n",
-            shell_quote(&pin.volume_uuid)
+            "mount_volume {} {} {}\n",
+            shell_quote(&pin.label),
+            shell_quote(&pin.volume_uuid),
+            shell_quote(mountpoint)
         ));
-        opt_outs.push_str(&format!("opt_out_of_spotlight {label} {mountpoint}\n"));
     }
-    mounts.push_str(&opt_outs);
-    Ok(mounts)
-}
-
-fn desired_mount_service(pins: &[FstabPin]) -> Result<MountServiceFiles, NativeBootstrapError> {
-    let calls = boot_calls(pins)?;
     let script = format!(
         r#"#!/bin/sh
 set -eu
 umask 022
 
-{BOOT_FAILURE_SHELL}{SPOTLIGHT_OPT_OUT_SHELL}
+{BOOT_FAILURE_SHELL}
 mount_volume() {{
     label=$1
     uuid=$2
@@ -599,7 +569,7 @@ mount_volume() {{
     fi
 }}
 
-{calls}"#
+{mounts}"#
     );
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -4692,105 +4662,6 @@ mod tests {
         ]
     }
 
-    /// Runs the generated boot calls behind the generated opt-out and a `mount_volume` stub that
-    /// records its label: the real one needs root and a volume, and the contract test pins it.
-    fn run_boot_calls(pins: &[FstabPin], mount_log: &Path) -> Output {
-        Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!(
-                "set -eu\n{BOOT_FAILURE_SHELL}{SPOTLIGHT_OPT_OUT_SHELL}mount_volume() {{ printf '%s\\n' \"$1\" >> \"$MOUNT_LOG\"; }}\n{}",
-                boot_calls(pins).unwrap()
-            ))
-            .arg("mount-volumes.sh")
-            .env("MOUNT_LOG", mount_log)
-            .output_locked()
-            .unwrap()
-    }
-
-    #[test]
-    fn boot_spotlight_opt_out_refusal_never_costs_a_mount() {
-        let directory =
-            std::env::temp_dir().join(format!("cowshed-spotlight-opt-out-{}", Uuid::new_v4()));
-        let pins = mount_service_pins()
-            .into_iter()
-            .map(|pin| FstabPin {
-                mountpoint: directory.join(&pin.label),
-                ..pin
-            })
-            .collect::<Vec<_>>();
-        for pin in &pins {
-            fs::create_dir_all(&pin.mountpoint).unwrap();
-        }
-        let markers = pins
-            .iter()
-            .map(|pin| pin.mountpoint.join(cowshed_apfs::SPOTLIGHT_OPT_OUT))
-            .collect::<Vec<_>>();
-        let mount_log = directory.join("mounts.log");
-        let chflags = |flag: &str, path: &Path| {
-            let output = Command::new("/usr/bin/chflags")
-                .arg(flag)
-                .arg(path)
-                .output_locked()
-                .unwrap();
-            assert!(output.status.success(), "{output:?}");
-        };
-
-        // SIP's refusal: an immutable directory refuses a new entry with EPERM, owner or not.
-        chflags("uchg", &pins[0].mountpoint);
-        let refused = run_boot_calls(&pins, &mount_log);
-        chflags("nouchg", &pins[0].mountpoint);
-        let stderr = String::from_utf8_lossy(&refused.stderr);
-        assert_eq!(refused.status.code(), Some(1), "{refused:?}");
-        assert_eq!(
-            fs::read_to_string(&mount_log).unwrap(),
-            "cowshed.store\ncowshed.caches\n",
-            "every volume mounts before any opt-out runs"
-        );
-        assert!(stderr.contains("Operation not permitted"), "{stderr}");
-        assert!(
-            stderr.contains("plant Spotlight opt-out for cowshed.store refused (exit 1)"),
-            "{stderr}"
-        );
-        assert!(!markers[0].exists());
-
-        let planted = run_boot_calls(&pins, &mount_log);
-        assert!(planted.status.success(), "{planted:?}");
-        let inodes = markers
-            .iter()
-            .map(|marker| {
-                let metadata = fs::symlink_metadata(marker).unwrap();
-                assert!(metadata.file_type().is_file());
-                assert_eq!(metadata.len(), 0);
-                metadata.ino()
-            })
-            .collect::<Vec<_>>();
-        let again = run_boot_calls(&pins, &mount_log);
-        assert!(again.status.success(), "{again:?}");
-        assert_eq!(
-            markers
-                .iter()
-                .map(|marker| fs::symlink_metadata(marker).unwrap().ino())
-                .collect::<Vec<_>>(),
-            inodes,
-            "a present marker is left alone"
-        );
-
-        // A squatter refuses instead of being written through.
-        let target = directory.join("target");
-        fs::write(&target, b"keep").unwrap();
-        fs::remove_file(&markers[1]).unwrap();
-        std::os::unix::fs::symlink(&target, &markers[1]).unwrap();
-        let squatted = run_boot_calls(&pins, &mount_log);
-        assert_eq!(squatted.status.code(), Some(1), "{squatted:?}");
-        assert!(
-            String::from_utf8_lossy(&squatted.stderr)
-                .contains("plant Spotlight opt-out for cowshed.caches refused (exit 1)"),
-            "{squatted:?}"
-        );
-        assert_eq!(fs::read(&target).unwrap(), b"keep");
-        fs::remove_dir_all(directory).unwrap();
-    }
-
     #[test]
     fn boot_mount_service_is_a_root_owned_shell_contract_not_a_cowshed_command() {
         let files = desired_mount_service(&mount_service_pins()).unwrap();
@@ -4798,12 +4669,6 @@ mod tests {
         let plist = String::from_utf8(files.plist.clone()).unwrap();
 
         assert!(!script.contains(".Spotlight-V100"));
-        assert!(
-            script.rfind("mount_volume '").unwrap()
-                < script.find("opt_out_of_spotlight '").unwrap(),
-            "every mount precedes every Spotlight opt-out"
-        );
-        assert!(script.ends_with(&boot_calls(&mount_service_pins()).unwrap()));
         assert!(script.contains("if password=$("));
         assert!(script.contains("unset password"));
         assert!(script.contains("refused (exit %s)"));
