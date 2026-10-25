@@ -14,17 +14,22 @@ inputs:
 runs:
   using: composite
   steps:
+    # The binaries are compiled from ttsc's own packages and from each package that ships a ttsc plugin, which declares
+    # ttsc as a dependency or peer (typia does). Those bun.lock entries, with the ttsc patch and the Go toolchain pins,
+    # are the whole key: a dependency change no plugin reaches, such as a release commit rewriting a workspace package's
+    # version, keeps the binaries. No match fails the step: this action only runs where bun.lock locks ttsc.
+    - name: Select ttsc lock entries
+      if: inputs.mode == 'restore'
+      shell: bash
+      run: |
+        mkdir -p .cache/ttsc
+        grep -E '^ +"(@ttsc/[^"]+|ttsc(/[^"]+)?)": |"ttsc": "' bun.lock > .cache/ttsc/plugin-lock-entries
+
     # A prefix hit is safe. ttsc names every entry by a hash of what it was compiled from (the ttsc and tsgo versions,
     # platform and architecture, the Go toolchain and its build environment, the plugin sources) and runs an entry only
     # when its name is the one it computes for this checkout, so a restored entry of other inputs is dead weight and
-    # never a wrong binary. f0707cbe5a dropped the fallback because a prefix hit sent ttsc to compile typescript-go from
-    # an empty `go list -m` directory; devenv pins that tree now (TTSC_TYPESCRIPT_GO_DIR), so it no longer comes from
-    # the module cache.
-    #
-    # The exact key alone missed on every publish. It hashes bun.lock, and a release commit rewrites a workspace
-    # package's version there, so the key rotates with no plugin input changed (Publish run 40134656607: packages/lmao
-    # went from 0.5.7-next.0 to 0.5.7, and both macOS legs missed and compiled typia from cold). The prefix falls back
-    # to the newest cache of this OS and architecture, whose entries still carry the names ttsc computes.
+    # never a wrong binary. devenv pins the typescript-go tree (TTSC_TYPESCRIPT_GO_DIR), so a prefix hit never sends
+    # ttsc to compile it from an empty `go list -m` directory.
     - name: Restore ttsc plugin binaries
       id: restore
       if: inputs.mode == 'restore'
@@ -34,16 +39,14 @@ runs:
         # workspace; devenv sets TTSC_CACHE_DIR to <repo>/.cache/ttsc.
         path: .cache/ttsc/plugins
         # prettier-ignore
-        key: ${{ runner.os }}-${{ runner.arch }}-ttsc-plugins-v1-${{ hashFiles('bun.lock', 'package.json', 'patches/ttsc@*.patch', 'tooling/direnv/devenv.lock', 'tooling/direnv/devenv.smoo.nix') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-ttsc-plugins-v1-${{ hashFiles('.cache/ttsc/plugin-lock-entries', 'patches/ttsc@*.patch', 'tooling/direnv/devenv.lock', 'tooling/direnv/devenv.smoo.nix') }}
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-ttsc-plugins-v1-
 
     # A composite action has no post step, so the save is a second call of this action, made by save-nix-devenv when
     # the job ends. It then sees every plugin the job compiled, Nx tasks included, and it still runs after a red job:
-    # actions/cache saves in its own post step only after a green one, and the arm64 leg of Publish run 40134656607
-    # compiled typia, failed a unit test and saved nothing. The save needs the key looked up here and the time of this
-    # restore: by then the release steps can have rewritten bun.lock, so hashing again could name a key no later run
-    # looks up. An exact hit, or a runner without a cache service, has nothing to save and leaves both unset.
+    # actions/cache saves in its own post step only after a green one. The save needs the key looked up here and the
+    # time of this restore. An exact hit, or a runner without a cache service, has nothing to save and leaves both unset.
     - name: Note the key and time for the job-end save
       if: steps.restore.outputs.cache-primary-key != '' && steps.restore.outputs.cache-hit != 'true'
       shell: bash

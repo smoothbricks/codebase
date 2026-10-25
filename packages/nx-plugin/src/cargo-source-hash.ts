@@ -112,6 +112,11 @@ export interface CargoResolve {
   /** The workspace's own members: `root`'s manifest governs each of them. */
   readonly members: ReadonlySet<string>;
   readonly local: readonly LocalCargoPackage[];
+  /**
+   * Every package Cargo.lock pins (registry, git, alternate registry), by package id: its `source`, which for a git
+   * dependency names the locked commit that the id alone does not.
+   */
+  readonly locked: ReadonlyMap<string, string>;
   /** Every dependency edge by package id, or null when Cargo reported no resolution. */
   readonly edges: ReadonlyMap<string, readonly string[]> | null;
 }
@@ -503,6 +508,7 @@ function cargoFromMetadata(metadata: CargoMetadata): CargoResolve {
           governingManifest: pkg.governing_manifest_path,
         };
       }),
+    locked: new Map(metadata.packages.flatMap((pkg) => (pkg.source === null ? [] : [[pkg.id, pkg.source] as const]))),
     edges:
       metadata.resolve === null
         ? null

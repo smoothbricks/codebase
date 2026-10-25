@@ -2,7 +2,7 @@ import { expect, it } from 'bun:test';
 import { realpath } from 'node:fs/promises';
 import { posix } from 'node:path';
 import { expandedFilesets, filesetSource } from './__tests__/cargo-closure-filesets.js';
-import { cargoClosureInputs } from './cargo-closure-input.js';
+import { cargoClosureInputs, cargoLockNodeName } from './cargo-closure-input.js';
 
 const root = await realpath(import.meta.dir);
 
@@ -12,7 +12,10 @@ async function equivalent(directories: readonly string[], files: readonly string
     ...directories.map((directory) => posix.join(directory, 'src/lib.rs')),
     ...files,
   ]);
-  expect(await cargoClosureInputs('', [filesetSource(root, directories, files)])).toEqual(expected);
+  expect(await cargoClosureInputs('', [filesetSource(root, directories, files)])).toEqual([
+    ...expected,
+    { externalDependencies: [cargoLockNodeName('')] },
+  ]);
 }
 
 it('preserves ordered inputs for roots, nested packages, prefix siblings, and loose targets', async () => {

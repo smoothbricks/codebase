@@ -88,7 +88,6 @@ describe('Cargo workspace layouts', () => {
       const inputs = await cargoPackageTestInputs(request);
       for (const path of [
         'Cargo.toml',
-        'Cargo.lock',
         '.cargo/config',
         '.cargo/config.toml',
         '.config/nextest.toml',
@@ -118,6 +117,8 @@ describe('Cargo workspace layouts', () => {
         'scripts/unrelated.sh',
       ])
         expect(matches(inputs, path)).toBe(false);
+      // The lock reaches runners through the crate's cargo-lock node, not this fileset.
+      expect(matches(inputs, 'Cargo.lock')).toBe(false);
       await write(root, 'crates/app/target/debug/generated.rs', 'generated');
       await write(root, 'crates/app/src/template.html', 'changed asset');
       expect(matches(await cargoPackageTestInputs(request), 'crates/app/target/debug/generated.rs')).toBe(false);
@@ -279,7 +280,7 @@ describe('Cargo workspace layouts', () => {
     }
   });
 
-  it('uses Cargo.lock for registry and git dependencies, and declared local target paths for source', async () => {
+  it("the registry and git lock entries reach runners through the crate's lock-scope node, not this fileset, and declared local target paths hash as source", async () => {
     const root = await mkdtemp(join(tmpdir(), 'nx-cargo-declared-'));
     try {
       await write(
@@ -297,7 +298,7 @@ describe('Cargo workspace layouts', () => {
         absoluteProjectRoot: root,
         memberDir: 'crates/app',
       });
-      expect(matches(inputs, 'Cargo.lock')).toBe(true);
+      expect(matches(inputs, 'Cargo.lock')).toBe(false);
       expect(matches(inputs, 'shared/build.rs')).toBe(true);
       expect(matches(inputs, 'shared/lib.rs')).toBe(true);
       expect(inputs).not.toContain('externalRustCrates');

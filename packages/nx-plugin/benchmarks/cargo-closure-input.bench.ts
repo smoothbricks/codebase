@@ -3,7 +3,7 @@ import { realpath } from 'node:fs/promises';
 import { cpus } from 'node:os';
 import { posix } from 'node:path';
 import { expandedFilesets, filesetSource } from '../src/__tests__/cargo-closure-filesets.js';
-import { cargoClosureInputs } from '../src/cargo-closure-input.js';
+import { cargoClosureInputs, cargoLockNodeName } from '../src/cargo-closure-input.js';
 
 // Run from the workspace root: taskpolicy -b bun packages/nx-plugin/benchmarks/cargo-closure-input.bench.ts
 // One caller, warmed resolution/source-scan data; the real async closure entry still performs its realpath.
@@ -20,7 +20,10 @@ for (const size of [1, 4, 16, 25, 64, 256, 1024, 4096]) {
     ['Cargo.toml', 'shared.rs', ...directories.map((directory) => posix.join(directory, 'src/lib.rs'))],
     copies,
   );
-  assert.deepEqual(await cargoClosureInputs('', [source]), expected);
+  assert.deepEqual(await cargoClosureInputs('', [source]), [
+    ...expected,
+    { externalDependencies: [cargoLockNodeName('')] },
+  ]);
   for (let warm = 0; warm < 3; warm += 1) await cargoClosureInputs('', [source]);
   const samples: number[] = [];
   let checksum = 0;

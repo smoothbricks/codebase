@@ -13,6 +13,7 @@ if (!existsSync(realPluginPath)) {
 // Nx's real loader uses require(), so this boundary must stay synchronous in Node and Bun.
 const plugin = createRequire(import.meta.url)('./dist/index.js');
 export const createNodesV2 = plugin.createNodesV2;
+export const createDependencies = plugin.createDependencies;
 export const preTasksExecution = plugin.preTasksExecution;
 export const postTasksExecution = plugin.postTasksExecution;
 export default plugin.default;

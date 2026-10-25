@@ -23,7 +23,7 @@ import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
-import { CARGO_CLOSURE_INPUT } from './cargo-closure-input.js';
+import { CARGO_CLOSURE_INPUT, isCargoLockInput } from './cargo-closure-input.js';
 import { CARGO_PRODUCER_METADATA } from './cargo-retention.js';
 import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
@@ -234,7 +234,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       });
       const toolchainInputs = [
         '{workspaceRoot}/package.json',
-        '{workspaceRoot}/bun.lock',
+        { externalDependencies: ['bun-lock:packages/example'] },
         '{workspaceRoot}/patches/**/*',
         '!{workspaceRoot}/patches/**/*.md',
         '{workspaceRoot}/tsconfig.base.json',
@@ -262,7 +262,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '!{workspaceRoot}/patches/**/*.md',
         '{workspaceRoot}/tsconfig.base.json',
         { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
-        { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
+        { externalDependencies: ['bun-lock:packages/example'] },
       ];
       // The compiler's store path names its pinned revision, so a compiler bump misses the cache.
       expect(targets.typecheck?.inputs).toEqual([
@@ -336,7 +336,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         // The root manifest's scripts, smoo and nx sections are read by no check: an
         // edit to a script or a developer link must not re-key every lint and typecheck.
         { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
-        { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
+        { externalDependencies: ['bun-lock:packages/example'] },
       ];
 
       // No crate manifest in this project, so no crate digest is declared at
@@ -392,12 +392,40 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'production',
         '^production',
         '{workspaceRoot}/package.json',
-        '{workspaceRoot}/bun.lock',
+        { externalDependencies: ['bun-lock:packages/example'] },
         '{workspaceRoot}/patches/**/*',
         '!{workspaceRoot}/patches/**/*.md',
         '{workspaceRoot}/tsconfig.base.json',
         '{projectRoot}/tsconfig.lib.json',
       ]);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('keeps the lockfiles out of the root versionless inputs, and names none in a member', async () => {
+    const workspace = await createWorkspace();
+    try {
+      // The root's {projectRoot} is the whole workspace, so its versionless
+      // inputs would reach the lockfiles the lock-scope nodes already key on.
+      // A member's {projectRoot} holds no lockfile, so it names none.
+      await workspace.write('package.json', '{"name":"root"}\n');
+      await workspace.write('tsconfig.lib.json', '{}\n');
+      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
+
+      const root = await inferProjectWithNxJson(workspace, 'package.json', {});
+      const member = await inferProjectWithNxJson(workspace, 'packages/example/package.json', {});
+      const lockfiles = ['!{projectRoot}/bun.lock', '!{projectRoot}/bun.lockb', '!{projectRoot}/Cargo.lock'];
+      expect(root?.targets?.typecheck?.inputs).toContain('versionlessProduction');
+      for (const name of ['versionlessProduction', 'versionlessDefault']) {
+        expect(root?.namedInputs?.[name]?.slice(-lockfiles.length)).toEqual(lockfiles);
+        const memberInputs = member?.namedInputs?.[name];
+        expect(memberInputs).toBeDefined();
+        for (const lockfile of lockfiles) {
+          expect(memberInputs).not.toContain(lockfile);
+        }
+      }
     } finally {
       await workspace.cleanup();
     }
@@ -460,7 +488,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '!{workspaceRoot}/patches/**/*.md',
         '{workspaceRoot}/tsconfig.base.json',
         { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
-        { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
+        { externalDependencies: ['bun-lock:packages/example'] },
         { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.lib.json',
       ]);
@@ -499,7 +527,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '!{workspaceRoot}/patches/**/*.md',
         ...configChain,
         { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
-        { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
+        { externalDependencies: ['bun-lock:packages/example'] },
       ];
       expect(targets.typecheck?.inputs).toEqual([
         'versionlessProduction',
@@ -521,7 +549,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'production',
         '^production',
         '{workspaceRoot}/package.json',
-        '{workspaceRoot}/bun.lock',
+        { externalDependencies: ['bun-lock:packages/example'] },
         '{workspaceRoot}/patches/**/*',
         '!{workspaceRoot}/patches/**/*.md',
         ...configChain,
@@ -592,7 +620,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/packages/example/tsconfig.cycle.json',
         '{workspaceRoot}/packages/example/tsconfig.lib.json',
         { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
-        { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
+        { externalDependencies: ['bun-lock:packages/example'] },
         { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.lib.json',
       ]);
@@ -636,7 +664,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/tsconfig.base.json',
         '{workspaceRoot}/packages/tsconfig/base.json',
         { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
-        { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
+        { externalDependencies: ['bun-lock:packages/example'] },
         { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.lib.json',
       ]);
@@ -673,7 +701,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '!{workspaceRoot}/patches/**/*.md',
         '{workspaceRoot}/tsconfig.base.json',
         { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
-        { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
+        { externalDependencies: ['bun-lock:packages/example'] },
         { env: 'SMOO_TYPECHECK_TSC' },
         '{projectRoot}/tsconfig.lib.json',
       ]);
@@ -943,13 +971,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test-ferris-core']?.inputs).toEqual(
         expect.arrayContaining([
           '{workspaceRoot}/packages/ferris/Cargo.toml',
-          '{workspaceRoot}/packages/ferris/Cargo.lock',
+          { externalDependencies: ['cargo-lock:packages/ferris/crates/ferris-core'] },
           '{workspaceRoot}/packages/ferris/crates/ferris-core/**/*',
         ]),
       );
       expect(targets['cargo-test-ferris-core']?.inputs).not.toContain(
         '{workspaceRoot}/packages/ferris/crates/ferris-wasm/**/*',
       );
+      expect(targets['cargo-test-ferris-core']?.inputs).not.toContain('{workspaceRoot}/packages/ferris/Cargo.lock');
       // One clippy for the workspace, in a target dir of its own: sharing the
       // dev build's `target/` queued the archive behind clippy's build lock.
       const [fmt, clippy] = targets['cargo-lint']?.options?.commands ?? [];
@@ -1702,7 +1731,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
   // commit re-ran every cargo verdict (measured in a consumer: every cargo-test-*
   // runner and the archive re-keyed on a one-integrity bun.lock edit). Here
   // the plugin is this repository's workspace project, which Nx refuses as an
-  // external dependency, so each target names none.
+  // external dependency, so each target names no npm package: its lockfile reach is one Cargo.lock scope node.
   it('keys every cached cargo target on the npm packages it runs, not the lockfile', async () => {
     const workspace = await createWorkspace();
     try {
@@ -1712,9 +1741,15 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(cached.length).toBeGreaterThan(0);
       for (const [name, target] of cached) {
         const named = (target.inputs ?? []).filter(
-          (input) => typeof input === 'object' && 'externalDependencies' in input,
+          (input) => typeof input === 'object' && 'externalDependencies' in input && !isCargoLockInput(input),
         );
         expect([name, named]).toEqual([name, [{ externalDependencies: [] }]]);
+        // The lockfile reaches each target through exactly one input: the Cargo.lock
+        // scope node it names, or the closure input that names it.
+        const lockReaches = (target.inputs ?? []).filter(
+          (input) => input === CARGO_CLOSURE_INPUT || isCargoLockInput(input),
+        );
+        expect([name, lockReaches.length]).toEqual([name, 1]);
       }
     } finally {
       await workspace.cleanup();
@@ -3170,6 +3205,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       for (const input of targets['cargo-test-archive']?.inputs ?? []) {
         expect(archive?.inputs).toContainEqual(input);
       }
+      // The lock-scope node the host archive names: the archive builds against the same locked crates.
+      expect(archive?.inputs).toContainEqual({ externalDependencies: ['cargo-lock:packages/ferris'] });
       expect(archive?.inputs).toContain('{projectRoot}/scripts/cargo-for-nextest.sh');
       expect(archive?.options?.env).toEqual({ CARGO: 'scripts/cargo-for-nextest.sh' });
       // The runner needs no driver: it never invokes cargo at all.

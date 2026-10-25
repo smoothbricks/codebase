@@ -25,6 +25,7 @@ export function filesetSource(
       root,
       members: new Set(local.map(({ id }) => id)),
       local,
+      locked: new Map(),
       edges: new Map(local.map(({ id }) => [id, []])),
     },
     indexed: new Set(directories.map((directory) => posix.join(directory, 'Cargo.toml'))),
@@ -81,10 +82,8 @@ export function expandedFilesets(
         posix.join(under, names.length === 1 ? names.join('') : `{${names.join(',')}}`),
       );
   const anchored = (path: string, pattern = '') => posix.join('{workspaceRoot}', path, pattern);
-  // cargoClosureInputs removes duplicate inputs, including a loose lockfile.
   return [
     ...new Set([
-      '{workspaceRoot}/Cargo.lock',
       ...packageGlobs.map((glob) => anchored(glob, '**/{*.rs,Cargo.toml,.cargo/config,.cargo/config.toml}')),
       ...packageGlobs.map((glob) => `!${anchored(glob, `**/{${HASH_SKIPPED_DIRECTORIES.join(',')}}/**`)}`),
       ...[...ancestors].sort().map((ancestor) => anchored(ancestor, `{${CARGO_ANCESTOR_INPUTS.join(',')}}`)),

@@ -81,7 +81,7 @@ wrapper it leaves makes every later `Error.captureStackTrace` onto a non-Error o
 follow-redirects' error types do when axios loads. For a native config `import type` and `export type` are erased, and
 the `node` that runs ESLint resolves each load with `createRequire(module).resolve` or
 `import.meta.resolve(specifier, module)`, one process per walk layer. A builtin, or a package installed outside the
-workspace's own files, adds nothing: `bun.lock` and the root manifest among the check inputs already key what is
+workspace's own files, adds nothing: the project's bun lock-scope node among the check inputs already keys what is
 installed. A package that resolves into the workspace (a member linked into `node_modules`) is keyed and walked like a
 relative module. Every loaded file also keys the package.json files that decide how it loads: the nearest one (its
 module format), a member's own (its entry) and that of a directory a relative specifier enters (its `main`). A load
@@ -280,14 +280,16 @@ build-script reads or custom environment variables that Cargo metadata cannot na
 
 A target whose inputs a repository DECLARES replaces the inferred list, pin included. Name the two `devenv.lock` entries
 in that declaration, or in the named input it uses, or a toolchain bump will not invalidate it. The replaced list also
-held the target's `externalDependencies` entry described below; restate it (`[]` for a target that runs only cargo), or
-every lockfile change re-keys the target.
+held the target's `externalDependencies` entries described below; restate them (`[]` for a target that runs only cargo,
+and the lock-scope node of its crates), or every lockfile change re-keys the target.
 
 Every cached cargo target names the npm packages its command runs as `externalDependencies`: none for cargo itself, and
 `@smoothbricks/nx-plugin` for a target that runs its executor or reads its installed files (the nextest tool config, the
 archive extractor). Without that input Nx keys a task whose executor is not an `@nx/` one on every package in the
 lockfile, so a lockfile-only commit re-ran every cargo verdict. Inside this repository the plugin is a workspace
-project, which Nx refuses as an external dependency, so the list is empty here.
+project, which Nx refuses as an external dependency, so the list is empty here. A second entry names the Cargo
+lock-scope node of the crates the target builds (`cargoClosure` carries it; a target that names neither gets the node of
+the directory it runs in). An entry naming only `cargo-lock:` nodes does not count as naming npm packages.
 
 No input declaration removes a project's own configuration from a task's key. Nx 23.2.1 adds `ProjectConfiguration` to
 every task (`hash_planner.rs` `gather_self_inputs`), and `hash_project_config.rs` hashes the executor, outputs, options,
@@ -504,9 +506,10 @@ under the project's root and every mutable local package they reach through norm
 to a workspace member outside that closure leaves the task key alone. The members Nx's file index holds become filesets:
 each package's `.rs` files, `Cargo.toml` files and `.cargo/config[.toml]` below its directory (skipping `target/` and
 the other directories the hash command skips), target sources outside it, its governing workspace manifest, the
-`Cargo.toml` and `.cargo/config[.toml]` of every directory from the package up to the Nx root, and the workspace's
-`Cargo.lock`. Nx hashes those from the file hashes it already keeps, so hashing these inputs starts no process. A graph
-with unchanged resolution inputs starts no Cargo process either.
+`Cargo.toml` and `.cargo/config[.toml]` of every directory from the package up to the Nx root, and the lock-scope node
+for the Cargo.lock entries the closure reaches (see below). Nx hashes those from the file hashes and node hashes it
+already keeps, so hashing these inputs starts no process. A graph with unchanged resolution inputs starts no Cargo
+process either.
 
 Fileset reduction works from the set of package directories: a path is covered exactly when it or one of its ancestors
 is a member. Nested packages therefore need no extra subtree pattern, and shared ancestors are visited once. Sibling
@@ -629,9 +632,10 @@ project declares its own named input and names its directory:
 ```
 
 Without `--closure`, `--include-workspace` hashes every mutable local package in the Cargo workspace. For a package-root
-workspace, pass its manifest last and name that workspace's `Cargo.lock`. Keep `externalRustCrates` for the plugin's
-external-source inference contract; unrelated TypeScript targets need neither input. An Nx `^production` input only
-follows existing project graph edges; it cannot replace a missing Cargo dependency closure.
+workspace, pass its manifest last and name that workspace's `Cargo.lock`: lock-scope nodes exist only for workspaces
+whose root is a project the plugin infers. Keep `externalRustCrates` for the plugin's external-source inference
+contract; unrelated TypeScript targets need neither input. An Nx `^production` input only follows existing project graph
+edges; it cannot replace a missing Cargo dependency closure.
 
 Files git ignores beneath a package directory are not hashed, matching Nx's own file inputs. A generated source is its
 producer's output: the consuming target depends on the producer and hashes the source through
@@ -648,15 +652,49 @@ Git and registry dependencies are identified by `Cargo.lock`; uncommitted change
 a pinned Git dependency. Local `path` dependencies stay live and their source edits change the digest. Build-script data
 and environment inputs outside the Rust/Cargo inputs above still require explicit Nx inputs.
 
+### Lockfile scope
+
+No inferred target hashes `bun.lock` or `Cargo.lock` as a file. Each names the external project-graph nodes that stand
+for the part of a lockfile it can reach, and Nx hashes those nodes into only the targets that name them, so a dependency
+change re-keys the tasks that can load what changed and no other.
+
+- `bun-lock:<projectRoot>`, one per `package.json` project (`bun-lock:.` for the root manifest). Its edges, added by the
+  plugin's `createDependencies`, go to the npm nodes the manifest's dependencies resolve to (resolved exactly as Nx
+  resolves a project's own package edges); a member's also go to the node of each workspace member it depends on and to
+  `bun-lock:.`, since a member's `node_modules` lookup ends in the root's. The root's node has no member edges: every
+  member reaches it, and a member loads another only through its own declaration. Nx's lockfile parser links every npm
+  node to the packages it depends on and hashes each by the integrity bun.lock records, so the node keys a target on the
+  closure its manifest reaches. Every inferred TypeScript target (`tsc-js`, `typecheck`, `typecheck-tests`, `lint`)
+  names its project's node.
+- `cargo-lock:<directory>`, for the crates under a directory: its hash digests, per Cargo workspace, every package of
+  the locked resolve closure of those crates (a locked package by Cargo package id and source, a path package by name,
+  each with what its dependencies resolved to). `cargoClosure` names its project's node; each `cargo-test-*` runner
+  names its crates' nodes; workspace-wide cargo targets name the workspace root's.
+
+A hand-written target names the same nodes in its `externalDependencies`:
+
+```json
+{ "inputs": ["default", "^dependencyDefault", { "externalDependencies": ["bun-lock:packages/example"] }] }
+```
+
+A `cargo-lock:` node exists when an input of a `package.json` project names it (inferred or declared), computed from the
+Cargo resolves the plugin already holds. `externalDependencies` takes no `{projectRoot}` token, so a workspace-wide
+named input or target default can name only `bun-lock:.`; with a `^` input the project's own npm edges come from Nx. A
+target that names no `externalDependencies` at all is still keyed on every package in every lockfile
+(`AllExternalDependencies`), the Cargo nodes included.
+
+The root project owns the lockfiles, so its `default` fileset holds them. Its versionless check inputs exclude
+`bun.lock`, `bun.lockb` and `Cargo.lock`; the nodes key what they decide.
+
 ### Manifest versions and validation inputs
 
 A release rewrites `version` in every package manifest it publishes and in the lockfile entries mirroring them. Those
 files are inputs of `lint`, `typecheck` and `typecheck-tests`, so a publish run misses the cache for the whole gate set
 over a change that alters no code. Those three targets therefore leave the raw manifests out of their filesets and hash
-them by field instead: a `json` input with `excludeFields` for `package.json#version`, and one dropping the lockfile's
-`workspaces` section, which is only the mirror of each member's own manifest. Nx hashes both in its native hasher, so
-this costs no process. Everything else still counts: a dependency range, an export map, and the lockfile's resolution
-table.
+them by field instead: a `json` input with `excludeFields` for `package.json#version`. The lockfile is no file input
+(see Lockfile scope), so the release's rewrite of its `workspaces` mirror re-keys nothing. Nx hashes the field input in
+its native hasher, so this costs no process. Everything else still counts: a dependency range, an export map, and every
+locked package the project reaches.
 
 The workspace root manifest also drops `scripts`, `smoo` and `nx` from these three targets' hash. No check reads them:
 scripts are commands a developer runs, `smoo.developerLinks` names links whose linked bytes reach a hash only through

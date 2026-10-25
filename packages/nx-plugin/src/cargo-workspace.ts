@@ -382,7 +382,9 @@ async function deriveCargoPackageTestInputs(
       ? posix.join('{workspaceRoot}', relative(workspaceRoot, absolutePath).split(sep).join('/'))
       : posix.join(inputRoot, cargoRelative);
   };
-  const inputs = new Set<string>([`${inputRoot}/Cargo.toml`, `${inputRoot}/Cargo.lock`]);
+  // Cargo.lock is not a fileset here: the runner names the crate's lock-scope
+  // node, the lock entries its closure reaches (cargo-closure-input.ts).
+  const inputs = new Set<string>([`${inputRoot}/Cargo.toml`]);
   const exclusions = new Set<string>();
   for (const dir of [...dirs].sort()) {
     const absoluteDir = resolve(absoluteProjectRoot, dir);

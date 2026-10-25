@@ -1,7 +1,8 @@
+import { createHash } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
 import { isAbsolute, join, posix, relative, sep } from 'node:path';
 
-import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
+import type { ProjectGraphExternalNode, TargetConfiguration } from 'nx/src/devkit-exports.js';
 
 import {
   CARGO_ANCESTOR_INPUTS,
@@ -18,9 +19,29 @@ import { globIndexedFiles } from './workspace-index.js';
 /**
  * The named input the plugin infers for every project with crates of a Cargo
  * workspace under its root: the mutable sources of the Cargo-resolved
- * dependency closure of those crates, and the lockfile that pins the rest.
+ * dependency closure of those crates, and the lock-scope node that stands for
+ * the Cargo.lock entries the closure reaches ({@link cargoLockNode}).
  */
 export const CARGO_CLOSURE_INPUT = 'cargoClosure';
+
+/** Every lock-scope node's name starts with this; the rest is the directory whose crates it covers. */
+export const CARGO_LOCK_NODE_PREFIX = 'cargo-lock:';
+
+/** The lock-scope node for the crates under `directory`, workspace-relative (`.` for the root). */
+export function cargoLockNodeName(directory: string): string {
+  return `${CARGO_LOCK_NODE_PREFIX}${posix.normalize(directory === '' ? '.' : directory)}`;
+}
+
+/** An input naming only lock-scope nodes: it keys a target on locked crates, never on npm packages. */
+export function isCargoLockInput(input: unknown): boolean {
+  if (typeof input !== 'object' || input === null || !('externalDependencies' in input)) return false;
+  const names: unknown = input.externalDependencies;
+  return (
+    Array.isArray(names) &&
+    names.length > 0 &&
+    names.every((name) => typeof name === 'string' && name.startsWith(CARGO_LOCK_NODE_PREFIX))
+  );
+}
 
 type Input = NonNullable<TargetConfiguration['inputs']>[number];
 
@@ -97,8 +118,8 @@ export async function resolveCargoClosureSource(
 
 /**
  * The `cargoClosure` definition for the project at `projectRoot`: for each
- * Cargo workspace with crates under it, the workspace's `Cargo.lock` plus the
- * resolve closure of those crates.
+ * Cargo workspace with crates under it, the resolve closure of those crates,
+ * and the lock-scope node of `projectRoot` for the locked rest.
  *
  * Closure members in Nx's file index are hashed by Nx itself, as filesets:
  * each package's Rust sources, manifests and Cargo configuration below its
@@ -142,11 +163,11 @@ export async function cargoClosureInputs(
       inputs.push(input);
     }
   }
+  inputs.push({ externalDependencies: [cargoLockNodeName(projectRoot)] });
   return inputs;
 }
 
 async function workspaceClosureInputs(projectRoot: string, source: CargoClosureSource): Promise<Input[]> {
-  const lock = posix.join('{workspaceRoot}', posix.dirname(source.manifest), 'Cargo.lock');
   const closureArguments = `--closure ${shellWord(projectRoot)} ${shellWord(source.manifest)}`;
 
   const { root, cargo, indexed } = source;
@@ -231,7 +252,6 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
       );
   const anchored = (path: string, pattern = '') => posix.join('{workspaceRoot}', path, pattern);
   return [
-    lock,
     ...packageGlobs.map((glob) => anchored(glob, PACKAGE_FILES)),
     ...packageGlobs.map((glob) => `!${anchored(glob, SKIPPED_TREES)}`),
     ...[...ancestors].sort().map((ancestor) => anchored(ancestor, ANCESTOR_FILES)),
@@ -241,6 +261,54 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
   ];
 }
 
+/**
+ * The external project-graph node that stands for the part of Cargo.lock the
+ * crates under `directory` reach, over every source with a crate there.
+ *
+ * Its hash digests, per Cargo workspace in manifest order, every package of
+ * the resolve closure of those crates: a locked package by its Cargo package
+ * id and source (registry, name and version; a git dependency's commit), a
+ * path package by name, each with the packages its dependencies resolved to.
+ * That is everything Cargo.lock decides for the closure. An edit to an entry
+ * no crate under `directory` reaches leaves the digest alone, and Nx hashes
+ * the node only into the targets that name it, so a lockfile change re-keys
+ * the users of what changed and nothing else. A registry package's checksum is
+ * not in Cargo's metadata and adds nothing: a published version's bytes never
+ * change, and every `--locked` build verifies them against Cargo.lock.
+ *
+ * Path packages are named, never identified by their ids: an id carries the
+ * checkout's absolute path, and a task key must not.
+ */
+export async function cargoLockNode(
+  directory: string,
+  sources: readonly CargoClosureSource[],
+): Promise<ProjectGraphExternalNode> {
+  const name = cargoLockNodeName(directory);
+  if (sources.length === 0) {
+    throw new CargoClosureInputError(directory, new Error('no Cargo workspace has a crate under it'));
+  }
+  const hash = createHash('sha256');
+  try {
+    for (const source of [...sources].sort((left, right) =>
+      left.manifest < right.manifest ? -1 : left.manifest > right.manifest ? 1 : 0,
+    )) {
+      const { cargo, root } = source;
+      const members = await dependencyClosure(cargo, join(root, directory));
+      const paths = new Map(cargo.local.map((pkg) => [pkg.id, `path:${pkg.name}`]));
+      const label = (id: string) => paths.get(id) ?? id;
+      const rows = [...members]
+        .map((id) =>
+          [label(id), cargo.locked.get(id) ?? '', ...(cargo.edges?.get(id) ?? []).map(label).sort()].join('\t'),
+        )
+        .sort();
+      hash.update(`${source.manifest}\n${rows.join('\n')}\n\0`);
+    }
+  } catch (error) {
+    throw new CargoClosureInputError(directory, error);
+  }
+  const digest = hash.digest('hex');
+  return { type: 'cargo', name, data: { packageName: name, version: digest, hash: digest } };
+}
 /** A compiled-in file and the source whose `include_str!`/`include_bytes!` names it, relative to the workspace root. */
 export interface CompiledInclusion {
   readonly declaring: string;

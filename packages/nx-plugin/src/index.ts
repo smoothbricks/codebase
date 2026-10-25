@@ -5,11 +5,13 @@ import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:p
 import { fileURLToPath } from 'node:url';
 
 import {
+  type CreateDependencies,
   type CreateNodesContextV2,
   type CreateNodesResultV2,
   type CreateNodesV2,
   type PostTasksExecution,
   type PreTasksExecution,
+  type ProjectGraphExternalNode,
   readJsonFile,
   type TargetConfiguration,
 } from 'nx/src/devkit-exports.js';
@@ -19,11 +21,16 @@ import { type ParsedCommandLine, parseJsonConfigFileContent, readConfigFile, sys
 
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import { BUILD_INPUTS_BIN } from './build-inputs.js';
+import { bunLockDependencies, bunLockInput, bunLockNode } from './bun-lock-scope.js';
 import {
   CARGO_CLOSURE_INPUT,
+  CARGO_LOCK_NODE_PREFIX,
   type CargoClosureSource,
   cargoClosureInputs,
+  cargoLockNode,
+  cargoLockNodeName,
   indexedCargoManifests,
+  isCargoLockInput,
   resolveCargoClosureSource,
 } from './cargo-closure-input.js';
 import {
@@ -105,8 +112,8 @@ export const DEPLOY_TARGET = 'deploy';
 /** The purely file-derived half a deploy needs built first; cached. */
 export const DEPLOY_BUILD_TARGET = 'deploy-build';
 
-/** The workspace-wide manifests a release rewrites: the version of every member, and the lockfile mirror of it. */
-const RELEASE_REWRITTEN_WORKSPACE_INPUTS = ['{workspaceRoot}/package.json', '{workspaceRoot}/bun.lock'];
+/** The workspace-wide manifest a release rewrites: the version of every member. */
+const RELEASE_REWRITTEN_WORKSPACE_INPUTS = ['{workspaceRoot}/package.json'];
 /** Installed patch bytes and pins affect the compiler; Markdown explains them but is not loaded. */
 const TYPESCRIPT_PATCH_INPUTS = ['{workspaceRoot}/patches/**/*', '!{workspaceRoot}/patches/**/*.md'];
 /**
@@ -135,16 +142,16 @@ function typecheckCommand(args: string): string {
 }
 
 /**
- * The two release-rewritten files hashed by field instead of by byte, for a
- * check that only reads them.
+ * The release-rewritten root manifest hashed by field instead of by byte, for
+ * a check that only reads it.
  *
  * A `json` input is hashed by Nx's own hasher, so this costs no process. The
- * lockfile's `workspaces` section is the mirror of each member's manifest —
- * name, version and dependency specifiers — and every one of those is already
- * hashed from the member's own `package.json`. Dropping that section keeps the
- * resolution table, which is the reason the lockfile is an input at all.
+ * lockfile is no file input at all: the packages it resolves reach a task as
+ * Nx's own lockfile nodes, the root manifest's through the bun root lock-scope
+ * node and the project's through its `^` input, so a release's rewrite of the
+ * lockfile's `workspaces` mirror re-keys nothing.
  *
- * The root manifest also drops `scripts`, `smoo` and `nx`. No lint or
+ * The root manifest drops `scripts`, `smoo` and `nx`. No lint or
  * typecheck reads them: `scripts` are commands a developer runs, `smoo` holds
  * the developer links whose linked bytes reach the hash only through their own
  * inputs, and the root project's `nx` configuration is hashed as that
@@ -155,7 +162,6 @@ function typecheckCommand(args: string): string {
  */
 const VERSIONLESS_TOOLCHAIN_MANIFEST_INPUTS = [
   { json: '{workspaceRoot}/package.json', excludeFields: ['version', 'scripts', 'smoo', 'nx'] },
-  { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
 ];
 
 /** A path segment Nx's workspace file map never carries, so a fileset naming it hashes nothing. */
@@ -278,8 +284,8 @@ function resolveTypescriptConfigExtends(specifier: string, fromConfigPath: strin
  * Nx hashes workspace files that are not in node_modules, so two ancestor
  * kinds cannot be named — and they are not the same thing:
  *
- *   - a dependency's config: `bun.lock` and the root manifest decide which
- *     bytes are installed, and both are already inputs. Where they sit is the
+ *   - a dependency's config: the lockfile entry of the package that holds it
+ *     decides which bytes are installed, and the task is keyed on it. Where they sit is the
  *     installer's business — bun keeps them in a global store outside the
  *     workspace entirely — so this is settled by HOW the specifier resolved,
  *     not by where it landed. A workspace member reached through its package
@@ -323,6 +329,14 @@ const VERSIONLESS_PACKAGE_INPUTS = [
   { json: '{projectRoot}/package.json', excludeFields: ['version'] },
 ];
 
+/**
+ * The root project owns the lockfiles, so its `default` fileset holds each
+ * whole, and a check keyed on it re-ran on every dependency change anywhere in
+ * the workspace. Its checks name what the lockfiles decide for it instead: the
+ * root manifest's bun lock-scope node and, for a root Cargo workspace, the
+ * Cargo nodes of its targets. No other project's fileset ever held them.
+ */
+const ROOT_LOCKFILE_EXCLUSIONS = ['!{projectRoot}/bun.lock', '!{projectRoot}/bun.lockb', '!{projectRoot}/Cargo.lock'];
 /**
  * Crate manifests, for the projects that have any.
  *
@@ -524,7 +538,6 @@ const CARGO_WORKSPACE_PATTERN = /^\s*\[workspace\]/m;
 const CARGO_INPUTS = [
   '{projectRoot}/**/*.rs',
   '{projectRoot}/**/Cargo.toml',
-  '{projectRoot}/**/Cargo.lock',
   '{projectRoot}/**/.cargo/config.toml',
   // Shell scripts a `.cargo/config.toml` points at — linker, runner, and rustc wrappers — decide
   // what the compiler produces as surely as the config naming them does. Tracking the config
@@ -539,8 +552,11 @@ const CARGO_INPUTS = [
 // step runs before the build), so every publish recompiled every native
 // binary on every platform for a change to a version string. What the N-API
 // build really reads is the package's `napi` block (binary name, targets) and
-// the `@napi-rs/cli` it runs; those are hashed as such by napiInputs().
+// the `@napi-rs/cli` it runs; those are hashed as such by napiInputs(). The
+// locked crates are each cached cargo target's lock-scope node (below).
 const CARGO_OUTPUT_INPUTS = CARGO_INPUTS;
+/** The lockfiles of crates no resolved Cargo workspace claims, which have no lock-scope node. */
+const UNRESOLVED_CARGO_LOCK_INPUT = '{projectRoot}/**/Cargo.lock';
 /** A full cargo-mutants sweep's wall-clock backstop: a sweep takes hours, and a hung one must still end. */
 const MUTATION_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 // The toolchain half of a cargo task's identity lives in its own module
@@ -835,6 +851,8 @@ function createCargoCrossTestTargets(
         ...(cargo === undefined ? [] : [`{projectRoot}/${cargo}`]),
         cargoRuntimeInput(projectRoot, 'rustc -vV && cargo -V && cargo nextest --version'),
         { externalDependencies: cargoCommandNpmPackages({ executor: archiveExecutor }, archiveCommand) },
+        // The Cargo.lock entries the whole workspace reaches, for the same reason.
+        { externalDependencies: [cargoLockNodeName(projectRoot)] },
       ],
       outputs: [`{projectRoot}/${archiveFile}`],
       dependsOn: [CARGO_FETCH_TARGET],
@@ -1093,7 +1111,10 @@ export const postTasksExecution: PostTasksExecution<ProducerReceiptsOptions> = a
   await postCargoRetention(options, context);
 };
 
-export default { createNodesV2, postTasksExecution, preTasksExecution };
+/** The lock-scope nodes' edges: each bun node's to the packages and members its manifest resolves. */
+export const createDependencies: CreateDependencies = (_options, context) => bunLockDependencies(context);
+
+export default { createNodesV2, createDependencies, postTasksExecution, preTasksExecution };
 
 interface PackageJson {
   bin?: unknown;
@@ -1212,7 +1233,10 @@ async function createProjectTargets(
   const hasCrateManifests = isCargoProject || existsSync(cargoTomlPath);
   const crateInputs =
     versionless !== null && hasCrateManifests ? await versionlessCrateInputs(projectRoot, workspaceRoot) : [];
-  const versionlessProjectInputs = versionless === null ? [] : [...VERSIONLESS_PACKAGE_INPUTS, ...crateInputs];
+  const versionlessProjectInputs =
+    versionless === null
+      ? []
+      : [...VERSIONLESS_PACKAGE_INPUTS, ...crateInputs, ...(projectRoot === '.' ? ROOT_LOCKFILE_EXCLUSIONS : [])];
   // The options a TypeScript task's answer really depends on, which is the
   // whole `extends` chain of the configs its commands name and not just those
   // two files. Resolved once per project: every target below shares it.
@@ -1220,11 +1244,21 @@ async function createProjectTargets(
     [...(hasLibTsconfig ? [libTsconfigPath] : []), ...(hasTestTsconfig ? [testTsconfigPath] : [])],
     workspaceRoot,
   );
-  const toolchainInputs = [...RELEASE_REWRITTEN_WORKSPACE_INPUTS, ...TYPESCRIPT_PATCH_INPUTS, ...typescriptConfigChain];
+  const toolchainInputs = [
+    ...RELEASE_REWRITTEN_WORKSPACE_INPUTS,
+    bunLockInput(projectRoot),
+    ...TYPESCRIPT_PATCH_INPUTS,
+    ...typescriptConfigChain,
+  ];
   const checkInputs =
     versionless === null
       ? toolchainInputs
-      : [...TYPESCRIPT_PATCH_INPUTS, ...typescriptConfigChain, ...VERSIONLESS_TOOLCHAIN_MANIFEST_INPUTS];
+      : [
+          ...TYPESCRIPT_PATCH_INPUTS,
+          ...typescriptConfigChain,
+          ...VERSIONLESS_TOOLCHAIN_MANIFEST_INPUTS,
+          bunLockInput(projectRoot),
+        ];
   const selfProduction = versionless === null ? 'production' : VERSIONLESS_PRODUCTION_INPUT;
   const selfDefault = versionless === null ? 'default' : VERSIONLESS_DEFAULT_INPUT;
   const dependencyProduction =
@@ -1701,7 +1735,8 @@ async function createProjectTargets(
   // Cache verdicts and dedicated artifacts, never Cargo's shared mutable build
   // directories. Resolve tool versions from the command's actual directory.
   // Name the npm packages the command runs (cargoCommandNpmPackages) unless
-  // the target already does.
+  // the target already does, and the Cargo.lock entries its crates reach (the
+  // lock-scope node of the directory it runs in) unless its inputs already do.
   for (const [name, target] of Object.entries(targets)) {
     const text = targetCommandText(target);
     if (!runsFrozenCargo(text)) continue;
@@ -1714,12 +1749,22 @@ async function createProjectTargets(
         ? ' && cargo nextest --version'
         : '';
     const inputs = target.inputs ?? CARGO_INPUTS;
-    const namesPackages = inputs.some((input) => typeof input === 'object' && 'externalDependencies' in input);
+    const namesPackages = inputs.some(
+      (input) => typeof input === 'object' && 'externalDependencies' in input && !isCargoLockInput(input),
+    );
+    const namesLock = inputs.some((input) => input === CARGO_CLOSURE_INPUT || isCargoLockInput(input));
+    const lockDirectory = typeof cwd === 'string' ? cwd : projectRoot;
     target.inputs = [
       ...inputs,
       ...CARGO_TOOLCHAIN_PIN_INPUTS,
       cargoRuntimeInput(typeof cwd === 'string' ? cwd : projectRoot, `rustc -vV && cargo -V${versions}`),
       ...(namesPackages ? [] : [{ externalDependencies: cargoCommandNpmPackages(target, text) }]),
+      ...(namesLock
+        ? []
+        : cargoSourcesUnder(lockDirectory, cargoWorkspaces).length > 0
+          ? [{ externalDependencies: [cargoLockNodeName(lockDirectory)] }]
+          : // No project-rooted Cargo workspace claims these crates, so the plugin holds no resolve to scope.
+            [UNRESOLVED_CARGO_LOCK_INPUT]),
     ];
   }
 
@@ -1992,19 +2037,21 @@ async function createProjectTargets(
   // computation and Nx hashes its files from its own index. Defined for a
   // project with a workspace crate under its root — the same projects the
   // `--closure <projectRoot>` command could describe.
-  const closureSources = cargoWorkspaces.filter((workspace) =>
-    workspace.packages.some(({ package: pkg }) => {
-      const crate = posix.join(workspace.projectRoot, pkg.dir);
-      return projectRoot === '.' || crate === projectRoot || crate.startsWith(`${projectRoot}/`);
-    }),
-  );
+  const closureSources = cargoSourcesUnder(projectRoot, cargoWorkspaces);
   if (closureSources.length > 0) {
-    namedInputs[CARGO_CLOSURE_INPUT] = await cargoClosureInputs(
-      projectRoot,
-      closureSources.map((workspace) => workspace.closureSource),
-    );
+    namedInputs[CARGO_CLOSURE_INPUT] = await cargoClosureInputs(projectRoot, closureSources);
   }
+  const externalNodes = await lockScopeNodes(
+    projectRoot,
+    [
+      ...Object.values(targets).map((target) => target.inputs),
+      ...Object.values(declaredTargets).map((target) => (isRecord(target) ? target.inputs : undefined)),
+      ...Object.values(namedInputs),
+    ],
+    cargoWorkspaces,
+  );
   return {
+    ...(Object.keys(externalNodes).length === 0 ? {} : { externalNodes }),
     projects: {
       [projectRoot]: {
         name: projectName,
@@ -2021,6 +2068,51 @@ async function createProjectTargets(
       },
     },
   };
+}
+
+/** The Cargo resolves with a workspace crate under `directory`: the ones its crates' closure and lock scope cover. */
+function cargoSourcesUnder(directory: string, cargoWorkspaces: readonly CargoWorkspace[]): CargoClosureSource[] {
+  return cargoWorkspaces
+    .filter((workspace) =>
+      workspace.packages.some(({ package: pkg }) => {
+        const crate = posix.join(workspace.projectRoot, pkg.dir);
+        return directory === '.' || crate === directory || crate.startsWith(`${directory}/`);
+      }),
+    )
+    .map((workspace) => workspace.closureSource);
+}
+
+/**
+ * The lock-scope nodes a project publishes: its own bun node, and one Cargo
+ * node per directory its inputs name, computed from the resolves that cover
+ * it. A project names only nodes its own crates' resolves define, so two
+ * projects publishing the same node publish the same value.
+ */
+async function lockScopeNodes(
+  projectRoot: string,
+  inputLists: readonly unknown[],
+  cargoWorkspaces: readonly CargoWorkspace[],
+): Promise<Record<string, ProjectGraphExternalNode>> {
+  const directories = new Set<string>();
+  for (const inputs of inputLists) {
+    if (!Array.isArray(inputs)) continue;
+    for (const input of inputs) {
+      if (!isRecord(input) || !Array.isArray(input.externalDependencies)) continue;
+      for (const name of input.externalDependencies) {
+        if (typeof name === 'string' && name.startsWith(CARGO_LOCK_NODE_PREFIX)) {
+          directories.add(name.slice(CARGO_LOCK_NODE_PREFIX.length));
+        }
+      }
+    }
+  }
+  const own = bunLockNode(projectRoot);
+  const nodes: Record<string, ProjectGraphExternalNode> = { [own.name]: own };
+  for (const node of await Promise.all(
+    [...directories].map((directory) => cargoLockNode(directory, cargoSourcesUnder(directory, cargoWorkspaces))),
+  )) {
+    nodes[node.name] = node;
+  }
+  return nodes;
 }
 
 interface ResolvedCargoWasmConfig {
@@ -2775,6 +2867,12 @@ async function cargoTestRunnerInputs(
       posix.join(inputRoot, NEXTEST_REPO_CONFIG_PATH),
     ]),
     fileHashInput(PLUGIN_NEXTEST_CONFIG_PATH),
+    // The Cargo.lock entries each selected crate's closure reaches.
+    {
+      externalDependencies: [
+        ...new Set(memberDirs.map((memberDir) => cargoLockNodeName(posix.join(workspace.projectRoot, memberDir)))),
+      ],
+    },
   ];
 }
 

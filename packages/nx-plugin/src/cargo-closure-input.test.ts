@@ -22,7 +22,7 @@ import {
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
-import { CARGO_CLOSURE_INPUT, indexedCargoManifests } from './cargo-closure-input.js';
+import { CARGO_CLOSURE_INPUT, cargoLockNodeName, indexedCargoManifests } from './cargo-closure-input.js';
 import { hashCargoPathInputs } from './cargo-source-hash.js';
 import { createNodesV2 } from './index.js';
 
@@ -223,7 +223,8 @@ it('leaves a closure inside the workspace to Nx: no process runs when its tasks 
         typeof input === 'object' && 'runtime' in input ? [input.runtime] : [],
       );
 
-    expect(closureOf('crates/leaf')).toContain('{workspaceRoot}/Cargo.lock');
+    expect(closureOf('crates/leaf')?.at(-1)).toEqual({ externalDependencies: [cargoLockNodeName('crates/leaf')] });
+    expect(closureOf('crates/leaf')).not.toContain('{workspaceRoot}/Cargo.lock');
     expect(runtimeCommands('crates/leaf')).toEqual([]);
     // app reaches `external`, the one member only a process can hash, and
     // only it: the in-workspace members stay filesets.
