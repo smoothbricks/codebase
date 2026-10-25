@@ -353,7 +353,8 @@ impl std::fmt::Display for CpuWaitCause {
     }
 }
 
-/// The one line a fork, or an attach that mounts, writes:
+/// The one line a fork, or an attach that mounts, writes (the gateway's own released-image
+/// cleanup asks its ledger in process, for every repository, and writes no line):
 /// `{"op":"quiet","repoId":"owner/repo","command":"fork <ws>"}`. The gateway answers
 /// [`crate::LeaseState::Queued`], with a [`CpuWaitCause::Quiet`] naming the repository's gate job
 /// while one holds or waits, and [`crate::LeaseState::Granted`] once none does; the client then
@@ -613,11 +614,14 @@ pub struct CpuGateWaiter {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CpuQuietWaiter {
-    pub repository: String,
+    /// The repository whose gate work it waits for; absent for the released-image cleanup, which
+    /// waits for any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
     /// The client process, when its socket named one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<i32>,
-    /// What the client said it waits to run: `fork <ws>` or `attach <ws>`.
+    /// What it waits to run: `fork <ws>`, `attach <ws>` or `image-cleanup <entry>`.
     pub command: String,
     /// Milliseconds since it asked.
     pub waited_ms: u64,

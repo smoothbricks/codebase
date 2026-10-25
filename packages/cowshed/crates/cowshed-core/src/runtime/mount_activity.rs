@@ -295,59 +295,6 @@ mod tests {
         fs::remove_dir_all(&beside).unwrap();
     }
 
-    /// A released image's deletion child is asked nothing about its descriptors for a tree its
-    /// entry cannot be on: it holds only that entry, and asking waits out each bounded `ftruncate`
-    /// cut it sits in, 12-14 s of a 34-49 s `rm` (02_workspaces.md, "Holders cowshed does not
-    /// run"). The stand-in, `dash` running a script named for the verb, holds a file of the mount
-    /// open, which the census names if it asks: it is named when its entry lies inside the mount,
-    /// and not when its entry is on another device (`/dev`, devfs).
-    #[test]
-    fn a_deletion_child_is_asked_only_about_a_tree_its_entry_may_be_on() {
-        use std::io::BufRead as _;
-        let verb = crate::storage::apfs::deleter::DELETE_VERB;
-        let mount = scratch("deleter-held");
-        let lock = mount.join("bun.lock");
-        fs::write(&lock, b"lock").unwrap();
-        let beside = scratch("deleter-beside");
-        fs::write(beside.join(verb), "exec 3<\"$HELD\"; echo held; read _\n").unwrap();
-        let deleter = |entry: &Path| {
-            let mut child = std::process::Command::new("/bin/dash")
-                .arg(verb)
-                .arg(entry)
-                .current_dir(&beside)
-                .env("HELD", &lock)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn_locked()
-                .unwrap();
-            let mut said = String::new();
-            std::io::BufReader::new(child.stdout.as_mut().unwrap())
-                .read_line(&mut said)
-                .unwrap();
-            assert_eq!(said, "held\n");
-            child
-        };
-        let mut elsewhere = deleter(Path::new("/dev/released.dmg"));
-        let mut inside = deleter(&mount.join(".deleting/released.dmg"));
-        let held = nx::tree_holds(&mount).unwrap();
-        let pids = [&elsewhere, &inside].map(|child| i32::try_from(child.id()).unwrap());
-        for child in [&mut elsewhere, &mut inside] {
-            drop(child.stdin.take());
-            child.wait().unwrap();
-        }
-        let named = |pid: i32| held.iter().any(|holder| holder.holder.pid == pid);
-        assert!(
-            !named(pids[0]),
-            "a deletion child whose entry is on another device is asked: {held:?}"
-        );
-        assert!(
-            named(pids[1]),
-            "a deletion child whose entry is in the tree is not asked: {held:?}"
-        );
-        fs::remove_dir_all(&mount).unwrap();
-        fs::remove_dir_all(&beside).unwrap();
-    }
-
     /// The refusal names every holder with its evidence, counts the ones past the first ten,
     /// and offers no flag that overrides it.
     #[test]

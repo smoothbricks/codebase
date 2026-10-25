@@ -1,3 +1,4 @@
+pub mod cleanup_order;
 pub mod deleter;
 pub mod extents;
 pub mod native;
@@ -42,9 +43,9 @@ pub struct ApfsSubstrateConfig {
     /// and main's mountpoint.
     pub checkout_path: PathBuf,
     pub capacity: ImageCapacity,
-    /// What a release starts its deletion child with (05_gateway.md, "Deleting released images");
-    /// none starts no child, and the gateway's startup scan frees the entry.
-    pub deletion_child: Option<deleter::DeletionChild>,
+    /// The gateway control socket a release hands its entry to (05_gateway.md, "Deleting released
+    /// images"); with none, the entry waits in `.deleting` for a gateway's start.
+    pub cleanup: Option<std::sync::Arc<Path>>,
 }
 
 impl ApfsSubstrateConfig {
@@ -58,18 +59,18 @@ impl ApfsSubstrateConfig {
             store_root: store_root.into(),
             checkout_path: checkout_path.into(),
             capacity: DEFAULT_IMAGE_CAPACITY,
-            deletion_child: None,
+            cleanup: None,
         }
     }
 
-    /// The config of a project in the validated store `storage`, whose releases start the deletion
-    /// child that store names.
+    /// The config of a project in the validated store `storage`, whose releases go to the gateway
+    /// that store names.
     pub fn for_storage(
         storage: &crate::storage::bootstrap::ValidatedHostStorage,
         checkout_path: impl Into<PathBuf>,
     ) -> Self {
         Self {
-            deletion_child: storage.roots().deletion_child().cloned(),
+            cleanup: storage.roots().cleanup().cloned(),
             ..Self::new(storage.namespace(), storage.store(), checkout_path)
         }
     }
@@ -4165,7 +4166,7 @@ pub(crate) fn retired_image_below(
 }
 
 /// `<sessions>/.deleting/<name>-<incarnation>.dmg`: where a workspace image's release is committed
-/// and waits for the background deletion (02_workspaces.md, `rm` step 5;
+/// and waits for the gateway's cleanup (02_workspaces.md, `rm` step 5;
 /// [`release::DELETING_DIRECTORY`]). Named like its trash entry, so an incarnation names one.
 pub(super) fn deleting_image_below(
     sessions: &Path,
@@ -4192,10 +4193,11 @@ pub(crate) fn is_deleting_image_name(name: &str) -> bool {
         .is_some()
 }
 
-/// The gateway's startup scan of the workspace images of every project in the store at `store`
-/// (05_gateway.md, "Deleting released images"): each project's `sessions/.deleting`.
-pub fn drain_store_session_releases(store: &Path) -> release::Pass {
-    release::drain_store(
+/// The released workspace images of every project in the store at `store`, as the gateway's
+/// cleanup lists them at its start (05_gateway.md, "Deleting released images"): each project's
+/// `sessions/.deleting`.
+pub fn released_sessions(store: &Path) -> release::Listing {
+    release::released_in_store(
         store,
         crate::repository::SESSIONS_DIRECTORY,
         release::DELETING_DIRECTORY,

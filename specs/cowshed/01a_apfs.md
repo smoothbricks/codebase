@@ -1067,18 +1067,20 @@ orphaned while it still owns an attached image.
 One `unlink` of a written image can reclaim its whole extent tree in one kernel operation, and other writers on the
 store's APFS container, including files inside a different attached image, can wait behind that work. Holding an open
 file descriptor can defer reclamation until its last close, so an unlink-only timer is not an end-to-end release timer.
-Background I/O priority (`IOPOL_THROTTLE`) prolongs that wait instead of shortening it: the releaser's own metadata
-reads are throttled with it, so the same free takes longer and holds the container's work longer. Cowshed instead frees
-at normal disk priority and cuts from the end with `ftruncate(2)`, at most **1,024 physical runs per cut**, then unlinks
-the empty file. A cut of 1,024 runs takes a fraction of a second and a longer cut's length grows with its extents; the
-bound is on reclamation work, **not a wall-time bound**. The file length remains the restart journal
-(16_build_volumes.md, "Garbage collection"). That bounded release runs only off every verb's path: the verb that
-releases an image spawns itself as a detached `__delete-released` child that frees that one image and does not wait for
-it, and the gateway's startup scan frees what a child or a crash left (05_gateway.md, "Deleting released images").
+Background I/O priority (`IOPOL_THROTTLE`) prolongs that wait instead of shortening it: the freeing thread's own
+metadata reads are throttled with it, so the same free takes longer and holds the container's work longer. Cowshed
+instead frees at normal disk priority and cuts from the end with `ftruncate(2)`, at most **1,024 physical runs per
+cut**, then unlinks the empty file. A cut of 1,024 runs takes a fraction of a second and a longer cut's length grows
+with its extents; the bound is on reclamation work, **not a wall-time bound**. The file length remains the restart
+journal (16_build_volumes.md, "Garbage collection"). That bounded release runs only off every verb's path, in the
+gateway: the verb that releases an image hands the renamed entry over and returns, and the gateway's `image-cleanup`
+thread frees one entry at a time, starting no cut while gate-class work of any repository holds or waits (05_gateway.md,
+"Deleting released images").
 
 Stepping lets other writers progress between cuts; it is neither a scheduling guarantee nor a maximum duration for one
-kernel call. Concurrent releases lengthen one another's cuts, and a pause between cuts does not shorten them, so cowshed
-adds no scheduling delay.
+kernel call. Concurrent releases lengthen one another's cuts, and a pause between cuts does not shorten them, so the
+gateway runs one release cut at a time and adds no timed delay: its only wait before a cut is for gate work to end, with
+no deadline.
 
 The first mutation of a clone is bounded by no step: a fresh clone's first cut, however few runs it removes, does
 whole-map work inside one `ftruncate` or 4 KiB `pwrite` call, before userspace can yield, and takes seconds or more.
@@ -1090,11 +1092,12 @@ Unlinking a still-shared clone can be cheap, but `EF_SHARES_ALL_BLOCKS` is an ob
 clear when the other owner unlinks, so a plan-time flag check does not say who owns the map when the cuts run and does
 not justify skipping cuts. Cowshed retains the stepped path for every file.
 
-Background reclamation moves the wait off verbs: the verb that releases an image spawns itself as a detached
-`__delete-released` child that frees that one image, and the gateway's startup scan frees what a child or a crash left
-(05_gateway.md, "Deleting released images"); nothing polls for work. So no verb waits for the cuts or for the first
-mutation, and a land or an `rm` does not hold its turn and locks through them. It does not split the first mutation:
-that call can stall the container's other writers, in the child as in a verb.
+Background reclamation moves the wait off verbs: the verb that releases an image hands its renamed entry to the gateway,
+whose cleanup frees one entry at a time and waits for the host's gate work before every cut (05_gateway.md, "Deleting
+released images"); nothing polls for work. So no verb waits for the cuts or for the first mutation, and a land or an
+`rm` does not hold its turn and locks through them. It does not split the first mutation: that call can stall the
+container's other writers, in the gateway's cut as in a verb's, and the wait before each cut keeps it from starting
+beside gate work.
 
 Remaining options, not additional guarantees or implemented cutovers:
 

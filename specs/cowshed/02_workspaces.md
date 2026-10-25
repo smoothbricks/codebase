@@ -327,8 +327,8 @@ with main retired nothing links one, so main's linked volume and its seed go wit
 unbinding while the project is still bound, naming it and why, for the same command to retry. A release only commits,
 and the unbinding is the project's last act, its store tree going with it, so before it plans terminal storage it moves
 each released image of its project, from `build/.deleting` and `sessions/.deleting`, into
-`<store>/.deleting/<fresh id>.dmg` and starts each one's deletion child (05_gateway.md, "Deleting released images"). It
-frees nothing itself, and a child that holds an entry moves with it, holding the open file. Anything there that is not a
+`<store>/.deleting/<fresh id>.dmg` and hands each one to the gateway (05_gateway.md, "Deleting released images"). It
+frees nothing itself, and a cut in progress moves with its entry, held open by the cleanup. Anything there that is not a
 released image stays, and the removal of terminal storage that follows refuses, naming it. Unbinding then removes
 terminal storage (`.staging/`, `sessions/`, `checkpoints/`, `tmp/` and `build/`, which by then may hold only empty
 directories and zero-length locks and holds; anything else refuses, named, before one entry is removed) and the empty
@@ -399,9 +399,9 @@ deliberate adoption; a new retirement has a new operation UUID.
 This releases mounted devices and removes the live registration; it does **not** claim to free the retained image bytes.
 The reported archive is the preservation artifact. `gc` does not discover that reserved namespace as a live project or
 silently delete its evidence. The one thing freed there is a released image already waiting in the project's deleting
-directories (`build/.deleting` and `sessions/.deleting`): it is no evidence, and the gateway's startup scan frees it
-where the rename left it (05_gateway.md, "Deleting released images"). Normal `rm main --restore` and its verified
-Git-containment rules remain unchanged.
+directories (`build/.deleting` and `sessions/.deleting`): it is no evidence, and the gateway's cleanup frees it where
+the rename left it, its startup listing finding it there (05_gateway.md, "Deleting released images"). Normal
+`rm main --restore` and its verified Git-containment rules remain unchanged.
 
 The native qualification runs ten complete attach/mount/busy-refusal/holder-close/forget cycles. Every cycle records
 `ioclasscount` before and after and proves that the owned image is no longer registered while its archive remains. The
@@ -1385,19 +1385,18 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    commit the release with one rename of the canonical source image, never replacing a file, to
    `sessions/.deleting/<ws>-<incarnation>.dmg` and sync both directories, opening no byte of the image: before the
    rename the workspace is whole, and after it nothing mounts, forks, fences or reads the image again. Right after the
-   rename is durable the removal starts the deletion in the background, a detached `__delete-released` child (the
-   running executable) that frees the entry in bounded steps, unlinks it and syncs the directory (05_gateway.md,
-   "Deleting released images"), removes the CA companion, grants sidecar and facts and answers; it frees no byte of the
-   image and never waits for the free (16_build_volumes.md, "Garbage collection"), so no reply of this verb waits for
-   source-image bytes, and until the child has finished, the store's container still holds the image's allocation: free
-   space lags the removal. If the child cannot be spawned the removal fails with its rename already durable, and its
-   retry finds the release committed; a child that ends badly is said on stderr by its reaper, and the next gateway
-   start frees what it left. A failure before the rename refuses with the owner metadata and mutating intent kept for
-   the same removal to retry. `sessions/.deleting/` holds released images waiting to be freed, not a crash journal: a
-   crash after the rename leaves the entry, which nothing names, for the gateway's next start, and the next lifecycle
-   open or recovery reconciles the record the rename left imageless without waiting for the entry or freeing it, because
-   the reconcile of a canonical sidecar whose image is gone never depended on the bytes being freed. The removal's retry
-   finds the workspace already gone. An open confined to other workspaces neither reads nor waits for it.
+   rename is durable the removal hands the entry to the gateway, one one-shot `released` request that returns at once
+   (05_gateway.md, "Deleting released images"), removes the CA companion, grants sidecar and facts and answers; it frees
+   no byte of the image and never waits for the free (16_build_volumes.md, "Garbage collection"), so no reply of this
+   verb waits for source-image bytes, and until the gateway's cleanup has freed the entry, the store's container still
+   holds the image's allocation: free space lags the removal. A gateway that is absent, does not answer or refuses is
+   said once on stderr and fails nothing, since the rename is the release: the entry waits for the gateway's next start.
+   A failure before the rename refuses with the owner metadata and mutating intent kept for the same removal to retry.
+   `sessions/.deleting/` holds released images waiting to be freed, not a crash journal: a crash after the rename leaves
+   the entry, which nothing names, for the gateway's next start, and the next lifecycle open or recovery reconciles the
+   record the rename left imageless without waiting for the entry or freeing it, because the reconcile of a canonical
+   sidecar whose image is gone never depended on the bytes being freed. The removal's retry finds the workspace already
+   gone. An open confined to other workspaces neither reads nor waits for it.
 
    Gitignored or hidden content is not rebuildable merely because Git calls the tree clean. What cowshed itself made in
    the checkout is not its content: `.cowshed/`, the volume's own bookkeeping (`.fseventsd`, the Spotlight, trash,
@@ -1550,12 +1549,12 @@ one call: every session workspace, including clones a create never published, un
 each removal has already committed its release or completed its recovery preservation when collection begins; collects;
 with `--abandon` keeps every abandon bundle's tips in main's repository as `gc --abandoned` does (01_storage.md) and
 then deletes the bundles in `sessions/.trash`, refusing before one is deleted when any cannot be kept; and restores
-main, whose final unbinding frees the project's released images itself ("Checkout layouts"). Each step is idempotent, so
-a refusal leaves the rest to the same command. A collection that still finds the store changed under it (another
-process) is refused as retryable — `Conflict` with `Retry::GcPlanStale` — and the same command finishes the removal;
-callers never sleep and retry `gc` themselves. Recovery images can hold only-copy work even after all abandoned commits
-were bundled; they therefore refuse terminal store removal until their contents have been deliberately recovered with
-`gc --recover` (step 5), which the refusal's hint names. Bundle authorization alone never discards them.
+main, whose final unbinding hands the project's released images to the gateway ("Checkout layouts"). Each step is
+idempotent, so a refusal leaves the rest to the same command. A collection that still finds the store changed under it
+(another process) is refused as retryable — `Conflict` with `Retry::GcPlanStale` — and the same command finishes the
+removal; callers never sleep and retry `gc` themselves. Recovery images can hold only-copy work even after all abandoned
+commits were bundled; they therefore refuse terminal store removal until their contents have been deliberately recovered
+with `gc --recover` (step 5), which the refusal's hint names. Bundle authorization alone never discards them.
 
 ## `cowshed attach` / `cowshed detach`
 
@@ -1673,14 +1672,6 @@ pids, the volume census included, which walks the processes itself rather than t
 The leases read are the host store's (`/private/cowshed/store/<owner>/<repo>/sessions`) only: a lifecycle operation in a
 test fixture's store elsewhere records its lease there, which no census reads, so it is asked like any other process and
 can still stall a concurrent census. Linux records no unique id and its census asks every process.
-
-Nor does the tree census ask a released image's deletion child (05_gateway.md, "Deleting released images") about its
-descriptors when its entry cannot be in the tree. The child is known by the arguments the kernel holds for it,
-`<exe> __delete-released <entry>`, and its entry cannot be in the tree when it is not below the tree's root and its
-directory is on another device than the root's: an entry's later move is a rename, which stays on its device. The child
-holds nothing but its entry, and it sits in each bounded `ftruncate` cut with that entry's vnode held, so a census that
-asked it waited out the cut: measured 2026-10-25, 12-14 s of a 34-49 s `rm` with ten children freeing. Its working
-directory and executable are still checked, and a child whose arguments cannot be read is asked like any process.
 
 A record's unique id is its exact decimal string (`DecimalU64` in `api::held_lock`, the form every kernel identifier on
 the wire takes), the one form any reader parses; the switch from a JSON number was a clean cutover, with no reader of

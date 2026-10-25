@@ -612,7 +612,7 @@ where
     }
 
     /// Unmount and detach build volume `id`, then commit its image to `build/.deleting`
-    /// and delete its record, hold and mountpoint (16_build_volumes.md, "Garbage collection"); the background deletion frees the image. Only cowshed's own claims keep a volume: a job Only cowshed's own claims keep a volume: a job
+    /// and delete its record, hold and mountpoint (16_build_volumes.md, "Garbage collection"); the gateway's cleanup frees the image. Only cowshed's own claims keep a volume: a job Only cowshed's own claims keep a volume: a job
     /// admitted on it holds it ([`BuildVolumeLayout::hold`]), which answers [`Release::Held`] and
     /// touches nothing. Anything else that has it open does not own it: when the kernel refuses
     /// the unforced unmount, the holders are named, given the detach grace to let go, and then
@@ -782,7 +782,7 @@ where
 
     /// Release the volume while retaining its claim and ownership record until its detached
     /// image's release is committed to `build/.deleting`, durably; then the record, hold and
-    /// mountpoint go and this answers, the bytes left to the background deletion. A failure refuses
+    /// mountpoint go and this answers, the bytes left to the gateway's cleanup. A failure refuses
     /// the retirement with its record intact. The deletion log names the owner read before the
     /// image and record are removed.
     pub fn release_claimed(
@@ -836,7 +836,7 @@ where
         })?;
         if removed {
             layout.journal_release(id, recorded.as_ref(), true);
-            self.delete_in_background(&layout.released(id))?;
+            self.hand_over(&layout.released(id));
         }
         // A volume whose image was already gone is retired by its record alone, said as such.
         if remove_if_present(&layout.record(id))? && !removed {
@@ -1714,7 +1714,7 @@ mod tests {
         }
         assert!(
             layout.released(&id).is_file(),
-            "the image waits in build/.deleting; a fixture store starts no deletion child"
+            "the image waits in build/.deleting; a fixture store names no gateway cleanup"
         );
     }
 

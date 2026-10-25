@@ -192,12 +192,21 @@ struct Checkout {
     waiting: VecDeque<Waiter>,
 }
 
+/// Whose gate work a quiet ask waits for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum QuietScope {
+    /// A fork's or an attach's: its repository's.
+    Repository(Arc<str>),
+    /// The released-image cleanup's, before each cut: any repository's.
+    Host,
+}
+
 /// A fork or an attach that mounts, waiting for its repository's gate work to end (05_gateway.md
 /// "A fork or attach waits for its repository's gate"). It holds no token.
 #[derive(Debug)]
 struct QuietWaiter {
     ticket: Ticket,
-    repo: Arc<str>,
+    scope: QuietScope,
     claim: Claim,
     asked: Instant,
 }
@@ -537,40 +546,50 @@ impl Ledger {
         }
     }
 
-    /// A fork or an attach that mounts asks whether `repo` is quiet: `None` when no gate-class
-    /// request of `repo` holds or waits, and it may run now; otherwise it waits, holding no
-    /// token, and the gate job heading `repo` is the one it waits for (05_gateway.md "A fork or
-    /// attach waits for its repository's gate"). One whose requester's `pool` lies in that gate
-    /// job's own pools works for the gate itself, and waiting would wait for itself: it runs now.
+    /// A quiet ask of `scope`: `None` when it may run now, otherwise the gate job it waits for;
+    /// it holds no token. A fork or attach waits while gate-class work of its repository holds or
+    /// waits, unless its requester's `pool` is one of the pools the gate job heading it serves:
+    /// that fork works for the gate itself, and waiting would wait for itself (05_gateway.md "A
+    /// fork or attach waits for its repository's gate"). The released-image cleanup waits while
+    /// gate-class work of any repository holds or waits (05_gateway.md "Deleting released images").
     pub(crate) fn ask_quiet(
         &mut self,
         ticket: Ticket,
-        repo: Arc<str>,
+        scope: QuietScope,
         pool: Option<&std::path::Path>,
         claim: Claim,
         asked: Instant,
     ) -> Option<CpuQueueEntry> {
-        let head = self.gate_head(&repo)?;
+        let head = self.quiet_head(&scope)?;
         if pool.is_some_and(|pool| self.gate_pools.get(pool) == Some(&head)) {
             return None;
         }
         let gate = self.gate_job(head);
         self.quiet.push(QuietWaiter {
             ticket,
-            repo,
+            scope,
             claim,
             asked,
         });
         Some(gate)
     }
 
-    /// The forks and attaches whose repository's gate work has ended leave the queue and may run.
+    /// The quiet waiters whose gate work has ended leave the queue and may run.
     pub(crate) fn release_quiet(&mut self, released: &mut Vec<Ticket>) {
         let (waiting, done): (Vec<QuietWaiter>, Vec<QuietWaiter>) = std::mem::take(&mut self.quiet)
             .into_iter()
-            .partition(|waiter| self.gate_head(&waiter.repo).is_some());
+            .partition(|waiter| self.quiet_head(&waiter.scope).is_some());
         self.quiet = waiting;
         released.extend(done.into_iter().map(|waiter| waiter.ticket));
+    }
+
+    /// The gate job a quiet ask of `scope` waits for: its repository's head, or for the host the
+    /// oldest gate job of any repository; `None` once no such gate-class request holds or waits.
+    fn quiet_head(&self, scope: &QuietScope) -> Option<Ticket> {
+        match scope {
+            QuietScope::Repository(repo) => self.gate_head(repo),
+            QuietScope::Host => self.queue_head().map(|(_, job)| job),
+        }
     }
 
     /// The tokens held by the work behind gate job `head`: background, and younger gate jobs.
@@ -895,7 +914,10 @@ impl Ledger {
                 .quiet
                 .iter()
                 .map(|waiter| CpuQuietWaiter {
-                    repository: waiter.repo.to_string(),
+                    repository: match &waiter.scope {
+                        QuietScope::Repository(repo) => Some(repo.to_string()),
+                        QuietScope::Host => None,
+                    },
                     pid: waiter.claim.pid,
                     command: waiter.claim.command.to_string(),
                     waited_ms: millis_since(waiter.asked, now),
@@ -958,7 +980,7 @@ enum Message {
     /// A fork or an attach that mounts asks whether its repository's gate works.
     Quiet {
         ticket: Ticket,
-        repo: Arc<str>,
+        scope: QuietScope,
         pool: Option<std::path::PathBuf>,
         claim: Claim,
         /// Told the gate job it waits for, or `None` when it may run at once.
@@ -1148,7 +1170,7 @@ impl CpuBudget {
     /// waits (05_gateway.md "A fork or attach waits for its repository's gate").
     pub(crate) fn ask_quiet(
         &self,
-        repo: Arc<str>,
+        scope: QuietScope,
         pool: Option<std::path::PathBuf>,
         claim: Claim,
     ) -> QuietAsk {
@@ -1157,7 +1179,7 @@ impl CpuBudget {
         let (granted, receiver) = oneshot::channel();
         let _ = self.messages.send(Message::Quiet {
             ticket,
-            repo,
+            scope,
             pool,
             claim,
             gate,
@@ -1243,7 +1265,7 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
     // The asks that may be lent the probation token, told when they are.
     let mut lends: HashMap<Ticket, oneshot::Sender<()>> = HashMap::new();
     // The forks and attaches waiting for their repository's gate work to end, told when it does.
-    let mut quiets: HashMap<Ticket, oneshot::Sender<()>> = HashMap::new();
+    let mut quiets: HashMap<Ticket, (QuietScope, oneshot::Sender<()>)> = HashMap::new();
     let mut released = Vec::new();
     let mut cut: Option<CutOff> = None;
     let mut effects = Vec::new();
@@ -1303,25 +1325,30 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
             Message::GatePool { job, endpoint } => ledger.gate_pool(job, endpoint),
             Message::Quiet {
                 ticket,
-                repo,
+                scope,
                 pool,
                 claim,
                 gate,
                 granted,
             } => {
-                // After a cut-off the restart forgets every gate job: nothing is left to wait for.
+                // After a cut-off the restart forgets every gate job: a fork or attach has nothing
+                // left to wait for, and the cleanup stops (its senders dropped) rather than cut
+                // through the restart.
                 if cut.is_some() {
-                    let _ = gate.send(None);
-                    let _ = granted.send(());
+                    if scope != QuietScope::Host {
+                        let _ = gate.send(None);
+                        let _ = granted.send(());
+                    }
                     continue;
                 }
-                match ledger.ask_quiet(ticket, repo, pool.as_deref(), claim, Instant::now()) {
+                let scope_of_waiter = scope.clone();
+                match ledger.ask_quiet(ticket, scope, pool.as_deref(), claim, Instant::now()) {
                     None => {
                         let _ = gate.send(None);
                         let _ = granted.send(());
                     }
                     Some(holder) => {
-                        quiets.insert(ticket, granted);
+                        quiets.insert(ticket, (scope_of_waiter, granted));
                         let _ = gate.send(Some(holder));
                     }
                 }
@@ -1344,9 +1371,12 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                 // Every sender still here is a queued ask: dropped, its waiter refuses.
                 let waiting: std::collections::HashSet<Ticket> =
                     grants.drain().map(|(ticket, _)| ticket).collect();
-                // The restart forgets the gate work every quiet waiter waits for: each runs now.
-                for (_, granted) in quiets.drain() {
-                    let _ = granted.send(());
+                // The restart forgets the gate work every quiet waiter waits for: a fork or attach
+                // runs now; the cleanup's wait is dropped, which stops it until the next gateway.
+                for (_, (scope, granted)) in quiets.drain() {
+                    if scope != QuietScope::Host {
+                        let _ = granted.send(());
+                    }
                 }
                 // Nothing is lent after a cut-off: an install is restarting the gateway.
                 lends.clear();
@@ -1378,7 +1408,7 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
             lends.remove(&grant.ticket);
         }
         for ticket in released.drain(..) {
-            if let Some(granted) = quiets.remove(&ticket) {
+            if let Some((_, granted)) = quiets.remove(&ticket) {
                 let _ = granted.send(());
             }
         }
@@ -1592,7 +1622,7 @@ mod tests {
             self.ledger
                 .ask_quiet(
                     ticket,
-                    Arc::from(repo),
+                    QuietScope::Repository(Arc::from(repo)),
                     None,
                     Claim::new(&format!("fork t{ticket}"), Some(7)),
                     now,
@@ -2334,7 +2364,7 @@ mod tests {
                 .ledger
                 .ask_quiet(
                     ticket,
-                    Arc::from("owner/a"),
+                    QuietScope::Repository(Arc::from("owner/a")),
                     Some(Path::new(pool)),
                     Claim::new("fork", Some(7)),
                     now,
@@ -2364,6 +2394,36 @@ mod tests {
         assert!(clock.balanced());
     }
 
+    /// The cleanup's host-wide quiet ask waits while any repository's gate work holds or waits,
+    /// for the oldest gate job, and runs once the last of it, in any repository, has left.
+    #[test]
+    fn the_cleanups_quiet_ask_waits_for_every_repositorys_gate_work() {
+        let mut clock = Clock::new(4);
+        let gate = |repo: &str, job| (Class::Gate(Arc::from(repo)), job);
+        let ask = |clock: &mut Clock, ticket| {
+            clock
+                .ledger
+                .ask_quiet(
+                    ticket,
+                    QuietScope::Host,
+                    None,
+                    Claim::new("image-cleanup", None),
+                    clock.origin,
+                )
+                .map(|gate| gate.job)
+        };
+        assert_eq!(ask(&mut clock, 10), None);
+        assert_eq!(clock.ask_as(0, 1, "a", 1, gate("owner/a", 1)), [(1, 1)]);
+        assert_eq!(clock.ask_as(0, 2, "b", 1, gate("owner/b", 2)), [(2, 1)]);
+        assert_eq!(ask(&mut clock, 11), Some(1));
+        assert_eq!(clock.status(0).quiet[0].repository, None);
+        clock.leave(1, 1);
+        assert!(clock.released().is_empty(), "owner/b's gate still works");
+        clock.leave(2, 2);
+        assert_eq!(clock.released(), [11]);
+        assert!(clock.balanced());
+    }
+
     /// A waiting fork runs once its repository's last gate-class request leaves, not when the
     /// gate's root does while its task still holds; a fork that closes while it waits leaves the
     /// queue and is never released; the status names each waiting one.
@@ -2380,13 +2440,13 @@ mod tests {
             clock.status(5).quiet,
             [
                 CpuQuietWaiter {
-                    repository: "owner/a".into(),
+                    repository: Some("owner/a".into()),
                     pid: Some(7),
                     command: "fork t10".into(),
                     waited_ms: 4,
                 },
                 CpuQuietWaiter {
-                    repository: "owner/a".into(),
+                    repository: Some("owner/a".into()),
                     pid: Some(7),
                     command: "fork t11".into(),
                     waited_ms: 3,

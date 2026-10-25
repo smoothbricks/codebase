@@ -15,6 +15,7 @@
 //! listener, limit and cache-root variants: one enum, so a value the controller can construct is
 //! exactly a value the daemon accepts, and `cowshed-gateway`'s own validators report through it.
 
+pub mod cleanup;
 pub mod cpu_budget;
 pub mod disk_lease;
 pub mod first_launch;
@@ -25,6 +26,7 @@ pub mod session;
 pub mod status;
 pub mod task_server;
 
+pub use cleanup::{RELEASED_OP, ReleaseRecord, ReleasedRequest};
 pub use cpu_budget::{
     CPU_POOL_ENV, CPU_TOKENS_ENV, CPU_TOKENS_OP, CpuBackgroundStake, CpuBudgetStatus,
     CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, CpuHolder, CpuProbation, CpuQuietWaiter,

@@ -2004,7 +2004,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// by its exact id now, as the open's own step, never left for a periodic or manual pass. One
     /// still forming (a create, fork or adopt in any process, a first touch a detached checkout
     /// may still finish) is its registrant's, and one a creator still holds defers under the
-    /// release's claim. Nothing here frees image bytes: the background deletion
+    /// release's claim. Nothing here frees image bytes: the gateway's cleanup
     /// frees what releases commit (05_gateway.md, "Deleting released images").
     pub async fn recover_registered(
         &self,

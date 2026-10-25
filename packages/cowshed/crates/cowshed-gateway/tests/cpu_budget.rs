@@ -731,9 +731,9 @@ async fn a_fork_waits_for_its_repositorys_gate_and_hears_which_one() {
         status
             .quiet
             .iter()
-            .map(|waiter| (waiter.repository.as_str(), waiter.command.as_str()))
+            .map(|waiter| (waiter.repository.as_deref(), waiter.command.as_str()))
             .collect::<Vec<_>>(),
-        [("owner/land", "fork x")],
+        [(Some("owner/land"), "fork x")],
         "{status:?}"
     );
     assert!(
@@ -747,6 +747,47 @@ async fn a_fork_waits_for_its_repositorys_gate_and_hears_which_one() {
     assert_eq!(fork.answer().await["lease"], "granted");
     assert!(ledger(&socket).await.quiet.is_empty());
     drop((fork, other));
+    gateway.drain().await.expect("drain");
+}
+
+/// 05_gateway.md "Deleting released images", over the socket: a release handed over while a
+/// land gates waits in the cleanup beside it, listed as a host-wide quiet waiter, and is freed
+/// once the gate ends; an entry that is not in a `.deleting` directory of the store is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handed_over_image_is_freed_once_gate_work_ends() {
+    let (gateway, root, socket) = gateway(4).await;
+    let store = root.path().join("store");
+    let deleting = store.join("acme/widget/build/.deleting");
+    std::fs::create_dir_all(&deleting).expect("deleting directory");
+    gateway
+        .clean_up_released_images(store.clone())
+        .expect("the cleanup starts");
+    let (gate, _pool) = Asker::gate_job(&socket, "/w/land").await;
+    let entry = deleting.join("0123.dmg");
+    std::fs::write(&entry, vec![9_u8; 64 * 1024]).expect("a released image");
+    let handed = |entry: &Path| {
+        format!(
+            "{}\n",
+            serde_json::json!({ "op": "released", "entry": entry, "extents": 1 })
+        )
+    };
+    let answer = one_shot(&socket, &handed(&entry)).await;
+    assert_eq!(answer["ok"], true, "{answer}");
+    // The ledger sends no change notification: read it until the cleanup's wait shows.
+    while ledger(&socket).await.quiet.is_empty() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let status = ledger(&socket).await;
+    assert_eq!(status.quiet[0].repository, None, "{status:?}");
+    assert!(entry.exists(), "no cut beside the gate");
+    drop(gate);
+    while entry.exists() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let outside = store.join("acme/widget/build/main.dmg");
+    let answer = one_shot(&socket, &handed(&outside)).await;
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["code"], "invalid-request", "{answer}");
     gateway.drain().await.expect("drain");
 }
 

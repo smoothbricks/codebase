@@ -523,7 +523,7 @@ replacement at its next job admission, as after a land; it is not restarted to t
 Byte accounting is the same as build-volume garbage collection: each RAW image contributes `st_blocks * 512`, a
 directory backend its allocated tree bytes. Dry-run reports the old image's allocated bytes and the seed clone's
 allocation estimate; execution reports the actual replacement allocation and, as `releasedBytes`, the old image's
-allocation once its release is committed (a background deletion frees the bytes later). A seal may flush more blocks
+allocation once its release is committed (the gateway's cleanup frees the bytes later). A seal may flush more blocks
 than preview observed. These are **per-image allocated bytes**, not a promise of that much unique physical free space:
 APFS clones and retained seeds can share extents. Subtracting the replacement allocation gives a per-image net estimate,
 not a container-free-space measurement.
@@ -701,9 +701,9 @@ below).
       that job's end releases it. This applies with `--no-retire` too. Nothing links it any more, so its release runs
       beside what the land does in the target next (its supervisor, a kept workspace's fresh clone, the adoption check
       of step 7), so the release's unmount, detach and commit rename can overlap them. It frees no byte before land
-      returns: a background deletion frees the committed image beside the land and after it, and the land never waits
-      for it (GC below). It needs no image lock: a fork or reseed that takes the lock after the rename reads the adopted
-      volume, and none that held it before the land took it still runs.
+      returns: the gateway's cleanup frees the committed image off the land's path, never starting a cut while gate work
+      runs, and the land never waits for it (GC below). It needs no image lock: a fork or reseed that takes the lock
+      after the rename reads the adopted volume, and none that held it before the land took it still runs.
 
    A skipped swap is reported in the land report with each holder's pid and command. The target keeps its build volume
    and builds the landed delta incrementally the next time anything builds there; forks start from the new seed until
@@ -1008,56 +1008,51 @@ delta incrementally, as an edit would.
   replaces a file: an id is never reused, so an entry already under its name is the same image's own committed release,
   and a rename over a file would free the file it replaces in one go. The commit never opens the image: it reads none of
   its bytes and needs no access to it, and every deletion syncs the `.deleting` directory and its parent before its
-  first cut, so none cuts the entry before the rename is durable. Once the rename is durable, the operation starts the
-  deletion in the background (below), removes the owner record, hold file and mountpoint, appends its deletion-log line
-  and answers, none of it waiting for the free. No verb frees a byte of an image and none finishes another operation's
+  first cut, so none cuts the entry before the rename is durable. Once the rename is durable, the operation hands the
+  entry to the gateway (below), removes the owner record, hold file and mountpoint, appends its deletion-log line and
+  answers, none of it waiting for the free. No verb frees a byte of an image and none finishes another operation's
   entry. Nothing depends on those bytes being freed: no record, link, hold or mount names the entry, and nothing mounts,
-  forks or reads it. Only space lags: until the background deletion finishes the entry the store's container still holds
-  the image's allocation, so free-space figures and the container's extent count lag the commit, and an entry whose
-  deletion did not run waits for the next gateway start. A failure refuses with its path and cause, a deletion child
-  that cannot be spawned included: before the rename the owner record stays for the same operation's retry, after it the
-  entry stays for its deletion or the startup scan and the retry finds the commit already made, makes its rename durable
-  and answers. A held job retains its registered volume ownership; a later sweep is not a substitute for completing the
-  owning lifecycle operation.
+  forks or reads it. Only space lags: until the gateway's cleanup finishes the entry the store's container still holds
+  the image's allocation, so free-space figures and the container's extent count lag the commit, and an entry the
+  gateway was not handed waits for its next start. A failure refuses with its path and cause: before the rename the
+  owner record stays for the same operation's retry, after it the entry stays for its deletion and the retry finds the
+  commit already made, makes its rename durable, hands the entry over and answers. A hand-over the gateway does not take
+  is no failure of the release (below). A held job retains its registered volume ownership; a later sweep is not a
+  substitute for completing the owning lifecycle operation.
 - The free is not a verb's work, because the verb waits for it and keeps its turn and locks meanwhile. Cutting at a
   bound (below) bounds what the container's other writers wait for, not what the verb that cuts waits for. So the free
-  runs in a background child of the verb that holds no turn and no lock but the image's own, and the gateway's startup
-  scan finishes what a child did not (05_gateway.md, "Deleting released images").
+  runs in the gateway, which holds no turn of any verb and no lock but the entry's own, and the verb only hands the
+  entry over (05_gateway.md, "Deleting released images").
 - `build/.deleting/` holds the committed releases of build volumes and seeds: an entry exists from its operation's
   rename to its unlink. Every other image of the project (a removed workspace's, a checkpoint's, a staged clone's, an
   orphan `gc` collects) commits the same way into `sessions/.deleting/`, a removed workspace's as
   `<ws>-<incarnation>.dmg` and any other as `reclaimed-<fresh 32-hex>.dmg` (05_gateway.md, "Deleting released images").
-  Right after the rename is durable the releasing process starts the deletion in the background and returns without
-  waiting: it spawns itself, the running executable (`std::env::current_exe()`, which the host store's roots carry), as
-  `<exe> __delete-released <entry>`, detached in its own process group, with stdin and stdout null and stderr inherited,
-  and with no PATH lookup. A spawn failure is the release's error (its rename is already durable and a retry finds it
-  committed); a child that ends badly is said on stderr by its reaper. The child frees that one entry with the bounded
-  release below, after it waits out (a blocking `flock`) a process that holds it, its owner still syncing the commit,
-  naming its holder on stderr, read afresh at each 90 s bound, while it waits, and it exits once the entry is gone.
-  Nothing mounts, forks or reads an entry, and nothing is opened through a link: the images directory and the deleting
-  directory are held by descriptor, a link or any other non-regular file at the image's name or an entry's refuses or is
-  named and left, untouched.
-- When the store names no child (a fixture store without a binary says so on stderr once per process) or the child ended
-  badly, the entry stays for the gateway's startup scan. Once, when the gateway starts, its `image-deleter` thread
-  passes over every project of this gateway's store, each one's `build/.deleting` and `sessions/.deleting`, the same two
-  directories of every archived project (`.retired-projects/<operation-id>/`) and the store's own `<store>/.deleting`,
-  frees each entry with the same bounded release, names each stray, each entry another process holds and each unreadable
-  directory, and ends; so a gateway restart or a reboot frees every entry left, an image cut short mid-free included.
-  Before its first cut the scan syncs the directory and its parent, because the operation may have died before syncing
-  its rename; a scan that cuts nothing syncs nothing. The gateway does nothing after that for released images: no
-  control request, queue, polling, timer or environment variable.
+  Right after the rename is durable the releasing process hands the entry to the gateway of its host namespace with one
+  one-shot `released` control request and returns without waiting, truncating nothing and starting no process
+  (05_gateway.md, "Deleting released images", for the request and its answer). A gateway that is absent, does not answer
+  or refuses is said once on stderr, and the entry waits in `.deleting` for the gateway's next start; the release
+  stands, its rename being the commit. Nothing mounts, forks or reads an entry, and nothing is opened through a link:
+  the images directory and the deleting directory are held by descriptor, a link or any other non-regular file at the
+  image's name or an entry's refuses or is named and left, untouched.
+- The gateway's `image-cleanup` thread frees what is handed over, one entry at a time, and lists at each gateway start
+  every entry a restart or a refused hand-over left: each project's `build/.deleting` and `sessions/.deleting`, the same
+  two directories of every archived project (`.retired-projects/<operation-id>/`) and the store's own
+  `<store>/.deleting`. So a gateway restart or a reboot frees every entry left, an image cut short mid-free included.
+  The order it frees in, its wait for gate work before every cut, and what it names and leaves are the gateway's
+  (05_gateway.md, "Deleting released images"). Before an entry's first cut it syncs the directory and its parent,
+  because the operation may have died before syncing its rename; listing syncs nothing.
 - In a directory store (the test substrate, 08_testing.md "directory_*") a release only renames the payload tree into a
   `.deleting` directory (a workspace-side payload into `<project>/sessions/.deleting/<name>`, a build volume into
   `build/.deleting/<id>.dmg`) and refuses no holder: a process holding anything inside keeps what it has open. The verb
-  deletes nothing and starts no child (it says so once per process), because a tree can be freed only with the directory
-  host's holder census, which runs in-process. A released payload stays in `.deleting` until its test store goes, and
-  `DirectoryExecutionHost::finish_build_releases` can finish build-volume trees, which names and leaves a tree a process
-  still holds anything inside, never deleting it from under its holder. For this substrate, retry confirmation and the
-  finisher's listing, accounting and recursive deletion resolve each child against its held parent descriptor, never the
-  deleting directory's replaceable pathname. Holder discovery uses the held directory's current kernel name with
-  entry-identity checks around the census; a changed name refuses the pass. The payload is opened only after that census
-  (so the observer is not itself a holder), checked against the observed identity, and both the deleting directory and
-  the source directory are synced for that entry before its first deletion.
+  deletes nothing and hands nothing over (it says so once per process), because a tree can be freed only with the
+  directory host's holder census, which runs in-process. A released payload stays in `.deleting` until its test store
+  goes, and `DirectoryExecutionHost::finish_build_releases` can finish build-volume trees, which names and leaves a tree
+  a process still holds anything inside, never deleting it from under its holder. For this substrate, retry confirmation
+  and the finisher's listing, accounting and recursive deletion resolve each child against its held parent descriptor,
+  never the deleting directory's replaceable pathname. Holder discovery uses the held directory's current kernel name
+  with entry-identity checks around the census; a changed name refuses the pass. The payload is opened only after that
+  census (so the observer is not itself a holder), checked against the observed identity, and both the deleting
+  directory and the source directory are synced for that entry before its first deletion.
 - Freeing an image never takes one go. One `unlink` of a written image is one free of its whole extent tree, and every
   writer of the store's APFS container waits behind it: a long free hangs every `cowshed fork` and `ls` on the host. So
   a deletion cuts the image from its end with `ftruncate(2)`, at most 1,024 physical runs (`F_LOG2PHYS_EXT`) per cut,
@@ -1066,11 +1061,13 @@ delta incrementally, as an edit would.
   on runs reclaimed, not time inside a kernel call. A fresh clone's first cut does whole-map first-mutation work inside
   one syscall, which a step limit or yield cannot split. An observed shared-map flag does not retain its other owner, so
   no flag-based shortcut bypasses the cuts. See 01a_apfs.md, "Freeing an image", for the reasons and limitations. The
-  image's length is the free's journal: a cut ends on a run boundary, so a free that did not finish (a crash, a stopped
-  child, a gateway restart) leaves a shorter image that the next gateway start's scan walks and finishes, and nothing
-  else records progress. A deletion holds the image's `flock` for the whole free. It runs at normal disk priority: a
-  thread throttled to background priority (`IOPOL_THROTTLE`) holds the container's work while its own metadata reads
-  wait, so the same free takes longer and the writers beside it wait longer.
+  image's length is the free's journal: a cut ends on a run boundary, so a free that did not finish (a crash, a gateway
+  restart) leaves a shorter image that the next gateway start's listing queues and the cleanup finishes, and nothing
+  else records progress. The gateway frees one entry at a time and waits for gate-class work to end before every cut
+  (05_gateway.md, "Deleting released images"); it holds the entry's `flock`, and no image lock, for the whole free, that
+  wait included. The free runs at normal disk priority: a thread throttled to background priority (`IOPOL_THROTTLE`)
+  holds the container's work while its own metadata reads wait, so the same free takes longer and the writers beside it
+  wait longer.
 - Workspace images containing the only copy of dirty or unlanded content keep their separate recovery rules; rebuildable
   build images do not use that preservation mechanism.
 - Every release that commits an image, a seed's or another volume's, whatever asked for it (collection, a land's release
@@ -1091,10 +1088,10 @@ delta incrementally, as an edit would.
   released with every volume an earlier collection left, and a volume that stays refuses the unbinding while the project
   is still bound (02_workspaces.md, "Checkout layouts"). The unbinding is the project's last act and its store tree goes
   with it, so before it plans what it deletes it moves each released image of its project, from `build/.deleting` and
-  `sessions/.deleting`, into `<store>/.deleting/<fresh id>.dmg` and starts each one's deletion child; it frees nothing
-  itself, and a child that holds an entry moves with it, holding the open file. Anything there that is not a released
-  image stays, and the terminal plan then refuses, naming it. With no volume left, the unbinding deletes `build/` (then
-  only empty directories and zero-length holds) and the project's `.build/<owner>/<repo>` mount tree.
+  `sessions/.deleting`, into `<store>/.deleting/<fresh id>.dmg` and hands each one to the gateway; it frees nothing
+  itself, and a cut the gateway is making moves with its entry, which the cleanup holds open. Anything there that is not
+  a released image stays, and the terminal plan then refuses, naming it. With no volume left, the unbinding deletes
+  `build/` (then only empty directories and zero-length holds) and the project's `.build/<owner>/<repo>` mount tree.
 - GC also enumerates sidecars whose images are already gone: every seed's, and every other record collection would
   release with its image: one recorded superseded, registered and interrupted, or naming a checkout that no longer links
   it. An image that does not exist cannot be waiting for anything, so deferring its record would defer it on every pass

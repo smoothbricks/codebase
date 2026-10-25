@@ -1703,8 +1703,9 @@ supervisor that ran the job retires.
   the lease's age, not its process's (05_gateway.md "Host CPU budget", Wire). `probation?` is
   `CpuProbation = { checkout, pid?, command, lentMs }`, the one request running on the probation token (05_gateway.md "A
   one-token job starts on probation"), absent when none is lent; it still waits in `background`. `quiet?` is
-  `[{ repository, pid?, command, waitedMs }]`, the forks and attaches waiting for their repository's gate, oldest first
-  (05_gateway.md "A fork or attach waits for its repository's gate"), absent when none waits.
+  `[{ repository?, pid?, command, waitedMs }]`, the forks and attaches waiting for their repository's gate and, with no
+  `repository`, the released-image cleanup's host-wide wait, oldest first (05_gateway.md "A fork or attach waits for its
+  repository's gate", "Deleting released images"), absent when none waits.
   `AuditEvent = { timestamp, repoId, workspaceIncarnation, workspace, action, decision, reason?, trace }`.
 
 `JsonEnvelope<T>` has only the private-body constructors `success(T)` → `{"ok":true,"result":T}` and

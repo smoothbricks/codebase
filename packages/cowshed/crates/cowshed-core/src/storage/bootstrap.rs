@@ -1039,29 +1039,23 @@ pub struct CanonicalRoots {
     telemetry: PathBuf,
     namespace: HostNamespace,
     ports: PortPartition,
-    /// What a release starts its deletion child with (05_gateway.md, "Deleting released images"):
-    /// this executable logging to the home's daemon log for the host store, none for a host with no
-    /// home or a fixture store unless its test names its own ([`Self::with_deletion_child`]).
-    deletion_child: Option<crate::storage::apfs::deleter::DeletionChild>,
+    /// The gateway control socket a release hands its entry to (05_gateway.md, "Deleting released
+    /// images"): the host store's gateway, none for a fixture store.
+    cleanup: Option<Arc<Path>>,
 }
 
 impl CanonicalRoots {
     pub fn global() -> Self {
+        let roots = Self::new(
+            PathBuf::from(STORE_ROOT),
+            HostNamespace::Production,
+            PortPartition::Host,
+        );
+        // Every release of the host store goes to that store's gateway (05_gateway.md, "Deleting
+        // released images").
         Self {
-            // Every release this process makes starts its deletion child as this executable: the
-            // cowshed CLI, the gateway or a supervisor, never a library host (05_gateway.md,
-            // "Deleting released images").
-            deletion_child: std::env::current_exe()
-                .ok()
-                .zip(std::env::var_os("HOME"))
-                .map(|(program, home)| {
-                    crate::storage::apfs::deleter::DeletionChild::host(&program, Path::new(&home))
-                }),
-            ..Self::new(
-                PathBuf::from(STORE_ROOT),
-                HostNamespace::Production,
-                PortPartition::Host,
-            )
+            cleanup: Some(Arc::from(roots.control_socket())),
+            ..roots
         }
     }
 
@@ -1082,7 +1076,7 @@ impl CanonicalRoots {
             telemetry,
             namespace,
             ports,
-            deletion_child: None,
+            cleanup: None,
         }
     }
 
@@ -1090,19 +1084,9 @@ impl CanonicalRoots {
         &self.store
     }
 
-    /// This fixture store's releases start `child`: the test's own built cowshed binary, logging
-    /// where the test reads.
-    pub fn with_deletion_child(
-        mut self,
-        child: crate::storage::apfs::deleter::DeletionChild,
-    ) -> Self {
-        self.deletion_child = Some(child);
-        self
-    }
-
-    /// What a release starts its deletion child with, if anything.
-    pub fn deletion_child(&self) -> Option<&crate::storage::apfs::deleter::DeletionChild> {
-        self.deletion_child.as_ref()
+    /// The gateway control socket this store's releases are handed to, if any.
+    pub fn cleanup(&self) -> Option<&Arc<Path>> {
+        self.cleanup.as_ref()
     }
 
     /// The store root shared, so a project's identity answer names it without copying it.

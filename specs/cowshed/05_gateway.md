@@ -766,12 +766,13 @@ coordinator-side; the data plane supplies neither git credentials nor a push pat
 
 ## Control plane (Unix socket + optional 7644)
 
-The control plane provides status and audit to host tools, a project-bound repo-mirror operation to coordinators, and
-the host's disk-lifecycle lease and CPU budget to every process that runs a disk tool or a parallel runner (below). Peer
-credentials on the Unix socket (and equivalent local authentication on TCP) must identify an authorized host process;
-the data-plane token is never accepted on the control plane. The Unix accept loop records listener failure, unreadable
-peer credentials, unauthorized UID, connection-capacity refusal, connection-task failure and shutdown; an admission
-refusal is never a silent return.
+The control plane provides status and audit to host tools, a project-bound repo-mirror operation to coordinators, the
+host's disk-lifecycle lease and CPU budget to every process that runs a disk tool or a parallel runner (below), and the
+hand-over of a released image to every process that releases one ("Deleting released images"). Peer credentials on the
+Unix socket (and equivalent local authentication on TCP) must identify an authorized host process; the data-plane token
+is never accepted on the control plane. The Unix accept loop records listener failure, unreadable peer credentials,
+unauthorized UID, connection-capacity refusal, connection-task failure and shutdown; an admission refusal is never a
+silent return.
 
 Workspace sessions are installed and removed over the control plane, and the gateway's session table is a cache of host
 inventory, never an authority. Each session carries its workspace's effective grant revision, which every grant change
@@ -1435,7 +1436,9 @@ core count.
   job of the same workspace lies in the same directory, `<store>/run/cpu/<incarnation>`, and is not one of them: a
   background run beside the land waits like any other; without it, a land task that forked its own repository would wait
   for its own land, forever. The `cpu-budget` ledger lists the waiting forks and attaches as `quiet`, each with its
-  `repository`, `pid`, `command` and `waitedMs`.
+  `repository`, `pid`, `command` and `waitedMs`. The same question has a host scope that only the gateway's own
+  released-image cleanup asks, in process and before every cut: it waits while gate-class work of any repository holds
+  or waits, and its `quiet` entry has no `repository` ("Deleting released images").
 - **No admission deadline, for any class** (Danny tg#6679, tg#6693). A gate is the highest-priority work there is, so it
   is never failed for waiting in the order that serves it: a gate jobserver request, like a background one, waits until
   it is granted or its client closes the connection, which leaves the queue. The operator request is
@@ -1663,30 +1666,32 @@ core count.
   each with `pid`, `command`, `want` and `waitedMs`), for the checkouts that have one; and `probation`, while the
   probation token is lent, naming its request's `checkout`, `pid`, `command` and `lentMs`, the milliseconds since it was
   lent, a request that still waits in `background` for its own token; and `quiet`, the forks and attaches waiting for
-  their repository's gate ("A fork or attach waits for its repository's gate"), oldest first, each with its
-  `repository`, `pid`, `command` and `waitedMs`. Every waiting entry is one request: a gate job whose tasks wait is one
-  entry per task — the job identity is the gate `job` number and each entry is a distinct connection — so the queue is
-  never collapsed per job; its pid, command and age tell the entries apart (measured 2026-10-19: fifteen
-  `batch-7 gate job 603 want 1` entries were fifteen of that gate's tasks, and read as duplicates because they named
-  nothing else). `holders` are the granted leases, one per runner holding tokens, oldest grant first, each with the
-  client's `pid` (the socket's peer; absent when the socket names none — a pool-relayed task is named by its own
-  connection to the pool), the `command` it named, the `tokens` it holds now, its `want`, and `heldMs`, the milliseconds
-  since its grant. The age is the lease's, never the process's: a lease is one connection granted once, and a process
-  that asks again holds a new lease with its own age; the ledger never scans processes, and `ps -p <pid>` gives the
-  process's age. Measured 2026-10-18: a ledger that named only `land-test-hang: held 15, running 1` read as an orphan,
-  and a live 34-minute `cargo test …` another unit was waiting on was killed by hand; its holder line would have said
-  what it was and that it was live. `cowshed gateway status` shows this ledger to the operator in the order it serves —
-  its count with what background holds and what its grants may take
+  their repository's gate ("A fork or attach waits for its repository's gate") and the released-image cleanup waiting
+  for any gate's end ("Deleting released images"), oldest first, each with its `repository` (absent for the cleanup),
+  `pid`, `command` (`image-cleanup <entry>` for the cleanup) and `waitedMs`. Every waiting entry is one request: a gate
+  job whose tasks wait is one entry per task — the job identity is the gate `job` number and each entry is a distinct
+  connection — so the queue is never collapsed per job; its pid, command and age tell the entries apart (measured
+  2026-10-19: fifteen `batch-7 gate job 603 want 1` entries were fifteen of that gate's tasks, and read as duplicates
+  because they named nothing else). `holders` are the granted leases, one per runner holding tokens, oldest grant first,
+  each with the client's `pid` (the socket's peer; absent when the socket names none — a pool-relayed task is named by
+  its own connection to the pool), the `command` it named, the `tokens` it holds now, its `want`, and `heldMs`, the
+  milliseconds since its grant. The age is the lease's, never the process's: a lease is one connection granted once, and
+  a process that asks again holds a new lease with its own age; the ledger never scans processes, and `ps -p <pid>`
+  gives the process's age. Measured 2026-10-18: a ledger that named only `land-test-hang: held 15, running 1` read as an
+  orphan, and a live 34-minute `cargo test …` another unit was waiting on was killed by hand; its holder line would have
+  said what it was and that it was live. `cowshed gateway status` shows this ledger to the operator in the order it
+  serves — its count with what background holds and what its grants may take
   (`gateway cpu budget: held <h>/<N> tokens, background holds <b>, at most <N> with no gate work`, or
   `…, quiet beside gate work: one token a grant while it holds under half`), the request on the probation token
   (`gateway cpu probation: <checkout>: pid <pid>, lent <age> ago: <command>`), the head gate job, the gate jobs behind
   it, the gate queue, then background, each running gate job and background stake followed by its leases, and last the
-  forks and attaches waiting for their repository's gate
-  (`gateway quiet queue <n>: repository=<repo>: pid <pid>, waiting <age>: <command>`) — in its human lines, and verbatim
-  as `cpuBudget` in `--json` (06_cli.md; 07_api.md `GatewayStatus`), where background may take `total` with neither
-  `gateJobs` nor `gateQueue` and one token a grant beside them, so whether queued lands wait behind the head of the
-  queue without loading it, why background waits beside free tokens, and who holds every token since when, is visible
-  rather than inferred; a daemon that does not answer `cpu-budget` is reported as such, never as an empty ledger.
+  forks and attaches waiting for their repository's gate and the released-image cleanup waiting for any
+  (`gateway quiet queue <n>: repository=<repo>: pid <pid>, waiting <age>: <command>`, `repository=any` for the cleanup)
+  — in its human lines, and verbatim as `cpuBudget` in `--json` (06_cli.md; 07_api.md `GatewayStatus`), where background
+  may take `total` with neither `gateJobs` nor `gateQueue` and one token a grant beside them, so whether queued lands
+  wait behind the head of the queue without loading it, why background waits beside free tokens, and who holds every
+  token since when, is visible rather than inferred; a daemon that does not answer `cpu-budget` is reported as such,
+  never as an empty ledger.
 - **The hold limit** (2026-10-19). A lease held past 30 minutes (`HOLD_LIMIT`) is named on the lines right after the
   ledger's count, oldest first, by checkout, pid, tokens, want, age and command
   (`gateway cpu hold past 30m: <checkout>: pid <pid>, <g>/<want> tokens, granted <age> ago: <command>`), so the first
@@ -1910,9 +1915,9 @@ mounts are restored. In order:
    before anything binds. Then count the recorded projects and list the workspace supervisors still serving from before
    this daemon, then serve: the control socket and the supervisor manager answer from the first moment. Status answers
    throughout, and so do the audit, mirror, and simulator requests, none of which reads a workspace mount. Once it
-   serves, the daemon starts the `image-deleter` thread, which makes one pass over the released images a crash or a
-   failed deletion left, and ends ("Deleting released images", below). It reads no mount and waits for neither step 3
-   nor step 4.
+   serves, the daemon starts the `image-cleanup` thread, which lists the released images a restart or a crash left, then
+   frees them and every entry handed over after, one at a time, for as long as the gateway runs ("Deleting released
+   images", below). It reads no mount and waits for neither step 3 nor step 4.
 3. Eagerly heal every recorded project's main: attached and mounted at its checkout path. Each step is a lifecycle span
    of its own — `startup-heal discover`, `startup-heal open <repo>`, `startup-heal mount <repo>/main` — so a slow pass
    reads as the step that spent the time. Session workspaces are not attached by the pass: a session the kernel still
@@ -1984,82 +1989,102 @@ One mount pathway cowshed owns end to end is worth more than the eager pass it w
 
 ## Deleting released images
 
-A released image is deleted in the background by a process the releasing verb starts, and the gateway's startup scan
-finishes what that process did not. Every image a cowshed operation removes is released, never unlinked by the verb: a
-retirement (`rm`), the volume and seed a land or a `reseed` replaces, a superseded volume a job's end releases, a fork's
-seed refresh, the staged clone a failed creation or restore leaves, a staged copy a re-adoption leaves, and what `gc`
-collects (a retired workspace's trash, an orphan session or staging image, an expired checkpoint). The operation commits
-the release with one `rename(2)` of the detached image, never replacing a file, into a `.deleting` directory beside it:
-`build/.deleting/<id>.dmg` for a build volume, and for any other image of the project `sessions/.deleting/`, a removed
-workspace's as `<ws>-<incarnation>.dmg` and any other as `reclaimed-<fresh 32-hex>.dmg`. It syncs the directories it
-touched (16_build_volumes.md, "Garbage collection"; 02_workspaces.md, `rm` step 5). The commit never opens the image, so
-it reads none of its bytes and needs no access to it; every deletion syncs the `.deleting` directory and its parent
-before its first cut, so none cuts an entry before its rename is durable. No verb frees the bytes itself, because a verb
-that frees holds its turn and its locks, a land its land turn and an `rm` its workspace's locks, for as long as the free
-takes.
+A released image is handed to the gateway, which frees it. Every image a cowshed operation removes is released, never
+unlinked by the verb: a retirement (`rm`), the volume and seed a land or a `reseed` replaces, a superseded volume a
+job's end releases, a fork's seed refresh, the staged clone a failed creation or restore leaves, a staged copy a
+re-adoption leaves, and what `gc` collects (a retired workspace's trash, an orphan session or staging image, an expired
+checkpoint). The operation commits the release with one `rename(2)` of the detached image, never replacing a file, into
+a `.deleting` directory beside it: `build/.deleting/<id>.dmg` for a build volume, and for any other image of the project
+`sessions/.deleting/`, a removed workspace's as `<ws>-<incarnation>.dmg` and any other as
+`reclaimed-<fresh 32-hex>.dmg`. It syncs the directories it touched (16_build_volumes.md, "Garbage collection";
+02_workspaces.md, `rm` step 5). The commit never opens the image, so it reads none of its bytes and needs no access to
+it. No verb frees the bytes itself, because a verb that frees holds its turn and its locks, a land its land turn and an
+`rm` its workspace's locks, for as long as the free takes. No releasing process ever truncates an image, and none starts
+a process to do it: lands, forks and rebases never wait for a deletion. Measured 2026-10-25: two deletion children of a
+land, started under its land turn, held the repository's land turn after the land exited, until their frees ended, and
+nine children truncating released images at once saturated the store's container, with lsof, git, forks and execs in
+uninterruptible waits behind them.
 
-- **A background child, started once the rename is durable.** The releasing process starts the deletion in the
-  background and returns without waiting: it spawns itself, the running executable (`std::env::current_exe()`, which the
-  host store's roots carry), as `<exe> __delete-released <entry>`, detached in its own process group, with stdin and
-  stdout null, its working directory `/`, and stderr appended to the host's daemon log,
-  `~/Library/Logs/cowshed/daemon-stderr.log` (13_telemetry.md, "The one text-file survivor"), its directory made if
-  absent. The child holds nothing of the verb's. Its stderr is never the verb's own: a reader of that stream (a
-  terminal, a script's pipe, an agent's capture) waits for its end of file, which an inheriting child holds until its
-  image is freed, so the verb reads as taking as long as the free. Measured 2026-10-25 with stderr piped: a plain `rm`
-  that exited at 29 s reached end of file at 228 s, one that exited at 47 s at 114 s, and an `rm --abandon` that exited
-  at 34 s at 378 s. Nor is its working directory the verb's, which may be a checkout a later `rm` asks about
-  (02_workspaces.md, "Holders cowshed does not run"). Nor does it inherit a descriptor of the verb's beyond its stdio:
-  its spawn seals every other descriptor at the one child-descriptor boundary (02_workspaces.md, "Held locks"), so it
-  holds no lock its verb held. Measured 2026-10-25: two deletion children of sb-train4's land, started under
-  `cowshed land-turn`, inherited the land turn's ticket descriptor and kept smoothbricks' turn after the land exited,
-  until their frees ended, and the next land and a doc commit waited behind a land that no longer ran. Nothing looks
-  `cowshed` up on PATH: the CLI, the gateway and the supervisors spawn themselves, and the N-API addon makes no release
-  in-process, since its verbs run in the cowshed binary. A spawn failure, or a daemon log that cannot be opened, is the
-  release's error: the verb fails with its rename already durable, and its retry finds the release committed. A child
-  that ends badly, with a non-zero status or a signal, is said on stderr by its reaper, and the next gateway start frees
-  what it left. A store whose configuration names no child, a fixture store without a binary or a host with no `HOME`,
-  starts none, says so on stderr once per process, and its entries wait for the startup scan. The child frees that one
-  entry with the bounded release: at most 1,024 physical runs per `ftruncate` cut from the end of the file, at normal
-  disk priority, then `unlink`, the file's length being the resume journal (16_build_volumes.md, "Garbage collection";
-  01a_apfs.md, "Freeing an image"). It first waits out (a blocking `flock`) a process that holds the entry, its owner
-  still syncing the commit, and while it waits it names its holder on stderr, read afresh at each 90 s bound, the bound
-  being a parameter of the wait. It exits once the entry is gone, or with a usage error when it is given no entry. No
-  queue, control request, timer or poll stands between the verb and the child.
-- **A startup scan finishes what a child did not.** When the store names no child or the child ended badly, the entry
-  stays in its `.deleting` directory for the gateway's startup scan. Once, right after the gateway starts serving
-  ("Startup contract", step 2), it starts one thread, `image-deleter`, which passes over every project of this gateway's
-  store, each one's `build/.deleting` and `sessions/.deleting`, the same two directories of every archived project
-  (`.retired-projects/<operation-id>/`, where `forget` renamed the project's tree with its released images in it,
-  02_workspaces.md; the receipt files beside an archive are skipped), and the store's own `<store>/.deleting`. It frees
-  each entry it finds as the child does, one image at a time, names each stray, each entry another process holds and
-  each unreadable directory, and ends. It looks nowhere else. An archive's released images are no evidence: they were
-  released before the archive's rename, and the scan opens nothing else in an archive. So a gateway restart or a reboot
-  (the gateway is `RunAtLoad`) finishes every entry left, an image cut short mid-free included. Before its first cut the
-  scan syncs the directory and its parent in full, because an owner may have died between its rename and the rename's
-  syncs; a scan that cuts nothing syncs nothing.
-- **The gateway does nothing else for it.** After that scan the gateway does no work for released images: no control
-  request, queue, polling, timer or environment variable. A deletion's own `flock` on the entry is the whole of the
-  exclusion between a child and a scan.
+- **Every release is a hand-off, made once its rename is durable.** The releasing process holds no image lock while it
+  renames and syncs, and returns at once. It hands the entry to the gateway of its host namespace (01_storage.md, "Host
+  namespace") with one one-shot control request,
+  `{"op":"released","entry":"<absolute path>","uniqueBytes":<n>?,"extents":<n>?}`, answered `{"ok":true}` once the
+  gateway has queued the entry. The two counts are the releaser's record of the image: `uniqueBytes`, the bytes it does
+  not share with its source, which freeing it returns, and `extents`, its physical runs, which freeing it costs. Each is
+  present only when the releaser knows it: seed capture and compaction record them, and a release that walks no extent
+  map (13_telemetry.md, "Native image observations") knows neither. If the gateway is absent, does not answer within the
+  2 s every admission's acknowledgement has ("A fork or attach waits for its repository's gate"), or refuses, the
+  releaser says so once on stderr, and the entry waits for the gateway's next start: its rename is the release, so the
+  verb still answers.
+- **The gateway validates what it is handed.** An entry is an absolute path, with no `..` component, inside the
+  gateway's store and in a `.deleting` directory; anything else is refused as `invalid-request` and queued nowhere.
+- **One thread, `image-cleanup`, owns the queue.** The gateway starts it when it starts serving ("Startup contract",
+  step 2), so neither the listing nor a free delays its readiness; until the thread has started, a hand-over is refused
+  as `rejected`, and the listing the thread makes first queues that entry, which is already in its `.deleting`
+  directory. That first step lists every leftover entry in the store: each project's `build/.deleting` and
+  `sessions/.deleting`, the same two directories of every archived project (`.retired-projects/<operation-id>/`, where
+  `forget` renamed the project's tree with its released images in it, 02_workspaces.md; the receipt files beside an
+  archive are skipped), and the store's own `<store>/.deleting`. Leftovers go into the queue as entries with no record,
+  oldest listed first. A stray, a non-regular file and a directory that cannot be read are named on stderr and left
+  untouched. The listing looks nowhere else and does no sync: an archive's released images are no evidence, they were
+  released before the archive's rename, and nothing else in an archive is opened. Entries handed over later join the
+  queue with the record their releaser sent.
+- **The next entry is a pure function of the queue and the pressure.** `cleanup_order::next(pending, pressure)`
+  (`storage/apfs/cleanup_order.rs`) picks it, and the thread reads the pressure before each pick.
+  - With no pressure, the entry with the fewest extents goes first: a cut's time grows with its extents, so each burst
+    of container work stays short for the gates beside it.
+  - Under pressure, the entry with the most unique bytes per extent goes first: the most space for the least work.
+    Unique bytes are the bytes the image does not share with its source: a clone's shared extents return nothing when it
+    is freed, so its allocated or sparse size is never used. Ties go to the fewer extents.
+  - An entry with no record goes last, oldest first, in both modes, and under pressure so does one without both counts.
+    Entries equal in every other respect go oldest first.
+  - Pressure is the store container's free space below 1/8 of its capacity, measured with `statvfs`:
+    `f_bavail·f_frsize < f_blocks·f_frsize / 8`. One constant, `PRESSURE_FREE_FRACTION = 8`, holds the fraction. A
+    container whose space cannot be read is under no pressure, and the thread says so on stderr.
+- **One cut at a time, and none beside gate work.** The thread frees one entry at a time, so one release cut runs per
+  gateway, and therefore per container on a host. Before every `ftruncate` cut it asks the gateway's own CPU ledger, in
+  process, whether the host is quiet: the question a fork asks for its repository ("A fork or attach waits for its
+  repository's gate"), asked at host scope. It waits, with no deadline, while gate-class work of any repository holds or
+  waits ("Room for a gate"). While it waits it holds only that entry's own `flock`, never an image lock
+  (`main.dmg.lock`, `sessions/<ws>.dmg.lock`; 01_storage.md, "Lock order") and never a token. The wait is said on
+  stderr, `cowshed: released-image cleanup of <entry> waits beside gate job: …`, and `cpu-budget`'s `quiet` ("Host CPU
+  budget", Wire) lists it with no `repository` and the command `image-cleanup <entry>`. A gate that starts while a cut
+  runs meets that one cut, and the next cut waits for the gate to end.
+- **One entry's free.** The thread `flock`s the entry without waiting. An entry another process holds is left, and said
+  on stderr: its holder is a releaser still syncing its own rename, and that releaser hands it over afterwards. Before
+  the first cut the thread syncs the entry's directory and that directory's parent, because a releaser may have died
+  between its rename and the rename's syncs. It then cuts from the end of the file, at most 1,024 physical runs per
+  `ftruncate`, at normal disk priority (16_build_volumes.md, "Garbage collection"; `IOPOL_THROTTLE` stays rejected,
+  01a_apfs.md, "Freeing an image"), unlinks the empty file and syncs the directory. The file's length is the journal: a
+  cut ends on a run boundary, so an entry cut short is finished from its length. The thread says on stderr each entry it
+  frees, with its bytes and cuts. An entry that is gone when its turn comes (freed already, or moved by a final
+  unbinding) needs nothing; one whose free fails is said with its cause and stays in `.deleting` for the gateway's next
+  start.
+- **A restart finishes what it cut.** An install's restart stops the thread mid-entry, and the next gateway's startup
+  listing finishes what it left: so a gateway restart or a reboot (the gateway is `RunAtLoad`) frees every entry left,
+  an image cut short mid-free included.
+- **What is never done.** No verb or other releasing process truncates an image, starts a process to free one, or holds
+  an image lock through a free. The gateway applies no `IOPOL_THROTTLE`, and no timer, poll or environment variable
+  drives the queue: the thread waits on its hand-overs and on the ledger's answer.
 
-Space lags. Until a child or the startup scan finishes an entry the store's container still holds its allocation, so
-free-space figures and extent counts lag the commit by the free's own duration, and an entry whose child did not run
-waits for the next gateway start. Nothing references an entry: no record, link, hold or mount names it, and nothing
+Space lags. Until the cleanup frees an entry the store's container still holds its allocation, so free-space figures and
+extent counts lag the commit by the entry's wait in the queue and the free's own duration, and an entry the gateway was
+never handed waits for its next start. Nothing references an entry: no record, link, hold or mount names it, and nothing
 mounts, forks or reads it.
 
-Two cases start no child. A store whose configuration names none, a fixture store without a binary (core tests have
-none; a test that names one names its daemon log too) or a host with no `HOME`, says so on stderr once per process, and
-the startup scan frees its entries. A directory store, the test substrate, only renames: its release moves the payload
-into `<project>/sessions/.deleting/<name>` (a build volume into `build/.deleting`), the verb deletes nothing and starts
-no child (said once per process), and a released payload stays in `.deleting` until its test store goes, because a tree
-can be freed only with the directory host's holder census, which runs in-process;
-`DirectoryExecutionHost::finish_build_releases` can finish build-volume trees, leaving one a process still holds
-(16_build_volumes.md, "Garbage collection").
+Two cases hand nothing over. A store whose configuration names no gateway (a fixture store no test gave one) says so on
+stderr once per process, and its entries wait in `.deleting` for a gateway's start. A directory store, the test
+substrate, only renames: its release moves the payload into `<project>/sessions/.deleting/<name>` (a build volume into
+`build/.deleting`), the verb deletes nothing and hands nothing over (said once per process), and a released payload
+stays in `.deleting` until its test store goes, because a tree can be freed only with the directory host's holder
+census, which runs in-process; `DirectoryExecutionHost::finish_build_releases` can finish build-volume trees, leaving
+one a process still holds (16_build_volumes.md, "Garbage collection").
 
 A project's final unbinding (`rm main --restore`, 02_workspaces.md, "Checkout layouts") frees nothing either. Its store
 tree goes with it, so before it plans terminal storage it moves each released image of its project, from
-`build/.deleting` and `sessions/.deleting`, into `<store>/.deleting/<fresh id>.dmg` and starts each one's deletion
-child. A child that holds an entry moves with it, since it holds the open file, and a stray left in those directories
-still refuses the plan.
+`build/.deleting` and `sessions/.deleting`, into `<store>/.deleting/<fresh id>.dmg` and hands each one over like any
+release. A cut the gateway is making moves with its entry, which the cleanup holds open, and the entry's new name is
+handed over with the rest; a stray left in those directories still refuses the plan.
 
 ## Availability and offline behavior
 

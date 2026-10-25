@@ -3287,15 +3287,12 @@ struct DeletingDirectory {
 }
 
 /// Move every released image the project's tree still holds into the store's own `.deleting`
-/// under a fresh name, and start each one's deletion child with `deletion_child` (05_gateway.md,
-/// "Deleting released images"): the unbinding deletes these trees, and frees nothing itself. One a
-/// child is freeing moves with it: the child holds the open file, not the name. Anything there that
+/// under a fresh name, and hand each one to the gateway's cleanup at `cleanup` (05_gateway.md,
+/// "Deleting released images"): the unbinding deletes these trees, and frees nothing itself. One
+/// the cleanup is freeing moves with it: it holds the open file, not the name. Anything there that
 /// is not a released image stays, for the terminal plan to refuse naming it.
 #[cfg(target_os = "macos")]
-fn move_terminal_releases(
-    project_root: &Path,
-    deletion_child: Option<&crate::storage::apfs::deleter::DeletionChild>,
-) -> Result<()> {
+fn move_terminal_releases(project_root: &Path, cleanup: Option<&Path>) -> Result<()> {
     let failed = |what: &str, path: &Path, error: std::io::Error| {
         CowshedError::environment_missing(
             format!("cannot {what} {}: {error}", path.display()),
@@ -3345,9 +3342,12 @@ fn move_terminal_releases(
                     .and_then(|held| cowshed_os::fsio::sync_held_directory(&held))
                     .map_err(|error| failed("sync", synced, error))?;
             }
-            if let Some(child) = deletion_child {
-                crate::storage::apfs::deleter::delete_in_background(child, &moved)
-                    .map_err(|error| failed("start the deletion of", &moved, error))?;
+            if let Some(socket) = cleanup {
+                crate::storage::apfs::deleter::hand_over(
+                    socket,
+                    &moved,
+                    cowshed_gateway_types::ReleaseRecord::default(),
+                );
             }
         }
     }
@@ -3449,9 +3449,9 @@ fn require_terminal_storage(project_root: &Path) -> Result<()> {
 fn clean_terminal_project_storage(
     project_root: &Path,
     binding: &Path,
-    deletion_child: Option<&crate::storage::apfs::deleter::DeletionChild>,
+    cleanup: Option<&Path>,
 ) -> Result<()> {
-    move_terminal_releases(project_root, deletion_child)?;
+    move_terminal_releases(project_root, cleanup)?;
     let mut plan = Vec::new();
     for (name, _) in TERMINAL_STORAGE_TREES {
         plan_terminal_storage_tree(&project_root.join(name), &mut plan)?;
@@ -3520,7 +3520,7 @@ fn remove_project_mount_trees(paths: &crate::repository::ProjectPaths) -> Result
 pub(crate) fn finish_restored_project_unbinding(
     paths: &crate::repository::ProjectPaths,
     expected: &RepositoryBinding,
-    deletion_child: Option<&crate::storage::apfs::deleter::DeletionChild>,
+    cleanup: Option<&Path>,
     observe: &mut impl FnMut(UnbindCheckpoint) -> Result<()>,
 ) -> Result<()> {
     let path = &paths.repository_binding;
@@ -3576,7 +3576,7 @@ pub(crate) fn finish_restored_project_unbinding(
         }
     };
     // Failure-prone storage and mount cleanup happens while controller authority still exists.
-    clean_terminal_project_storage(&paths.project_root, path, deletion_child)?;
+    clean_terminal_project_storage(&paths.project_root, path, cleanup)?;
     remove_project_mount_trees(paths)?;
     if bound {
         observe(UnbindCheckpoint::BeforeBindingRemoval)?;
@@ -8846,12 +8846,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         }
         let paths = self.layout.project().clone();
         let expected = self.descriptor.binding.clone();
-        let deletion_child = self.substrate.config().deletion_child.clone();
+        let cleanup = self.substrate.config().cleanup.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
             finish_restored_project_unbinding(
                 &paths,
                 expected.as_ref(),
-                deletion_child.as_ref(),
+                cleanup.as_deref(),
                 &mut |_| Ok(()),
             )
         })

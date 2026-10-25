@@ -2802,8 +2802,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
 
     /// Release `image`, the retired workspace's canonical or trashed image (02_workspaces.md, `rm`
     /// step 5): one rename to `sessions/.deleting/<ws>-<incarnation>.dmg` commits it, so nothing
-    /// mounts, forks or reads it again, and this returns once that rename is durable; its deletion
-    /// child, or the gateway's startup scan, frees the bytes (05_gateway.md, "Deleting released
+    /// mounts, forks or reads it again, and this returns once that rename is durable; the gateway's
+    /// cleanup, which it is handed to, frees the bytes (05_gateway.md, "Deleting released
     /// images"). Its CA companion, facts and grants sidecar are then removed by
     /// [`ApfsExecutionHost::reclaim_image`]. A crash after the rename leaves the entry, which nothing
     /// names, for that scan.
@@ -2825,7 +2825,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 .map_err(|error| io_error("release a retired workspace image", image, error))
         })?;
         if released {
-            self.delete_in_background(&entry)?;
+            self.hand_over(&entry);
             deletion_log::log_deletion_for_image(
                 image,
                 DeletionOp::ReclaimImage,
@@ -2836,22 +2836,26 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         Ok(())
     }
 
-    /// Start freeing `entry`, a release this host just committed, in a detached child running the
-    /// program its config names (05_gateway.md, "Deleting released images"). A spawn failure is the
-    /// release's error. A config that names none (a fixture store no test gave a binary) starts
-    /// nothing, says so once, and leaves the entry to the gateway's startup scan.
-    pub(super) fn delete_in_background(&self, entry: &Path) -> Result<(), ApfsStorageError> {
-        match &self.config.deletion_child {
-            Some(child) => super::deleter::delete_in_background(child, entry)
-                .map_err(|error| io_error("start a released image's deletion", entry, error)),
+    /// Hand `entry`, a release this host just committed and made durable, to the gateway's cleanup
+    /// its config names (05_gateway.md, "Deleting released images"), and return: nothing here frees
+    /// it. A config that names none (a fixture store no test gave a gateway) says so once, and the
+    /// entry waits in `.deleting` for a gateway's start.
+    pub(super) fn hand_over(&self, entry: &Path) {
+        match &self.config.cleanup {
+            Some(socket) => {
+                super::deleter::hand_over(
+                    socket,
+                    entry,
+                    cowshed_gateway_types::ReleaseRecord::default(),
+                );
+            }
             None => {
                 static SAID: std::sync::Once = std::sync::Once::new();
                 SAID.call_once(|| {
                     cowshed_os::eprintln!(
-                        "cowshed: this store names no deletion child; its released images wait in .deleting for the gateway's startup scan"
+                        "cowshed: this store names no gateway cleanup; its released images wait in .deleting for a gateway's start"
                     )
                 });
-                Ok(())
             }
         }
     }
@@ -2897,7 +2901,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let released = super::release::commit_release(image, &entry)
             .map_err(|error| io_error("release an image nothing owns", image, error))?;
         if released {
-            self.delete_in_background(&entry)?;
+            self.hand_over(&entry);
         }
         Ok(released)
     }

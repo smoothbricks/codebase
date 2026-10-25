@@ -451,15 +451,15 @@ never named: a mount just to rename one would advance its image mtime, the seed-
 `rm` and `land`, including `land --no-retire`, collect build volumes synchronously: the moment no checkout links a
 volume and it is no target's latest seed, it is detached and released, unless a running cowshed job's shared hold or an
 unfinished create/fork in the lifecycle intent journal proves an owner. A release commits the image with one rename into
-the project's `build/.deleting`, starts a detached child of the command that frees it a bounded step at a time
-(05_gateway.md, "Deleting released images"), and frees no byte itself, so space lags the command by the free. If the
-child cannot be spawned, the command fails with the release already committed, and its retry finds it so; a child that
-ends badly is said on stderr by its reaper, and the gateway's next start frees what it left. `gc` collects build volumes
-the same way, committing and never freeing. A non-forced unmount gets a bounded grace; if it still refuses and no owner
-remains, release forces the unmount. It names each initial holder's pid and command on stderr and says whether the
-volume was released within the grace or forced afterwards. Force revokes those processes' volume access rather than
-killing them. A job admitted before an adoption retains its old volume until its hold is dropped. Failed forks and
-superseded seeds use the same release rule (16, "Garbage collection").
+the project's `build/.deleting`, hands the entry to the gateway, whose `image-cleanup` thread frees it a bounded step at
+a time (05_gateway.md, "Deleting released images"), and frees no byte itself, so space lags the command by the free. A
+hand-over the gateway does not take (absent, silent or refusing) is said on stderr and fails nothing: the release
+stands, and the entry waits for the gateway's next start. `gc` collects build volumes the same way, committing and never
+freeing. A non-forced unmount gets a bounded grace; if it still refuses and no owner remains, release forces the
+unmount. It names each initial holder's pid and command on stderr and says whether the volume was released within the
+grace or forced afterwards. Force revokes those processes' volume access rather than killing them. A job admitted before
+an adoption retains its old volume until its hold is dropped. Failed forks and superseded seeds use the same release
+rule (16, "Garbage collection").
 
 Both explicit `gc` and opportunistic collection explain deferrals: job holds, unfinished create/fork work, unreadable
 detached checkouts or records, and release failures name the volume and reason; opportunistic collection counts routine
@@ -489,7 +489,8 @@ repositories inside the images, grants and resource evidence — unchanged to `.
 store. Nothing is deleted, rewritten or copied, and the retained image bytes are not freed: the archive is the
 preservation artifact. An archive is reserved host storage that no verb discovers, heals or reclaims, and one that
 already exists is never overwritten. Only a released image already waiting in the project's deleting directories is
-freed there, by the gateway's startup scan (05_gateway.md, "Deleting released images"); it is no evidence.
+freed there, by the gateway's cleanup, whose startup listing finds it in the archive (05_gateway.md, "Deleting released
+images"); it is no evidence.
 
 A supervisor that has not finished draining, an owner that still holds the project and a holder that keeps an image busy
 each refuse their step as a `conflict` (exit 4), and nothing is forced: the project stays fenced, and the same command

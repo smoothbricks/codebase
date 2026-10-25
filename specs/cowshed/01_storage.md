@@ -60,10 +60,10 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
                                      #   that upgrades to exclusive with no record beside it (02_workspaces.md)
     <repo>.run                       # one retirement execution, fenced to the exact recorded generation
   .retired-projects/                  # preserved, detached evidence; never discovered as live projects
-    <operation-id>/                  # the complete former project store tree, renamed without copying or deleting; the gateway's startup scan frees the released images waiting in it
+    <operation-id>/                  # the complete former project store tree, renamed without copying or deleting; the gateway's cleanup lists the released images waiting in it at its start and frees them
     <operation-id>.json              # completed retirement receipt
   .deleting/                         # released images a project's unbinding moved out of its tree
-    <id>.dmg                         # a fresh id, waiting for its background deletion
+    <id>.dmg                         # a fresh id, waiting for the gateway's cleanup
   <owner>/                           # a project owner, and the only store-root entry discovery reads
     .cowshed-owner                   # empty: makes this directory an owner (written when its first project is provisioned)
   <owner>/<repo>/                    # primary repo_id, encoded one component at a time
@@ -88,14 +88,14 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
       <workspace>.intent.lock        # flock the process executing <workspace>'s lifecycle intent holds
       <workspace>.land.lock          # flock a land or an rm of <workspace> holds for its run (02 "A land and an rm of one workspace exclude each other")
       .trash/                        # recovery images of dirty, unlanded or only-copy removals, kept until gc --recover
-      .deleting/<name>.dmg           # committed releases of the project's other images (a removed workspace's as <ws>-<inc>.dmg, any other as reclaimed-<fresh 32-hex>.dmg), each waiting for its background deletion
+      .deleting/<name>.dmg           # committed releases of the project's other images (a removed workspace's as <ws>-<inc>.dmg, any other as reclaimed-<fresh 32-hex>.dmg), each waiting for the gateway's cleanup
     checkpoints/
       <workspace>/<label>.dmg        # clonefile snapshot
     build/
       <id>.dmg                       # one build volume: Cargo target dirs + Nx cache and task DB (16_build_volumes.md)
       <id>.dmg.json                  # its sidecar: built-at tree, linking checkout, checked-out tree when placed, seed flag, created
       <id>.dmg.hold                  # flock each job on the volume holds shared; a release claims it exclusive, then deletes it
-      .deleting/<id>.dmg             # a committed release, waiting for its background deletion
+      .deleting/<id>.dmg             # a committed release, waiting for the gateway's cleanup
     tmp/
       <workspace>/                   # its TMPDIR, 0700: writable by its own sandbox only; reclaimed with its retired image,
                                      #   read-only directories its tools sealed made owner-writable first (`go clean -modcache`)
@@ -328,10 +328,10 @@ The APFS adapter's interrupted image/metadata publication protocol is specified 
 
 Copy-on-write divergence only ever accumulates — checkpoints, idle workspaces, abandon bundles, ZFS origin pins
 (09_substrates.md), and APFS image-size ratchet all grow silently. `cowshed gc` enforces retention conventions.
-Reclaiming an image, whatever reclaims it, is releasing it: one rename into a `.deleting` directory, then a deletion in
-the background (05_gateway.md, "Deleting released images"). Background deletion handles only explicitly released images
-(build volumes, the sources of clean removals, the orphan, expired and staged images that `gc` and failed verbs release)
-and provably dead scratch, never idle workspaces:
+Reclaiming an image, whatever reclaims it, is releasing it: one rename into a `.deleting` directory, then a hand-over to
+the gateway, which deletes it in the background (05_gateway.md, "Deleting released images"). Background deletion handles
+only explicitly released images (build volumes, the sources of clean removals, the orphan, expired and staged images
+that `gc` and failed verbs release) and provably dead scratch, never idle workspaces:
 
 | Object                                       | Default retention                                                                      | Exempt / override                                                                                                                                                            |
 | -------------------------------------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -339,7 +339,7 @@ and provably dead scratch, never idle workspaces:
 | CI failure checkpoints                       | same checkpoint rule as above                                                          | labeled `ci-fail`, therefore explicitly pinned until unpinned; `10_ci.md`                                                                                                    |
 | Idle workspaces                              | _flagged_ by `cowshed doctor` after 14 days no exec, **never auto-destroyed**          | landing/removal is always explicit                                                                                                                                           |
 | Recovery images (`sessions/.trash/…`)        | retained even when their record is missing; never deleted by startup or generic `gc`   | `cowshed gc --recover <image> --to <dir>` moves one out of the store with a manifest (02_workspaces.md); clean landed source images are released to `.deleting`, not here    |
-| Released images (`.deleting/…`)              | a committed release waits there, named by nothing, until it is freed in the background | a detached child of the releasing verb frees each entry; the gateway's startup scan frees leftovers (05_gateway.md); no verb frees one: `rm`, `land` and `gc` only commit it |
+| Released images (`.deleting/…`)              | a committed release waits there, named by nothing, until it is freed in the background | each is handed to the gateway's `image-cleanup` queue, which lists leftovers at its start (05_gateway.md); no verb frees it: `rm`, `land` and `gc` only commit and hand over |
 | Abandon bundles (`sessions/.trash/*.bundle`) | never reclaimed by default; their tips are also kept as refs in main's repository      | explicit `cowshed gc --abandoned`                                                                                                                                            |
 | Abandoned refs (in main's repository)        | retired by every `gc` once main holds each tip, by ancestry, content or patch identity | `cowshed gc --supersede <ws>/<head> --reason <one line>`                                                                                                                     |
 | Dead shared-temp scratch                     | sockets/empty locks deleted; all other contents renamed to `<store>/.trash/scratch/`   | unknown/live owners kept; archived evidence kept for 24 hours before background deletion                                                                                     |
@@ -359,7 +359,7 @@ and provably dead scratch, never idle workspaces:
   sweep options. Pinned checkpoints are retained and never become candidates. `execute_gc(plan)` acquires all plan locks
   without waiting, re-enumerates at the plan's observation time under the same options, and rejects a
   pin/incarnation/path/byte/concurrency change as stale before any mutation. Only an unchanged plan releases retired
-  workspaces' trash, orphan staging and session images and expired checkpoints for background deletion (05_gateway.md,
+  workspaces' trash, orphan staging and session images and expired checkpoints to the gateway's cleanup (05_gateway.md,
   "Deleting released images"), removes orphan mountpoints and staging metadata, and, only under `--abandoned`, reclaims
   abandon bundles; execution reports the allocated bytes of the images it released, which their deletions free after it
   answers. Nothing compacts an image: guest-freed space stays allocated, so an image's allocation tracks its high-water

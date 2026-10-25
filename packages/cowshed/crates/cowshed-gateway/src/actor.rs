@@ -185,6 +185,9 @@ pub struct Gateway {
     sim_broker: SimBrokerHandle,
     repo_mirror_task: Option<JoinHandle<()>>,
     sim_broker_task: Option<JoinHandle<()>>,
+    cpu_budget: crate::cpu_budget::CpuBudget,
+    /// The released-image cleanup, once [`Gateway::clean_up_released_images`] started it.
+    cleanup: Arc<std::sync::OnceLock<crate::cleanup::ImageCleanup>>,
 }
 
 impl Gateway {
@@ -347,6 +350,7 @@ impl Gateway {
         };
         let actor = tokio::spawn(state.run());
         let cpu_budget = crate::cpu_budget::CpuBudget::start(config.cpu_budget);
+        let cleanup = Arc::new(std::sync::OnceLock::new());
         let control = match &config.control_socket {
             Some(path) => {
                 match ControlRuntime::start(
@@ -365,8 +369,9 @@ impl Gateway {
                         cpu_budget: cpu_budget.clone(),
                         task_server: crate::task_server::TaskServer::start(
                             config.task_server,
-                            cpu_budget,
+                            cpu_budget.clone(),
                         ),
+                        cleanup: Arc::clone(&cleanup),
                         jobserver: crate::jobserver::JobserverFifos::start(
                             path.parent()
                                 .map(|parent| parent.join("jobserver"))
@@ -401,7 +406,22 @@ impl Gateway {
             sim_broker,
             repo_mirror_task: Some(repo_mirror_task),
             sim_broker_task: Some(sim_broker_task),
+            cpu_budget,
+            cleanup,
         })
+    }
+
+    /// Start freeing the released images of the store at `store` (05_gateway.md, "Deleting
+    /// released images"): one thread lists what an earlier gateway left and frees every entry
+    /// handed over from then on, one at a time. Until it starts, a hand-over is refused and its
+    /// entry waits for the listing. A second call starts nothing.
+    pub fn clean_up_released_images(&self, store: std::path::PathBuf) -> std::io::Result<()> {
+        if self.cleanup.get().is_some() {
+            return Ok(());
+        }
+        let started = crate::cleanup::ImageCleanup::start(store, self.cpu_budget.clone())?;
+        let _ = self.cleanup.set(started);
+        Ok(())
     }
 
     pub fn handle(&self) -> GatewayHandle {

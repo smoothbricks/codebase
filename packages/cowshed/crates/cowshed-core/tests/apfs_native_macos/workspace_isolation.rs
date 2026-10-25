@@ -64,7 +64,7 @@ fn clean_source_release_commits_to_deleting_and_keeps_authority_when_the_commit_
             .sessions
             .join(format!(".deleting/raven-{LIVE}.dmg"))
             .is_file(),
-        "the image waits in sessions/.deleting; a fixture store starts no deletion child"
+        "the image waits in sessions/.deleting; a fixture store names no gateway cleanup"
     );
     assert!(!sidecar_path(&canonical).exists());
     assert!(!ca_key_path(&canonical).exists());

@@ -24,9 +24,9 @@
 //! An image a lifecycle operation owns is released by one rename into the [`DELETING_DIRECTORY`]
 //! beside it ([`commit_release`]), so no cut ever lands on an image anything can still find, and
 //! the operation answers once that rename is durable. Its bytes are freed off every verb's path,
-//! by a detached deletion child the releasing process starts ([`super::deleter`]), and whatever a
-//! crash or a dead child left by the gateway's startup scan ([`drain`], 05_gateway.md "Deleting
-//! released images").
+//! by the gateway's cleanup queue, one entry at a time, which the releasing process hands the entry
+//! to ([`super::deleter`]); at its start the queue lists whatever an earlier gateway left
+//! ([`released_in`], 05_gateway.md "Deleting released images").
 
 use std::ffi::{CStr, CString};
 use std::fs::{self, File};
@@ -36,8 +36,6 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::time::Duration;
 
 use cowshed_os::fork_lock::Fenced;
 use cowshed_os::fsio::{
@@ -255,9 +253,16 @@ impl Release {
         Ok(Some(cut))
     }
 
-    /// Make every cut left and unlink the empty file from its held directory.
-    pub fn finish(mut self) -> io::Result<Released> {
-        while self.step()?.is_some() {}
+    /// Make every cut left, calling `before_cut` before each (the cleanup waits there for gate
+    /// work to end), and unlink the empty file from its held directory.
+    pub fn finish(
+        mut self,
+        before_cut: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<Released> {
+        while self.plan.next().is_some() {
+            before_cut()?;
+            self.step()?;
+        }
         // SAFETY: the held directory descriptor and the NUL-terminated name outlive the call.
         if unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0) } != 0 {
             let error = io::Error::last_os_error();
@@ -276,19 +281,24 @@ impl Release {
 /// Release the file at `path` in bounded steps, then unlink it.
 pub fn release_file(path: &Path, step: StepExtents) -> io::Result<Released> {
     match Release::open(path, step)? {
-        Opened::Release(release) => release.finish(),
+        Opened::Release(release) => release.finish(&mut || Ok(())),
         Opened::Absent => Ok(Released::Absent),
         Opened::Busy => Ok(Released::Busy),
     }
 }
-/// Free the one committed release at `entry` in bounded steps and unlink it: the deletion child a
-/// releasing process starts on its entry (05_gateway.md, "Deleting released images"). A process
-/// that holds the entry is waited out, its holder named once per bound ([`lock_naming_holder`]),
-/// and what it left is finished: nothing, when it was another deletion that unlinked it
-/// ([`Released::Absent`], as when nothing is there). The
-/// directory and its parent are synced before the first cut and the directory after the unlink,
-/// as [`drain`] does. A link or any other non-regular file at `entry` refuses, untouched.
-pub fn free_committed(entry: &Path) -> io::Result<Released> {
+/// Free the one committed release at `entry` in bounded steps and unlink it, calling
+/// `before_cut` before each cut, whose error stops the free with what it cut so far (its length
+/// is the journal): what the gateway's cleanup does with each entry it picks
+/// (05_gateway.md, "Deleting released images"). An entry another process holds is left to it
+/// ([`Released::Busy`]): its releaser is still syncing its rename, and hands it over after. One
+/// another deletion unlinked, or nothing there, is [`Released::Absent`]. The directory and its
+/// parent are synced before the first cut, since the releaser may have died between its rename
+/// and that rename's syncs, and the directory after the unlink. A link or any other non-regular
+/// file at `entry` refuses, untouched.
+pub fn free_committed(
+    entry: &Path,
+    before_cut: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<Released> {
     let (directory, name) = match anchor(entry) {
         Ok(anchored) => anchored,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Released::Absent),
@@ -299,7 +309,11 @@ pub fn free_committed(entry: &Path) -> io::Result<Released> {
         Entry::NotImage => return Err(not_image(entry.display())),
         Entry::Image(file) => file,
     };
-    lock_naming_holder(&file, entry, HOLDER_REPORT, say)?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => return Ok(Released::Busy),
+        Err(fs::TryLockError::Error(error)) => return Err(error),
+    }
     if file.metadata()?.nlink() == 0 {
         return Ok(Released::Absent);
     }
@@ -307,7 +321,8 @@ pub fn free_committed(entry: &Path) -> io::Result<Released> {
     if let Some(parent) = entry.parent().and_then(Path::parent) {
         sync_held_directory(&open_directory_nofollow(parent)?)?;
     }
-    let released = Release::plan(directory.try_clone()?, name, file, STEP_EXTENTS)?.finish()?;
+    let released =
+        Release::plan(directory.try_clone()?, name, file, STEP_EXTENTS)?.finish(before_cut)?;
     sync_held_directory(&directory)?;
     Ok(released)
 }
@@ -443,69 +458,27 @@ fn anchor(path: &Path) -> io::Result<(File, CString)> {
     ))
 }
 
-/// How long a wait for a released image's lock stays silent before it names the holder again.
-const HOLDER_REPORT: Duration = Duration::from_secs(90);
-
-/// Write one holder line on stderr.
-fn say(line: String) {
-    cowshed_os::eprintln!("{line}");
-}
-
-/// Wait in `flock(2)` for `file`, the released image at `entry`, which another process may hold.
-/// While it waits, `say` gets a line naming the holder at once and again at every `bound`, the
-/// holder read anew each time from the kernel, until the holder lets go and the lock is granted.
-fn lock_naming_holder(
-    file: &File,
-    entry: &Path,
-    bound: Duration,
-    say: impl Fn(String) + Send + 'static,
-) -> io::Result<()> {
-    match file.try_lock() {
-        Ok(()) => return Ok(()),
-        Err(fs::TryLockError::WouldBlock) => {}
-        Err(fs::TryLockError::Error(error)) => return Err(error),
-    }
-    let (granted, waiting) = mpsc::channel::<()>();
-    let path = entry.to_owned();
-    let reporter = std::thread::Builder::new()
-        .name("released-image-wait".to_owned())
-        .spawn(move || {
-            while let Err(mpsc::RecvTimeoutError::Timeout) = {
-                say(format!(
-                    "cowshed: waiting for released image {}, which another process frees: {}",
-                    path.display(),
-                    crate::held_lock::holders(&path)
-                ));
-                waiting.recv_timeout(bound)
-            } {}
-        })?;
-    let locked = file.lock();
-    drop(granted);
-    let _ = reporter.join();
-    locked
-}
-
 fn c_name(name: &[u8]) -> io::Result<CString> {
     CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains NUL"))
 }
 
-/// The directory, beside the images it holds, where each released image waits for its deletion
-/// child, or the gateway's startup scan: `build/.deleting/<id>.dmg`, `sessions/.deleting/<name>.dmg`
+/// The directory, beside the images it holds, where each released image waits for
+/// the gateway's cleanup: `build/.deleting/<id>.dmg`, `sessions/.deleting/<name>.dmg`
 /// (16_build_volumes.md, "Garbage collection"; 02_workspaces.md, `rm` step 5; 05_gateway.md,
 /// "Deleting released images"). An entry exists from its operation's rename to its unlink; nothing
 /// mounts, forks, reads or names it in between.
 pub const DELETING_DIRECTORY: &str = ".deleting";
 
 /// Commit the release of `image`, owned by the calling operation, to `entry` in its directory's
-/// [`DELETING_DIRECTORY`], crash-safely, and say whether an image was released.
+/// [`DELETING_DIRECTORY`], crash-safely, and say whether an image was released. Its caller then
+/// hands `entry` to the gateway's cleanup ([`super::deleter::hand_over`]).
 ///
 /// The commit is one rename of `image` to `entry`, with every directory it touched synced: before
 /// it the image is its owner's and untouched, after it nothing finds the image by its name, so a
 /// cut never lands on an image that can still be mounted, forked or read. The image is never
 /// opened: the commit reads none of its bytes and needs no access to it, and every deleter makes
 /// the rename durable itself before its first cut. Once the syncs are done this returns: the
-/// caller removes the owner record at once, and the bytes wait for the background deletion
-/// ([`drain`]). Every directory is held by descriptor and no entry is opened through a link: a link
+/// caller removes the owner record at once, and the bytes wait for the gateway's cleanup. Every directory is held by descriptor and no entry is opened through a link: a link
 /// or any other non-regular file at either name refuses, untouched.
 ///
 /// An entry already under `entry` is the same image's committed release (an id and an incarnation
@@ -582,9 +555,8 @@ impl Anchors {
 
     /// Commit the image: rename it into the journal, never replacing a file there, and make the
     /// rename durable. `false` when no image is there. The image is never opened, so the commit
-    /// reads none of its bytes and needs no access to it; a deleter that lists the entry before
-    /// these syncs makes the rename durable itself before its first cut ([`drain`],
-    /// [`free_committed`]).
+    /// reads none of its bytes and needs no access to it; a cleanup that lists the entry before
+    /// these syncs makes the rename durable itself before its first cut ([`free_committed`]).
     fn commit(&self) -> io::Result<bool> {
         match classify(&self.image_directory, &self.image_name)? {
             Kind::Absent => return Ok(false),
@@ -611,7 +583,7 @@ impl Anchors {
     }
 }
 
-/// What deleting released images freed.
+/// What freeing released images freed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Drained {
     pub images: usize,
@@ -626,17 +598,18 @@ impl Drained {
     }
 }
 
-/// directory it left where it was, with why. Values, not lines on stderr: its caller says them
-/// (the gateway's startup scan) or acts on them (an unbinding's plan).
+/// The released images a listing of deleting directories found, in the order it found them, and
+/// each entry or directory it left where it was, with why. Values, not lines on stderr: the
+/// gateway's cleanup says the ones it leaves and queues the rest.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Pass {
-    pub drained: Drained,
+pub struct Listing {
+    pub entries: Vec<PathBuf>,
     pub left: Vec<Left>,
 }
 
-impl Pass {
+impl Listing {
     pub fn add(&mut self, other: Self) {
-        self.drained.add(other.drained);
+        self.entries.extend(other.entries);
         self.left.extend(other.left);
     }
 
@@ -645,22 +618,21 @@ impl Pass {
     }
 }
 
-/// An entry, or a whole directory of them, a deleter's pass left untouched.
+/// An entry, or a whole directory of them, a listing or a free left untouched.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Left {
     pub path: PathBuf,
     pub why: Why,
 }
 
-/// Why a deleter's pass left [`Left::path`].
+/// Why a listing or a free left [`Left::path`].
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Why {
     /// Not a regular file named as a released image: never opened through a link, never freed.
     NotImage,
-    /// Another process holds the entry's lock: its owner's commit is still syncing, or another
-    /// deleter is freeing it.
+    /// Another process holds the entry's lock: its releaser's commit is still syncing.
     Busy,
-    /// The directory could not be read or finished; its entries stay for the next pass.
+    /// The directory could not be read; its entries stay for the next gateway start.
     Failed(String),
 }
 
@@ -678,87 +650,49 @@ impl std::fmt::Display for Left {
     }
 }
 
-/// Free every committed release in `directory` (a [`DELETING_DIRECTORY`]), one at a time on the
-/// calling thread, each in bounded steps at normal disk priority. The directory is held by
-/// descriptor and refused when it is a link; each entry is opened in it without following a link.
-/// Only regular files whose names `is_entry` accepts are released; anything else is left,
-/// untouched, and named in the pass. An entry another process holds is left to it, and one a crash
-/// or a stopped deleter left half-released is finished from its length. A directory that does not
-/// exist is empty; one that cannot be read refuses.
-///
-/// Before its first cut the directory and its parent are synced: an entry's owner may have died
-/// between its rename and that rename's syncs, and a cut that outlived a rename a crash then undid
-/// would leave the image's own name on shortened bytes. A rename is one APFS transaction, which a
-/// full sync of the directory it entered makes durable; every entry listed was renamed before the
-/// listing, so one sync after it covers them all. A pass that cuts nothing syncs nothing, so a
-/// deleter that finds only what it leaves costs a listing.
-pub fn drain(directory: &Path, is_entry: impl Fn(&str) -> bool) -> io::Result<Pass> {
+/// The committed releases in `directory` (a [`DELETING_DIRECTORY`]): every regular file whose
+/// name `is_entry` accepts, read without following a link and without opening it; anything else is
+/// left, untouched, and named. The directory is held by descriptor and refused when it is a link.
+/// One that does not exist is empty. Listing syncs nothing and locks nothing: an entry another
+/// process holds is found busy when its free comes ([`free_committed`]).
+pub fn released_in(directory: &Path, is_entry: impl Fn(&str) -> bool) -> io::Result<Listing> {
     let directory_fd = match open_directory_nofollow(directory) {
         Ok(directory_fd) => directory_fd,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Pass::default()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Listing::default()),
         Err(error) => return Err(error),
     };
-    let entries = fs::read_dir(directory)?.collect::<io::Result<Vec<_>>>()?;
-    let mut pass = Pass::default();
-    let mut synced = false;
-    for entry in entries {
+    let mut listing = Listing::default();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
         let path = entry.path();
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            pass.leave(path, Why::NotImage);
-            continue;
+        let image = match entry.file_name().to_str() {
+            Some(name) if is_entry(name) => {
+                matches!(
+                    classify(&directory_fd, &c_name(name.as_bytes())?)?,
+                    Kind::Image { .. }
+                )
+            }
+            _ => false,
         };
-        let file =
-            match is_entry(name).then(|| open_entry(&directory_fd, &c_name(name.as_bytes())?)) {
-                Some(Ok(Entry::Absent)) => continue,
-                Some(Ok(Entry::Image(file))) => file,
-                Some(Ok(Entry::NotImage)) | None => {
-                    pass.leave(path, Why::NotImage);
-                    continue;
-                }
-                Some(Err(error)) => return Err(error),
-            };
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(fs::TryLockError::WouldBlock) => {
-                pass.leave(path, Why::Busy);
-                continue;
-            }
-            Err(fs::TryLockError::Error(error)) => return Err(error),
-        }
-        if !synced {
-            sync_held_directory(&directory_fd)?;
-            if let Some(parent) = directory.parent() {
-                sync_held_directory(&open_directory_nofollow(parent)?)?;
-            }
-            synced = true;
-        }
-        let release = Release::plan(
-            directory_fd.try_clone()?,
-            c_name(name.as_bytes())?,
-            file,
-            STEP_EXTENTS,
-        )?;
-        if let Released::Freed { bytes, .. } = release.finish()? {
-            pass.drained.add(Drained { images: 1, bytes });
+        if image {
+            listing.entries.push(path);
+        } else {
+            listing.leave(path, Why::NotImage);
         }
     }
-    if pass.drained.images > 0 {
-        sync_held_directory(&directory_fd)?;
-    }
-    Ok(pass)
+    Ok(listing)
 }
 
-/// [`drain`] the directory `<project>/<images>/<namespace>` of every project in the store at
-/// `store` (`<store>/<owner>/<repo>`), summed. A directory that cannot be listed or drained is
-/// left in the pass, so one unreadable project never holds back the rest.
-pub fn drain_store(
+/// [`released_in`] the directory `<project>/<images>/<namespace>` of every project in the store at
+/// `store` (`<store>/<owner>/<repo>`), together. A directory that cannot be listed is left in the
+/// listing, so one unreadable project never holds back the rest.
+pub fn released_in_store(
     store: &Path,
     images: &str,
     namespace: &str,
     is_entry: impl Fn(&str) -> bool,
-) -> Pass {
-    let mut pass = Pass::default();
+) -> Listing {
+    let mut pass = Listing::default();
     let failed = |path: &Path, error: io::Error| Left {
         path: path.to_owned(),
         why: Why::Failed(error.to_string()),
@@ -798,7 +732,7 @@ pub fn drain_store(
                 }
             };
             let directory = repo.join(images).join(namespace);
-            match drain(&directory, &is_entry) {
+            match released_in(&directory, &is_entry) {
                 Ok(project) => pass.add(project),
                 Err(error) => pass.left.push(failed(&directory, error)),
             }
@@ -812,6 +746,34 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    /// What the gateway's cleanup did over one deleting directory, in the shape these tests read.
+    #[derive(Debug, Default, Eq, PartialEq)]
+    struct Pass {
+        drained: Drained,
+        left: Vec<Left>,
+    }
+
+    /// The cleanup over `directory` alone: list it, then free each entry, as the gateway's queue
+    /// does with no gate work beside it.
+    fn drain(directory: &Path, is_entry: impl Fn(&str) -> bool) -> io::Result<Pass> {
+        let Listing { entries, left } = released_in(directory, is_entry)?;
+        let mut pass = Pass {
+            drained: Drained::default(),
+            left,
+        };
+        for entry in entries {
+            match free_committed(&entry, &mut || Ok(()))? {
+                Released::Freed { bytes, .. } => pass.drained.add(Drained { images: 1, bytes }),
+                Released::Busy => pass.left.push(Left {
+                    path: entry,
+                    why: Why::Busy,
+                }),
+                Released::Absent => {}
+            }
+        }
+        Ok(pass)
+    }
 
     /// Runs as `(hole before, length)` pairs laid out from offset 0, and a trailing hole.
     fn layout(runs: &[(u64, u64)], trailing: u64) -> (Vec<(u64, u64)>, u64) {
@@ -961,7 +923,8 @@ mod tests {
             before.0.div_ceil(bound.get()),
             "the resumed release plans from what is left: {left:?}"
         );
-        let Released::Freed { bytes, steps } = second.finish().expect("finish") else {
+        let Released::Freed { bytes, steps } = second.finish(&mut || Ok(())).expect("finish")
+        else {
             panic!("the release frees the file");
         };
         assert_eq!(bytes, before.1, "the resumed release counts what was left");
@@ -1192,6 +1155,42 @@ mod tests {
         fs::remove_dir_all(&root).expect("cleanup");
     }
 
+    /// The cleanup calls its hook before every cut, and only before a cut: an image of many runs
+    /// is cut in steps, each after the hook (where the gateway waits out gate work), and an entry
+    /// another process holds is left busy without one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_cleanup_yields_before_every_cut_and_never_cuts_a_held_entry() {
+        use crate::storage::apfs::extents::tests::{fragmented_sparse_file, scratch};
+
+        let root = scratch("cleanup-yield");
+        let (image, _) = fragmented_sparse_file(&root.0);
+        let entry = root.0.join(DELETING_DIRECTORY).join("image.dmg");
+        assert!(commit_release(&image, &entry).expect("commit"));
+        let held = fs::File::open(&entry).expect("a releaser's descriptor");
+        held.lock().expect("the releaser holds the entry");
+        let mut asked = 0;
+        assert_eq!(
+            free_committed(&entry, &mut || {
+                asked += 1;
+                Ok(())
+            })
+            .expect("a held entry"),
+            Released::Busy
+        );
+        assert_eq!(asked, 0, "a held entry is never cut");
+        drop(held);
+        let Released::Freed { steps, .. } = free_committed(&entry, &mut || {
+            asked += 1;
+            Ok(())
+        })
+        .expect("the free") else {
+            panic!("the entry is freed once its releaser lets go");
+        };
+        assert!(steps >= 1, "an image is freed by cuts");
+        assert_eq!(asked, steps, "one wait before each cut");
+    }
+
     /// An owner that died between its commit's rename and that rename's syncs leaves an entry a
     /// crash could still put back under the image's name. The deleter syncs the deleting directory
     /// and its parent, under the entry's lock, before its first cut, and the directory again once
@@ -1249,47 +1248,6 @@ mod tests {
         );
         assert_eq!(fs::read(&entry).expect("the entry"), vec![9_u8; 64 * 1024]);
         drop(releaser);
-        fs::remove_dir_all(&root).expect("cleanup");
-    }
-
-    /// A wait for a released image another process holds names that holder at once and again at
-    /// every bound until the holder lets go; then the lock is granted. The lines are read as they
-    /// arrive, with the bound set to a millisecond.
-    #[test]
-    fn a_lock_wait_names_its_holder_once_per_bound_until_it_lets_go() {
-        let root =
-            std::env::temp_dir().join(format!("cowshed-release-holder-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).expect("root");
-        let entry = root.join("image.dmg");
-        fs::write(&entry, vec![9_u8; 4096]).expect("entry");
-        let holder = fs::File::open(&entry).expect("the holder's descriptor");
-        holder.lock().expect("the holder takes the entry");
-
-        let (lines, said) = mpsc::channel();
-        let waiter = std::thread::spawn({
-            let entry = entry.clone();
-            move || {
-                let file = fs::File::open(&entry).expect("the waiter's descriptor");
-                lock_naming_holder(&file, &entry, Duration::from_millis(1), move |line| {
-                    let _ = lines.send(line);
-                })
-            }
-        });
-        for _ in 0..2 {
-            let line = said.recv().expect("a holder line");
-            assert!(
-                line.starts_with(&format!(
-                    "cowshed: waiting for released image {}",
-                    entry.display()
-                )),
-                "{line}"
-            );
-        }
-        drop(holder);
-        waiter
-            .join()
-            .expect("the waiter")
-            .expect("the lock is granted once the holder lets go");
         fs::remove_dir_all(&root).expect("cleanup");
     }
 }

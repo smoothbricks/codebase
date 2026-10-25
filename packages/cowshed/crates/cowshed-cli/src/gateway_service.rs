@@ -1494,25 +1494,6 @@ async fn refuse_restart_while_busy(
     }
 }
 
-/// Finish, once, on a thread of its own, every released image the store's deleting directories
-/// still hold when the gateway starts (05_gateway.md, "Deleting released images"): those whose
-/// deletion child died or never started, and those earlier builds left. Nothing runs after it.
-fn finish_released_images_at_start(store: PathBuf) {
-    let started = std::thread::Builder::new()
-        .name("image-deleter".to_owned())
-        .spawn(move || {
-            let pass = cowshed_core::storage::apfs::deleter::startup_pass(&store);
-            for line in cowshed_core::storage::apfs::deleter::startup_report(&pass) {
-                cowshed_os::eprintln!("{line}");
-            }
-        });
-    if let Err(error) = started {
-        cowshed_os::eprintln!(
-            "cowshed: released images left in each project's build/.deleting and sessions/.deleting are not finished by this gateway: {error}"
-        );
-    }
-}
-
 /// Queue this daemon's stderr lines for a writer thread of their own (13_telemetry.md, "The one
 /// text-file survivor"), or say why they stay in place.
 pub(crate) fn detach_stderr(daemon: &str) {
@@ -1645,8 +1626,13 @@ async fn run_daemon() -> Result<()> {
     let handle = OwnedGateway::new(gateway.handle());
     let started = async {
         serve_supervisors(&store_root, manager).await?;
-        // Both host sockets serve before the startup scan of released images begins.
-        finish_released_images_at_start(store_root.clone());
+        // Both host sockets serve before the released-image cleanup lists what an earlier gateway
+        // left (05_gateway.md, "Deleting released images"); it runs on a thread of its own.
+        if let Err(error) = gateway.clean_up_released_images(store_root.clone()) {
+            cowshed_os::eprintln!(
+                "cowshed: released images wait in .deleting: this gateway's cleanup did not start: {error}"
+            );
+        }
         // Both host sockets are serving before storage recovery can wait on an owned process.
         // Only pre-existing positive authorizations resume; a refusal leaves that project
         // fenced and cannot prevent unrelated projects from healing.
@@ -2164,7 +2150,7 @@ fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
         format!(
             "gateway quiet queue {}: repository={}: {}, waiting {}: {}",
             place + 1,
-            waiter.repository,
+            waiter.repository.as_deref().unwrap_or("any"),
             pid_words(waiter.pid),
             age_words(waiter.waited_ms),
             waiter.command

@@ -1042,16 +1042,14 @@ struct ThreadWithPath {
 /// from this user, or that exited since the listing, shows none. A missing `root` has none.
 #[cfg(target_os = "macos")]
 pub fn tree_holds(root: &Path) -> io::Result<Vec<TreeHold>> {
-    use std::os::unix::fs::MetadataExt as _;
     let root = match fs::canonicalize(root) {
         Ok(root) => root,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    let device = fs::metadata(&root)?.dev();
     let mut holds = Vec::new();
     for pid in census_pids()? {
-        if let Some(hold) = hold_in_tree(pid, &root, device)? {
+        if let Some(hold) = hold_in_tree(pid, &root)? {
             holds.push(TreeHold {
                 holder: Holder {
                     pid,
@@ -1065,11 +1063,9 @@ pub fn tree_holds(root: &Path) -> io::Result<Vec<TreeHold>> {
 }
 
 /// What `pid` holds inside `root`, on `device`, if anything. Cheapest first: the directories
-/// cost one call, the executable one more, and the descriptors a listing plus one call per vnode,
-/// which a released image's deletion child is not asked when its entry cannot be in `root`
-/// ([`deletes_outside`]).
+/// cost one call, the executable one more, and the descriptors a listing plus one call per vnode.
 #[cfg(target_os = "macos")]
-fn hold_in_tree(pid: libc::pid_t, root: &Path, device: u64) -> io::Result<Option<Hold>> {
+fn hold_in_tree(pid: libc::pid_t, root: &Path) -> io::Result<Option<Hold>> {
     if let Some(hold) = directories(pid)?
         .into_iter()
         .find(|hold| hold.path().starts_with(root))
@@ -1079,41 +1075,10 @@ fn hold_in_tree(pid: libc::pid_t, root: &Path, device: u64) -> io::Result<Option
     if let Some(executable) = executable(pid).filter(|path| path.starts_with(root)) {
         return Ok(Some(Hold::Executable(executable)));
     }
-    if deletes_outside(pid, root, device) {
-        return Ok(None);
-    }
     Ok(open_vnodes(pid)?
         .into_iter()
         .find(|path| path.starts_with(root))
         .map(Hold::OpenFile))
-}
-
-/// Whether `pid` is a released image's deletion child, `<cowshed> __delete-released <entry>` by
-/// the arguments the kernel holds (05_gateway.md, "Deleting released images"), whose entry cannot
-/// be in `root`: not below it, and in a directory on another device than `root`'s `device`. A
-/// rename that moves an entry stays on its device, so an entry that moved is still not in
-/// `root`. Such a child holds nothing but its entry, and sits in each bounded `ftruncate` cut
-/// with that entry's vnode held, so asking its descriptors waits out the cut (02_workspaces.md,
-/// "Holders cowshed does not run"). Arguments that cannot be read prove nothing: it is asked.
-#[cfg(target_os = "macos")]
-fn deletes_outside(pid: libc::pid_t, root: &Path, device: u64) -> bool {
-    use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::MetadataExt as _;
-    let Ok(arguments) = cowshed_os::process::process_arguments(pid) else {
-        return false;
-    };
-    let [_, verb, entry] = arguments.argv.as_slice() else {
-        return false;
-    };
-    if verb.as_slice() != crate::storage::apfs::deleter::DELETE_VERB.as_bytes() {
-        return false;
-    }
-    let entry = Path::new(std::ffi::OsStr::from_bytes(entry));
-    !entry.starts_with(root)
-        && entry
-            .parent()
-            .and_then(|deleting| fs::metadata(deleting).ok())
-            .is_some_and(|deleting| deleting.dev() != device)
 }
 
 /// `pid`'s working directory and root directory (`PROC_PIDVNODEPATHINFO`). A process the kernel

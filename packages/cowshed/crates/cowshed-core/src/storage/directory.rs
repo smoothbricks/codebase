@@ -1086,7 +1086,7 @@ impl DirectoryExecutionHost {
     /// Release a payload inside the store as every release is (05_gateway.md, "Deleting released
     /// images"): unmount it if it is mounted (the mount record goes back to being the payload
     /// directory), rename it into its project's `sessions/.deleting` under a name no other entry
-    /// has. Nothing is deleted: a directory store starts no deletion child (said once per process),
+    /// has. Nothing is deleted: a directory store hands nothing to a gateway (said once per process),
     /// and a released payload stays in `.deleting`, named by nothing, until its test store goes.
     /// Its records stay for the caller.
     fn delete_payload(&self, image: &Path) -> Result<bool, ApfsStorageError> {
@@ -1107,7 +1107,7 @@ impl DirectoryExecutionHost {
                 static SAID: std::sync::Once = std::sync::Once::new();
                 SAID.call_once(|| {
                     cowshed_os::eprintln!(
-                        "cowshed: a directory store starts no deletion child; its released payloads wait in .deleting"
+                        "cowshed: a directory store hands no release to a gateway; its released payloads wait in .deleting"
                     )
                 });
                 Ok(true)

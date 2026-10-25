@@ -8,6 +8,7 @@
 
 mod actor;
 mod cache;
+mod cleanup;
 mod config;
 mod control;
 mod cpu_budget;

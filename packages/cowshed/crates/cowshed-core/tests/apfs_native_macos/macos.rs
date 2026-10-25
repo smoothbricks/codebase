@@ -4611,12 +4611,17 @@ fn a_workspace_release_is_reconciled_by_recovery_and_finished_by_the_next_delete
     );
     host.recover_pending(&fixture.config(), &[])
         .expect("repeated recovery is idempotent");
-    let pass = cowshed_core::storage::apfs::drain_store_session_releases(&fixture.root);
-    assert_eq!(pass.drained.images, 1, "{pass:?}");
-    assert!(pass.left.is_empty(), "{pass:?}");
+    let listing = cowshed_core::storage::apfs::released_sessions(&fixture.root);
+    assert_eq!(listing.entries, std::slice::from_ref(&entry), "{listing:?}");
+    assert!(listing.left.is_empty(), "{listing:?}");
+    assert!(matches!(
+        cowshed_core::storage::apfs::release::free_committed(&entry, &mut || Ok(()))
+            .expect("the cleanup's free"),
+        cowshed_core::storage::apfs::release::Released::Freed { .. }
+    ));
     assert!(
         !entry.exists(),
-        "the deleter's next pass frees and unlinks the entry"
+        "the cleanup frees and unlinks the entry the stop left"
     );
 }
 
