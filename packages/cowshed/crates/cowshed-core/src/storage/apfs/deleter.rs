@@ -81,33 +81,48 @@ fn delete(entry: &Path) -> bool {
 /// deletion runs in a detached child, `<program> __delete-released <entry>` (its own process
 /// group, so the verb's terminal signals do not reach it), that outlives this process. It holds
 /// nothing of the verb's: it works in `/`, so no checkout a later `rm` asks about is its
-/// working directory, and its stderr appends to `child.log`, never the verb's own, whose reader
+/// working directory; its stderr appends to `child.log`, never the verb's own, whose reader
 /// (a terminal, a script's pipe, an agent's capture) would otherwise wait for the child's end of
-/// file and see the verb answer only once its image was freed. A child that cannot start, or a
+/// file and see the verb answer only once its image was freed; and it inherits no descriptor but
+/// its stdio, sealed at the one child-descriptor boundary (`crate::exec::prepare_child_descriptors`).
+/// A verb run under `cowshed land-turn` holds its repository's turn through an inherited
+/// descriptor; measured 2026-10-25, two deletion children of sb-train4's land kept that
+/// descriptor, and with it smoothbricks' land turn, after the land exited, until their frees ended. A child that cannot start, or a
 /// log that cannot be opened, is the release's error; one that ends badly is said, and the
 /// gateway's next start frees what it left.
 pub fn delete_in_background(child: &DeletionChild, entry: &Path) -> io::Result<()> {
     let program = &child.program;
     let log = daemon_log(&child.log)?;
-    let mut child = Command::new(program.as_ref())
+    let mut command = Command::new(program.as_ref());
+    command
         .arg(DELETE_VERB)
         .arg(entry)
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log)
-        .process_group(0)
-        .spawn_locked()
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "cannot start {} to delete released image {}: {error}",
-                    program.display(),
-                    entry.display()
-                ),
-            )
-        })?;
+        .process_group(0);
+    crate::exec::prepare_child_descriptors(&mut command).map_err(|failure| {
+        io::Error::new(
+            failure.source.kind(),
+            format!(
+                "cannot seal the descriptors of {} to delete released image {}: {}",
+                program.display(),
+                entry.display(),
+                failure.source
+            ),
+        )
+    })?;
+    let mut child = command.spawn_locked().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot start {} to delete released image {}: {error}",
+                program.display(),
+                entry.display()
+            ),
+        )
+    })?;
     // Reaped here while this process lives, a bad end said; reparented to launchd once this
     // process exits.
     let entry = entry.to_owned();
@@ -237,6 +252,74 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&log).expect("the daemon log"),
             format!("{DELETE_VERB} {} /\n", entry.display())
+        );
+        fs::remove_dir_all(&store).expect("cleanup");
+    }
+
+    /// The deletion child inherits none of the verb's descriptors: a verb run under
+    /// `cowshed land-turn` holds its repository's turn through an inheritable descriptor on the
+    /// turn's ticket, and a child that kept it held the turn until its free ended. Here the verb
+    /// holds an exclusive lock through such a descriptor, starts the child, and closes its own: the
+    /// lock is free while the child still runs. The program stands in for the cowshed binary; it
+    /// says it started through one FIFO and waits on another, so nothing is timed.
+    #[test]
+    fn the_deletion_child_holds_none_of_the_verbs_descriptors() {
+        use std::io::{Read as _, Write as _};
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let store = store("fds");
+        let program = store.join("deleter");
+        fs::write(
+            &program,
+            "#!/bin/sh\nprintf started > \"$2.ready\"\nread line < \"$2.go\"\n",
+        )
+        .expect("program");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).expect("executable");
+        let entry = volume(&store);
+        released(&entry);
+        let fifo = |suffix: &str| {
+            let path = PathBuf::from(format!("{}.{suffix}", entry.display()));
+            let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("path");
+            // SAFETY: `name` is a NUL-terminated path that outlives the call.
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
+            path
+        };
+        let (ready, go) = (fifo("ready"), fifo("go"));
+        let ticket = store.join("ticket");
+        let held = fs::File::create(&ticket).expect("ticket");
+        // SAFETY: plain descriptor operations on a descriptor this test owns.
+        unsafe {
+            assert_eq!(libc::flock(held.as_raw_fd(), libc::LOCK_EX), 0, "lock");
+            assert_eq!(
+                libc::fcntl(held.as_raw_fd(), libc::F_SETFD, 0),
+                0,
+                "inheritable"
+            );
+        }
+        let child = DeletionChild {
+            program: Arc::from(program.as_path()),
+            log: Arc::from(store.join("daemon-stderr.log").as_path()),
+        };
+        delete_in_background(&child, &entry).expect("started");
+        let mut said = String::new();
+        fs::File::open(&ready)
+            .expect("the child's ready FIFO")
+            .read_to_string(&mut said)
+            .expect("the child says it started");
+        assert_eq!(said, "started");
+        drop(held);
+        let again = fs::File::open(&ticket).expect("ticket again");
+        // SAFETY: a non-blocking lock attempt on a descriptor this test owns.
+        let locked = unsafe { libc::flock(again.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let error = io::Error::last_os_error();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&go)
+            .and_then(|mut go| go.write_all(b"\n"))
+            .expect("let the child end");
+        assert_eq!(
+            locked, 0,
+            "the running deletion child keeps the verb's lock: {error}"
         );
         fs::remove_dir_all(&store).expect("cleanup");
     }

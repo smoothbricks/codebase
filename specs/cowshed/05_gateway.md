@@ -1833,19 +1833,23 @@ takes.
   image is freed, so the verb reads as taking as long as the free. Measured 2026-10-25 with stderr piped: a plain `rm`
   that exited at 29 s reached end of file at 228 s, one that exited at 47 s at 114 s, and an `rm --abandon` that exited
   at 34 s at 378 s. Nor is its working directory the verb's, which may be a checkout a later `rm` asks about
-  (02_workspaces.md, "Holders cowshed does not run"). Nothing looks `cowshed` up on PATH: the CLI, the gateway and the
-  supervisors spawn themselves, and the N-API addon makes no release in-process, since its verbs run in the cowshed
-  binary. A spawn failure, or a daemon log that cannot be opened, is the release's error: the verb fails with its rename
-  already durable, and its retry finds the release committed. A child that ends badly, with a non-zero status or a
-  signal, is said on stderr by its reaper, and the next gateway start frees what it left. A store whose configuration
-  names no child, a fixture store without a binary or a host with no `HOME`, starts none, says so on stderr once per
-  process, and its entries wait for the startup scan. The child frees that one entry with the bounded release: at most
-  1,024 physical runs per `ftruncate` cut from the end of the file, at normal disk priority, then `unlink`, the file's
-  length being the resume journal (16_build_volumes.md, "Garbage collection"; 01a_apfs.md, "Freeing an image"). It first
-  waits out (a blocking `flock`) a process that holds the entry, its owner still syncing the commit, and while it waits
-  it names its holder on stderr, read afresh at each 90 s bound, the bound being a parameter of the wait. It exits once
-  the entry is gone, or with a usage error when it is given no entry. No queue, control request, timer or poll stands
-  between the verb and the child.
+  (02_workspaces.md, "Holders cowshed does not run"). Nor does it inherit a descriptor of the verb's beyond its stdio:
+  its spawn seals every other descriptor at the one child-descriptor boundary (02_workspaces.md, "Held locks"), so it
+  holds no lock its verb held. Measured 2026-10-25: two deletion children of sb-train4's land, started under
+  `cowshed land-turn`, inherited the land turn's ticket descriptor and kept smoothbricks' turn after the land exited,
+  until their frees ended, and the next land and a doc commit waited behind a land that no longer ran. Nothing looks
+  `cowshed` up on PATH: the CLI, the gateway and the supervisors spawn themselves, and the N-API addon makes no release
+  in-process, since its verbs run in the cowshed binary. A spawn failure, or a daemon log that cannot be opened, is the
+  release's error: the verb fails with its rename already durable, and its retry finds the release committed. A child
+  that ends badly, with a non-zero status or a signal, is said on stderr by its reaper, and the next gateway start frees
+  what it left. A store whose configuration names no child, a fixture store without a binary or a host with no `HOME`,
+  starts none, says so on stderr once per process, and its entries wait for the startup scan. The child frees that one
+  entry with the bounded release: at most 1,024 physical runs per `ftruncate` cut from the end of the file, at normal
+  disk priority, then `unlink`, the file's length being the resume journal (16_build_volumes.md, "Garbage collection";
+  01a_apfs.md, "Freeing an image"). It first waits out (a blocking `flock`) a process that holds the entry, its owner
+  still syncing the commit, and while it waits it names its holder on stderr, read afresh at each 90 s bound, the bound
+  being a parameter of the wait. It exits once the entry is gone, or with a usage error when it is given no entry. No
+  queue, control request, timer or poll stands between the verb and the child.
 - **A startup scan finishes what a child did not.** When the store names no child or the child ended badly, the entry
   stays in its `.deleting` directory for the gateway's startup scan. Once, right after the gateway starts serving
   ("Startup contract", step 2), it starts one thread, `image-deleter`, which passes over every project of this gateway's
