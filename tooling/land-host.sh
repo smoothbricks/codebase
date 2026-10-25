@@ -120,22 +120,24 @@ gate_workspace() {
   fi
   replay_gate_output "$output"
   rm "$output"
-  # The gate's task hashes are read now, straight after the gate, so the run summary is the gate's own.
+  # The gate's task hashes are read now, straight after the gate, so the run summary is the gate's own. The cache never
+  # blocks a land (05_gateway.md, "Publication"): hashes that cannot be read are said, and the land goes on unpublished.
   hashes=$(mktemp "${TMPDIR:-/tmp}/land-hashes.XXXXXX")
   bun "$here/land-publish.ts" hashes "$checkout/.nx/cache/run.json" >"$hashes" || {
-    hashes_status=$?
-    say "could not read the gate's task hashes from $checkout/.nx/cache/run.json; the land stops"
-    exit "$hashes_status"
+    say "could not read the gate's task hashes from $checkout/.nx/cache/run.json (status $?); the land goes on without publishing: the cache never blocks a land"
+    rm "$hashes"
+    hashes=
   }
   say "cross-linting $head for Linux"
   cowshed exec "$workspace" --class gate --host -- direnv exec "$checkout" bun run check:linux </dev/null >"$output" 2>&1 || {
     linux_status=$?
     replay_gate_output "$output"
     say "Linux cross check exited $linux_status; the land stops; complete output: $output"
-    rm "$hashes"
+    [ -z "$hashes" ] || rm "$hashes"
     exit "$linux_status"
   }
   rm "$output"
+  [ -n "$hashes" ] || return 0
   # The gate and the Linux cross check passed, so the gate's task results are the land's to publish. The cache never
   # blocks a land: a failed publish is said, and the land goes on.
   cowshed exec "$workspace" --class gate --host -- direnv exec "$checkout" bun "$here/land-publish.ts" publish "$checkout" "$hashes" </dev/null >&2 || say "publishing the gate's Nx results failed (status $?); the land goes on: the cache never blocks a land"

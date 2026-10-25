@@ -7,4 +7,6 @@ export interface Call {
   readonly output?: string;
   /** Refuse unless both output descriptors name the same regular capture file. */
   readonly requireFileOutput?: boolean;
+  /** A gate run that passes but leaves no run summary behind, as one whose summary Nx could not write. */
+  readonly writesNoSummary?: boolean;
 }

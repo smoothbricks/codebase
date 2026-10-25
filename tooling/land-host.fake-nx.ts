@@ -45,7 +45,7 @@ if (call.requireFileOutput) {
   }
 }
 
-if (call.exit === 0 && args.includes('gate')) {
+if (call.exit === 0 && args.includes('gate') && call.writesNoSummary !== true) {
   // What a gate run leaves for land-publish.ts to read: a run summary whose tasks carry the hashes it publishes.
   mkdirSync(join('.nx', 'cache'), { recursive: true });
   writeFileSync(

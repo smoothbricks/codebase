@@ -6,6 +6,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -204,6 +205,7 @@ function fixture(replayFails = false, publishFails = false): Land {
   mkdirSync(join(main, 'tooling'), { recursive: true });
   mkdirSync(state);
   mkdirSync(bin);
+  mkdirSync(join(state, 'tmp'));
   for (const file of ['land-host.sh', 'land-decide.ts', 'land-history.ts', 'land-publish.ts', 'land-summary.ts']) {
     cpSync(join(tooling, file), join(main, 'tooling', file));
   }
@@ -258,6 +260,8 @@ function fixture(replayFails = false, publishFails = false): Land {
           FIX_PUBLISH: publishFails ? 'refuse' : 'accept',
           FIX_MAIN: main,
           FIX_WS: ws,
+          // The land's temporary files, so a case can prove none is left behind.
+          TMPDIR: join(state, 'tmp'),
         },
       });
       // The production failure log outlives the script; this fixture owns and removes its retained logs.
@@ -420,6 +424,18 @@ describe('land-host.sh', () => {
     expect(run.status, run.log).toBe(0);
     expect(run.log).toContain('the publish was refused');
     expect(run.log).toContain('failed (status 1); the land goes on');
+    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
+  });
+
+  it('lands without publishing when the gate passes without a readable run summary, and leaves no temporary file', () => {
+    const land = fixture();
+    const gated = git(land.ws, 'rev-parse', 'HEAD');
+    const run = land.land([DAEMON_STOP, { ...passingRun(GATE), writesNoSummary: true }, passingRun(MAIN_BUILD)]);
+    expect(run.status, run.log).toBe(0);
+    expect(run.log).toContain("could not read the gate's task hashes");
+    expect(run.log).toContain('the land goes on without publishing: the cache never blocks a land');
+    expect(existsSync(join(land.state, 'publish.args'))).toBe(false);
+    expect(readdirSync(join(land.state, 'tmp')).filter((name) => name.startsWith('land-'))).toEqual([]);
     expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
   });
 
