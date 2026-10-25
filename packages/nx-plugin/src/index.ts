@@ -7,6 +7,7 @@ import {
   EXTRACTED_BINARIES_METADATA,
   EXTRACTED_CARGO_METADATA,
   EXTRACTED_TARGET_DIR,
+  NEXTEST_ARCHIVE_KEY_SUFFIX,
 } from '@smoothbricks/nextest-extract';
 import {
   type CreateDependencies,
@@ -94,7 +95,13 @@ import { isNonSourceDirectory } from './source-directories.js';
 import { postTasksExecution as postTaskResults, preTasksExecution as preTaskResults } from './task-results.js';
 import { SHARD_TIMINGS_EXECUTOR, SHARD_TIMINGS_TARGET, timingsShardedSuite } from './test-timings.js';
 import { assertUpstreamBasePrecondition } from './test-walk-policy.js';
-import { toolCommand } from './tool-bins.js';
+import {
+  type NativeTools,
+  nativeToolCommand,
+  nativeToolDependsOn,
+  resolveNativeTools,
+  toolCommand,
+} from './tool-bins.js';
 import {
   isBuildOutputTargetName,
   isTestRunnerTargetName,
@@ -777,20 +784,26 @@ function createCargoWasmTarget(
  *
  * The directory and the archive are ONE command: nextest does not create the
  * archive's parent, so the archive step consumes what the `mkdir` produced.
+ * The same command writes the task's hash beside the archive, the key every
+ * runner's extraction is looked up by (smoo-nx-nextest-extract), and declares it
+ * an output, so a cache hit restores the key with the archive it names.
  */
+const CARGO_TEST_ARCHIVE_KEY_FILE = `${CARGO_TEST_ARCHIVE_FILE}${NEXTEST_ARCHIVE_KEY_SUFFIX}`;
+
 function createCargoTestArchiveTarget(projectRoot: string, toolConfig: string): TargetConfiguration {
   return {
     executor: 'nx:run-commands',
     metadata: CARGO_PRODUCER_METADATA,
     cache: true,
     inputs: CARGO_INPUTS,
-    outputs: [`{projectRoot}/${CARGO_TEST_ARCHIVE_FILE}`],
+    outputs: [`{projectRoot}/${CARGO_TEST_ARCHIVE_FILE}`, `{projectRoot}/${CARGO_TEST_ARCHIVE_KEY_FILE}`],
     options: {
       command: sequence([
         `mkdir -p ${posix.dirname(CARGO_TEST_ARCHIVE_FILE)}`,
         cargoFrozen(
           `nextest archive --workspace --archive-file ${CARGO_TEST_ARCHIVE_FILE} --user-config-file none ${toolConfig}`,
         ),
+        `printf '%s\\n' "$NX_TASK_HASH" > ${CARGO_TEST_ARCHIVE_KEY_FILE}`,
       ]),
       cwd: projectRoot,
     },
@@ -1032,9 +1045,19 @@ function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandl
     const errors: Array<[file: string | null, error: Error]> = [];
     let cargoWorkspaces: CargoWorkspace[];
     let eslint: EslintWorkspace | null;
+    let nativeTools: NativeTools | null;
     try {
       cargoWorkspaces = await resolveCargoWorkspaces(projectConfigurationFiles, context.workspaceRoot, hostPlatform);
       eslint = await eslintWorkspace(context.workspaceRoot);
+      nativeTools =
+        hostPlatform === null
+          ? null
+          : await resolveNativeTools(
+              context.workspaceRoot,
+              projectConfigurationFiles,
+              EXECUTABLE_PLATFORM_DIRECTORY[hostPlatform.targetFamily][hostPlatform.architecture],
+              scriptcTargetName(hostPlatform),
+            );
     } catch (error) {
       throw new AggregateCreateNodesError([[null, error instanceof Error ? error : new Error(String(error))]], results);
     }
@@ -1059,6 +1082,7 @@ function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandl
               packageJsonPath,
               context.workspaceRoot,
               hostPlatform,
+              nativeTools,
               cargoWorkspaces,
               eslint,
               versionless,
@@ -1329,6 +1353,7 @@ async function createProjectTargets(
   packageJsonPath: string,
   workspaceRoot: string,
   hostPlatform: NapiPlatform | null,
+  nativeTools: NativeTools | null,
   cargoWorkspaces: readonly CargoWorkspace[],
   eslint: EslintWorkspace | null,
   versionless: VersionlessManifestPolicy | null,
@@ -1513,7 +1538,10 @@ async function createProjectTargets(
   }
 
   if (napiConfig) {
-    Object.assign(targets, createNapiTargets(projectRoot, napiConfig, hostPlatform, isRepoRootedCargoProject));
+    Object.assign(
+      targets,
+      createNapiTargets(projectRoot, napiConfig, hostPlatform, nativeTools, isRepoRootedCargoProject),
+    );
     if (
       !('napi-test' in (packageJson.nx?.targets ?? {})) &&
       existsSync(join(absoluteProjectRoot, 'src/native.test.ts'))
@@ -1632,6 +1660,7 @@ async function createProjectTargets(
     for (const group of cargoWorkspace.serialGroups) {
       targets[cargoTestGroupTargetName(group.group)] = cargoTestGroupTarget(
         cargoWorkspace,
+        nativeTools,
         await cargoTestRunnerInputs(workspaceRoot, cargoWorkspace, serialGroupMemberDirs(cargoWorkspace, group)),
         group,
       );
@@ -1747,6 +1776,7 @@ async function createProjectTargets(
       projectRoot,
       workspaceRoot,
       cargoWorkspace,
+      nativeTools,
     );
     // Serial-group runners belong to the workspace root, outside inferred ordinary tests. Explicit repository
     // aggregates can reach them; their own inputs decide whether each runner executes or replays from cache.
@@ -2456,6 +2486,7 @@ function createNapiTargets(
   projectRoot: string,
   config: ResolvedNapiConfig,
   hostPlatform: NapiPlatform | null,
+  nativeTools: NativeTools | null,
   repoRooted: boolean,
 ): Record<string, TargetConfiguration> {
   // napi derives the addon filename ([name]) from the nearest package.json `napi`
@@ -2481,9 +2512,11 @@ function createNapiTargets(
       CARGO_PROFILE_OUTPUT_DIR[profile],
       `lib${config.cargoPackage.replaceAll('-', '_')}.d`,
     );
-    const bin = toolCommand(cargoCwd, 'build-inputs', 'dist/ts/bin/smoo-nx-build-inputs.js', 'node');
+    const bin = nativeToolCommand(nativeTools, cargoCwd, 'build-inputs', 'smoo-nx-build-inputs');
     return ` && ${bin} --manifest-path ${config.manifestPath} --dep-info ${depInfo} --output ${outputDirectory}`;
   };
+  // The task that builds the executable recordInputs runs, when this workspace builds it.
+  const buildInputsTool = nativeToolDependsOn(nativeTools, 'build-inputs');
   const hasHostPlatformTarget = config.targets.some((triple) => {
     const convention = NAPI_TARGET_CONVENTIONS[triple];
     return convention !== undefined && sameNapiPlatform(convention, hostPlatform);
@@ -2524,7 +2557,7 @@ function createNapiTargets(
       executor: 'nx:run-commands',
       metadata: CARGO_PRODUCER_METADATA,
       cache: true,
-      dependsOn: ['^build'],
+      dependsOn: ['^build', ...buildInputsTool],
       inputs: cargoInputs,
       outputs: ['{projectRoot}/dist/native/host/'],
       options: {
@@ -2571,6 +2604,7 @@ function createNapiTargets(
       executor: 'nx:run-commands',
       metadata: CARGO_PRODUCER_METADATA,
       cache: true,
+      ...(buildInputsTool.length > 0 ? { dependsOn: buildInputsTool } : {}),
       inputs: cargoInputs,
       outputs: [`{projectRoot}/${outputDirectory}/`],
       options: {
@@ -2880,12 +2914,13 @@ async function resolveCargoWorkspaces(
  * own on every run, so N pieces paid N extractions of every binary in the
  * workspace to run 1/N of the tests each: on a workspace with ~200 test
  * binaries, ~25 runners extracting side by side on a loaded host all hit the
- * 120s bound still "Extracting". `smoo-nx-nextest-extract` hashes the archive,
- * unpacks it under that hash unless a previous runner already did — one
+ * 120s bound still "Extracting". `smoo-nx-nextest-extract` reads the archive's
+ * key, the hash of the task that produced it (createCargoTestArchiveTarget),
+ * unpacks it under that key unless a previous runner already did — one
  * extracts while the rest wait — and prints the directory; the run then reuses
  * it through nextest's own reuse-build flags, which is what `--archive-file`
- * does after unpacking. Keyed by the archive's bytes, so a rebuilt or restored
- * archive can never run an older extraction's binaries. The one difference
+ * does after unpacking. Keyed by the producing task's inputs, so a rebuilt or
+ * restored archive of other inputs can never run an older extraction's binaries. The one difference
  * from `--archive-file` is the Rust standard library directory: nextest has no
  * flag to remap it, so a run uses the producing toolchain's own sysroot rather
  * than the archived copy of it — the same toolchain, because the archive's hash
@@ -2934,6 +2969,7 @@ async function addCargoTestTargets(
   projectRoot: string,
   workspaceRoot: string,
   workspace: CargoWorkspace,
+  nativeTools: NativeTools | null,
 ): Promise<string[]> {
   const targetNames: string[] = [];
   for (const plan of workspace.packages) {
@@ -2947,7 +2983,7 @@ async function addCargoTestTargets(
     });
     for (const piece of plan.pieces) {
       targetNames.push(piece.targetName);
-      targets[piece.targetName] = cargoTestRunnerTarget(workspace, archive, inputs, piece);
+      targets[piece.targetName] = cargoTestRunnerTarget(workspace, nativeTools, archive, inputs, piece);
     }
   }
   return targetNames;
@@ -3046,15 +3082,15 @@ async function cargoTestRunnerInputs(
  * workspace builds its command here, so the extraction, reuse-build, tool config and cwd cannot
  * drift between the per-crate pieces and the serial groups.
  */
-function nextestRunnerCommand(workspace: CargoWorkspace, selector: string, flags: string): string {
+function nextestRunnerCommand(
+  workspace: CargoWorkspace,
+  nativeTools: NativeTools | null,
+  selector: string,
+  flags: string,
+): string {
   const toolConfig = nextestToolConfigArg(workspace.projectRoot);
   // Relative to the runner's cwd, so the hashed command is the same in every checkout.
-  const extract = toolCommand(
-    workspace.projectRoot,
-    'nextest-extract',
-    'dist/ts/bin/smoo-nx-nextest-extract.js',
-    'node',
-  );
+  const extract = nativeToolCommand(nativeTools, workspace.projectRoot, 'nextest-extract', 'smoo-nx-nextest-extract');
   const reuseExtraction =
     `--binaries-metadata "$extracted/${EXTRACTED_BINARIES_METADATA}" ` +
     `--cargo-metadata "$extracted/${EXTRACTED_CARGO_METADATA}" ` +
@@ -3070,6 +3106,7 @@ function nextestRunnerCommand(workspace: CargoWorkspace, selector: string, flags
 /** One per-crate piece: a bounded run of its partition of the archive's tests. */
 function cargoTestRunnerTarget(
   workspace: CargoWorkspace,
+  nativeTools: NativeTools | null,
   archive: CargoTargetDependency,
   inputs: NonNullable<TargetConfiguration['inputs']>,
   piece: CargoTestPiece,
@@ -3078,9 +3115,14 @@ function cargoTestRunnerTarget(
     executor: '@smoothbricks/nx-plugin:bounded-exec',
     cache: true,
     inputs,
-    dependsOn: [archive],
+    dependsOn: [archive, ...nativeToolDependsOn(nativeTools, 'nextest-extract')],
     options: {
-      command: nextestRunnerCommand(workspace, piece.selector, `${piece.extra} --no-fail-fast --no-tests=pass`),
+      command: nextestRunnerCommand(
+        workspace,
+        nativeTools,
+        piece.selector,
+        `${piece.extra} --no-fail-fast --no-tests=pass`,
+      ),
       cwd: workspace.projectRoot,
       idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
       killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
@@ -3098,6 +3140,7 @@ function cargoTestRunnerTarget(
  */
 function cargoTestGroupTarget(
   workspace: CargoWorkspace,
+  nativeTools: NativeTools | null,
   inputs: NonNullable<TargetConfiguration['inputs']>,
   group: SerialTestGroup,
 ): TargetConfiguration {
@@ -3105,9 +3148,9 @@ function cargoTestGroupTarget(
     executor: '@smoothbricks/nx-plugin:bounded-exec',
     cache: true,
     inputs: [...inputs, fileHashInput(PLUGIN_NEXTEST_CODE_BOUND)],
-    dependsOn: [CARGO_TEST_ARCHIVE_TARGET],
+    dependsOn: [CARGO_TEST_ARCHIVE_TARGET, ...nativeToolDependsOn(nativeTools, 'nextest-extract')],
     options: {
-      command: nextestRunnerCommand(workspace, group.filter, ' --no-fail-fast --no-tests=fail'),
+      command: nextestRunnerCommand(workspace, nativeTools, group.filter, ' --no-fail-fast --no-tests=fail'),
       cwd: workspace.projectRoot,
       idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
       killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,

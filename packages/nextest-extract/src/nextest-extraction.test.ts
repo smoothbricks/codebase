@@ -9,6 +9,7 @@ import {
   EXTRACTED_CARGO_METADATA,
   EXTRACTED_TARGET_DIR,
   ensureNextestArchiveExtracted,
+  NEXTEST_ARCHIVE_KEY_SUFFIX,
   NEXTEST_EXTRACTION_DIRECTORY,
   type NextestArchiveExtractor,
   type NextestExtractionEvent,
@@ -38,6 +39,7 @@ describe('ensureNextestArchiveExtracted', () => {
     try {
       const archive = join(root, 'archive.tar.zst');
       await writeFile(archive, 'archive bytes');
+      await writeFile(`${archive}${NEXTEST_ARCHIVE_KEY_SUFFIX}`, '1234567890\n');
       const paths = nextestExtractionPaths(join(root, 'extractions'), await nextestArchiveKey(archive));
       // A holder killed mid-extraction (a bounded run's SIGKILL) leaves its
       // lock behind, and a pid in it that may since belong to anyone.
@@ -71,11 +73,11 @@ describe('ensureNextestArchiveExtracted', () => {
     try {
       const archive = join(root, 'archive.tar.zst');
       await writeFile(archive, 'archive bytes');
+      await writeFile(`${archive}${NEXTEST_ARCHIVE_KEY_SUFFIX}`, '1234567890\n');
       const paths = nextestExtractionPaths(join(root, 'extractions'), await nextestArchiveKey(archive));
-      // Unpacked from the old bytes, but the directory would be named for
-      // them while the path now holds others: a later run hashing the new
-      // bytes would never find it, and one hashing the old bytes again — the
-      // archive restored from cache — must not find a mixture.
+      // Unpacked from the old file, but the directory would be named for the
+      // task while the path now holds another rebuild of it: a mixture must
+      // never be published under the key.
       const rebuiltMidway: NextestArchiveExtractor = async (source, destination) => {
         await unpack(source, destination);
         await writeFile(archive, 'rebuilt archive bytes');
@@ -88,6 +90,21 @@ describe('ensureNextestArchiveExtracted', () => {
       // No directory under the old key, no staging left over, no lock held.
       expect(await readdir(paths.root)).toEqual([]);
       await expect(stat(paths.directory)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses an archive no task named instead of hashing its bytes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nextest-extraction-'));
+    try {
+      const archive = join(root, 'archive.tar.zst');
+      await writeFile(archive, 'archive bytes');
+      await expect(nextestArchiveKey(archive)).rejects.toThrow(
+        /has no .*archive\.tar\.zst\.key, so no Nx task names it/,
+      );
+      await writeFile(`${archive}${NEXTEST_ARCHIVE_KEY_SUFFIX}`, '\n');
+      await expect(nextestArchiveKey(archive)).rejects.toThrow(/names no task hash/);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -164,6 +181,8 @@ describe('smoo-nx-nextest-extract', () => {
         status: 0,
         stderr: '',
       });
+      // The key its cargo-test-archive task writes beside it.
+      await writeFile(join(root, `archive.tar.zst${NEXTEST_ARCHIVE_KEY_SUFFIX}`), '987654321\n');
 
       const shards = await Promise.all([1, 2, 3, 4].map((n) => shard(root, n)));
 
@@ -175,7 +194,7 @@ describe('smoo-nx-nextest-extract', () => {
       );
       // One shard unpacked it; the others waited on it or found it done.
       expect(shards.filter(({ stderr }) => stderr.includes(': extracted archive.tar.zst ')).length).toBe(1);
-      // One extraction under the archive's hash, nothing staged or locked beside it, and no shard's TMPDIR touched.
+      // One extraction under the archive's task hash, nothing staged or locked beside it, and no shard's TMPDIR touched.
       expect(await readdir(extractions)).toEqual([key]);
       for (const { tmp } of shards) {
         expect({ tmp, entries: await readdir(tmp) }).toEqual({ tmp, entries: [] });

@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, createReadStream, openSync, writeSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { closeSync, openSync, writeSync } from 'node:fs';
 import { mkdir, mkdtemp, open, readdir, readFile, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -42,18 +42,52 @@ export interface NextestExtractionTiming {
 
 const DEFAULT_TIMING: NextestExtractionTiming = { heartbeatMs: 1_000, staleAfterMs: 10_000, pollMs: 100 };
 
-/** The SHA-256 of the archive's bytes: the only identity an extraction is ever looked up by. */
+/**
+ * The file beside an archive that names it: the hash of the Nx task that produced the archive, which that task writes
+ * there (`printf '%s\n' "$NX_TASK_HASH"`) and Nx restores with the archive as one more output.
+ */
+export const NEXTEST_ARCHIVE_KEY_SUFFIX = '.key';
+
+/**
+ * The only identity an extraction is ever looked up by: the task hash in `<archive>.key`. Equal task hashes mean equal
+ * inputs, so one extraction serves every archive that hash names, restored or rebuilt, and nothing reads the archive's
+ * bytes to tell. An archive with no key was not made by the task, and is refused rather than trusted.
+ */
 export async function nextestArchiveKey(archive: string): Promise<string> {
-  const hash = createHash('sha256');
-  for await (const chunk of createReadStream(archive, { highWaterMark: 1 << 20 })) {
-    hash.update(chunk);
+  const file = `${archive}${NEXTEST_ARCHIVE_KEY_SUFFIX}`;
+  const text = await readFile(file, 'utf8').catch((error: unknown) => {
+    if (errorCode(error) === 'ENOENT') {
+      throw new Error(
+        `${archive} has no ${file}, so no Nx task names it; build the archive through its cargo-test-archive target`,
+      );
+    }
+    throw error;
+  });
+  const key = text.trim();
+  if (!/^\w+$/.test(key)) {
+    throw new Error(`${file} names no task hash: it holds ${JSON.stringify(text)}`);
   }
-  return hash.digest('hex');
+  return key;
+}
+
+/**
+ * An archive's key and the state of its file: a rewrite under the same key, an Nx rerun of the same inputs or a
+ * restore racing an extraction, changes the file's identity, size or modification time.
+ */
+interface ArchiveIdentity {
+  readonly key: string;
+  readonly file: string;
+}
+
+async function archiveIdentity(archive: string): Promise<ArchiveIdentity> {
+  const key = await nextestArchiveKey(archive);
+  const file = await stat(archive);
+  return { key, file: `device ${file.dev} inode ${file.ino}, ${file.size} bytes, modified ${file.mtimeMs}` };
 }
 
 /**
  * The directory, inside the Cargo target directory, that holds a workspace's
- * archive extractions. An extraction is content-keyed per-checkout tool state
+ * archive extractions. An extraction is task-keyed per-checkout tool state
  * of the same kind as the rest of the target directory: rebuilt from an Nx
  * output, reused by the next run, never an Nx output itself. It therefore lives
  * wherever Cargo's build tree lives, which a checkout that keeps its build state
@@ -118,12 +152,12 @@ function cargoTargetDirectory(metadata: string): string {
  * The directory under `root` holding `archive`'s extraction, extracting it
  * first if no caller has yet.
  *
- * Correctness does not rest on the lock. An extraction lands under the hash of
- * the bytes it came from by renaming a private staging directory into place,
- * so a directory under a key is a complete extraction of exactly those bytes
+ * Correctness does not rest on the lock. An extraction lands under the task hash
+ * of the archive it came from by renaming a private staging directory into place,
+ * so a directory under a key is a complete extraction of an archive of that task
  * or it does not exist: concurrent extractors cannot corrupt it, the loser of
  * a race discards its own copy, and an archive rewritten mid-extraction is
- * caught by hashing it again before publishing. The lock only stops every
+ * caught by reading its key and its file's state again before publishing. The lock only stops every
  * runner of one Nx run from unpacking the same bytes side by side, which is the
  * cost it exists to remove.
  *
@@ -140,7 +174,8 @@ export async function ensureNextestArchiveExtracted(
   timing: NextestExtractionTiming = DEFAULT_TIMING,
 ): Promise<NextestExtraction> {
   const started = performance.now();
-  const key = await nextestArchiveKey(archive);
+  const identity = await archiveIdentity(archive);
+  const key = identity.key;
   const paths = nextestExtractionPaths(root, key);
   if (await isDirectory(paths.directory)) {
     return { kind: 'reused', key, directory: paths.directory };
@@ -158,7 +193,7 @@ export async function ensureNextestArchiveExtracted(
         if (await isDirectory(paths.directory)) {
           return settled();
         }
-        const published = await extractAndPublish(archive, key, paths, extract);
+        const published = await extractAndPublish(archive, identity, paths, extract);
         if (published) {
           await removeOtherKeys(paths.root, key);
           return { kind: 'extracted', key, directory: paths.directory, elapsedMs: performance.now() - started };
@@ -196,7 +231,7 @@ export async function ensureNextestArchiveExtracted(
  */
 async function extractAndPublish(
   archive: string,
-  key: string,
+  before: ArchiveIdentity,
   paths: NextestExtractionPaths,
   extract: NextestArchiveExtractor,
 ): Promise<boolean> {
@@ -208,11 +243,11 @@ async function extractAndPublish(
         throw new Error(`extracting ${archive} produced no ${file}; a reuse run cannot read this layout`);
       }
     }
-    const after = await nextestArchiveKey(archive);
-    if (after !== key) {
+    const after = await archiveIdentity(archive);
+    if (after.key !== before.key || after.file !== before.file) {
       throw new Error(
-        `${archive} changed while it was being extracted (sha256 ${key} before, ${after} after); ` +
-          'rerun once whatever is rewriting it has finished',
+        `${archive} changed while it was being extracted (task ${before.key}, ${before.file} before; ` +
+          `task ${after.key}, ${after.file} after); rerun once whatever is rewriting it has finished`,
       );
     }
     await rename(staging, paths.directory);

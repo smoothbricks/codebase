@@ -23,7 +23,7 @@ try {
         break;
     }
   });
-  const identity = `${archive} (sha256 ${extraction.key.slice(0, 12)})`;
+  const identity = `${archive} (task ${extraction.key})`;
   switch (extraction.kind) {
     case 'reused':
       say(`running ${identity} from ${extraction.directory}`);

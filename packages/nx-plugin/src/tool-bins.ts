@@ -1,4 +1,7 @@
-import { posix } from 'node:path';
+import { readFile, realpath } from 'node:fs/promises';
+import { dirname, join, posix, relative } from 'node:path';
+
+import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
 
 /** The workspace root's link to this plugin, which every workspace that uses it has. */
 const PLUGIN_LINK = 'node_modules/@smoothbricks/nx-plugin';
@@ -12,11 +15,95 @@ const PLUGIN_LINK = 'node_modules/@smoothbricks/nx-plugin';
  * plugin's real location, whose depth from each workspace differs), and then one step up to the package beside the
  * plugin: every install layout puts a package's dependencies next to it, the workspace's `packages/` directory for a
  * linked checkout, a hoisted `node_modules/@smoothbricks/`, a bun or pnpm store's per-package `node_modules`. The kernel
- * resolves that `..` from where the link really points, so a native executable runs from the path as written. Node
- * resolves its main module lexically, which would drop the link before the `..`, so a JavaScript CLI is named through
- * the link's `realpath` first.
+ * resolves that `..` from where the link really points, so a native executable runs from the path as written, which is
+ * why it is concatenated rather than joined: a lexical join would drop the link before the `..`. Node resolves its main
+ * module lexically too, so a JavaScript CLI is named through the link's `realpath` first.
  */
 export function toolCommand(cwd: string, tool: string, file: string, runtime: 'native' | 'node'): string {
   const link = posix.join(posix.relative(cwd, '.'), PLUGIN_LINK);
-  return runtime === 'native' ? posix.join(link, '..', tool, file) : `node "$(realpath ${link})/../${tool}/${file}"`;
+  return runtime === 'native' ? `${link}/../${tool}/${file}` : `node "$(realpath ${link})/../${tool}/${file}"`;
+}
+
+/** The tool packages whose executables inferred commands run. */
+const NATIVE_TOOL_PACKAGES = ['build-inputs', 'nextest-extract'] as const;
+
+export type NativeToolPackage = (typeof NATIVE_TOOL_PACKAGES)[number];
+
+type TargetDependency = NonNullable<TargetConfiguration['dependsOn']>[number];
+
+/**
+ * The tool packages' executables as the inferring host runs them. Every scriptc package ships each platform's
+ * executable under `dist/bin/<platform>/`, so an installed tool package already carries this host's. A tool package
+ * that is a project of the workspace being inferred (a checkout of the repository that builds it) has only what its
+ * `scriptc-<arch>-<family>` target last wrote, so a command running it depends on that target.
+ */
+export interface NativeTools {
+  /** The host's directory under a tool package's `dist/bin`. */
+  readonly platform: string;
+  /** The host's scriptc target, the one that writes `dist/bin/<platform>/`. */
+  readonly target: string;
+  /** Each tool package that is a project of this workspace, to its project name. */
+  readonly projects: ReadonlyMap<NativeToolPackage, string>;
+}
+
+/**
+ * The tools of the workspace at `workspaceRoot`, whose project manifests are `projectManifests` (workspace-relative):
+ * a tool package is a project when the plugin's link resolves beside one of them.
+ */
+export async function resolveNativeTools(
+  workspaceRoot: string,
+  projectManifests: readonly string[],
+  platform: string,
+  target: string,
+): Promise<NativeTools> {
+  const projects = new Map<NativeToolPackage, string>();
+  const plugin = await realpath(join(workspaceRoot, PLUGIN_LINK)).catch((error: unknown) => {
+    // A workspace whose install has not linked the plugin yet has no tool package of its own either.
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
+    throw error;
+  });
+  if (plugin !== null) {
+    const root = await realpath(workspaceRoot);
+    for (const tool of NATIVE_TOOL_PACKAGES) {
+      const manifest = relative(root, join(dirname(plugin), tool, 'package.json')).replaceAll('\\', '/');
+      if (!projectManifests.includes(manifest)) continue;
+      const parsed: unknown = JSON.parse(await readFile(join(root, manifest), 'utf8'));
+      const name = projectName(parsed);
+      if (name === undefined) throw new Error(`${manifest}: a tool package names its Nx project in name or nx.name`);
+      projects.set(tool, name);
+    }
+  }
+  return { platform, target, projects };
+}
+
+function projectName(manifest: unknown): string | undefined {
+  if (typeof manifest !== 'object' || manifest === null) return undefined;
+  const nx = 'nx' in manifest && typeof manifest.nx === 'object' && manifest.nx !== null ? manifest.nx : undefined;
+  const nxName = nx !== undefined && 'name' in nx && typeof nx.name === 'string' ? nx.name : undefined;
+  const name = 'name' in manifest && typeof manifest.name === 'string' ? manifest.name : undefined;
+  return nxName ?? name;
+}
+
+/**
+ * The command running `tool`'s executable `bin` from `cwd`. `tools` is null on a host no scriptc platform covers,
+ * where no tool package carries an executable to run.
+ */
+export function nativeToolCommand(
+  tools: NativeTools | null,
+  cwd: string,
+  tool: NativeToolPackage,
+  bin: string,
+): string {
+  if (tools === null) {
+    throw new Error(
+      `@smoothbricks/${tool} ships ${bin} for darwin-arm64, darwin-x64, linux-arm64 and linux-x64 only, and Nx is inferring this workspace for another platform`,
+    );
+  }
+  return toolCommand(cwd, tool, `dist/bin/${tools.platform}/${bin}`, 'native');
+}
+
+/** The task that builds `tool`'s executables for this host, when this workspace builds them. */
+export function nativeToolDependsOn(tools: NativeTools | null, tool: NativeToolPackage): TargetDependency[] {
+  const project = tools?.projects.get(tool);
+  return project === undefined || tools === null ? [] : [{ projects: [project], target: tools.target }];
 }

@@ -31,6 +31,7 @@ import {
   EXTRACTED_BINARIES_METADATA,
   EXTRACTED_CARGO_METADATA,
   EXTRACTED_TARGET_DIR,
+  NEXTEST_ARCHIVE_KEY_SUFFIX,
 } from '@smoothbricks/nextest-extract';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
@@ -205,9 +206,10 @@ describe('cargo retention after real Nx runs', () => {
           status: 0,
           stderr: '',
         });
-        // The bytes an Nx cache restore would hand back, in a fresh place.
+        // The outputs an Nx cache restore would hand back, in a fresh place: the archive and its task's key.
         const restored = join(root, 'restored.tar.zst');
         await cp(archive, restored);
+        await writeFile(`${restored}${NEXTEST_ARCHIVE_KEY_SUFFIX}`, '424242\n');
         const applied = planned(await retain(fx.ws, { apply: true, now: future() }));
         expect(reclaimPaths(applied)).toEqual(expect.arrayContaining(gen.superseded));
         const extracted = spawnSync(

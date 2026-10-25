@@ -119,7 +119,8 @@ ${expected.map((name) => `    #[test] fn ${name}() { record("${name}");${serial.
     const targets = result[0]?.[1].projects?.['.']?.targets;
     if (targets === undefined) throw new Error('Cargo fixture inferred no targets');
     // The archive is the one real prerequisite: every runner executes its binaries.
-    await run(root, ['sh', '-c', command(targets, 'cargo-test-archive')]);
+    // Nx gives every task its hash; the archive command writes it beside the archive as the runners' extraction key.
+    await run(root, ['sh', '-c', command(targets, 'cargo-test-archive')], { NX_TASK_HASH: '424242' });
     const source = { root, targets };
     const passingSeed = await groupSucceeds(source);
     shared = { ...source, passingSeed };
@@ -284,12 +285,12 @@ async function executesEveryTestOnce(): Promise<void> {
     const observed = (await readFile(log, 'utf8')).trim().split('\n').sort();
     expect(observed).toEqual([...tests].sort());
   }
-  // The six runners shared one extraction, in Cargo's build tree: the archive's directory holds only the
-  // archive, the declared Nx output.
+  // The six runners shared one extraction, in Cargo's build tree: the archive's directory holds only the archive and
+  // its key, the declared Nx outputs.
   expect(await readdir(join(root, 'target', NEXTEST_EXTRACTION_DIRECTORY))).toEqual([
     await nextestArchiveKey(join(root, '.cache/nextest/archive.tar.zst')),
   ]);
-  expect(await readdir(join(root, '.cache/nextest'))).toEqual(['archive.tar.zst']);
+  expect((await readdir(join(root, '.cache/nextest'))).sort()).toEqual(['archive.tar.zst', 'archive.tar.zst.key']);
   // The serial group is one unpartitioned runner.
   expect(command(targets, GROUP_TARGET)).not.toContain('--partition');
 }

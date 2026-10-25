@@ -35,6 +35,9 @@ import { applyWorkspaceConfig, RELEASE_CONFIGURATION } from './workspace-config-
 
 useFixtureCargoHome();
 
+/** The inferring host's directory under a tool package's dist/bin, the one inferred commands run a tool from. */
+const HOST_TOOLS = `${process.platform === 'darwin' ? 'darwin' : 'linux'}-${process.arch}`;
+
 const [, rawInferTargets] = createNodesV2;
 const inferTargets: typeof rawInferTargets = async (files, options, context) => {
   await prepareCargoFixture(context.workspaceRoot);
@@ -1037,7 +1040,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // builds, re-resolves features, or writes cargo's flocked `target/`.
       expect(targets['cargo-test-archive']?.executor).toBe('nx:run-commands');
       expect(targets['cargo-test-archive']?.cache).toBe(true);
-      expect(targets['cargo-test-archive']?.outputs).toEqual(['{projectRoot}/.cache/nextest/archive.tar.zst']);
+      expect(targets['cargo-test-archive']?.outputs).toEqual([
+        '{projectRoot}/.cache/nextest/archive.tar.zst',
+        '{projectRoot}/.cache/nextest/archive.tar.zst.key',
+      ]);
       expect(targets['cargo-test-archive']?.options).toMatchObject({ cwd: 'packages/ferris' });
       // nextest does not create the archive's parent directory and fails the
       // whole build if it is missing (measured: "error writing to archive").
@@ -1051,7 +1057,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // the root `node_modules` link because the plugin's real location is a
       // different number of `../` away from each checkout.
       expect(String(targets['cargo-test-archive']?.options?.command)).toBe(
-        'mkdir -p .cache/nextest && cargo --frozen nextest archive --workspace --archive-file .cache/nextest/archive.tar.zst --user-config-file none --tool-config-file "smoo:$PWD/../../node_modules/@smoothbricks/nx-plugin/nextest.toml"',
+        'mkdir -p .cache/nextest && cargo --frozen nextest archive --workspace --archive-file .cache/nextest/archive.tar.zst --user-config-file none --tool-config-file "smoo:$PWD/../../node_modules/@smoothbricks/nx-plugin/nextest.toml" && ' +
+          'printf \'%s\\n\' "$NX_TASK_HASH" > .cache/nextest/archive.tar.zst.key',
       );
       expect(targets['cargo-test-archive']?.inputs).toContain('{projectRoot}/.config/nextest.toml');
       // Tests compile the dev profile only. Nx forwards a run's configuration
@@ -1071,7 +1078,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // moved tree). `--workspace` is not merely redundant here, nextest
       // rejects it beside a reused build.
       expect(targets['cargo-test-ferris-core']?.options?.command).toMatch(
-        /^extracted="\$\(node "\$\(realpath \.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\)\/\.\.\/nextest-extract\/dist\/ts\/bin\/smoo-nx-nextest-extract\.js" \.cache\/nextest\/archive\.tar\.zst\)" && cargo --frozen nextest run --binaries-metadata "\$extracted\/target\/nextest\/binaries-metadata\.json" --cargo-metadata "\$extracted\/target\/nextest\/cargo-metadata\.json" --target-dir-remap "\$extracted\/target" --workspace-remap \. -E 'package\(ferris-core\)' --no-fail-fast --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/\.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/nextest\.toml"$/,
+        /^extracted="\$\(\.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/\.\.\/nextest-extract\/dist\/bin\/[a-z0-9-]+\/smoo-nx-nextest-extract \.cache\/nextest\/archive\.tar\.zst\)" && cargo --frozen nextest run --binaries-metadata "\$extracted\/target\/nextest\/binaries-metadata\.json" --cargo-metadata "\$extracted\/target\/nextest\/cargo-metadata\.json" --target-dir-remap "\$extracted\/target" --workspace-remap \. -E 'package\(ferris-core\)' --no-fail-fast --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/\.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/nextest\.toml"$/,
       );
       expect(targets['cargo-test-ferris-core']?.inputs).toContain(
         '{workspaceRoot}/packages/ferris/.config/nextest.toml',
@@ -1621,7 +1628,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // At the root the helper and the plugin's nextest config are the root's
       // own `node_modules` link, no `../`.
       expect(runtime['cargo-test-runtime-core-shard1']?.options?.command).toStartWith(
-        'extracted="$(node "$(realpath node_modules/@smoothbricks/nx-plugin)/../nextest-extract/dist/ts/bin/smoo-nx-nextest-extract.js" .cache/nextest/archive.tar.zst)" && ',
+        `extracted="$(node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/bin/${HOST_TOOLS}/smoo-nx-nextest-extract .cache/nextest/archive.tar.zst)" && `,
       );
       expect(runtime['cargo-test-runtime-core-shard1']?.options?.command).toContain(
         `--target-dir-remap "$extracted/target" --workspace-remap . -E 'package(runtime-core)`,
@@ -1705,7 +1712,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           'packages/native/node_modules/.bin/napi build --platform --no-js --dts native.napi.d.ts --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/.cache/native-debug',
       });
       const platformBuild = (release: string): string =>
-        `packages/native/node_modules/.bin/napi build${release} --platform --no-js --dts native.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/dist/native/darwin-arm64 && node "$(realpath node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js" --manifest-path packages/native/crates/native-napi/Cargo.toml --dep-info aarch64-apple-darwin/${release === '' ? 'debug' : 'release'}/libnative_napi.d --output packages/native/dist/native/darwin-arm64`;
+        `packages/native/node_modules/.bin/napi build${release} --platform --no-js --dts native.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/dist/native/darwin-arm64 && node_modules/@smoothbricks/nx-plugin/../build-inputs/dist/bin/${HOST_TOOLS}/smoo-nx-build-inputs --manifest-path packages/native/crates/native-napi/Cargo.toml --dep-info aarch64-apple-darwin/${release === '' ? 'debug' : 'release'}/libnative_napi.d --output packages/native/dist/native/darwin-arm64`;
       expect(native['napi-arm64-macos']?.options).toMatchObject({ cwd: '.', command: platformBuild('') });
       expect(native['napi-arm64-macos']?.configurations?.[RELEASE_CONFIGURATION]).toEqual({
         command: platformBuild(' --release'),
@@ -2006,7 +2013,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('extracts the test archive once for all per-crate runners, and again only when its bytes change', async () => {
+  it('extracts the test archive once for all per-crate runners, and again only when its task changes', async () => {
     const workspace = await createWorkspace();
     const root = workspace.context.workspaceRoot;
     const crates = ['ferris-a', 'ferris-b', 'ferris-c'];
@@ -2070,6 +2077,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         );
 
       await workspace.write('packages/ferris/.cache/nextest/archive.tar.zst', 'first archive');
+      // The key its cargo-test-archive task writes beside it: that task's hash.
+      await workspace.write('packages/ferris/.cache/nextest/archive.tar.zst.key', '1001\n');
       for (const run of await runAll()) {
         expect(run).toMatchObject({ exitCode: 0 });
       }
@@ -2080,9 +2089,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'run first archive',
       ]);
 
-      // A rebuilt archive is new bytes at the same path: the runners must not
-      // execute what the old one unpacked, and the old unpacking is garbage.
+      // A rebuilt archive is another task's output at the same path: the runners
+      // must not execute what the old one unpacked, and the old unpacking is garbage.
       await workspace.write('packages/ferris/.cache/nextest/archive.tar.zst', 'second archive');
+      await workspace.write('packages/ferris/.cache/nextest/archive.tar.zst.key', '1002\n');
       for (const run of await runAll()) {
         expect(run).toMatchObject({ exitCode: 0 });
       }
@@ -2097,7 +2107,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'run second archive',
       ]);
       // The old unpacking is gone from Cargo's build tree, and the archive's
-      // directory holds only the archive, the declared Nx output.
+      // directory holds only the archive and its key, the declared Nx outputs.
       const extracted = join(root, 'packages/ferris/target', NEXTEST_EXTRACTION_DIRECTORY);
       const unpacked = (await readdir(extracted, { recursive: true })).filter((path) =>
         path.endsWith('binaries-metadata.json'),
@@ -2105,7 +2115,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(await Promise.all(unpacked.map((path) => readFile(join(extracted, path), 'utf8')))).toEqual([
         'second archive',
       ]);
-      expect(await readdir(join(root, 'packages/ferris/.cache/nextest'))).toEqual(['archive.tar.zst']);
+      expect((await readdir(join(root, 'packages/ferris/.cache/nextest'))).sort()).toEqual([
+        'archive.tar.zst',
+        'archive.tar.zst.key',
+      ]);
     } finally {
       await workspace.cleanup();
     }
@@ -2240,13 +2253,19 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets[`napi${hostSuffix}`]).toBeDefined();
       expect(targets['cargo-napi']).toBeUndefined();
 
-      // A platform outside NAPI_TARGET_CONVENTIONS leaves no native host target,
-      // which is precisely the condition that infers the dedicated host build.
+      // A host no declared triple serves infers the dedicated host build. Here the host is darwin-arm64 and the
+      // package declares Linux addons alone.
+      const linuxOnly = await readFile(join(workspace.context.workspaceRoot, 'packages/cowshed/package.json'), 'utf8');
+      const manifest = JSON.parse(linuxOnly) as { napi: { targets: string[] } };
+      manifest.napi.targets = ['aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-gnu'];
+      await workspace.write('packages/cowshed/package.json', JSON.stringify(manifest));
       const unservedHostTargets = await inferProjectTargets(
         workspace,
         'packages/cowshed/package.json',
-        createNodesV2ForPlatform('win32', 'x64'),
+        createNodesV2ForPlatform('darwin', 'arm64'),
       );
+      const buildInputs =
+        '../../node_modules/@smoothbricks/nx-plugin/../build-inputs/dist/bin/darwin-arm64/smoo-nx-build-inputs';
       expect(unservedHostTargets['cargo-napi']).toMatchObject({
         executor: 'nx:run-commands',
         cache: true,
@@ -2256,21 +2275,41 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         outputs: ['{projectRoot}/dist/native/host/'],
         options: {
           cwd: 'packages/cowshed',
-          command:
-            'napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/host && node "$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js" --manifest-path crates/cowshed-napi/Cargo.toml --dep-info debug/libcowshed_napi.d --output dist/native/host',
+          command: `napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/host && ${buildInputs} --manifest-path crates/cowshed-napi/Cargo.toml --dep-info debug/libcowshed_napi.d --output dist/native/host`,
         },
         configurations: {
           [RELEASE_CONFIGURATION]: {
-            command:
-              'napi build --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/host && node "$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js" --manifest-path crates/cowshed-napi/Cargo.toml --dep-info release/libcowshed_napi.d --output dist/native/host',
+            command: `napi build --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/host && ${buildInputs} --manifest-path crates/cowshed-napi/Cargo.toml --dep-info release/libcowshed_napi.d --output dist/native/host`,
           },
         },
       });
-      expect(unservedHostTargets.build?.dependsOn).toEqual(['^build', 'cargo-test-archive', 'cargo-napi', 'tsc-js']);
+      expect(unservedHostTargets.build?.dependsOn).toEqual([
+        '^build',
+        'cargo-test-archive',
+        'cargo-napi',
+        'tsc-js',
+        'cli-arm64-macos',
+      ]);
+      // A platform no scriptc platform covers has no build-inputs executable for the napi commands to run.
+      const unservedFailure = await inferProjectTargets(
+        workspace,
+        'packages/cowshed/package.json',
+        createNodesV2ForPlatform('win32', 'x64'),
+      ).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      if (!(unservedFailure instanceof AggregateCreateNodesError)) {
+        throw new Error(`expected AggregateCreateNodesError, got ${String(unservedFailure)}`);
+      }
+      expect(unservedFailure.errors[0]?.[1]?.message).toMatch(
+        /ships smoo-nx-build-inputs for darwin-arm64, darwin-x64, linux-arm64 and linux-x64 only/,
+      );
+      await workspace.write('packages/cowshed/package.json', linuxOnly);
       expect(targets['napi-arm64-macos']?.outputs).toEqual(['{projectRoot}/dist/native/darwin-arm64/']);
       // Every local build compiles dev; only the release configuration ships.
       const darwinArm64Build = (release: string): string =>
-        `napi build${release} --platform --no-js --dts cowshed.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/darwin-arm64 && node "$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js" --manifest-path crates/cowshed-napi/Cargo.toml --dep-info aarch64-apple-darwin/${release === '' ? 'debug' : 'release'}/libcowshed_napi.d --output dist/native/darwin-arm64`;
+        `napi build${release} --platform --no-js --dts cowshed.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/darwin-arm64 && ../../node_modules/@smoothbricks/nx-plugin/../build-inputs/dist/bin/${HOST_TOOLS}/smoo-nx-build-inputs --manifest-path crates/cowshed-napi/Cargo.toml --dep-info aarch64-apple-darwin/${release === '' ? 'debug' : 'release'}/libcowshed_napi.d --output dist/native/darwin-arm64`;
       expect(targets['napi-arm64-macos']?.options).toMatchObject({ command: darwinArm64Build('') });
       expect(targets['napi-arm64-macos']?.configurations?.[RELEASE_CONFIGURATION]).toEqual({
         command: darwinArm64Build(' --release'),
@@ -2386,7 +2425,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'napi-debug',
       ]);
       expect(targets['cargo-test-cowshed-napi']?.options?.command).toMatch(
-        /^extracted="\$\(node "\$\(realpath \.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\)\/\.\.\/nextest-extract\/dist\/ts\/bin\/smoo-nx-nextest-extract\.js" \.cache\/nextest\/archive\.tar\.zst\)" && cargo --frozen nextest run --binaries-metadata "\$extracted\/target\/nextest\/binaries-metadata\.json" --cargo-metadata "\$extracted\/target\/nextest\/cargo-metadata\.json" --target-dir-remap "\$extracted\/target" --workspace-remap \. -E 'package\(cowshed-napi\)' --no-fail-fast --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
+        /^extracted="\$\(\.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/\.\.\/nextest-extract\/dist\/bin\/[a-z0-9-]+\/smoo-nx-nextest-extract \.cache\/nextest\/archive\.tar\.zst\)" && cargo --frozen nextest run --binaries-metadata "\$extracted\/target\/nextest\/binaries-metadata\.json" --cargo-metadata "\$extracted\/target\/nextest\/cargo-metadata\.json" --target-dir-remap "\$extracted\/target" --workspace-remap \. -E 'package\(cowshed-napi\)' --no-fail-fast --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
       );
       expect(targets['napi-test']).toMatchObject({
         executor: '@smoothbricks/nx-plugin:bounded-exec',
@@ -3397,7 +3436,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // A distinct archive file, declared as this target's output: the host
       // archive must survive a cross build and each must be cached as itself.
       expect(archive?.outputs).toEqual(['{projectRoot}/.cache/nextest/archive-aarch64-apple-darwin.tar.zst']);
-      expect(targets['cargo-test-archive']?.outputs).toEqual(['{projectRoot}/.cache/nextest/archive.tar.zst']);
+      expect(targets['cargo-test-archive']?.outputs).toEqual([
+        '{projectRoot}/.cache/nextest/archive.tar.zst',
+        '{projectRoot}/.cache/nextest/archive.tar.zst.key',
+      ]);
       expect(archive?.cache).toBe(true);
       // Everything the host archive hashes, plus the declared driver: the
       // script that decides how the foreign link happens is an input of the
