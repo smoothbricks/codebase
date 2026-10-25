@@ -1,0 +1,8 @@
+{
+  "ffi_format": 6,
+  "functions": [
+    { "name": "tryLockFd", "symbol": "cargo_retain_try_lock", "params": ["i32", "mutable-bytes"], "returns": "i32" }
+  ],
+  "libraries": [],
+  "system_libraries": []
+}

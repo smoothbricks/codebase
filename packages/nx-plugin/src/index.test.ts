@@ -888,8 +888,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-napi']).toBeUndefined();
       expect(targets['cargo-sweep']).toBeUndefined();
       expect(targets['cargo-retention']?.options).toEqual({
-        command:
-          'node "$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../cargo-retain/dist/bin/smoo-nx-cargo-retain.js"',
+        command: 'node "$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../cargo-retain/dist/node-cli.js"',
         cwd: 'packages/ferris',
       });
       expect(targets['cargo-retention']?.cache).toBe(false);

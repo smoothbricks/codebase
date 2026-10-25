@@ -1596,7 +1596,7 @@ async function createProjectTargets(
       executor: 'nx:run-commands',
       cache: false,
       options: {
-        command: toolCommand(cargoWorkspaceRoot, 'cargo-retain', 'dist/bin/smoo-nx-cargo-retain.js', 'node'),
+        command: toolCommand(cargoWorkspaceRoot, 'cargo-retain', 'dist/node-cli.js', 'node'),
         cwd: cargoWorkspaceRoot,
       },
     };

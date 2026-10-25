@@ -17,6 +17,7 @@ import {
   type RetentionReport,
   retainCargoWorkspace,
 } from '../cargo-retention.js';
+import { nodeLocks } from '../locks-node.js';
 import { outsideTreesTmpdir } from './outside-trees.js';
 
 /** Three days past the newest stamp a fixture build can carry: drops only the recency root. */
@@ -260,7 +261,7 @@ export async function emptyHash(meta: string): Promise<void> {
 export type PlannedOutcome = Extract<RetentionOutcome, { kind: 'planned' | 'reclaimed' }>;
 
 export async function retain(root: string, options: RetentionOptions): Promise<RetentionReport> {
-  const result = await retainCargoWorkspace(root, options);
+  const result = await retainCargoWorkspace(root, options, nodeLocks);
   if (!result.ok) throw new Error(`retention error: ${JSON.stringify(result.error)}`);
   return result.value;
 }
@@ -578,6 +579,7 @@ export function retainWithoutPerl(
   env: NodeJS.ProcessEnv,
 ): RetentionRun {
   const compiled = join(import.meta.dir, '..', '..', 'dist', 'cargo-retention.js');
+  const locksCompiled = join(import.meta.dir, '..', '..', 'dist', 'locks-node.js');
   const source = lines(
     'import cp from "node:child_process";',
     'import { syncBuiltinESMExports } from "node:module";',
@@ -590,8 +592,9 @@ export function retainWithoutPerl(
     '};',
     'syncBuiltinESMExports();',
     `const { retainCargoWorkspace } = await import(${JSON.stringify(compiled)});`,
+    `const { nodeLocks } = await import(${JSON.stringify(locksCompiled)});`,
     'Object.defineProperty(process, "platform", { value: "linux" });',
-    `const result = await retainCargoWorkspace(${JSON.stringify(workspace)}, { apply: process.argv[2] === "apply", now: new Date(${future().getTime()}) });`,
+    `const result = await retainCargoWorkspace(${JSON.stringify(workspace)}, { apply: process.argv[2] === "apply", now: new Date(${future().getTime()}) }, nodeLocks);`,
     'console.log(JSON.stringify(result));',
   );
   const child = spawnSync(node, ['--input-type=module', '-e', source, perl, apply ? 'apply' : 'plan'], {

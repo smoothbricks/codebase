@@ -9,8 +9,8 @@
  *
  * - Every `fingerprint/<kind>.json` names its unit's identity (every field but `deps`, `local` and the
  *   toolchain, which is `rustc` and the `--sysroot` flag; unknown fields included) and its dependency edges
- *   (`deps[i][3]`, the dependency's fingerprint hash). Integers are kept exact: `JSON.parse` hands each number's
- *   source text to the reviver, so a u64 is never rounded through a double.
+ *   (`deps[i][3]`, the dependency's fingerprint hash). Integers are kept exact: {@link parseExactJson} reads every
+ *   integer as a bigint from its digits, so a u64 is never rounded through a double.
  * - The hash file beside it (`fingerprint/<kind>`) holds that unit's own fingerprint hash as
  *   the 16 hex digits of the u64's little-endian bytes; an edge resolves to every unit whose
  *   hash file holds it. Cargo stamps the hash file's mtime on every use when `-Zmtime-on-use` is on (cowshed
@@ -52,30 +52,24 @@
  *
  * Not reclaimed here: `incremental/` and the split-debuginfo objects rustc keeps inside current
  * units (rust-lang/rust#161824).
+ *
+ * Native build: scriptc compiles the emitted JavaScript, where a parameter carries no type. It infers one from the
+ * call sites, and where that fails (an `any` reaching an overloaded Node API, a Stats handed to a parameter) the code
+ * is shaped so the type is plain: a JSDoc `@param {type}` on the function, a number rather than a Stats. A call with
+ * spread arguments on a typed array (`list.push(...more)`) traps at run time, so a loop pushes each element.
  */
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, constants, lstatSync, openSync, readdirSync, readFileSync, writeSync } from 'node:fs';
-import {
-  type FileHandle,
-  lstat,
-  mkdir,
-  open,
-  readdir,
-  readFile,
-  realpath,
-  rename,
-  rmdir,
-  unlink,
-} from 'node:fs/promises';
+import { closeSync, lstatSync, openSync, readdirSync, readFileSync, writeSync } from 'node:fs';
+import { lstat, mkdir, readdir, readFile, realpath, rename, rmdir, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, normalize, relative, resolve, sep } from 'node:path';
-import { createInterface } from 'node:readline';
 import typia, { type tags } from 'typia';
 import { CARGO_ANCESTOR_INPUTS } from './cargo-ancestor-inputs.js';
-import { O_EXLOCK } from './open-flags.js';
+import { describeCause, errorCode, type Result } from './errors.js';
+import type { Hold, LockProvider } from './locks.js';
 
-export type Result<T, E> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: E };
+export type { Result } from './errors.js';
 
 export type RetentionError =
   | { readonly kind: 'cargo-metadata'; readonly cwd: string; readonly detail: string }
@@ -414,15 +408,12 @@ function hashText(hash: bigint): string {
   return text;
 }
 
-function describeCause(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function errorCode(error: unknown): string | undefined {
-  return error instanceof Error && 'code' in error && typeof error.code === 'string' ? error.code : undefined;
-}
-
-/** Create `path`, failing if it exists, and write `text` into it. */
+/**
+ * Create `path`, failing if it exists, and write `text` into it.
+ *
+ * @param {string} path
+ * @param {string} text
+ */
 function writeNew(path: string, text: string): void {
   const fd = openSync(path, 'wx');
   try {
@@ -442,113 +433,6 @@ async function lstatOrUndefined(path: string) {
 
 function ioError(operation: string, path: string, error: unknown): RetentionError {
   return { kind: 'io', operation, path, detail: describeCause(error) };
-}
-
-// ---- Cargo's locks ----
-//
-// Cargo takes flock(2) on its lock files, so a pass takes the same lock: exclusive, never waiting. The kernel lets go
-// of it when the descriptor holding it closes, however its process ends. macOS holds it in-process: `open(2)` with
-// O_EXLOCK | O_NONBLOCK is `flock(LOCK_EX | LOCK_NB)` made with the open, so a sandbox that refuses to exec an
-// interpreter costs the pass nothing. Node has no flock(2) anywhere else, so a perl child holds it there, for as long
-// as its stdin pipe lives. Whichever holds it, an attempt that cannot be made is a value, never an exception.
-
-const LOCK_HELPER = [
-  'use strict; use Fcntl qw(:flock O_RDONLY O_CREAT); $| = 1;',
-  'my $mode = shift @ARGV; my @held;',
-  'for my $path (@ARGV) {',
-  '  my $flags = $mode eq "create" ? O_RDONLY | O_CREAT : O_RDONLY;',
-  '  sysopen(my $fh, $path, $flags, 0644) or do { print "error\\t$path\\t$!\\n"; exit 0 };',
-  '  if (!flock($fh, LOCK_EX | LOCK_NB)) { print(($!{EWOULDBLOCK} ? "busy\\t$path\\n" : "error\\t$path\\t$!\\n")); exit 0 }',
-  '  push @held, $fh;',
-  '}',
-  'print "held\\n";',
-  '1 while defined(my $line = <STDIN>);',
-].join('\n');
-
-type LockMode = 'existing' | 'create';
-
-interface Hold {
-  release(): Promise<void>;
-}
-type HoldAttempt =
-  | { readonly kind: 'held'; readonly hold: Hold }
-  | { readonly kind: 'busy'; readonly lock: string }
-  /** The attempt could not be made at all: nothing is held, and nobody is known to hold the lock. */
-  | { readonly kind: 'unavailable'; readonly reason: string };
-
-/** Every lock in `paths` exclusively and without waiting, in order; the first held one makes it `busy`. */
-function tryHold(paths: readonly string[], mode: LockMode): Promise<HoldAttempt> {
-  return process.platform === 'darwin' ? holdInProcess(paths, mode) : holdThroughPerl(paths, mode);
-}
-
-/** `open(2)` takes each flock(2) itself: contention fails the open with EAGAIN, and closing the descriptor lets go. */
-async function holdInProcess(paths: readonly string[], mode: LockMode): Promise<HoldAttempt> {
-  const flags =
-    (mode === 'create' ? constants.O_RDONLY | constants.O_CREAT : constants.O_RDONLY) | constants.O_NONBLOCK | O_EXLOCK;
-  const held: FileHandle[] = [];
-  const letGo = async (): Promise<void> => {
-    await Promise.all(held.map((handle) => handle.close()));
-  };
-  for (const path of paths) {
-    try {
-      held.push(await open(path, flags, 0o644));
-    } catch (error) {
-      await letGo();
-      return errorCode(error) === 'EAGAIN'
-        ? { kind: 'busy', lock: path }
-        : { kind: 'unavailable', reason: describeCause(error) };
-    }
-  }
-  return { kind: 'held', hold: { release: letGo } };
-}
-
-function startHelper(mode: LockMode, paths: readonly string[]) {
-  return spawn('perl', ['-e', LOCK_HELPER, mode, ...paths], { stdio: ['pipe', 'pipe', 'pipe'] });
-}
-
-/** A perl child takes each flock(2) on its own descriptor and holds it for as long as its stdin pipe lives. */
-async function holdThroughPerl(paths: readonly string[], mode: LockMode): Promise<HoldAttempt> {
-  let child: ReturnType<typeof startHelper>;
-  try {
-    child = startHelper(mode, paths);
-  } catch (error) {
-    // Node throws, not emits 'error', for exec failures it does not class as run-time, such as EPERM from a sandbox.
-    return { kind: 'unavailable', reason: `cannot run perl: ${describeCause(error)}` };
-  }
-  const exited = new Promise<void>((resolve) => child.once('close', () => resolve()));
-  let stderr = '';
-  child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
-    stderr += chunk;
-  });
-  const lines = createInterface({ input: child.stdout });
-  const first = await new Promise<Result<string, string>>((resolve) => {
-    child.once('error', (error) => resolve({ ok: false, error: `cannot run perl: ${error.message}` }));
-    lines.once('line', (line) => resolve({ ok: true, value: line }));
-    lines.once('close', () => resolve({ ok: false, error: `perl ended before answering: ${stderr.trim()}` }));
-  });
-  if (!first.ok) {
-    child.stdin.destroy();
-    return { kind: 'unavailable', reason: first.error };
-  }
-  const [verdict, path, detail] = first.value.split('\t');
-  if (verdict === 'held') {
-    return {
-      kind: 'held',
-      hold: {
-        async release() {
-          child.stdin.end();
-          await exited;
-        },
-      },
-    };
-  }
-  child.stdin.end();
-  await exited;
-  if (verdict === 'busy' && path !== undefined) return { kind: 'busy', lock: path };
-  return {
-    kind: 'unavailable',
-    reason: verdict === 'error' ? `${path}: ${detail}` : `unexpected answer ${first.value}`,
-  };
 }
 
 // ---- The target directory's profiles ----
@@ -628,6 +512,11 @@ interface ProfileScan {
   readonly stamped: number;
 }
 
+/**
+ * The modification time of the regular file at `path` in whole milliseconds, or `undefined` when there is none.
+ *
+ * @param {string} path
+ */
 function mtimeMs(path: string): number | undefined {
   const stats = lstatSync(path, { throwIfNoEntry: false });
   return stats?.isFile() === true ? Math.floor(stats.mtimeMs) : undefined;
@@ -909,13 +798,8 @@ async function removeTree(path: string, linked: Map<string, number>): Promise<By
  * A generation's device and inode as the trash manifest spells them, or `undefined` when a double cannot hold either
  * exactly: the manifest proves a generation by those digits, so a rounded number proves nothing.
  */
-export function exactIdentity(stats: {
-  readonly dev: number;
-  readonly ino: number;
-}): { readonly dev: string; readonly ino: string } | undefined {
-  return Number.isSafeInteger(stats.dev) && Number.isSafeInteger(stats.ino)
-    ? { dev: String(stats.dev), ino: String(stats.ino) }
-    : undefined;
+export function exactIdentity(dev: number, ino: number): { readonly dev: string; readonly ino: string } | undefined {
+  return Number.isSafeInteger(dev) && Number.isSafeInteger(ino) ? { dev: String(dev), ino: String(ino) } : undefined;
 }
 
 interface Moved {
@@ -936,7 +820,8 @@ async function moveToTrash(profile: string, victims: readonly Meta[]): Promise<R
     const pass = randomUUID();
     const entries: Moved[] = [];
     for (const victim of victims) {
-      const identity = exactIdentity(await lstat(victim.path));
+      const victimStats = await lstat(victim.path);
+      const identity = exactIdentity(victimStats.dev, victimStats.ino);
       if (identity === undefined) {
         const detail = 'its device or inode number is not an exact integer';
         return {
@@ -997,7 +882,7 @@ async function purgeTrash(profile: string, linked: Map<string, number>): Promise
         const moved = join(passDir, String(index));
         const stats = await lstatOrUndefined(moved);
         if (stats === undefined) continue;
-        const identity = exactIdentity(stats);
+        const identity = exactIdentity(stats.dev, stats.ino);
         if (!stats.isDirectory() || identity?.dev !== entry.dev || identity?.ino !== entry.ino) {
           retained.push({
             path: moved,
@@ -1092,7 +977,12 @@ async function profileLocks(
   return { ok: true, value: locks };
 }
 
-/** Identity of the scheduling policy, Cargo configuration, workspace and actual target directory. */
+/**
+ * Identity of the scheduling policy, Cargo configuration, workspace and actual target directory.
+ *
+ * @param {string} workspaceRoot
+ * @param {string} targetDir
+ */
 function schedulingConfiguration(
   workspaceRoot: string,
   targetDir: string,
@@ -1189,9 +1079,14 @@ function nextAutomaticPass(
     return undefined;
   }
 }
+/**
+ * One retention pass over the Cargo workspace at `cargoWorkspaceRoot`, with its locks taken by `provider`: `nodeLocks` from
+ * Node, `ffiLocks` in the compiled CLI.
+ */
 export async function retainCargoWorkspace(
   cargoWorkspaceRoot: string,
   options: RetentionOptions,
+  provider: LockProvider,
 ): Promise<Result<RetentionReport, RetentionError>> {
   if (options.now !== undefined && !Number.isFinite(options.now.getTime())) {
     return {
@@ -1231,7 +1126,7 @@ export async function retainCargoWorkspace(
   });
   let retention: Hold | undefined;
   if (options.apply) {
-    const attempt = await tryHold([join(targetDir, RETENTION_LOCK)], 'create');
+    const attempt = await provider.tryHold([join(targetDir, RETENTION_LOCK)], 'create');
     if (attempt.kind === 'busy') return { ok: true, value: report({ kind: 'busy', lock: attempt.lock }) };
     if (attempt.kind === 'unavailable') {
       return { ok: true, value: report(lockRefusal(targetDir, 'the retention lock', attempt.reason)) };
@@ -1249,7 +1144,7 @@ export async function retainCargoWorkspace(
       );
       if (due !== undefined) return { ok: true, value: report({ kind: 'not-due', nextDueAt: due }) };
     }
-    const result = await passRoots(targetDir, layout.value.profiles, members, options);
+    const result = await passRoots(targetDir, layout.value.profiles, members, options, provider);
     if (!result.ok) return result;
     const done: RetentionReport = {
       workspaceRoot,
@@ -1283,9 +1178,10 @@ async function passNested(
   root: string,
   members: ReadonlySet<string>,
   options: RetentionOptions,
+  provider: LockProvider,
 ): Promise<Result<PassReport, RetentionError>> {
   const layout = await discoverLayout(root);
-  if (layout.ok) return pass(root, layout.value.profiles, members, options, true);
+  if (layout.ok) return pass(root, layout.value.profiles, members, options, provider, true);
   if (layout.error.kind !== 'target-not-cargo') return layout;
   return {
     ok: true,
@@ -1303,18 +1199,19 @@ async function passRoots(
   profiles: readonly string[],
   members: ReadonlySet<string>,
   options: RetentionOptions,
+  provider: LockProvider,
 ): Promise<Result<{ readonly outcome: PassOutcome; readonly nestedRoots: readonly NestedRoot[] }, RetentionError>> {
-  const own = await pass(targetDir, profiles, members, options, false);
+  const own = await pass(targetDir, profiles, members, options, provider, false);
   if (!own.ok) return own;
   const { outcome } = own.value;
   const nestedRoots: NestedRoot[] = [];
   if (outcome.kind === 'planned' || outcome.kind === 'reclaimed') {
     const pending = [...own.value.nestedRoots];
     for (let root = pending.pop(); root !== undefined; root = pending.pop()) {
-      const passed = await passNested(root, members, options);
+      const passed = await passNested(root, members, options, provider);
       if (!passed.ok) return passed;
       nestedRoots.push({ root, outcome: passed.value.outcome });
-      pending.push(...passed.value.nestedRoots);
+      for (const found of passed.value.nestedRoots) pending.push(found);
     }
   }
   nestedRoots.sort((a, b) => (a.root < b.root ? -1 : a.root > b.root ? 1 : 0));
@@ -1332,6 +1229,7 @@ async function pass(
   profiles: readonly string[],
   members: ReadonlySet<string>,
   options: RetentionOptions,
+  provider: LockProvider,
   nested: boolean,
 ): Promise<Result<PassReport, RetentionError>> {
   const nestedRoots = new Set<string>();
@@ -1344,7 +1242,7 @@ async function pass(
   const locks = await profileLocks(profiles);
   if (!locks.ok) return complete({ kind: 'refused', ...locks.error });
   const lockStarted = performance.now();
-  const attempt = await tryHold(locks.value, 'existing');
+  const attempt = await provider.tryHold(locks.value, 'existing');
   performance.measure('cargoRetention:locks', { start: lockStarted });
   if (attempt.kind === 'busy') return complete({ kind: 'busy', lock: attempt.lock });
   if (attempt.kind === 'unavailable') return complete(lockRefusal(targetDir, "Cargo's locks", attempt.reason));
@@ -1379,8 +1277,8 @@ async function pass(
         continue;
       }
       ownedProfiles.push(profile);
-      metas.push(...scanned.value.metas);
-      anomalies.push(...scanned.value.anomalies);
+      for (const meta of scanned.value.metas) metas.push(meta);
+      for (const anomaly of scanned.value.anomalies) anomalies.push(anomaly);
       stamped += scanned.value.stamped;
     }
     performance.measure('cargoRetention:scan', { start: scanStarted });
@@ -1423,8 +1321,8 @@ async function pass(
   for (const profile of ownedProfiles) {
     const purged = await purgeTrash(profile, linked);
     if (!purged.ok) return purged;
-    reclaim.push(...purged.value.reclaimed);
-    retained.push(...purged.value.retained);
+    for (const entry of purged.value.reclaimed) reclaim.push(entry);
+    for (const entry of purged.value.retained) retained.push(entry);
   }
   let linkedBytes = 0;
   for (const blocks of linked.values()) linkedBytes += blocks;

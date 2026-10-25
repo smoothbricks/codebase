@@ -8,6 +8,7 @@ import {
   refusedAnywhere,
   retainCargoWorkspace,
 } from '@smoothbricks/cargo-retain';
+import { nodeLocks } from '@smoothbricks/cargo-retain/locks-node';
 import { logger, type ProjectGraph, readCachedProjectGraph } from 'nx/src/devkit-exports.js';
 import type { PostTasksExecutionContext } from 'nx/src/project-graph/plugins/public-api.js';
 
@@ -70,7 +71,7 @@ export async function postTasksExecution(_options: unknown, context: PostTasksEx
     const cpu = process.cpuUsage();
     let result: Result<RetentionReport, RetentionError>;
     try {
-      result = await retainCargoWorkspace(root, { apply: true, automatic: true });
+      result = await retainCargoWorkspace(root, { apply: true, automatic: true }, nodeLocks);
     } catch (error) {
       // Maintenance never fails the run it follows: say what escaped, then go on to the next workspace.
       const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);

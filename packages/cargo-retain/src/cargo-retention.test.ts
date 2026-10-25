@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { chmod, cp, lstat, mkdir, readdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import {
   AUTOMATIC_INTERVAL_MS,
   describeRetention,
@@ -11,10 +11,13 @@ import {
   parseExactJson,
   RECENT_USE_MS,
   RETENTION_RECEIPT,
+  type RetentionReport,
   readCargoFingerprint,
   refusedAnywhere,
   retainCargoWorkspace,
 } from './cargo-retention.js';
+import type { HoldAttempt, LockMode, LockProvider } from './locks.js';
+import { nodeLocks } from './locks-node.js';
 import {
   artifacts,
   backdate,
@@ -122,17 +125,17 @@ function identityIgnoresToolchain(): void {
 /** Case: the trash manifest proves a generation by device and inode digits, so a number a double rounds proves nothing. */
 function exactIdentityRefusesWhatADoubleCannotHold(): void {
   const check = labelled('exactIdentity refuses a device or inode a double cannot hold');
-  check(exactIdentity({ dev: 16777232, ino: 4294967296 }), 'ordinary numbers').toEqual({
+  check(exactIdentity(16777232, 4294967296), 'ordinary numbers').toEqual({
     dev: '16777232',
     ino: '4294967296',
   });
-  check(exactIdentity({ dev: 1, ino: Number.MAX_SAFE_INTEGER }), 'the largest exact inode').toEqual({
+  check(exactIdentity(1, Number.MAX_SAFE_INTEGER), 'the largest exact inode').toEqual({
     dev: '1',
     ino: '9007199254740991',
   });
-  check(exactIdentity({ dev: 1, ino: Number.MAX_SAFE_INTEGER + 1 }), 'an inode 2^53 or more').toBeUndefined();
-  check(exactIdentity({ dev: 2 ** 60, ino: 1 }), 'a device 2^53 or more').toBeUndefined();
-  check(exactIdentity({ dev: 1, ino: Number.NaN }), 'not a number').toBeUndefined();
+  check(exactIdentity(1, Number.MAX_SAFE_INTEGER + 1), 'an inode 2^53 or more').toBeUndefined();
+  check(exactIdentity(2 ** 60, 1), 'a device 2^53 or more').toBeUndefined();
+  check(exactIdentity(1, Number.NaN), 'not a number').toBeUndefined();
 }
 
 /** What `JSON.parse` makes of `text` with every integer a bigint from its source digits: the oracle for the exact reader. */
@@ -400,6 +403,7 @@ async function noOpPassReadsFingerprintsOnce(fx: Churn): Promise<void> {
   await clearReceipt(fx.target);
   planned(await retain(fx.ws, { apply: true, now: future() }));
   const module = join(import.meta.dir, '..', 'dist', 'cargo-retention.js');
+  const locksModule = join(import.meta.dir, '..', 'dist', 'locks-node.js');
   const source = lines(
     'import fs from "node:fs";',
     'import promises from "node:fs/promises";',
@@ -425,7 +429,8 @@ async function noOpPassReadsFingerprintsOnce(fx: Churn): Promise<void> {
     '}',
     'syncBuiltinESMExports();',
     `const { retainCargoWorkspace } = await import(${JSON.stringify(module)});`,
-    `const result = await retainCargoWorkspace(${JSON.stringify(fx.ws)}, { apply: process.argv[1] === 'automatic', automatic: process.argv[1] === 'automatic', now: new Date(${future().getTime()}) });`,
+    `const { nodeLocks } = await import(${JSON.stringify(locksModule)});`,
+    `const result = await retainCargoWorkspace(${JSON.stringify(fx.ws)}, { apply: process.argv[1] === 'automatic', automatic: process.argv[1] === 'automatic', now: new Date(${future().getTime()}) }, nodeLocks);`,
     'if (!result.ok) throw new Error(JSON.stringify(result.error));',
     'console.log(JSON.stringify({ report: result.value, reads, stats, asyncFingerprintCalls, children }));',
   );
@@ -682,7 +687,7 @@ async function reclaimsNestedRoot(fx: Churn): Promise<void> {
 async function cliPlansReadOnlyAndApplies(fx: Churn, superseded: readonly string[]): Promise<void> {
   const check = labelled('the CLI plans read-only, applies with a receipt, and exits 3 on a refused pass');
   await clearReceipt(fx.target);
-  const bin = join(import.meta.dir, '..', 'dist', 'bin', 'smoo-nx-cargo-retain.js');
+  const bin = join(import.meta.dir, '..', 'dist', 'node-cli.js');
   const cli = async (args: string[]): Promise<CargoRun> => {
     const child = Bun.spawn(['node', bin, ...args], { cwd: fx.ws, env: cargoEnv(), stdout: 'pipe', stderr: 'pipe' });
     const [code, stdout, stderr] = await Promise.all([
@@ -880,7 +885,11 @@ async function automaticCadence(fx: Churn, superseded: readonly string[]): Promi
   const forced = await retain(fx.ws, { apply: true, now: within });
   check(forced.outcome.kind).toBe('refused');
   check(forced.completed).toBeUndefined();
-  const invalidClock = await retainCargoWorkspace(fx.ws, { apply: true, automatic: true, now: new Date(Number.NaN) });
+  const invalidClock = await retainCargoWorkspace(
+    fx.ws,
+    { apply: true, automatic: true, now: new Date(Number.NaN) },
+    nodeLocks,
+  );
   check(invalidClock.ok).toBe(false);
   const due = new Date(now.getTime() + AUTOMATIC_INTERVAL_MS);
   const failed = await retain(fx.ws, { apply: true, automatic: true, now: due });
@@ -1363,13 +1372,13 @@ describe('cargo retention against real Cargo target layouts', () => {
 
   it('accepts a real pre-created Cargo target without a backup tag, but refuses a foreign root or forged tag', async () => {
     await inFixture(async (root) => {
-      const empty = await retainCargoWorkspace(root, { apply: false });
+      const empty = await retainCargoWorkspace(root, { apply: false }, nodeLocks);
       if (empty.ok) throw new Error('an empty directory produced a report');
       expect(empty.error.kind).toBe('cargo-metadata');
       const fx = await churnFixture(root, false);
       await mkdir(fx.target, { recursive: true });
       await scopedTo(fx.target, async () => {
-        const foreign = await retainCargoWorkspace(fx.ws, { apply: false });
+        const foreign = await retainCargoWorkspace(fx.ws, { apply: false }, nodeLocks);
         if (foreign.ok) throw new Error('an unbuilt target produced a report');
         expect(foreign.error.kind).toBe('target-not-cargo');
         const gen = await churnGenerations(fx);
@@ -1378,9 +1387,85 @@ describe('cargo retention against real Cargo target layouts', () => {
         expect(reclaimPaths(applied)).toEqual(gen.superseded);
         await expectFresh(fx.ws);
         await writeFile(join(fx.target, 'CACHEDIR.TAG'), 'bogus\n');
-        const forged = await retainCargoWorkspace(fx.ws, { apply: false, now: future() });
+        const forged = await retainCargoWorkspace(fx.ws, { apply: false, now: future() }, nodeLocks);
         if (forged.ok) throw new Error('a forged CACHEDIR.TAG produced a report');
         expect(forged.error.kind).toBe('target-not-cargo');
+      });
+    });
+  });
+
+  it('takes its locks through the provider it is given, releases what it held, and reports what the provider says', async () => {
+    await inFixture(async (root) => {
+      const check = labelled('the pass takes and releases its locks through the provider it is given');
+      const fx = await churnFixture(root, false);
+      await scopedTo(fx.target, async () => {
+        await churnGenerations(fx);
+        const asked: string[] = [];
+        const released: string[] = [];
+        const holding = (mode: LockMode): HoldAttempt => ({
+          kind: 'held',
+          hold: {
+            async release() {
+              released.push(mode);
+            },
+          },
+        });
+        const providing = (answer: (mode: LockMode, paths: readonly string[]) => HoldAttempt): LockProvider => ({
+          async tryHold(paths, mode) {
+            asked.push(`${mode} ${paths.map((path) => relative(fx.target, path)).join(' ')}`);
+            return answer(mode, paths);
+          },
+        });
+        const run = async (apply: boolean, provider: LockProvider): Promise<RetentionReport> => {
+          asked.length = 0;
+          released.length = 0;
+          const result = await retainCargoWorkspace(fx.ws, { apply, now: future() }, provider);
+          if (!result.ok) throw new Error(`retention error: ${JSON.stringify(result.error)}`);
+          return result.value;
+        };
+        // A provider that grants everything is asked for the retention lock to create first, then for each Cargo lock
+        // that exists, and gives back Cargo's before the retention lock.
+        const plan = await run(false, providing(holding));
+        check(plan.outcome.kind, 'a plan').toBe('planned');
+        check(asked.length, 'a plan asks once').toBe(1);
+        check(
+          asked[0]?.startsWith('existing debug/.cargo-lock debug/.cargo-build-lock'),
+          'a plan asks for Cargo locks',
+        ).toBe(true);
+        check(released, 'a plan releases them').toEqual(['existing']);
+        const applied = await run(true, providing(holding));
+        check(applied.outcome.kind, 'an apply').toBe('reclaimed');
+        check(asked[0], 'an apply asks for the retention lock first').toBe(`create ${RETENTION_LOCK}`);
+        check(asked[1]?.startsWith('existing debug/.cargo-lock'), 'then for the Cargo locks').toBe(true);
+        check(released, 'Cargo locks go back before the retention lock').toEqual(['existing', 'create']);
+        // A Cargo lock another holds is `busy`, naming it; the retention lock taken before it is still given back.
+        const busy = await run(
+          true,
+          providing((mode, paths) => (mode === 'create' ? holding(mode) : { kind: 'busy', lock: paths[1] ?? '' })),
+        );
+        if (busy.outcome.kind !== 'busy') throw new Error(`expected busy, got ${JSON.stringify(busy.outcome)}`);
+        check(relative(fx.target, busy.outcome.lock), 'the busy lock').toBe('debug/.cargo-build-lock');
+        check(released, 'a busy pass gives back the retention lock').toEqual(['create']);
+        // A lock the provider cannot even attempt refuses the pass with the provider's own words.
+        const unavailable = await run(
+          true,
+          providing((mode) => (mode === 'create' ? holding(mode) : { kind: 'unavailable', reason: 'no flock here' })),
+        );
+        if (unavailable.outcome.kind !== 'refused')
+          throw new Error(`expected refused, got ${JSON.stringify(unavailable.outcome)}`);
+        check(unavailable.outcome.reason, 'the provider words').toBe("cannot attempt Cargo's locks: no flock here");
+        check(released, 'a refused pass gives back the retention lock').toEqual(['create']);
+        const noRetention = await run(
+          true,
+          providing(() => ({ kind: 'unavailable', reason: 'no flock here' })),
+        );
+        if (noRetention.outcome.kind !== 'refused')
+          throw new Error(`expected refused, got ${JSON.stringify(noRetention.outcome)}`);
+        check(noRetention.outcome.reason, 'the retention lock words').toContain(
+          'cannot attempt the retention lock: no flock here',
+        );
+        check(asked.length, 'nothing else is asked once the retention lock cannot be').toBe(1);
+        check(released, 'nothing was held, so nothing is given back').toEqual([]);
       });
     });
   });

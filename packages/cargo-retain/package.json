@@ -18,6 +18,11 @@
       "import": "./dist/cargo-ancestor-inputs.js",
       "default": "./dist/cargo-ancestor-inputs.js"
     },
+    "./locks-node": {
+      "types": "./dist/locks-node.d.ts",
+      "import": "./dist/locks-node.js",
+      "default": "./dist/locks-node.js"
+    },
     "./open-flags": {
       "types": "./dist/open-flags.d.ts",
       "import": "./dist/open-flags.js",
@@ -45,6 +50,8 @@
   "files": [
     "dist",
     "src",
+    "ffi.json",
+    "native",
     "!**/*.tsbuildinfo"
   ],
   "scripts": {
