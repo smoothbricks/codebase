@@ -54,7 +54,7 @@ describe('create-package generator', () => {
       expect(pkg.nx?.name).toBe('duration');
       expect(pkg.nx?.targets?.lint).toEqual({});
       expect(pkg.nx?.targets?.test?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
-      expect(pkg.nx?.targets?.test?.options?.command).toBe('bun test');
+      expect(pkg.nx?.targets?.test?.options?.command).toBe('bun test --timeout=0');
 
       // tsconfig.json (wrapper)
       const tsconfig = readJson(tree, 'packages/duration/tsconfig.json');

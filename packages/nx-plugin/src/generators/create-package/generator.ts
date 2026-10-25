@@ -1,7 +1,11 @@
 // Scaffold TypeScript libraries and Rust workspaces through one convention-owned generator.
 // CLI wiring: packages/cli/src/generate/index.ts (variant registry)
 import { readJson, type Tree, writeJson } from 'nx/src/devkit-exports.js';
-import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from '../../bounded-test-policy.js';
+import {
+  BOUNDED_TEST_IDLE_TIMEOUT_MS,
+  BOUNDED_TEST_KILL_AFTER_MS,
+  BUN_TEST_TIMEOUT_FLAG,
+} from '../../bounded-test-policy.js';
 import { renderCargoDevProfiles } from '../../cargo-dev-profile.js';
 
 import type { CreatePackageGeneratorSchema } from './schema.js';
@@ -130,7 +134,7 @@ function buildTypeScriptPackageJson(
         test: {
           executor: '@smoothbricks/nx-plugin:bounded-exec',
           options: {
-            command: 'bun test',
+            command: `bun test ${BUN_TEST_TIMEOUT_FLAG}`,
             cwd: '{projectRoot}',
             idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
             killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
