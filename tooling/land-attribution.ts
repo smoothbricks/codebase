@@ -20,7 +20,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { cacheDir } from 'nx/src/utils/cache-directory.js';
-import { isRecord } from './land-publish.ts';
+import { isRecord, staleSummary } from './land-publish.ts';
 
 /** A file read as what it claims to be, or the reason it is not. Nothing malformed is read as empty. */
 export type Reading<T> =
@@ -51,14 +51,8 @@ export function failedTasks(summaryJson: string, since: number): Reading<string[
   if (!isRecord(summary.value) || !isRecord(summary.value.run) || !Array.isArray(summary.value.tasks)) {
     return refused('the run summary has no run object or no tasks array');
   }
-  const started = summary.value.run.startTime;
-  const startedAt = typeof started === 'string' ? Date.parse(started) : Number.NaN;
-  if (Number.isNaN(startedAt)) return refused(`the run summary has no start time: ${JSON.stringify(started)}`);
-  if (startedAt < since) {
-    return refused(
-      `the run summary is of an invocation that began at ${started}, before this gate began at ${new Date(since).toISOString()}`,
-    );
-  }
+  const stale = staleSummary(summary.value.run, since);
+  if (stale !== undefined) return refused(stale);
   const failed = new Set<string>();
   for (const row of summary.value.tasks) {
     if (!isRecord(row) || typeof row.taskId !== 'string' || typeof row.status !== 'number') {

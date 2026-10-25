@@ -37,7 +37,7 @@ for (const id of named) {
   }
   const files = new Set<string>();
   for (const plan of Object.values(inspector.inspectTaskInputs(task.target))) {
-    for (const file of plan.files) files.add(file);
+    for (const file of [...plan.files, ...plan.depOutputs]) files.add(file);
   }
   inputs[id] = [...files].sort();
 }

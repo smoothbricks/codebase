@@ -118,7 +118,10 @@ attribute_failures() {
     say "the gate's run summary names no failed task, so no commit is named"
     return 0
   fi
-  inputs=$(mktemp "${TMPDIR:-/tmp}/land-inputs.XXXXXX")
+  inputs=$(mktemp "${TMPDIR:-/tmp}/land-inputs.XXXXXX") || {
+    say "could not name the commits that reach the failed tasks (status $?)"
+    return 0
+  }
   # Task ids hold no whitespace, so each failed one is one argument.
   if gate_job node "$checkout/tooling/land-inputs.mts" gate $failed >"$inputs" &&
     attribution=$(printf '%s\n' "$failed" | (cd "$checkout" && bun "$here/land-attribution.ts" attribute --base "$base" --head "$head" --inputs "$inputs")); then
@@ -126,7 +129,8 @@ attribute_failures() {
   else
     say "could not name the commits that reach the failed tasks"
   fi
-  rm "$inputs"
+  rm "$inputs" || say "could not remove $inputs (status $?)"
+  return 0
 }
 
 # Gates exactly the rebased tree. Reporting never changes Nx's status or grants permission to land.
@@ -155,10 +159,11 @@ gate_workspace() {
   fi
   replay_gate_output "$output"
   rm "$output"
-  # The gate's task hashes are read now, straight after the gate, so the run summary is the gate's own. The cache never
-  # blocks a land (05_gateway.md, "Publication"): hashes that cannot be read are said, and the land goes on unpublished.
+  # The gate's task hashes are read now, straight after the gate, from the run summary the gate's own Nx began (one an
+  # earlier invocation began is refused). The cache never blocks a land (05_gateway.md, "Publication"): hashes that
+  # cannot be read are said, and the land goes on unpublished.
   hashes=$(mktemp "${TMPDIR:-/tmp}/land-hashes.XXXXXX")
-  bun "$here/land-publish.ts" hashes "$checkout/.nx/cache/run.json" >"$hashes" || {
+  bun "$here/land-publish.ts" hashes "$checkout/.nx/cache/run.json" "$began" >"$hashes" || {
     say "could not read the gate's task hashes from $checkout/.nx/cache/run.json (status $?); the land goes on without publishing: the cache never blocks a land"
     rm "$hashes"
     hashes=
@@ -166,9 +171,9 @@ gate_workspace() {
   say "cross-linting $head for Linux"
   gate_job bun run check:linux >"$output" 2>&1 || {
     linux_status=$?
+    [ -z "$hashes" ] || rm "$hashes"
     replay_gate_output "$output"
     say "Linux cross check exited $linux_status; the land stops; complete output: $output"
-    [ -z "$hashes" ] || rm "$hashes"
     exit "$linux_status"
   }
   rm "$output"

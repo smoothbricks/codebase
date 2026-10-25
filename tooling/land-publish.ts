@@ -4,14 +4,15 @@
 // cache, and only a land publishes). land-host.sh runs this twice: 'hashes' right after the gate passes, while the Nx
 // run summary still belongs to the gate, and 'publish' once the Linux cross check passes.
 //
-//   land-publish.ts hashes RUN_JSON           print the distinct task hashes of the run's succeeded tasks
+//   land-publish.ts hashes RUN_JSON SINCE     print the distinct task hashes of the run's succeeded tasks, refusing a
+//                                             summary whose run began before SINCE (epoch seconds): an earlier run's
 //   land-publish.ts publish CHECKOUT HASHES   store those tasks' results with the build volume's nx_publish.js
 
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 
-const USAGE = 'usage: land-publish.ts hashes RUN_JSON | publish CHECKOUT HASHES_JSON\n';
+const USAGE = 'usage: land-publish.ts hashes RUN_JSON SINCE_EPOCH | publish CHECKOUT HASHES_JSON\n';
 
 /** A task hash as the gateway's cache route takes it (05_gateway.md). */
 const TASK_HASH = /^[A-Za-z0-9_-]{1,128}$/;
@@ -38,8 +39,23 @@ function isTaskHash(value: unknown): value is string {
   return typeof value === 'string' && TASK_HASH.test(value);
 }
 
-/** The distinct hashes of the run's succeeded tasks (status 0), in run order. Every task must be well formed, failed or not. */
-export function succeededHashes(summaryJson: string): HashList {
+/**
+ * Why a run summary's `run` is not of the invocation that began at `since` (epoch milliseconds), or undefined when it
+ * is. A summary Nx began before the gate is an earlier invocation's: its tasks are not the gate's.
+ */
+export function staleSummary(run: Record<string, unknown>, since: number): string | undefined {
+  const started = run.startTime;
+  const startedAt = typeof started === 'string' ? Date.parse(started) : Number.NaN;
+  if (Number.isNaN(startedAt)) return `the run summary has no start time: ${JSON.stringify(started)}`;
+  if (startedAt >= since) return undefined;
+  return `the run summary is of an invocation that began at ${started}, before this gate began at ${new Date(since).toISOString()}`;
+}
+
+/**
+ * The distinct hashes of the run's succeeded tasks (status 0), in run order, from a summary Nx began at or after
+ * `since` (epoch milliseconds). Every task must be well formed, failed or not.
+ */
+export function succeededHashes(since: number, summaryJson: string): HashList {
   let summary: unknown;
   try {
     summary = JSON.parse(summaryJson);
@@ -49,6 +65,8 @@ export function succeededHashes(summaryJson: string): HashList {
   if (!isRecord(summary) || !isRecord(summary.run) || !Array.isArray(summary.tasks)) {
     return refusal('the run summary has no run object or no tasks array');
   }
+  const stale = staleSummary(summary.run, since);
+  if (stale !== undefined) return refusal(stale);
   const tasks: readonly unknown[] = summary.tasks;
   const hashes = new Set<string>();
   for (const task of tasks) {
@@ -113,8 +131,10 @@ function fail(why: string): number {
 
 async function main(argv: readonly string[]): Promise<number> {
   const [verb, first, second] = argv;
-  if (verb === 'hashes' && argv.length === 2 && first !== undefined) {
-    const result = succeededHashes(readFileSync(first, 'utf8'));
+  if (verb === 'hashes' && argv.length === 3 && first !== undefined && second !== undefined) {
+    const since = Number(second);
+    if (!Number.isInteger(since)) return fail(`SINCE must be whole epoch seconds, not ${second}`);
+    const result = succeededHashes(since * 1000, readFileSync(first, 'utf8'));
     if (result.kind === 'refused') return fail(result.why);
     process.stdout.write(`${JSON.stringify(result.hashes)}\n`);
     return 0;

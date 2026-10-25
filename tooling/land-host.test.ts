@@ -499,6 +499,27 @@ describe('land-host.sh', () => {
     expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
   });
 
+  it('publishes nothing from a run summary an earlier invocation wrote, and lands', () => {
+    const land = fixture();
+    const gated = git(land.ws, 'rev-parse', 'HEAD');
+    mkdirSync(join(land.ws, '.nx/cache'), { recursive: true });
+    writeFileSync(
+      join(land.ws, '.nx/cache/run.json'),
+      JSON.stringify({
+        run: { command: 'nx run-many -t gate', startTime: '2026-01-01T00:00:00.000Z', endTime: '', inner: false },
+        tasks: [{ taskId: '@smoothbricks/codebase:gate', hash: 'stale-hash', status: 0 }],
+      }),
+    );
+    const run = land.land([DAEMON_STOP, passingRun(GATE), passingRun(MAIN_BUILD)]);
+    expect(run.status, run.log).toBe(0);
+    expect(run.log).toContain(
+      'the run summary is of an invocation that began at 2026-01-01T00:00:00.000Z, before this gate',
+    );
+    expect(run.log).toContain('the land goes on without publishing: the cache never blocks a land');
+    expect(existsSync(join(land.state, 'publish.args'))).toBe(false);
+    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
+  });
+
   it('names no commit from a run summary an earlier invocation wrote', () => {
     const land = fixture();
     mkdirSync(join(land.ws, '.nx/cache'), { recursive: true });
