@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { processTable } from '../../testing.js';
+import { processesOf, processTree } from '../../testing.js';
 import { stopProbe } from './hang-diagnostics.js';
 
 /**
@@ -25,9 +25,17 @@ describe('privileged hang probe host proofs', () => {
       const listed = await Promise.race([once(probe.stdout, 'data').then(() => true), exited.then(() => false)]);
       expect(listed, `sudo -n ${command} ended before listing: ${stderr}`).toBe(true);
       if (probe.pid === undefined) throw new Error('sudo has no pid');
+      // What sudo runs as root, its lsof included: recorded while sudo still holds it as its own.
+      const commands = (await processTree([probe.pid])).filter((entry) => entry.pid !== probe.pid);
+      expect(
+        commands.some((entry) => entry.command.includes('lsof')),
+        `no lsof under sudo: ${JSON.stringify(commands)}`,
+      ).toBe(true);
       stopProbe('sudo', probe.pid);
       await exited;
-      const left = (await processTable()).filter((entry) => entry.command.trim() === command);
+      const left = (await processesOf(commands.map((entry) => entry.pid))).filter(
+        (entry) => !entry.stat.startsWith('Z'),
+      );
       expect(left, 'root lsof rows left after sudo exited').toEqual([]);
     } finally {
       probe.stdout.destroy();

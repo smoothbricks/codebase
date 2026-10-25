@@ -20,7 +20,7 @@ import { Watcher, WorkspaceContext } from 'nx/src/native/index.js';
 import { globWithWorkspaceContextSync, resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
-import { awaitExit, processTable, terminate } from './testing.js';
+import { awaitExit, processesOf, terminate } from './testing.js';
 
 const repositoryRoot = join(import.meta.dir, '../../..');
 const lintScript = join(repositoryRoot, 'tooling/lint-dot-inputs.ts');
@@ -266,7 +266,7 @@ it('preserves tracked input hashes and the graph while dot staging never causes 
     ) {
       throw new Error('the graph proof did not start its owned daemon');
     }
-    const beforeProcesses = (await processTable()).filter(({ pid }) => pid === previous.processId);
+    const beforeProcesses = await processesOf([previous.processId]);
     await writeFile(join(root, '.nxignore'), nxignore);
     // Let the old startup ignore snapshot retire before requesting the new graph.
     await awaitExit(beforeProcesses, 'the daemon whose ignore policy changed');

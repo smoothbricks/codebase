@@ -7,7 +7,7 @@ import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, stopFixtureNxDaemon, withNxFixture } from './__tests__/fixture-nx-env.js';
-import { awaitExit, isRunning, processTable, terminate } from './testing.js';
+import { awaitExit, isRunning, processesOf, terminate } from './testing.js';
 
 /**
  * Guards the `NX_DAEMON_START=never` hunks of `patches/nx@23.2.1.patch`. A stock client that finds no live daemon
@@ -247,7 +247,7 @@ it('the NX_DAEMON_START=never daemon states walk one fixture', async () => {
 
     // A record whose daemon has gone (killed, so it never cleared its record) is no daemon to use and no reason to
     // start one.
-    const killed = (await processTable()).filter((entry) => entry.pid === daemon);
+    const killed = await processesOf([daemon]);
     terminate(daemon, 'SIGKILL');
     await awaitExit(killed, 'the killed fixture daemon');
     showProjects(workspace, never, `${cases.never}: dead record`);

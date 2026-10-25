@@ -23,7 +23,7 @@ import { useTestSpan } from '@smoothbricks/lmao/testing/bun';
 import { whenChanged } from '../../__tests__/path-change.js';
 import { standInCowshed } from '../../__tests__/stand-in-cowshed.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
-import { pidsWorkingIn, terminate } from '../../testing.js';
+import { terminate } from '../../testing.js';
 import { cowshedSubtreeOwner, type SubtreeOwner, type SubtreeRetirement } from './owned-subtree.js';
 import {
   ARCHIVES_KEPT,
@@ -401,7 +401,6 @@ async function nativeRamVolume(): Promise<void> {
     try {
       // Ends on the watch event that creates the writer's `w1` in the lease, not on a poll.
       await whenChanged(leaseB.directory, () => existsSync(join(leaseB.directory, 'w1')));
-      expect(await pidsWorkingIn(leaseB.directory)).toContain(bystander.pid ?? 0);
       const fourth = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid));
       const d = await fourth.acquire(subtrees);
       if (!d.ok || d.value.kind !== 'leased') {

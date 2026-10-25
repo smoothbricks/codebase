@@ -13,7 +13,6 @@ import {
   processGroupHasMembers,
   signalProcessGroup,
 } from '../../process-group.js';
-import { censusDiagnostic } from '../../testing.js';
 
 import {
   CPU_POOL_ENV,
@@ -551,8 +550,7 @@ export async function runBoundedExec(
           appendStderr(`RAM temp volume: lease ${retained}\n`);
         }
       } else if (released) {
-        const left = await censusDiagnostic(held.directory);
-        appendStderr(`${describeRamTempError(released.error)}\n${left === null ? '' : `${left}\n`}`);
+        appendStderr(`${describeRamTempError(released.error)}\n`);
       }
     })();
     return tempReleased;

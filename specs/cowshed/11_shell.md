@@ -828,8 +828,10 @@ version without changing the birth. Signalling still reads the current unique-id
 version-bound permission check. Every native read failure, including EPERM, remains an error, never absence.
 
 Linux currently returns typed `FoldUnavailable`: whole-job cgroup membership is not retained per-command ancestry. The
-caller takes no RAM lease and reports that fact, just as on a no-supervisor runner. A cwd/TMPDIR census remains a
-failure-only diagnostic; it cannot signal processes, refuse a gate, or become a fallback ownership authority.
+caller takes no RAM lease and reports that fact, just as on a no-supervisor runner. No census of working directories or
+`TMPDIR` stands in, not even as a failure diagnostic: it asks every process of the user, and one caught in an
+uninterruptible kernel wait holds it there (measured 2026-10-25: `lsof -d cwd` slept 77.8 s on a `cowshed fork`'s first
+write to its build image). A diagnostic names only what its caller started, walking down from those pids.
 
 #### Separate unit: Linux per-command cgroup admission (LINUX-COMMAND-CGROUP)
 

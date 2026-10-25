@@ -15,7 +15,7 @@ import typia from 'typia';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { whenFound } from './__tests__/path-change.js';
-import { awaitExit, isRunning, type ProcessEntry, processTable, terminate, withDescendants } from './testing.js';
+import { awaitExit, isRunning, type ProcessEntry, processesOf, processTree, terminate } from './testing.js';
 
 /**
  * Guards the event-driven validity hunk of `patches/nx@23.2.1.patch` (upstream nrwl/nx#37113, fixing nrwl/nx#37112).
@@ -257,8 +257,8 @@ async function linkedPluginCheckout(root: string, name: string): Promise<LinkedP
 }
 
 async function processEntry(pid: number): Promise<ProcessEntry> {
-  const entry = (await processTable()).find((candidate) => candidate.pid === pid);
-  if (entry === undefined) throw new Error(`process ${pid} is not in the process table`);
+  const [entry] = await processesOf([pid]);
+  if (entry === undefined) throw new Error(`process ${pid} no longer exists`);
   return entry;
 }
 
@@ -368,9 +368,9 @@ async function watchUntil<T>(
 
 /** Capture the expected holder and the current record before fixture retirement removes the evidence. */
 async function daemonDiagnostics(workspace: string, expectedPid: number): Promise<string> {
-  const [record, table] = await Promise.all([daemonRecord(workspace), processTable()]);
-  const expected = table.find(({ pid }) => pid === expectedPid);
-  const processes = withDescendants(table, record === null ? [expectedPid] : [expectedPid, record.processId]);
+  const record = await daemonRecord(workspace);
+  const processes = await processTree(record === null ? [expectedPid] : [expectedPid, record.processId]);
+  const expected = processes.find(({ pid }) => pid === expectedPid);
   const logPath = join(dirname(recordPath(workspace)), 'daemon.log');
   let log: string;
   try {
@@ -380,7 +380,7 @@ async function daemonDiagnostics(workspace: string, expectedPid: number): Promis
   }
   return [
     `workspace ${workspace}; expected daemon pid ${expectedPid}: ${
-      expected === undefined ? 'absent from process table' : `state=${expected.stat} command=${expected.command}`
+      expected === undefined ? 'no longer running' : `state=${expected.stat} command=${expected.command}`
     }`,
     `current daemon record ${JSON.stringify(record)}`,
     `daemon processes ${JSON.stringify(processes)}`,

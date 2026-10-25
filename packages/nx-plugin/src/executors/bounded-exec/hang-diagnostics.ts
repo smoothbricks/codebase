@@ -159,7 +159,7 @@ export function captureHangDiagnostics(
       return result;
     };
     const census = async (name: string): Promise<ObservedProcess[] | null> => {
-      // Bare `ps`, resolved through PATH like testing.ts's processTable: NixOS has no /bin/ps.
+      // Bare `ps`, resolved through PATH like testing.ts's processesOf: NixOS has no /bin/ps.
       const result = await probe(name, 'ps', ['-A', '-o', PS_FIELDS], CENSUS_LIMIT_MS);
       if (finished) return null;
       if (result.status !== 'exited' || result.code !== 0) {

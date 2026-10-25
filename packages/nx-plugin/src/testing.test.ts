@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, symlink, wri
 import { createConnection, createServer, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import fc from 'fast-check';
 import { fixtureNxEnv, nxFixtureRoot, withNxFixture } from './__tests__/fixture-nx-env.js';
 import {
   awaitExit,
@@ -16,12 +17,14 @@ import {
   ownedFixtureRoot,
   ownedWorkspaceSocketDirectory,
   type ProcessEntry,
-  processTable,
+  processesOf,
+  processTree,
   publishFixtureSocketDirectory,
   retireFixtureSocketDirectory,
   socketNamespace,
   stopNxDaemon,
   terminate,
+  walkTree,
   withDescendants,
 } from './testing.js';
 
@@ -61,8 +64,8 @@ async function startDaemon(
 
 /** Which of `processes` still run, zombies (already exited) aside. */
 async function stillRunning(processes: readonly ProcessEntry[]): Promise<string[]> {
-  const live = (await processTable()).filter((entry) => !entry.stat.startsWith('Z')).map((entry) => entry.pid);
-  return processes.filter((entry) => live.includes(entry.pid)).map((entry) => `${entry.pid} ${entry.command}`);
+  const listed = await processesOf(processes.map((entry) => entry.pid));
+  return listed.filter((entry) => !entry.stat.startsWith('Z')).map((entry) => `${entry.pid} ${entry.command}`);
 }
 
 it('lists a process once when it descends from another of the pids it is asked about', () => {
@@ -81,28 +84,85 @@ it('lists a process once when it descends from another of the pids it is asked a
   ).toEqual([10, 11, 12]);
 });
 
-it('finds its Darwin working-directory holder without system sbin on PATH', async () => {
-  if (process.platform !== 'darwin') return;
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'cwd-restricted-path-')));
+it('walks the children it is given down from its roots, each pid once and roots first', async () => {
+  // 13 lists 10 as its child: a reused pid, which must end the walk rather than loop it.
+  const children = new Map<number, number[]>([
+    [10, [11, 12]],
+    [11, [13]],
+    [12, []],
+    [13, [10]],
+  ]);
+  const asked: number[][] = [];
+  const walked = await walkTree([10, 10, 11], async (parents) => {
+    asked.push([...parents]);
+    return parents.flatMap((pid) => children.get(pid) ?? []);
+  });
+  expect(walked).toEqual([10, 11, 12, 13]);
+  // Each generation asks only for the pids it added, and none is asked about twice.
+  expect(asked).toEqual([
+    [10, 11],
+    [12, 13],
+  ]);
+  // A root that no longer runs has no children, and is kept for whoever reads the processes to drop.
+  expect(await walkTree([99], async () => [])).toEqual([99]);
+  expect(await walkTree([], async () => [1])).toEqual([]);
+});
+
+it('walks exactly the processes a table says descend from its roots', async () => {
+  // A forest: each pid's parent is a lower pid or none, as a process table's parent links are.
+  const forest = fc
+    .array(fc.nat(), { minLength: 1, maxLength: 40 })
+    .map((links) => links.map((link, index) => ({ pid: index + 1, ppid: link % (index + 1) })));
+  await fc.assert(
+    fc.asyncProperty(forest, fc.array(fc.nat(), { maxLength: 5 }), async (rows, picks) => {
+      const table: ProcessEntry[] = rows.map((row) => ({ ...row, stat: 'S', command: `p${row.pid}` }));
+      const roots = picks.map((pick) => (pick % rows.length) + 1);
+      const walked = await walkTree(roots, async (parents) =>
+        table.filter((entry) => parents.includes(entry.ppid)).map((entry) => entry.pid),
+      );
+      expect(new Set(walked).size).toBe(walked.length);
+      expect([...walked].sort((a, b) => a - b)).toEqual(
+        withDescendants(table, roots)
+          .map((entry) => entry.pid)
+          .sort((a, b) => a - b),
+      );
+    }),
+  );
+});
+
+it('lists a spawned tree from its root, leaving its parent and siblings out', async () => {
+  const sibling = Bun.spawn(['sleep', '600'], { stdout: 'ignore', stderr: 'ignore' });
+  const root = Bun.spawn(['sh', '-c', 'sleep 600 & echo $!; wait'], { stdout: 'pipe', stderr: 'ignore' });
+  let grandchild = 0;
   try {
-    const child = Bun.spawn(
-      [
-        process.execPath,
-        '-e',
-        `import { pidsWorkingIn } from ${JSON.stringify(join(import.meta.dir, 'testing.ts'))};
-console.log(JSON.stringify(await pidsWorkingIn(process.cwd())));`,
-      ],
-      { cwd: root, env: { ...process.env, PATH: '/usr/bin:/bin' }, stdout: 'pipe', stderr: 'pipe' },
-    );
-    const [code, stdout, stderr] = await Promise.all([
-      child.exited,
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
+    const reader = root.stdout.getReader();
+    const decoder = new TextDecoder();
+    let output = '';
+    while (!output.includes('\n')) {
+      const next = await reader.read();
+      if (next.done) throw new Error(`the tree's root exited before it named its child: ${output}`);
+      output += decoder.decode(next.value);
+    }
+    reader.releaseLock();
+    grandchild = Number(output.trim());
+    const tree = await processTree([root.pid]);
+    expect(tree.map((entry) => [entry.pid, entry.ppid])).toEqual([
+      [root.pid, process.pid],
+      [grandchild, root.pid],
     ]);
-    expect(code, stderr).toBe(0);
-    expect(JSON.parse(stdout)).toContain(child.pid);
+    const own = (await processTree([process.pid])).map((entry) => entry.pid);
+    expect(own[0]).toBe(process.pid);
+    expect(own).toEqual(expect.arrayContaining([sibling.pid, root.pid, grandchild]));
+    // Only the named processes are read, and one that has gone is not listed.
+    expect((await processesOf([sibling.pid])).map((entry) => entry.command)).toEqual(['sleep 600']);
+    sibling.kill('SIGKILL');
+    await sibling.exited;
+    expect(await processesOf([sibling.pid])).toEqual([]);
   } finally {
-    await rm(root, { recursive: true });
+    sibling.kill('SIGKILL');
+    if (grandchild > 0) terminate(grandchild, 'SIGKILL');
+    root.kill('SIGKILL');
+    await Promise.all([sibling.exited, root.exited]);
   }
 });
 
@@ -180,7 +240,7 @@ it('stops a recorded daemon and its tree, and signals nothing it finds only by c
           // The worker was in the daemon's tree before the stop, so stopNxDaemon ended it.
           const worker = Number(await readFile(workerFile, 'utf8'));
           // A zombie has exited already; a signal probe would still count it as running.
-          const live = (await processTable()).filter((entry) => entry.pid === worker && !entry.stat.startsWith('Z'));
+          const live = (await processesOf([worker])).filter((entry) => !entry.stat.startsWith('Z'));
           expect(live).toEqual([]);
         }
       } finally {
@@ -195,7 +255,7 @@ it('stops a recorded daemon and its tree, and signals nothing it finds only by c
             terminate(pid);
           }
         }
-        await awaitExit(withDescendants(await processTable(), owned), `orphan probe of ${workspace}`);
+        await awaitExit(await processTree(owned), `orphan probe of ${workspace}`);
       }
     }
   });

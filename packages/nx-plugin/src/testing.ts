@@ -10,13 +10,19 @@
  * `<parent>/smoothbricks-fixtures/<suite>/run-<pid>`, where the caller names
  * the parent: the temp directory, or the directory of a volume the fixture has
  * to lie on. A process that gets SIGTERM, SIGINT or SIGHUP (a bounded test
- * leg's timeout sends SIGTERM, and SIGKILL 10 s later) first stops whatever
- * still works in every run it holds, then dies of that signal. One killed
- * outright cannot, so the first fixture a process creates for a suite under a
- * parent reclaims every run of that suite there whose owner is gone: each
- * process working in it is stopped, then the run is deleted. A run whose owner
- * still exists is never touched by another process, so nothing outside a dead
- * or dying run of the same suite is ever signalled.
+ * leg's timeout sends SIGTERM, and SIGKILL 10 s later) first names its own
+ * descendants that still run and deletes every run it holds, then dies of that
+ * signal. One killed outright cannot, so the first fixture a process creates
+ * for a suite under a parent deletes every run of that suite there whose owner
+ * is gone. A run whose owner still exists is never touched by another process.
+ * Nothing is signalled for working in a run: what a fixture left running is
+ * ended by the job's supervisor with the test command's subtree (bounded-exec).
+ *
+ * No helper here reads a process it was not given. Each starts from pids its
+ * caller holds (a child it spawned, a daemon's record, this process) and walks
+ * down their children, never across the host's process table: any process of
+ * the user caught in an uninterruptible kernel wait holds a reader of its
+ * files or arguments there with it.
  *
  * The module also says where a fixture's sockets and loopback listeners may
  * live, because a Cowshed sandbox admits only its own: a Unix socket under its
@@ -24,22 +30,21 @@
  * literal `/tmp/x.sock` or a port-0 listener still binds there, and then no
  * process of the workspace can reach it (specs/cowshed/04_sandbox.md).
  *
- * Node APIs and the library's public workspace-root finder only: this module
- * is built with the library and imported by Bun tests in other packages.
+ * Node APIs and the library's own modules only: this module is built with the
+ * library and imported by Bun tests in other packages.
  */
-import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { lstatSync, readlinkSync, realpathSync, statSync } from 'node:fs';
 import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:net';
-import { tmpdir, userInfo } from 'node:os';
+import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, sep } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { promisify } from 'node:util';
 import { findNxWorkspaceRoot } from './ensure-built.js';
+import { childPids } from './process-children.js';
+import { listing } from './process-listing.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from './test-backstop.js';
 
-const run = promisify(execFile);
 /**
  * How long a stopped process may take to exit when no caller names a grace: the leg's no-progress backstop
  * (specs/cowshed/08_testing.md), so the exit itself decides and a hung one is the leg's to report. A smaller literal
@@ -60,22 +65,70 @@ export interface ProcessEntry {
   readonly command: string;
 }
 
-/** Every process on the host, as `ps` lists it on macOS and Linux alike. */
-export async function processTable(): Promise<ProcessEntry[]> {
-  const { stdout } = await run('ps', ['-A', '-o', 'pid=', '-o', 'ppid=', '-o', 'stat=', '-o', 'command='], {
-    maxBuffer: 64 * 1024 * 1024,
-  });
+/**
+ * The processes among `pids` that still exist, zombies included, as `ps -p` lists them on macOS and Linux alike, in
+ * `ps`'s order. Only the named processes are read.
+ */
+export async function processesOf(pids: readonly number[]): Promise<ProcessEntry[]> {
+  if (pids.length === 0) {
+    return [];
+  }
+  const stdout = await listing('ps', [
+    '-o',
+    'pid=',
+    '-o',
+    'ppid=',
+    '-o',
+    'stat=',
+    '-o',
+    'command=',
+    '-p',
+    pids.join(','),
+  ]);
   return stdout
     .split('\n')
     .filter((line) => line.trim() !== '')
     .map((line) => {
-      const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s?(.*)$/.exec(line);
+      const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s*(.*)$/.exec(line);
       if (match === null) {
         throw new Error(`Unable to parse ps line: ${line}`);
       }
       const [, pid, ppid, stat, command] = match;
       return { pid: Number(pid), ppid: Number(ppid), stat: stat ?? '', command: command ?? '' };
     });
+}
+
+/**
+/**
+ * `roots` and every process descending from one, each once, in the order found: generation by generation, each the
+ * children `children` lists for the pids the one before added. A pid already found is not walked again, so a reused
+ * pid listed as a child of its own descendant ends the walk instead of looping it. The walk reads nothing but
+ * `children`, and keeps a root that no longer runs: whoever reads the processes drops it.
+ */
+export async function walkTree(
+  roots: readonly number[],
+  children: (parents: readonly number[]) => Promise<readonly number[]>,
+): Promise<number[]> {
+  const found = new Set<number>();
+  for (let generation = roots; generation.length > 0; ) {
+    const added = [...new Set(generation)].filter((pid) => !found.has(pid));
+    for (const pid of added) {
+      found.add(pid);
+    }
+    generation = added.length === 0 ? [] : await children(added);
+  }
+  return [...found];
+}
+
+/**
+ * The processes of `roots` that still exist and every process descending from one, roots first, in the order
+ * {@link walkTree} found them. Only those processes are read. A child forked after its parent's children were listed,
+ * or reparented away before, is not in it.
+ */
+export async function processTree(roots: readonly number[]): Promise<ProcessEntry[]> {
+  const order = await walkTree(roots, childPids);
+  const listed = new Map((await processesOf(order)).map((entry) => [entry.pid, entry]));
+  return order.flatMap((pid) => listed.get(pid) ?? []);
 }
 
 /**
@@ -143,7 +196,9 @@ export async function awaitExit(
     if (performance.now() > deadline) {
       // A signal probe also answers for a zombie, which has already exited.
       const live = new Set(
-        (await processTable()).filter((entry) => !entry.stat.startsWith('Z')).map((entry) => entry.pid),
+        (await processesOf(waiting.map((entry) => entry.pid)))
+          .filter((entry) => !entry.stat.startsWith('Z'))
+          .map((entry) => entry.pid),
       );
       const survivors = waiting.filter((entry) => live.has(entry.pid));
       if (survivors.length === 0) {
@@ -158,140 +213,23 @@ export async function awaitExit(
   }
 }
 
-/** Every process of this user whose working directory is `root` or lies beneath it, deleted or not. */
-export async function pidsWorkingIn(root: string): Promise<number[]> {
-  const under = (cwd: string) => cwd === root || cwd.startsWith(`${root}/`);
-  switch (process.platform) {
-    case 'linux': {
-      const found: number[] = [];
-      for (const pid of (await readdir('/proc')).filter((name) => /^\d+$/.test(name))) {
-        const cwd = await readlink(`/proc/${pid}/cwd`).catch((error: unknown) => {
-          // Another user's process, or one that exited since the listing.
-          if (errorCode(error) === 'EACCES' || errorCode(error) === 'ENOENT' || errorCode(error) === 'ESRCH') {
-            return null;
-          }
-          throw error;
-        });
-        if (cwd !== null && under(cwd.replace(/ \(deleted\)$/, ''))) {
-          found.push(Number(pid));
-        }
-      }
-      return found;
-    }
-    case 'darwin': {
-      // lsof keeps naming a working directory after it has been deleted. It
-      // exits 1 when a listed process vanished before it was read; what it
-      // printed for the rest is still the answer.
-      const fields = await run('/usr/sbin/lsof', ['-nP', '-a', '-d', 'cwd', '-u', String(userInfo().uid), '-Fpn'], {
-        maxBuffer: 64 * 1024 * 1024,
-      }).then(
-        ({ stdout }) => stdout,
-        (error: unknown) => {
-          if (error instanceof Error && 'code' in error && error.code === 1 && 'stdout' in error) {
-            return String(error.stdout);
-          }
-          throw error;
-        },
-      );
-      const found: number[] = [];
-      let pid = 0;
-      for (const line of fields.split('\n')) {
-        if (line.startsWith('p')) {
-          pid = Number(line.slice(1));
-        } else if (line.startsWith('n') && under(line.slice(1))) {
-          found.push(pid);
-        }
-      }
-      return found;
-    }
-    default:
-      throw new Error(`No working-directory scan for ${process.platform}`);
-  }
-}
-
 /**
- * Every process of this user started with `TMPDIR` set to `root` or beneath it. Such a process
- * writes there whatever its working directory: a ttsc plugin build copies its Go sources into
- * `$TMPDIR` from a process working in its project, and Node and Bun write their compile cache
- * there on the way out. The environment is the one the process was started with, which is the
- * one its children inherit unless it changed it for them.
+ * This process's descendants that still run, as text for a failure report about `subject`, or null when none does.
+ * A process is named as this process's own, never for where it works, and no caller signals anything on its word: a
+ * process is ended by the owner that started it, the supervisor's observed tree (specs/cowshed/11_shell.md, "Process
+ * identity and signal ownership"). One reparented away when its parent exited is no longer this process's to see. A
+ * listing that cannot be read says so instead of failing the report it serves.
  */
-export async function pidsWithTempIn(root: string): Promise<number[]> {
-  // The value as it follows `TMPDIR=`: `root` itself, with or without its trailing slash, or below it.
-  const names = (value: string) => value.startsWith(root) && ['', '/', ' '].includes(value.charAt(root.length));
-  switch (process.platform) {
-    case 'linux': {
-      const found: number[] = [];
-      for (const pid of (await readdir('/proc')).filter((name) => /^\d+$/.test(name))) {
-        const environ = await readFile(`/proc/${pid}/environ`, 'utf8').catch((error: unknown) => {
-          // Another user's process, or one that exited since the listing.
-          if (errorCode(error) === 'EACCES' || errorCode(error) === 'ENOENT' || errorCode(error) === 'ESRCH') {
-            return null;
-          }
-          throw error;
-        });
-        const entry = environ?.split('\0').find((variable) => variable.startsWith('TMPDIR='));
-        if (entry !== undefined && names(entry.slice('TMPDIR='.length))) {
-          found.push(Number(pid));
-        }
-      }
-      return found;
-    }
-    case 'darwin': {
-      // `ps -E` follows each command line with the environment it was started with, as words
-      // separated by spaces, and only for this user's processes. A word `TMPDIR=<root>` is matched
-      // with what follows it in that word, so a root containing a space is still found whole. An
-      // argument spelled `TMPDIR=<root>` names the same directory and counts too: an `env` that
-      // sets it is about to run something there. `/bin/ps` by path: a procps `ps` has no `-E`.
-      const { stdout } = await run('/bin/ps', ['-E', '-ww', '-U', String(userInfo().uid), '-o', 'pid=,command='], {
-        maxBuffer: 256 * 1024 * 1024,
-      });
-      const token = ` TMPDIR=${root}`;
-      const found: number[] = [];
-      for (const line of stdout.split('\n')) {
-        const row = /^\s*(\d+) (.*)$/.exec(line);
-        if (row === null) {
-          continue;
-        }
-        const words = ` ${row[2]}`;
-        for (let at = words.indexOf(token); at !== -1; at = words.indexOf(token, at + 1)) {
-          if (names(words.slice(at + ' TMPDIR='.length))) {
-            found.push(Number(row[1]));
-            break;
-          }
-        }
-      }
-      return found;
-    }
-    default:
-      throw new Error(`No TMPDIR scan for ${process.platform}`);
-  }
-}
-
-/**
- * What the host census still finds working in `directory`, as text for a failure report, or null
- * when it finds nothing. A process is named because its working directory or the `TMPDIR` it was
- * started with lies there, which proves nothing about whose it is, so no caller signals anything
- * on its word: a process is ended by the owner that started it, the supervisor's observed tree
- * (specs/cowshed/11_shell.md, "Process identity and signal ownership"). A census that cannot be
- * read says so instead of failing the report it serves.
- */
-export async function censusDiagnostic(directory: string): Promise<string | null> {
+export async function descendantsDiagnostic(subject: string): Promise<string | null> {
   try {
-    const [working, temp, table] = await Promise.all([
-      pidsWorkingIn(directory),
-      pidsWithTempIn(directory),
-      processTable(),
-    ]);
-    const pids = new Set([...working, ...temp]);
-    const named = table
-      .filter((entry) => pids.has(entry.pid) && entry.pid !== process.pid && !entry.stat.startsWith('Z'))
+    const named = (await processTree([process.pid]))
+      .filter((entry) => entry.pid !== process.pid && !entry.stat.startsWith('Z'))
       .map((entry) => `${entry.pid} (${entry.command.slice(0, 160)})`);
     return named.length === 0
       ? null
-      : `the host census names ${named.join(', ')} working in ${directory} (diagnostic only: nothing was signalled)`;
+      : `descendants of this process still run at ${subject}: ${named.join(', ')} (diagnostic only: nothing was signalled)`;
   } catch (error) {
-    return `the host census of ${directory} could not be read: ${error instanceof Error ? error.message : String(error)}`;
+    return `descendants of this process at ${subject} could not be listed: ${error instanceof Error ? error.message : String(error)}`;
   }
 }
 
@@ -322,7 +260,7 @@ export async function nxDaemonProcesses(workspace: string): Promise<ProcessEntry
   ) {
     throw new Error(`Nx daemon record ${record} names no process id`);
   }
-  return withDescendants(await processTable(), [parsed.processId]);
+  return processTree([parsed.processId]);
 }
 
 /**
@@ -334,36 +272,25 @@ export async function nxDaemonProcesses(workspace: string): Promise<ProcessEntry
  * spawned to end on its own: plugin workers once they see it gone, the editor
  * extension probe it starts at launch never. Those get SIGTERM with it, the
  * ones it started while it was stopping included: the daemon's own record
- * names the root, and the process table its descendants. A child that
+ * names the root, and the walk down its children the rest. A child that
  * outlives the daemon is reparented and leaves that tree; it stays in the
  * tree the job's supervisor observes, which ends it with the test command's
- * subtree (bounded-exec), so here the census only names it. A missing record
- * can mean startup has not published it yet: the daemon-stop command is
- * skipped, and the census still reports. Nx opens the daemon's log,
- * `d/daemon.log`, before it spawns any daemon, so a workspace without one
- * never started a daemon and has nothing of one to name: the census, a host
- * process scan, is skipped for it.
+ * subtree (bounded-exec). A missing record can mean startup has not published
+ * it yet: then nothing is stopped here.
  */
 export async function stopNxDaemon(workspace: string, stop: () => Promise<void>): Promise<void> {
   const [daemon, ...before] = await nxDaemonProcesses(workspace);
-  if (daemon !== undefined) {
-    await stop();
-    const known = new Set([daemon.pid, ...before.map((entry) => entry.pid)]);
-    const after = withDescendants(await processTable(), [daemon.pid]).filter((entry) => !known.has(entry.pid));
-    const spawned = [...before, ...after];
-    for (const entry of spawned) {
-      terminate(entry.pid);
-    }
-    await awaitExit([daemon, ...spawned], `Nx daemon of ${workspace}`);
-  } else if (
-    lstatSync(join(workspace, '.nx', 'workspace-data', 'd', 'daemon.log'), { throwIfNoEntry: false }) === undefined
-  ) {
+  if (daemon === undefined) {
     return;
   }
-  const left = await censusDiagnostic(workspace);
-  if (left !== null) {
-    process.stderr.write(`Nx processes of ${workspace}: ${left}\n`);
+  await stop();
+  const known = new Set([daemon.pid, ...before.map((entry) => entry.pid)]);
+  const after = (await processTree([daemon.pid])).filter((entry) => !known.has(entry.pid));
+  const spawned = [...before, ...after];
+  for (const entry of spawned) {
+    terminate(entry.pid);
   }
+  await awaitExit([daemon, ...spawned], `Nx daemon of ${workspace}`);
 }
 
 /**
@@ -443,17 +370,20 @@ function ownRunSignals(): void {
  * open failed included, and one failing cuts no other short; each failure is
  * written to stderr with the suite directory of its run. A repeated signal
  * meets a handler, not the default, so it waits for this and neither starts a
- * second reclaim nor kills the first. That wait is the reclaim's own: for each
- * run, after any sweep it was still opening with, the census report and the
- * delete. What a fixture left running is ended by the job's supervisor with the
- * test command's subtree (bounded-exec), not here. A bounded test leg's SIGKILL
- * ends this whatever it is.
+ * second reclaim nor kills the first. That wait is the reclaim's own: the
+ * report of this process's descendants still running, then for each run, after
+ * any sweep it was still opening with, the delete. What a fixture left running
+ * is ended by the job's supervisor with the test command's subtree
+ * (bounded-exec), not here. A bounded test leg's SIGKILL ends this whatever it
+ * is.
  */
 async function retireRuns(signal: NodeJS.Signals): Promise<void> {
+  const left = await descendantsDiagnostic(`its ${signal}`);
+  if (left !== null) {
+    process.stderr.write(`reclaiming this process's fixture runs: ${left}\n`);
+  }
   const runs = [...runDirectories];
-  const outcomes = await Promise.allSettled(
-    runs.map(async ([, opened]) => reclaimRun(await opened, 'signalled fixture run')),
-  );
+  const outcomes = await Promise.allSettled(runs.map(async ([, opened]) => reclaimRun(await opened)));
   for (const [index, outcome] of outcomes.entries()) {
     if (outcome.status === 'rejected') {
       const reason = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
@@ -511,31 +441,14 @@ async function reclaimDeadRuns(suiteDirectory: string): Promise<void> {
   }
   try {
     for (const directory of dead) {
-      await reclaimRun(directory, 'dead fixture run');
+      await reclaimRun(directory);
     }
   } finally {
     await rm(lock, { force: true });
   }
 }
 
-async function reclaimRun(directory: string, owner: string): Promise<void> {
-  const roots = await readdir(directory).catch((error: unknown) => {
-    if (errorCode(error) === 'ENOENT') {
-      return null;
-    }
-    throw error;
-  });
-  if (roots === null) {
-    return;
-  }
-  // A fixture deletes its root only once its daemon has stopped, so an emptied
-  // run needs no report.
-  if (roots.length > 0) {
-    const left = await censusDiagnostic(directory);
-    if (left !== null) {
-      process.stderr.write(`reclaiming ${owner} ${directory}: ${left}\n`);
-    }
-  }
+async function reclaimRun(directory: string): Promise<void> {
   // A killed fixture may never have reached its own alias retirement, and its
   // workspace may be gone. The alias is its own record: one whose target is the
   // socket state of a workspace in this reclaimed run, and whose name is that

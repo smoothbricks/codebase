@@ -22,7 +22,7 @@ import { onProgressClock } from '../../__tests__/progress-clock.js';
 import { type StandInMode, standInCowshed } from '../../__tests__/stand-in-cowshed.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { processGroupHasMembers } from '../../process-group.js';
-import { ownedSocketDirectory, pidsWorkingIn, processTable } from '../../testing.js';
+import { ownedSocketDirectory, processesOf } from '../../testing.js';
 import { CPU_POOL_ENV, type CpuPool, createCpuPool, type InheritedCpuPool, readInheritedCpuPool } from './cpu-pool.js';
 import { CPU_TOKENS_ENV, type CpuBudget, gatewayCpuBudget, type TokenGrant } from './cpu-tokens.js';
 import {
@@ -1149,7 +1149,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(volume.order[1]).toBe(`release ${directory}`);
   });
 
-  it("retires only the command's own subtree: a bystander working in its directory, which the census named, survives", async () => {
+  it("retires only the command's own subtree: a bystander working in its directory survives", async () => {
     const workspace = await createWorkspace();
     const leftover = join(workspace.root, 'leftover.pid');
     // No task started it; it only works where the command works, as an editor, an indexer or another job's process can.
@@ -1157,8 +1157,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const bystanderExited = once(bystander, 'exit');
     try {
       const bystanderPid = bystander.pid ?? 0;
-      // Before: the census that used to decide what a command's end killed names the bystander with the command's own.
-      expect(await pidsWorkingIn(workspace.root)).toContain(bystanderPid);
 
       const result = await runBoundedExec(
         { command: `sleep 600 & echo $! > ${leftover}`, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
@@ -2628,8 +2626,8 @@ async function standInOwner(
 
 /** Which of `pids` still run, a zombie counting as exited: a reparented one waits on its reaper, not on anything here. */
 async function live(pids: readonly number[]): Promise<number[]> {
-  const table = await processTable();
-  return pids.filter((pid) => table.some((entry) => entry.pid === pid && !entry.stat.startsWith('Z')));
+  const listed = await processesOf(pids);
+  return pids.filter((pid) => listed.some((entry) => entry.pid === pid && !entry.stat.startsWith('Z')));
 }
 
 function captureWrite(chunks: string[], onChunk?: (text: string) => void): typeof process.stdout.write {

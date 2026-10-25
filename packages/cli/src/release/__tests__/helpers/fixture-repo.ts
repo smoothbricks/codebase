@@ -7,12 +7,11 @@ import {
   awaitExit,
   fixtureSocketDirectory,
   ownedFixtureRoot,
-  processTable,
+  processTree,
   publishFixtureSocketDirectory,
   retireFixtureSocketDirectory,
   stopNxDaemon,
   terminate,
-  withDescendants,
 } from '@smoothbricks/nx-plugin/testing';
 import { decode, printCommandOutput } from '../../../lib/run.js';
 import type { GitReleaseTagInfo } from '../../core.js';
@@ -117,7 +116,7 @@ export async function withFixtureRepo(fn: (root: string) => Promise<void>): Prom
 function retireFixture(fixture: Fixture): Promise<void> {
   fixture.retirement ??= (async () => {
     liveFixtures.delete(fixture);
-    const clients = withDescendants(await processTable(), [...fixture.clients]);
+    const clients = await processTree([...fixture.clients]);
     for (const client of clients) {
       terminate(client.pid);
     }

@@ -7,8 +7,7 @@ import {
   fixtureSocketDirectory,
   nxDaemonProcesses,
   ownedFixtureRoot,
-  pidsWorkingIn,
-  processTable,
+  processesOf,
   publishFixtureSocketDirectory,
   reclaimDeadFixtureRuns,
   retireFixtureSocketDirectory,
@@ -185,12 +184,10 @@ describe('release planning with fixture git repositories', () => {
   });
 
   it('leaves no process of its Nx daemon running once the fixture retires, though its body threw', async () => {
-    let fixtureRoot = '';
     let daemonPids: number[] = [];
     let daemonOwned = false;
     // The body fails with its daemon up; a body that returns retires through the same finally.
     const thrown = withFixtureRepo(async (root) => {
-      fixtureRoot = root;
       await writeWorkspace(root);
       await writeBuildablePackage(root, '@scope/a', 'packages/a');
       await runFixtureNx(root, ['show', 'projects'], FIXTURE_STARTS_ITS_OWN_DAEMON);
@@ -203,18 +200,18 @@ describe('release planning with fixture git repositories', () => {
     await expect(thrown).rejects.toThrow('the fixture body failed on purpose');
     // Ownership proves a live fixture daemon existed; Nx may run its plugins in-process.
     expect(daemonOwned).toBe(true);
-    expect(await survivors(fixtureRoot, daemonPids)).toEqual([]);
+    expect(await survivors(daemonPids)).toEqual([]);
   });
 
   it('stops the Nx daemon of a fixture whose test finished without its body', async () => {
-    const { root, pids } = await abandonFixture(`
+    const { pids } = await abandonFixture(`
       await runFixtureNx(root, ['show', 'projects'], FIXTURE_STARTS_ITS_OWN_DAEMON);
       const daemon = await nxDaemonProcesses(root);
       if (!(await fixtureDaemonOwnedBy(daemon[0]?.pid ?? 0, root))) throw new Error('not the fixture daemon');
       console.log('ABANDONED_FIXTURE_PIDS ' + daemon.map((entry) => entry.pid).join(' '));
     `);
 
-    expect(await survivors(root, pids)).toEqual([]);
+    expect(await survivors(pids)).toEqual([]);
   });
 
   it('stops an abandoned fixture nx client still starting its daemon, and that daemon', async () => {
@@ -223,15 +220,19 @@ describe('release planning with fixture git repositories', () => {
     // the client lives on in the deleted root. The client is another process
     // and its log the only signal it gives, so the body polls for it. The
     // retirement kills the client, hence the catch.
-    const { root } = await abandonFixture(`
+    const { pids } = await abandonFixture(`
       void runFixtureNx(root, ['daemon', '--start'], FIXTURE_STARTS_ITS_OWN_DAEMON).catch(() => {});
       const log = join(root, '.nx', 'workspace-data', 'd', 'daemon.log');
       while (!(existsSync(log) && readFileSync(log, 'utf8').includes('Starting new daemon server in background'))) {
         await Bun.sleep(5);
       }
+      // What this run started, the client and anything it has spawned: retiring must end each of them.
+      const tree = await processTree([process.pid]);
+      console.log('ABANDONED_FIXTURE_PIDS ' + tree.filter((entry) => entry.pid !== process.pid).map((entry) => entry.pid).join(' '));
     `);
 
-    expect(await survivors(root, [])).toEqual([]);
+    expect(pids).not.toEqual([]);
+    expect(await survivors(pids)).toEqual([]);
   });
 
   it('repairs multiple fetched remote targets from a runner clone, building each at its own checkout', async () => {
@@ -476,7 +477,7 @@ async function abandonFixture(body: string): Promise<{ root: string; pids: numbe
       `import { test } from 'bun:test';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { nxDaemonProcesses } from ${testing};
+import { nxDaemonProcesses, processTree } from ${testing};
 import {
   FIXTURE_STARTS_ITS_OWN_DAEMON,
   fixtureDaemonOwnedBy,
@@ -529,16 +530,11 @@ test('returns without its fixture body', async () => {
   }
 }
 
-/**
- * What still runs of `pids`, and every process of this user whose working
- * directory lies in `root`.
- */
-async function survivors(root: string, pids: readonly number[]): Promise<string[]> {
-  const running = (await processTable())
-    .filter((entry) => !entry.stat.startsWith('Z') && pids.includes(entry.pid))
+/** What still runs of `pids`, a zombie counting as exited. */
+async function survivors(pids: readonly number[]): Promise<string[]> {
+  return (await processesOf(pids))
+    .filter((entry) => !entry.stat.startsWith('Z'))
     .map((entry) => `${entry.pid} ${entry.command}`);
-  const working = (await pidsWorkingIn(root)).map((pid) => `${pid} works in ${root}`);
-  return [...running, ...working];
 }
 
 /**

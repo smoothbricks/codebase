@@ -117,17 +117,21 @@ allowlist. The shards of one suite must share one cwd and every argument but `--
 because the files it runs could only be guessed.
 
 Real Nx fixtures own their cache and workspace-data directories and stop their daemon before removing the fixture. The
-daemon is the process its workspace record names, and its descendants in the process table; those get SIGTERM and are
-awaited. Nothing is signalled because it works in the fixture: a host census of working directories and `TMPDIR` cannot
-tell a fixture's orphan from an editor, an indexer or another job's process there, so it decides nothing
-(`specs/cowshed/11_shell.md`, "Process identity and signal ownership"). A process that left the daemon's tree (a child
-its last act started, reparented when it exited) stays in the tree the job's supervisor observes, and is retired with
-the test command's subtree when that command ends (`bounded-exec`, below). The census only names what still works in a
-fixture on stderr (`censusDiagnostic`): after a daemon stop, when a dead run is reclaimed, and when a signalled test
-process deletes its own runs. Fixtures that intentionally strip caller directory overrides declare
-`cacheDirectory: ".nx/cache"` in their own `nx.json`; this keeps the native task database local too, rather than leaving
-a new `~/.nx/<repoKey>` behind. Offline, path-only Cargo fixtures likewise own a temporary `CARGO_HOME`; production
-commands still keep the caller's Cargo home.
+daemon is the process its workspace record names, and its descendants, found by walking down its children; those get
+SIGTERM and are awaited. Nothing is signalled because it works in the fixture: where a process works says nothing about
+whose it is (`specs/cowshed/11_shell.md`, "Process identity and signal ownership"). A process that left the daemon's
+tree (a child its last act started, reparented when it exited) stays in the tree the job's supervisor observes, and is
+retired with the test command's subtree when that command ends (`bounded-exec`, below). No fixture helper reads a
+process it was not given: each starts from pids its caller holds (a child it spawned, a daemon's record, the test
+process itself) and walks down their children (`pgrep -P` on macOS, each parent's `/proc/<pid>/task/*/children` on
+Linux), then lists exactly those with `ps -p`, each under a deadline. A census of the user's processes by working
+directory or `TMPDIR` (`lsof -d cwd`, `ps -E`) asked every one of them, and one caught in an uninterruptible kernel wait
+held the census with it: measured 2026-10-25, `lsof -d cwd` slept 77.8 s on a `cowshed fork`'s first write to its build
+image. What a signalled test process still runs of its own tree is named on stderr (`descendantsDiagnostic`) when it
+deletes its runs. Fixtures that intentionally strip caller directory overrides declare `cacheDirectory: ".nx/cache"` in
+their own `nx.json`; this keeps the native task database local too, rather than leaving a new `~/.nx/<repoKey>` behind.
+Offline, path-only Cargo fixtures likewise own a temporary `CARGO_HOME`; production commands still keep the caller's
+Cargo home.
 
 Fixture sockets and loopback listeners live where a Cowshed sandbox admits them, never at a literal `/tmp` path or on
 port 0. A fixture's short socket parent alias lives beside the Nx socket directory the job supplies (the parent of
@@ -1745,9 +1749,8 @@ lease, and that the command did not start, is in no such tree and is never signa
 nothing will retire what it leaves; a client that cannot reach the supervisor at retirement fails the run, naming why,
 and its lease is archived. Only then does the lease go. Without a supervisor socket nothing could end what the command
 leaves in a lease before it is reclaimed, so no lease is taken and the run says so
-(`RAM temp volume not leased: no cowshed supervisor owns this command's processes`). The host census of working
-directories and `TMPDIR` survives only as a diagnostic: when a lease cannot be released, it names what still works there
-and signals nothing.
+(`RAM temp volume not leased: no cowshed supervisor owns this command's processes`). A lease that cannot be released is
+reported with its error alone; no census of the user's processes names what works there.
 
 A task records its handle beside its lease (`<lease>.subtree`, on the volume, outside the command's reach) once the
 supervisor admits the command. A lease whose task died is reclaimed by the next task: it hands the recorded handle back
@@ -1845,12 +1848,12 @@ on another device refuses cleanup instead of changing an attached volume. Held l
 The real RAM-volume regression walks one volume's lifecycle in a single test: unmarked debris and a live-lease refusal,
 recovery over the debris, concurrent leases, failed-acquire lease/claim rollback, read-only cleanup, a held dead lease,
 owner detach and reclaim of that lease while a writer the dead task left still writes into it through `TMPDIR` (retired
-through its recorded handle, then archived whole, readonly tree and modes included) and a bystander works in it (named
-by the census, never signalled), beside a dead lease that recorded no handle and one whose handle another live job holds
-(kept, then reclaimed once that job ends), a later dead lease whose archive rotates the oldest out and is deleted in the
-background, a failed run's own lease archived below the half-volume floor and so deleted with every other archive, and
-the final detach. Its supervisor is a stand-in speaking the subtree verbs' wire shapes, whose tree is the root's process
-group (`src/__tests__/stand-in-cowshed.ts`). Its volume uses a real private gateway served by `ram_fixture <ns>` on its
+through its recorded handle, then archived whole, readonly tree and modes included) and a bystander works in it (never
+signalled), beside a dead lease that recorded no handle and one whose handle another live job holds (kept, then
+reclaimed once that job ends), a later dead lease whose archive rotates the oldest out and is deleted in the background,
+a failed run's own lease archived below the half-volume floor and so deleted with every other archive, and the final
+detach. Its supervisor is a stand-in speaking the subtree verbs' wire shapes, whose tree is the root's process group
+(`src/__tests__/stand-in-cowshed.ts`). Its volume uses a real private gateway served by `ram_fixture <ns>` on its
 namespace's socket, with `recordedRamAttach` capturing every attached identity and `disk-command --gateway-socket`
 routing native admission. The helper is closed only after exact-owned teardown, which then removes the namespace root;
 no test asks the installed gateway. External symlink targets and held directory modes stay unchanged, without duplicate
@@ -2135,15 +2138,16 @@ tests) owns those roots:
   it, `<parentDirectory>/smoothbricks-fixtures/<suite>/run-<pid>`. The caller always names the parent: `tmpdir()`, or
   the directory of the volume a fixture has to lie on. The parent is resolved through every link first, so one spelled
   two ways is one run, and a process holds one run for each parent and suite. The first root a process creates for a
-  suite under a parent first reclaims every run of that suite there whose owner pid is gone: each process working in it
-  gets SIGTERM (SIGKILL if it outlives 10 s); once all have exited, every socket alias naming a workspace of that run
-  (see `publishFixtureSocketDirectory`) is unlinked, whether that workspace still exists or not, then the run is
-  deleted. A run whose owner is alive is never touched by another process, and other entries of the socket namespace are
-  left alone. A killed process therefore leaves what it owned in a `run-<pid>` of its own, inside that parent's
+  suite under a parent first reclaims every run of that suite there whose owner pid is gone: nothing in it is signalled
+  (what its owner left running is its supervisor's to retire); every socket alias naming a workspace of that run (see
+  `publishFixtureSocketDirectory`) is unlinked, whether that workspace still exists or not, then the run is deleted. A
+  run whose owner is alive is never touched by another process, and other entries of the socket namespace are left
+  alone. A killed process therefore leaves what it owned in a `run-<pid>` of its own, inside that parent's
   `smoothbricks-fixtures` directory, never as a bare prefix among whatever else the parent holds, and the next process
   to use that parent and suite reclaims it. The owner itself, on SIGTERM, SIGINT or SIGHUP (a bounded test leg's timeout
-  sends SIGTERM, then SIGKILL 10 s later), first stops whatever still works in every run it holds, all at once, and
-  makes no new root meanwhile; a repeated signal waits for that. Then it dies of the first signal it got.
+  sends SIGTERM, then SIGKILL 10 s later), first names on stderr its own descendants that still run, then deletes every
+  run it holds, all at once, and makes no new root meanwhile; a repeated signal waits for that. Then it dies of the
+  first signal it got.
 - `reclaimDeadFixtureRuns(parentDirectory, suite)` runs that sweep on demand, for a test that has just watched a
   fixture-owning process die.
 - `fixtureSocketDirectory(workspace)` names, without creating anything, the `nx` socket leaf below a short parent alias
@@ -2162,10 +2166,12 @@ tests) owns those roots:
   the workspace's path alone, so a deleted workspace retires too. A colliding non-symlink or retargeted alias refuses
   instead of removing another owner's entry; removing the fixture root reclaims its physical socket directories.
 - `stopNxDaemon(workspace, stop)` runs the caller's `nx daemon --stop` and waits until the daemon recorded in
-  `<workspace>/.nx/workspace-data/d/server-process.json`, and its descendants, has exited, then names on stderr every
-  process the host census still finds working in the workspace. That final census also catches editor probes reparented
-  when the daemon exits. It runs only where a daemon was started: Nx opens `d/daemon.log` before it spawns one, so a
-  workspace without that log, such as a daemonless fixture's, skips the host process scan.
+  `<workspace>/.nx/workspace-data/d/server-process.json`, and its descendants, has exited. A workspace with no live
+  record has nothing of a daemon to stop here.
+- `processesOf(pids)` lists exactly the named processes that still exist (`ps -p`); `processTree(roots)` adds every
+  process descending from them, roots first, by walking down their children (`process-children.ts`; the walk itself is
+  `walkTree`). `descendantsDiagnostic(subject)` names the test process's own running descendants for a failure report.
+  Each listing waits at most the leg's no-progress backstop and then fails naming its command rather than answer empty.
 
 A fixture retires on every exit path, a throwing body included: stop its daemon, unlink its socket alias, then delete
 its root. A daemon that outlives the stop keeps the alias and the root, so the next run's sweep still finds both.

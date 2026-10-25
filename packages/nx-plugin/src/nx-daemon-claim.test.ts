@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, stopFixtureNxDaemon, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { whenChanged } from './__tests__/path-change.js';
-import { awaitExit, isRunning, ownedWorkspaceSocketDirectory, processTable, terminate } from './testing.js';
+import { awaitExit, isRunning, ownedWorkspaceSocketDirectory, processesOf, terminate } from './testing.js';
 
 /**
  * Guards the daemon-claim hunk of `patches/nx@23.2.1.patch`. Every Nx 23.2.1 daemon overwrote the workspace's
@@ -207,7 +207,7 @@ it('replaces a daemon whose socket was removed, which no client could reach', as
     await fixtureWorkspace(workspace);
     const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
     const lost = await startedDaemon(workspace, env);
-    const lostProcess = (await processTable()).filter((entry) => entry.pid === lost.processId);
+    const lostProcess = await processesOf([lost.processId]);
     // What a temp-directory reaper does to a socket that has not been used for days.
     await unlink(lost.socketPath);
     await awaitExit(lostProcess, `the Nx daemon ${lost.processId}, whose socket was removed`);

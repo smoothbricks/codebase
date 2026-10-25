@@ -19,7 +19,7 @@ import {
 } from './executors/bounded-exec/verdict.js';
 import { createNodesV2ForPlatform } from './index.js';
 import { NEXTEST_EXTRACTION_DIRECTORY, nextestArchiveKey } from './nextest-extraction.js';
-import { censusDiagnostic } from './testing.js';
+import { descendantsDiagnostic } from './testing.js';
 
 useFixtureCargoHome();
 
@@ -146,8 +146,8 @@ function caseBody(body: () => Promise<void>): () => Promise<void> {
  * capture instead of returning it. The barrier then ends the children it started, and only those: a plain child's
  * process group is killed, and a graceful driver gets SIGTERM so its bounded executor relays the stop to what it runs.
  * Only once every child's exit has settled and the body has settled does the barrier report. A child whose exit was
- * not confirmed is returned by name, not hidden. What the host census still finds in the fixture is printed to stderr
- * as a diagnostic, never signalled and never a failure, since ownership is the supervisor's process tree.
+ * not confirmed is returned by name, not hidden. What of this process's own tree still runs is printed to stderr as a
+ * diagnostic, never signalled and never a failure, since ownership is the supervisor's process tree.
  */
 async function settle(): Promise<string[]> {
   ending = true;
@@ -169,7 +169,7 @@ async function settle(): Promise<string[]> {
     }),
   );
   await Promise.allSettled([bodyDone]);
-  const left = fixtureRoot === undefined ? null : await censusDiagnostic(fixtureRoot);
+  const left = fixtureRoot === undefined ? null : await descendantsDiagnostic(`the fixture ${fixtureRoot}`);
   if (left !== null) process.stderr.write(`${left}\n`);
   const problems: string[] = [];
   const unconfirmed = exits.filter((line): line is string => line !== null);

@@ -15,9 +15,9 @@ import {
   NX_LONGEST_SOCKET_NAME,
   ownedFixtureRoot,
   ownedSocketDirectory,
-  processTable,
+  processesOf,
+  processTree,
   stopNxDaemon,
-  withDescendants,
 } from '../packages/nx-plugin/src/testing.js';
 
 const root = findNxWorkspaceRoot(process.cwd());
@@ -100,12 +100,10 @@ try {
   if (record.workspaceRoot !== workspace || !isRunning(record.processId)) {
     throw new Error(`the daemon record does not name the live owned workspace: ${JSON.stringify(record)}`);
   }
-  const processes = (await processTable()).filter(({ pid }) => pid === record.processId);
+  const processes = await processesOf([record.processId]);
   if (processes.length !== 1) throw new Error(`the kernel does not name daemon ${record.processId}`);
   await showProjects();
-  const workers = withDescendants(await processTable(), [record.processId]).filter(({ command }) =>
-    command.includes('plugin-worker'),
-  );
+  const workers = (await processTree([record.processId])).filter(({ command }) => command.includes('plugin-worker'));
   if (workers.length === 0) throw new Error(`daemon ${record.processId} keeps no plugin worker after a graph request`);
   const client = connect(record.socketPath);
   connection = client;
@@ -119,7 +117,7 @@ try {
   );
   await sleep(timeoutMs + 10_000);
   const still = parseRecord(await readFile(recordPath, 'utf8'));
-  const alive = (await processTable()).find(({ pid }) => pid === record.processId);
+  const [alive] = await processesOf([record.processId]);
   if (client.destroyed || still.processId !== record.processId || alive === undefined || alive.stat.startsWith('Z')) {
     throw new Error(`the silent connected client lost daemon ${record.processId}: ${JSON.stringify({ still, alive })}`);
   }
@@ -133,7 +131,7 @@ try {
   });
   connection = undefined;
   await sleep(timeoutMs - 10_000);
-  const beforeDeadline = (await processTable()).find(({ pid }) => pid === record.processId);
+  const [beforeDeadline] = await processesOf([record.processId]);
   if (performance.now() - disconnectedAt >= timeoutMs) {
     throw new Error('the host delayed the before-deadline kernel observation past the idle boundary');
   }
@@ -156,7 +154,7 @@ try {
       phase: 'disconnected-idle-exited',
       elapsedMs,
       stopped,
-      kernel: await processTable().then((table) => table.filter(({ pid }) => pid === record.processId)),
+      kernel: await processesOf([record.processId]),
     }),
   );
 } finally {
