@@ -6,7 +6,8 @@ This spec owns repository identity, the logical store layout, shared metadata an
 [APFS storage](./01a_apfs.md) owns the macOS image format, Disk Arbitration lifecycle, device custody, mount policy,
 dedicated volume provisioning and host failure mechanisms. [ZFS storage](./01b_zfs.md) owns the pool, root dataset,
 dataset lifecycle and macOS dataset properties. Both implement the same logical contract through
-[09_substrates.md](./09_substrates.md).
+[09_substrates.md](./09_substrates.md). [macOS host constraints](./01c_macos.md) indexes the platform behavior the macOS
+rules answer.
 
 ## Repository identity
 

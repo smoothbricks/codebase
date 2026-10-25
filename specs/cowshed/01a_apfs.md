@@ -6,7 +6,9 @@ image or store churn lands on the Data volume, so the user's unique data keeps i
 itself.
 
 Repository identity, logical layout, shared metadata and retention policy belong to [01_storage.md](./01_storage.md).
-This companion owns the macOS/APFS implementation.
+This companion owns the macOS/APFS implementation. The other macOS host constraints — Spotlight policy, launchd,
+Gatekeeper, Seatbelt, the kernel's process and socket interfaces — are indexed in [01c_macos.md](./01c_macos.md), which
+links back to the sections here.
 
 ## Images
 

@@ -14,7 +14,9 @@ closed and widen only through explicit, controller-owned grants.
 | Linux    | ZFS datasets (snapshot + clone)   | Landlock + network namespace | secret-service / systemd-creds |
 
 The substrate and enforcement layers sit behind traits (09_substrates.md, 04_sandbox.md); every concept above them —
-grants, gateway, cache taxonomy, CLI contract, marker files — is identical across platforms.
+grants, gateway, cache taxonomy, CLI contract, marker files — is identical across platforms. The macOS host behavior
+that the substrate and the sandbox answer — disk-image drivers, Spotlight, launchd, Gatekeeper, Seatbelt, the kernel's
+process and socket interfaces — is indexed in [01c_macos.md](./01c_macos.md).
 
 ## Problem
 
