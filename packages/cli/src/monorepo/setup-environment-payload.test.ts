@@ -76,6 +76,10 @@ async function publishedRegistry(): Promise<PublishedRegistry> {
   tampered[last] = (tampered[last] ?? 0) ^ 0xff;
   let served = real;
   const server = Bun.serve({
+    // The origin below names 127.0.0.1, so bind exactly that. A wildcard bind lets another process's
+    // 127.0.0.1 listener (a concurrent shard's fixture registry) take the same port number, and the
+    // more specific bind then answers this fixture's requests.
+    hostname: '127.0.0.1',
     port: 0,
     fetch(request) {
       const url = new URL(request.url);
