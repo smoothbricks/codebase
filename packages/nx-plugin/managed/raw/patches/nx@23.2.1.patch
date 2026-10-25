@@ -384,7 +384,7 @@ index 9bd7b61bf9ad94c72a198dfe6f15fbcb68dfaac3..6b982fae848cc82a310eee9a1036be1a
      flushSyncGeneratorChangesToDisk(generators: string[]): Promise<FlushSyncGeneratorChangesResult>;
      getRegisteredSyncGenerators(): Promise<{
 diff --git a/dist/src/daemon/client/client.js b/dist/src/daemon/client/client.js
-index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..efa1a128d3e1bb3d46fb29e6ceb086b8b94eeb30 100644
+index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..70e79e17d15f86c89bd3a88042275eab1fdca0ee 100644
 --- a/dist/src/daemon/client/client.js
 +++ b/dist/src/daemon/client/client.js
 @@ -40,7 +40,6 @@ const nx_console_1 = require("../message-types/nx-console");
@@ -493,7 +493,83 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..efa1a128d3e1bb3d46fb29e6ceb086b8
      getSocketPath() {
          const daemonProcessJson = (0, cache_1.readDaemonProcessJsonCache)();
          if (daemonProcessJson?.socketPath) {
-@@ -668,27 +731,6 @@ class DaemonClient {
+@@ -295,6 +358,7 @@ class DaemonClient {
+                 // failure would otherwise leave this channel silent forever.
+                 this.fileWatcherMessenger?.close();
+             });
++            this.watchStreamDaemon('fileWatcherMessenger', this.fileWatcherCallbacks, 'REGISTER_FILE_WATCHER');
+             this.fileWatcherMessenger.sendMessage({
+                 type: 'REGISTER_FILE_WATCHER',
+                 config,
+@@ -311,6 +375,43 @@ class DaemonClient {
+             }
+         };
+     }
++    /**
++     * A file-watcher or project-graph-listener stream waits on the daemon its
++     * record named when the stream connected, as a request does
++     * (`sendMessageToDaemon`). A listener that outlived that daemon accepts the
++     * stream and never closes it, so no reconnect ever runs. Once that pid no
++     * longer runs, every callback gets the loss naming the pid and the socket,
++     * then 'closed', and the stream is let go. A record that names no pid arms no
++     * check.
++     */
++    watchStreamDaemon(field, callbacks, type) {
++        const messenger = this[field];
++        const daemonPid = (0, cache_1.getDaemonProcessIdSync)();
++        if (!messenger || !Number.isInteger(daemonPid)) {
++            return;
++        }
++        const socketPath = (0, cache_1.readDaemonProcessJsonCache)()?.socketPath ?? null;
++        const liveness = setInterval(() => {
++            if (this[field] !== messenger) {
++                clearInterval(liveness);
++                return;
++            }
++            if (daemonRuns(daemonPid)) {
++                return;
++            }
++            clearInterval(liveness);
++            const error = daemonGone(daemonPid, socketPath, type);
++            const waiting = [...callbacks.values()];
++            // Emptied before the close, so its reconnect finds nobody to reconnect.
++            callbacks.clear();
++            for (const cb of waiting) {
++                cb(error, null);
++                cb('closed', null);
++            }
++            messenger.close();
++        }, DAEMON_LIVENESS_MS);
++        liveness.unref();
++    }
+     async reconnectFileWatcher() {
+         // Guard against concurrent reconnection attempts
+         if (this.fileWatcherReconnecting) {
+@@ -399,6 +500,7 @@ class DaemonClient {
+                 // not emit, so close explicitly to hand off to it.
+                 this.fileWatcherMessenger?.close();
+             });
++            this.watchStreamDaemon('fileWatcherMessenger', this.fileWatcherCallbacks, 'REGISTER_FILE_WATCHER');
+             // Re-register all stored configs
+             for (const cfg of this.fileWatcherConfigs.values()) {
+                 this.fileWatcherMessenger.sendMessage({
+@@ -475,6 +577,7 @@ class DaemonClient {
+                 }
+                 this.projectGraphListenerMessenger?.close();
+             });
++            this.watchStreamDaemon('projectGraphListenerMessenger', this.projectGraphListenerCallbacks, register_project_graph_listener_1.REGISTER_PROJECT_GRAPH_LISTENER);
+             this.projectGraphListenerMessenger.sendMessage({
+                 type: register_project_graph_listener_1.REGISTER_PROJECT_GRAPH_LISTENER,
+             });
+@@ -575,6 +678,7 @@ class DaemonClient {
+                 // not emit, so close explicitly to hand off to it.
+                 this.projectGraphListenerMessenger?.close();
+             });
++            this.watchStreamDaemon('projectGraphListenerMessenger', this.projectGraphListenerCallbacks, register_project_graph_listener_1.REGISTER_PROJECT_GRAPH_LISTENER);
+             // Re-register
+             this.projectGraphListenerMessenger.sendMessage({
+                 type: register_project_graph_listener_1.REGISTER_PROJECT_GRAPH_LISTENER,
+@@ -668,27 +772,6 @@ class DaemonClient {
          };
          return this.sendToDaemonViaQueue(message);
      }
@@ -521,7 +597,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..efa1a128d3e1bb3d46fb29e6ceb086b8
      getSyncGeneratorChanges(generators) {
          const message = {
              type: get_sync_generator_changes_1.GET_SYNC_GENERATOR_CHANGES,
-@@ -813,8 +855,15 @@ class DaemonClient {
+@@ -813,8 +896,15 @@ class DaemonClient {
                  }
              }
              if (!probe.available) {
@@ -539,7 +615,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..efa1a128d3e1bb3d46fb29e6ceb086b8
              }
              this.setUpConnection();
              this._daemonStatus = DaemonStatus.CONNECTED;
-@@ -825,19 +874,38 @@ class DaemonClient {
+@@ -825,19 +915,38 @@ class DaemonClient {
          }
          else if (this._daemonStatus == DaemonStatus.CONNECTING) {
              await this._waitForDaemonReady;
@@ -585,7 +661,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..efa1a128d3e1bb3d46fb29e6ceb086b8
      }
      setUpConnection() {
          const socketPath = this.getSocketPath();
-@@ -846,7 +914,13 @@ class DaemonClient {
+@@ -846,7 +955,13 @@ class DaemonClient {
          // sendMessageToDaemon method uses a keep-alive setTimeout to
          // explicitly hold the event loop open while awaiting a response.
          socket.unref();
@@ -600,7 +676,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..efa1a128d3e1bb3d46fb29e6ceb086b8
              // it's ok for the daemon to terminate if the client doesn't wait on
              // any messages from the daemon
              if (this.queue.isEmpty()) {
-@@ -892,12 +966,22 @@ class DaemonClient {
+@@ -892,12 +1007,22 @@ class DaemonClient {
              else {
                  error = daemonProcessException(err.toString());
              }
@@ -623,7 +699,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..efa1a128d3e1bb3d46fb29e6ceb086b8
          // Create a new ready promise for new requests to wait on
          this._waitForDaemonReady = new Promise((resolve) => (this._daemonReady = resolve));
          // Set status to CONNECTING so new requests will wait for reconnection
-@@ -911,9 +995,7 @@ class DaemonClient {
+@@ -911,9 +1036,7 @@ class DaemonClient {
          catch (err) {
              if (err instanceof daemon_socket_messenger_1.VersionMismatchError) {
                  // New daemon has different version - reject with error so caller can handle
@@ -634,7 +710,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..efa1a128d3e1bb3d46fb29e6ceb086b8
                  return;
              }
              throw err;
-@@ -934,10 +1016,8 @@ class DaemonClient {
+@@ -934,10 +1057,8 @@ class DaemonClient {
              }
          }
          else {
@@ -647,7 +723,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..efa1a128d3e1bb3d46fb29e6ceb086b8
          }
      }
      establishConnection() {
-@@ -998,6 +1078,9 @@ class DaemonClient {
+@@ -998,6 +1119,9 @@ class DaemonClient {
          return { available: false, refusal };
      }
      async sendMessageToDaemon(message, force) {
@@ -657,7 +733,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..efa1a128d3e1bb3d46fb29e6ceb086b8
          // the first message sent to the daemon includes an env prop
          // that updates the process.env values on the daemon.
          if (!this.envReflectionSent && !global.NX_PLUGIN_WORKER) {
-@@ -1005,7 +1088,15 @@ class DaemonClient {
+@@ -1005,7 +1129,15 @@ class DaemonClient {
              this.envReflectionSent = true;
          }
          await this.startDaemonIfNecessary();
@@ -673,7 +749,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..efa1a128d3e1bb3d46fb29e6ceb086b8
          return new Promise((resolve, reject) => {
              perf_hooks_1.performance.mark('sendMessageToDaemon-start');
              // An open promise isn't enough to keep the event loop
-@@ -1016,12 +1107,25 @@ class DaemonClient {
+@@ -1016,12 +1148,25 @@ class DaemonClient {
              keepAlive = setTimeout(() => {
                  reject(new Error('The daemon timed out while processing ' + message.type));
              }, 20 * 60 * 1000);
@@ -699,7 +775,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..efa1a128d3e1bb3d46fb29e6ceb086b8
          });
      }
      async registerDaemonProcessWithMetricsService(daemonPid) {
-@@ -1055,7 +1159,13 @@ class DaemonClient {
+@@ -1055,7 +1200,13 @@ class DaemonClient {
                  console[parsedResult.level](parsedResult.message);
                  return;
              }
@@ -714,7 +790,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..efa1a128d3e1bb3d46fb29e6ceb086b8
                  this.currentReject(parsedResult.error);
              }
              else {
-@@ -1132,8 +1242,11 @@ class DaemonClient {
+@@ -1132,8 +1283,11 @@ class DaemonClient {
           */
          const { available, refusal: polled } = await this.waitForServerToBeAvailable({ ignoreVersionMismatch: true });
          if (available) {
@@ -728,7 +804,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..efa1a128d3e1bb3d46fb29e6ceb086b8
          }
          else {
              // A permission refusal from either source wins, then the poll's errno,
-@@ -1161,19 +1274,31 @@ class DaemonClient {
+@@ -1161,19 +1315,31 @@ class DaemonClient {
              ].join('\n'));
          }
      }
@@ -770,7 +846,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..efa1a128d3e1bb3d46fb29e6ceb086b8
              }
          }
          (0, tmp_dir_1.removeSocketDir)();
-@@ -1200,6 +1325,44 @@ function isDocker() {
+@@ -1200,6 +1366,44 @@ function isDocker() {
  function nxJsonIsNotPresent() {
      return !(0, nx_json_1.hasNxJson)(workspace_root_1.workspaceRoot);
  }
@@ -815,7 +891,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..efa1a128d3e1bb3d46fb29e6ceb086b8
  /**
   * The operating system refused the connection. Most often the socket belongs to
   * another user, which is the guarantee the owner-only socket directory buys —
-@@ -1226,6 +1389,21 @@ function daemonPermissionException(socketPath, cause) {
+@@ -1226,6 +1430,21 @@ function daemonPermissionException(socketPath, cause) {
      error.daemonPermissionError = true;
      return error;
  }
