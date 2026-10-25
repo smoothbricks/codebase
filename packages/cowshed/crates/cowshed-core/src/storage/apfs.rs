@@ -42,9 +42,9 @@ pub struct ApfsSubstrateConfig {
     /// and main's mountpoint.
     pub checkout_path: PathBuf,
     pub capacity: ImageCapacity,
-    /// The program a release starts its deletion child with (05_gateway.md, "Deleting released
-    /// images"); none starts no child, and the gateway's startup scan frees the entry.
-    pub deletion_child: Option<PathBuf>,
+    /// What a release starts its deletion child with (05_gateway.md, "Deleting released images");
+    /// none starts no child, and the gateway's startup scan frees the entry.
+    pub deletion_child: Option<deleter::DeletionChild>,
 }
 
 impl ApfsSubstrateConfig {
@@ -69,7 +69,7 @@ impl ApfsSubstrateConfig {
         checkout_path: impl Into<PathBuf>,
     ) -> Self {
         Self {
-            deletion_child: storage.roots().deletion_child().map(Path::to_owned),
+            deletion_child: storage.roots().deletion_child().cloned(),
             ..Self::new(storage.namespace(), storage.store(), checkout_path)
         }
     }

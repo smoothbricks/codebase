@@ -3220,7 +3220,10 @@ struct DeletingDirectory {
 /// child is freeing moves with it: the child holds the open file, not the name. Anything there that
 /// is not a released image stays, for the terminal plan to refuse naming it.
 #[cfg(target_os = "macos")]
-fn move_terminal_releases(project_root: &Path, deletion_child: Option<&Path>) -> Result<()> {
+fn move_terminal_releases(
+    project_root: &Path,
+    deletion_child: Option<&crate::storage::apfs::deleter::DeletionChild>,
+) -> Result<()> {
     let failed = |what: &str, path: &Path, error: std::io::Error| {
         CowshedError::environment_missing(
             format!("cannot {what} {}: {error}", path.display()),
@@ -3270,8 +3273,8 @@ fn move_terminal_releases(project_root: &Path, deletion_child: Option<&Path>) ->
                     .and_then(|held| cowshed_os::fsio::sync_held_directory(&held))
                     .map_err(|error| failed("sync", synced, error))?;
             }
-            if let Some(program) = deletion_child {
-                crate::storage::apfs::deleter::delete_in_background(program, &moved)
+            if let Some(child) = deletion_child {
+                crate::storage::apfs::deleter::delete_in_background(child, &moved)
                     .map_err(|error| failed("start the deletion of", &moved, error))?;
             }
         }
@@ -3374,7 +3377,7 @@ fn require_terminal_storage(project_root: &Path) -> Result<()> {
 fn clean_terminal_project_storage(
     project_root: &Path,
     binding: &Path,
-    deletion_child: Option<&Path>,
+    deletion_child: Option<&crate::storage::apfs::deleter::DeletionChild>,
 ) -> Result<()> {
     move_terminal_releases(project_root, deletion_child)?;
     let mut plan = Vec::new();
@@ -3445,7 +3448,7 @@ fn remove_project_mount_trees(paths: &crate::repository::ProjectPaths) -> Result
 pub(crate) fn finish_restored_project_unbinding(
     paths: &crate::repository::ProjectPaths,
     expected: &RepositoryBinding,
-    deletion_child: Option<&Path>,
+    deletion_child: Option<&crate::storage::apfs::deleter::DeletionChild>,
     observe: &mut impl FnMut(UnbindCheckpoint) -> Result<()>,
 ) -> Result<()> {
     let path = &paths.repository_binding;
@@ -8687,7 +8690,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             finish_restored_project_unbinding(
                 &paths,
                 expected.as_ref(),
-                deletion_child.as_deref(),
+                deletion_child.as_ref(),
                 &mut |_| Ok(()),
             )
         })

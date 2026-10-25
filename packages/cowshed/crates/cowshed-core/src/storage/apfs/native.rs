@@ -2850,7 +2850,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     /// nothing, says so once, and leaves the entry to the gateway's startup scan.
     pub(super) fn delete_in_background(&self, entry: &Path) -> Result<(), ApfsStorageError> {
         match &self.config.deletion_child {
-            Some(program) => super::deleter::delete_in_background(program, entry)
+            Some(child) => super::deleter::delete_in_background(child, entry)
                 .map_err(|error| io_error("start a released image's deletion", entry, error)),
             None => {
                 static SAID: std::sync::Once = std::sync::Once::new();

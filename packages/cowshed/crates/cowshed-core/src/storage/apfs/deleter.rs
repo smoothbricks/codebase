@@ -10,6 +10,7 @@ use std::io;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use cowshed_os::fork_lock::Spawn as _;
 
@@ -24,6 +25,29 @@ pub fn store_deleting(store: &Path) -> PathBuf {
 
 /// The argument a deletion child is started with, before the entry it frees.
 pub const DELETE_VERB: &str = "__delete-released";
+
+/// Where a deletion child's stderr goes, below the home directory: the host's daemon log, the
+/// launchd `StandardErrorPath` the gateway, its supervisors and their children already write
+/// (13_telemetry.md, "The one text-file survivor").
+pub const DAEMON_LOG: &str = "Library/Logs/cowshed/daemon-stderr.log";
+
+/// What a release starts to free its entry (05_gateway.md, "Deleting released images"): the
+/// program, run as `<program> __delete-released <entry>`, and the log its stderr appends to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeletionChild {
+    pub program: Arc<Path>,
+    pub log: Arc<Path>,
+}
+
+impl DeletionChild {
+    /// `program` logging to `home`'s daemon log: what a host store's releases start.
+    pub fn host(program: &Path, home: &Path) -> Self {
+        Self {
+            program: Arc::from(program),
+            log: Arc::from(home.join(DAEMON_LOG)),
+        }
+    }
+}
 
 /// Run as the deletion child when the arguments say so, before anything else starts: free the
 /// one entry named and answer the exit status. `None` when this process is not one.
@@ -55,15 +79,23 @@ fn delete(entry: &Path) -> bool {
 
 /// Start freeing `entry`, a release this process just committed, and return at once. The
 /// deletion runs in a detached child, `<program> __delete-released <entry>` (its own process
-/// group, so the verb's terminal signals do not reach it), that outlives this process. A child
-/// that cannot start is the release's error; one that ends badly is said, and the gateway's next
-/// start frees what it left.
-pub fn delete_in_background(program: &Path, entry: &Path) -> io::Result<()> {
-    let mut child = Command::new(program)
+/// group, so the verb's terminal signals do not reach it), that outlives this process. It holds
+/// nothing of the verb's: it works in `/`, so no checkout a later `rm` asks about is its
+/// working directory, and its stderr appends to `child.log`, never the verb's own, whose reader
+/// (a terminal, a script's pipe, an agent's capture) would otherwise wait for the child's end of
+/// file and see the verb answer only once its image was freed. A child that cannot start, or a
+/// log that cannot be opened, is the release's error; one that ends badly is said, and the
+/// gateway's next start frees what it left.
+pub fn delete_in_background(child: &DeletionChild, entry: &Path) -> io::Result<()> {
+    let program = &child.program;
+    let log = daemon_log(&child.log)?;
+    let mut child = Command::new(program.as_ref())
         .arg(DELETE_VERB)
         .arg(entry)
+        .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
+        .stderr(log)
         .process_group(0)
         .spawn_locked()
         .map_err(|error| {
@@ -93,6 +125,26 @@ pub fn delete_in_background(program: &Path, entry: &Path) -> io::Result<()> {
             ),
         })?;
     Ok(())
+}
+
+/// `log` opened to append, its directory made first, so a host whose log directory nothing made
+/// yet still keeps what its deletion children say.
+fn daemon_log(log: &Path) -> io::Result<std::fs::File> {
+    let opened = || {
+        if let Some(directory) = log.parent() {
+            std::fs::create_dir_all(directory)?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+    };
+    opened().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot open the deletion log {}: {error}", log.display()),
+        )
+    })
 }
 
 /// The gateway's startup scan of the store at `store`: every project's `build/.deleting` and
@@ -152,6 +204,41 @@ mod tests {
             "acme/widget/build/.deleting/{}.dmg",
             crate::build_volume::BuildVolumeId::mint()
         ))
+    }
+
+    /// The deletion child holds nothing of the verb that started it: its stderr appends to the
+    /// daemon log it is given, never the verb's own, whose reader would otherwise wait for the
+    /// child's end of file (an `rm` piped into a script read as taking as long as the free), and
+    /// it works in `/`, never in the verb's working directory. The program stands in for the
+    /// cowshed binary: it says its arguments and directory on stderr, then marks itself done.
+    #[test]
+    fn the_deletion_child_logs_to_the_daemon_log_from_the_root_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let store = store("log");
+        let program = store.join("deleter");
+        fs::write(
+            &program,
+            "#!/bin/sh\necho \"$1 $2 $(pwd)\" >&2\n: > \"$2.done\"\n",
+        )
+        .expect("program");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).expect("executable");
+        let entry = volume(&store);
+        released(&entry);
+        let log = store.join("Logs/cowshed/daemon-stderr.log");
+        let child = DeletionChild {
+            program: Arc::from(program.as_path()),
+            log: Arc::from(log.as_path()),
+        };
+        delete_in_background(&child, &entry).expect("started");
+        let done = entry.with_extension("dmg.done");
+        while !done.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            fs::read_to_string(&log).expect("the daemon log"),
+            format!("{DELETE_VERB} {} /\n", entry.display())
+        );
+        fs::remove_dir_all(&store).expect("cleanup");
     }
 
     /// The startup pass finishes every release left from before the gateway, in every project's,

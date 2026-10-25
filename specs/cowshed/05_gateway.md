@@ -1835,18 +1835,26 @@ takes.
 - **A background child, started once the rename is durable.** The releasing process starts the deletion in the
   background and returns without waiting: it spawns itself, the running executable (`std::env::current_exe()`, which the
   host store's roots carry), as `<exe> __delete-released <entry>`, detached in its own process group, with stdin and
-  stdout null and stderr inherited. Nothing looks `cowshed` up on PATH: the CLI, the gateway and the supervisors spawn
-  themselves, and the N-API addon makes no release in-process, since its verbs run in the cowshed binary. A spawn
-  failure is the release's error: the verb fails with its rename already durable, and its retry finds the release
-  committed. A child that ends badly, with a non-zero status or a signal, is said on stderr by its reaper, and the next
-  gateway start frees what it left. A store whose configuration names no child, a fixture store without a binary, starts
-  none, says so on stderr once per process, and its entries wait for the startup scan. The child frees that one entry
-  with the bounded release: at most 1,024 physical runs per `ftruncate` cut from the end of the file, at normal disk
-  priority, then `unlink`, the file's length being the resume journal (16_build_volumes.md, "Garbage collection";
-  01a_apfs.md, "Freeing an image"). It first waits out (a blocking `flock`) a process that holds the entry, its owner
-  still syncing the commit, and while it waits it names its holder on stderr, read afresh at each 90 s bound, the bound
-  being a parameter of the wait. It exits once the entry is gone, or with a usage error when it is given no entry. No
-  queue, control request, timer or poll stands between the verb and the child.
+  stdout null, its working directory `/`, and stderr appended to the host's daemon log,
+  `~/Library/Logs/cowshed/daemon-stderr.log` (13_telemetry.md, "The one text-file survivor"), its directory made if
+  absent. The child holds nothing of the verb's. Its stderr is never the verb's own: a reader of that stream (a
+  terminal, a script's pipe, an agent's capture) waits for its end of file, which an inheriting child holds until its
+  image is freed, so the verb reads as taking as long as the free. Measured 2026-10-25 with stderr piped: a plain `rm`
+  that exited at 29 s reached end of file at 228 s, one that exited at 47 s at 114 s, and an `rm --abandon` that exited
+  at 34 s at 378 s. Nor is its working directory the verb's, which may be a checkout a later `rm` asks about
+  (02_workspaces.md, "Holders cowshed does not run"). Nothing looks `cowshed` up on PATH: the CLI, the gateway and the
+  supervisors spawn themselves, and the N-API addon makes no release in-process, since its verbs run in the cowshed
+  binary. A spawn failure, or a daemon log that cannot be opened, is the release's error: the verb fails with its rename
+  already durable, and its retry finds the release committed. A child that ends badly, with a non-zero status or a
+  signal, is said on stderr by its reaper, and the next gateway start frees what it left. A store whose configuration
+  names no child, a fixture store without a binary or a host with no `HOME`, starts none, says so on stderr once per
+  process, and its entries wait for the startup scan. The child frees that one entry with the bounded release: at most
+  1,024 physical runs per `ftruncate` cut from the end of the file, at normal disk priority, then `unlink`, the file's
+  length being the resume journal (16_build_volumes.md, "Garbage collection"; 01a_apfs.md, "Freeing an image"). It first
+  waits out (a blocking `flock`) a process that holds the entry, its owner still syncing the commit, and while it waits
+  it names its holder on stderr, read afresh at each 90 s bound, the bound being a parameter of the wait. It exits once
+  the entry is gone, or with a usage error when it is given no entry. No queue, control request, timer or poll stands
+  between the verb and the child.
 - **A startup scan finishes what a child did not.** When the store names no child or the child ended badly, the entry
   stays in its `.deleting` directory for the gateway's startup scan. Once, right after the gateway starts serving
   ("Startup contract", step 2), it starts one thread, `image-deleter`, which passes over every project of this gateway's
@@ -1869,11 +1877,11 @@ waits for the next gateway start. Nothing references an entry: no record, link, 
 mounts, forks or reads it.
 
 Two cases start no child. A store whose configuration names none, a fixture store without a binary (core tests have
-none; cowshed-cli tests pass their built binary), says so on stderr once per process, and the startup scan frees its
-entries. A directory store, the test substrate, only renames: its release moves the payload into
-`<project>/sessions/.deleting/<name>` (a build volume into `build/.deleting`), the verb deletes nothing and starts no
-child (said once per process), and a released payload stays in `.deleting` until its test store goes, because a tree can
-be freed only with the directory host's holder census, which runs in-process;
+none; a test that names one names its daemon log too) or a host with no `HOME`, says so on stderr once per process, and
+the startup scan frees its entries. A directory store, the test substrate, only renames: its release moves the payload
+into `<project>/sessions/.deleting/<name>` (a build volume into `build/.deleting`), the verb deletes nothing and starts
+no child (said once per process), and a released payload stays in `.deleting` until its test store goes, because a tree
+can be freed only with the directory host's holder census, which runs in-process;
 `DirectoryExecutionHost::finish_build_releases` can finish build-volume trees, leaving one a process still holds
 (16_build_volumes.md, "Garbage collection").
 
