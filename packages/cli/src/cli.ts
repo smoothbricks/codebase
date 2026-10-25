@@ -11,6 +11,13 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   // Every Nx smoo loads in-process or starts answers from the installed Nx: a daemon otherwise installs `nx@latest` to
   // answer Nx Console's status, and a client without the variable recomputes the daemon's graph.
   process.env.NX_USE_LOCAL = 'true';
+  // `smoo nx-<tool>` hands argv to the tool before Commander parses anything (lib/nx-tools.ts).
+  const [command, ...args] = argv;
+  if (command?.startsWith('nx-')) {
+    const { runNxTool } = await import('./lib/nx-tools.js');
+    process.exitCode = runNxTool(command, args);
+    return;
+  }
   const program = buildProgram();
   try {
     await program.parseAsync(argv, { from: 'user' });
@@ -80,7 +87,8 @@ function buildProgram(): Command {
     // first operand when positional options are enabled here, on the parent
     // of the command that declares `passThroughOptions`.
     .enablePositionalOptions()
-    .showHelpAfterError();
+    .showHelpAfterError()
+    .addHelpText('after', '\n  nx-<tool> [args...]  run a SmoothBricks Nx tool: its smoo-nx-<tool> bin');
 
   const monorepo = program.command('monorepo').description('Manage SmoothBricks-style monorepos');
   monorepo

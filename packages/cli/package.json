@@ -82,6 +82,9 @@
   ],
   "dependencies": {
     "@arethetypeswrong/core": "^0.18.2",
+    "@smoothbricks/build-inputs": "workspace:*",
+    "@smoothbricks/failure-summary": "workspace:*",
+    "@smoothbricks/nextest-extract": "workspace:*",
     "@smoothbricks/nx-plugin": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
     "commander": "^14.0.3",

@@ -68,6 +68,11 @@ smoo playwright run <command> [args...]
 smoo nx refresh-test-timings <project>
 ```
 
+`smoo nx-<tool> [args...]` runs the `smoo-nx-<tool>` bin of a SmoothBricks tool package the CLI depends on
+(`@smoothbricks/failure-summary`, `@smoothbricks/nextest-extract`, `@smoothbricks/build-inputs`, and the plugin's own
+`smoo-nx-*` bins) with the remaining arguments, under smoo's runtime; the tool's exit status is smoo's. Those packages'
+`bin` fields are the list: `smoo nx-absent` exits 64 naming every tool.
+
 An option value smoo cannot honour is refused before the command runs, as one line naming the option, the value given
 and what it accepts, followed by the command's help; the exit status is 1. That covers `--pr` (an integer from 1 through
 999999999, in decimal), `--stage` on `wrangler deploy-stage`, `wrangler deployed-version` and `github-ci nx-deploy`

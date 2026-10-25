@@ -25,6 +25,9 @@
     },
     {
       "path": "./tsconfig.lib.json"
-    }
+    },
+    { "path": "../build-inputs/tsconfig.lib.json" },
+    { "path": "../failure-summary/tsconfig.lib.json" },
+    { "path": "../nextest-extract/tsconfig.lib.json" }
   ]
 }
