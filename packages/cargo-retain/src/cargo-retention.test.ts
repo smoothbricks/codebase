@@ -8,6 +8,7 @@ import {
   describeRetention,
   exactIdentity,
   fingerprintIdentity,
+  parseExactJson,
   RECENT_USE_MS,
   RETENTION_RECEIPT,
   readCargoFingerprint,
@@ -132,6 +133,80 @@ function exactIdentityRefusesWhatADoubleCannotHold(): void {
   check(exactIdentity({ dev: 1, ino: Number.MAX_SAFE_INTEGER + 1 }), 'an inode 2^53 or more').toBeUndefined();
   check(exactIdentity({ dev: 2 ** 60, ino: 1 }), 'a device 2^53 or more').toBeUndefined();
   check(exactIdentity({ dev: 1, ino: Number.NaN }), 'not a number').toBeUndefined();
+}
+
+/** What `JSON.parse` makes of `text` with every integer a bigint from its source digits: the oracle for the exact reader. */
+function oracleParse(text: string): unknown {
+  return JSON.parse(text, (_key: string, value: unknown, context?: { readonly source?: string }) =>
+    typeof value === 'number' && context?.source !== undefined ? BigInt(context.source) : value,
+  );
+}
+
+/** Case: the exact JSON reader keeps u64 digits, refuses a non-integer and malformed text, and keeps `__proto__` data. Pure values. */
+function exactJsonReaderIsExactAndStrict(): void {
+  const check = labelled('the exact JSON reader keeps u64 digits and refuses what is not an integer or not JSON');
+  const read = (text: string): unknown => {
+    const parsed = parseExactJson(text);
+    if (!parsed.ok) throw new Error(`${text}: ${parsed.error}`);
+    return parsed.value;
+  };
+  check(read('18446744073709551615'), 'the largest u64').toBe(18446744073709551615n);
+  check(read('[-0, 0, -17, 9007199254740993]'), 'a double would round the last').toEqual([
+    0n,
+    0n,
+    -17n,
+    9007199254740993n,
+  ]);
+  check(read(' {"a" : [true,false,null,"x\\u0041\\n"] , "b":{}} '), 'every JSON form').toEqual({
+    a: [true, false, null, 'xA\n'],
+    b: {},
+  });
+  check(read('{"a":1,"a":2}'), 'a later duplicate name wins, as in JSON.parse').toEqual({ a: 2n });
+  const proto = read('{"__proto__":{"polluted":1}}');
+  check(Object.getPrototypeOf(proto), '__proto__ stays data').toBe(Object.prototype);
+  check(Object.hasOwn(Object(proto), '__proto__'), '__proto__ is an own property').toBe(true);
+  for (const bad of [
+    '',
+    '{',
+    '[',
+    '[1,]',
+    '[1 2]',
+    '{"a":}',
+    '{"a" 1}',
+    '{a:1}',
+    '1.5',
+    '1e3',
+    '01',
+    '-',
+    '"a',
+    '"\\q"',
+    '"tab\there"',
+    'nul',
+    '{"a":1}x',
+  ]) {
+    check(parseExactJson(bad).ok, JSON.stringify(bad)).toBe(false);
+  }
+  check(parseExactJson(`${'['.repeat(65)}${']'.repeat(65)}`).ok, 'nesting past the limit').toBe(false);
+  check(parseExactJson(`${'['.repeat(60)}${']'.repeat(60)}`).ok, 'nesting inside the limit').toBe(true);
+}
+
+/** Case: the exact reader reads every fingerprint Cargo wrote as `JSON.parse` with its source-text reviver does. */
+async function exactReaderAgreesWithJsonParse(fx: Churn): Promise<void> {
+  const check = labelled('the exact JSON reader agrees with JSON.parse on every real fingerprint');
+  let compared = 0;
+  for (const pkg of ['ret-leaf', 'ret-mid', 'ret-app', 'ret-ext']) {
+    for (const meta of await metasOf(fx.target, pkg)) {
+      const fingerprints = join(meta, 'fingerprint');
+      for (const name of (await readdir(fingerprints)).filter((file) => file.endsWith('.json'))) {
+        const text = await readFile(join(fingerprints, name), 'utf8');
+        const parsed = parseExactJson(text);
+        check(parsed.ok, `${pkg} ${name} reads`).toBe(true);
+        if (parsed.ok) check(parsed.value, `${pkg} ${name}`).toEqual(oracleParse(text));
+        compared += 1;
+      }
+    }
+  }
+  check(compared, 'fingerprints compared').toBeGreaterThan(3);
 }
 
 /** Case: refuses the whole pass over one unreadable fingerprint and changes nothing. */
@@ -1097,10 +1172,12 @@ describe('cargo retention against real Cargo target layouts', () => {
     keepsExactDigitsInTheParser();
     identityIgnoresToolchain();
     exactIdentityRefusesWhatADoubleCannotHold();
+    exactJsonReaderIsExactAndStrict();
     await inFixture(async (root) => {
       const fx = await churnFixture(root, false);
       await scopedTo(fx.target, async () => {
         const gen = await churnGenerations(fx);
+        await exactReaderAgreesWithJsonParse(fx);
         // Refusals first: each asserts its refusal and puts back the bytes it touched.
         await refusesOverUnreadableFingerprint(fx);
         await refusesWithoutPerl(fx);

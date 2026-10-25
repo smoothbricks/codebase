@@ -55,7 +55,7 @@
  */
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { constants, lstatSync, readdirSync, readFileSync } from 'node:fs';
+import { closeSync, constants, lstatSync, openSync, readdirSync, readFileSync, writeSync } from 'node:fs';
 import {
   type FileHandle,
   lstat,
@@ -67,7 +67,6 @@ import {
   rename,
   rmdir,
   unlink,
-  writeFile,
 } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, normalize, relative, resolve, sep } from 'node:path';
@@ -81,7 +80,6 @@ export type Result<T, E> = { readonly ok: true; readonly value: T } | { readonly
 export type RetentionError =
   | { readonly kind: 'cargo-metadata'; readonly cwd: string; readonly detail: string }
   | { readonly kind: 'target-not-cargo'; readonly targetDir: string; readonly detail: string }
-  | { readonly kind: 'lossless-json-unavailable'; readonly detail: string }
   | { readonly kind: 'io'; readonly operation: string; readonly path: string; readonly detail: string };
 
 export type ReclaimReason = 'superseded-generation';
@@ -201,40 +199,153 @@ interface TrashManifest {
 }
 const validateManifest = typia.createValidate<TrashManifest>();
 
-interface JsonSourceContext {
-  readonly source?: string;
+// ---- Exact JSON ----
+//
+// Cargo writes fingerprint hashes as bare u64 integers, which a double cannot hold, and the native build of this
+// selector has no `JSON.parse` reviver source text to recover their digits from. So fingerprints are read by this
+// parser: every integer is a bigint from its digits, and any other number is refused rather than rounded. What it
+// returns is checked afterwards by the generated validator, never by hand.
+
+interface JsonReader {
+  readonly text: string;
+  at: number;
 }
 
-/** Every integer as a bigint from its source digits; the reviver throws rather than round. */
-function exactIntegers(_key: string, value: unknown, context?: JsonSourceContext): unknown {
-  if (typeof value !== 'number') return value;
-  const source = context?.source;
-  if (source === undefined) throw new Error('JSON.parse gave the reviver no number source text');
-  if (!INTEGER.test(source)) throw new Error(`non-integer number ${source}`);
-  return BigInt(source);
+const MAX_JSON_DEPTH = 64;
+
+function jsonError(reader: JsonReader, what: string): Error {
+  return new Error(`${what} at offset ${reader.at}`);
 }
 
-/** Whether this runtime hands a reviver each number's source text (the JSON.parse source text access proposal). */
-function losslessJsonAvailable(): boolean {
-  const probe: unknown = JSON.parse(
-    '[18446744073709551615]',
-    (_key: string, value: unknown, context?: JsonSourceContext) =>
-      typeof value === 'number' ? context?.source : value,
-  );
-  return Array.isArray(probe) && probe[0] === '18446744073709551615';
+function skipJsonSpace(reader: JsonReader): void {
+  while (reader.at < reader.text.length) {
+    const code = reader.text.charCodeAt(reader.at);
+    if (code !== 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) return;
+    reader.at += 1;
+  }
+}
+
+/** The string at the cursor: found by its closing quote, decoded by `JSON.parse`, which also refuses bad escapes. */
+function readJsonString(reader: JsonReader): string {
+  const start = reader.at;
+  reader.at += 1;
+  while (reader.at < reader.text.length) {
+    const code = reader.text.charCodeAt(reader.at);
+    if (code === 0x22) {
+      reader.at += 1;
+      const decoded: unknown = JSON.parse(reader.text.slice(start, reader.at));
+      if (typeof decoded !== 'string') throw jsonError(reader, 'a string was expected');
+      return decoded;
+    }
+    reader.at += code === 0x5c ? 2 : 1;
+  }
+  throw jsonError(reader, 'a string is not closed');
+}
+
+function readJsonInteger(reader: JsonReader): bigint {
+  const start = reader.at;
+  if (reader.text.charCodeAt(reader.at) === 0x2d) reader.at += 1;
+  while (reader.at < reader.text.length) {
+    const code = reader.text.charCodeAt(reader.at);
+    if (code < 0x30 || code > 0x39) break;
+    reader.at += 1;
+  }
+  const next = reader.text.charCodeAt(reader.at);
+  if (next === 0x2e || next === 0x65 || next === 0x45) throw jsonError(reader, 'a non-integer number');
+  const digits = reader.text.slice(start, reader.at);
+  if (!INTEGER.test(digits)) throw jsonError(reader, `a malformed number ${digits}`);
+  return BigInt(digits);
+}
+
+function readJsonLiteral(reader: JsonReader, word: string, value: boolean | null): boolean | null {
+  if (!reader.text.startsWith(word, reader.at)) throw jsonError(reader, 'an unexpected character');
+  reader.at += word.length;
+  return value;
+}
+
+function readJsonArray(reader: JsonReader, depth: number): unknown[] {
+  reader.at += 1;
+  const items: unknown[] = [];
+  skipJsonSpace(reader);
+  if (reader.text.charCodeAt(reader.at) === 0x5d) {
+    reader.at += 1;
+    return items;
+  }
+  for (;;) {
+    items.push(readJsonValue(reader, depth + 1));
+    skipJsonSpace(reader);
+    const next = reader.text.charCodeAt(reader.at);
+    reader.at += 1;
+    if (next === 0x5d) return items;
+    if (next !== 0x2c) throw jsonError(reader, 'a comma or a closing bracket was expected');
+  }
+}
+
+/** A later duplicate of a name wins, as in `JSON.parse`; `Object.fromEntries` also keeps `__proto__` an own property. */
+function readJsonObject(reader: JsonReader, depth: number): unknown {
+  reader.at += 1;
+  const entries: [string, unknown][] = [];
+  skipJsonSpace(reader);
+  if (reader.text.charCodeAt(reader.at) === 0x7d) {
+    reader.at += 1;
+    return Object.fromEntries(entries);
+  }
+  for (;;) {
+    skipJsonSpace(reader);
+    if (reader.text.charCodeAt(reader.at) !== 0x22) throw jsonError(reader, 'a property name was expected');
+    const name = readJsonString(reader);
+    skipJsonSpace(reader);
+    if (reader.text.charCodeAt(reader.at) !== 0x3a) throw jsonError(reader, 'a colon was expected');
+    reader.at += 1;
+    entries.push([name, readJsonValue(reader, depth + 1)]);
+    skipJsonSpace(reader);
+    const next = reader.text.charCodeAt(reader.at);
+    reader.at += 1;
+    if (next === 0x7d) return Object.fromEntries(entries);
+    if (next !== 0x2c) throw jsonError(reader, 'a comma or a closing brace was expected');
+  }
+}
+
+function readJsonValue(reader: JsonReader, depth: number): unknown {
+  if (depth >= MAX_JSON_DEPTH) throw jsonError(reader, 'nesting is too deep');
+  skipJsonSpace(reader);
+  const code = reader.text.charCodeAt(reader.at);
+  switch (code) {
+    case 0x7b:
+      return readJsonObject(reader, depth);
+    case 0x5b:
+      return readJsonArray(reader, depth);
+    case 0x22:
+      return readJsonString(reader);
+    case 0x74:
+      return readJsonLiteral(reader, 'true', true);
+    case 0x66:
+      return readJsonLiteral(reader, 'false', false);
+    case 0x6e:
+      return readJsonLiteral(reader, 'null', null);
+    default:
+      if (code === 0x2d || (code >= 0x30 && code <= 0x39)) return readJsonInteger(reader);
+      throw jsonError(reader, 'an unexpected character');
+  }
+}
+
+/** The JSON document in `text` with every number a bigint; a non-integer number or any malformed text is an error. */
+export function parseExactJson(text: string): Result<unknown, string> {
+  const reader: JsonReader = { text, at: 0 };
+  try {
+    const value = readJsonValue(reader, 0);
+    skipJsonSpace(reader);
+    if (reader.at !== text.length) throw jsonError(reader, 'unexpected text after the document');
+    return { ok: true, value };
+  } catch (error) {
+    return { ok: false, error: describeCause(error) };
+  }
 }
 
 export function readCargoFingerprint(text: string): Result<CargoFingerprint, string> {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text, exactIntegers);
-  } catch (error) {
-    return {
-      ok: false,
-      error: `unreadable fingerprint JSON: ${error instanceof Error ? error.message : String(error)}`,
-    };
-  }
-  const checked = validateFingerprint(parsed);
+  const parsed = parseExactJson(text);
+  if (!parsed.ok) return { ok: false, error: `unreadable fingerprint JSON: ${parsed.error}` };
+  const checked = validateFingerprint(parsed.value);
   if (!checked.success) {
     return {
       ok: false,
@@ -311,6 +422,15 @@ function errorCode(error: unknown): string | undefined {
   return error instanceof Error && 'code' in error && typeof error.code === 'string' ? error.code : undefined;
 }
 
+/** Create `path`, failing if it exists, and write `text` into it. */
+function writeNew(path: string, text: string): void {
+  const fd = openSync(path, 'wx');
+  try {
+    writeSync(fd, text);
+  } finally {
+    closeSync(fd);
+  }
+}
 async function lstatOrUndefined(path: string) {
   try {
     return await lstat(path);
@@ -827,7 +947,7 @@ async function moveToTrash(profile: string, victims: readonly Meta[]): Promise<R
       entries.push({ from: victim.path, ...identity });
     }
     const manifest: TrashManifest = { version: 1, entries };
-    await writeFile(join(trash, `${pass}.json`), JSON.stringify(manifest), { flag: 'wx' });
+    writeNew(join(trash, `${pass}.json`), JSON.stringify(manifest));
     await mkdir(join(trash, pass));
     for (const [index, entry] of entries.entries()) await rename(entry.from, join(trash, pass, String(index)));
     return { ok: true, value: undefined };
@@ -1084,15 +1204,6 @@ export async function retainCargoWorkspace(
       },
     };
   }
-  if (!losslessJsonAvailable()) {
-    return {
-      ok: false,
-      error: {
-        kind: 'lossless-json-unavailable',
-        detail: 'JSON.parse does not hand revivers the source text of numbers',
-      },
-    };
-  }
   const metadataStarted = performance.now();
   const workspace = await cargoWorkspace(cargoWorkspaceRoot);
   performance.measure('cargoRetention:metadata', { start: metadataStarted });
@@ -1155,7 +1266,7 @@ export async function retainCargoWorkspace(
       const receipt = join(targetDir, RETENTION_RECEIPT);
       const staging = `${receipt}.${randomUUID()}.tmp`;
       try {
-        await writeFile(staging, `${JSON.stringify(done, null, 2)}\n`, { flag: 'wx' });
+        writeNew(staging, `${JSON.stringify(done, null, 2)}\n`);
         await rename(staging, receipt);
       } catch (error) {
         return { ok: false, error: ioError('write retention receipt', receipt, error) };
@@ -1404,8 +1515,6 @@ export function describeRetentionError(error: RetentionError): string {
       return `cargo metadata in ${error.cwd} failed: ${error.detail}`;
     case 'target-not-cargo':
       return `${error.targetDir} is not a Cargo target directory: ${error.detail}`;
-    case 'lossless-json-unavailable':
-      return `cannot read Cargo fingerprints exactly: ${error.detail}`;
     case 'io':
       return `cannot ${error.operation} ${error.path}: ${error.detail}`;
   }
