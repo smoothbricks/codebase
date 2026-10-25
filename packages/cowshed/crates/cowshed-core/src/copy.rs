@@ -1031,9 +1031,9 @@ fn classify(metadata: &fs::Metadata) -> Option<EntryKind> {
     }
 }
 
-/// The volume's own bookkeeping ([`cowshed_apfs::VOLUME_METADATA`], and adopted main's Spotlight
-/// opt-out [`cowshed_apfs::SPOTLIGHT_OPT_OUT`]): it is neither copied from the source nor deleted
-/// from the destination.
+/// The volume's own bookkeeping ([`cowshed_apfs::VOLUME_METADATA`], and the Spotlight opt-out
+/// [`cowshed_apfs::SPOTLIGHT_OPT_OUT`] older volumes carry): it is neither copied from the source
+/// nor deleted from the destination.
 fn is_apfs_volume_metadata(name: &OsStr) -> bool {
     cowshed_apfs::VOLUME_METADATA
         .iter()

@@ -5162,30 +5162,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         .await
     }
 
-    /// Adopt and an already-adopted main's adopt check initialize the image, not each clone or
-    /// mount. Mount authority comes from the substrate, never from an empty checkout directory.
-    async fn initialize_main_volume(
-        &self,
-        workspace: &crate::storage::lifecycle::LifecycleWorkspace,
-    ) -> Result<()> {
-        use crate::storage::lifecycle::{MountIntent, Substrate};
-        let mount = self
-            .substrate
-            .ensure_mounted(workspace, MountIntent { browse: false })
-            .await
-            .map_err(native_storage_error)?;
-        crate::storage::lifecycle::dispatch_blocking(move || {
-            cowshed_apfs::initialize_volume_root(&mount).map_err(|error| {
-                CowshedError::environment_missing(
-                    format!("initialize main volume {}: {error}", mount.display()),
-                    "make main's volume root writable and remove any conflicting Spotlight marker",
-                )
-            })
-        })
-        .await
-        .map_err(|error| CowshedError::internal(format!("initialize main volume: {error}")))?
-    }
-
     /// Everything adoption does once main is mounted at the checkout. Each step is safe to repeat
     /// on a replay: the commitment is append-safe, completion overwrites, and the first touch
     /// finds the volume an interrupted one linked.
@@ -5203,10 +5179,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         first: super::build_volumes::FirstMint<H>,
     ) -> Result<WorkspaceSnapshot> {
         use super::supervisor::CommitmentSink;
-        if let Err(error) = self.initialize_main_volume(workspace).await {
-            first.settle().await;
-            return Err(error);
-        }
         let introduced = self
             .commitments
             .record(super::supervisor::CommitmentDraft::WorkspaceIntroduced {
@@ -12736,8 +12708,6 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         if let Some(expected) = self.completed_workspace_intent(&intent).cloned() {
             let current = self.current(&main_name()).await?;
             Self::require_exact_incarnation(&current, &expected)?;
-            self.initialize_main_volume(&current.derived.workspace)
-                .await?;
             return self.snapshot(&current);
         }
 
@@ -12745,9 +12715,6 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .await?
             .is_empty()
         {
-            let current = self.current(&main_name()).await?;
-            self.initialize_main_volume(&current.derived.workspace)
-                .await?;
             return Err(CowshedError::conflict(
                 "repository is already adopted",
                 "list the existing main workspace",

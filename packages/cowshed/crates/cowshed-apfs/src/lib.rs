@@ -4338,7 +4338,10 @@ pub const EVENT_LOG_DIRECTORY: &str = ".fseventsd";
 /// The marker fseventsd reads when a volume mounts: present, it keeps no log of the volume and
 /// still delivers the volume's live events to every stream.
 pub const EVENT_LOG_OPT_OUT: &str = "no_log";
-/// The marker adopted main carries at its volume root, inherited by its image clones.
+/// macOS's Spotlight opt-out marker. Cowshed writes no Spotlight policy, but volumes adopted while
+/// it planted this file (until 2026-10-25) carry it at their root and their clones inherit it, so,
+/// like [`VOLUME_METADATA`], excludes, copies and retirements pass over it as the volume's, not the
+/// repository's.
 pub const SPOTLIGHT_OPT_OUT: &str = ".metadata_never_index";
 
 /// What macOS keeps at every volume's root for itself: the event log, the Spotlight index, the
@@ -4371,7 +4374,6 @@ enum EventLog {
 /// calls take.
 const EVENT_LOG_DIRECTORY_C: &std::ffi::CStr = c".fseventsd";
 const EVENT_LOG_OPT_OUT_C: &std::ffi::CStr = c"no_log";
-const SPOTLIGHT_OPT_OUT_C: &std::ffi::CStr = c".metadata_never_index";
 /// Opening a directory for lookups alone needs only search permission: root's 0700 refuses
 /// it, the 0711 a retirement leaves grants it. Linux names the same access `O_PATH`.
 #[cfg(target_vendor = "apple")]
@@ -4491,22 +4493,6 @@ fn plant_empty_marker(directory: &File, marker: &std::ffi::CStr) -> io::Result<M
             )
         }
         _ => Err(error),
-    }
-}
-
-/// Initialize adopted main's volume root before its image is cloned. Existing adopted mains
-/// pass through the same helper on an adopt check; a conflicting entry is never overwritten.
-pub fn initialize_volume_root(mount_point: &Path) -> io::Result<()> {
-    match plant_empty_marker(&open_volume_root(mount_point)?, SPOTLIGHT_OPT_OUT_C)? {
-        Marker::Planted => Ok(()),
-        Marker::Refused => Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("cannot create {SPOTLIGHT_OPT_OUT}"),
-        )),
-        Marker::Squatted => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{SPOTLIGHT_OPT_OUT} is not an empty regular file"),
-        )),
     }
 }
 
@@ -8527,34 +8513,6 @@ mod tests {
         }
         // The descendant's last act before it exits.
         assert_eq!(descendant.acknowledgment(), "ended\n");
-    }
-
-    #[test]
-    fn main_volume_initialization_plants_the_spotlight_opt_out_and_refuses_a_squatter() {
-        let root = temp_path("spotlight-opt-out", "mnt");
-        fs::create_dir_all(&root).unwrap();
-        initialize_volume_root(&root).unwrap();
-        let marker = root.join(SPOTLIGHT_OPT_OUT);
-        assert_eq!(fs::metadata(&marker).unwrap().len(), 0);
-        initialize_volume_root(&root).expect("idempotent");
-        fs::remove_file(&marker).unwrap();
-        let elsewhere = root.with_extension("elsewhere");
-        std::os::unix::fs::symlink(&elsewhere, &marker).unwrap();
-        assert_eq!(
-            initialize_volume_root(&root).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert!(
-            !elsewhere.exists(),
-            "nothing is written through the symlink"
-        );
-        fs::remove_file(&marker).unwrap();
-        fs::write(&marker, b"not empty").unwrap();
-        assert_eq!(
-            initialize_volume_root(&root).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

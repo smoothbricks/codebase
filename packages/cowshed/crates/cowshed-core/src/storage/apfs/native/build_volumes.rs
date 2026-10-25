@@ -1540,10 +1540,7 @@ mod tests {
                 let path = entry.unwrap().path();
                 let metadata = fs::symlink_metadata(&path).unwrap();
                 let relative = path.strip_prefix(root).unwrap().to_path_buf();
-                if relative.starts_with(".fseventsd")
-                    || relative.starts_with(".Spotlight-V100")
-                    || relative == Path::new(cowshed_apfs::SPOTLIGHT_OPT_OUT)
-                {
+                if relative.starts_with(".fseventsd") || relative.starts_with(".Spotlight-V100") {
                     continue;
                 }
                 if metadata.is_dir() {

@@ -850,18 +850,6 @@ fn highest_free_port_blocks<const N: usize>(fixture: &Fixture) -> [PortBlock; N]
         .unwrap_or_else(|free: Vec<PortBlock>| panic!("{N} free macOS port blocks, not {free:?}"))
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn real_apfs_adopt_initializes_mains_spotlight_marker() {
-    let fixture = Fixture::with(Project::Plain);
-    let mut service = fixture.open().await;
-    adopt(&fixture, &mut service).await;
-    let main = service.path("main", false).await.expect("adopted main");
-    let marker = fs::symlink_metadata(main.mount.join(cowshed_apfs::SPOTLIGHT_OPT_OUT))
-        .expect("adopt writes main's Spotlight opt-out");
-    assert!(marker.file_type().is_file());
-    assert_eq!(marker.len(), 0);
-}
-
 /// Two workspaces recorded with one port block — what an allocator that missed an unfinished
 /// intent's block handed out — are a `port-block-collision` doctor names with both, and
 /// `doctor --repair` moves the newer one to a free block: its grants publish the new block and
