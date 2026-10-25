@@ -44,8 +44,12 @@ The controller validates that fence from the named workspace's authoritative sna
 missing or corrupt sibling session/grants record cannot refuse another workspace's admission, job observation, stdin,
 logs, resources, or session operations. Project enumeration still reports its own inventory faults. Mount assurance and
 publication recovery on a workspace request use that same scope: held canonical image locks select the exact workspaces
-to recover before any sidecar is read. Store-wide recovery is an explicit startup/maintenance pass, not a dependency of
-a live job's supervisor lookup.
+to recover before any sidecar is read. An opening takes those locks without waiting. A selected lock another process
+holds is a live lifecycle operation's, such as a fork's of `main` or a restore's still fencing, and that workspace's
+publication, a pending restore's activation included, is left to the holder or the next opening; with every selected
+lock held the opening recovers nothing, and never falls back to the store-wide pass. So no opening, `cowshed ls`'s and
+`cowshed exec`'s included, waits for another process's fork. Store-wide recovery is an explicit startup/maintenance
+pass, not a dependency of a live job's supervisor lookup.
 
 A cold `Workspaces`, `Removal` or `Supervisor` opening observes main and its explicitly selected names, filtering
 pending and retired records before reading their sidecars. It additionally observes the invocation-origin workspace only

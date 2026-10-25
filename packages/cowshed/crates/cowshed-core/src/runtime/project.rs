@@ -3697,6 +3697,29 @@ fn plan_empty_directories_on(path: &Path, device: u64, plan: &mut Vec<PathBuf>) 
     Ok(())
 }
 
+/// The pending restores an opening may activate. The store-wide pass (`scoped` false) takes the
+/// store's locks and every restore with them; a scoped opening activates only a restore whose
+/// image lock it holds (`held`): one another process holds is that restore's own, still fencing,
+/// and is left to it (07_api.md, "Authority model").
+#[cfg(any(test, target_os = "macos"))]
+fn restorable_publications(
+    pending: &[crate::storage::apfs::PendingPublicationFact],
+    scoped: bool,
+    held: &[PathBuf],
+) -> Vec<crate::storage::apfs::PendingPublicationFact> {
+    pending
+        .iter()
+        .filter(|fact| {
+            !scoped || {
+                let mut lock = fact.image.clone().into_os_string();
+                lock.push(".lock");
+                held.contains(&PathBuf::from(lock))
+            }
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(any(test, target_os = "macos"))]
 fn verified_recovery_facts<'a>(
     facts: &'a [crate::storage::lifecycle::StorageFact],
@@ -4020,7 +4043,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             names.insert(origin.workspace.clone());
         }
         let retired_names = observation_names.clone();
-        let (host, facts, pending, lifecycle_intents) =
+        let (host, facts, pending, restorable, lifecycle_intents, publication_guards) =
             crate::storage::lifecycle::dispatch_blocking(move || {
                 let lifecycle_intents = match replay_journal {
                     Some(journal) => journal,
@@ -4036,27 +4059,36 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     return Err(error);
                 }
                 // Only explicit store maintenance completes unrelated publications. A scoped
-                // opening holds its selected image locks before recovery reads any sidecar.
+                // opening recovers a selected workspace only under its image lock, taken before
+                // recovery reads any sidecar, and waits for none: a lock another process holds is
+                // a live lifecycle operation's (a fork holds its source's, `main`'s included,
+                // through its clone), and that workspace's publication is the holder's, or the
+                // next opening's, to finish (07_api.md, "Authority model"). So `ls`, `exec` and
+                // every verb that names a workspace never wait on another's fork of main.
+                let mut held = Vec::with_capacity(publication_locks.len());
+                let mut guards = Vec::with_capacity(publication_locks.len());
                 if repairs {
-                    let _guard = if publication_locks.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            host.lock_images(
-                                &publication_locks,
-                                cowshed_apfs::store_lock::LockMode::Wait,
+                    for lock in &publication_locks {
+                        if let Some(guard) = host
+                            .lock_images(
+                                std::slice::from_ref(lock),
+                                cowshed_apfs::store_lock::LockMode::Try,
                                 &crate::api::held_lock::LockHolding::store(
                                     crate::api::held_lock::LockOperation::Open,
                                 ),
                             )
                             .map_err(native_storage_error)?
-                            .ok_or_else(|| {
-                                CowshedError::internal("blocking image lock unavailable")
-                            })?,
-                        )
-                    };
-                    host.recover_pending(&recovery_config, &publication_locks)
-                        .map_err(native_storage_error)?;
+                        {
+                            held.push(lock.clone());
+                            guards.push(guard);
+                        }
+                    }
+                    // No lock at all selects the store-wide pass, which a scoped opening never
+                    // runs: with every selected lock held elsewhere it recovers nothing.
+                    if publication_locks.is_empty() || !held.is_empty() {
+                        host.recover_pending(&recovery_config, &held)
+                            .map_err(native_storage_error)?;
+                    }
                 }
                 let facts = match &observation_names {
                     None => host.list(&recovery_repo).map_err(native_storage_error)?,
@@ -4088,7 +4120,17 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 let pending = host
                     .pending_publications_for(&recovery_repo, observation_names.as_ref())
                     .map_err(native_storage_error)?;
-                Ok::<_, CowshedError>((host, facts, pending, lifecycle_intents))
+                let restorable =
+                    restorable_publications(&pending, !publication_locks.is_empty(), &held);
+                // Only a restore's activation needs the locks past this point; with none to
+                // activate they are let go here, before anything else the opening does.
+                let guards = if restorable.is_empty() {
+                    drop(guards);
+                    Vec::new()
+                } else {
+                    guards
+                };
+                Ok::<_, CowshedError>((host, facts, pending, restorable, lifecycle_intents, guards))
             })
             .await
             .map_err(|error| {
@@ -4179,12 +4221,13 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             host,
             config.clone(),
             &repo_id,
-            &pending,
+            &restorable,
             retired,
             &mut commitments,
             &recovery_scope,
         )
         .await?;
+        drop(publication_guards);
         let descriptor = ProjectDescriptor {
             repo_id,
             binding: std::sync::Arc::new(binding),
@@ -26157,6 +26200,73 @@ mod binding_tests {
         drop(destination);
         drop(commitments);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A scoped opening activates only the pending restores whose image lock it holds: a restore
+    /// of main fencing under main's lock in another process is left to it, while the store-wide
+    /// pass and an opening holding main's lock take it.
+    #[test]
+    fn an_opening_activates_only_the_restores_whose_image_lock_it_holds() {
+        use crate::metadata::WorkspaceRole;
+        use crate::storage::apfs::PendingPublicationFact;
+        use crate::storage::lifecycle::{LifecycleWorkspace, Revision};
+
+        let store = PathBuf::from("/private/cowshed/store/acme/widget");
+        let replaced =
+            WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").expect("replaced");
+        let destination =
+            WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").expect("destination");
+        let pending = [PendingPublicationFact {
+            workspace: LifecycleWorkspace::new(
+                repo_id("acme/widget"),
+                WorkspaceName::new("main").expect("main"),
+                destination.clone(),
+                Revision::new(2),
+                Revision::new(11),
+                WorkspaceRole::Main,
+            )
+            .expect("destination workspace"),
+            image: store.join("main.dmg"),
+            mount_point: store.join("mount"),
+            source_checkpoint: "baseline".to_owned(),
+            source_incarnation: replaced.clone(),
+            replaced_incarnation: replaced,
+            destination_incarnation: destination,
+        }];
+        let incarnations = |restorable: Vec<PendingPublicationFact>| {
+            restorable
+                .into_iter()
+                .map(|fact| fact.destination_incarnation)
+                .collect::<Vec<_>>()
+        };
+        let all = vec![pending[0].destination_incarnation.clone()];
+
+        assert_eq!(
+            incarnations(restorable_publications(&pending, true, &[])),
+            Vec::new(),
+            "a restore whose lock another process holds stays that process's"
+        );
+        assert_eq!(
+            incarnations(restorable_publications(
+                &pending,
+                true,
+                &[store.join("sessions/raven.dmg.lock")]
+            )),
+            Vec::new(),
+            "another workspace's lock is not the restore's"
+        );
+        assert_eq!(
+            incarnations(restorable_publications(
+                &pending,
+                true,
+                &[store.join("main.dmg.lock")]
+            )),
+            all
+        );
+        assert_eq!(
+            incarnations(restorable_publications(&pending, false, &[])),
+            all
+        );
     }
 }
 

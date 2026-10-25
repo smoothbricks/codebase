@@ -1341,6 +1341,81 @@ async fn a_supervisor_serves_while_other_processes_hold_its_image_locks() {
         .expect("stop the ordinary opening");
 }
 
+/// An ordinary opening waits for no image lock another process holds (07_api.md, "Authority
+/// model"): what `cowshed ls` opens, naming no workspace, and what `cowshed exec served` opens,
+/// naming `served`, both open and list the project while other processes hold main's lock and
+/// `served`'s, as forks cloning them hold each. Measured 2026-10-25: a `cowshed ls` waited 300 s
+/// and an exec into an existing workspace more than two minutes in `flock` on `main.dmg.lock`,
+/// under `acquire_image_locks` in the project opening, behind forks of main.
+#[tokio::test]
+async fn an_ordinary_opening_waits_for_no_image_lock_another_process_holds() {
+    let fixture = Fixture::new("open-locks");
+    let runtime = fixture.adopt().await;
+    fixture
+        .mint(&runtime, "served", ForkOptions::default())
+        .await
+        .expect("mint the served workspace");
+    runtime
+        .shutdown()
+        .await
+        .expect("stop the controller that minted it");
+    let layout = fixture.layout();
+    let scratch = fixture.checkout.parent().expect("the scratch root");
+    let locks = [WorkspaceName::main(), name("served")].map(|workspace| {
+        layout
+            .canonical_image(&workspace)
+            .expect("a selected image")
+            .lock()
+            .to_owned()
+    });
+    let holders = locks
+        .each_ref()
+        .map(|lock| LockHolder::hold(scratch, fixture.storage.store(), lock));
+
+    let listing = ProjectRuntime::open_directory_existing_at(
+        &fixture.checkout,
+        RecoveryScope::Workspaces(Default::default()),
+        fixture.storage.clone(),
+        refusing_gateway::connect,
+    )
+    .await
+    .expect("a listing's opening waits on no lock another operation holds");
+    assert_eq!(fixture.listed(&listing).await, ["main", "served"]);
+    listing
+        .shutdown()
+        .await
+        .expect("stop the listing's runtime");
+    let naming = fixture
+        .open_naming("served")
+        .await
+        .expect("an exec's opening waits on no lock another operation holds");
+    assert_eq!(fixture.listed(&naming).await, ["main", "served"]);
+    naming.shutdown().await.expect("stop the naming runtime");
+    for holder in holders {
+        holder.release();
+    }
+
+    // With no holder an opening takes the locks it selects and lets go of each before it
+    // answers: a client never holds an image lock while it waits on anything else, the gateway
+    // included, whose startup mounts adopted projects under main's lock.
+    let reopened = fixture
+        .open_naming("served")
+        .await
+        .expect("an exec's opening once the holders let go");
+    for lock in &locks {
+        fs::File::open(lock)
+            .expect("an image lock file")
+            .try_lock()
+            .unwrap_or_else(|error| {
+                panic!("the opened runtime still holds {}: {error}", lock.display())
+            });
+    }
+    reopened
+        .shutdown()
+        .await
+        .expect("stop the reopened runtime");
+}
+
 /// Names the scratch root of the fixture whose `served` workspace this test binary serves when it
 /// runs as [`supervisor_process`].
 const SUPERVISOR_SCRATCH_ENV: &str = "COWSHED_TEST_SUPERVISOR_SCRATCH";
