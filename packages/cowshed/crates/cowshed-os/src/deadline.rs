@@ -12,7 +12,9 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::process::ExitStatus;
 use std::sync::LazyLock;
+use std::sync::mpsc;
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
@@ -23,6 +25,8 @@ use lmao_core::{BlockedReason, Clock};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UnixStream;
 use tokio::time::Sleep;
+
+use crate::process::{ExitWatch, RunState};
 
 /// One request and its one answer from a running cowshed daemon over a local socket.
 pub const CONTROL: Bound = Bound::new(LatencyClass::Control, Duration::from_secs(5));
@@ -90,6 +94,8 @@ pub fn idle(op: &'static str, silence: Duration) -> Idle {
 pub enum PeerAddress {
     Unix(PathBuf),
     Tcp(SocketAddr),
+    /// One end of a socketpair the peer inherited: no address names it, its pid does.
+    Pair,
 }
 
 /// What the kernel said about the process at the other end.
@@ -130,6 +136,15 @@ impl Peer {
         self
     }
 
+    /// The peer at the other end of a socketpair, the child `pid` that inherited it.
+    pub fn paired(role: &'static str, pid: i32) -> Self {
+        Self {
+            role,
+            address: PeerAddress::Pair,
+            pid: PeerPid::Known(pid),
+        }
+    }
+
     pub fn tcp(role: &'static str, address: SocketAddr) -> Self {
         Self {
             role,
@@ -146,6 +161,7 @@ impl fmt::Display for Peer {
                 write!(formatter, "{} at {}", self.role, socket.display())?
             }
             PeerAddress::Tcp(address) => write!(formatter, "{} at {address}", self.role)?,
+            PeerAddress::Pair => write!(formatter, "{} on a socketpair", self.role)?,
         }
         match &self.pid {
             PeerPid::Known(pid) => write!(formatter, " (pid {pid})"),
@@ -334,6 +350,331 @@ pub async fn within<T>(
     tokio::time::timeout(remaining, work)
         .await
         .map_err(|_| expired())
+}
+
+/// A child process a wait is on, named as the reader of an expiry needs it: what it is to the
+/// waiter, its pid, and what the kernel showed it doing when the wait gave up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildPeer {
+    pub role: &'static str,
+    pub pid: u32,
+    pub state: RunState,
+}
+
+impl ChildPeer {
+    /// `role` at `pid`, in the state the kernel shows it in now.
+    pub fn observed(role: &'static str, pid: u32) -> Self {
+        let state = libc::pid_t::try_from(pid).map_or_else(
+            |error| RunState::Unread(error.to_string()),
+            crate::process::run_state,
+        );
+        Self { role, pid, state }
+    }
+}
+
+impl fmt::Display for ChildPeer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} pid {} ({})", self.role, self.pid, self.state)
+    }
+}
+
+/// How waiting for a child to exit failed. Terminal either way: nothing waits again, and the
+/// child is left as it is.
+#[derive(Debug, thiserror::Error)]
+pub enum ReapError {
+    #[error("{0}")]
+    Expired(Box<Expired<ChildPeer>>),
+    #[error("{op}: waiting for {role} pid {pid} failed after {elapsed:?}: {source}")]
+    Wait {
+        op: &'static str,
+        role: &'static str,
+        pid: u32,
+        elapsed: Duration,
+        #[source]
+        source: io::Error,
+    },
+}
+
+impl ReapError {
+    /// The lmao error code this failure is reported under.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Expired(_) => "TIMEOUT",
+            Self::Wait { .. } => "IO",
+        }
+    }
+
+    pub const fn retry_class(&self) -> RetryClass {
+        RetryClass::Terminal
+    }
+}
+
+/// Wait for `child`, `role` to this process, to exit within what is left of `deadline`: its
+/// status, or the expiry naming its pid and the state the kernel shows it in, with `last` the
+/// last thing this process did to it (the signal that should have ended it, or nothing). The exit
+/// is watched (`ExitWatch`), never polled. Expiry ends the wait, never the child: one stuck in
+/// an uninterruptible kernel call stays as it is, named.
+pub fn reap(
+    role: &'static str,
+    child: &mut std::process::Child,
+    deadline: &Deadline,
+    last: Progress,
+) -> Result<ExitStatus, ReapError> {
+    let pid = child.id();
+    let failed = |source| ReapError::Wait {
+        op: deadline.op(),
+        role,
+        pid,
+        elapsed: deadline.elapsed(clock()),
+        source,
+    };
+    let expired = || {
+        ReapError::Expired(Box::new(deadline.expired(
+            ChildPeer::observed(role, pid),
+            last,
+            clock(),
+        )))
+    };
+    // No watch is a child that has already exited (Darwin refuses to watch a zombie).
+    if let Some(watch) = ExitWatch::of(pid).map_err(failed)? {
+        loop {
+            let remaining = deadline.remaining(clock()).ok_or_else(expired)?;
+            match watch.within(remaining) {
+                Ok(true) => break,
+                Ok(false) => return Err(expired()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(failed(error)),
+            }
+        }
+    }
+    // WHY unbounded: the child has exited, so its status is collected at once.
+    child.wait().map_err(failed)
+}
+
+/// [`reap`] for a child tokio spawned, whose exit tokio's own driver watches.
+pub async fn reap_async(
+    role: &'static str,
+    child: &mut tokio::process::Child,
+    deadline: &Deadline,
+    last: Progress,
+) -> Result<ExitStatus, ReapError> {
+    // No pid is a child tokio has already reaped: its status is kept and answered at once.
+    let pid = child.id().unwrap_or_default();
+    let failed = |source| ReapError::Wait {
+        op: deadline.op(),
+        role,
+        pid,
+        elapsed: deadline.elapsed(clock()),
+        source,
+    };
+    let expired = || {
+        ReapError::Expired(Box::new(deadline.expired(
+            ChildPeer::observed(role, pid),
+            last,
+            clock(),
+        )))
+    };
+    let remaining = deadline.remaining(clock()).ok_or_else(expired)?;
+    match tokio::time::timeout(remaining, child.wait()).await {
+        Ok(status) => status.map_err(failed),
+        Err(_) => Err(expired()),
+    }
+}
+
+/// How running a child to its end within a deadline ([`output_within`]) failed.
+#[derive(Debug, thiserror::Error)]
+pub enum RunError {
+    #[error("{op}: {role} could not be started: {source}")]
+    Spawn {
+        op: &'static str,
+        role: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error(transparent)]
+    Reap(#[from] ReapError),
+    #[error(transparent)]
+    Output(#[from] OutputError),
+}
+
+impl RunError {
+    /// The lmao error code this failure is reported under.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Spawn { .. } => "IO",
+            Self::Reap(failure) => failure.code(),
+            Self::Output(failure) => failure.code(),
+        }
+    }
+}
+
+/// Run `command`, `role` to this process, as [`crate::fork_lock::Run::output_locked`] does (no
+/// input, both outputs collected), within `deadline`: from its spawn to its exit and its
+/// output's end. Past the bound the run fails naming the child, its pid and its state, and the
+/// child is left as it is.
+pub fn output_within(
+    role: &'static str,
+    command: &mut std::process::Command,
+    deadline: &Deadline,
+) -> Result<std::process::Output, RunError> {
+    use crate::fork_lock::Spawn as _;
+
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn_locked()
+        .map_err(|source| RunError::Spawn {
+            op: deadline.op(),
+            role,
+            source,
+        })?;
+    let pumps = OutputPumps::start(&mut child);
+    let status = reap(role, &mut child, deadline, Progress::Nothing)?;
+    let (stdout, stderr) = pumps.join(role, child.id(), deadline)?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// One of a child's two output streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl fmt::Display for OutputStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        })
+    }
+}
+
+/// How collecting an exited child's output failed.
+#[derive(Debug, thiserror::Error)]
+pub enum OutputError {
+    /// The child exited, but a stream was still open at the bound: a process that inherited the
+    /// pipe from it, one it started, holds it (code `TIMEOUT`, terminal).
+    #[error("{expired}; its {stream} is still open: a process it started holds the pipe")]
+    Held {
+        stream: OutputStream,
+        expired: Box<Expired<ChildPeer>>,
+    },
+    #[error("{op}: reading the {stream} of {role} pid {pid} failed: {source}")]
+    Read {
+        op: &'static str,
+        role: &'static str,
+        pid: u32,
+        stream: OutputStream,
+        #[source]
+        source: io::Error,
+    },
+}
+
+impl OutputError {
+    /// The lmao error code this failure is reported under.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Held { .. } => "TIMEOUT",
+            Self::Read { .. } => "IO",
+        }
+    }
+}
+
+/// A child's piped stdout and stderr, each read to its end on a thread of its own while the child
+/// runs, as `Command::output` reads them, so a verbose child never wedges on a full pipe.
+pub struct OutputPumps {
+    pending: usize,
+    done: mpsc::Receiver<(OutputStream, io::Result<Vec<u8>>)>,
+}
+
+impl OutputPumps {
+    /// Start reading `child`'s piped stdout and stderr; a stream that is not piped reads empty.
+    pub fn start(child: &mut std::process::Child) -> Self {
+        use std::io::Read as _;
+
+        let (sent, done) = mpsc::channel();
+        let mut pending = 0;
+        let mut pump = |stream, pipe: Option<Box<dyn std::io::Read + Send>>| {
+            let Some(mut pipe) = pipe else { return };
+            pending += 1;
+            let sent = sent.clone();
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let read = pipe.read_to_end(&mut bytes).map(|_| bytes);
+                // A collector that gave up has already failed naming this stream's holder.
+                let _ = sent.send((stream, read));
+            });
+        };
+        pump(
+            OutputStream::Stdout,
+            child
+                .stdout
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+        );
+        pump(
+            OutputStream::Stderr,
+            child
+                .stderr
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+        );
+        Self { pending, done }
+    }
+
+    /// The bytes each stream carried to its end, the child `role` at `pid` having exited, within
+    /// what is left of `deadline`. A stream still open at the bound is held by a process that
+    /// inherited the pipe; the wait ends naming the child and that stream, and the pump stays
+    /// with the pipe until its holder closes it.
+    pub fn join(
+        self,
+        role: &'static str,
+        pid: u32,
+        deadline: &Deadline,
+    ) -> Result<(Vec<u8>, Vec<u8>), OutputError> {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut open = [OutputStream::Stdout, OutputStream::Stderr]
+            .into_iter()
+            .take(self.pending)
+            .collect::<Vec<_>>();
+        while !open.is_empty() {
+            let held = || OutputError::Held {
+                stream: open[0],
+                expired: Box::new(deadline.expired(
+                    ChildPeer::observed(role, pid),
+                    Progress::State("exited"),
+                    clock(),
+                )),
+            };
+            let remaining = deadline.remaining(clock()).ok_or_else(held)?;
+            let (stream, read) = match self.done.recv_timeout(remaining) {
+                Ok(done) => done,
+                Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(held());
+                }
+            };
+            let bytes = read.map_err(|source| OutputError::Read {
+                op: deadline.op(),
+                role,
+                pid,
+                stream,
+                source,
+            })?;
+            match stream {
+                OutputStream::Stdout => stdout = bytes,
+                OutputStream::Stderr => stderr = bytes,
+            }
+            open.retain(|pending| *pending != stream);
+        }
+        Ok((stdout, stderr))
+    }
 }
 
 impl<S> PeerStream<S> {
@@ -527,7 +868,149 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PeerStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fork_lock::Spawn as _;
+    use crate::process::RunState;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    const SHORT_REAP: Bound = Bound::new(LatencyClass::Reap, Duration::from_millis(50));
+
+    /// Kill the process group `leader` leads, which this test started.
+    fn kill_group(leader: u32) {
+        let group = libc::pid_t::try_from(leader).expect("a pid");
+        // SAFETY: a negative pid addresses only the group this test's own child leads.
+        assert_eq!(
+            unsafe { libc::kill(-group, libc::SIGKILL) },
+            0,
+            "kill the test's group"
+        );
+    }
+
+    #[test]
+    fn a_child_that_never_exits_is_not_waited_for_past_its_bound() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("600")
+            .spawn_locked()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let failure = reap(
+            "probe child",
+            &mut child,
+            &start("reap probe", SHORT_REAP),
+            Progress::Nothing,
+        )
+        .expect_err("sleep 600 does not exit within 50 ms");
+        let ReapError::Expired(expired) = &failure else {
+            panic!("expected TIMEOUT, got {failure}");
+        };
+        assert_eq!(expired.op, "reap probe");
+        assert_eq!(expired.peer.pid, pid);
+        assert_eq!(expired.peer.state, RunState::Sleeping, "{failure}");
+        assert!(expired.elapsed >= SHORT_REAP.within, "{failure}");
+        assert_eq!(failure.code(), "TIMEOUT");
+        // The expiry left the child running: it is reaped once killed.
+        child.kill().expect("kill sleep");
+        let status = reap(
+            "probe child",
+            &mut child,
+            &start("reap probe", REAP),
+            Progress::Signalled {
+                signal: libc::SIGKILL,
+            },
+        )
+        .expect("a killed child is reaped");
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn an_exited_childs_output_held_by_its_own_child_expires_naming_the_stream() {
+        use std::os::unix::process::CommandExt as _;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "/bin/sleep 600 & printf started"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn_locked()
+            .expect("spawn sh");
+        let pid = child.id();
+        let pumps = OutputPumps::start(&mut child);
+        let status = reap(
+            "probe child",
+            &mut child,
+            &start("reap probe", REAP),
+            Progress::Nothing,
+        )
+        .expect("sh exits once it started sleep");
+        assert!(status.success(), "{status}");
+        let failure = pumps
+            .join("probe child", pid, &start("collect output", SHORT_REAP))
+            .expect_err("sleep holds both pipes");
+        kill_group(pid);
+        let OutputError::Held { stream, expired } = &failure else {
+            panic!("expected the held pipe, got {failure}");
+        };
+        assert_eq!(*stream, OutputStream::Stdout);
+        assert_eq!(expired.peer.pid, pid);
+        assert_eq!(expired.op, "collect output");
+        assert!(expired.elapsed >= SHORT_REAP.within, "{failure}");
+        assert_eq!(failure.code(), "TIMEOUT");
+    }
+
+    #[test]
+    fn a_command_run_within_a_deadline_answers_its_output_or_names_the_child_it_waits_on() {
+        let output = output_within(
+            "probe command",
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "printf out; printf err >&2; exit 3"]),
+            &start("run probe", REAP),
+        )
+        .expect("sh ends at once");
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(
+            (output.stdout.as_slice(), output.stderr.as_slice()),
+            (&b"out"[..], &b"err"[..])
+        );
+
+        use std::os::unix::process::CommandExt as _;
+        let failure = output_within(
+            "probe command",
+            std::process::Command::new("/bin/sleep")
+                .arg("600")
+                .process_group(0),
+            &start("run probe", SHORT_REAP),
+        )
+        .expect_err("sleep 600 does not end within 50 ms");
+        let RunError::Reap(ReapError::Expired(expired)) = &failure else {
+            panic!("expected TIMEOUT, got {failure}");
+        };
+        kill_group(expired.peer.pid);
+        assert_eq!(expired.peer.role, "probe command");
+        assert_eq!(failure.code(), "TIMEOUT");
+    }
+
+    #[test]
+    fn an_exited_childs_output_is_joined_whole() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf out; printf err >&2"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn_locked()
+            .expect("spawn sh");
+        let pid = child.id();
+        let pumps = OutputPumps::start(&mut child);
+        reap(
+            "probe child",
+            &mut child,
+            &start("reap probe", REAP),
+            Progress::Nothing,
+        )
+        .expect("sh exits");
+        let (stdout, stderr) = pumps
+            .join("probe child", pid, &start("collect output", REAP))
+            .expect("both pipes close with the child");
+        assert_eq!(stdout, b"out");
+        assert_eq!(stderr, b"err");
+    }
 
     const SHORT: Bound = Bound::new(LatencyClass::Control, Duration::from_millis(50));
 

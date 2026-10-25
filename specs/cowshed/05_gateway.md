@@ -878,6 +878,15 @@ the handshake bound.
   is never heartbeated: an install reads it from a client of another build, whose reader ignores unknown fields and
   would take a heartbeat line for a ledger with no gate jobs, and it answers from the ledger at once. A held request
   (`disk-lease`, `cpu-tokens`, `jobserver`, `resident-pool`, `ram-lease`) keeps its own protocol above.
+  - **A child's exit and its output are reap-class waits.** A child cowshed has signalled to end is waited for within
+    the reap bound (`cowshed-os::deadline::reap`), its exit watched (`ExitWatch`: `NOTE_EXIT`, a pidfd), never polled.
+    Past the bound the wait fails `TIMEOUT` naming the child's pid and the state the kernel shows it in
+    (`cowshed-os::process::run_state`), so a child stuck in an uninterruptible kernel call, which no signal ends, is
+    named as such. Once a child has exited, its piped stdout and stderr are read to their end within the reap bound
+    (`OutputPumps`): a pipe still open then is held by a process the child started, and the run fails `TIMEOUT` naming
+    the child and the stream. A failed read of either stream is a typed failure, never empty output. In both cases the
+    child, and whatever holds its pipe, is left as it is. Every disk child's run takes both waits
+    (`SystemCommandRunner`).
 - **Spans.** A failure reaches the boundary that owns the wait as a value. An owner that has a span ends it `span-err`
   with the failure's message.
 

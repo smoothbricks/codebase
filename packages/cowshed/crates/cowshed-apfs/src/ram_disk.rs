@@ -131,6 +131,7 @@ impl RamDisks for SystemRamDisks {
                         | CommandRunFailure::Deadline { .. }
                         | CommandRunFailure::Kill { .. }
                         | CommandRunFailure::Reap { .. }
+                        | CommandRunFailure::Output { .. }
                         | CommandRunFailure::Input { .. } => RamDetached::Unknown { reason },
                     };
                 }

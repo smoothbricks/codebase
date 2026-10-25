@@ -246,10 +246,18 @@ pub enum CommandRunFailure {
         source: io::Error,
         ended: Result<Option<ProcessStatus>, io::Error>,
     },
-    /// The group was signalled, but reaping the child failed.
+    /// The group was signalled, but the child was not reaped: waiting for it failed, or it did
+    /// not end within the reap bound, which names its pid and the state the kernel shows it in
+    /// (an uninterruptible kernel wait no signal ends).
     Reap {
         deadline: Duration,
-        source: io::Error,
+        failure: Box<cowshed_os::deadline::ReapError>,
+    },
+    /// The child ended with `ended`, but its output was not collected: a pipe a process it
+    /// started still held at the reap bound, or a read of it failed.
+    Output {
+        ended: ProcessStatus,
+        failure: Box<cowshed_os::deadline::OutputError>,
     },
     /// The child ended with `ended`, but the bytes given as its standard input could not be
     /// written to it for a reason other than the child closing its end.
@@ -326,11 +334,18 @@ impl fmt::Display for CommandRunError {
                     Err(error) => write!(f, "could not observe or reap the child: {error}"),
                 }
             }
-            CommandRunFailure::Reap { deadline, source } => {
+            CommandRunFailure::Reap { deadline, failure } => {
                 fmt_command(f, program, args)?;
                 write!(
                     f,
-                    " did not finish within {deadline:?}; the owned process group was signalled, but could not reap the child: {source}"
+                    " did not finish within {deadline:?}; the owned process group was signalled, but could not reap the child: {failure}"
+                )
+            }
+            CommandRunFailure::Output { ended, failure } => {
+                fmt_command(f, program, args)?;
+                write!(
+                    f,
+                    " ended with {ended}, but its output was not collected: {failure}"
                 )
             }
             CommandRunFailure::Input { source, ended } => {
@@ -365,13 +380,14 @@ impl std::error::Error for CommandRunError {
             CommandRunFailure::Spawn(source)
             | CommandRunFailure::Wait(source)
             | CommandRunFailure::Kill { source, .. }
-            | CommandRunFailure::Reap { source, .. }
             | CommandRunFailure::Input { source, .. } => Some(source),
             CommandRunFailure::Deadline { .. }
             | CommandRunFailure::Unspawned(_)
             | CommandRunFailure::VolumeRename
             | CommandRunFailure::DeviceChanged(_) => None,
             CommandRunFailure::Release(refusal) => Some(refusal),
+            CommandRunFailure::Reap { failure, .. } => Some(failure),
+            CommandRunFailure::Output { failure, .. } => Some(failure),
         }
     }
 }
@@ -548,6 +564,9 @@ pub enum PastDeadline {
 pub struct DeadlinePolicy {
     pub deadline: Duration,
     pub past_deadline: PastDeadline,
+    /// How long the child's exit after SIGKILL, and its output's end after its exit, are waited
+    /// for: the reap class (specs/cowshed/05_gateway.md, "Deadlines").
+    pub reap: cowshed_os::deadline::Bound,
 }
 
 impl DeadlinePolicy {
@@ -562,6 +581,7 @@ impl DeadlinePolicy {
             } else {
                 PastDeadline::Kill
             },
+            reap: cowshed_os::deadline::REAP,
         }
     }
 
@@ -788,7 +808,6 @@ impl SystemCommandRunner {
         total: Option<CommandDeadline>,
         warn: &mut dyn FnMut(Duration),
     ) -> Result<CommandOutput, CommandRunError> {
-        use std::io::Read;
         crate::disk_lease::refuse_volume_rename(&request.program, &request.args)?;
         release_authority::refuse_unauthorized_release(request)?;
         if let Some(deadline) = total
@@ -816,53 +835,32 @@ impl SystemCommandRunner {
             .map(|(bytes, stdin)| Feed::new(bytes, stdin));
         // Drain both pipes on dedicated threads while the deadline poll runs, exactly as
         // `Command::output` drains while it waits: a verbose child (fsck) must never wedge
-        // on a full pipe just because the parent is polling instead of reading. A child
-        // killed at the deadline drops its pipes, which ends both pumps. A disk-image
+        // on a full pipe just because the parent is polling instead of reading. A disk-image
         // command has no pipes to drain: its output lands in files (spawn_disk_child), so
         // nothing it writes can wedge on a caller that is no longer there.
-        let stdout = (!output_files.is_some()).then(|| {
-            std::thread::spawn({
-                let mut pipe = child.stdout.take();
-                move || {
-                    let mut bytes = Vec::new();
-                    if let Some(pipe) = pipe.as_mut() {
-                        let _ = pipe.read_to_end(&mut bytes);
-                    }
-                    bytes
-                }
-            })
-        });
-        let stderr = (!output_files.is_some()).then(|| {
-            std::thread::spawn({
-                let mut pipe = child.stderr.take();
-                move || {
-                    let mut bytes = Vec::new();
-                    if let Some(pipe) = pipe.as_mut() {
-                        let _ = pipe.read_to_end(&mut bytes);
-                    }
-                    bytes
-                }
-            })
-        });
-        let collect = |stdout: Option<std::thread::JoinHandle<Vec<u8>>>,
-                       stderr: Option<std::thread::JoinHandle<Vec<u8>>>|
-         -> (Vec<u8>, Vec<u8>) {
-            match &output_files {
-                Some(directory) => {
-                    let read = |name: &str| fs::read(directory.join(name)).unwrap_or_default();
-                    let output = (read("stdout"), read("stderr"));
-                    let _ = fs::remove_dir_all(directory);
-                    output
-                }
-                None => (
-                    stdout
-                        .map(|pump| pump.join().unwrap_or_default())
-                        .unwrap_or_default(),
-                    stderr
-                        .map(|pump| pump.join().unwrap_or_default())
-                        .unwrap_or_default(),
-                ),
+        let pumps = output_files
+            .is_none()
+            .then(|| cowshed_os::deadline::OutputPumps::start(&mut child));
+        let pid = child.id();
+        // Once the child has exited its pipes close with it, unless a process it started still
+        // holds one: that is waited for within the reap bound, and named past it.
+        let collect = |pumps: Option<cowshed_os::deadline::OutputPumps>| match &output_files {
+            Some(directory) => {
+                let read = |name: &str| fs::read(directory.join(name)).unwrap_or_default();
+                let output = (read("stdout"), read("stderr"));
+                let _ = fs::remove_dir_all(directory);
+                Ok(output)
             }
+            None => pumps.map_or_else(
+                || Ok((Vec::new(), Vec::new())),
+                |pumps| {
+                    pumps.join(
+                        DISK_CHILD_ROLE,
+                        pid,
+                        &cowshed_os::deadline::start("collect disk child output", policy.reap),
+                    )
+                },
+            ),
         };
         let started = total.map_or_else(std::time::Instant::now, |deadline| deadline.started);
         let mut warned = 0;
@@ -878,16 +876,24 @@ impl SystemCommandRunner {
                     // Closed before the output is collected: a descendant that waits for the end
                     // of its input is not left waiting on this run.
                     let input_failure = feed.take().and_then(Feed::close);
-                    let (stdout, stderr) = collect(stdout, stderr);
+                    let collected = collect(pumps);
+                    let ended = ProcessStatus::from(status);
                     if let Some(source) = input_failure {
+                        if let Err(failure) = &collected {
+                            warn_output_failed(request, failure);
+                        }
                         return Err(CommandRunError {
                             request: request.clone(),
-                            failure: CommandRunFailure::Input {
-                                source,
-                                ended: ProcessStatus::from(status),
-                            },
+                            failure: CommandRunFailure::Input { source, ended },
                         });
                     }
+                    let (stdout, stderr) = collected.map_err(|failure| CommandRunError {
+                        request: request.clone(),
+                        failure: CommandRunFailure::Output {
+                            ended,
+                            failure: Box::new(failure),
+                        },
+                    })?;
                     let output = std::process::Output {
                         status,
                         stdout,
@@ -913,25 +919,33 @@ impl SystemCommandRunner {
                     }
                     DeadlineStep::Kill => {
                         // Closed before the group is killed and its output collected, as at a
-                        // normal end. The run's failure is its deadline; a feed failure before it
-                        // is said here, never dropped.
+                        // normal end. The run's failure is its deadline; a feed or output failure
+                        // beside it is said here, never dropped.
                         if let Some(failure) = feed.take().and_then(Feed::close) {
                             warn_input_failed(request, &failure);
                         }
-                        let pid = child.id();
                         let failure = match kill_disk_child_group(&mut child) {
-                            Ok(()) => match child.wait() {
+                            Ok(()) => match cowshed_os::deadline::reap(
+                                DISK_CHILD_ROLE,
+                                &mut child,
+                                &cowshed_os::deadline::start("reap killed disk child", policy.reap),
+                                cowshed_os::deadline::Progress::Signalled {
+                                    signal: libc::SIGKILL,
+                                },
+                            ) {
                                 Ok(status) => {
-                                    let _ = collect(stdout, stderr);
+                                    if let Err(failure) = collect(pumps) {
+                                        warn_output_failed(request, &failure);
+                                    }
                                     CommandRunFailure::Deadline {
                                         deadline: policy.deadline,
                                         pid,
                                         ended: ProcessStatus::from(status),
                                     }
                                 }
-                                Err(source) => CommandRunFailure::Reap {
+                                Err(failure) => CommandRunFailure::Reap {
                                     deadline: policy.deadline,
-                                    source,
+                                    failure: Box::new(failure),
                                 },
                             },
                             Err(source) => {
@@ -1513,6 +1527,20 @@ fn set_nonblocking(stdin: &std::process::ChildStdin) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// What a disk child is named as when a wait on it gives up.
+const DISK_CHILD_ROLE: &str = "disk child";
+
+/// Say that the output of a command whose run already failed for another reason (its input or
+/// its deadline) was not collected either, on the channel the runner says every other warning on.
+fn warn_output_failed(request: &CommandRequest, failure: &cowshed_os::deadline::OutputError) {
+    use std::io::Write;
+    let line = format!(
+        "cowshed: warning: the output of {} was not collected: {failure}\\n",
+        request.program.display()
+    );
+    let _ = io::stderr().lock().write_all(line.as_bytes());
 }
 
 /// Say that the input given to a command the deadline then killed had failed, on the channel the
@@ -8145,6 +8173,7 @@ mod tests {
         let policy = DeadlinePolicy {
             deadline,
             past_deadline: PastDeadline::WarnEvery(Duration::from_millis(50)),
+            reap: cowshed_os::deadline::REAP,
         };
         let request = CommandRequest::new(
             "/bin/sh",
@@ -8343,6 +8372,7 @@ mod tests {
         let policy = DeadlinePolicy {
             deadline: Duration::from_millis(10),
             past_deadline: PastDeadline::WarnEvery(Duration::from_millis(10)),
+            reap: cowshed_os::deadline::REAP,
         };
         assert!(matches!(
             DeadlinePolicy::for_request(&disk_image_request(), policy.deadline).past_deadline,
@@ -8384,6 +8414,52 @@ mod tests {
         assert_eq!(output.stdout, b"done");
         fs::remove_file(pid_file).expect("remove owned pid receipt");
         fs::remove_file(release).expect("remove owned release marker");
+    }
+
+    /// A disk child that exits while a process it started keeps its stdout open is not waited for
+    /// past the reap bound: the run answers the child's exit and names the held pipe, where it
+    /// used to park its runner until that process ended.
+    #[test]
+    fn a_disk_child_whose_own_child_holds_its_output_fails_naming_the_held_pipe() {
+        let request =
+            CommandRequest::new("/bin/sh", ["-c", "/bin/sleep 600 & printf started; exit 0"]);
+        let policy = DeadlinePolicy {
+            deadline: DISK_CHILD_DEADLINE,
+            past_deadline: PastDeadline::Kill,
+            reap: cowshed_os::deadline::Bound::new(
+                cowshed_os::deadline::LatencyClass::Reap,
+                Duration::from_millis(50),
+            ),
+        };
+        let error = SystemCommandRunner::run_unleased(
+            &request,
+            ChildInput::Null,
+            policy,
+            None,
+            &mut |_| panic!("no deadline warning for a child that exits at once"),
+        )
+        .expect_err("sleep keeps the pipes open");
+        let CommandRunFailure::Output { ended, failure } = &error.failure else {
+            panic!("expected the held pipe, got {error}");
+        };
+        let cowshed_os::deadline::OutputError::Held { stream, expired } = failure.as_ref() else {
+            panic!("expected the held pipe, got {error}");
+        };
+        // The disk child led its own group (setsid), which its sleep inherited.
+        let group = libc::pid_t::try_from(expired.peer.pid).expect("a pid");
+        // SAFETY: a negative pid addresses only the group this test's disk child led.
+        assert_eq!(unsafe { libc::kill(-group, libc::SIGKILL) }, 0);
+        assert_eq!(*ended, ProcessStatus::Exit(0));
+        assert_eq!(*stream, cowshed_os::deadline::OutputStream::Stdout);
+        assert_eq!(expired.op, "collect disk child output");
+        assert_eq!(expired.peer.role, "disk child");
+        assert!(expired.elapsed >= policy.reap.within, "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("its output was not collected"),
+            "{message}"
+        );
+        assert!(message.contains("stdout is still open"), "{message}");
     }
 
     const DISK_CHILD_INPUT_ROLE: &str = "COWSHED_TEST_DISK_CHILD_INPUT";

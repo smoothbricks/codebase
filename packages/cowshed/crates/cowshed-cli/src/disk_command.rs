@@ -117,6 +117,7 @@ fn runner_error(error: CommandRunError) -> CowshedError {
         | CommandRunFailure::Wait(_)
         | CommandRunFailure::Kill { .. }
         | CommandRunFailure::Reap { .. }
+        | CommandRunFailure::Output { .. }
         | CommandRunFailure::Input { .. } => CowshedError::internal(message),
     }
 }
@@ -425,7 +426,13 @@ mod tests {
             request: request.clone(),
             failure: CommandRunFailure::Reap {
                 deadline: std::time::Duration::from_millis(37),
-                source: io::Error::from(io::ErrorKind::Interrupted),
+                failure: Box::new(cowshed_os::deadline::ReapError::Wait {
+                    op: "reap killed disk child",
+                    role: "disk child",
+                    pid: 123,
+                    elapsed: std::time::Duration::from_millis(1),
+                    source: io::Error::from(io::ErrorKind::Interrupted),
+                }),
             },
         });
         assert_eq!(failed_reap.exec_wrapper_exit_code(), 100);
