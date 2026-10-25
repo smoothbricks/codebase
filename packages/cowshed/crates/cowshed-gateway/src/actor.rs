@@ -1131,6 +1131,9 @@ struct Actor {
     next_audit: u64,
     leaf_cache: LeafCache,
     draining: bool,
+    /// The drain's bound on the exit of the Nx backends it signalled: the reap class
+    /// (05_gateway.md "Deadlines"), injected so a test passes a short one the same way.
+    nx_backend_reap: cowshed_os::deadline::Bound,
     drain_reply: Option<oneshot::Sender<()>>,
     audit_failure: Option<AuditError>,
     /// The workspace listeners an install carried across the restart, by address, until a
@@ -1190,6 +1193,7 @@ impl Actor {
             next_queue: 1,
             next_audit: 1,
             draining: false,
+            nx_backend_reap: cowshed_os::deadline::REAP,
             drain_reply: None,
             audit_failure: None,
             carried: HashMap::new(),
@@ -2864,15 +2868,20 @@ impl Actor {
         }
     }
 
+    /// Ends a drain once nothing is in flight: every Nx backend it started is signalled `SIGTERM`
+    /// and waited for within one reap bound, the sessions stop and the audit is flushed. A
+    /// backend still running past the bound fails the drain naming its pid and state; it is
+    /// dropped with the actor and killed as every backend the gateway owns is (`kill_on_drop`).
     async fn finish_drain(&mut self) -> Result<bool, GatewayError> {
         if !self.draining || self.global_active.total() != 0 {
             return Ok(false);
         }
+        let mut signalled = Vec::new();
         for (_, state) in self.nx_backends.drain() {
             match state {
                 NxBackendState::Starting { task } => task.abort(),
                 NxBackendState::Ready {
-                    process: Some(mut process),
+                    process: Some(process),
                     ..
                 } => {
                     if let Some(pid) = process.id() {
@@ -2885,11 +2894,30 @@ impl Actor {
                             return Err(std::io::Error::last_os_error().into());
                         }
                     }
-                    process.wait().await?;
+                    signalled.push(process);
                 }
                 NxBackendState::Ready { process: None, .. }
                 | NxBackendState::Failed { .. }
                 | NxBackendState::Clearing => {}
+            }
+        }
+        // One budget for all of them: they were signalled together, so they drain together, and
+        // the drain stays inside launchd's exit timeout however many there are.
+        let deadline = cowshed_os::deadline::start("drain nx cache backend", self.nx_backend_reap);
+        let mut stuck = None;
+        for mut process in signalled {
+            if let Err(failure) = cowshed_os::deadline::reap_async(
+                "nx cache backend",
+                &mut process,
+                &deadline,
+                cowshed_os::deadline::Progress::Signalled {
+                    signal: libc::SIGTERM,
+                },
+            )
+            .await
+            {
+                cowshed_os::eprintln!("cowshed: {failure}");
+                stuck.get_or_insert(failure);
             }
         }
         let sessions = std::mem::take(&mut self.sessions);
@@ -2899,6 +2927,9 @@ impl Actor {
         self.audit.flush().await?;
         if let Some(error) = self.audit_failure.take() {
             return Err(GatewayError::Audit(error));
+        }
+        if let Some(failure) = stuck {
+            return Err(GatewayError::NxBackendExit(failure));
         }
         if let Some(reply) = self.drain_reply.take() {
             let _ = reply.send(());
@@ -3545,6 +3576,10 @@ pub enum GatewayError {
     NxBackend(String),
     #[error("Nx cache store not cleared: {0}")]
     NxCacheClear(#[from] NxCacheClearRefusal),
+    /// An Nx backend the drain signalled did not exit within the reap bound (code `TIMEOUT`), or
+    /// waiting for it failed: its op, pid and the state the kernel showed it in.
+    #[error(transparent)]
+    NxBackendExit(cowshed_os::deadline::ReapError),
     #[error("gateway session capacity is exhausted")]
     SessionCapacity,
     #[error("gateway I/O failed: {0}")]
@@ -4278,6 +4313,76 @@ mod tests {
             fixture.actor.nx_admission("owner/nx-panic").await,
             NxAdmission::Unavailable(_)
         ));
+        fixture.finish().await;
+    }
+
+    /// 05_gateway.md "Deadlines": the drain waits for an Nx backend it signalled within the reap
+    /// bound. A backend that ignores `SIGTERM` fails the drain naming its pid within that bound,
+    /// and the actor turns again, so it is never parked past launchd's exit timeout. Real time: the
+    /// child's exit arrives outside the runtime, so a short bound is injected where production
+    /// passes `REAP`.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn drain_names_an_nx_backend_that_ignores_sigterm() {
+        use cowshed_os::deadline::{Bound, LatencyClass, Progress, ReapError};
+        use cowshed_os::fork_lock::Spawn as _;
+        use tokio::io::AsyncBufReadExt as _;
+        let root = TestRoot::new("drain-stuck");
+        let mut fixture = TestActor::new(&root).await;
+        let mut process = tokio::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "trap '' TERM; echo trapped; while :; do sleep 1; done",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn_locked()
+            .expect("start the backend that ignores SIGTERM");
+        // Signalled before its trap is set, the shell would end on SIGTERM, as a backend does.
+        let mut trapped = String::new();
+        tokio::io::BufReader::new(process.stdout.take().expect("the stand-in's stdout"))
+            .read_line(&mut trapped)
+            .await
+            .expect("read the stand-in's trap line");
+        assert_eq!(trapped, "trapped\n");
+        let pid = process.id().expect("the stand-in's pid");
+        fixture.actor.nx_backends.insert(
+            "owner/nx-stuck".to_owned(),
+            NxBackendState::Ready {
+                backend: unit_backend("owner/nx-stuck"),
+                process: Some(Box::new(process)),
+            },
+        );
+        let bound = Duration::from_millis(500);
+        fixture.actor.nx_backend_reap = Bound::new(LatencyClass::Reap, bound);
+        fixture.actor.draining = true;
+        let started = std::time::Instant::now();
+        let drained = timeout(Duration::from_secs(10), fixture.actor.finish_drain())
+            .await
+            .expect("the drain returns instead of parking the actor on the backend");
+        let waited = started.elapsed();
+        let Err(GatewayError::NxBackendExit(ReapError::Expired(expired))) = &drained else {
+            panic!("the drain fails with the backend's reap expiry: {drained:?}");
+        };
+        assert_eq!(expired.op, "drain nx cache backend");
+        assert_eq!(expired.peer.role, "nx cache backend");
+        assert_eq!(expired.peer.pid, pid);
+        assert_eq!(expired.bound, bound);
+        assert_eq!(
+            expired.last,
+            Progress::Signalled {
+                signal: libc::SIGTERM
+            }
+        );
+        assert!(
+            waited >= bound && waited < bound + Duration::from_secs(2),
+            "the drain gives up at its bound, not before or long after: {waited:?}"
+        );
+        let said = drained.expect_err("matched above").to_string();
+        assert!(said.contains(&format!("pid {pid}")), "{said}");
+        assert!(fixture.actor.nx_backends.is_empty());
         fixture.finish().await;
     }
 

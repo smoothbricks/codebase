@@ -252,11 +252,11 @@ is overdue, whatever `launchctl bootout` itself answered (it can exit non-zero w
 answer is kept as context): an `environment-missing` error naming what is left — the pid that has not exited, or the job
 launchd still holds — with the bootstrap that loads the agent once that has gone, and a restore never kickstarts it. The
 gateway plist states `ExitTimeOut` 30 s (`GATEWAY_EXIT_TIMEOUT`), and the daemon's drain force-stops what it accepted
-after 20 s (`GATEWAY_DRAIN_WITHIN`), so the drain, its force stop and the audit flush finish before launchd's kill.
-Measured 2026-10-22: launchd's default exit timeout is 5 s; the plist stated none, so a bootout SIGKILLed a draining
-gateway 5.03 s after its SIGTERM, while the install's own wait, a fixed 5 s, gave up 0.03 s earlier and reported the
-bootout stuck; its restore then kickstarted the job still in teardown (launchctl 37), and launchd dropped it a moment
-later, leaving the host with no gateway.
+after 20 s (`GATEWAY_DRAIN_WITHIN`), so the drain, its force stop, its reap of the Nx backends ("Deadlines") and the
+audit flush finish before launchd's kill. Measured 2026-10-22: launchd's default exit timeout is 5 s; the plist stated
+none, so a bootout SIGKILLed a draining gateway 5.03 s after its SIGTERM, while the install's own wait, a fixed 5 s,
+gave up 0.03 s earlier and reported the bootout stuck; its restore then kickstarted the job still in teardown (launchctl
+37), and launchd dropped it a moment later, leaving the host with no gateway.
 
 **An install refuses while a land or a gate runs.** Activating the agent restarts a gateway that runs, and so does the
 host move inside `setup`; a restart closes every lease connection ("Crash safety by connection"), a land's gate-job pool
@@ -929,6 +929,16 @@ the handshake bound.
     empty-membership notification and each signalled member's pidfd within one reap bound, past which it fails `TIMEOUT`
     naming every member still alive with its pid, image and kernel state (07_api.md, "Complete job accounting and
     observation reconciliation").
+  - **The gateway's drain reaps its Nx backends within one reap bound.** Once nothing is in flight, the drain sends
+    `SIGTERM` to every Nx cache backend it started and waits for all of them within one reap bound
+    (`cowshed-os::deadline::reap_async`). The actor is therefore parked at most that long, and the drain ends inside
+    launchd's kill: the force stop at 20 s (`GATEWAY_DRAIN_WITHIN`), this bound and the audit flush fit in the 30 s exit
+    timeout (`GATEWAY_EXIT_TIMEOUT`, "The installed cowshed"). A backend still running past the bound fails the drain
+    `TIMEOUT`, naming its pid and the state the kernel shows it in, said on stderr for each such backend; the sessions
+    still stop and the audit is still flushed first. The wait itself kills nothing: the backend is dropped with the
+    actor and killed as every backend the gateway owns is when dropped (`kill_on_drop`), and its stdin closes with the
+    gateway (Nx route). Measured 2026-10-26: a backend stand-in that ignores `SIGTERM` parked the drain past a 10 s
+    guard; it now fails at its bound (`drain_names_an_nx_backend_that_ignores_sigterm`).
 - **A short lock is a request.** A lock taken for one short critical section is waited for within its class's bound. The
   job records lock (11_shell.md, "Job control") is held for an open's recovery of the records and its scan of the job
   directories that stay, a refresh, one record-sequence allocation and its append, and a checkpoint's hash of the
