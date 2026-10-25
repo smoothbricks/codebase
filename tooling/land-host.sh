@@ -14,10 +14,14 @@
 #    A failure summary keeps unique tasks and exact diagnostics; the complete failed output is retained.
 #    The gate runs as a cowshed gate job (`cowshed exec --class gate --host`): the jobserver serves every task it
 #    starts ahead of other execs, at nice 0 where they run at +10 (05_gateway.md, "Host CPU budget").
+#    A red names, for each task the gate failed, the commits of the land that change a file Nx hashes for it or for a
+#    task it waits for (tooling/land-attribution.ts); naming never changes the verdict. A red land's next attempt gates
+#    whole again, and Nx's cache replays every task whose inputs did not move.
 #    After the gate passes, `bun run check:linux` cross-lints the same tree for Linux: the pre-push hook refuses a
 #    tree whose Linux cross check is not cached, so a land that skipped it would leave main unpushable.
 #    After the gate and the Linux cross check pass, the gate run's task results are published to the
-#    project's localhost Nx cache, the only writer to it (sheds only read it).
+#    project's localhost Nx cache, the only writer to it (sheds only read it). The cache never blocks a land: task
+#    hashes that cannot be read from the gate's run summary, or a publish that fails, are said and the land goes on.
 # 4. `cowshed land` fast-forwards main to exactly the gated commit and retires the workspace. If main moved
 #    meanwhile, rebase and gate the new tree; this is a source fence, never a retry of a red gate.
 # 5. Build main's outputs at the landed commit (`nx run-many -t build` in main). Main's built products (the plugin's,
@@ -96,6 +100,35 @@ replay_gate_output() {
   }
 }
 
+# <command...> as a gate job of <workspace>, at its root and in its own devenv, taking no input.
+gate_job() {
+  cowshed exec "$workspace" --class gate --host -- direnv exec "$checkout" "$@" </dev/null
+}
+
+# Names, for each task the gate failed, the commits of $base..$head that change a file Nx hashes for it or for a task
+# it waits for. tooling/land-attribution.ts reads the failed tasks from the run summary the gate's Nx wrote (as a gate
+# job, which names Nx's cache directory) and names the commits; the workspace's own tooling/land-inputs.mts lists the
+# files, under node, from the Nx the gate ran. Reporting only: a step that fails is said, and the verdict stands.
+attribute_failures() {
+  failed=$(gate_job bun "$here/land-attribution.ts" failed --since "$began") || {
+    say "could not read which tasks the gate failed (status $?), so no commit is named"
+    return 0
+  }
+  if [ -z "$failed" ]; then
+    say "the gate's run summary names no failed task, so no commit is named"
+    return 0
+  fi
+  inputs=$(mktemp "${TMPDIR:-/tmp}/land-inputs.XXXXXX")
+  # Task ids hold no whitespace, so each failed one is one argument.
+  if gate_job node "$checkout/tooling/land-inputs.mts" gate $failed >"$inputs" &&
+    attribution=$(printf '%s\n' "$failed" | (cd "$checkout" && bun "$here/land-attribution.ts" attribute --base "$base" --head "$head" --inputs "$inputs")); then
+    printf '%s\n' "$attribution" | while IFS= read -r line; do say "$line"; done
+  else
+    say "could not name the commits that reach the failed tasks"
+  fi
+  rm "$inputs"
+}
+
 # Gates exactly the rebased tree. Reporting never changes Nx's status or grants permission to land.
 gate_workspace() {
   say "gating $head (rebased onto $base) on the host"
@@ -105,16 +138,18 @@ gate_workspace() {
   }
   output=$(mktemp "${TMPDIR:-/tmp}/land-gate.XXXXXX")
   gate_status=0
+  began=$(date +%s)
   # The landing gate is never CPU-limited: it is the run that moves main. It runs as a gate job, so the
   # jobserver ranks each of its tasks' CPU asks ahead of every other exec's, oldest first, and runs them at
   # nice 0 where other execs run at +10. Its own grant is the one token Nx's orchestrator uses; every task
   # asks for its own through the job's pool. Nothing here caps a width: load is the jobserver's to order.
-  cowshed exec "$workspace" --class gate --host -- direnv exec "$checkout" bun nx run-many -t gate --parallel="$(sysctl -n hw.ncpu)" --nx-bail=false --outputStyle=static-failures-only </dev/null >"$output" 2>&1 || gate_status=$?
+  gate_job bun nx run-many -t gate --parallel="$(sysctl -n hw.ncpu)" --nx-bail=false --outputStyle=static-failures-only >"$output" 2>&1 || gate_status=$?
   if [ "$gate_status" -ne 0 ]; then
     (cd "$checkout" && direnv exec "$checkout" bun "$here/land-summary.ts" "$output") >&2 || {
       say "failure summary unavailable; complete gate output: $output"
       replay_gate_output "$output"
     }
+    attribute_failures
     say "gate exited $gate_status; the land stops; complete output: $output"
     exit "$gate_status"
   fi
@@ -129,7 +164,7 @@ gate_workspace() {
     hashes=
   }
   say "cross-linting $head for Linux"
-  cowshed exec "$workspace" --class gate --host -- direnv exec "$checkout" bun run check:linux </dev/null >"$output" 2>&1 || {
+  gate_job bun run check:linux >"$output" 2>&1 || {
     linux_status=$?
     replay_gate_output "$output"
     say "Linux cross check exited $linux_status; the land stops; complete output: $output"
@@ -140,7 +175,7 @@ gate_workspace() {
   [ -n "$hashes" ] || return 0
   # The gate and the Linux cross check passed, so the gate's task results are the land's to publish. The cache never
   # blocks a land: a failed publish is said, and the land goes on.
-  cowshed exec "$workspace" --class gate --host -- direnv exec "$checkout" bun "$here/land-publish.ts" publish "$checkout" "$hashes" </dev/null >&2 || say "publishing the gate's Nx results failed (status $?); the land goes on: the cache never blocks a land"
+  gate_job bun "$here/land-publish.ts" publish "$checkout" "$hashes" >&2 || say "publishing the gate's Nx results failed (status $?); the land goes on: the cache never blocks a land"
   rm "$hashes"
 }
 

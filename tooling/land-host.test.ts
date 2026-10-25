@@ -18,13 +18,15 @@ import { judgeHistory, PRE_REWRITE_MAIN } from './land-history.ts';
 import type { Call } from './land-host.plan.ts';
 
 // Behavioural tests of tooling/land-host.sh: the script runs for real, against real git repositories for main and the
-// workspace and the real ancestry guard and failure reporter. Four things are stand-ins on PATH, because they are this machine's
-// operator tooling and the gate itself: `cowshed` (a workspace is a git clone of main; rebase and land and their
-// fences are git operations; the gate must run as `exec <ws> --class gate --host --`, at the workspace root),
-// `direnv` (runs the command it is given) and `bun nx` (land-host.fake-nx.ts plays back
-// the calls a scenario scripts: its exact output and exit status). A scenario names every nx call the land may make,
-// in order: a call it did not
-// script fails the land. node (the publisher's runtime) records what land-publish.ts gave it, and refuses when FIX_PUBLISH says so.
+// workspace and the real ancestry guard, failure reporter and attribution (land-attribution.ts). Four things are
+// stand-ins on PATH, because they are this machine's operator tooling and the gate itself: `cowshed` (a workspace is a
+// git clone of main; rebase and land and their fences are git operations; the gate must run as
+// `exec <ws> --class gate --host --`, at the workspace root, where the job names Nx's cache directory in
+// NX_CACHE_DIRECTORY), `direnv` (runs the command it is given) and `bun nx` (land-host.fake-nx.ts plays back the calls
+// a scenario scripts: its exact output, exit status and run summary rows). A scenario names every nx call the land may
+// make, in order: a call it did not script fails the land. node runs the publisher, recording what land-publish.ts gave
+// it and refusing when FIX_PUBLISH says so, and the workspace's tooling/land-inputs.mts, recording the tasks it was asked
+// about and printing the inputs the fixture keeps in inputs.json.
 
 const tooling = import.meta.dir;
 const repo = dirname(tooling);
@@ -42,6 +44,13 @@ const DAEMON_STOP: Call = { args: ['daemon', '--stop'], exit: 0 };
 /** The build a successful land runs in main, so main's built outputs match the sources it lands. */
 const MAIN_BUILD = ['run-many', '-t', 'build', '--outputStyle=static-failures-only'];
 const passingRun = (args: readonly string[]): Call => ({ args, exit: 0 });
+/** A whole gate that passed: its run summary carries the root aggregate's row, the hash a land publishes. */
+const GATE_PASSED: Call = {
+  ...passingRun(GATE),
+  run: [{ taskId: '@smoothbricks/codebase:gate', hash: 'gate-hash', status: 0 }],
+};
+/** The files Nx hashes for each task and the tasks it waits for: the workspace's one commit writes change.txt. */
+const INPUTS = { 'lib:lint': ['change.txt', 'lib/src/index.ts'], 'lib:test': ['lib/src/index.ts'] };
 
 /** The task's actual output followed by Nx's final list; repeated entries must be shown only once. */
 function failedRun(message: string, exit = 1): Call {
@@ -68,6 +77,13 @@ function failedRun(message: string, exit = 1): Call {
 
 const stubs: Record<string, string> = {
   node: `#!/bin/sh
+case $1 in
+*/land-inputs.mts)
+  # The workspace's tooling/land-inputs.mts: the input files of the failed tasks it names.
+  printf '%s\\n' "$@" >"$FIX_STATE/inputs.args"
+  exec cat "$FIX_STATE/inputs.json"
+  ;;
+esac
 cat >"$FIX_STATE/publish.program"
 printf '%s\\n' "$@" >"$FIX_STATE/publish.args"
 [ "$FIX_PUBLISH" = refuse ] && { echo 'the publish was refused' >&2; exit 1; }
@@ -133,6 +149,8 @@ land)
 exec)
   [ -n "$1" ] && [ "$2" = --class ] && [ "$3" = gate ] && [ "$4" = --host ] && [ "$5" = -- ] || exit 64
   shift 5
+  # The job names the directory its Nx writes the run summary into, as the workspace supervisor does.
+  export NX_CACHE_DIRECTORY="$FIX_WS/.nx/cache"
   cd "$FIX_WS" && exec "$@"
   ;;
 *) exit 64 ;;
@@ -206,7 +224,15 @@ function fixture(replayFails = false, publishFails = false): Land {
   mkdirSync(state);
   mkdirSync(bin);
   mkdirSync(join(state, 'tmp'));
-  for (const file of ['land-host.sh', 'land-decide.ts', 'land-history.ts', 'land-publish.ts', 'land-summary.ts']) {
+  writeFileSync(join(state, 'inputs.json'), JSON.stringify(INPUTS));
+  for (const file of [
+    'land-host.sh',
+    'land-attribution.ts',
+    'land-decide.ts',
+    'land-history.ts',
+    'land-publish.ts',
+    'land-summary.ts',
+  ]) {
     cpSync(join(tooling, file), join(main, 'tooling', file));
   }
   symlinkSync(join(repo, 'node_modules'), join(main, 'node_modules'));
@@ -340,6 +366,8 @@ describe('land-host.sh', () => {
     expect(run.log).toContain(`failed ${TASK}\n${message}`);
     expect(run.log.split(message)).toHaveLength(2);
     expect(run.log).toContain('gate exited 7; the land stops');
+    // This gate left no run summary, so no failed task is read and no commit named; the verdict stands.
+    expect(run.log).toContain('could not read which tasks the gate failed');
     expect(run.nx).toEqual(['daemon --stop', GATE.join(' ')]);
     expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
     expect(git(land.ws, 'rev-parse', 'HEAD')).toBe(gated);
@@ -407,7 +435,7 @@ describe('land-host.sh', () => {
   it('publishes the gate task results once the Linux cross check passes, and lands', () => {
     const land = fixture();
     const gated = git(land.ws, 'rev-parse', 'HEAD');
-    const run = land.land([DAEMON_STOP, passingRun(GATE), passingRun(MAIN_BUILD)]);
+    const run = land.land([DAEMON_STOP, GATE_PASSED, passingRun(MAIN_BUILD)]);
     expect(run.status, run.log).toBe(0);
     expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
     // The publisher gets the cowshed bridge as one program, then the checkout and the gate's succeeded task hashes.
@@ -420,7 +448,7 @@ describe('land-host.sh', () => {
   it('lands even when the publish is refused, and says so', () => {
     const land = fixture(false, true);
     const gated = git(land.ws, 'rev-parse', 'HEAD');
-    const run = land.land([DAEMON_STOP, passingRun(GATE), passingRun(MAIN_BUILD)]);
+    const run = land.land([DAEMON_STOP, GATE_PASSED, passingRun(MAIN_BUILD)]);
     expect(run.status, run.log).toBe(0);
     expect(run.log).toContain('the publish was refused');
     expect(run.log).toContain('failed (status 1); the land goes on');
@@ -430,13 +458,64 @@ describe('land-host.sh', () => {
   it('lands without publishing when the gate passes without a readable run summary, and leaves no temporary file', () => {
     const land = fixture();
     const gated = git(land.ws, 'rev-parse', 'HEAD');
-    const run = land.land([DAEMON_STOP, { ...passingRun(GATE), writesNoSummary: true }, passingRun(MAIN_BUILD)]);
+    const run = land.land([DAEMON_STOP, passingRun(GATE), passingRun(MAIN_BUILD)]);
     expect(run.status, run.log).toBe(0);
     expect(run.log).toContain("could not read the gate's task hashes");
     expect(run.log).toContain('the land goes on without publishing: the cache never blocks a land');
     expect(existsSync(join(land.state, 'publish.args'))).toBe(false);
     expect(readdirSync(join(land.state, 'tmp')).filter((name) => name.startsWith('land-'))).toEqual([]);
     expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
+  });
+
+  it('names, for each task a red gate failed, the commits of the land that change its inputs, and keeps the verdict', () => {
+    const land = fixture();
+    const change = git(land.ws, 'rev-parse', 'HEAD');
+    const before = git(land.main, 'rev-parse', 'HEAD');
+    const run = land.land([
+      DAEMON_STOP,
+      {
+        ...failedRun('error: lib lint', 3),
+        run: [
+          { taskId: 'app:lint', hash: 'app-lint', status: 0 },
+          { taskId: 'lib:lint', hash: 'lib-lint', status: 1 },
+          { taskId: 'lib:test', hash: 'lib-test', status: 1 },
+        ],
+      },
+    ]);
+    expect(run.status, run.log).toBe(3);
+    expect(run.log).toContain(
+      `land-host: lib:lint failed; 1 of the land's 1 commits change its inputs: ${change.slice(0, 10)} feat(tooling): the change\n`,
+    );
+    expect(run.log).toContain(
+      "land-host: lib:test failed; none of the land's 1 commits changes a file Nx hashes for it or for a task it waits for (a commit that only deletes files is not seen)",
+    );
+    expect(run.log.indexOf('land-host: lib:lint failed')).toBeLessThan(
+      run.log.indexOf('gate exited 3; the land stops'),
+    );
+    // Nx is asked for the input files of the failed tasks alone, by the workspace's own land-inputs.mts.
+    expect(readFileSync(join(land.state, 'inputs.args'), 'utf8')).toBe(
+      `${join(land.ws, 'tooling/land-inputs.mts')}\ngate\nlib:lint\nlib:test\n`,
+    );
+    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
+  });
+
+  it('names no commit from a run summary an earlier invocation wrote', () => {
+    const land = fixture();
+    mkdirSync(join(land.ws, '.nx/cache'), { recursive: true });
+    writeFileSync(
+      join(land.ws, '.nx/cache/run.json'),
+      JSON.stringify({
+        run: { command: 'nx run-many -t gate', startTime: '2026-01-01T00:00:00.000Z', endTime: '', inner: false },
+        tasks: [{ taskId: 'lib:lint', hash: 'lib-lint', status: 1 }],
+      }),
+    );
+    const run = land.land([DAEMON_STOP, failedRun('error: no summary written')]);
+    expect(run.status, run.log).toBe(1);
+    expect(run.log).toContain(
+      'the run summary is of an invocation that began at 2026-01-01T00:00:00.000Z, before this gate',
+    );
+    expect(run.log).toContain('could not read which tasks the gate failed');
+    expect(run.log).not.toContain('land-host: lib:lint failed');
   });
 
   it('refuses to land main itself', () => {

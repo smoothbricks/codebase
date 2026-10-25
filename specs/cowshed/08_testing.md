@@ -789,6 +789,20 @@ reporter is unavailable replay only its final 64 KiB under a 10-second bound (th
 failure stops the land. The reporter reads the complete file, not the replayed suffix. The pre-rewrite ancestry cutoff
 remains a separate guard before rebase.
 
+A red names the commits to read first. The wrapper reads the run summary the gate's Nx wrote (`run.json` in Nx's cache
+directory, refusing one whose `run.startTime` precedes the second the gate began in) and lists the tasks that failed; a
+task Nx skipped because a task it waits for failed has no row and is not listed. For each failed task it prints the
+commits of the land (`base..head`) that change a file Nx hashes for that task or for a task it waits for
+(`tooling/land-attribution.ts`). The files come from Nx's hash plan (`HashPlanInspector.inspectTaskInputs`), asked for
+the failed tasks alone by the workspace's `tooling/land-inputs.mts` under node, the runtime `bun nx` runs Nx's CLI in:
+bun resolves some external packages to other versions, so a plan read under bun is not the one the gate ran. A commit
+that only deletes input files is not seen, and a failed task no commit reaches fails on what the land shares with main
+or on an input that is no workspace file. Naming is reporting only: a step that fails is said, and Nx's exit status
+stays the verdict. A red land's next attempt gates whole again. Nx's cache already replays every task whose inputs did
+not move, and a task Nx does not cache has a verdict its hash does not decide, so no record of earlier passes stands in
+for running it. After a passing gate, task hashes that cannot be read from the run summary are said and the land goes on
+without publishing them: the cache never blocks a land (05_gateway.md, "Publication").
+
 Every test target, the groups included, is bounded by progress alone: the run ends when the time since the last finished
 test reaches its configured `idleTimeoutMs` (`BOUNDED_TEST_IDLE_TIMEOUT_MS` in the plugin's test-target policy), and
 names the tests still running. Time a descendant reports its own work queued for host CPU tokens is not idle time and is

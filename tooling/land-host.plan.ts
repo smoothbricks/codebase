@@ -7,6 +7,13 @@ export interface Call {
   readonly output?: string;
   /** Refuse unless both output descriptors name the same regular capture file. */
   readonly requireFileOutput?: boolean;
-  /** A gate run that passes but leaves no run summary behind, as one whose summary Nx could not write. */
-  readonly writesNoSummary?: boolean;
+  /** The rows of the run summary Nx writes into its cache directory; a call that names none leaves no summary. */
+  readonly run?: readonly RunRow[];
+}
+
+/** One task row of a run summary (`run.json`): the task ran at `hash` and exited with `status`. */
+export interface RunRow {
+  readonly taskId: string;
+  readonly hash: string;
+  readonly status: number;
 }

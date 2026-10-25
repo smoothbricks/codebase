@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // A stand-in `nx` for land-host.test.ts: plays back the calls the test scripted, in order, and leaves behind what a
-// real run leaves for tooling/land-host.sh to read in the working directory (the workspace root): what the run prints,
-// and its exit status. No report can override a failed gate.
+// real run leaves for tooling/land-host.sh to read: what the run prints, its exit status and, when the call names its
+// rows, the run summary in Nx's cache directory. No report can override a failed gate.
 //
 // FIX_STATE names a directory holding `plan.json`, an array of calls. A call whose arguments are not the next
 // scripted one, or one past the end of the plan, exits 97 or 98 and says so: the script under test did something the
@@ -45,26 +45,20 @@ if (call.requireFileOutput) {
   }
 }
 
-if (call.exit === 0 && args.includes('gate') && call.writesNoSummary !== true) {
-  // What a gate run leaves for land-publish.ts to read: a run summary whose tasks carry the hashes it publishes.
-  mkdirSync(join('.nx', 'cache'), { recursive: true });
+if (call.run !== undefined) {
+  // The run summary Nx writes into its cache directory, the one the gate job names in NX_CACHE_DIRECTORY (the cowshed
+  // stand-in names one, as the workspace supervisor does): what land-publish.ts and land-attribution.ts read.
+  const cache = process.env.NX_CACHE_DIRECTORY;
+  if (cache === undefined) {
+    process.stderr.write('fake nx: a call that writes a run summary needs NX_CACHE_DIRECTORY\n');
+    process.exit(95);
+  }
+  mkdirSync(cache, { recursive: true });
   writeFileSync(
-    join('.nx', 'cache', 'run.json'),
+    join(cache, 'run.json'),
     JSON.stringify({
-      run: { command: `nx ${args.join(' ')}`, startTime: '', endTime: '', inner: false },
-      tasks: [
-        {
-          taskId: 'gate',
-          target: 'gate',
-          projectName: 'cowshed',
-          hash: 'gate-hash',
-          startTime: '',
-          endTime: '',
-          params: '',
-          cacheStatus: 'local-cache-hit',
-          status: 0,
-        },
-      ],
+      run: { command: `nx ${args.join(' ')}`, startTime: new Date().toISOString(), endTime: '', inner: false },
+      tasks: call.run.map((row) => ({ ...row, cacheStatus: 'cache-miss' })),
     }),
   );
 }
