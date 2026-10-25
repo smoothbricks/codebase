@@ -21,6 +21,7 @@ pub mod thread_kinds {
     include!(concat!(env!("OUT_DIR"), "/thread_kinds.rs"));
 }
 pub mod context;
+pub mod deadline;
 pub mod entry_type;
 pub mod identity;
 pub mod packed_header;
@@ -49,7 +50,7 @@ pub use packed_header::{
     entry_type_from_header, pack_dynamic, pack_static, supports_static_vocabulary,
     vocabulary_id_from_header,
 };
-pub use result::{RetryPolicy, SpanOutcome, Transient};
+pub use result::{BlockedReason, RetryPolicy, SpanOutcome, Transient};
 pub use scope::{ScopeEntry, ScopeValue, SpanScope, report_scope_mismatch};
 pub use thread_buffer::{
     AttributeValue, ColumnValue, ColumnValueKind, ColumnValueRef, FlushWindow, ThreadBufferError,

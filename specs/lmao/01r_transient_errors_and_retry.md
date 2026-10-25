@@ -570,6 +570,28 @@ const NETWORK_BLIP = Transient('NETWORK_BLIP', {
 });
 ```
 
+## Rust: `lmao-core` <a id="smoo/lmao!n/op-retry.rust"></a>
+
+`lmao-core` carries the same model in Rust's shape (`src/result.rs`). `Transient<E>` puts the `RetryPolicy` on the error
+value, and the span executor's `__span_with_retry` runs the loop. `BlockedReason` (`service`, `ended`, `index`) mirrors
+`Blocked.ts`, and its `name()` is `getBlockedReasonName`. Rust's `Result` and enums already discriminate the error, so
+there is no `CodeError` class.
+
+`src/deadline.rs` holds the values for waiting on another process. They are pure and run over the injected `Clock`:
+
+- A `Deadline` is one request's budget under a `LatencyClass` (`Control`, `Handshake`, `Reap`, `Ffi`). The `Bound` for
+  each class comes from its owner's spec table. When the deadline passes it yields `Expired`, code `TIMEOUT`, which
+  names the op, the peer, the class, the bound, the elapsed time and the last `Progress`.
+- An `Idle` measures how long the holder of a long wait (a job, a held lease, a stream) has been silent since its last
+  `Progress`. It has no total ceiling. When the silence passes its bound it yields `Silent`, code `SILENT`, which names
+  the holder.
+- `RetryClass` (`Transient`, `Blocked`, `Terminal`) is derived from an error's variant and never stored. An expiry is
+  `Terminal`: nothing retries around it and nothing raises its bound.
+
+`lmao-core` has no dependencies, so a host-primitives crate takes these values without lmao's telemetry runtime. The I/O
+shell that maps sockets and timers onto them belongs to that crate. In cowshed it is `cowshed-os::deadline`
+(smoothbricks `specs/cowshed/05_gateway.md`, "Deadlines").
+
 ## Integration Points <a id="smoo/lmao!n/op-retry.integration-points"></a>
 
 This system integrates with:

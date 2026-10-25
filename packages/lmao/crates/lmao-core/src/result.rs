@@ -63,6 +63,35 @@ impl<E> Transient<E> {
     }
 }
 
+/// Why an operation cannot proceed now (`01r` "Blocked Class"; TS `errors/Blocked.ts`). The
+/// engine that runs the operation again decides when; the span's retry loop never retries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockedReason {
+    /// A service the operation needs is not there to answer.
+    Service { name: String },
+    /// The target already ended.
+    Ended { target: String },
+    /// An index the operation reads is not ready.
+    Index { index_name: String },
+}
+
+impl BlockedReason {
+    /// The display name `getBlockedReasonName` gives the same reason.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Service { name } => name,
+            Self::Ended { target } => target,
+            Self::Index { index_name } => index_name,
+        }
+    }
+}
+
+impl std::fmt::Display for BlockedReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Blocked: {}", self.name())
+    }
+}
+
 /// How a span completed — what gets written to row 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpanOutcome {
