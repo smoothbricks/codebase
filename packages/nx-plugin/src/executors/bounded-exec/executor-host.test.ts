@@ -10,8 +10,7 @@ import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from '../../
 import { CPU_POOL_ENV, type CpuPool, createCpuPool } from './cpu-pool.js';
 import { CPU_TOKENS_ENV } from './cpu-tokens.js';
 import { resolveCowshedExecutable } from './executor.js';
-import { SUPERVISOR_SOCKET_ENV } from './owned-subtree.js';
-import { COWSHED_EXECUTABLE_ENV } from './ram-temp.js';
+import { COWSHED_EXECUTABLE_ENV, SUPERVISOR_SOCKET_ENV } from './owned-subtree.js';
 import {
   attachedDisks,
   detachOwned,

@@ -11,10 +11,10 @@ import { churnScript, openForProbe, writerRemains } from '../../__tests__/churn-
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { awaitExit, ownedSocketDirectory } from '../../testing.js';
 import { GATEWAY_SOCKET } from './gateway-lease.js';
+import { COWSHED_EXECUTABLE_ENV } from './owned-subtree.js';
 import { attachRamDisk } from './ram-attach.js';
 import {
   type AttachedRamDisk,
-  COWSHED_EXECUTABLE_ENV,
   type CommandOutput,
   createHostCommands,
   describeRamTempError,

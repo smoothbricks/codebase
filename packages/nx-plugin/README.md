@@ -2070,6 +2070,40 @@ time, which is the host's, rather than its progress. Only a leg that runs `bun t
 its `src/`, where Bun's test-file discovery is cheap; any other command (a cargo workspace's per-crate nextest legs run
 from the workspace root, a gate may run a script that lives in another project) may use any `cwd`.
 
+### Bounded exec key
+
+A workspace that runs this plugin from a linked checkout, where no lockfile sees its bytes, can key each bounded-exec
+task by the executor's module closure. The executor's `executors.json` record names, under `outputNeutral`, the modules
+that closure may stop at: their bytes and their imports are not keyed, while the bytes of every module that imports them
+are. A module is output-neutral when everything it hands the executor is either a failure or one of the values that
+already differ between runs of one task key: the CPU grant a host gives and whether its gateway answers at all, the
+volume and path of the run's `TMPDIR`, the directory a CPU pool's socket binds in, and timing. No key holds any of
+those, and Nx caches only passing runs, so a cached pass is sound only if the command's result holds whichever of them a
+run gets. A change to such a module moves which of them a run gets, or fails more runs; it never changes what a given
+value does to the command, which the keyed modules decide. Each entry, and what the executor takes from it:
+
+- `ram-temp.js`, with `ram-temp-held.js`, `ram-attach.js`, `ram-detach.js` and `disk-lease.js`: the RAM temp lease. The
+  command sees the lease's directory as its `TMPDIR`, on a volume of the lease's capacity. Off macOS, without a
+  supervisor, or with no RAM left, the same task runs on the inherited or an ordinary temp directory instead. A lease
+  that cannot be taken, released or recorded, or leftovers the supervisor cannot retire within the lease's grace, fail
+  the run or are said on stderr. The variable naming the cowshed executable, which the command does see, lives in the
+  core `owned-subtree.ts`.
+- `gateway-lease.js`: the gateway's lease protocol, its socket path and the grant it reads from an answer. The grant
+  reaches the command only through `cpu-tokens.js`, as a token count; a gateway that is absent or refuses leaves the
+  command unsized, as on any host without a gateway, and an install that outlives its deadline fails the run.
+- `hang-diagnostics.js`: the snapshot taken shortly before the no-progress bound fires. It probes with `ps`, `lsof` and
+  `sample`, which suspends the runner for about a second, and signals nothing but its own probes. Its text and lock
+  waits are read only once the bound has expired the run, which fails it.
+- `testing.js` (and `ensure-built`, whose workspace-root finder it uses, and the producer receipt modules it imports):
+  the host census the executor quotes when a lease release fails, and the directory a CPU pool binds its socket in. A
+  directory that cannot be made refuses the run.
+
+`cpu-tokens.js`, `cpu-pool.js` and `progress.js` are not output-neutral although they schedule: `sizeRunner` decides
+what a token count does to the command's parallelism flags and test-thread variables, `cpu-pool.js` writes the jobserver
+flags into `MAKEFLAGS` and `CARGO_MAKEFLAGS`, and `withProgressReport` adds `--dots` to `bun test` and `-json` to
+`go test`. They stay keyed until those functions move into modules of their own. A module that comes to decide what a
+value does to the command, its environment or a passing verdict leaves `outputNeutral` in the same commit.
+
 ## Test Fixtures That Run Nx
 
 The executor's real-process tests acknowledge handler installation and process-group membership before delivering a

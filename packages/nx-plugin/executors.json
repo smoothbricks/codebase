@@ -3,7 +3,17 @@
     "bounded-exec": {
       "implementation": "./dist/executors/bounded-exec/executor.js",
       "schema": "./src/executors/bounded-exec/schema.json",
-      "description": "Run a command with bounded timeout and force-kill behavior"
+      "description": "Run a command with bounded timeout and force-kill behavior",
+      "outputNeutral": [
+        "./dist/executors/bounded-exec/disk-lease.js",
+        "./dist/executors/bounded-exec/gateway-lease.js",
+        "./dist/executors/bounded-exec/hang-diagnostics.js",
+        "./dist/executors/bounded-exec/ram-attach.js",
+        "./dist/executors/bounded-exec/ram-detach.js",
+        "./dist/executors/bounded-exec/ram-temp-held.js",
+        "./dist/executors/bounded-exec/ram-temp.js",
+        "./dist/testing.js"
+      ]
     },
     "typescript-emit": {
       "implementation": "./dist/executors/typescript-emit/executor.js",

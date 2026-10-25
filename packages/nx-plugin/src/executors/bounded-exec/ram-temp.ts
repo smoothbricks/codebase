@@ -25,6 +25,7 @@ import { isRecord } from '../../type-guards.js';
 import { diskClassOf, type PhaseShare, recordedShare, takeDiskLease } from './disk-lease.js';
 import { GATEWAY_SOCKET } from './gateway-lease.js';
 import {
+  COWSHED_EXECUTABLE_ENV,
   type CoverageGap,
   parseHandle,
   type SignalledProcess,
@@ -2665,13 +2666,6 @@ export function diskCommand(
     lifetime: image ? 'stop-wait' : 'facade-owned',
   };
 }
-
-/**
- * The variable naming the cowshed executable that runs `cowshed disk-command`. Unset, it is the installed `cowshed`
- * on PATH. A repository that tests its own cowshed sets it, on the targets that test it, to that checkout's build:
- * an installed cowshed that predates a command its own checkout added would fail the very code under test.
- */
-export const COWSHED_EXECUTABLE_ENV = 'COWSHED_EXECUTABLE';
 
 /** Whether this process already said the cowshed gateway is not there to lease disk commands. */
 let gatewayAbsenceSaid = false;

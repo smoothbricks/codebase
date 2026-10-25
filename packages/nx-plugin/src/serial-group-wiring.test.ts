@@ -18,7 +18,7 @@ import {
   SERIAL_TEST_GROUP_PLATFORM,
   serialTestGroups,
 } from './cargo-workspace.js';
-import { COWSHED_EXECUTABLE_ENV } from './executors/bounded-exec/ram-temp.js';
+import { COWSHED_EXECUTABLE_ENV } from './executors/bounded-exec/owned-subtree.js';
 import { isRecord } from './type-guards.js';
 
 /** The repository this package is built in: its own nextest config, nx.json and manifests are what these pin. */

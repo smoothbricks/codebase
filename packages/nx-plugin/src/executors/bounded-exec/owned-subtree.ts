@@ -16,6 +16,14 @@ import { isRecord } from '../../type-guards.js';
 export const SUPERVISOR_SOCKET_ENV = 'COWSHED_SUPERVISOR_SOCKET';
 
 /**
+ * The variable naming the cowshed executable that runs `cowshed disk-command` and `cowshed subtree-root`. Unset, it is
+ * the installed `cowshed` on PATH. A repository that tests its own cowshed sets it, on the targets that test it, to that
+ * checkout's build: an installed cowshed that predates a command its own checkout added would fail the very code under
+ * test. The executor passes the one it resolved to the command, so it is part of what the command runs.
+ */
+export const COWSHED_EXECUTABLE_ENV = 'COWSHED_EXECUTABLE';
+
+/**
  * The descriptor `cowshed subtree-root` writes its admission to. fd 3 is the runner lifecycle's duplex socket
  * (`runner-hook.ts`), which must reach the command, so the admission takes the next one.
  */

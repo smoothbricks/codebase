@@ -42,6 +42,7 @@ import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
 import type { LockWait } from './lock-wait.js';
 import { createNoSpaceWatch } from './no-space.js';
 import {
+  COWSHED_EXECUTABLE_ENV,
   cowshedSubtreeOwner,
   HANDLE_FD,
   readAdmission,
@@ -51,7 +52,6 @@ import {
 } from './owned-subtree.js';
 import { createRunProgress, withProgressReport } from './progress.js';
 import {
-  COWSHED_EXECUTABLE_ENV,
   createHostCommands,
   describeCoverageGap,
   describeRamTempError,
