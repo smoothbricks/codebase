@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitStatus;
 use std::sync::LazyLock;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
@@ -435,7 +436,12 @@ pub fn reap(
             clock(),
         )))
     };
-    // No watch is a child that has already exited (Darwin refuses to watch a zombie).
+    // A child already collected, or exited and collected now, answers before any watch, so a pid
+    // that was freed and reused is never watched.
+    if let Some(status) = child.try_wait().map_err(failed)? {
+        return Ok(status);
+    }
+    // No watch is a child that exited since (Darwin refuses to watch a zombie).
     if let Some(watch) = ExitWatch::of(pid).map_err(failed)? {
         loop {
             // A spent budget still looks once: an exited child answers its status.
@@ -451,6 +457,24 @@ pub fn reap(
     child.wait().map_err(failed)
 }
 
+/// Hand `child`, whose wait expired, to a thread that collects its exit whenever it comes and
+/// says so, so a child that leaves an uninterruptible kernel call late is reaped, never left a
+/// zombie for the life of this process. Nothing waits for that thread.
+pub fn collect_later(role: &'static str, mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        let pid = child.id();
+        // WHY unbounded: nothing waits on this thread; it only collects the exit when it comes.
+        match child.wait() {
+            Ok(status) => {
+                crate::eprintln!("cowshed: {role} pid {pid} ended after its wait expired: {status}")
+            }
+            Err(error) => crate::eprintln!(
+                "cowshed: {role} pid {pid} could not be collected after its wait expired: {error}"
+            ),
+        }
+    });
+}
+
 /// [`reap`] for a child tokio spawned, whose exit tokio's own driver watches.
 pub async fn reap_async(
     role: &'static str,
@@ -458,8 +482,30 @@ pub async fn reap_async(
     deadline: &Deadline,
     last: Progress,
 ) -> Result<ExitStatus, ReapError> {
-    // No pid is a child tokio has already reaped: its status is kept and answered at once.
-    let pid = child.id().unwrap_or_default();
+    // A child tokio has already collected keeps its status and has no pid: it answers at once,
+    // and no pid of it is ever read again.
+    let pid = match (child.try_wait(), child.id()) {
+        (Ok(Some(status)), _) => return Ok(status),
+        (Ok(None), Some(pid)) => pid,
+        (Ok(None), None) => {
+            return Err(ReapError::Wait {
+                op: deadline.op(),
+                role,
+                pid: 0,
+                elapsed: deadline.elapsed(clock()),
+                source: io::Error::other("tokio reports neither an exit status nor a pid"),
+            });
+        }
+        (Err(source), pid) => {
+            return Err(ReapError::Wait {
+                op: deadline.op(),
+                role,
+                pid: pid.unwrap_or_default(),
+                elapsed: deadline.elapsed(clock()),
+                source,
+            });
+        }
+    };
     let failed = |source| ReapError::Wait {
         op: deadline.op(),
         role,
@@ -588,26 +634,45 @@ impl OutputError {
 }
 
 /// A child's piped stdout and stderr, each read to its end on a thread of its own while the child
-/// runs, as `Command::output` reads them, so a verbose child never wedges on a full pipe.
+/// runs, as `Command::output` reads them, so a verbose child never wedges on a full pipe. Once
+/// nobody will collect the output (the pumps are dropped, a join gave up), each pump drops what
+/// it reads and keeps draining to its holder's close: a held pipe costs one blocked thread and no
+/// memory, and its holder is never sent `SIGPIPE`.
 pub struct OutputPumps {
-    pending: usize,
+    started: Vec<OutputStream>,
     done: mpsc::Receiver<(OutputStream, io::Result<Vec<u8>>)>,
+    abandoned: Arc<AtomicBool>,
+}
+
+impl Drop for OutputPumps {
+    fn drop(&mut self) {
+        self.abandoned.store(true, Ordering::Release);
+    }
 }
 
 impl OutputPumps {
     /// Start reading `child`'s piped stdout and stderr; a stream that is not piped reads empty.
     pub fn start(child: &mut std::process::Child) -> Self {
-        use std::io::Read as _;
-
         let (sent, done) = mpsc::channel();
-        let mut pending = 0;
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let mut started = Vec::with_capacity(2);
         let mut pump = |stream, pipe: Option<Box<dyn std::io::Read + Send>>| {
             let Some(mut pipe) = pipe else { return };
-            pending += 1;
+            started.push(stream);
             let sent = sent.clone();
+            let abandoned = Arc::clone(&abandoned);
             std::thread::spawn(move || {
                 let mut bytes = Vec::new();
-                let read = pipe.read_to_end(&mut bytes).map(|_| bytes);
+                let mut chunk = [0_u8; 64 * 1024];
+                let read = loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) => break Ok(bytes),
+                        Ok(_) if abandoned.load(Ordering::Acquire) => bytes = Vec::new(),
+                        Ok(length) => bytes.extend_from_slice(&chunk[..length]),
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                        Err(error) => break Err(error),
+                    }
+                };
                 // A collector that gave up has already failed naming this stream's holder.
                 let _ = sent.send((stream, read));
             });
@@ -626,13 +691,18 @@ impl OutputPumps {
                 .take()
                 .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
         );
-        Self { pending, done }
+        Self {
+            started,
+            done,
+            abandoned,
+        }
     }
 
-    /// The bytes each stream carried to its end, the child `role` at `pid` having exited, within
-    /// what is left of `deadline`. A stream still open at the bound is held by a process that
-    /// inherited the pipe; the wait ends naming the child and that stream, and the pump stays
-    /// with the pipe until its holder closes it.
+    /// The bytes each stream carried to its end, the child `role` at `pid` having exited and
+    /// been collected, within what is left of `deadline`; a spent budget still takes what has
+    /// already arrived. A stream still open at the bound is held by a process that inherited the
+    /// pipe: the wait ends naming the child and that stream, and the pump drains it, keeping
+    /// nothing, until its holder closes it. The collected child's pid is never read again.
     pub fn join(
         self,
         role: &'static str,
@@ -641,24 +711,35 @@ impl OutputPumps {
     ) -> Result<(Vec<u8>, Vec<u8>), OutputError> {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let mut open = [OutputStream::Stdout, OutputStream::Stderr]
-            .into_iter()
-            .take(self.pending)
-            .collect::<Vec<_>>();
-        while !open.is_empty() {
-            let held = || OutputError::Held {
-                stream: open[0],
-                expired: Box::new(deadline.expired(
-                    ChildPeer::observed(role, pid),
-                    Progress::State("exited"),
-                    clock(),
-                )),
-            };
-            let remaining = deadline.remaining(clock()).ok_or_else(held)?;
-            let (stream, read) = match self.done.recv_timeout(remaining) {
+        let mut open = self.started.clone();
+        while let Some(&first) = open.first() {
+            let (stream, read) = match self
+                .done
+                .recv_timeout(deadline.remaining(clock()).unwrap_or_default())
+            {
                 Ok(done) => done,
-                Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(held());
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(OutputError::Held {
+                        stream: first,
+                        expired: Box::new(deadline.expired(
+                            ChildPeer {
+                                role,
+                                pid,
+                                state: RunState::Gone,
+                            },
+                            Progress::State("exited"),
+                            clock(),
+                        )),
+                    });
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(OutputError::Read {
+                        op: deadline.op(),
+                        role,
+                        pid,
+                        stream: first,
+                        source: io::Error::other("its pump ended without an answer"),
+                    });
                 }
             };
             let bytes = read.map_err(|source| OutputError::Read {
@@ -1021,6 +1102,29 @@ mod tests {
             .await
             .expect("an exited child is answered whatever the budget left");
         assert_eq!(status.code(), Some(5));
+    }
+
+    #[test]
+    fn a_child_with_only_stderr_piped_answers_its_stderr() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf err >&2"])
+            .stderr(std::process::Stdio::piped())
+            .spawn_locked()
+            .expect("spawn sh");
+        let pid = child.id();
+        let pumps = OutputPumps::start(&mut child);
+        reap(
+            "probe child",
+            &mut child,
+            &start("reap probe", REAP),
+            Progress::Nothing,
+        )
+        .expect("sh exits");
+        let (stdout, stderr) = pumps
+            .join("probe child", pid, &start("collect output", REAP))
+            .expect("the one pipe closes with the child");
+        assert!(stdout.is_empty());
+        assert_eq!(stderr, b"err");
     }
 
     #[test]

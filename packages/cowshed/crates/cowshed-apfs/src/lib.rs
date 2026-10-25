@@ -943,10 +943,20 @@ impl SystemCommandRunner {
                                         ended: ProcessStatus::from(status),
                                     }
                                 }
-                                Err(failure) => CommandRunFailure::Reap {
-                                    deadline: policy.deadline,
-                                    failure: Box::new(failure),
-                                },
+                                Err(failure) => {
+                                    // The child stays stuck, named; its exit is collected whenever
+                                    // it comes, and its pumps, dropped here, drain without keeping.
+                                    if matches!(
+                                        failure,
+                                        cowshed_os::deadline::ReapError::Expired(_)
+                                    ) {
+                                        cowshed_os::deadline::collect_later(DISK_CHILD_ROLE, child);
+                                    }
+                                    CommandRunFailure::Reap {
+                                        deadline: policy.deadline,
+                                        failure: Box::new(failure),
+                                    }
+                                }
                             },
                             Err(source) => {
                                 let ended = child

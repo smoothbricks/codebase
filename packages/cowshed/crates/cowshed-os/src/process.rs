@@ -347,31 +347,37 @@ fn darwin_run_state(pid: libc::pid_t) -> io::Result<RunState> {
         libc::SSTOP => return Ok(RunState::Stopped),
         _ => {}
     }
-    let mut threads = [0_u64; 64];
-    let capacity =
-        libc::c_int::try_from(std::mem::size_of_val(&threads)).map_err(io::Error::other)?;
-    // SAFETY: `threads` is writable storage of exactly `capacity` bytes.
-    let listed = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            PROC_PIDLISTTHREADS,
-            0,
-            threads.as_mut_ptr().cast(),
-            capacity,
-        )
-    };
-    if listed <= 0 {
-        let error = io::Error::last_os_error();
-        return match error.raw_os_error() {
-            Some(libc::ESRCH) => Ok(RunState::Gone),
-            _ => Err(error),
+    // The kernel copies as many thread handles as fit: a full buffer may have left some out.
+    let mut threads = vec![0_u64; 64];
+    let count = loop {
+        let capacity = libc::c_int::try_from(std::mem::size_of_val(threads.as_slice()))
+            .map_err(io::Error::other)?;
+        // SAFETY: `threads` is writable storage of exactly `capacity` bytes.
+        let listed = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDLISTTHREADS,
+                0,
+                threads.as_mut_ptr().cast(),
+                capacity,
+            )
         };
-    }
-    let count = usize::try_from(listed).map_err(io::Error::other)? / std::mem::size_of::<u64>();
+        if listed <= 0 {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ESRCH) => Ok(RunState::Gone),
+                _ => Err(error),
+            };
+        }
+        if listed < capacity {
+            break usize::try_from(listed).map_err(io::Error::other)? / std::mem::size_of::<u64>();
+        }
+        threads.resize(threads.len() * 2, 0);
+    };
     let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_threadinfo>())
         .map_err(io::Error::other)?;
     let mut uninterruptible = false;
-    for &thread in &threads[..count] {
+    for &thread in threads.iter().take(count) {
         let mut info = std::mem::MaybeUninit::<libc::proc_threadinfo>::zeroed();
         // SAFETY: `info` is writable storage of exactly `size` bytes.
         let written = unsafe {

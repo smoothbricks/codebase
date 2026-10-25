@@ -109,6 +109,18 @@ fn runner_error(error: CommandRunError) -> CowshedError {
             "no disk tool renames a volume; create it under its final name (specs/cowshed/01a_apfs.md, \"Ownership, identity, and the volume label\")",
         ),
         CommandRunFailure::Release(refusal) => CowshedError::conflict(message, refusal.hint()),
+        CommandRunFailure::Reap { failure, .. }
+            if matches!(*failure, cowshed_os::deadline::ReapError::Expired(_)) =>
+        {
+            CowshedError::conflict(
+                message,
+                "the named process did not end after SIGKILL; its state says why (an uninterruptible kernel wait ends only when that call returns)",
+            )
+        }
+        CommandRunFailure::Output { .. } => CowshedError::conflict(
+            message,
+            "a process the tool started still holds its output pipe; find it in the tool's process group",
+        ),
         CommandRunFailure::DeviceChanged(_) => CowshedError::conflict(
             message,
             "read the I/O Registry again and detach the device its entry names now, if any",
@@ -117,7 +129,6 @@ fn runner_error(error: CommandRunError) -> CowshedError {
         | CommandRunFailure::Wait(_)
         | CommandRunFailure::Kill { .. }
         | CommandRunFailure::Reap { .. }
-        | CommandRunFailure::Output { .. }
         | CommandRunFailure::Input { .. } => CowshedError::internal(message),
     }
 }
