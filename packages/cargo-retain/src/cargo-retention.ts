@@ -174,7 +174,7 @@ const LEGACY_SCRIPT_NAME = /-[0-9a-f]{16}$/;
 const HASH_TEXT = /^[0-9a-f]{16}$/;
 const INTEGER = /^-?(?:0|[1-9]\d*)$/;
 const MANIFEST_NAME = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.json$/;
-const SECTOR = 512n;
+const SECTOR = 512;
 
 type U64 = bigint & tags.Type<'uint64'>;
 /** One `fingerprint/<kind>.json`: Cargo's `Fingerprint`, integers exact. Additive: unknown fields enter the identity. */
@@ -313,7 +313,7 @@ function errorCode(error: unknown): string | undefined {
 
 async function lstatOrUndefined(path: string) {
   try {
-    return await lstat(path, { bigint: true });
+    return await lstat(path);
   } catch (error) {
     if (errorCode(error) === 'ENOENT') return undefined;
     throw error;
@@ -509,8 +509,8 @@ interface ProfileScan {
 }
 
 function mtimeMs(path: string): number | undefined {
-  const stats = lstatSync(path, { bigint: true, throwIfNoEntry: false });
-  return stats?.isFile() === true ? Number(stats.mtimeMs) : undefined;
+  const stats = lstatSync(path, { throwIfNoEntry: false });
+  return stats?.isFile() === true ? Math.floor(stats.mtimeMs) : undefined;
 }
 
 /** Directory types already returned by the kernel; never follow a symbolic link to classify an entry. */
@@ -732,26 +732,26 @@ interface Bytes {
 
 /** Allocated bytes under `path` (never following a link): those whose every link is inside it, and the rest. */
 async function measureTree(path: string): Promise<Bytes> {
-  const inodes = new Map<string, { seen: bigint; nlink: bigint; blocks: bigint }>();
+  const inodes = new Map<string, { seen: number; nlink: number; blocks: number }>();
   const walk = async (entry: string): Promise<void> => {
-    const stats = await lstat(entry, { bigint: true });
+    const stats = await lstat(entry);
     if (stats.isDirectory()) {
       for (const name of await readdir(entry)) await walk(join(entry, name));
       return;
     }
     const key = `${stats.dev}:${stats.ino}`;
     const known = inodes.get(key);
-    if (known === undefined) inodes.set(key, { seen: 1n, nlink: stats.nlink, blocks: stats.blocks });
-    else known.seen += 1n;
+    if (known === undefined) inodes.set(key, { seen: 1, nlink: stats.nlink, blocks: stats.blocks });
+    else known.seen += 1;
   };
   await walk(path);
-  let bytes = 0n;
-  let linkedBytes = 0n;
+  let bytes = 0;
+  let linkedBytes = 0;
   for (const inode of inodes.values()) {
     if (inode.seen >= inode.nlink) bytes += inode.blocks * SECTOR;
     else linkedBytes += inode.blocks * SECTOR;
   }
-  return { bytes: Number(bytes), linkedBytes: Number(linkedBytes) };
+  return { bytes, linkedBytes };
 }
 
 /**
@@ -759,11 +759,11 @@ async function measureTree(path: string): Promise<Bytes> {
  * `linkedBytes` were still linked elsewhere when unlinked. `linked` carries the inodes still
  * linked across the pass, so a later unlink that frees one takes it out again.
  */
-async function removeTree(path: string, linked: Map<string, bigint>): Promise<Bytes> {
-  let freed = 0n;
-  let stillLinked = 0n;
+async function removeTree(path: string, linked: Map<string, number>): Promise<Bytes> {
+  let freed = 0;
+  let stillLinked = 0;
   const remove = async (entry: string): Promise<void> => {
-    const stats = await lstat(entry, { bigint: true });
+    const stats = await lstat(entry);
     if (stats.isDirectory()) {
       for (const name of await readdir(entry)) await remove(join(entry, name));
       await rmdir(entry);
@@ -771,7 +771,7 @@ async function removeTree(path: string, linked: Map<string, bigint>): Promise<By
     }
     const key = `${stats.dev}:${stats.ino}`;
     await unlink(entry);
-    if (stats.nlink === 1n) {
+    if (stats.nlink === 1) {
       freed += stats.blocks * SECTOR;
       linked.delete(key);
     } else {
@@ -780,10 +780,23 @@ async function removeTree(path: string, linked: Map<string, bigint>): Promise<By
     }
   };
   await remove(path);
-  return { bytes: Number(freed), linkedBytes: Number(stillLinked) };
+  return { bytes: freed, linkedBytes: stillLinked };
 }
 
 // ---- Trash ----
+
+/**
+ * A generation's device and inode as the trash manifest spells them, or `undefined` when a double cannot hold either
+ * exactly: the manifest proves a generation by those digits, so a rounded number proves nothing.
+ */
+export function exactIdentity(stats: {
+  readonly dev: number;
+  readonly ino: number;
+}): { readonly dev: string; readonly ino: string } | undefined {
+  return Number.isSafeInteger(stats.dev) && Number.isSafeInteger(stats.ino)
+    ? { dev: String(stats.dev), ino: String(stats.ino) }
+    : undefined;
+}
 
 interface Moved {
   readonly from: string;
@@ -803,8 +816,15 @@ async function moveToTrash(profile: string, victims: readonly Meta[]): Promise<R
     const pass = randomUUID();
     const entries: Moved[] = [];
     for (const victim of victims) {
-      const stats = await lstat(victim.path, { bigint: true });
-      entries.push({ from: victim.path, dev: stats.dev.toString(), ino: stats.ino.toString() });
+      const identity = exactIdentity(await lstat(victim.path));
+      if (identity === undefined) {
+        const detail = 'its device or inode number is not an exact integer';
+        return {
+          ok: false,
+          error: { kind: 'io', operation: 'identify superseded generation', path: victim.path, detail },
+        };
+      }
+      entries.push({ from: victim.path, ...identity });
     }
     const manifest: TrashManifest = { version: 1, entries };
     await writeFile(join(trash, `${pass}.json`), JSON.stringify(manifest), { flag: 'wx' });
@@ -826,7 +846,7 @@ interface Purged {
  * (a real directory with the manifest's device and inode), whichever pass moved it. Anything
  * else in the trash is retained and reported, never deleted.
  */
-async function purgeTrash(profile: string, linked: Map<string, bigint>): Promise<Result<Purged, RetentionError>> {
+async function purgeTrash(profile: string, linked: Map<string, number>): Promise<Result<Purged, RetentionError>> {
   const trash = join(profile, TRASH);
   const reclaimed: Reclaimable[] = [];
   const retained: Retained[] = [];
@@ -857,7 +877,8 @@ async function purgeTrash(profile: string, linked: Map<string, bigint>): Promise
         const moved = join(passDir, String(index));
         const stats = await lstatOrUndefined(moved);
         if (stats === undefined) continue;
-        if (!stats.isDirectory() || stats.dev.toString() !== entry.dev || stats.ino.toString() !== entry.ino) {
+        const identity = exactIdentity(stats);
+        if (!stats.isDirectory() || identity?.dev !== entry.dev || identity?.ino !== entry.ino) {
           retained.push({
             path: moved,
             reason: 'unproven-trash-entry',
@@ -958,7 +979,7 @@ function schedulingConfiguration(
   members: ReadonlySet<string>,
 ): Result<string, RetentionError> {
   try {
-    const target = lstatSync(targetDir, { bigint: true });
+    const target = lstatSync(targetDir);
     const hash = createHash('sha256').update(
       JSON.stringify({
         version: SCHEDULE_VERSION,
@@ -966,8 +987,8 @@ function schedulingConfiguration(
         recentUse: RECENT_USE_MS,
         workspaceRoot,
         targetDir,
-        dev: target.dev.toString(),
-        ino: target.ino.toString(),
+        dev: String(target.dev),
+        ino: String(target.ino),
         members: [...members].sort(),
       }),
     );
@@ -1285,7 +1306,7 @@ async function pass(
       outcome('planned', reclaim, linkedBytes, [...selection.kept, ...anomalies], recencyOf(metas, stamped)),
     );
   }
-  const linked = new Map<string, bigint>();
+  const linked = new Map<string, number>();
   const reclaim: Reclaimable[] = [];
   const retained: Retained[] = [...selection.kept, ...anomalies];
   for (const profile of ownedProfiles) {
@@ -1294,9 +1315,9 @@ async function pass(
     reclaim.push(...purged.value.reclaimed);
     retained.push(...purged.value.retained);
   }
-  let linkedBytes = 0n;
+  let linkedBytes = 0;
   for (const blocks of linked.values()) linkedBytes += blocks;
-  return complete(outcome('reclaimed', reclaim, Number(linkedBytes), retained, recencyOf(metas, stamped)));
+  return complete(outcome('reclaimed', reclaim, linkedBytes, retained, recencyOf(metas, stamped)));
 }
 
 /** A pass that could not even attempt a lock changed nothing: it is refused, naming why on one line. */

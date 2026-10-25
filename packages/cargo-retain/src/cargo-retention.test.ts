@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import {
   AUTOMATIC_INTERVAL_MS,
   describeRetention,
+  exactIdentity,
   fingerprintIdentity,
   RECENT_USE_MS,
   RETENTION_RECEIPT,
@@ -115,6 +116,22 @@ function identityIgnoresToolchain(): void {
     identity('8522741132697106019', '["--sysroot","/nix/store/a-rust","-C","target-cpu=native"]', '["extra"]'),
     'another feature set',
   ).not.toBe(base);
+}
+
+/** Case: the trash manifest proves a generation by device and inode digits, so a number a double rounds proves nothing. */
+function exactIdentityRefusesWhatADoubleCannotHold(): void {
+  const check = labelled('exactIdentity refuses a device or inode a double cannot hold');
+  check(exactIdentity({ dev: 16777232, ino: 4294967296 }), 'ordinary numbers').toEqual({
+    dev: '16777232',
+    ino: '4294967296',
+  });
+  check(exactIdentity({ dev: 1, ino: Number.MAX_SAFE_INTEGER }), 'the largest exact inode').toEqual({
+    dev: '1',
+    ino: '9007199254740991',
+  });
+  check(exactIdentity({ dev: 1, ino: Number.MAX_SAFE_INTEGER + 1 }), 'an inode 2^53 or more').toBeUndefined();
+  check(exactIdentity({ dev: 2 ** 60, ino: 1 }), 'a device 2^53 or more').toBeUndefined();
+  check(exactIdentity({ dev: 1, ino: Number.NaN }), 'not a number').toBeUndefined();
 }
 
 /** Case: refuses the whole pass over one unreadable fingerprint and changes nothing. */
@@ -1079,6 +1096,7 @@ describe('cargo retention against real Cargo target layouts', () => {
   it('walks the retention cases over one churned Cargo target, asserting after every step (mtime-on-use false)', async () => {
     keepsExactDigitsInTheParser();
     identityIgnoresToolchain();
+    exactIdentityRefusesWhatADoubleCannotHold();
     await inFixture(async (root) => {
       const fx = await churnFixture(root, false);
       await scopedTo(fx.target, async () => {
