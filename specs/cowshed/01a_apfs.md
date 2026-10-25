@@ -1112,6 +1112,60 @@ Remaining options, not additional guarantees or implemented cutovers:
 - A shared-unlink optimization would need an enforceable lifetime/immutability hold on another map owner through final
   close, not a second flag read. A smaller step or an inter-step yield cannot split the first mutation either.
 
+### The vnode table
+
+macOS caches file contents in the unified buffer cache, attached to each file's vnode, and caches vnodes up to
+`kern.maxvnodes`. Below the limit a new vnode is a fresh allocation or a dead one reused. Once the allocated vnodes
+reach the limit, each new vnode is stolen from the free list, and reclaiming a vnode pushes and invalidates its file's
+cached pages. XNU `bsd/vfs/vfs_subr.c`: `new_vnode` allocates or reuses a dead vnode while
+`numvnodes - deadvnodes + deadvnodes_noreuse < desiredvnodes` (`kern.num_vnodes` is `numvnodes`, dead vnodes included;
+`desiredvnodes` is `kern.maxvnodes`), and a stolen vnode is reclaimed through `vgone`, whose `vclean` with `DOCLOSE`
+calls `ubc_msync` with `UBC_PUSHALL | UBC_INVALIDATE | UBC_SYNC`. The kernel keeps at most a few hundred dead vnodes, so
+`kern.num_vnodes` at `kern.maxvnodes` is where stealing starts, give or take that many. From there, file cache is
+evicted by vnode count, not by memory: the files touched least recently lose their pages however much memory is free.
+
+Image-backed volumes pay for this twice. A file inside a mounted workspace or build volume is cached under its own vnode
+on that volume, and the in-kernel attach ("Mounts") reads the image's blocks through the `.dmg`'s vnode on the store
+volume, whose pages cache the same bytes again. While both vnodes live, the bytes are cached twice; once the in-volume
+vnode is recycled, the `.dmg`'s pages are the only cache left, and each re-read pays the APFS lookup and the disk-image
+driver's block path instead of a page hit. A fleet of about 180 attached images fills a limit of 1,048,576 in about ten
+minutes, and the boot default (263,168 on a 128 GiB host) sooner, so build and test inputs inside the images lose their
+cache between runs while the backing images' pages stay.
+
+**The floor.** `kern.maxvnodes` is at least one vnode per 32 KiB of memory, `hw.memsize / 32768`: 4,194,304 on a 128 GiB
+host. A cached regular file costs about 1.2 KB of kernel memory in the zone elements it holds — vnode (272 B), APFS
+inode (432 B), name-cache entry (112 B), UBC info (96 B), vnode pager (48 B) and VM object (256 B), the element sizes
+`zprint` reports — so a full cache at the floor costs under 4% of memory, paid only as files are touched.
+
+Every limit fills on a busy host: every file touched keeps its vnode until it is stolen, so a full table is a full
+cache, like a full page cache. What a limit decides is the eviction horizon, the free vnodes divided by the steal rate.
+While the table is full, the rate of `vfs.vnstats.num_newvnode_calls_nodead` (new vnodes that found no dead one to
+reuse) is the steal rate. With about 180 attached images, 4,194,304 fills in hours where 1,048,576 fills in about ten
+minutes; full, it holds about 3.2 million free vnodes against about 1,250 steals a second, so a file keeps its vnode and
+pages for about 45 minutes untouched, while memory is full of file pages at the same time. A larger limit would buy
+horizon with kernel memory taken from those pages, so the floor is the limit; a full table under it evicts file cache
+that memory could still hold.
+
+About a quarter of a full table is in use, and process descriptors account for few of them: setting a vnode's parent
+takes a use reference on the directory (`vnode_update_identity` in `bsd/vfs/vfs_cache.c`), so a directory stays in use
+while any child's vnode is cached, and only files and directories with no cached children are stolen.
+
+**Setting it.** `sudo sysctl -w kern.maxvnodes=<n>` takes effect at once and lasts until reboot. The kernel boots with
+its default, so the host's boot configuration sets the limit at every boot; on nix-darwin that is a
+`launchd.daemons.<name>` job with `serviceConfig.RunAtLoad = true` and
+`serviceConfig.ProgramArguments = [ "/usr/sbin/sysctl" "-w" "kern.maxvnodes=<n>" ]`, one argument per element. Cowshed
+writes no kernel tunable itself: the limit is the operator's.
+
+**Checking it.** `sysctl kern.maxvnodes kern.num_vnodes kern.free_vnodes hw.memsize`. `kern.num_vnodes` at
+`kern.maxvnodes` means stealing has started, give or take the dead-vnode slack: each new vnode recycles a cached one.
+`kern.num_recycledvnodes` counts every `vclean`, deleted files and unmounted volumes included, so it keeps rising below
+the limit and does not by itself measure the limit's pressure. `cowshed doctor`'s `vnode-table` probe judges the same
+values (`cowshed-core/src/vnodes.rs`): `vnode-table-saturated` when the vnodes in use reach the limit and file-system
+calls stall ([01c_macos.md §The kernel vnode table saturates](./01c_macos.md#the-kernel-vnode-table-saturates)),
+`vnode-cache-full` when the table is full at a limit under the floor, and `vnode-limit-below-floor` when it has room
+under such a limit. Each is a warning whose hint names the value to set, now and at boot; a full table at or over the
+floor is no finding.
+
 ## Ownership, identity, and the volume label
 
 Three questions, three authorities, none of them the volume label:

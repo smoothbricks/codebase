@@ -4877,34 +4877,72 @@ fn caches_volume_finding() -> Option<Finding> {
     })
 }
 
-/// A saturated kernel vnode table, which stalls every mount, attach and workspace command on
-/// the host until a vnode can be recycled — the cause behind a disk child that hangs past its
-/// deadline on an image that is fine.
+/// The kernel vnode table judged against this host's memory: a saturated table stalls every
+/// mount, attach and workspace command until a vnode can be recycled (the cause behind a disk
+/// child that hangs past its deadline on an image that is fine), a full one under the floor drops
+/// a cached file's pages with every new vnode while memory could still hold them, and a limit
+/// under the floor gets there. A full table at or over the floor is a full cache and no finding.
 fn vnode_table_finding(
     table: std::io::Result<cowshed_core::vnodes::VnodeTable>,
 ) -> Option<Finding> {
-    match table {
-        Ok(table) if table.saturated() => Some(Finding {
-            code: "vnode-table-saturated".into(),
-            severity: FindingSeverity::Warning,
-            message: format!(
+    use cowshed_core::vnodes::Pressure;
+    let table = match table {
+        Ok(table) => table,
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return None,
+        Err(error) => {
+            return Some(Finding {
+                code: "vnode-table".into(),
+                severity: FindingSeverity::Warning,
+                message: format!(
+                    "could not read kern.num_vnodes, kern.free_vnodes, kern.maxvnodes and \
+                     hw.memsize: {error}"
+                ),
+                hint: "sysctl kern.num_vnodes kern.free_vnodes kern.maxvnodes hw.memsize".into(),
+                path: None,
+            });
+        }
+    };
+    let (code, message) = match table.pressure() {
+        Pressure::Sound => return None,
+        Pressure::Saturated => (
+            "vnode-table-saturated",
+            format!(
                 "{table}; mounts, attaches and workspace commands stall behind vnode recycling"
             ),
-            hint: table.remedy(),
-            path: None,
-        }),
-        Ok(_) => None,
-        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
-        Err(error) => Some(Finding {
-            code: "vnode-table".into(),
-            severity: FindingSeverity::Warning,
-            message: format!(
-                "could not read kern.num_vnodes, kern.free_vnodes and kern.maxvnodes: {error}"
+        ),
+        Pressure::Full => (
+            "vnode-cache-full",
+            format!(
+                "the kernel vnode cache is full at kern.maxvnodes {}, under the floor of {} \
+                 (kern.num_vnodes {}, {} free): each new vnode reclaims a cached one and drops \
+                 that file's cached pages, so files in mounted images lose their page cache",
+                table.limit,
+                table.floor(),
+                table.allocated,
+                table.free
             ),
-            hint: "sysctl kern.num_vnodes kern.free_vnodes kern.maxvnodes".into(),
-            path: None,
-        }),
-    }
+        ),
+        Pressure::BelowFloor => (
+            "vnode-limit-below-floor",
+            format!(
+                "kern.maxvnodes {} is below the floor of {} (hw.memsize {} / {} bytes per vnode); \
+                 once kern.num_vnodes ({} now) reaches that limit, each new vnode drops a cached \
+                 file's pages",
+                table.limit,
+                table.floor(),
+                table.memory,
+                cowshed_core::vnodes::MEMORY_PER_VNODE,
+                table.allocated
+            ),
+        ),
+    };
+    Some(Finding {
+        code: code.into(),
+        severity: FindingSeverity::Warning,
+        message,
+        hint: table.remedy(),
+        path: None,
+    })
 }
 
 /// `diskimagesiod` helpers that outlived their disk image, each still holding the 72 MiB of
@@ -6551,27 +6589,61 @@ mod tests {
     }
 
     #[test]
-    fn doctor_names_a_saturated_vnode_table_and_the_limit_to_raise() {
+    fn doctor_names_vnode_pressure_and_the_limit_to_set() {
         use cowshed_core::vnodes::VnodeTable;
-        let finding = vnode_table_finding(Ok(VnodeTable {
-            allocated: 272_631,
-            free: 0,
-            limit: 263_168,
-        }))
-        .expect("a saturated table is a finding");
-        assert_eq!(finding.code, "vnode-table-saturated");
-        assert_eq!(finding.severity, FindingSeverity::Warning);
-        assert!(finding.hint.contains("kern.maxvnodes="), "{finding:?}");
-
-        // This host's steady state when it was reported saturated: a full cache, mostly free.
-        let full_cache = VnodeTable {
-            allocated: 1_048_649,
-            free: 893_580,
-            limit: 1_048_576,
+        let host = |allocated, free, limit| VnodeTable {
+            allocated,
+            free,
+            limit,
+            memory: 128 << 30,
         };
-        assert!(vnode_table_finding(Ok(full_cache)).is_none());
+        let cases = [
+            (host(1_048_649, 0, 1_048_576), Some("vnode-table-saturated")),
+            // The fleet at a 1 Mi limit: full, mostly free.
+            (
+                host(1_048_576, 899_560, 1_048_576),
+                Some("vnode-cache-full"),
+            ),
+            // The boot default with room left.
+            (
+                host(200_000, 150_000, 263_168),
+                Some("vnode-limit-below-floor"),
+            ),
+            (host(2_036_323, 1_594_926, 4_194_304), None),
+            // Full at the floor: a full cache, not a finding.
+            (host(4_195_395, 3_217_877, 4_194_304), None),
+        ];
+        for (table, code) in cases {
+            let finding = vnode_table_finding(Ok(table));
+            assert_eq!(
+                finding.as_ref().map(|finding| finding.code.as_str()),
+                code,
+                "{table:?}"
+            );
+            if let Some(finding) = finding {
+                assert_eq!(finding.severity, FindingSeverity::Warning);
+                assert!(
+                    finding.hint.contains("sysctl -w kern.maxvnodes=4194304"),
+                    "{finding:?}"
+                );
+                assert!(finding.hint.contains("launchd.daemons"), "{finding:?}");
+            }
+        }
+        // Saturated at the floor still stalls, and its remedy doubles the limit.
+        let stalled = vnode_table_finding(Ok(host(4_194_304, 0, 4_194_304)))
+            .expect("a table saturated at the floor is a finding");
+        assert_eq!(stalled.code, "vnode-table-saturated");
+        assert!(
+            stalled.hint.contains("kern.maxvnodes=8388608"),
+            "{stalled:?}"
+        );
         let linux = std::io::Error::new(std::io::ErrorKind::Unsupported, "no vnode table");
         assert!(vnode_table_finding(Err(linux)).is_none());
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let refused = vnode_table_finding(Err(denied)).expect("an unreadable table is a finding");
+        assert_eq!(refused.code, "vnode-table");
+        assert!(refused.message.contains("hw.memsize"), "{refused:?}");
+        assert!(refused.hint.contains("hw.memsize"), "{refused:?}");
     }
 
     fn reading(

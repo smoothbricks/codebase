@@ -54,7 +54,7 @@ Find the symptom in the left column and follow the link.
 | A release waits behind a SecurityAgent prompt; `ReleaseNeedsAuthorization`                                                                                                                               | [Releasing another user's image prompts for authorization](#releasing-another-users-image-prompts-for-authorization)                            |
 | `Resource busy`; `dissented by PID`; a detach that waits                                                                                                                                                 | [A busy volume refuses unmount](#a-busy-volume-refuses-unmount)                                                                                 |
 | `/dev/diskN` names a different image than it did a moment ago                                                                                                                                            | [BSD device names are reused](#bsd-device-names-are-reused)                                                                                     |
-| `kern.maxvnodes` in an error; a `mount_apfs` or `hdiutil` child stalls past its deadline; `vnode-table-saturated`                                                                                        | [The kernel vnode table saturates](#the-kernel-vnode-table-saturates)                                                                           |
+| `kern.maxvnodes` in an error; a `mount_apfs` or `hdiutil` child stalls past its deadline; `vnode-table-saturated`, `vnode-cache-full` or `vnode-limit-below-floor`                                       | [The kernel vnode table saturates](#the-kernel-vnode-table-saturates)                                                                           |
 | `departed-volume-references`; `lsmp -a` lists `AppleAPFSVolume` rights after their volumes left                                                                                                          | [Spotlight (`mds`) leaks a media port per admitted volume](#spotlight-mds-leaks-a-media-port-per-admitted-volume)                               |
 | A cowshed volume is indexed by Spotlight; `mdutil -s` reports `unknown indexing state`                                                                                                                   | [Spotlight indexing opt-outs](#spotlight-indexing-opt-outs)                                                                                     |
 | `dev.cowshed.storage` exits 1 at `merge Spotlight Search Privacy exclusions`; `mkstemp failed on /System/Volumes/Data/.Spotlight-V100/…`                                                                 | [Spotlight indexing opt-outs](#spotlight-indexing-opt-outs)                                                                                     |
@@ -501,15 +501,19 @@ Find the symptom in the left column and follow the link.
 
 ### The kernel vnode table saturates
 
-- **Fact.** macOS caches vnodes up to `kern.maxvnodes`, a full cache is healthy, and saturation is vnodes in use
-  (`kern.num_vnodes` − `kern.free_vnodes`) reaching the limit, when a `mount_apfs` that takes a second on a healthy host
-  passes a two-minute deadline (`sysctl(3)` lists `kern.maxvnodes` and `kern.num_vnodes`, XNU `bsd/kern/kern_sysctl.c`
-  defines `kern.free_vnodes`, and the rest is the code's own comment and measurement).
-- **Rule.** cowshed names the vnode table as the cause only when vnodes in use reach `kern.maxvnodes`, and `doctor`
-  prints the raise as `sudo sysctl kern.maxvnodes=<n>` for the operator to decide.
-- **Owners.** _No spec owner_ for the saturation rule.
-  [01a_apfs.md §Owned-registry release boundary](./01a_apfs.md#owned-registry-release-boundary) (a child failure names a
-  saturated vnode table);
+- **Fact.** macOS caches vnodes up to `kern.maxvnodes`. At the limit no call waits for another to release a vnode: each
+  new vnode reclaims a free one, which drops that file's cached pages
+  ([01a_apfs.md §The vnode table](./01a_apfs.md#the-vnode-table)). Saturation is vnodes in use (`kern.num_vnodes` −
+  `kern.free_vnodes`) reaching the limit, when a `mount_apfs` that takes a second on a healthy host passes a two-minute
+  deadline (`sysctl(3)` lists `kern.maxvnodes` and `kern.num_vnodes`, XNU `bsd/kern/kern_sysctl.c` defines
+  `kern.free_vnodes`, and the rest is the code's own comment and measurement).
+- **Rule.** cowshed names the vnode table as a failure's cause only when vnodes in use reach `kern.maxvnodes`. `doctor`
+  also reports a full cache under one vnode per 32 KiB of memory (`vnode-cache-full`) and such a limit with room left
+  (`vnode-limit-below-floor`), and prints the raise to that floor as `sudo sysctl -w kern.maxvnodes=<n>` with the
+  boot-time job that keeps it, for the operator to decide. A full cache at or over the floor is no finding.
+- **Owners.** [01a_apfs.md §The vnode table](./01a_apfs.md#the-vnode-table) (the floor, the full cache and doctor's
+  findings); [01a_apfs.md §Owned-registry release boundary](./01a_apfs.md#owned-registry-release-boundary) (a child
+  failure names a saturated vnode table);
   [docs/troubleshooting.md §A disk child `did not finish within 120s`](../../packages/cowshed/docs/troubleshooting.md#a-disk-child-did-not-finish-within-120s);
   [06_cli.md §Onboarding and repair](./06_cli.md#onboarding-and-repair) (names the probe). Code:
   [`cowshed-core/src/vnodes.rs`]; [`cowshed-core/src/error.rs`] `storage_failure`; [`cowshed-cli/src/runtime.rs`]

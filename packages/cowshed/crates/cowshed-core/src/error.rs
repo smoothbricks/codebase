@@ -1247,6 +1247,7 @@ mod tests {
                 allocated: 272_631,
                 free: 0,
                 limit: 263_168,
+                memory: 16 << 30,
             })
         };
         let hung = || {
