@@ -1445,6 +1445,7 @@ async function createProjectTargets(
                 absoluteProjectRoot: join(workspaceRoot, cargoWorkspaceRoot),
                 memberDir: plan.package.dir,
                 cache: cargoWorkspace.inputsCache,
+                cargo: cargoWorkspace.closureSource.cargo,
               }),
             ),
           )
@@ -2826,15 +2827,16 @@ function serialGroupMemberDirs(workspace: CargoWorkspace, group: SerialTestGroup
 
 /**
  * The inputs of the runners that select crates from one cargo workspace: the
- * sources of the crates they select, every member manifest, and the repository's
- * nextest config.
+ * sources of the crates they select, the manifest of every package the workspace
+ * builds, and the repository's nextest config.
  *
  * Workspace-anchored for the reason `cargoPackageTestInputs` gives: a
  * `{projectRoot}` glob hashes only files this project owns, and sibling manifests
  * belong to whichever nested project holds them. A workspace nextest build unifies
- * features across every selected member, so a sibling manifest can change a crate's
- * tests without being a path dependency: track those manifests, not unrelated
- * sibling sources.
+ * features across every package it compiles, so a sibling manifest can change a
+ * crate's tests without being a path dependency: a member's, and a path package's
+ * that reaches the build only as another crate's dev-dependency. Track those
+ * manifests, not unrelated sibling sources.
  *
  * The repository's own nextest config layers OVER the plugin's tool config, so it
  * decides timeouts, groups and archive contents: a cached verdict that ignored it
@@ -2853,13 +2855,21 @@ async function cargoTestRunnerInputs(
         absoluteProjectRoot: join(workspaceRoot, workspace.projectRoot),
         memberDir,
         cache: workspace.inputsCache,
+        cargo: workspace.closureSource.cargo,
       }),
     ),
   );
   return [
     ...new Set([
       ...sources.flat(),
-      ...workspace.packages.map((member) => posix.join(inputRoot, member.package.dir, 'Cargo.toml')),
+      ...workspace.closureSource.cargo.local.flatMap((pkg) => {
+        const manifest = relative(workspace.closureSource.root, pkg.manifest);
+        // A manifest outside the Nx workspace is no fileset; only a crate whose own closure reaches it keys it,
+        // through `externalRustCrates`.
+        return manifest === '..' || manifest.startsWith(`..${sep}`) || isAbsolute(manifest)
+          ? []
+          : [posix.join('{workspaceRoot}', manifest.split(sep).join('/'))];
+      }),
       posix.join(inputRoot, NEXTEST_REPO_CONFIG_PATH),
     ]),
     fileHashInput(PLUGIN_NEXTEST_CONFIG_PATH),

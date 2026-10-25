@@ -46,8 +46,8 @@ async function cargoSource(root: string, randVersion: string): Promise<CargoClos
       [rand, REGISTRY],
     ]),
     edges: new Map([
-      [a.id, [serde]],
-      [b.id, [rand]],
+      [a.id, [{ pkg: serde, devOnly: false }]],
+      [b.id, [{ pkg: rand, devOnly: false }]],
       [serde, []],
       [rand, []],
     ]),
@@ -83,6 +83,65 @@ it('digests path packages by name, so two checkouts of one lock share a Cargo lo
   expect(await node(left)).toBe(await node(right));
 });
 
+it("keys a crate's Cargo lock-scope node on what its dependencies link, never on their dev-dependencies", async () => {
+  const root = await workspace('smoo-cargo-lock-dev-');
+  const local = (name: string): LocalCargoPackage => {
+    const directory = join(root, 'crates', name);
+    return {
+      id: `path+file://${directory}#${name}@0.1.0`,
+      name,
+      version: '0.1.0',
+      directory,
+      manifest: join(directory, 'Cargo.toml'),
+      sources: [join(directory, 'src/lib.rs')],
+      governingManifest: join(root, 'Cargo.toml'),
+    };
+  };
+  const [top, mid] = [local('top'), local('mid')];
+  for (const pkg of [top, mid]) await mkdir(pkg.directory, { recursive: true });
+  // `top` links `mid`; `mid` links serde and tests with rand.
+  const source = (serdeVersion: string, randVersion: string): CargoClosureSource => {
+    const serde = locked('serde', serdeVersion);
+    const rand = locked('rand', randVersion);
+    const cargo: CargoResolve = {
+      root,
+      members: new Set([top.id, mid.id]),
+      local: [top, mid],
+      locked: new Map([
+        [serde, REGISTRY],
+        [rand, REGISTRY],
+      ]),
+      edges: new Map([
+        [top.id, [{ pkg: mid.id, devOnly: false }]],
+        [
+          mid.id,
+          [
+            { pkg: serde, devOnly: false },
+            { pkg: rand, devOnly: true },
+          ],
+        ],
+        [serde, []],
+        [rand, []],
+      ]),
+    };
+    return {
+      manifest: 'Cargo.toml',
+      workspaceRoot: root,
+      root,
+      cargo,
+      indexed: new Set(),
+      compiledFilesCache: new Map(),
+    };
+  };
+  const hash = async (directory: string, serdeVersion: string, randVersion: string) =>
+    (await cargoLockNode(directory, [source(serdeVersion, randVersion)])).data.hash;
+  // A rand bump moves only the node of the crate whose tests build it.
+  expect(await hash('crates/top', '1.0.219', '0.9.2')).toBe(await hash('crates/top', '1.0.219', '0.9.1'));
+  expect(await hash('crates/mid', '1.0.219', '0.9.2')).not.toBe(await hash('crates/mid', '1.0.219', '0.9.1'));
+  // A serde bump moves both: `top` links what `mid` links.
+  expect(await hash('crates/top', '1.0.220', '0.9.1')).not.toBe(await hash('crates/top', '1.0.219', '0.9.1'));
+  expect(await hash('crates/mid', '1.0.220', '0.9.1')).not.toBe(await hash('crates/mid', '1.0.219', '0.9.1'));
+});
 it('refuses a Cargo lock-scope node no resolve covers, rather than keying it on nothing', async () => {
   await expect(cargoLockNode('crates/none', [])).rejects.toThrow('no Cargo workspace has a crate under it');
 });

@@ -29,7 +29,10 @@ for (const size of [16, 64, 256, 1024]) {
   const source = filesetSource(root, directories, []);
   // A chain of overlapping diamonds has exponentially many paths but only two edges per vertex.
   const edges = new Map(
-    source.cargo.local.map(({ id }, index) => [id, [index + 1, index + 2].filter((next) => next < size).map(String)]),
+    source.cargo.local.map(({ id }, index) => [
+      id,
+      [index + 1, index + 2].filter((next) => next < size).map((next) => ({ pkg: String(next), devOnly: false })),
+    ]),
   );
   const cargo = { ...source.cargo, edges };
   // Root selects all local members; the traversal must still deduplicate the converging edge visits.

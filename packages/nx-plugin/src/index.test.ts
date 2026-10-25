@@ -21,6 +21,7 @@ import { mergeTargetConfigurations } from 'nx/src/project-graph/utils/project-co
 import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
 import { getOutputsForTargetAndConfiguration } from 'nx/src/tasks-runner/utils.js';
 import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
+import { prepareCargoFixture } from './__tests__/cargo-fixture.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import { CARGO_CLOSURE_INPUT, isCargoLockInput } from './cargo-closure-input.js';
@@ -2658,6 +2659,48 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  // A runner keyed every closure crate's dev-dependencies, though Cargo builds a dependency for its library alone,
+  // so a dependency's test helper re-keyed every crate above it (35 of 87 runners in one downstream workspace).
+  it("keys a crate's runner on every crate its dependencies link, and on their dev-dependencies' manifests alone", async () => {
+    const workspace = await createWorkspace();
+    try {
+      await writeApfsSplitFixture(workspace, APFS_SPLIT_GROUPS);
+      // cowshed-core tests with lmao-core; cowshed-cli links cowshed-core.
+      await workspace.write(
+        'packages/cowshed/crates/cowshed-core/Cargo.toml',
+        [
+          '[package]',
+          'name = "cowshed-core"',
+          '',
+          '[dependencies]',
+          'cowshed-apfs = { path = "../cowshed-apfs" }',
+          'cowshed-os = { path = "../cowshed-os" }',
+          '',
+          '[dev-dependencies]',
+          'lmao-core = { path = "../../../lmao/crates/lmao-core" }',
+          '',
+        ].join('\n'),
+      );
+      const cowshed = (await inferApfsSplit(workspace)).get('packages/cowshed') ?? {};
+      const cli = cowshed['cargo-test-cowshed-cli'];
+      const core = cowshed['cargo-test-cowshed-core'];
+
+      expect(hashedCrates(cli)).toEqual(['cowshed-apfs', 'cowshed-cli', 'cowshed-core', 'cowshed-os']);
+      expect(hashedCrates(core)).toEqual(['cowshed-apfs', 'cowshed-core', 'cowshed-os', 'lmao-core']);
+      const hashedBy = (path: string) => ({ cli: hashes(cli, path), core: hashes(core, path) });
+      // An edit to the dependency's test helper reruns that dependency's tests alone.
+      expect(hashedBy('packages/lmao/crates/lmao-core/src/lib.rs')).toEqual({ cli: false, core: true });
+      // An edit to a crate the dependency links reruns both.
+      expect(hashedBy('packages/cowshed/crates/cowshed-os/src/lib.rs')).toEqual({ cli: true, core: true });
+      expect(hashedBy('packages/cowshed/crates/cowshed-core/src/lib.rs')).toEqual({ cli: true, core: true });
+      // The helper's manifest stays in both keys: the workspace archive unifies its features into every binary.
+      for (const runner of [cli, core]) {
+        expect(runner?.inputs).toContain('{workspaceRoot}/packages/lmao/crates/lmao-core/Cargo.toml');
+      }
+    } finally {
+      await workspace.cleanup();
+    }
+  });
   it('refuses a serial group scoped to a package that is not a member of the Cargo workspace', async () => {
     const workspace = await createWorkspace();
     try {
@@ -3266,46 +3309,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
   });
   //#endregion
 });
-
-/**
- * Target-inference fixtures declare real Cargo workspaces. Supply their empty
- * Rust library and initial lock before inference, rather than relying on a
- * rejected Cargo query. Explicit sources and locks, including planted failures,
- * remain untouched.
- */
-async function prepareCargoFixture(root: string): Promise<void> {
-  const manifests = (await readdir(root, { recursive: true }))
-    .filter((path) => path === 'Cargo.toml' || path.endsWith('/Cargo.toml'))
-    .filter((path) => !path.split('/').some((part) => ['node_modules', 'target', '.nx'].includes(part)));
-  const workspaces: string[] = [];
-  for (const manifest of manifests) {
-    const path = join(root, manifest);
-    const contents = await readFile(path, 'utf8');
-    if (/^\[package\]\s*$/m.test(contents)) {
-      const source = join(dirname(path), 'src/lib.rs');
-      if (!(await Bun.file(source).exists())) {
-        await mkdir(dirname(source), { recursive: true });
-        await writeFile(source, '// Empty Cargo fixture library.\n');
-      }
-    }
-    if (/^\[workspace\]\s*$/m.test(contents)) workspaces.push(path);
-  }
-  for (const manifest of workspaces) {
-    if (await Bun.file(join(dirname(manifest), 'Cargo.lock')).exists()) continue;
-    const child = Bun.spawn(['cargo', 'generate-lockfile', '--offline', '--manifest-path', manifest], {
-      env: process.env,
-      cwd: root,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    const [code, stdout, stderr] = await Promise.all([
-      child.exited,
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
-    ]);
-    if (code !== 0) throw new Error(`Cargo fixture ${manifest} could not lock:\n${stdout}${stderr}`);
-  }
-}
 
 async function createWorkspace(parent = tmpdir()): Promise<WorkspaceFixture> {
   // Canonical, because macOS puts the temp directory behind a /private symlink

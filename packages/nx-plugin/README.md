@@ -280,12 +280,14 @@ recompiling unchanged code. Nx never restores or collects shared Cargo build dir
 dedicated Wasm/N-API **outputs**, remain cacheable.
 
 Validation inputs include the crate's files, every file its sources compile in through a literal `include_str!` or
-`include_bytes!` path outside the crate's directory (a shipped skill or a shared corpus beside the crates), local
-dependency closure, governing manifests and configuration, the declared toolchain pin, and the toolchain's own reported
-versions. The pin is `devenv.lock`, hashed as an ordinary file input at both `{workspaceRoot}/devenv.lock` and
+`include_bytes!` path outside the crate's directory (a shipped skill or a shared corpus beside the crates), the crates
+Cargo builds for its tests, governing manifests and configuration, the declared toolchain pin, and the toolchain's own
+reported versions. The pin is `devenv.lock`, hashed as an ordinary file input at both `{workspaceRoot}/devenv.lock` and
 `{workspaceRoot}/tooling/direnv/devenv.lock` — devenv resolves it into the rustc, cargo, linker, C toolchain and SDK
 every cargo command inherits, so bumping it invalidates every cached cargo target. Workspace test runners additionally
-hash all workspace member manifests because those affect unified features, and the nextest executable/configuration.
+hash the manifest of every package the workspace build compiles inside the Nx workspace (a member's, and a path
+package's that reaches the build only as some crate's dev-dependency), because those affect unified features, and the
+nextest executable/configuration.
 
 Nothing machine-local takes part. The ambient cargo environment and the global `$CARGO_HOME/config.toml` are
 deliberately not hashed: their values carry absolute store paths and per-checkout state directories, which would make
@@ -517,14 +519,15 @@ it in each custom Cargo target's `inputs`, alongside `cargoToolchain`, the targe
 ```
 
 Cargo decides the closure. Graph inference checks the content-keyed locked offline resolution of the local packages
-under the project's root and every mutable local package they reach through normal, build or dev dependencies; an edit
-to a workspace member outside that closure leaves the task key alone. The members Nx's file index holds become filesets:
-each package's `.rs` files, `Cargo.toml` files and `.cargo/config[.toml]` below its directory (skipping `target/` and
-the other directories the hash command skips), target sources outside it, its governing workspace manifest, the
-`Cargo.toml` and `.cargo/config[.toml]` of every directory from the package up to the Nx root, and the lock-scope node
-for the Cargo.lock entries the closure reaches (see below). Nx hashes those from the file hashes and node hashes it
-already keeps, so hashing these inputs starts no process. A graph with unchanged resolution inputs starts no Cargo
-process either.
+under the project's root and every mutable local package Cargo builds for them: their normal, build and dev
+dependencies, and below them only normal and build dependencies, since Cargo builds a dependency for its library and
+build script alone and never for its own tests. An edit to a workspace member outside that closure, a dependency's test
+helper included, leaves the task key alone. The members Nx's file index holds become filesets: each package's `.rs`
+files, `Cargo.toml` files and `.cargo/config[.toml]` below its directory (skipping `target/` and the other directories
+the hash command skips), target sources outside it, its governing workspace manifest, the `Cargo.toml` and
+`.cargo/config[.toml]` of every directory from the package up to the Nx root, and the lock-scope node for the Cargo.lock
+entries the closure reaches (see below). Nx hashes those from the file hashes and node hashes it already keeps, so
+hashing these inputs starts no process. A graph with unchanged resolution inputs starts no Cargo process either.
 
 Fileset reduction works from the set of package directories: a path is covered exactly when it or one of its ancestors
 is a member. Nested packages therefore need no extra subtree pattern, and shared ancestors are visited once. Sibling
@@ -903,7 +906,8 @@ Concrete targets come from concrete files:
   resolves a `{projectRoot}` glob against only the files its project owns, and a nested package owns the crates under
   it, so a root workspace's archive spelled that way hashes none of its members and replays stale binaries against
   edited crates. Each member crate gets a cached `cargo-test-<package>` run (30s slow-test warning, no per-test kill)
-  whose inputs include that crate and its path dependencies, and whose command runs
+  whose inputs include the crates Cargo builds for that crate's tests (from Cargo's locked resolve: its dependencies and
+  its own dev-dependencies, never the dev-dependencies of the crates below it), and whose command runs
   `cargo --frozen nextest run --binaries-metadata … --cargo-metadata … --target-dir-remap … --workspace-remap . -E 'package(<crate>)'`
   from the archive's one extraction. Runners therefore execute rather than build: they compile nothing in cargo's build
   tree, and fan out instead of chaining. They do not unpack the archive each: before the run, `smoo-nx-nextest-extract`

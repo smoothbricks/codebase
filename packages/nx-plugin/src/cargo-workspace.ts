@@ -1,10 +1,10 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join, normalize, posix, relative, resolve, sep } from 'node:path';
+import { readFile, realpath } from 'node:fs/promises';
+import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { readNxJson } from 'nx/src/config/nx-json.js';
 import { parse as parseToml, type TomlTable } from 'smol-toml';
 
-import { type CompiledCargoInput, compiledInFiles } from './cargo-source-hash.js';
+import { buildClosure, type CargoResolve, type CompiledCargoInput, compiledInFiles } from './cargo-source-hash.js';
 
 export interface CargoWorkspacePackage {
   name: string;
@@ -223,6 +223,8 @@ export interface CargoPackageTestInputsOptions {
   /** The cargo workspace root holding the top-level `Cargo.toml`. */
   absoluteProjectRoot: string;
   memberDir: string;
+  /** Cargo's locked resolve of that workspace, which decides the crates the member's tests build. */
+  cargo: CargoResolve;
   /** Shared across every call of one graph computation; see {@link createCargoInputsCache}. */
   cache?: CargoInputsCache;
 }
@@ -258,7 +260,7 @@ export function cargoPackageTestInputs(options: CargoPackageTestInputsOptions): 
 }
 
 async function deriveCargoPackageTestInputs(
-  { workspaceRoot, absoluteProjectRoot, memberDir }: CargoPackageTestInputsOptions,
+  { workspaceRoot, absoluteProjectRoot, memberDir, cargo }: CargoPackageTestInputsOptions,
   cache: CargoInputsCache,
 ): Promise<string[]> {
   // Every fileset is anchored at `{workspaceRoot}`, never `{projectRoot}`: Nx
@@ -276,110 +278,45 @@ async function deriveCargoPackageTestInputs(
     cache.manifests.set(normalized, parsed);
     return parsed;
   };
-  const rootManifest = await loadManifest(join(absoluteProjectRoot, 'Cargo.toml'));
-  // The closure over in-tree path dependencies, not the direct edge set: a
+  // Cargo reports canonical paths, so every path below is related to the canonical roots.
+  const [nxRoot, cargoRoot, crateDirectory] = await Promise.all([
+    realpath(workspaceRoot),
+    realpath(absoluteProjectRoot),
+    realpath(join(absoluteProjectRoot, memberDir)),
+  ]);
+  const crate = cargo.local.find((pkg) => pkg.directory === crateDirectory);
+  if (crate === undefined) {
+    throw new Error(`Cargo's resolve of ${join(absoluteProjectRoot, 'Cargo.toml')} holds no package at ${memberDir}`);
+  }
+  // Exactly the crates Cargo builds for this crate's tests, read from Cargo's
+  // own resolve: the crate's normal, build and dev dependencies, and below it
+  // only normal and build ones (`buildClosure`), with the workspace's patches
+  // and replacements already applied. The closure, not the direct edge set: a
   // test binary links every crate beneath it, and the chained cargo-test
-  // targets order runs without contributing to each other's hash, so a
-  // dependency reachable only through another crate would otherwise change
-  // nothing in the target that links it.
+  // targets order runs without contributing to each other's hash. A
+  // dependency's own dev-dependencies never compile into this crate's test
+  // binaries, so an edit to one leaves this key alone.
+  const closure = buildClosure(cargo, [crate.id]);
   const dirs = new Set<string>();
   const external = new Map<string, string>();
-  const pending = [normalize(memberDir).split(sep).join('/')];
   const declaredSources = new Set<string>();
-  // Workspace patches/replacements can substitute local code for locked sources.
-  if (isRecord(rootManifest.patch)) {
-    for (const replacements of Object.values(rootManifest.patch)) {
-      enqueuePathDependencies(
-        { dependencies: replacements },
-        '.',
-        new Map(),
-        pending,
-        external,
-        absoluteProjectRoot,
-        workspaceRoot,
-      );
+  for (const pkg of cargo.local) {
+    if (!closure.has(pkg.id)) continue;
+    if (isOutsideRoot(relative(nxRoot, pkg.directory))) {
+      external.set(pkg.name, pkg.directory);
+    } else {
+      dirs.add(relative(cargoRoot, pkg.directory).split(sep).join('/') || '.');
     }
-  }
-  if (isRecord(rootManifest.replace)) {
-    enqueuePathDependencies(
-      { dependencies: rootManifest.replace },
-      '.',
-      new Map(),
-      pending,
-      external,
-      absoluteProjectRoot,
-      workspaceRoot,
-    );
-  }
-  while (pending.length > 0) {
-    const dir = pending.pop();
-    if (dir === undefined || dirs.has(dir)) {
-      continue;
-    }
-    dirs.add(dir);
-    const crateTomlPath = join(absoluteProjectRoot, dir, 'Cargo.toml');
-    if (!existsSync(crateTomlPath)) {
-      continue;
-    }
-    const crateParsed = await loadManifest(crateTomlPath);
-    if (!isRecord(crateParsed)) {
-      continue;
-    }
-    let owner = resolve(absoluteProjectRoot, dir);
-    if (isRecord(crateParsed.package) && typeof crateParsed.package.workspace === 'string') {
-      owner = resolve(owner, crateParsed.package.workspace);
-      if (isOutsideRoot(relative(workspaceRoot, owner))) {
-        external.set(`${dir} workspace`, owner);
-      }
-    }
-    let workspacePathDeps = new Map<string, string>();
-    while (!isOutsideRoot(relative(workspaceRoot, owner))) {
-      const manifestPath = join(owner, 'Cargo.toml');
-      if (existsSync(manifestPath)) {
-        const manifest = await loadManifest(manifestPath);
-        if (isRecord(manifest.workspace)) {
-          workspacePathDeps = workspacePathDependencies(manifest, owner);
-          declaredSources.add(manifestPath);
-          break;
-        }
-      }
-      const parent = dirname(owner);
-      if (parent === owner) break;
-      owner = parent;
-    }
-    enqueuePathDependencies(crateParsed, dir, workspacePathDeps, pending, external, absoluteProjectRoot, workspaceRoot);
-    // All cfg variants can affect a compiled target; do not evaluate Cargo cfg here.
-    if (isRecord(crateParsed.target)) {
-      for (const target of Object.values(crateParsed.target)) {
-        if (isRecord(target)) {
-          enqueuePathDependencies(
-            target,
-            dir,
-            workspacePathDeps,
-            pending,
-            external,
-            absoluteProjectRoot,
-            workspaceRoot,
-          );
-        }
-      }
-    }
-    if (isRecord(crateParsed.package) && typeof crateParsed.package.build === 'string') {
-      declaredSources.add(resolve(absoluteProjectRoot, dir, crateParsed.package.build));
-    }
-    for (const targetName of ['lib', 'bin', 'example', 'test', 'bench']) {
-      const targets = crateParsed[targetName];
-      for (const target of Array.isArray(targets) ? targets : [targets]) {
-        if (isRecord(target) && typeof target.path === 'string') {
-          declaredSources.add(resolve(absoluteProjectRoot, dir, target.path));
-        }
-      }
+    // Target sources outside the package's directory (a shared build script, a `[lib] path`), and its governing
+    // manifest.
+    for (const source of [...pkg.sources, pkg.governingManifest]) {
+      if (isOutsideRoot(relative(pkg.directory, source))) declaredSources.add(source);
     }
   }
   const inputPath = (absolutePath: string): string => {
-    const cargoRelative = relative(absoluteProjectRoot, absolutePath).split(sep).join('/');
+    const cargoRelative = relative(cargoRoot, absolutePath).split(sep).join('/');
     return isOutsideRoot(cargoRelative)
-      ? posix.join('{workspaceRoot}', relative(workspaceRoot, absolutePath).split(sep).join('/'))
+      ? posix.join('{workspaceRoot}', relative(nxRoot, absolutePath).split(sep).join('/'))
       : posix.join(inputRoot, cargoRelative);
   };
   // Cargo.lock is not a fileset here: the runner names the crate's lock-scope
@@ -387,12 +324,12 @@ async function deriveCargoPackageTestInputs(
   const inputs = new Set<string>([`${inputRoot}/Cargo.toml`]);
   const exclusions = new Set<string>();
   for (const dir of [...dirs].sort()) {
-    const absoluteDir = resolve(absoluteProjectRoot, dir);
+    const absoluteDir = resolve(cargoRoot, dir);
     // Cargo packages can compile include_bytes!, headers, schemas and build.rs,
     // not only Rust sources. Nested packages are separate source owners.
     inputs.add(`${inputPath(absoluteDir)}/**/*`);
     for (const child of nestedCrateDirs(absoluteDir, cache)) {
-      const childDir = relative(absoluteProjectRoot, child).split(sep).join('/');
+      const childDir = relative(cargoRoot, child).split(sep).join('/');
       if (!dirs.has(childDir)) exclusions.add(`!${inputPath(child)}/**`);
     }
     // `include_str!("../../../skills/SKILL.md")` compiles a file the package's own
@@ -403,7 +340,7 @@ async function deriveCargoPackageTestInputs(
     }
   }
   for (const source of [...declaredSources].sort()) {
-    const sourceRelative = relative(workspaceRoot, source);
+    const sourceRelative = relative(nxRoot, source);
     if (isOutsideRoot(sourceRelative)) {
       external.set(source, source);
     } else {
@@ -412,7 +349,7 @@ async function deriveCargoPackageTestInputs(
   }
   // Cargo/rustup search from the command's working directory upwards. Do not
   // hash unrelated descendant configuration or generated Cargo target caches.
-  for (let current = resolve(absoluteProjectRoot); ; current = dirname(current)) {
+  for (let current = cargoRoot; ; current = dirname(current)) {
     for (const config of [
       '.cargo/config',
       '.cargo/config.toml',
@@ -430,14 +367,14 @@ async function deriveCargoPackageTestInputs(
           const cargoConfig = await loadManifest(configPath);
           if (isRecord(cargoConfig.build) && typeof cargoConfig.build['target-dir'] === 'string') {
             const targetDir = resolve(current, cargoConfig.build['target-dir']);
-            if (!isOutsideRoot(relative(workspaceRoot, targetDir))) {
+            if (!isOutsideRoot(relative(nxRoot, targetDir))) {
               exclusions.add(`!${inputPath(targetDir)}/**`);
             }
           }
         }
       }
     }
-    if (current === resolve(workspaceRoot) || dirname(current) === current) break;
+    if (current === nxRoot || dirname(current) === current) break;
   }
   inputs.add(`${inputRoot}/.config/nextest.toml`);
   for (const generated of ['.git', 'node_modules', '.nx']) {

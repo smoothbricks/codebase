@@ -8,6 +8,7 @@ import type { ProjectGraph } from 'nx/src/config/project-graph';
 import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
 import { parse as parseToml } from 'smol-toml';
 import typia from 'typia';
+import { readCargoResolve } from './cargo-source-hash.js';
 import {
   type CargoWorkspacePackage,
   cargoPackageTestInputs,
@@ -44,6 +45,7 @@ describe('the real-APFS serial groups of this repository', () => {
   it('hash a scenario edit for the device group alone, and the production substrate they share for both', async () => {
     const groups = serialTestGroups(join(REPOSITORY, NEXTEST_REPO_CONFIG_PATH));
     const members = listCargoWorkspacePackages(REPOSITORY);
+    const cargo = await readCargoResolve(join(REPOSITORY, 'Cargo.toml'), REPOSITORY);
     // The inputs Nx hashes for a group's runner: the closure of every package its filter names, as the plugin derives it.
     const inputsOf = async (group: string): Promise<string[]> => {
       const scope = groups.find((candidate) => candidate.group === group)?.scope;
@@ -56,6 +58,7 @@ describe('the real-APFS serial groups of this repository', () => {
             workspaceRoot: REPOSITORY,
             absoluteProjectRoot: REPOSITORY,
             memberDir: member.dir,
+            cargo,
           });
         }),
       );

@@ -235,7 +235,7 @@ function metadataNamed(root: string, name: string) {
     ],
     resolve: {
       nodes: [
-        { id: name, deps: [{ pkg: 'external' }] },
+        { id: name, deps: [{ pkg: 'external', dep_kinds: [{ kind: null, target: null }] }] },
         { id: 'external', deps: [] },
       ],
     },

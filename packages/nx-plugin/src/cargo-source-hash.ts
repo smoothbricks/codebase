@@ -39,7 +39,7 @@ interface CargoMetadata {
     /** Added by the cache after Cargo identifies each local package's governing workspace. */
     governing_manifest_path?: string;
   }[];
-  resolve: { nodes: { id: string; deps: { pkg: string }[] }[] } | null;
+  resolve: { nodes: { id: string; deps: { pkg: string; dep_kinds: { kind: CargoDependencyKind }[] }[] }[] } | null;
   workspace_members: string[];
   workspace_root: string;
 }
@@ -84,6 +84,7 @@ function parseCargoMetadata(json: string): CargoMetadata {
               id: text(member(node, 'id'), 'resolve node id'),
               deps: list(member(node, 'deps'), 'resolve node deps').map((dependency) => ({
                 pkg: text(member(dependency, 'pkg'), 'resolve edge'),
+                dep_kinds: dependencyKinds(member(dependency, 'dep_kinds')),
               })),
             })),
           },
@@ -93,6 +94,31 @@ function parseCargoMetadata(json: string): CargoMetadata {
     workspace_root: text(member(document, 'workspace_root'), 'workspace_root'),
   };
 }
+
+/** How a package declares a dependency: `[dependencies]` (null), `[dev-dependencies]` or `[build-dependencies]`. */
+type CargoDependencyKind = null | 'dev' | 'build';
+
+/** A resolve edge's `dep_kinds`. An edge Cargo reports with no kind is refused: read as dev-only, it would drop a dependency. */
+function dependencyKinds(value: unknown): { kind: CargoDependencyKind }[] {
+  if (!Array.isArray(value) || value.length === 0)
+    throw new Error('cargo metadata reported no valid resolve edge kinds');
+  return value.map((entry: unknown) => {
+    const kind = typeof entry === 'object' && entry !== null ? Reflect.get(entry, 'kind') : undefined;
+    if (kind !== null && kind !== 'dev' && kind !== 'build')
+      throw new Error('cargo metadata reported no valid resolve edge kind');
+    return { kind };
+  });
+}
+
+/** One resolved dependency of a package: the package it resolved to, and whether every declaration of it is a dev one. */
+export interface CargoEdge {
+  readonly pkg: string;
+  /** Cargo builds this dependency for the dependent's tests, examples and benches only. */
+  readonly devOnly: boolean;
+}
+
+/** Every package Cargo builds for a selection, by package id, each with the dependencies Cargo builds for it. */
+export type CargoClosure = ReadonlyMap<string, readonly string[]>;
 
 /** A mutable (path) package in Cargo's locked resolve. Every path is canonical. */
 export interface LocalCargoPackage {
@@ -119,7 +145,7 @@ export interface CargoResolve {
    */
   readonly locked: ReadonlyMap<string, string>;
   /** Every dependency edge by package id, or null when Cargo reported no resolution. */
-  readonly edges: ReadonlyMap<string, readonly string[]> | null;
+  readonly edges: ReadonlyMap<string, readonly CargoEdge[]> | null;
 }
 
 export interface CargoPathInputsOptions {
@@ -388,8 +414,8 @@ interface ResolveState {
   pending?: { readonly key: string; readonly promise: Promise<CargoResolve> };
 }
 const resolves = new Map<string, ResolveState>();
-// v2 retains package name/version for checkout-independent artifact input identities.
-const RESOLVE_CACHE_SCHEMA = 'cargo-resolve-v2';
+// v3 retains each resolve edge's dependency kinds, which decide what Cargo builds for a selected package.
+const RESOLVE_CACHE_SCHEMA = 'cargo-resolve-v3';
 
 /**
  * The longest one Cargo child, or one wait for a foreign resolve flight's lock, may take.
@@ -511,7 +537,12 @@ function cargoFromMetadata(metadata: CargoMetadata): CargoResolve {
     edges:
       metadata.resolve === null
         ? null
-        : new Map(metadata.resolve.nodes.map((node) => [node.id, node.deps.map((dep) => dep.pkg)])),
+        : new Map(
+            metadata.resolve.nodes.map((node) => [
+              node.id,
+              node.deps.map((dep) => ({ pkg: dep.pkg, devOnly: dep.dep_kinds.every(({ kind }) => kind === 'dev') })),
+            ]),
+          ),
   };
 }
 
@@ -1034,22 +1065,35 @@ export async function hashCargoPathInputs(
 }
 
 /**
- * The ids Cargo's resolve graph reaches from the local packages under
- * `directory`, over every dependency kind: a target may build, test or run
- * build scripts, and any of those compiles the edge's source.
+ * What Cargo builds for the local packages under `directory`, as {@link buildClosure} computes it with those packages
+ * selected.
  */
-export async function dependencyClosure(cargo: CargoResolve, directory: string): Promise<ReadonlySet<string>> {
+export async function dependencyClosure(cargo: CargoResolve, directory: string): Promise<CargoClosure> {
   const base = await realpath(directory);
-  const pending = cargo.local
+  const selected = cargo.local
     .filter((pkg) => pkg.directory === base || pkg.directory.startsWith(`${base}${sep}`))
     .map((pkg) => pkg.id);
-  if (pending.length === 0) throw new Error(`no local Cargo package lies under ${directory}`);
+  if (selected.length === 0) throw new Error(`no local Cargo package lies under ${directory}`);
+  return buildClosure(cargo, selected);
+}
+
+/**
+ * The packages Cargo compiles to build, test or run the `selected` ones, each with the dependencies Cargo builds for
+ * it. A selected package's targets reach every dependency kind: its library and binaries the normal ones, its build
+ * script the build ones, its tests, examples and benches the dev ones. Below the selection Cargo builds a package for
+ * its library and build script alone, so a dependency's own dev-dependencies never compile into a selected package's
+ * binaries and are not part of what it builds.
+ */
+export function buildClosure(cargo: CargoResolve, selected: readonly string[]): CargoClosure {
   if (cargo.edges === null) throw new Error('cargo metadata reported no dependency resolution');
-  const reached = new Set<string>();
+  const roots = new Set(selected);
+  const reached = new Map<string, readonly string[]>();
+  const pending = [...selected];
   for (let id = pending.pop(); id !== undefined; id = pending.pop()) {
     if (reached.has(id)) continue;
-    reached.add(id);
-    for (const dependency of cargo.edges.get(id) ?? []) pending.push(dependency);
+    const built = (cargo.edges.get(id) ?? []).filter((edge) => roots.has(id) || !edge.devOnly).map((edge) => edge.pkg);
+    reached.set(id, built);
+    pending.push(...built);
   }
   return reached;
 }

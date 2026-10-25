@@ -2,7 +2,10 @@ import { describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
 import { Glob } from 'bun';
+import { prepareCargoFixture } from './__tests__/cargo-fixture.js';
+import { readCargoResolve } from './cargo-source-hash.js';
 
 import {
   attributeCargoWorkspacePackages,
@@ -16,6 +19,7 @@ import {
   serialTestGroups,
 } from './cargo-workspace.js';
 
+useFixtureCargoHome();
 describe('Cargo workspace layouts', () => {
   it('discovers root, globbed and implicit members, excludes packages and assigns the deepest owner', async () => {
     const root = await mkdtemp(join(tmpdir(), 'nx-cargo-members-'));
@@ -62,7 +66,7 @@ describe('Cargo workspace layouts', () => {
     }
   });
 
-  it('hashes assets, build scripts and transitive cfg/build/dev dependencies without unrelated package sources', async () => {
+  it('hashes assets, build scripts and cfg/build/dev dependencies, the crates they link, and no unrelated package source', async () => {
     const root = await mkdtemp(join(tmpdir(), 'nx-cargo-inputs-'));
     try {
       await write(
@@ -73,8 +77,9 @@ describe('Cargo workspace layouts', () => {
       await write(
         root,
         'crates/app/Cargo.toml',
-        '[package]\nname="app"\nbuild="build/build.rs"\n[dependencies]\nrenamed={workspace=true}\n[target.\'cfg(unix)\'.build-dependencies]\nbuilder={path="../builder"}\n[target.\'cfg(windows)\'.dev-dependencies]\nfixture={path="../excluded"}\n',
+        '[package]\nname="app"\nbuild="build/build.rs"\n[dependencies]\nrenamed={workspace=true}\n[target.\'cfg(unix)\'.build-dependencies]\nbuilder={path="../builder"}\n[target.\'cfg(windows)\'.dev-dependencies]\nfixture={package="excluded",path="../excluded"}\n',
       );
+      await write(root, 'crates/app/build/build.rs', 'fn main() {}\n');
       await write(
         root,
         'crates/base/Cargo.toml',
@@ -84,8 +89,7 @@ describe('Cargo workspace layouts', () => {
       await write(root, 'crates/builder/Cargo.toml', '[package]\nname="builder"\n');
       await write(root, 'crates/excluded/Cargo.toml', '[package]\nname="excluded"\n');
       await write(root, 'crates/app/nested/Cargo.toml', '[package]\nname="unrelated"\n');
-      const request = { workspaceRoot: root, absoluteProjectRoot: root, memberDir: 'crates/app' };
-      const inputs = await cargoPackageTestInputs(request);
+      const inputs = await testInputs(root, 'crates/app');
       for (const path of [
         'Cargo.toml',
         '.cargo/config',
@@ -121,8 +125,41 @@ describe('Cargo workspace layouts', () => {
       expect(matches(inputs, 'Cargo.lock')).toBe(false);
       await write(root, 'crates/app/target/debug/generated.rs', 'generated');
       await write(root, 'crates/app/src/template.html', 'changed asset');
-      expect(matches(await cargoPackageTestInputs(request), 'crates/app/target/debug/generated.rs')).toBe(false);
-      expect(await cargoPackageTestInputs(request)).toEqual(await cargoPackageTestInputs(request));
+      expect(matches(await testInputs(root, 'crates/app'), 'crates/app/target/debug/generated.rs')).toBe(false);
+      expect(await testInputs(root, 'crates/app')).toEqual(await testInputs(root, 'crates/app'));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  // Cargo builds a dependency for its library and build script alone. A dependency's own dev-dependencies never
+  // compile into the test binaries of the crate above it, so an edit to one must leave that crate's key alone, while
+  // every crate it links still keys it.
+  it("hashes a dependency's dev-dependencies for that dependency's tests only, and what it links for both", async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nx-cargo-dev-closure-'));
+    try {
+      await write(root, 'Cargo.toml', '[workspace]\nmembers=["crates/*"]\n');
+      await write(root, 'crates/top/Cargo.toml', '[package]\nname="top"\n[dependencies]\nmid={path="../mid"}\n');
+      await write(
+        root,
+        'crates/mid/Cargo.toml',
+        '[package]\nname="mid"\n[dependencies]\nleaf={path="../leaf"}\n[dev-dependencies]\nhelper={path="../helper"}\n',
+      );
+      await write(root, 'crates/leaf/Cargo.toml', '[package]\nname="leaf"\n');
+      await write(
+        root,
+        'crates/helper/Cargo.toml',
+        '[package]\nname="helper"\n[dependencies]\nhelper-leaf={path="../helper-leaf"}\n',
+      );
+      await write(root, 'crates/helper-leaf/Cargo.toml', '[package]\nname="helper-leaf"\n');
+      const top = await testInputs(root, 'crates/top');
+      const mid = await testInputs(root, 'crates/mid');
+      const hashedBy = (path: string) => ({ top: matches(top, path), mid: matches(mid, path) });
+      expect(hashedBy('crates/top/src/lib.rs')).toEqual({ top: true, mid: false });
+      expect(hashedBy('crates/mid/src/lib.rs')).toEqual({ top: true, mid: true });
+      expect(hashedBy('crates/leaf/src/lib.rs')).toEqual({ top: true, mid: true });
+      expect(hashedBy('crates/helper/src/lib.rs')).toEqual({ top: false, mid: true });
+      expect(hashedBy('crates/helper-leaf/src/lib.rs')).toEqual({ top: false, mid: true });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -155,11 +192,7 @@ describe('Cargo workspace layouts', () => {
       await write(root, 'crates/app/nested/src/lib.rs', 'const N: &str = include_str!("../../../../nested.txt");');
       await write(root, 'nested.txt', 'another package compiles this');
 
-      const inputs = await cargoPackageTestInputs({
-        workspaceRoot: root,
-        absoluteProjectRoot: root,
-        memberDir: 'crates/app',
-      });
+      const inputs = await testInputs(root, 'crates/app');
       for (const path of ['skills/SKILL.md', 'corpus.json', 'crates/app/src/data/inside.txt']) {
         expect(matches(inputs, path)).toBe(true);
       }
@@ -181,11 +214,7 @@ describe('Cargo workspace layouts', () => {
         '[package]\nname="app"\n[dependencies]\nbase={path="../../../base"}\n',
       );
       await write(root, 'packages/base/Cargo.toml', '[package]\nname="base"\n');
-      const inputs = await cargoPackageTestInputs({
-        workspaceRoot: root,
-        absoluteProjectRoot: join(root, 'packages/app'),
-        memberDir: 'crates/app',
-      });
+      const inputs = await testInputs(root, 'crates/app', join(root, 'packages/app'));
       expect(matches(inputs, 'packages/app/crates/app/src/lib.rs')).toBe(true);
       expect(matches(inputs, 'packages/base/src/lib.rs')).toBe(true);
       expect(matches(inputs, '.cargo/config.toml')).toBe(true);
@@ -198,15 +227,19 @@ describe('Cargo workspace layouts', () => {
     }
   });
 
-  it('resolves inherited dependencies against their own workspace and hashes local patches', async () => {
+  it('hashes an inherited dependency with its own workspace manifest, and the local patch Cargo resolves to', async () => {
     const root = await mkdtemp(join(tmpdir(), 'nx-cargo-inheritance-'));
     try {
       await write(
         root,
         'Cargo.toml',
-        '[workspace]\nmembers=["app"]\nexclude=["vendor"]\n[patch.crates-io]\npatched={path="patches/base"}\n',
+        '[workspace]\nmembers=["app"]\nexclude=["vendor","patches"]\n[patch.crates-io]\npatched={path="patches/base"}\n',
       );
-      await write(root, 'app/Cargo.toml', '[package]\nname="app"\n[dependencies]\nbase={path="../vendor/base"}\n');
+      await write(
+        root,
+        'app/Cargo.toml',
+        '[package]\nname="app"\n[dependencies]\nbase={path="../vendor/base"}\npatched="0.1"\n',
+      );
       await write(
         root,
         'vendor/Cargo.toml',
@@ -218,12 +251,8 @@ describe('Cargo workspace layouts', () => {
         '[package]\nname="base"\nworkspace=".."\n[dependencies]\nleaf={workspace=true}\n',
       );
       await write(root, 'vendor/leaf/Cargo.toml', '[package]\nname="leaf"\n');
-      await write(root, 'patches/base/Cargo.toml', '[package]\nname="patched"\n');
-      const inputs = await cargoPackageTestInputs({
-        workspaceRoot: root,
-        absoluteProjectRoot: root,
-        memberDir: 'app',
-      });
+      await write(root, 'patches/base/Cargo.toml', '[package]\nname="patched"\nversion="0.1.0"\n');
+      const inputs = await testInputs(root, 'app');
       for (const path of ['vendor/Cargo.toml', 'vendor/leaf/src/lib.rs', 'patches/base/src/lib.rs']) {
         expect(matches(inputs, path)).toBe(true);
       }
@@ -238,19 +267,20 @@ describe('Cargo workspace layouts', () => {
     try {
       await write(root, 'Cargo.toml', '[package]\nname="app"\n[workspace]\n');
       await write(root, '.cargo/config.toml', '[build]\ntarget-dir="cache/cargo"\n');
-      const request = { workspaceRoot: root, absoluteProjectRoot: root, memberDir: '.' };
-      const before = await cargoPackageTestInputs(request);
+      const before = await testInputs(root, '.');
       expect(matches(before, 'cache/cargo/debug/generated.rs')).toBe(false);
       expect(matches(before, 'src/data.bin')).toBe(true);
       await write(root, 'cache/cargo/debug/generated.rs', 'generated');
-      expect(await cargoPackageTestInputs(request)).toEqual(before);
+      expect(await testInputs(root, '.')).toEqual(before);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
   it('requires externalRustCrates only for paths outside Nx, including absolute and declared build paths', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'nx-cargo-external-'));
+    // The Nx workspace sits one level down, so the packages and build script outside it are this test's own.
+    const outside = await mkdtemp(join(tmpdir(), 'nx-cargo-external-'));
+    const root = join(outside, 'nx');
     try {
       await write(
         root,
@@ -260,47 +290,51 @@ describe('Cargo workspace layouts', () => {
       await write(
         root,
         'crates/app/Cargo.toml',
-        `[package]\nname="app"\nbuild="../../../build.rs"\n[dependencies]\nexternal={workspace=true}\nlocal={path=${JSON.stringify(join(root, 'crates/base'))}}\n[target.'cfg(unix)'.dependencies]\nabsolute={path=${JSON.stringify(join(dirname(root), 'absolute'))}}\n`,
+        '[package]\nname="app"\nbuild="../../../build.rs"\n[dependencies]\nexternal={workspace=true}\nlocal={package="base",path=' +
+          JSON.stringify(join(root, 'crates/base')) +
+          "}\n[target.'cfg(unix)'.dependencies]\nabsolute={path=" +
+          JSON.stringify(join(outside, 'absolute')) +
+          '}\n',
       );
       await write(root, 'crates/base/Cargo.toml', '[package]\nname="base"\n');
+      await write(outside, 'build.rs', 'fn main() {}\n');
+      for (const name of ['external', 'absolute']) {
+        await write(outside, `${name}/Cargo.toml`, `[package]\nname="${name}"\n`);
+        await write(outside, `${name}/src/lib.rs`, '');
+      }
       await write(root, 'nx.json', JSON.stringify({ namedInputs: {} }));
-      const request = { workspaceRoot: root, absoluteProjectRoot: root, memberDir: 'crates/app' };
-      await expect(cargoPackageTestInputs(request)).rejects.toThrow();
+      await expect(testInputs(root, 'crates/app')).rejects.toThrow();
       await write(
         root,
         'nx.json',
         JSON.stringify({ namedInputs: { externalRustCrates: [{ runtime: 'echo source-digest' }] } }),
       );
-      const inputs = await cargoPackageTestInputs(request);
+      const inputs = await testInputs(root, 'crates/app');
       expect(inputs).toContain('externalRustCrates');
       expect(matches(inputs, 'crates/base/src/lib.rs')).toBe(true);
       expect(inputs.some((input) => input.includes('../'))).toBe(false);
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
     }
   });
 
-  it("the registry and git lock entries reach runners through the crate's lock-scope node, not this fileset, and declared local target paths hash as source", async () => {
+  it('hashes declared target paths outside the package as source, and never Cargo.lock', async () => {
     const root = await mkdtemp(join(tmpdir(), 'nx-cargo-declared-'));
     try {
-      await write(
-        root,
-        'Cargo.toml',
-        '[workspace]\nmembers=["crates/app"]\n[workspace.dependencies]\nremote={git="https://example.org/source.git",rev="abc123"}\n',
-      );
+      await write(root, 'Cargo.toml', '[workspace]\nmembers=["crates/app"]\n');
       await write(
         root,
         'crates/app/Cargo.toml',
-        '[package]\nname="app"\nbuild="../../shared/build.rs"\n[lib]\npath="../../shared/lib.rs"\n[dependencies]\nremote={workspace=true}\nregistry="1"\n',
+        '[package]\nname="app"\nbuild="../../shared/build.rs"\n[lib]\npath="../../shared/lib.rs"\n',
       );
-      const inputs = await cargoPackageTestInputs({
-        workspaceRoot: root,
-        absoluteProjectRoot: root,
-        memberDir: 'crates/app',
-      });
+      await write(root, 'shared/build.rs', 'fn main() {}\n');
+      await write(root, 'shared/lib.rs', '');
+      const inputs = await testInputs(root, 'crates/app');
+      // The registry and git entries of Cargo.lock reach runners through the crate's lock-scope node.
       expect(matches(inputs, 'Cargo.lock')).toBe(false);
       expect(matches(inputs, 'shared/build.rs')).toBe(true);
       expect(matches(inputs, 'shared/lib.rs')).toBe(true);
+      expect(matches(inputs, 'shared/unrelated.rs')).toBe(false);
       expect(inputs).not.toContain('externalRustCrates');
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -336,6 +370,22 @@ function matches(inputs: readonly string[], path: string): boolean {
     filesets.some((input) => !input.startsWith('!') && match(input)) &&
     !filesets.some((input) => input.startsWith('!') && match(input.slice(1)))
   );
+}
+
+/**
+ * The inputs graph inference derives for the member at `memberDir` of the Cargo workspace at `cargoRoot`: from
+ * Cargo's own locked resolve of the fixture, its empty libraries and lockfile supplied first as inference fixtures
+ * get them.
+ */
+async function testInputs(root: string, memberDir: string, cargoRoot = root): Promise<string[]> {
+  await prepareCargoFixture(root);
+  const indexed = new Set(
+    [...new Glob('**/Cargo.toml').scanSync({ cwd: root })].filter(
+      (path) => !path.split('/').some((part) => ['node_modules', 'target', '.nx'].includes(part)),
+    ),
+  );
+  const cargo = await readCargoResolve(join(cargoRoot, 'Cargo.toml'), root, indexed);
+  return cargoPackageTestInputs({ workspaceRoot: root, absoluteProjectRoot: cargoRoot, memberDir, cargo });
 }
 
 async function write(root: string, path: string, contents: string): Promise<void> {

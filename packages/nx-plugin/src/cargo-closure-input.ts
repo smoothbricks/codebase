@@ -268,7 +268,8 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
  * Its hash digests, per Cargo workspace in manifest order, every package of
  * the resolve closure of those crates: a locked package by its Cargo package
  * id and source (registry, name and version; a git dependency's commit), a
- * path package by name, each with the packages its dependencies resolved to.
+ * path package by name, each with the packages its built dependencies resolved to
+ * (a dependency's own dev-dependencies are not built for these crates; see `buildClosure`).
  * That is everything Cargo.lock decides for the closure. An edit to an entry
  * no crate under `directory` reaches leaves the digest alone, and Nx hashes
  * the node only into the targets that name it, so a lockfile change re-keys
@@ -293,13 +294,11 @@ export async function cargoLockNode(
       left.manifest < right.manifest ? -1 : left.manifest > right.manifest ? 1 : 0,
     )) {
       const { cargo, root } = source;
-      const members = await dependencyClosure(cargo, join(root, directory));
+      const closure = await dependencyClosure(cargo, join(root, directory));
       const paths = new Map(cargo.local.map((pkg) => [pkg.id, `path:${pkg.name}`]));
       const label = (id: string) => paths.get(id) ?? id;
-      const rows = [...members]
-        .map((id) =>
-          [label(id), cargo.locked.get(id) ?? '', ...(cargo.edges?.get(id) ?? []).map(label).sort()].join('\t'),
-        )
+      const rows = [...closure]
+        .map(([id, built]) => [label(id), cargo.locked.get(id) ?? '', ...built.map(label).sort()].join('\t'))
         .sort();
       hash.update(`${source.manifest}\n${rows.join('\n')}\n\0`);
     }
