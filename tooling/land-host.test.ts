@@ -150,6 +150,11 @@ exec)
   export NX_CACHE_DIRECTORY="$FIX_WS/.nx/cache"
   cd "$FIX_WS" && exec "$@"
   ;;
+reseed)
+  # The fixture's main was never seeded: the preview refuses, as cowshed does for a missing seed.
+  printf '{"ok":false,"error":{"code":"notFound","message":"main has no seed"}}\\n'
+  exit 1
+  ;;
 *) exit 64 ;;
 esac
 `,
@@ -227,6 +232,7 @@ function fixture(replayFails = false, publishFails = false): Land {
     'land-attribution.ts',
     'land-decide.ts',
     'land-history.ts',
+    'land-pick.ts',
     'land-publish.ts',
     'land-summary.ts',
     'land-cargo-env.ts',
@@ -338,6 +344,7 @@ describe('land-host.sh', () => {
     ]);
     expect(run.status, run.log).toBe(0);
     expect(run.log).toContain('gating');
+    expect(run.log).toContain("main has no seed to price; the gate builds on ws's own build volume");
     expect(run.nx).toEqual(['daemon --stop', GATE.join(' '), MAIN_BUILD.join(' ')]);
     expect(run.log).toContain("building main's outputs");
     expect(run.log).not.toContain('capture-prefix');

@@ -602,9 +602,13 @@ explicitly discards state an active workspace owns. The workspace must already b
 link can be read. The target need not be mounted. No source image, Git ref, HEAD, index, tracked edit, untracked file or
 declared task output is copied, reset or deleted. Only the excluded `.cowshed/build` link changes.
 
-When selecting whether to reseed, cheaply priced Nx rebuild time decides; when no usable Nx work score exists
-(Cargo-only projects included), space decides and the default is the project's main seed, because unpriced
-workspace-only build state retains private blocks.
+Whether to reseed is decided by rebuild time: for the tree about to build, the Nx miss-work seconds plus the Cargo
+dirty-unit seconds each image leaves. The Nx term is the same for every image wherever the project's localhost Nx cache
+serves the tree's hashes (05_gateway.md, "Publication"): every land publishes its gate's results there, so a seed's gate
+entries are already shared, and only Cargo freshness, with the non-cacheable tasks that compile through it, differs
+between images. Space decides only when no Cargo unit is priced (Cargo-only projects without a timed unit, and projects
+without Cargo, included); the default is then the project's main seed, because unpriced workspace-only build state
+retains private blocks. A land makes this choice before its gate ("Picking a land's build volume", below).
 
 The seed is cloned as it stands, even when it is behind the target's live build volume or built at another tree.
 Workspace-specific output is lost: the next build pays a cold rebuild for incremental units or cache entries the seed
@@ -648,6 +652,63 @@ not a container-free-space measurement.
   filesystem readers; then replace the volume, report released allocation and verify dirty tracked source, untracked
   files, Git state and index bytes unchanged. A stale source seed is used without refreshing or mounting it. Focused
   directory tests refuse absent seeds, unfinished lifecycle journal entries, held image locks and stale plans.
+
+### Picking a land's build volume
+
+Before its gate, a land picks the image the gate builds on: the workspace's own build volume, or a clone of main's
+latest seed, the image `cowshed reseed <ws> --from main` clones. Today the land wrapper picks (SmoothBricks:
+`tooling/land-host.sh` through `tooling/land-pick.ts`), after the rebase and before the gate, and again before every
+re-gate after main moved; the pick is to move into `cowshed land`. With the land and rebase carries gone, a land's Nx
+hits come only from the image it gates on and the shared cache, so the price is the Cargo term above.
+
+An image's price is the compile seconds of the workspace's Cargo units it would rebuild for the rebased tree:
+
+- **The tree each image was built at.** Main's seed: its sidecar's `tree` (01_storage.md, "Directory layout"). The
+  workspace's own volume: the tree its checkout had before this rebase, which its own builds ran at (a land refuses a
+  dirty tree, step 1) and which the previous gate ran at on a re-gate. A workspace that never built its own commits is
+  priced as if it had; the units of those commits rebuild in either image, so the error never favors the seed.
+- **Which units are dirty.** Cargo freshness is content identity ("Clones preserve mtimes; directories are never
+  copied"), so a unit is dirty when a source it reads differs between the image's tree and the rebased tree.
+  `git diff-tree` names the differing paths; the workspace member whose manifest directory is the deepest to hold a path
+  owns it. A path under a member's `tests/`, `benches/` or `examples/` dirties only that target's unit (`tests/<t>.rs`
+  and `tests/<t>/main.rs` are target `<t>`; any other file there, a shared `tests/common/mod.rs`, dirties every target
+  of that kind). Any other owned path dirties the member's library and, through the rebased tree's `cargo metadata`
+  resolve graph, every member depending on it, transitively. A registry package whose `Cargo.lock` entry the rebased
+  tree has and the image's tree lacked, or locked otherwise, dirties every member reaching it. A change in meaning
+  (blank lines and whole-line comments aside) to the root `Cargo.toml`, any `.cargo/config` or `.cargo/config.toml`, or
+  `rust-toolchain`/`rust-toolchain.toml` dirties every member: its effect on unit identity is not computed.
+- **What a unit costs.** Its compile seconds in the workspace's host dev/test target
+  (`target/debug/build/<package>/<unit hash>/fingerprint/`): the modification time of the unit's `<unit>.json`
+  fingerprint, which Cargo writes once the unit is built, less that of `invoked.timestamp`, written before the compiler
+  starts. Of a unit's generations, the one whose hash file was used last counts (`-Zmtime-on-use`, "One Cargo
+  environment on every path"). A unit costs the same whichever image holds it, so the workspace's own fingerprints price
+  both images. A dirty member with no timed unit is reported `unpriced`, never priced free. Registry units are not
+  priced: sccache serves them. Every price is serial unit-seconds, not gate wall time.
+- **Equal Cargo environments and one freshness mode are assumed.** A unit whose environment input differs between the
+  build that filled an image and the gate (a `CC_<target>` one set and the other did not) rebuilds whatever its tree,
+  and so does every unit of an image built under the other fingerprint mode (`"fingerprint":"mtime"` units where the
+  gate's are `"content"`); the price sees neither. "One Cargo environment on every path" forbids the first, and "Clones
+  preserve mtimes; directories are never copied" the second: never mix modes in one build volume.
+
+The cheaper image wins; a tie keeps the workspace's own volume, so a land never replaces a volume for nothing. With no
+timed unit at all, space decides for main's seed (above). The pick only chooses where the gate starts: a reseed preview
+that finds no seed, a pricing failure, and a reseed cowshed refuses (a held lock, main's image lock under a fork, a land
+or a seed compaction included; an admitted job's hold) are each said, and the gate builds on the workspace's own volume.
+A seed compaction changes no price: its copy is published at the copied seed's tree with that seed's bytes ("Seed
+compaction"), so a reseed that clones it gates on what was priced.
+
+Measured 2026-10-25 on SmoothBricks (`cargo test --no-run --workspace` at tree `e5578ec`, each candidate a clone of a
+seed): main's seed (1 path apart) rebuilt 94 units, 1151-1290 serial s and 123-154 s wall, from a host shell that set
+`CC_aarch64_apple_darwin` where the seed's builder had not; with that variable unset, as the seed was built, it rebuilt
+87 units, 1076 serial s and 143 s wall, so the environment difference alone cost 75-215 serial s. Those 87 units are
+`--workspace` feature unification the gate's per-task Cargo runs do not share: they rebuild in every image and do not
+move the pick. A seed 442 paths apart rebuilt 144 units, 2650 serial s and 206 s wall, so the two images differ by about
+1574 serial s and 63 s wall. The fingerprint times of that build summed to 2616 s against Cargo's own 2650 s, and the
+dirty-unit rules named exactly the 18 packages that rebuilt.
+
+- **Enforced by**: `tooling/land-pick.test.ts` (ownership, test-only reach, closure, lock and configuration changes,
+  pricing, the tie and space rules, the preview's seed) and `tooling/land-host.test.ts` (a land whose main has no seed
+  gates on the workspace's own volume and says so).
 
 ### Clearing a checkout's Nx state
 
