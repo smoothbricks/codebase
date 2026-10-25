@@ -105,6 +105,9 @@
         ]
       },
       "lint": {
+        "dependsOn": [
+          "spec-links"
+        ],
         "inputs": [
           "...",
           "{workspaceRoot}/**/*.rs",
@@ -133,6 +136,14 @@
             "bun packages/nx-plugin/src/bin/smoo-nx-test-walks.ts",
             "bun --preload ./packages/validation/src/bun/preload.ts packages/nx-plugin/src/bin/smoo-nx-test-clocks.ts"
           ]
+        }
+      },
+      "spec-links": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "bun tooling/checks/spec-links.fixtures.ts && bun tooling/checks/spec-links.ts",
+          "cwd": "{workspaceRoot}"
         }
       },
       "local-registry": {
