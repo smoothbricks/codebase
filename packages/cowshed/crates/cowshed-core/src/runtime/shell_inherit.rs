@@ -118,6 +118,7 @@ fn workspace_owned(name: &str) -> bool {
     ]
     .contains(&name)
         || crate::capabilities::sccache::HOST_ENVIRONMENT.contains(&name)
+        || crate::capabilities::cargo::HOST_ENVIRONMENT.contains(&name)
 }
 
 fn credential(name: &str, value: Option<&str>) -> bool {
@@ -1118,6 +1119,10 @@ mod tests {
         assert_eq!(withheld("SOME_URL", Some("https://host/x@y")), None);
         assert_eq!(
             withheld("COWSHED_RUNTIME_LINK", Some("/tmp/cs-1")),
+            Some(Withheld::WorkspaceOwned)
+        );
+        assert_eq!(
+            withheld("CARGO_UNSTABLE_MTIME_ON_USE", Some("true")),
             Some(Withheld::WorkspaceOwned)
         );
         assert_eq!(

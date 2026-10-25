@@ -9288,6 +9288,10 @@ mod workspace_toolchain_tests {
             vars.get("CARGO_NET_GIT_FETCH_WITH_CLI").map(String::as_str),
             Some("true")
         );
+        assert_eq!(
+            vars.get("CARGO_UNSTABLE_MTIME_ON_USE").map(String::as_str),
+            Some("true")
+        );
         assert!(
             !private.join("home/.netrc").exists(),
             "the netrc a previous wiring left, token and all, is gone"
@@ -9475,7 +9479,8 @@ mod workspace_toolchain_tests {
     /// or whose pinned store path was collected, builds without a wrapper rather than failing
     /// every cargo at its version probe. Neither the wrapper nor its cwd normalization is the
     /// caller's, in a one-shot child or a warm shell's command, and `CARGO_INCREMENTAL` stays
-    /// cargo's to decide.
+    /// cargo's to decide. Every cargo also records each unit use (`CARGO_UNSTABLE_MTIME_ON_USE`),
+    /// whatever its caller names, and the host shell's `.cowshed/env` says the same.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn cargo_wraps_rustc_with_the_pinned_sccache_or_with_nothing() {
@@ -9495,6 +9500,10 @@ mod workspace_toolchain_tests {
             ("RUSTC_WRAPPER".to_owned(), "/bin/false".to_owned()),
             ("SCCACHE_BASEDIR_CWD".to_owned(), "0".to_owned()),
             ("SCCACHE_BASEDIR".to_owned(), "/elsewhere".to_owned()),
+            (
+                crate::capabilities::cargo::MTIME_ON_USE_ENV.to_owned(),
+                "false".to_owned(),
+            ),
         ]);
         // Detection reads the host's pinned client, so each case configures a fresh snapshot,
         // as a supervisor start does.
@@ -9526,7 +9535,10 @@ mod workspace_toolchain_tests {
                 .expect("source host environment");
             assert!(output.status.success());
             let text = String::from_utf8(output.stdout).unwrap();
-            for name in crate::capabilities::sccache::HOST_ENVIRONMENT {
+            for name in crate::capabilities::sccache::HOST_ENVIRONMENT
+                .into_iter()
+                .chain(crate::capabilities::cargo::HOST_ENVIRONMENT)
+            {
                 let value = text
                     .lines()
                     .find_map(|line| line.strip_prefix(&format!("{name}=")));
@@ -9547,12 +9559,13 @@ mod workspace_toolchain_tests {
                 "SCCACHE_BASEDIR_CWD",
                 "SCCACHE_BASEDIR",
                 "CARGO_INCREMENTAL",
+                crate::capabilities::cargo::MTIME_ON_USE_ENV,
             ]
             .map(|name| child.get(OsStr::new(name)).cloned())
         };
         // A cargo project on a host with no pinned client builds without a wrapper, and the
         // caller's wrapper and request bases never reach the child either.
-        let unwrapped = [None, None, None, None];
+        let unwrapped = [None, None, None, None, Some(OsString::from("true"))];
         assert_eq!(wiring().await, unwrapped, "no sccache pinned");
 
         let store_path = root.join("store/0000-sccache-cowshed");
@@ -9568,6 +9581,7 @@ mod workspace_toolchain_tests {
                 Some(OsString::from("1")),
                 Some(mount.clone().into_os_string()),
                 None,
+                Some(OsString::from("true")),
             ],
             "the pinned program"
         );

@@ -857,6 +857,11 @@ It also exports `COWSHED_RUNTIME_LINK`, the short `/tmp/cs-<digest>` link throug
 runtime directory, named after the workspace's mount. A host shell takes Nx's socket directory below it, by the same
 literal path as the workspace's jobs, so both reach one Nx daemon.
 
+For a Cargo project it also exports `CARGO_UNSTABLE_MTIME_ON_USE=true`, and every job of the project gets the same value
+whatever its caller sets: Cargo then stamps the fingerprint hash file of each unit a build uses, which is how Cargo
+output retention knows a unit is still in use. It changes no unit hash or freshness verdict, and stable Cargo ignores
+it.
+
 ```
 $ cowshed exec raven -- sh -c 'echo $((COWSHED_PORT_BASE + 1))'
 40961

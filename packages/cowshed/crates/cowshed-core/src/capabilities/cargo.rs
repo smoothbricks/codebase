@@ -64,6 +64,14 @@ pub static HOME: SharedToolHome = SharedToolHome {
 pub const GIT_FETCH_WITH_CLI_ENV: &str = "CARGO_NET_GIT_FETCH_WITH_CLI";
 /// Cargo's documented environment spelling of `http.cainfo`.
 pub const CA_ENV: &str = "CARGO_HTTP_CAINFO";
+/// Cargo's `-Zmtime-on-use`, spelled as the environment variable Cargo reads for it: every use of a
+/// unit, a `Fresh` one included, stamps the unit's fingerprint hash file, which is how Cargo output
+/// retention tells a unit still in use from one only built long ago (16_build_volumes.md, "One
+/// Cargo environment on every path"). It adds no unit hash, directory name or stale verdict, and
+/// stable Cargo ignores it.
+pub const MTIME_ON_USE_ENV: &str = "CARGO_UNSTABLE_MTIME_ON_USE";
+/// Host shells source the same recording as supervisor children.
+pub const HOST_ENVIRONMENT: [&str; 1] = [MTIME_ON_USE_ENV];
 const RUSTUP_HOME_ENV: &str = "RUSTUP_HOME";
 
 /// rustup's proxies, which dispatch on the name they are invoked by.
@@ -86,6 +94,9 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
         GIT_FETCH_WITH_CLI_ENV,
         EnvAction::Own(OsString::from("true")),
     );
+    contribution
+        .env
+        .insert(MTIME_ON_USE_ENV, EnvAction::Own(OsString::from("true")));
     if let Some(bundle) = context.trust_bundle {
         contribution
             .env
@@ -232,6 +243,7 @@ mod tests {
                 ("CARGO_TARGET_DIR", EnvAction::Unset),
                 (CA_ENV, EnvAction::Default(bundle.clone().into())),
                 (GIT_FETCH_WITH_CLI_ENV, EnvAction::Own("true".into())),
+                (MTIME_ON_USE_ENV, EnvAction::Own("true".into())),
             ])
         );
         assert_eq!(

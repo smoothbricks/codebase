@@ -171,10 +171,7 @@ pub(crate) fn write_workspace_environment(
         EnvironmentMount::Served { capability_env, .. } => capability_env
             .env
             .iter()
-            .filter(|(name, _)| {
-                crate::capabilities::sccache::HOST_ENVIRONMENT.contains(name)
-                    || **name == "NX_MAX_CACHE_SIZE"
-            })
+            .filter(|(name, _)| host_capability_names().any(|host| host == **name))
             .map(|(name, action)| {
                 name.len()
                     + 96
@@ -254,10 +251,7 @@ pub(crate) fn write_workspace_environment(
         .expect("writing to a String cannot fail");
     }
     if let EnvironmentMount::Served { capability_env, .. } = mount {
-        for name in crate::capabilities::sccache::HOST_ENVIRONMENT
-            .into_iter()
-            .chain(["NX_MAX_CACHE_SIZE"])
-        {
+        for name in host_capability_names() {
             let Some(action) = capability_env.env.get(name) else {
                 continue;
             };
@@ -297,6 +291,14 @@ pub(crate) fn write_workspace_environment(
     Ok(())
 }
 
+/// The capability-contributed variables a host shell sources from `.cowshed/env` as its jobs get them: the
+/// compiler-cache client's, a Cargo project's recording of unit use, and Nx's cache size.
+fn host_capability_names() -> impl Iterator<Item = &'static str> {
+    crate::capabilities::sccache::HOST_ENVIRONMENT
+        .into_iter()
+        .chain(crate::capabilities::cargo::HOST_ENVIRONMENT)
+        .chain(["NX_MAX_CACHE_SIZE"])
+}
 fn write_shell_quoted(contents: &mut String, value: &str) {
     contents.push('\'');
     for character in value.chars() {
@@ -321,6 +323,10 @@ mod tests {
         assert_eq!(PORT_BLOCK_SIZE_ENV, "COWSHED_PORT_BLOCK_SIZE");
         assert_eq!(TEMP_DIR_ENV, "TMPDIR");
         assert_eq!(RUNTIME_LINK_ENV, "COWSHED_RUNTIME_LINK");
+        assert_eq!(
+            crate::capabilities::cargo::MTIME_ON_USE_ENV,
+            "CARGO_UNSTABLE_MTIME_ON_USE"
+        );
     }
 
     #[test]
@@ -433,6 +439,58 @@ mod tests {
                 "{marker:?}",
             );
         }
+    }
+
+    /// A served environment of a Cargo project makes a host shell's Cargo record each unit use,
+    /// whatever the shell exported before it sourced the file; a plain repository's environment
+    /// leaves the variable alone.
+    #[test]
+    fn a_cargo_projects_published_environment_records_each_unit_use() {
+        use cowshed_os::fork_lock::Run as _;
+        let root =
+            std::env::temp_dir().join(format!("cowshed-mtime-on-use-{}", uuid::Uuid::new_v4()));
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(mount.join(".cowshed")).unwrap();
+        let mut cargo = CapabilityContribution::default();
+        cargo.env.insert(
+            crate::capabilities::cargo::MTIME_ON_USE_ENV,
+            EnvAction::Own(std::ffi::OsString::from("true")),
+        );
+        let plain = CapabilityContribution::default();
+        for (label, contribution, expected) in [
+            ("a Cargo project", &cargo, "true\n"),
+            ("a plain repository", &plain, "false\n"),
+        ] {
+            write_workspace_environment(
+                EnvironmentMount::Served {
+                    workspace_mount: &mount,
+                    host_home: &root,
+                    temp_dir: &root,
+                    capability_env: contribution,
+                },
+                Platform::Linux,
+                None,
+            )
+            .unwrap();
+            let output = std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    ". \"$1\"; printf '%s\\n' \"${CARGO_UNSTABLE_MTIME_ON_USE-unset}\"",
+                    "cowshed-env",
+                ])
+                .arg(mount.join(WORKSPACE_ENVIRONMENT_PATH))
+                .env_clear()
+                .env(crate::capabilities::cargo::MTIME_ON_USE_ENV, "false")
+                .output_locked()
+                .unwrap();
+            assert!(output.status.success(), "{label}: {output:?}");
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                expected,
+                "{label}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

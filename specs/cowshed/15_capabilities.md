@@ -74,11 +74,13 @@ BLAKE3 hashes their working-tree bytes, so unstaged edits refresh the build-stat
 fingerprint also folds in a discovery revision, so a cowshed that asks differently rediscovers instead of keeping an
 earlier discovery's answer, findings included. Caller environment and untracked config are not fingerprint inputs.
 Cargo's contribution drops caller `CARGO_TARGET_DIR` so where a job writes depends on the tracked project files, exactly
-the fingerprint's inputs, not an unrelated shell's override. Forks inherit the snapshot and fixed links without
-rediscovery. Nx contributes `.nx/cache` and `.nx/workspace-data`. Codegraph contributes each detected project's
-`.codegraph/` index as build state, held at the project's `codegraph` path on the build volume. The root index uses the
-fixed link `.codegraph -> .cowshed/build/codegraph` and is cloned and adopted with that volume, not migrated to the
-source volume (16_build_volumes.md, "Owned index links").
+the fingerprint's inputs, not an unrelated shell's override. It also owns `CARGO_UNSTABLE_MTIME_ON_USE=true`, so every
+cargo of a project records the use of the units it builds on (16_build_volumes.md, "One Cargo environment on every
+path"). Forks inherit the snapshot and fixed links without rediscovery. Nx contributes `.nx/cache` and
+`.nx/workspace-data`. Codegraph contributes each detected project's `.codegraph/` index as build state, held at the
+project's `codegraph` path on the build volume. The root index uses the fixed link
+`.codegraph -> .cowshed/build/codegraph` and is cloned and adopted with that volume, not migrated to the source volume
+(16_build_volumes.md, "Owned index links").
 
 Bun also contributes metadata-only lookup beneath the host's `~/.bun/install/global/node_modules`, where `bun link`
 registers developer packages. Resolving a workspace's package alias through that registration does not read or list the

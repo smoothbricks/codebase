@@ -3983,6 +3983,137 @@ async fn directory_a_fork_of_a_warm_target_is_all_fresh_and_all_hits_substrate_l
     cowshed_os::eprintln!("physical warm proof: owned scratch teardown complete");
 }
 
+/// The hash file of the unit named `file` (`<kind>-<crate>`) under `target/debug`: the one file
+/// Cargo's `-Zmtime-on-use` stamps on every use of the unit.
+fn unit_hash_file(target: &Path, file: &str) -> PathBuf {
+    let mut found = Vec::new();
+    let mut pending = vec![target.join("debug")];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
+        {
+            let entry = entry.expect("directory entry");
+            if entry.file_type().expect("entry type").is_dir() {
+                pending.push(entry.path());
+            } else if entry.file_name().to_str() == Some(file) {
+                found.push(entry.path());
+            }
+        }
+    }
+    assert_eq!(
+        found.len(),
+        1,
+        "one hash file named {file} under {}: {found:?}",
+        target.display()
+    );
+    found.remove(0)
+}
+
+fn modified(path: &Path) -> SystemTime {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or_else(|error| panic!("stat {}: {error}", path.display()))
+}
+
+fn set_modified(path: &Path, time: SystemTime) {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(time))
+        .unwrap_or_else(|error| panic!("stamp {}: {error}", path.display()));
+}
+
+/// Every cargo a workspace runs records each use of a unit (16_build_volumes.md, "One Cargo
+/// environment on every path"): a no-op `cargo build -p fixture-base` stamps the fingerprint hash
+/// file of the unit it used, and of no other, from a sandboxed job and from a host shell that
+/// sources `.cowshed/env`. The control is the same host build without the file: it stamps
+/// nothing, so the stamp is the exported flag's and not Cargo's own. Each build is checked
+/// `Fresh`, since a recompile would also write the hash file.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_noop_cargo_build_stamps_the_units_it_uses_and_no_others_substrate_lifecycle() {
+    const BASE_ONLY: &str = "cargo build -p fixture-base --message-format=json";
+    let rust = RustToolchain::of_this_test();
+    let mut fixture = Fixture::with_directory(Project::Build {
+        nx: None,
+        rust: Some(&rust),
+    });
+    let mut service = serve_project(&mut fixture, &[]).await;
+    assert_target_on_build_volume(&fixture.checkout);
+    let workspace = new_workspace(&mut service, "w").await;
+    let cold = cargo_artifacts(&sh(&mut service, "w", CARGO_BUILD).await);
+    assert_eq!(cold.len(), 2, "{cold:?}");
+    let target = workspace.join("target");
+    let base = unit_hash_file(&target, "lib-fixture_base");
+    let app = unit_hash_file(&target, "lib-fixture_app");
+    let long_ago = SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
+    let backdate = || {
+        for file in [&base, &app] {
+            set_modified(file, long_ago);
+        }
+    };
+    let stamped = |file: &Path| modified(file) > long_ago + Duration::from_secs(24 * 60 * 60);
+    let only_fresh = |stdout: &[u8], leg: &str| {
+        let artifacts = cargo_artifacts(stdout);
+        assert_eq!(artifacts.len(), 1, "{leg}: {artifacts:?}");
+        assert!(
+            artifacts.iter().all(|(_, fresh)| *fresh),
+            "{leg} recompiled: {artifacts:?}"
+        );
+    };
+    let host = |sourced: bool| {
+        let script = format!(
+            "{}exec {BASE_ONLY}",
+            if sourced { ". .cowshed/env; " } else { "" }
+        );
+        let output = Command::new("/bin/sh")
+            .args(["-ec", &script])
+            .current_dir(&workspace)
+            .env_clear()
+            .env("HOME", fixture.storage.home())
+            .env(
+                "PATH",
+                std::env::join_paths([
+                    workspace.join(".cowshed/bin").as_path(),
+                    Path::new("/usr/bin"),
+                    Path::new("/bin"),
+                ])
+                .unwrap(),
+            )
+            .output()
+            .expect("host cargo build");
+        assert!(
+            output.status.success(),
+            "host Cargo: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+
+    backdate();
+    only_fresh(&sh(&mut service, "w", BASE_ONLY).await, "sandboxed job");
+    assert!(
+        stamped(&base),
+        "a job's no-op build stamps the unit it used"
+    );
+    assert!(!stamped(&app), "and not a unit it did not use");
+
+    backdate();
+    only_fresh(&host(false), "host shell without .cowshed/env");
+    assert!(
+        !stamped(&base),
+        "a host shell that never sourced .cowshed/env stamps nothing: the flag is what stamps"
+    );
+    only_fresh(&host(true), "host shell sourcing .cowshed/env");
+    assert!(
+        stamped(&base),
+        "a host shell that sourced .cowshed/env stamps the unit it used"
+    );
+    assert!(!stamped(&app), "and not a unit it did not use");
+
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
+
 /// The checkout path [`Project::Declared`] declares as build state.
 const DECLARED_STATE: &str = "upstream";
 

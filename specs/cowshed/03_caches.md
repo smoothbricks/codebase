@@ -351,6 +351,8 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     `NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true`; the route takes no credential, 05_gateway.md "`/nx/v1/cache/{hash}`").
     It never exports the bare token as `COWSHED_WORKSPACE_TOKEN`. A served mount also publishes the sccache capability's
     client environment below, and Nx's `NX_MAX_CACHE_SIZE` default; explicit caller cache-size overrides are preserved.
+    A served mount of a Cargo project also exports the Cargo capability's `CARGO_UNSTABLE_MTIME_ON_USE=true`, so a host
+    shell's cargo records each unit use as a job's does (16_build_volumes.md, "One Cargo environment on every path").
     Linux exports no port values: services use private loopback and package/proxy wiring uses `http://127.0.0.1:7644`.
     No workspace-identity variable is exported; anything that needs identity derives it from cwd via
     `.cowshed/workspace.json` or asks the CLI. A served mount binds `NODE_COMPILE_CACHE` to
@@ -389,6 +391,11 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
       and names the program rather than a `PATH` entry: shell activation owns `PATH`, and a repository shell that ships
       no sccache left a bare `sccache` unresolvable, failing every cargo at its version probe. A host that pinned none —
       sccache is opt-in — or whose pinned store path was collected gets no wrapper at all; no value is the caller's;
+    - for a Cargo project, the Cargo capability's `CARGO_UNSTABLE_MTIME_ON_USE=true`, which `.cowshed/env` sources too
+      and no caller's value replaces: a build stamps the fingerprint hash file of every unit it uses, `Fresh` ones
+      included, so Cargo output retention can tell a unit still in use from one only built long ago. It changes no unit
+      hash, directory name or freshness verdict, and stable Cargo ignores it (16_build_volumes.md, "One Cargo
+      environment on every path");
     - trust anchors as defaults a caller may override: the core's `GIT_SSL_CAINFO` and `SSL_CERT_FILE`, and each
       detected capability's own — `CARGO_HTTP_CAINFO`, `NODE_EXTRA_CA_CERTS`, `NIX_SSL_CERT_FILE` with an
       `ssl-cert-file` line appended to `NIX_CONFIG`, `UV_SYSTEM_CERTS=true` (04_sandbox.md);

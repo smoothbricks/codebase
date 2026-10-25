@@ -1348,10 +1348,26 @@ the same unit-identity environment. Concretely:
   the wrapper does not change fingerprints either way. Danny, 2026-09-30: "sccache is for CI and stable crates, not for
   dev targets". Host shells receive the detector's exact pinned client, endpoints and request bases through
   `.cowshed/env`, matching supervisor children; absent pinned clients unset stale wrapper settings.
+- **Every use of a unit is recorded.** `CARGO_UNSTABLE_MTIME_ON_USE=true` (`-Zmtime-on-use`) makes a build stamp the
+  fingerprint hash file of every unit it uses, `Fresh` ones included. Cargo output retention
+  (`packages/nx-plugin/README.md`, "Cargo Workspace Layouts") reads that stamp as the unit's last use; without it a
+  unit's last use is its last compile, and a unit that a branch switch keeps reusing looks as old as its build. The
+  Cargo capability owns it for every job of a Cargo project, so a caller's value never turns it off, and the workspace
+  environment cowshed provides exports it for host shells. Measured on a two-crate workspace: the unit directory names
+  and every fingerprint byte are those of a build without it, a build with it and one without are each `Fresh` over the
+  other's units, and a no-op `cargo build -p a` stamps `a`'s hash file and not an unrelated unit's. Stable Cargo (1.95.0
+  and 1.97.0) ignores the variable without a warning, so it is exported unconditionally.
 - **Enforced by**: a test that builds a fixture workspace in one checkout, clones its build volume to a second checkout
   at another path, runs the same build from a host shell with `CI=true` exported and from a sandboxed job, and requires
   every unit `Fresh`. The repository's own Cargo configuration also receives a real-repository two-checkout build
   requiring every inherited unit `Fresh`, not just a fixture.
+- **Enforced by**: `directory_a_noop_cargo_build_stamps_the_units_it_uses_and_no_others_substrate_lifecycle`
+  (`crates/cowshed-cli/tests/command_dispatch/macos.rs`): a no-op `cargo build -p` from a sandboxed job and from a host
+  shell that sources `.cowshed/env` stamps the used unit's hash file and no other's, and the same host build without the
+  file stamps nothing. `cargo_wraps_rustc_with_the_pinned_sccache_or_with_nothing` holds the job and the sourced file to
+  one value whatever the caller names, `a_detected_project_gets_its_tools_wiring_and_a_trust_bundle` and
+  `a_plain_repository_gets_port_loaders_but_no_tool_wiring` hold the job's variable to Cargo projects, and
+  `a_cargo_projects_published_environment_records_each_unit_use` holds a served file to the same split.
 
 ### Clones preserve mtimes; directories are never copied
 
