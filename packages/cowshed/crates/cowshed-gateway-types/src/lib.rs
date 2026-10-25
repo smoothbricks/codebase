@@ -17,6 +17,7 @@
 
 pub mod cpu_budget;
 pub mod disk_lease;
+pub mod first_launch;
 pub mod policy;
 pub mod ram_disk;
 pub mod repo_id;
@@ -36,6 +37,7 @@ pub use disk_lease::{
     DISK_LEASE_OP, DISK_PHASE_MEMBERS, DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState,
     PhaseShare,
 };
+pub use first_launch::{FIRST_LAUNCH_OP, FirstLaunch, FirstLaunchProbe};
 pub use policy::{
     CanonicalHost, CanonicalTarget, EgressGrant, EgressMode, HostPattern, MirrorProtocol,
     MirrorRoute, PolicyDenial, PolicyError, ResolvedMirrorRoute, TargetScheme, WorkspacePolicy,

@@ -126,6 +126,7 @@ reaches it after a reboot whatever volume the build came from (a workspace image
 | `cowshed-<sha256>`       | A stored copy, named for the SHA-256 of its bytes (64 lowercase hex digits), mode 0755.        |
 | `cowshed-<sha256>.build` | That copy's build record, JSON `{"commit","commitTime"}`, written by a build that records one. |
 | `nx-cache-server`        | The Nx cache server's stable name, a link to its own stored copy `nx-cache-server-<sha256>`.   |
+| `cowshed-gateway-host`   | The program launchd runs for the gateway: a copy of the build, signed ("The gateway host").    |
 
 `cowshed-source`, one level up beside `bin`, records the path the current install came from and its package version.
 `install.lock`, beside it, is the install slot's lock (below); it is never removed. Nothing in `bin` answers to `cargo`
@@ -158,9 +159,48 @@ checkout, a main not yet mounted) fails that start by name, an outage until the 
 file in `bin`, are synced, and are renamed to the copy's name. A copy whose bytes and mode already match is never
 rewritten, so whatever runs from it runs exactly that build for as long as it exists. The stable name moves from one
 whole build to the next in one rename of a temporary link, so launchd, which restarts a `KeepAlive` service the moment
-it exits, never finds a half-written binary or a missing name there. The gateway plist names the stable name, so the
-plist never changes with the build; an install moves the link and restarts the agent onto it. Installing a build the
-stable name already runs changes nothing.
+it exits, never finds a half-written binary or a missing name there. The gateway plist names the gateway host and, as
+its child, the stable name, so the plist never changes with the build; an install moves the link and restarts the agent
+onto it. Installing a build the stable name already runs changes nothing.
+
+**The gateway host.** launchd runs `bin/cowshed-gateway-host __gateway-host <bin/cowshed> gateway run`. The host spawns
+its arguments as its child, passes the child SIGTERM, SIGINT, SIGHUP and SIGQUIT, and exits as the child did — its exit
+code, or death by its signal — and does nothing else: it keeps no state and restarts nothing, since launchd's
+`KeepAlive` restarts the pair. The child stays in the host's process group, so launchd's teardown of the job reaches it
+even when the host itself is killed. The host spawns and never execs, because after an exec the process would carry the
+new image's path and signature.
+
+It exists for macOS's first-launch scan: macOS assesses each new executable on its first launch and charges the wait to
+the run's responsible process. A launchd job is its own responsible process and everything it starts inherits that, so
+the host is the responsible process of the daemon, every workspace supervisor and every workspace job, `--host` gates
+included. A Developer Tools entry exempts a responsible process and its descendants, and tccd keys a non-bundle client's
+entry to its resolved path and its designated requirement, not to a signing identity alone
+(anthropics/claude-code#85586: "tccd records the grant by path, not by code signature"; abhaymettu/tcc-helper: "macOS
+keys a TCC grant to the resolved binary path plus its code signature"). The daemon's own path is its content-addressed
+copy, new with every build, and an ad-hoc signature's requirement is its cdhash, so neither can hold the entry. The host
+holds both still. Its path is fixed, and every install signs it with the user's cowshed code-signing identity: a
+self-signed P-256 certificate named `cowshed gateway host` (keyUsage digitalSignature, extended key usage codeSigning)
+in cowshed's own keychain `~/Library/Keychains/cowshed-signing.keychain`, made by the first install that finds none,
+with no authorization and no prompt. That keychain has the empty password, never locks by time or sleep, and is appended
+to the user's keychain search list, the only place `codesign --sign` looks; setup unlocks it with that password before
+signing. The key is imported with an access list naming `codesign` and its partition list set with the keychain's
+password, so signing raises no dialog either. The login keychain is never written: a key imported there carries
+`security`'s partition, `codesign` then raises a keychain dialog (observed on macOS 26.6), and setting its partition
+list needs the login password. The empty password protects nothing a same-user process could not already do through
+`codesign`. The certificate is never trusted for code signing: trusting it needs an authorization, and neither
+`codesign` nor a `certificate leaf` requirement needs trust. The host's designated requirement is
+`identifier "dev.cowshed.gateway-host" and certificate leaf = H"<certificate sha1>"`, the same for every build. Two
+identities of that name refuse the install by name rather than choose; uninstall leaves the identity in the keychain,
+since the Developer Tools entry names it.
+
+An install that moves the stable name to another build rewrites the host: the build is copied into a temporary file in
+`bin`, signed there, synced and renamed over the host, so the host is always one whole signed file. Any install or setup
+that finds the host absent, or not satisfying that requirement, rewrites it the same way, without a restart: launchd
+runs the rewritten file at its next start. Otherwise the host is left as it is. A running host keeps the file it started
+from. The one step that completes the exemption is the operator's, one administrator authorization once per host: System
+Settings → Privacy & Security → Developer Tools → + →
+`~/Library/Application Support/dev.cowshed/bin/cowshed-gateway-host` (⇧⌘G takes the path). No install can take it, so
+none raises it; `cowshed doctor` reports whether it holds (06_cli.md, `first-launch-scan`).
 
 **The `PATH` entry.** `setup` points the first `cowshed` on the operator's `PATH` at the stable name: the first absolute
 `PATH` directory holding a symbolic link or an executable file of that name. A symbolic link — what `bun link`,
@@ -202,18 +242,19 @@ its storage repair succeeded.
 **A restart waits for the old gateway's exit, within launchd's own bound.** An activation that boots the agent out (a
 changed plist, a daemon running other bytes) and `gateway stop` wait until the old daemon has exited — the kernel's
 `NOTE_EXIT`, watched from before the bootout signals it, which it posts once the process has released every descriptor,
-its listeners included — and launchd no longer holds the job. launchd SIGKILLs a process its bootout's SIGTERM has not
-ended at the agent's exit timeout, so that is the only bound: the exit timeout of the definition launchd loaded, read
-from `launchctl print`, plus 1 s its unload may trail its kill by. Past it the bootout is overdue, whatever
-`launchctl bootout` itself answered (it can exit non-zero while launchd tears the job down; its answer is kept as
-context): an `environment-missing` error naming what is left — the pid that has not exited, or the job launchd still
-holds — with the bootstrap that loads the agent once that has gone, and a restore never kickstarts it. The gateway plist
-states `ExitTimeOut` 30 s (`GATEWAY_EXIT_TIMEOUT`), and the daemon's drain force-stops what it accepted after 20 s
-(`GATEWAY_DRAIN_WITHIN`), so the drain, its force stop and the audit flush finish before launchd's kill. Measured
-2026-10-22: launchd's default exit timeout is 5 s; the plist stated none, so a bootout SIGKILLed a draining gateway 5.03
-s after its SIGTERM, while the install's own wait, a fixed 5 s, gave up 0.03 s earlier and reported the bootout stuck;
-its restore then kickstarted the job still in teardown (launchctl 37), and launchd dropped it a moment later, leaving
-the host with no gateway.
+its listeners included — and launchd no longer holds the job. The pid launchd holds is the gateway host's, which exits
+only after the daemon, its child, has, so the host's `NOTE_EXIT` is the daemon's. launchd SIGKILLs a process its
+bootout's SIGTERM has not ended at the agent's exit timeout, so that is the only bound: the exit timeout of the
+definition launchd loaded, read from `launchctl print`, plus 1 s its unload may trail its kill by. Past it the bootout
+is overdue, whatever `launchctl bootout` itself answered (it can exit non-zero while launchd tears the job down; its
+answer is kept as context): an `environment-missing` error naming what is left — the pid that has not exited, or the job
+launchd still holds — with the bootstrap that loads the agent once that has gone, and a restore never kickstarts it. The
+gateway plist states `ExitTimeOut` 30 s (`GATEWAY_EXIT_TIMEOUT`), and the daemon's drain force-stops what it accepted
+after 20 s (`GATEWAY_DRAIN_WITHIN`), so the drain, its force stop and the audit flush finish before launchd's kill.
+Measured 2026-10-22: launchd's default exit timeout is 5 s; the plist stated none, so a bootout SIGKILLed a draining
+gateway 5.03 s after its SIGTERM, while the install's own wait, a fixed 5 s, gave up 0.03 s earlier and reported the
+bootout stuck; its restore then kickstarted the job still in teardown (launchctl 37), and launchd dropped it a moment
+later, leaving the host with no gateway.
 
 **An install refuses while a land or a gate runs.** Activating the agent restarts a gateway that runs, and so does the
 host move inside `setup`; a restart closes every lease connection ("Crash safety by connection"), a land's gate-job pool
@@ -438,11 +479,11 @@ have let a release train's build of a sibling commit replace an installed build 
 nothing; before that, twice a `cowshed setup` run through a launcher that resolved to a stale checkout build put back a
 gateway without a landed feature.
 
-**Uninstall.** `setup --uninstall` and `gateway stop --purge` remove, after the agent is gone, the stable name first (so
-nothing launchd could start dangles), then every stored copy with its `.build` record, a `cargo` link an earlier install
-planted, and every `cowshed` on `PATH` that is a link saying exactly the stable path — the entries setup made, and no
-other link that merely arrives there; a `cargo` no install planted is left as it is. A plain `gateway stop` keeps all of
-it: it is host state rather than agent state, and the next `start` is then a plist write.
+**Uninstall.** `setup --uninstall` and `gateway stop --purge` remove, after the agent is gone, the gateway host and then
+the stable name (so nothing launchd could start dangles), then every stored copy with its `.build` record, a `cargo`
+link an earlier install planted, and every `cowshed` on `PATH` that is a link saying exactly the stable path — the
+entries setup made, and no other link that merely arrives there; a `cargo` no install planted is left as it is. A plain
+`gateway stop` keeps all of it: it is host state rather than agent state, and the next `start` is then a plist write.
 
 ## Egress modes
 
@@ -786,9 +827,13 @@ whose message names that work; any other refusal is `rejected`.
 
 `{"op":"ram-attach","sectors":<n>}` is one-shot and attaches one RAM disk of `n` 512-byte sectors for the caller ("RAM
 disks", below). It answers `ramDisk: { device: "/dev/diskN" }`, the whole disk `hdiutil` printed.
-`{"op":"ram-detach","device":"/dev/diskN","registryEntry":"0x<hex>"}` is one-shot and detaches the RAM disk that I/O
-Registry entry registers as that whole disk. It answers `ramDetach`, whose `outcome` is `terminal`, `not-started` or
-`unknown` (same section).
+`{"op":"first-launch"}` is one-shot and measures a fresh executable's first launch from the daemon's own process ("The
+gateway host"): a copy of the daemon's executable, signed ad hoc again under an identifier no launch has used, launched
+twice with `--version`, each timed from spawn to exit, then removed. It answers
+`firstLaunch: { firstMicros, secondMicros }`; a daemon that supplies no probe, or a probe that fails, is `rejected` with
+the probe's own words. `{"op":"ram-detach","device":"/dev/diskN","registryEntry":"0x<hex>"}` is one-shot and detaches
+the RAM disk that I/O Registry entry registers as that whole disk. It answers `ramDetach`, whose `outcome` is
+`terminal`, `not-started` or `unknown` (same section).
 
 Every request is one line. A one-shot request is followed by the client's EOF and answered with one line; a
 `disk-lease`, `cpu-tokens`, `jobserver` or `resident-pool` request is held for as long as its client keeps the

@@ -274,6 +274,9 @@ pub struct GatewayConfig {
     /// What attaches and detaches the host's RAM disks for `ram-attach` and `ram-detach` (05_gateway.md, "RAM disks"): the
     /// daemon's disk runner, which this crate does not link. `None` attaches none.
     pub ram_disks: Option<Arc<dyn cowshed_gateway_types::RamDisks>>,
+    /// What measures a fresh executable's first launch for the `first-launch` op (05_gateway.md,
+    /// "Control plane"): the daemon's probe, which this crate does not link. `None` measures nothing.
+    pub first_launch: Option<Arc<dyn cowshed_gateway_types::FirstLaunchProbe>>,
     /// Existing standalone accepted-artifact server, started lazily per Nx project.
     pub nx_cache: Option<crate::nx_cache::NxCacheServiceConfig>,
     /// macOS: the socket an install serves while it restarts this gateway (`handoff_path`). The
@@ -303,6 +306,7 @@ impl Default for GatewayConfig {
             executable_sha256: None,
             startup: None,
             ram_disks: None,
+            first_launch: None,
             nx_cache: None,
             listener_handoff: None,
         }

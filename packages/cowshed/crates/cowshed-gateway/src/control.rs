@@ -21,11 +21,11 @@ use zeroize::{Zeroize, Zeroizing};
 
 use cowshed_gateway_types::{
     CPU_TOKENS_OP, CpuBudgetStatus, DISK_LEASE_OP, DaemonStatus, DiskClass, EgressGrant,
-    EgressMode, HostPattern, JOBSERVER_OP, LeaseClass, LeaseState, MirrorRoute, PhaseShare,
-    RAM_ATTACH_OP, RAM_DETACH_OP, RESIDENT_POOL_OP, RamAttachRefusal, RamDetached, RamDiskAttached,
-    RamDiskDevice, RamDiskEntry, RamDiskSectors, RamDisks, TASK_ADMIT_OP, TaskClass, TaskGrant,
-    TaskOutcome, TaskQueueStatus, TaskRunCaps, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy,
-    WorkspaceSession, WorkspaceToken,
+    EgressMode, FIRST_LAUNCH_OP, FirstLaunch, FirstLaunchProbe, HostPattern, JOBSERVER_OP,
+    LeaseClass, LeaseState, MirrorRoute, PhaseShare, RAM_ATTACH_OP, RAM_DETACH_OP,
+    RESIDENT_POOL_OP, RamAttachRefusal, RamDetached, RamDiskAttached, RamDiskDevice, RamDiskEntry,
+    RamDiskSectors, RamDisks, TASK_ADMIT_OP, TaskClass, TaskGrant, TaskOutcome, TaskQueueStatus,
+    TaskRunCaps, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 
 use crate::{
@@ -156,6 +156,16 @@ impl GatewayControlClient {
             .await?;
         check_response(&response)?;
         response.cpu_budget.ok_or(ControlError::InvalidResponse)
+    }
+
+    /// A first-launch measurement answered within `within`, as [`Self::status_within`]. The daemon
+    /// makes it by two timed launches, so it needs far more time than a status ask.
+    pub async fn first_launch_within(&self, within: Duration) -> Result<FirstLaunch, ControlError> {
+        let response: ControlResponse = self
+            .exchange_within(&ControlRequest::FirstLaunch, Some(within))
+            .await?;
+        check_response(&response)?;
+        response.first_launch.ok_or(ControlError::InvalidResponse)
     }
 
     /// The gate jobs a gateway restart now would cut off (05_gateway.md, "An install refuses
@@ -478,6 +488,8 @@ enum ControlRequest {
         #[serde(rename = "registryEntry")]
         registry_entry: RamDiskEntry,
     },
+    /// Measure a fresh executable's first and second launch (05_gateway.md, "Control plane").
+    FirstLaunch,
 }
 
 /// A request as the control socket reads it: a one-shot [`ControlRequest`] answered and closed,
@@ -696,6 +708,9 @@ struct ControlResponse {
     /// What is known of a `ram-detach`: `terminal`, `not-started` or `unknown`.
     #[serde(skip_serializing_if = "Option::is_none")]
     ram_detach: Option<RamDetached>,
+    /// The measurement a `first-launch` made: the first and second launch of a fresh executable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_launch: Option<FirstLaunch>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -947,6 +962,7 @@ pub(crate) struct ControlServices {
     pub task_server: crate::task_server::TaskServer,
     pub jobserver: crate::jobserver::JobserverFifos,
     pub ram_disks: Option<Arc<dyn RamDisks>>,
+    pub first_launch: Option<Arc<dyn FirstLaunchProbe>>,
 }
 
 impl ControlServices {
@@ -976,6 +992,7 @@ impl fmt::Debug for ControlServices {
             .field("cpu_budget", &self.cpu_budget)
             .field("task_server", &self.task_server)
             .field("ram_disks", &self.ram_disks)
+            .field("first_launch", &self.first_launch)
             .finish()
     }
 }
@@ -1805,6 +1822,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         "nx-cache-clear" => &["op", "repoId"],
         RAM_ATTACH_OP => &["op", "sectors"],
         RAM_DETACH_OP => &["op", "device", "registryEntry"],
+        FIRST_LAUNCH_OP => &["op"],
         TASK_ADMIT_OP => &[
             "op",
             "unit",
@@ -2261,6 +2279,10 @@ async fn dispatch(
             detach_ram_disk(services.ram_disks.clone(), device, registry_entry).await,
             None,
         ),
+        ControlRequest::FirstLaunch => (
+            measure_first_launch(services.first_launch.clone()).await,
+            None,
+        ),
     }
 }
 
@@ -2290,6 +2312,28 @@ async fn attach_ram_disk(
         Err(error) => failure(
             ControlFailureCode::Rejected,
             format!("the RAM disk attach thread failed: {error}"),
+        ),
+    }
+}
+
+/// Measure a fresh executable's first launch on a blocking thread: each launch runs a process to
+/// its exit, and the probe waits for both (05_gateway.md, "Control plane").
+async fn measure_first_launch(probe: Option<Arc<dyn FirstLaunchProbe>>) -> ControlResponse {
+    let Some(probe) = probe else {
+        return failure(
+            ControlFailureCode::Rejected,
+            "this gateway measures no first launch: its daemon supplied no probe".to_owned(),
+        );
+    };
+    match tokio::task::spawn_blocking(move || probe.measure()).await {
+        Ok(Ok(first_launch)) => ControlResponse {
+            first_launch: Some(first_launch),
+            ..success()
+        },
+        Ok(Err(message)) => failure(ControlFailureCode::Rejected, message),
+        Err(_) => failure(
+            ControlFailureCode::Rejected,
+            "the first-launch probe thread failed".to_owned(),
         ),
     }
 }
@@ -2479,6 +2523,7 @@ fn success() -> ControlResponse {
         install: None,
         ram_disk: None,
         ram_detach: None,
+        first_launch: None,
     }
 }
 
@@ -2671,6 +2716,7 @@ mod tests {
             r#"{"op":"cpu-tokens","want":4,"command":"nextest"}"#,
             r#"{"op":"cpu-tokens","want":4,"checkout":"/w","command":"nextest","pid":1}"#,
             r#"{"op":"cpu-budget","verbose":true}"#,
+            r#"{"op":"first-launch","x":1}"#,
         ] {
             assert!(parse_control_request(request.as_bytes()).is_err());
         }
@@ -2716,6 +2762,11 @@ mod tests {
             parse_control_request(br#"{"op":"nx-cache-clear","repoId":"acme/widget","all":true}"#)
                 .is_err()
         );
+
+        assert!(matches!(
+            parse_control_request(br#"{"op":"first-launch"}"#),
+            Ok(Incoming::Request(ControlRequest::FirstLaunch))
+        ));
 
         // A RAM attach names a positive size and nothing else: no argv reaches hdiutil.
         assert!(matches!(
@@ -2927,6 +2978,41 @@ mod tests {
             Err(ControlError::InvalidResponse)
         ));
         answering.await.expect("answers");
+    }
+
+    /// A first-launch probe that answers the same measurement every time it is asked.
+    #[derive(Debug)]
+    struct AnsweringFirstLaunch(FirstLaunch);
+
+    impl FirstLaunchProbe for AnsweringFirstLaunch {
+        fn measure(&self) -> Result<FirstLaunch, String> {
+            Ok(self.0)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_first_launch_answer_is_its_two_launch_times_on_the_wire() {
+        let probe = AnsweringFirstLaunch(FirstLaunch {
+            first_micros: 7,
+            second_micros: 3,
+        });
+        let answered = measure_first_launch(Some(Arc::new(probe))).await;
+        assert_eq!(
+            serde_json::to_value(&answered).expect("encode"),
+            serde_json::json!({
+                "ok": true,
+                "firstLaunch": {"firstMicros": 7, "secondMicros": 3},
+            })
+        );
+        let unserved = measure_first_launch(None).await;
+        assert_eq!(
+            serde_json::to_value(&unserved).expect("encode"),
+            serde_json::json!({
+                "ok": false,
+                "code": "rejected",
+                "error": "this gateway measures no first launch: its daemon supplied no probe",
+            })
+        );
     }
 
     /// RAM disks whose detach starts, says so, and ends only once the test releases it, then says

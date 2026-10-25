@@ -552,6 +552,18 @@ per step on stderr. A named workspace that is mounted and served answers from li
 decline leaves the workspace resident again (attached, supervisor current, gateway reconciled), so only the first one
 after a change pays for it.
 
+## New binaries start slowly in `cowshed exec`, or `cowshed doctor` warns `first-launch-scan`
+
+macOS scans each new executable on its first launch and charges the wait to the run's responsible process. Every
+workspace job's responsible process is the gateway host,
+`~/Library/Application Support/dev.cowshed/bin/cowshed-gateway-host`, which `cowshed setup` signs with your cowshed
+identity (05_gateway.md "The gateway host"). Until it has a Developer Tools entry, a gate's fresh test binaries and
+build scripts wait seconds for the scan where the same binaries start in milliseconds from your terminal. Add it once,
+as an administrator: System Settings → Privacy & Security → Developer Tools → + → ⇧⌘G → that path. The entry outlives
+every later `cowshed setup`, since setup rewrites the host at the same path with the same designated requirement.
+`cowshed doctor` then reports `first-launch-exempt` with the four launch times. Never turn Gatekeeper or XProtect off
+machine-wide instead.
+
 ## "cowshed volumes owned by another user"
 
 The cowshed volumes belong to exactly one uid. If `doctor` reports a foreign-uid volume, you are running cowshed as the

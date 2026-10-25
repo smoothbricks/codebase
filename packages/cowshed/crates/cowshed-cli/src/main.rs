@@ -7,6 +7,15 @@ use cowshed_cli::run::{Ending, prepare, run_interruptible};
 const INTERRUPTED_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 fn main() {
+    // The gateway host launchd runs (05_gateway.md "The gateway host") does nothing but run its
+    // child, so it runs before anything else: one thread, no warm-host registration.
+    let mut host = std::env::args_os().skip(1);
+    if host
+        .next()
+        .is_some_and(|verb| verb == cowshed_cli::gateway_host::VERB)
+    {
+        cowshed_cli::gateway_host::run(&host.collect::<Vec<_>>());
+    }
     // A deletion child frees its one released image and exits, before anything else starts
     // (05_gateway.md, "Deleting released images").
     if let Some(code) = cowshed_core::storage::apfs::deleter::dispatch() {

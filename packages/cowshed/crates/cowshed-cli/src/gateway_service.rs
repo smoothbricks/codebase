@@ -1,6 +1,7 @@
 use crate::agent_cycle::{self, Bootout, Held, LoadedAgent, Reload, Remains};
 use crate::args::GatewayCommand;
 use crate::build_record::{BuildRecord, unproven_refusal, unrecorded_refusal};
+use crate::code_signing::{self, Keychain, SigningIdentity};
 use crate::install_basis::{self, InstallSlot};
 use crate::land_turn::local_clock;
 use crate::launchd::{
@@ -9,7 +10,8 @@ use crate::launchd::{
     InstalledExecutable, LaunchAgentSpec, LaunchAgentTarget, LaunchctlCommand, LaunchdExecutor,
     LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem, NativeLaunchctlCommand,
     PRIVATE_DIRECTORY_MODE, RemovalOutcome, StableLink, kickstart_hint, plan_cargo_link_removal,
-    plan_executable_install, plan_executable_remove, plan_install, plan_remove, replace_symlink,
+    plan_executable_install, plan_executable_remove, plan_gateway_host_install, plan_install,
+    plan_remove, replace_symlink,
 };
 use crate::output::Output;
 use crate::path_entry::PathEntryOutcome;
@@ -58,6 +60,7 @@ pub use cowshed_core::gateway_sessions::{
     reconcile_against_status, reconcile_project, reconcile_project_with_reallocator,
     session_from_fact, sessions_from_facts, stable_workspace_id,
 };
+use cowshed_gateway_types::FirstLaunch;
 use std::collections::BTreeSet;
 
 /// Bind the runtime's gateway dependency once, without making a control request during open.
@@ -818,6 +821,7 @@ where
         adopted_mains(&home).await
     })
     .await?;
+    let identity = gateway_host_identity(&home)?;
     let bun = invoking_bun()?;
     let client = GatewayControlClient::new(paths.control_socket.clone()).map_err(control_error)?;
     // Activation restarts a gateway that runs; one that answers is refused the restart while a
@@ -842,7 +846,14 @@ where
     // Held until the restarted gateway serves: it took the listeners before it bound anything.
     let _carrying = carry_listeners(&paths.control_socket, downgrade);
     let written = executor.execute_install(&plan).map_err(launchd_error)?;
-    install_and_activate_gateway(&mut executor, &home, &candidate, spec.target(), written)?;
+    install_and_activate_gateway(
+        &mut executor,
+        &home,
+        &candidate,
+        spec.target(),
+        written,
+        identity,
+    )?;
     let reported = await_healthy(
         output,
         slot,
@@ -1100,6 +1111,13 @@ pub(crate) fn installed_files(executable: &HostStableExecutable) -> Result<Vec<P
     if observe_cargo_link(executable)? == CargoLink::Planted {
         present.push(executable.directory().join(CARGO_LINK_NAME));
     }
+    // The gateway host before the stable name it runs: launchd starts the host, so nothing it
+    // could start is left once the host is gone.
+    if executable.name() == COWSHED_BINARY_NAME
+        && inspect_existing(&executable.gateway_host())?.is_some()
+    {
+        present.push(executable.gateway_host());
+    }
     if inspect_existing(executable.path())?.is_some() {
         present.push(executable.path().to_path_buf());
     }
@@ -1273,6 +1291,60 @@ pub(crate) struct Unanswered {
     pub(crate) within: Duration,
 }
 
+/// What doctor's first-launch probe read (05_gateway.md "The gateway host"): a fresh
+/// executable's first and second launch in this process, the host shell's, and in the gateway
+/// daemon's, whose responsible process every workspace job has, or why the daemon measured none;
+/// and the gateway host a Developer Tools entry has to name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FirstLaunchReading {
+    pub(crate) host: FirstLaunch,
+    pub(crate) gateway: std::result::Result<FirstLaunch, String>,
+    pub(crate) gateway_host: PathBuf,
+}
+
+/// Measure a first launch here, then ask the gateway to measure one within `within`. One after
+/// the other: the scans of both would otherwise wait in one queue and charge each other.
+pub(crate) async fn first_launch_within(
+    roots: &CanonicalRoots,
+    within: Duration,
+) -> Result<FirstLaunchReading> {
+    let gateway_host = HostStableExecutable::new(&canonical_home()?, COWSHED_BINARY_NAME)
+        .map_err(launchd_error)?
+        .gateway_host();
+    // Under the gateway host, inside a workspace job, this process's launches are a job's: there
+    // is no host-shell launch here to compare the gateway's with.
+    if crate::first_launch::responsible_program().is_some_and(|program| program == gateway_host) {
+        return Err(CowshedError::conflict(
+            format!(
+                "this doctor runs under the gateway host {}, as a workspace job does, so it has no host-shell launch to compare the gateway's with",
+                gateway_host.display()
+            ),
+            "run cowshed doctor from a terminal, outside any workspace job",
+        ));
+    }
+    let template = running_executable()?;
+    let host = tokio::task::spawn_blocking(move || crate::first_launch::measure(&template))
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("the first-launch probe thread failed: {error}"))
+        })?
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!("could not measure a first launch in this shell: {error}"),
+                "codesign --version",
+            )
+        })?;
+    let client = GatewayControlClient::new(roots.control_socket()).map_err(control_error)?;
+    let gateway = client
+        .first_launch_within(within)
+        .await
+        .map_err(|error| error.to_string());
+    Ok(FirstLaunchReading {
+        host,
+        gateway,
+        gateway_host,
+    })
+}
 /// [`service_status`] for `doctor`, from a gateway that must answer within `within` of taking
 /// each request (specs/cowshed/06_cli.md, "doctor"): one that stays silent is [`Unanswered`].
 pub(crate) async fn service_status_within(
@@ -1561,6 +1633,12 @@ async fn run_daemon() -> Result<()> {
         #[cfg(target_os = "macos")]
         ram_disks: Some(Arc::new(cowshed_apfs::ram_disk::SystemRamDisks::new(
             storage.namespace(),
+        ))),
+        // Doctor's first-launch probe runs here, so its launches have the responsible process
+        // every job has (05_gateway.md "The gateway host").
+        #[cfg(target_os = "macos")]
+        first_launch: Some(Arc::new(crate::first_launch::DaemonFirstLaunch::new(
+            executable.clone(),
         ))),
         ..paths.config(effective_uid(), executable)
     };
@@ -2235,6 +2313,7 @@ fn install_nx_cache_server<F, C>(
 ) -> Result<HostStableExecutable>
 where
     F: LaunchdFilesystem,
+    C: LaunchctlCommand,
 {
     let executable = HostStableExecutable::new(home, "nx-cache-server").map_err(launchd_error)?;
     let source = packaged_nx_cache_server(&executable, cowshed_source)?;
@@ -2260,6 +2339,7 @@ pub fn install_host_stable_executable<F, C>(
 ) -> Result<HostStableExecutable>
 where
     F: LaunchdFilesystem,
+    C: LaunchctlCommand,
 {
     let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
     remove_planted_cargo_link(executor, &executable)?;
@@ -2267,19 +2347,78 @@ where
     Ok(executable)
 }
 
+/// Install the stored copy of `source` and point the stable name at it: `NoChange` when the stable
+/// name already ran it.
 fn install_stored_executable<F, C>(
     executor: &mut LaunchdExecutor<F, C>,
     executable: &HostStableExecutable,
     digest: &ExecutableDigest,
     source: &Path,
-) -> Result<()>
+) -> Result<InstallOutcome>
 where
     F: LaunchdFilesystem,
+    C: LaunchctlCommand,
 {
     let state = observe_executable_install(executable, digest, source)?;
     executor
         .execute_install(&plan_executable_install(executable, digest, source, &state))
-        .map_err(launchd_error)?;
+        .map_err(launchd_error)
+}
+
+/// This user's cowshed signing identity, made in cowshed's own keychain in `home` when it holds
+/// none ([`code_signing::prepare`], [`code_signing::ensure_identity`]).
+fn gateway_host_identity(home: &Path) -> Result<SigningIdentity> {
+    let keychain = Keychain::cowshed(home);
+    code_signing::prepare(&keychain)?;
+    code_signing::ensure_identity(&keychain)
+}
+
+/// Install the gateway host beside `executable` from `source`, signed with `identity`
+/// (05_gateway.md "The gateway host"): when it is absent, when it does not satisfy `identity`'s
+/// designated requirement, or when `moved` says this install moved the stable name to another
+/// build. Otherwise it is left as it is. A Developer Tools entry holds the host's path and
+/// requirement, and a rewrite keeps both, so the entry outlives every install.
+fn install_gateway_host<F, C>(
+    executor: &mut LaunchdExecutor<F, C>,
+    executable: &HostStableExecutable,
+    source: &Path,
+    identity: SigningIdentity,
+    moved: bool,
+) -> Result<()>
+where
+    F: LaunchdFilesystem,
+    C: LaunchctlCommand,
+{
+    let host = executable.gateway_host();
+    let current = match inspect_existing(&host)? {
+        None => false,
+        Some(metadata) if is_user_owned(&metadata, false) => {
+            !moved
+                && executor.satisfies(&host, identity).map_err(|error| {
+                    CowshedError::environment_missing(
+                        format!(
+                            "could not check the gateway host {}'s signature: {error}",
+                            host.display()
+                        ),
+                        format!("codesign --verify --verbose '{}'", host.display()),
+                    )
+                })?
+        }
+        Some(_) => {
+            return Err(CowshedError::integrity(
+                format!(
+                    "the gateway host is not a user-owned regular file: {}",
+                    host.display()
+                ),
+                "remove it and rerun cowshed setup",
+            ));
+        }
+    };
+    if !current {
+        executor
+            .execute_install(&plan_gateway_host_install(executable, source, identity))
+            .map_err(launchd_error)?;
+    }
     Ok(())
 }
 
@@ -2294,6 +2433,7 @@ fn remove_planted_cargo_link<F, C>(
 ) -> Result<()>
 where
     F: LaunchdFilesystem,
+    C: LaunchctlCommand,
 {
     match observe_cargo_link(executable)? {
         CargoLink::Absent => Ok(()),
@@ -2666,6 +2806,7 @@ pub fn retain_previous_executable<F, C>(
 ) -> Result<Option<PathBuf>>
 where
     F: LaunchdFilesystem,
+    C: LaunchctlCommand,
 {
     let Some(metadata) = inspect_existing(executable.path())? else {
         return Ok(None);
@@ -2699,6 +2840,7 @@ fn prune_superseded<F, C>(
     previous: Option<&Path>,
 ) where
     F: LaunchdFilesystem,
+    C: LaunchctlCommand,
 {
     let previous = previous
         .and_then(Path::file_name)
@@ -2760,6 +2902,7 @@ fn install_and_activate_gateway<F, C>(
     candidate: &Candidate,
     target: &LaunchAgentTarget,
     plist: InstallOutcome,
+    identity: SigningIdentity,
 ) -> Result<HostStableExecutable>
 where
     F: LaunchdFilesystem,
@@ -2768,7 +2911,15 @@ where
     let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
     remove_planted_cargo_link(executor, &executable)?;
     let retained = retain_previous_executable(executor, &executable)?;
-    install_stored_executable(executor, &executable, &candidate.digest, &candidate.source)?;
+    let moved =
+        install_stored_executable(executor, &executable, &candidate.digest, &candidate.source)?;
+    install_gateway_host(
+        executor,
+        &executable,
+        &candidate.source,
+        identity,
+        moved == InstallOutcome::Changed,
+    )?;
     record_installed_source(&executable, &candidate.source);
     record_installed_build(&executable, candidate);
     let uid = effective_uid();
@@ -2937,6 +3088,7 @@ pub async fn refresh_gateway_binary(
         gates,
         &mut executor,
         invoking_bun,
+        || gateway_host_identity(home),
     )
     .await?;
     if let Some(ServiceBinaryRefresh::Refreshed { .. }) = &refresh {
@@ -2972,6 +3124,10 @@ struct IncomingBuild<'a> {
 /// restarts that daemon, so it is first refused while a land or a gate of that daemon runs
 /// ([`refuse_restart_while_busy`]). `bun` is asked only when a gateway agent is installed: a host
 /// without one needs no interpreter.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each input is a seam setup's refresh tests inject: the host, the build, launchd, bun and the signing identity"
+)]
 async fn refresh_gateway_from<C: LaunchctlCommand>(
     namespace: HostNamespace,
     home: &Path,
@@ -2980,6 +3136,7 @@ async fn refresh_gateway_from<C: LaunchctlCommand>(
     gates: Option<(&InstallSlot, &GatewayControlClient)>,
     executor: &mut LaunchdExecutor<NativeFilesystem, C>,
     bun: impl FnOnce() -> Result<BunDirectory>,
+    identity: impl FnOnce() -> Result<SigningIdentity>,
 ) -> Result<Option<ServiceBinaryRefresh>> {
     let IncomingBuild {
         candidate,
@@ -3036,6 +3193,13 @@ async fn refresh_gateway_from<C: LaunchctlCommand>(
     // repaired, so this runs before the no-op return and before any activation: a missing
     // companion fails here rather than after the host has changed.
     install_nx_cache_server(executor, home, &candidate.source)?;
+    // The gateway host is repaired like the companion, before the no-op return and without a
+    // restart: a missing or foreign-signed host is rewritten, and launchd runs the rewritten file
+    // at the next start. An install that moves the stable name rewrites it below.
+    let identity = identity()?;
+    if !binary_is_stale {
+        install_gateway_host(executor, &executable, &candidate.source, identity, false)?;
+    }
     if !restarts {
         return Ok(None);
     }
@@ -3048,6 +3212,7 @@ async fn refresh_gateway_from<C: LaunchctlCommand>(
             candidate,
             spec.target(),
             InstallOutcome::Changed,
+            identity,
         )?;
     } else if daemon_is_stale {
         activate_launch_agent(
@@ -3124,6 +3289,7 @@ fn install_cli_from<F, C>(
 ) -> Result<CliInstall>
 where
     F: LaunchdFilesystem,
+    C: LaunchctlCommand,
 {
     let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
     // Whatever the build: a setup that finds its cowshed current still removes the `cargo` link
@@ -3586,9 +3752,24 @@ mod tests {
         fs::remove_dir_all(&home).ok();
     }
 
+    /// launchctl recorded and answered, and `codesign` recorded apart from it: answered as a
+    /// success (a verification failing when `unsatisfied`), or run for real for a host proof.
     #[derive(Default)]
     struct RecordingGatewayLaunchctl {
         argv: Vec<Vec<std::ffi::OsString>>,
+        codesign: Vec<Vec<std::ffi::OsString>>,
+        unsatisfied: bool,
+        real_codesign: bool,
+    }
+
+    /// A signing identity for tests whose `codesign` is recorded, never run.
+    fn test_identity() -> SigningIdentity {
+        SigningIdentity {
+            certificate: code_signing::CertificateHash::parse(
+                "8eadaf1cdf363f71ed26d32d033c4cf4ed65010c",
+            )
+            .unwrap(),
+        }
     }
 
     impl LaunchctlCommand for RecordingGatewayLaunchctl {
@@ -3597,6 +3778,21 @@ mod tests {
             executable: &Path,
             arguments: &[std::ffi::OsString],
         ) -> io::Result<crate::launchd::LaunchctlOutput> {
+            if executable == Path::new(code_signing::CODESIGN) {
+                self.codesign.push(arguments.to_vec());
+                if self.real_codesign {
+                    return NativeLaunchctlCommand.run(executable, arguments);
+                }
+                return Ok(crate::launchd::LaunchctlOutput {
+                    status: if self.unsatisfied && arguments[0] == "--verify" {
+                        crate::launchd::CommandStatus::ExitCode(3)
+                    } else {
+                        crate::launchd::CommandStatus::Success
+                    },
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                });
+            }
             assert_eq!(executable, Path::new("/bin/launchctl"));
             self.argv.push(arguments.to_vec());
             Ok(crate::launchd::LaunchctlOutput {
@@ -3658,6 +3854,7 @@ mod tests {
                 None,
                 &mut executor,
                 || Ok(test_bun(&home)),
+                || Ok(test_identity()),
             )
             .await
             .unwrap();
@@ -3687,7 +3884,8 @@ mod tests {
                     None,
                     None,
                     &mut executor,
-                    || Ok(test_bun(&home))
+                    || Ok(test_bun(&home)),
+                    || Ok(test_identity())
                 )
                 .await
                 .unwrap(),
@@ -3729,6 +3927,7 @@ mod tests {
             None,
             &mut executor,
             || Ok(test_bun(&home)),
+            || Ok(test_identity()),
         )
         .await
         .unwrap();
@@ -3815,6 +4014,7 @@ mod tests {
                 None,
                 &mut executor,
                 || Ok(test_bun(&home)),
+                || Ok(test_identity()),
             )
             .await
             .unwrap();
@@ -3959,6 +4159,7 @@ mod tests {
                 None,
                 executor,
                 || Ok(test_bun(&home)),
+                || Ok(test_identity()),
             )
             .await
             .unwrap()
@@ -4047,6 +4248,7 @@ mod tests {
                 None,
                 &mut executor,
                 || Ok(test_bun(&home)),
+                || Ok(test_identity()),
             )
             .await
             .unwrap()
@@ -4162,7 +4364,8 @@ mod tests {
                 None,
                 None,
                 &mut executor,
-                || Ok(test_bun(&home))
+                || Ok(test_bun(&home)),
+                || Ok(test_identity())
             )
             .await
             .unwrap(),
@@ -4292,6 +4495,7 @@ mod tests {
             &second,
             spec.target(),
             InstallOutcome::Changed,
+            test_identity(),
         )
         .expect_err("launchctl refuses");
         assert!(
@@ -4333,9 +4537,13 @@ mod tests {
         impl LaunchctlCommand for TearingDown {
             fn run(
                 &mut self,
-                _: &Path,
+                executable: &Path,
                 arguments: &[std::ffi::OsString],
             ) -> io::Result<crate::launchd::LaunchctlOutput> {
+                // The gateway host's signature is not launchd's business.
+                if executable == Path::new(code_signing::CODESIGN) {
+                    return Ok(crate::launchd::LaunchctlOutput::success());
+                }
                 let verb = arguments[0].to_string_lossy().into_owned();
                 let (status, stdout) = match verb.as_str() {
                     "print" => (
@@ -4376,6 +4584,7 @@ mod tests {
                 &second,
                 spec.target(),
                 InstallOutcome::Changed,
+                test_identity(),
             )
             .expect_err("the bootout went overdue");
             assert_eq!(error.code, ErrorCode::EnvironmentMissing, "{case}");
@@ -4432,6 +4641,229 @@ mod tests {
         }
     }
 
+    /// What one setup refresh of `candidate` did on `home`: its answer, the launchctl verbs it
+    /// ran and the `codesign` argv it ran, under the recording launchctl `command`.
+    async fn refresh_recording(
+        home: &Path,
+        candidate: &Candidate,
+        command: RecordingGatewayLaunchctl,
+        identity: SigningIdentity,
+    ) -> (
+        Option<ServiceBinaryRefresh>,
+        Vec<Vec<std::ffi::OsString>>,
+        Vec<Vec<std::ffi::OsString>>,
+    ) {
+        let mut executor: RecordingExecutor =
+            LaunchdExecutor::new(NativeFilesystem::new(), command);
+        let refreshed = refresh_gateway_from(
+            HostNamespace::Production,
+            home,
+            IncomingBuild {
+                candidate,
+                debug_build: false,
+                basis: Ok(()),
+            },
+            None,
+            None,
+            &mut executor,
+            || Ok(test_bun(home)),
+            || Ok(identity),
+        )
+        .await
+        .unwrap();
+        let (_, command) = executor.into_parts();
+        (refreshed, command.argv, command.codesign)
+    }
+
+    /// Setup installs the gateway host as a signed copy of the build, and rewrites it when a
+    /// setup moves the stable name to another build, when it is gone, or when it no longer
+    /// satisfies the identity's requirement; a setup of the build already installed only checks
+    /// its signature and leaves the file alone. A rewrite never restarts the gateway by itself.
+    #[tokio::test]
+    async fn setup_signs_the_gateway_host_and_rewrites_it_only_when_it_must() {
+        let (home, executable, _) = host_with_agent("gateway-host");
+        let host = executable.gateway_host();
+        let first = build(&home, "first", b"the first release", None);
+        let second = build(&home, "second", b"the second release", None);
+        let identity = test_identity();
+        let signed_once = |codesign: &[Vec<std::ffi::OsString>]| {
+            assert_eq!(codesign.len(), 1, "{codesign:?}");
+            assert_eq!(
+                codesign[0][..7],
+                identity.sign_arguments(&host)[..7],
+                "{codesign:?}"
+            );
+        };
+
+        let (refreshed, _, codesign) = refresh_recording(
+            &home,
+            &first,
+            RecordingGatewayLaunchctl::default(),
+            identity,
+        )
+        .await;
+        assert!(refreshed.is_some());
+        signed_once(&codesign);
+        assert_eq!(fs::read(&host).unwrap(), b"the first release");
+        assert_eq!(
+            fs::metadata(&host).unwrap().mode() & 0o777,
+            STABLE_BINARY_MODE
+        );
+        let inode = fs::metadata(&host).unwrap().ino();
+
+        let (refreshed, argv, codesign) = refresh_recording(
+            &home,
+            &first,
+            RecordingGatewayLaunchctl::default(),
+            identity,
+        )
+        .await;
+        assert_eq!(refreshed, None);
+        assert!(argv.is_empty(), "{argv:?}");
+        assert_eq!(codesign, [identity.verify_arguments(&host)]);
+        assert_eq!(
+            fs::metadata(&host).unwrap().ino(),
+            inode,
+            "a current host is left alone"
+        );
+
+        let (_, _, codesign) = refresh_recording(
+            &home,
+            &first,
+            RecordingGatewayLaunchctl {
+                unsatisfied: true,
+                ..RecordingGatewayLaunchctl::default()
+            },
+            identity,
+        )
+        .await;
+        assert_eq!(codesign.len(), 2, "verified, then signed: {codesign:?}");
+        assert_eq!(codesign[0], identity.verify_arguments(&host));
+        signed_once(&codesign[1..]);
+
+        let (refreshed, _, codesign) = refresh_recording(
+            &home,
+            &second,
+            RecordingGatewayLaunchctl::default(),
+            identity,
+        )
+        .await;
+        assert!(refreshed.is_some());
+        signed_once(&codesign);
+        assert_eq!(fs::read(&host).unwrap(), b"the second release");
+
+        fs::remove_file(&host).unwrap();
+        let (refreshed, argv, codesign) = refresh_recording(
+            &home,
+            &second,
+            RecordingGatewayLaunchctl::default(),
+            identity,
+        )
+        .await;
+        assert_eq!(refreshed, None, "a repaired host restarts nothing");
+        assert!(argv.is_empty(), "{argv:?}");
+        signed_once(&codesign);
+        assert_eq!(fs::read(&host).unwrap(), b"the second release");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    /// The proof with a throwaway keychain: its home is a scratch directory, and its search-list
+    /// entry and keychain are removed afterwards. Run first, before the user's own:
+    /// `cargo test -p cowshed-cli --lib host_proof -- --ignored --nocapture`.
+    #[cfg(target_os = "macos")]
+    #[ignore = "host proof: adds a throwaway keychain to this user's search list for its run"]
+    #[tokio::test]
+    async fn host_proof_a_throwaway_keychain_signs_without_a_dialog() {
+        let keychain_home = scratch_root("host-proof-keychain");
+        let keychain = Keychain::cowshed(&keychain_home);
+        prove_one_requirement_across_two_setups(&keychain_home).await;
+        let listed = std::process::Command::new(code_signing::SECURITY)
+            .args(["list-keychains", "-d", "user"])
+            .output()
+            .unwrap();
+        let kept: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix('"')?
+                    .strip_suffix('"')
+                    .map(str::to_owned)
+            })
+            .filter(|entry| Path::new(entry) != keychain.path())
+            .collect();
+        let restored = std::process::Command::new(code_signing::SECURITY)
+            .args(["list-keychains", "-d", "user", "-s"])
+            .args(&kept)
+            .status()
+            .unwrap();
+        assert!(restored.success());
+        let _ = std::process::Command::new(code_signing::SECURITY)
+            .arg("delete-keychain")
+            .arg(keychain.path())
+            .status();
+        fs::remove_dir_all(keychain_home).unwrap();
+    }
+
+    /// The same proof with this user's own cowshed keychain, the one setup uses.
+    #[cfg(target_os = "macos")]
+    #[ignore = "host proof: makes or reuses this user's cowshed signing keychain and identity"]
+    #[tokio::test]
+    async fn host_proof_the_gateway_host_keeps_its_designated_requirement_across_two_setups() {
+        prove_one_requirement_across_two_setups(&canonical_home().unwrap()).await;
+    }
+
+    /// Host proof (05_gateway.md "The gateway host"): two setups of two different builds into an
+    /// isolated home — its own `bin`, its own plist, launchd recorded and never asked — sign the
+    /// gateway host with an identity in cowshed's keychain under `keychain_home`, made there when
+    /// it holds none, and the host's designated requirement is the same after both while its code
+    /// is not. Every step is given what it needs, so none can raise a dialog.
+    #[cfg(target_os = "macos")]
+    async fn prove_one_requirement_across_two_setups(keychain_home: &Path) {
+        use cowshed_os::fork_lock::Run as _;
+        let identity = gateway_host_identity(keychain_home).unwrap();
+        let (home, executable, _) = host_with_agent("host-proof");
+        let host = executable.gateway_host();
+        let mut seen = Vec::new();
+        for (name, program) in [("first", "/usr/bin/true"), ("second", "/usr/bin/false")] {
+            let candidate = build(&home, name, &fs::read(program).unwrap(), None);
+            refresh_recording(
+                &home,
+                &candidate,
+                RecordingGatewayLaunchctl {
+                    real_codesign: true,
+                    ..RecordingGatewayLaunchctl::default()
+                },
+                identity,
+            )
+            .await;
+            let shown = std::process::Command::new(code_signing::CODESIGN)
+                .args(["-dvvv", "-r-"])
+                .arg(&host)
+                .output_locked()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&shown.stderr),
+                String::from_utf8_lossy(&shown.stdout)
+            );
+            cowshed_os::eprintln!(
+                "setup {name} ({program}): codesign -dvvv -r- {}\n{text}",
+                host.display()
+            );
+            let line = |prefix: &str| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix(prefix))
+                    .unwrap_or_else(|| panic!("no {prefix} in {text}"))
+                    .to_owned()
+            };
+            seen.push((line("designated => "), line("CDHash=")));
+        }
+        assert_eq!(seen[0].0, identity.designated_requirement());
+        assert_eq!(seen[0].0, seen[1].0, "one requirement across both setups");
+        assert_ne!(seen[0].1, seen[1].1, "two setups installed two builds");
+        fs::remove_dir_all(home).unwrap();
+    }
+
     /// A build whose package has no Nx cache server dependency cannot be installed: the refresh
     /// names the missing companion and stops before any launchctl call or change to the stable name.
     #[tokio::test]
@@ -4460,6 +4892,7 @@ mod tests {
             None,
             &mut executor,
             || Ok(test_bun(&home)),
+            || Ok(test_identity()),
         )
         .await
         .expect_err("the companion is required");

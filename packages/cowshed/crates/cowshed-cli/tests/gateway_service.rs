@@ -961,7 +961,11 @@ fn installing_the_agent_binary_publishes_a_content_addressed_copy_and_reuses_it(
     // The plist launchd reads names the stable name, which never changes with the build.
     let spec = LaunchAgentSpec::gateway(HostNamespace::Production, &executable, &bun())
         .expect("valid spec");
-    assert_eq!(spec.program_arguments().next(), executable.path().to_str());
+    assert_eq!(
+        spec.program_arguments().next(),
+        executable.gateway_host().to_str()
+    );
+    assert_eq!(spec.program_arguments().nth(2), executable.path().to_str());
 
     // A current copy is left in place: same inode, no rewrite of a running binary.
     let reinstalled = install_host_stable_executable(&mut executor, &home, &source)
@@ -1043,7 +1047,11 @@ fn installing_from_a_workspace_build_copies_onto_the_host_volume() {
     );
     let spec = LaunchAgentSpec::gateway(HostNamespace::Production, &executable, &bun())
         .expect("valid spec");
-    assert_eq!(spec.program_arguments().next(), executable.path().to_str());
+    assert_eq!(
+        spec.program_arguments().next(),
+        executable.gateway_host().to_str()
+    );
+    assert_eq!(spec.program_arguments().nth(2), executable.path().to_str());
 
     fs::remove_dir_all(&home).expect("remove scratch home");
 }

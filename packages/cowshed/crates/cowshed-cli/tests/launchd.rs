@@ -6,6 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use cowshed_apfs::image::ImageCapacity;
+use cowshed_cli::code_signing::{CODESIGN, CertificateHash, SigningIdentity};
 use cowshed_cli::launchd::{
     BunDirectory, CARGO_LINK_NAME, COWSHED_BINARY_NAME, CommandStatus, ControlAction,
     ControlExecutionError, ControlPlan, DevenvProfile, ExecutableDigest, ExecutableInstallState,
@@ -14,7 +15,8 @@ use cowshed_cli::launchd::{
     LaunchdError, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, Mutation,
     NativeFilesystem, PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE, SCCACHE_BINARY_NAME,
     STABLE_BINARY_MODE, ServiceLifecycle, StableLink, StoreBackedProgram, plan_cargo_link_removal,
-    plan_executable_install, plan_executable_remove, plan_install, plan_remove, replace_symlink,
+    plan_executable_install, plan_executable_remove, plan_gateway_host_install, plan_install,
+    plan_remove, replace_symlink,
 };
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
@@ -32,6 +34,9 @@ const HOME: &str = "/Users/cowshed-test";
 /// The only path shape a cowshed LaunchAgent can name: on the volume that carries the plist.
 const EXECUTABLE: &str = "/Users/cowshed-test/Library/Application Support/dev.cowshed/bin/cowshed";
 const BINARY_DIRECTORY: &str = "/Users/cowshed-test/Library/Application Support/dev.cowshed/bin";
+/// The program the gateway agent names: the gateway host, beside the stable name.
+const GATEWAY_HOST: &str =
+    "/Users/cowshed-test/Library/Application Support/dev.cowshed/bin/cowshed-gateway-host";
 const SUPPORT_DIRECTORY: &str = "/Users/cowshed-test/Library/Application Support/dev.cowshed";
 /// The nix GC root `cowshed setup --sccache` registers, and the store path it pins. The sccache
 /// agent names the store path, so the plist carries the build's own content hash rather than a
@@ -73,8 +78,11 @@ fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_bytes() {
     let spec = gateway();
 
     assert_eq!(spec.label(), "dev.cowshed.gateway");
-    assert_eq!(spec.executable(), Path::new(EXECUTABLE));
-    assert_eq!(spec.arguments(), ["gateway", "run"]);
+    assert_eq!(spec.executable(), Path::new(GATEWAY_HOST));
+    assert_eq!(
+        spec.arguments(),
+        ["__gateway-host", EXECUTABLE, "gateway", "run"]
+    );
     assert_eq!(spec.lifecycle(), ServiceLifecycle::KeepAlive);
     assert_eq!(
         spec.plist_path(),
@@ -90,7 +98,7 @@ fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_bytes() {
     );
     assert_eq!(
         spec.program_arguments().collect::<Vec<_>>(),
-        vec![EXECUTABLE, "gateway", "run"]
+        vec![GATEWAY_HOST, "__gateway-host", EXECUTABLE, "gateway", "run"]
     );
 
     let expected = concat!(
@@ -103,6 +111,8 @@ fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_bytes() {
         "  <string>dev.cowshed.gateway</string>\n",
         "  <key>ProgramArguments</key>\n",
         "  <array>\n",
+        "    <string>/Users/cowshed-test/Library/Application Support/dev.cowshed/bin/cowshed-gateway-host</string>\n",
+        "    <string>__gateway-host</string>\n",
         "    <string>/Users/cowshed-test/Library/Application Support/dev.cowshed/bin/cowshed</string>\n",
         "    <string>gateway</string>\n",
         "    <string>run</string>\n",
@@ -1174,6 +1184,7 @@ fn each_agent_plist_names_only_the_program_its_type_can_prove() {
     assert_eq!(cowshed.support_directory(), Path::new(SUPPORT_DIRECTORY));
     assert_eq!(cowshed.home(), Path::new(HOME));
     assert_eq!(cowshed.name(), "cowshed");
+    assert_eq!(cowshed.gateway_host(), Path::new(GATEWAY_HOST));
 
     let sccache = sccache_program();
     assert_eq!(sccache.program(), Path::new(SCCACHE_PROGRAM));
@@ -1195,7 +1206,7 @@ fn each_agent_plist_names_only_the_program_its_type_can_prove() {
         )
         .unwrap(),
     ];
-    for (spec, expected) in specs.iter().zip([EXECUTABLE, SCCACHE_PROGRAM]) {
+    for (spec, expected) in specs.iter().zip([GATEWAY_HOST, SCCACHE_PROGRAM]) {
         assert_eq!(spec.executable(), Path::new(expected));
         assert_eq!(spec.program_arguments().next(), Some(expected));
         let plist = String::from_utf8(spec.plist_bytes()).unwrap();
@@ -1536,6 +1547,95 @@ fn executor_publishes_the_copy_and_then_the_link_through_temporary_files() {
     );
 }
 
+/// The gateway host is published as one whole signed file: copied into a temporary file,
+/// signed there by `codesign` with this user's identity, synced, and only then renamed over the
+/// host. A signature `codesign` refuses publishes nothing and leaves no temporary behind.
+#[test]
+fn the_gateway_host_is_signed_before_it_is_published_and_a_refused_signature_publishes_nothing() {
+    let executable = cowshed_binary();
+    let identity = SigningIdentity {
+        certificate: CertificateHash::parse("8eadaf1cdf363f71ed26d32d033c4cf4ed65010c").unwrap(),
+    };
+    let source = PathBuf::from("/nix/store/abc-cowshed/bin/cowshed");
+    let plan = plan_gateway_host_install(&executable, &source, identity);
+    let binary_directory = PathBuf::from(BINARY_DIRECTORY);
+    let temporary = binary_directory.join(".exclusive-no-follow-temp");
+    assert_eq!(
+        plan.operations(),
+        [
+            Mutation::CopyToTemporaryFile {
+                directory: binary_directory.clone(),
+                name_prefix: ".cowshed-gateway-host.".into(),
+                source: source.clone(),
+                mode: STABLE_BINARY_MODE,
+            },
+            Mutation::SignTemporaryFile { identity },
+            Mutation::SyncTemporaryFile,
+            Mutation::RenameTemporaryFile {
+                destination: PathBuf::from(GATEWAY_HOST),
+            },
+            Mutation::SyncDirectory {
+                path: binary_directory.clone(),
+            },
+        ]
+    );
+
+    let mut executor = LaunchdExecutor::new(
+        FakeFilesystem::default(),
+        FakeCommand::with_outputs([Ok(LaunchctlOutput::success())]),
+    );
+    assert_eq!(
+        executor.execute_install(&plan).unwrap(),
+        InstallOutcome::Changed
+    );
+    let (filesystem, command) = executor.into_parts();
+    assert_eq!(
+        command.invocations,
+        [CommandInvocation {
+            executable: PathBuf::from(CODESIGN),
+            arguments: identity.sign_arguments(&temporary),
+        }]
+    );
+    assert_eq!(
+        filesystem.events,
+        [
+            FilesystemEvent::CopyTemporary {
+                directory: binary_directory.clone(),
+                name_prefix: ".cowshed-gateway-host.".into(),
+                source,
+                mode: STABLE_BINARY_MODE,
+            },
+            FilesystemEvent::SyncFile(temporary.clone()),
+            FilesystemEvent::Rename(temporary.clone(), PathBuf::from(GATEWAY_HOST)),
+            FilesystemEvent::SyncDirectory(binary_directory),
+        ]
+    );
+
+    let mut executor = LaunchdExecutor::new(
+        FakeFilesystem::default(),
+        FakeCommand::with_outputs([Ok(LaunchctlOutput {
+            status: CommandStatus::ExitCode(1),
+            stdout: Vec::new(),
+            stderr: b"no identity found".to_vec(),
+        })]),
+    );
+    let error = executor.execute_install(&plan).unwrap_err();
+    assert_eq!(error.operation(), FilesystemOperation::SignTemporaryFile);
+    assert!(error.to_string().contains("no identity found"), "{error}");
+    let (filesystem, _) = executor.into_parts();
+    assert_eq!(
+        filesystem.events.last(),
+        Some(&FilesystemEvent::Remove(temporary))
+    );
+    assert!(
+        !filesystem
+            .events
+            .iter()
+            .any(|event| matches!(event, FilesystemEvent::Rename(..))),
+        "an unsigned host is never published"
+    );
+}
+
 /// The same discipline on the real filesystem: the stable name is replaced by a rename, so a
 /// reader meets the old build or the new one and never an absence, and what it replaces may be a
 /// link or the plain binary an older install left there.
@@ -1775,9 +1875,10 @@ mod descriptor_inheritance {
             quote(&socket),
             quote(&std::env::current_exe().expect("probe test binary"))
         );
-        fs::write(executable.path(), program).expect("launchd probe executable");
+        // The plist names the gateway host; the probe stands in for it and ignores its arguments.
+        fs::write(executable.gateway_host(), program).expect("launchd probe executable");
         fs::set_permissions(
-            executable.path(),
+            executable.gateway_host(),
             fs::Permissions::from_mode(STABLE_BINARY_MODE),
         )
         .expect("executable mode");

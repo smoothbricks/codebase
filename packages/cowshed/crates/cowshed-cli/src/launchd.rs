@@ -21,6 +21,11 @@ pub const PRIVATE_PLIST_MODE: u32 = 0o600;
 pub const STABLE_BINARY_MODE: u32 = 0o755;
 pub const COWSHED_BINARY_NAME: &str = "cowshed";
 
+/// The gateway host's name in the host-stable directory (05_gateway.md "The gateway host"): the
+/// program launchd runs for the gateway agent, a signed copy of the build at a path no install
+/// moves, so the path and designated requirement a Developer Tools entry holds never change.
+pub const GATEWAY_HOST_NAME: &str = "cowshed-gateway-host";
+
 /// `cargo` in the host-stable directory. Earlier installs linked it beside the stable `cowshed`
 /// name, and that binary answered as `cargo`; cowshed no longer does — a CPU grant reaches Cargo
 /// as the make jobserver configuration Cargo reads itself (05_gateway.md, "Host CPU budget") — so
@@ -181,6 +186,10 @@ impl HostStableExecutable {
             .expect("derived paths always have a parent")
     }
 
+    /// The gateway host beside this stable name: [`GATEWAY_HOST_NAME`] in [`Self::directory`].
+    pub fn gateway_host(&self) -> PathBuf {
+        self.directory().join(GATEWAY_HOST_NAME)
+    }
     /// The content-addressed copy of the build whose bytes hash to `digest`: `<name>-<digest>`,
     /// beside the stable name. It is written once, by the install that first meets those bytes,
     /// and never rewritten, so whatever runs from it runs exactly that build for as long as it
@@ -473,6 +482,11 @@ impl LaunchAgentSpec {
     /// The label is `namespace`'s ([`HostNamespace::launchd_label`], 01_storage.md "Host
     /// namespace"): production's `dev.cowshed.gateway`, a test namespace's
     /// `dev.cowshed-test-<ns>.gateway`.
+    ///
+    /// launchd runs the gateway host ([`crate::gateway_host`]) from its fixed path, and the host
+    /// runs the stable name's `gateway run` as its child: the daemon runs its own content-addressed
+    /// copy, and every process it starts, every workspace job included, has the host as its
+    /// responsible process.
     pub fn gateway(
         namespace: HostNamespace,
         executable: &HostStableExecutable,
@@ -484,10 +498,19 @@ impl LaunchAgentSpec {
         );
         let mut spec = Self::assemble(
             executable.home(),
-            executable.path(),
+            &executable.gateway_host(),
             AgentDefinition {
                 label: namespace.launchd_label("gateway"),
-                arguments: vec!["gateway".into(), "run".into()],
+                arguments: vec![
+                    crate::gateway_host::VERB.into(),
+                    executable
+                        .path()
+                        .to_str()
+                        .expect("validated paths are UTF-8")
+                        .into(),
+                    "gateway".into(),
+                    "run".into(),
+                ],
                 environment: vec![("PATH".to_owned(), path)],
                 lifecycle: ServiceLifecycle::KeepAlive,
                 standard_error_file: "daemon-stderr.log",
@@ -748,6 +771,12 @@ pub enum Mutation {
         name_prefix: String,
         target: PathBuf,
     },
+    /// Sign the active temporary file in place as the gateway host with `identity`
+    /// ([`crate::code_signing`]), through the executor's command runner, so the bytes renamed
+    /// into place are the signed ones.
+    SignTemporaryFile {
+        identity: crate::code_signing::SigningIdentity,
+    },
     SyncTemporaryFile,
     RenameTemporaryFile {
         destination: PathBuf,
@@ -936,6 +965,36 @@ pub fn plan_executable_install(
     }
 
     InstallPlan { operations }
+}
+
+/// Plan the gateway host's install (05_gateway.md "The gateway host"): `source` copied into a
+/// temporary file beside [`HostStableExecutable::gateway_host`], signed there with `identity`,
+/// synced, and renamed over the host. The host is one file at a path no install moves, so
+/// launchd and a Developer Tools entry always name the same one; each rewrite replaces it whole
+/// in one rename, and a host still running keeps the file it started from. The directory exists:
+/// the stored copy's install, which made it, runs first.
+pub fn plan_gateway_host_install(
+    executable: &HostStableExecutable,
+    source: &Path,
+    identity: crate::code_signing::SigningIdentity,
+) -> InstallPlan {
+    let directory = executable.directory().to_path_buf();
+    InstallPlan {
+        operations: vec![
+            Mutation::CopyToTemporaryFile {
+                directory: directory.clone(),
+                name_prefix: format!(".{GATEWAY_HOST_NAME}."),
+                source: source.to_path_buf(),
+                mode: STABLE_BINARY_MODE,
+            },
+            Mutation::SignTemporaryFile { identity },
+            Mutation::SyncTemporaryFile,
+            Mutation::RenameTemporaryFile {
+                destination: executable.gateway_host(),
+            },
+            Mutation::SyncDirectory { path: directory },
+        ],
+    }
 }
 
 /// Plan the removal of the `cargo` link an earlier install left in the host-stable `directory`.
@@ -1273,6 +1332,7 @@ pub enum FilesystemOperation {
     CreateTemporaryFile,
     CreateTemporarySymlink,
     CopyTemporaryFile,
+    SignTemporaryFile,
     SyncTemporaryFile,
     RenameTemporaryFile,
     RemoveFile,
@@ -1615,13 +1675,29 @@ impl<F, C> LaunchdExecutor<F, C> {
     }
 }
 
+impl<F, C: LaunchctlCommand> LaunchdExecutor<F, C> {
+    /// Whether `path` carries `identity`'s signature intact, its designated requirement
+    /// satisfied, as `codesign --verify` judges it through the executor's command runner.
+    pub fn satisfies(
+        &mut self,
+        path: &Path,
+        identity: crate::code_signing::SigningIdentity,
+    ) -> io::Result<bool> {
+        let output = self.command.run(
+            Path::new(crate::code_signing::CODESIGN),
+            &identity.verify_arguments(path),
+        )?;
+        crate::code_signing::verification(output.status, &output.stderr).map_err(io::Error::other)
+    }
+}
+
 impl LaunchdExecutor<NativeFilesystem, NativeLaunchctlCommand> {
     pub fn native() -> Self {
         Self::new(NativeFilesystem::new(), NativeLaunchctlCommand)
     }
 }
 
-impl<F: LaunchdFilesystem, C> LaunchdExecutor<F, C> {
+impl<F: LaunchdFilesystem, C: LaunchctlCommand> LaunchdExecutor<F, C> {
     pub fn execute_install(
         &mut self,
         plan: &InstallPlan,
@@ -1727,6 +1803,29 @@ impl<F: LaunchdFilesystem, C> LaunchdExecutor<F, C> {
                             Err(error),
                         ),
                     }
+                }
+                Mutation::SignTemporaryFile { identity } => {
+                    let Some(path) = temporary_file.as_deref() else {
+                        return Err(InstallExecutionError::InvalidPlan {
+                            operation: FilesystemOperation::SignTemporaryFile,
+                            reason: "there is no active temporary file",
+                        });
+                    };
+                    let signed = self
+                        .command
+                        .run(
+                            Path::new(crate::code_signing::CODESIGN),
+                            &identity.sign_arguments(path),
+                        )
+                        .and_then(|output| match output.status {
+                            CommandStatus::Success => Ok(()),
+                            status => Err(io::Error::other(format!(
+                                "{} ended {status:?}: {}",
+                                crate::code_signing::CODESIGN,
+                                String::from_utf8_lossy(&output.stderr).trim()
+                            ))),
+                        });
+                    (FilesystemOperation::SignTemporaryFile, path, signed)
                 }
                 Mutation::SyncTemporaryFile => {
                     let Some(path) = temporary_file.as_deref() else {

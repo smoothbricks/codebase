@@ -5054,6 +5054,67 @@ fn departed_volume_references_finding(
     })
 }
 
+/// The System Settings pane a Developer Tools entry is added in.
+const DEVELOPER_TOOLS_PANE: &str =
+    "open 'x-apple.systempreferences:com.apple.preference.security?Privacy_DevTools'";
+
+/// Whether workspace jobs pay macOS's first-launch scan, judged from doctor's probe
+/// (05_gateway.md "The gateway host"): `first-launch-exempt` (info) when the gateway's fresh
+/// executable starts at host-shell speed, `first-launch-scan` (warning) naming the one entry to
+/// add when it waits, `first-launch-unmeasured` (warning) when either side measured nothing.
+fn first_launch_finding(reading: Result<gateway_service::FirstLaunchReading>) -> Finding {
+    let unmeasured = |message: String, hint: String| Finding {
+        code: "first-launch-unmeasured".into(),
+        severity: FindingSeverity::Warning,
+        message,
+        hint,
+        path: None,
+    };
+    let reading = match reading {
+        Ok(reading) => reading,
+        Err(error) => return unmeasured(error.message, error.hint),
+    };
+    let gateway = match reading.gateway {
+        Ok(gateway) => gateway,
+        Err(error) => {
+            return unmeasured(
+                format!("the gateway measured no first launch: {error}"),
+                "cowshed setup".into(),
+            );
+        }
+    };
+    let host = reading.host;
+    let ms = |micros: u64| format!("{}.{} ms", micros / 1000, micros % 1000 / 100);
+    let measured = format!(
+        "a fresh executable's first launch took {} under the gateway (then {}) and {} in this shell (then {})",
+        ms(gateway.first_micros),
+        ms(gateway.second_micros),
+        ms(host.first_micros),
+        ms(host.second_micros)
+    );
+    let path = reading.gateway_host.display();
+    match crate::first_launch::judge(host, gateway) {
+        crate::first_launch::Exemption::Exempt => Finding {
+            code: "first-launch-exempt".into(),
+            severity: FindingSeverity::Info,
+            message: format!(
+                "{measured}: workspace jobs launch new executables at host-shell speed"
+            ),
+            hint: String::new(),
+            path: Some(reading.gateway_host.clone()),
+        },
+        crate::first_launch::Exemption::Charged => Finding {
+            code: "first-launch-scan".into(),
+            severity: FindingSeverity::Warning,
+            message: format!(
+                "{measured}: macOS scans every new executable a workspace job launches, because the gateway host {path} has no Developer Tools entry; add it once in System Settings → Privacy & Security → Developer Tools → + (⇧⌘G takes the path {path})"
+            ),
+            hint: DEVELOPER_TOOLS_PANE.into(),
+            path: Some(reading.gateway_host.clone()),
+        },
+    }
+}
+
 async fn diagnose_host() -> Result<Vec<Finding>> {
     use cowshed_core::doctor::{probe, probe_sync, probe_value, waits_on};
     let home = gateway_service::canonical_home()?;
@@ -5090,6 +5151,7 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
         gateway_service::service_status_within(&roots, DOCTOR_PEER_ANSWER).await
     })
     .await;
+    let serves = matches!(&gateway, Ok(Ok(status)) if status.running);
     match gateway {
         Ok(Ok(status)) => findings.extend(gateway_findings(&status)),
         Ok(Err(unanswered)) => findings.push(unanswered_finding(
@@ -5105,6 +5167,19 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
             hint: "cowshed gateway start".into(),
             path: None,
         }),
+    }
+    // Only a gateway that serves can measure: one that is down or silent is its own finding.
+    if serves {
+        findings.push(first_launch_finding(
+            probe("first-launch", async {
+                waits_on(
+                    format_args!("first-launch"),
+                    format_args!("the gateway daemon at {}", roots.control_socket().display()),
+                );
+                gateway_service::first_launch_within(&roots, DOCTOR_PEER_ANSWER).await
+            })
+            .await,
+        ));
     }
     findings.extend(vnode_table_finding(probe_sync(
         format_args!("vnode-table"),
@@ -6455,6 +6530,61 @@ mod tests {
         assert!(vnode_table_finding(Ok(full_cache)).is_none());
         let linux = std::io::Error::new(std::io::ErrorKind::Unsupported, "no vnode table");
         assert!(vnode_table_finding(Err(linux)).is_none());
+    }
+
+    fn reading(
+        host: (u64, u64),
+        gateway: std::result::Result<(u64, u64), &str>,
+    ) -> Result<gateway_service::FirstLaunchReading> {
+        let launch = |(first, second): (u64, u64)| cowshed_gateway_types::FirstLaunch {
+            first_micros: first * 1000,
+            second_micros: second * 1000,
+        };
+        Ok(gateway_service::FirstLaunchReading {
+            host: launch(host),
+            gateway: gateway.map(launch).map_err(str::to_owned),
+            gateway_host: PathBuf::from(
+                "/home/Library/Application Support/dev.cowshed/bin/cowshed-gateway-host",
+            ),
+        })
+    }
+
+    /// A gateway whose fresh executable waits for the scan names the one entry to add, by path,
+    /// and the pane to add it in.
+    #[test]
+    fn a_charged_first_launch_names_the_gateway_host_to_add_to_developer_tools() {
+        let finding = first_launch_finding(reading((25, 27), Ok((6_800, 29))));
+        assert_eq!(finding.code, "first-launch-scan");
+        assert_eq!(finding.severity, FindingSeverity::Warning);
+        assert!(
+            finding.message.contains("6800.0 ms under the gateway (then 29.0 ms) and 25.0 ms in this shell (then 27.0 ms)"),
+            "{finding:?}"
+        );
+        assert!(finding.message.contains("Developer Tools"), "{finding:?}");
+        assert!(
+            finding
+                .message
+                .contains("/home/Library/Application Support/dev.cowshed/bin/cowshed-gateway-host"),
+            "{finding:?}"
+        );
+        assert_eq!(finding.hint, DEVELOPER_TOOLS_PANE);
+        assert!(
+            doctor_report(vec![finding]).healthy,
+            "a scan is a cost, not a broken host"
+        );
+    }
+
+    #[test]
+    fn an_exempt_first_launch_is_information_and_a_missing_measurement_a_warning() {
+        let exempt = first_launch_finding(reading((25, 27), Ok((31, 26))));
+        assert_eq!(exempt.code, "first-launch-exempt");
+        assert_eq!(exempt.severity, FindingSeverity::Info);
+        assert!(exempt.hint.is_empty());
+        let older =
+            first_launch_finding(reading((25, 27), Err("unknown gateway control operation")));
+        assert_eq!(older.code, "first-launch-unmeasured");
+        assert_eq!(older.severity, FindingSeverity::Warning);
+        assert_eq!(older.hint, "cowshed setup");
     }
 
     #[test]
