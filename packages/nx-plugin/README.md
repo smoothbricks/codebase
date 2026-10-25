@@ -1798,9 +1798,11 @@ unresolved mutation custody fail closed.
 The volume marker is version 1 JSON containing `volumeName`, `owner: "gateway"` and the exact `registryEntry` captured
 immediately after this gateway attach. Before leasing, a fresh registry/mount snapshot proves that entry still names
 this mounted volume; the root and marker identities are revalidated under the ledger lock. A changed identity refuses
-instead of silently following a replacement. A legacy name-only marker or an unmarked disk with no exact creation
-receipt is unproven: it is not leased, rewritten, reclaimed or detached. Fixture debris reclamation consumes only the
-exact identities its own real attaches recorded, never UID or size alone.
+instead of silently following a replacement. The last release detaches outside the lock, so the volume can go between
+these reads: a volume gone part way is no volume, as when its marker is absent, and the caller looks again, proving
+whatever it then finds afresh; only a volume still mounted under the same identity is refused. A legacy name-only marker
+or an unmarked disk with no exact creation receipt is unproven: it is not leased, rewritten, reclaimed or detached.
+Fixture debris reclamation consumes only the exact identities its own real attaches recorded, never UID or size alone.
 
 The volume's kernel `O_EXLOCK` admits ledger mutations and releases on process death. It is held only for cheap lease
 and operation claims and their publication: host-wide process and disk-inventory probes, directory cleanup, provisioning

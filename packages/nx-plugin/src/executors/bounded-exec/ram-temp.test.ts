@@ -12,7 +12,7 @@ import {
   watch,
   writeFileSync,
 } from 'node:fs';
-import { readFile, writeFile } from 'node:fs/promises';
+import { open, readFile, writeFile } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
@@ -1181,6 +1181,62 @@ describe('creating the RAM temp volume', () => {
           detail: '/dev/disk9 has no exact gateway creation receipt; no reclaim or detach admitted',
         },
       });
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('observing the RAM temp volume', () => {
+  it('takes a volume detached while its marker is read as no volume, and creates one, never failing the lease', async () => {
+    // Another caller's last release detaches the volume outside the lock while this acquire observes it: the marker is
+    // a FIFO, so the acquire's read ends only when the test closes its writer, after the marker is gone, which is what
+    // the detach leaves between the marker's read and the identity's lstat.
+    const parent = mkdtempSync(join(tmpdir(), 'ra-gone-'));
+    const root = join(parent, 'root');
+    mkdirSync(root, { mode: 0o700 });
+    const paths = {
+      ...ramTempPaths(userInfo(), NAMESPACE),
+      root,
+      mountpoint: join(root, 'ram'),
+      leaseBytesMax: Number.MAX_SAFE_INTEGER,
+      staging: join(root, 'ram-new'),
+      lockFile: join(parent, 'v.lock'),
+    };
+    mkdirSync(paths.mountpoint);
+    const marker = join(paths.mountpoint, '.smoo-ram');
+    execFileSync('/usr/bin/mkfifo', [marker]);
+    const asked: number[] = [];
+    const commands: HostCommands = {
+      async run(file, args): Promise<CommandOutput> {
+        if (file === '/usr/sbin/ioreg' || file === '/sbin/mount') {
+          return { status: 0, stdout: '', stderr: '' };
+        }
+        throw new Error(`${[file, ...args].join(' ')} ran: only the creation inventory runs before the attach`);
+      },
+      async detachRam() {
+        throw new Error('no disk exists');
+      },
+      async attachRam(sectors) {
+        asked.push(sectors);
+        return { ok: false, error: 'the owner refused' };
+      },
+    };
+    try {
+      const acquired = new RamTempVolume(paths, 64 * 1024 * 1024, commands).acquire(noSubtrees);
+      // Opens once the acquire has opened the marker for its read.
+      const writer = await open(marker, 'w');
+      await writer.writeFile(
+        JSON.stringify({ version: 1, volumeName: paths.volumeName, owner: 'gateway', registryEntry: '0x100000abc' }),
+      );
+      rmSync(marker);
+      await writer.close();
+      // Gone is no volume: the acquire creates one, which reaches the attach its owner refuses.
+      expect(await acquired).toEqual({
+        ok: false,
+        error: { kind: 'provision-failed', step: 'ram-lease', detail: 'the owner refused' },
+      });
+      expect(asked).toEqual([131_072]);
     } finally {
       rmSync(parent, { recursive: true, force: true });
     }

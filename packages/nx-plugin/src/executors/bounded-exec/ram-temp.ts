@@ -1331,7 +1331,14 @@ export class RamTempVolume {
       if (!before.ok) return before;
       if (before.value !== null && op.provenance !== before.value.key) {
         const validated = await this.validateProvenance(before.value);
-        if (!validated.ok) return validated;
+        if (!validated.ok) {
+          // The last release detaches outside the lock, so the volume can go between its observation and this
+          // registry read: a volume no longer there is looked at again, and only the one still mounted is refused.
+          const again = await this.observe();
+          if (!again.ok) return again;
+          if (again.value?.key !== before.value.key) continue;
+          return validated;
+        }
         op.provenance = before.value.key;
       }
       const lock = await this.lock();
@@ -1449,19 +1456,23 @@ export class RamTempVolume {
     let root: BigIntStats;
     let parent: BigIntStats;
     let mark: BigIntStats;
+    let names: string[];
     try {
       [root, parent, mark] = await Promise.all([
         stat(this.paths.mountpoint, { bigint: true }),
         stat(join(this.paths.mountpoint, '..'), { bigint: true }),
         lstat(markerPath, { bigint: true }),
       ]);
+      names = await readdir(this.paths.mountpoint);
     } catch (error) {
       if (errorCode(error) === 'EPERM') return denied(this.paths.mountpoint, error);
+      // The marker was read, then the volume went: the last release detaches it outside the lock, and its mountpoint
+      // with it. What is mounted now is nothing, as when the marker is not there to read.
+      if (errorCode(error) === 'ENOENT') return { ok: true, value: null };
       throw error;
     }
     if (root.dev === parent.dev || !mark.isFile())
       return failed('provenance', 'gateway marker is not on a separately mounted RAM volume');
-    const names = await readdir(this.paths.mountpoint);
     const rootIdentity = `root ${root.dev}:${root.ino}:${root.birthtimeNs}`;
     const registry = `registry ${marker.registryEntry}`;
     return {
