@@ -36,15 +36,38 @@ async function recordedCheckout(): Promise<{ root: string; checkout: string }> {
   return { root, checkout };
 }
 
-/** This process's `cowshed host` children: the launcher execs the binary, so each is our child. */
+/**
+ * This process's `cowshed host` children: the launcher execs the binary, so each is our child. Only this process's own
+ * children are read, never the host's process table: a process of the user caught in an uninterruptible kernel wait
+ * holds a reader of that table there with it, which `ps -ax` was. `pgrep -P` names the children from the kernel's
+ * parent links and `ps -p` reads those pids alone, both through PATH as nx-plugin's process-children.ts does (NixOS has
+ * no /bin/ps); a cowshed test cannot import that module without every cowshed cache key following the plugin's sources.
+ */
 function hostChildren(): number[] {
-  const listed = spawnSync('/bin/ps', ['-ax', '-o', 'pid=,ppid=,command='], { encoding: 'utf8' });
-  expect(listed.status).toBe(0);
-  return listed.stdout
+  const children = list('pgrep', ['-P', String(process.pid)])
     .split('\n')
-    .map((line) => line.trim().split(/\s+/))
-    .filter(([, ppid, ...command]) => Number(ppid) === process.pid && command.join(' ').endsWith('cowshed host'))
-    .map(([pid]) => Number(pid));
+    .filter((line) => line !== '');
+  if (children.length === 0) {
+    return [];
+  }
+  return list('ps', ['-o', 'pid=', '-o', 'command=', '-p', children.join(',')])
+    .split('\n')
+    .flatMap((line) => {
+      const [, pid, command] = /^\s*(\d+)\s+(.*)$/.exec(line) ?? [];
+      return pid !== undefined && command?.endsWith('cowshed host') ? [Number(pid)] : [];
+    });
+}
+
+/** The output of `file args` through PATH: `pgrep -P` and `ps -p` exit 1 with no output when no process matches. */
+function list(file: string, args: readonly string[]): string {
+  const ran = spawnSync(file, args, { encoding: 'utf8' });
+  if (ran.status === 0) {
+    return ran.stdout;
+  }
+  if (ran.status === 1 && ran.stdout === '' && ran.stderr === '') {
+    return '';
+  }
+  throw new Error(`${file} ${args.join(' ')} failed (${ran.error ?? `status ${ran.status}`}): ${ran.stderr}`);
 }
 
 describe('openHost', () => {

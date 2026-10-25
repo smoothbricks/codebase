@@ -1007,9 +1007,9 @@ Concrete targets come from concrete files:
 - `cargo-test` is the ordinary suite alone: it depends on the crate pieces and never on a serial group, so a run of it
   never reaches a group's real-image tests. The inferred `test` of the cargo workspace root and of every project that
   owns crates depends on `cargo-test` alone. Explicit repository config owns host coverage: this repository's root
-  `host-e2e` depends on both real-APFS groups, and `gate` depends on `host-e2e` plus every project's `lint`, `test` and
-  `build`. `nx run-many -t gate` therefore covers the host boundary without pulling it into ordinary `test`; each group
-  replays from cache unless its own inputs changed.
+  `host-e2e` depends on both real-APFS groups and on cowshed's `host-napi-test`, and `gate` depends on `host-e2e` plus
+  every project's `lint`, `test` and `build`. `nx run-many -t gate` therefore covers the host boundary without pulling
+  it into ordinary `test`; each proof replays from cache unless its own inputs changed.
 - A group's runner hashes only the crates its filter can select tests from, with everything they link, every member
   manifest and the repository's nextest config, so a change to an unrelated crate leaves it cached. The filter is read
   as nextest reads it (its precedence, blanks and predicate arguments; `filterScope`): a plain `package(<name>)` or

@@ -469,7 +469,7 @@
           "^build"
         ],
         "options": {
-          "comment": "openHost and the typed launchers end to end: the built addon starts the package launcher's cowshed host, and each launcher spawns its verb through the package launcher, so the launcher's binary must be this checkout's build.",
+          "comment": "openHost and the typed launchers end to end: the built addon starts the package launcher's cowshed host, and each launcher spawns its verb through the package launcher, so the launcher's binary must be this checkout's build. It needs a Mac: host.diskCommand runs the real hdiutil. The root host-e2e aggregate reaches it and gate reaches it through that; test never does, because the Linux CI job runs test (specs/cowshed/08_testing.md, CI).",
           "command": "bun test --config=../bunfig.napi-test.toml --timeout=0 host.napi.test.ts launchers.napi.test.ts",
           "cwd": "{projectRoot}/src",
           "env": {
@@ -704,7 +704,7 @@
       },
       "test": {
         "executor": "nx:noop",
-        "//": "Replaces the inferred test. cargo-test is the ordinary crate suite alone, reached here through napi-test. The root's host-e2e aggregate owns the serial real-image groups, and gate reaches them without adding them to ordinary test. They replay from cache unless their own inputs change.",
+        "//": "Replaces the inferred test. cargo-test is the ordinary crate suite alone, reached here through napi-test. The root's host-e2e aggregate owns the serial real-image groups and host-napi-test, and gate reaches them without adding them to ordinary test. They replay from cache unless their own inputs change.",
         "dependsOn": [
           "napi-test",
           "launcher-test",

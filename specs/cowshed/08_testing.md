@@ -759,19 +759,26 @@ Native-host integration whose subject combines physical images with core lifecyc
 assertions, image resizing, re-adoption and native recovery boundaries. The host target depends on the disk-image
 target: the two groups never run concurrently. Each nextest group declares `max-threads = 1`. `.config/nextest.toml`
 owns their package-scoped selection filters, and the code-time wrapper rules select the same tests. Ordinary and
-exceptions shards exclude those filters. The root `host-e2e` target depends on both groups; the root `gate` target
-depends on every project's `lint`, `test` and `build` plus `host-e2e`. The land wrapper (`tooling/land-host.sh`) runs
-`nx run-many -t gate --parallel=$(sysctl -n hw.ncpu)` after rebasing and stopping the workspace's daemon. **The landing
-gate is never CPU-limited**: it runs at the core count, at default priority, with no `taskpolicy -b` and no outer
-deadline, because it is the run that moves main. Measured 2026-10-16: the same gate took 40 minutes capped at
-`--parallel=2` under `taskpolicy -b` and 4m44s uncapped, and two per-test timeouts that reproduced in every capped run
-did not reproduce once the cap was removed - the failures were the cap, not the tests. Exploratory runs are the ones
-that get limited, and they are limited by being stopped rather than by being niced. This reaches the same checks as
-naming the ordinary targets and both host groups explicitly, but Nx owns the target list. Ordinary `test` remains free
-of the expensive host groups: Rule 2 keeps the inner loop cheap, while the explicit land gate includes host coverage and
-each group replays from cache unless its own inputs changed. `nx run-many -t host-e2e` is the focused host proof. Every
-test has one runner, and non-macOS inference supplies neither APFS runner; package-declared placeholders and explicit
-dependency edges may remain.
+exceptions shards exclude those filters. The root `host-e2e` target depends on both groups and on
+`cowshed:host-napi-test`; the root `gate` target depends on every project's `lint`, `test` and `build` plus `host-e2e`.
+The land wrapper (`tooling/land-host.sh`) runs `nx run-many -t gate --parallel=$(sysctl -n hw.ncpu)` after rebasing and
+stopping the workspace's daemon. **The landing gate is never CPU-limited**: it runs at the core count, at default
+priority, with no `taskpolicy -b` and no outer deadline, because it is the run that moves main. Measured 2026-10-16: the
+same gate took 40 minutes capped at `--parallel=2` under `taskpolicy -b` and 4m44s uncapped, and two per-test timeouts
+that reproduced in every capped run did not reproduce once the cap was removed - the failures were the cap, not the
+tests. Exploratory runs are the ones that get limited, and they are limited by being stopped rather than by being niced.
+This reaches the same checks as naming the ordinary targets, both host groups and `cowshed:host-napi-test` explicitly,
+but Nx owns the target list. Ordinary `test` remains free of the expensive host groups and of that proof: Rule 2 keeps
+the inner loop cheap, while the explicit land gate includes host coverage and each proof replays from cache unless its
+own inputs changed. `nx run-many -t host-e2e` is the focused host proof. Every test has one runner, and non-macOS
+inference supplies neither APFS runner; package-declared placeholders and explicit dependency edges may remain.
+
+`cowshed:host-napi-test` is the built addon's host proof, run against this checkout's launcher and CLI binary, which is
+why it depends on `build`. `host.napi.test.ts` runs `openHost`: each host row answers what its verb prints, refusals are
+typed, and `close()` resolves once `cowshed host` has exited. `launchers.napi.test.ts` runs `spawnLock`, `spawnHold`,
+`spawnSubtreeRoot` and `spawnLandTurn` through the same launcher. The disk-command case of `host.napi.test.ts` runs the
+real `hdiutil`, the TypeScript twin of the CLI `host.rs` proof in `real_apfs_host`, so the target needs a Mac and is
+reached only through `host-e2e`: the Linux CI job (the CI section, below) runs `test` and cannot host it.
 
 The land gate uses `--outputStyle=static-failures-only` and must exit zero before the expected-tip fast-forward and
 workspace retirement. Any failed task, timeout or infrastructure failure stops the land: there is no bound-only retry,
@@ -1321,10 +1328,11 @@ established before the Linux leg gates.
 - One job, `Validate` (`.github/workflows/ci.yml`), on every push to `main` and every pull request: Build, Lint, Unit
   Tests and Browser Tests through `smoo github-ci nx-smart`, on Linux only — the self-hosted `nixos-latest-x64` runner
   for the repository's own branches, `ubuntu-latest` for pull requests from forks. There are no macOS runners, no
-  Linux+ZFS runner, and no nightly run, so every macOS-only test (APFS, Seatbelt, launchd, the escape tests) runs only
-  where a developer runs the gate: `bun nx run-many -t gate` on a Mac, with `bun run check:linux` cross-linting the
-  Linux target. The check compiles test targets too; native-only methods and fixture helpers share their callers'
-  platform guards, never warning suppressions. Retained-input attach construction remains available to portable tests;
-  APFS supervisor mounting is macOS-only, and the macOS child-fence race keeps its imports inside that test.
+  Linux+ZFS runner, and no nightly run, so every macOS-only test (APFS, Seatbelt, launchd, the escape tests, the
+  built-addon host proof) runs only where a developer runs the gate: `bun nx run-many -t gate` on a Mac, with
+  `bun run check:linux` cross-linting the Linux target. The check compiles test targets too; native-only methods and
+  fixture helpers share their callers' platform guards, never warning suppressions. Retained-input attach construction
+  remains available to portable tests; APFS supervisor mounting is macOS-only, and the macOS child-fence race keeps its
+  imports inside that test.
 - Lint is `cargo fmt --all --check` and `cargo clippy --workspace --all-targets --config 'build.warnings="deny"'` (repo
   rule: fix everything you see — no pre-existing-failure waivers).

@@ -77,7 +77,13 @@
         "executor": "nx:noop",
         "dependsOn": [
           "cargo-test-group-real-apfs",
-          "cargo-test-group-real-apfs-host"
+          "cargo-test-group-real-apfs-host",
+          {
+            "target": "host-napi-test",
+            "projects": [
+              "cowshed"
+            ]
+          }
         ]
       },
       "gate": {

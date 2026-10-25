@@ -26,6 +26,8 @@ const REPOSITORY = fileURLToPath(new URL('../../..', import.meta.url));
 const ROOT_PROJECT = '@smoothbricks/codebase';
 const DEVICE_GROUP = 'cargo-test-group-real-apfs';
 const HOST_GROUP = 'cargo-test-group-real-apfs-host';
+/** cowshed's host proof of the built addon (`openHost` and the typed launchers), which needs a Mac. */
+const HOST_NAPI = 'host-napi-test';
 /** cowshed's build, which leaves the host's own CLI where the package's launcher finds it. */
 const CHECKOUT_COWSHED_BUILD = { projects: ['cowshed'], target: 'build' };
 /** The target that provisions the per-user mount root the real-image fixtures keep their scratch trees below. */
@@ -115,17 +117,19 @@ describe('the real-APFS serial groups of this repository', () => {
     }
   });
 
-  it('reaches host groups only through the explicit host and land gates, preserving the old land task set', async () => {
+  it('reaches the host proofs only through the explicit host and land gates, adding them to the old land task set', async () => {
     const graph = await projectGraph();
     const projects = Object.keys(graph.nodes);
     const targets = [...new Set(projects.flatMap((name) => Object.keys(graph.nodes[name]?.data.targets ?? {})))];
     const tasks = createTaskGraph(graph, {}, projects, targets, undefined, {});
     const device = `${ROOT_PROJECT}:${DEVICE_GROUP}`;
     const host = `${ROOT_PROJECT}:${HOST_GROUP}`;
+    const napi = `cowshed:${HOST_NAPI}`;
     const hostGate = `${ROOT_PROJECT}:host-e2e`;
     const gate = `${ROOT_PROJECT}:gate`;
-    // Package-declared nodes and explicit edges exist on every host; only macOS inference supplies a runner.
-    expect(Object.keys(tasks.tasks)).toEqual(expect.arrayContaining([device, host, hostGate, gate]));
+    // Package-declared nodes and explicit edges exist on every host; only macOS inference supplies a group runner.
+    // cowshed declares its host-napi-test whole, so every host plans that task too.
+    expect(Object.keys(tasks.tasks)).toEqual(expect.arrayContaining([device, host, napi, hostGate, gate]));
     for (const name of [DEVICE_GROUP, HOST_GROUP]) {
       const target = graph.nodes[ROOT_PROJECT]?.data.targets?.[name];
       expect(target, name).toBeDefined();
@@ -142,7 +146,7 @@ describe('the real-APFS serial groups of this repository', () => {
       ...(tasks.dependencies[id] ?? []),
       ...(tasks.continuousDependencies?.[id] ?? []),
     ];
-    const groupsReached: Record<string, string[]> = {};
+    const proofsReached: Record<string, string[]> = {};
     for (const id of Object.keys(tasks.tasks)) {
       const seen = new Set<string>();
       const pending = edges(id);
@@ -151,22 +155,26 @@ describe('the real-APFS serial groups of this repository', () => {
         seen.add(next);
         pending.push(...edges(next));
       }
-      const groups = [...seen].filter((reached) => reached === device || reached === host).sort();
-      if (groups.length > 0) groupsReached[id] = groups;
+      const proofs = [...seen].filter((reached) => reached === device || reached === host || reached === napi).sort();
+      if (proofs.length > 0) proofsReached[id] = proofs;
     }
-    // Ordinary tests must not pull expensive images into the inner loop. Only these explicit aggregates may.
-    expect(groupsReached).toEqual({ [host]: [device], [hostGate]: [device, host], [gate]: [device, host] });
+    // Ordinary tests must not pull expensive images, or a proof that needs a Mac, into the inner loop. Only these
+    // explicit aggregates may.
+    expect(proofsReached).toEqual({ [host]: [device], [hostGate]: [device, host, napi], [gate]: [device, host, napi] });
     const planned = (selected: string[]): string[] => {
       const runnable = projects.filter((name) =>
         selected.some((target) => graph.nodes[name]?.data.targets?.[target] !== undefined),
       );
       return Object.keys(createTaskGraph(graph, {}, runnable, selected, undefined, {}).tasks).sort();
     };
-    const oldGate = planned(['lint', 'test', 'build', DEVICE_GROUP, HOST_GROUP]);
-    expect(planned(['gate']).filter((id) => id !== gate && id !== hostGate)).toEqual(oldGate);
-    expect(planned(['host-e2e']).filter((id) => id !== hostGate)).toEqual(planned([DEVICE_GROUP, HOST_GROUP]));
+    const landSet = planned(['lint', 'test', 'build', DEVICE_GROUP, HOST_GROUP, HOST_NAPI]);
+    expect(planned(['gate']).filter((id) => id !== gate && id !== hostGate)).toEqual(landSet);
+    expect(planned(['host-e2e']).filter((id) => id !== hostGate)).toEqual(
+      planned([DEVICE_GROUP, HOST_GROUP, HOST_NAPI]),
+    );
     expect(planned(['test'])).not.toContain(device);
     expect(planned(['test'])).not.toContain(host);
+    expect(planned(['test'])).not.toContain(napi);
   });
 
   it('wrap exactly their tests in the 30s code-bound class, behind the 60s class that wins first', async () => {
