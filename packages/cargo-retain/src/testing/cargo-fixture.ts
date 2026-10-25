@@ -73,8 +73,15 @@ export function scopedTo(targetDir: string, run: () => Promise<void>): Promise<v
   return withEnv({ CARGO_TARGET_DIR: targetDir, CARGO_BUILD_DIR: undefined, CARGO_BUILD_TARGET: undefined }, run);
 }
 
+/**
+ * The environment fixture cargo runs under: the job's own, without its wrappers and
+ * without any `CARGO_UNSTABLE_*` switch. Each fixture's `.cargo/config.toml` states the
+ * unstable features it tests; cowshed exports `CARGO_UNSTABLE_MTIME_ON_USE=true` into
+ * every job, which would otherwise turn mtime-on-use on for the fixture that tests it off.
+ */
 export function cargoEnv(): NodeJS.ProcessEnv {
-  return { ...process.env, RUSTC_WRAPPER: '', RUSTC_WORKSPACE_WRAPPER: '', CARGO_NET_OFFLINE: 'true' };
+  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('CARGO_UNSTABLE_')));
+  return { ...env, RUSTC_WRAPPER: '', RUSTC_WORKSPACE_WRAPPER: '', CARGO_NET_OFFLINE: 'true' };
 }
 
 export interface CargoRun {

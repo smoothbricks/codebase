@@ -1175,6 +1175,24 @@ async function reportsRecencyFromStampedUse(fx: Churn, stamping: boolean): Promi
 }
 
 describe('cargo retention against real Cargo target layouts', () => {
+  it('runs fixture cargo without any CARGO_UNSTABLE_* switch the job environment carries', async () => {
+    await withEnv(
+      {
+        CARGO_UNSTABLE_MTIME_ON_USE: 'true',
+        CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'false',
+        RET_UNRELATED: 'kept',
+        RUSTC_WRAPPER: 'sccache',
+      },
+      async () => {
+        const env = cargoEnv();
+        expect(Object.keys(env).filter((name) => name.startsWith('CARGO_UNSTABLE_'))).toEqual([]);
+        expect(env.RET_UNRELATED).toBe('kept');
+        expect(env.RUSTC_WRAPPER).toBe('');
+        expect(env.RUSTC_WORKSPACE_WRAPPER).toBe('');
+        expect(env.CARGO_NET_OFFLINE).toBe('true');
+      },
+    );
+  });
   it('walks the retention cases over one churned Cargo target, asserting after every step (mtime-on-use false)', async () => {
     keepsExactDigitsInTheParser();
     identityIgnoresToolchain();
