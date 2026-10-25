@@ -13,6 +13,16 @@ pub fn connect(_: &ValidatedHostStorage) -> Result<Box<dyn GatewayControl>> {
 
 #[async_trait]
 impl GatewayControl for RefusingGateway {
+    async fn gates_in_flight(
+        &self,
+    ) -> std::result::Result<
+        std::collections::BTreeSet<cowshed_core::api::dto::GateJobRef>,
+        GatewayStatusError,
+    > {
+        Err(GatewayStatusError::Control(
+            "lifecycle-only fixture unexpectedly requested the gates in flight".to_owned(),
+        ))
+    }
     async fn status(&self) -> std::result::Result<DaemonStatus, GatewayStatusError> {
         Err(GatewayStatusError::Control(
             "lifecycle-only fixture unexpectedly requested gateway status".to_owned(),

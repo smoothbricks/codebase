@@ -2127,9 +2127,37 @@ export type LandRequest = {
  */
 export type LandSeed =
   | { readonly kind: 'unchanged' }
-  | { readonly kind: 'frozen' }
+  | ({ readonly kind: 'frozen' } & {
+      readonly compaction: LandSeedCompaction;
+    })
   | ({ readonly kind: 'sealBusy' } & {
       readonly reason: string;
+    });
+
+/**
+ * What a land that froze its target's seed did about compacting it (16_build_volumes.md, "Seed
+ * compaction"). None of these fails the land.
+ */
+export type LandSeedCompaction =
+  | { readonly kind: 'notMain' }
+  | ({ readonly kind: 'held' } & {
+      readonly error: string;
+      readonly secondsAgo: number & tags.Type<'uint64'>;
+    })
+  | ({ readonly kind: 'recent' } & {
+      readonly secondsAgo: number & tags.Type<'uint64'>;
+    })
+  | ({ readonly kind: 'below' } & {
+      readonly extents: number & tags.Type<'uint64'>;
+    })
+  | { readonly kind: 'noSeed' }
+  | ({ readonly kind: 'started' } & {
+      readonly pid: number & tags.Type<'uint32'>;
+      readonly extents: number & tags.Type<'uint64'>;
+      readonly log: string;
+    })
+  | ({ readonly kind: 'failed' } & {
+      readonly error: string;
     });
 
 /**
@@ -3238,6 +3266,35 @@ export type SealedJobRef = {
   readonly outlived?: ReadonlyArray<OutlivedProcess>;
   readonly outlivedIncomplete?: boolean;
 };
+
+/**
+ * What one seed compaction did (16_build_volumes.md, "Seed compaction"): the result of the
+ * internal `coordinator.compactSeed`, which the process a land starts runs.
+ */
+export type SeedCompactionReport =
+  | { readonly kind: 'running' }
+  | ({ readonly kind: 'recent' } & {
+      readonly secondsAgo: number & tags.Type<'uint64'>;
+    })
+  | ({ readonly kind: 'below' } & {
+      readonly extents: number & tags.Type<'uint64'>;
+    })
+  | { readonly kind: 'noSeed' }
+  | ({ readonly kind: 'stopped' } & {
+      readonly bytes: number & tags.Type<'uint64'>;
+      readonly why: string;
+    })
+  | ({ readonly kind: 'superseded' } & {
+      readonly seed: string;
+    })
+  | ({ readonly kind: 'compacted' } & {
+      readonly seed: string;
+      readonly replacement: string;
+      readonly before: number & tags.Type<'uint64'>;
+      readonly after: number & tags.Type<'uint64'>;
+      readonly bytes: number & tags.Type<'uint64'>;
+      readonly elapsedMs: number & tags.Type<'uint64'>;
+    });
 
 export type SessionRequest = {
   readonly repoId: RepoId;

@@ -2848,6 +2848,12 @@
           }
         },
         "seed": {
+          "compaction": {
+            "extents": 612000,
+            "kind": "started",
+            "log": "/Users/fixture/.cache/cowshed/build/.compacting/log",
+            "pid": 4243
+          },
           "kind": "frozen"
         }
       },
@@ -2874,6 +2880,11 @@
           }
         },
         "seed": {
+          "compaction": {
+            "error": "build volume storage failed: the copy could not be written",
+            "kind": "held",
+            "secondsAgo": 3600
+          },
           "kind": "frozen"
         }
       },

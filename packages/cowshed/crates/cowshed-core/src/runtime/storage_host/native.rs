@@ -253,4 +253,55 @@ where
     ) -> Result<crate::storage::lifecycle::DefragmentOutcome, ApfsStorageError> {
         MacOsApfsExecutionHost::defragment_build_volume(self, layout, claim)
     }
+
+    fn seed_extents(
+        &self,
+        layout: &BuildVolumeLayout,
+        seed: &BuildVolumeId,
+        stop_at: u64,
+    ) -> Result<Option<ExtentCount>, ApfsStorageError> {
+        MacOsApfsExecutionHost::seed_extents(self, layout, seed, stop_at).map(Some)
+    }
+
+    fn release_seed_compaction_leftovers(
+        &self,
+        layout: &BuildVolumeLayout,
+    ) -> Result<(), ApfsStorageError> {
+        MacOsApfsExecutionHost::release_seed_compaction_leftovers(self, layout)
+    }
+    fn stage_seed_compaction(
+        &self,
+        layout: &BuildVolumeLayout,
+        seed: &BuildVolumeId,
+    ) -> Result<CompactionSource, ApfsStorageError> {
+        MacOsApfsExecutionHost::stage_seed_compaction(self, layout, seed)
+    }
+
+    fn copy_seed_compaction(
+        &self,
+        source: CompactionSource,
+        keep_going: &mut dyn FnMut(u64) -> std::ops::ControlFlow<String>,
+    ) -> Result<SeedCompaction, ApfsStorageError> {
+        MacOsApfsExecutionHost::copy_seed_compaction(self, source, keep_going)
+    }
+
+    fn publish_seed_compaction(
+        &self,
+        layout: &BuildVolumeLayout,
+        compacted: CompactedSeed,
+        destination: &BuildVolumeId,
+        registration: &Registration,
+    ) -> Result<(), ApfsStorageError> {
+        MacOsApfsExecutionHost::publish_seed_compaction(
+            self,
+            layout,
+            compacted,
+            destination,
+            registration,
+        )
+    }
+
+    fn discard_seed_compaction(&self, compacted: CompactedSeed) -> Result<(), ApfsStorageError> {
+        MacOsApfsExecutionHost::discard_seed_compaction(self, compacted)
+    }
 }

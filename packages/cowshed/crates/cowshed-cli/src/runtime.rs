@@ -3735,13 +3735,29 @@ fn fold_line(folded: &FoldedWorkspace) -> String {
 /// What the land did with build volumes, one stderr line each (16_build_volumes.md, Land steps
 /// 4–7); the seeded/adopted/skipped state is also the controller's durable `LandOutcome` record.
 fn land_build_volume_lines(build: &cowshed_core::api::dto::LandBuildVolume) -> Vec<String> {
-    use cowshed_core::api::dto::{Adoption, LandSeed};
+    use cowshed_core::api::dto::{Adoption, LandSeed, LandSeedCompaction};
     let mut lines = Vec::new();
     match &build.seed {
         LandSeed::Unchanged => {}
-        LandSeed::Frozen => {
+        LandSeed::Frozen { compaction } => {
             lines
                 .push("build volume the target's seed is frozen from the landed volume".to_owned());
+            match compaction {
+                LandSeedCompaction::NotMain
+                | LandSeedCompaction::Recent { .. }
+                | LandSeedCompaction::Below { .. }
+                | LandSeedCompaction::NoSeed => {}
+                LandSeedCompaction::Started { pid, extents, log } => lines.push(format!(
+                    "build volume: main's seed holds at least {extents} extents; process {pid} compacts it in the background, logging to {}",
+                    log.display()
+                )),
+                LandSeedCompaction::Held { error, seconds_ago } => lines.push(format!(
+                    "build volume: main's seed is not compacted, because a compaction by this cowshed build failed {seconds_ago} s ago: {error}; no land of this build starts one until `cowshed __compact-seed <project-root>` succeeds"
+                )),
+                LandSeedCompaction::Failed { error } => lines.push(format!(
+                    "build volume: main's seed compaction was not started: {error}; no land of this build starts one until `cowshed __compact-seed <project-root>` succeeds"
+                )),
+            }
         }
         LandSeed::SealBusy { reason } => lines.push(format!(
             "build volume: the target keeps its previous seed, because the landed volume could not be sealed for capture: {reason}; the next fork's reseed refreezes it once that holder lets go"

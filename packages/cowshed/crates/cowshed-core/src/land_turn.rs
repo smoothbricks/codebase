@@ -355,9 +355,13 @@ pub struct RepoTurns {
     pub abandoned: Vec<TurnEvent>,
 }
 
-/// Every repository with a live ticket or a ticket abandoned at or after `abandoned_since_unix_ms`,
-/// as `observe` and `abandoned_since` read each.
-pub fn observe_all(root: &Path, abandoned_since_unix_ms: u64) -> io::Result<Vec<RepoTurns>> {
+/// Every repository with a live ticket or, when `abandoned_since_unix_ms` is given, a ticket
+/// abandoned at or after it, as `observe` and `abandoned_since` read each. `None` reads no
+/// repository's log: the live tickets alone.
+pub fn observe_all(
+    root: &Path,
+    abandoned_since_unix_ms: Option<u64>,
+) -> io::Result<Vec<RepoTurns>> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -374,7 +378,10 @@ pub fn observe_all(root: &Path, abandoned_since_unix_ms: u64) -> io::Result<Vec<
         };
         // Read the queue first: a dead ticket it finds is recorded as abandoned, and then shown.
         let tickets = observe(&entry.path())?;
-        let abandoned = abandoned_since(&entry.path(), abandoned_since_unix_ms)?;
+        let abandoned = match abandoned_since_unix_ms {
+            Some(since) => abandoned_since(&entry.path(), since)?,
+            None => Vec::new(),
+        };
         if !tickets.is_empty() || !abandoned.is_empty() {
             repositories.push(RepoTurns {
                 repo,

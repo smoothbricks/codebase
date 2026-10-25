@@ -23,7 +23,7 @@ use super::dto::{
 use super::dto::{
     BinaryData, BuildStateListing, CredentialReport, DiskCommandEvent, DiskCommandTool,
     GatewayStatus, IdentityReport, MountResult, NxStoreClearResult, ProjectWorkspaces,
-    SccacheStatus, SkillInstallReport,
+    SccacheStatus, SeedCompactionReport, SkillInstallReport,
 };
 use super::fd_holder::FdHolders;
 use super::held_lock::{DecimalU64, LockObservation};
@@ -359,6 +359,8 @@ operations! {
     internal json "coordinator.serveSupervisor" CoordinatorServeSupervisor(WorkspaceRequest) -> EmptyResult;
     /// Refreshes a mounted workspace's build state.
     internal json "coordinator.refreshBuildState" CoordinatorRefreshBuildState(WorkspaceRequest) -> BuildStateRefresh;
+    /// Compacts main's seed once a land found it past the extent bound.
+    internal json "coordinator.compactSeed" CoordinatorCompactSeed(RepoRequest) -> SeedCompactionReport;
     /// Admits one job; inline stdin travels as the upload frame.
     worker upload "worker.exec" WorkerExec(ExecParams) -> JobId;
     /// Writes one chunk of a streamed stdin at its byte offset.

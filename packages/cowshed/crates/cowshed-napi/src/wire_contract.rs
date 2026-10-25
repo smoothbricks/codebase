@@ -970,7 +970,13 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
     };
     let land_held = cowshed_core::api::dto::LandedReport {
         build_volume: cowshed_core::api::dto::LandBuildVolume {
-            seed: cowshed_core::api::dto::LandSeed::Frozen,
+            seed: cowshed_core::api::dto::LandSeed::Frozen {
+                compaction: cowshed_core::api::dto::LandSeedCompaction::Started {
+                    pid: 4243,
+                    extents: 612_000,
+                    log: PathBuf::from("/Users/fixture/.cache/cowshed/build/.compacting/log"),
+                },
+            },
             adoption: cowshed_core::api::dto::Adoption::Skipped {
                 reason: cowshed_core::api::dto::AdoptionSkip::TargetHeld {
                     database: PathBuf::from("/Users/fixture/Dev/widget/.nx/workspace-data/A-v3.db"),
@@ -986,7 +992,12 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
     };
     let land_opening = cowshed_core::api::dto::LandedReport {
         build_volume: cowshed_core::api::dto::LandBuildVolume {
-            seed: cowshed_core::api::dto::LandSeed::Frozen,
+            seed: cowshed_core::api::dto::LandSeed::Frozen {
+                compaction: cowshed_core::api::dto::LandSeedCompaction::Held {
+                    error: "build volume storage failed: the copy could not be written".to_owned(),
+                    seconds_ago: 3600,
+                },
+            },
             adoption: cowshed_core::api::dto::Adoption::Skipped {
                 reason: cowshed_core::api::dto::AdoptionSkip::TargetOpening {
                     database: PathBuf::from("/Users/fixture/Dev/widget/.nx/workspace-data/A-v3.db"),

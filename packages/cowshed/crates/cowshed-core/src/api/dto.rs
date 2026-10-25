@@ -3947,14 +3947,120 @@ pub struct LandBuildVolume {
 pub enum LandSeed {
     /// The land skipped its adoption before freezing a seed; the target's seed is as it was.
     Unchanged,
-    /// The target's seed is frozen from the landing volume.
-    Frozen,
+    /// The target's seed is frozen from the landing volume; `compaction` is what the land did
+    /// about compacting it.
+    Frozen { compaction: LandSeedCompaction },
     /// Required storage capture admission was refused, so the target retains its previous seed
     /// while adoption goes ahead. The next fork may capture the adopted volume once that admission
     /// succeeds; open handles on exempt contributed caches do not refuse capture.
     SealBusy { reason: String },
 }
 
+/// What a land that froze its target's seed did about compacting it (16_build_volumes.md, "Seed
+/// compaction"). None of these fails the land.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum LandSeedCompaction {
+    /// The target is not main; only main's seed is compacted.
+    NotMain,
+    /// A compaction by this cowshed build failed `secondsAgo` seconds ago with `error`, so none
+    /// was started: no land of this build starts one until a compaction succeeds.
+    Held {
+        error: String,
+        #[serde(rename = "secondsAgo")]
+        seconds_ago: u64,
+    },
+    /// A compaction succeeded `secondsAgo` seconds ago, within the interval.
+    Recent {
+        #[serde(rename = "secondsAgo")]
+        seconds_ago: u64,
+    },
+    /// The seed holds `extents`, under the bound.
+    Below { extents: u64 },
+    /// Main has no published seed, or its backend keeps no extent map.
+    NoSeed,
+    /// Process `pid` compacts the seed, which holds at least `extents` extents, in the
+    /// background, its stderr appended to `log`.
+    Started {
+        pid: u32,
+        extents: u64,
+        log: PathBuf,
+    },
+    /// Deciding or starting the compaction failed with `error`. The failure is recorded, so the
+    /// next lands of this build hold back for it.
+    Failed { error: String },
+}
+/// What one seed compaction did (16_build_volumes.md, "Seed compaction"): the result of the
+/// internal `coordinator.compactSeed`, which the process a land starts runs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum SeedCompactionReport {
+    /// Another process holds the project's compaction turn.
+    Running,
+    /// A compaction succeeded this many seconds ago, within the interval.
+    Recent {
+        #[serde(rename = "secondsAgo")]
+        seconds_ago: u64,
+    },
+    /// The seed holds `extents`, under the bound: left as it is.
+    Below { extents: u64 },
+    /// Main has no published seed, or its backend keeps no extent map.
+    NoSeed,
+    /// The copy stopped once `bytes` were copied, because `why`; the seed is as it was.
+    Stopped { bytes: u64, why: String },
+    /// A land or a reseed replaced `seed` while it was copied; the copy was released.
+    Superseded { seed: String },
+    /// `replacement`, a contiguous copy of `seed`, is main's seed now.
+    Compacted {
+        seed: String,
+        replacement: String,
+        before: u64,
+        after: u64,
+        bytes: u64,
+        #[serde(rename = "elapsedMs")]
+        elapsed_ms: u64,
+    },
+}
+
+impl std::fmt::Display for SeedCompactionReport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Running => {
+                formatter.write_str("another process is compacting this project's seed")
+            }
+            Self::Recent { seconds_ago } => write!(
+                formatter,
+                "a compaction succeeded {seconds_ago} s ago, within the interval: nothing to do"
+            ),
+            Self::Below { extents } => {
+                write!(
+                    formatter,
+                    "the seed holds {extents} extents, under the bound: left as it is"
+                )
+            }
+            Self::NoSeed => formatter.write_str("there is no seed with an extent map to compact"),
+            Self::Stopped { bytes, why } => write!(
+                formatter,
+                "stopped after copying {bytes} bytes: {why}; the seed is as it was"
+            ),
+            Self::Superseded { seed } => write!(
+                formatter,
+                "seed {seed} was replaced while it was copied; the copy was released"
+            ),
+            Self::Compacted {
+                seed,
+                replacement,
+                before,
+                after,
+                bytes,
+                elapsed_ms,
+            } => write!(
+                formatter,
+                "seed {seed} ({before} extents) is replaced by {replacement} ({after} extents): {bytes} bytes copied in {elapsed_ms} ms"
+            ),
+        }
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Adoption {

@@ -76,6 +76,7 @@
   "coordinator.worker": { "repoId": "acme/widget", "workspace": "feature" },
   "coordinator.serveSupervisor": { "repoId": "acme/widget", "workspace": "feature" },
   "coordinator.refreshBuildState": { "repoId": "acme/widget", "workspace": "feature" },
+  "coordinator.compactSeed": { "repoId": "acme/widget" },
   "coordinator.exec": {
     "repoId": "acme/widget",
     "workspace": "feature",

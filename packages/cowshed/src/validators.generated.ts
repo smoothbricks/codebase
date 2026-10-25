@@ -958,6 +958,13 @@ export const parseLandSeed = (json: string): Api.LandSeed => assertLandSeed(JSON
 export const assertLandSeedList = typia.createAssertEquals<readonly Api.LandSeed[]>();
 export const parseLandSeedList = (json: string): readonly Api.LandSeed[] => assertLandSeedList(JSON.parse(json));
 
+export const assertLandSeedCompaction = typia.createAssertEquals<Api.LandSeedCompaction>();
+export const parseLandSeedCompaction = (json: string): Api.LandSeedCompaction =>
+  assertLandSeedCompaction(JSON.parse(json));
+export const assertLandSeedCompactionList = typia.createAssertEquals<readonly Api.LandSeedCompaction[]>();
+export const parseLandSeedCompactionList = (json: string): readonly Api.LandSeedCompaction[] =>
+  assertLandSeedCompactionList(JSON.parse(json));
+
 export const assertLandTurnName = typia.createAssertEquals<Api.LandTurnName>();
 export const parseLandTurnName = (json: string): Api.LandTurnName => assertLandTurnName(JSON.parse(json));
 export const assertLandTurnNameList = typia.createAssertEquals<readonly Api.LandTurnName[]>();
@@ -1561,6 +1568,13 @@ export const parseSealedJobRef = (json: string): Api.SealedJobRef => assertSeale
 export const assertSealedJobRefList = typia.createAssertEquals<readonly Api.SealedJobRef[]>();
 export const parseSealedJobRefList = (json: string): readonly Api.SealedJobRef[] =>
   assertSealedJobRefList(JSON.parse(json));
+
+export const assertSeedCompactionReport = typia.createAssertEquals<Api.SeedCompactionReport>();
+export const parseSeedCompactionReport = (json: string): Api.SeedCompactionReport =>
+  assertSeedCompactionReport(JSON.parse(json));
+export const assertSeedCompactionReportList = typia.createAssertEquals<readonly Api.SeedCompactionReport[]>();
+export const parseSeedCompactionReportList = (json: string): readonly Api.SeedCompactionReport[] =>
+  assertSeedCompactionReportList(JSON.parse(json));
 
 export const assertSessionRequest = typia.createAssertEquals<Api.SessionRequest>();
 export const parseSessionRequest = (json: string): Api.SessionRequest => assertSessionRequest(JSON.parse(json));

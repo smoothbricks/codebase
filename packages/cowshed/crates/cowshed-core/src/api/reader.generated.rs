@@ -595,7 +595,28 @@ static LAND_SEED: Reader = Reader::Internal {
         ("sealBusy", &LAND_SEED__SEAL_BUSY),
     ],
 };
-static LAND_SEED__FROZEN: Reader = Reader::Record(&[]);
+static LAND_SEED_COMPACTION: Reader = Reader::Internal {
+    tag: "kind",
+    arms: &[
+        ("notMain", &LAND_SEED_COMPACTION__NOT_MAIN),
+        ("held", &LAND_SEED_COMPACTION__HELD),
+        ("recent", &LAND_SEED_COMPACTION__RECENT),
+        ("below", &LAND_SEED_COMPACTION__BELOW),
+        ("noSeed", &LAND_SEED_COMPACTION__NO_SEED),
+        ("started", &LAND_SEED_COMPACTION__STARTED),
+        ("failed", &LAND_SEED_COMPACTION__FAILED),
+    ],
+};
+static LAND_SEED_COMPACTION__BELOW: Reader = Reader::Record(&[("extents", &LEAF)]);
+static LAND_SEED_COMPACTION__FAILED: Reader = Reader::Record(&[("error", &LEAF)]);
+static LAND_SEED_COMPACTION__HELD: Reader =
+    Reader::Record(&[("error", &LEAF), ("secondsAgo", &LEAF)]);
+static LAND_SEED_COMPACTION__NOT_MAIN: Reader = Reader::Record(&[]);
+static LAND_SEED_COMPACTION__NO_SEED: Reader = Reader::Record(&[]);
+static LAND_SEED_COMPACTION__RECENT: Reader = Reader::Record(&[("secondsAgo", &LEAF)]);
+static LAND_SEED_COMPACTION__STARTED: Reader =
+    Reader::Record(&[("pid", &LEAF), ("extents", &LEAF), ("log", &LEAF)]);
+static LAND_SEED__FROZEN: Reader = Reader::Record(&[("compaction", &LAND_SEED_COMPACTION)]);
 static LAND_SEED__SEAL_BUSY: Reader = Reader::Record(&[("reason", &LEAF)]);
 static LAND_SEED__UNCHANGED: Reader = Reader::Record(&[]);
 static LAND_TURN_QUEUE: Reader = Reader::Record(&[
@@ -1321,6 +1342,10 @@ impl Projected for crate::api::dto::SccacheStatus {
 
 impl Projected for crate::api::dto::SealedJob {
     const READER: &'static Reader = &SEALED_JOB_REF;
+}
+
+impl Projected for crate::api::dto::SeedCompactionReport {
+    const READER: &'static Reader = &LEAF;
 }
 
 impl Projected for crate::api::dto::SkillInstallReport {

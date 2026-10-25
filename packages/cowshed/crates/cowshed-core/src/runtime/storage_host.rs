@@ -12,9 +12,13 @@ use crate::build_volume::{
 };
 use crate::metadata::{DetachedWorkspaceMetadata, WorkspaceName};
 use crate::repository::RepoId;
-use crate::storage::apfs::native::{BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease};
+use crate::storage::apfs::native::{
+    BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease, CompactedSeed, CompactionSource,
+    SeedCompaction,
+};
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, Labelled};
 use crate::storage::lifecycle::DerivedWorkspace;
+use crate::storage::lifecycle::ExtentCount;
 use crate::storage::lifecycle::ResizeOutcome;
 use crate::storage::recovery::ReAdoptSource;
 use cowshed_apfs::image::ImageCapacity;
@@ -197,4 +201,35 @@ pub(crate) trait RuntimeStorageHost:
         layout: &BuildVolumeLayout,
         claim: &ReleaseClaim,
     ) -> Result<crate::storage::lifecycle::DefragmentOutcome, ApfsStorageError>;
+
+    /// Seed compaction (16_build_volumes.md, "Seed compaction"). `None` when the seed's backend
+    /// keeps no extent map, so there is nothing to compact.
+    fn seed_extents(
+        &self,
+        layout: &BuildVolumeLayout,
+        seed: &BuildVolumeId,
+        stop_at: u64,
+    ) -> Result<Option<ExtentCount>, ApfsStorageError>;
+    fn release_seed_compaction_leftovers(
+        &self,
+        layout: &BuildVolumeLayout,
+    ) -> Result<(), ApfsStorageError>;
+    fn stage_seed_compaction(
+        &self,
+        layout: &BuildVolumeLayout,
+        seed: &BuildVolumeId,
+    ) -> Result<CompactionSource, ApfsStorageError>;
+    fn copy_seed_compaction(
+        &self,
+        source: CompactionSource,
+        keep_going: &mut dyn FnMut(u64) -> std::ops::ControlFlow<String>,
+    ) -> Result<SeedCompaction, ApfsStorageError>;
+    fn publish_seed_compaction(
+        &self,
+        layout: &BuildVolumeLayout,
+        compacted: CompactedSeed,
+        destination: &BuildVolumeId,
+        registration: &Registration,
+    ) -> Result<(), ApfsStorageError>;
+    fn discard_seed_compaction(&self, compacted: CompactedSeed) -> Result<(), ApfsStorageError>;
 }

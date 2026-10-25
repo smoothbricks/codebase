@@ -35,6 +35,12 @@ pub fn count_extents(path: &Path) -> Result<ExtentCount, ApfsStorageError> {
     Ok(measure(path, None)?.extents)
 }
 
+/// Count the file's runs up to `stop_at`, never past it: whether an image is past a bound is
+/// decided without walking a map of millions.
+pub fn count_extents_to(path: &Path, stop_at: u64) -> Result<ExtentCount, ApfsStorageError> {
+    Ok(measure(path, Some(stop_at))?.extents)
+}
+
 /// A disposable witness of this file's physical write generation, never a Git tree or HEAD.
 /// No second registry is kept: callers retain this value only across the operation it proves.
 #[derive(Clone, Debug)]
@@ -223,51 +229,29 @@ pub fn require_room_for_rewrite(image: &Path) -> Result<u64, ApfsStorageError> {
     Ok(needed)
 }
 
+/// What a copy that may be stopped did ([`copy_contiguously`]).
+#[derive(Debug, Eq, PartialEq)]
+pub enum Copied<Stop> {
+    /// Every data byte is in the destination, its mode copied and flushed.
+    Complete { bytes: u64 },
+    /// `keep_going` broke with `why` once `bytes` were copied; the destination is removed.
+    Stopped { bytes: u64, why: Stop },
+}
+
 /// Copy the image's data into a fresh sibling, holes preserved, and rename it over the image.
 ///
 /// The caller holds the workspace's lifecycle lock and has detached the image. Returns the data
 /// bytes copied. A failure before the rename leaves the image untouched and removes the copy.
 pub fn rewrite_contiguously(image: &Path) -> Result<u64, ApfsStorageError> {
-    let source =
-        File::open(image).map_err(|error| io_error("open image to rewrite", image, error))?;
-    let metadata = source
-        .metadata()
-        .map_err(|error| io_error("inspect image to rewrite", image, error))?;
     let sibling = rewrite_sibling(image);
     // Only an interrupted rewrite leaves a sibling behind, and nothing else can be writing one
     // while the caller holds the lock: it is garbage, and the new copy takes its name.
     remove_if_present(&sibling)?;
-    let destination = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&sibling)
-        .map_err(|error| io_error("create the rewrite copy", &sibling, error))?;
-    let copied =
-        copy_data(&source, &destination, metadata.len(), image, &sibling).and_then(|bytes| {
-            destination
-                .set_permissions(Permissions::from_mode(metadata.mode() & 0o7777))
-                .map_err(|error| {
-                    io_error("copy the image's mode onto the rewrite", &sibling, error)
-                })?;
-            destination
-                .sync_all()
-                .map_err(|error| io_error("flush the rewrite copy", &sibling, error))?;
-            Ok(bytes)
-        });
-    drop(destination);
-    let bytes = match copied {
-        Ok(bytes) => bytes,
-        Err(primary) => {
-            return Err(match fs::remove_file(&sibling) {
-                Ok(()) => primary,
-                Err(cleanup) => ApfsStorageError::Cleanup {
-                    operation: "remove the copy a failed rewrite left behind",
-                    primary: Box::new(primary),
-                    cleanup: Box::new(io_error("remove the rewrite copy", &sibling, cleanup)),
-                },
-            });
-        }
+    let bytes = match copy_contiguously(image, &sibling, |_| {
+        ControlFlow::<std::convert::Infallible>::Continue(())
+    })? {
+        Copied::Complete { bytes } => bytes,
+        Copied::Stopped { why, .. } => match why {},
     };
     fs::rename(&sibling, image)
         .map_err(|error| io_error("publish the rewritten image", image, error))?;
@@ -280,23 +264,81 @@ pub fn rewrite_contiguously(image: &Path) -> Result<u64, ApfsStorageError> {
     Ok(bytes)
 }
 
-fn copy_data(
+/// Copy `source`'s data into a new file at `destination` with plain `pread`/`pwrite`, holes
+/// preserved, its mode copied, flushed: fresh, contiguous space that shares no extent with
+/// `source`. `keep_going` is asked after every chunk with the bytes copied so far; a break stops
+/// the copy. A stop or a failure removes the destination, so it exists only complete.
+pub fn copy_contiguously<Stop>(
+    source: &Path,
+    destination: &Path,
+    keep_going: impl FnMut(u64) -> ControlFlow<Stop>,
+) -> Result<Copied<Stop>, ApfsStorageError> {
+    let reader =
+        File::open(source).map_err(|error| io_error("open the image to copy", source, error))?;
+    let metadata = reader
+        .metadata()
+        .map_err(|error| io_error("inspect the image to copy", source, error))?;
+    let writer = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(destination)
+        .map_err(|error| io_error("create the contiguous copy", destination, error))?;
+    let copied = copy_data(
+        &reader,
+        &writer,
+        metadata.len(),
+        source,
+        destination,
+        keep_going,
+    )
+    .and_then(|copied| {
+        if let Copied::Complete { .. } = copied {
+            writer
+                .set_permissions(Permissions::from_mode(metadata.mode() & 0o7777))
+                .map_err(|error| {
+                    io_error("copy the image's mode onto the copy", destination, error)
+                })?;
+            writer
+                .sync_all()
+                .map_err(|error| io_error("flush the contiguous copy", destination, error))?;
+        }
+        Ok(copied)
+    });
+    drop(writer);
+    match copied {
+        Ok(complete @ Copied::Complete { .. }) => Ok(complete),
+        Ok(stopped @ Copied::Stopped { .. }) => fs::remove_file(destination)
+            .map(|()| stopped)
+            .map_err(|error| io_error("remove the copy a stop left behind", destination, error)),
+        Err(primary) => Err(match fs::remove_file(destination) {
+            Ok(()) => primary,
+            Err(cleanup) => ApfsStorageError::Cleanup {
+                operation: "remove the copy a failed copy left behind",
+                primary: Box::new(primary),
+                cleanup: Box::new(io_error("remove the contiguous copy", destination, cleanup)),
+            },
+        }),
+    }
+}
+
+fn copy_data<Stop>(
     source: &File,
     destination: &File,
     length: u64,
     image: &Path,
-    sibling: &Path,
-) -> Result<u64, ApfsStorageError> {
+    copy: &Path,
+    mut keep_going: impl FnMut(u64) -> ControlFlow<Stop>,
+) -> Result<Copied<Stop>, ApfsStorageError> {
     // The copy passes each byte through once; caching it would only evict what the rest of the
     // machine is using, hundreds of gigabytes' worth for a large main.
     bypass_cache(source).map_err(|error| io_error("bypass the cache reading", image, error))?;
-    bypass_cache(destination)
-        .map_err(|error| io_error("bypass the cache writing", sibling, error))?;
+    bypass_cache(destination).map_err(|error| io_error("bypass the cache writing", copy, error))?;
     let mut buffer = vec![0_u8; buffer_len(COPY_CHUNK_BYTES)?];
     let mut copied = 0_u64;
     let mut offset = 0;
     while let Some((start, end)) = next_data_region(source, offset, length)
-        .map_err(|error| io_error("find image data to rewrite", image, error))?
+        .map_err(|error| io_error("find image data to copy", image, error))?
     {
         let mut position = start;
         while position < end {
@@ -307,14 +349,20 @@ fn copy_data(
                 .map_err(|error| io_error("read image data", image, error))?;
             destination
                 .write_all_at(chunk, position)
-                .map_err(|error| io_error("write the rewrite copy", sibling, error))?;
+                .map_err(|error| io_error("write the contiguous copy", copy, error))?;
             position += step;
+            if let ControlFlow::Break(why) = keep_going(copied + (position - start)) {
+                return Ok(Copied::Stopped {
+                    bytes: copied + (position - start),
+                    why,
+                });
+            }
         }
         // APFS can zero-fill the hole a write skips over (the boot Data volume does), which would
         // turn every hole the image had into allocated zeros: punch it back.
         if start > offset {
             punch_hole(destination, offset, start - offset).map_err(|error| {
-                io_error("keep the image's hole in the rewrite copy", sibling, error)
+                io_error("keep the image's hole in the contiguous copy", copy, error)
             })?;
         }
         copied += end - start;
@@ -325,17 +373,17 @@ fn copy_data(
     // write, so punch it after the final size is set.
     destination
         .set_len(length)
-        .map_err(|error| io_error("size the rewrite copy", sibling, error))?;
+        .map_err(|error| io_error("size the contiguous copy", copy, error))?;
     if offset < length {
         punch_hole(destination, offset, length - offset).map_err(|error| {
             io_error(
-                "keep the image's trailing hole in the rewrite copy",
-                sibling,
+                "keep the image's trailing hole in the contiguous copy",
+                copy,
                 error,
             )
         })?;
     }
-    Ok(copied)
+    Ok(Copied::Complete { bytes: copied })
 }
 
 fn buffer_len(bytes: u64) -> Result<usize, ApfsStorageError> {
@@ -520,7 +568,7 @@ fn available_bytes(directory: &Path) -> Result<u64, ApfsStorageError> {
 }
 
 #[cfg(all(test, target_os = "macos"))]
-pub(super) mod tests {
+pub(crate) mod tests {
     use std::fs::{self, File, OpenOptions, Permissions};
     use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
@@ -618,9 +666,7 @@ pub(super) mod tests {
 
     /// Two data regions around a hole and a trailing hole — the shape of a sparse disk image —
     /// with every other page of the data rewritten while a clone shares it.
-    pub(in crate::storage::apfs) fn fragmented_sparse_file(
-        root: &Path,
-    ) -> (PathBuf, Vec<(u64, u64)>) {
+    pub(crate) fn fragmented_sparse_file(root: &Path) -> (PathBuf, Vec<(u64, u64)>) {
         let path = root.join("image.dmg");
         let file = OpenOptions::new()
             .create_new(true)
@@ -723,5 +769,42 @@ pub(super) mod tests {
             .expect("write");
         file.sync_all().expect("flush");
         assert!(count_extents(&path).expect("count").get() >= 1);
+    }
+
+    #[test]
+    fn a_stopped_copy_removes_its_copy_and_leaves_the_source_as_it_was() {
+        let root = scratch("stopped");
+        let (image, regions) = fragmented_sparse_file(&root.0);
+        let extents = count_extents(&image).expect("count");
+        let copy = root.0.join("copy.dmg");
+        let mut asked = 0;
+        let copied = super::copy_contiguously(&image, &copy, |bytes| {
+            asked += 1;
+            if bytes >= MIB {
+                std::ops::ControlFlow::Break("a gate started")
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })
+        .expect("copy");
+        assert_eq!(
+            copied,
+            super::Copied::Stopped {
+                bytes: 4 * MIB,
+                why: "a gate started"
+            }
+        );
+        assert_eq!(
+            asked, 1,
+            "asked after every chunk, stopped at the first break"
+        );
+        assert!(!copy.exists(), "a stopped copy is removed");
+        assert_eq!(data_regions(&image), regions);
+        assert_eq!(count_extents(&image).expect("count"), extents);
+        assert_eq!(
+            super::count_extents_to(&image, 3).expect("bounded").get(),
+            3,
+            "a bounded count stops at its bound"
+        );
     }
 }

@@ -439,7 +439,7 @@ fn a_waiter_killed_in_line_is_recorded_as_abandoned() {
     // No land asked after W1, so the status read is the first to find its dead ticket.
     let root = home.repo_dir();
     let root = root.parent().expect("the land-turn root");
-    let turns = observe_all(root, 0).expect("observe the queues");
+    let turns = observe_all(root, Some(0)).expect("observe the queues");
     let repo = turns
         .iter()
         .find(|turns| turns.repo == REPO)

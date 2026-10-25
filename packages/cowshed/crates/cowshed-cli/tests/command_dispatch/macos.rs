@@ -2611,7 +2611,7 @@ fn assert_land_outcome(telemetry: &Path, report: &LandedReport) {
     };
     assert_eq!(
         outcome.seeded,
-        matches!(build.seed, cowshed_core::api::dto::LandSeed::Frozen)
+        matches!(build.seed, cowshed_core::api::dto::LandSeed::Frozen { .. })
     );
     assert_eq!(
         outcome.skip.as_ref(),
@@ -2669,7 +2669,10 @@ async fn land_nx_project(
     // The undeclared output is untracked work in the topic, which a retire refuses.
     let report = land(&mut service, "topic", false, &[&build, &test]).await;
     cowshed_os::eprintln!("land report: {report:?}");
-    assert_eq!(report.build_volume.seed, LandSeed::Frozen, "{report:?}");
+    assert!(
+        matches!(report.build_volume.seed, LandSeed::Frozen { .. }),
+        "{report:?}"
+    );
     let cowshed_core::api::dto::Adoption::Adopted { check: rerun, .. } =
         &report.build_volume.adoption
     else {
@@ -3937,7 +3940,10 @@ async fn directory_a_fork_of_a_warm_target_is_all_fresh_and_all_hits_substrate_l
         "w1 forks main's empty first seed, so it builds every unit: {cold:?}"
     );
     let report = land(&mut service, "w1", true, &[&nx_check, CARGO_BUILD]).await;
-    assert_eq!(report.build_volume.seed, LandSeed::Frozen, "{report:?}");
+    assert!(
+        matches!(report.build_volume.seed, LandSeed::Frozen { .. }),
+        "{report:?}"
+    );
     assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
 
     let w2 = new_workspace(&mut service, "w2").await;
@@ -4239,7 +4245,10 @@ async fn what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it(
     let report = land(service, "topic", true, &[&nx_check]).await;
     assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
     assert!(report.retired, "{report:?}");
-    assert_eq!(report.build_volume.seed, LandSeed::Frozen, "{report:?}");
+    assert!(
+        matches!(report.build_volume.seed, LandSeed::Frozen { .. }),
+        "{report:?}"
+    );
     match &report.build_volume.adoption {
         Adoption::Adopted { check, .. } => {
             assert_eq!(check.hits, 2, "a:build and a:test hit in main: {report:?}");
@@ -4759,9 +4768,8 @@ async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
     }
     let lockf = i32::try_from(opening.0.id()).expect("a pid fits i32");
     let report = land(&mut service, "topic", false, &[&nx_check]).await;
-    assert_eq!(
-        report.build_volume.seed,
-        LandSeed::Frozen,
+    assert!(
+        matches!(report.build_volume.seed, LandSeed::Frozen { .. }),
         "a skipped swap still freezes its seed: {report:?}"
     );
     assert_land_outcome(fixture.storage.telemetry(), &report);
@@ -4821,9 +4829,8 @@ async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
     })
     .await;
     let report = land(&mut service, "topic", true, &[&nx_check]).await;
-    assert_eq!(
-        report.build_volume.seed,
-        LandSeed::Frozen,
+    assert!(
+        matches!(report.build_volume.seed, LandSeed::Frozen { .. }),
         "forks still start from the new seed: {report:?}"
     );
     assert_land_outcome(fixture.storage.telemetry(), &report);
@@ -4902,9 +4909,8 @@ async fn directory_an_open_cache_reader_allows_seed_capture_and_adoption_substra
     .await;
 
     let report = land(&mut service, "topic", true, &[&nx_check]).await;
-    assert_eq!(
-        report.build_volume.seed,
-        LandSeed::Frozen,
+    assert!(
+        matches!(report.build_volume.seed, LandSeed::Frozen { .. }),
         "an exempt cache reader must not refuse seed capture: {report:?}"
     );
     match &report.build_volume.adoption {
@@ -6873,7 +6879,10 @@ async fn land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption(
         } => assert_eq!(daemon.pid, daemon_pid, "{report:?}"),
         other => panic!("an unproven landing daemon skips adoption: {other:?}"),
     }
-    assert_ne!(report.build_volume.seed, LandSeed::Frozen, "{report:?}");
+    assert!(
+        !matches!(report.build_volume.seed, LandSeed::Frozen { .. }),
+        "{report:?}"
+    );
     assert!(
         !exit.within(Duration::ZERO).unwrap(),
         "the actual foreign identity survived retirement"

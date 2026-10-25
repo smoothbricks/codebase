@@ -4347,6 +4347,14 @@ mod tests {
 
     #[async_trait]
     impl crate::gateway_sessions::GatewayControl for RecordingControl {
+        async fn gates_in_flight(
+            &self,
+        ) -> std::result::Result<
+            std::collections::BTreeSet<crate::api::dto::GateJobRef>,
+            crate::gateway_sessions::GatewayStatusError,
+        > {
+            Ok(std::collections::BTreeSet::new())
+        }
         async fn status(
             &self,
         ) -> std::result::Result<

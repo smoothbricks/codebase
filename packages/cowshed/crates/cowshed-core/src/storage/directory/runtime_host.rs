@@ -257,4 +257,53 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
     ) -> Result<crate::storage::lifecycle::DefragmentOutcome, ApfsStorageError> {
         Err(unsupported("defragmenting a build volume"))
     }
+
+    fn seed_extents(
+        &self,
+        _layout: &BuildVolumeLayout,
+        _seed: &BuildVolumeId,
+        _stop_at: u64,
+    ) -> Result<Option<crate::storage::lifecycle::ExtentCount>, ApfsStorageError> {
+        // A directory seed is a tree of files, not an image: no extent map, nothing to compact.
+        Ok(None)
+    }
+
+    fn release_seed_compaction_leftovers(
+        &self,
+        _layout: &BuildVolumeLayout,
+    ) -> Result<(), ApfsStorageError> {
+        Err(unsupported("compacting a seed"))
+    }
+    fn stage_seed_compaction(
+        &self,
+        _layout: &BuildVolumeLayout,
+        _seed: &BuildVolumeId,
+    ) -> Result<crate::storage::apfs::native::CompactionSource, ApfsStorageError> {
+        Err(unsupported("compacting a seed"))
+    }
+
+    fn copy_seed_compaction(
+        &self,
+        _source: crate::storage::apfs::native::CompactionSource,
+        _keep_going: &mut dyn FnMut(u64) -> std::ops::ControlFlow<String>,
+    ) -> Result<crate::storage::apfs::native::SeedCompaction, ApfsStorageError> {
+        Err(unsupported("compacting a seed"))
+    }
+
+    fn publish_seed_compaction(
+        &self,
+        _layout: &BuildVolumeLayout,
+        _compacted: crate::storage::apfs::native::CompactedSeed,
+        _destination: &BuildVolumeId,
+        _registration: &crate::build_volume::Registration,
+    ) -> Result<(), ApfsStorageError> {
+        Err(unsupported("compacting a seed"))
+    }
+
+    fn discard_seed_compaction(
+        &self,
+        _compacted: crate::storage::apfs::native::CompactedSeed,
+    ) -> Result<(), ApfsStorageError> {
+        Err(unsupported("compacting a seed"))
+    }
 }

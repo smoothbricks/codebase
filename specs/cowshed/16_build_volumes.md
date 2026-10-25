@@ -33,10 +33,12 @@ each of them.
    blocks (01a_apfs.md "Images", its clone-cost bullet): extents multiply under churn while clones are held, and the
    first write to a clone costs time per extent. Build state is where nearly all of main's churn comes from: every build
    of main rewrites gigabytes under `target/` and `.nx/cache` while sessions hold clones of main's image. With build
-   state on its own volume, main's source image changes only when its tree changes (a land's fast-forward, an edit), and
-   build churn lands in build volumes that are replaced at every land instead of accumulating extents. Main's source
-   image therefore fragments no faster than an image that has no clone, and `cowshed defrag main` is a repair for
-   imports, not a routine operation.
+   state on its own volume, main's source image changes only when its tree changes (a land's fast-forward, an edit).
+   Main's source image therefore fragments no faster than an image that has no clone, and `cowshed defrag main` is a
+   repair for imports, not a routine operation. Build volumes are not replaced by anything that sheds extents: a fork
+   clones its target's seed, a land adopts the landing volume and a seed is captured from it, so every build volume
+   inherits its parent's extent map and adds its own churn. SmoothBricks' main seed went from 434,000 to 881,000 extents
+   in four days. Seed compaction (Targets and seeds) bounds that lineage.
 2. **Without build volumes, a land rebuilds main from scratch, or main is never warm.** A workspace builds and checks
    its work, lands, and then main has to build the same tree again before the next fork can start warm. A warm step for
    main would be a background job that can fail, queue, or be skipped; while it lags, every fork starts cold, and
@@ -477,6 +479,81 @@ fast-forward performs no output restoration or adoption.
   behind; an already-held admission skips direct capture without mutating images or replacing the old seed, and the skip
   names the process holding the hold.
 
+### Seed compaction
+
+A seed is detached and immutable, so rewriting it into contiguous space stops no live shell. A land into main that froze
+main's seed starts the compaction when the seed holds at least **500,000 extents**, no compaction of the project has
+succeeded in the last **24 hours**, and no compaction by the land's own cowshed build has failed since (Failures). No
+timer starts it. A compaction that finds its seed replaced, or cannot tell whether a gate or a land runs, is started
+again by the next land that freezes main's seed.
+
+- **Why 500,000.** A fork's first write costs 0.1 to 0.2 ms per extent of its seed's map, and every fork pays it twice
+  (its volume, then its own seed's capture), so 500,000 extents cost a fork about 140 s. A compaction writes the whole
+  seed once and leaves about as many extents as the image has data regions, the floor of a copy that keeps holes (near
+  100,000 for a 209 GB seed); larger write chunks and `F_PREALLOCATE` do not lower it. It pays for itself within four
+  forks, and a seed growing about 110,000 extents a day is due again after a few days. Compacting at every land would
+  rewrite the seed every time and hold main's image lock for minutes.
+- **Off the land path.** The land decides, with the seed's extents counted no further than the bound, and starts
+  `cowshed __compact-seed <project-root>` in a session of its own, holding no descriptor of the land's but its stdio,
+  its stderr appended to `build/.compacting/log` (the land creates `build/.compacting` first). The land answers without
+  waiting for it.
+- **The land reports it.** The land report's frozen seed carries what the land did about compaction: `notMain`; `recent`
+  or `below` (with the age of the last success or the extents counted); `noSeed`; `started` (the process, the extents
+  and the log); `held` (the recorded failure of this build and its age); or `failed` (deciding or starting failed now,
+  and why). None of these fails the land.
+- **Failures.** A land whose decision or start fails, and a compaction that ends in an error, write
+  `build/.compacting/failed`: the cowshed build that failed (its `BuildId`, 11_shell.md "Draining a supervisor of
+  another build") and the error, written aside and renamed into place. While the record names the land's own build, the
+  land starts nothing and reports `held`, so a cause that does not change is not met again at every land. A land of
+  another build starts a compaction as usual, since a new build is how a fix ships.
+  `cowshed __compact-seed <project-root>` run by hand does not read the record, and any success removes it. A compaction
+  that finds its seed replaced, cannot tell whether a gate or a land runs, or finds another one running has not failed.
+- **One at a time.** The process takes the project's compaction lock (`build/.compacting/lock`) without waiting and
+  exits if another process holds it. It reads the last success (the modification time of `build/.compacting/succeeded`)
+  and the bound again. It then refreshes main's seed exactly as a fork of main does (Fork step 2), under main's image
+  lock. The copy then holds what main's live volume holds, so the next fork's reseed keeps the compacted seed instead of
+  replacing it with a capture of a volume written after the seed.
+- **Only the refresh, the clone and the publication hold main's image lock.** Still under the lock that the refresh
+  took, the seed is cloned to `build/.compacting/source.dmg` (milliseconds; the clone is never written, so a land or
+  reseed that retires the seed meanwhile changes nothing it reads). With no lock held, the clone's data is copied with
+  plain `pread`/`pwrite` into `build/.compacting/copy.dmg`, keeping holes, as `defrag` copies (01a_apfs.md, "Images").
+  The copy runs at normal disk priority and past the cache (`F_NOCACHE` on both descriptors): it holds for every gate
+  and land (below), so between them the disk is its to use, and it passes each byte once, so caching it would only evict
+  the working set of the rest of the host. Measured 2026-10-25 on this host: throttled (`IOPOL_THROTTLE`), a 367 GB seed
+  copied at 26 MB/s, about four hours; at normal priority one copied 209 GB in 440 s. The clone is then released in
+  bounded steps at normal priority, because a throttled free holds the container's work (Garbage collection). Forks and
+  lands of main proceed throughout the copy and clone the seed as it stands.
+- **It holds for gates and lands.** After its first chunk and every GiB after that, the copy checks whether main's
+  latest seed is still the one it copies, then asks whether any gate job holds or waits for CPU tokens (`cpu-budget`)
+  and whether a land holds or waits for any repository's turn (05_gateway.md, "Land turns"). A land's gate can run as
+  plain host work the CPU ledger does not count, and a land that starts the compaction still holds its own turn. While
+  either runs, the copy holds where it is, says once in its log what it waits for, and checks both again every **15 s**;
+  it says how long it waited when it goes on. If the seed was replaced, or the gateway's answer or the land turns cannot
+  be read, the copy stops and is removed. The seed is left as it was. A gateway that is not running runs no gate.
+- **Publication.** Under main's image lock again, the copy is published only if the seed it copied is still main's
+  latest. The copy is registered as a new seed of main at the copied seed's tree before its image exists, renamed into
+  place, and given the copied seed's freshness mark (its bytes are that seed's, so they are no newer). It is proven
+  forkable and published, as a captured seed is. Every older seed is then committed to `build/.deleting`, as a fork's
+  seed refresh retires the seeds it replaces. If a land or reseed replaced the seed meanwhile, the copy is released. A
+  publication records the success.
+- **Main's live volume is not rewritten.** It is mounted and written, and the next land replaces it with a landing
+  volume. Forks made after the compacted seed is published start compact, and their lands carry the compact lineage into
+  main.
+- **Leftovers.** `build/.compacting` is read by no enumeration of images, records or `build/.deleting`. An interrupted
+  compaction's clone and copy are released, in bounded steps, by the next compaction once it holds the compaction lock
+  and before it takes main's image lock: freeing a whole seed's extent map takes minutes, and no fork or land waits on
+  it.
+- The process reports one line on stderr: running elsewhere, recent, below the bound, no seed, stopped and why,
+  superseded, or compacted with both extent counts, the bytes copied and the time taken.
+- **Enforced by**: unit tests of the decision (a seed under the bound is left alone; one at the bound is due; a success
+  within the interval, or one dated after the clock, is recent without counting extents) and of the hold (a failure of
+  the land's build holds it; another build's does not); a test in which the first start, with no `build/.compacting`,
+  starts a process that holds none of the land's descriptors; a held copy asks again until it may go on; a copy that a
+  stop interrupts removes its copy and leaves the source unchanged; and a real-APFS test in which a fragmented seed is
+  cloned, copied and published as main's latest seed, with at least ten times fewer extents, the same data and holes,
+  and the copied seed's freshness mark, while the old seed is committed to `build/.deleting`, and in which a copy whose
+  seed was replaced is released instead of published.
+
 ### Workspace reseed
 
 `cowshed reseed <ws> [--from <target>] [--dry-run]` discards a workspace's accumulated incremental build state and gives
@@ -744,6 +821,9 @@ without failing the land.
 
 8. **Retire the workspace**. An adopted build volume is now the target's and does not retire with it. After a
    compare-and-swap at step 3 nothing adopted it, so it is still the workspace's.
+
+A land into main whose seed capture published a seed then starts that seed's compaction when it is due (Seed
+compaction).
 
 ### Adoption copies nothing
 

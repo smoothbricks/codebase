@@ -43,9 +43,16 @@ use cowshed_apfs::store_lock::LockMode;
 
 type Host = MacOsApfsExecutionHost<SystemCommandRunner>;
 
+mod compaction;
 mod nx_clear;
 mod reseed;
+pub use compaction::SEED_COMPACTION_VERB;
+pub(crate) use compaction::{
+    Admission, CompactionDue, Published, SEED_COMPACTION_WAIT, seconds_since, start_compaction,
+};
 pub(crate) use reseed::ReseedWorkspace;
+
+pub(crate) use compaction::gates_hold;
 
 /// A workspace at one incarnation: whose seed a seed is.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -3108,7 +3115,7 @@ fn storage(error: crate::storage::apfs::ApfsStorageError) -> CowshedError {
     )
 }
 
-fn io(operation: &str, path: &Path, error: &std::io::Error) -> CowshedError {
+pub(super) fn io(operation: &str, path: &Path, error: &std::io::Error) -> CowshedError {
     CowshedError::environment_missing(
         format!("cannot {operation} at {}: {error}", path.display()),
         "cowshed doctor --json",
@@ -8340,6 +8347,245 @@ fn main() {
         );
         assert!(scratch.layout.read_record(&live).unwrap().is_published());
         fs::remove_dir(scratch.layout.image(&ownerless)).unwrap();
+        scratch.release_all();
+    }
+
+    /// Seed compaction (16_build_volumes.md, "Seed compaction") over a real fragmented seed: a
+    /// stop removes the copy and leaves the seed; a held copy asks again until it may go on; a copy publishes as main's latest seed with far
+    /// fewer extents, the same bytes and holes and the copied seed's freshness mark, and the old
+    /// seed goes to the build journal; a copy whose seed a land replaced meanwhile is released.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_a_fragmented_seed_is_compacted_and_a_replaced_one_is_not() {
+        use crate::storage::apfs::native::SeedCompaction;
+        let scratch = Scratch::new("seed-compaction");
+        let target = owner("main", '0');
+        let seed_registration = |tree: char| {
+            Registration::new(
+                BuildVolumeRecord::new(
+                    Some(GitOid::new(tree.to_string().repeat(40)).unwrap()),
+                    BuildVolumeRole::Seed {
+                        target: target.name.clone(),
+                        incarnation: target.incarnation.clone(),
+                    },
+                ),
+                Registrant::Workspace {
+                    incarnation: target.incarnation.clone(),
+                },
+            )
+        };
+        let seed = BuildVolumeId::mint();
+        let registration = seed_registration('a');
+        let creating = scratch.layout.register(&seed, &registration).unwrap();
+        let fragmenting = scratch.root.path().join("fragmenting");
+        fs::create_dir_all(&fragmenting).unwrap();
+        let (fragmented, _) =
+            crate::storage::apfs::extents::tests::fragmented_sparse_file(&fragmenting);
+        fs::rename(&fragmented, scratch.layout.image(&seed)).unwrap();
+        scratch.layout.publish(&seed, &registration).unwrap();
+        drop(creating);
+        let bytes = fs::read(scratch.layout.image(&seed)).unwrap();
+        let written = fs::metadata(scratch.layout.image(&seed))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let compacting = scratch.layout.compacting();
+        let left = || {
+            ["source.dmg", "copy.dmg"]
+                .into_iter()
+                .filter(|name| compacting.join(name).exists())
+                .collect::<Vec<_>>()
+        };
+        let stage = || async {
+            let locked = scratch.lock(&target).await;
+            scratch
+                .volumes
+                .stage_compaction(&locked)
+                .await
+                .unwrap()
+                .expect("main has a seed")
+        };
+
+        let stopped = scratch
+            .volumes
+            .copy_compaction(
+                target.clone(),
+                stage().await,
+                Box::new(|| super::Admission::Stop("gate jobs run: job 7 in /w".to_owned())),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&stopped, SeedCompaction::Stopped { why, .. } if why == "gate jobs run: job 7 in /w"),
+            "{stopped:?}"
+        );
+        assert_eq!(
+            left(),
+            Vec::<&str>::new(),
+            "a stopped compaction leaves nothing"
+        );
+        assert_eq!(
+            scratch
+                .layout
+                .seed_of(&target.name, &target.incarnation)
+                .unwrap()
+                .unwrap()
+                .0,
+            seed
+        );
+
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = std::sync::Arc::clone(&asked);
+        let SeedCompaction::Copied(compacted) = scratch
+            .volumes
+            .copy_compaction(
+                target.clone(),
+                stage().await,
+                Box::new(move || {
+                    // Held twice, as while a gate job or a land runs, then let go on.
+                    if counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2 {
+                        super::Admission::Wait
+                    } else {
+                        super::Admission::Copy
+                    }
+                }),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("nothing stops the copy");
+        };
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "a held copy asks again until it may go on"
+        );
+        assert!(compacted.before.get() >= 256, "{compacted:?}");
+        assert!(
+            compacted.after.get() * 10 <= compacted.before.get(),
+            "{compacted:?}"
+        );
+        assert_eq!(compacted.bytes, 8 * 1024 * 1024, "only the data is copied");
+        let locked = scratch.lock(&target).await;
+        let Published::Replaced {
+            seed: replaced,
+            replacement,
+            superseded,
+        } = scratch
+            .volumes
+            .publish_compaction(&locked, compacted)
+            .await
+            .unwrap()
+        else {
+            panic!("main's seed is still the one copied");
+        };
+        drop(locked);
+        scratch.volumes.retire_superseded(superseded).await;
+        assert_eq!(replaced, seed);
+        let (latest, record) = scratch
+            .layout
+            .seed_of(&target.name, &target.incarnation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest, replacement);
+        assert!(record.is_published());
+        assert_eq!(record.tree, Some(GitOid::new("a".repeat(40)).unwrap()));
+        let image = scratch.layout.image(&replacement);
+        assert!(
+            fs::read(&image).unwrap() == bytes,
+            "the copy holds the seed's bytes"
+        );
+        let metadata = fs::metadata(&image).unwrap();
+        assert_eq!(
+            metadata.modified().unwrap(),
+            written,
+            "the seed's freshness mark"
+        );
+        assert!(
+            metadata.blocks() * 512 <= 9 * 1024 * 1024,
+            "holes stay holes: {} bytes allocated",
+            metadata.blocks() * 512
+        );
+        assert!(
+            !scratch.layout.image(&seed).exists(),
+            "the old seed is retired"
+        );
+        assert!(scratch.layout.read_record_present(&seed).unwrap().is_none());
+        assert_eq!(left(), Vec::<&str>::new());
+
+        // A land publishes main's next seed: `tree` names it, `bytes` fill it.
+        let land = |tree: char| {
+            let landed = BuildVolumeId::mint();
+            // Records name whole seconds, so a land in the same second as the compaction's
+            // publication would tie it: date the land's seed after it.
+            let registration = Registration::new(
+                BuildVolumeRecord {
+                    created_at: format!(
+                        "2099-01-01T00:00:{:02}Z",
+                        u32::from(tree) - u32::from('a')
+                    ),
+                    ..seed_registration(tree).registered().clone()
+                },
+                Registrant::Workspace {
+                    incarnation: target.incarnation.clone(),
+                },
+            );
+            let creating = scratch.layout.register(&landed, &registration).unwrap();
+            fs::write(scratch.layout.image(&landed), vec![7_u8; 4096]).unwrap();
+            scratch.layout.publish(&landed, &registration).unwrap();
+            drop(creating);
+            landed
+        };
+
+        // Between the copy and its publication: the copy is released, not published.
+        let SeedCompaction::Copied(compacted) = scratch
+            .volumes
+            .copy_compaction(
+                target.clone(),
+                stage().await,
+                Box::new(|| super::Admission::Copy),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("nothing stops the copy");
+        };
+        let landed = land('b');
+        let locked = scratch.lock(&target).await;
+        let published = scratch
+            .volumes
+            .publish_compaction(&locked, compacted)
+            .await
+            .unwrap();
+        drop(locked);
+        assert!(
+            matches!(&published, Published::Superseded { seed } if *seed == replacement),
+            "{published:?}"
+        );
+        assert_eq!(
+            scratch
+                .layout
+                .seed_of(&target.name, &target.incarnation)
+                .unwrap()
+                .unwrap()
+                .0,
+            landed
+        );
+        assert_eq!(left(), Vec::<&str>::new());
+
+        // During the copy: its own check stops it at the first chunk.
+        let source = stage().await;
+        let landed = land('c');
+        let compaction = scratch
+            .volumes
+            .copy_compaction(target.clone(), source, Box::new(|| super::Admission::Copy))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&compaction, SeedCompaction::Stopped { why, .. } if why.contains(landed.as_str())),
+            "{compaction:?}"
+        );
+        assert_eq!(left(), Vec::<&str>::new());
         scratch.release_all();
     }
 }

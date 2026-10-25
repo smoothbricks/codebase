@@ -140,16 +140,16 @@ impl ControlSocket {
 
 #[async_trait]
 impl GatewayControl for ControlSocket {
+    async fn gates_in_flight(
+        &self,
+    ) -> std::result::Result<
+        std::collections::BTreeSet<cowshed_core::api::dto::GateJobRef>,
+        GatewayStatusError,
+    > {
+        self.0.gates_in_flight().await.map_err(status_error)
+    }
     async fn status(&self) -> std::result::Result<DaemonStatus, GatewayStatusError> {
-        self.0.status().await.map_err(|error| match error {
-            // A missing socket is not a fault: no daemon is running, and the remedy is to start
-            // one rather than to report a broken control plane.
-            ControlError::Wait(WaitError::Absent { .. }) => GatewayStatusError::Absent,
-            error => match expired(&error) {
-                Some(failure) => GatewayStatusError::Waited(Box::new(failure)),
-                None => GatewayStatusError::Control(error.to_string()),
-            },
-        })
+        self.0.status().await.map_err(status_error)
     }
 
     async fn install(&self, session: &WorkspaceSession) -> std::result::Result<(), ControlRefusal> {
@@ -184,6 +184,19 @@ fn control_refusal(error: ControlError) -> ControlRefusal {
         error => match expired(&error) {
             Some(failure) => ControlRefusal::Waited(Box::new(failure)),
             None => ControlRefusal::Failed(error.to_string()),
+        },
+    }
+}
+
+/// A status read's failure as [`GatewayControl`] answers it. A missing socket is not a fault: no
+/// daemon is running, so no gate job runs, and the remedy is to start one rather than to report
+/// a broken control plane. An expired wait is said as one.
+fn status_error(error: ControlError) -> GatewayStatusError {
+    match error {
+        ControlError::Wait(WaitError::Absent { .. }) => GatewayStatusError::Absent,
+        error => match expired(&error) {
+            Some(failure) => GatewayStatusError::Waited(Box::new(failure)),
+            None => GatewayStatusError::Control(error.to_string()),
         },
     }
 }
@@ -1452,7 +1465,10 @@ fn observe_land_turns(home: &Path) -> (Vec<LandTurnQueue>, Option<String>) {
         .map_or(0, |since| {
             u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
         });
-    match turns::observe_all(&turns::land_turn_root(&support_directory(home)), since) {
+    match turns::observe_all(
+        &turns::land_turn_root(&support_directory(home)),
+        Some(since),
+    ) {
         Ok(queues) => (
             queues
                 .into_iter()
@@ -1499,7 +1515,7 @@ async fn refuse_restart_while_busy(
     stderr: &mut impl Write,
 ) -> Result<()> {
     let root = turns::land_turn_root(&support_directory(home));
-    let lands = turns::observe_all(&root, u64::MAX).map_err(|error| {
+    let lands = turns::observe_all(&root, None).map_err(|error| {
         CowshedError::environment_missing(
             format!(
                 "this install cannot tell whether a land runs, so it installed and restarted \
@@ -3603,6 +3619,26 @@ mod tests {
     use cowshed_os::namespace::TestNamespace;
 
     type RecordingExecutor = LaunchdExecutor<NativeFilesystem, RecordingGatewayLaunchctl>;
+
+    /// A gateway that is not running answers both status reads `Absent`: its socket is missing,
+    /// which the bounded connect reports as `WaitError::Absent`, so a seed compaction's copy reads
+    /// no gate job and goes on (16_build_volumes.md, "Seed compaction").
+    #[tokio::test]
+    async fn a_missing_gateway_socket_reads_as_no_gateway() {
+        let socket = PathBuf::from(format!(
+            "/tmp/cowshed-no-gateway-{}.sock",
+            std::process::id()
+        ));
+        let control = ControlSocket::at(socket).unwrap();
+        assert_eq!(
+            control.gates_in_flight().await,
+            Err(GatewayStatusError::Absent)
+        );
+        assert!(matches!(
+            control.status().await,
+            Err(GatewayStatusError::Absent)
+        ));
+    }
 
     /// A build file under `home` with a record of the commit it was made from, as a release
     /// binary carries one; the commit is the time spelled as hex, for tests that judge nothing.

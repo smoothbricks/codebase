@@ -106,6 +106,8 @@ enum Prepared {
     },
     GatewayGitFetch,
     WorkspaceSupervisor(Vec<OsString>),
+
+    SeedCompaction(Vec<OsString>),
 }
 
 impl Invocation {
@@ -121,7 +123,9 @@ impl Invocation {
                 *quiet
             }
             Prepared::Command(parsed) => parsed.global.quiet,
-            Prepared::GatewayGitFetch | Prepared::WorkspaceSupervisor(_) => false,
+            Prepared::GatewayGitFetch
+            | Prepared::WorkspaceSupervisor(_)
+            | Prepared::SeedCompaction(_) => false,
         };
         let mut output = output::Output::stdio(quiet);
         crate::lock::report(&mut output, &error)
@@ -137,6 +141,12 @@ pub fn prepare(arguments: Vec<OsString>) -> Result<Invocation, i32> {
         .is_some_and(|argument| argument == crate::workspace_supervisor::VERB)
     {
         return Ok(Invocation(Prepared::WorkspaceSupervisor(arguments)));
+    }
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == cowshed_core::runtime::SEED_COMPACTION_VERB)
+    {
+        return Ok(Invocation(Prepared::SeedCompaction(arguments)));
     }
     if arguments
         .first()
@@ -235,6 +245,10 @@ async fn run_with(invocation: Invocation, interrupts: InterruptPolicy) -> Ending
         }
         Prepared::WorkspaceSupervisor(arguments) => {
             Ending::Finished(crate::workspace_supervisor::run(&arguments[1..]).await)
+        }
+
+        Prepared::SeedCompaction(arguments) => {
+            Ending::Finished(crate::seed_compaction::run(&arguments[1..]).await)
         }
         Prepared::GatewayGitFetch => Ending::Finished(match run_gateway_git_fetch_helper() {
             Ok(()) => 0,

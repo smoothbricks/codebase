@@ -1168,7 +1168,11 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         retired: true,
         folded: Vec::new(),
         build_volume: cowshed_core::api::dto::LandBuildVolume {
-            seed: cowshed_core::api::dto::LandSeed::Frozen,
+            seed: cowshed_core::api::dto::LandSeed::Frozen {
+                compaction: cowshed_core::api::dto::LandSeedCompaction::Failed {
+                    error: "cannot open the seed compaction log at /Users/fixture/.cache/cowshed/build/.compacting/log: Permission denied (os error 13)".to_owned(),
+                },
+            },
             adoption: cowshed_core::api::dto::Adoption::Skipped {
                 reason: cowshed_core::api::dto::AdoptionSkip::TargetHeld {
                     database: PathBuf::from("/m/.nx/workspace-data/A-v3.db"),
@@ -1185,7 +1189,8 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
     assert_eq!(land["targetWasCheckedOut"], true);
     assert_eq!(
         land["buildVolume"],
-        json!({"seed":{"kind":"frozen"},"adoption":{"kind":"skipped","reason":{"kind":"targetHeld",
+        json!({"seed":{"kind":"frozen","compaction":{"kind":"failed","error":"cannot open the seed compaction log at /Users/fixture/.cache/cowshed/build/.compacting/log: Permission denied (os error 13)"}},
+            "adoption":{"kind":"skipped","reason":{"kind":"targetHeld",
             "database":"/m/.nx/workspace-data/A-v3.db","holders":[{"pid":42,"command":"node nx run-many"}]}}})
     );
 

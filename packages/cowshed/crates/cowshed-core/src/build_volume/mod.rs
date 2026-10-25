@@ -51,6 +51,8 @@ pub(crate) const RECORD_SUFFIX: &str = ".json";
 /// The lock beside each image that every job admitted on the volume holds shared for its whole
 /// run, and that a release takes exclusively: `<id>.dmg.hold` ([`BuildVolumeHold`]).
 pub(crate) const HOLD_SUFFIX: &str = ".hold";
+/// Where a seed compaction works ([`BuildVolumeLayout::compacting`]).
+const COMPACTING_DIRECTORY: &str = ".compacting";
 /// The volume's own statement of the build-state paths it holds, at its root. It travels with
 /// every clone, so a fork knows what its source linked without rediscovering it.
 pub const STATE_FILE: &str = "cowshed-build-state.json";
@@ -753,6 +755,13 @@ impl BuildVolumeLayout {
     /// `id`'s entry in [`Self::deleting`] once its release is committed.
     pub fn released(&self, id: &BuildVolumeId) -> PathBuf {
         self.deleting().join(format!("{id}.{IMAGE_EXTENSION}"))
+    }
+
+    /// Where a seed compaction works (16_build_volumes.md, "Seed compaction"),
+    /// `build/.compacting`: its lock, its last success, the clone of the seed it copies and the
+    /// copy. No enumeration of images, records or the release journal reads it.
+    pub fn compacting(&self) -> PathBuf {
+        self.images.join(COMPACTING_DIRECTORY)
     }
 
     /// Release `id`'s detached image inside the operation that retires or replaces it, and say

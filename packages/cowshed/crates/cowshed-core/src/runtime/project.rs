@@ -217,6 +217,14 @@ pub trait ProjectRuntimeHost: Send + 'static {
             "serving a workspace supervisor is unavailable for this runtime host",
         ))
     }
+
+    /// Compact main's seed when it is due (16_build_volumes.md, "Seed compaction"): the whole of
+    /// the `cowshed __compact-seed` process a land starts.
+    async fn compact_seed(&mut self) -> Result<crate::api::dto::SeedCompactionReport> {
+        Err(CowshedError::internal(
+            "compacting a seed is unavailable for this runtime host",
+        ))
+    }
     /// Make room under IOKit's IOMedia match-notification ceiling for what a verb may attach
     /// (02_workspaces.md, "Making room for an attach"): best effort, never failing the verb. A
     /// host without disk images has no media to make room among.
@@ -1197,6 +1205,18 @@ impl ProjectRuntime {
             .await
     }
 
+    /// Compact main's seed when it is due ([`ProjectRuntimeHost::compact_seed`]): the whole of
+    /// the `cowshed __compact-seed` process.
+    pub async fn compact_seed(&self) -> Result<crate::api::dto::SeedCompactionReport> {
+        self.router
+            .call::<operations::CoordinatorCompactSeed>(
+                self.coordinator(),
+                operations::RepoRequest {
+                    repo_id: self.descriptor.repo_id.clone(),
+                },
+            )
+            .await
+    }
     fn coordinator(&self) -> ConnectionAuthority {
         ConnectionAuthority::Coordinator {
             repo_id: self.descriptor.repo_id.clone(),
@@ -1516,6 +1536,10 @@ impl ProjectActor {
                 self.require_repo(&params.repo_id)?;
                 self.host.serve_supervisor(params.workspace).await?;
                 respond::<operations::CoordinatorServeSupervisor>(&EmptyResult {})
+            }
+            Op::CoordinatorCompactSeed(params) => {
+                self.require_repo(&params.repo_id)?;
+                respond::<operations::CoordinatorCompactSeed>(&self.host.compact_seed().await?)
             }
             Op::CoordinatorRefreshBuildState(params) => {
                 self.require_repo(&params.repo_id)?;
@@ -5998,19 +6022,15 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         // A busy seal keeps the previous seed and the adoption still runs: the seal fences only
         // the captured bytes, and the restored volume is as quiet for the target as before. The
         // seeds a freeze replaced are claimed under the lock and retired once it is let go.
-        let (seed, superseded) = match timed_async(
+        let (seal_busy, superseded) = match timed_async(
             "land",
             "freeze-seed",
             volumes.freeze_seed(&locked, &quiet, tree.clone()),
         )
         .await?
         {
-            Ok(super::build_volumes::Freeze::Frozen { superseded }) => {
-                (LandSeed::Frozen, Some(superseded))
-            }
-            Ok(super::build_volumes::Freeze::SealBusy { reason }) => {
-                (LandSeed::SealBusy { reason }, None)
-            }
+            Ok(super::build_volumes::Freeze::Frozen { superseded }) => (None, Some(superseded)),
+            Ok(super::build_volumes::Freeze::SealBusy { reason }) => (Some(reason), None),
             Err(reason) => return Ok(skipped(reason)),
         };
         let closed = match closed {
@@ -6021,7 +6041,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     volumes.retire_superseded(superseded).await;
                 }
                 return Ok(LandBuildVolume {
-                    seed,
+                    seed: self.land_seed(&into.name, seal_busy, &volumes).await,
                     adoption: Adoption::Skipped { reason },
                 });
             }
@@ -6123,9 +6143,301 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 Adoption::Adopted { elapsed_ms, check }
             }
         };
-        Ok(LandBuildVolume { seed, adoption })
+        Ok(LandBuildVolume {
+            seed: self.land_seed(&into.name, seal_busy, &volumes).await,
+            adoption,
+        })
     }
 
+    /// What the land's freeze did with `target`'s seed, `seal_busy` being why a conflicting claim
+    /// refused its capture. Once main's seed is frozen, the land starts
+    /// its compaction when it is due (16_build_volumes.md, "Seed compaction") and answers without
+    /// waiting for it. A decision or start that fails is the report's value, not the land's error:
+    /// the land has succeeded. It is recorded, so the next lands of this build hold back for it
+    /// instead of failing the same way.
+    async fn land_seed(
+        &mut self,
+        target: &WorkspaceName,
+        seal_busy: Option<String>,
+        volumes: &super::build_volumes::BuildVolumes<H>,
+    ) -> crate::api::dto::LandSeed {
+        use crate::api::dto::{LandSeed, LandSeedCompaction};
+        match seal_busy {
+            Some(reason) => LandSeed::SealBusy { reason },
+            None if !target.is_main() => LandSeed::Frozen {
+                compaction: LandSeedCompaction::NotMain,
+            },
+            None => LandSeed::Frozen {
+                compaction: match self.start_seed_compaction(volumes).await {
+                    Ok(compaction) => compaction,
+                    Err(mut error) => {
+                        if let Err(recording) = volumes.record_compaction_failure(&error.message) {
+                            error.message = format!(
+                                "{}; recording that failure failed too: {}",
+                                error.message, recording.message
+                            );
+                        }
+                        LandSeedCompaction::Failed {
+                            error: error.message,
+                        }
+                    }
+                },
+            },
+        }
+    }
+
+    /// Main's seed compaction, started in a process of its own ([`super::build_volumes::start_compaction`])
+    /// when the seed is due and no failure of this build is held; a thread reaps it.
+    async fn start_seed_compaction(
+        &mut self,
+        volumes: &super::build_volumes::BuildVolumes<H>,
+    ) -> Result<crate::api::dto::LandSeedCompaction> {
+        use super::build_volumes::{CompactionDue, io, seconds_since};
+        use crate::api::dto::LandSeedCompaction;
+        if let Some(held) = volumes.compaction_held()? {
+            return Ok(LandSeedCompaction::Held {
+                error: held.error,
+                seconds_ago: seconds_since(held.at),
+            });
+        }
+        let main = main_name();
+        let current = self.current(&main).await?;
+        let owner = super::build_volumes::Owner {
+            name: main,
+            incarnation: current.derived.workspace.incarnation().clone(),
+        };
+        let extents = match volumes.compaction_due(owner).await? {
+            CompactionDue::Due { extents } => extents,
+            CompactionDue::Below { extents } => return Ok(LandSeedCompaction::Below { extents }),
+            CompactionDue::Recent { at } => {
+                return Ok(LandSeedCompaction::Recent {
+                    seconds_ago: seconds_since(at),
+                });
+            }
+            CompactionDue::NoSeed => return Ok(LandSeedCompaction::NoSeed),
+        };
+        let executable = std::env::current_exe()
+            .map_err(|error| io("find this cowshed executable", Path::new("cowshed"), &error))?;
+        let (mut child, log) = super::build_volumes::start_compaction(
+            &executable,
+            &self.descriptor.git_root,
+            &volumes.layout.compacting(),
+        )?;
+        let pid = child.id();
+        std::thread::Builder::new()
+            .name("seed-compaction-reaper".to_owned())
+            .spawn(move || {
+                if let Err(error) = child.wait() {
+                    cowshed_os::eprintln!(
+                        "cowshed: the seed compaction process {pid} could not be reaped: {error}"
+                    );
+                }
+            })
+            .map_err(|error| io("reap the seed compaction", &executable, &error))?;
+        Ok(LandSeedCompaction::Started { pid, extents, log })
+    }
+
+    /// `coordinator.compactSeed` (16_build_volumes.md, "Seed compaction"). Under the project's
+    /// compaction turn, once main's seed is due: refresh main's seed as a fork of main does, so
+    /// the copy holds what main's volume holds and the next fork's reseed keeps it; clone it
+    /// aside under main's image lock; copy it with no lock held, checking at every GiB and holding
+    /// while a gate job or a land runs; and publish the copy under the lock again, unless a land or a reseed
+    /// replaced the seed meanwhile.
+    async fn compact_main_seed(&mut self) -> Result<crate::api::dto::SeedCompactionReport> {
+        use super::build_volumes::{CompactionDue, Owner, Published};
+        use crate::api::dto::SeedCompactionReport;
+        use crate::storage::apfs::native::SeedCompaction;
+        let started = std::time::Instant::now();
+        self.validate_binding().await?;
+        let volumes = self.build_volumes()?;
+        let Some(turn) = volumes.try_compaction_turn()? else {
+            return Ok(SeedCompactionReport::Running);
+        };
+        let main = main_name();
+        let current = self.current(&main).await?;
+        let owner = Owner {
+            name: main.clone(),
+            incarnation: current.derived.workspace.incarnation().clone(),
+        };
+        match volumes.compaction_due(owner.clone()).await? {
+            CompactionDue::Due { .. } => {}
+            CompactionDue::Below { extents } => {
+                return Ok(SeedCompactionReport::Below { extents });
+            }
+            CompactionDue::Recent { at } => {
+                return Ok(SeedCompactionReport::Recent {
+                    seconds_ago: super::build_volumes::seconds_since(at),
+                });
+            }
+            CompactionDue::NoSeed => return Ok(SeedCompactionReport::NoSeed),
+        }
+        volumes.release_compaction_leftovers().await?;
+        let main_mount = self.workspace_mount_path(&main)?;
+        let lock = self
+            .layout
+            .canonical_image(&main)
+            .map_err(native_integrity_error)?
+            .lock()
+            .to_owned();
+        let holding = crate::api::held_lock::LockHolding::of(
+            crate::api::held_lock::LockOperation::Defragment,
+            &main,
+        );
+        let aim = self.seed_aim(&main, &main_mount, None).await?;
+        let locked = match volumes
+            .try_lock_target(owner.clone(), lock.clone(), holding.clone())
+            .await?
+        {
+            Ok(locked) => locked,
+            Err(contended) => contended.wait().await?,
+        };
+        let mut refreshed = volumes
+            .refresh_seed(owner.clone(), main_mount, aim, holding.clone())
+            .await?;
+        super::build_volumes::say_refresh(&main, &main, &refreshed);
+        let superseded = refreshed.superseded.take();
+        let staged = volumes.stage_compaction(&locked).await;
+        drop(locked);
+        // The seeds the refresh replaced are claimed under the lock and retired once it is let go.
+        if let Some(superseded) = superseded {
+            volumes.retire_superseded(superseded).await;
+        }
+        let Some(source) = staged? else {
+            return Ok(SeedCompactionReport::NoSeed);
+        };
+        let compacted = match self
+            .copy_between_gates(&volumes, owner.clone(), source)
+            .await?
+        {
+            SeedCompaction::Stopped { bytes, why } => {
+                return Ok(SeedCompactionReport::Stopped { bytes, why });
+            }
+            SeedCompaction::Copied(compacted) => compacted,
+        };
+        let (before, after, bytes) = (
+            compacted.before.get(),
+            compacted.after.get(),
+            compacted.bytes,
+        );
+        let locked = match volumes.try_lock_target(owner, lock, holding).await? {
+            Ok(locked) => locked,
+            Err(contended) => contended.wait().await?,
+        };
+        let published = volumes.publish_compaction(&locked, compacted).await?;
+        drop(locked);
+        Ok(match published {
+            Published::Superseded { seed } => SeedCompactionReport::Superseded {
+                seed: seed.to_string(),
+            },
+            Published::Replaced {
+                seed,
+                replacement,
+                superseded,
+            } => {
+                volumes.retire_superseded(superseded).await;
+                turn.succeeded()?;
+                SeedCompactionReport::Compacted {
+                    seed: seed.to_string(),
+                    replacement: replacement.to_string(),
+                    before,
+                    after,
+                    bytes,
+                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                }
+            }
+        })
+    }
+
+    /// The compaction's copy, whose every check asks this controller, on its own task, whether to
+    /// go on: an answer, not a timer, so the copy is asked exactly as often as it checks. While a
+    /// gate job or a land runs, the controller says why once in the compaction's log, holds
+    /// [`SEED_COMPACTION_WAIT`] and answers `Wait`; the copy checks its seed and asks again.
+    async fn copy_between_gates(
+        &self,
+        volumes: &super::build_volumes::BuildVolumes<H>,
+        owner: super::build_volumes::Owner,
+        source: crate::storage::apfs::native::CompactionSource,
+    ) -> Result<crate::storage::apfs::native::SeedCompaction> {
+        use super::build_volumes::{Admission, SEED_COMPACTION_WAIT};
+        type Answer = tokio::sync::oneshot::Sender<Admission>;
+        let (asks, mut asked) = tokio::sync::mpsc::channel::<Answer>(1);
+        let unanswered =
+            || Admission::Stop("nothing answers whether a gate job or a land runs".to_owned());
+        let admit = Box::new(move || {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            if asks.blocking_send(reply).is_err() {
+                return unanswered();
+            }
+            answer.blocking_recv().unwrap_or_else(|_| unanswered())
+        });
+        let copying = volumes.copy_compaction(owner, source, admit);
+        tokio::pin!(copying);
+        let mut waiting: Option<(std::time::Instant, String)> = None;
+        loop {
+            tokio::select! {
+                copied = &mut copying => return copied,
+                Some(reply) = asked.recv() => {
+                    let admission = match self.why_compaction_waits().await {
+                        Ok(None) => {
+                            if let Some((since, _)) = waiting.take() {
+                                cowshed_os::eprintln!(
+                                    "cowshed: seed compaction: copying again after waiting {} s",
+                                    since.elapsed().as_secs()
+                                );
+                            }
+                            Admission::Copy
+                        }
+                        Ok(Some(why)) => {
+                            let since = match waiting.take() {
+                                Some((since, said)) if said == why => since,
+                                held => {
+                                    cowshed_os::eprintln!("cowshed: seed compaction: waiting: {why}");
+                                    held.map_or_else(std::time::Instant::now, |(since, _)| since)
+                                }
+                            };
+                            waiting = Some((since, why));
+                            tokio::time::sleep(SEED_COMPACTION_WAIT).await;
+                            Admission::Wait
+                        }
+                        Err(why) => Admission::Stop(why),
+                    };
+                    // A copy that stopped waiting has failed, and `copying` answers that.
+                    let _ = reply.send(admission);
+                }
+            }
+        }
+    }
+
+    /// Why a seed compaction's copy waits now (16_build_volumes.md, "Seed compaction"): a gate
+    /// job holds or waits for CPU tokens, or a land holds or waits for a repository's turn, whose
+    /// gate may run as plain host work the CPU ledger does not count. `Err` is why it stops:
+    /// either cannot be read, and not knowing is no permission. No gateway runs no gate job.
+    async fn why_compaction_waits(&self) -> std::result::Result<Option<String>, String> {
+        if let Some(why) =
+            super::build_volumes::gates_hold(self.gateway_control.gates_in_flight().await)?
+        {
+            return Ok(Some(why));
+        }
+        let root =
+            crate::land_turn::land_turn_root(&crate::host_dirs::support_directory(&self.home));
+        let turns = crate::land_turn::observe_all(&root, None)
+            .map_err(|error| format!("whether a land holds a turn cannot be read: {error}"))?;
+        let held = turns
+            .iter()
+            .filter_map(|repo| {
+                repo.tickets.first().map(|holder| {
+                    format!(
+                        "{} by {} (pid {}, {} waiting)",
+                        repo.repo,
+                        holder.workspace,
+                        holder.pid,
+                        repo.tickets.len() - 1
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok((!held.is_empty()).then(|| format!("lands hold turns: {}", held.join(", "))))
+    }
     /// Fork step 2's aim (16_build_volumes.md, "Which volume a seed holds"): the tree a fork of
     /// `target` checks out, `revision`'s or else the target's own, and, when that is the target's
     /// `HEAD^{tree}`, every other live workspace, any of which may have landed it outside
@@ -15644,7 +15956,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 landing_incarnation: landing_incarnation.clone(),
                 target_incarnation: target_incarnation.clone(),
                 landed_head: source_head.clone(),
-                seeded: matches!(build_volume.seed, crate::api::dto::LandSeed::Frozen),
+                seeded: matches!(build_volume.seed, crate::api::dto::LandSeed::Frozen { .. }),
                 skip: match &build_volume.adoption {
                     crate::api::dto::Adoption::Adopted { .. } => None,
                     crate::api::dto::Adoption::Skipped { reason } => Some(reason.clone()),
@@ -15821,6 +16133,25 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
 
     async fn serve_supervisor(&mut self, workspace: WorkspaceName) -> Result<()> {
         self.serve_supervisor_until_retired(workspace).await
+    }
+
+    /// A compaction that ends in an error records it, so no land of this build starts another
+    /// until one succeeds (16_build_volumes.md, "Seed compaction"); the error is still the answer.
+    async fn compact_seed(&mut self) -> Result<crate::api::dto::SeedCompactionReport> {
+        let compacted = self.compact_main_seed().await;
+        let Err(mut error) = compacted else {
+            return compacted;
+        };
+        if let Err(recording) = self
+            .build_volumes()
+            .and_then(|volumes| volumes.record_compaction_failure(&error.message))
+        {
+            error.message = format!(
+                "{}; recording that failure failed too: {}",
+                error.message, recording.message
+            );
+        }
+        Err(error)
     }
 
     async fn refresh_build_state(

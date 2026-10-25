@@ -27,6 +27,7 @@ pub mod probe;
 pub mod resident;
 pub mod run;
 pub mod runtime;
+pub mod seed_compaction;
 pub mod setup_service;
 pub mod skill;
 mod subtree;

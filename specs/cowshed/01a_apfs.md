@@ -116,7 +116,8 @@ links back to the sections here.
   earlier clones and checkpoints still share the old blocks; the verb refuses before detaching when the store volume
   lacks it. Nothing enumerates `<image>.defrag` as an image or sidecar; the next `defrag` replaces one an interrupted
   run left, and `doctor` names it until then. Mains are never detached implicitly (the gateway keeps them mounted), so
-  no path rewrites main on its own. A refused resumed clone remains pending because it may contain the only copy of
+  no path rewrites main on its own; main's detached seed is rewritten by seed compaction (16_build_volumes.md, "Seed
+  compaction") with this same copy. A refused resumed clone remains pending because it may contain the only copy of
   dirty or unlanded work. Its hint names `cowshed defrag <pending-destination>`, not its source: the command opens
   without replaying the failed fork, claims the existing creator-intent lease, revalidates the exact pending metadata
   under its image lock, and rewrites the same payload without activating it or changing its journal phase. A live
@@ -1107,7 +1108,8 @@ Remaining options, not additional guarantees or implemented cutovers:
   after cloning a fragmented live source cannot undo the first-mutation cost already introduced.
 - Avoid sharing a live fragmented source's map: copy its data without `clonefile`, under the existing consistency and
   ownership protocol, accepting the I/O and free-space cost; or quiesce the source while paying first mutation.
-  Quiescence moves the pause to an explicit maintenance window rather than shortening the kernel work.
+  Quiescence moves the pause to an explicit maintenance window rather than shortening the kernel work. Seed compaction
+  (16_build_volumes.md, "Seed compaction") takes the copy for main's detached seed, off the land path.
 - Put latency-sensitive writers on a different APFS container/device. Another image or volume in the same container is
   not an isolation boundary. Such placement needs its own measurement; it is not proved here.
 - A shared-unlink optimization would need an enforceable lifetime/immutability hold on another map owner through final

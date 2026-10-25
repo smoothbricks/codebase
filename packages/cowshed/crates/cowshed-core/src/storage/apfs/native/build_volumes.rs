@@ -21,6 +21,65 @@ use crate::storage::lifecycle::ResizeOutcome;
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess, mount_is_in_progress};
 use cowshed_os::process::Holder;
+use std::ops::ControlFlow;
+
+use crate::storage::apfs::extents::{self, Copied};
+use crate::storage::apfs::release::{Released, STEP_EXTENTS, release_file};
+use crate::storage::lifecycle::ExtentCount;
+
+/// The never-written clone of the seed a compaction copies, in [`BuildVolumeLayout::compacting`].
+const COMPACTION_SOURCE: &str = "source.dmg";
+/// The compaction's contiguous copy, until it is published or released.
+const COMPACTION_COPY: &str = "copy.dmg";
+
+/// A seed cloned aside for its compaction (16_build_volumes.md, "Seed compaction"). The clone
+/// shares the seed's blocks and is never written, so a land or reseed that retires the seed
+/// meanwhile changes nothing the copy reads.
+#[derive(Debug)]
+pub struct CompactionSource {
+    seed: BuildVolumeId,
+    clone: PathBuf,
+    written: SystemTime,
+}
+
+impl CompactionSource {
+    /// The seed this is a clone of.
+    pub fn seed(&self) -> &BuildVolumeId {
+        &self.seed
+    }
+}
+
+/// A seed's data copied into fresh, contiguous space, not yet published.
+#[derive(Debug)]
+pub struct CompactedSeed {
+    seed: BuildVolumeId,
+    copy: PathBuf,
+    written: SystemTime,
+    /// The seed's extents.
+    pub before: ExtentCount,
+    /// The copy's extents.
+    pub after: ExtentCount,
+    /// The data bytes copied.
+    pub bytes: u64,
+}
+
+impl CompactedSeed {
+    /// The seed this is a copy of.
+    pub fn seed(&self) -> &BuildVolumeId {
+        &self.seed
+    }
+}
+
+/// What a seed compaction's copy did.
+#[derive(Debug)]
+pub enum Compaction {
+    Copied(CompactedSeed),
+    /// Stopped once `bytes` were copied, because `why`; nothing of it is left.
+    Stopped {
+        bytes: u64,
+        why: String,
+    },
+}
 
 /// What releasing a build volume did.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1043,6 +1102,187 @@ where
             extents: extents::count_extents(&image)?,
             bytes,
         })
+    }
+
+    /// How many extents seed `seed`'s image holds, counted no further than `stop_at`.
+    pub fn seed_extents(
+        &self,
+        layout: &BuildVolumeLayout,
+        seed: &BuildVolumeId,
+        stop_at: u64,
+    ) -> Result<ExtentCount, ApfsStorageError> {
+        let image = layout.image(seed);
+        self.verify_controller_path(&image)?;
+        extents::count_extents_to(&image, stop_at)
+    }
+
+    /// Release what an interrupted compaction left in [`BuildVolumeLayout::compacting`], its
+    /// clone and its copy, in bounded steps (16_build_volumes.md, "Seed compaction",
+    /// "Leftovers"). The caller holds the project's compaction lock, so they are garbage, and no
+    /// image lock: freeing a whole seed's extent map takes minutes.
+    pub fn release_seed_compaction_leftovers(
+        &self,
+        layout: &BuildVolumeLayout,
+    ) -> Result<(), ApfsStorageError> {
+        let directory = layout.compacting();
+        for name in [COMPACTION_SOURCE, COMPACTION_COPY] {
+            release_compaction_file(&directory.join(name))?;
+        }
+        Ok(())
+    }
+    /// Clone published seed `seed` aside for its compaction (16_build_volumes.md, "Seed
+    /// compaction"), with the instant of the last write it holds. The caller holds the target's
+    /// image lock, so nothing retires the seed during the clone, and the project's compaction
+    /// lock, after [`Self::release_seed_compaction_leftovers`] emptied the directory.
+    pub fn stage_seed_compaction(
+        &self,
+        layout: &BuildVolumeLayout,
+        seed: &BuildVolumeId,
+    ) -> Result<CompactionSource, ApfsStorageError> {
+        let image = layout.image(seed);
+        self.verify_controller_path(&image)?;
+        let directory = layout.compacting();
+        fs::create_dir_all(&directory)
+            .map_err(|error| io_error("create the seed compaction directory", &directory, error))?;
+        let clone = directory.join(COMPACTION_SOURCE);
+        let written = written_at(&image)?;
+        self.capture_build_seed(&image, None, &clone)?;
+        Ok(CompactionSource {
+            seed: seed.clone(),
+            clone,
+            written,
+        })
+    }
+
+    /// Copy `source`'s data into fresh, contiguous space at normal disk priority and past the cache,
+    /// asking `keep_going` after every chunk with the bytes copied so far, then release the clone
+    /// in bounded steps: a throttled free holds the container's work
+    /// ([`crate::build_volume::drain_released`]). No lock is held; a stop or a failure leaves
+    /// nothing behind.
+    pub fn copy_seed_compaction(
+        &self,
+        source: CompactionSource,
+        keep_going: &mut dyn FnMut(u64) -> ControlFlow<String>,
+    ) -> Result<Compaction, ApfsStorageError> {
+        let CompactionSource {
+            seed,
+            clone,
+            written,
+        } = source;
+        let copy = clone.with_file_name(COMPACTION_COPY);
+        let copied = extents::count_extents(&clone).and_then(|before| {
+            extents::copy_contiguously(&clone, &copy, keep_going).map(|copied| (before, copied))
+        });
+        let released = release_compaction_file(&clone);
+        let (before, copied) = match (copied, released) {
+            (Ok(copied), Ok(())) => copied,
+            // A complete copy stays where it is, for the next compaction to release first.
+            (Ok(_), Err(cleanup)) => return Err(cleanup),
+            (Err(primary), released) => {
+                return crate::storage::apfs::combine_cleanup(
+                    "release the seed's clone a failed compaction left",
+                    primary,
+                    released,
+                );
+            }
+        };
+        match copied {
+            Copied::Stopped { bytes, why } => Ok(Compaction::Stopped { bytes, why }),
+            Copied::Complete { bytes } => match extents::count_extents(&copy) {
+                Ok(after) => Ok(Compaction::Copied(CompactedSeed {
+                    seed,
+                    copy,
+                    written,
+                    before,
+                    after,
+                    bytes,
+                })),
+                Err(primary) => crate::storage::apfs::combine_cleanup(
+                    "release a compacted copy that could not be measured",
+                    primary,
+                    release_compaction_file(&copy),
+                ),
+            },
+        }
+    }
+
+    /// Publish `compacted` as `destination`, the seed `registration` records, which is its
+    /// target's latest from then on: registered before its image exists, moved into place, given
+    /// the copied seed's freshness mark (the bytes are that seed's, so they are no newer), proven
+    /// forkable, published and proven again across publication, as a captured seed is. The
+    /// caller holds the target's image lock and has checked that `compacted`'s seed is still the
+    /// latest. A failure releases what was registered.
+    pub fn publish_seed_compaction(
+        &self,
+        layout: &BuildVolumeLayout,
+        compacted: CompactedSeed,
+        destination: &BuildVolumeId,
+        registration: &Registration,
+    ) -> Result<(), ApfsStorageError> {
+        let to = layout.image(destination);
+        self.verify_controller_path(&to)?;
+        let creating = match layout.register(destination, registration) {
+            Ok(creating) => creating,
+            Err(error) => {
+                return crate::storage::apfs::combine_cleanup(
+                    "release a compacted copy whose seed could not be registered",
+                    host_error(error),
+                    release_compaction_file(&compacted.copy),
+                );
+            }
+        };
+        let placed = (|| {
+            fs::rename(&compacted.copy, &to)
+                .map_err(|error| io_error("place the compacted seed", &to, error))?;
+            let images = layout.images();
+            fs::File::open(images)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| io_error("sync the build images directory", images, error))?;
+            set_written(&to, compacted.written)?;
+            extents::prove_forkable(&to)
+        })();
+        let proof = match placed {
+            Ok(proof) => proof,
+            Err(error) => return Err(self.unregister(layout, destination, creating, error)),
+        };
+        if let Err(error) = layout.publish(destination, registration) {
+            return Err(self.unregister(layout, destination, creating, host_error(error)));
+        }
+        if let Err(error) = proof.revalidate(&to) {
+            let error = match layout.write_record(destination, registration.registered()) {
+                Ok(()) => error,
+                Err(cleanup) => ApfsStorageError::Cleanup {
+                    operation: "unpublish a compacted seed whose extent proof went stale",
+                    primary: Box::new(error),
+                    cleanup: Box::new(host_error(cleanup)),
+                },
+            };
+            return Err(self.unregister(layout, destination, creating, error));
+        }
+        drop(creating);
+        Ok(())
+    }
+
+    /// Release a compacted copy nothing will publish: a land or a reseed replaced its seed while
+    /// it was copied.
+    pub fn discard_seed_compaction(
+        &self,
+        compacted: CompactedSeed,
+    ) -> Result<(), ApfsStorageError> {
+        release_compaction_file(&compacted.copy)
+    }
+}
+
+/// Release one of a seed compaction's files in bounded steps (16_build_volumes.md, "Garbage
+/// collection"): a clone whose seed was retired meanwhile owns that seed's whole extent map.
+fn release_compaction_file(path: &Path) -> Result<(), ApfsStorageError> {
+    match release_file(path, STEP_EXTENTS) {
+        Ok(Released::Freed { .. } | Released::Absent) => Ok(()),
+        Ok(Released::Busy) => Err(ApfsStorageError::Host(format!(
+            "{} is being released by another process, but only the compaction holding its project's compaction lock touches it",
+            path.display()
+        ))),
+        Err(error) => Err(io_error("release a seed compaction's file", path, error)),
     }
 }
 
