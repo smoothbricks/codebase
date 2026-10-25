@@ -14,8 +14,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitStatus;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
@@ -577,7 +576,13 @@ pub fn output_within(
             source,
         })?;
     let pumps = OutputPumps::start(&mut child);
-    let status = reap(role, &mut child, deadline, Progress::Nothing)?;
+    let status = match reap(role, &mut child, deadline, Progress::Nothing) {
+        Ok(status) => status,
+        Err(failure) => {
+            collect_later(role, child);
+            return Err(failure.into());
+        }
+    };
     let (stdout, stderr) = pumps.join(role, child.id(), deadline)?;
     Ok(std::process::Output {
         status,
@@ -633,48 +638,55 @@ impl OutputError {
     }
 }
 
-/// A child's piped stdout and stderr, each read to its end on a thread of its own while the child
-/// runs, as `Command::output` reads them, so a verbose child never wedges on a full pipe. Once
-/// nobody will collect the output (the pumps are dropped, a join gave up), each pump drops what
-/// it reads and keeps draining to its holder's close: a held pipe costs one blocked thread and no
-/// memory, and its holder is never sent `SIGPIPE`.
-pub struct OutputPumps {
-    started: Vec<OutputStream>,
-    done: mpsc::Receiver<(OutputStream, io::Result<Vec<u8>>)>,
-    abandoned: Arc<AtomicBool>,
+/// What a pump has from its stream: the next bytes, the stream's end, or the read that failed.
+enum Pumped {
+    Chunk(OutputStream, Vec<u8>),
+    End(OutputStream),
+    Failed(OutputStream, io::Error),
 }
 
-impl Drop for OutputPumps {
-    fn drop(&mut self) {
-        self.abandoned.store(true, Ordering::Release);
-    }
+/// A child's piped stdout and stderr, each read on a thread of its own while the child runs, as
+/// `Command::output` reads them, so a verbose child never wedges on a full pipe. Each pump hands
+/// its bytes over as they arrive; once the pumps are dropped (a join gave up, a run failed), what
+/// was read and not collected is freed with them, and each pump reads on, keeping nothing, until
+/// its holder closes the pipe: a held pipe costs one blocked thread and no memory, and its holder
+/// is never sent `SIGPIPE`.
+pub struct OutputPumps {
+    started: Vec<OutputStream>,
+    pumped: mpsc::Receiver<Pumped>,
 }
 
 impl OutputPumps {
     /// Start reading `child`'s piped stdout and stderr; a stream that is not piped reads empty.
     pub fn start(child: &mut std::process::Child) -> Self {
-        let (sent, done) = mpsc::channel();
-        let abandoned = Arc::new(AtomicBool::new(false));
+        use std::io::Read as _;
+
+        let (sent, pumped) = mpsc::channel();
         let mut started = Vec::with_capacity(2);
         let mut pump = |stream, pipe: Option<Box<dyn std::io::Read + Send>>| {
             let Some(mut pipe) = pipe else { return };
             started.push(stream);
             let sent = sent.clone();
-            let abandoned = Arc::clone(&abandoned);
             std::thread::spawn(move || {
-                let mut bytes = Vec::new();
                 let mut chunk = [0_u8; 64 * 1024];
-                let read = loop {
+                // A send refused is a collector that is gone: the bytes are dropped, and the
+                // pump drains on to the holder's close.
+                loop {
                     match pipe.read(&mut chunk) {
-                        Ok(0) => break Ok(bytes),
-                        Ok(_) if abandoned.load(Ordering::Acquire) => bytes = Vec::new(),
-                        Ok(length) => bytes.extend_from_slice(&chunk[..length]),
+                        Ok(0) => {
+                            let _ = sent.send(Pumped::End(stream));
+                            return;
+                        }
+                        Ok(length) => {
+                            let _ = sent.send(Pumped::Chunk(stream, chunk[..length].to_vec()));
+                        }
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                        Err(error) => break Err(error),
+                        Err(error) => {
+                            let _ = sent.send(Pumped::Failed(stream, error));
+                            return;
+                        }
                     }
-                };
-                // A collector that gave up has already failed naming this stream's holder.
-                let _ = sent.send((stream, read));
+                }
             });
         };
         pump(
@@ -691,18 +703,14 @@ impl OutputPumps {
                 .take()
                 .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
         );
-        Self {
-            started,
-            done,
-            abandoned,
-        }
+        Self { started, pumped }
     }
 
     /// The bytes each stream carried to its end, the child `role` at `pid` having exited and
     /// been collected, within what is left of `deadline`; a spent budget still takes what has
     /// already arrived. A stream still open at the bound is held by a process that inherited the
-    /// pipe: the wait ends naming the child and that stream, and the pump drains it, keeping
-    /// nothing, until its holder closes it. The collected child's pid is never read again.
+    /// pipe: the wait ends naming the child and that stream. The collected child's pid is never
+    /// read again.
     pub fn join(
         self,
         role: &'static str,
@@ -713,11 +721,22 @@ impl OutputPumps {
         let mut stderr = Vec::new();
         let mut open = self.started.clone();
         while let Some(&first) = open.first() {
-            let (stream, read) = match self
-                .done
+            match self
+                .pumped
                 .recv_timeout(deadline.remaining(clock()).unwrap_or_default())
             {
-                Ok(done) => done,
+                Ok(Pumped::Chunk(OutputStream::Stdout, bytes)) => stdout.extend_from_slice(&bytes),
+                Ok(Pumped::Chunk(OutputStream::Stderr, bytes)) => stderr.extend_from_slice(&bytes),
+                Ok(Pumped::End(stream)) => open.retain(|pending| *pending != stream),
+                Ok(Pumped::Failed(stream, source)) => {
+                    return Err(OutputError::Read {
+                        op: deadline.op(),
+                        role,
+                        pid,
+                        stream,
+                        source,
+                    });
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     return Err(OutputError::Held {
                         stream: first,
@@ -741,19 +760,7 @@ impl OutputPumps {
                         source: io::Error::other("its pump ended without an answer"),
                     });
                 }
-            };
-            let bytes = read.map_err(|source| OutputError::Read {
-                op: deadline.op(),
-                role,
-                pid,
-                stream,
-                source,
-            })?;
-            match stream {
-                OutputStream::Stdout => stdout = bytes,
-                OutputStream::Stderr => stderr = bytes,
             }
-            open.retain(|pending| *pending != stream);
         }
         Ok((stdout, stderr))
     }

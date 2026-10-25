@@ -108,12 +108,14 @@ fn run_disk_tool(
     SystemCommandRunner::new(namespace)
         .run_with_deadline(&request, deadline)
         .map_err(|error| match error.failure {
-            CommandRunFailure::Reap { .. } | CommandRunFailure::Output { .. } => {
-                HostError::new(format!(
-                    "disk command {:?} ran, but its end was not observed: {error}",
-                    command.program()
-                ))
-            }
+            CommandRunFailure::Reap { .. } => HostError::new(format!(
+                "disk command {:?} ran, but its end was not observed: {error}",
+                command.program()
+            )),
+            CommandRunFailure::Output { .. } => HostError::new(format!(
+                "disk command {:?} ran, but its output was not collected: {error}",
+                command.program()
+            )),
             CommandRunFailure::Deadline { deadline, .. }
             | CommandRunFailure::Unspawned(deadline) => HostError::new(format!(
                 "disk command {:?} produced no result within {deadline:?}: {error}",

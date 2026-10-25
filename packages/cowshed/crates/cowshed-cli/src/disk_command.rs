@@ -117,10 +117,14 @@ fn runner_error(error: CommandRunError) -> CowshedError {
                 "the named process did not end after SIGKILL; its state says why (an uninterruptible kernel wait ends only when that call returns)",
             )
         }
-        CommandRunFailure::Output { .. } => CowshedError::conflict(
-            message,
-            "a process the tool started still holds its output pipe; find it in the tool's process group",
-        ),
+        CommandRunFailure::Output { failure, .. }
+            if matches!(*failure, cowshed_os::deadline::OutputError::Held { .. }) =>
+        {
+            CowshedError::conflict(
+                message,
+                "a process the tool started still holds its output pipe; find it in the tool's process group",
+            )
+        }
         CommandRunFailure::DeviceChanged(_) => CowshedError::conflict(
             message,
             "read the I/O Registry again and detach the device its entry names now, if any",
@@ -129,6 +133,7 @@ fn runner_error(error: CommandRunError) -> CowshedError {
         | CommandRunFailure::Wait(_)
         | CommandRunFailure::Kill { .. }
         | CommandRunFailure::Reap { .. }
+        | CommandRunFailure::Output { .. }
         | CommandRunFailure::Input { .. } => CowshedError::internal(message),
     }
 }
