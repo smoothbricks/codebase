@@ -45,11 +45,16 @@ export function detachGatewayRamDisk(
     // Native output is bounded by the gateway contract; never buffer an unbounded peer reply.
     if (received.length > 2 * 64 * 1024 * 6 + 4096)
       return finish(null, 'gateway detach reply exceeds its bounded output contract');
-    const newline = received.indexOf('\n');
-    if (newline < 0) return;
-    const parsed = readDetachAnswer(received.slice(0, newline));
-    if (parsed === null) finish(null, `gateway detach reply proves no terminal outcome: ${received.slice(0, 512)}`);
-    else finish(parsed);
+    for (let newline = received.indexOf('\n'); newline >= 0; newline = received.indexOf('\n')) {
+      const line = received.slice(0, newline);
+      received = received.slice(newline + 1);
+      // The gateway heartbeats an answer that is not ready yet (05_gateway.md, "Deadlines"): never the answer.
+      if (isHeartbeat(line)) continue;
+      const parsed = readDetachAnswer(line);
+      if (parsed === null) finish(null, `gateway detach reply proves no terminal outcome: ${line.slice(0, 512)}`);
+      else finish(parsed);
+      return;
+    }
   });
   connection.on('error', (error) => {
     if (!dispatched) finish({ status: 103, stdout: '', stderr: `gateway detach did not start: ${error.message}` });
@@ -57,6 +62,25 @@ export function detachGatewayRamDisk(
   });
   connection.on('close', () => finish(null, 'gateway detach closed without an authoritative outcome'));
   return answer;
+}
+
+/** `{"ok":true,"progress":<n>}`: a gateway control answer's heartbeat line (05_gateway.md, "Deadlines"). */
+function isHeartbeat(line: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return false;
+  }
+  return (
+    typeof parsed === 'object' &&
+    parsed !== null &&
+    'ok' in parsed &&
+    parsed.ok === true &&
+    'progress' in parsed &&
+    typeof parsed.progress === 'number' &&
+    !('ramDetach' in parsed)
+  );
 }
 
 /** Only the gateway can attest whether its exact native child ran and was reaped. */
