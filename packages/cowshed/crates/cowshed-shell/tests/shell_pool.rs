@@ -1549,30 +1549,27 @@ fn one_token(request: ExecRequest) -> ExecRequest {
     }
 }
 
-/// Follow `job`'s stderr until it holds `marker`; what it held by then.
+/// Follow `job`'s stderr until it holds `marker`; what it held by then. A marker that never
+/// comes is a hang the leg's no-progress bound names.
 async fn stderr_reaches(handle: &WorkspaceSupervisorHandle, job: JobId, marker: &str) -> String {
     let mut bytes = Vec::new();
-    tokio::time::timeout(Duration::from_secs(60), async {
-        while !String::from_utf8_lossy(&bytes).contains(marker) {
-            let chunk = handle
-                .log_read(
-                    job,
-                    StreamKind::Stderr,
-                    bytes.len().try_into().expect("offset"),
-                    true,
-                )
-                .await
-                .expect("the job's stderr");
-            assert!(
-                !(chunk.eof && chunk.bytes.is_empty()),
-                "the job's stderr ended without {marker}: {}",
-                String::from_utf8_lossy(&bytes)
-            );
-            bytes.extend_from_slice(&chunk.bytes);
-        }
-    })
-    .await
-    .expect(marker);
+    while !String::from_utf8_lossy(&bytes).contains(marker) {
+        let chunk = handle
+            .log_read(
+                job,
+                StreamKind::Stderr,
+                bytes.len().try_into().expect("offset"),
+                true,
+            )
+            .await
+            .expect("the job's stderr");
+        assert!(
+            !(chunk.eof && chunk.bytes.is_empty()),
+            "the job's stderr ended without {marker}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        bytes.extend_from_slice(&chunk.bytes);
+    }
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
@@ -1592,9 +1589,9 @@ fn process_state(pid: u32) -> char {
 /// The probation token through a real gateway, supervisor and sandbox (05_gateway.md "A
 /// one-token job starts on probation"). A background job holds every token: a one-token
 /// `git ls-files` runs at once on the probation token and ends, where it waited for the holder
-/// before. A one-token job that turns CPU-heavy is stopped at its bound and stays stopped, the
-/// probation token passed on, until the holder returns its tokens; its grant continues it to its
-/// end.
+/// before. A one-token job that turns CPU-heavy is stopped at its bound and passes the probation
+/// token on: a second one-token read runs on it to its end while the heavy job stays stopped,
+/// until the holder returns its tokens; the heavy job's grant continues it to its end.
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_a_one_token_job_runs_on_probation_and_a_heavy_one_waits_stopped() {
@@ -1643,11 +1640,22 @@ async fn host_controller_a_one_token_job_runs_on_probation_and_a_heavy_one_waits
         .pid
         .expect("the heavy job runs");
     assert_eq!(process_state(pid), 'T', "stopped at its bound: {over}");
-    let status = ledger.status().await;
+    // The hand-off is the next one-token read running on the probation token to its end; the
+    // supervisor stopped the heavy job before it said so, and nothing continues it before its
+    // grant.
+    let next = run(&handle, one_token(request(&["git", "ls-files"])))
+        .await
+        .ok();
+    assert!(
+        next.stderr.contains("cowshed: jobserver probation start"),
+        "{}",
+        next.stderr
+    );
+    assert_eq!(process_state(pid), 'T', "still stopped without its grant");
     assert_eq!(
-        (status.held, status.probation),
-        (2, None),
-        "the probation token passed on, and the ledger holds its total"
+        ledger.status().await.held,
+        2,
+        "the ledger holds no more than its total"
     );
     end_holder(&handle, holding).await;
     let heavy = ran(&handle, heavy).await.ok();
