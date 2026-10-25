@@ -310,6 +310,26 @@ gateway records there; its land turn is. Status reads the slot without taking it
 `land --preflight` only reads the pre-check fences (02_workspaces.md): it is not a land step, waits for no install,
 requires no matching daemon build and never re-execs the installed cowshed.
 
+**A land installs its own cowshed after its turn.** A land that changed cowshed, or a project it depends on (Nx's
+affected set over the land's commits, and the root `Cargo.lock`, which Nx attributes to the root project alone), leaves
+the host running the build before it, and cannot install that build from inside its own turn: an install refuses while
+any land holds its turn, the installing land's included. `tooling/land-install.sh <repo> <before> <head>` therefore runs
+once the turn has ended. It builds the release CLI (`cli-arm64-macos` or `cli-x64-macos`, `production`) and the Nx cache
+server bundle as a land turn of its own (`cowshed land-turn <repo>`), so main stands still and no land's fast-forward or
+build races it, and stages both in `.cache/cowshed-release/<head>/` laid out as a distribution
+(`<package>/dist/bin/<platform>/cowshed`, the server under `<package>/node_modules`, where setup looks for it): the
+debug build every land replays into `dist/bin` replaces the release binary there, and a stage is the copy whose path an
+operator is told to run until three newer stages exist, each newer install superseding it. With no turn held it asks the
+staged build's `doctor` whether `setup` would raise the administrator authorization (its host-storage findings come from
+the plan setup executes, and it errs toward asking) and `gateway status` for what an install refuses under or waits for:
+a land turn's holder, a gate job holding or wanting tokens, another install holding the install slot. It runs the staged
+`setup` once, in main's devenv (setup installs the PATH it runs under, and its discovery runs cargo), only when neither
+says otherwise, and a refusal `setup` still answers is classified by a fresh status. Every outcome is one line on
+stdout, `<UTC time> <commit> install attended|unverified|deferred|installed|failed|skipped`, and the first three carry
+the exact command, which enters that devenv too: to run by hand (`attended`, `unverified`) or to rerun once the named
+work has ended (`deferred`). An install that cannot be taken is deferred, never waited for; the operator's land-status
+record holds it for whoever watches that record.
+
 **An install never refuses a client connection.** A restart closes every workspace listener until the next gateway's
 startup pass restores its session (5 s and more), and a stock client cannot wait for that: measured 2026-10-20, an
 install restarted the gateway under a shed's Nx build, and Nx read the refused cache connection
