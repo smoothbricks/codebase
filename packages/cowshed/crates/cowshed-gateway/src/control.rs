@@ -2510,9 +2510,20 @@ async fn hold_ram_lease<R, W>(
                 Refused::Attach(refusal @ RamAttachRefusal::TooLarge { .. }) => {
                     failure(ControlFailureCode::InvalidRequest, refusal.to_string())
                 }
-                Refused::Attach(refusal @ RamAttachRefusal::Failed(_)) => {
-                    failure(ControlFailureCode::Rejected, refusal.to_string())
-                }
+                Refused::Attach(refusal @ RamAttachRefusal::Failed(_)) => failure(
+                    ControlFailureCode::Rejected,
+                    format!(
+                        "{refusal}; a disk it may have made is left to the next gateway's \\
+                         startup scan"
+                    ),
+                ),
+                Refused::Unintended(error) => failure(
+                    ControlFailureCode::Rejected,
+                    format!(
+                        "the gateway could not record the intent of a RAM disk attach ({error}); \\
+                         nothing was attached"
+                    ),
+                ),
                 Refused::Unrecorded { error, detached } => failure(
                     ControlFailureCode::Rejected,
                     format!(
@@ -2576,7 +2587,7 @@ async fn hold_ram_lease<R, W>(
     };
     let (detacher, detaching, ended, said) = (Arc::clone(&disks), records, lease, why.clone());
     let detached = match tokio::task::spawn_blocking(move || {
-        ram_lease::detach(&*detacher, &detaching, &ended, &said)
+        ram_lease::detach(&*detacher, &detaching, &ended, &said).0
     })
     .await
     {
@@ -3357,12 +3368,12 @@ mod tests {
             detached
         }
 
-        fn registers(
-            &self,
-            _device: &RamDiskDevice,
-            _entry: RamDiskEntry,
-        ) -> std::io::Result<bool> {
+        fn registered(&self, _entry: RamDiskEntry) -> std::io::Result<bool> {
             Ok(false)
+        }
+
+        fn unmounted(&self, _sectors: RamDiskSectors) -> std::io::Result<Vec<RamDiskAttached>> {
+            Ok(Vec::new())
         }
     }
 
@@ -3383,12 +3394,12 @@ mod tests {
             panic!("the detach of {device} panicked after it started")
         }
 
-        fn registers(
-            &self,
-            _device: &RamDiskDevice,
-            _entry: RamDiskEntry,
-        ) -> std::io::Result<bool> {
+        fn registered(&self, _entry: RamDiskEntry) -> std::io::Result<bool> {
             Ok(false)
+        }
+
+        fn unmounted(&self, _sectors: RamDiskSectors) -> std::io::Result<Vec<RamDiskAttached>> {
+            Ok(Vec::new())
         }
     }
 
@@ -3451,8 +3462,22 @@ mod tests {
             )
         }
 
-        fn registers(&self, _device: &RamDiskDevice, entry: RamDiskEntry) -> std::io::Result<bool> {
+        fn registered(&self, entry: RamDiskEntry) -> std::io::Result<bool> {
             Ok(self.registered.lock().unwrap().contains(&entry))
+        }
+
+        /// Every disk it holds counts as mounted nowhere: a test names what it leaves.
+        fn unmounted(&self, _sectors: RamDiskSectors) -> std::io::Result<Vec<RamDiskAttached>> {
+            Ok(self
+                .registered
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|entry| RamDiskAttached {
+                    device: Self::disk9().device,
+                    registry_entry: *entry,
+                })
+                .collect())
         }
     }
 
@@ -3585,7 +3610,7 @@ mod tests {
             .unwrap();
         records.record(&lease).expect("record");
         let served: Arc<dyn RamDisks> = disks.clone();
-        crate::ram_lease::sweep(Some(served), &records, records.left())
+        crate::ram_lease::sweep(Some(served), &records)
             .expect("a lease to sweep")
             .await
             .expect("the sweep");
@@ -3599,7 +3624,7 @@ mod tests {
             "and its record removed"
         );
         let quiet: Arc<dyn RamDisks> = disks.clone();
-        assert!(crate::ram_lease::sweep(Some(quiet), &records, records.left()).is_none());
+        assert!(crate::ram_lease::sweep(Some(quiet), &records).is_none());
         std::fs::remove_dir_all(root).expect("remove root");
     }
 
@@ -3687,5 +3712,63 @@ mod tests {
                 stderr_truncated: false,
             }
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_startup_scan_detaches_a_disk_whose_attach_a_previous_gateway_never_answered() {
+        let (root, records) = lease_records();
+        let disks = Arc::new(MemoryDisks::default());
+        let sectors = RamDiskSectors::new(std::num::NonZeroU64::new(16).unwrap());
+        // The previous gateway recorded its intent and its attach made a disk, but it stopped
+        // before it recorded the lease: only the intent names the attach.
+        drop(records.intend(sectors).expect("intent"));
+        disks.attach(sectors).unwrap();
+        let served: Arc<dyn RamDisks> = disks.clone();
+        crate::ram_lease::sweep(Some(served), &records)
+            .expect("an intent to sweep")
+            .await
+            .expect("the sweep");
+        assert_eq!(
+            disks.counts(),
+            (1, 1, 0),
+            "the unanswered attach's disk is detached"
+        );
+        assert!(
+            records.left().expect("records").is_empty(),
+            "and its intent removed"
+        );
+        std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ram_lease_whose_intent_cannot_be_recorded_attaches_nothing() {
+        let root = std::env::temp_dir().join(format!("cowshed-ram-lease-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).expect("root");
+        // The records' directory is a file: no intent can be written there.
+        std::fs::write(root.join("ram-leases"), b"").expect("a file in the way");
+        let records = crate::ram_lease::Records::beside(&root.join("gateway.sock"));
+        let disks = Arc::new(MemoryDisks::default());
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(server);
+        let served: Arc<dyn RamDisks> = disks.clone();
+        hold_ram_lease(
+            reader,
+            writer,
+            RamDiskSectors::new(std::num::NonZeroU64::new(16).unwrap()),
+            Some(served),
+            records,
+        )
+        .await;
+        let mut answer = String::new();
+        use tokio::io::AsyncReadExt as _;
+        tokio::io::BufReader::new(client)
+            .read_to_string(&mut answer)
+            .await
+            .expect("answer");
+        let answer: serde_json::Value = serde_json::from_str(answer.trim()).expect("one line");
+        assert_eq!(answer["ok"], false, "{answer}");
+        assert_eq!(answer["code"], "rejected", "{answer}");
+        assert_eq!(disks.counts(), (0, 0, 0), "nothing was attached");
+        std::fs::remove_dir_all(root).expect("remove root");
     }
 }

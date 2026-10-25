@@ -915,7 +915,9 @@ describe("the gateway's ram-lease", () => {
       move: 'unanswered',
       outcome: {
         ok: false,
-        error: expect.stringContaining("the lease is lost, and the disk is the gateway's to detach"),
+        error: expect.stringContaining(
+          'nothing is known: the gateway may have handed the disk over or left it to its next startup scan; detach it by its entry',
+        ),
       },
       seen: [LEASE_REQUEST, '{"end":"keep"}', 'EOF'],
     },
@@ -925,7 +927,7 @@ describe("the gateway's ram-lease", () => {
       move: 'unanswered',
       outcome: {
         ok: false,
-        error: expect.stringContaining("the lease is lost, and the disk is the gateway's to detach"),
+        error: expect.stringContaining('the lease is lost, so nothing is known of a detach'),
       },
       seen: [LEASE_REQUEST, '{"end":"release"}', 'EOF'],
     },
@@ -1216,10 +1218,14 @@ interface StandInGateway {
  * answers ioreg, mount, diskutil, mount_apfs and umount from the disk and the mounts it holds, so provisioning's own
  * checks run unchanged. Its mounts are no separate device, so the marker leaves with the staging mount and the
  * mountpoint never holds the marked volume: a provisioning that succeeds on it ends at the lease the creation then takes.
- * It fails the step named injected, records every step and every end of the lease in order, and every detach the caller
- * runs itself.
+ * It fails the injected step by its exit or by a throw, records every step and every end of the lease in order, and
+ * every detach the caller runs itself.
  */
-function provisioningStandIn(paths: RamTempPaths, injected: string | null, gateway: StandInGateway) {
+function provisioningStandIn(
+  paths: RamTempPaths,
+  injected: { readonly step: string; readonly by: 'exit' | 'throw' } | null,
+  gateway: StandInGateway,
+) {
   const calls: { file: string; args: readonly string[] }[] = [];
   const steps: string[] = [];
   const detaches: { device: string; registryEntry: string }[] = [];
@@ -1237,7 +1243,10 @@ function provisioningStandIn(paths: RamTempPaths, injected: string | null, gatew
       calls.push({ file, args });
       const step = stepOf(paths, file, args);
       if (step !== null) steps.push(step);
-      if (step !== null && step === injected) return { status: 1, stdout: '', stderr: 'injected' };
+      if (step !== null && step === injected?.step) {
+        if (injected.by === 'throw') throw new Error('injected throw');
+        return { status: 1, stdout: '', stderr: 'injected' };
+      }
       if (file === '/usr/sbin/ioreg') {
         const disk = args.includes('IOHDIXHDDriveOutKernel') ? kernel.disk : null;
         return {
@@ -1303,7 +1312,7 @@ describe('the lease on the RAM disk a creation attaches', () => {
   const granted: StandInGateway = { owner: uid, keep: { ok: true, value: undefined }, lost: false };
   const cases: {
     name: string;
-    injected: string | null;
+    injected: { step: string; by: 'exit' | 'throw' } | null;
     gateway: StandInGateway;
     /** The creation's failure, given the volume's mountpoint. */
     error: (mountpoint: string) => { step: string; detail: string };
@@ -1312,7 +1321,7 @@ describe('the lease on the RAM disk a creation attaches', () => {
   }[] = [
     {
       name: 'is released, and never detached by the creator, when the staging mount fails',
-      injected: 'mount_apfs',
+      injected: { step: 'mount_apfs', by: 'exit' },
       gateway: granted,
       error: () => ({ step: 'mount_apfs (staging)', detail: 'exit 1: injected' }),
       steps: ['mount_apfs', 'release'],
@@ -1320,9 +1329,17 @@ describe('the lease on the RAM disk a creation attaches', () => {
     },
     {
       name: 'is released, and never detached by the creator, when the mountpoint mount fails',
-      injected: 'mount',
+      injected: { step: 'mount', by: 'exit' },
       gateway: granted,
       error: () => ({ step: 'mount_apfs (mountpoint)', detail: 'exit 1: injected' }),
+      steps: ['mount_apfs', 'unmount', 'mount', 'release'],
+      detaches: [],
+    },
+    {
+      name: 'is released once, and never detached by the creator, when a provisioning step throws',
+      injected: { step: 'mount', by: 'throw' },
+      gateway: granted,
+      error: () => ({ step: 'provision', detail: 'injected throw' }),
       steps: ['mount_apfs', 'unmount', 'mount', 'release'],
       detaches: [],
     },

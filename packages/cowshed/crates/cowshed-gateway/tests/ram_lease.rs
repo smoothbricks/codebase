@@ -86,3 +86,44 @@ async fn the_next_gateway_detaches_a_lease_a_stopped_gateway_held() {
     drop(disks);
     next.drain().await.expect("drain the next gateway");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_next_gateway_detaches_a_disk_a_stopped_gateway_attached_but_never_recorded() {
+    let (first, root, socket) = gateway(DiskLeaseLimits::default()).await;
+    let sectors = fixture_sectors(2);
+    let held = socket.clone();
+    let namespace = root.namespace();
+    let (stream, owned, disks) = tokio::task::spawn_blocking(move || {
+        let mut disks = FixtureDisks::new(namespace);
+        let (stream, answer) = lease(&held, sectors);
+        let owned = disks.own(leased_device(&answer), sectors);
+        (stream, owned, disks)
+    })
+    .await
+    .expect("the lease");
+    first.drain().await.expect("drain the first gateway");
+    drop(stream);
+    // What a gateway stopped mid-attach leaves: the attach's intent and no lease record.
+    let records = root.path().join("ram-leases");
+    std::fs::remove_file(records.join(owned.entry.to_string())).expect("unrecord the lease");
+    std::fs::write(records.join("1-0.intent"), sectors.get().to_string()).expect("the intent");
+    assert!(
+        owned.is_registered(),
+        "a stopped gateway detaches nothing: {owned:?}"
+    );
+    let (next, _) = gateway_on(&root, DiskLeaseLimits::default()).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while owned.is_registered() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !owned.is_registered(),
+        "the next gateway's startup scan detached the unrecorded attach's disk: {owned:?}"
+    );
+    assert!(
+        !records.join("1-0.intent").exists(),
+        "and removed its intent"
+    );
+    drop(disks);
+    next.drain().await.expect("drain the next gateway");
+}

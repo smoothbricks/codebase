@@ -257,7 +257,10 @@ export interface RamDiskLease {
   readonly device: string;
   /** Its I/O Registry entry, `0x…`, as the gateway read it right after its attach. */
   readonly registryEntry: string;
-  /** The caller owns the disk from here. Err: the lease was lost or refused; the disk is the gateway's to detach. */
+  /**
+   * The caller owns the disk from here. Err: the gateway refused, or no answer came, and then nothing is known: the
+   * gateway may have handed the disk over or left it to its next startup scan, so the caller detaches it by its entry.
+   */
   keep(): Promise<Result<void, string>>;
   /** The gateway detaches the disk now. Ok: its detach answer; Err: the lease was lost (no answer), so nothing is known of a detach. */
   release(): Promise<Result<CommandOutput, string>>;
@@ -1810,15 +1813,21 @@ export class RamTempVolume {
         : { ok: false, error: attached.error };
     }
     // Every path from here ends the lease: kept once the volume is mounted and marked at its mountpoint, released on
-    // any failure before that.
+    // any failure or throw before that.
     const lease = attached.value;
+    const kept = await this.provisionAndKeep(lease).catch((error: unknown) =>
+      failed<void>('provision', errorText(error)),
+    );
+    return kept.ok ? kept : this.rollBack(op, lease, kept.error);
+  }
+
+  /** Provision the leased disk, and keep it once its volume is mounted and marked at its mountpoint. */
+  private async provisionAndKeep(lease: RamDiskLease): Promise<Result<void, ProvisionFailed>> {
     const identity = await this.attachedIdentity(lease.device);
     const provisioned = identity.ok ? await this.provision(lease.device, identity.value.entry) : identity;
-    if (!provisioned.ok) return this.rollBack(op, lease, provisioned.error);
+    if (!provisioned.ok) return provisioned;
     const kept = await lease.keep();
-    return kept.ok
-      ? kept
-      : this.rollBack(op, lease, { kind: 'provision-failed', step: 'ram-lease keep', detail: kept.error });
+    return kept.ok ? kept : failed('ram-lease keep', kept.error);
   }
 
   /**

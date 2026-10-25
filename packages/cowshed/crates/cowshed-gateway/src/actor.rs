@@ -3301,13 +3301,11 @@ impl ControlRuntime {
             None
         };
 
-        // The leases a previous gateway held are read before this one serves, so none of this
-        // gateway's own is among them; their detaches run on in the background (05_gateway.md,
-        // "RAM disks").
+        // What a previous gateway left is read before this one serves, so none of this gateway's
+        // own leases is among it; the detaches run on in the background (05_gateway.md, "RAM disks").
         drop(crate::ram_lease::sweep(
             services.ram_disks.clone(),
             &services.ram_leases,
-            services.ram_leases.left(),
         ));
         let capacity = 1024;
         let cpu_budget = services.cpu_budget.clone();

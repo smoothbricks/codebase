@@ -12,8 +12,9 @@ import type { RamDiskLease, RamUnavailable, Result } from './ram-temp.js';
  * one line, `{"ok":true,"ramDisk":{"device":"/dev/diskN","registryEntry":"0x…"}}` or a refusal. The connection is the
  * lease: the gateway holds the disk until the client writes `{"end":"keep"}`, after which the disk is the caller's, or
  * `{"end":"release"}`, which the gateway answers with its detach as `ram-detach` does. A connection that ends first,
- * at the client's deadline or with its process, has the gateway detach the disk. An end the gateway never answers means
- * it restarted: the lease is lost, and the next gateway's startup scan detaches the disk.
+ * at the client's deadline or with its process, has the gateway detach the disk. An end the gateway never answers leaves
+ * nothing known: the gateway may have handed the disk over or left it to its next startup scan, so the caller detaches it
+ * by its entry.
  */
 
 export const RAM_LEASE_OP = 'ram-lease';
@@ -204,7 +205,11 @@ function heldLease(
           : 'it closed the connection';
     return {
       ok: false,
-      error: `the gateway answered no ${how} of the ram-lease of ${disk.device} (${why}): the lease is lost, and the disk is the gateway's to detach`,
+      error: `the gateway answered no ${how} of the ram-lease of ${disk.device} (${why}): ${
+        how === 'keep'
+          ? 'nothing is known: the gateway may have handed the disk over or left it to its next startup scan; detach it by its entry'
+          : 'the lease is lost, so nothing is known of a detach'
+      }`,
     };
   };
   return {

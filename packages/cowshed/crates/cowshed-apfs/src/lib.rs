@@ -5498,6 +5498,9 @@ mod io_registry {
         fn CFArrayGetTypeID() -> usize;
         fn CFArrayGetCount(array: CfType) -> CfIndex;
         fn CFArrayGetValueAtIndex(array: CfType, index: CfIndex) -> CfType;
+        fn CFDataGetTypeID() -> usize;
+        fn CFDataGetLength(data: CfType) -> CfIndex;
+        fn CFDataGetBytePtr(data: CfType) -> *const u8;
 
         fn CFRetain(object: CfType) -> CfType;
         fn CFDictionaryCreateMutable(
@@ -6329,6 +6332,102 @@ mod io_registry {
         }
         Ok(None)
     }
+
+    /// A legacy RAM disk as one registry snapshot lists it: its registry entry, its whole disk once
+    /// it has published one, and every BSD media node below it.
+    pub(super) struct RegisteredRamDisk {
+        pub(super) entry: u64,
+        pub(super) whole: Option<String>,
+        pub(super) media: Vec<String>,
+    }
+
+    /// Every legacy RAM disk of `uid` whose image is `ram://<sectors>`, from one registry snapshot.
+    /// One that leaves the registry mid-read is departing and is not listed.
+    pub(super) fn ram_disks_of(
+        sectors: u64,
+        uid: libc::uid_t,
+    ) -> io::Result<Vec<RegisteredRamDisk>> {
+        let image = format!("ram://{sectors}");
+        let keys = Keys {
+            bsd_name: key("BSD Name")?,
+            content: key("Content")?,
+            size: key("Size")?,
+            source: key("image-path")?,
+            owner: key("owner-uid")?,
+            driver: Driver::InKernel,
+        };
+        let mut disks = Vec::new();
+        for device in registered(c"IOHDIXHDDriveOutKernel")? {
+            let read = (|| -> Read<Option<RegisteredRamDisk>> {
+                let id = entry_id(&device, "read a RAM disk's registry id")?;
+                let Some(path) = property(&device, &keys.source)? else {
+                    return Ok(None);
+                };
+                if data_text(path.0, "image-path")? != image
+                    || u64_property(&device, &keys.owner, "owner-uid")? != Some(u64::from(uid))
+                {
+                    return Ok(None);
+                }
+                let mut found = DeviceMedia::default();
+                while !read_media(&device, 0, &keys, &mut found)? {
+                    found = DeviceMedia::default();
+                }
+                let media = found.media.into_iter().map(|media| media.device).collect();
+                Ok(Some(RegisteredRamDisk {
+                    entry: id,
+                    whole: found.whole,
+                    media,
+                }))
+            })();
+            match read {
+                Ok(Some(disk)) => disks.push(disk),
+                Ok(None) | Err(Unread::Gone) => {}
+                Err(Unread::Failed(error)) => return Err(error),
+            }
+        }
+        Ok(disks)
+    }
+
+    /// Whether `entry_id` is still registered. An entry id is never reused, so its absence alone
+    /// proves its device left the registry; an entry with no whole media yet is still there.
+    pub(super) fn entry_registered(entry_id: u64) -> io::Result<bool> {
+        // SAFETY: the answer is a +1 matching dictionary or null.
+        let matching = unsafe { IORegistryEntryIDMatching(entry_id) };
+        if matching.is_null() {
+            return Err(io::Error::other(format!(
+                "IORegistryEntryIDMatching({entry_id:#x}) returned no matching dictionary"
+            )));
+        }
+        // SAFETY: `matching` is a +1 dictionary the call consumes; the answer is +1 or 0.
+        let service = unsafe { IOServiceGetMatchingService(MAIN_PORT_DEFAULT, matching) };
+        if service == 0 {
+            return Ok(false);
+        }
+        drop(Object(service));
+        Ok(true)
+    }
+
+    /// The text of `value`, a live CF object borrowed for the call, which must be data holding
+    /// UTF-8, as a legacy drive's `image-path` does, a trailing NUL dropped.
+    fn data_text(value: CfType, name: &str) -> io::Result<String> {
+        // SAFETY: `value` is a live CF object.
+        if unsafe { CFGetTypeID(value) != CFDataGetTypeID() } {
+            return Err(invalid(format!("registry property {name} is not data")));
+        }
+        // SAFETY: `value` is a live CFData.
+        let (length, bytes) = unsafe { (CFDataGetLength(value), CFDataGetBytePtr(value)) };
+        let bytes = match usize::try_from(length) {
+            // SAFETY: CFData's byte pointer is valid for its length while `value` lives.
+            Ok(length) if length > 0 && !bytes.is_null() => unsafe {
+                std::slice::from_raw_parts(bytes, length)
+            },
+            _ => &[],
+        };
+        let text = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+        String::from_utf8(text.to_vec())
+            .map_err(|_| invalid(format!("registry property {name} is not UTF-8")))
+    }
+
     /// Registered entries whose class is exactly `class`, subclasses excluded, as the kernel's
     /// instance counts count them. An entry that leaves the registry mid-read is departing.
     fn registered_exactly(class: &CStr) -> io::Result<u64> {

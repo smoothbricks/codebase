@@ -940,12 +940,16 @@ malformed provenance or unreadable pending authority is still an error. Required
 another medium.
 
 The attach is a lease the requesting connection holds, and every way it ends settles the disk, so no disk outlives every
-owner. Right after `hdiutil` answers, on the blocking thread that ran it, the gateway reads the disk's I/O Registry
-entry and records the lease durably, one file per lease named by that entry and holding its whole disk, in `ram-leases/`
-beside its control socket (mode 0700); only then does it answer `ramDisk`. A disk whose entry cannot be read is detached
-again by the name the attach just printed, which nobody else has heard of, and one whose lease cannot be recorded is
-detached by its entry; either attach is `rejected`. The client keeps the connection open and writes one end line, which
-decides the lease (`cowshed-gateway`'s `ram_lease` core):
+owner. The gateway keeps its records in `ram-leases/` beside its control socket (mode 0700); each file is written whole
+under a scratch name and renamed into place. Before `hdiutil` spawns, the gateway records the attach's intent,
+`<pid>-<n>.intent` holding the sectors asked. Right after `hdiutil` answers, on the blocking thread that ran it, the
+gateway reads the disk's I/O Registry entry and records the lease, a file named by that entry and holding its whole
+disk, then removes the intent; only then does it answer `ramDisk`. An intent that cannot be recorded refuses the attach
+before any spawn. A disk whose lease cannot be recorded is detached by its entry. A disk whose entry cannot be read is
+never detached by its name, which proves nothing once the registry could not say whose it is; its intent stays. An
+attach that failed keeps its intent too, since it may still have made a disk; one refused before its spawn removes it.
+Each of these is `rejected`. The client keeps the connection open and writes one end line, which decides the lease
+(`cowshed-gateway`'s `ram_lease` core):
 
 - `{"end":"keep"}`: the disk is the caller's from then on. The gateway removes the record and answers `ok: true`. A
   record it cannot remove would make the next startup scan detach a disk its owner uses, so the gateway then detaches
@@ -956,12 +960,18 @@ decides the lease (`cowshed-gateway`'s `ram_lease` core):
   the disk; nobody is left to answer.
 
 Each detach is the registry-bound one `ram-detach` runs, on a blocking thread no connection owns. The record goes only
-once a registry read right after the detach no longer finds the entry registering the disk; a disk still registered
-(busy, so the unforced detach failed), or a registry that cannot be read, keeps its record. A gateway that stops while
-it holds a lease, its connections aborted with it, leaves the record too. The gateway's startup scan reads every record
-before its control socket serves, so each is a previous gateway's lease whose owner's connection is gone, and detaches
-each on a blocking thread, removing the record by the same rule. The scan is the only retry: a record waits for the next
-gateway start, never for a timer. The gateway says every lease it detaches on its stderr, as
+once the entry is no longer registered right after the detach: an entry id is never reused, so only its absence proves
+the disk gone. An entry still registered, with or without its whole disk (busy, so the unforced detach failed, or not
+started), or a registry that cannot be read, keeps its record. A gateway that stops while it holds a lease, its
+connections aborted with it, leaves the record; one that stops mid-attach, aborted, killed or past its drain while
+`hdiutil` still runs, leaves the intent. The gateway's startup scan reads every record and intent before its control
+socket serves, so each is a previous gateway's, and reads then, for each intent's size, the RAM disks of that size this
+user attached that nothing mounts. On a blocking thread it detaches each recorded lease's disk, removing the record by
+the same rule, and each such disk no record names; an intent goes once every disk of its size it found has left the
+registry. A scratch file a writer died before renaming is removed, and a file that names no lease or intent is said and
+left in place. The scan is the only retry: a record or intent waits for the next gateway start, never for a timer. The
+gateway says every lease it detaches on its stderr, as
+`cowshed: ram-lease <device> entry=<entry> <why>: detach outcome=<outcome>; <record>`.
 `cowshed: ram-lease <device> entry=<entry> <why>: detach outcome=<outcome>; <record>`.
 
 A kept disk's caller owns the volume on it and detaches the disk only through `ram-detach` naming its entry and whole

@@ -38,34 +38,6 @@ impl SystemRamDisks {
             lease_socket: lease_socket(namespace),
         }
     }
-
-    /// Detach `device`, a disk this gateway's attach just made and whose registry entry it could
-    /// not read, by its name: nothing has heard of the disk, so its name is still its own. Says
-    /// how it ended, for the refusal.
-    fn detach_unidentified(&self, device: &RamDiskDevice) -> String {
-        let command = format!("hdiutil detach {device}");
-        let request = CommandRequest::new(HDIUTIL, ["detach", device.as_str()]);
-        let ran = self
-            .runner
-            .run_within(&request, DISK_CHILD_DEADLINE, |deadline, run| {
-                leased_at(
-                    &self.lease_socket,
-                    DiskClass::Storage,
-                    &command,
-                    deadline,
-                    run,
-                )
-            });
-        match ran {
-            Ok(output) if output.status.succeeded() => format!("{command} detached it"),
-            Ok(output) => format!(
-                "{command} ended {}: {}; the disk stays attached",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-            Err(error) => format!("{command} failed ({error}); the disk stays attached"),
-        }
-    }
 }
 
 impl RamDisks for SystemRamDisks {
@@ -124,11 +96,11 @@ impl RamDisks for SystemRamDisks {
             Ok(None) => "the registry lists no RAM disk drive above it".to_owned(),
             Err(error) => format!("the registry could not be read: {error}"),
         };
-        // No identity, so no registry-bound detach can ever name it: this attach's own disk, which
-        // nobody has heard of, is detached by its name now (no force).
+        // No identity, so no registry-bound detach can name it, and a name is no proof once the
+        // registry could not say whose it is: the disk is left for the lease's own record of its
+        // attach to settle (05_gateway.md, "RAM disks").
         Err(RamAttachRefusal::Failed(format!(
-            "{command} attached {device}, but its registry entry is unknown ({unread}); {}",
-            self.detach_unidentified(&device)
+            "{command} attached {device}, but its registry entry is unknown ({unread}); it is not detached by name"
         )))
     }
 
@@ -177,9 +149,27 @@ impl RamDisks for SystemRamDisks {
         RamDetached::terminal(status, &output.stdout, &output.stderr, output_limit)
     }
 
-    fn registers(&self, device: &RamDiskDevice, entry: RamDiskEntry) -> std::io::Result<bool> {
-        crate::io_registry::whole_disk_of_entry(entry.get())
-            .map(|whole| whole.as_deref() == Some(device.as_str()))
+    fn registered(&self, entry: RamDiskEntry) -> std::io::Result<bool> {
+        crate::io_registry::entry_registered(entry.get())
+    }
+
+    fn unmounted(&self, sectors: RamDiskSectors) -> std::io::Result<Vec<RamDiskAttached>> {
+        let mounted: std::collections::HashSet<String> = crate::mounts::kernel_mounts()?
+            .iter()
+            .map(|mount| mount.source_device.clone())
+            .collect();
+        // SAFETY: `geteuid` reads this process's credentials and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        Ok(crate::io_registry::ram_disks_of(sectors.get(), uid)?
+            .into_iter()
+            .filter(|disk| disk.media.iter().all(|device| !mounted.contains(device)))
+            .filter_map(|disk| {
+                Some(RamDiskAttached {
+                    device: RamDiskDevice::parse(&disk.whole?).ok()?,
+                    registry_entry: RamDiskEntry::new(std::num::NonZeroU64::new(disk.entry)?),
+                })
+            })
+            .collect())
     }
 }
 

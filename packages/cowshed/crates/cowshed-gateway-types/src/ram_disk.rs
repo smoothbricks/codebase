@@ -342,9 +342,13 @@ pub trait RamDisks: fmt::Debug + Send + Sync {
         output_limit: usize,
     ) -> RamDetached;
 
-    /// Whether `entry` still registers `device` as its whole disk: what settles a detach whose
-    /// outcome alone does not say the disk is gone.
-    fn registers(&self, device: &RamDiskDevice, entry: RamDiskEntry) -> std::io::Result<bool>;
+    /// Whether `entry` is still registered at all. An entry id is never reused, so only its absence
+    /// proves the disk left the registry: what settles a detach whose outcome alone does not.
+    fn registered(&self, entry: RamDiskEntry) -> std::io::Result<bool>;
+
+    /// The RAM disks of `sectors` this user attached that nothing mounts: what an attach whose
+    /// lease a previous gateway never recorded may have left.
+    fn unmounted(&self, sectors: RamDiskSectors) -> std::io::Result<Vec<RamDiskAttached>>;
 }
 
 #[cfg(test)]
