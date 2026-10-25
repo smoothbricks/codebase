@@ -77,6 +77,7 @@
     "bin",
     "dist",
     "src",
+    "test-timings.json",
     "!**/*.tsbuildinfo"
   ],
   "dependencies": {
@@ -102,27 +103,12 @@
       "test": {
         "executor": "nx:noop",
         "dependsOn": [
-          "test-shell-entry",
           "test-shard-1",
           "test-shard-2",
           "test-shard-3",
-          "test-shard-4"
+          "test-shard-4",
+          "test-shard-5"
         ]
-      },
-      "test-shell-entry": {
-        "executor": "@smoothbricks/nx-plugin:bounded-exec",
-        "cache": true,
-        "inputs": [
-          "default",
-          "^dependencyDefault",
-          "bunToolchain"
-        ],
-        "options": {
-          "command": "bun test --timeout=0 src/monorepo/setup-environment",
-          "cwd": "{projectRoot}",
-          "idleTimeoutMs": 180000,
-          "killAfterMs": 10000
-        }
       },
       "test-shard-1": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
@@ -133,7 +119,7 @@
           "bunToolchain"
         ],
         "options": {
-          "command": "bun test --timeout=0 --path-ignore-patterns='**/setup-environment*.test.ts' --shard=1/4",
+          "command": "bun test --timeout=0 --timings=test-timings.json --shard=1/5",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
@@ -148,7 +134,7 @@
           "bunToolchain"
         ],
         "options": {
-          "command": "bun test --timeout=0 --path-ignore-patterns='**/setup-environment*.test.ts' --shard=2/4",
+          "command": "bun test --timeout=0 --timings=test-timings.json --shard=2/5",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
@@ -163,7 +149,7 @@
           "bunToolchain"
         ],
         "options": {
-          "command": "bun test --timeout=0 --path-ignore-patterns='**/setup-environment*.test.ts' --shard=3/4",
+          "command": "bun test --timeout=0 --timings=test-timings.json --shard=3/5",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
@@ -178,7 +164,22 @@
           "bunToolchain"
         ],
         "options": {
-          "command": "bun test --timeout=0 --path-ignore-patterns='**/setup-environment*.test.ts' --shard=4/4",
+          "command": "bun test --timeout=0 --timings=test-timings.json --shard=4/5",
+          "cwd": "{projectRoot}",
+          "idleTimeoutMs": 180000,
+          "killAfterMs": 10000
+        }
+      },
+      "test-shard-5": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "default",
+          "^dependencyDefault",
+          "bunToolchain"
+        ],
+        "options": {
+          "command": "bun test --timeout=0 --timings=test-timings.json --shard=5/5",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000

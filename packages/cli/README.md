@@ -324,11 +324,14 @@ Concrete targets use `{tool}-{output}` names and describe the tool that runs and
   `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`, `*-bun`, and `*-wasm` instead of duplicating commands.
 - `lint` is an aggregate validation target. It is not a formatting target.
 
-This CLI's `cli:test` target runs the slow shell-entry integration files (`src/monorepo/setup-environment*.test.ts`, one
-per subject over the shared fixture in `src/monorepo/__tests__/helpers/shell-entry.ts`) on their own and divides every
-other Bun test file across four native `--shard` targets. All five bounded targets must pass; the four shards ignore
-only the shell-entry files, so new tests discovered under `src/` remain in the suite without maintaining a file list or
-extending its timeout.
+This CLI's `cli:test` target divides every Bun test file across five native `--shard` targets, partitioned by the
+measured per-file durations in `test-timings.json` (`--timings=test-timings.json --shard=N/5`) instead of by file count,
+so one slow file no longer decides a shard's length. All five bounded targets must pass, and normal discovery still runs
+every test file under `src/` exactly once, including files the manifest does not name yet. The shell-entry integration
+files (`src/monorepo/setup-environment*.test.ts`, one per subject over the shared fixture in
+`src/monorepo/__tests__/helpers/shell-entry.ts`) are ordinary shard members; the logic they used to reach only through a
+whole shell entry is tested by direct calls (`installed-bun-links.test.ts`, `uv-relocation.test.ts`,
+`developer-links-declared.test.ts`).
 
 `smoo nx refresh-test-timings <project>` rewrites a project's `--timings` manifest. It runs the project's `bun test`
 shard command once without `--shard`, plus `--update-timings`, in the shards' cwd, so Bun writes every test file's
