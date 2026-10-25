@@ -2623,10 +2623,9 @@ impl<'a> BitSink<'a> {
         self.acc = bits >> (64 - filled);
     }
 
-    /// Append `len` bits of `src` starting at bit `from`. `src` must hold
-    /// at least 8 bytes past the run's last byte, which every plane of an
-    /// Elias-Fano payload does (the low plane's pad and the sample tables
-    /// follow it).
+    /// Append `len` bits of `src` starting at bit `from`. Reads past the end
+    /// of `src` see zeros: a short Elias-Fano payload's last plane ends at
+    /// its last byte, with no pad behind it.
     fn copy(&mut self, src: &[u8], mut from: u64, mut len: u64) {
         // Top the accumulator up to a whole word so the body needs none.
         if self.filled != 0 {
@@ -2643,11 +2642,11 @@ impl<'a> BitSink<'a> {
         let mut byte = (from / 8) as usize;
         let shift = (from % 8) as u32;
         while len >= 64 {
-            let lo = read_u64_at(src, byte);
+            let lo = read_u64_padded(src, byte);
             let word = if shift == 0 {
                 lo
             } else {
-                (lo >> shift) | (read_u64_at(src, byte + 8) << (64 - shift))
+                (lo >> shift) | (read_u64_padded(src, byte + 8) << (64 - shift))
             };
             self.flush(word);
             byte += 8;

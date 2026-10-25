@@ -366,6 +366,17 @@ mod tests {
 
     use super::{and_step, check_and, patch_step, xorshift};
 
+    /// Inputs the fuzz targets once failed on, replayed in the default lane;
+    /// each file is named for the defect it found.
+    #[test]
+    fn fuzz_regressions_replay_clean() {
+        // A patch on a short Elias-Fano root spliced a plane with an 8-byte
+        // read at byte 52 of a 57-byte source with no pad behind it.
+        patch_step(include_bytes!(
+            "../fuzz/regressions/patch_step/ef-splice-unpadded-copy"
+        ));
+    }
+
     /// Fixed-seed operation lists: the fuzz targets' steps in the default
     /// lane. The skew switch is per-thread, so these tests force arms
     /// without racing any other test of the binary.
