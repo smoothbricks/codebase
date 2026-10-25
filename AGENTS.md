@@ -26,11 +26,11 @@
    diagnose their runners but do not replace Nx acceptance. After success, confirm main's accepted commit and the
    workspace's retirement; remove only a residual completed workspace, never failed or unlanded work.
 6. **Choose documentation custody by relationship.** Fix standalone or unrelated Markdown immediately on main through
-   its doc lane. Keep a code unit's own docs/specs with that code and land them atomically. The repo card defines the
-   local lock and gate behavior; a Markdown-only commit does not imply its contents are irrelevant to later acceptance.
+   its doc lane. Keep a code unit's own docs/specs with that code and land them atomically. A Markdown-only commit is
+   still an input to later acceptance: the next land re-gates the tasks it reaches.
 7. **Fix concurrency defects; do not serialize them into passing.** Prove the fix under intended concurrency. Shared
-   mutable state needs explicit ownership: single writers, one producer per checkout, land/ref locks and operator
-   admission or priority for scarce resources are legitimate. They are not permission to hide a failing concurrent test.
+   mutable state needs explicit ownership: single writers, one producer per checkout, the cowshed land turn and
+   jobserver admission are legitimate. They are not permission to hide a failing concurrent test.
 8. **Test at the defect's owner and the smallest real boundary.** Do not repeat dependency suites in consumers or
    re-prove OS internals. Exercise our real OS/process/network integration where that behavior matters; use real
    in-memory implementations for logic, never fake echoes. Decisions (event handling, ordering, timeouts, retries as
@@ -76,7 +76,7 @@
     result, so the reader needs no second run to understand it.
 16. **No env-var, lock or ceremony fixes.** Never add environment variables, lock files, holder markers, wrapper
     protocols or hooks to work around a tool or coordinate agents; fix the tool itself. Cowshed's jobserver and land
-    turn are the coordination. Anything else needs Danny's explicit approval first.
+    turn are the coordination. Anything else needs a maintainer's explicit approval first.
 
 17. **Pay for computation once; keep what it proves.** Prefer work that leaves reusable structure: one structure, many
     consumers; compute order once. Derived state (indexes, envelopes, checkpoints, caches) is a byproduct, never a
@@ -117,13 +117,12 @@ sheet.
   Focused proof does not replace the land wrapper's acceptance of the rebased candidate. Read its exit status and
   evidence. For platform-conditional Rust, run `bun run check:linux` before the relevant final land/push; it proves
   Linux compilation, not Linux test execution.
-- **Land:** `<land-command> land <ws>`, where `<land-command>` is the operator-configured, repository-locking host
-  entry. It invokes `tooling/land-host.sh`; that script owns acceptance of the rebased tree and takes no fleet lock
-  itself. Do not invoke its unlocked internals directly or reconstruct its retry/waiver taxonomy in this sheet.
+- **Land:** `<land-command> land <ws>`, where `<land-command>` is the operator-configured host entry that takes the
+  repository's cowshed land turn. It invokes `tooling/land-host.sh`; that script owns acceptance of the rebased tree. Do
+  not invoke its internals directly or reconstruct its retry/waiver taxonomy in this sheet.
 - **Markdown commit:** `<land-command> git -C <main> commit --only -m 'docs: summary' -- <paths>`. Stage new files
-  through `<land-command> git -C <main> add -- <paths>`. Use conventional commits, no trailers. This configured entry
-  takes the repository gate lock, so Markdown can wait behind a land. It runs the Git command, not a separate
-  Markdown-validating, ref-lock-only lane. Follow the custody card without claiming a nonwaiting lane.
+  through `<land-command> git -C <main> add -- <paths>`. Use conventional commits, no trailers. The entry takes the
+  repository's cowshed land turn briefly and runs no gate of its own.
 - **Build state:** shell/cowshed owns paired absolute Nx state paths and daemon lifecycle, preserving explicit absolute
   CI/cowshed overrides. Tasks and agents must not redirect them ad hoc. Declare all restorable deliverables as Nx
   outputs, never mutable tool state; keep one producer per checkout. Infer targets and inspect their resolved graph,
@@ -154,6 +153,6 @@ sheet.
 
 | Unit                                                  | Workspace                                    | Commit and acceptance                                                                    |
 | ----------------------------------------------------- | -------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| Only Markdown, unrelated to an active code unit       | Main, no shed                                | Exact-path commit through the configured locking entry; do not start a code gate for it. |
+| Only Markdown, unrelated to an active code unit       | Main, no shed                                | Exact-path commit through the configured entry; takes the land turn briefly, no gate.    |
 | Code plus docs/specs describing that code             | Unit's shed                                  | One coherent unit through the land wrapper.                                              |
 | Unrelated Markdown found while working in a code shed | Main for the doc fix; code stays in its shed | Fix immediately through the doc lane; the next rebase must reuse unaffected task caches. |
